@@ -131,18 +131,26 @@ fn cert(ca: Option<&Cert>, server: bool) -> Cert {
     Cert { cert, key }
 }
 
-#[tokio::test]
-async fn agent_transaction_surface_is_unchanged() {
+async fn agent_fixture(
+    engine: giggles_core::Engine,
+) -> (
+    std::path::PathBuf,
+    Arc<Service>,
+    Running,
+    ClientConfig,
+    giggles_core::SqlSession,
+) {
     let path = std::env::temp_dir().join(format!(
-        "modes-agent-{}-{}",
+        "modes-agent-{}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        SERIAL.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&path).unwrap();
-    let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+    let admin = Admin::create_engine(path.join("db.redb"), Limits::default(), engine).unwrap();
     let ca = cert(None, false);
     let server = cert(Some(&ca), true);
     let app = cert(Some(&ca), false);
@@ -153,6 +161,7 @@ async fn agent_transaction_surface_is_unchanged() {
             tables: BTreeSet::from(["app".into()]),
         },
     };
+    let ddl = admin.sql_session();
     let service = Service::new(admin, vec![binding], Clock::new(0, 3600).unwrap()).unwrap();
     let server_tls = tls::server(
         vec![server.cert.der().clone()],
@@ -175,6 +184,13 @@ async fn agent_transaction_surface_is_unchanged() {
             PrivatePkcs8KeyDer::from(app.key.serialize_der()).into(),
         )
         .unwrap();
+    (path, service, agent, client_tls, ddl)
+}
+
+#[tokio::test]
+async fn agent_transaction_surface_is_unchanged() {
+    let (path, service, agent, client_tls, ddl) = agent_fixture(giggles_core::Engine::Legacy).await;
+    drop(ddl);
     let (c, conn) = Config::new()
         .host("localhost")
         .hostaddr(agent.address.ip())
@@ -262,7 +278,7 @@ async fn agent_transaction_surface_is_unchanged() {
     std::fs::remove_dir_all(path).unwrap();
 }
 
-async fn wire_cycle(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
+async fn wire_cycle(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<(u8, Vec<u8>)> {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let mut messages = Vec::new();
         loop {
@@ -280,7 +296,10 @@ async fn wire_cycle(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
     .await
     .unwrap()
 }
-async fn wire_query(stream: &mut TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {
+async fn wire_query(
+    stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
+    sql: &str,
+) -> Vec<(u8, Vec<u8>)> {
     let mut body = Vec::new();
     giggles_server::pgwire::z(sql, &mut body);
     let mut packet = Vec::new();
@@ -579,4 +598,115 @@ async fn set_transaction_outside_a_block_warns_and_does_nothing() {
     wire_query(&mut stream, "ROLLBACK").await;
     drop(stream);
     f.stop().await;
+}
+
+// Check each extended-protocol stage independently: Parse/Describe must not
+// create a transaction that changes a control plan's eventual refusal.
+#[tokio::test]
+async fn agent_extended_control_stages_preserve_refusals_after_catalog_change() {
+    #[cfg(feature = "engine-rocksdb")]
+    let engine = giggles_core::Engine::V2;
+    #[cfg(not(feature = "engine-rocksdb"))]
+    let engine = giggles_core::Engine::Legacy;
+    let (path, service, agent, client_tls, mut ddl) = agent_fixture(engine).await;
+    let mut tcp = TcpStream::connect(agent.address).await.unwrap();
+    tcp.write_all(&[0, 0, 0, 8, 4, 210, 22, 47]).await.unwrap();
+    assert_eq!(tcp.read_u8().await.unwrap(), b'S');
+    let mut stream = tokio_rustls::TlsConnector::from(Arc::new(client_tls))
+        .connect("localhost".try_into().unwrap(), tcp)
+        .await
+        .unwrap();
+    let startup = b"\0\x03\0\0user\0giggles\0database\0giggles\0\0";
+    stream.write_u32((startup.len() + 4) as u32).await.unwrap();
+    stream.write_all(startup).await.unwrap();
+    wire_cycle(&mut stream).await;
+
+    // A profile refusal at Parse discards subsequent Bind/Describe/Execute
+    // messages through Sync; none may turn rejected syntax into a portal.
+    let mut packet = Vec::new();
+    for (tag, body) in [
+        (b'P', &b"bad\0BEGIN WORK\0\0\0"[..]),
+        (b'B', &b"p\0bad\0\0\0\0\0\0\0"[..]),
+        (b'D', &b"Pp\0"[..]),
+        (b'E', &b"p\0\0\0\0\0"[..]),
+        (b'S', &b""[..]),
+    ] {
+        giggles_server::pgwire::frame(tag, body, &mut packet).unwrap();
+    }
+    stream.write_all(&packet).await.unwrap();
+    assert_eq!(tags(&wire_cycle(&mut stream).await), b"EZ");
+
+    // Core accepts this spelling at Parse; the agent profile historically
+    // refuses it at Execute with 25000. Catalog refresh must preserve that.
+    // Legacy plans retain their epoch fence; catalog-driven re-preparation is V2-only.
+    let refresh_points: &[&str] = match engine {
+        giggles_core::Engine::V2 => &["none", "describe", "bind"],
+        giggles_core::Engine::Legacy => &["none"],
+    };
+    for &refresh_at in refresh_points {
+        let name = format!("s_{refresh_at}");
+        let mut parse = Vec::new();
+        giggles_server::pgwire::z(&name, &mut parse);
+        giggles_server::pgwire::z("ROLLBACK TRANSACTION", &mut parse);
+        parse.extend_from_slice(&[0, 0]);
+        let mut packet = Vec::new();
+        giggles_server::pgwire::frame(b'P', &parse, &mut packet).unwrap();
+        giggles_server::pgwire::frame(b'S', &[], &mut packet).unwrap();
+        stream.write_all(&packet).await.unwrap();
+        let parsed = wire_cycle(&mut stream).await;
+        assert_eq!(tags(&parsed), b"1Z");
+        assert_eq!(parsed.last().unwrap().1, b"I");
+        if refresh_at == "describe" {
+            ddl.execute(
+                &format!("CREATE TABLE drift_{refresh_at} (id BIGINT PRIMARY KEY)"),
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+        let mut describe = vec![b'S'];
+        giggles_server::pgwire::z(&name, &mut describe);
+        let mut packet = Vec::new();
+        giggles_server::pgwire::frame(b'D', &describe, &mut packet).unwrap();
+        giggles_server::pgwire::frame(b'S', &[], &mut packet).unwrap();
+        stream.write_all(&packet).await.unwrap();
+        let described = wire_cycle(&mut stream).await;
+        assert_eq!(tags(&described), b"tnZ");
+        assert_eq!(described.last().unwrap().1, b"I");
+        if refresh_at == "bind" {
+            ddl.execute(
+                &format!("CREATE TABLE drift_{refresh_at} (id BIGINT PRIMARY KEY)"),
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+        let mut bind = b"\0".to_vec();
+        giggles_server::pgwire::z(&name, &mut bind);
+        bind.extend_from_slice(&[0; 6]);
+        let mut packet = Vec::new();
+        for (tag, body) in [
+            (b'B', bind.as_slice()),
+            (b'D', &b"P\0"[..]),
+            (b'E', &b"\0\0\0\0\0"[..]),
+            (b'S', &b""[..]),
+        ] {
+            giggles_server::pgwire::frame(tag, body, &mut packet).unwrap();
+        }
+        stream.write_all(&packet).await.unwrap();
+        let executed = wire_cycle(&mut stream).await;
+        assert_eq!(tags(&executed), b"2nEZ", "{refresh_at}");
+        assert!(executed.iter().any(|(tag, body)| {
+            *tag == b'E'
+                && body
+                    .split(|byte| *byte == 0)
+                    .any(|field| field == b"C25000")
+        }));
+        assert_eq!(executed.last().unwrap().1, b"I");
+    }
+    drop(stream);
+    drop(ddl);
+    agent.shutdown().await.unwrap();
+    drop(service);
+    std::fs::remove_dir_all(path).unwrap();
 }

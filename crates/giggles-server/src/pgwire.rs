@@ -1208,6 +1208,13 @@ fn begin_implicit(
     }
     Ok(())
 }
+// Bind and Execute must classify core control plans alike. Opening an
+// implicit transaction for a control plan changes its profile semantics before
+// re-preparation or execution (for example, turning a refusal into a rollback).
+fn needs_implicit_transaction(prepared: &Prepared) -> bool {
+    !matches!(prepared.command(), "BEGIN" | "COMMIT" | "ROLLBACK")
+}
+
 fn control(sql: &str) -> Option<&'static str> {
     let sql = sql.trim().strip_suffix(';').unwrap_or(sql.trim()).trim();
     ["BEGIN", "COMMIT", "ROLLBACK"]
@@ -1780,6 +1787,7 @@ impl State {
                 let s = self.statements.get(&stmt).ok_or("26000")?;
                 if let Plan::Sql(p) = &s.p
                     && session.task().is_none()
+                    && needs_implicit_transaction(p)
                 {
                     if !p.is_ddl() {
                         begin_implicit(session, &mut self.implicit, &mut self.settings)?;
@@ -2345,10 +2353,10 @@ impl State {
                 if p.result.is_none() {
                     let command = prepared.command();
                     read_only_check(prepared.write_tables().first().map_or(command, |(_, command)| *command), &self.settings, session, &mut self.diagnostic)?;
-                    if !matches!(command, "BEGIN" | "COMMIT" | "ROLLBACK") {
+                    if needs_implicit_transaction(prepared) {
                         begin_implicit(session, &mut self.implicit, &mut self.settings)?;
                     }
-                    if !matches!(command, "BEGIN" | "COMMIT" | "ROLLBACK") {
+                    if needs_implicit_transaction(prepared) {
                         self.settings.queried = true;
                     }
                     let (result, spilled) = if command == "BEGIN" && self.implicit {
