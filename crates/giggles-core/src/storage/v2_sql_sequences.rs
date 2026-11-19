@@ -197,7 +197,27 @@ fn receive_one<'a>(
     mut guard: SlotGuard<'a>,
 ) -> Result<SlotGuard<'a>, ReceiveError> {
     if guard.receiving {
-        return guard.wait().map_err(ReceiveError::Core);
+        // Observe under the slot lock so a subsequent state change either bumps
+        // the generation before we sleep or notifies us. Always reacquire the
+        // slot after at most one cancellation slice: this also rechecks state
+        // after a missed signal and returns Fenced if the slot was poisoned.
+        let observed = *slot.ack_gen.lock().map_err(|_| CoreError::Fenced)?;
+        drop(guard);
+        crate::cancellation::check()?;
+        let slice = crate::cancellation::Cancellation::current()
+            .map_or(std::time::Duration::from_millis(5), |c| c.wait_slice());
+        let deadline = std::time::Instant::now() + slice;
+        let mut generation = slot.ack_gen.lock().map_err(|_| CoreError::Fenced)?;
+        while *generation == observed {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() { break; }
+            let (next, timeout) = slot.ack_cv.wait_timeout(generation, remaining)
+                .map_err(|_| CoreError::Fenced)?;
+            generation = next;
+            if timeout.timed_out() { break; }
+        }
+        drop(generation);
+        return slot.counter.lock_cancellable().map_err(ReceiveError::Core);
     }
     let Some(write) = guard.inflight.pop_front() else {
         return Ok(guard);
@@ -210,6 +230,7 @@ fn receive_one<'a>(
             let mut guard = slot.counter.lock().map_err(|_| CoreError::Fenced)?;
             guard.inflight.push_front(write);
             guard.receiving = false;
+            wake_ack_waiters(slot)?;
             return Err(error.into());
         }
         match write
@@ -229,11 +250,34 @@ fn receive_one<'a>(
     if outcome.is_ok() {
         guard.acknowledge(write.incarnation, write.hw);
     }
+    wake_ack_waiters(slot)?;
     match outcome {
         Ok(()) => Ok(guard),
         Err(engine::txn::TxnError::SequenceGone) => Err(ReceiveError::Gone(write.incarnation)),
         Err(error) => Err(ReceiveError::Core(error.into())),
     }
+}
+
+// Only callers that observed receiving=true use this wakeup. drain_ready cannot
+// advance coverage while receiving; synchronous installs drain receivers first.
+// The durable DDL publication path also signals after installing a new incarnation.
+// Inflight pushes do not complete the oldest ack. Retirement without an install
+// is observed when the retired receiver finishes (including SequenceGone).
+pub(super) fn wake_ack_waiters(slot: &v2::SeqSlot) -> Result<(), CoreError> {
+    let mut generation = slot.ack_gen.lock().map_err(|_| CoreError::Fenced)?;
+    *generation = generation.wrapping_add(1);
+    slot.ack_cv.notify_all();
+    Ok(())
+}
+
+/// Publish a durable incarnation and wake callers waiting on the old receiver.
+pub(in crate::storage) fn install_and_wake(
+    slot: &v2::SeqSlot,
+    current: &mut v2::SeqSlotState,
+    counter: sequences::SeqCounter,
+) -> Result<(), CoreError> {
+    current.install(counter);
+    wake_ack_waiters(slot)
 }
 
 fn drain_ready(guard: &mut v2::SeqSlotState) {

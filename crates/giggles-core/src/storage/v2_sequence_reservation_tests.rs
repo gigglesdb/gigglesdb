@@ -950,14 +950,29 @@ fn pipeline_crash_worker() {
     };
     let count: i64 = std::env::var("PIPELINE_CRASH_N").unwrap().parse().unwrap();
     let admin = Admin::open(PathBuf::from(path), Limits::default()).unwrap();
-    let mut s = admin.sql_session();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let start = Arc::new(std::sync::Barrier::new(16));
+    let workers: Vec<_> = (0..16).map(|lane| {
+        let admin = admin.clone();
+        let start = start.clone();
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let mut s = admin.sql_session();
+            start.wait();
+            for _ in (lane..count).step_by(16) {
+                let value = scalar(&mut s, "SELECT nextval('pipeline_crash')");
+                tx.send(value).unwrap();
+            }
+        })
+    }).collect();
+    let mut seen = BTreeSet::new();
     for _ in 0..count {
-        println!(
-            "RETURNED={}",
-            scalar(&mut s, "SELECT nextval('pipeline_crash')")
-        );
+        let value = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert!(seen.insert(value));
+        println!("RETURNED={value}");
         std::io::stdout().flush().unwrap();
     }
+    for worker in workers { worker.join().unwrap(); }
     crate::storage::crash_now();
 }
 #[cfg(feature = "engine-rocksdb")]
@@ -1226,4 +1241,166 @@ fn committed_value(
     let result = super::committed_value(db, slot, id, def, operation, value, called, &unsettled);
     settle(db, &unsettled)?;
     result
+}
+
+#[cfg(feature = "engine-rocksdb")]
+struct ReleaseGate<F: FnMut()>(F);
+#[cfg(feature = "engine-rocksdb")]
+impl<F: FnMut()> Drop for ReleaseGate<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
+// Gate a real SQL coverage ack so every caller contends with one receiver.
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn coverage_waiters_sleep_and_resume() {
+    use std::{sync::mpsc, time::{Duration, Instant}};
+    let f = Fixture::new(Engine::V2);
+    let mut s = f.session();
+    run(&mut s, "CREATE SEQUENCE sleeping");
+    assert_eq!(scalar(&mut s, "SELECT nextval('sleeping')"), 1);
+    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else { unreachable!() };
+    db.sequencer.gate_counter_acks(true);
+    // Release gated acks even if an assertion unwinds, so workers finish
+    // before fixture teardown instead of hanging on a gated receiver.
+    let _release = ReleaseGate(|| db.sequencer.gate_counter_acks(false));
+    for expected in 2..=33 { assert_eq!(scalar(&mut s, "SELECT nextval('sleeping')"), expected); }
+    let slot = db.sql_counters.lock().unwrap().values().next().unwrap().clone();
+    let (tx, rx) = mpsc::channel();
+    let start = Arc::new(std::sync::Barrier::new(32));
+    let workers: Vec<_> = (0..32).map(|_| {
+        let admin = f.admin.as_ref().unwrap().clone();
+        let tx = tx.clone();
+        let start = start.clone();
+        thread::spawn(move || {
+            let mut s = admin.sql_session();
+            start.wait();
+            // Report each value as it returns: one uncovered return must be seen
+            // by the negative check below, even if a later call then blocks.
+            for _ in 0..32 { tx.send(scalar(&mut s, "SELECT nextval('sleeping')")).unwrap(); }
+        })
+    }).collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while slot.counter.lock().unwrap().waiting_returns < 32 {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    // All callers have entered coverage waits. Keep only this short negative
+    // observation window: no positive event can prove they stay blocked.
+    assert!(rx.recv_timeout(Duration::from_millis(20)).is_err(), "returned without durable coverage");
+    db.sequencer.gate_counter_acks(false);
+    let resumed = Instant::now();
+    let mut values = BTreeSet::new();
+    for _ in 0..1024 {
+        assert!(values.insert(rx.recv_timeout(Duration::from_secs(10)).unwrap()));
+    }
+    assert!(resumed.elapsed() < Duration::from_secs(10));
+    for worker in workers { worker.join().unwrap(); }
+    assert_eq!(values.len(), 1024);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn coverage_nonreceiver_cancellation_and_deadline() {
+    use std::{sync::mpsc, time::{Duration, Instant}};
+    let f = Fixture::new(Engine::V2);
+    let mut s = f.session();
+    run(&mut s, "CREATE SEQUENCE cancel_waiter");
+    scalar(&mut s, "SELECT nextval('cancel_waiter')");
+    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else { unreachable!() };
+    db.sequencer.gate_counter_acks(true);
+    // Release gated acks even if an assertion unwinds, so workers finish
+    // before fixture teardown instead of hanging on a gated receiver.
+    let _release = ReleaseGate(|| db.sequencer.gate_counter_acks(false));
+    for _ in 2..=33 { scalar(&mut s, "SELECT nextval('cancel_waiter')"); }
+    let slot = db.sql_counters.lock().unwrap().values().next().unwrap().clone();
+    let admin = f.admin.as_ref().unwrap().clone();
+    let receiver = thread::spawn(move || scalar(&mut admin.sql_session(), "SELECT nextval('cancel_waiter')"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !slot.counter.lock().unwrap().receiving {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    for timed in [false, true] {
+        let cancel = crate::cancellation::Cancellation::new(None);
+        let c = cancel.clone();
+        let admin = f.admin.as_ref().unwrap().clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            tx.send(c.scope(|| admin.sql_session().execute_at("SELECT nextval('cancel_waiter')", &[], None, &clock()))).unwrap();
+        });
+        while slot.counter.lock().unwrap().waiting_returns < 2 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let began = Instant::now();
+        if timed {
+            cancel.deadline(Instant::now() + Duration::from_millis(80));
+        } else {
+            assert!(cancel.cancel());
+        }
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Err(CoreError::Cancelled));
+        assert!(began.elapsed() < Duration::from_secs(2));
+        worker.join().unwrap();
+    }
+    db.sequencer.gate_counter_acks(false);
+    assert_eq!(receiver.join().unwrap(), 34);
+    assert_eq!(scalar(&mut s, "SELECT nextval('cancel_waiter')"), 37);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn coverage_nonreceiver_survives_ddl_restart() {
+    use std::{sync::mpsc, time::{Duration, Instant}};
+    let f = Fixture::new(Engine::V2);
+    let mut s = f.session();
+    run(&mut s, "CREATE SEQUENCE restart_waiters");
+    scalar(&mut s, "SELECT nextval('restart_waiters')");
+    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else { unreachable!() };
+    db.sequencer.gate_counter_acks(true);
+    // Release gated acks even if an assertion unwinds, so workers finish
+    // before fixture teardown instead of hanging on a gated receiver.
+    let _release = ReleaseGate(|| db.sequencer.gate_counter_acks(false));
+    for _ in 2..=33 { scalar(&mut s, "SELECT nextval('restart_waiters')"); }
+    let slot = db.sql_counters.lock().unwrap().values().next().unwrap().clone();
+    let (tx, rx) = mpsc::channel();
+    let mut workers = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for count in 1..=2 {
+        let admin = f.admin.as_ref().unwrap().clone();
+        let tx = tx.clone();
+        workers.push(thread::spawn(move || {
+            tx.send(scalar(&mut admin.sql_session(), "SELECT nextval('restart_waiters')")).unwrap();
+        }));
+        loop {
+            let guard = slot.counter.lock().unwrap();
+            if guard.receiving && guard.waiting_returns == count { break; }
+            drop(guard);
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let before = *slot.ack_gen.lock().unwrap();
+    let admin = f.admin.as_ref().unwrap().clone();
+    let (tx, restarted) = mpsc::channel();
+    let restart = thread::spawn(move || {
+        let mut s = admin.sql_session();
+        run(&mut s, "BEGIN");
+        run(&mut s, "ALTER SEQUENCE restart_waiters RESTART WITH 1000");
+        run(&mut s, "COMMIT");
+        tx.send(()).unwrap();
+    });
+    let outcome = restarted.recv_timeout(Duration::from_secs(10));
+    // Release even on failure, so fixture teardown cannot hang on gated acks.
+    db.sequencer.gate_counter_acks(false);
+    outcome.unwrap();
+    restart.join().unwrap();
+    assert_ne!(*slot.ack_gen.lock().unwrap(), before);
+    let values: BTreeSet<_> = (0..2).map(|_| rx.recv_timeout(Duration::from_secs(10)).unwrap()).collect();
+    assert_eq!(values, BTreeSet::from([34, 35]));
+    for worker in workers { worker.join().unwrap(); }
+    assert_eq!(slot.counter.lock().unwrap().waiting_returns, 0);
+    assert_eq!(scalar(&mut s, "SELECT nextval('restart_waiters')"), 1000);
 }

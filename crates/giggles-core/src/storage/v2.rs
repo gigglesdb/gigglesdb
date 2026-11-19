@@ -16,6 +16,8 @@ pub(super) mod maintenance;
 #[derive(Default)]
 pub(crate) struct SeqSlot {
     pub(crate) counter: crate::cancellation::WaitMutex<SeqSlotState>,
+    pub(crate) ack_gen: std::sync::Mutex<u64>,
+    pub(crate) ack_cv: std::sync::Condvar,
 }
 
 /// (a) A returned value is covered by an Ok durable ack for its incarnation,

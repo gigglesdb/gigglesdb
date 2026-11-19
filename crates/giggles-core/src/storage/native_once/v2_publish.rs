@@ -105,7 +105,7 @@ impl SqlSession {
             if db.catalog().current_local_view()?.sequences.get(id)
                     .is_some_and(|def| def.incarnation == counter.incarnation)
                     && current.counter.as_ref().is_none_or(|current| current.incarnation != counter.incarnation) {
-                current.install(counter.clone());
+                v2_sql::sql_sequences::install_and_wake(slot, &mut current, counter.clone())?;
             }
         }
         drop(live);

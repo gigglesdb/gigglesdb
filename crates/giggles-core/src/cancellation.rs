@@ -55,7 +55,7 @@ impl Cancellation {
             Ok(())
         }
     }
-    fn wait_slice(&self) -> Duration {
+    pub(crate) fn wait_slice(&self) -> Duration {
         const SLICE: Duration = Duration::from_millis(5);
         self.0
             .deadline
