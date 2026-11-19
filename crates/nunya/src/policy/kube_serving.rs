@@ -96,14 +96,14 @@ impl Backend for KubeBackend {
             .map_err(api_error)
     }
 }
-/// Caller-supplied view of loaded revisions and the future adoption hook.
+/// Caller-supplied view of loaded revisions and authoritative head adoption.
 pub trait LoadedPolicies: Send + Sync {
     /// Revision actually loaded by the route, or fail closed.
     fn loaded(&self, route: &RouteId) -> Result<u64, ServingError>;
     /// Wait for older local releases before confirming a loaded revision.
     fn released(&self, _route: &RouteId, _timeout: Duration) -> bool { true }
-    /// Publish the fetched head locally, without further revision-store API calls.
-    fn adopt(&self, route: &RouteId, revision: &crate::policy::PolicyRevision) -> Result<(), ServingError>;
+    /// Reconcile ownership and publish the fetched head after authoritative validation.
+    fn adopt(&self, route: &RouteId, revision: &crate::policy::PolicyRevision, timeout: Duration) -> Result<(), ServingError>;
 }
 /// Per-pod Lease renewer; it never deletes leases on shutdown.
 pub struct ServingRenewer {
@@ -213,17 +213,22 @@ impl ServingRenewer {
         let wait_start = std::time::Instant::now();
         for route in &self.routes {
             let head = self.backend.head(route, self.remaining(end)?)?;
-            let local = self.loaded.loaded(route)?;
-            if head != 0 && local != head {
+            // Readiness may be blocked by the old document or by another route.
+            // Adopt every head before requiring all routes to be loaded.
+            if head != 0 && self.loaded.loaded(route) != Ok(head) {
                 let revision = self.backend.revision(route, self.remaining(end)?)?;
                 if revision.number != head { return Err(ServingError::Invalid); }
-                self.loaded.adopt(route, &revision)?;
+                self.loaded.adopt(route, &revision, self.remaining(end)?)?;
             }
-            let loaded = if head == 0 { 0 } else { self.loaded.loaded(route)? };
+            loaded_heads.insert(route.as_str().to_owned(), head);
+        }
+        for route in &self.routes {
+            let head = loaded_heads[route.as_str()];
+            let local = self.loaded.loaded(route)?;
+            let loaded = if head == 0 { 0 } else { local };
             if loaded != head {
                 return Err(ServingError::Invalid);
             }
-            loaded_heads.insert(route.as_str().to_owned(), loaded);
             if head == 0 || self.loaded.released(route, wait.saturating_sub(wait_start.elapsed()).min(self.remaining(end)?)) { confirmed.insert(route.as_str().to_owned(), loaded); }
 
         }
@@ -326,7 +331,7 @@ impl Drop for CloseOnDrop {
 }
 
 #[cfg(all(test, feature = "kubernetes"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{
         Mutex,
@@ -372,7 +377,7 @@ mod tests {
         fn loaded(&self, _: &RouteId) -> Result<u64, ServingError> {
             Ok(1)
         }
-        fn adopt(&self, _: &RouteId, _: &crate::policy::PolicyRevision) -> Result<(), ServingError> {
+        fn adopt(&self, _: &RouteId, _: &crate::policy::PolicyRevision, _: Duration) -> Result<(), ServingError> {
             Err(ServingError::Invalid)
         }
     }
@@ -404,6 +409,27 @@ mod tests {
             },
         };
         (fake, renewer)
+    }
+    /// Exercise the real renewal cycle against a fixed durable head without Kubernetes I/O.
+    pub(crate) fn revision_renewer(loaded: Arc<dyn LoadedPolicies>, revision: crate::policy::PolicyRevision, gate: Arc<ServingGate>) -> (ServingRenewer, Arc<AtomicU64>) {
+        struct Head {
+            revision: crate::policy::PolicyRevision,
+            writes: Arc<AtomicU64>,
+        }
+        impl Backend for Head {
+            fn head(&self, _: &RouteId, _: Duration) -> Result<u64, ServingError> { Ok(self.revision.number) }
+            fn revision(&self, _: &RouteId, _: Duration) -> Result<crate::policy::PolicyRevision, ServingError> { Ok(self.revision.clone()) }
+            fn lease(&self, _: Duration) -> Result<Option<Lease>, ServingError> { Ok(None) }
+            fn save(&self, _: Lease, _: bool, _: Duration) -> Result<(), ServingError> { self.writes.fetch_add(1, SeqCst); Ok(()) }
+        }
+        let (_, mut renewer) = fixture();
+        let writes = Arc::new(AtomicU64::new(0));
+        renewer.routes = vec![revision.route.clone()];
+        renewer.backend = Arc::new(Head { revision, writes: writes.clone() });
+        renewer.clock = Arc::new(RealClock);
+        renewer.loaded = loaded;
+        renewer.gate = gate;
+        (renewer, writes)
     }
     #[test]
     fn successful_cycle_uses_request_start_and_pod_metadata() {
@@ -538,7 +564,7 @@ mod tests {
         struct Policies { fence: Arc<crate::policy::RevisionFence> }
         impl LoadedPolicies for Policies {
             fn loaded(&self, _: &RouteId) -> Result<u64, ServingError> { Ok(1) }
-            fn adopt(&self, _: &RouteId, _: &crate::policy::PolicyRevision) -> Result<(), ServingError> { Err(ServingError::Invalid) }
+            fn adopt(&self, _: &RouteId, _: &crate::policy::PolicyRevision, _: Duration) -> Result<(), ServingError> { Err(ServingError::Invalid) }
             fn released(&self, _: &RouteId, timeout: Duration) -> bool { self.fence.wait_released(self.fence.epoch(),timeout) == 0 }
         }
         let (fake, mut r) = fixture(); let fence = Arc::new(crate::policy::RevisionFence::default());

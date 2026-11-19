@@ -348,3 +348,6 @@ impl FailoverHub {
     /// Read the bound policy without exposing values in assertions.
     pub(crate) fn policy(&self) -> Arc<Policy> { self.fixture.ctx.policy.read().unwrap().clone() }
 }
+
+#[cfg(test)]
+mod root_causes { include!("peer_pods_root_causes.rs"); }

@@ -174,6 +174,17 @@ impl From<StoreError> for RevisionStoreError {
 }
 /// Narrow durable policy backend shared by local and remote implementations.
 pub trait RevisionStore: Send + Sync {
+    /// Read ownership and the service head within one serving reconciliation budget.
+    #[cfg(feature = "kubernetes")]
+    fn serving_snapshot(&self, route: &RouteId, timeout: std::time::Duration) -> Result<(Owner, Option<PolicyRevision>), RevisionStoreError> {
+        let start = std::time::Instant::now();
+        if timeout.is_zero() { return Err(RevisionStoreError::Unavailable); }
+        let owner = self.owner(route)?;
+        if start.elapsed() >= timeout { return Err(RevisionStoreError::Unavailable); }
+        let head = if owner == Owner::Service { self.active(route)? } else { None };
+        if start.elapsed() >= timeout { return Err(RevisionStoreError::Unavailable); }
+        Ok((owner, head))
+    }
     /// Read the active revision.
     fn active(&self, route: &RouteId) -> Result<Option<PolicyRevision>, RevisionStoreError>;
     /// Compare and set the active revision, replaying retry keys first.

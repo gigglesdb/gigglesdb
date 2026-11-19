@@ -121,6 +121,12 @@ struct PeerBindings {
     snapshot: BindingsProvider,
 }
 #[cfg(feature = "kubernetes")]
+struct FollowerHead {
+    predecessor: Arc<PolicyDocument>,
+    owner: Owner,
+    revision: Option<PolicyRevision>,
+}
+#[cfg(feature = "kubernetes")]
 fn stamp_number(stamp: &str) -> Option<u64> {
     stamp.strip_prefix("rev-")?.split('-').next()?.parse().ok()
 }
@@ -358,10 +364,32 @@ impl Hub {
     }
     /// Publish a durable head locally without writing revision storage.
     pub(crate) fn adopt_revision(&self, route: &RouteId, r: &PolicyRevision) -> Result<(), PolicyOpError> {
+        #[cfg(feature = "kubernetes")]
+        { self.adopt_revision_with_timeout(route, r, crate::policy::kube_store::API_TIMEOUT) }
+        #[cfg(not(feature = "kubernetes"))]
+        {
+            if &r.route != route { return Err(PolicyOpError::Unavailable); }
+            let mut state = self.state.lock().map_err(|_| PolicyOpError::Unavailable)?;
+            if self.route_owners.read().map_err(|_| PolicyOpError::Unavailable)?.get(route.as_str()) != Some(&Owner::Service) { return Err(PolicyOpError::NotServiceOwned); }
+            self.publish_revision(&mut state, route, r, false)
+        }
+    }
+    /// Reconcile a fetched revision using the serving loop's remaining budget.
+    #[cfg(feature = "kubernetes")]
+    pub(crate) fn adopt_revision_with_timeout(&self, route: &RouteId, r: &PolicyRevision, timeout: Duration) -> Result<(), PolicyOpError> {
         if &r.route != route { return Err(PolicyOpError::Unavailable); }
+        let start = std::time::Instant::now();
+        let follower = self.is_follower();
+        let head = follower.then(|| self.read_follower_head(route, start, timeout));
         let mut state = self.state.lock().map_err(|_| PolicyOpError::Unavailable)?;
+        if let Some(head) = head {
+            return self.adopt_follower_head(&mut state, route, Some(r), head, start, timeout).and_then(|adopted| {
+                if adopted { Ok(()) } else { Err(PolicyOpError::NotServiceOwned) }
+            });
+        }
         if self.route_owners.read().map_err(|_| PolicyOpError::Unavailable)?.get(route.as_str()) != Some(&Owner::Service) { return Err(PolicyOpError::NotServiceOwned); }
-        self.publish_revision(&mut state, route, r, self.is_follower())
+        if self.is_follower() { return Err(PolicyOpError::Unavailable); }
+        self.publish_revision(&mut state, route, r, false)
     }
     #[allow(clippy::too_many_arguments)]
     fn publish_compiled(&self, route: &RouteId, published: &PublishedRoute, policy: &mut Arc<Policy>, compiled: &Arc<Policy>, change: Option<&MembershipChange>, r: &PolicyRevision, predecessor: &str, follower: bool) -> Result<(), PolicyOpError> {
@@ -382,7 +410,7 @@ impl Hub {
         let index = state.unit(route.as_str()).map_err(|_| PolicyOpError::UnknownRoute)?;
         let stamp = state.units[index].revisions.read().map_err(|_| PolicyOpError::Unavailable)?.policy.clone();
         let loaded = stamp.strip_prefix("rev-").and_then(|s| s.split('-').next()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-        if loaded == r.number {
+        if loaded == r.number && !follower {
             #[cfg(feature = "kubernetes")]
             self.record_bindings_revision(route.as_str(), &stamp, follower);
             return Ok(());
@@ -766,11 +794,75 @@ impl Hub {
         }
         Ok(())
     }
+    // Capture the local predecessor briefly, then perform all revision-backend I/O
+    // without the publication lock. Kubernetes reads both fields in one bounded GET.
+    #[cfg(feature = "kubernetes")]
+    #[allow(clippy::result_large_err)]
+    fn read_follower_head(&self, route: &RouteId, start: std::time::Instant, timeout: Duration) -> Result<FollowerHead, PolicyOpError> {
+        let predecessor = {
+            let state = self.state.lock().map_err(|_| PolicyOpError::Unavailable)?;
+            state.units[state.unit(route.as_str()).map_err(|_| PolicyOpError::UnknownRoute)?].doc.clone()
+        };
+        let remaining = timeout.checked_sub(start.elapsed()).filter(|t| !t.is_zero()).ok_or(PolicyOpError::Unavailable)?;
+        let backend = self.revision_store.read().map_err(|_| PolicyOpError::Unavailable)?.clone();
+        let (owner, revision) = match backend {
+            Some(backend) => backend.serving_snapshot(route, remaining)?,
+            None => (Owner::File, None),
+        };
+        Ok(FollowerHead { predecessor, owner, revision })
+    }
+    // Revalidate and publish under the lock. A failed read/adoption must not be
+    // undone by recompiling the previous document.
+    #[cfg(feature = "kubernetes")]
+    #[allow(clippy::result_large_err)] // Reuse the policy-operation error type used by publication.
+    fn adopt_follower_head(&self, state: &mut State, route: &RouteId, expected: Option<&PolicyRevision>, head: Result<FollowerHead, PolicyOpError>, start: std::time::Instant, timeout: Duration) -> Result<bool, PolicyOpError> {
+        let index = state.unit(route.as_str()).map_err(|_| PolicyOpError::UnknownRoute)?;
+        let result = (|| {
+            let FollowerHead { predecessor, owner, revision } = head?;
+            if start.elapsed() >= timeout || !self.is_follower() || !Arc::ptr_eq(&predecessor, &state.units[index].doc) {
+                return Err(PolicyOpError::Unavailable);
+            }
+            self.route_owners.write().map_err(|_| PolicyOpError::Unavailable)?.insert(route.as_str().into(), owner);
+            if owner == Owner::File { return if expected.is_none() { Ok(false) } else { Err(PolicyOpError::NotServiceOwned) }; }
+            if state.configured.iter().filter(|(_, i)| *i == index).count() != 1 { return Err(PolicyOpError::SharedPolicyFile); }
+            let head = revision.ok_or(PolicyOpError::MissingRevision)?;
+            if &head.route != route || expected.is_some_and(|r| r != &head) { return Err(PolicyOpError::Unavailable); }
+            self.publish_revision(state, route, &head, true)?;
+            state.units[index].service_failed = false;
+            Ok(true)
+        })();
+        if result.is_err() {
+            for published in &mut state.units[index].routes { published.membership_failed = true; }
+            if let Some(gate) = &self.serving_gate { gate.close(); }
+        }
+        result
+    }
     #[cfg(feature = "kubernetes")]
     fn recompile_bindings_with_role(&self, follower: bool) {
+        let start = std::time::Instant::now();
+        let timeout = crate::policy::kube_store::API_TIMEOUT;
+        let heads = if follower {
+            let Ok(state) = self.state.lock() else { return; };
+            let routes = state.configured.clone();
+            drop(state);
+            routes.into_iter().map(|(route, index)| {
+                let head = self.read_follower_head(&route, start, timeout);
+                (route, index, head)
+            }).collect::<Vec<_>>()
+        } else { Vec::new() };
         let Ok(mut state) = self.state.lock() else { return; };
+        let mut reconciled = std::collections::BTreeSet::new();
+        if follower {
+            for (route, index, head) in heads {
+                match self.adopt_follower_head(&mut state, &route, None, head, start, timeout) {
+                    Ok(false) => {}, // File-owned routes still compile their file document.
+                    Ok(true) | Err(_) => { reconciled.insert(index); },
+                }
+            }
+        }
         let independent = state.units.len() > 1;
-        for unit in &mut state.units {
+        for (index, unit) in state.units.iter_mut().enumerate() {
+            if reconciled.contains(&index) { continue; }
             let stamp = match unit.revisions.read() { Ok(r) => r.policy.clone(), Err(_) => continue };
             let hash = unit.hash.clone();
             let doc = (*unit.doc).clone();

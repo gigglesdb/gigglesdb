@@ -1055,3 +1055,6 @@ async fn bindings_expire_after_one_term_and_refuse_observed_term_change() {
     drop(cache);
     cleanup(f).await;
 }
+
+#[cfg(test)]
+mod root_causes { include!("root_causes_tests.rs"); }

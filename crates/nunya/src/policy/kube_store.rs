@@ -227,6 +227,13 @@ impl KubernetesRevisionStore {
     }
 }
 impl RevisionStore for KubernetesRevisionStore {
+    fn serving_snapshot(&self, route: &RouteId, timeout: std::time::Duration) -> Result<(Owner, Option<PolicyRevision>), RevisionStoreError> {
+        if timeout.is_zero() { return Err(RevisionStoreError::Unavailable); }
+        let Some(head) = self.backend.head_timeout(&name(route)?, timeout)? else { return Ok((Owner::File, None)); };
+        validate(&head.spec, route)?;
+        if head.spec.owner == "service" { Ok((Owner::Service, head.spec.revision)) }
+        else { Ok((Owner::File, None)) }
+    }
     fn active(&self, route: &RouteId) -> Result<Option<PolicyRevision>, RevisionStoreError> {
         let r = self.read(route)?.and_then(|h| h.spec.revision);
         if let Some(r) = &r {

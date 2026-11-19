@@ -1024,7 +1024,8 @@ async fn run_inner(mut config: Config, #[cfg(feature = "kubernetes")] election_t
     result
 }
 #[cfg(feature = "kubernetes")]
-struct ServingPolicies(Arc<crate::reload::Hub>);
+/// Loaded-policy adapter shared by serving renewal and its regression tests.
+pub(crate) struct ServingPolicies(pub(crate) Arc<crate::reload::Hub>);
 #[cfg(feature = "kubernetes")]
 impl crate::policy::kube_serving::LoadedPolicies for ServingPolicies {
     fn loaded(&self, route: &crate::state::model::RouteId) -> Result<u64, crate::policy::kube_serving::ServingError> {
@@ -1035,9 +1036,9 @@ impl crate::policy::kube_serving::LoadedPolicies for ServingPolicies {
             rest.split('-').next().and_then(|n| n.parse().ok()).ok_or(ServingError::Invalid)
         } else { Ok(0) }
     }
-    fn adopt(&self, route: &crate::state::model::RouteId, r: &crate::policy::PolicyRevision) -> Result<(), crate::policy::kube_serving::ServingError> {
+    fn adopt(&self, route: &crate::state::model::RouteId, r: &crate::policy::PolicyRevision, timeout: Duration) -> Result<(), crate::policy::kube_serving::ServingError> {
         use crate::policy::kube_serving::ServingError;
-        self.0.adopt_revision(route, r).map_err(|_| ServingError::Invalid)
+        self.0.adopt_revision_with_timeout(route, r, timeout).map_err(|_| ServingError::Invalid)
     }
     fn released(&self, route: &crate::state::model::RouteId, timeout: Duration) -> bool {
         self.0.fence_for(route).is_some_and(|f| f.wait_released(f.epoch(), timeout) == 0)

@@ -53,6 +53,20 @@ fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, PeerError> {
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, PeerError> {
     serde_json::to_vec(value).map_err(|_| PeerError::Protocol)
 }
+struct PeerThread {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for PeerThread {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() { let _ = stop.send(()); }
+        if let Some(thread) = self.thread.take() {
+            // Cancellation runs on the caller's executor, while a synchronous
+            // handler may still be waiting on storage or policy publication.
+            let _ = std::thread::Builder::new().name("nunya-peer-reaper".into()).spawn(move || { let _ = thread.join(); });
+        }
+    }
+}
 impl PeerServer {
     /// Construct an unwired peer listener service.
     pub fn new(
@@ -96,12 +110,34 @@ impl PeerServer {
         Arc::get_mut(&mut self).ok_or(PeerError::Protocol)?.limit_source = Some(source);
         Ok(self)
     }
-    /// Serve the supplied listener until the caller cancels this future.
+    /// Serve on a dedicated runtime until the caller cancels this future.
     pub async fn serve(
         self: Arc<Self>,
         listener: tokio::net::TcpListener,
     ) -> Result<(), PeerError> {
         if self.serving_gate.is_none() { return Err(PeerError::Protocol); }
+        let listener = listener.into_std().map_err(|_| PeerError::Transport)?;
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let thread = std::thread::Builder::new().name("nunya-peer".into()).spawn(move || {
+            // Synchronous self-peer callers may occupy every gateway worker.
+            // Both listener registration and request execution belong here.
+            let result = (|| {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| PeerError::Transport)?;
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener).map_err(|_| PeerError::Transport)?;
+                    tokio::select! {
+                        result = self.serve_connections(listener) => result,
+                        _ = stopped => Ok(()),
+                    }
+                })
+            })();
+            let _ = done.send(result);
+        }).map_err(|_| PeerError::Transport)?;
+        let _thread = PeerThread { stop: Some(stop), thread: Some(thread) };
+        finished.await.map_err(|_| PeerError::Transport)?
+    }
+    async fn serve_connections(self: Arc<Self>, listener: tokio::net::TcpListener) -> Result<(), PeerError> {
         let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {

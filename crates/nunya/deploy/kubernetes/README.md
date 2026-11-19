@@ -1,19 +1,34 @@
 # Kubernetes multi-replica deployment
 
-Status: multi-replica serving is UNSUPPORTED. This manifest describes the
-intended topology, but the live three-replica proof on kind failed. Run one
-replica (`replicas: 1`) for serving until a later release says otherwise.
+Status: multi-replica serving is supported only in the one-node topology below:
+one RWO PVC on local-path or block CSI storage, required pod co-location,
+`[kubernetes.peer]`, and a CNI that enforces NetworkPolicy.
 
-Failed or unproven in that run:
-- Shared sessions across pods FAILED with inconsistent admission: a follower stayed
-  refusing with "policy membership requires successful reload"; the leader answered
-  "token not valid in this session".
-- Cross-pod revocation and per-principal limits failed or were blocked.
-- Counter survival across failover failed or was blocked.
-- Restart ordering remains unproven.
-- Sustained readiness of all three replicas failed (follower serving leases expired).
+## Qualified
 
-The intended topology runs three replicas on one node, sharing one 1Gi
+The live kind + Calico v3.31.2 proof used three replicas from these manifests
+with an image built using `--features kubernetes`:
+- All three stayed Ready together, including followers started before policy import.
+- A leader-issued session worked on every pod with identical tokens.
+- Revocation reached every pod in under one second, within one serving-lease term.
+- The per-principal tokenize limit held across pods: exactly the limit, then NY007.
+- Leader force-delete handed over in about 17 seconds, retaining sessions, tokens
+  and counters.
+- A tightened apply stopped a follower cursor with NY008 before it was reported active.
+- An API-partitioned pod returned NY013 and `/ready` 503.
+- A restarted pod served only the current revision.
+- NetworkPolicy blocked peer port 6482 from non-Nunya pods and kept 6480 closed.
+
+## Limits
+
+- Node loss is an outage; this topology provides no node HA.
+- A frozen old leader blocks failover until killed; this fails closed.
+- Leader takeover took about 17 seconds in the kind run.
+- kindnet does not enforce NetworkPolicy; an enforcing CNI is required.
+
+See [`../../harness/k8s/`](../../harness/k8s/) for re-running the proof.
+
+The supported topology runs three replicas on one node, sharing one 1Gi
 ReadWriteOnce PVC mounted at
 `/state`. Use local-path or a block CSI storage class with working exclusive
 file locks; never NFS, ReadWriteMany or ReadWriteOncePod. Required pod affinity
@@ -22,8 +37,8 @@ Only the leader-Lease holder opens the state store; its exclusive file lock is
 the fence. Followers use the authenticated peer API. A frozen old leader blocks
 failover until killed and its lock released.
 
-This topology is intended to give process failover and rolling restarts, with
-no node HA; multi-replica serving remains unproven. Node loss
+This topology provides process failover and supports rolling restarts, with
+no node HA. Node loss
 means an outage until the node or volume returns. RollingUpdate allows one
 surge replica on the same node and at most one unavailable replica. Reserve
 capacity for that fourth pod. The PDB limits voluntary evictions only.
@@ -62,12 +77,11 @@ The following are operator instructions; review them against your target cluster
    Share the same peer Secret (at least 32 random bytes) across all replicas.
    Retain a secure backup of the root key for the persistent state.
 5. Apply `networkpolicy.yaml` using a CNI that enforces NetworkPolicy.
-   Enforcement depends on the CNI and was not demonstrated on kind's default
-   CNI: a non-nunya pod could still reach port 6482.
+   The proof used Calico v3.31.2; kind's default kindnet does not enforce it.
 6. Apply `pdb.yaml`.
 7. Edit `deployment.yaml`: supply an image built with `--features kubernetes`,
    the upstream and bootstrap route policy, and the appropriate storage class.
-   Keep `replicas: 1` for serving; 3 replicas is for testing the topology only.
+   Keep the default `replicas: 3` within the supported one-node topology.
    Optionally set the commented nodeSelector to the volume's node. Apply it.
 
 The init container (Alpine 3.21.3) renders the downward API values, including

@@ -68,8 +68,9 @@ metadata:
   name: nunya
   namespace: nunya
 spec:
-  # Multi-replica serving is UNSUPPORTED (see README); 3 is the topology under test.
-  replicas: 1
+  # Supported: three replicas on one node sharing one RWO PVC (see README).
+  # NetworkPolicy requires a CNI that enforces it.
+  replicas: 3
   # RWO permits concurrent mounts on one node. One surge pod allows rolling
   # replacement without evicting all replicas; required affinity keeps it local.
   strategy:
