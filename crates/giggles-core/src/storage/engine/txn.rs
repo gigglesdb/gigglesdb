@@ -175,6 +175,7 @@ pub(crate) struct Savepoint {
     undo_len: usize,
     raw_len: usize,
     lock_undo_len: usize,
+    releases_locks: bool,
     features_or: u64,
     minimum_subversion: u32,
 }
@@ -457,7 +458,8 @@ pub(crate) struct Transaction {
     write_limit: Option<usize>,
     savepoint_owner: Arc<()>,
     savepoint_sequence: u64,
-    savepoints: Vec<(u64, usize)>,
+    savepoints: Vec<(u64, usize, bool)>,
+    lock_savepoints: usize,
     undo: Vec<UndoWrite>,
     undo_bytes: usize,
     lock_undo: Vec<(LockKey, super::locks::HeldModes)>,
@@ -509,6 +511,7 @@ impl Transaction {
             savepoint_owner: Arc::new(()),
             savepoint_sequence: 0,
             savepoints: Vec::new(),
+            lock_savepoints: 0,
             undo: Vec::new(),
             undo_bytes: 0,
             lock_undo: Vec::new(),
@@ -539,6 +542,14 @@ impl Transaction {
     /// Marks buffered writes; undo records, keys, and prior values count against
     /// the write-set limit while a savepoint remains live.
     pub(crate) fn savepoint(&mut self) -> Savepoint {
+        self.make_savepoint(true)
+    }
+    /// Marks statement writes without enabling lock journaling. Locks are retained
+    /// on statement rollback; an enclosing lock-releasing mark still journals them.
+    pub(crate) fn statement_savepoint(&mut self) -> Savepoint {
+        self.make_savepoint(false)
+    }
+    fn make_savepoint(&mut self, releases_locks: bool) -> Savepoint {
         // Never wrap and revive a released token, even at an identical undo mark.
         self.savepoint_sequence = self
             .savepoint_sequence
@@ -550,10 +561,12 @@ impl Transaction {
             undo_len: self.undo.len(),
             raw_len: self.raw.len(),
             lock_undo_len: self.lock_undo.len(),
+            releases_locks,
             features_or: self.features_or,
             minimum_subversion: self.minimum_subversion,
         };
-        self.savepoints.push((mark.sequence, mark.undo_len));
+        self.savepoints.push((mark.sequence, mark.undo_len, releases_locks));
+        self.lock_savepoints += usize::from(releases_locks);
         mark
     }
     fn savepoint_index(&self, mark: &Savepoint) -> Result<usize, TxnError> {
@@ -562,8 +575,12 @@ impl Transaction {
         }
         self.savepoints
             .iter()
-            .position(|entry| *entry == (mark.sequence, mark.undo_len))
+            .position(|entry| *entry == (mark.sequence, mark.undo_len, mark.releases_locks))
             .ok_or(TxnError::Misuse)
+    }
+    fn truncate_savepoints(&mut self, len: usize) {
+        self.lock_savepoints -= self.savepoints[len..].iter().filter(|entry| entry.2).count();
+        self.savepoints.truncate(len);
     }
     /// Restores buffered writes and keeps this mark reusable, invalidating later marks.
     /// Locks, the `locked` entries permitting writes, and SERIALIZABLE reads are
@@ -591,7 +608,7 @@ impl Transaction {
             self.write_bytes = undo.write_bytes;
             self.undo_bytes -= undo.bytes;
         }
-        self.savepoints.truncate(index + 1);
+        self.truncate_savepoints(index + 1);
         self.raw.truncate(mark.raw_len);
         self.features_or = mark.features_or;
         self.minimum_subversion = mark.minimum_subversion;
@@ -600,7 +617,7 @@ impl Transaction {
     /// SQL subtransaction rollback. Native/statement rollback retains locks;
     /// its journal entries still belong to any enclosing SQL savepoint.
     pub(crate) fn rollback_to_releasing_locks(&mut self, mark: &Savepoint) -> Result<(), TxnError> {
-        if mark.lock_undo_len > self.lock_undo.len() {
+        if !mark.releases_locks || mark.lock_undo_len > self.lock_undo.len() {
             return Err(TxnError::Misuse);
         }
         self.rollback_to(mark)?;
@@ -624,7 +641,7 @@ impl Transaction {
     fn acquire_tracked(&mut self, requested: &[(LockKey, LockMode)], grouped: bool,
         deadline: Option<Instant>, cancel: &dyn Fn() -> bool) -> Result<(), TxnError> {
         let TxnServices::Local { locks, .. } = &self.services else { return Ok(()); };
-        let tracked: Vec<_> = if self.savepoints.is_empty() { Vec::new() } else {
+        let tracked: Vec<_> = if self.lock_savepoints == 0 { Vec::new() } else {
             requested.iter().filter(|(key, _)| match key {
                 LockKey::Row { pk, .. } => !pk.is_empty(),
                 LockKey::RowKey { .. } => true,
@@ -644,7 +661,7 @@ impl Transaction {
     /// Keeps writes while invalidating this mark and all later marks.
     pub(crate) fn release(&mut self, mark: Savepoint) -> Result<(), TxnError> {
         let index = self.savepoint_index(&mark)?;
-        self.savepoints.truncate(index);
+        self.truncate_savepoints(index);
         if self.savepoints.is_empty() {
             self.lock_undo.clear();
             self.undo = Vec::new();
@@ -1572,3 +1589,7 @@ mod drop_tests;
 #[cfg(test)]
 #[path = "locks_savepoint_tests.rs"]
 mod locks_savepoint_tests;
+
+#[cfg(test)]
+#[path = "statement_savepoint_tests.rs"]
+mod statement_savepoint_tests;

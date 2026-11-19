@@ -438,6 +438,28 @@ fn timed_out_update_group_leaves_no_exclusion_after_rollback_to() {
 
 // PG18.6: l7-oracle.txt and l7b-oracle.txt.
 #[test]
+fn plain_statements_then_savepoint_release_only_post_savepoint_locks() {
+    let (admin, path) = fixture();
+    let mut a = admin.sql_session(); let mut b = admin.sql_session();
+    run(&mut a, "BEGIN");
+    run(&mut a, "UPDATE lk SET v=7 WHERE id=1");
+    run(&mut a, "SAVEPOINT s");
+    run(&mut a, "UPDATE lk SET v=8 WHERE id=2");
+    let error = a.execute("SELECT 1/0", &[], None).unwrap_err();
+    assert_eq!(giggles_core::sqlstate(&error), "22012");
+    run(&mut a, "ROLLBACK TO s");
+
+    run(&mut b, "BEGIN");
+    let cancel = giggles_core::Cancellation::new(None);
+    cancel.set_lock_timeout(Some(std::time::Duration::from_secs(1)));
+    cancel.scope(|| b.execute("UPDATE lk SET v=9 WHERE id=2", &[], None)).unwrap();
+    let error = cancel.scope(|| b.execute("UPDATE lk SET v=9 WHERE id=1", &[], None)).unwrap_err();
+    assert_eq!(giggles_core::sqlstate(&error), "55P03");
+    run(&mut a, "COMMIT"); run(&mut b, "ROLLBACK");
+    drop(a); drop(b); drop(admin); std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn savepoint_releases_all_select_modes_and_reverts_only_upgrades() {
     let (admin, path) = fixture();
     for held in ["KEY SHARE", "SHARE", "NO KEY UPDATE", "UPDATE"] {

@@ -533,7 +533,7 @@ impl SqlSession {
                     if !self.copy_input.as_ref().is_some_and(|input| input.started) {
                         txn.begin_statement();
                     }
-                    let mark = txn.savepoint();
+                    let mark = txn.statement_savepoint();
                     let result = (|| {
                         // DDL stages a catalog-wide image (including schema cascades and
                         // new FK edges), so retain its exclusive catalog barrier. DML
