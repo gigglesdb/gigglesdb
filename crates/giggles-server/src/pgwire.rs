@@ -978,6 +978,11 @@ impl Statement {
         if let Plan::Sql(p) = &self.p
             && session.task().is_none()
         {
+            // An aborted transaction reports 25P02 before any authorization,
+            // as core Describe does.
+            if session.is_aborted() && !p.allows_aborted_transaction() {
+                return Err("25P02");
+            }
             // Description caches follow the transaction snapshot; grants do not.
             // Reuse Bind's current authority check without acquiring relation locks.
             core(session.authority_scope(|session| {

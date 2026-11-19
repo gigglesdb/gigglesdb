@@ -98,6 +98,9 @@ async fn case(label: &str, setup: &str, sql: &str, change: &str, expected: Optio
         }
         bind_authority_probe(pg.address, &clients[0], &admin, label).await;
         None
+    } else if label == "describe-aborted" {
+        describe_aborted_probe(pg.address, &clients[0]).await;
+        None
     } else if label.starts_with("describe-") {
         describe_authority_probe(pg.address, &clients[0], label).await;
         None
@@ -1007,4 +1010,46 @@ async fn describe_checks_current_grants_repeatable_read() {
 #[tokio::test]
 async fn describe_checks_current_grants_serializable() {
     case("describe-serializable", "CREATE TABLE t(a int); GRANT SELECT ON t TO r", "", "", None).await;
+}
+
+
+// PostgreSQL 18.6 oracle (2026-11-18): Parse/BEGIN/Bind, SELECT 1/0 ->
+// 22012, REVOKE in another session, Describe Statement -> 25P02 and Describe
+// Portal -> 25P02. After ROLLBACK, PG describes the cached statement successfully;
+// GigglesDB intentionally rechecks live grants there and reports 42501.
+// Bind inside BEGIN so the portal survives the preceding Sync.
+async fn describe_aborted_probe(address: std::net::SocketAddr, owner: &tokio_postgres::Client) {
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    let startup = b"\0\x03\0\0user\0r\0database\0postgres\0\0";
+    stream.write_u32((startup.len() + 4) as u32).await.unwrap();
+    stream.write_all(startup).await.unwrap();
+    receive(&mut stream, b'Z').await;
+    let mut parse = b"s\0".to_vec();
+    giggles_server::pgwire::z("SELECT * FROM t", &mut parse);
+    parse.extend_from_slice(&[0, 0]);
+    send(&mut stream, &[(b'P', &parse), (b'S', b"")]).await;
+    assert_eq!(response_code(&receive(&mut stream, b'Z').await), None);
+    send(&mut stream, &[(b'Q', b"BEGIN\0")]).await;
+    assert_eq!(response_code(&receive(&mut stream, b'Z').await), None);
+    send(&mut stream, &[(b'B', b"p\0s\0\0\0\0\0\0\0"), (b'S', b"")]).await;
+    assert_eq!(response_code(&receive(&mut stream, b'Z').await), None);
+    send(&mut stream, &[(b'Q', b"SELECT 1 / 0\0")]).await;
+    assert_eq!(response_code(&receive(&mut stream, b'Z').await), Some("22012"));
+    owner.batch_execute("REVOKE SELECT ON t FROM r").await.unwrap();
+    for describe in [b"Ss\0", b"Pp\0"] {
+        send(&mut stream, &[(b'D', describe), (b'S', b"")]).await;
+        let messages = receive(&mut stream, b'Z').await;
+        assert_eq!(response_code(&messages), Some("25P02"), "{describe:?}: {messages:?}");
+        assert!(!messages.iter().any(|(tag, _)| matches!(tag, b't' | b'T' | b'n')));
+    }
+    send(&mut stream, &[(b'Q', b"ROLLBACK\0")]).await;
+    assert_eq!(response_code(&receive(&mut stream, b'Z').await), None);
+    send(&mut stream, &[(b'D', b"Ss\0"), (b'S', b"")]).await;
+    assert_eq!(response_code(&receive(&mut stream, b'Z').await), Some("42501"));
+    send(&mut stream, &[(b'X', b"")]).await;
+}
+
+#[tokio::test]
+async fn describe_aborted_transaction_precedes_revoked_grants() {
+    case("describe-aborted", "CREATE TABLE t(a int); GRANT SELECT ON t TO r", "", "", None).await;
 }
