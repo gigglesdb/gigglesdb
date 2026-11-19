@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nunya
+  namespace: nunya
+spec:
+  # Limits voluntary evictions only; this provides no node HA.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nunya

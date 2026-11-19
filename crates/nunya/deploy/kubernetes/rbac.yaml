@@ -2,21 +2,26 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: nunya
+  namespace: nunya
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: nunya
+  namespace: nunya
 rules:
+  # Route-derived head names are dynamic: read, initialize and CAS-update.
   - apiGroups: [nunya.gigglesdb.dev]
     resources: [nunyapolicies]
     verbs: [get, create, update]
   - apiGroups: [nunya.gigglesdb.dev]
+    # Dynamic immutable history names: read, enumerate and append.
     resources: [nunyapolicyrevisions]
     verbs: [get, list, create]
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
-    # Dynamic per-pod serving names and leader listing cannot be name-scoped.
+    # Dynamic serving names and unfiltered-by-name serving list prevent resourceNames.
+    # Leader election and serving renewals use get/update; activation uses list.
     verbs: [get, update, list]
   # Kubernetes cannot restrict create by resourceNames.
   - apiGroups: [coordination.k8s.io]
@@ -27,9 +32,11 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: nunya
+  namespace: nunya
 subjects:
   - kind: ServiceAccount
     name: nunya
+    namespace: nunya
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role

@@ -1,9 +1,8 @@
-# Preview only: multi-replica serving is unsupported until GD-0088 8b/8c.
-# These replicas demonstrate the policy store and leader election only.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: nunya-kubernetes
+  namespace: nunya
 data:
   nunya.toml.template: |
     listen = "0.0.0.0:6432"
@@ -26,6 +25,10 @@ data:
     lease_duration_secs = 15
     renew_deadline_secs = 10
     retry_period_secs = 2
+    [kubernetes.peer]
+    secret_file = "/peer/secret"
+    listen = "0.0.0.0:6482"
+    counter_batch = 16
     [upstream]
     host = "postgres"
     user = "nunya"
@@ -46,24 +49,69 @@ data:
     version = 2
     default = "tokenize"
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nunya-state
+  namespace: nunya
+spec:
+  accessModes: [ReadWriteOnce]
+  # Set storageClassName to local-path or a block CSI class; never NFS/RWX.
+  # storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: nunya-policy-preview
+  name: nunya
+  namespace: nunya
 spec:
-  replicas: 3
+  # Multi-replica serving is UNSUPPORTED (see README); 3 is the topology under test.
+  replicas: 1
+  # RWO permits concurrent mounts on one node. One surge pod allows rolling
+  # replacement without evicting all replicas; required affinity keeps it local.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
   selector:
     matchLabels:
-      app: nunya-policy-preview
+      app.kubernetes.io/name: nunya
   template:
     metadata:
       labels:
-        app: nunya-policy-preview
+        app.kubernetes.io/name: nunya
     spec:
       serviceAccountName: nunya
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Optionally pin to the PV node; choose the actual hostname.
+      # nodeSelector:
+      #   kubernetes.io/hostname: state-node
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: nunya
+              topologyKey: kubernetes.io/hostname
       initContainers:
         - name: render-config
-          image: alpine:3.21
+          image: alpine:3.21.3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
           command: [/bin/sh, -ec]
           args:
             - |
@@ -110,7 +158,12 @@ spec:
       containers:
         - name: nunya
           # Supply an image built with --features kubernetes.
-          image: nunya:kubernetes-preview
+          image: nunya:kubernetes
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
           args: [serve, --config, /config/nunya.toml]
           env:
             - name: POD_UID
@@ -132,10 +185,29 @@ spec:
               containerPort: 6480
             - name: management
               containerPort: 6481
+            - name: peer
+              containerPort: 6482
           readinessProbe:
             httpGet:
               path: /ready
               port: admin
+            periodSeconds: 2
+            timeoutSeconds: 3
+            failureThreshold: 1
+          # Gate closure affects readiness only; allow 60 seconds of health failures.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: admin
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          startupProbe:
+            httpGet:
+              path: /health
+              port: admin
+            periodSeconds: 5
+            failureThreshold: 60
           volumeMounts:
             - name: template
               mountPath: /etc/nunya
@@ -145,6 +217,9 @@ spec:
               readOnly: true
             - name: credentials
               mountPath: /credentials
+              readOnly: true
+            - name: peer
+              mountPath: /peer
               readOnly: true
             - name: state
               mountPath: /state
@@ -157,6 +232,25 @@ spec:
         - name: credentials
           secret:
             secretName: nunya-credentials
-        # Local sessions/scopes/counters are lost on restart; shared state is 8c.
+            defaultMode: 0440
+        - name: peer
+          secret:
+            secretName: nunya-peer
+            defaultMode: 0400
         - name: state
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: nunya-state
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nunya
+  namespace: nunya
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nunya
+  ports:
+    - name: postgres
+      port: 6432
+      targetPort: postgres

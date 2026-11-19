@@ -1,0 +1,32 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nunya
+  namespace: nunya
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: nunya
+  policyTypes: [Ingress]
+  ingress:
+    # Peer requests are restricted to nunya pods in this same namespace.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: nunya
+      ports:
+        - protocol: TCP
+          port: 6482
+    # Open client/management access by default. Narrow with from, for example:
+    # from:
+    #   - namespaceSelector:
+    #       matchLabels:
+    #         kubernetes.io/metadata.name: application
+    - ports:
+        - protocol: TCP
+          port: 6432
+        - protocol: TCP
+          port: 6481
+  # Admin 6480 includes unauthenticated POST /reload; never allow pod ingress.
+  # Kubelet probes originate on the node; most CNIs allow node-to-pod traffic.
+  # Verify that behavior for your CNI. No egress policy is imposed here.
