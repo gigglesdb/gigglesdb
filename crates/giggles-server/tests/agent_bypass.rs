@@ -5,9 +5,11 @@ mod agent_support;
 use agent_support::parity::{self, *};
 use agent_support::{Msg, Startup, TestCert, binding, certificate, error_of, raw_startup};
 use bytes::Bytes;
+#[cfg(feature = "legacy-task")]
+use giggles_server::api::json as wire_json;
 use giggles_server::{
     Binding, Request, Role, Running,
-    api::{json as wire_json, proto},
+    api::proto,
     auth::{PostgresListener, TlsMode, serve_postgresql},
     transport::Client,
 };
@@ -349,11 +351,7 @@ async fn legacy_task_cert_refused_on_agent_listeners() {
     f.service
         .reload_bindings(vec![Binding {
             fingerprint: legacy.fingerprint(),
-            role: Role::Task {
-                domain: f.admin.authority_metadata().unwrap().0.to_string(),
-                task: giggles_core::TaskId(91),
-                principal: giggles_core::Principal(92),
-            },
+            role: Role::NoSql { domain: f.admin.authority_metadata().unwrap().0.to_string() },
         }])
         .unwrap();
     cert_refused(&f, &legacy).await;
@@ -429,6 +427,7 @@ async fn task_session_cannot_approve_undo_define_or_revoke_tasks() {
     f.stop().await;
 }
 
+#[cfg(feature = "legacy-task")]
 #[tokio::test]
 async fn task_session_cannot_reach_legacy_giggles_json_or_request_sql() {
     let f = ParityFixture::start().await;

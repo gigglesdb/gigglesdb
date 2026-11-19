@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 use bytes::Bytes;
-use giggles_core::{
-    Admin, Column, Grant, Key, Limits, Policy, Principal, Row, RowId, Status, TaskId, TenantId,
-};
+use giggles_core::{Admin, Limits};
+#[cfg(feature = "legacy-task")]
+use giggles_core::{Column, Grant, Key, Policy, Principal, Row, RowId, Status, TaskId, TenantId};
 use giggles_server::{
     Binding, Role, Running, Service,
     api::{
@@ -189,6 +189,9 @@ impl Fixture {
         sql.execute("CREATE TABLE other (id BIGINT PRIMARY KEY)", &[], None)
             .unwrap();
         drop(sql);
+        #[cfg(not(feature = "legacy-task"))]
+        let _ = (resources, seed_rows);
+        #[cfg(feature = "legacy-task")]
         if seed_rows {
         admin
             .grant(Grant {
@@ -247,6 +250,9 @@ impl Fixture {
             },
             Binding {
                 fingerprint: tls::fingerprint(task.cert.der()),
+                #[cfg(not(feature = "legacy-task"))]
+                role: Role::NoSql { domain },
+                #[cfg(feature = "legacy-task")]
                 role: Role::Task {
                     domain,
                     task: TaskId(1),

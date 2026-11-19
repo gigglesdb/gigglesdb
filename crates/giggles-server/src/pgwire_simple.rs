@@ -324,7 +324,7 @@ impl State {
         sql: &str,
         session: &mut Session,
         out: &mut Vec<u8>,
-        received: std::time::Instant,
+        _received: std::time::Instant,
         implicit: &mut bool,
     ) -> R<()> {
         if session.task().is_some() {
@@ -434,6 +434,7 @@ impl State {
             return Ok(());
         }
         core(session.authorize_sequence_sql(sql))?;
+        #[cfg(feature = "legacy-task")]
         if let Some(json) = sql.strip_prefix("GIGGLES ") {
             if !matches!(session.role, Role::Task { .. }) {
                 return Err("42501");
@@ -442,7 +443,7 @@ impl State {
             if matches!(req, Request::Sql { .. } | Request::Ping) {
                 return Err("42501");
             }
-            let response = session.handle_received(req, received);
+            let response = session.handle_received(req, _received);
             let value = serde_json::to_string(&response).map_err(|_| "XX000")?;
             let d = Description {
                 type_oids: vec![],
@@ -476,7 +477,9 @@ impl State {
                 out,
             )?;
             complete("SELECT", &result, out)?;
-        } else if let Some(stmt) = crate::auth::statements::parse(sql) {
+            return Ok(());
+        }
+        if let Some(stmt) = crate::auth::statements::parse(sql) {
             read_only_check(
                 admin_command(&stmt),
                 &self.settings,
@@ -1026,7 +1029,9 @@ pub(super) fn validate_lock(
                         }
                 }
                 Role::Application { tables, .. } => tables.contains(table),
-                Role::Task { .. } | Role::NoSql { .. } => false,
+                Role::NoSql { .. } => false,
+                #[cfg(feature = "legacy-task")]
+                Role::Task { .. } => false,
             };
             if !allowed {
                 return Err(CoreError::Policy(Error::Scope));

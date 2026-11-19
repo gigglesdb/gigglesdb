@@ -581,8 +581,9 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
                         // role check alone does not cover them.
                         let stream = stream
                             && !session.agent
-                            && session.task().is_none()
-                            && !matches!(session.role, crate::Role::Task { .. });
+                            && session.task().is_none();
+                        #[cfg(feature = "legacy-task")]
+                        let stream = stream && !matches!(session.role, crate::Role::Task { .. });
                         let (result, spill) = spill::bounded(|| {
                             if stream {
                                 spill::streaming(|| execute_reply(session, request, operation_id, received, encoding))

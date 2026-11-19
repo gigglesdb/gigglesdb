@@ -150,6 +150,7 @@ fn role_key(role: &Role) -> ((u8, String), String) {
     match role {
         Role::Database { name } => ((0, name.clone()), name.clone()),
         Role::Application { domain, .. } => ((1, format!("{role:?}")), domain.clone()),
+        #[cfg(feature = "legacy-task")]
         Role::Task { domain, .. } => ((2, format!("{role:?}")), domain.clone()),
         Role::NoSql { domain } => ((3, format!("{role:?}")), domain.clone()),
     }

@@ -1,5 +1,5 @@
 use giggles_core::{
-    Admin, Limits, Principal, TaskId,
+    Admin, Limits,
     roles::{NewRole, SchemaPrivilege},
 };
 use giggles_server::{
@@ -628,11 +628,7 @@ async fn sequence_ddl(protocol: Protocol) {
     f.service
         .reload_bindings(vec![Binding {
             fingerprint: tls::fingerprint(f.app.cert.der()),
-            role: Role::Task {
-                domain: f.admin.authority_metadata().unwrap().0.to_string(),
-                task: TaskId(91),
-                principal: Principal(92),
-            },
+            role: Role::NoSql { domain: f.admin.authority_metadata().unwrap().0.to_string() },
         }])
         .unwrap();
     let (task, connection) = config
@@ -1114,11 +1110,7 @@ async fn extension_scalars_route_through_database_context() {
     f.service
         .reload_bindings(vec![Binding {
             fingerprint: tls::fingerprint(f.app.cert.der()),
-            role: Role::Task {
-                domain: f.admin.authority_metadata().unwrap().0.to_string(),
-                task: TaskId(91),
-                principal: Principal(92),
-            },
+            role: Role::NoSql { domain: f.admin.authority_metadata().unwrap().0.to_string() },
         }])
         .unwrap();
     let server_tls = tls::server(

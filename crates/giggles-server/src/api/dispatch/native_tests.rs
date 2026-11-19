@@ -206,50 +206,7 @@ async fn dropped_native_receiver_restores_same_staged_session() {
     f.runtime.shutdown().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn task_identity_cannot_execute_native_data_blocks_or_controls() {
-    let mut f = Fixture::new();
-    let fingerprint = f.owner.fingerprint.clone();
-    f.runtime
-        .service
-        .reload_bindings(vec![Binding {
-            fingerprint: fingerprint.clone(),
-            role: Role::Task {
-                domain: f
-                    .runtime
-                    .service
-                    .admin
-                    .authority_metadata()
-                    .unwrap()
-                    .0
-                    .to_string(),
-                task: giggles_core::TaskId(91),
-                principal: giggles_core::Principal(92),
-            },
-        }])
-        .unwrap();
-    f.owner = f.runtime.authenticate(&fingerprint).unwrap();
-    f.token = f.runtime.open(&f.owner).unwrap().session_id;
-    for request in [
-        insert(1),
-        read_native(),
-        native(json!({"transaction":{"transaction":{"readOnly":true}}})),
-        native(json!({"begin":{}})),
-        native(json!({"commit":{}})),
-        native(json!({"rollback":{}})),
-    ] {
-        let result = f.execute(request).await.unwrap();
-        assert_eq!(result.reply.code, "42501");
-        assert_eq!(
-            result.reply.transaction_state,
-            proto::TransactionState::Idle as i32
-        );
-        assert!(result.reply.native_result.is_none());
-        assert!(result.reply.sql.is_none());
-    }
-    assert_eq!(f.rows(), 0);
-    f.runtime.shutdown().await;
-}
+
 
 #[tokio::test(flavor = "current_thread")]
 async fn wrapped_requests_cannot_hide_unauthorized_tables() {
@@ -307,5 +264,48 @@ async fn native_controls_report_transaction_state_and_storage_failure_stays_unkn
         Some(proto::execute_reply::NativeResult::NativeError(error))
         if error.kind == proto::NativeErrorClass::Unknown as i32));
     drop(reply);
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn task_identity_cannot_execute_native_data_blocks_or_controls() {
+    let mut f = Fixture::new();
+    let fingerprint = f.owner.fingerprint.clone();
+    f.runtime
+        .service
+        .reload_bindings(vec![Binding {
+            fingerprint: fingerprint.clone(),
+            role: Role::NoSql {
+                domain: f
+                    .runtime
+                    .service
+                    .admin
+                    .authority_metadata()
+                    .unwrap()
+                    .0
+                    .to_string(),
+            },
+        }])
+        .unwrap();
+    f.owner = f.runtime.authenticate(&fingerprint).unwrap();
+    f.token = f.runtime.open(&f.owner).unwrap().session_id;
+    for request in [
+        insert(1),
+        read_native(),
+        native(json!({"transaction":{"transaction":{"readOnly":true}}})),
+        native(json!({"begin":{}})),
+        native(json!({"commit":{}})),
+        native(json!({"rollback":{}})),
+    ] {
+        let result = f.execute(request).await.unwrap();
+        assert_eq!(result.reply.code, "42501");
+        assert_eq!(
+            result.reply.transaction_state,
+            proto::TransactionState::Idle as i32
+        );
+        assert!(result.reply.native_result.is_none());
+        assert!(result.reply.sql.is_none());
+    }
+    assert_eq!(f.rows(), 0);
     f.runtime.shutdown().await;
 }

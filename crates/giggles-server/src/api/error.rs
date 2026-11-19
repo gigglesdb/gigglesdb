@@ -2,6 +2,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApiError {
     InvalidArgument,
+    LegacyTaskRetired,
     Unauthenticated,
     SessionNotFound,
     SessionBusy,
@@ -16,7 +17,7 @@ pub enum ApiError {
 impl ApiError {
     pub fn code(self) -> &'static str {
         match self {
-            Self::InvalidArgument => "INVALID_ARGUMENT",
+            Self::InvalidArgument | Self::LegacyTaskRetired => "INVALID_ARGUMENT",
             Self::Unauthenticated => "UNAUTHENTICATED",
             Self::SessionNotFound => "SESSION_NOT_FOUND",
             Self::SessionBusy => "SESSION_BUSY",
@@ -31,6 +32,7 @@ impl ApiError {
     pub fn message(self) -> &'static str {
         match self {
             Self::InvalidArgument => "invalid request",
+            Self::LegacyTaskRetired => "retired legacy task prototype; enable the legacy-task feature",
             Self::Unauthenticated => "authentication required",
             Self::SessionNotFound => "session not found",
             Self::SessionBusy => "session busy",
@@ -44,7 +46,7 @@ impl ApiError {
 
     pub fn http_status(self) -> u16 {
         match self {
-            Self::InvalidArgument => 400,
+            Self::InvalidArgument | Self::LegacyTaskRetired => 400,
             Self::Unauthenticated => 401,
             Self::SessionNotFound => 404,
             Self::SessionBusy => 409,
@@ -59,7 +61,7 @@ impl ApiError {
 
     pub fn grpc_status(self) -> tonic::Status {
         let code = match self {
-            Self::InvalidArgument => tonic::Code::InvalidArgument,
+            Self::InvalidArgument | Self::LegacyTaskRetired => tonic::Code::InvalidArgument,
             Self::Unauthenticated => tonic::Code::Unauthenticated,
             Self::SessionNotFound => tonic::Code::NotFound,
             Self::SessionBusy => tonic::Code::Aborted,

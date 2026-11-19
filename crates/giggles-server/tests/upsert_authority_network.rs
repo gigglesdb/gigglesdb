@@ -1,9 +1,12 @@
 //! E939: UPSERT authority is checked before target/excluded name resolution.
 mod api_support;
 
+#[cfg(feature = "legacy-task")]
 use giggles_core::{CoreError, Error};
+#[cfg(feature = "legacy-task")]
 use std::sync::Arc;
 
+#[cfg(feature = "legacy-task")]
 #[tokio::test]
 async fn upsert_authority_precedes_ambiguity_on_native_and_non_sql_surfaces() {
     let f = api_support::Fixture::new().await;

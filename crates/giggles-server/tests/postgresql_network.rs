@@ -444,6 +444,7 @@ async fn agent_identity_gains_no_role_powers() {
     agent.shutdown().await.unwrap();
     f.stop().await;
 }
+#[cfg(feature = "legacy-task")]
 #[tokio::test]
 async fn postgresql_session_cannot_run_task_statements() {
     let f = Fixture::new(TlsMode::Disabled, false, false).await;

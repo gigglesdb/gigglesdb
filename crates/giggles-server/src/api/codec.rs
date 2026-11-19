@@ -1,8 +1,8 @@
 //! Typed transport conversion. This module grants no identity or database authority.
 use super::{error::ApiError, proto};
-use giggles_core::{
-    ApprovalId, Column, Key, OperationId, RowId, Selection, Status, TenantId, relational::Value,
-};
+use giggles_core::relational::Value;
+#[cfg(feature = "legacy-task")]
+use giggles_core::{ApprovalId, Column, Key, OperationId, RowId, Selection, Status, TenantId};
 use prost::Message;
 
 #[derive(Debug)]
@@ -215,6 +215,8 @@ fn decode_request(input: proto::execute_request::Request) -> Result<Invocation, 
             });
         }
         P::TaskOutcome(proto::TaskOutcomeRequest {}) => return Ok(Invocation::TaskOutcome),
+        #[cfg(not(feature = "legacy-task"))]
+        P::Preview(_) | P::Execute(_) | P::RepairSql(_) | P::Status(_) => return Err(ApiError::LegacyTaskRetired),
         P::Ping(_) => crate::Request::Ping,
         P::Sql(sql) => crate::Request::Sql {
             sql: sql.sql,
@@ -224,18 +226,22 @@ fn decode_request(input: proto::execute_request::Request) -> Result<Invocation, 
                 .map(decode_value)
                 .collect::<Result<_, _>>()?,
         },
+        #[cfg(feature = "legacy-task")]
         P::Preview(p) => crate::Request::Preview {
             request: decode_task(p.request.ok_or(ApiError::InvalidArgument)?)?,
         },
+        #[cfg(feature = "legacy-task")]
         P::Execute(p) => crate::Request::Execute {
             request: decode_task(p.request.ok_or(ApiError::InvalidArgument)?)?,
             approval: p.approval.map(ApprovalId),
         },
+        #[cfg(feature = "legacy-task")]
         P::RepairSql(p) => crate::Request::RepairSql {
             operation: OperationId(p.operation.ok_or(ApiError::InvalidArgument)?),
             sql: p.sql,
             approval: p.approval.map(ApprovalId),
         },
+        #[cfg(feature = "legacy-task")]
         P::Status(p) => crate::Request::Status {
             operation: OperationId(p.operation.ok_or(ApiError::InvalidArgument)?),
         },
@@ -284,6 +290,7 @@ pub fn decode_value(value: proto::Value) -> Result<Value, ApiError> {
     })
 }
 
+#[cfg(feature = "legacy-task")]
 fn decode_status(value: i32) -> Result<Status, ApiError> {
     match proto::DeliveryStatus::try_from(value) {
         Ok(proto::DeliveryStatus::Failed) => Ok(Status::Failed),
@@ -293,6 +300,7 @@ fn decode_status(value: i32) -> Result<Status, ApiError> {
     }
 }
 
+#[cfg(feature = "legacy-task")]
 fn decode_task(input: proto::TaskRequest) -> Result<giggles_core::Request, ApiError> {
     let column = match proto::Column::try_from(input.column) {
         Ok(proto::Column::Status) => Column::Status,
@@ -445,71 +453,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn required_presence_and_unknown_enums_reject() {
-        assert_eq!(
-            decode_value(proto::Value::default()),
-            Err(ApiError::InvalidArgument)
-        );
-        assert_eq!(
-            decode_value(proto::Value {
-                value: Some(proto::value::Value::NullValue(7))
-            }),
-            Err(ApiError::InvalidArgument)
-        );
-        assert!(decode_execute(proto::ExecuteRequest::default()).is_err());
-        for operation in [None, Some(0), Some(u64::MAX)] {
-            let req = proto::ExecuteRequest {
-                request: Some(proto::execute_request::Request::Status(
-                    proto::StatusRequest { operation },
-                )),
-                budget_ms: Some(0), operation_id: None,
-            };
-            let got = decode_execute(req);
-            if let Some(id) = operation {
-                let got = got.unwrap();
-                assert_eq!(got.budget_ms, 0);
-                assert!(
-                    matches!(got.request, Invocation::Legacy(crate::Request::Status { operation }) if operation.0 == id)
-                );
-            } else {
-                assert!(got.is_err());
-            }
-        }
-        for value in [0, -1, i32::MAX] {
-            assert!(decode_status(value).is_err());
-        }
-    }
 
-    #[test]
-    fn duplicate_task_keys_are_preserved() {
-        let key = proto::Key {
-            tenant: Some(0),
-            row: Some(u64::MAX),
-        };
-        let req = decode_task(proto::TaskRequest {
-            operation: Some(0),
-            selection: Some(proto::Selection {
-                selection: Some(proto::selection::Selection::Keys(proto::KeyList {
-                    items: vec![key, key],
-                })),
-            }),
-            column: proto::Column::Status as i32,
-            after: proto::DeliveryStatus::Queued as i32,
-        })
-        .unwrap();
-        assert_eq!(req.operation, OperationId(0));
-        assert_eq!(
-            req.selection,
-            Selection::Keys(vec![
-                Key {
-                    tenant: TenantId(0),
-                    row: RowId(u64::MAX)
-                };
-                2
-            ])
-        );
-    }
+
+
 
     #[test]
     fn denied_reply_fields_are_not_reconstructed() {
@@ -604,6 +550,41 @@ mod tests {
         ));
     }
 
+
+
+
+    #[cfg(feature = "legacy-task")]
+    #[test]
+    fn duplicate_task_keys_are_preserved() {
+        let key = proto::Key {
+            tenant: Some(0),
+            row: Some(u64::MAX),
+        };
+        let req = decode_task(proto::TaskRequest {
+            operation: Some(0),
+            selection: Some(proto::Selection {
+                selection: Some(proto::selection::Selection::Keys(proto::KeyList {
+                    items: vec![key, key],
+                })),
+            }),
+            column: proto::Column::Status as i32,
+            after: proto::DeliveryStatus::Queued as i32,
+        })
+        .unwrap();
+        assert_eq!(req.operation, OperationId(0));
+        assert_eq!(
+            req.selection,
+            Selection::Keys(vec![
+                Key {
+                    tenant: TenantId(0),
+                    row: RowId(u64::MAX)
+                };
+                2
+            ])
+        );
+    }
+
+    #[cfg(feature = "legacy-task")]
     #[test]
     fn optional_zero_approval_and_budget_are_distinct_from_absence() {
         for approval in [None, Some(0), Some(u64::MAX)] {
@@ -634,6 +615,44 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-task")]
+    #[test]
+    fn required_presence_and_unknown_enums_reject() {
+        assert_eq!(
+            decode_value(proto::Value::default()),
+            Err(ApiError::InvalidArgument)
+        );
+        assert_eq!(
+            decode_value(proto::Value {
+                value: Some(proto::value::Value::NullValue(7))
+            }),
+            Err(ApiError::InvalidArgument)
+        );
+        assert!(decode_execute(proto::ExecuteRequest::default()).is_err());
+        for operation in [None, Some(0), Some(u64::MAX)] {
+            let req = proto::ExecuteRequest {
+                request: Some(proto::execute_request::Request::Status(
+                    proto::StatusRequest { operation },
+                )),
+                budget_ms: Some(0), operation_id: None,
+            };
+            let got = decode_execute(req);
+            if let Some(id) = operation {
+                let got = got.unwrap();
+                assert_eq!(got.budget_ms, 0);
+                assert!(
+                    matches!(got.request, Invocation::Legacy(crate::Request::Status { operation }) if operation.0 == id)
+                );
+            } else {
+                assert!(got.is_err());
+            }
+        }
+        for value in [0, -1, i32::MAX] {
+            assert!(decode_status(value).is_err());
+        }
+    }
+
+    #[cfg(feature = "legacy-task")]
     #[test]
     fn task_required_presence_and_every_business_enum_are_checked() {
         let valid = proto::TaskRequest {
@@ -698,4 +717,5 @@ mod tests {
             assert!(decode_task(req).is_err());
         }
     }
+
 }

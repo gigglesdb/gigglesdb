@@ -6,6 +6,7 @@ edition = "2024"
 autotests = false
 
 [features]
+legacy-task = []
 default = ["engine-rocksdb", "mimalloc"]
 mimalloc = ["dep:mimalloc"]
 engine-rocksdb = ["giggles-core/engine-rocksdb", "giggles-language/engine-rocksdb", "dep:giggles-replication", "dep:raft", "dep:protobuf"]

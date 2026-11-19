@@ -1,5 +1,5 @@
 use giggles_core::{
-    Admin, Limits, Principal, TaskId,
+    Admin, Limits,
     roles::{NewRole, SchemaPrivilege, TablePrivilege},
 };
 use giggles_server::{
@@ -366,11 +366,7 @@ async fn authority(protocol: Protocol) {
     f.service
         .reload_bindings(vec![Binding {
             fingerprint: tls::fingerprint(f.app.cert.der()),
-            role: Role::Task {
-                domain: f.admin.authority_metadata().unwrap().0.to_string(),
-                task: TaskId(91),
-                principal: Principal(92),
-            },
+            role: Role::NoSql { domain: f.admin.authority_metadata().unwrap().0.to_string() },
         }])
         .unwrap();
     let (task, connection) = config

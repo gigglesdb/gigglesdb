@@ -1,5 +1,5 @@
 use giggles_core::{
-    Admin, CoreError, Error, Limits, Principal, TaskId,
+    Admin, CoreError, Error, Limits,
     relational::Value,
     roles::{NewRole, TablePrivilege},
 };
@@ -86,11 +86,7 @@ impl Fixture {
                     },
                     Binding {
                         fingerprint: TASK.into(),
-                        role: Role::Task {
-                            domain: domain.clone(),
-                            task: TaskId(91),
-                            principal: Principal(92),
-                        },
+                        role: Role::NoSql { domain: domain.clone() },
                     },
                 ],
                 Clock::new(0, 3600).unwrap(),

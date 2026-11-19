@@ -1,5 +1,7 @@
+#[cfg(feature = "legacy-task")]
+use giggles_core::OperationId;
 use giggles_core::{
-    Admin, CoreError, Error, Limits, OperationId,
+    Admin, CoreError, Error, Limits,
     relational::{SqlResult, Value},
     roles::{NewRole, RoleChanges},
 };
@@ -265,6 +267,7 @@ fn database_role_is_a_serializable_provisioned_certificate_binding() {
     assert_eq!(f.service.session(APP_FP).unwrap().handle(Request::Ping).code, "ok");
 }
 
+#[cfg(feature = "legacy-task")]
 #[test]
 fn database_session_rejects_task_status_but_handles_ping_and_sql() {
     let f = Fixture::new();

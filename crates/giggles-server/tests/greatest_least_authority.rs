@@ -1,4 +1,4 @@
-use giggles_core::{Admin, CoreError, Error, Limits, Principal, TaskId};
+use giggles_core::{Admin, CoreError, Error, Limits};
 use giggles_server::{Binding, Request, Role, Service, Session, clock::Clock};
 use std::{
     collections::BTreeSet,
@@ -63,11 +63,7 @@ impl Fixture {
                 },
                 Binding {
                     fingerprint: TASK.into(),
-                    role: Role::Task {
-                        domain,
-                        task: TaskId(91),
-                        principal: Principal(92),
-                    },
+                    role: Role::NoSql { domain },
                 },
             ],
             Clock::new(0, 3600).unwrap(),

@@ -458,6 +458,7 @@ async fn legacy_server_0a000() {
     assert_eq!(e.code().unwrap().code(), "0A000");
 }
 
+#[cfg(feature = "legacy-task")]
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn legacy_GIGGLES_STATUS_still_parses() {

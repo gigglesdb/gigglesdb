@@ -1,8 +1,10 @@
 //! Explicit protocol-v3 subset; not PostgreSQL server compatibility.
 use crate::{
-    Request, Role, Session, pg_catalog_wire as catalog_wire,
+    Role, Session, pg_catalog_wire as catalog_wire,
     transport::{IO_TIMEOUT, MAX_FRAME, MAX_RESPONSE},
 };
+#[cfg(feature = "legacy-task")]
+use crate::Request;
 use giggles_core::{
     CoreError,
     relational::{DataType, Description, Prepared, SqlResult, Value},
@@ -949,6 +951,7 @@ enum Plan {
     Sql(Box<Prepared>),
     Copy(giggles_core::relational::Copy, Box<Prepared>),
     CopyOut(Box<crate::auth::statements::CopyOutput>),
+    #[cfg(feature = "legacy-task")]
     Task(crate::task_statement::TaskStatement),
     /// GD-0061 R3-207: a protected form; task sessions only.
     Protected(Box<crate::agent::statement::ProtectedStatement>),
@@ -973,6 +976,8 @@ struct Statement {
 impl Statement {
     fn describe(&self, session: &mut Session) -> R<Description> {
         match &self.p {
+            #[cfg(feature = "legacy-task")]
+            Plan::Task(_) => Ok(self.d.clone()),
             // A task session holds only relation-free catalog plans, which
             // read no catalog (R3-206).
             Plan::Catalog(..) if session.task().is_some() => Ok(self.d.clone()),
@@ -995,7 +1000,6 @@ impl Statement {
                 Ok(self.d.clone())
             }
             Plan::CopyOut(_) | Plan::Explain(_) | Plan::Cursor(_)
-            | Plan::Task(_)
             | Plan::AccessShare(_)
             | Plan::Admin(_)
             | Plan::Empty
@@ -1437,15 +1441,20 @@ impl State {
                     parameters: vec![],
                 },
             )
-        } else if sql
+        } else if cfg!(feature = "legacy-task") && sql
             .trim_start_matches(|c: char| c.is_ascii_whitespace())
             .starts_with("GIGGLES")
         {
-            if !matches!(session.role, Role::Task { .. }) {
-                return Err("42501");
+            #[cfg(not(feature = "legacy-task"))]
+            { return Err("42601"); }
+            #[cfg(feature = "legacy-task")]
+            {
+                if !matches!(session.role, Role::Task { .. }) {
+                    return Err("42501");
+                }
+                let task = crate::task_statement::TaskStatement::parse(sql)?;
+                (Plan::Task(task), task.description())
             }
-            let task = crate::task_statement::TaskStatement::parse(sql)?;
-            (Plan::Task(task), task.description())
         } else if let Some(function) =
             settings_functions::parse(sql, session, &mut self.diagnostic)?
         {
@@ -1823,6 +1832,7 @@ impl State {
                         )?
                     });
                 }
+                #[cfg(feature = "legacy-task")]
                 if let Plan::Task(task) = s.p {
                     task.bind(&params)?;
                 }
@@ -2242,6 +2252,7 @@ impl State {
                     complete("SHOW", result, out)?;
                     return Ok(true);
                 }
+                #[cfg(feature = "legacy-task")]
                 if let Plan::Task(task) = p.s.p {
                     let request = task.bind(&p.params)?;
                     let response = session.handle_prepared_task(request, received);

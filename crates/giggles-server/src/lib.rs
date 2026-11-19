@@ -19,6 +19,7 @@ pub use transport::*;
 
 mod cancel;
 mod advisory;
+#[cfg(feature = "legacy-task")]
 pub mod task_statement;
 pub(crate) mod task_ddl;
 

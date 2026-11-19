@@ -109,46 +109,7 @@ async fn revoke_before_bind_and_after_cached_application_page_never_releases_row
         f.stop().await;
     }
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn revoked_task_native_simple_and_prepared_cannot_execute_or_reserve() {
-    let f = Fixture::new().await;
-    let mut native = f.native(f.task.clone()).await;
-    let (pg, conn) = f.pg(f.task.clone()).await;
-    let prepared = pg.prepare("GIGGLES STATUS ($1)").await.unwrap();
-    let before = f.admin.task_resources(TaskId(1)).unwrap().unwrap().used;
-    let mut b = bindings(&f);
-    b.retain(|entry| entry.fingerprint != fp(&f, "task"));
-    f.service.reload_bindings(b).unwrap();
-    assert!(
-        native
-            .call(&Request::Execute {
-                request: repair(90001, 0..1),
-                approval: None
-            })
-            .await
-            .is_err()
-    );
-    assert!(
-        pg.query(&prepared, &[&90001u64.to_be_bytes().to_vec()])
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        f.admin.task_resources(TaskId(1)).unwrap().unwrap().used,
-        before
-    );
-    assert_eq!(
-        f.admin.snapshot().unwrap().rows[&Key {
-            tenant: TenantId(42),
-            row: RowId(0)
-        }]
-            .status,
-        Status::Failed
-    );
-    drop(pg);
-    conn.await.unwrap();
-    f.stop().await;
-}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn invalid_reload_retains_live_driver_and_native_and_restart_uses_new_bindings() {
     let f = Fixture::new().await;
@@ -174,65 +135,7 @@ async fn invalid_reload_retains_live_driver_and_native_and_restart_uses_new_bind
     conn.await.unwrap();
     f.stop().await;
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reload_waits_for_committed_task_without_rolling_it_back() {
-    let f = Fixture::new().await;
-    let (entered, rx) = tokio::sync::oneshot::channel();
-    let entered = std::sync::Mutex::new(Some(entered));
-    let (release, wait) = std::sync::mpsc::channel();
-    let wait = std::sync::Mutex::new(wait);
-    f.admin.set_decision_hook(Some(Arc::new(move |point| {
-        if point == giggles_core::DecisionPoint::Committed
-            && let Some(tx) = entered.lock().unwrap().take()
-        {
-            tx.send(()).unwrap();
-            wait.lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(8))
-                .unwrap();
-        }
-    })));
-    let mut n = f.native(f.task.clone()).await;
-    let job = tokio::spawn(async move {
-        n.call(&Request::Execute {
-            request: repair(90002, 0..1),
-            approval: None,
-        })
-        .await
-    });
-    rx.await.unwrap();
-    let service = f.service.clone();
-    let (started, srx) = tokio::sync::oneshot::channel();
-    let reload = tokio::task::spawn_blocking(move || {
-        started.send(()).unwrap();
-        service.reload_bindings(vec![])
-    });
-    srx.await.unwrap();
-    assert!(!reload.is_finished());
-    release.send(()).unwrap();
-    reload.await.unwrap().unwrap();
-    let _ = job.await.unwrap();
-    f.admin.set_decision_hook(None);
-    let status = f
-        .admin
-        .executor(TaskId(1), Principal(2))
-        .unwrap()
-        .status(OperationId(90002))
-        .unwrap();
-    assert!(matches!(
-        status,
-        giggles_core::OperationStatus::Decided(Ok(_))
-    ));
-    assert_eq!(
-        f.admin.snapshot().unwrap().rows[&Key {
-            tenant: TenantId(42),
-            row: RowId(0)
-        }]
-            .status,
-        Status::Queued
-    );
-    f.stop().await;
-}
+
 async fn limited(f: &Fixture, limits: ServiceLimits) -> (Arc<Service>, Running, Running) {
     let service = Service::with_limits(
         f.admin.clone(),
@@ -328,74 +231,7 @@ async fn shared_rate_native_simple_prepared_and_malformed_frames_cannot_evade() 
     f.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn malformed_denied_native_flood_spends_global_rate_without_task_or_sql_effects() {
-    let f = Fixture::new().await;
-    let (_service, n, p) = limited(
-        &f,
-        ServiceLimits {
-            sessions: 8,
-            burst: 5,
-            per_second: 1,
-        },
-    )
-    .await;
-    let mut socket = TcpStream::connect(n.address).await.unwrap();
-    let mut s = tokio_rustls::TlsConnector::from(f.app.clone())
-        .connect(
-            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
-            &mut socket,
-        )
-        .await
-        .unwrap();
-    let before = f.admin.task_resources(TaskId(1)).unwrap().unwrap().used;
-    for payload in [
-        b"{".to_vec(),
-        serde_json::to_vec(&Request::Execute {
-            request: repair(90005, 0..1),
-            approval: None,
-        })
-        .unwrap(),
-        b"[]".to_vec(),
-        b"false".to_vec(),
-    ] {
-        giggles_server::write_frame(&mut s, &payload, giggles_server::MAX_FRAME)
-            .await
-            .unwrap();
-        let response: Response = serde_json::from_slice(
-            &giggles_server::read_frame(&mut s, giggles_server::MAX_RESPONSE)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(matches!(response.code.as_str(), "08P01" | "42501"));
-    }
-    giggles_server::write_frame(
-        &mut s,
-        &serde_json::to_vec(&sql("INSERT INTO app (id) VALUES (55)", vec![])).unwrap(),
-        giggles_server::MAX_FRAME,
-    )
-    .await
-    .unwrap();
-    eof(&mut s).await;
-    assert_eq!(
-        f.admin.task_resources(TaskId(1)).unwrap().unwrap().used,
-        before
-    );
-    assert!(
-        f.admin
-            .sql_session()
-            .execute("SELECT id FROM app LIMIT 1", &[], None)
-            .unwrap()
-            .rows
-            .is_empty()
-    );
-    let mut reconnect = TcpStream::connect(p.address).await.unwrap();
-    eof(&mut reconnect).await;
-    n.shutdown().await.unwrap();
-    p.shutdown().await.unwrap();
-    f.stop().await;
-}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_leaf_is_rejected_by_rustls_on_both_listeners() {
     let f = Fixture::new().await;

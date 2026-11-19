@@ -6,15 +6,17 @@ use giggles_core::{
 use giggles_core::task::{Page, Released, Unreleased};
 use giggles_pg_types::temporal::SessionZone;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "legacy-task")]
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "role", deny_unknown_fields)]
 pub enum Role {
+    #[cfg(feature = "legacy-task")]
     Task {
         domain: String,
         task: TaskId,
@@ -27,6 +29,32 @@ pub enum Role {
     Database { name: String },
     /// GD-0061 R3-1202: a certificate identity with no authority; answers Ping only.
     NoSql { domain: String },
+}
+impl<'de> Deserialize<'de> for Role {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "role", deny_unknown_fields)]
+        enum Input {
+            Task { domain: String, task: TaskId, principal: Principal },
+            Application { domain: String, tables: BTreeSet<String> },
+            Database { name: String },
+            NoSql { domain: String },
+        }
+        match Input::deserialize(deserializer)? {
+            Input::Task { domain, task, principal } => {
+                #[cfg(feature = "legacy-task")]
+                { Ok(Role::Task { domain, task, principal }) }
+                #[cfg(not(feature = "legacy-task"))]
+                {
+                    let _ = (domain, task, principal);
+                    Err(serde::de::Error::custom("role Task is the retired legacy task prototype; enable the legacy-task feature or bind the certificate to NoSql/Application/Database"))
+                }
+            }
+            Input::Application { domain, tables } => Ok(Role::Application { domain, tables }),
+            Input::Database { name } => Ok(Role::Database { name }),
+            Input::NoSql { domain } => Ok(Role::NoSql { domain }),
+        }
+    }
 }
 impl Role {
     pub fn is_sql(&self) -> bool {
@@ -92,18 +120,22 @@ pub enum Request {
         budget_ms: u64,
         request: Box<Request>,
     },
+    #[cfg(feature = "legacy-task")]
     Preview {
         request: giggles_core::Request,
     },
+    #[cfg(feature = "legacy-task")]
     Execute {
         request: giggles_core::Request,
         approval: Option<ApprovalId>,
     },
+    #[cfg(feature = "legacy-task")]
     RepairSql {
         operation: OperationId,
         sql: String,
         approval: Option<ApprovalId>,
     },
+    #[cfg(feature = "legacy-task")]
     Status {
         operation: OperationId,
     },
@@ -159,6 +191,7 @@ impl Response {
             ..Self::code("ok")
         }
     }
+    #[cfg(feature = "legacy-task")]
     fn decision(operation: OperationId, d: Decision) -> Self {
         match d {
             Ok(r) => Self {
@@ -181,6 +214,7 @@ fn task_session_refusal() -> CoreError {
         giggles_core::task::StatementClass::Other,
     ))
 }
+#[cfg(feature = "legacy-task")]
 fn digest(effects: &[Effect]) -> String {
     // Stable v1 digest; no raw before/after rows are returned.
     hex::encode(Sha256::digest(
@@ -219,6 +253,7 @@ pub struct Service {
     pub(crate) advisory: crate::advisory::Locks,
     pub(crate) blocking: crate::blocking::Blocking,
     pub(crate) cancellations: crate::cancel::Registry,
+    #[cfg(feature = "legacy-task")]
     task_gate: std::sync::Mutex<()>,
     pub(crate) admin: Admin,
     pub(crate) clock: Clock,
@@ -301,6 +336,7 @@ impl Service {
             pgwire_blocking_tasks: std::sync::atomic::AtomicU64::new(0),
             blocking: crate::blocking::Blocking::new(),
             cancellations: crate::cancel::Registry::default(),
+            #[cfg(feature = "legacy-task")]
             task_gate: std::sync::Mutex::new(()),
             statement_gate: std::sync::OnceLock::new(),
             password_generations: std::sync::Mutex::new(BTreeMap::new()),
@@ -378,10 +414,14 @@ impl Service {
                 return Err(CoreError::Limit);
             }
             match &b.role {
-                Role::Task { domain: bound, .. } | Role::Application { domain: bound, .. }
+                Role::Application { domain: bound, .. }
                 | Role::NoSql { domain: bound }
                     if bound != &domain =>
                 {
+                    return Err(CoreError::Policy(Error::Authentication));
+                }
+                #[cfg(feature = "legacy-task")]
+                Role::Task { domain: bound, .. } if bound != &domain => {
                     return Err(CoreError::Policy(Error::Authentication));
                 }
                 Role::Database { name } => {
@@ -1500,7 +1540,9 @@ impl Session {
                         )
                     }
                 }
-                Role::Task { .. } | Role::NoSql { .. } => return Err(CoreError::Policy(Error::Scope)),
+                Role::NoSql { .. } => return Err(CoreError::Policy(Error::Scope)),
+                #[cfg(feature = "legacy-task")]
+                Role::Task { .. } => return Err(CoreError::Policy(Error::Scope)),
             };
             let metadata = session.sql.catalog_metadata()?;
             let epoch = metadata.presentation.epoch;
@@ -2044,7 +2086,9 @@ impl Session {
                             })
                     }
                     Role::Application { tables, .. } => tables.contains(table),
-                    Role::Task { .. } | Role::NoSql { .. } => false,
+                    Role::NoSql { .. } => false,
+                #[cfg(feature = "legacy-task")]
+                Role::Task { .. } => false,
                 };
                 if !allowed {
                     return Err(CoreError::Policy(Error::Scope));
@@ -2093,7 +2137,11 @@ impl Session {
         reqs: &[(String, roles::TablePrivilege)],
         superuser: bool,
     ) -> Result<bool, CoreError> {
-        if matches!(&self.role, Role::Task { .. } | Role::NoSql { .. }) {
+        if matches!(&self.role, Role::NoSql { .. }) {
+            return Ok(false);
+        }
+        #[cfg(feature = "legacy-task")]
+        if matches!(&self.role, Role::Task { .. }) {
             return Ok(false);
         }
         for (table, privilege) in reqs {
@@ -2104,7 +2152,9 @@ impl Session {
                 Role::Database { name } => {
                     superuser || self.table_privilege_allowed(table, name, Some(*privilege))?
                 }
-                Role::Task { .. } | Role::NoSql { .. } => false,
+                Role::NoSql { .. } => false,
+                #[cfg(feature = "legacy-task")]
+                Role::Task { .. } => false,
             };
             if !allowed {
                 return Ok(false);
@@ -2993,6 +3043,7 @@ impl Session {
         self.api_path.sql_committed = result.is_ok() && p.command() == "COMMIT";
         result
     }
+    #[cfg(feature = "legacy-task")]
     fn executor(&self) -> Result<(Executor, (u64, u64)), CoreError> {
         self.check_binding()?;
         let Role::Task {
@@ -3014,6 +3065,7 @@ impl Session {
         self.handle_received(request, std::time::Instant::now())
     }
     /// All task transports use the same immutable-response reservation gate.
+    #[cfg(feature = "legacy-task")]
     pub(crate) fn handle_prepared_task(
         &mut self,
         request: Request,
@@ -3032,31 +3084,34 @@ impl Session {
         let context = Cancellation::current().unwrap_or_default();
         context.scope(|| {
             let response = self.handle_scoped(request, received, &context);
-            if !matches!(self.role, Role::Task { .. }) {
-                return response;
-            }
-            // Freeze exactly the Response later encoded by both transports. A
-            // 1024-byte allowance covers their bounded decision framing/control.
-            let reserve = (|| {
-                let size = serde_json::to_vec(&response)
-                    .map_err(|_| CoreError::Limit)?
-                    .len();
-                let bytes = u64::try_from(size)
-                    .ok()
-                    .and_then(|n| n.checked_add(1024))
-                    .ok_or(CoreError::Limit)?;
-                let _gate = giggles_core::cancellation::lock(&self.service.task_gate)?;
-                let (executor, time) = self.executor()?;
-                executor.reserve_disclosure(bytes, time.0, time.1)
-            })();
-            if let Err(error) = reserve {
-                // Fixed envelope: never echo operation, counts, digests, original
-                // denial or remaining allowance when release is unauthorized.
-                return Response::code(match error {
-                    CoreError::Cancelled => "57014",
-                    CoreError::Policy(Error::UncertainTime | Error::TimeRegression) => "55000",
-                    _ => "42501",
-                });
+            #[cfg(feature = "legacy-task")]
+            {
+                if !matches!(self.role, Role::Task { .. }) {
+                    return response;
+                }
+                // Freeze exactly the Response later encoded by both transports. A
+                // 1024-byte allowance covers their bounded decision framing/control.
+                let reserve = (|| {
+                    let size = serde_json::to_vec(&response)
+                        .map_err(|_| CoreError::Limit)?
+                        .len();
+                    let bytes = u64::try_from(size)
+                        .ok()
+                        .and_then(|n| n.checked_add(1024))
+                        .ok_or(CoreError::Limit)?;
+                    let _gate = giggles_core::cancellation::lock(&self.service.task_gate)?;
+                    let (executor, time) = self.executor()?;
+                    executor.reserve_disclosure(bytes, time.0, time.1)
+                })();
+                if let Err(error) = reserve {
+                    // Fixed envelope: never echo operation, counts, digests, original
+                    // denial or remaining allowance when release is unauthorized.
+                    return Response::code(match error {
+                        CoreError::Cancelled => "57014",
+                        CoreError::Policy(Error::UncertainTime | Error::TimeRegression) => "55000",
+                        _ => "42501",
+                    });
+                }
             }
             response
         })
@@ -3078,8 +3133,9 @@ impl Session {
             let class = match &request {
                 Request::Ping => Some(giggles_core::task::StatementClass::Show),
                 Request::Sql { .. } => None,
-                Request::Deadline { .. }
-                | Request::Preview { .. }
+                Request::Deadline { .. } => Some(giggles_core::task::StatementClass::Other),
+                #[cfg(feature = "legacy-task")]
+                Request::Preview { .. }
                 | Request::Execute { .. }
                 | Request::RepairSql { .. }
                 | Request::Status { .. } => Some(giggles_core::task::StatementClass::Other),
@@ -3105,7 +3161,9 @@ impl Session {
             context.deadline(received + budget);
         }
         let operation = match &request {
+            #[cfg(feature = "legacy-task")]
             Request::Execute { request, .. } => Some(request.operation),
+            #[cfg(feature = "legacy-task")]
             Request::RepairSql { operation, .. } | Request::Status { operation } => {
                 Some(*operation)
             }
@@ -3113,7 +3171,9 @@ impl Session {
         };
         // Keep time issuance in decision order across both transports. Core
         // still revalidates revoke/expiry atomically; this gate adds no authority.
+        #[cfg(feature = "legacy-task")]
         let service = self.service.clone();
+        #[cfg(feature = "legacy-task")]
         let _gate = if matches!(self.role, Role::Task { .. }) {
             match giggles_core::cancellation::lock(&service.task_gate) {
                 Ok(g) => Some(g),
@@ -3153,6 +3213,7 @@ impl Session {
                     let result = self.execute_api_sql(&sql, &params)?;
                     Ok(Response::released_sql(self.release_page(result)?))
                 }
+                #[cfg(feature = "legacy-task")]
                 Request::Preview { request } => {
                     let (e, time) = self.executor()?;
                     let p = e.preview_current(&request, time.0, time.1)?;
@@ -3163,6 +3224,7 @@ impl Session {
                         ..Response::code("preview")
                     })
                 }
+                #[cfg(feature = "legacy-task")]
                 Request::Execute { request, approval } => {
                     let (e, time) = self.executor()?;
                     let op = request.operation;
@@ -3171,6 +3233,7 @@ impl Session {
                         e.execute_current(request, time.0, time.1, approval)?,
                     ))
                 }
+                #[cfg(feature = "legacy-task")]
                 Request::RepairSql {
                     operation,
                     sql,
@@ -3183,6 +3246,7 @@ impl Session {
                         e.execute_current(r, time.0, time.1, approval)?,
                     ))
                 }
+                #[cfg(feature = "legacy-task")]
                 Request::Status { operation } => {
                     let (e, time) = self.executor()?;
                     Ok(match e.status_current(operation, time.0, time.1)? {
@@ -3566,6 +3630,7 @@ mod lifecycle_tests {
         service.reload_bindings(bindings.clone()).unwrap();
         let mut session = service.session(&bindings[0].fingerprint).unwrap();
         assert_eq!(session.handle(Request::Ping).code, "ok");
+        #[cfg(feature = "legacy-task")]
         let repair = giggles_core::Request {
             operation: OperationId(1),
             selection: Selection::Keys(vec![]),
@@ -3574,9 +3639,13 @@ mod lifecycle_tests {
         };
         for request in [
             Request::Sql { sql: "invalid SQL".into(), params: vec![] },
+            #[cfg(feature = "legacy-task")]
             Request::Preview { request: repair.clone() },
+            #[cfg(feature = "legacy-task")]
             Request::Execute { request: repair, approval: None },
+            #[cfg(feature = "legacy-task")]
             Request::RepairSql { operation: OperationId(1), sql: "invalid SQL".into(), approval: None },
+            #[cfg(feature = "legacy-task")]
             Request::Status { operation: OperationId(1) },
             Request::Deadline { budget_ms: u64::MAX, request: Box::new(Request::Ping) },
         ] {
@@ -3804,81 +3873,7 @@ mod lifecycle_tests {
             );
         }
     }
-    #[test]
-    fn native_task_copy_denies_before_malformed_statement_or_data() {
-        let (service, mut bindings) = fixture();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        service
-            .admin
-            .grant(Grant {
-                task: TaskId(91),
-                issuer: Principal(90),
-                executor: Principal(92),
-                approver: Principal(93),
-                policy: Policy {
-                    tenant: TenantId(42),
-                    columns: BTreeSet::from([Column::Status]),
-                    transitions: BTreeSet::from([(Status::Failed, Status::Queued)]),
-                    incident: (100, 107),
-                    distinct_limit: 20,
-                    transition_limit: 20,
-                    approval_above: 10,
-                    valid_from: 1,
-                    expires: now + 7200,
-                },
-            })
-            .unwrap();
-        service
-            .admin
-            .provision_task_resources(
-                TaskId(91),
-                TaskResources {
-                    read_rows: 1000,
-                    disclosed_rows: 1000,
-                    encoded_bytes: 1_000_000,
-                },
-            )
-            .unwrap();
-        service.admin.executor(TaskId(91), Principal(92)).unwrap();
-        bindings[0].role = Role::Task {
-            domain: service.admin.authority_metadata().unwrap().0.to_string(),
-            task: TaskId(91),
-            principal: Principal(92),
-        };
-        service.reload_bindings(bindings.clone()).unwrap();
-        let mut task = service.session(&bindings[0].fingerprint).unwrap();
-        for sql in [
-            "COPY app FROM STDIN",
-            "COPY missing FROM STDIN WITH (FORMAT",
-            "COPY (",
-            "COPY \"unterminated",
-            "COPY secret_schema.t FROM STDIN",
-            "COPY app FROM STDIN; not-an-int",
-        ] {
-            assert_eq!(sqlstate(&task.execute_sql(sql, &[]).unwrap_err()), "42501");
-            assert_eq!(
-                task.handle(Request::Sql {
-                    sql: sql.into(),
-                    params: vec![]
-                })
-                .code,
-                "42501"
-            );
-        }
-        assert!(
-            service
-                .admin
-                .task_resources(TaskId(91))
-                .unwrap()
-                .unwrap()
-                .used
-                .encoded_bytes
-                > 0
-        );
-    }
+
     fn sql_instant(session: &mut Session, sql: &str) -> i64 {
         match session.execute_sql(sql, &[]).unwrap().rows[0].values[0] {
             Value::TimestampTz(value) => value.microseconds(),
@@ -4203,84 +4198,7 @@ mod lifecycle_tests {
                 .is_empty()
         );
     }
-    #[test]
-    fn database_catalog_snapshot_filters_owners_and_grants_and_rechecks_role() {
-        let (service, _) = fixture();
-        let roles = service.admin.roles();
-        for (name, superuser) in [("owner", true), ("reader", false)] {
-            roles
-                .create(roles::NewRole {
-                    name: name.into(),
-                    login: true,
-                    superuser,
-                    ..roles::NewRole::default()
-                })
-                .unwrap();
-        }
-        let mut owner = service.role_session("owner").unwrap();
-        owner
-            .execute_sql("CREATE TABLE owned (id BIGINT PRIMARY KEY)", &[])
-            .unwrap();
-        owner
-            .execute_sql("CREATE TABLE hidden (id BIGINT PRIMARY KEY)", &[])
-            .unwrap();
-        assert_eq!(
-            roles.table_owner("owned").unwrap().as_deref(),
-            Some("owner")
-        );
-        roles.set_table_owner("owned", "reader").unwrap();
-        roles
-            .grant_table("app", "reader", &[roles::TablePrivilege::Select])
-            .unwrap();
-        roles
-            .grant_table("missing", "reader", &[roles::TablePrivilege::Select])
-            .unwrap();
-        let catalog = service.admin.catalog().unwrap();
-        let snapshot = owner.catalog_snapshot().unwrap();
-        assert_eq!((snapshot.0, snapshot.1), catalog);
-        let mut reader = service.role_session("reader").unwrap();
-        assert_eq!(reader.fingerprint, "pgrole:reader");
-        let visible = reader.catalog_snapshot().unwrap().1;
-        assert_eq!(visible.len(), 2);
-        assert!(
-            visible
-                .iter()
-                .all(|table| table.name == "app" || table.name == "owned")
-        );
-        assert_eq!(reader.handle(Request::Ping).code, "ok");
-        assert_eq!(
-            reader
-                .handle(Request::Status {
-                    operation: OperationId(1)
-                })
-                .code,
-            "42501"
-        );
-        assert!(reader.execute_sql("BEGIN", &[]).is_ok());
-        assert!(reader.execute_sql("ROLLBACK", &[]).is_ok());
-        assert!(reader.prepare("SELECT id FROM owned LIMIT 1").is_ok());
-        roles
-            .alter(
-                "reader",
-                roles::RoleChanges {
-                    login: Some(false),
-                    ..roles::RoleChanges::default()
-                },
-            )
-            .unwrap();
-        assert!(matches!(
-            reader.catalog_snapshot(),
-            Err(CoreError::Policy(Error::Authentication))
-        ));
-        assert!(matches!(
-            service.role_session("reader"),
-            Err(CoreError::Policy(Error::Authentication))
-        ));
-        assert!(matches!(
-            service.role_session("missing"),
-            Err(CoreError::Policy(Error::Authentication))
-        ));
-    }
+
     #[test]
     fn database_catalog_snapshot_accepts_heap_created_by_sql_session() {
         let (service, _) = fixture();
@@ -4384,29 +4302,7 @@ mod lifecycle_tests {
         assert_eq!(session.catalog_snapshot().unwrap().1, visible);
         session.execute_sql("ROLLBACK", &[]).unwrap();
     }
-    #[test]
-    fn metadata_snapshot_denies_task_roles_and_does_not_invent_missing_tables() {
-        let (service, mut bindings) = fixture();
-        let domain = service.admin.authority_metadata().unwrap().0.to_string();
-        bindings[0].role = Role::Task {
-            domain: domain.clone(),
-            task: TaskId(91),
-            principal: Principal(92),
-        };
-        service.reload_bindings(bindings.clone()).unwrap();
-        let mut task = service.session(&bindings[0].fingerprint).unwrap();
-        assert!(matches!(
-            task.catalog_snapshot(),
-            Err(CoreError::Policy(Error::Scope))
-        ));
-        bindings[0].role = Role::Application {
-            domain,
-            tables: BTreeSet::from(["not_created".into()]),
-        };
-        service.reload_bindings(bindings.clone()).unwrap();
-        let mut empty = service.session(&bindings[0].fingerprint).unwrap();
-        assert!(empty.catalog_snapshot().unwrap().1.is_empty());
-    }
+
     #[test]
     fn metadata_snapshot_fences_new_schema_during_transaction() {
         let (service, mut bindings) = fixture();
@@ -4754,4 +4650,200 @@ mod lifecycle_tests {
                 .is_empty()
         );
     }
+    #[cfg(feature = "legacy-task")]
+    #[test]
+    fn database_catalog_snapshot_filters_owners_and_grants_and_rechecks_role() {
+        let (service, _) = fixture();
+        let roles = service.admin.roles();
+        for (name, superuser) in [("owner", true), ("reader", false)] {
+            roles
+                .create(roles::NewRole {
+                    name: name.into(),
+                    login: true,
+                    superuser,
+                    ..roles::NewRole::default()
+                })
+                .unwrap();
+        }
+        let mut owner = service.role_session("owner").unwrap();
+        owner
+            .execute_sql("CREATE TABLE owned (id BIGINT PRIMARY KEY)", &[])
+            .unwrap();
+        owner
+            .execute_sql("CREATE TABLE hidden (id BIGINT PRIMARY KEY)", &[])
+            .unwrap();
+        assert_eq!(
+            roles.table_owner("owned").unwrap().as_deref(),
+            Some("owner")
+        );
+        roles.set_table_owner("owned", "reader").unwrap();
+        roles
+            .grant_table("app", "reader", &[roles::TablePrivilege::Select])
+            .unwrap();
+        roles
+            .grant_table("missing", "reader", &[roles::TablePrivilege::Select])
+            .unwrap();
+        let catalog = service.admin.catalog().unwrap();
+        let snapshot = owner.catalog_snapshot().unwrap();
+        assert_eq!((snapshot.0, snapshot.1), catalog);
+        let mut reader = service.role_session("reader").unwrap();
+        assert_eq!(reader.fingerprint, "pgrole:reader");
+        let visible = reader.catalog_snapshot().unwrap().1;
+        assert_eq!(visible.len(), 2);
+        assert!(
+            visible
+                .iter()
+                .all(|table| table.name == "app" || table.name == "owned")
+        );
+        assert_eq!(reader.handle(Request::Ping).code, "ok");
+        assert_eq!(
+            reader
+                .handle(Request::Status {
+                    operation: OperationId(1)
+                })
+                .code,
+            "42501"
+        );
+        assert!(reader.execute_sql("BEGIN", &[]).is_ok());
+        assert!(reader.execute_sql("ROLLBACK", &[]).is_ok());
+        assert!(reader.prepare("SELECT id FROM owned LIMIT 1").is_ok());
+        roles
+            .alter(
+                "reader",
+                roles::RoleChanges {
+                    login: Some(false),
+                    ..roles::RoleChanges::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            reader.catalog_snapshot(),
+            Err(CoreError::Policy(Error::Authentication))
+        ));
+        assert!(matches!(
+            service.role_session("reader"),
+            Err(CoreError::Policy(Error::Authentication))
+        ));
+        assert!(matches!(
+            service.role_session("missing"),
+            Err(CoreError::Policy(Error::Authentication))
+        ));
+    }
+
+    #[test]
+    fn metadata_snapshot_denies_task_roles_and_does_not_invent_missing_tables() {
+        let (service, mut bindings) = fixture();
+        let domain = service.admin.authority_metadata().unwrap().0.to_string();
+        bindings[0].role = Role::NoSql {
+            domain: domain.clone(),
+        };
+        service.reload_bindings(bindings.clone()).unwrap();
+        let mut task = service.session(&bindings[0].fingerprint).unwrap();
+        assert!(matches!(
+            task.catalog_snapshot(),
+            Err(CoreError::Policy(Error::Scope))
+        ));
+        bindings[0].role = Role::Application {
+            domain,
+            tables: BTreeSet::from(["not_created".into()]),
+        };
+        service.reload_bindings(bindings.clone()).unwrap();
+        let mut empty = service.session(&bindings[0].fingerprint).unwrap();
+        assert!(empty.catalog_snapshot().unwrap().1.is_empty());
+    }
+
+    #[cfg(feature = "legacy-task")]
+    #[test]
+    fn native_task_copy_denies_before_malformed_statement_or_data() {
+        let (service, mut bindings) = fixture();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        service
+            .admin
+            .grant(Grant {
+                task: TaskId(91),
+                issuer: Principal(90),
+                executor: Principal(92),
+                approver: Principal(93),
+                policy: Policy {
+                    tenant: TenantId(42),
+                    columns: BTreeSet::from([Column::Status]),
+                    transitions: BTreeSet::from([(Status::Failed, Status::Queued)]),
+                    incident: (100, 107),
+                    distinct_limit: 20,
+                    transition_limit: 20,
+                    approval_above: 10,
+                    valid_from: 1,
+                    expires: now + 7200,
+                },
+            })
+            .unwrap();
+        service
+            .admin
+            .provision_task_resources(
+                TaskId(91),
+                TaskResources {
+                    read_rows: 1000,
+                    disclosed_rows: 1000,
+                    encoded_bytes: 1_000_000,
+                },
+            )
+            .unwrap();
+        service.admin.executor(TaskId(91), Principal(92)).unwrap();
+        bindings[0].role = Role::Task {
+            domain: service.admin.authority_metadata().unwrap().0.to_string(),
+            task: TaskId(91),
+            principal: Principal(92),
+        };
+        service.reload_bindings(bindings.clone()).unwrap();
+        let mut task = service.session(&bindings[0].fingerprint).unwrap();
+        for sql in [
+            "COPY app FROM STDIN",
+            "COPY missing FROM STDIN WITH (FORMAT",
+            "COPY (",
+            "COPY \"unterminated",
+            "COPY secret_schema.t FROM STDIN",
+            "COPY app FROM STDIN; not-an-int",
+        ] {
+            assert_eq!(sqlstate(&task.execute_sql(sql, &[]).unwrap_err()), "42501");
+            assert_eq!(
+                task.handle(Request::Sql {
+                    sql: sql.into(),
+                    params: vec![]
+                })
+                .code,
+                "42501"
+            );
+        }
+        assert!(
+            service
+                .admin
+                .task_resources(TaskId(91))
+                .unwrap()
+                .unwrap()
+                .used
+                .encoded_bytes
+                > 0
+        );
+    }
+
+}
+
+#[cfg(all(test, not(feature = "legacy-task")))]
+mod tests {
+    #[test]
+    fn task_binding_rejected_without_legacy_feature() {
+        let error = serde_json::from_str::<Vec<super::Binding>>(
+            r#"[{"fingerprint":"1111111111111111111111111111111111111111111111111111111111111111","role":{"role":"Task","domain":"d","task":1,"principal":1}}]"#,
+        ).unwrap_err();
+        assert!(error.to_string().contains("role Task is the retired legacy task prototype"), "{error}");
+    }
+
+
+
+
+
+
 }

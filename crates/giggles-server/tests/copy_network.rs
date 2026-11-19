@@ -1,7 +1,9 @@
 //! Raw PostgreSQL-v3 COPY sequences qualified against PostgreSQL 18.6.
 mod api_support;
 
-use giggles_core::{Admin, CoreError, Error, Limits, roles::NewRole};
+use giggles_core::{Admin, Limits, roles::NewRole};
+#[cfg(feature = "legacy-task")]
+use giggles_core::{CoreError, Error};
 use giggles_server::{
     Running, Service,
     auth::{PostgresqlConfig, TlsMode, serve_postgresql},
@@ -554,6 +556,7 @@ async fn binary_garbage_after_trailer_is_atomic_bad_format() {
     }
 }
 
+#[cfg(feature = "legacy-task")]
 #[tokio::test]
 async fn copy_authority_precedes_classification_on_native_and_non_sql_surfaces() {
     let f = api_support::Fixture::new().await;

@@ -1,5 +1,5 @@
 use giggles_core::{
-    Admin, CrashPoint, Limits, Principal, TaskId,
+    Admin, CrashPoint, Limits,
     roles::{NewRole, SchemaPrivilege, TablePrivilege},
 };
 use giggles_server::{Binding, Role, Service, clock::Clock, sqlstate};
@@ -213,11 +213,7 @@ fn alter_requires_owner_and_rename_publishes_authority_atomically() {
     let fingerprint = "a".repeat(64);
     let binding = Binding {
         fingerprint: fingerprint.clone(),
-        role: Role::Task {
-            domain: admin.authority_metadata().unwrap().0.to_string(),
-            task: TaskId(91),
-            principal: Principal(92),
-        },
+        role: Role::NoSql { domain: admin.authority_metadata().unwrap().0.to_string() },
     };
     let service = Service::new(admin.clone(), vec![binding], Clock::new(0, 3600).unwrap()).unwrap();
     let mut task = service.session(&fingerprint).unwrap();

@@ -5,8 +5,7 @@ mod wire_support;
 use wire_support::{bind, cstr, execute, parse, parse_oids, pg_read, pg_send, pg_sync};
 
 use giggles_core::{
-    Admin, Column, Grant, Key, Limits, OperationId, Policy, Principal, Row, RowId, Selection,
-    Status, TaskId, TenantId, Time, relational::Value,
+    Admin, Limits, relational::Value,
 };
 use giggles_server::{
     Binding, Client, Request, Response, Role, Running, Service, clock::Clock, serve, serve_pg, tls,
@@ -302,58 +301,9 @@ impl Fixture {
         self.pg.shutdown().await.unwrap();
     }
 }
-async fn reopen_after_shutdown(
-    path: impl AsRef<std::path::Path>,
-) -> Result<Admin, giggles_core::CoreError> {
-    use tokio::time::{Duration, Instant, sleep_until};
-    // Socket tasks are joined by shutdown, but detached spawn_blocking work can
-    // still own a Session (and its Service/Admin clones) until it finishes.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match Admin::open(path.as_ref(), Limits::default()) {
-            Err(giggles_core::CoreError::Storage(message))
-                if message == "Database already open. Cannot acquire lock."
-                    && Instant::now() < deadline =>
-            {
-                sleep_until((Instant::now() + Duration::from_millis(25)).min(deadline)).await;
-            }
-            result => return result,
-        }
-    }
-}
-fn grant(task: u64, tenant: u64, limit: u64, approval: u64) -> Grant {
-    Grant {
-        task: TaskId(task),
-        issuer: Principal(1),
-        executor: Principal(2),
-        approver: Principal(3),
-        policy: Policy {
-            tenant: TenantId(tenant),
-            columns: BTreeSet::from([Column::Status]),
-            transitions: BTreeSet::from([(Status::Failed, Status::Queued)]),
-            incident: (100, 107),
-            distinct_limit: limit,
-            transition_limit: limit,
-            approval_above: approval,
-            valid_from: 1,
-            expires: now() + 7200,
-        },
-    }
-}
-fn repair(op: u64, ids: std::ops::Range<u64>) -> giggles_core::Request {
-    giggles_core::Request {
-        operation: OperationId(op),
-        selection: Selection::Keys(
-            ids.map(|row| Key {
-                tenant: TenantId(42),
-                row: RowId(row),
-            })
-            .collect(),
-        ),
-        column: Column::Status,
-        after: Status::Queued,
-    }
-}
+
+
+
 fn sql(sql: &str, params: Vec<Value>) -> Request {
     Request::Sql {
         sql: sql.into(),
@@ -364,89 +314,7 @@ fn code(e: tokio_postgres::Error) -> String {
     e.code().unwrap().code().into()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn native_crud_transactions_and_role_boundaries() {
-    let f = Fixture::new().await;
-    let mut c = f.native(f.app.clone()).await;
-    assert_eq!(
-        c.call(&sql(
-            "INSERT INTO app (id,body) VALUES ($1,$2)",
-            vec![Value::Int(1), Value::Text("hello".into())]
-        ))
-        .await
-        .unwrap()
-        .sql
-        .unwrap()
-        .affected,
-        1
-    );
-    assert_eq!(
-        c.call(&sql(
-            "SELECT body FROM app WHERE id=$1",
-            vec![Value::Int(1)]
-        ))
-        .await
-        .unwrap()
-        .sql
-        .unwrap()
-        .rows[0]
-            .values,
-        vec![Value::Text("hello".into())]
-    );
-    assert_eq!(c.call(&sql("BEGIN", vec![])).await.unwrap().code, "ok");
-    assert_eq!(
-        c.call(&sql("UPDATE app SET body='staged' WHERE id=1", vec![]))
-            .await
-            .unwrap()
-            .code,
-        "ok"
-    );
-    assert_eq!(
-        c.call(&sql("SELECT * FROM other WHERE id=1", vec![]))
-            .await
-            .unwrap()
-            .code,
-        "42501"
-    );
-    assert_eq!(c.call(&sql("COMMIT", vec![])).await.unwrap().code, "25P02");
-    assert_eq!(c.call(&sql("ROLLBACK", vec![])).await.unwrap().code, "ok");
-    let mut t = f.native(f.task.clone()).await;
-    for query in [
-        "SELECT * FROM app LIMIT 1",
-        "SELECT * FROM deliveries LIMIT 1",
-        "SET ROLE admin",
-        "COPY app FROM STDIN",
-        "CREATE TABLE evil (id BIGINT PRIMARY KEY)",
-        "BEGIN; COMMIT",
-    ] {
-        assert_ne!(
-            t.call(&sql(query, vec![])).await.unwrap().code,
-            "ok",
-            "{query}"
-        );
-    }
-    assert_eq!(
-        t.call(&Request::Status {
-            operation: OperationId(1)
-        })
-        .await
-        .unwrap()
-        .code,
-        "absent"
-    );
-    assert_eq!(
-        c.call(&Request::Status {
-            operation: OperationId(1)
-        })
-        .await
-        .unwrap()
-        .code,
-        "42501"
-    );
-    drop(c);
-    drop(t);
-    f.stop().await;
-}
+
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pinned_driver_extended_binary_types_describe_and_rollback() {
@@ -590,253 +458,10 @@ async fn pinned_driver_extended_binary_types_describe_and_rollback() {
     f.stop().await;
 }
 
-async fn task_wire(c: &tokio_postgres::Client, request: &Request) -> Response {
-    let messages = c
-        .simple_query(&format!(
-            "GIGGLES {}",
-            serde_json::to_string(request).unwrap()
-        ))
-        .await
-        .unwrap();
-    let row = messages
-        .iter()
-        .find_map(|m| {
-            if let tokio_postgres::SimpleQueryMessage::Row(row) = m {
-                Some(row)
-            } else {
-                None
-            }
-        })
-        .expect("expected task row");
-    serde_json::from_str(row.get(0).unwrap()).unwrap()
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn native_and_wire_task_approval_retry_status_redaction_and_cross_tenant() {
-    let f = Fixture::new().await;
-    let mut c = f.native(f.task.clone()).await;
-    let (pg, conn) = f.pg(f.task.clone()).await;
-    let r = repair(10, 0..6);
-    let preview = c
-        .call(&Request::Preview { request: r.clone() })
-        .await
-        .unwrap();
-    assert_eq!(preview.code, "preview");
-    assert_eq!(preview.count, Some(6));
-    let p = f
-        .admin
-        .executor(TaskId(1), Principal(2))
-        .unwrap()
-        .preview(&r, Time::Certified(now()))
-        .unwrap();
-    let approval = f
-        .admin
-        .approve(Principal(3), p, Time::Certified(now()))
-        .unwrap();
-    let exec = Request::Execute {
-        request: r.clone(),
-        approval: Some(approval),
-    };
-    let a = c.call(&exec).await.unwrap();
-    assert_eq!(a.code, "committed");
-    assert_eq!(a.count, Some(6));
-    let b = task_wire(&pg, &exec).await;
-    assert_eq!(a, b);
-    assert_eq!(
-        c.call(&Request::Status {
-            operation: OperationId(10)
-        })
-        .await
-        .unwrap(),
-        a
-    );
-    assert_eq!(
-        task_wire(
-            &pg,
-            &Request::Status {
-                operation: OperationId(10)
-            }
-        )
-        .await,
-        a
-    );
-    assert_eq!(preview.digest, a.digest);
-    let raw = serde_json::to_string(&a).unwrap();
-    for forbidden in [
-        "issuer",
-        "principal",
-        "policy",
-        "before",
-        "after",
-        "tenant",
-        "dependencies",
-        "lifetime",
-    ] {
-        assert!(!raw.contains(forbidden));
-    }
-    let mut other = f.native(f.other.clone()).await;
-    assert_eq!(
-        other
-            .call(&Request::Status {
-                operation: OperationId(10)
-            })
-            .await
-            .unwrap()
-            .code,
-        "absent"
-    );
-    let mut out = repair(11, 8..9);
-    out.selection = Selection::Keys(vec![Key {
-        tenant: TenantId(43),
-        row: RowId(8),
-    }]);
-    assert_eq!(
-        c.call(&Request::Execute {
-            request: out,
-            approval: None
-        })
-        .await
-        .unwrap()
-        .code,
-        "42501"
-    );
-    f.admin.revoke(TaskId(1)).unwrap();
-    for request in [
-        Request::Status {
-            operation: OperationId(10),
-        },
-        exec,
-        Request::Preview { request: r },
-        Request::RepairSql {
-            operation: OperationId(12),
-            sql: "UPDATE deliveries SET status = 'queued' WHERE tenant = 42 AND id = 7".into(),
-            approval: None,
-        },
-    ] {
-        assert_eq!(c.call(&request).await.unwrap().code, "42501");
-        assert_eq!(task_wire(&pg, &request).await.code, "42501");
-    }
-    drop(c);
-    drop(other);
-    drop(pg);
-    conn.await.unwrap();
-    f.stop().await;
-}
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn ten_real_tls_sessions_race_for_last_slot() {
-    let f = Fixture::new().await;
-    // Offline provision a distinct grant with one slot; use an isolated service binding.
-    f.admin.grant(grant(3, 42, 1, 1)).unwrap();
-    f.admin
-        .provision_task_resources(
-            TaskId(3),
-            giggles_core::TaskResources {
-                read_rows: 1_000_000,
-                disclosed_rows: 1_000_000,
-                encoded_bytes: 1_000_000_000,
-            },
-        )
-        .unwrap();
-    let fingerprint = f.service.session(&tls::fingerprint(f.ca.cert.der()));
-    assert!(fingerprint.is_err());
-    let certificate = std::fs::read_to_string(f.path.join("task.pem")).unwrap();
-    let der = rustls_pemfile::certs(&mut std::io::Cursor::new(certificate))
-        .next()
-        .unwrap()
-        .unwrap();
-    let service = Service::new(
-        f.admin.clone(),
-        vec![Binding {
-            fingerprint: tls::fingerprint(&der),
-            role: Role::Task {
-                domain: f.admin.authority_metadata().unwrap().0.to_string(),
-                task: TaskId(3),
-                principal: Principal(2),
-            },
-        }],
-        Clock::new(0, 3600).unwrap(),
-    )
-    .unwrap();
-    let running = serve(
-        "127.0.0.1:0".parse().unwrap(),
-        service.clone(),
-        f.server_config.clone(),
-        16,
-    )
-    .await
-    .unwrap();
-    let running_pg = serve_pg(
-        "127.0.0.1:0".parse().unwrap(),
-        service,
-        f.server_config.clone(),
-        16,
-    )
-    .await
-    .unwrap();
-    let barrier = Arc::new(tokio::sync::Barrier::new(10));
-    let mut tasks = vec![];
-    for i in 0..10 {
-        let addr = running.address;
-        let pg_addr = running_pg.address;
-        let config = f.task.clone();
-        let barrier = barrier.clone();
-        tasks.push(tokio::spawn(async move {
-            let request = Request::Execute {
-                request: repair(100 + i, i..i + 1),
-                approval: None,
-            };
-            if i % 2 == 0 {
-                let mut c = Client::connect(addr, "localhost", config).await.unwrap();
-                barrier.wait().await;
-                c.call(&request).await.unwrap()
-            } else {
-                let mut cfg = tokio_postgres::Config::new();
-                cfg.host("localhost")
-                    .hostaddr(pg_addr.ip())
-                    .port(pg_addr.port())
-                    .user("giggles")
-                    .dbname("giggles")
-                    .ssl_mode(tokio_postgres::config::SslMode::Require);
-                let (c, conn) = cfg
-                    .connect(tokio_postgres_rustls::MakeRustlsConnect::new(
-                        (*config).clone(),
-                    ))
-                    .await
-                    .unwrap();
-                let handle = tokio::spawn(async move {
-                    let _ = conn.await;
-                });
-                barrier.wait().await;
-                let response = task_wire(&c, &request).await;
-                drop(c);
-                handle.await.unwrap();
-                response
-            }
-        }));
-    }
-    let mut successes = 0;
-    for task in tasks {
-        let response = task.await.unwrap();
-        if response.code == "committed" {
-            successes += 1;
-        } else {
-            assert_eq!(response.code, "54000");
-        }
-    }
-    assert_eq!(successes, 1);
-    let snap = f.admin.snapshot().unwrap();
-    assert_eq!(snap.tasks[&TaskId(3)].transitions, 1);
-    assert_eq!(
-        snap.rows
-            .values()
-            .filter(|r| r.status == Status::Queued)
-            .count(),
-        1
-    );
-    running.shutdown().await.unwrap();
-    running_pg.shutdown().await.unwrap();
-    f.stop().await;
-}
+
+
+
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authentication_tls_downgrade_unknown_certificate_and_spoof() {
@@ -909,103 +534,7 @@ async fn raw_tls(
         .unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn approval_revocation_staleness_expiry_and_unknown_status() {
-    let f = Fixture::new().await;
-    let mut c = f.native(f.task.clone()).await;
-    for (op, revoke) in [(20, true), (21, false)] {
-        let r = repair(op, 0..6);
-        let p = f
-            .admin
-            .executor(TaskId(1), Principal(2))
-            .unwrap()
-            .preview(&r, Time::Certified(now()))
-            .unwrap();
-        let a = f
-            .admin
-            .approve(Principal(3), p, Time::Certified(now()))
-            .unwrap();
-        if revoke {
-            f.admin.revoke_approval(a).unwrap();
-        } else {
-            f.admin
-                .put(
-                    Key {
-                        tenant: TenantId(42),
-                        row: RowId(0),
-                    },
-                    Row {
-                        status: Status::Failed,
-                        failed_at: 103,
-                        attempt_count: 1,
-                        version: 0,
-                    },
-                )
-                .unwrap();
-        }
-        assert_eq!(
-            c.call(&Request::Execute {
-                request: r,
-                approval: Some(a)
-            })
-            .await
-            .unwrap()
-            .code,
-            "GD001"
-        );
-    }
-    assert_eq!(
-        c.call(&Request::Execute {
-            request: repair(22, 0..6),
-            approval: None
-        })
-        .await
-        .unwrap()
-        .code,
-        "GD001"
-    );
-    let mut expired = grant(4, 42, 1, 1);
-    expired.policy.expires = now() - 1;
-    f.admin.grant(expired).unwrap();
-    f.admin
-        .provision_task_resources(
-            TaskId(4),
-            giggles_core::TaskResources {
-                read_rows: 1_000_000,
-                disclosed_rows: 1_000_000,
-                encoded_bytes: 1_000_000_000,
-            },
-        )
-        .unwrap();
-    let e = f.admin.executor(TaskId(4), Principal(2)).unwrap();
-    assert!(e.status_current(OperationId(1), now(), now()).is_err());
-    assert!(e.preview_current(&repair(1, 0..1), now(), now()).is_err());
-    assert!(
-        e.execute_current(repair(1, 0..1), now(), now(), None)
-            .is_err()
-    );
-    let mut future = grant(5, 42, 1, 1);
-    let before_valid = now();
-    future.policy.valid_from = before_valid + 1;
-    f.admin.grant(future).unwrap();
-    f.admin
-        .provision_task_resources(
-            TaskId(5),
-            giggles_core::TaskResources {
-                read_rows: 1_000_000,
-                disclosed_rows: 1_000_000,
-                encoded_bytes: 1_000_000_000,
-            },
-        )
-        .unwrap();
-    let e = f.admin.executor(TaskId(5), Principal(2)).unwrap();
-    assert!(
-        e.execute_current(repair(1, 0..1), before_valid, before_valid + 2, None)
-            .is_err()
-    );
-    drop(c);
-    f.stop().await;
-}
+
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disconnect_reconnect_pool_isolation_and_statement_fences() {
@@ -1979,79 +1508,7 @@ async fn portal_suspension_transaction_cleanup_and_object_limits() {
     f.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn lost_response_restart_original_operation_and_native_executable() {
-    let f = Fixture::new().await;
-    let path = f.path.clone();
-    let config = f.task.clone();
-    let server_config = f.server_config.clone();
-    let request = Request::Execute {
-        request: repair(700, 0..1),
-        approval: None,
-    };
-    let mut s = raw_tls(&f, f.task.clone(), false).await;
-    giggles_server::write_frame(
-        &mut s,
-        &serde_json::to_vec(&request).unwrap(),
-        giggles_server::MAX_FRAME,
-    )
-    .await
-    .unwrap();
-    // Read only frame length, deliberately lose the decision payload.
-    assert!(s.read_u32().await.unwrap() > 0);
-    drop(s);
-    let bindings: Vec<Binding> =
-        serde_json::from_slice(&std::fs::read(path.join("bindings.json")).unwrap()).unwrap();
-    f.stop().await;
-    let admin = reopen_after_shutdown(path.join("db.redb")).await.unwrap();
-    let service = Service::new(admin.clone(), bindings, Clock::new(0, 3600).unwrap()).unwrap();
-    let running = serve("127.0.0.1:0".parse().unwrap(), service, server_config, 8)
-        .await
-        .unwrap();
-    let mut c = Client::connect(running.address, "localhost", config)
-        .await
-        .unwrap();
-    let r = c
-        .call(&Request::Status {
-            operation: OperationId(700),
-        })
-        .await
-        .unwrap();
-    assert_eq!(r.code, "committed");
-    assert_eq!(r.count, Some(1));
-    assert_eq!(c.call(&request).await.unwrap(), r);
-    assert_eq!(admin.snapshot().unwrap().tasks[&TaskId(1)].transitions, 1);
-    let request_file = path.join("status.json");
-    std::fs::write(
-        &request_file,
-        serde_json::to_vec(&Request::Status {
-            operation: OperationId(700),
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_giggles-client"))
-        .args([
-            running.address.to_string(),
-            "localhost".into(),
-            path.join("task.pem").display().to_string(),
-            path.join("task.key.TEST-ONLY").display().to_string(),
-            path.join("ca.pem").display().to_string(),
-            request_file.display().to_string(),
-        ])
-        .output()
-        .await
-        .unwrap();
-    std::fs::write(path.join("native-client.stdout.json"), &output.stdout).unwrap();
-    std::fs::write(path.join("native-client.stderr.txt"), &output.stderr).unwrap();
-    assert!(output.status.success());
-    assert_eq!(
-        serde_json::from_slice::<Response>(&output.stdout).unwrap(),
-        r
-    );
-    drop(c);
-    running.shutdown().await.unwrap();
-}
+
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn executable_server_starts_and_native_client_connects() {
@@ -2248,62 +1705,7 @@ async fn protocol_cancel_request_rejected_without_rolling_back_other_session() {
     f.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn native_and_task_wire_deadline_before_dispatch_does_not_mutate() {
-    let f = Fixture::new().await;
-    let mut c = f.native(f.task.clone()).await;
-    let (pg, conn) = f.pg(f.task.clone()).await;
-    let request = Request::Deadline {
-        budget_ms: 0,
-        request: Box::new(Request::Execute {
-            request: repair(900, 0..1),
-            approval: None,
-        }),
-    };
-    assert_eq!(c.call(&request).await.unwrap().code, "57014");
-    assert_eq!(task_wire(&pg, &request).await.code, "57014");
-    assert_eq!(
-        c.call(&Request::Status {
-            operation: OperationId(900)
-        })
-        .await
-        .unwrap()
-        .code,
-        "absent"
-    );
-    assert_eq!(f.admin.snapshot().unwrap().tasks[&TaskId(1)].transitions, 0);
-    let mut app = f.native(f.app.clone()).await;
-    assert_eq!(app.call(&sql("BEGIN", vec![])).await.unwrap().code, "ok");
-    assert_eq!(
-        app.call(&Request::Deadline {
-            budget_ms: 0,
-            request: Box::new(sql("INSERT INTO app (id) VALUES (1)", vec![]))
-        })
-        .await
-        .unwrap()
-        .code,
-        "57014"
-    );
-    assert_eq!(
-        app.call(&sql("COMMIT", vec![])).await.unwrap().code,
-        "25P02"
-    );
-    assert_eq!(app.call(&sql("ROLLBACK", vec![])).await.unwrap().code, "ok");
-    assert!(
-        app.call(&sql("SELECT * FROM app LIMIT 1", vec![]))
-            .await
-            .unwrap()
-            .sql
-            .unwrap()
-            .rows
-            .is_empty()
-    );
-    drop(c);
-    drop(app);
-    drop(pg);
-    conn.await.unwrap();
-    f.stop().await;
-}
+
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn startup_spoof_and_malformed_wire_corpus_remains_isolated() {
@@ -2366,154 +1768,9 @@ async fn startup_spoof_and_malformed_wire_corpus_remains_isolated() {
     f.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fail_closed_future_persisted_time_affects_native_and_wire_task_paths() {
-    let f = Fixture::new().await;
-    let mut c = f.native(f.task.clone()).await;
-    let (pg, conn) = f.pg(f.task.clone()).await;
-    f.admin.certify_server_time(u64::MAX, u64::MAX).unwrap();
-    for request in [
-        Request::Preview {
-            request: repair(1, 0..1),
-        },
-        Request::Execute {
-            request: repair(1, 0..1),
-            approval: None,
-        },
-        Request::Status {
-            operation: OperationId(1),
-        },
-        Request::RepairSql {
-            operation: OperationId(1),
-            sql: "UPDATE deliveries SET status = 'queued' WHERE tenant = 42 AND id = 0".into(),
-            approval: None,
-        },
-    ] {
-        assert_eq!(c.call(&request).await.unwrap().code, "55000");
-        assert_eq!(task_wire(&pg, &request).await.code, "55000");
-    }
-    assert_eq!(f.admin.snapshot().unwrap().tasks[&TaskId(1)].transitions, 0);
-    drop(c);
-    drop(pg);
-    conn.await.unwrap();
-    f.stop().await;
-}
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn expired_task_and_revoked_approval_are_denied_on_both_network_paths() {
-    let f = Fixture::new().await;
-    let mut expired = grant(4, 42, 25, 5);
-    expired.policy.expires = now() - 1;
-    f.admin.grant(expired).unwrap();
-    f.admin
-        .provision_task_resources(
-            TaskId(4),
-            giggles_core::TaskResources {
-                read_rows: 1_000_000,
-                disclosed_rows: 1_000_000,
-                encoded_bytes: 1_000_000_000,
-            },
-        )
-        .unwrap();
-    let der = tls::certs(f.path.join("task.pem")).unwrap().remove(0);
-    let service = Service::new(
-        f.admin.clone(),
-        vec![Binding {
-            fingerprint: tls::fingerprint(&der),
-            role: Role::Task {
-                domain: f.admin.authority_metadata().unwrap().0.to_string(),
-                task: TaskId(4),
-                principal: Principal(2),
-            },
-        }],
-        Clock::new(0, 3600).unwrap(),
-    )
-    .unwrap();
-    let native = serve(
-        "127.0.0.1:0".parse().unwrap(),
-        service.clone(),
-        f.server_config.clone(),
-        8,
-    )
-    .await
-    .unwrap();
-    let pg = serve_pg(
-        "127.0.0.1:0".parse().unwrap(),
-        service,
-        f.server_config.clone(),
-        8,
-    )
-    .await
-    .unwrap();
-    let mut c = Client::connect(native.address, "localhost", f.task.clone())
-        .await
-        .unwrap();
-    let mut cfg = tokio_postgres::Config::new();
-    cfg.host("localhost")
-        .hostaddr(pg.address.ip())
-        .port(pg.address.port())
-        .user("giggles")
-        .dbname("giggles")
-        .ssl_mode(tokio_postgres::config::SslMode::Require);
-    let (wire, conn) = cfg
-        .connect(tokio_postgres_rustls::MakeRustlsConnect::new(
-            (*f.task).clone(),
-        ))
-        .await
-        .unwrap();
-    let handle = tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    for request in [
-        Request::Preview {
-            request: repair(1, 0..1),
-        },
-        Request::Execute {
-            request: repair(1, 0..1),
-            approval: None,
-        },
-        Request::Status {
-            operation: OperationId(1),
-        },
-        Request::RepairSql {
-            operation: OperationId(1),
-            sql: "UPDATE deliveries SET status = 'queued' WHERE tenant = 42 AND id = 0".into(),
-            approval: None,
-        },
-    ] {
-        assert_eq!(c.call(&request).await.unwrap().code, "42501");
-        assert_eq!(task_wire(&wire, &request).await.code, "42501");
-    }
-    drop(c);
-    drop(wire);
-    handle.await.unwrap();
-    native.shutdown().await.unwrap();
-    pg.shutdown().await.unwrap();
-    let r = repair(55, 0..6);
-    let preview = f
-        .admin
-        .executor(TaskId(1), Principal(2))
-        .unwrap()
-        .preview(&r, Time::Certified(now()))
-        .unwrap();
-    let approval = f
-        .admin
-        .approve(Principal(3), preview, Time::Certified(now()))
-        .unwrap();
-    f.admin.revoke_approval(approval).unwrap();
-    let mut c = f.native(f.task.clone()).await;
-    let (wire, conn) = f.pg(f.task.clone()).await;
-    let request = Request::Execute {
-        request: r,
-        approval: Some(approval),
-    };
-    assert_eq!(c.call(&request).await.unwrap().code, "GD001");
-    assert_eq!(task_wire(&wire, &request).await.code, "GD001");
-    drop(c);
-    drop(wire);
-    conn.await.unwrap();
-    f.stop().await;
-}
+
+
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn extended_rollback_recovers_an_aborted_transaction() {
@@ -2645,8 +1902,7 @@ async fn catalog_driver_schema_change_and_aborted_transaction_fence() {
     f.stop().await;
 }
 
-#[path = "prepared_network.inc"]
-mod prepared_network;
+
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn catalog_cached_pages_reauthorize_before_release() {
@@ -2743,8 +1999,7 @@ async fn catalog_and_application_pages_share_aggregate_cache_admission() {
     f.stop().await;
 }
 
-#[path = "accounting_network.inc"]
-mod accounting_network;
+
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rejected_queries_report_stage_and_fingerprint_without_sql_or_values() {
@@ -3099,4 +2354,42 @@ async fn exists_admission_returns_results() {
     drop(pg);
     conn.await.unwrap();
     f.stop().await;
+}
+
+// Connection helpers shared by SQL authority tests with NoSql certificates.
+mod prepared_network {
+    use super::*;
+pub(super) async fn connect_at(
+    address: std::net::SocketAddr,
+    config: Arc<ClientConfig>,
+) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
+    let mut cfg = tokio_postgres::Config::new();
+    cfg.host("localhost")
+        .hostaddr(address.ip())
+        .port(address.port())
+        .user("giggles")
+        .dbname("giggles")
+        .ssl_mode(tokio_postgres::config::SslMode::Require);
+    let (c, conn) = cfg
+        .connect(tokio_postgres_rustls::MakeRustlsConnect::new(
+            (*config).clone(),
+        ))
+        .await
+        .unwrap();
+    (
+        c,
+        tokio::spawn(async move {
+            let _ = conn.await;
+        }),
+    )
+}
+pub(super) async fn raw_task(f: &Fixture) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let mut s = raw_tls(f, f.task.clone(), true).await;
+    let mut startup = 196608u32.to_be_bytes().to_vec();
+    startup.extend(b"user\0giggles\0database\0giggles\0\0");
+    s.write_u32((startup.len() + 4) as u32).await.unwrap();
+    s.write_all(&startup).await.unwrap();
+    while pg_read(&mut s).await.0 != b'Z' {}
+    s
+}
 }

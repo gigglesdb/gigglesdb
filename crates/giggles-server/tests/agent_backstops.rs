@@ -13,9 +13,11 @@
 #![cfg(feature = "engine-rocksdb")]
 mod agent_support;
 
+#[cfg(feature = "legacy-task")]
+use agent_support::ordinary_wire;
 use agent_support::{
     AGENT_STARTUP, AgentServer, Msg, admin, binding, certificate, connect_raw, error_of, now_ms,
-    ordinary_wire, timestamptz, DAY_MS,
+    timestamptz, DAY_MS,
 };
 use giggles_core::{
     CoreError,
@@ -284,6 +286,7 @@ async fn bare_update_through_execute_prepared_refused() {
     assert_eq!(database_state(&server), before);
 }
 
+#[cfg(feature = "legacy-task")]
 #[tokio::test]
 async fn framed_request_on_agent_session_only_ping() {
     let (server, agent, _) = started().await;
@@ -505,6 +508,7 @@ async fn planner_shapes_with_catalog_stay_in_scope() {
     assert!(server.admin.roles().get("intruder").unwrap().is_none());
 }
 
+#[cfg(feature = "legacy-task")]
 #[tokio::test]
 async fn non_task_sessions_unaffected() {
     let (server, _, ordinary) = started().await;

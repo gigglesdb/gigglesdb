@@ -125,7 +125,7 @@
       "limit_ids": ["server_frame_bytes", "server_response_bytes", "server_io_timeout_seconds", "server_deadline_ms", "sql_bytes", "sql_params", "sql_transactions"],
       "docs": ["crates/giggles-server/README.md", "crates/giggles-server/COMPATIBILITY.md", "crates/giggles-server/SECURITY.md", "crates/giggles-core/SQL.md"],
       "sources": [{"path":"crates/giggles-server/src/service.rs","needle":"table != \"giggles_join\" && tables.contains(table)"}, {"path":"crates/giggles-server/src/service.rs","needle":"if matches!(&self.role, Role::Application { .. }) && !p.is_ddl()"}, {"path":"crates/giggles-server/src/service.rs","needle":"session.sql.execute_prepared_unreleased(p, params, None)"}],
-      "evidence": [{"path":"crates/giggles-server/tests/network.rs","test":"native_crud_transactions_and_role_boundaries","scope":"Actual local TLS native CRUD and role separation."}, {"path":"crates/giggles-server/tests/network.rs","test":"authentication_tls_downgrade_unknown_certificate_and_spoof","scope":"TLS and certificate binding negative cases."}, {"path":"crates/giggles-server/tests/network.rs","test":"native_and_task_wire_deadline_before_dispatch_does_not_mutate","scope":"Pre-dispatch deadline behavior."}]
+      "evidence": [{"path":"crates/giggles-server/tests/task_release_native.rs","test":"non_task_native_unchanged","scope":"Actual native non-task CRUD and transaction behavior."}, {"path":"crates/giggles-server/tests/network.rs","test":"authentication_tls_downgrade_unknown_certificate_and_spoof","scope":"TLS and certificate binding negative cases."}, {"path":"crates/giggles-server/tests/cancellation_network.inc","test":"actual_native_deadline_predecision_and_postdecision_preserve_outcomes","scope":"Native deadline behavior before and after decisions."}]
     },
     {
       "id": "server_pgwire_application",
@@ -145,29 +145,98 @@
       "id": "server_task_repair",
       "state": "restricted",
       "sql_support": "finite_repair",
-      "endpoint": "Native Request::RepairSql { operation, sql, approval }; pgwire simple GIGGLES followed by one native JSON task request",
-      "authority": "Task certificate binding fixes domain/task/principal. Server-certified time and fresh task/credential checks gate execute/status/retry; approval remains trusted-local provisioning.",
-      "implemented": ["Finite repair SQL lowers with parse_repair and uses the same task decision as typed preview/execute/status. Outputs contain bounded count/digest, not protected preimages."],
-      "restrictions": ["No generic deliveries/application-table SQL, task transaction controls, remote task approval/provisioning or role rebinding.", "After missing response, use only original operation ID and payload; absent status is not proof of rollback. Revoke/expiry can deny completed remote retry/status."],
-      "unverified": ["This is finite repair compatibility, not general SQL over task-owned tables."],
-      "limit_ids": ["repair_sql_bytes", "server_frame_bytes", "server_response_bytes", "server_deadline_ms"],
-      "docs": ["crates/giggles-server/README.md", "crates/giggles-server/COMPATIBILITY.md", "crates/giggles-server/SECURITY.md"],
-      "sources": [{"path":"crates/giggles-server/src/service.rs","needle":"Request::RepairSql"}],
-      "evidence": [{"path":"crates/giggles-server/tests/network.rs","test":"native_and_wire_task_approval_retry_status_redaction_and_cross_tenant","scope":"Local TLS task approval, retry/status, redaction and tenant separation."}, {"path":"crates/giggles-core/tests/server_boundary.rs","test":"remote_retry_revocation_gate_differs_from_trusted_forensic_status","scope":"Current remote authority differs from trusted forensic access."}]
+      "endpoint": "R3 agent task sessions: PREVIEW CHANGE, APPROVE CHANGE and COMMIT CHANGE; task SQL over pgwire",
+      "authority": "An agent credential (issued in SQL with ISSUE CREDENTIAL, or a bound client certificate) maps to a task-only executor and its permitted task names. R3 session admission, task scope, preview digest and approval govern each statement.",
+      "implemented": [
+        "R3 task statements preview changes, approve exact digests and commit within task scope; released rows are masked and charged."
+      ],
+      "restrictions": [
+        "Task-only sessions admit the R3 task statement classes and enforce current task authority.",
+        "Retries preserve the original operation identity; withheld responses do not undo committed changes."
+      ],
+      "unverified": [
+        "Only the documented R3 task grammar and existing tests establish this inventory."
+      ],
+      "limit_ids": [
+        "server_frame_bytes",
+        "server_response_bytes",
+        "server_deadline_ms"
+      ],
+      "docs": [
+        "crates/giggles-server/README.md",
+        "crates/giggles-server/COMPATIBILITY.md",
+        "crates/giggles-server/SECURITY.md"
+      ],
+      "sources": [
+        {
+          "path": "crates/giggles-server/src/pgwire_task.rs",
+          "needle": "fn task_statement("
+        },
+        {
+          "path": "crates/giggles-core/src/task/statements.rs",
+          "needle": "pub enum TaskStatement"
+        }
+      ],
+      "evidence": [
+        {
+          "path": "crates/giggles-server/tests/task_release_extended.rs",
+          "test": "portal_paging_releases_each_fetch",
+          "scope": "R3 task portal slices are released individually."
+        },
+        {
+          "path": "crates/giggles-core/tests/task_legacy_ports.rs",
+          "test": "stale_preview_then_repreview_and_approval",
+          "scope": "R3 preview and approval binding."
+        }
+      ]
     },
     {
       "id": "server_task_prepared",
       "state": "restricted",
       "sql_support": "finite_repair",
-      "endpoint": "pgwire extended finite GIGGLES STATUS ($1), PREVIEW/EXECUTE KEY (...) and PREVIEW/EXECUTE RANGE (...) statements",
-      "authority": "Same Task certificate and decision engine as native task calls. Parse/Bind/Describe are pure; Execute rechecks current authority and time, including completed portal replay.",
-      "implemented": ["Exact placeholder grammar, typed operation/key/range/status/approval arguments; binary BYTEA carries unsigned 64-bit IDs; signed BIGINT interval bounds are nonnegative; approval alone can be NULL."],
-      "restrictions": ["No arbitrary SQL, literal arguments, casts, comments, semicolons or suffixes. This is a finite task wire interface, not generic prepared SQL authority.", "Original operation IDs and canonical deduplication remain mandatory; no remote approval creation."],
-      "unverified": ["Only the documented task grammar and pinned driver/raw-wire tests establish compatibility."],
-      "limit_ids": ["prepared_task_bytes", "pg_objects", "server_frame_bytes", "server_response_bytes"],
-      "docs": ["crates/giggles-server/PREPARED_TASKS.md", "crates/giggles-server/COMPATIBILITY.md"],
-      "sources": [{"path":"crates/giggles-server/src/task_statement.rs","needle":"GIGGLES"}],
-      "evidence": [{"path":"crates/giggles-server/tests/prepared_network.inc","test":"prepared_task_actual_driver_metadata_native_equivalence_and_unsigned_ids","scope":"Actual pinned-driver metadata and finite typed/native equivalence."}, {"path":"crates/giggles-server/tests/prepared_network.inc","test":"prepared_task_bind_describe_are_pure_and_completed_portal_rechecks_revoke","scope":"Pure metadata and fresh execution authority."}, {"path":"crates/giggles-server/tests/prepared_network.inc","test":"prepared_task_typed_malformed_null_oid_count_grammar_and_recovery_corpus","scope":"Finite grammar/type rejection and protocol recovery."}]
+      "endpoint": "R3 agent task sessions: PREVIEW CHANGE, APPROVE CHANGE and COMMIT CHANGE; task SQL over pgwire",
+      "authority": "An agent credential (issued in SQL with ISSUE CREDENTIAL, or a bound client certificate) maps to a task-only executor and its permitted task names. R3 session admission, task scope, preview digest and approval govern each statement.",
+      "implemented": [
+        "R3 task statements preview changes, approve exact digests and commit within task scope; released rows are masked and charged."
+      ],
+      "restrictions": [
+        "Task-only sessions admit the R3 task statement classes and enforce current task authority.",
+        "Retries preserve the original operation identity; withheld responses do not undo committed changes."
+      ],
+      "unverified": [
+        "Only the documented R3 task grammar and existing tests establish this inventory."
+      ],
+      "limit_ids": [
+        "pg_objects",
+        "server_frame_bytes",
+        "server_response_bytes"
+      ],
+      "docs": [
+        "crates/giggles-server/README.md",
+        "crates/giggles-server/COMPATIBILITY.md"
+      ],
+      "sources": [
+        {
+          "path": "crates/giggles-server/src/pgwire_task.rs",
+          "needle": "fn task_statement("
+        },
+        {
+          "path": "crates/giggles-core/src/task/statements.rs",
+          "needle": "pub enum TaskStatement"
+        }
+      ],
+      "evidence": [
+        {
+          "path": "crates/giggles-server/tests/task_release_extended.rs",
+          "test": "portal_paging_releases_each_fetch",
+          "scope": "R3 task portal slices are released individually."
+        },
+        {
+          "path": "crates/giggles-core/tests/task_legacy_ports.rs",
+          "test": "stale_preview_then_repreview_and_approval",
+          "scope": "R3 preview and approval binding."
+        }
+      ]
     },
     {
       "id": "server_bundled_client",
@@ -209,8 +278,7 @@
     {"id":"server_deadline_ms","value":10000,"unit":"maximum native Deadline budget milliseconds","source":{"path":"crates/giggles-server/src/service.rs","needle":"budget_ms > 10_000"}},
     {"id":"pg_startup_bytes","value":8192,"unit":"maximum pgwire startup bytes including length","source":{"path":"crates/giggles-server/src/pgwire_startup.rs","needle":"!(8..=8192).contains(&n)"}},
     {"id":"pg_objects","value":1024,"unit":"prepared statements and separately portals per session","source":{"path":"crates/giggles-server/src/pgwire.rs","needle":"const MAX_NAMED_STATEMENTS: usize = 1024;"}},
-    {"id":"pg_name_bytes","value":63,"unit":"prepared statement/portal name bytes","source":{"path":"crates/giggles-server/src/pgwire.rs","needle":"name.len() > 63"}},
-    {"id":"prepared_task_bytes","value":4096,"unit":"finite prepared task statement bytes","source":{"path":"crates/giggles-server/src/task_statement.rs","needle":"4096"}}
+    {"id":"pg_name_bytes","value":63,"unit":"prepared statement/portal name bytes","source":{"path":"crates/giggles-server/src/pgwire.rs","needle":"name.len() > 63"}}
   ],
   "core_sql_cases": [
     {"id":"typed_point","sql":"SELECT title, active FROM app WHERE id=$1","params":[{"Int":1}],"rows":[[{"Text":"first"},{"Bool":true}]],"error":null,"reason":"A full primary-key equality may omit LIMIT; parameters retain their scalar types."},

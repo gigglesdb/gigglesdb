@@ -215,6 +215,8 @@ pub fn decode_execute(bytes: &[u8]) -> Result<proto::ExecuteRequest, ApiError> {
     let (kind, value) = root.one()?;
     use proto::execute_request::Request as P;
     let request = match kind.as_str() {
+        #[cfg(not(feature = "legacy-task"))]
+        "preview" | "execute" | "repairSql" | "status" => return Err(ApiError::LegacyTaskRetired),
         "catalog" => P::Catalog(super::native_json::Decoder::default().catalog(value)?),
         "sequence" => P::Sequence(super::native_json::Decoder::default().sequence(value)?),
         "searchPath" => P::SearchPath(super::native_json::Decoder::default().search_path(value)?),
@@ -257,12 +259,14 @@ pub fn decode_execute(bytes: &[u8]) -> Result<proto::ExecuteRequest, ApiError> {
             fields.finish()?;
             P::Sql(proto::SqlRequest { sql, params })
         }
+        #[cfg(feature = "legacy-task")]
         "preview" => {
             let mut fields = Object::new(value)?;
             let request = Some(decode_task(fields.required("request")?)?);
             fields.finish()?;
             P::Preview(proto::PreviewRequest { request })
         }
+        #[cfg(feature = "legacy-task")]
         "execute" => {
             let mut fields = Object::new(value)?;
             let request = Some(decode_task(fields.required("request")?)?);
@@ -270,6 +274,7 @@ pub fn decode_execute(bytes: &[u8]) -> Result<proto::ExecuteRequest, ApiError> {
             fields.finish()?;
             P::Execute(proto::TaskExecuteRequest { request, approval })
         }
+        #[cfg(feature = "legacy-task")]
         "repairSql" => {
             let mut fields = Object::new(value)?;
             let operation = Some(uint(fields.required("operation")?)?);
@@ -286,6 +291,7 @@ pub fn decode_execute(bytes: &[u8]) -> Result<proto::ExecuteRequest, ApiError> {
                 approval,
             })
         }
+        #[cfg(feature = "legacy-task")]
         "status" => {
             let mut fields = Object::new(value)?;
             let operation = Some(uint(fields.required("operation")?)?);
@@ -364,6 +370,7 @@ pub(super) fn decode_value(value: Json) -> Result<proto::Value, ApiError> {
     };
     Ok(proto::Value { value: Some(value) })
 }
+#[cfg(feature = "legacy-task")]
 fn status(value: Json) -> Result<i32, ApiError> {
     match text(value)?.as_str() {
         "DELIVERY_STATUS_FAILED" => Ok(proto::DeliveryStatus::Failed as i32),
@@ -372,6 +379,7 @@ fn status(value: Json) -> Result<i32, ApiError> {
         _ => Err(ApiError::InvalidArgument),
     }
 }
+#[cfg(feature = "legacy-task")]
 fn decode_task(value: Json) -> Result<proto::TaskRequest, ApiError> {
     let mut fields = Object::new(value)?;
     let operation = Some(uint(fields.required("operation")?)?);
@@ -391,6 +399,7 @@ fn decode_task(value: Json) -> Result<proto::TaskRequest, ApiError> {
         after,
     })
 }
+#[cfg(feature = "legacy-task")]
 fn decode_selection(value: Json) -> Result<proto::Selection, ApiError> {
     let (kind, value) = Object::new(value)?.one()?;
     let mut fields = Object::new(value)?;
@@ -788,6 +797,7 @@ mod tests {
         assert!(parse(over.as_bytes()).is_err());
     }
 
+    #[cfg(feature = "legacy-task")]
     #[test]
     fn json_integer_and_base64_canonical_forms() {
         for input in ["0", "-9223372036854775808", "9223372036854775807"] {
@@ -830,6 +840,7 @@ mod tests {
         assert!(decode_execute(br#"{"status":{"operation":1}}"#).is_err());
     }
 
+    #[cfg(feature = "legacy-task")]
     #[test]
     fn all_request_variants_match_native() {
         let cases = [

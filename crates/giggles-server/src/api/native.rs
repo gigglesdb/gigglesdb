@@ -209,9 +209,9 @@ pub(crate) fn request_class(request: &ops::Request) -> StatementClass {
 fn legacy_class(request: &crate::Request) -> StatementClass {
     match request {
         crate::Request::Ping => StatementClass::Show,
-        crate::Request::Sql { .. }
-        | crate::Request::Deadline { .. }
-        | crate::Request::Preview { .. }
+        crate::Request::Sql { .. } | crate::Request::Deadline { .. } => StatementClass::Other,
+        #[cfg(feature = "legacy-task")]
+        crate::Request::Preview { .. }
         | crate::Request::Execute { .. }
         | crate::Request::RepairSql { .. }
         | crate::Request::Status { .. } => StatementClass::Other,

@@ -1,5 +1,5 @@
 use giggles_core::{
-    Admin, Limits, Principal, TaskId,
+    Admin, Limits,
     roles::{NewRole, SchemaPrivilege},
 };
 use giggles_server::{
@@ -60,11 +60,7 @@ async fn constraint_wire_errors_and_deferred_commit_rollback() {
         admin.clone(),
         vec![Binding {
             fingerprint: fingerprint.clone(),
-            role: Role::Task {
-                domain: admin.authority_metadata().unwrap().0.to_string(),
-                task: TaskId(91),
-                principal: Principal(92),
-            },
+            role: Role::NoSql { domain: admin.authority_metadata().unwrap().0.to_string() },
         }],
         Clock::new(0, 3600).unwrap(),
     )

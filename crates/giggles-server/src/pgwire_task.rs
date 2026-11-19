@@ -51,6 +51,7 @@ pub(super) fn plan_class(plan: &Plan) -> Option<StatementClass> {
         Plan::Catalog(plan, _, _) if !plan.depends_on_relations() => StatementClass::Show,
         Plan::Catalog(..) => StatementClass::Catalog,
         Plan::Copy(..) | Plan::CopyOut(_) => StatementClass::Copy,
+        #[cfg(feature = "legacy-task")]
         Plan::Task(_) => StatementClass::Other,
         // R3-707: the approver forms are never admitted in a task session (D7.1).
         Plan::Change(_) => StatementClass::Other,
@@ -797,9 +798,10 @@ impl State {
             | Plan::Sql(_)
             | Plan::Copy(..)
             | Plan::CopyOut(_)
-            | Plan::Task(_)
             | Plan::Change(_)
             | Plan::TaskDdl(_) => Err(refuse(&mut self.diagnostic, class)),
+            #[cfg(feature = "legacy-task")]
+            Plan::Task(_) => Err(refuse(&mut self.diagnostic, class)),
         }
     }
 
