@@ -564,3 +564,6 @@ mod sql_numeric_domain;
 mod fk_row_locks;
 #[path = "sql_row_locks.rs"]
 mod sql_row_locks;
+
+#[path = "default_parse_cache.rs"]
+mod default_parse_cache;

@@ -505,7 +505,7 @@ impl Merge {
                                     state,
                                     &table.columns[super::super::super::col(table, name)?],
                                 ) {
-                                    out.extend(defaults::dependencies(&sql)?.into_iter().map(Some));
+                                    out.extend(defaults::dependencies(&sql)?.iter().cloned().map(Some));
                                 }
                             }
                         }

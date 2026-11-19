@@ -719,7 +719,7 @@ impl Insert {
                 let generates = supplied.is_none_or(|slot| row_defaults[slot])
                     || self.overriding == Some(false) && state.column_identity(column.id).is_some();
                 if generates && let Some(sql) = defaults::default_sql(state, column) {
-                    dependencies.extend(defaults::dependencies(&sql)?.into_iter().map(Some));
+                    dependencies.extend(defaults::dependencies(&sql)?.iter().cloned().map(Some));
                 }
             }
         }
@@ -732,7 +732,7 @@ impl Insert {
                 if matches!(value, Operand::Default) {
                     let column = &table.columns[col(table, name)?];
                     if let Some(sql) = defaults::default_sql(state, column) {
-                        dependencies.extend(defaults::dependencies(&sql)?.into_iter().map(Some));
+                        dependencies.extend(defaults::dependencies(&sql)?.iter().cloned().map(Some));
                     }
                 }
             }

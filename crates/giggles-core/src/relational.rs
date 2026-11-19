@@ -3012,7 +3012,7 @@ impl Prepared {
             Statement::Create { defaults, .. } => defaults
                 .iter()
                 .flatten()
-                .flat_map(|sql| defaults::dependencies(sql).unwrap_or_default())
+                .flat_map(|sql| defaults::dependencies(sql).unwrap_or_default().to_vec())
                 .map(Some)
                 .collect(),
             Statement::UpdateExpressions { sets, .. } => sets
@@ -3040,7 +3040,7 @@ impl Prepared {
         let mut dependencies = vec![];
         let mut add = |column: &ColumnDef| -> R<()> {
             if let Some(sql) = defaults::default_sql(state, column) {
-                dependencies.extend(defaults::dependencies(&sql)?.into_iter().map(Some));
+                dependencies.extend(defaults::dependencies(&sql)?.iter().cloned().map(Some));
             }
             Ok(())
         };

@@ -38,7 +38,7 @@ impl AlterTable {
                 Action::Add(_, _, Some(sql), ..) | Action::Default(_, Some(sql)) => Some(sql),
                 _ => None,
             })
-            .flat_map(|sql| defaults::dependencies(sql).unwrap_or_default())
+            .flat_map(|sql| defaults::dependencies(sql).unwrap_or_default().to_vec())
             .map(Some)
             .collect()
     }

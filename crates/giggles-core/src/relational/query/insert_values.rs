@@ -1,5 +1,42 @@
 //! Input-only scalar expressions for single-row INSERT VALUES.
 use super::*;
+use std::{cell::RefCell, collections::HashMap};
+
+thread_local! {
+    static DEFAULT_SCALARS: RefCell<HashMap<String, Scalar>> = RefCell::new(HashMap::new());
+}
+
+// Stop before inference or binding: those depend on the destination type.
+fn default_scalar(sql: &str) -> R<Scalar> {
+    if let Some(value) = DEFAULT_SCALARS.with(|cache| cache.borrow().get(sql).cloned()) {
+        return Ok(value);
+    }
+    let value = parse_default_scalar(sql)?;
+    DEFAULT_SCALARS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 512 {
+            cache.clear();
+        }
+        cache.insert(sql.into(), value.clone());
+    });
+    Ok(value)
+}
+
+fn parse_default_scalar(sql: &str) -> R<Scalar> {
+    let mut parser = Parser {
+        tokens: lex(sql)?,
+        at: 0,
+        params: BTreeSet::new(),
+        relations: Vec::new(),
+    };
+    let mut value = Scalar::parse_aggregate_argument(&mut parser, 0)?;
+    value.resolve_extension_default();
+    if parser.at != parser.tokens.len() || !parser.params.is_empty() {
+        return Err(SqlError::Unsupported);
+    }
+    shape(&value, 0, &mut 0)?;
+    Ok(value)
+}
 
 #[derive(Debug, Clone)]
 pub(in super::super) struct InsertExpressions {
@@ -220,18 +257,7 @@ impl InsertExpressions {
         clock: Option<&crate::relational::clock::ExecutionClock>,
         evaluate: bool,
     ) -> R<Option<Value>> {
-        let mut parser = Parser {
-            tokens: lex(sql)?,
-            at: 0,
-            params: BTreeSet::new(),
-            relations: Vec::new(),
-        };
-        let mut value = Scalar::parse_aggregate_argument(&mut parser, 0)?;
-        value.resolve_extension_default();
-        if parser.at != parser.tokens.len() || !parser.params.is_empty() {
-            return Err(SqlError::Unsupported);
-        }
-        shape(&value, 0, &mut 0)?;
+        let value = default_scalar(sql)?;
         let no_columns = |_: &ColumnRef, _: usize| Err(SqlError::Unsupported);
         let mut parameters = vec![];
         value.infer(None, &mut parameters, &no_columns, &[])?;

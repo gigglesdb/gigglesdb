@@ -1,5 +1,31 @@
 //! Bounded default syntax, assignment validation, and PostgreSQL-style stored text.
 use super::*;
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
+
+thread_local! {
+    // Only syntax is cached: catalog lookup and evaluation stay with the caller.
+    static DEPENDENCIES: RefCell<HashMap<String, Rc<[String]>>> = RefCell::new(HashMap::new());
+    static QUALIFIED_DEFAULTS: RefCell<HashMap<String, Rc<str>>> = RefCell::new(HashMap::new());
+}
+
+fn cached_syntax<T: Clone>(
+    cache: &'static std::thread::LocalKey<RefCell<HashMap<String, T>>>,
+    sql: &str,
+    parse: impl FnOnce() -> R<T>,
+) -> R<T> {
+    if let Some(value) = cache.with(|cache| cache.borrow().get(sql).cloned()) {
+        return Ok(value);
+    }
+    let value = parse()?;
+    cache.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 512 {
+            cache.clear();
+        }
+        cache.insert(sql.into(), value.clone());
+    });
+    Ok(value)
+}
 
 #[derive(Debug, Clone)]
 pub(crate) enum SequenceDdl {
@@ -859,7 +885,11 @@ pub(super) fn check_explicit(state: &Relational, column: &ColumnDef) -> R<()> {
         Ok(())
     }
 }
-pub(super) fn dependencies(sql: &str) -> R<Vec<String>> {
+pub(super) fn dependencies(sql: &str) -> R<Rc<[String]>> {
+    cached_syntax(&DEPENDENCIES, sql, || parse_dependencies(sql).map(Rc::from))
+}
+
+fn parse_dependencies(sql: &str) -> R<Vec<String>> {
     let mut parser = Parser {
         tokens: lex(&format!("{sql},"))?,
         at: 0,
@@ -1322,6 +1352,18 @@ pub(super) fn evaluate_sql(
     target: &DataType,
     clock: Option<&clock::ExecutionClock>,
 ) -> R<Value> {
+    let qualified = cached_syntax(&QUALIFIED_DEFAULTS, sql, || qualify_default(sql))?;
+    // Character defaults are stored as text constants. Evaluate that physical
+    // value before the caller applies the destination column's character rules;
+    // relabeling a text cast as varchar/bpchar would change its scalar cast type.
+    let evaluation_target = match target {
+        DataType::Varchar | DataType::Bpchar => &DataType::Text,
+        other => other,
+    };
+    query::InsertExpressions::default_value(&qualified, evaluation_target, clock, true)?
+        .ok_or(SqlError::Type)
+}
+fn qualify_default(sql: &str) -> R<Rc<str>> {
     let mut parser = Parser {
         tokens: lex(&format!("{sql},"))?,
         at: 0,
@@ -1335,16 +1377,9 @@ pub(super) fn evaluate_sql(
     {
         return Err(SqlError::Unsupported);
     }
-    // Character defaults are stored as text constants. Evaluate that physical
-    // value before the caller applies the destination column's character rules;
-    // relabeling a text cast as varchar/bpchar would change its scalar cast type.
-    let evaluation_target = match target {
-        DataType::Varchar | DataType::Bpchar => &DataType::Text,
-        other => other,
-    };
-    query::InsertExpressions::default_value(&value.sql(), evaluation_target, clock, true)?
-        .ok_or(SqlError::Type)
+    Ok(Rc::from(value.sql()))
 }
+
 pub(super) fn evaluate(
     state: &Relational,
     column: &ColumnDef,
