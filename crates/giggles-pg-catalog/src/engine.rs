@@ -350,6 +350,7 @@ struct Scan {
     explicit_catalog: bool,
     core_scalar: bool,
     introspection: bool,
+    role_privilege: bool,
     introspection_only: bool,
     has_relations: bool,
     user: bool,
@@ -415,6 +416,7 @@ impl Visitor for Scan {
                 | "pg_get_userbyid" | "format_type" | "obj_description" | "pg_collation_actual_version"
                 | "col_description" | "shobj_description" | "pg_get_viewdef"
                 | "pg_has_role" | "has_table_privilege" | "has_column_privilege"));
+            self.role_privilege |= function(&f.name).is_ok_and(|n| n == "pg_has_role");
             self.introspection |= introspection;
             self.introspection_only &= introspection;
         }
@@ -488,6 +490,7 @@ impl Scan {
             explicit_catalog: false,
             core_scalar: false,
             introspection: false,
+            role_privilege: false,
             introspection_only: true,
             has_relations: false,
             user: false,
@@ -804,6 +807,10 @@ fn plan_inner(
     let _ = statements.visit(&mut core_concat);
     if core_concat.0 && !scan.explicit_catalog {
         return Ok(None);
+    }
+    if scan.role_privilege && scan.has_relations && !scan.user && !scan.mutation {
+        scan.catalog = true;
+        scan.explicit_catalog = true;
     }
     let introspection = scan.introspection && scan.introspection_only && !scan.has_relations;
     scan.catalog |= introspection;
@@ -2050,6 +2057,9 @@ impl Compiler {
                 for (f, c) in fields.iter_mut().zip(&a.columns) {
                     f.name = ident(&c.name)
                 }
+            } else if default == "unnest" && fields.len() == 1
+                && matches!(&source, Source::Unnest(..) | Source::ZipUnnest(..)) {
+                fields[0].name = ident(&a.name);
             }
             ident(&a.name)
         } else {
@@ -5613,15 +5623,32 @@ impl Runtime<'_> {
             }
             "pg_has_role" => {
                 if v.iter().any(|v| matches!(v, N)) { N } else {
-                    let member = if v.len() == 3 { text(v[0].clone())? } else { self.snapshot.user.clone() };
-                    let role = text(v[v.len()-2].clone())?;
-                    let option = text(v[v.len()-1].clone())?.to_ascii_uppercase();
-                    let index = match option.trim() { "MEMBER" => 0, "USAGE" => 1, "SET" => 2,
-                        _ => return Err(Error::InvalidPrivilege(format!("unrecognized privilege type: \"{option}\""))) };
-                    if !self.snapshot.role_privileges.keys().any(|(name, _)| name == &member) { return Err(Error::UnknownRole(member)); }
-                    if !self.snapshot.role_privileges.keys().any(|(_, name)| name == &role) { return Err(Error::UnknownRole(role)); }
-                    let privileges = self.snapshot.role_privileges.get(&(member, role)).ok_or(Error::Unsupported)?;
-                    B(privileges[index])
+                    let resolve = |value: &Value| -> Result<Option<String>, Error> {
+                        match value {
+                            I(oid) => Ok(self.snapshot.roles.iter().find(|r| i64::from(r.oid) == *oid).map(|r| r.name.clone())),
+                            _ => {
+                                let name = text(value.clone())?;
+                                if self.snapshot.roles.iter().any(|r| r.name == name) { Ok(Some(name)) }
+                                else { Err(Error::UnknownRole(name)) }
+                            }
+                        }
+                    };
+                    let member = if v.len() == 3 { resolve(&v[0])? } else { Some(self.snapshot.user.clone()) };
+                    let role = resolve(&v[v.len()-2])?;
+                    let option = text(v[v.len()-1].clone())?;
+                    let mut indexes = Vec::new();
+                    for item in option.split(',') {
+                        let normalized = item.trim().to_ascii_uppercase();
+                        let (base, admin) = normalized.strip_suffix(" WITH ADMIN OPTION")
+                            .or_else(|| normalized.strip_suffix(" WITH GRANT OPTION"))
+                            .map_or((normalized.as_str(), false), |base| (base, true));
+                        let index = match base { "MEMBER" => 0, "USAGE" => 1, "SET" => 2,
+                            _ => return Err(Error::InvalidPrivilege(format!("unrecognized privilege type: \"{}\"", item.trim()))) };
+                        indexes.push(if admin { 3 } else { index });
+                    }
+                    let superuser = member.as_ref().is_some_and(|name| self.snapshot.roles.iter().any(|r| &r.name == name && r.superuser));
+                    let privileges = member.zip(role).and_then(|pair| self.snapshot.role_privileges.get(&pair));
+                    B(superuser || privileges.is_some_and(|p| indexes.iter().any(|i| p[*i])))
                 }
             }
             "has_table_privilege" | "has_column_privilege" => self.privilege_function(n, &v)?,

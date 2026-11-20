@@ -284,3 +284,34 @@ fn invalid_acl_inputs_are_rejected() {
         Err(Error::InvalidSnapshot)
     );
 }
+
+#[test]
+fn role_privilege_signatures_lists_and_strictness() {
+    let mut s = snapshot();
+    s.role_privileges.insert(("app".into(), "app".into()), [true, true, true, false]);
+    for sql in ["pg_has_role('app','app','MEMBER')", "pg_has_role(42::oid,'app','USAGE')",
+        "pg_has_role('app',42::oid,'SET')", "pg_has_role(42::oid,42::oid,'MEMBER')",
+        "pg_has_role('app','USAGE')", "pg_has_role(42::oid,'SET')",
+        "pg_has_role('app','app',' usage , MEMBER WITH ADMIN OPTION')"] {
+        yes(&s, sql, true);
+    }
+    for sql in ["pg_has_role('app','app','MEMBER WITH ADMIN OPTION')",
+        "pg_has_role('app','app','SET WITH GRANT OPTION')", "pg_has_role(999999::oid,'app','USAGE')",
+        "pg_has_role('app',999999::oid,'USAGE')"] { yes(&s, sql, false); }
+    assert!(matches!(run(&s, "pg_has_role('app','app',' bogus ')") , Err(Error::InvalidPrivilege(message)) if message == "unrecognized privilege type: \"bogus\""));
+    for privilege in ["", "MEMBER,", "SELECT"] {
+        let sql = format!("pg_has_role('app','app','{privilege}')");
+        assert!(matches!(run(&s, &sql), Err(Error::InvalidPrivilege(_))));
+    }
+    assert!(matches!(run(&s, "pg_has_role('public','app','MEMBER')"), Err(Error::UnknownRole(_))));
+    assert_eq!(run(&s, "pg_has_role(NULL,'app','MEMBER')").unwrap(), Value::Null);
+}
+
+#[test]
+fn role_privilege_unnest_route() {
+    let mut s = snapshot();
+    s.role_privileges.insert(("app".into(), "app".into()), [true, true, true, false]);
+    let sql = "SELECT pg_has_role('app', r, 'MEMBER') FROM unnest(ARRAY['app']) r";
+    let p = plan_gateway(sql).unwrap().expect("role privilege unnest route");
+    assert_eq!(execute(&p, &s, &[]).unwrap().rows, vec![vec![Value::Bool(true)]]);
+}

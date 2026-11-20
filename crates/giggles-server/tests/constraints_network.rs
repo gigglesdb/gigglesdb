@@ -176,9 +176,6 @@ async fn constraint_wire_errors_and_deferred_commit_rollback() {
         "ALTER TABLE absent ADD CHECK (missing > 0)",
         "ALTER TABLE parent_simple ADD CONSTRAINT hidden_fk FOREIGN KEY (missing) REFERENCES hidden.missing (missing)",
         "DROP TABLE parent_simple",
-        "DROP TABLE absent",
-        "DROP TABLE IF EXISTS absent CASCADE",
-        "DROP TABLE hidden.missing",
         "DROP TABLE giggles_reserved",
     ] {
         for session in [&mut other, &mut task] {
@@ -188,6 +185,13 @@ async fn constraint_wire_errors_and_deferred_commit_rollback() {
                 "{sql}"
             );
         }
+    }
+    assert_eq!(sqlstate(&other.execute_sql("DROP TABLE hidden.missing", &[]).unwrap_err()), "3F000");
+    assert_eq!(sqlstate(&task.execute_sql("DROP TABLE hidden.missing", &[]).unwrap_err()), "42501");
+    assert_eq!(sqlstate(&other.execute_sql("DROP TABLE absent", &[]).unwrap_err()), "42P01");
+    other.execute_sql("DROP TABLE IF EXISTS absent CASCADE", &[]).unwrap();
+    for sql in ["DROP TABLE absent", "DROP TABLE IF EXISTS absent CASCADE"] {
+        assert_eq!(sqlstate(&task.execute_sql(sql, &[]).unwrap_err()), "42501");
     }
     // Referenced ownership must precede column and key resolution, including CREATE.
     for sql in [

@@ -2112,6 +2112,14 @@ impl Query {
         }
         found
     }
+    pub(super) fn invoker_authorization_tables(&self) -> R<Vec<String>> {
+        let mut out = self.sources.iter().map(|s| s.name.clone()).collect::<BTreeSet<_>>();
+        if let Some(child) = self.derived() { out.extend(child.invoker_authorization_tables()?); }
+        for filter in self.filter.iter().chain(self.joins.iter().map(|j| &j.on)) {
+            filter.visit_subqueries(&mut |_, child| { out.extend(child.invoker_authorization_tables()?); Ok(()) })?;
+        }
+        Ok(out.into_iter().collect())
+    }
     pub(super) fn authorization_tables(&self) -> R<Vec<String>> {
         Ok(self.dependencies()?.relations.into_iter().collect())
     }

@@ -791,11 +791,14 @@ impl RoleCatalog {
 
     pub fn admin_of(&self, member: &str, role: &str) -> Result<bool, RoleError> {
         validate_name(role)?;
-        let privileges = self.privileges_of(member)?;
-        Ok(self
-            .edges()?
-            .iter()
-            .any(|e| e.role == role && e.admin && privileges.contains(&e.member)))
+        validate_name(member)?;
+        Ok(Self::admin_in_edges(&self.edges()?, member, role))
+    }
+
+    /// ADMIN authority from a statement's current membership image.
+    pub fn admin_in_edges(edges: &[MembershipEdge], member: &str, role: &str) -> bool {
+        let privileges = reachable(edges, member, |e| e.inherit);
+        edges.iter().any(|e| e.role == role && e.admin && privileges.contains(&e.member))
     }
 
     /// Returns Unchanged only when an existing grant's explicitly supplied options did not change.
@@ -822,7 +825,10 @@ impl RoleCatalog {
         validate_name(role)?;
         validate_name(member)?;
         if grantor != BOOTSTRAP { validate_name(grantor)?; }
-        self.write(|table| {
+        self.write(|table| Self::grant_membership_in(table, role, member, grantor, options, explicit))
+    }
+
+    fn grant_membership_in(table: &mut RoleTable, role: &str, member: &str, grantor: &str, options: MembershipOptions, explicit: bool) -> Result<MembershipGrant, RoleError> {
             require_role(table, role)?;
             require_role(table, member)?;
             let grantor = if !explicit && role_record(table, grantor)?.is_some_and(|role| role.superuser) { BOOTSTRAP } else { grantor };
@@ -875,7 +881,6 @@ impl RoleCatalog {
             store_edge(table, &edge)?;
             task_only_invariants(table)?;
             Ok(result)
-        })
     }
 
     /// None removes the grant; Some clears just that option. False means no matching grant.
@@ -905,7 +910,10 @@ impl RoleCatalog {
         validate_name(role)?;
         validate_name(member)?;
         if grantor != BOOTSTRAP { validate_name(grantor)?; }
-        self.write(|table| {
+        self.write(|table| Self::revoke_membership_in(table, role, member, grantor, option, cascade, explicit))
+    }
+
+    fn revoke_membership_in(table: &mut RoleTable, role: &str, member: &str, grantor: &str, option: Option<MembershipOption>, cascade: bool, explicit: bool) -> Result<bool, RoleError> {
             require_role(table, role)?;
             require_role(table, member)?;
             let edges = membership_edges(table)?;
@@ -952,6 +960,52 @@ impl RoleCatalog {
                 }
             }
             Ok(true)
+    }
+
+    /// Apply the Cartesian product atomically, preserving statement order and duplicates.
+    /// Authorization runs for each granted role before any of its pairs are processed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn membership_batch(
+        &self, roles: &[String], members: &[String], grantor: &str,
+        grant: bool, options: MembershipOptions, revoke: Option<MembershipOption>,
+        cascade: bool, explicit: bool,
+        authorize: impl FnMut(&str, &[MembershipEdge]) -> Result<(), RoleError>,
+    ) -> Result<Vec<bool>, RoleError> {
+        let mut unchanged = Vec::new();
+        self.membership_batch_reporting(roles, members, grantor, grant, options, revoke,
+            cascade, explicit, authorize, &mut unchanged, &mut None)?;
+        Ok(unchanged)
+    }
+
+    /// Pair diagnostics survive rollback; `missing` names the failed lookup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn membership_batch_reporting(
+        &self, roles: &[String], members: &[String], grantor: &str,
+        grant: bool, options: MembershipOptions, revoke: Option<MembershipOption>,
+        cascade: bool, explicit: bool,
+        mut authorize: impl FnMut(&str, &[MembershipEdge]) -> Result<(), RoleError>,
+        unchanged: &mut Vec<bool>, missing: &mut Option<String>,
+    ) -> Result<(), RoleError> {
+        unchanged.clear();
+        *missing = None;
+        for name in roles.iter().chain(members) { validate_name(name)?; }
+        if grantor != BOOTSTRAP { validate_name(grantor)?; }
+        self.write(|table| {
+            for member in members {
+                require_role(table, member).inspect_err(|_| *missing = Some(member.clone()))?;
+            }
+            for role in roles {
+                require_role(table, role).inspect_err(|_| *missing = Some(role.clone()))?;
+                authorize(role, &membership_edges(table)?)?;
+                for member in members {
+                    unchanged.push(if grant {
+                        Self::grant_membership_in(table, role, member, grantor, options, explicit)? == MembershipGrant::Unchanged
+                    } else {
+                        !Self::revoke_membership_in(table, role, member, grantor, revoke, cascade, explicit)?
+                    });
+                }
+            }
+            Ok(())
         })
     }
 
@@ -1297,6 +1351,33 @@ mod tests {
             name: name.into(),
             ..NewRole::default()
         }
+    }
+
+    #[test]
+    fn membership_statement_rolls_back_all_pairs() {
+        database(|admin, _| {
+            let catalog = admin.roles();
+            for name in ["g1", "g2", "u1", "u2"] {
+                catalog.create(NewRole { name: name.into(), ..Default::default() }).unwrap();
+            }
+            let names = |names: &[&str]| names.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+            let before = catalog.edges().unwrap();
+            let roles = names(&["g1", "g2"]);
+            let members = names(&["u1", "g1"]);
+            assert!(matches!(catalog.membership_batch(&roles, &members, BOOTSTRAP, true,
+                MembershipOptions::default(), None, false, false, |_, _| Ok(())), Err(RoleError::MembershipCycle { .. })));
+            assert_eq!(catalog.edges().unwrap(), before);
+            let members = names(&["u1", "u2"]);
+            catalog.membership_batch(&roles, &members, BOOTSTRAP, true,
+                MembershipOptions::default(), None, false, false, |_, _| Ok(())).unwrap();
+            assert_eq!(catalog.edges().unwrap().len(), before.len() + 4);
+            assert!(catalog.membership_batch(&names(&["g1", "absent"]), &members, BOOTSTRAP, false,
+                MembershipOptions::default(), None, false, false, |_, _| Ok(())).is_err());
+            assert_eq!(catalog.edges().unwrap().len(), before.len() + 4);
+            let result = catalog.membership_batch(&names(&["g1"]), &names(&["u1", "u1"]), BOOTSTRAP, true,
+                MembershipOptions::default(), None, false, false, |_, _| Ok(())).unwrap();
+            assert_eq!(result, [true, true]);
+        });
     }
 
     fn main_records(admin: &Admin) -> Vec<(Vec<u8>, Vec<u8>)> {

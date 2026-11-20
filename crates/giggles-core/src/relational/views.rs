@@ -187,8 +187,16 @@ impl Prepared {
                 if state.relation_name_taken(name) && !state.view_names.contains_key(name) { return Err(SqlError::WrongObjectType); }
                 match state.view_names.get(name).map(|(id, _)| id) {
                     Some(id) => { dropped.insert(*id); }
-                    None if ddl.optional => user_types::view_missing_notice(split_key(name).1.trim_start_matches('\0')),
-                    None => return Err(SqlError::UnknownTable),
+                    None if ddl.optional => {
+                        let (schema, object) = split_key(name);
+                        if !schema.is_empty() && schema != "public" && !state.ext.schemas.contains_key(schema) {
+                            user_types::missing_object_notice("schema", schema);
+                        } else { user_types::view_missing_notice(object); }
+                    },
+                    None => {
+                        user_types::view_replace_error(format!("view \"{}\" does not exist", split_key(name).1.trim_start_matches('\0')));
+                        return Err(SqlError::UnknownTable);
+                    },
                 }
             }
             loop {

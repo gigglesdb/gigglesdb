@@ -158,6 +158,29 @@ async fn add_column_if_not_exists_notices_and_ownership_over_pgwire() {
         field(&notice.1, b'M'),
         "view \"missing_view\" does not exist, skipping"
     );
+    for (kind, command) in [("table", "TABLE"), ("sequence", "SEQUENCE"), ("index", "INDEX")] {
+        let object = format!("missing_{kind}");
+        let response = query(&mut owner, &format!("DROP {command} IF EXISTS {object}")).await;
+        completed(&response, &format!("DROP {command}"));
+        let notice = response.iter().find(|m| m.0 == b'N').unwrap();
+        assert_eq!(field(&notice.1, b'C'), "00000");
+        assert_eq!(field(&notice.1, b'M'), format!("{kind} \"{object}\" does not exist, skipping"));
+    }
+    for command in ["VIEW", "SEQUENCE", "TABLE", "INDEX"] {
+        let response = query(&mut owner, &format!("DROP {command} IF EXISTS r0c_w1_absent_schema.missing")).await;
+        completed(&response, &format!("DROP {command}"));
+        let notice = response.iter().find(|m| m.0 == b'N').unwrap();
+        assert_eq!(field(&notice.1, b'C'), "00000");
+        assert_eq!(field(&notice.1, b'M'), "schema \"r0c_w1_absent_schema\" does not exist, skipping");
+    }
+    for (kind, command, code) in [("view", "VIEW", "42P01"), ("table", "TABLE", "42P01"),
+        ("sequence", "SEQUENCE", "42P01"), ("index", "INDEX", "42704")] {
+        let object = format!("missing_{kind}");
+        let response = query(&mut owner, &format!("DROP {command} {object}")).await;
+        let error = response.iter().find(|m| m.0 == b'E').unwrap();
+        assert_eq!(field(&error.1, b'C'), code);
+        assert_eq!(field(&error.1, b'M'), format!("{kind} \"{object}\" does not exist"));
+    }
     let mut other = connect(pg.address, "other").await;
     for denied in [
         sql,

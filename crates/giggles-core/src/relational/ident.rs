@@ -39,7 +39,7 @@ pub(super) fn truncate(value: &str, limit: usize) -> &str {
     &value[..end]
 }
 impl Parser {
-    fn raw_name(&mut self) -> R<String> {
+    pub(super) fn raw_name(&mut self) -> R<String> {
         let value = match self.tokens.get(self.at) {
             Some(Token::Word(value) | Token::QuotedIdent(value)) => value,
             _ => return Err(SqlError::Syntax),

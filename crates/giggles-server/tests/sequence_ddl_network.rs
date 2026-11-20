@@ -324,13 +324,9 @@ async fn sequence_ddl(protocol: Protocol) {
                 "42501",
             )
             .await;
-        protocol
-            .error(
-                &outsider,
-                &format!("DROP SEQUENCE IF EXISTS {sequence}"),
-                "42501",
-            )
-            .await;
+        let sql = format!("DROP SEQUENCE IF EXISTS {sequence}");
+        if sequence == "absent" { protocol.ok(&outsider, &sql).await; }
+        else { protocol.error(&outsider, &sql, "42501").await; }
     }
     if matches!(protocol, Protocol::Extended) {
         let dynamic = alice.prepare("SELECT nextval($1)").await.unwrap();
@@ -569,8 +565,9 @@ async fn sequence_ddl(protocol: Protocol) {
         ),
     ] {
         let messages = raw_query(protocol, f.pg.address, sql).await;
-        assert!(
-            !messages.iter().any(|(kind, _)| *kind == b'N'),
+        assert_eq!(
+            messages.iter().any(|(kind, _)| *kind == b'N'),
+            sql == "DROP SEQUENCE IF EXISTS absent_notice",
             "{messages:?}"
         );
         let (_, body) = messages
@@ -723,7 +720,8 @@ async fn sequence_owner_name_reuse(protocol: Protocol) {
         "ALTER SEQUENCE ghost RESTART",
         "DROP SEQUENCE ghost",
     ] {
-        protocol.error(&outsider, sql, "42501").await;
+        let expected = if sql == "DROP SEQUENCE ghost" { "42P01" } else { "42501" };
+        protocol.error(&outsider, sql, expected).await;
     }
     protocol.ok(&bob, "CREATE SEQUENCE ghost").await;
     for sql in [

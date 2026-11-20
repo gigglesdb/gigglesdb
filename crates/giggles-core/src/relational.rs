@@ -1786,6 +1786,7 @@ pub struct Prepared {
     schema_user: String,
     extension_owner: std::sync::Arc<std::sync::atomic::AtomicU32>,
     warnings: Vec<String>,
+    authorization_has_views: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // Awaiting v2 dispatch integration.
@@ -1996,6 +1997,7 @@ impl Prepared {
             extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
             unbound_statement: None,
             warnings: vec![],
+            authorization_has_views: false,
         }
     }
     /// Construct an unbound read; callers still perform their normal authorization.
@@ -2820,7 +2822,17 @@ impl Prepared {
     }
 
     /// Complete syntactic reads, collected before gateway classification or binding.
+    /// View marker captured from the catalog already loaded during schema binding.
+    pub fn authorization_has_views(&self) -> bool { self.authorization_has_views }
+
     pub fn authorization_tables(&self) -> R<Vec<String>> {
+        self.authorization_tables_for(false)
+    }
+    /// Database view reads authorize generated dependencies as their owners.
+    pub fn invoker_authorization_tables(&self) -> R<Vec<String>> {
+        self.authorization_tables_for(true)
+    }
+    fn authorization_tables_for(&self, invoker: bool) -> R<Vec<String>> {
         if let Statement::Plan(plan) = &self.statement { return plan.authorization_tables(); }
         let query = match &self.statement {
             Statement::View(ddl) => ddl.query.as_ref(),
@@ -2831,7 +2843,7 @@ impl Prepared {
         };
         let mut tables = match query {
             Some(query) => {
-                let mut tables = query.authorization_tables()?;
+                let mut tables = if invoker { query.invoker_authorization_tables()? } else { query.authorization_tables()? };
                 if searched::target(self).is_some() {
                     // Retain child reads, then add target-column reads below.
                     let children = query.subquery_tables();
@@ -2996,6 +3008,7 @@ impl Prepared {
             extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
             unbound_statement: None,
             warnings: vec![],
+            authorization_has_views: false,
             statement: Statement::Select {
                 name: scan.table,
                 projection: scan.projection,
@@ -3232,7 +3245,8 @@ impl Prepared {
         let Ok(tokens) = lex(sql) else {
             return Ok(vec![]);
         };
-        if !matches!(tokens.first(),Some(Token::Word(word)) if word == "drop") {
+        if !matches!(tokens.first(),Some(Token::Word(word)) if word == "drop")
+            || !matches!(tokens.get(1), Some(Token::Word(word)) if matches!(word.as_str(), "table" | "view")) {
             return Ok(vec![]);
         }
         let mut parser = Parser {
@@ -3243,8 +3257,23 @@ impl Prepared {
         };
         match parser.parse()? {
             Statement::DropTable { names, .. } => Ok(names),
+            Statement::View(ddl) if ddl.query.is_none() => Ok(ddl.names),
             _ => Ok(vec![]),
         }
+    }
+    /// Reserved engine names must retain authority checks before classification.
+    pub fn reserved_relation_name(name: &str) -> bool {
+        matches!(schema_binding::validate_key(name.trim_start_matches('\0')), Err(SqlError::Reserved))
+    }
+    /// Parse an index drop target before binding can report a missing index.
+    pub fn drop_index_target(sql: &str) -> R<Option<String>> {
+        let Ok(tokens) = lex(sql) else { return Ok(None); };
+        if !matches!(tokens.first(), Some(Token::Word(word)) if word == "drop")
+            || !matches!(tokens.get(1), Some(Token::Word(word)) if word == "index") {
+            return Ok(None);
+        }
+        let mut parser = Parser { tokens, at: 0, params: BTreeSet::new(), relations: Vec::new() };
+        Ok(Some(sql_index::parse_drop_authority_target(&mut parser)?.name))
     }
     /// Lexical routing hint; core resolves extension installation and signatures.
     pub fn extension_routine_call(sql: &str) -> bool {
@@ -3424,6 +3453,7 @@ impl Prepared {
             extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
             unbound_statement: None,
             warnings: take_sql_warnings(),
+            authorization_has_views: false,
         })
     }
     /// Transaction-local name, normalized using PostgreSQL identifier rules.
@@ -4049,6 +4079,7 @@ impl Relational {
             extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
                 unbound_statement: None,
                 warnings: vec![],
+            authorization_has_views: false,
                 statement: Statement::Insert {
                     name: values.name.clone(),
                     columns: values.columns.clone(),
@@ -4215,7 +4246,12 @@ impl Relational {
                 } else if sql_index::primary_table(self, &index.name).is_some() {
                     return Err(SqlError::DependentObjects);
                 } else if !index.optional {
+                    user_types::view_replace_error(format!("index \"{}\" does not exist", split_key(&index.name).1.trim_start_matches('\0')));
                     return Err(SqlError::UndefinedObject);
+                } else {
+                    let (schema, name) = split_key(&index.name);
+                    let (kind, name) = if !schema.is_empty() && schema != "public" && !self.ext.schemas.contains_key(schema) { ("schema", schema) } else { ("index", name) };
+                    user_types::missing_object_notice(kind, name);
                 }
             }
             Statement::CreateIndex(index) => {

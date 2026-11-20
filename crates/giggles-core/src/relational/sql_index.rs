@@ -145,6 +145,15 @@ pub(super) fn primary_table<'a>(state: &'a Relational, name: &str) -> Option<&'a
     })
 }
 pub(super) fn parse_drop(p: &mut Parser) -> R<DropIndex> {
+    parse_drop_impl(p, false)
+}
+
+// Parse-only authorization hint: reserved names still fail the execution parser.
+pub(super) fn parse_drop_authority_target(p: &mut Parser) -> R<DropIndex> {
+    parse_drop_impl(p, true)
+}
+
+fn parse_drop_impl(p: &mut Parser, authority_only: bool) -> R<DropIndex> {
     p.need("drop")?;
     p.need("index")?;
     if p.word("concurrently") {
@@ -154,7 +163,12 @@ pub(super) fn parse_drop(p: &mut Parser) -> R<DropIndex> {
     if optional {
         p.need("exists")?;
     }
-    let name = p.table_name()?;
+    let name = if authority_only {
+        let first = p.raw_name()?;
+        if p.sym('.') { relation_key(&first, &p.raw_name()?) } else { first }
+    } else {
+        p.table_name()?
+    };
     let cascade = p.word("cascade");
     if !cascade {
         p.word("restrict");

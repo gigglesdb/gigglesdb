@@ -166,7 +166,7 @@ impl Diagnostic {
         if result.is_err() && message.as_deref().is_some_and(|m|
             m.starts_with("FOR ") || m.starts_with("syntax error at or near ") || m.starts_with("could not obtain lock on row ")
                 || m == "canceling statement due to lock timeout"
-                || m.starts_with("permission denied for table ")
+                || m.starts_with("permission denied for table ") || m.starts_with("view ") || m.starts_with("sequence ") || m.starts_with("index ")
                 || m.starts_with("relation ") && m.contains(" clause not found in FROM clause")) {
             self.wire_message = message.clone();
         }
@@ -216,6 +216,16 @@ impl Diagnostic {
     fn role_admin_error(&mut self, session: &Session, stmt: &crate::auth::statements::AdminStatement, code: &'static str) -> &'static str {
         use crate::auth::statements::AdminStatement as A;
         match (code, stmt) {
+            ("42P01", A::DropTable(_, names)) => {
+                let sql = session.service.admin.sql_session();
+                if let Some(name) = names.iter().find(|name| {
+                    let key = name.strip_prefix("public\0").unwrap_or(name);
+                    !sql.relation_exists(key).unwrap_or(true)
+                }) {
+                    let name = name.split_once('\0').map_or(name.as_str(), |(_, name)| name).trim_start_matches('\0');
+                    self.wire_message = Some(format!("table \"{name}\" does not exist"));
+                }
+            }
             ("42939", A::Create(name, ..)) => {
                 self.wire_message = Some(format!("role name \"{name}\" is reserved"));
                 self.wire_detail = Some("Role names starting with \"pg_\" are reserved.".into());
@@ -226,6 +236,7 @@ impl Diagnostic {
             }
             ("42501", A::Membership { grant, roles, grantor, .. }) => {
                 let verb = if *grant { "grant" } else { "revoke" };
+                let failed_role = crate::auth::statements::take_membership_error();
                 if let Some(grantor) = grantor {
                     let catalog = session.service.admin.roles();
                     let grantor = match grantor.as_str() { "\0current_user" | "\0current_role" => match session.authority_role() { Role::Database { name } => name.as_str(), _ => grantor }, "\0session_user" => session.session_user_name().unwrap_or(grantor), _ => grantor };
@@ -238,15 +249,16 @@ impl Diagnostic {
                         return code;
                     }
                 }
-                if let Some(role) = roles.first() {
+                if let Some(role) = failed_role.as_ref().or_else(|| roles.iter().find(|role| {
+                    let Role::Database { name } = session.authority_role() else { return true; };
+                    !session.service.admin.roles().admin_of(name, role).unwrap_or(false)
+                })) {
                     self.wire_message = Some(format!("permission denied to {verb} role \"{role}\""));
                     self.wire_detail = Some(format!("Only roles with the ADMIN option on role \"{role}\" may {verb} this role."));
                 }
             }
-            ("0LP01", A::Membership { roles, members, .. }) => {
-                if let (Some(role), Some(member)) = (roles.first(), members.first()) {
-                    self.wire_message = Some(format!("role \"{role}\" is a member of role \"{member}\""));
-                }
+            ("0LP01", A::Membership { .. }) => {
+                self.wire_message = crate::auth::statements::take_membership_error();
             }
             ("0A000", A::Membership { roles, members, .. }) => {
                 if roles.iter().any(|r| r == "pg_database_owner") { self.wire_message = Some("role \"pg_database_owner\" cannot have explicit members".into()); }
@@ -261,8 +273,8 @@ impl Diagnostic {
                 self.wire_message = Some(format!("role name \"{name}\" is reserved"));
                 self.wire_detail = Some("Cannot alter reserved roles.".into());
             }
-            ("42704", A::Membership { roles, members, grantor, .. }) => {
-                if let Some(name) = roles.iter().chain(members).chain(grantor).find(|name| session.service.admin.roles().get(name).ok().flatten().is_none()) {
+            ("42704", A::Membership { .. }) => {
+                if let Some(name) = crate::auth::statements::take_membership_error() {
                     self.wire_message = Some(format!("role \"{name}\" does not exist"));
                 }
             }
@@ -1467,7 +1479,7 @@ impl State {
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
         session.set_max_value_bytes(self.settings.current.max_value_bytes);
         session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
-        simple::role_notices(session, &self.settings.current, out)?;
+        if result.is_ok() { simple::role_notices(session, &self.settings.current, out)?; }
         result
     }
     fn prepare_statement(
@@ -3045,6 +3057,11 @@ impl State {
                     Ok(true)
                 } else {
                     diagnostic_error(code, message, Some(&self.diagnostic), out);
+                    // Error formatting discards partial result frames, but role
+                    // diagnostics produced before a rollback must reach the client.
+                    let error = std::mem::take(out);
+                    simple::role_notices(session, &self.settings.current, out).map_err(io::Error::other)?;
+                    out.extend(error);
                     if matches!(tag, b'Q' | b'S') {
                         self.drain = false;
                         ready(session, out).map(|()| true).map_err(io::Error::other)

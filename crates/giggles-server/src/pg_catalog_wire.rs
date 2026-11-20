@@ -294,6 +294,9 @@ pub(crate) fn snapshot(
                         member.superuser || catalog.is_member(&member.name, &role.name).map_err(|_| "XX000")?,
                         member.superuser || inherited.contains(&role.name),
                         member.superuser || catalog.can_set(&member.name, &role.name).map_err(|_| "XX000")?,
+                        member.superuser || catalog.edges().map_err(|_| "XX000")?.iter().any(|edge|
+                            edge.role == role.name && edge.admin
+                            && catalog.is_member(&member.name, &edge.member).unwrap_or(false)),
                     ]);
                 }
             }

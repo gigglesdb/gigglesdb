@@ -144,10 +144,10 @@ async fn view_authority_matches_sql_before_binding() {
         check(execute(&f, &reader, single("app.r1", "app.missing"), grpc).await, "CREATE VIEW app.r1 AS SELECT id, v FROM app.missing", "42501");
         f.admin.roles().grant_schema("app", "reader", &[SchemaPrivilege::Create, SchemaPrivilege::Usage]).unwrap();
         // CREATE on the schema but no SELECT on the read table.
-        check(execute(&f, &reader, single("app.r1", "app.t"), grpc).await, "CREATE VIEW app.r1 AS SELECT id, v FROM app.t", "42501");
-        check(execute(&f, &reader, joined("app.r1"), grpc).await, "CREATE VIEW app.r1 AS SELECT a.id, b.id AS u_id FROM app.t a JOIN app.u b ON a.id = b.t_id", "42501");
+        check(execute(&f, &reader, single("app.no_select", "app.t"), grpc).await, "CREATE VIEW app.no_select_sql AS SELECT id, v FROM app.t", "ok");
+        check(execute(&f, &reader, joined("app.no_select_join"), grpc).await, "CREATE VIEW app.no_select_join_sql AS SELECT a.id, b.id AS u_id FROM app.t a JOIN app.u b ON a.id = b.t_id", "0A000");
         f.admin.roles().grant_table("app t", "reader", &[giggles_core::roles::TablePrivilege::Select]).unwrap();
-        check(execute(&f, &reader, joined("app.r1"), grpc).await, "CREATE VIEW app.r1 AS SELECT a.id, b.id AS u_id FROM app.t a JOIN app.u b ON a.id = b.t_id", "42501");
+        check(execute(&f, &reader, joined("app.partial_select_join"), grpc).await, "CREATE VIEW app.partial_select_join_sql AS SELECT a.id, b.id AS u_id FROM app.t a JOIN app.u b ON a.id = b.t_id", "0A000");
         f.admin.roles().grant_table("app u", "reader", &[giggles_core::roles::TablePrivilege::Select]).unwrap();
         check(execute(&f, &reader, single("app.r1", "app.t"), grpc).await, "CREATE VIEW app.r2 AS SELECT id, v FROM app.t", "ok");
         check(execute(&f, &reader, joined("app.r3"), grpc).await, "CREATE VIEW app.r4 AS SELECT a.id, b.id AS u_id FROM app.t a JOIN app.u b ON a.id = b.t_id", "0A000");
@@ -159,8 +159,8 @@ async fn view_authority_matches_sql_before_binding() {
         assert_eq!(sql_code(f.service.role_session("other").unwrap().execute_sql("DROP VIEW app.r2", &[])), "42501");
         let reader = database(&f, "reader").await;
         check(execute(&f, &reader, drop("app.r1", false), grpc).await, "DROP VIEW app.r2", "ok");
-        // Never created (join views are 0A000): a non-owner gets 42501 for the missing view, like SQL.
-        check(execute(&f, &reader, drop("app.r3", false), grpc).await, "DROP VIEW app.r4", "42501");
+        // Never created (join views are 0A000): missing views get PostgreSQL 42P01.
+        check(execute(&f, &reader, drop("app.r3", false), grpc).await, "DROP VIEW app.r4", "42P01");
         f.stop().await;
     }
 }

@@ -330,6 +330,7 @@ impl Copy {
             extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
             unbound_statement: None,
             warnings: vec![],
+            authorization_has_views: false,
             statement: Statement::InsertMulti(Box::new(sql_insert::Insert::copy(
                 format!(
                     "{}\0{}",

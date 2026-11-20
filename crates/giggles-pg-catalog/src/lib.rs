@@ -208,7 +208,7 @@ pub struct CatalogSnapshot {
     pub user: String,
     pub session_user: Option<String>,
     pub role_memberships: Vec<Vec<Value>>,
-    pub role_privileges: std::collections::BTreeMap<(String, String), [bool; 3]>,
+    pub role_privileges: std::collections::BTreeMap<(String, String), [bool; 4]>,
     pub database: String,
     /// Existing schemas in the session's explicit search path, in lookup order.
     pub search_path: Vec<String>,

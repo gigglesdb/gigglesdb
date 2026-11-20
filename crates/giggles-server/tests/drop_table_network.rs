@@ -503,3 +503,29 @@ async fn mixed_case_unquoted_and_quoted_drop_targets() {
         f.pg.shutdown().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn builtin_schema_drop_checks_simple_and_extended() {
+    for protocol in [Protocol::Simple, Protocol::Extended] {
+        let f = Fixture::new().await;
+        let owner = f.connect("owner", "owner-pw").await;
+        protocol.ok(&owner, "CREATE ROLE alice LOGIN PASSWORD 'alice-pw'").await;
+        let alice = f.connect("alice", "alice-pw").await;
+        for sql in [
+            "DROP TABLE pg_catalog.pg_class",
+            "DROP TABLE IF EXISTS pg_catalog.pg_class",
+            "DROP VIEW information_schema.tables",
+            "DROP VIEW IF EXISTS information_schema.tables",
+            "DROP INDEX pg_catalog.pg_class_oid_index",
+            "DROP INDEX IF EXISTS pg_catalog.pg_class_oid_index",
+        ] {
+            protocol.error(&alice, sql, "42501").await;
+        }
+        // As on main, the physical DROP route cannot remove virtual catalogs.
+        protocol.error(&owner, "DROP TABLE pg_catalog.pg_class", "42P01").await;
+        assert!(!protocol.strings(&owner, "SELECT relname FROM pg_catalog.pg_class WHERE relname='pg_class'").await.is_empty());
+        drop(alice);
+        drop(owner);
+        f.pg.shutdown().await.unwrap();
+    }
+}

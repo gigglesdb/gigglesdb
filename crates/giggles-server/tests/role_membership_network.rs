@@ -350,3 +350,121 @@ async fn executor_refusal_precedes_superuser_switch_and_membership_write() {
     }
     f.pg.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn multi_target_atomic_diagnostics_and_notice_order() {
+    let f = Fixture::new(Engine::V2).await;
+    let (owner, mut notices) = f.connect_notices("owner").await;
+    run(&owner, "CREATE ROLE g1; CREATE ROLE g2; CREATE ROLE u1; CREATE ROLE u2; CREATE ROLE u3; CREATE ROLE adm; GRANT g1 TO adm WITH ADMIN OPTION; SET ROLE adm").await.unwrap();
+    let error = owner.simple_query("GRANT g1, g2 TO u1").await.unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "42501");
+    assert_eq!(error.message(), "permission denied to grant role \"g2\"");
+    assert_eq!(error.detail(), Some("Only roles with the ADMIN option on role \"g2\" may grant this role."));
+    assert!(!f.admin.roles().is_member("u1", "g1").unwrap());
+    run(&owner, "RESET ROLE; GRANT g2 TO g1").await.unwrap();
+    let before = f.admin.roles().edges().unwrap();
+    let error = owner.simple_query("GRANT u1, g1 TO u2, g2").await.unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "0LP01");
+    assert_eq!(error.message(), "role \"g1\" is a member of role \"g2\"");
+    assert_eq!(f.admin.roles().edges().unwrap(), before);
+    run(&owner, "GRANT g1 TO u1; GRANT g1, g2 TO u1, u2").await.unwrap();
+    assert!(notices.recv().await.unwrap().message().contains("role \"u1\" has already been granted membership in role \"g1\""));
+    assert!(notices.try_recv().is_err());
+    run(&owner, "GRANT g1 TO u1, u1").await.unwrap();
+    for _ in 0..2 { assert_eq!(notices.recv().await.unwrap().code().code(), "00000"); }
+    assert!(notices.try_recv().is_err());
+    run(&owner, "REVOKE g1, g2 FROM u3").await.unwrap();
+    for role in ["g1", "g2"] {
+        let warning = notices.recv().await.unwrap();
+        assert_eq!(warning.code().code(), "01000");
+        assert!(warning.message().contains(&format!("membership in role \"{role}\"")));
+    }
+    assert!(notices.try_recv().is_err());
+    let row = owner.query_one("SELECT pg_has_role('u1', r, 'MEMBER') FROM unnest(ARRAY['g1']) r", &[]).await.unwrap();
+    assert!(row.get::<_, bool>(0));
+    f.pg.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn failed_membership_keeps_diagnostics_and_lookup_identity() {
+    let f = Fixture::new(Engine::V2).await;
+    let (owner, mut notices) = f.connect_notices("owner").await;
+    run(&owner, "CREATE ROLE rn_g1; CREATE ROLE rn_g2; CREATE ROLE rn_u; CREATE ROLE rn_adm; GRANT rn_g1 TO rn_adm WITH ADMIN OPTION").await.unwrap();
+    for extended in [false, true] {
+        run(&owner, "SET ROLE rn_adm; GRANT rn_g1 TO rn_u").await.unwrap();
+        for grant in [true, false] {
+            if !grant { run(&owner, "REVOKE rn_g1 FROM rn_u").await.unwrap(); }
+            let before = f.admin.roles().edges().unwrap();
+            let sql = if grant { "GRANT rn_g1,rn_g2 TO rn_u" } else { "REVOKE rn_g1,rn_g2 FROM rn_u" };
+            let error = if extended { owner.query(sql, &[]).await.unwrap_err() } else { owner.simple_query(sql).await.unwrap_err() };
+            assert_eq!(error.code().unwrap().code(), "42501");
+            // The notice must already have arrived when the ERROR is delivered.
+            let notice = notices.try_recv().unwrap();
+            assert_eq!(notice.code().code(), if grant { "00000" } else { "01000" });
+            assert_eq!(notice.message(), format!("role \"rn_u\" {} membership in role \"rn_g1\" by role \"rn_adm\"", if grant { "has already been granted" } else { "has not been granted" }));
+            assert!(notices.try_recv().is_err());
+            assert_eq!(f.admin.roles().edges().unwrap(), before);
+        }
+        run(&owner, "RESET ROLE; GRANT rn_g1 TO rn_u").await.unwrap();
+        let before = f.admin.roles().edges().unwrap();
+        let sql = "GRANT rn_g1,rn_missing TO rn_u";
+        let error = if extended { owner.query(sql, &[]).await.unwrap_err() } else { owner.simple_query(sql).await.unwrap_err() };
+        assert_eq!(error.as_db_error().unwrap().message(), "role \"rn_missing\" does not exist");
+        assert_eq!(notices.try_recv().unwrap().code().code(), "00000");
+        assert_eq!(f.admin.roles().edges().unwrap(), before);
+        for (sql, name) in [
+            ("GRANT rn_missing TO rn_u GRANTED BY rn_bad_grantor", "rn_bad_grantor"),
+            ("GRANT rn_g1 TO rn_no_member GRANTED BY rn_bad_grantor", "rn_bad_grantor"),
+            ("GRANT rn_missing TO rn_no_member", "rn_no_member"),
+            ("REVOKE rn_missing FROM rn_u GRANTED BY rn_bad_grantor", "rn_bad_grantor"),
+            ("REVOKE rn_g1 FROM rn_no_member GRANTED BY rn_bad_grantor", "rn_bad_grantor"),
+            ("REVOKE rn_missing FROM rn_no_member", "rn_no_member"),
+        ] {
+            let error = if extended { owner.query(sql, &[]).await.unwrap_err() } else { owner.simple_query(sql).await.unwrap_err() };
+            let error = error.as_db_error().unwrap();
+            assert_eq!(error.code().code(), "42704");
+            assert_eq!(error.message(), format!("role \"{name}\" does not exist"));
+        }
+        run(&owner, "REVOKE rn_g1 FROM rn_u").await.unwrap();
+    }
+    f.pg.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn view_bound_sources_and_ownerless_api_compatibility() {
+    use giggles_core::roles::TablePrivilege;
+    let f = Fixture::new(Engine::V2).await;
+    let owner = f.connect("owner").await;
+    run(&owner, "CREATE ROLE rs_owner; CREATE SCHEMA rs_data; CREATE TABLE rs_data.t(a int); INSERT INTO rs_data.t VALUES(83); GRANT USAGE ON SCHEMA rs_data TO rs_owner; GRANT SELECT ON rs_data.t TO rs_owner; GRANT CREATE ON SCHEMA public TO rs_owner; SET ROLE rs_owner; CREATE VIEW public.rs_v AS SELECT a FROM rs_data.t; RESET ROLE; REVOKE USAGE ON SCHEMA rs_data FROM rs_owner").await.unwrap();
+    for role in ["rs_owner", "owner"] {
+        run(&owner, &format!("SET ROLE {role}")).await.unwrap();
+        assert_eq!(owner.query_one("SELECT * FROM rs_v", &[]).await.unwrap().get::<_, i32>(0), 83);
+        assert!(owner.simple_query("SELECT * FROM rs_v").await.is_ok());
+        run(&owner, "RESET ROLE").await.unwrap();
+    }
+    let mut sql = f.admin.sql_session();
+    sql.execute("CREATE TABLE legacy_t(a int)", &[], None).unwrap();
+    sql.execute("INSERT INTO legacy_t VALUES(17)", &[], None).unwrap();
+    sql.execute("CREATE VIEW legacy_v AS SELECT a FROM legacy_t", &[], None).unwrap();
+    assert_eq!(f.admin.roles().table_owner("legacy_v").unwrap(), None);
+    for role in ["plain", "manager"] {
+        f.admin.roles().grant_table("legacy_v", role, &[TablePrivilege::Select]).unwrap();
+    }
+    f.admin.roles().grant_table("legacy_t", "plain", &[TablePrivilege::Select]).unwrap();
+    for role in ["owner", "plain", "manager"] {
+        let client = f.connect(role).await;
+        for extended in [false, true] {
+            if role == "manager" {
+                let error = if extended { client.query("SELECT * FROM legacy_v", &[]).await.unwrap_err() } else { client.simple_query("SELECT * FROM legacy_v").await.unwrap_err() };
+                assert_eq!(error.code().unwrap().code(), "42501");
+            } else if extended {
+                assert_eq!(client.query_one("SELECT * FROM legacy_v", &[]).await.unwrap().get::<_, i32>(0), 17);
+            } else {
+                let rows = client.simple_query("SELECT * FROM legacy_v").await.unwrap();
+                assert!(rows.iter().any(|r| matches!(r, tokio_postgres::SimpleQueryMessage::Row(r) if r.get(0) == Some("17"))));
+            }
+        }
+    }
+    f.pg.shutdown().await.unwrap();
+}

@@ -61,10 +61,10 @@ async fn catalog_creator_ownership_and_privilege_order() {
             (json!({"catalog":{"alterTable":{"table":"app.t","renameColumn":{"from":"id","to":"x"}}}}), "ALTER TABLE app.t RENAME COLUMN id TO x", "42501"),
             (json!({"catalog":{"createIndex":{"table":"app.t","name":"bad_i","columns":["id"]}}}), "CREATE INDEX bad_i ON app.t(id)", "42501"),
             (json!({"catalog":{"dropIndex":{"name":"app.t_v"}}}), "DROP INDEX app.t_v", "42501"),
-            (drop("app.absent"), "DROP TABLE app.absent", "42501"),
+            (drop("app.absent"), "DROP TABLE app.absent", "42P01"),
             (json!({"catalog":{"alterTable":{"table":"app.absent","addColumn":{"name":"x","dataType":"Text"}}}}), "ALTER TABLE app.absent ADD COLUMN x TEXT", "42501"),
             (json!({"catalog":{"createIndex":{"table":"app.absent","name":"absent_i","columns":["id"]}}}), "CREATE INDEX absent_i ON app.absent(id)", "42501"),
-            (json!({"catalog":{"dropIndex":{"name":"app.absent_i"}}}), "DROP INDEX app.absent_i", "42501"),
+            (json!({"catalog":{"dropIndex":{"name":"app.absent_i"}}}), "DROP INDEX app.absent_i", "42704"),
             (json!({"catalog":{"createIndex":{"table":"app.t","name":"bad_i","columns":["missing"]}}}), "CREATE INDEX bad_i ON app.t(missing)", "42501"),
             (json!({"catalog":{"alterTable":{"table":"app.t","renameColumn":{"from":"missing","to":"x"}}}}), "ALTER TABLE app.t RENAME COLUMN missing TO x", "42501"),
             (create("nosuch.x"), "CREATE TABLE nosuch.x(id BIGINT PRIMARY KEY)", "3F000"),
@@ -72,6 +72,17 @@ async fn catalog_creator_ownership_and_privilege_order() {
             assert_code(&execute(&f,&other,request,grpc).await,code);
             sql(&f,"other",query,code);
         }
+        // Existing schema without USAGE hides both missing and existing objects.
+        f.admin.roles().revoke_schema("app","other",&[SchemaPrivilege::Usage]).unwrap();
+        for (request, query) in [
+            (drop("app.absent"), "DROP TABLE app.absent"),
+            (json!({"catalog":{"dropIndex":{"name":"app.absent_i"}}}), "DROP INDEX app.absent_i"),
+            (json!({"catalog":{"dropIndex":{"name":"app.t_v"}}}), "DROP INDEX app.t_v"),
+        ] {
+            assert_code(&execute(&f,&other,request,grpc).await,"42501");
+            sql(&f,"other",query,"42501");
+        }
+        f.admin.roles().grant_schema("app","other",&[SchemaPrivilege::Usage]).unwrap();
         let mut denied=f.service.role_session("other").unwrap();
         denied.execute_sql("BEGIN",&[]).unwrap();
         for (q,code) in [("DROP TABLE app.t","42501"),("SELECT * FROM app.t","25P02")] {

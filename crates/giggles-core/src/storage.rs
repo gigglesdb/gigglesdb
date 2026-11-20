@@ -4838,6 +4838,24 @@ impl SqlSession {
         }
     }
 
+    /// Direct view sources in the current catalog; None denotes an ordinary relation.
+    pub fn view_authorization_sources(&self, name: &str) -> Result<Option<Vec<String>>, CoreError> {
+        self.inspect_metadata(|s| {
+            let key = s.sql.resolve_relation_key(name, &self.search_path);
+            let Some((id, _)) = s.sql.view_names.get(&key) else { return Ok(None) };
+            let view = s.sql.views.and_then(|views| views.get(id)).ok_or(CoreError::Sql(relational::SqlError::UnknownTable))?;
+            let mut sources = Vec::new();
+            for dependency in &view.dependencies {
+                if let Some(table) = s.sql.tables.values().find(|t| t.id == dependency.relation) {
+                    sources.push(s.sql.table_key(table));
+                } else if let Some((name, _)) = s.sql.view_names.iter().find(|(_, (id, _))| *id == dependency.relation) {
+                    sources.push(name.clone());
+                }
+            }
+            Ok(Some(sources))
+        })
+    }
+
     /// A V2 transaction's own table tombstone, not an older snapshot's missing table.
     pub fn table_dropped_in_transaction(&self, id: u64) -> bool {
         self.v2_transaction.as_ref().is_some_and(|txn|

@@ -322,7 +322,7 @@ impl State {
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
         session.set_max_value_bytes(self.settings.current.max_value_bytes);
         session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
-        role_notices(session, &self.settings.current, out)?;
+        if result.is_ok() { role_notices(session, &self.settings.current, out)?; }
         result
     }
 

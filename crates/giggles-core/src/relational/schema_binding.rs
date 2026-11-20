@@ -124,6 +124,7 @@ impl Prepared {
             schema_user: self.schema_user.clone(),
             extension_owner: self.extension_owner.clone(),
             warnings: self.warnings.clone(),
+            authorization_has_views: false,
         };
         let create = |name: &str| -> R<String> {
             let schema = if name.contains('\0') {
@@ -237,6 +238,8 @@ impl Prepared {
         {
             bound.statement = Statement::Plan(plan);
         }
+        bound.authorization_has_views = bound.authorization_tables()?.iter()
+            .any(|name| state.view_names.contains_key(name));
         Ok(bound)
     }
 }
@@ -299,4 +302,13 @@ mod tests {
         reopened.validate().unwrap();
         assert_eq!(before, bincode::serialize(&reopened).unwrap());
     }
+    #[test]
+    fn drop_authority_targets_precede_catalog_binding() {
+        assert_eq!(Prepared::drop_table_targets("DROP VIEW information_schema.tables").unwrap(), vec!["information_schema\0tables"]);
+        assert!(Prepared::drop_table_targets("DROP INDEX pg_catalog.pg_class_oid_index").unwrap().is_empty());
+        assert_eq!(Prepared::drop_index_target("DROP INDEX IF EXISTS pg_catalog.pg_class_oid_index").unwrap(), Some("pg_catalog\0pg_class_oid_index".into()));
+        assert!(Prepared::drop_index_target("DROP INDEX pg_catalog.pg_class_oid_index extra").is_err());
+        assert_eq!(Prepared::parse("DROP INDEX pg_catalog.pg_class_oid_index", 0, 0).unwrap_err(), SqlError::Reserved);
+    }
+
 }

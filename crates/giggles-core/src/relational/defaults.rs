@@ -528,7 +528,7 @@ pub(super) fn execute_sequence(state: &mut Relational, ddl: &SequenceDdl) -> R<u
             // Resolve the whole list against a private candidate: failure is atomic.
             for name in names {
                 if let Err(error) = candidate.require_relation_schema(name) {
-                    if *optional { continue; }
+                    if *optional { user_types::missing_object_notice("schema", split_key(name).0); continue; }
                     return Err(error);
                 }
                 let Some((&id, seq)) = candidate
@@ -542,8 +542,10 @@ pub(super) fn execute_sequence(state: &mut Relational, ddl: &SequenceDdl) -> R<u
                     }
 
                     if *optional {
+                        user_types::missing_object_notice("sequence", split_key(name).1);
                         continue;
                     }
+                    user_types::view_replace_error(format!("sequence \"{}\" does not exist", split_key(name).1.trim_start_matches('\0')));
                     return Err(SqlError::UnknownTable);
                 };
                 if seq.identity {

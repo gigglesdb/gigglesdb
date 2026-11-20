@@ -7,8 +7,11 @@ async fn view_select_simple_extended_authority_and_drop() {
     let path = std::env::temp_dir().join(format!("view-select-wire-{}",std::process::id()));
     let admin = Admin::create_engine(&path,Limits::default(),Engine::V2).unwrap();
     admin.roles().create(NewRole { name:"reader".into(),login:true,..Default::default() }).unwrap();
+    admin.roles().create(NewRole { name:"view_owner".into(),login:false,..Default::default() }).unwrap();
+    admin.roles().create(NewRole { name:"no_view".into(),login:true,..Default::default() }).unwrap();
     let mut s = admin.sql_session();
     for sql in ["CREATE TABLE t(a int,b int)","INSERT INTO t VALUES(1,2)","CREATE VIEW v(x,y) AS SELECT b,a FROM t"] { s.execute(sql,&[],None).unwrap(); }
+    admin.roles().set_table_owner("v", "view_owner").unwrap();
     admin.roles().grant_table("v","reader",&[TablePrivilege::Select]).unwrap();
     let service = Service::new(admin.clone(),vec![],Clock::new(0,3600).unwrap()).unwrap();
     let config = PostgresqlConfig { listen:"127.0.0.1:0".parse().unwrap(),tls:TlsMode::Disabled,
@@ -21,6 +24,10 @@ async fn view_select_simple_extended_authority_and_drop() {
         assert_eq!(error.code().unwrap().code(),"42501");
     }
     admin.roles().grant_table("t","reader",&[TablePrivilege::Select]).unwrap();
+    assert_eq!(client.simple_query("SELECT * FROM v").await.unwrap_err().code().unwrap().code(), "42501");
+    assert_eq!(client.query("SELECT * FROM v", &[]).await.unwrap_err().code().unwrap().code(), "42501");
+    admin.roles().revoke_table("t","reader",&[TablePrivilege::Select]).unwrap();
+    admin.roles().grant_table("t","view_owner",&[TablePrivilege::Select]).unwrap();
     for extended in [false,true] {
         if extended {
             let statement = client.prepare("SELECT * FROM v WHERE y=$1 ORDER BY x LIMIT 1").await.unwrap();
@@ -31,6 +38,12 @@ async fn view_select_simple_extended_authority_and_drop() {
             assert!(rows.iter().any(|r| matches!(r,tokio_postgres::SimpleQueryMessage::Row(r) if r.get(0)==Some("2") && r.get(1)==Some("1"))));
         }
     }
+    let denied = client.simple_query("SELECT * FROM t").await.unwrap_err();
+    assert_eq!(denied.code().unwrap().code(), "42501");
+    let (other, other_connection) = tokio_postgres::Config::new().hostaddr(running.address.ip()).port(running.address.port()).user("no_view").dbname("postgres").connect(tokio_postgres::NoTls).await.unwrap();
+    let other_connection = tokio::spawn(other_connection);
+    assert_eq!(other.simple_query("SELECT * FROM v").await.unwrap_err().code().unwrap().code(), "42501");
+    drop(other); other_connection.await.unwrap().unwrap();
     let statement = client.prepare("SELECT * FROM v").await.unwrap();
     s.execute("DROP VIEW v",&[],None).unwrap();
     let refresh_error = client.query(&statement,&[]).await.unwrap_err();

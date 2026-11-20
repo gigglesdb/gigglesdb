@@ -42,7 +42,12 @@ pub(super) fn sql_notice_detail(message: String, detail: String, code: &'static 
 pub(super) fn sql_notice(message: String, code: &'static str) {
     SQL_NOTICES.with(|notices| notices.borrow_mut().push((message, None, Some(code))));
 }
+pub(super) fn missing_object_notice(kind: &str, name: &str) {
+    let name = name.trim_start_matches('\0');
+    SQL_NOTICES.with(|notices| notices.borrow_mut().push((format!("{kind} \"{name}\" does not exist, skipping"), None, None)));
+}
 pub(super) fn view_missing_notice(name: &str) {
+    let name = name.trim_start_matches('\0');
     SQL_NOTICES.with(|notices| notices.borrow_mut().push((format!("view \"{name}\" does not exist, skipping"), None, None)));
 }
 pub(super) fn duplicate_column_notice(column: &str, table: &str) {

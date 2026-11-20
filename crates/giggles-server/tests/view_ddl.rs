@@ -10,7 +10,11 @@ async fn view_ddl_authorization_precedes_semantics() {
     let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
     for name in ["owner", "other"] {
         admin.roles().create(NewRole { name: name.into(), login: true, ..Default::default() }).unwrap();
-        admin.roles().grant_schema("public", name, &[SchemaPrivilege::Create, SchemaPrivilege::Usage]).unwrap();
+        // The denied role lacks target-schema CREATE. Source SELECT is deferred
+        // until a view read, so it cannot be the DDL authorization boundary.
+        let privileges = if name == "owner" { &[SchemaPrivilege::Create, SchemaPrivilege::Usage][..] }
+            else { &[SchemaPrivilege::Usage][..] };
+        admin.roles().grant_schema("public", name, privileges).unwrap();
     }
     let service = Service::new(admin.clone(), vec![], Clock::new(0,3600).unwrap()).unwrap();
     service.role_session("owner").unwrap().execute_sql("CREATE TABLE t(id int)",&[]).unwrap();

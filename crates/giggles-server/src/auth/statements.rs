@@ -6,6 +6,13 @@ use giggles_core::{
     roles::{CatalogRole, NewRole, RoleChanges, RoleError, SchemaPrivilege, TablePrivilege},
 };
 
+thread_local! {
+    static MEMBERSHIP_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+pub(crate) fn take_membership_error() -> Option<String> {
+    MEMBERSHIP_ERROR.with(|error| error.borrow_mut().take())
+}
+
 #[derive(Clone)]
 pub(crate) enum AdminStatement {
     Error(&'static str),
@@ -617,6 +624,23 @@ pub(crate) fn execute(
             let tables = admin.catalog().map_err(|e| crate::service::sqlstate(&e))?.1;
             let schemas = admin.catalog_schema_metadata().map_err(|_| "XX000")?;
             for name in names {
+                let (schema, _) = name.split_once('\0').unwrap_or(("public", name.as_str()));
+                if !schema.is_empty() && schema != "public" && !crate::service::is_builtin_catalog_schema(schema) && !schemas.schemas.contains_key(schema) {
+                    if *if_exists {
+                        notices.push((false, format!("schema \"{schema}\" does not exist, skipping")));
+                        continue;
+                    }
+                    return Err("3F000");
+                }
+                if !actor.superuser && !schema.is_empty() {
+                    let inherited = catalog.privileges_of(&actor.name).map_err(state)?;
+                    let capabilities = catalog.builtin_capabilities_of(&actor.name).map_err(state)?;
+                    let usage = schema == "public" || inherited.iter().any(|role|
+                        schemas.schemas.get(schema).is_some_and(|(_, owner)| owner == role)
+                        || (capabilities.contains(role) && matches!(role.as_str(), "pg_read_all_data" | "pg_write_all_data"))
+                        || catalog.schema_privileges(schema, role).is_ok_and(|p| p.contains(&SchemaPrivilege::Usage)));
+                    if !usage { return Err("42501"); }
+                }
                 if !tables.iter().any(|table| {
                     &giggles_core::relational::relation_key(
                         schemas
@@ -627,6 +651,9 @@ pub(crate) fn execute(
                     ) == name
                 }) {
                     if *if_exists {
+                        let (schema, object) = name.split_once('\0').unwrap_or(("public", name.as_str()));
+                        let (kind, missing) = if !schema.is_empty() && schema != "public" && !crate::service::is_builtin_catalog_schema(schema) && !schemas.schemas.contains_key(schema) { ("schema", schema) } else { ("table", object.trim_start_matches('\0')) };
+                        notices.push((false, format!("{kind} \"{missing}\" does not exist, skipping")));
                         continue;
                     }
                     return Err("42P01");
@@ -663,39 +690,48 @@ pub(crate) fn execute(
             Ok("DROP TABLE")
         }
         AdminStatement::Membership { grant, roles, members, options, revoke, grantor, cascade } => {
+            MEMBERSHIP_ERROR.with(|error| *error.borrow_mut() = None);
             let requested = grantor.as_deref().unwrap_or(&actor.name);
-            let grantor_role = catalog.get(requested).map_err(state)?.ok_or("42704")?;
+            let grantor_role = catalog.get(requested).map_err(state)?.ok_or_else(|| {
+                MEMBERSHIP_ERROR.with(|error| *error.borrow_mut() = Some(requested.to_owned()));
+                "42704"
+            })?;
             if requested != actor.name && !actor.superuser && !catalog.can_set(&actor.name, requested).map_err(state)? { return Err("42501"); }
             let explicit = grantor.is_some();
             let bootstrap = grantor_role.superuser && bootstrap_grantor(&catalog).map_err(state)?.as_deref() == Some(requested);
-            for role in roles {
-                catalog.get(role).map_err(state)?.ok_or("42704")?;
-                if !actor.superuser && !catalog.admin_of(&actor.name, role).map_err(state)? { return Err("42501"); }
-                if (!grantor_role.superuser || (explicit && *grant && !bootstrap)) && !catalog.admin_of(requested, role).map_err(state)? { return Err("42501"); }
-            }
             let grantor = if grantor_role.superuser && (!explicit || bootstrap) { giggles_core::roles::BOOTSTRAP_GRANTOR } else { requested };
             let display_grantor = if explicit { requested } else if grantor == giggles_core::roles::BOOTSTRAP_GRANTOR { "bootstrap" } else { grantor };
-            for member in members { catalog.get(member).map_err(state)?.ok_or("42704")?; }
-            for role in roles {
-                for member in members {
-                    if *grant {
-                        let result = if explicit {
-                            catalog.grant_membership_options_explicit(role, member, grantor, *options)
-                        } else {
-                            catalog.grant_membership_options(role, member, grantor, *options)
-                        }.map_err(state)?;
-                        if result == giggles_core::roles::MembershipGrant::Unchanged {
-                            notices.push((false, format!("role \"{member}\" has already been granted membership in role \"{role}\" by role \"{display_grantor}\"")));
-                        }
-                    } else if !if explicit {
-                        catalog.revoke_membership_options_explicit(role, member, grantor, *revoke, *cascade)
-                    } else {
-                        catalog.revoke_membership_options(role, member, grantor, *revoke, *cascade)
-                    }.map_err(state)? {
-                        notices.push((true, format!("role \"{member}\" has not been granted membership in role \"{role}\" by role \"{display_grantor}\"")));
+            let mut denied = false;
+            let mut unchanged = Vec::new();
+            let mut missing = None;
+            let result = catalog.membership_batch_reporting(roles, members, grantor, *grant, *options, *revoke, *cascade, explicit, |role, edges| {
+                let admin = |name| giggles_core::roles::RoleCatalog::admin_in_edges(edges, name, role);
+                if (actor.superuser || admin(&actor.name))
+                    && ((grantor_role.superuser && (!explicit || !*grant || bootstrap)) || admin(requested)) {
+                    Ok(())
+                } else {
+                    denied = true;
+                    MEMBERSHIP_ERROR.with(|error| *error.borrow_mut() = Some(role.to_owned()));
+                    Err(RoleError::Invalid)
+                }
+            }, &mut unchanged, &mut missing).map_err(|error| {
+                if let Some(name) = missing {
+                    MEMBERSHIP_ERROR.with(|error| *error.borrow_mut() = Some(name));
+                }
+                if denied { "42501" } else {
+                    if matches!(error, RoleError::MembershipCycle { .. }) {
+                        MEMBERSHIP_ERROR.with(|message| *message.borrow_mut() = Some(error.to_string()));
                     }
+                    state(error)
+                }
+            });
+            for ((role, member), unchanged) in roles.iter().flat_map(|role| members.iter().map(move |member| (role, member))).zip(unchanged) {
+                if unchanged {
+                    let message = if *grant { "has already been granted" } else { "has not been granted" };
+                    notices.push((!*grant, format!("role \"{member}\" {message} membership in role \"{role}\" by role \"{display_grantor}\"")));
                 }
             }
+            result?;
             Ok(if *grant { "GRANT ROLE" } else { "REVOKE ROLE" })
         }
         AdminStatement::Grant {
@@ -1281,7 +1317,7 @@ mod tests {
                 "{sql}"
             );
         }
-        for name in ["x".repeat(64), format!("\"{}\"", "ÃƒÂ©".repeat(32))] {
+        for name in ["x".repeat(64), format!("\"{}\"", "ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©".repeat(32))] {
             assert!(matches!(
                 parse(&format!("DROP TABLE {name}")),
                 Some(AdminStatement::Error("42601"))
@@ -1320,7 +1356,7 @@ mod tests {
             Some(AdminStatement::Error("42601"))
         ));
         assert!(matches!(
-            parse(&format!("CREATE ROLE \"{}\"", "ÃƒÂ©".repeat(32))),
+            parse(&format!("CREATE ROLE \"{}\"", "ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©".repeat(32))),
             Some(AdminStatement::Error("42601"))
         ));
     }

@@ -1084,6 +1084,11 @@ impl Drop for Session {
         self.service.advisory.release(self.backend_pid, false);
     }
 }
+// Virtual namespaces exposed by pg_namespace exist even without physical schema metadata.
+pub(crate) fn is_builtin_catalog_schema(schema: &str) -> bool {
+    matches!(schema, "pg_catalog" | "information_schema")
+}
+
 impl Session {
     fn authority_role_live(&self, role: &roles::CatalogRole) -> bool {
         if self.effective_role.is_some() { !role.task_only }
@@ -1999,7 +2004,13 @@ impl Session {
                 parse_error(session, CoreError::Sql(error))
             })?;
             for table in drop_targets {
-                session.authorize_alter_table(&table)?;
+                session.authorize_drop_target(&table)?;
+            }
+            if let Some(index) = Prepared::drop_index_target(sql).map_err(|error| {
+                session.sql.abort();
+                parse_error(session, CoreError::Sql(error))
+            })? {
+                session.authorize_drop_schema(&index)?;
             }
             let sequence_targets = Prepared::sequence_ddl_targets(sql).map_err(|error| {
                 session.sql.abort();
@@ -2013,7 +2024,8 @@ impl Session {
                     session.authorize_create_sequence()?;
                 } else {
                     for sequence in sequence_targets {
-                        session.authorize_alter_table(&sequence)?;
+                        if sql.trim_start().to_ascii_lowercase().starts_with("drop") { session.authorize_drop_target(&sequence)?; }
+                        else { session.authorize_alter_table(&sequence)?; }
                     }
                 }
                 if let Some(table) = Prepared::sequence_owned_by(sql).map_err(CoreError::Sql)? {
@@ -2191,6 +2203,31 @@ impl Session {
         }
         Ok(())
     }
+    fn authorize_drop_schema(&mut self, key: &str) -> Result<(), CoreError> {
+        if matches!(self.role, Role::Database { .. }) && self.sql.task().is_none() {
+            let key = self.sql.resolve_relation_reference(key)?;
+            let schema = key.split_once('\0').map_or("public", |(schema, _)| schema);
+            if let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role)
+                && !self.table_privilege_superuser()?
+                && (is_builtin_catalog_schema(schema) || self.sql.schema_metadata()?.schemas.contains_key(schema))
+                && !self.schema_privilege_allowed(schema, name, roles::SchemaPrivilege::Usage)?
+            {
+                self.sql.abort();
+                return Err(CoreError::Policy(Error::Scope));
+            }
+        }
+        Ok(())
+    }
+    fn authorize_drop_target(&mut self, table: &str) -> Result<(), CoreError> {
+        // Ordinary database roles get PostgreSQL's missing-object diagnostics.
+        // Task and gateway admission still runs before object lookup.
+        if matches!(self.role, Role::Database { .. }) && self.sql.task().is_none() {
+            let key = self.sql.resolve_relation_reference(table)?;
+            self.authorize_drop_schema(&key)?;
+            if !Prepared::reserved_relation_name(&key) && !self.sql.relation_exists(&key)? { return Ok(()); }
+        }
+        self.authorize_alter_table(table)
+    }
     fn authorize_alter_table(&mut self, table: &str) -> Result<(), CoreError> {
         let resolved = self.sql.resolve_relation_reference(table)?;
         let table = resolved.as_str();
@@ -2293,9 +2330,13 @@ impl Session {
         let name_at_commit = self.sql.table_authority_name(table)?;
         let schema = name_at_commit.split_once('\0').map_or("public", |(schema, _)| schema);
         if !self.schema_privilege_allowed(schema, name, roles::SchemaPrivilege::Usage)? { return Ok(false); }
+        self.relation_privilege_allowed(&name_at_commit, name, privilege)
+    }
+    // Stored view sources are already bound: schema name lookup is not repeated.
+    fn relation_privilege_allowed(&self, name_at_commit: &str, name: &str, privilege: Option<roles::TablePrivilege>) -> Result<bool, CoreError> {
         let owner = self
             .sql
-            .table_owner(&name_at_commit)
+            .table_owner(name_at_commit)
             .map_err(|_| CoreError::Policy(Error::Scope))?;
         let catalog = self.service.admin.roles();
         let roles = catalog.privileges_of(name).map_err(role_lookup_error)?;
@@ -2304,8 +2345,37 @@ impl Session {
             || privilege.is_some_and(|privilege| {
                 (capabilities.contains(name) && name == "pg_read_all_data" && privilege == roles::TablePrivilege::Select)
                 || (capabilities.contains(name) && name == "pg_write_all_data" && matches!(privilege, roles::TablePrivilege::Insert | roles::TablePrivilege::Update | roles::TablePrivilege::Delete))
-                || self.sql.table_privileges(&name_at_commit, name).is_ok_and(|p| p.contains(&privilege))
+                || self.sql.table_privileges(name_at_commit, name).is_ok_and(|p| p.contains(&privilege))
             })))
+    }
+    fn view_sources_allowed(&self, table: &str, depth: usize) -> Result<bool, CoreError> {
+        let Some(sources) = self.sql.view_authorization_sources(table)? else { return Ok(true) };
+        if depth >= 32 { return Ok(false); }
+        let key = self.sql.table_authority_name(table)?;
+        let owner = self.sql.table_owner(&key).map_err(role_lookup_error)?;
+        // Core/API and legacy views have no recorded definer; retain invoker ACLs.
+        let ownerless = owner.is_none();
+        let owner = match owner {
+            Some(owner) => owner,
+            None => match self.effective_role.as_ref().unwrap_or(&self.role) {
+                Role::Database { name } => name.clone(),
+                _ => return Ok(false),
+            },
+        };
+        let catalog = self.service.admin.roles();
+        let Some(role) = catalog.get(&owner).map_err(role_lookup_error)? else { return Ok(false) };
+        for source in sources {
+            let allowed = role.superuser || if ownerless {
+                self.table_privilege_allowed(&source, &owner, Some(roles::TablePrivilege::Select))?
+            } else {
+                self.relation_privilege_allowed(&self.sql.table_authority_name(&source)?, &owner, Some(roles::TablePrivilege::Select))?
+            };
+            if !allowed {
+                return Ok(false);
+            }
+            if !self.view_sources_allowed(&source, depth + 1)? { return Ok(false); }
+        }
+        Ok(true)
     }
     pub(crate) fn table_privilege_superuser(&self) -> Result<bool, CoreError> {
         let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) else {
@@ -2324,6 +2394,7 @@ impl Session {
         &self,
         reqs: &[(String, roles::TablePrivilege)],
         superuser: bool,
+        check_views: bool,
     ) -> Result<bool, CoreError> {
         let acting_role = self.effective_role.as_ref().unwrap_or(&self.role);
         if matches!(acting_role, Role::NoSql { .. }) {
@@ -2339,7 +2410,8 @@ impl Session {
                     table != "giggles_join" && tables.contains(table)
                 }
                 Role::Database { name } => {
-                    superuser || self.table_privilege_allowed(table, name, Some(*privilege))?
+                    (superuser || self.table_privilege_allowed(table, name, Some(*privilege))?)
+                        && (!check_views || *privilege != roles::TablePrivilege::Select || self.view_sources_allowed(table, 0)?)
                 }
                 Role::NoSql { .. } => false,
                 #[cfg(feature = "legacy-task")]
@@ -2361,7 +2433,7 @@ impl Session {
     ) -> Result<(), CoreError> {
         self.authority_scope(|session| {
             let superuser = session.table_privilege_superuser()?;
-            if !session.table_requirements_allowed(reqs, superuser)? {
+            if !session.table_requirements_allowed(reqs, superuser, true)? {
                 session.sql.abort();
                 return Err(CoreError::Policy(Error::Scope));
             }
@@ -2376,7 +2448,23 @@ impl Session {
         // Same rules as SQL CREATE SEQUENCE / DROP SEQUENCE in `authorize`.
         match request {
             C::CreateSequence { .. } => return self.authorize_create_sequence(),
-            C::DropSequence { name, .. } => return self.authorize_alter_table(name),
+            C::DropSequence { name, .. } | C::DropView { name, .. } => {
+                let key = self.sql.native_relation_reference(name)?;
+                return self.authorize_drop_target(&key);
+            }
+            C::DropTable { table, .. } => {
+                let key = self.sql.native_relation_reference(table)?;
+                return self.authorize_drop_target(&key);
+            }
+            C::DropIndex { name, .. } if matches!(self.role, Role::Database { .. }) && self.sql.task().is_none() => {
+                // Schema USAGE precedes index existence, just as in SQL.
+                let key = self.sql.native_relation_reference(name)?;
+                self.authorize_drop_schema(&key)?;
+                if let Some(table) = self.sql.native_index_table(name)? {
+                    return self.authorize_alter_table(&table);
+                }
+                return Ok(());
+            }
             _ => {}
         }
         if matches!(request, C::AddConstraint { .. } | C::DropConstraint { .. }) {
@@ -2405,22 +2493,7 @@ impl Session {
                     C::CreateIndex { table, .. } => self.sql.relation_schema(&self.sql.native_relation_reference(table)?)?,
                     _ => self.sql.relation_schema("")?,
                 };
-                let create = self.schema_privilege_allowed(&schema, name, roles::SchemaPrivilege::Create)?;
-                // SQL CREATE VIEW also needs SELECT on every relation the view reads.
-                create && match request {
-                    C::CreateView { read, .. } => {
-                        let sources = match read {
-                            relational::ViewRead::Single(read) => vec![read.table.as_str()],
-                            relational::ViewRead::Two(read) => vec![read.left.table.as_str(), read.right.table.as_str()],
-                        };
-                        let mut reqs = Vec::new();
-                        for table in sources {
-                            reqs.push((self.sql.native_relation_reference(table).unwrap_or_else(|_| table.to_owned()), roles::TablePrivilege::Select));
-                        }
-                        self.table_requirements_allowed(&reqs, false)?
-                    }
-                    _ => true,
-                }
+                self.schema_privilege_allowed(&schema, name, roles::SchemaPrivilege::Create)?
             }
         };
         if !allowed { self.sql.abort(); return Err(CoreError::Policy(Error::Scope)); }
@@ -2505,7 +2578,8 @@ impl Session {
                 self.authorize_create_sequence()?;
             } else {
                 for sequence in p.sequence_ddl_names() {
-                    self.authorize_alter_table(sequence)?;
+                    if p.command() == "DROP SEQUENCE" { self.authorize_drop_target(sequence)?; }
+                    else { self.authorize_alter_table(sequence)?; }
                 }
             }
             if let Some(table) = p.sequence_owned_by_table() {
@@ -2520,6 +2594,11 @@ impl Session {
         // E939: collect every child dependency before table-free/routine classification.
         // Routine/sequence authority and classification keep their existing gates.
         let read_tables = p.authorization_tables().map_err(CoreError::Sql)?;
+        let invoker_tables = p.invoker_authorization_tables().map_err(CoreError::Sql)?;
+        let check_views = p.authorization_has_views();
+        let read_tables = if matches!(self.role, Role::Database { .. }) && self.sql.task().is_none() {
+            invoker_tables
+        } else { read_tables };
         let write_tables = p.write_tables();
         let update_table = p.authorization_update_table();
         let relation_free_plan = p.is_planner_statement()
@@ -2535,7 +2614,7 @@ impl Session {
                 Some(_) if p.is_multi_source_read() => joined_read || relation_free_plan || modifying_plan,
                 Some(table) => self.table_requirements_allowed(
                     &[(table.to_owned(), roles::TablePrivilege::Select)],
-                    false,
+                    false, check_views,
                 )?,
                 None => true,
             }
@@ -2556,11 +2635,14 @@ impl Session {
                     else { vec![p.table().ok_or(CoreError::Policy(Error::Scope))?] };
                 let mut owns_all = true;
                 for table in targets {
+                    if p.is_drop_table() && !self.sql.relation_exists(table)? { continue; }
                     let name_at_commit = self.sql.table_authority_name(table)?;
                     owns_all &= self.sql.table_owner(&name_at_commit)
                         .map_err(|_| CoreError::Policy(Error::Scope))?.as_ref().is_some_and(|owner| self.service.admin.roles().privileges_of(name).is_ok_and(|roles| roles.contains(owner)));
                 }
                 owns_all
+            } else if p.command() == "DROP INDEX" && p.table().is_none() {
+                true
             } else if p.is_ddl() {
                 let schema = if matches!(p.command(), "CREATE TABLE" | "CREATE VIEW") {
                     self.sql.creation_schema(p)?
@@ -2585,7 +2667,7 @@ impl Session {
                         _ => None,
                     };
                     if let Some(privilege) = privilege {
-                        self.table_requirements_allowed(&[(table.to_owned(), privilege)], false)?
+                        self.table_requirements_allowed(&[(table.to_owned(), privilege)], false, check_views)?
                     } else {
                         self.table_privilege_allowed(table, name, None)?
                     }
@@ -2602,7 +2684,7 @@ impl Session {
                 && self.role.is_sql()
                 && p.deferred_routine_only());
         let mut allowed = allowed;
-        if allowed && !superuser {
+        if allowed && p.command() != "CREATE VIEW" {
             let mut reqs: Vec<_> = read_tables.into_iter()
                 .map(|table| (table, roles::TablePrivilege::Select))
                 .collect();
@@ -2621,13 +2703,13 @@ impl Session {
                 };
                 reqs.push((table, privilege));
             }
-            allowed = self.table_requirements_allowed(&reqs, false)?;
+            allowed = self.table_requirements_allowed(&reqs, superuser, check_views)?;
         }
         if !allowed {
             let mut error = CoreError::Policy(Error::Scope);
             for table in p.row_lock_tables() {
                 if !self.table_requirements_allowed(&[(table.clone(), roles::TablePrivilege::Select),
-                    (table.clone(), roles::TablePrivilege::Update)], false)? {
+                    (table.clone(), roles::TablePrivilege::Update)], false, check_views)? {
                     error = giggles_core::relational::row_lock_permission_error(&table);
                     break;
                 }
@@ -4407,6 +4489,37 @@ mod lifecycle_tests {
         assert!(matches!(pgwire.check_binding(),
             Err(CoreError::Policy(Error::Authentication))));
     }
+    #[test]
+    fn admin_drop_table_checks_schema_before_object_and_owner() {
+        let (service, _) = fixture();
+        let roles = service.admin.roles();
+        for (name, superuser) in [("owner", true), ("reader", false)] {
+            roles.create(roles::NewRole { name: name.into(), login: true, superuser, ..Default::default() }).unwrap();
+        }
+        let mut owner = service.role_session("owner").unwrap();
+        owner.execute_sql("CREATE SCHEMA app", &[]).unwrap();
+        owner.execute_sql("CREATE TABLE app.t(id BIGINT PRIMARY KEY)", &[]).unwrap();
+        let mut reader = service.role_session("reader").unwrap();
+        for (query, code) in [
+            ("DROP TABLE hidden.missing", "3F000"),
+            ("DROP TABLE missing", "42P01"),
+            ("DROP TABLE app.missing", "42501"),
+            ("DROP TABLE IF EXISTS app.missing", "42501"),
+            ("DROP TABLE app.t", "42501"),
+        ] {
+            assert_eq!(reader.execute_admin(&crate::auth::statements::parse(query).unwrap()), Err(code), "{query}");
+        }
+        assert_eq!(reader.execute_admin(&crate::auth::statements::parse("DROP TABLE IF EXISTS hidden.missing").unwrap()), Ok("DROP TABLE"));
+        assert_eq!(std::mem::take(&mut reader.role_notices), vec![(false, "schema \"hidden\" does not exist, skipping".into())]);
+        roles.grant_schema("app", "reader", &[roles::SchemaPrivilege::Usage]).unwrap();
+        assert_eq!(reader.execute_admin(&crate::auth::statements::parse("DROP TABLE app.missing").unwrap()), Err("42P01"));
+        assert_eq!(reader.execute_admin(&crate::auth::statements::parse("DROP TABLE IF EXISTS app.missing").unwrap()), Ok("DROP TABLE"));
+        assert_eq!(reader.execute_admin(&crate::auth::statements::parse("DROP TABLE app.t").unwrap()), Err("42501"));
+        assert_eq!(std::mem::take(&mut reader.role_notices), vec![(false, "table \"missing\" does not exist, skipping".into())]);
+        roles.set_table_owner("app\0t", "reader").unwrap();
+        assert_eq!(reader.execute_admin(&crate::auth::statements::parse("DROP TABLE app.t").unwrap()), Ok("DROP TABLE"));
+    }
+
     #[test]
     fn drop_index_requires_table_ownership_even_with_schema_create() {
         let (service, _) = fixture();
