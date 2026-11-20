@@ -4459,6 +4459,9 @@ impl SqlSession {
         let (expanded, _) = self.task_output_plan(p).map_err(CoreError::Task)?;
         Ok(expanded)
     }
+    pub(crate) fn task_search_path(&self) -> &[String] {
+        &self.search_path
+    }
     fn task_output_plan(
         &self,
         p: &relational::Prepared,
@@ -4474,11 +4477,12 @@ impl SqlSession {
             .ok_or(TaskError::Revoked)?;
         let labels = self.task_column_labels().map_err(core)?;
         let plan = self.inspect_metadata(|s| {
-            Ok(crate::task::columns::apply_in_catalog(
+            Ok(crate::task::columns::apply_in_catalog_with_path(
                 &def,
                 ctx.bound_def_version,
                 &labels,
                 &s.sql,
+                &self.search_path,
                 p,
             ))
         });

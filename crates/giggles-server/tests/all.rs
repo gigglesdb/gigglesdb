@@ -382,3 +382,5 @@ mod w1e_task_privileges;
 
 #[path = "task_hidden_owners.rs"]
 mod task_hidden_owners;
+#[path = "task_qualified_target.rs"]
+mod task_qualified_target;

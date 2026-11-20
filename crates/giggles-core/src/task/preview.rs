@@ -346,11 +346,12 @@ fn dry_run(
         let mut read = db.begin(Isolation::ReadCommitted);
         let catalog = db.catalog().snapshot(&mut read)?;
         let image = catalog.image().map_err(sql)?;
-        columns::apply_in_catalog(
+        columns::apply_in_catalog_with_path(
             &latest,
             ctx.bound_def_version,
             &catalog.parts.column_labels,
             &image,
+            session.task_search_path(),
             &prepared,
         )?
         .0

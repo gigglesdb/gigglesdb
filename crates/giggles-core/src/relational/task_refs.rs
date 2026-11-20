@@ -5,6 +5,16 @@ use super::*;
 use crate::task::columns::{OutputItem, Position, StatementShape};
 
 impl Prepared {
+    /// Relation names as written, before schema binding turns public-qualified
+    /// names into bare storage keys. Task isolation resolves these once using
+    /// the statement session's binding path.
+    pub(crate) fn task_syntactic_shape(&self) -> R<StatementShape> {
+        let Some(statement) = &self.unbound_statement else { return self.task_shape(); };
+        let mut syntactic = self.clone();
+        syntactic.statement = (**statement).clone();
+        syntactic.task_shape()
+    }
+
     /// Collect the column references and shape facts of this statement.
     ///
     /// `Query`, `Select`, `Update` and `UpdateExpressions` are walked; every

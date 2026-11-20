@@ -346,6 +346,18 @@ pub(crate) fn check(
     table: &TableDef,
     shape: &StatementShape,
 ) -> Result<OutputPlan, TaskError> {
+    check_tables(def, marks, table, shape, || {
+        shape.tables.iter().all(|t| same_table(t, &table.name))
+    })
+}
+
+fn check_tables(
+    def: &TaskDef,
+    marks: &ColumnMarks,
+    table: &TableDef,
+    shape: &StatementShape,
+    tables_allowed: impl FnOnce() -> bool,
+) -> Result<OutputPlan, TaskError> {
     match shape.class {
         StatementClass::Select | StatementClass::Update => {}
         StatementClass::Explain => return Err(denied(DenyRule::Explain)),
@@ -357,7 +369,7 @@ pub(crate) fn check(
     if shape.casts_user_type {
         return Err(denied(DenyRule::UserType));
     }
-    if shape.tables.iter().any(|t| !same_table(t, &table.name)) {
+    if !tables_allowed() {
         return Err(denied(DenyRule::OtherTable));
     }
     if shape.joins > 0 || shape.tables.len() > 1 {
@@ -476,13 +488,26 @@ pub(crate) fn apply(
     table: &TableDef,
     p: &Prepared,
 ) -> Result<(Prepared, OutputPlan), TaskError> {
+    apply_checked(def, bound_def_version, marks, table, p, |shape| {
+        check(def, marks, table, shape)
+    })
+}
+
+fn apply_checked(
+    def: &TaskDef,
+    bound_def_version: u64,
+    marks: &ColumnMarks,
+    table: &TableDef,
+    p: &Prepared,
+    check_shape: impl Fn(&StatementShape) -> Result<OutputPlan, TaskError>,
+) -> Result<(Prepared, OutputPlan), TaskError> {
     if def.def_version != bound_def_version {
         return Err(denied(DenyRule::DefinitionChanged));
     }
     let shape = p.task_shape().map_err(TaskError::Sql)?;
     // Refuse by shape before expanding, so a star over another table never
     // expands and a refused statement reads no column list.
-    check(def, marks, table, &shape)?;
+    check_shape(&shape)?;
     let star = star_columns(def, marks, table);
     let returning = returning_columns(def, marks, table);
     if (shape.star && star.is_empty()) || (shape.returning_star && returning.is_empty()) {
@@ -495,7 +520,7 @@ pub(crate) fn apply(
     };
     debug_assert!(!expanded.task_has_star());
     let shape = expanded.task_shape().map_err(TaskError::Sql)?;
-    let plan = check(def, marks, table, &shape)?;
+    let plan = check_shape(&shape)?;
     Ok((expanded, plan))
 }
 
@@ -511,11 +536,12 @@ pub(crate) fn apply(
 /// are read from it. A task whose table no longer exists in `catalog` refuses
 /// every statement with `OtherTable`.
 #[allow(dead_code, reason = "call sites wait for R3-202 session state")]
-pub(crate) fn apply_in_catalog(
+pub(crate) fn apply_in_catalog_with_path(
     def: &TaskDef,
     bound_def_version: u64,
     labels: &std::collections::BTreeMap<(u64, u64), u8>,
     catalog: &Relational,
+    path: &[String],
     p: &Prepared,
 ) -> Result<(Prepared, OutputPlan), TaskError> {
     if def.def_version != bound_def_version {
@@ -527,7 +553,30 @@ pub(crate) fn apply_in_catalog(
         .find(|t| t.id == def.table)
         .ok_or(denied(DenyRule::OtherTable))?;
     let marks = ColumnMarks::from_labels(table, labels);
-    apply(def, bound_def_version, &marks, table, p)
+    let tables = p.task_syntactic_shape().map_err(TaskError::Sql)?.tables;
+    apply_checked(def, bound_def_version, &marks, table, p, |shape| {
+        check_tables(def, &marks, table, shape, || {
+            // Shape names are syntactic: resolve exactly as binding does,
+            // before inspecting columns or expanding stars. Views have no
+            // table entry and cannot pass this identity check.
+            tables.iter().all(|name| {
+                let key = catalog.resolve_relation_key(name, path);
+                catalog.tables.get(&key).is_some_and(|t| t.id == def.table)
+            })
+        })
+    })
+}
+
+// Preserve the public-schema fixture helper used by existing unit tests.
+#[cfg(test)]
+fn apply_in_catalog(
+    def: &TaskDef,
+    bound_def_version: u64,
+    labels: &std::collections::BTreeMap<(u64, u64), u8>,
+    catalog: &Relational,
+    p: &Prepared,
+) -> Result<(Prepared, OutputPlan), TaskError> {
+    apply_in_catalog_with_path(def, bound_def_version, labels, catalog, &["public".into()], p)
 }
 
 /// The SQL rules for one statement text, for tests that compare the native

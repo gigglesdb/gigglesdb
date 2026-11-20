@@ -726,11 +726,12 @@ fn attempt(
         db.catalog().snapshot(&mut read)?
     };
     let image = latest_catalog.image().map_err(|e| TaskError::Core(Box::new(CoreError::Sql(e))))?;
-    let ruled = columns::apply_in_catalog(
+    let ruled = columns::apply_in_catalog_with_path(
         &latest,
         ctx.bound_def_version,
         &latest_catalog.parts.column_labels,
         &image,
+        session.task_search_path(),
         statement,
     );
     let expanded = match ruled {
@@ -786,7 +787,7 @@ fn attempt(
     // The column rules again at the statement snapshot, in case a label or
     // the table changed after the first check; a denial is recorded.
     if let Err(error) =
-        columns::apply_in_catalog(&def, ctx.bound_def_version, &view.column_labels, &state, statement)
+        columns::apply_in_catalog_with_path(&def, ctx.bound_def_version, &view.column_labels, &state, session.task_search_path(), statement)
     {
         if !matches!(error, TaskError::Denied(_)) {
             return Err(error);

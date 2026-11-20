@@ -744,6 +744,13 @@ impl TaskCatalog {
         }
         // Row 12: predicates in the section 4 subset, deterministic.
         let image = db.catalog().snapshot(txn)?.image()?;
+        // Engine entries carry a qualified storage key in `name`; predicate
+        // binding needs the image's bare name and separate schema mapping.
+        let table = image
+            .tables
+            .values()
+            .find(|candidate| candidate.id == table.id)
+            .ok_or(SqlError::UnknownTable)?;
         let canon = |sql: &PredicateText| {
             crate::relational::task_predicate::canonical(&image, table, &sql.0)
                 .map(PredicateText)
