@@ -1,5 +1,8 @@
 //! Live qualification: no substitute database is used when the server is absent.
 
+#[path = "support/root.rs"]
+mod test_root;
+
 use skedaddle::mapping::{
     Classification, DomainConstraints, Mapping, MappingError, PgType, TypeIdentity, Value,
     gigglesdb::GigglesdbMapping,
@@ -40,9 +43,7 @@ impl Drop for Server {
 async fn start_server(
     binary: PathBuf,
 ) -> Result<(Server, Client, tokio::task::JoinHandle<()>), TestError> {
-    let parent = std::env::var_os("SKEDADDLE_TEST_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    let parent = crate::test_root::scratch_root();
     let root = parent.join(format!("gd65-n4-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root)?;
     let listener = TcpListener::bind(("127.0.0.1", 0))?;

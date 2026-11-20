@@ -1,4 +1,7 @@
-use std::{fs, path::PathBuf};
+#[path = "support/root.rs"]
+mod test_root;
+
+use std::fs;
 
 use serde_json::json;
 use skedaddle::{
@@ -13,11 +16,7 @@ use skedaddle::{
 };
 
 fn secret_file(value: &str) -> SecretRef {
-    let root = PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT")
-            .expect("set SKEDADDLE_TEST_ROOT under J:/gigglesdb-work"),
-    )
-    .join(format!("security-{}", uuid::Uuid::new_v4()));
+    let root = crate::test_root::scratch_root().join(format!("security-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let path = root.join("secret.txt");
     fs::write(&path, value).unwrap();

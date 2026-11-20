@@ -206,7 +206,7 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(state: State) -> Self {
-        let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("set test root"))
+        let root = crate::test_root::scratch_root()
             .join(format!("fenced-resume-{}", uuid::Uuid::new_v4()));
         for name in ["journal", "buffer", "scratch"] {
             std::fs::create_dir_all(root.join(name)).unwrap();

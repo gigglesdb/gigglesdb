@@ -1,6 +1,9 @@
 //! Real PostgreSQL lane; never starts Docker or other infrastructure. The
 //! existing harness supplies SKEDADDLE_TEST_CONFIG with `pg_chunk` or `pg` DSN,
 //! logical WAL, slot/publication privileges, and SKEDADDLE_TEST_ROOT under J:.
+#[path = "support/root.rs"]
+mod test_root;
+
 use futures::FutureExt;
 use skedaddle::{
     buffer::format::SegmentRecord,
@@ -14,12 +17,7 @@ use skedaddle::{
         pgoutput::{Column, Decoder, Message, OldTuple, Tuple},
     },
 };
-use std::{
-    error::Error,
-    io::Write,
-    panic::AssertUnwindSafe,
-    path::{Path, PathBuf},
-};
+use std::{error::Error, io::Write, panic::AssertUnwindSafe, path::Path};
 use tokio_postgres::Client;
 
 #[derive(Debug)]
@@ -410,19 +408,8 @@ async fn chunk_resume_after_crash() -> TestResult {
             chunk: plan[0].clone(),
             attempt: 0,
         }];
-        let root = PathBuf::from(
-            std::env::var_os("SKEDADDLE_TEST_ROOT")
-                .ok_or("harness must set SKEDADDLE_TEST_ROOT under J:/gigglesdb-work")?,
-        )
-        .join(&f.id);
-        if !root
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_lowercase()
-            .starts_with("j:/gigglesdb-work/")
-        {
-            return Err("test root must stay under J:/gigglesdb-work".into());
-        }
+        let root = crate::test_root::scratch_root().join(&f.id);
+        crate::test_root::assert_under_work_root(&root);
         std::fs::create_dir_all(&root)?;
         let path = root.join("chunk-journal.json");
         durable_write(&path, &serde_json::to_vec(&journal)?)?;

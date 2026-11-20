@@ -44,12 +44,8 @@ fn txn(n: u64) -> AssembledTxn {
     .unwrap()
 }
 async fn reader() -> (BufferReader, Arc<dyn BufferStore>, ReaderConfig) {
-    let root = std::path::PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT")
-            .expect("SKEDADDLE_TEST_ROOT required under J:/gigglesdb-work"),
-    )
-    .join(format!("p6b-{}", uuid::Uuid::new_v4()));
-    assert!(root.starts_with("J:/gigglesdb-work"));
+    let root = crate::test_root::scratch_root().join(format!("p6b-{}", uuid::Uuid::new_v4()));
+    crate::test_root::assert_under_work_root(&root);
     std::fs::create_dir_all(&root).unwrap();
     let store: Arc<dyn BufferStore> =
         Arc::new(ObjectBufferStore::local(root, Duration::from_secs(30)).unwrap());
@@ -353,8 +349,7 @@ impl Destination for CaptureFault {
 }
 
 async fn equal_h_reader(records: Vec<Vec<SegmentRecord>>) -> (Arc<dyn BufferStore>, ReaderConfig) {
-    let root = std::path::PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap())
-        .join(format!("equal-h-{}", uuid::Uuid::new_v4()));
+    let root = crate::test_root::scratch_root().join(format!("equal-h-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let store: Arc<dyn BufferStore> =
         Arc::new(ObjectBufferStore::local(root, Duration::from_secs(30)).unwrap());

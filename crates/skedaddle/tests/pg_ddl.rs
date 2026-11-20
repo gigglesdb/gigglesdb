@@ -1,3 +1,6 @@
+#[path = "support/root.rs"]
+mod test_root;
+
 use serde_json::json;
 use skedaddle::pg::ddl::*;
 use skedaddle::pg::pgoutput::Message;
@@ -885,8 +888,7 @@ impl Live {
             .run_async(
                 intent,
                 |intent, sql| {
-                    let root = std::env::var("SKEDADDLE_TEST_ROOT")
-                        .map_err(|e| DdlError(e.to_string()))?;
+                    let root = crate::test_root::scratch_root().display().to_string();
                     let path = Path::new(&root).join(format!("{}-{intent:?}-intent.sql", self.id));
                     let mut file =
                         std::fs::File::create(path).map_err(|e| DdlError(e.to_string()))?;
@@ -933,7 +935,7 @@ impl Live {
             if prefix != MESSAGE_PREFIX {
                 continue;
             }
-            let root = std::env::var("SKEDADDLE_TEST_ROOT")?;
+            let root = crate::test_root::scratch_root().display().to_string();
             let path = Path::new(&root).join(format!("{}-wire.jsonl", self.id));
             let mut file = std::fs::OpenOptions::new()
                 .create(true)

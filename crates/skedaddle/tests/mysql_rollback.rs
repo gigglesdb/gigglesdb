@@ -1,4 +1,7 @@
 //! Real dual-engine data-path rollback after simulated activation; no access restoration.
+#[path = "support/root.rs"]
+mod test_root;
+
 #[path = "../src/mysql/capture/test_support.rs"]
 mod startup_support;
 use mysql_async::prelude::Queryable;
@@ -354,7 +357,7 @@ async fn live_forward_reverse_exact_stop_receipt_replay_and_echo() -> Result {
     } else {
         MysqlOrder::file(&status.server_uuid)?
     });
-    let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("task root")).join(&id);
+    let root = crate::test_root::scratch_root().join(&id);
     std::fs::create_dir_all(&root)?;
     let forward_cfg = WriterConfig {
         prefix: "forward".into(),

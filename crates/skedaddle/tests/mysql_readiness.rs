@@ -1,6 +1,9 @@
 //! Probe qualification on a real TLS binlog stream. The cursor below advances
 //! only over complete, manifest-durable captured transactions. Engine marker
 //! admission is independently owned/tested by the connector-neutral hub.
+#[path = "support/root.rs"]
+mod test_root;
+
 #[path = "../src/mysql/capture/test_support.rs"]
 mod startup_support;
 use mysql_async::prelude::Queryable;
@@ -20,7 +23,7 @@ use skedaddle::{
     },
     pg::chunk::{ChunkId, Watermark, WatermarkKind},
 };
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 async fn next(capture: &mut MysqlCapture) -> Captured {
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -48,8 +51,7 @@ async fn idle_burst_and_file_rotation_readiness() -> Result<(), Box<dyn std::err
         return Ok(());
     };
     let config: MysqlConfig = serde_json::from_slice(&std::fs::read(path)?)?;
-    let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("harness test root"))
-        .join(format!("readiness-{}", uuid::Uuid::new_v4()));
+    let root = crate::test_root::scratch_root().join(format!("readiness-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(root.join("scratch"))?;
     std::fs::create_dir_all(root.join("buffer"))?;
     let mut admin = config.connect().await?;

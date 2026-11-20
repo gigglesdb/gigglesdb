@@ -1,4 +1,7 @@
 //! Real CLI failure/control paths; the online qualifier is loudly config-gated.
+#[path = "support/root.rs"]
+mod test_root;
+
 use serde_json::{Value, json};
 use skedaddle::{
     MigrationDefinition,
@@ -14,8 +17,7 @@ use std::{
 
 fn root() -> PathBuf {
     let path =
-        PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("set SKEDADDLE_TEST_ROOT"))
-            .join(format!("runner-verify-{}", uuid::Uuid::new_v4()));
+        crate::test_root::scratch_root().join(format!("runner-verify-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&path).unwrap();
     path
 }

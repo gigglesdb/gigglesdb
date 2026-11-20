@@ -1,3 +1,6 @@
+#[path = "support/root.rs"]
+mod test_root;
+
 #[path = "../src/mysql/capture/test_support.rs"]
 mod startup_support;
 use futures::StreamExt;
@@ -18,7 +21,7 @@ use skedaddle::{
     },
     pg::chunk::{ChunkId, Watermark, WatermarkKind},
 };
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::time::{Instant, timeout_at};
 
 const COLUMNS: &str = "i8,u8,i16,u16,i24,u24,i32,u32,i64,u64,decv,fv,dv,bits,d,dt,ts,tm,yr,cv,vv,txt,bv,blobv,ev,sv,jv,nullable_v,wide_row";
@@ -123,8 +126,7 @@ async fn live_capture_durable_mapping_control_progress_and_restart()
         return Ok(());
     };
     let cfg: MysqlConfig = serde_json::from_slice(&std::fs::read(path)?)?;
-    let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("harness test root"))
-        .join(format!("capture-{}", uuid::Uuid::new_v4()));
+    let root = crate::test_root::scratch_root().join(format!("capture-{}", uuid::Uuid::new_v4()));
     for name in ["buffer", "scratch"] {
         std::fs::create_dir_all(root.join(name))?;
     }

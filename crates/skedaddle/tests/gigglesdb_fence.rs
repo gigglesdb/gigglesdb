@@ -1,4 +1,7 @@
 //! Real server tests. Set GIGGLES_SERVER_BIN to run; no database mocks.
+#[path = "support/root.rs"]
+mod test_root;
+
 use skedaddle::{
     gigglesdb::fence::{Fence, FenceConfig, Intent, Step, require_capability},
     pg::fence::{Connection, FenceError, Rows, Table},
@@ -77,9 +80,7 @@ fn setup() -> Option<(Server, Db, Fence)> {
         eprintln!("SKIP gigglesdb_fence: GIGGLES_SERVER_BIN unset (real server required)");
         return None;
     };
-    let root = std::path::PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT").expect("set SKEDADDLE_TEST_ROOT"),
-    );
+    let root = crate::test_root::scratch_root();
     let path = root.join(format!(
         "n7-{}-{}",
         std::process::id(),

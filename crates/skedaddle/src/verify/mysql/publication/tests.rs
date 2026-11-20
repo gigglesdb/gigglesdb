@@ -69,7 +69,7 @@ pub fn publication() -> Publication {
     }
 }
 async fn owner() -> (Runtime, Journal, SourceIdentity) {
-    let root = std::path::PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap())
+    let root = crate::test_root::scratch_root()
         .join(format!("mysql-publication-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let j = Journal::new(

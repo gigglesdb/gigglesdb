@@ -1,3 +1,6 @@
+#[path = "support/root.rs"]
+mod test_root;
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -11,11 +14,7 @@ use skedaddle::{
 };
 
 fn scratch() -> PathBuf {
-    let path = PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT")
-            .expect("set SKEDADDLE_TEST_ROOT under J:/gigglesdb-work"),
-    )
-    .join(format!("hooks-{}", uuid::Uuid::new_v4()));
+    let path = crate::test_root::scratch_root().join(format!("hooks-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&path).unwrap();
     path
 }

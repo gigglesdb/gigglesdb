@@ -655,8 +655,8 @@ mod tests {
     #[tokio::test]
     async fn poisoned_local_sync_never_publishes_trusted_candidate() {
         use std::time::Duration;
-        let root = std::path::PathBuf::from(std::env::var_os("TEMP").unwrap())
-            .join(format!("refresh-poison-{}", uuid::Uuid::new_v4()));
+        let root =
+            crate::test_root::temp_root().join(format!("refresh-poison-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         // TEMP may use the J: alias on Linux; confinement needs a native absolute root.
         let root = root.canonicalize().unwrap();
@@ -686,8 +686,8 @@ mod tests {
     async fn periodic_refresh_clock_detects_old_tampering_even_behind_checkpoint() {
         use object_store::ObjectStoreExt;
         use std::time::{Duration, Instant};
-        let root = std::path::PathBuf::from(std::env::var_os("TEMP").unwrap())
-            .join(format!("refresh-clock-{}", uuid::Uuid::new_v4()));
+        let root =
+            crate::test_root::temp_root().join(format!("refresh-clock-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         // TEMP may use the J: alias on Linux; confinement needs a native absolute root.
         let root = root.canonicalize().unwrap();
@@ -723,12 +723,11 @@ mod tests {
     #[tokio::test]
     async fn intent_executor_rejects_each_stale_capability_field() {
         use std::{
-            path::PathBuf,
             sync::Arc,
             time::{Duration, SystemTime, UNIX_EPOCH},
         };
-        let base = PathBuf::from(std::env::var_os("TEMP").expect("set task TEMP on J:"));
-        assert!(base.starts_with("J:/gigglesdb-work"));
+        let base = crate::test_root::temp_root();
+        crate::test_root::assert_under_work_root(&base);
         let root = base.join(format!(
             "intent-unit-{}-{}",
             std::process::id(),

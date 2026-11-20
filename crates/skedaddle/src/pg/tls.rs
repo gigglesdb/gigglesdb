@@ -286,10 +286,8 @@ XvsIkJU=
 "#;
 
     fn ca_file(pem: &str) -> PathBuf {
-        let root = PathBuf::from(
-            std::env::var_os("SKEDADDLE_TEST_ROOT").expect("task test root required"),
-        );
-        assert!(root.starts_with("J:/gigglesdb-work"));
+        let root = crate::test_root::scratch_root();
+        crate::test_root::assert_under_work_root(&root);
         let path = root.join(format!("tls-{}.pem", uuid::Uuid::new_v4()));
         std::fs::write(&path, pem).unwrap();
         path

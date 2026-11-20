@@ -5,7 +5,8 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 jroot="$RUNNER_TEMP/jroot"
 mkdir -p "$jroot/gigglesdb-work/tmp/skedaddle"
 export TEMP=j:/gigglesdb-work/tmp TMP=j:/gigglesdb-work/tmp
-export SKEDADDLE_TEST_ROOT=J:/gigglesdb-work/tmp/skedaddle
+export SKEDADDLE_TEST_WORK_ROOT="$jroot/gigglesdb-work"
+export SKEDADDLE_TEST_ROOT="$SKEDADDLE_TEST_WORK_ROOT/tmp/skedaddle"
 export TMPDIR="$jroot/gigglesdb-work/tmp"
 for crate in "$root"/crates/*; do
   [[ -f $crate/Cargo.toml ]] || continue

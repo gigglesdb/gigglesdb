@@ -1,4 +1,7 @@
 //! Real GigglesDB apply qualification, including actual socket loss at COMMIT.
+#[path = "support/root.rs"]
+mod test_root;
+
 use async_trait::async_trait;
 use skedaddle::{
     buffer::reader::ReaderCheckpoint,
@@ -100,9 +103,7 @@ async fn fixture() -> TestResult<Option<(Server, Client)>> {
         eprintln!("SKIPPED: set GIGGLES_SERVER_BIN to run live GigglesDB apply qualification");
         return Ok(None);
     };
-    let parent = PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT").ok_or("SKEDADDLE_TEST_ROOT required")?,
-    );
+    let parent = crate::test_root::scratch_root();
     let root = parent.join(format!("gd65-n3-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root)?;
     let listener = TcpListener::bind(("127.0.0.1", 0))?;

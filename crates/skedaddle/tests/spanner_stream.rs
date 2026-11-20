@@ -1,3 +1,6 @@
+#[path = "support/root.rs"]
+mod test_root;
+
 #[path = "support/spanner.rs"]
 mod spanner_support;
 
@@ -107,7 +110,8 @@ async fn both_dialects_stream() -> Result<(), Box<dyn std::error::Error + Send +
             }
             raw.extend(rows);
         }
-        if let Ok(root) = std::env::var("SKEDADDLE_TEST_ROOT") {
+        if std::env::var_os("SKEDADDLE_TEST_ROOT").is_some() {
+            let root = crate::test_root::scratch_root().display().to_string();
             std::fs::create_dir_all(&root)?;
             std::fs::write(
                 format!("{root}/spanner-{name}.json"),

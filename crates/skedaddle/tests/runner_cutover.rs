@@ -16,9 +16,9 @@ use std::{
 };
 
 fn root() -> PathBuf {
-    let path = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("task test root"))
+    let path = crate::support::test_root::scratch_root()
         .join(format!("runner-cutover-{}", uuid::Uuid::new_v4()));
-    assert!(path.starts_with("J:/gigglesdb-work"));
+    crate::support::test_root::assert_under_work_root(&path);
     fs::create_dir_all(&path).unwrap();
     path
 }

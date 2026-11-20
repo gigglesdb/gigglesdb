@@ -1,4 +1,7 @@
 //! Real definition/runner preflight, using only harness-provisioned MySQL.
+#[path = "support/root.rs"]
+mod test_root;
+
 use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use skedaddle::{
@@ -6,11 +9,7 @@ use skedaddle::{
     capability::ItemStatus,
     mysql::{client::MysqlConfig, preflight::Options},
 };
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{fs, path::Path, process::Command};
 
 struct Tables {
     config: MysqlConfig,
@@ -97,8 +96,7 @@ async fn exercise(prepare: bool) {
     };
     let observed = config.gtid.clone();
     let opposite = if observed == "ON" { "OFF" } else { "ON" };
-    let base =
-        PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("harness test root required"));
+    let base = crate::test_root::scratch_root();
     let root = base.join(format!(
         "definition-preflight-{}",
         uuid::Uuid::new_v4().simple()

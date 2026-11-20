@@ -477,6 +477,7 @@ def linux_fs():
             '--env', 'TEMP=/work/linux-tmp', '--env', 'TMP=/work/linux-tmp',
             '--env', 'TMPDIR=/work/linux-tmp',
             '--env', 'SKEDADDLE_TEST_ROOT=/work/linux-scratch',
+            '--env', 'SKEDADDLE_TEST_WORK_ROOT=/work',
             LOCK['rust']['ref'],
             'cargo', 'test', '--locked', '--test', 'fsconfine', '--', '--nocapture',
             check=False, timeout=7200)

@@ -2,6 +2,9 @@
 //! Set SKEDADDLE_PG_ACTIVATE_DSN to a harness superuser DSN (verified TLS)
 //! with CREATEDB permission. All fixture databases/roles are uniquely named.
 
+#[path = "support/root.rs"]
+mod test_root;
+
 use skedaddle::pg::{
     activate::{
         BlockerKind, Config, DestinationFence, Error, SequenceName, SequenceScope, Step,
@@ -116,8 +119,7 @@ impl Fixture {
             );
             return None;
         };
-        let root = std::env::var("SKEDADDLE_TEST_ROOT")
-            .expect("set task-specific SKEDADDLE_TEST_ROOT under J:/gigglesdb-work");
+        let root = crate::test_root::scratch_root().display().to_string();
         assert!(
             std::path::Path::new(&root).is_dir(),
             "test root must already exist"

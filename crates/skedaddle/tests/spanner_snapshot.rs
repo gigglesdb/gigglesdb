@@ -1,4 +1,7 @@
 //! Live snapshot cancellation, durable redelivery, and exact-T2 reconciliation.
+#[path = "support/root.rs"]
+mod test_root;
+
 #[path = "support/spanner.rs"]
 mod spanner_support;
 
@@ -331,11 +334,9 @@ async fn qualify(name: &str, dialect: SpannerDialect) -> Result<(), Error> {
         &endpoint.change_stream,
         t,
     )?);
-    let root = std::path::PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT").ok_or("SKEDADDLE_TEST_ROOT required")?,
-    )
-    .join(format!("s6c-{name}-{}", uuid::Uuid::new_v4()));
-    assert!(root.starts_with("J:/gigglesdb-work"));
+    let root =
+        crate::test_root::scratch_root().join(format!("s6c-{name}-{}", uuid::Uuid::new_v4()));
+    crate::test_root::assert_under_work_root(&root);
     let first_writer = writer(&root, order.clone()).await?;
     let staging = Arc::new(ObjectBufferStore::local(
         root.join("stage"),

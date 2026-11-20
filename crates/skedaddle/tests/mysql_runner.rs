@@ -1,4 +1,7 @@
 //! Real CLI assess/start and library resume, in one harness-owned paired cell.
+#[path = "support/root.rs"]
+mod test_root;
+
 use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use skedaddle::{MigrationDefinition, coordinator::State, mysql::client::MysqlConfig};
@@ -42,10 +45,8 @@ async fn live_copy_dml_pause_drop_resume_and_quiet_catchup() -> Result {
     let pg: Value = serde_json::from_slice(&fs::read(
         std::env::var_os("SKEDADDLE_TEST_CONFIG").ok_or("paired PG required")?,
     )?)?;
-    let root = std::path::PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT").ok_or("test root required")?,
-    )
-    .join(format!("mysql-runner-{}", uuid::Uuid::new_v4().simple()));
+    let root = crate::test_root::scratch_root()
+        .join(format!("mysql-runner-{}", uuid::Uuid::new_v4().simple()));
     fs::create_dir_all(&root)?;
     let readme = include_str!("../README.md");
     let mut value: Value = serde_json::from_str(

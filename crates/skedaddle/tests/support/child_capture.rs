@@ -1,4 +1,6 @@
 //! Drain both pipes continuously into task-local diagnostic files.
+use crate::test_root;
+
 use std::{
     fs, io,
     path::PathBuf,
@@ -9,10 +11,7 @@ use std::{
 pub struct CapturedChild(pub Option<Child>, Vec<JoinHandle<io::Result<u64>>>, PathBuf);
 impl CapturedChild {
     pub fn new(mut child: Option<Child>) -> Self {
-        let root = PathBuf::from(
-            std::env::var_os("SKEDADDLE_TEST_ROOT").expect("set SKEDADDLE_TEST_ROOT"),
-        )
-        .join(format!("child-{}", uuid::Uuid::new_v4()));
+        let root = test_root::scratch_root().join(format!("child-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let mut tasks = Vec::new();
         let child_ref = child.as_mut().unwrap();

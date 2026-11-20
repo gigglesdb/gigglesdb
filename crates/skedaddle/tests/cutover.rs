@@ -609,11 +609,8 @@ fn measured_interruption_reported() {
         return;
     };
     let _serial = SERIAL.lock().unwrap();
-    let root = PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT")
-            .expect("set SKEDADDLE_TEST_ROOT under J:/gigglesdb-work"),
-    );
-    assert!(root.starts_with("J:/gigglesdb-work"));
+    let root = crate::support::test_root::scratch_root();
+    crate::support::test_root::assert_under_work_root(&root);
     let mut f = Fixture::new(urls, true);
     let mut state = State::new(f.key.clone()).unwrap();
     let audit = Rc::new(RefCell::new(None));

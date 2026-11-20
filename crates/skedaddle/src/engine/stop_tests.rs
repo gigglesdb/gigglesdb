@@ -400,8 +400,7 @@ impl Applier for FirstThenSlow {
 
 #[test]
 fn control_contention_and_stale_generations_never_pause_a_new_owner() {
-    let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap())
-        .join(format!("control-{}", uuid::Uuid::new_v4()));
+    let root = crate::test_root::scratch_root().join(format!("control-{}", uuid::Uuid::new_v4()));
     let control = PauseControl::new(&root).unwrap();
     let owner = control.activate().unwrap();
     assert!(control.activate().is_err());

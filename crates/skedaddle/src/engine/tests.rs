@@ -276,8 +276,7 @@ impl Fixture {
     }
     async fn with_definition(definition: Option<crate::MigrationDefinition>) -> Self {
         let root =
-            PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("set task test root"))
-                .join(format!("engine-{}", uuid::Uuid::new_v4()));
+            crate::test_root::scratch_root().join(format!("engine-{}", uuid::Uuid::new_v4()));
         for p in ["journal", "buffer", "scratch"] {
             std::fs::create_dir_all(root.join(p)).unwrap();
         }
@@ -549,7 +548,7 @@ mod opaque_capture {
     }
     impl Seam {
         async fn new() -> Self {
-            let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap())
+            let root = crate::test_root::scratch_root()
                 .join(format!("opaque-capture-{}", uuid::Uuid::new_v4()));
             for directory in ["buffer", "journal", "scratch"] {
                 std::fs::create_dir_all(root.join(directory)).unwrap();

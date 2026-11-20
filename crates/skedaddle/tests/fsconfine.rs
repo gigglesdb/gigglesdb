@@ -1,3 +1,6 @@
+#[path = "support/root.rs"]
+mod test_root;
+
 use skedaddle::fsconfine::Dir;
 #[cfg(windows)]
 use std::path::Path;
@@ -8,9 +11,8 @@ use std::{
 };
 
 fn fixture(name: &str) -> PathBuf {
-    let base =
-        PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("explicit task test root"));
-    assert!(base.starts_with("J:/gigglesdb-work") || base.starts_with("/work/"));
+    let base = crate::test_root::scratch_root();
+    crate::test_root::assert_under_work_root(&base);
     let path = base.join(format!("fsconfine-{name}-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&path).unwrap();
     path

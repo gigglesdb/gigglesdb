@@ -1,5 +1,8 @@
 //! Explicit sizing experiment against the real, pinned-core Local projection.
 //! No source rows are stored here: only coordinator metadata is generated.
+#[path = "support/root.rs"]
+mod test_root;
+
 use giggles_core::{
     Admin, Limits,
     relational::{SqlRow, Value, encode_key},
@@ -29,11 +32,8 @@ const INSTANCE: &str = "gd49-d2-sizing-coordinator";
 const CAP: u64 = 16 * 1024 * 1024;
 
 fn root(name: &str) -> PathBuf {
-    let root = PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT")
-            .expect("set SKEDADDLE_TEST_ROOT under J:/gigglesdb-work"),
-    );
-    assert!(root.starts_with("J:/gigglesdb-work"));
+    let root = crate::test_root::scratch_root();
+    crate::test_root::assert_under_work_root(&root);
     let root = root.join(format!(
         "{name}-{}-{}",
         std::process::id(),

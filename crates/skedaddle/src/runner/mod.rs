@@ -827,7 +827,7 @@ mod config_tests {
 
     #[test]
     fn pg_and_gigglesdb_server_share_pgwire_config() {
-        let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("task test root"));
+        let root = crate::test_root::scratch_root();
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("n5a-pgwire-config");
         std::fs::write(&path, "host=localhost port=5432 user=test dbname=test").unwrap();

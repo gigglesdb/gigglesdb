@@ -1,3 +1,6 @@
+#[path = "support/root.rs"]
+mod test_root;
+
 #[path = "../src/mysql/capture/test_support.rs"]
 mod startup_support;
 use mysql_async::prelude::Queryable;
@@ -16,11 +19,7 @@ use skedaddle::{
         resume::ResumeBlocker,
     },
 };
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::Path, sync::Arc, time::Duration};
 
 fn source() -> SourceIdentity {
     SourceIdentity {
@@ -117,8 +116,7 @@ async fn live_killed_connections_exactly_once_purged_history_and_source_divergen
         return Ok(());
     };
     let cfg: MysqlConfig = serde_json::from_slice(&std::fs::read(path)?)?;
-    let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("harness test root"))
-        .join(format!("resume-{}", uuid::Uuid::new_v4()));
+    let root = crate::test_root::scratch_root().join(format!("resume-{}", uuid::Uuid::new_v4()));
     let mut admin = cfg.connect().await?;
     admin
         .conn

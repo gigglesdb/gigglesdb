@@ -106,8 +106,8 @@ fn zoo() -> TableDescriptor {
     }
 }
 async fn writer(p: &MysqlPosition) -> (BufferWriter, BufferReader, PathBuf) {
-    let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("set task test root"))
-        .join(format!("mysql-capture-{}", uuid::Uuid::new_v4()));
+    let root =
+        crate::test_root::scratch_root().join(format!("mysql-capture-{}", uuid::Uuid::new_v4()));
     for name in ["buffer", "scratch"] {
         std::fs::create_dir_all(root.join(name)).unwrap();
     }

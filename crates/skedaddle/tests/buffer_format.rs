@@ -1,3 +1,6 @@
+#[path = "support/root.rs"]
+mod test_root;
+
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
@@ -456,10 +459,7 @@ fn large_streaming_txn_codec_bounded_memory_300_mb() {
     const BUDGET: usize = 256 * 1024;
     const PAYLOAD: usize = 64 * 1024;
     const EVENTS: u32 = 4_800;
-    let root = std::path::PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT").expect("SKEDADDLE_TEST_ROOT required"),
-    )
-    .join("format-streaming-large");
+    let root = crate::test_root::scratch_root().join("format-streaming-large");
     fs::create_dir_all(&root).unwrap();
     // Reuse these two retained evidence paths on reruns, staying below 1 GB.
     let create = |name| {
@@ -1050,8 +1050,7 @@ fn handles_short_reads_writes_io_errors_and_poisoned_streams() {
 
 #[test]
 fn streams_more_than_64_mib_with_small_measured_peak_memory() {
-    let root = std::env::var_os("SKEDADDLE_TEST_ROOT")
-        .expect("SKEDADDLE_TEST_ROOT must point under the J: task folder");
+    let root = crate::test_root::scratch_root().into_os_string();
     let root = std::path::PathBuf::from(root).join("buffer-format");
     fs::create_dir_all(&root).unwrap();
     let path = root.join(format!("large-{}.seg", std::process::id()));

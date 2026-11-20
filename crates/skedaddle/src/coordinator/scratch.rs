@@ -92,10 +92,9 @@ mod tests {
 
     #[test]
     fn core_export_failures_remove_their_partial_staging() {
-        let parent =
-            PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("set J: test root"))
-                .join(format!("scratch-export-failures-{}", uuid::Uuid::new_v4()));
-        assert!(parent.starts_with("J:/gigglesdb-work"));
+        let parent = crate::test_root::scratch_root()
+            .join(format!("scratch-export-failures-{}", uuid::Uuid::new_v4()));
+        crate::test_root::assert_under_work_root(&parent);
         std::fs::create_dir_all(&parent).unwrap();
         let database = parent.join("db");
         let admin = Admin::create(&database, Limits::default()).unwrap();

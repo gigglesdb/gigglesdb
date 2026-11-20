@@ -240,7 +240,7 @@ fn schema_boundary_blocker(boundary: &crate::engine::SchemaBoundary, running: bo
 mod tests {
     use super::*;
     use crate::{buffer::backends::ObjectBufferStore, definition::LocalFsOptions};
-    use std::{path::PathBuf, time::Duration};
+    use std::time::Duration;
 
     #[test]
     fn mysql_overrides_positive_pg_facts_but_pg_diagnostics_are_unchanged() {
@@ -387,10 +387,8 @@ mod tests {
     }
 
     fn local() -> (MigrationDefinition, ObjectBufferStore) {
-        let root = PathBuf::from(
-            std::env::var_os("SKEDADDLE_TEST_ROOT").expect("set SKEDADDLE_TEST_ROOT"),
-        )
-        .join(format!("runner-buffer-readiness-{}", uuid::Uuid::new_v4()));
+        let root = crate::test_root::scratch_root()
+            .join(format!("runner-buffer-readiness-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let mut definition = MigrationDefinition::from_json(
             include_str!("../../README.md")

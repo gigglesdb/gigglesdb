@@ -1,4 +1,7 @@
 //! Real primary/replica failover. The harness owns both servers and their data.
+#[path = "support/root.rs"]
+mod test_root;
+
 #[path = "../src/mysql/capture/test_support.rs"]
 mod startup_support;
 use mysql_async::prelude::Queryable;
@@ -78,8 +81,7 @@ fn position(status: &MysqlStatus) -> MysqlPosition {
 }
 
 fn root(name: &str) -> PathBuf {
-    PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("harness test root"))
-        .join(format!("failover-{name}-{}", uuid::Uuid::new_v4()))
+    crate::test_root::scratch_root().join(format!("failover-{name}-{}", uuid::Uuid::new_v4()))
 }
 
 async fn writer(root: &Path, start: &MysqlPosition) -> BufferWriter {

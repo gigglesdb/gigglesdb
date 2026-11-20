@@ -1,4 +1,7 @@
 //! Subprocess-only crash/rebuild driver, excluded from normal builds.
+#[path = "../../tests/support/root.rs"]
+mod test_root;
+
 use object_store::local::LocalFileSystem;
 use skedaddle::coordinator::{epoch::Coordinator, journal::Journal, local::Local, *};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -15,11 +18,14 @@ async fn main() -> Result<()> {
     let path = PathBuf::from(&args[2]);
     let output = PathBuf::from(&args[3]);
     for p in [&object_root, &path, &output] {
+        #[cfg(windows)]
         if !p.starts_with("J:/gigglesdb-work") {
             return Err(Error::Rejected(
                 "fixture paths must stay under J:/gigglesdb-work".into(),
             ));
         }
+        #[cfg(not(windows))]
+        test_root::assert_under_work_root(p);
     }
     let store = Arc::new(
         LocalFileSystem::new_with_prefix(object_root)?

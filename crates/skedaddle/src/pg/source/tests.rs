@@ -41,8 +41,7 @@ fn resolve(_: &Relation<'_>, column: &RelationColumn<'_>) -> Result<ColumnMappin
     }))
 }
 fn root() -> PathBuf {
-    let parent = std::env::var_os("SKEDADDLE_TEST_ROOT")
-        .expect("source tests require SKEDADDLE_TEST_ROOT under the task folder");
+    let parent = crate::test_root::scratch_root().into_os_string();
     let path = PathBuf::from(parent).join(format!("pg-source-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(path.join("store")).unwrap();
     std::fs::create_dir_all(path.join("scratch")).unwrap();

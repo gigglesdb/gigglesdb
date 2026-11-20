@@ -27,3 +27,7 @@ pub mod verify;
 
 pub use capability::{CapabilityItem, CapabilityReport, Criticality, Evidence, ItemStatus};
 pub use definition::{DefinitionError, MigrationDefinition, ValidationError};
+
+#[cfg(test)]
+#[path = "../tests/support/root.rs"]
+mod test_root;

@@ -532,7 +532,7 @@ fn crash_after_durable_report_before_transition_preserves_atomicity_and_retry_bi
     let runtime = tokio::runtime::Runtime::new().unwrap();
     if let Some(root) = std::env::var_os("SKEDADDLE_VERIFICATION_CRASH_ROOT") {
         let root = std::path::PathBuf::from(root);
-        assert!(root.starts_with("J:/gigglesdb-work"));
+        crate::support::test_root::assert_under_work_root(&root);
         runtime.block_on(async {
             let j = journal(&root);
             let mut c = owner(j).await;

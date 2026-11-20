@@ -582,7 +582,7 @@ fn crash_staging_is_identifiable_and_reported_on_restart() {
     if let Some(kind) = std::env::var_os("SKEDADDLE_STAGING_CRASH_KIND") {
         let root =
             std::path::PathBuf::from(std::env::var_os("SKEDADDLE_STAGING_CRASH_ROOT").unwrap());
-        assert!(root.starts_with("J:/gigglesdb-work"));
+        crate::support::test_root::assert_under_work_root(&root);
         if kind == "object" {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
                 let store = skedaddle::coordinator::journal::local_store(&root).unwrap();

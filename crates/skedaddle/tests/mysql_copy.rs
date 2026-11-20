@@ -1,4 +1,7 @@
 //! D15: real engine/capture/chunk/journal/buffer; replay follows PG apply row semantics.
+#[path = "support/root.rs"]
+mod test_root;
+
 #[path = "../src/mysql/capture/test_support.rs"]
 mod startup_support;
 use mysql_async::{Params, prelude::Queryable};
@@ -428,10 +431,7 @@ async fn scenario(cfg: &MysqlConfig, crash: bool) -> Result {
         MysqlOrder::file(&s.server_uuid)?
     });
     let start = status(&mut admin).await?;
-    let root = std::path::PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT").ok_or("task test root absent")?,
-    )
-    .join(format!("d15-{}", uuid::Uuid::new_v4()));
+    let root = crate::test_root::scratch_root().join(format!("d15-{}", uuid::Uuid::new_v4()));
     for p in ["buffer", "journal", "scratch"] {
         std::fs::create_dir_all(root.join(p))?;
     }

@@ -1070,9 +1070,8 @@ fn live_reverse_capture_buffers_and_resumes_the_durable_manifest() {
             Ok(self.0.pop_front().expect("finite PG fixture stream"))
         }
     }
-    let root =
-        std::path::PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("task test root"))
-            .join(format!("reverse-live-{}", uuid::Uuid::new_v4()));
+    let root = crate::support::test_root::scratch_root()
+        .join(format!("reverse-live-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(root.join("store")).unwrap();
     let store =
         Arc::new(ObjectBufferStore::local(root.join("store"), Duration::from_secs(5)).unwrap());

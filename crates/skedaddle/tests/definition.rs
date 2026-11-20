@@ -1,3 +1,6 @@
+#[path = "support/root.rs"]
+mod test_root;
+
 use std::{
     fs,
     path::PathBuf,
@@ -46,13 +49,8 @@ fn fixture(input: impl AsRef<[u8]>) -> PathBuf {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let root = ROOT.get_or_init(|| {
-        let base = std::env::var_os("SKEDADDLE_TEST_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("J:/gigglesdb-work"));
-        assert!(
-            base.starts_with("J:/gigglesdb-work"),
-            "fixtures must stay under J:/gigglesdb-work"
-        );
+        let base = crate::test_root::scratch_root();
+        crate::test_root::assert_under_work_root(&base);
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1894,6 +1892,9 @@ fn capability_report_lists_column_exclusion_names_per_table() {
 #[test]
 fn destination_acknowledgments_are_optional_strict_and_digest_compatible() {
     let mut value = example_value();
+    // Pin the historical digest fixture independently of README path wording.
+    value["buffer"]["backend"]["options"]["path"] =
+        json!("J:/gigglesdb-work/example-migration/buffer");
     let old = parse_value(&value).unwrap();
     assert!(
         old.fence_plan

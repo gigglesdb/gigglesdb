@@ -891,9 +891,9 @@ mod tests {
 
     #[test]
     fn projection_sql_error_rolls_back_deletions_and_anchor() {
-        let root = PathBuf::from(std::env::var_os("TEMP").expect("set task TEMP on J:"))
-            .join(format!("local-atomic-{}", uuid::Uuid::new_v4()));
-        assert!(root.starts_with("J:/gigglesdb-work"));
+        let root =
+            crate::test_root::temp_root().join(format!("local-atomic-{}", uuid::Uuid::new_v4()));
+        crate::test_root::assert_under_work_root(&root);
         std::fs::create_dir_all(&root).unwrap();
         let mut local = Local::create(root.join("db")).unwrap();
         let owner = Entry::new(

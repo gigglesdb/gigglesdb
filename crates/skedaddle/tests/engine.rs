@@ -1,5 +1,8 @@
 //! H1-gated end-to-end engine test. No service startup here. Database operations
 //! are real; local buffer, journal, capture, chunk SQL and apply executor are real.
+#[path = "support/root.rs"]
+mod test_root;
+
 use async_trait::async_trait;
 use futures::FutureExt;
 use sha2::{Digest, Sha256};
@@ -41,7 +44,6 @@ use std::{
     error::Error,
     io::{BufReader, Write},
     panic::AssertUnwindSafe,
-    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -504,8 +506,7 @@ async fn partial_chunk_copy_excludes_sentinel_from_destination_buffer_and_logs()
         .env("E4D_PARTIAL_LOG_CHILD", "1")
         .output()?;
     let log =
-        PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").ok_or("task test root absent")?)
-            .join(format!("e4d-partial-{}.log", uuid::Uuid::new_v4()));
+        crate::test_root::scratch_root().join(format!("e4d-partial-{}.log", uuid::Uuid::new_v4()));
     let mut diagnostics = output.stdout;
     diagnostics.extend(output.stderr);
     std::fs::write(&log, &diagnostics)?;
@@ -610,7 +611,7 @@ fn copy_table(
         let repl = replication(&cfg)?;
         let result = AssertUnwindSafe(Box::pin(async {
         let root =
-            PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").ok_or("task test root absent")?)
+            crate::test_root::scratch_root()
                 .join(&id);
         for name in ["journal", "buffer", "scratch"] {
             std::fs::create_dir_all(root.join(name))?;
@@ -1724,8 +1725,7 @@ async fn operational_runner_restart_restores_schema_before_reconnect_live() -> T
     let source = connect(source_dsn, ca).await?;
     let destination = connect(destination_dsn, ca).await?;
     let schema = format!("rs{}", uuid::Uuid::new_v4().simple());
-    let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").ok_or("task root absent")?)
-        .join(&schema);
+    let root = crate::test_root::scratch_root().join(&schema);
     std::fs::create_dir_all(&root)?;
     let ddl = format!(
         "CREATE SCHEMA {schema};CREATE TABLE {schema}.rows(id integer PRIMARY KEY,body text)"

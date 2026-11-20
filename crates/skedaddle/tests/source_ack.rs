@@ -2,6 +2,9 @@
 //! Live qualification needs a combined TLS PostgreSQL + MinIO harness config;
 //! the existing p3 and pg-matrix lanes do not provide that combination.
 
+#[path = "support/root.rs"]
+mod test_root;
+
 use skedaddle::pg::pgoutput::StandbyStatusUpdate;
 
 #[test]
@@ -132,12 +135,9 @@ mod crash {
         }
     }
     fn root() -> PathBuf {
-        let path = PathBuf::from(
-            std::env::var_os("SKEDADDLE_TEST_ROOT")
-                .expect("set task SKEDADDLE_TEST_ROOT under J:/gigglesdb-work"),
-        )
-        .join(format!("source-ack-{}", uuid::Uuid::new_v4()));
-        assert!(path.starts_with("J:/gigglesdb-work"));
+        let path =
+            crate::test_root::scratch_root().join(format!("source-ack-{}", uuid::Uuid::new_v4()));
+        crate::test_root::assert_under_work_root(&path);
         std::fs::create_dir_all(&path).unwrap();
         path
     }

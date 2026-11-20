@@ -344,10 +344,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_deadline_and_id_are_rejected_without_creating_control_files() {
-        let root = std::path::PathBuf::from(
-            std::env::var_os("SKEDADDLE_TEST_ROOT").expect("set SKEDADDLE_TEST_ROOT"),
-        )
-        .join(format!(
+        let root = crate::test_root::scratch_root().join(format!(
             "nonexistent-rollback-request-{}",
             uuid::Uuid::new_v4()
         ));

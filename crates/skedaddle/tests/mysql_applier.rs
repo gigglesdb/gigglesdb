@@ -1,3 +1,6 @@
+#[path = "support/root.rs"]
+mod test_root;
+
 use mysql_async::prelude::Queryable;
 use skedaddle::{
     buffer::{
@@ -170,8 +173,8 @@ async fn restricted_adapter_checkpoint_restart_and_binlog_refusal()
     admin.conn.query_drop("SET SESSION sql_log_bin=1").await?;
     config.user = "adapter_apply".into();
     config.password = "adapter-test".into();
-    let root = std::path::PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap())
-        .join(format!("mysql-adapter-{}", uuid::Uuid::new_v4()));
+    let root =
+        crate::test_root::scratch_root().join(format!("mysql-adapter-{}", uuid::Uuid::new_v4()));
     for dir in ["buffer", "journal", "scratch"] {
         std::fs::create_dir_all(root.join(dir))?;
     }

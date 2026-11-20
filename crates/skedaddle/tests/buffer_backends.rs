@@ -1,3 +1,6 @@
+#[path = "support/root.rs"]
+mod test_root;
+
 use object_store::aws::AmazonS3Builder;
 use sha2::{Digest, Sha256};
 use skedaddle::buffer::backends::{
@@ -697,9 +700,9 @@ async fn streaming_unknown_completion_resolved_by_digest() {
 fn startup_reclaims_only_identified_unlocked_scratch() {
     // Intentionally retained unknown scratch belongs outside the harness's
     // leak-audited product roots. It remains under this task's explicit TEMP.
-    let root = PathBuf::from(std::env::var_os("TEMP").unwrap())
+    let root = crate::test_root::temp_root()
         .join(format!("p3-reclamation-evidence-{}", uuid::Uuid::new_v4()));
-    assert!(root.starts_with("J:/gigglesdb-work"));
+    crate::test_root::assert_under_work_root(&root);
     std::fs::create_dir_all(&root).unwrap();
     let stage = root.join(format!("#skedaddle-stage-{}", uuid::Uuid::new_v4()));
     let txn = root.join(format!("txn-{}.skedaddle-scratch", uuid::Uuid::new_v4()));
@@ -738,11 +741,8 @@ fn startup_reclaims_only_identified_unlocked_scratch() {
     assert_eq!(std::fs::read(unknown).unwrap(), b"fixture");
 }
 fn scratch(name: &str) -> PathBuf {
-    let root = PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT")
-            .expect("set SKEDADDLE_TEST_ROOT under J:/gigglesdb-work"),
-    );
-    assert!(root.starts_with("J:/gigglesdb-work"));
+    let root = crate::test_root::scratch_root();
+    crate::test_root::assert_under_work_root(&root);
     let path = root.join(format!("p3-{name}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&path).unwrap();
     path

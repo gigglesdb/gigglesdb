@@ -1,4 +1,7 @@
 //! Real local-journal/local-buffer qualification of coordinator GC authority.
+#[path = "support/root.rs"]
+mod test_root;
+
 use std::{
     cmp::Ordering,
     path::PathBuf,
@@ -81,11 +84,8 @@ fn config() -> ReaderConfig {
     }
 }
 fn fresh_root() -> PathBuf {
-    let root = PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT")
-            .expect("set SKEDADDLE_TEST_ROOT under J:/gigglesdb-work"),
-    );
-    assert!(root.starts_with("J:/gigglesdb-work"));
+    let root = crate::test_root::scratch_root();
+    crate::test_root::assert_under_work_root(&root);
     let root = root.join(format!("coordinator-gc-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     std::fs::create_dir_all(root.join("buffer")).unwrap();

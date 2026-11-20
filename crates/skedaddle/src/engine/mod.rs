@@ -1685,8 +1685,8 @@ mod installer_plan_tests {
     use crate::coordinator::local::Local;
 
     pub(super) async fn assessed() -> (Engine, Journal, std::path::PathBuf) {
-        let root = std::path::PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap())
-            .join(format!("installer-{}", uuid::Uuid::new_v4()));
+        let root =
+            crate::test_root::scratch_root().join(format!("installer-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("journal")).unwrap();
         let journal = Journal::new(
             Arc::new(coordinator::journal::local_store(root.join("journal")).unwrap()),

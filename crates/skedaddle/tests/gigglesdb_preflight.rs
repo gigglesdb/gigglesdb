@@ -1,5 +1,8 @@
 //! Real GigglesDB destination qualification; absence of a server is explicit.
 
+#[path = "support/root.rs"]
+mod test_root;
+
 use std::{
     error::Error,
     fs,
@@ -59,9 +62,7 @@ async fn live() -> Result<Option<Live>, TestError> {
         );
         return Ok(None);
     };
-    let parent = std::env::var_os("SKEDADDLE_TEST_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    let parent = crate::test_root::scratch_root();
     let root = parent.join(format!("gd65-n2b-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root)?;
     let listener = TcpListener::bind(("127.0.0.1", 0))?;

@@ -1,4 +1,7 @@
 //! Real emulator -> Capture -> local manifests -> journal -> inclusive restart.
+#[path = "support/root.rs"]
+mod test_root;
+
 #[path = "support/spanner.rs"]
 mod spanner_support;
 
@@ -171,11 +174,9 @@ async fn qualify(name: &str, dialect: SpannerDialect) -> Result<(), Error> {
             },
         )
     };
-    let root = std::path::PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT").ok_or("SKEDADDLE_TEST_ROOT required")?,
-    )
-    .join(format!("s5c-{name}-{}", uuid::Uuid::new_v4()));
-    assert!(root.starts_with("J:/gigglesdb-work"));
+    let root =
+        crate::test_root::scratch_root().join(format!("s5c-{name}-{}", uuid::Uuid::new_v4()));
+    crate::test_root::assert_under_work_root(&root);
     std::fs::create_dir_all(root.join("journal"))?;
     let journal = Journal::new(
         Arc::new(local_store(root.join("journal"))?),

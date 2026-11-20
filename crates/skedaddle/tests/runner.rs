@@ -1,4 +1,7 @@
 //! Real local control/CLI tests and explicitly gated PostgreSQL lifecycle proof.
+#[path = "support/root.rs"]
+mod test_root;
+
 use serde_json::{Value, json};
 use skedaddle::{
     MigrationDefinition,
@@ -306,9 +309,7 @@ async fn live_cli_excluded_sentinel_catching_up_pause_resume_and_equal_row_count
 }
 
 fn root() -> PathBuf {
-    let root =
-        PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("set SKEDADDLE_TEST_ROOT"))
-            .join(format!("runner-{}", uuid::Uuid::new_v4()));
+    let root = crate::test_root::scratch_root().join(format!("runner-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     root
 }

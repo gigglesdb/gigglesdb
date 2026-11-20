@@ -1716,10 +1716,8 @@ mod tests {
     }
     #[tokio::test]
     async fn failed_real_journal_refresh_revokes_retained_readiness() {
-        let root = PathBuf::from(
-            std::env::var_os("SKEDADDLE_TEST_ROOT").expect("set SKEDADDLE_TEST_ROOT"),
-        )
-        .join(format!("runner-readiness-{}", uuid::Uuid::new_v4()));
+        let root = crate::test_root::scratch_root()
+            .join(format!("runner-readiness-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let journal = Journal::new(
             Arc::new(coordinator::journal::local_store(&root).unwrap()),
@@ -1747,7 +1745,7 @@ mod tests {
             buffer::backends::ObjectBufferStore,
             definition::{BufferBackend, LocalFsOptions},
         };
-        let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap()).join(format!(
+        let root = crate::test_root::scratch_root().join(format!(
             "runner-independent-readiness-{}",
             uuid::Uuid::new_v4()
         ));
@@ -1809,7 +1807,7 @@ mod tests {
             buffer::backends::ObjectBufferStore,
             definition::{BufferBackend, LocalFsOptions},
         };
-        let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap()).join(format!(
+        let root = crate::test_root::scratch_root().join(format!(
             "runner-published-readiness-{}",
             uuid::Uuid::new_v4()
         ));
@@ -1919,8 +1917,8 @@ mod tests {
 
     #[tokio::test]
     async fn actual_ddl_exit_publishes_terminal_boundary_after_real_owner_retirement() {
-        let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap())
-            .join(format!("terminal-ddl-{}", uuid::Uuid::new_v4()));
+        let root =
+            crate::test_root::scratch_root().join(format!("terminal-ddl-{}", uuid::Uuid::new_v4()));
         let control = root.join("m.control");
         let (runtime, journal) =
             engine::tests::live_readiness_tests::retired_ddl_runtime(control.clone()).await;

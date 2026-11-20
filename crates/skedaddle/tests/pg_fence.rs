@@ -3,6 +3,9 @@
 //! Put psql on PATH or set SKEDADDLE_PSQL. No containers are started here.
 //! Run with --nocapture to retain the loud infrastructure skip reasons.
 
+#[path = "support/root.rs"]
+mod test_root;
+
 use std::{
     collections::BTreeSet,
     fs::{self, File},
@@ -239,10 +242,7 @@ impl Fixture {
             );
             return None;
         };
-        let root = PathBuf::from(
-            std::env::var("SKEDADDLE_TEST_ROOT")
-                .expect("set SKEDADDLE_TEST_ROOT beneath this task's J: folder"),
-        );
+        let root = crate::test_root::scratch_root();
         let epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -815,8 +815,7 @@ fn missing_psql_cleans_partial_construction() {
         })
     };
     let before = snapshot();
-    let missing = PathBuf::from(std::env::var("SKEDADDLE_TEST_ROOT").unwrap())
-        .join("deliberately-absent-psql.exe");
+    let missing = crate::test_root::scratch_root().join("deliberately-absent-psql.exe");
     assert!(!missing.exists());
     let failed = std::panic::catch_unwind(|| {
         Fixture::new_with_psql("missing_psql_cleanup", Some(missing.to_str().unwrap()))

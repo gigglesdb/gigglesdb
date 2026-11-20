@@ -1167,7 +1167,7 @@ mod exclusion_tests {
 
     #[tokio::test]
     async fn operational_coordinator_configures_exclusion_before_acquire() {
-        let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("task test root"))
+        let root = crate::test_root::scratch_root()
             .join(format!("runner-exclusion-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let binding = SourceBinding {
@@ -1223,7 +1223,7 @@ mod exclusion_tests {
         .unwrap()
     }
     fn binding_root() -> PathBuf {
-        let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("task test root"))
+        let root = crate::test_root::scratch_root()
             .join(format!("runtime-binding-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         root

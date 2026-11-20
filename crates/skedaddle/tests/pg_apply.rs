@@ -2,6 +2,9 @@
 //! Set SKEDADDLE_TEST_CONFIG with a `pg_apply` superuser DSN. The production
 //! installer provisions progress/receipts. No service is started by this binary.
 //! Harness invocation: cargo test --test pg_apply -- --ignored --nocapture.
+#[path = "support/root.rs"]
+mod test_root;
+
 use async_trait::async_trait;
 use std::{collections::BTreeMap, error::Error, sync::Arc};
 
@@ -959,10 +962,7 @@ async fn pair_buffer_records(
         format::{Limits, ManifestEntry, SegmentEncoder, SegmentHeader, segment_key},
         reader::ReaderConfig,
     };
-    let root = std::path::PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT").ok_or("SKEDADDLE_TEST_ROOT required")?,
-    )
-    .join(&fixture.id);
+    let root = crate::test_root::scratch_root().join(&fixture.id);
     std::fs::create_dir_all(&root)?;
     let store: std::sync::Arc<dyn BufferStore> = std::sync::Arc::new(ObjectBufferStore::local(
         root,

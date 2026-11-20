@@ -1,3 +1,6 @@
+#[path = "support/root.rs"]
+mod test_root;
+
 #[path = "../src/mysql/capture/test_support.rs"]
 mod startup_support;
 use mysql_async::prelude::Queryable;
@@ -120,10 +123,7 @@ async fn live_apply_echo_concurrent_user_gc_and_dump_reconnect()
     } else {
         MysqlOrder::file(&status.server_uuid)?
     });
-    let root = std::path::PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT").expect("harness test root"),
-    )
-    .join(format!("echo-{}", uuid::Uuid::new_v4()));
+    let root = crate::test_root::scratch_root().join(format!("echo-{}", uuid::Uuid::new_v4()));
     for name in ["buffer", "scratch"] {
         std::fs::create_dir_all(root.join(name))?;
     }

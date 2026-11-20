@@ -1,4 +1,7 @@
 //! D-A2 crash boundaries: real local buffer manifests and fsync journal objects.
+#[path = "support/root.rs"]
+mod test_root;
+
 use skedaddle::{
     buffer::{
         backends::ObjectBufferStore,
@@ -117,9 +120,8 @@ async fn marker(j: &Journal, state: &mut Materialized, w: &BufferWriter, f: &Fro
     .await;
 }
 async fn crash_history(stage: u8) {
-    let root = std::path::PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap())
-        .join(format!("s2-{}", uuid::Uuid::new_v4()));
-    assert!(root.starts_with("J:/gigglesdb-work"));
+    let root = crate::test_root::scratch_root().join(format!("s2-{}", uuid::Uuid::new_v4()));
+    crate::test_root::assert_under_work_root(&root);
     std::fs::create_dir_all(&root).unwrap();
     let j = journal(&root.join("journal"));
     let mut state = Materialized::default();

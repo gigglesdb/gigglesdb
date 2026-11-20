@@ -2,6 +2,9 @@
 //! Uses the existing `pg` and TLS/SCRAM `replication` fixture in
 //! SKEDADDLE_TEST_CONFIG. Also verifies the actual replication session settings
 //! on initial connection and reconnect before capturing the integer/text workload.
+#[path = "support/root.rs"]
+mod test_root;
+
 use std::{
     cmp::Ordering,
     error::Error,
@@ -159,10 +162,7 @@ async fn seeded_committed_history_matches_local_buffer() -> Result<(), Box<dyn E
         )
         .await?;
         assert_settings(stream.session_settings());
-        let root = std::path::PathBuf::from(
-            std::env::var_os("SKEDADDLE_TEST_ROOT").expect("task SKEDADDLE_TEST_ROOT"),
-        )
-        .join(format!("pg-source-live-{id}"));
+        let root = crate::test_root::scratch_root().join(format!("pg-source-live-{id}"));
         std::fs::create_dir_all(root.join("store"))?;
         std::fs::create_dir_all(root.join("scratch"))?;
         let store = Arc::new(ObjectBufferStore::local(

@@ -16,7 +16,7 @@ fn typed_started_survives_process_crash_before_local_apply() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     if let Some(root) = std::env::var_os("SKEDADDLE_CHUNK_CRASH_ROOT") {
         let root = std::path::PathBuf::from(root);
-        assert!(root.starts_with("J:/gigglesdb-work"));
+        crate::support::test_root::assert_under_work_root(&root);
         runtime.block_on(async {
             let journal = Journal::new(
                 fs_store(root.join("objects")),
@@ -156,7 +156,7 @@ fn lifecycle_regression_survives_crash_before_local_apply() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     if let Some(root) = std::env::var_os("SKEDADDLE_LIFECYCLE_CRASH_ROOT") {
         let root = std::path::PathBuf::from(root);
-        assert!(root.starts_with("J:/gigglesdb-work"));
+        crate::support::test_root::assert_under_work_root(&root);
         std::fs::create_dir_all(root.join("objects")).unwrap();
         runtime.block_on(async {
             let journal = Journal::new(

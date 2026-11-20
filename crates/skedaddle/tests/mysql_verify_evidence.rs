@@ -1,5 +1,8 @@
 //! Real MySQL capture/marker qualification. Applied wait uses an in-test source:
 //! this lane has no live PostgreSQL destination applier.
+#[path = "support/root.rs"]
+mod test_root;
+
 #[path = "../src/mysql/capture/test_support.rs"]
 mod startup_support;
 use async_trait::async_trait;
@@ -396,9 +399,7 @@ async fn live_complete_evidence_marker_and_reconnect() -> Result<(), Box<dyn std
         db_name: "verify_evidence".into(),
         stream: "evidence".into(),
     };
-    let root = std::path::PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT").expect("harness test root"),
-    )
+    let root = crate::test_root::scratch_root()
     .join(format!("evidence-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(root.join("buffer"))?;
     std::fs::create_dir_all(root.join("scratch"))?;

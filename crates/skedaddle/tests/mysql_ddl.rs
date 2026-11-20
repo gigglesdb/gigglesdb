@@ -1,3 +1,6 @@
+#[path = "support/root.rs"]
+mod test_root;
+
 #[path = "../src/mysql/capture/test_support.rs"]
 mod startup_support;
 use mysql_async::prelude::Queryable;
@@ -123,10 +126,7 @@ async fn live_ddl_unselected_progress_and_selected_typed_stops()
         return Ok(());
     };
     let cfg: MysqlConfig = serde_json::from_slice(&std::fs::read(path)?)?;
-    let root = std::path::PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT").expect("harness test root"),
-    )
-    .join(format!("ddl-{}", uuid::Uuid::new_v4()));
+    let root = crate::test_root::scratch_root().join(format!("ddl-{}", uuid::Uuid::new_v4()));
     let mut admin = cfg.connect().await?;
     admin.conn.query_drop("SET NAMES utf8mb4").await?;
     admin

@@ -1,3 +1,6 @@
+#[path = "support/root.rs"]
+mod test_root;
+
 #[cfg(feature = "test-crash")]
 use skedaddle::buffer::writer::CrashPoint;
 use skedaddle::{
@@ -170,11 +173,8 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
 static ALLOCATOR: MeasuredAllocator = MeasuredAllocator;
 
 fn scratch(name: &str) -> PathBuf {
-    let root = PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT")
-            .expect("set SKEDADDLE_TEST_ROOT under J:/gigglesdb-work"),
-    );
-    assert!(root.starts_with("J:/gigglesdb-work"));
+    let root = crate::test_root::scratch_root();
+    crate::test_root::assert_under_work_root(&root);
     let path = root.join(format!("p3-writer-{name}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&path).unwrap();
     path

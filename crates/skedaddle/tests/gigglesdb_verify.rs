@@ -1,4 +1,7 @@
 //! Real PostgreSQL equivalence and optional live GigglesDB dialect qualification.
+#[path = "support/root.rs"]
+mod test_root;
+
 use skedaddle::{mapping::PgType, verify::sql::SqlDialect};
 use std::io::Write;
 use std::{
@@ -155,10 +158,7 @@ async fn live_gigglesdb_dialect() -> Result {
         )?;
         return Ok(());
     };
-    let root = PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT").ok_or("SKEDADDLE_TEST_ROOT required")?,
-    )
-    .join(format!("n5b-{}", uuid::Uuid::new_v4()));
+    let root = crate::test_root::scratch_root().join(format!("n5b-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root)?;
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();

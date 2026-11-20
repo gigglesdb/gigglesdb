@@ -1,6 +1,9 @@
 //! Crash-window qualification against a real filesystem, coordinator journal and
 //! buffer. The object-store wrapper only injects cancellation/outage points;
 //! every successful operation reaches the real fsync-enabled local backend.
+#[path = "support/root.rs"]
+mod test_root;
+
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path, *};
@@ -379,10 +382,8 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let parent = PathBuf::from(
-            std::env::var_os("SKEDADDLE_TEST_ROOT").expect("set task SKEDADDLE_TEST_ROOT"),
-        );
-        assert!(parent.starts_with("J:/gigglesdb-work"));
+        let parent = crate::test_root::scratch_root();
+        crate::test_root::assert_under_work_root(&parent);
         let root = parent.join(format!("ddl-restart-{}", uuid::Uuid::new_v4()));
         for dir in ["objects", "buffer", "scratch"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();

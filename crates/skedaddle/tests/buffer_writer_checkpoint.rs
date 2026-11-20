@@ -1,3 +1,6 @@
+#[path = "support/root.rs"]
+mod test_root;
+
 use async_trait::async_trait;
 use skedaddle::{
     buffer::{
@@ -45,12 +48,9 @@ fn txn(n: u64) -> AssembledTxn {
     .unwrap()
 }
 fn root() -> PathBuf {
-    let path = PathBuf::from(
-        std::env::var_os("SKEDADDLE_TEST_ROOT")
-            .expect("set SKEDADDLE_TEST_ROOT under J:/gigglesdb-work"),
-    )
-    .join(format!("p3f-writer-{}", uuid::Uuid::new_v4()));
-    assert!(path.starts_with("J:/gigglesdb-work"));
+    let path =
+        crate::test_root::scratch_root().join(format!("p3f-writer-{}", uuid::Uuid::new_v4()));
+    crate::test_root::assert_under_work_root(&path);
     std::fs::create_dir_all(&path).unwrap();
     path
 }

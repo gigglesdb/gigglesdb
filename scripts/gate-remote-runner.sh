@@ -162,7 +162,8 @@ cd /home/user/gigglesdb/crates || exit 1
 jroot=/dev/shm/jroot
 mkdir -p "$jroot/gigglesdb-work/tmp/skedaddle"
 export TEMP=j:/gigglesdb-work/tmp TMP=j:/gigglesdb-work/tmp TMPDIR=$jroot/gigglesdb-work/tmp
-export SKEDADDLE_TEST_ROOT=J:/gigglesdb-work/tmp/skedaddle
+export SKEDADDLE_TEST_WORK_ROOT="$jroot/gigglesdb-work"
+export SKEDADDLE_TEST_ROOT="$SKEDADDLE_TEST_WORK_ROOT/tmp/skedaddle"
 for c in *; do
   [[ -f $c/Cargo.toml ]] || continue
   ln -sfn "$jroot" "$c/j:"

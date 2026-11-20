@@ -1734,7 +1734,7 @@ mod tests {
     };
 
     async fn service() -> Service {
-        let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("task test root"))
+        let root = crate::test_root::scratch_root()
             .join(format!("runner-cutover-unit-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let journal = Journal::new(

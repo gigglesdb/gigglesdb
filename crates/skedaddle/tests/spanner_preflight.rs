@@ -1,4 +1,7 @@
 //! Both dialects against the repository's labelled, ephemeral emulator harness.
+#[path = "support/root.rs"]
+mod test_root;
+
 #[path = "support/spanner.rs"]
 mod spanner_support;
 
@@ -132,8 +135,8 @@ async fn run(dialect: SpannerDialect, name: &str) -> Result<(), Error> {
     let report = preflight::inspect(&client, &selected, &Options::default()).await?;
     assert_eq!(report.blockers().count(), 0, "{name}: {:?}", report.issues);
     let metadata = schema::collect(&client, true).await?;
-    let output =
-        std::path::PathBuf::from(std::env::var("SKEDADDLE_TEST_ROOT")?).join(format!("s7-{name}"));
+    let output = std::path::PathBuf::from(crate::test_root::scratch_root().display().to_string())
+        .join(format!("s7-{name}"));
     std::fs::create_dir_all(&output)?;
     std::fs::write(
         output.join("information-schema.json"),

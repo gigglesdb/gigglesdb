@@ -157,8 +157,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn no_owner_and_invalid_request_are_typed() {
-        let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap())
-            .join(uuid::Uuid::new_v4().to_string());
+        let root = crate::test_root::scratch_root().join(uuid::Uuid::new_v4().to_string());
         let response = request_gc(&root, "migration").await;
         assert_eq!(response.exit_code, 6);
         assert_eq!(response.data["error"]["kind"], "no_owner");
@@ -173,8 +172,7 @@ mod request_tests {
     #[tokio::test]
     async fn live_request_response_and_owner_generation_changes() {
         for action in ["response", "stopped", "replacement"] {
-            let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap())
-                .join(uuid::Uuid::new_v4().to_string());
+            let root = crate::test_root::scratch_root().join(uuid::Uuid::new_v4().to_string());
             let control = root.join("migration.control");
             std::fs::create_dir_all(&control).unwrap();
             let owner = std::fs::OpenOptions::new()

@@ -637,8 +637,7 @@ mod tests {
     use crate::pg::{activate, fence, reverse as pg};
     use std::{path::PathBuf, sync::Arc};
     fn task_root() -> PathBuf {
-        let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap())
-            .join(format!("post-{}", uuid::Uuid::new_v4()));
+        let root = crate::test_root::scratch_root().join(format!("post-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         root
     }

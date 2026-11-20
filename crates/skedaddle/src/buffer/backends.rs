@@ -1792,9 +1792,8 @@ mod local_io_tests {
         use std::sync::Mutex;
 
         fn fixture() -> ObjectBufferStore {
-            let root =
-                PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("test scratch root"))
-                    .join(format!("buffer-publication-{}", uuid::Uuid::new_v4()));
+            let root = crate::test_root::scratch_root()
+                .join(format!("buffer-publication-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&root).unwrap();
             ObjectBufferStore::local(root, Duration::from_secs(3)).unwrap()
         }
@@ -2048,7 +2047,7 @@ mod local_io_tests {
 
         #[test]
         fn publication_retry_does_not_retry_access_denied() {
-            let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap());
+            let root = crate::test_root::scratch_root();
             let path = root.join(format!("write-only-{}", uuid::Uuid::new_v4()));
             let file = std::fs::OpenOptions::new()
                 .create_new(true)

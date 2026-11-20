@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+#[path = "root.rs"]
+pub mod test_root;
+
 pub mod counting;
 pub mod oracle;
 pub mod workload;
@@ -19,16 +22,7 @@ use std::{
 
 pub fn scratch(name: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root = std::env::var_os("SKEDADDLE_TEST_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("TEMP").expect("set task TEMP under J:/gigglesdb-work"))
-                .join("skedaddle-test-scratch")
-        });
-    assert!(
-        root.starts_with("J:/gigglesdb-work"),
-        "all scratch must remain on J:"
-    );
+    let root = test_root::scratch_root();
     let path = root.join(format!(
         "p2-{name}-{}-{}-{}",
         std::process::id(),

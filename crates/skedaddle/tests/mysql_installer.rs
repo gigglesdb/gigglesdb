@@ -1,4 +1,7 @@
 //! One harness-owned MySQL + PG18 cell, with real local journal and databases.
+#[path = "support/root.rs"]
+mod test_root;
+
 use mysql_async::prelude::Queryable;
 use skedaddle::{
     coordinator::{
@@ -81,7 +84,7 @@ async fn live_engine_install_retry_and_mismatch() -> Result {
         let identity = SourceIdentity { engine: "mysql".into(), system_id: "f3a-cluster".into(),
             lineage: "test".into(), db_name: schema.clone(), stream: "main".into() };
         let mut installer = MysqlInstaller::new(cfg.clone(), destination.clone(), identity.clone(), tables.clone(), selected.clone())?;
-        let root = std::path::PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").ok_or("test root missing")?)
+        let root = crate::test_root::scratch_root()
             .join(format!("mysql-installer-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("journal"))?;
         let journal = Journal::new(Arc::new(local_store(root.join("journal"))?), "installer", "test", Duration::from_secs(3))?;

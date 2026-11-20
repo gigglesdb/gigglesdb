@@ -124,7 +124,7 @@ mod tests {
     #[tokio::test]
     async fn journal_absence_and_authentication_failure() {
         use std::{sync::Arc, time::Duration};
-        let root = std::path::PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap())
+        let root = crate::test_root::scratch_root()
             .join(format!("verify-checkpoint-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let journal = Journal::new(
