@@ -356,12 +356,12 @@ fn blocking_covered_group_preserves_member_mode_sets_and_skips_drain() {
         let i = lm.shard(&d);
         lm.registry.pending(TxnId(2), true);
         state.guards.slice_mut()[i].waiters.insert(id, Waiter {
-            txn: TxnId(2), key: d.clone(), mode: LockMode::Exclusive,
-            upgrade: false, group: vec![(d.clone(), LockMode::Exclusive)],
-            cancelled: true, slot: Arc::new(Slot::default()), prepared: PreparedKey::new(&d),
+            txn: TxnId(2), key: lm.prepare(d.clone()), mode: LockMode::Exclusive,
+            upgrade: false, group: vec![(lm.prepare(d.clone()), LockMode::Exclusive)],
+            cancelled: true, slot: Arc::new(Slot::default()), prepared: PreparedKey::new(&lm.prepare(d.clone())),
         });
         state.guards.slice_mut()[i].by_txn.entry(TxnId(2)).or_default().push(id);
-        state.key_mut(&d).unwrap().queue.push(id);
+        state.key_mut(&lm.prepare(d.clone())).unwrap().queue.push(id);
         id
     };
     lm.acquire_points(txn, &[(k.clone(), LockMode::Shared), (d.clone(), LockMode::Shared)], None, &|| false).unwrap();

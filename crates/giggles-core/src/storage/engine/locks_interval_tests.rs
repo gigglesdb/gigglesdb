@@ -90,7 +90,7 @@ fn assert_clean(lm: &LockManager) {
     assert!(state.guards.slice().iter().all(|s| s.keys.is_empty()), "keys left: {:?}", state.keys().collect::<Vec<_>>());
     assert!(state.guards.slice().iter().all(|s| s.waiters.is_empty()));
     assert!(state.intervals.iter().all(HashSet::is_empty));
-    assert!(state.points.iter().all(BTreeSet::is_empty));
+    assert!(state.points.iter().all(BTreeMap::is_empty));
 }
 
 #[test]
@@ -477,7 +477,7 @@ fn points_held_before_the_first_interval_still_block_it() {
     {
         let state = lm.global().unwrap();
         assert_eq!(state.indexed, [false, false]);
-        assert!(state.points.iter().all(BTreeSet::is_empty));
+        assert!(state.points.iter().all(BTreeMap::is_empty));
     }
     assert_eq!(
         now(&lm, 2, rows(1, 9), LockMode::Shared),

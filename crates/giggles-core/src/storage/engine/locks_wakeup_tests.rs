@@ -91,7 +91,7 @@ fn assert_clean(lm: &LockManager) {
     assert!(state.guards.slice().iter().all(|s| s.held.is_empty()));
     assert!(lm.registry.stripes.iter().all(|s| s.lock().unwrap().is_empty()));
     assert!(state.intervals.iter().all(HashSet::is_empty));
-    assert!(state.points.iter().all(BTreeSet::is_empty));
+    assert!(state.points.iter().all(BTreeMap::is_empty));
 }
 
 #[test]
