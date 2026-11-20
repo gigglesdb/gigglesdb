@@ -949,7 +949,7 @@ impl SqlSession {
                         let context = clock.map(|clock| {
                             clock.with_sequences(sql_sequences::callback(
                                 db.clone(),
-                                catalog_image,
+                                catalog_image.clone(),
                                 self.sequence_baseline.clone(),
                                 self.pending_sequences.clone(),
                                 self.sequence_values.clone(),
@@ -961,6 +961,11 @@ impl SqlSession {
                                 self.xact.clone(),
                                 Some(txn.id()),
                             ))
+                        });
+                        let context = context.map(|clock| match self.privilege_callback.as_ref().filter(|_| p.has_privilege_inquiry()) {
+                            Some(callback) => clock.with_privileges(callback.clone(), privilege_provider(
+                                PrivilegeImage::Catalog(catalog_image.clone()), self.search_path.clone(), Some(txn), true)),
+                            None => clock,
                         });
                         if let Some(input) = self.copy_input.as_mut() {
                             let table = bound.table().ok_or(CoreError::Sql(E::Unsupported))?;

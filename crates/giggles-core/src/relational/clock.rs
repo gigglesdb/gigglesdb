@@ -58,12 +58,18 @@ pub(crate) type SequenceCallback =
     Arc<dyn Fn(&str, &str, Option<i64>, bool) -> Result<Value, CoreError> + Send + Sync>;
 pub(crate) type XactCallback =
     Arc<dyn Fn(&str, Option<i64>) -> Result<Value, CoreError> + Send + Sync>;
+struct PrivilegeExecution {
+    callback: crate::PrivilegeCallback,
+    provider: crate::storage::PrivilegeProvider,
+    metadata: Mutex<(Option<crate::PrivilegeMetadata>, Option<Vec<String>>)>,
+}
 #[derive(Clone)]
 pub(crate) struct ExecutionClock {
     clock: StatementClock,
     error: Arc<Mutex<Option<CoreError>>>,
     sequence: Option<SequenceCallback>,
     xact: Option<XactCallback>,
+    privilege: Option<Arc<PrivilegeExecution>>,
     extra_float_digits: i32,
     /// OBS_* bits, shared by every clone made from one execution.
     observed: Arc<AtomicU8>,
@@ -74,6 +80,7 @@ impl ExecutionClock {
             clock: clock.clone(),
             sequence: None,
             xact: None,
+            privilege: None,
             extra_float_digits: 1,
             error: Arc::new(Mutex::new(None)),
             observed: Arc::new(AtomicU8::new(0)),
@@ -139,6 +146,31 @@ impl ExecutionClock {
         self.observe(OBS_XACT);
         match (self.xact.as_ref().ok_or(SqlError::Unsupported)?)(name, arg) {
             Ok(value) => Ok(value),
+            Err(error) => {
+                *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                Err(SqlError::Unsupported)
+            }
+        }
+    }
+    pub(crate) fn with_privileges(&self, callback: crate::PrivilegeCallback,
+        metadata: crate::storage::PrivilegeProvider) -> Self {
+        let mut context = self.clone();
+        context.privilege = Some(Arc::new(PrivilegeExecution {callback, provider: metadata, metadata: Mutex::new((None, None))}));
+        context
+    }
+    pub(crate) fn set_privilege_search_path(&self, path: &[String]) {
+        if let Some(execution) = &self.privilege {
+            execution.metadata.lock().unwrap_or_else(|e| e.into_inner()).1 = Some(path.to_vec());
+        }
+    }
+    pub(crate) fn privilege(&self, name: &str, args: &[Value]) -> Result<Value, SqlError> {
+        let execution = self.privilege.as_deref().ok_or(SqlError::Unsupported)?;
+        let mut state = execution.metadata.lock().unwrap_or_else(|e| e.into_inner());
+        let path = state.1.take();
+        let metadata = state.0.get_or_insert_with(|| (execution.provider)());
+        if let Some(path) = path { metadata.set_search_path(path); }
+        match (execution.callback)(name, args, metadata) {
+            Ok(value) => Ok(value.map_or(Value::Null, Value::Bool)),
             Err(error) => {
                 *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
                 Err(SqlError::Unsupported)

@@ -1694,40 +1694,21 @@ impl Session {
             if session.sql.task().is_some() {
                 return session.task_catalog_snapshot();
             }
-            let tables = match session.effective_role.as_ref().unwrap_or(&session.role) {
-                Role::Application { domain, tables } => {
+            match session.authority_role() {
+                Role::Application { domain, .. } => {
                     if session.service.admin.authority_metadata()?.0.to_string() != *domain {
                         return Err(CoreError::Policy(Error::Authentication));
                     }
-                    Some(tables.clone())
                 }
                 Role::Database { name } => {
-                    let role = session
-                        .service
-                        .admin
-                        .roles()
-                        .get(name)
-                        .map_err(role_lookup_error)?
+                    session.service.admin.roles().get(name).map_err(role_lookup_error)?
                         .filter(|role| session.authority_role_live(role))
                         .ok_or(CoreError::Policy(Error::Authentication))?;
-                    if role.superuser {
-                        None
-                    } else {
-                        let catalog = session.service.admin.roles();
-                        let privileges = catalog.privileges_of(name).map_err(role_lookup_error)?;
-                        let capabilities = catalog.builtin_capabilities_of(name).map_err(role_lookup_error)?;
-                        if capabilities.contains("pg_read_all_data") || capabilities.contains("pg_write_all_data") { None }
-                        else {
-                            let mut visible = BTreeSet::new();
-                            for name in privileges { visible.extend(catalog.visible_tables(&name).map_err(role_lookup_error)?); }
-                            Some(visible)
-                        }
-                    }
                 }
-                Role::NoSql { .. } => return Err(CoreError::Policy(Error::Scope)),
-                #[cfg(feature = "legacy-task")]
-                Role::Task { .. } => return Err(CoreError::Policy(Error::Scope)),
-            };
+                _ => return Err(CoreError::Policy(Error::Scope)),
+            }
+            let tables = crate::pg_catalog_wire::authorized_tables(
+                session.authority_role(), &session.service.admin.roles(), std::iter::empty())?;
             let metadata = session.sql.catalog_metadata()?;
             let epoch = metadata.presentation.epoch;
             let catalog = metadata.tables;
@@ -2911,7 +2892,7 @@ impl Session {
         if self.is_aborted() {
             return Err(CoreError::Sql(giggles_core::relational::SqlError::Aborted));
         }
-        let result = cursor.fetch_unreleased(max_rows, max_bytes);
+        let result = self.sql.fetch_cursor_unreleased(cursor, max_rows, max_bytes);
         if result.is_err() {
             self.abort();
         }
@@ -3067,7 +3048,10 @@ impl Session {
                 zone: session.zone,
                 wall: Some(Arc::new(move || service.clock.sql_micros())),
             };
-            let result = session.sql.open_cursor_at(&bound, params, &clock);
+            let result = if bound.has_privilege_inquiry() {
+                let callback = crate::pg_catalog_wire::privilege_callback(session);
+                session.sql.with_privilege_callback(callback, |sql| sql.open_cursor_at(&bound, params, &clock))
+            } else { session.sql.open_cursor_at(&bound, params, &clock) };
             if !session.sql.in_transaction() {
                 session.transaction_us = None;
             } else if clock.unavailable.is_none() {
@@ -3176,7 +3160,10 @@ impl Session {
                     if plain && session.sql.task().is_some() {
                         return Err(task_session_refusal());
                     }
-                    let result = session.sql.execute_prepared_at_unreleased(p, params, None, &clock);
+                    let result = if p.has_privilege_inquiry() {
+                        let callback = crate::pg_catalog_wire::privilege_callback(session);
+                        session.sql.with_privilege_callback(callback, |sql| sql.execute_prepared_at_unreleased(p, params, None, &clock))
+                    } else { session.sql.execute_prepared_at_unreleased(p, params, None, &clock) };
                     if !session.sql.in_transaction() { session.transaction_us = None; }
                     else if clock.unavailable.is_none() { session.transaction_us = Some(transaction_us); }
                     // DDL bookkeeping reads a plain result only; a task

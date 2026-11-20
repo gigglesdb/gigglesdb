@@ -344,7 +344,7 @@ fn parse_skippable_default(p: &mut Parser) -> R<()> {
     }
     let mut tokens = vec![Token::Word("select".into())];
     tokens.extend_from_slice(&p.tokens[start..p.at]);
-    let mut syntax = Parser {
+    let mut syntax = Parser { privilege_seen: false, privilege_casts: false,
         tokens,
         at: 0,
         params: BTreeSet::new(),

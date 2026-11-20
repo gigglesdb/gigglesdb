@@ -230,7 +230,7 @@ impl Execution<'_> {
 impl Prepared {
     pub(crate) fn exists_test_query(&mut self, sql: &str) {
         self.unbound_statement = None;
-        self.statement = Statement::Query(Query::parse(&mut Parser {
+        self.statement = Statement::Query(Query::parse(&mut Parser { privilege_seen: false, privilege_casts: false,
             tokens: lex(sql).unwrap(), at: 0, params: BTreeSet::new(), relations: vec![],
         }).unwrap());
     }

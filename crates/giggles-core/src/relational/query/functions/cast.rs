@@ -354,6 +354,17 @@ pub(super) fn apply(value: Value, ty: &DataType, modifier: i32, budget: &mut usi
 
 // Builtin grammar keeps its existing diagnostics; unknown names bind to domains.
 pub(super) fn parse_expression(p: &mut Parser, value: Scalar) -> R<Scalar> {
+    if p.privilege_casts {
+        let start = p.at;
+        if p.word("pg_catalog") && !p.sym('.') { p.at = start; }
+        if let Some(Token::Word(name)) = p.tokens.get(p.at)
+            && matches!(name.as_str(), "oid" | "name") {
+                let name = format!("\0inquiry_{name}");
+                p.at += 1;
+                return Ok(Scalar::Call(name, vec![value]));
+        }
+        p.at = start;
+    }
     let start = p.at;
     match super::cast_type(p) {
         Ok(target) => Ok(expression(value, target)),
@@ -367,4 +378,40 @@ pub(super) fn parse_expression(p: &mut Parser, value: Scalar) -> R<Scalar> {
         }
         Err(error) => Err(error),
     }
+}
+
+// PG18 oid input accepts negative int4 spellings; int8 conversion is unsigned.
+pub(super) fn inquiry(value: Value, ty: &DataType, name: &str, budget: &mut usize) -> R<Value> {
+    if value == Value::Null { return Ok(value); }
+    if name == "\0inquiry_name" {
+        let Value::Text(mut text) = cast_value(value, &DataType::Text, budget)? else { return Err(SqlError::Type); };
+        let mut end = text.len().min(63);
+        while !text.is_char_boundary(end) { end -= 1; }
+        text.truncate(end);
+        return Ok(Value::Text(text));
+    }
+    let number = match value {
+        Value::Text(text) => {
+            let text = text.trim();
+            let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+            let (radix, digits) = if let Some(d) = unsigned.strip_prefix("0x").or_else(|| unsigned.strip_prefix("0X")) { (16, d) }
+                else if let Some(d) = unsigned.strip_prefix("0b").or_else(|| unsigned.strip_prefix("0B")) { (2, d) }
+                else if unsigned.starts_with('0') && unsigned.len() > 1 { (8, unsigned) }
+                else { (10, unsigned) };
+            if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+                return Err(SqlError::InvalidTextRepresentation);
+            }
+            let magnitude = i64::from_str_radix(digits, radix).map_err(|_| SqlError::Overflow)?;
+            let number = if text.starts_with('-') { -magnitude } else { magnitude };
+            if !(i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&number) { return Err(SqlError::Overflow); }
+            number
+        }
+        Value::Int(number) => {
+            let min = if *ty == DataType::BigInt { 0 } else { i64::from(i32::MIN) };
+            if !(min..=i64::from(u32::MAX)).contains(&number) { return Err(SqlError::Overflow); }
+            number
+        }
+        _ => return Err(SqlError::Type),
+    };
+    Ok(Value::Int(i64::from(number as u32)))
 }

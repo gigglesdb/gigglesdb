@@ -61,6 +61,8 @@ fn copy_error<T>(error: SqlError, message: impl Into<String>) -> R<T> {
 impl CopyOptions {
     pub fn parse(sql: &str, from: bool) -> R<Self> {
         let mut p = Parser {
+            privilege_casts: false,
+            privilege_seen: false,
             tokens: lex(sql)?,
             at: 0,
             params: BTreeSet::new(),
@@ -613,6 +615,8 @@ impl Copy {
             end = next(sql, &mut at)?.ok_or(SqlError::Syntax)?.1;
         }
         let mut p = Parser {
+            privilege_casts: false,
+            privilege_seen: false,
             tokens: lex(&sql[..end])?,
             at: 0,
             params: BTreeSet::new(),
@@ -623,6 +627,8 @@ impl Copy {
     }
     pub fn parse(sql: &str) -> R<Self> {
         let mut p = Parser {
+            privilege_casts: false,
+            privilege_seen: false,
             tokens: lex(sql)?,
             at: 0,
             params: BTreeSet::new(),
@@ -721,6 +727,7 @@ impl Copy {
             unbound_statement: None,
             warnings: vec![],
             authorization_has_views: false,
+            privilege_inquiry: false,
             statement: Statement::InsertMulti(Box::new(sql_insert::Insert::copy(
                 format!(
                     "{}\0{}",

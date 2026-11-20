@@ -24,7 +24,7 @@ pub(super) fn extract(p: &mut Parser) -> R<Vec<Clause>> {
             seen_page = true;
         }
         if depth != 0 || qualified || !word(p.tokens.get(i), "for") { i += 1; continue; }
-        let mut q = Parser { tokens: p.tokens[i..].to_vec(), at: 1, params: BTreeSet::new(), relations: vec![] };
+        let mut q = Parser { privilege_seen: false, privilege_casts: false, tokens: p.tokens[i..].to_vec(), at: 1, params: BTreeSet::new(), relations: vec![] };
         let mode = if q.word("update") { RowLock::Update }
             else if q.word("no") { q.need("key")?; q.need("update")?; RowLock::NoKeyUpdate }
             else if q.word("share") { RowLock::Share }
@@ -196,7 +196,7 @@ mod tests {
             "SELECT a.id FROM a JOIN b ON EXISTS(SELECT 1 FROM c FOR UPDATE)",
             "SELECT count(*) FROM a HAVING EXISTS(SELECT 1 FROM c FOR UPDATE)",
         ] {
-            let q = Query::parse(&mut Parser { tokens: lex(sql).unwrap(), at: 0, params: BTreeSet::new(), relations: vec![] }).unwrap();
+            let q = Query::parse(&mut Parser { privilege_seen: false, privilege_casts: false, tokens: lex(sql).unwrap(), at: 0, params: BTreeSet::new(), relations: vec![] }).unwrap();
             assert_eq!(q.row_lock_command(), Some("SELECT FOR UPDATE"), "{sql}");
             let expected = if sql.contains("FOR SHARE") { vec!["a", "b"] } else { vec!["c"] };
             assert_eq!(q.row_lock_tables(), expected, "{sql}");

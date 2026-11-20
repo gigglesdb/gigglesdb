@@ -100,7 +100,8 @@ struct Fixture {
     path: std::path::PathBuf,
 }
 impl Fixture {
-    async fn new() -> Self {
+    async fn new() -> Self { Self::new_engine(giggles_core::Engine::Legacy).await }
+    async fn new_engine(engine: giggles_core::Engine) -> Self {
         let root = std::path::PathBuf::from(
             std::env::var_os("TEMP").expect("set task TEMP under J:/gigglesdb-work"),
         );
@@ -120,7 +121,7 @@ impl Fixture {
             SERIAL.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&path).unwrap();
-        let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+        let admin = Admin::create_engine(path.join("db.redb"), Limits::default(), engine).unwrap();
         admin
             .roles()
             .create(NewRole {
@@ -325,4 +326,213 @@ async fn catalog_inquiry_group_schema_database_sequence() {
     }
     drop(owner);
     f.finish().await;
+}
+
+// W1d: identical evaluator behavior on catalog and application execution paths.
+#[tokio::test]
+async fn application_rows_privilege_equivalence_and_parameters() {
+    let f = Fixture::new().await;
+    let owner = f.connect("owner", "owner-pw").await;
+    for sql in [
+        "CREATE ROLE w1d_g",
+        "CREATE ROLE w1d_u IN ROLE w1d_g",
+        "CREATE TABLE w1d_t(id INTEGER PRIMARY KEY)",
+        "INSERT INTO w1d_t VALUES (1)",
+        "GRANT SELECT ON w1d_t TO w1d_g",
+    ] { Protocol::Simple.ok(&owner, sql).await; }
+    for role in ["owner", "w1d_u"] {
+        Protocol::Simple.ok(&owner, &format!("SET ROLE {role}")).await;
+        for expression in [
+            "pg_has_role('w1d_g','USAGE')",
+            "pg_has_role('w1d_u','w1d_g','MEMBER')",
+            "has_table_privilege('w1d_t','SELECT')",
+            "has_column_privilege('w1d_t','id','SELECT')",
+            "has_any_column_privilege('w1d_t','SELECT')",
+            "has_schema_privilege('public','USAGE')",
+            "has_database_privilege('postgres','CONNECT')",
+            "has_type_privilege('int4','USAGE')",
+            "pg_has_role(NULL,'w1d_g','MEMBER')",
+        ] {
+            let catalog: Option<bool> = owner.query_one(&format!("SELECT {expression}"), &[]).await.unwrap().get(0);
+            let application: Option<bool> = owner.query_one(&format!("SELECT {expression} FROM w1d_t"), &[]).await.unwrap().get(0);
+            assert_eq!(application, catalog, "role={role}: {expression}");
+        }
+        for (expression, expected) in [
+            ("pg_has_role('w1d_missing','w1d_g','MEMBER')", "42704"),
+            ("pg_has_role('w1d_u','w1d_g','BOGUS')", "22023"),
+        ] {
+            for suffix in ["", " FROM w1d_t"] {
+                let e = owner.query(&format!("SELECT {expression}{suffix}"), &[]).await.unwrap_err();
+                assert_eq!(e.code().unwrap().code(), expected, "{expression}{suffix}");
+            }
+        }
+        let statement = owner.prepare("SELECT pg_has_role($1::text,'w1d_g',$2::text) FROM w1d_t").await.unwrap();
+        assert!(owner.query_one(&statement, &[&"w1d_u", &"MEMBER"]).await.unwrap().get::<_, bool>(0));
+        Protocol::Simple.ok(&owner, "RESET ROLE").await;
+    }
+    drop(owner);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn application_rows_privilege_cursor() {
+    let f = Fixture::new().await;
+    let owner = f.connect("owner", "owner-pw").await;
+    for sql in [
+        "CREATE TABLE w1d_cursor_t(id INTEGER PRIMARY KEY)",
+        "INSERT INTO w1d_cursor_t VALUES (1),(2)",
+        "BEGIN",
+        "DECLARE w1d_c CURSOR FOR SELECT id, pg_has_role('owner','owner','MEMBER') FROM w1d_cursor_t ORDER BY id",
+    ] { Protocol::Simple.ok(&owner, sql).await; }
+    for expected in ["1", "2"] {
+        let rows = owner.simple_query("FETCH 1 FROM w1d_c").await.unwrap();
+        let row = rows.iter().find_map(|r| match r { SimpleQueryMessage::Row(r) => Some(r), _ => None }).unwrap();
+        assert_eq!(row.get(0), Some(expected));
+        assert_eq!(row.get(1), Some("t"));
+    }
+    Protocol::Simple.ok(&owner, "CLOSE w1d_c").await;
+    Protocol::Simple.ok(&owner, "COMMIT").await;
+    drop(owner);
+    f.finish().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn application_rows_privilege_transaction_private_table() {
+    let f = Fixture::new_engine(giggles_core::Engine::V2).await;
+    let owner = f.connect("owner", "owner-pw").await;
+    for sql in ["BEGIN", "CREATE TABLE w1d_private(id INTEGER PRIMARY KEY)",
+        "INSERT INTO w1d_private VALUES (1)"] { Protocol::Simple.ok(&owner, sql).await; }
+    let row = owner.query_one("SELECT has_table_privilege('w1d_private','SELECT'), has_column_privilege('w1d_private','id','SELECT') FROM w1d_private", &[]).await.unwrap();
+    assert!(row.get::<_,bool>(0));
+    assert!(row.get::<_,bool>(1));
+    Protocol::Simple.ok(&owner,"ROLLBACK").await;
+    drop(owner);
+    f.finish().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn application_rows_privilege_transaction_private_non_superuser_table() {
+    let f = Fixture::new_engine(giggles_core::Engine::V2).await;
+    let owner = f.connect("owner", "owner-pw").await;
+    for sql in ["CREATE ROLE w1d_private_owner LOGIN PASSWORD 'private-pw'",
+        "GRANT CREATE ON SCHEMA public TO w1d_private_owner"] { Protocol::Simple.ok(&owner, sql).await; }
+    let owner = f.connect("w1d_private_owner", "private-pw").await;
+    for sql in ["BEGIN", "CREATE TABLE w1d_private(id INTEGER PRIMARY KEY)",
+        "INSERT INTO w1d_private VALUES (1)"] { Protocol::Simple.ok(&owner, sql).await; }
+    let row = owner.query_one("SELECT has_table_privilege('w1d_private','SELECT'), has_column_privilege('w1d_private','id','SELECT') FROM w1d_private", &[]).await.unwrap();
+    assert!(row.get::<_,bool>(0));
+    assert!(row.get::<_,bool>(1));
+    Protocol::Simple.ok(&owner,"ROLLBACK").await;
+    drop(owner);
+    f.finish().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn application_rows_privilege_task_only_refused() {
+    let f = Fixture::new_engine(giggles_core::Engine::V2).await;
+    let owner = f.connect("owner", "owner-pw").await;
+    for sql in ["CREATE ROLE w1d_task LOGIN PASSWORD 'task-pw'",
+        "CREATE TABLE w1d_denied(id INTEGER PRIMARY KEY)",
+        "INSERT INTO w1d_denied VALUES (1)"] { Protocol::Simple.ok(&owner,sql).await; }
+    let baseline = f.connect("w1d_task", "task-pw").await;
+    let inquiry = f.connect("w1d_task", "task-pw").await;
+    Protocol::Simple.ok(&owner, "ALTER ROLE w1d_task TASKONLY").await;
+    // Main fences these live identities before dispatch, closing the connection
+    // without a SQLSTATE. An evaluator call would instead report missing role.
+    for (client, sql) in [(&baseline, "SELECT id FROM w1d_denied"),
+        (&inquiry, "SELECT id, pg_has_role('missing','owner','MEMBER') FROM w1d_denied")] {
+        let e = client.simple_query(sql).await.unwrap_err();
+        assert!(e.is_closed(), "{sql}: {e:?}");
+        assert!(e.code().is_none(), "{sql}: {e:?}");
+    }
+    drop(baseline);
+    drop(inquiry);
+    drop(owner);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn application_inquiry_contextual_casts() {
+    let f = Fixture::new().await;
+    let owner = f.connect("owner", "owner-pw").await;
+    for sql in ["CREATE TABLE w1d_cast(id INTEGER PRIMARY KEY)", "INSERT INTO w1d_cast VALUES (1)"] {
+        Protocol::Simple.ok(&owner, sql).await;
+    }
+    for expression in ["pg_has_role('-1'::oid,'4294967295'::oid,'MEMBER')",
+        "pg_has_role('owner'::name,'owner','MEMBER')"] {
+        assert!(owner.query_one(&format!("SELECT {expression} FROM w1d_cast"), &[]).await.unwrap().get::<_, bool>(0));
+    }
+    let long_role = "n".repeat(63);
+    Protocol::Simple.ok(&owner, &format!("CREATE ROLE {long_role}")).await;
+    assert!(owner.query_one(&format!("SELECT pg_has_role('{long_role}suffix'::name,'{long_role}','MEMBER') FROM w1d_cast"), &[]).await.unwrap().get::<_, bool>(0));
+    for (input, state) in [("'4294967296'", "22003"), ("'abc'", "22P02"), ("99999999999", "22003")] {
+        let e = owner.query(&format!("SELECT pg_has_role({input}::oid,'owner','MEMBER') FROM w1d_cast"), &[]).await.unwrap_err();
+        assert_eq!(e.code().unwrap().code(), state);
+    }
+    // Main rejects these PG-only types on core application rows (0A000).
+    for ty in ["oid", "name"] {
+        let e = owner.query(&format!("SELECT '1'::{ty} FROM w1d_cast"), &[]).await.unwrap_err();
+        assert_eq!(e.code().unwrap().code(), "0A000", "{ty}");
+    }
+    drop(owner);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn w1e_contextual_oid_spellings() {
+    let f = Fixture::new().await;
+    let owner = f.connect("owner", "owner-pw").await;
+    Protocol::Simple.ok(&owner, "CREATE TABLE w1e_cast(id INT PRIMARY KEY)").await;
+    Protocol::Simple.ok(&owner, "INSERT INTO w1e_cast VALUES (1)").await;
+    for text in ["0x10", "0X10", "0b10000", "0B10000"] {
+        let row = owner.query_one(&format!("SELECT pg_has_role('{text}'::oid,'owner','MEMBER') = pg_has_role(16::oid,'owner','MEMBER') FROM w1e_cast"), &[]).await.unwrap();
+        assert!(row.get::<_,bool>(0));
+    }
+    for (text, state) in [("0o20","22P02"),("1_0","22P02"),("0x100000000","22003"),("-0x80000001","22003")] {
+        let e = owner.query(&format!("SELECT pg_has_role('{text}'::oid,'owner','MEMBER') FROM w1e_cast"), &[]).await.unwrap_err();
+        assert_eq!(e.code().unwrap().code(), state);
+    }
+    drop(owner); f.finish().await;
+}
+#[tokio::test]
+async fn w1e_execution_search_path() {
+    let f = Fixture::new().await;
+    let owner = f.connect("owner", "owner-pw").await;
+    for sql in ["CREATE SCHEMA w1e_path", "CREATE TABLE w1e_path.t(id INT PRIMARY KEY)", "INSERT INTO w1e_path.t VALUES (1)", "SET search_path=w1e_path"] {
+        Protocol::Simple.ok(&owner, sql).await;
+    }
+    let row = owner.query_one("SELECT has_table_privilege('t','SELECT'),has_column_privilege('t','id','SELECT') FROM w1e_path.t", &[]).await.unwrap();
+    assert!(row.get::<_,bool>(0)); assert!(row.get::<_,bool>(1));
+    Protocol::Simple.ok(&owner, "CREATE TABLE public.t(other INT PRIMARY KEY)").await;
+    let prepared = owner.prepare("SELECT has_column_privilege('t','id','SELECT') FROM w1e_path.t").await.unwrap();
+    assert!(owner.query_one(&prepared, &[]).await.unwrap().get::<_,bool>(0));
+    Protocol::Simple.ok(&owner, "BEGIN").await;
+    Protocol::Simple.ok(&owner, "DECLARE w1e_c CURSOR FOR SELECT has_column_privilege('t','id','SELECT') FROM w1e_path.t").await;
+    Protocol::Simple.ok(&owner, "SET search_path=public").await;
+    let e = owner.query(&prepared, &[]).await.unwrap_err();
+    assert_eq!(e.code().unwrap().code(), "42703");
+    Protocol::Simple.ok(&owner, "ROLLBACK").await;
+    // Reopen the cursor after the prepared-statement error aborted the transaction.
+    Protocol::Simple.ok(&owner, "SET search_path=w1e_path").await;
+    Protocol::Simple.ok(&owner, "BEGIN").await;
+    Protocol::Simple.ok(&owner, "DECLARE w1e_c CURSOR FOR SELECT has_column_privilege('t','id','SELECT') FROM w1e_path.t").await;
+    Protocol::Simple.ok(&owner, "SET search_path=public").await;
+    // PG18.6 w1e-path-oracle-exact.out: FETCH uses the changed path, so public.t has no id.
+    let e = owner.simple_query("FETCH 1 FROM w1e_c").await.unwrap_err();
+    assert_eq!(e.code().unwrap().code(), "42703");
+    Protocol::Simple.ok(&owner, "ROLLBACK").await;
+    // Populate the inquiry cache, then change the path between FETCH evaluations.
+    Protocol::Simple.ok(&owner, "INSERT INTO w1e_path.t VALUES (2),(3)").await;
+    Protocol::Simple.ok(&owner, "SET search_path=w1e_path").await;
+    Protocol::Simple.ok(&owner, "BEGIN").await;
+    Protocol::Simple.ok(&owner, "DECLARE w1e_cached CURSOR FOR SELECT has_column_privilege('t','id','SELECT') FROM w1e_path.t").await;
+    Protocol::Simple.ok(&owner, "FETCH 1 FROM w1e_cached").await;
+    Protocol::Simple.ok(&owner, "SET search_path=public").await;
+    let e = owner.simple_query("FETCH ALL FROM w1e_cached").await.unwrap_err();
+    assert_eq!(e.code().unwrap().code(), "42703");
+    Protocol::Simple.ok(&owner, "ROLLBACK").await;
+    drop(owner); f.finish().await;
 }

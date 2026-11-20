@@ -205,7 +205,7 @@ fn expression(tokens: Vec<Token>) -> R<Filter> {
     {
         return Err(SqlError::Unsupported);
     }
-    let mut p = Parser {
+    let mut p = Parser { privilege_seen: false, privilege_casts: false,
         tokens,
         at: 0,
         params: BTreeSet::new(),
@@ -237,7 +237,7 @@ fn query(table: &TableDef, key: &str, expr: &str) -> R<Query> {
             tokens[at] = Token::Word("coalesce".into());
         }
     }
-    let mut p = Parser {
+    let mut p = Parser { privilege_seen: false, privilege_casts: false,
         tokens,
         at: 0,
         params: BTreeSet::new(),

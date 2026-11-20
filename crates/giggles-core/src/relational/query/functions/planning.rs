@@ -409,6 +409,7 @@ impl BoundScalar {
             | Node::Column(..)
             | Node::Clock(..)
             | Node::Sequence(..)
+            | Node::Privilege(..)
             | Node::Xact(..)
             | Node::ZonedOperator(..)
             | Node::CrossCompare(..)
@@ -495,6 +496,7 @@ impl BoundScalar {
             | Node::Param(_)
             | Node::Clock(..)
             | Node::Sequence(..)
+            | Node::Privilege(..)
             | Node::Xact(..)
             | Node::SessionCast(..)
             | Node::ZonedOperator(..) => false,
@@ -536,6 +538,7 @@ impl BoundScalar {
             }
             Node::CrossCompare(_, a, b, _) => a.insert_input_only() && b.insert_input_only(),
             Node::Sequence(_, args, _)
+            | Node::Privilege(_, args, _)
             | Node::Xact(_, args, _)
             | Node::ZonedOperator(_, args, _) => args.iter().all(Self::insert_input_only),
             Node::Cast(value) => {

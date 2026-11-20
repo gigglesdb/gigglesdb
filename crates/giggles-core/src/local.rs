@@ -67,6 +67,7 @@ pub fn policy_code(e: Error) -> u32 {
 }
 pub fn failure(e: CoreError) -> Reply {
     let code = match &e {
+        CoreError::PrivilegeInquiry(_) => 12,
         CoreError::Policy(e) => policy_code(*e),
         CoreError::Storage(_) => 10,
         CoreError::Corrupt(_) => 11,

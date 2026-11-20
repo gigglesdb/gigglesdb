@@ -164,7 +164,7 @@ pub(crate) fn membership_features(key: &[u8], value: &[u8]) -> u64 {
     }
 }
 
-pub(super) fn encode_key(raw: &[u8]) -> Result<Vec<u8>, CoreError> {
+pub(crate) fn encode_key(raw: &[u8]) -> Result<Vec<u8>, CoreError> {
     for (index, prefix) in PREFIXES.iter().enumerate() {
         if let Some(name) = raw.strip_prefix(*prefix) {
             let mut key = vec![8 + index as u8];

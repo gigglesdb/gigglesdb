@@ -125,6 +125,7 @@ impl Prepared {
             extension_owner: self.extension_owner.clone(),
             warnings: self.warnings.clone(),
             authorization_has_views: false,
+            privilege_inquiry: self.privilege_inquiry,
         };
         let create = |name: &str| -> R<String> {
             let schema = if name.contains('\0') {
@@ -240,6 +241,8 @@ impl Prepared {
         }
         bound.authorization_has_views = bound.authorization_tables()?.iter()
             .any(|name| state.view_names.contains_key(name));
+        bound.privilege_inquiry |= bound.authorization_tables()?.iter().any(|name|
+            state.view_names.get(name).is_some_and(|(_,p)| p.as_ref().is_ok_and(|p| p.has_privilege_inquiry())));
         Ok(bound)
     }
 }

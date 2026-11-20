@@ -23,7 +23,7 @@ fn default_scalar(sql: &str) -> R<Scalar> {
 }
 
 fn parse_default_scalar(sql: &str) -> R<Scalar> {
-    let mut parser = Parser {
+    let mut parser = Parser { privilege_seen: false, privilege_casts: false,
         tokens: lex(sql)?,
         at: 0,
         params: BTreeSet::new(),

@@ -817,7 +817,7 @@ impl Filter {
     }
     fn parse_child(p: &mut Parser) -> R<Box<Query>> {
         let end = subquery_end(&p.tokens, p.at - 1)?;
-        let mut child = Parser {
+        let mut child = Parser { privilege_seen: false, privilege_casts: false,
             tokens: p.tokens[p.at..end].to_vec(),
             at: 0,
             params: BTreeSet::new(),
@@ -825,6 +825,7 @@ impl Filter {
         };
         let query = Query::parse(&mut child)?;
         if query.derived().is_some() { return Err(SqlError::Unsupported); }
+        p.privilege_seen |= child.privilege_seen;
         p.params.extend(child.params);
         p.relations.extend(child.relations);
         p.at = end + 1;
@@ -1987,6 +1988,11 @@ impl Query {
         Ok(found)
     }
 
+    pub(in crate::relational) fn has_privilege_inquiry(&self) -> bool {
+        let mut found = false;
+        let _ = self.walk_scalars(&mut |s| { found |= s.has_privilege_inquiry(); Ok(()) });
+        found
+    }
     fn walk_scalars(&self, visit: &mut impl FnMut(&Scalar) -> R<()>) -> R<()> {
         if let Some(q) = self.derived() { q.walk_scalars(visit)?; }
         for (item, _) in &self.items {
@@ -6401,7 +6407,7 @@ mod join_visit_budget_tests {
                 2,
             ),
         ] {
-            let query = Query::parse(&mut Parser {
+            let query = Query::parse(&mut Parser { privilege_seen: false, privilege_casts: false,
                 tokens: lex(sql).unwrap(),
                 at: 0,
                 params: BTreeSet::new(),
@@ -6764,7 +6770,7 @@ mod in_subquery_execution_tests {
         state
     }
     fn query(sql: &str) -> Query {
-        Query::parse(&mut Parser {
+        Query::parse(&mut Parser { privilege_seen: false, privilege_casts: false,
             tokens: lex(sql).unwrap(),
             at: 0,
             params: BTreeSet::new(),

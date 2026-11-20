@@ -5,7 +5,7 @@ pub(in crate::relational) fn extension_call(
     state: &Relational,
     path: &[String],
 ) -> R<Option<String>> {
-    let mut p = Parser {
+    let mut p = Parser { privilege_seen: false, privilege_casts: false,
         tokens: lex(sql)?,
         at: 0,
         params: BTreeSet::new(),
@@ -42,7 +42,7 @@ pub(in crate::relational) fn view_call(
     state: &Relational,
     path: &[String],
 ) -> R<Option<String>> {
-    let mut p = Parser {
+    let mut p = Parser { privilege_seen: false, privilege_casts: false,
         tokens: lex(sql)?,
         at: 0,
         params: BTreeSet::new(),

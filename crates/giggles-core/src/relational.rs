@@ -1140,6 +1140,8 @@ pub(crate) use schema_binding::split_key;
 pub use schemas::{SchemaMetadata, schema_search_path};
 
 struct Parser {
+    privilege_casts: bool,
+    privilege_seen: bool,
     tokens: Vec<Token>,
     at: usize,
     params: BTreeSet<usize>,
@@ -1787,6 +1789,7 @@ pub struct Prepared {
     extension_owner: std::sync::Arc<std::sync::atomic::AtomicU32>,
     warnings: Vec<String>,
     authorization_has_views: bool,
+    privilege_inquiry: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // Awaiting v2 dispatch integration.
@@ -1998,6 +2001,7 @@ impl Prepared {
             unbound_statement: None,
             warnings: vec![],
             authorization_has_views: false,
+            privilege_inquiry: false,
         }
     }
     /// Construct an unbound read; callers still perform their normal authorization.
@@ -3009,6 +3013,7 @@ impl Prepared {
             unbound_statement: None,
             warnings: vec![],
             authorization_has_views: false,
+            privilege_inquiry: false,
             statement: Statement::Select {
                 name: scan.table,
                 projection: scan.projection,
@@ -3056,6 +3061,13 @@ impl Prepared {
         Self::parse(sql, 0, 0)
             .map(|prepared| prepared.sequences())
             .unwrap_or_default()
+    }
+    pub fn has_privilege_inquiry(&self) -> bool {
+        self.privilege_inquiry || match &self.statement {
+            Statement::Query(q) => q.has_privilege_inquiry(),
+            Statement::Plan(p) => p.has_privilege_inquiry(),
+            _ => false,
+        }
     }
     pub fn sequences(&self) -> Vec<Option<String>> {
         let mut dependencies = match &self.statement {
@@ -3232,7 +3244,7 @@ impl Prepared {
         if matches!(tokens.get(1), Some(Token::Word(word)) if matches!(word.as_str(), "sequence" | "collation")) {
             return Ok(None);
         }
-        let mut parser = Parser {
+        let mut parser = Parser { privilege_seen: false, privilege_casts: false,
             tokens,
             at: 0,
             params: BTreeSet::new(),
@@ -3249,7 +3261,7 @@ impl Prepared {
             || !matches!(tokens.get(1), Some(Token::Word(word)) if matches!(word.as_str(), "table" | "view")) {
             return Ok(vec![]);
         }
-        let mut parser = Parser {
+        let mut parser = Parser { privilege_seen: false, privilege_casts: false,
             tokens,
             at: 0,
             params: BTreeSet::new(),
@@ -3272,7 +3284,7 @@ impl Prepared {
             || !matches!(tokens.get(1), Some(Token::Word(word)) if word == "index") {
             return Ok(None);
         }
-        let mut parser = Parser { tokens, at: 0, params: BTreeSet::new(), relations: Vec::new() };
+        let mut parser = Parser { privilege_seen: false, privilege_casts: false, tokens, at: 0, params: BTreeSet::new(), relations: Vec::new() };
         Ok(Some(sql_index::parse_drop_authority_target(&mut parser)?.name))
     }
     /// Lexical routing hint; core resolves extension installation and signatures.
@@ -3377,7 +3389,7 @@ impl Prepared {
     pub(crate) fn parse(sql: &str, domain: u128, epoch: u64) -> R<Self> {
         assert_sql_frontend_allowed();
         take_sql_warnings();
-        let mut p = Parser {
+        let mut p = Parser { privilege_seen: false, privilege_casts: false,
             tokens: column_collations::rewrite_into(lex(sql)?)?,
             at: 0,
             params: BTreeSet::new(),
@@ -3454,6 +3466,7 @@ impl Prepared {
             unbound_statement: None,
             warnings: take_sql_warnings(),
             authorization_has_views: false,
+            privilege_inquiry: p.privilege_seen,
         })
     }
     /// Transaction-local name, normalized using PostgreSQL identifier rules.
@@ -4080,6 +4093,7 @@ impl Relational {
                 unbound_statement: None,
                 warnings: vec![],
             authorization_has_views: false,
+            privilege_inquiry: false,
                 statement: Statement::Insert {
                     name: values.name.clone(),
                     columns: values.columns.clone(),
@@ -4832,7 +4846,7 @@ mod arithmetic_lexer_tests {
             ("+7", 7),
             ("- /*gap*/ 7", -7),
         ] {
-            let mut parser = Parser {
+            let mut parser = Parser { privilege_seen: false, privilege_casts: false,
                 tokens: lex(sql).unwrap(),
                 at: 0,
                 params: BTreeSet::new(),

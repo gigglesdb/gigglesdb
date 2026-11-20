@@ -685,7 +685,7 @@ fn sql_insert_parser_row_cap_1024_and_1025() {
             }
             tokens.extend(lex(&format!("({id},0)")).unwrap());
         }
-        Parser {
+        Parser { privilege_seen: false, privilege_casts: false,
             tokens,
             at: 0,
             params: BTreeSet::new(),

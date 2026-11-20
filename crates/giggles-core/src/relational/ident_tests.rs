@@ -1,7 +1,7 @@
 use super::*;
 use std::collections::BTreeSet;
 fn parser(sql: &str) -> Parser {
-    Parser {
+    Parser { privilege_seen: false, privilege_casts: false,
         tokens: super::super::lex(sql).unwrap(),
         at: 0,
         params: BTreeSet::new(),

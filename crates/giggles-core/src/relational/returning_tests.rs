@@ -141,7 +141,7 @@ fn returning_errors_precede_mutation_and_bind_even_without_rows() {
 #[test]
 fn returning_projection_reuses_binder_and_admits_total_output() {
     let mut state = state();
-    let mut parser = Parser {
+    let mut parser = Parser { privilege_seen: false, privilege_casts: false,
         tokens: lex("RETURNING id, upper(txt) AS label").unwrap(),
         at: 0,
         params: BTreeSet::new(),

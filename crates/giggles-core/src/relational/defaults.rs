@@ -559,7 +559,7 @@ pub(super) fn execute_sequence(state: &mut Relational, ddl: &SequenceDdl) -> R<u
                                 let Ok(tokens) = lex(dependency) else {
                                     return false;
                                 };
-                                let mut parser = Parser {
+                                let mut parser = Parser { privilege_seen: false, privilege_casts: false,
                                     tokens,
                                     at: 0,
                                     params: BTreeSet::new(),
@@ -778,7 +778,7 @@ pub(super) fn install_create(
             && let Some(default) = default
             && default != "NULL"
         {
-            let mut parser = Parser {
+            let mut parser = Parser { privilege_seen: false, privilege_casts: false,
                 tokens: lex(&format!("{default},"))?,
                 at: 0,
                 params: BTreeSet::new(),
@@ -819,7 +819,7 @@ pub(super) fn normalize_r1_sequence_defaults(
     }
     for column in ext.columns.values_mut() {
         if let Some(sql) = &mut column.default {
-            let mut parser = Parser {
+            let mut parser = Parser { privilege_seen: false, privilege_casts: false,
                 tokens: lex(&format!("{sql},"))?,
                 at: 0,
                 params: BTreeSet::new(),
@@ -859,7 +859,7 @@ pub(super) fn present_default(state: &Relational, sql: &str, path: &[String]) ->
         }
     }
     let Ok(tokens) = lex(&format!("{sql},")) else { return sql.to_owned() };
-    let mut parser = Parser { tokens, at: 0,
+    let mut parser = Parser { privilege_seen: false, privilege_casts: false, tokens, at: 0,
         params: BTreeSet::new(), relations: Vec::new() };
     let Ok(mut value) = expression(&mut parser, 0) else { return sql.to_owned() };
     if parser.at + 1 != parser.tokens.len() || parser.tokens.get(parser.at) != Some(&Token::Symbol(',')) {
@@ -892,7 +892,7 @@ pub(super) fn dependencies(sql: &str) -> R<Rc<[String]>> {
 }
 
 fn parse_dependencies(sql: &str) -> R<Vec<String>> {
-    let mut parser = Parser {
+    let mut parser = Parser { privilege_seen: false, privilege_casts: false,
         tokens: lex(&format!("{sql},"))?,
         at: 0,
         params: BTreeSet::new(),
@@ -1021,7 +1021,7 @@ impl Expression {
                 for a in args {a.resolve(state,path)?;}
             }
             Self::Sequence(name) => {
-                let mut p = Parser {
+                let mut p = Parser { privilege_seen: false, privilege_casts: false,
                     tokens: lex(name)?,
                     at: 0,
                     params: BTreeSet::new(),
@@ -1366,7 +1366,7 @@ pub(super) fn evaluate_sql(
         .ok_or(SqlError::Type)
 }
 fn qualify_default(sql: &str) -> R<Rc<str>> {
-    let mut parser = Parser {
+    let mut parser = Parser { privilege_seen: false, privilege_casts: false,
         tokens: lex(&format!("{sql},"))?,
         at: 0,
         params: BTreeSet::new(),
@@ -1467,7 +1467,7 @@ pub(super) fn install_alter(
     path: &[String],
 ) -> R<()> {
     let value = if let Some(sql) = sql {
-        let mut parser = Parser {
+        let mut parser = Parser { privilege_seen: false, privilege_casts: false,
             tokens: lex(&format!("{sql},"))?,
             at: 0,
             params: BTreeSet::new(),
@@ -1590,14 +1590,14 @@ mod tests {
             ),
             ("NULL", DataType::Integer, "NULL"),
         ] {
-            let mut p = Parser {
+            let mut p = Parser { privilege_seen: false, privilege_casts: false,
                 tokens: lex(&format!("{input},")).unwrap(),
                 at: 0,
                 params: BTreeSet::new(),
                 relations: Vec::new(),
             };
             assert_eq!(parse(&mut p, &target).unwrap(), expected, "{input}");
-            let mut p = Parser {
+            let mut p = Parser { privilege_seen: false, privilege_casts: false,
                 tokens: lex(&format!("{expected},")).unwrap(),
                 at: 0,
                 params: BTreeSet::new(),

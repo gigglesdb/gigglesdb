@@ -281,7 +281,7 @@ impl Inner {
     }
     pub(super) fn sequence_callback(
         self: &Arc<Self>,
-        snapshot: State,
+        snapshot: Arc<State>,
         baseline: BTreeMap<u64, u128>,
         pending: Pending,
         values: SessionValues,
@@ -331,7 +331,7 @@ impl Inner {
             }
             let mut pending = pending.lock().map_err(|_| CoreError::Fenced)?;
             if !committed {
-                current = snapshot.clone();
+                current = (*snapshot).clone();
                 merge(&mut current, &pending);
             }
             if operation == "currval" {

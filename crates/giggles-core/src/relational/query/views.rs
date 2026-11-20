@@ -118,7 +118,7 @@ impl Query {
 
 
 fn stored_query(sql: &str) -> R<Query> {
-    let mut parser = Parser { tokens: lex(sql)?, at: 0, params: BTreeSet::new(), relations: vec![] };
+    let mut parser = Parser { privilege_seen: false, privilege_casts: false, tokens: lex(sql)?, at: 0, params: BTreeSet::new(), relations: vec![] };
     Query::parse(&mut parser)
 }
 pub(super) fn bind_filters(query: &Query, state: &Relational, tables: &[&TableDef], joins: &mut Vec<BoundJoin>, filter: &mut Option<BoundFilter>) -> R<()> {
@@ -178,6 +178,13 @@ fn view_filter_sql(f: &Filter) -> R<String> {
         Filter::Logic(a, and, b) => format!("({} {} {})", view_filter_sql(a)?, if *and { "AND" } else { "OR" }, view_filter_sql(b)?),
         _ => return Err(SqlError::Unsupported),
     })
+}
+
+
+impl Projection {
+    pub(in crate::relational) fn has_privilege_inquiry(&self) -> bool {
+        self.filters.iter().any(|f| stored_query(&f.select).is_ok_and(|q| q.has_privilege_inquiry()))
+    }
 }
 
 #[cfg(test)]

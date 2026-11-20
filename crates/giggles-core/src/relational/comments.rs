@@ -40,7 +40,7 @@ impl Prepared {
         if !matches!(tokens.first(), Some(Token::Word(w)) if w == "comment") { return Ok(None); }
         result?;
         if collations::claims(&tokens) { return Ok(None); }
-        let mut parser = Parser { tokens, at: 1, params: BTreeSet::new(), relations: Vec::new() };
+        let mut parser = Parser { privilege_seen: false, privilege_casts: false, tokens, at: 1, params: BTreeSet::new(), relations: Vec::new() };
         Ok(Some(parse(&mut parser)?.table))
     }
     pub(crate) fn apply_comment(&self, state: &Relational, parts: &mut crate::storage::CatalogParts) -> R<()> {

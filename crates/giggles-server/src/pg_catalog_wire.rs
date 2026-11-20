@@ -45,17 +45,126 @@ pub(crate) fn error(error: giggles_pg_catalog::Error) -> &'static str {
     }
 }
 
-#[allow(
-    clippy::needless_update,
-    reason = "trailing ..default() keeps this literal compiling when giggles-pg-catalog adds CatalogSnapshot fields"
-)]
+struct SnapshotContext {
+    metadata: giggles_core::CatalogMetadata,
+    identity: SnapshotIdentity,
+    owners: std::collections::BTreeMap<String, String>,
+}
+struct SnapshotIdentity {
+    registry: giggles_core::roles::RoleCatalog,
+    zone: giggles_pg_types::temporal::SessionZone,
+    backend_pid: i32,
+    backend_ssl: bool,
+    locks: Vec<(u64, u64, String, bool)>,
+    session_user: Option<String>,
+    user: String,
+    database: String,
+}
+fn identity(session: &crate::Session) -> SnapshotIdentity {
+    SnapshotIdentity { registry: session.service.admin.roles(),
+        zone: session.zone().unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0)),
+        backend_pid: session.backend_pid, backend_ssl: session.backend_ssl,
+        locks: session.sql.held_table_locks().into_iter().map(|(a,b,c,d)| (a,b,c.into(),d)).collect(),
+        session_user: session.session_user_name().map(str::to_owned),
+        user: match session.authority_role() { crate::Role::Database { name } => name.clone(), _ => "giggles".into() },
+        database: session.database.as_deref().unwrap_or("giggles").into() }
+}
+/// Capture only identity here. Catalog projection and authorization visibility are
+/// deferred to the first non-NULL call and cached for this execution.
+pub(crate) fn privilege_callback(session: &crate::Session) -> giggles_core::PrivilegeCallback {
+    use std::sync::{Arc, Mutex};
+    let identity = identity(session);
+    let role = session.authority_role().clone();
+    let state = Mutex::new((Some(identity), None));
+    Arc::new(move |name, args, metadata| {
+        let mut state = state.lock().map_err(|_| giggles_core::CoreError::Fenced)?;
+        if state.1.is_none() {
+            let identity = state.0.take().ok_or(giggles_core::CoreError::Fenced)?;
+            let mut catalog = metadata.catalog()?;
+            let registry = &identity.registry;
+            let owners = owner_keys(&catalog).into_iter().map(|key| {
+                Ok(metadata.table_owner(registry, &key)?.map(|owner| (key,owner)))
+            }).collect::<std::result::Result<Vec<_>, giggles_core::CoreError>>()?
+                .into_iter().flatten().collect::<std::collections::BTreeMap<_, _>>();
+            let visible = authorized_tables(&role, registry, owners.iter().map(|(key, owner)| (key.as_str(), owner.as_str())))?;
+            catalog.tables.retain(|table| visible.as_ref().is_none_or(|visible| visible.contains(
+                &giggles_core::relational::relation_key(catalog.schemas.tables.get(&table.id)
+                    .map_or("public", String::as_str), &table.name))));
+            let tables = catalog.tables.clone();
+            let indexes = catalog.indexes.clone();
+            let typmods = catalog.typmods.clone();
+            let types = catalog.types.clone();
+            let epoch = catalog.presentation.epoch;
+            let path = metadata.search_path().to_vec();
+            let mut snapshot = snapshot_owned(SnapshotContext { identity, owners, metadata: catalog },
+                epoch, tables, indexes, typmods, types).map_err(giggles_core::CoreError::PrivilegeInquiry)?;
+            snapshot.search_path = path;
+            state.1 = Some(snapshot);
+        }
+        let snapshot = state.1.as_mut().ok_or(giggles_core::CoreError::Fenced)?;
+        // A cursor keeps its catalog image, but each FETCH supplies its evaluation path.
+        snapshot.search_path = metadata.search_path().to_vec();
+        let args = args.iter().map(|value| match value {
+            giggles_core::relational::Value::Null => Ok(Value::Null),
+            giggles_core::relational::Value::Text(value) => Ok(Value::Text(value.clone())),
+            giggles_core::relational::Value::Int(value) => Ok(Value::Int(*value)),
+            _ => Err(giggles_core::CoreError::PrivilegeInquiry("42804")),
+        }).collect::<std::result::Result<Vec<_>, _>>()?;
+        giggles_pg_catalog::privilege_inquiry::evaluate(name, &args, &snapshot.user,
+            snapshot.session_user.as_deref().unwrap_or(&snapshot.user), snapshot)
+            .map_err(|e| giggles_core::CoreError::PrivilegeInquiry(error(e)))
+    })
+}
+/// The ordinary catalog adapter and execution callback select the same tables.
+pub(crate) fn authorized_tables<'a>(role: &crate::Role, registry: &giggles_core::roles::RoleCatalog,
+    execution_owners: impl Iterator<Item = (&'a str, &'a str)>)
+    -> std::result::Result<Option<std::collections::BTreeSet<String>>, giggles_core::CoreError> {
+    use crate::service::role_lookup_error;
+    use giggles_core::{CoreError, Error};
+    match role {
+        crate::Role::Application { tables, .. } => Ok(Some(tables.clone())),
+        crate::Role::Database { name } => {
+            let role = registry.get(name).map_err(role_lookup_error)?
+                .ok_or(CoreError::Policy(Error::Authentication))?;
+            if role.superuser { return Ok(None); }
+            let privileges = registry.privileges_of(name).map_err(role_lookup_error)?;
+            let capabilities = registry.builtin_capabilities_of(name).map_err(role_lookup_error)?;
+            if capabilities.contains("pg_read_all_data") || capabilities.contains("pg_write_all_data") {
+                return Ok(None);
+            }
+            let mut visible = std::collections::BTreeSet::new();
+            for name in &privileges { visible.extend(registry.visible_tables(name).map_err(role_lookup_error)?); }
+            // Captured execution ownership includes transaction-private CREATE TABLE.
+            visible.extend(execution_owners.filter(|(_, owner)| privileges.contains(*owner))
+                .map(|(key, _)| key.to_owned()));
+            Ok(Some(visible))
+        }
+        _ => Err(CoreError::Policy(Error::Scope)),
+    }
+}
+fn owner_keys(metadata: &giggles_core::CatalogMetadata) -> Vec<String> {
+    metadata.tables.iter().map(|table| giggles_core::relational::relation_key(
+        metadata.schemas.tables.get(&table.id).map_or("public", String::as_str), &table.name))
+        .chain(metadata.sequences.iter().map(|(_, name)| name.clone())).collect()
+}
 pub(crate) fn snapshot(
-    session: &crate::Session,
-    epoch: u64,
-    tables: Vec<giggles_core::relational::TableDef>,
-    indexes: Vec<giggles_core::IndexInfo>,
-    mut column_typmods: std::collections::BTreeMap<u64, i32>,
-    types: giggles_core::relational::UserTypeCatalog,
+    session: &crate::Session, epoch: u64,
+    tables: Vec<giggles_core::relational::TableDef>, indexes: Vec<giggles_core::IndexInfo>,
+    column_typmods: std::collections::BTreeMap<u64, i32>, types: giggles_core::relational::UserTypeCatalog,
+) -> Result<giggles_pg_catalog::CatalogSnapshot> {
+    let metadata = session.sql.catalog_metadata().map_err(|e| crate::service::sqlstate(&e))?;
+    let owners = owner_keys(&metadata).into_iter().filter_map(|key|
+        session.sql.table_owner(&key).ok().flatten().map(|owner| (key,owner))).collect();
+    let snapshot = snapshot_owned(SnapshotContext { identity: identity(session), metadata, owners }, epoch, tables, indexes, column_typmods, types)?;
+    if session.task().is_none() { return Ok(snapshot); }
+    let view = session.task_catalog_view().map_err(|e| crate::service::sqlstate(&e))?;
+    Ok(task_filtered(snapshot, &view))
+}
+#[allow(clippy::needless_update)]
+fn snapshot_owned(
+    context: SnapshotContext, epoch: u64,
+    tables: Vec<giggles_core::relational::TableDef>, indexes: Vec<giggles_core::IndexInfo>,
+    mut column_typmods: std::collections::BTreeMap<u64, i32>, types: giggles_core::relational::UserTypeCatalog,
 ) -> Result<giggles_pg_catalog::CatalogSnapshot> {
     use giggles_core::relational::DataType as C;
     use giggles_pg_catalog::ScalarType as P;
@@ -78,9 +187,9 @@ pub(crate) fn snapshot(
         .collect::<std::collections::BTreeSet<_>>();
     column_typmods.retain(|id, _| columns.contains(id));
     let visible: std::collections::BTreeSet<_> = tables.iter().map(|table| table.id).collect();
-    let (roles, table_owners) = catalog_roles(session, &tables);
+    let (roles, table_owners) = catalog_roles(&context, &tables);
     let mut table_acls = std::collections::BTreeMap::new();
-    let schemas_for_acl = session.sql.schema_metadata().map_err(|_| "XX000")?;
+    let schemas_for_acl = context.metadata.schemas.clone();
     for table in &tables {
         use giggles_core::roles::TablePrivilege as C;
         use giggles_pg_catalog::{AclEntry, AclPrivilege as P};
@@ -93,7 +202,7 @@ pub(crate) fn snapshot(
         );
         let owner = *table_owners.get(&table.id).unwrap_or(&10);
         let mut grants = vec![];
-        for (role, privileges) in session.service.admin.roles().table_acl(&key).map_err(|_| "XX000")? {
+        for (role, privileges) in context.identity.registry.clone().table_acl(&key).map_err(|_| "XX000")? {
             let grantee = if role.is_empty() { 0 } else {
                 let Some(role) = roles.iter().find(|r| r.name == role) else { continue; };
                 role.oid
@@ -185,8 +294,7 @@ pub(crate) fn snapshot(
             )
         })
         .collect();
-    let catalog = session.sql.catalog_metadata()
-        .map_err(|e| crate::service::sqlstate(&e))?;
+    let catalog = context.metadata;
     let metadata = catalog.schemas;
     if metadata.epoch != epoch {
         return Err("40001");
@@ -236,7 +344,7 @@ pub(crate) fn snapshot(
     }).collect();
     let sequences = catalog.sequences.into_iter()
         .filter_map(|(oid,name)| {
-            let owner = session.sql.table_owner(&name).ok().flatten()?;
+            let owner = context.owners.get(&name).cloned()?;
             let owner = roles.iter().find(|r| r.name == owner)?.oid;
             let (schema,name) = name.split_once('\0').unwrap_or(("public",&name));
             Some(giggles_pg_catalog::SequenceDef {oid,schema:schema.into(),name:name.into(),owner,acl:None})
@@ -245,7 +353,7 @@ pub(crate) fn snapshot(
     for role in &roles {
         for name in schemas.keys().map(String::as_str).chain(["public"]) {
             use giggles_core::roles::SchemaPrivilege as P;
-            let granted = session.service.admin.roles().schema_privileges(name,&role.name).map_err(|_| "XX000")?;
+            let granted = context.identity.registry.clone().schema_privileges(name,&role.name).map_err(|_| "XX000")?;
             if !granted.is_empty() {schema_privileges.insert((role.oid,name.to_owned()),[granted.contains(&P::Create),granted.contains(&P::Usage)]);}
         }
     }
@@ -253,7 +361,7 @@ pub(crate) fn snapshot(
         schema_privileges,
         sequences,
         extensions,
-        timezone: session.zone().unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0)),
+        timezone: context.identity.zone,
         views: presentation.views.into_iter().map(|(id, v)| (id, v.definition)).collect(),
         comments: presentation.comments,
         column_defaults: presentation.defaults, column_identities: presentation.identities,
@@ -271,11 +379,11 @@ pub(crate) fn snapshot(
                 validated: c.validated, expression: c.expression, index: c.index,
             }).collect(),
         generation,
-        backend_pid: session.backend_pid,
-        table_locks: session.sql.held_table_locks().into_iter()
+        backend_pid: context.identity.backend_pid,
+        table_locks: context.identity.locks.into_iter()
             .filter(|(_, table, _, _)| visible.contains(table))
-            .map(|(txn, table, mode, fastpath)| (txn, table, session.backend_pid, mode.into(), fastpath)).collect(),
-        backend_ssl: session.backend_ssl,
+            .map(|(txn, table, mode, fastpath)| (txn, table, context.identity.backend_pid, mode, fastpath)).collect(),
+        backend_ssl: context.identity.backend_ssl,
         schemas,
         table_schemas: metadata
             .tables
@@ -289,9 +397,9 @@ pub(crate) fn snapshot(
         roles,
         table_owners,
         table_acls,
-        session_user: session.session_user_name().map(str::to_owned),
+        session_user: context.identity.session_user,
         role_memberships: {
-            let catalog = session.service.admin.roles();
+            let catalog = context.identity.registry.clone();
             let roles = catalog.list().map_err(|_| "XX000")?;
             let bootstrap = roles.iter().filter(|r| r.superuser).min_by_key(|r| r.oid).map(|r| r.name.as_str()).unwrap_or("postgres");
             let oid = |name: &str| roles.iter().find(|r| r.name == name).map(|r| Value::Int(i64::from(r.oid))).unwrap_or(Value::Null);
@@ -301,7 +409,7 @@ pub(crate) fn snapshot(
             ]).collect()
         },
         role_privileges: {
-            let catalog = session.service.admin.roles();
+            let catalog = context.identity.registry.clone();
             let listed = catalog.list().map_err(|_| "XX000")?;
             let mut result = std::collections::BTreeMap::new();
             for member in &listed {
@@ -320,11 +428,8 @@ pub(crate) fn snapshot(
             }
             result
         },
-        user: match session.authority_role() {
-            crate::Role::Database { name } => name.clone(),
-            _ => "giggles".into(),
-        },
-        database: session.database.as_deref().unwrap_or("giggles").into(),
+        user: context.identity.user,
+        database: context.identity.database,
         column_typmods,
         indexes: indexes
             .into_iter()
@@ -386,13 +491,7 @@ pub(crate) fn snapshot(
         // Forward-compatible with CatalogSnapshot fields added by giggles-pg-catalog (track G).
         ..giggles_pg_catalog::CatalogSnapshot::default()
     };
-    if session.task().is_none() {
-        return Ok(snapshot);
-    }
-    let view = session
-        .task_catalog_view()
-        .map_err(|e| crate::service::sqlstate(&e))?;
-    Ok(task_filtered(snapshot, &view))
+    Ok(snapshot)
 }
 
 /// GD-0061 R3-312: a task session's catalog. `tables` already holds only the
@@ -412,6 +511,7 @@ fn task_filtered(
         .iter()
         .any(|table| !table.primary_key.is_empty());
     snapshot.views.clear();
+    snapshot.sequences.clear();
     snapshot.comments.retain(|(table, column), text| {
         *table == view.table && (*column == 0 || shown(column)) && !view.mentions_hidden(text)
     });
@@ -446,6 +546,22 @@ fn task_filtered(
         .roles
         .retain(|role| role.oid == 10 || role.name == user || Some(role.oid) == owner);
     let roles: std::collections::BTreeSet<u32> = snapshot.roles.iter().map(|r| r.oid).collect();
+    snapshot.role_memberships.retain(|edge| {
+        matches!((edge.get(1), edge.get(2)), (Some(Value::Int(parent)), Some(Value::Int(member)))
+            if u32::try_from(*parent).is_ok_and(|oid| roles.contains(&oid))
+                && u32::try_from(*member).is_ok_and(|oid| roles.contains(&oid)))
+    });
+    for edge in &mut snapshot.role_memberships {
+        if let Some(grantor) = edge.get_mut(3)
+            && !matches!(grantor, Value::Int(oid) if u32::try_from(*oid).is_ok_and(|oid| roles.contains(&oid))) {
+            *grantor = Value::Null;
+        }
+    }
+    let role_names: std::collections::BTreeSet<&str> = snapshot.roles.iter().map(|r| r.name.as_str()).collect();
+    snapshot.role_privileges.retain(|(member, parent), _|
+        role_names.contains(member.as_str()) && role_names.contains(parent.as_str()));
+    snapshot.schema_privileges.retain(|(role, schema), _|
+        roles.contains(role) && snapshot.schemas.contains_key(schema));
     snapshot.table_owners.retain(|table, _| *table == view.table);
     snapshot.table_acls.retain(|table, _| *table == view.table);
     for acl in snapshot.table_acls.values_mut() {
@@ -624,14 +740,14 @@ pub(crate) fn with_application_rows(
 /// role literally named `giggles` takes that slot. Registry failures fall back
 /// to the bootstrap-only default, which every caller already accepted.
 fn catalog_roles(
-    session: &crate::Session,
+    context: &SnapshotContext,
     tables: &[giggles_core::relational::TableDef],
 ) -> (
     Vec<giggles_pg_catalog::RoleDef>,
     std::collections::BTreeMap<u64, u32>,
 ) {
     let default = giggles_pg_catalog::CatalogSnapshot::default();
-    let registry = session.service.admin.roles();
+    let registry = context.identity.registry.clone();
     let Ok(listed) = registry.list() else {
         return (default.roles, default.table_owners);
     };
@@ -670,7 +786,7 @@ fn catalog_roles(
     let owners = tables
         .iter()
         .filter_map(|table| {
-            let schemas = session.sql.schema_metadata().ok()?;
+            let schemas = context.metadata.schemas.clone();
             let key = giggles_core::relational::relation_key(
                 schemas
                     .tables
@@ -678,8 +794,8 @@ fn catalog_roles(
                     .map_or("public", String::as_str),
                 &table.name,
             );
-            let owner = session.sql.table_owner(&key).ok()??;
-            Some((table.id, *oids.get(&owner)?))
+            let owner = context.owners.get(&key)?;
+            Some((table.id, *oids.get(owner)?))
         })
         .collect();
     (roles, owners)
@@ -1795,4 +1911,26 @@ mod tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod w1e_regressions {
+    use super::*;
+    #[test]
+    fn task_sequences_and_schema_grants_are_hidden() {
+        for owner in [10, 999] {
+            let mut s = giggles_pg_catalog::CatalogSnapshot::default();
+            s.sequences.push(giggles_pg_catalog::SequenceDef { oid: 90000, schema: "public".into(), name: "secret_sequence".into(), owner, acl: None });
+            s.schema_privileges.insert((999, "secret_schema".into()), [true,true]);
+            let s = task_filtered(s, &crate::service::TaskCatalogView { table: 7, schema: "public".into(), columns: Default::default(), hidden: vec!["secret_sequence".into()] });
+            let plan = giggles_pg_catalog::plan("SELECT relname FROM pg_class").unwrap().unwrap();
+            giggles_pg_catalog::execute(&plan, &s, &[]).unwrap();
+            assert!(s.sequences.is_empty());
+            assert!(s.schema_privileges.is_empty());
+            for name in ["secret_sequence", "absent_sequence"] {
+                let plan = giggles_pg_catalog::plan(&format!("SELECT has_sequence_privilege('{name}','USAGE') FROM pg_class LIMIT 1")).unwrap().unwrap();
+                assert!(matches!(giggles_pg_catalog::execute(&plan, &s, &[]), Err(giggles_pg_catalog::Error::UnknownRelation(_))));
+            }
+        }
+    }
 }

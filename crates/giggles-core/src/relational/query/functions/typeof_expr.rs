@@ -71,7 +71,7 @@ pub(super) fn regtype(value: Value) -> R<Value> {
     if input == "unknown" {
         return Ok(Value::Text(input));
     }
-    let mut parser = Parser {
+    let mut parser = Parser { privilege_seen: false, privilege_casts: false,
         tokens: lex(&input)?,
         at: 0,
         params: BTreeSet::new(),

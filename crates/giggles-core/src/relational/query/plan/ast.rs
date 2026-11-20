@@ -274,3 +274,14 @@ impl Plan {
         Ok(())
     }
 }
+
+impl Plan {
+    pub(in crate::relational) fn has_privilege_inquiry(&self) -> bool {
+        let mut found = false;
+        self.visit_queries(&mut |q| found |= q.has_privilege_inquiry());
+        self.visit_scalars(&mut |s| found |= s.has_privilege_inquiry());
+        found || self.mutation.as_ref().is_some_and(|m| m.has_privilege_inquiry())
+            || self.merge.as_ref().is_some_and(|m| m.has_privilege_inquiry())
+            || self.ctes.iter().any(|c| c.dml.as_ref().is_some_and(|p| p.has_privilege_inquiry()))
+    }
+}

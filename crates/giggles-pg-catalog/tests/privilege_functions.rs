@@ -377,3 +377,24 @@ fn catalog_inquiry_sequences_and_unknown_oids() {
     assert_eq!(run(&s,"has_any_column_privilege(NULL,'SELECT')").unwrap(),Value::Null);
     assert_eq!(privilege_inquiry::evaluate("has_table_privilege",&[Value::Text("t".into()),Value::Text("SELECT".into())],"giggles","app",&s).unwrap(),Some(true));
 }
+
+#[test]
+fn w1e_unknown_oid_family_shortcuts() {
+    let s = snapshot();
+    for (family, privilege) in [("schema","USAGE"),("database","CONNECT"),("type","USAGE")] {
+        yes(&s, &format!("has_{family}_privilege('giggles',4294967294::oid,'{privilege}')"), true);
+        assert_eq!(run(&s, &format!("has_{family}_privilege('app',4294967294::oid,'{privilege}')")).unwrap(), Value::Null);
+        assert!(matches!(run(&s, &format!("has_{family}_privilege('giggles',4294967294::oid,'BOGUS')")), Err(Error::InvalidPrivilege(_))));
+    }
+    for family in ["table", "sequence"] {
+        assert_eq!(run(&s, &format!("has_{family}_privilege('giggles',4294967294::oid,'SELECT')")).unwrap(), Value::Null);
+    }
+}
+#[test]
+fn w1e_missing_namespace_is_distinct_from_missing_relation() {
+    let s = snapshot();
+    for expression in ["has_table_privilege('{}','SELECT')", "has_column_privilege('{}','id','SELECT')", "has_sequence_privilege('{}','USAGE')"] {
+        assert!(matches!(run(&s, &expression.replace("{}", "w1e_missing.t")), Err(Error::Inquiry("3F000"))));
+        assert!(matches!(run(&s, &expression.replace("{}", "public.missing")), Err(Error::UnknownRelation(_))));
+    }
+}

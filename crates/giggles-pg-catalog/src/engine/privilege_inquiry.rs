@@ -11,6 +11,11 @@ fn role(rt: &mut Runtime<'_>, value: &Value) -> R<i64> {
 }
 fn reachable(rt: &mut Runtime<'_>, member: i64, target: i64, option: usize) -> R<bool> {
     if member == target { return Ok(true); }
+    // Unknown OIDs retain PostgreSQL's identity shortcut, but cannot enter the graph.
+    if !rt.snapshot.roles.iter().any(|r| i64::from(r.oid) == member)
+        || !rt.snapshot.roles.iter().any(|r| i64::from(r.oid) == target) {
+        return Ok(false);
+    }
     let mut seen = std::collections::BTreeSet::from([member]);
     let mut pending = vec![member];
     while let Some(member) = pending.pop() {
@@ -80,6 +85,10 @@ pub(super) fn evaluate(rt: &mut Runtime<'_>, name: &str, values: &[Value], effec
     if name == "pg_has_role" {
         let target = role(rt, &values[at])?;
         if superuser { return Ok(B(true)); }
+        if !rt.snapshot.roles.iter().any(|r| i64::from(r.oid) == member)
+            || !rt.snapshot.roles.iter().any(|r| i64::from(r.oid) == target) {
+            return Ok(B(member == target && requested.iter().any(|(_, admin)| !admin)));
+        }
         for (p, admin) in requested {
             let index = if admin {3} else {match p.as_str() {"MEMBER"=>0,"USAGE"=>1,_=>2}};
             let names = rt.snapshot.roles.iter().find(|r| i64::from(r.oid) == member)
@@ -108,7 +117,7 @@ pub(super) fn evaluate(rt: &mut Runtime<'_>, name: &str, values: &[Value], effec
         let relation = &rt.catalogs[catalog];
         rt.charge(relation.rows.len())?;
         let Some(row) = relation.rows.iter().find(|r| &r[0] == lookup || &r[1] == lookup).cloned() else {
-            return if matches!(object,S(_)) { Err(Error::Inquiry(missing)) } else { Ok(N) };
+            return if matches!(object,S(_)) { Err(Error::Inquiry(missing)) } else { Ok(if superuser { B(true) } else { N }) };
         };
         let owner = relation.fields.iter().position(|f| f.name == owner_field).and_then(|i| if let I(o)=row[i] {Some(o)} else {None});
         let owns = superuser || match owner {Some(o)=>inherited(rt,member,o)?,None=>false};
@@ -152,10 +161,10 @@ pub(super) fn evaluate(rt: &mut Runtime<'_>, name: &str, values: &[Value], effec
             }
             return Ok(B(false));
         }
-        if let S(n) = object { regclass_oid(n,rt.snapshot).map_err(|_| Error::UnknownRelation(n.clone()))?; return Err(Error::Inquiry("42809")); }
+        if let S(n) = object { relation_oid(n,rt.snapshot)?; return Err(Error::Inquiry("42809")); }
         return if rt.catalogs["pg_class"].rows.iter().any(|r| &r[0]==object) { Err(Error::Inquiry("42809")) } else { Ok(N) };
     }
-    let oid = match object { S(n)=>i64::from(regclass_oid(n,rt.snapshot).map_err(|e| if n.split('.').count()>2 && !n.contains('"') {e} else {Error::UnknownRelation(n.clone())})?), I(oid)=>*oid, _=>return Err(Error::Type) };
+    let oid = match object { S(n)=>i64::from(relation_oid(n,rt.snapshot)?), I(oid)=>*oid, _=>return Err(Error::Type) };
     let relation = &rt.catalogs["pg_class"];
     rt.charge(relation.rows.len())?;
     let Some(row) = relation.rows.iter().find(|r| r[0] == I(oid)).cloned() else { return Ok(N); };
@@ -190,4 +199,14 @@ fn object_name(parser: &mut Parser<'_>) -> R<Vec<String>> {
     let name = parser.parse_object_name(false).map_err(|_| Error::Syntax)?;
     if parser.peek_token().token != Token::EOF {return Err(Error::Syntax);}
     Ok(object(&name))
+}
+
+fn relation_oid(name: &str, snapshot: &CatalogSnapshot) -> R<u32> {
+    let mut parser = Parser::new(&PostgreSqlDialect {}).with_recursion_limit(64)
+        .try_with_sql(name).map_err(|_| Error::Syntax)?;
+    let parts = object_name(&mut parser)?;
+    if let [schema, _] = parts.as_slice()
+        && !matches!(schema.as_str(), "public" | "pg_catalog" | "information_schema")
+        && !snapshot.schemas.contains_key(schema) { return Err(Error::Inquiry("3F000")); }
+    regclass_oid(name, snapshot).map_err(|e| if parts.len() > 2 { e } else { Error::UnknownRelation(name.into()) })
 }

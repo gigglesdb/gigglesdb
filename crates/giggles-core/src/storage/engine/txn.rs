@@ -9,6 +9,7 @@ use super::{
     once_guard::{CommitGuard, GuardRejection},
     ssi_validate::{ValidationConfig, Validator},
 };
+pub(crate) type PrivilegeWrites = BTreeMap<(Keyspace, Vec<u8>), Option<Vec<u8>>>;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Bound,
@@ -445,7 +446,7 @@ pub(crate) struct Transaction {
     snapshot_error: Option<TxnError>,
     /// Fresh cluster catalog validation timestamp, reused within one statement.
     catalog_check_ts: Option<Ts>,
-    writes: BTreeMap<(Keyspace, Vec<u8>), Option<Vec<u8>>>,
+    writes: Arc<PrivilegeWrites>,
     catalog_generation: u64,
     features_or: u64,
     minimum_subversion: u32,
@@ -499,7 +500,7 @@ impl Transaction {
             snapshot: None,
             snapshot_error: None,
             catalog_check_ts: None,
-            writes: BTreeMap::new(),
+            writes: Arc::new(BTreeMap::new()),
             features_or: 0,
             minimum_subversion: 0,
             catalog_generation: 0,
@@ -599,10 +600,10 @@ impl Transaction {
             }
             match undo.previous {
                 Some(value) => {
-                    self.writes.insert(undo.key, value);
+                    Arc::make_mut(&mut self.writes).insert(undo.key, value);
                 }
                 None => {
-                    self.writes.remove(&undo.key);
+                    Arc::make_mut(&mut self.writes).remove(&undo.key);
                 }
             }
             self.write_bytes = undo.write_bytes;
@@ -869,6 +870,7 @@ impl Transaction {
         };
         Ok(mvcc::latest_version(seq.kv(), Keyspace::Kernel, key)?.and_then(|(_, value)| value))
     }
+    pub(crate) fn privilege_writes(&self) -> Arc<PrivilegeWrites> { self.writes.clone() }
     pub(crate) fn catalog_writes(&self) -> impl Iterator<Item = (&Vec<u8>, &Option<Vec<u8>>)> {
         // Metadata reads must not walk the growing row/index overlay during COPY.
         self.writes
@@ -1241,9 +1243,9 @@ impl Transaction {
             cached.current = None;
         }
         if undo_size == 0 {
-            self.writes.insert(write_key, value);
+            Arc::make_mut(&mut self.writes).insert(write_key, value);
         } else {
-            let previous = self.writes.insert(write_key.clone(), value);
+            let previous = Arc::make_mut(&mut self.writes).insert(write_key.clone(), value);
             self.undo.push(UndoWrite {
                 key: write_key,
                 previous,
@@ -1418,7 +1420,7 @@ impl Transaction {
                     reads: (self.isolation == Isolation::Serializable)
                         .then(|| std::mem::take(&mut self.reads)),
                     validation: self.validation_config.clone(),
-                    writes: std::mem::take(&mut self.writes),
+                    writes: Arc::unwrap_or_clone(std::mem::take(&mut self.writes)),
                     features_or: self.features_or,
                     raw: std::mem::take(&mut self.raw),
                 },
@@ -1436,7 +1438,7 @@ impl Transaction {
         // Drop releases locks and unregisters the snapshot on success or error.
         let request = CommitRequest {
             snapshot,
-            writes: std::mem::take(&mut self.writes),
+            writes: Arc::unwrap_or_clone(std::mem::take(&mut self.writes)),
             features_or: self.features_or,
             minimum_subversion: self.minimum_subversion,
             raw: std::mem::take(&mut self.raw),

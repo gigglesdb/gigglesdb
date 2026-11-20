@@ -376,3 +376,6 @@ mod row_locks_network;
 mod role_membership_network;
 #[path = "durable_release.rs"]
 mod durable_release;
+
+#[path = "w1e_task_privileges.rs"]
+mod w1e_task_privileges;

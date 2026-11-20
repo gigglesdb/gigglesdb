@@ -72,6 +72,11 @@ pub(super) const CAST_TYPMOD: &str = "\0cast:typmod";
 const UNDEFINED_ROUTINE_PREFIX: &str = "public.\0";
 const PG_TOAST_ROUTINE_PREFIX: &str = "pg_toast.\0";
 const INVALID_SCHEMA_ROUTINE_PREFIX: &str = "schema.\0";
+fn privilege_name(name: &str) -> bool {
+    matches!(name, "pg_has_role" | "has_table_privilege" | "has_schema_privilege"
+        | "has_column_privilege" | "has_any_column_privilege" | "has_database_privilege"
+        | "has_sequence_privilege" | "has_type_privilege")
+}
 fn deferred_routine_error(name: &str) -> Option<SqlError> {
     if name.starts_with(UNDEFINED_ROUTINE_PREFIX) || name.starts_with(PG_TOAST_ROUTINE_PREFIX) {
         Some(SqlError::UndefinedFunction)
@@ -145,6 +150,11 @@ enum Node {
         Option<crate::relational::clock::ExecutionClock>,
     ),
     Sequence(
+        String,
+        Vec<BoundScalar>,
+        Option<crate::relational::clock::ExecutionClock>,
+    ),
+    Privilege(
         String,
         Vec<BoundScalar>,
         Option<crate::relational::clock::ExecutionClock>,
@@ -843,6 +853,7 @@ impl Scalar {
                 if name == "trim" && !qualified_call && !quoted {
                     return Self::parse_trim_construct(p, depth, aggregate_argument);
                 }
+                p.privilege_seen |= privilege_name(&name);
                 let mut args = vec![];
                 if name == "extract" && !qualified_call && !quoted {
                     let field = match p.tokens.get(p.at).cloned() {
@@ -872,6 +883,8 @@ impl Scalar {
                         {
                             return Err(SqlError::Syntax);
                         }
+                        let previous_casts = p.privilege_casts;
+                        p.privilege_casts = privilege_name(&name);
                         // regclass is an object reference only in the first sequence
                         // argument. Lower its literal spelling without adding a wire type.
                         if args.is_empty()
@@ -898,6 +911,7 @@ impl Scalar {
                                 },
                             );
                         }
+                        p.privilege_casts = previous_casts;
                         if !qualified_call
                             && !quoted
                             && name == "overlay"
@@ -1269,6 +1283,33 @@ impl Scalar {
                         i32::try_from(*modifier).map_err(|_| SqlError::Type)?,
                     ),
                 });
+            }
+            Self::Call(name, args) if matches!(name.as_str(), "\0inquiry_oid" | "\0inquiry_name") => {
+                let value = args[0].bind(resolve, tables, parameters)?;
+                return Ok(BoundScalar {
+                    ty: if name == "\0inquiry_oid" { DataType::BigInt } else { DataType::Text },
+                    node: Node::Privilege(name.clone(), vec![value], None),
+                });
+            }
+            Self::Call(name, args) if privilege_name(name) => {
+                let arity = if name == "has_column_privilege" { 3 } else { 2 };
+                if args.len() != arity && args.len() != arity + 1 {
+                    return Err(SqlError::UndefinedFunction);
+                }
+                let bound = args.iter().enumerate().map(|(position, arg)| {
+                    let value = arg.bind(resolve, tables, parameters)?;
+                    if !matches!(value.ty, DataType::Text | DataType::Varchar | DataType::Bpchar
+                        | DataType::SmallInt | DataType::Integer | DataType::BigInt) {
+                        return Err(SqlError::UndefinedFunction);
+                    }
+                    if position + 1 == args.len() && !matches!(value.ty,
+                        DataType::Text | DataType::Varchar | DataType::Bpchar) {
+                        return Err(SqlError::UndefinedFunction);
+                    }
+                    Ok(value)
+                }).collect::<R<Vec<_>>>()?;
+                return Ok(BoundScalar { ty: DataType::Boolean,
+                    node: Node::Privilege(name.clone(), bound, None) });
             }
             Self::Call(name, args) if deferred_routine_error(name).is_some() => {
                 uuid_ossp::missing_diagnostic(name, args, resolve, tables, parameters)?;
@@ -1887,6 +1928,7 @@ impl BoundScalar {
             }
             Node::Clock(_, _, target) => *target = clock.cloned(),
             Node::Sequence(_, args, target)
+            | Node::Privilege(_, args, target)
             | Node::Xact(_, args, target)
             | Node::ZonedOperator(_, args, target) => {
                 *target = clock.cloned();
@@ -1931,6 +1973,7 @@ impl BoundScalar {
             | Node::Call(name, _)
             | Node::Clock(name, ..)
             | Node::Sequence(name, ..)
+            | Node::Privilege(name, ..)
             | Node::Xact(name, ..) => Some(name),
             Node::Cast(a) | Node::SessionCast(a, _) | Node::TypmodCast(a, _) => a.strong_name(),
             _ => None,
@@ -1982,7 +2025,7 @@ impl BoundScalar {
             Node::Call(n, args) if collation::internal(n) || aggregate_order::internal(n) || n == "\0array_subscript" => args[0].name(),
             Node::Call(n, _) if n.starts_with("\0json_") => "?column?",
             Node::Call(n, _) if arithmetic::internal_name(n) => "?column?",
-            Node::Call(n, _) | Node::Clock(n, ..) | Node::Sequence(n, ..) | Node::Xact(n, ..) => n,
+            Node::Call(n, _) | Node::Clock(n, ..) | Node::Sequence(n, ..) | Node::Xact(n, ..) | Node::Privilege(n, ..) => n,
         }
     }
     pub(super) fn aggregate_order_parts(&self) -> Option<(&str, &[BoundScalar])> {
@@ -2048,6 +2091,14 @@ impl BoundScalar {
                 });
                 charge(budget, &value)?;
                 Ok(value)
+            }
+            Node::Privilege(name, args, clock) => {
+                if matches!(name.as_str(), "\0inquiry_oid" | "\0inquiry_name") {
+                    return cast::inquiry(args[0].eval(row, params, budget)?, &args[0].ty, name, budget);
+                }
+                let args = args.iter().map(|arg| arg.eval(row, params, budget)).collect::<R<Vec<_>>>()?;
+                if args.contains(&Value::Null) { return Ok(Value::Null); }
+                clock.as_ref().ok_or(SqlError::Unsupported)?.privilege(name, &args)
             }
             Node::Xact(name, args, clock) => {
                 let arg = match args.first() {
@@ -2905,6 +2956,9 @@ impl Scalar {
                 uuid_ossp::missing_diagnostic(n, args, resolve, tables, parameters)?;
                 return Err(deferred_routine_error(n).unwrap());
             }
+            Self::Call(n, args) if privilege_name(n) => {
+                for arg in args { arg.infer(Some(&DataType::Text), parameters, resolve, tables)?; }
+            }
             Self::Call(n, args) if n == "pg_xact_status" => {
                 for arg in args {
                     arg.infer(Some(&DataType::BigInt), parameters, resolve, tables)?;
@@ -3515,5 +3569,13 @@ mod budget_tests {
         for _ in 0..8 { reserve(&mut used, MAX_RESULT_BYTES).unwrap(); }
         assert!(matches!(reserve(&mut used, 1), Err(SqlError::Limit)));
         assert!(matches!(reserve(&mut 0, 2 * MAX_RESULT_BYTES + 1), Err(SqlError::Limit)));
+    }
+}
+
+impl Scalar {
+    pub(in crate::relational) fn has_privilege_inquiry(&self) -> bool {
+        let mut found = false;
+        let _ = walk_scalar(self, &mut |s| { found |= matches!(s, Scalar::Call(name, _) if privilege_name(name)); Ok(()) });
+        found
     }
 }

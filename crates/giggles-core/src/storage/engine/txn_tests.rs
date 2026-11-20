@@ -1528,7 +1528,7 @@ fn commit_with_observed_validator(
         minimum_subversion: 0,
         raw: Vec::new(),
         snapshot,
-        writes: std::mem::take(&mut t.writes),
+        writes: Arc::unwrap_or_clone(std::mem::take(&mut t.writes)),
         validation: Some(Box::new(move |log, kv, snapshot, _| {
             check.validate(log, kv, snapshot)
         })),

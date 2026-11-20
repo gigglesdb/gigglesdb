@@ -387,7 +387,7 @@ fn prepared_parameters_and_null_ordering() {
 fn cancellation_and_retention_are_statement_scoped() {
     let mut cancel = || true;
     let state = Relational::default();
-    let mut p = Parser {
+    let mut p = Parser { privilege_seen: false, privilege_casts: false,
         tokens: lex("VALUES(1) UNION SELECT 2").unwrap(),
         at: 0,
         params: BTreeSet::new(),

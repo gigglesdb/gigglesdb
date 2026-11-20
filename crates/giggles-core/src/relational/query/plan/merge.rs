@@ -1594,3 +1594,9 @@ mod tests {
         assert_eq!(run(&mut b, "UPDATE m SET a=0 WHERE id=1").affected, 1);
     }
 }
+
+impl Merge {
+    pub(super) fn has_privilege_inquiry(&self) -> bool {
+        self.input.has_privilege_inquiry() || self.plans().any(Plan::has_privilege_inquiry)
+    }
+}

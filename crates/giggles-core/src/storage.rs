@@ -135,6 +135,8 @@ pub enum CoreError {
     Sql(relational::SqlError),
     /// Schema DDL error outside the frozen, persisted scalar-error enum.
     DuplicateSchema,
+    /// Execution-only privilege inquiry error; never persisted.
+    PrivilegeInquiry(&'static str),
     /// Task-session error (GD-0061). Never stored in `SqlError`, which is persisted.
     Task(crate::task::TaskError),
     /// A query temp (spill) file failed: 53100 when the device is full, else 58030.
@@ -2129,6 +2131,7 @@ pub(crate) type XactSlot = Arc<Mutex<Option<engine::xact::XactGuard>>>;
 /// Trusted session only. Dropping a session discards its staged transaction.
 /// No lock or admission ticket lives across client calls.
 pub struct SqlSession {
+    privilege_callback: Option<PrivilegeCallback>,
     admin: Admin,
     staged: Option<State>,
     v2_transaction: Option<engine::txn::Transaction>,
@@ -2182,6 +2185,7 @@ struct UnnamedPlanKey {
 impl Admin {
     pub fn sql_session(&self) -> SqlSession {
         SqlSession {
+            privilege_callback: None,
             admin: self.clone(),
             staged: None,
             v2_transaction: None,
@@ -2283,6 +2287,82 @@ pub struct CatalogMetadata {
     pub typmods: BTreeMap<u64, i32>,
     pub indexes: Vec<IndexInfo>,
 }
+fn catalog_metadata_from(s: &MetadataState<'_>, path: &[String], generation: u64) -> Result<CatalogMetadata, CoreError> {
+
+            let presentation = s.sql.catalog_presentation_in_path(path).map_err(CoreError::Sql)?;
+            let tables = s.sql.tables.values().cloned().chain(presentation.views.values().map(|v| v.table.clone())).collect();
+            Ok(CatalogMetadata {
+                presentation, tables,
+                sequences: s.sql.catalog_ext().sequences.iter().map(|(id,d)| Ok((relational::type_oid(*id).map_err(CoreError::Sql)?,d.name.clone()))).collect::<Result<_,CoreError>>()?,
+                schemas: s.sql.schema_metadata(), types: s.sql.user_type_catalog(),
+                collation_oids:s.sql.collation_oids().map_err(CoreError::Sql)?,
+                collations: s.sql.catalog_ext().collations.iter().map(|(id,c)| Ok((relational::type_oid(*id).map_err(CoreError::Sql)?,c.clone()))).collect::<Result<_,CoreError>>()?,
+                generation,
+                typmods: s.sql.catalog_ext().columns.iter().filter_map(|(&id, c)| c.typmod.map(|m| (id, m)))
+                    .chain(s.sql.views.into_iter().flatten().flat_map(|(_, v)| v.columns.iter().map(|c| (c.id, c.typmod)))).collect(),
+                indexes: s.sql.secondary_descriptors_engine().iter().map(|d| IndexInfo {
+                    id: d.id, table: d.table, name: relational::split_key(&d.name).1.into(),
+                    columns: d.columns.clone(), unique: d.unique,
+                }).collect(),
+            })
+    }
+
+/// Owned execution metadata. Projection is deferred until the first inquiry.
+pub struct PrivilegeMetadata {
+    image: PrivilegeImage,
+    path: Vec<String>,
+    ownership: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    generation: u64,
+}
+impl PrivilegeMetadata {
+    pub fn search_path(&self) -> &[String] { &self.path }
+    pub(crate) fn set_search_path(&mut self, path: Vec<String>) { self.path = path; }
+    pub fn catalog(&self) -> Result<CatalogMetadata, CoreError> {
+        let image = self.image.get();
+        catalog_metadata_from(&MetadataState::new(image, image.epoch, 0), &self.path, self.generation)
+    }
+    pub fn table_owner(&self, registry: &roles::RoleCatalog, name: &str) -> Result<Option<String>, CoreError> {
+        let key = roles::engine::encode_key(&[b"owner/".as_slice(), name.as_bytes()].concat())?;
+        if let Some(value) = self.ownership.get(&key) {
+            return value.as_ref().map(|v| String::from_utf8(v[1..].to_vec())
+                .map_err(|e| CoreError::Corrupt(e.to_string()))).transpose();
+        }
+        registry.table_owner(name).map_err(|_| CoreError::Fenced)
+    }
+}
+/// One statement's privilege evaluator, installed only after authorization.
+pub type PrivilegeCallback = Arc<dyn Fn(&str, &[relational::Value], &PrivilegeMetadata)
+    -> Result<Option<bool>, CoreError> + Send + Sync>;
+impl SqlSession {
+    pub fn with_privilege_callback<T>(&mut self, callback: PrivilegeCallback,
+        execute: impl FnOnce(&mut Self) -> T) -> T {
+        let previous = self.privilege_callback.replace(callback);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(self)));
+        self.privilege_callback = previous;
+        match result { Ok(result) => result, Err(panic) => std::panic::resume_unwind(panic) }
+    }
+}
+enum PrivilegeImage { Legacy(Arc<State>), Catalog(Arc<relational::Relational>) }
+impl PrivilegeImage {
+    fn get(&self) -> &relational::Relational { match self { Self::Legacy(s) => &s.sql, Self::Catalog(s) => s } }
+}
+#[cfg(test)]
+thread_local! { static PRIVILEGE_CAPTURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+pub(crate) type PrivilegeProvider = Arc<dyn Fn() -> PrivilegeMetadata + Send + Sync>;
+fn privilege_provider(image: PrivilegeImage, path: Vec<String>, txn: Option<&engine::txn::Transaction>, v2: bool) -> PrivilegeProvider {
+    let writes = txn.map(|txn| txn.privilege_writes());
+    Arc::new(move || {
+        #[cfg(test)]
+        PRIVILEGE_CAPTURES.set(PRIVILEGE_CAPTURES.get() + 1);
+        let generation = if v2 { catalog_xid_from_hlc(image.get().epoch) } else { image.get().generation };
+        PrivilegeMetadata { image: match &image { PrivilegeImage::Legacy(s) => PrivilegeImage::Legacy(s.clone()),
+            PrivilegeImage::Catalog(s) => PrivilegeImage::Catalog(s.clone()) }, path: path.clone(), generation,
+            ownership: writes.iter().flat_map(|writes| writes.iter())
+                .filter(|((space,key),_)| *space == engine::kv::Keyspace::Catalog && key.first() == Some(&10))
+                .map(|((_,key),value)| (key.clone(),value.clone())).collect() }
+    })
+}
+
 /// One conversion point for the V2 catalog xid (physical milliseconds -> seconds).
 fn catalog_xid_from_hlc(epoch: u64) -> u64 {
     (epoch >> 16) / 1000
@@ -2332,24 +2412,9 @@ impl SqlSession {
     /// Coherent catalog metadata, including V2 transaction-private DDL.
     pub fn catalog_metadata(&self) -> Result<CatalogMetadata, CoreError> {
         let read = |s: &MetadataState<'_>| {
-            let presentation = s.sql.catalog_presentation_in_path(&self.search_path).map_err(CoreError::Sql)?;
-            let tables = s.sql.tables.values().cloned().chain(presentation.views.values().map(|v| v.table.clone())).collect();
-            Ok(CatalogMetadata {
-                presentation, tables,
-                sequences: s.sql.catalog_ext().sequences.iter().map(|(id,d)| Ok((relational::type_oid(*id).map_err(CoreError::Sql)?,d.name.clone()))).collect::<Result<_,CoreError>>()?,
-                schemas: s.sql.schema_metadata(), types: s.sql.user_type_catalog(),
-                collation_oids:s.sql.collation_oids().map_err(CoreError::Sql)?,
-                collations: s.sql.catalog_ext().collations.iter().map(|(id,c)| Ok((relational::type_oid(*id).map_err(CoreError::Sql)?,c.clone()))).collect::<Result<_,CoreError>>()?,
-                generation: match &self.admin.inner.backend {
-                    Backend::Legacy(_) => s.sql.generation,
-                    Backend::V2(_) => catalog_xid_from_hlc(s.sql.epoch),
-                },
-                typmods: s.sql.catalog_ext().columns.iter().filter_map(|(&id, c)| c.typmod.map(|m| (id, m)))
-                    .chain(s.sql.views.into_iter().flatten().flat_map(|(_, v)| v.columns.iter().map(|c| (c.id, c.typmod)))).collect(),
-                indexes: s.sql.secondary_descriptors_engine().iter().map(|d| IndexInfo {
-                    id: d.id, table: d.table, name: relational::split_key(&d.name).1.into(),
-                    columns: d.columns.clone(), unique: d.unique,
-                }).collect(),
+            catalog_metadata_from(s, &self.search_path, match &self.admin.inner.backend {
+                Backend::Legacy(_) => s.sql.generation,
+                Backend::V2(_) => catalog_xid_from_hlc(s.sql.epoch),
             })
         };
         // Legacy wire catalogs retain their established committed-only behavior.
@@ -3479,7 +3544,7 @@ impl SqlSession {
             state.sql.catalog_ext().sequences.iter().map(|(&id, d)| (id, d.incarnation)).collect()
         };
         let callback = self.admin.inner.sequence_callback(
-            state.clone(), baseline, self.pending_sequences.clone(),
+            Arc::new(state.clone()), baseline, self.pending_sequences.clone(),
             self.sequence_values.clone(), self.sequence_tables.clone(), self.search_path.clone(),
         );
         Ok((Arc::new(state.sql), callback))
@@ -3965,7 +4030,7 @@ impl SqlSession {
             let context = relational::clock::ExecutionClock::new(clock)
                 .with_extra_float_digits(self.extra_float_digits)
                 .with_sequences(self.admin.inner.sequence_callback(
-                    state.clone(),
+                    Arc::new(state.clone()),
                     baseline,
                     self.pending_sequences.clone(),
                     self.sequence_values.clone(),
@@ -4698,14 +4763,15 @@ impl SqlSession {
                 .collect()
         };
         let context = clock.map(|clock| {
-            clock.with_sequences(self.admin.inner.sequence_callback(
-                s.clone(),
-                baseline,
-                self.pending_sequences.clone(),
-                self.sequence_values.clone(),
-                self.sequence_tables.clone(),
-                self.search_path.clone(),
-            ))
+            let snapshot = Arc::new(s.clone());
+            let context = clock.with_sequences(self.admin.inner.sequence_callback(
+                snapshot.clone(), baseline, self.pending_sequences.clone(),
+                self.sequence_values.clone(), self.sequence_tables.clone(), self.search_path.clone()));
+            match self.privilege_callback.as_ref().filter(|_| p.has_privilege_inquiry()) {
+                Some(callback) => context.with_privileges(callback.clone(), privilege_provider(
+                    PrivilegeImage::Legacy(snapshot), self.search_path.clone(), None, false)),
+                None => context,
+            }
         });
         let clock = context.as_ref();
         let sequence_before = if p.is_sequence_ddl() || p.truncate_restarts_identity() {
@@ -6164,3 +6230,28 @@ mod column_collation_format_tests;
 
 #[cfg(all(test, feature = "engine-rocksdb"))]
 mod native_many_tests;
+
+#[cfg(test)]
+mod w1e_laziness {
+    use super::*;
+    #[test]
+    fn no_inquiry_and_null_only_capture_nothing() {
+        for engine in [crate::Engine::Legacy, #[cfg(feature = "engine-rocksdb")] crate::Engine::V2] {
+        let path = std::path::PathBuf::from(std::env::var_os("TEMP").unwrap()).join(format!("w1e-lazy-{engine:?}-{}", std::process::id()));
+        let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
+        let mut session = admin.sql_session();
+        session.execute("CREATE TABLE t(id INT PRIMARY KEY)", &[], None).unwrap();
+        session.execute("INSERT INTO t VALUES (1),(2)", &[], None).unwrap();
+        let clock = relational::StatementClock { unavailable: None, transaction_us: 0, statement_us: 0, zone: None, wall: None };
+        for sql in ["SELECT id FROM t", "SELECT pg_has_role(NULL,'MEMBER') FROM t"] {
+            let before = PRIVILEGE_CAPTURES.get();
+            session.with_privilege_callback(Arc::new(|_,_,_| Ok(Some(true))), |s| s.execute_at(sql, &[], None, &clock)).unwrap();
+            assert_eq!(PRIVILEGE_CAPTURES.get(), before, "{sql}");
+        }
+        let before = PRIVILEGE_CAPTURES.get();
+        session.with_privilege_callback(Arc::new(|_,_,_| Ok(Some(true))), |s| s.execute_at("SELECT pg_has_role('giggles','MEMBER') FROM t", &[], None, &clock)).unwrap();
+        assert_eq!(PRIVILEGE_CAPTURES.get(), before + 1);
+        drop(session); drop(admin); std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+}

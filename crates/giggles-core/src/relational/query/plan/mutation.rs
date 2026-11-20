@@ -1254,3 +1254,13 @@ mod tests {
         assert_eq!(run(&mut b, "UPDATE m SET a=0 WHERE id=1").affected, 1);
     }
 }
+
+impl Mutation {
+    pub(super) fn has_privilege_inquiry(&self) -> bool {
+        let mut found = false;
+        self.from.visit_queries(&mut |q| found |= q.has_privilege_inquiry());
+        self.from.visit_scalars(&mut |s| found |= s.has_privilege_inquiry());
+        found || self.groups.iter().filter_map(|(_,p)| p.as_ref()).chain(Some(&self.predicate))
+            .chain(self.returning.as_ref()).any(Plan::has_privilege_inquiry)
+    }
+}

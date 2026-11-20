@@ -41,6 +41,16 @@ enum Data {
 fn row_size(row: &SqlRow) -> usize {
     row.values.iter().map(relational::value_bytes).sum()
 }
+impl SqlSession {
+    /// Fetch with the current owned path while retaining the cursor's catalog and identity.
+    pub fn fetch_cursor_unreleased(&self, cursor: &mut Cursor, max_rows: usize, max_bytes: usize)
+        -> Result<crate::task::release::Unreleased<Vec<SqlRow>>, CoreError> {
+        if let Some(clock) = &cursor.clock {
+            clock.set_privilege_search_path(&self.search_path);
+        }
+        cursor.fetch_unreleased(max_rows, max_bytes)
+    }
+}
 impl Cursor {
     /// Fetch a bounded chunk. V2 admits one oversized row alone; legacy retains
     /// its hard page limit. Zero budgets are rejected. Exhaustion is sticky.
@@ -410,7 +420,7 @@ impl SqlSession {
                     };
                     let context = context.map(|c| {
                         c.with_sequences(self.admin.inner.sequence_callback(
-                            s.clone(),
+                            Arc::new(s.clone()),
                             baseline,
                             self.pending_sequences.clone(),
                             self.sequence_values.clone(),
@@ -421,6 +431,12 @@ impl SqlSession {
                     (Arc::new(s.sql), None, context, None)
                 }
             };
+            let context = context.map(|clock| match self.privilege_callback.as_ref().filter(|_| p.has_privilege_inquiry()) {
+                Some(callback) => clock.with_privileges(callback.clone(), privilege_provider(
+                    PrivilegeImage::Catalog(image.clone()), self.search_path.clone(), self.v2_transaction.as_ref(),
+                    matches!(self.admin.inner.backend, Backend::V2(_)))),
+                None => clock,
+            });
             match Plan::new(&image, &p, params, context.clone()).map_err(CoreError::Sql)? {
                 Some(plan) => Ok(Cursor {
                     data: Data::Scan {

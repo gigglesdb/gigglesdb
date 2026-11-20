@@ -3,7 +3,7 @@ use super::*;
 pub(super) type ParseResult<T> = Result<T, ParseError>;
 
 pub(super) fn parser(tokens: &[Token]) -> Parser {
-    Parser {
+    Parser { privilege_seen: false, privilege_casts: false,
         tokens: tokens.to_vec(),
         at: 0,
         params: BTreeSet::new(),

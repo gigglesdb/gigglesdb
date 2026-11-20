@@ -1511,7 +1511,7 @@ mod tests {
         state
     }
     fn query(sql: &str) -> Query {
-        Query::parse(&mut Parser {
+        Query::parse(&mut Parser { privilege_seen: false, privilege_casts: false,
             tokens: lex(sql).unwrap(),
             at: 0,
             params: BTreeSet::new(),
