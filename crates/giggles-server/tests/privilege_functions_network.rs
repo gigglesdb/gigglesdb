@@ -223,3 +223,106 @@ async fn simple_real_grants_and_revoke() {
 async fn extended_real_grants_and_revoke() {
     privileges(Protocol::Extended).await;
 }
+
+// GD-0079 follow-up: privilege inquiries must also bind on application rows.
+#[tokio::test]
+async fn application_rows_privilege_inquiries() {
+    let f = Fixture::new().await;
+    let owner = f.connect("owner", "owner-pw").await;
+    for sql in [
+        "CREATE ROLE inquiry_group",
+        "CREATE ROLE inquiry_member IN ROLE inquiry_group",
+        "CREATE TABLE inquiry_rows (id INTEGER PRIMARY KEY, who TEXT)",
+        "INSERT INTO inquiry_rows VALUES (1,'inquiry_member')",
+    ] {
+        Protocol::Simple.ok(&owner, sql).await;
+    }
+    let rows = owner.query("SELECT id, pg_has_role(who,'inquiry_group','MEMBER') FROM inquiry_rows", &[])
+        .await.expect("privilege inquiry on application rows");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].get::<_, bool>(1));
+    drop(owner);
+    f.finish().await;
+}
+
+// PG18.6: rolesfu2/w1b-unknown-oid-oracle.sql. A missing role OID is
+// still usable for identity comparisons and PUBLIC ACLs; a missing object
+// OID instead yields NULL. Keep an application relation in this query.
+#[tokio::test]
+async fn application_rows_privilege_unknown_oids() {
+    let f = Fixture::new().await;
+    let owner = f.connect("owner", "owner-pw").await;
+    Protocol::Simple.ok(&owner, "CREATE TABLE inquiry_oid_rows (id INTEGER PRIMARY KEY)").await;
+    Protocol::Simple.ok(&owner, "INSERT INTO inquiry_oid_rows VALUES (1)").await;
+    let rows = owner.query(
+        "SELECT pg_has_role(4294967294::oid,4294967294::oid,'MEMBER'), \
+         pg_has_role(4294967294::oid,'owner'::name,'MEMBER'), \
+         pg_has_role('owner'::name,4294967294::oid,'MEMBER'), \
+         has_table_privilege(4294967294::oid,'pg_class','SELECT'), \
+         has_table_privilege('owner'::name,4294967294::oid,'SELECT') \
+         FROM inquiry_oid_rows", &[],
+    ).await.expect("function-specific unknown OID behavior on application rows");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].get::<_, bool>(0));
+    assert!(!rows[0].get::<_, bool>(1));
+    assert!(rows[0].get::<_, bool>(2));
+    assert!(rows[0].get::<_, bool>(3));
+    assert_eq!(rows[0].get::<_, Option<bool>>(4), None);
+    drop(owner);
+    f.finish().await;
+}
+
+// Describe must bind the return type without evaluating a privilege inquiry
+// or needing execution identity. oracle-b.out establishes the boolean type.
+#[tokio::test]
+async fn application_rows_privilege_describe() {
+    let f = Fixture::new().await;
+    let owner = f.connect("owner", "owner-pw").await;
+    Protocol::Simple.ok(&owner, "CREATE TABLE inquiry_describe_rows (id INTEGER PRIMARY KEY)").await;
+    let statement = owner.prepare(
+        "SELECT pg_has_role('owner','owner','MEMBER'), \
+         has_table_privilege('inquiry_describe_rows','SELECT'), \
+         has_schema_privilege('public','USAGE'), \
+         has_column_privilege('inquiry_describe_rows','id','SELECT'), \
+         has_any_column_privilege('inquiry_describe_rows','SELECT'), \
+         has_database_privilege(current_database(),'CONNECT') \
+         FROM inquiry_describe_rows",
+    ).await.expect("Describe privilege inquiries without evaluation");
+    assert_eq!(statement.columns().len(), 6);
+    for column in statement.columns() {
+        assert_eq!(column.type_(), &tokio_postgres::types::Type::BOOL);
+    }
+    drop(owner);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn catalog_inquiry_group_schema_database_sequence() {
+    let f = Fixture::new().await;
+    let owner = f.connect("owner", "owner-pw").await;
+    let p = Protocol::Extended;
+    for sql in ["CREATE ROLE w1c_g", "CREATE ROLE w1c_u IN ROLE w1c_g",
+        "CREATE TABLE w1c_t(id INTEGER)", "GRANT SELECT ON w1c_t TO w1c_g",
+        "CREATE SEQUENCE w1c_s"] {p.ok(&owner,sql).await;}
+    for expression in ["has_table_privilege('w1c_u','w1c_t','SELECT')",
+        "has_column_privilege('w1c_u','w1c_t','id','SELECT')",
+        "has_any_column_privilege('w1c_u','w1c_t','SELECT')",
+        "has_schema_privilege('w1c_u','public','USAGE')",
+        "has_database_privilege('w1c_u','postgres','CONNECT')",
+        "has_sequence_privilege('w1c_s','USAGE')",
+        "pg_has_role(4294967294::oid,4294967294::oid,'MEMBER')",
+        "has_table_privilege(4294967294::oid,'pg_class','SELECT')"] {
+        p.boolean(&owner,expression,true).await;
+    }
+    for (expression,code) in [
+        ("has_table_privilege('w1c_missing','w1c_t','SELECT')","42704"),
+        ("has_table_privilege('w1c_u','w1c_missing','SELECT')","42P01"),
+        ("has_sequence_privilege('w1c_t','USAGE')","42809"),
+        ("has_schema_privilege('w1c_u','public','BOGUS')","22023"),
+    ] {
+        let e = owner.query(&format!("SELECT {expression}"),&[]).await.unwrap_err();
+        assert_eq!(e.code().unwrap().code(),code,"{expression}");
+    }
+    drop(owner);
+    f.finish().await;
+}

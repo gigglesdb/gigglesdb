@@ -488,8 +488,10 @@ fn types_rejected_before_empty_execution() {
 }
 #[test]
 fn privileges_are_read_only_and_visibility_bounded() {
-    // PG18: owners and superusers hold every table privilege (GD-0077 E2e).
-    assert_eq!(run("SELECT has_table_privilege('inventory','SELECT'), has_table_privilege('inventory','UPDATE'), has_table_privilege('hidden','SELECT'), has_schema_privilege('public','USAGE'), has_schema_privilege('public','CREATE') FROM pg_database").rows,vec![vec![Value::Bool(true),Value::Bool(true),Value::Bool(false),Value::Bool(true),Value::Bool(false)]]);
+    // PG18.6 oracle-w1c.out: missing named objects error; superusers can CREATE.
+    let p = plan("SELECT has_table_privilege('hidden','SELECT') FROM pg_database").unwrap().unwrap();
+    assert_eq!(execute(&p,&snapshot(),&[]),Err(Error::UnknownRelation("hidden".into())));
+    assert_eq!(run("SELECT has_table_privilege('inventory','SELECT'), has_table_privilege('inventory','UPDATE'), has_schema_privilege('public','USAGE'), has_schema_privilege('public','CREATE') FROM pg_database").rows,vec![vec![Value::Bool(true),Value::Bool(true),Value::Bool(true),Value::Bool(true)]]);
 }
 #[test]
 fn bounds_parameter_nesting_and_intermediate_arrays() {

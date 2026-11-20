@@ -40,6 +40,7 @@ pub use engine::explain::{ExplainQuery, explain_query, explain_statement};
 /// Quote an identifier for PostgreSQL plan text using the catalog's rules.
 pub fn quote_explain_identifier(name: &str) -> String { catalog::quote_identifier(name) }
 mod engine;
+pub mod privilege_inquiry;
 pub use engine::{
     Plan, describe, execute, execute_with_startup, plan, plan_gateway, plan_gateway_with_relations,
 };
@@ -123,6 +124,7 @@ pub struct RoleDef {
 /// Privileges representable in a PostgreSQL table or column ACL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AclPrivilege {
+    Usage,
     Insert,
     Select,
     Update,
@@ -143,6 +145,7 @@ impl AclPrivilege {
             Self::References => 'x',
             Self::Trigger => 't',
             Self::Maintain => 'm',
+            Self::Usage => 'U',
         }
     }
 }
@@ -173,6 +176,9 @@ pub struct UserType {
 /// the host remains responsible for authentication, membership, and authorization.
 #[derive(Debug, Clone)]
 pub struct CatalogSnapshot {
+    pub sequences: Vec<SequenceDef>,
+    /// Direct role/schema CREATE and USAGE grants, projected by the host.
+    pub schema_privileges: std::collections::BTreeMap<(u32, String), [bool; 2]>,
     pub extensions: Vec<ExtensionDef>,
     /// Catalog xid: legacy publication counter or V2 physical HLC seconds.
     /// xmin exposes its low 32 bits; this is never a raw HLC timestamp.
@@ -238,6 +244,8 @@ impl CatalogSnapshot {
 impl Default for CatalogSnapshot {
     fn default() -> Self {
         Self {
+            sequences: Vec::new(),
+            schema_privileges: Default::default(),
             extensions: vec![ExtensionDef::plpgsql(), ExtensionDef::uuid_ossp()],
             generation: 0,
             views: Default::default(),
@@ -436,6 +444,8 @@ pub struct ResultSet {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
+    /// SQLSTATE for a privilege inquiry object lookup or kind error.
+    Inquiry(&'static str),
     Syntax,
     Unsupported,
     MixedRelations,
@@ -519,3 +529,7 @@ impl ExtensionDef {
             schema: None, requires: vec![], installed: None }
     }
 }
+
+/// In-memory sequence identity and owning role; no storage encoding is implied.
+#[derive(Debug, Clone)]
+pub struct SequenceDef { pub oid: u32, pub schema: String, pub name: String, pub owner: u32, pub acl: Option<Vec<AclEntry>> }

@@ -1,3 +1,4 @@
+mod privilege_inquiry;
 use crate::{catalog, *};
 mod flat_union;
 mod admission;
@@ -415,7 +416,9 @@ impl Visitor for Scan {
                 "pg_get_indexdef" | "pg_get_constraintdef" | "pg_get_expr"
                 | "pg_get_userbyid" | "format_type" | "obj_description" | "pg_collation_actual_version"
                 | "col_description" | "shobj_description" | "pg_get_viewdef"
-                | "pg_has_role" | "has_table_privilege" | "has_column_privilege"));
+                | "pg_has_role" | "has_table_privilege" | "has_column_privilege"
+                | "has_any_column_privilege" | "has_sequence_privilege"
+                | "has_schema_privilege" | "has_database_privilege" | "has_type_privilege"));
             self.role_privilege |= function(&f.name).is_ok_and(|n| n == "pg_has_role");
             self.introspection |= introspection;
             self.introspection_only &= introspection;
@@ -3466,7 +3469,9 @@ fn check_expr(e: &mut E) -> R<()> {
             "pg_get_userbyid" | "pg_table_is_visible" | "pg_type_is_visible" | "pg_collation_actual_version" => {
                 expect(&mut args[0], PgType::Oid)?
             }
-            "pg_has_role" | "has_table_privilege" | "has_column_privilege" => {
+            "pg_has_role" | "has_table_privilege" | "has_column_privilege"
+            | "has_any_column_privilege" | "has_sequence_privilege"
+            | "has_schema_privilege" | "has_database_privilege" | "has_type_privilege" => {
                 let last = args.len() - 1;
                 expect(&mut args[last], PgType::Text)?;
                 for arg in &mut args[..last] {
@@ -3476,9 +3481,6 @@ fn check_expr(e: &mut E) -> R<()> {
                     }
                 }
             }
-            "has_type_privilege"
-            | "has_schema_privilege"
-            | "has_database_privilege" => expect(&mut args[1], PgType::Text)?,
             "nullif" => {
                 let t = common_type(args.iter())?;
                 for x in args {
@@ -3548,12 +3550,12 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         ("nullif", 2) => a[0].ty,
         ("coalesce", n) if n > 0 => a[0].ty,
         ("pg_has_role", 2 | 3) => PgType::Bool,
-        ("has_table_privilege", 2 | 3) | ("has_column_privilege", 3 | 4) => PgType::Bool,
+        ("has_table_privilege" | "has_any_column_privilege" | "has_sequence_privilege", 2 | 3) | ("has_column_privilege", 3 | 4) => PgType::Bool,
         (
             "has_schema_privilege"
             | "has_type_privilege"
             | "has_database_privilege",
-            2,
+            2 | 3,
         )
         | ("pg_table_is_visible" | "pg_type_is_visible", 1) => PgType::Bool,
         _ => return Err(Error::Unsupported),
@@ -3712,6 +3714,14 @@ struct Runtime<'a> {
     parameters: &'a [Value],
     work: usize,
     recursive_rows: BTreeMap<String, Vec<Vec<Value>>>,
+}
+pub(crate) fn evaluate_privilege(name: &str, values: &[Value], effective_role: &str, snapshot: &CatalogSnapshot) -> R<Option<bool>> {
+    validate_values(values)?;
+    let catalogs = catalog::build(snapshot)?;
+    let mut rt = Runtime { snapshot, startup:None, catalogs:&catalogs, parameters:&[],work:0,recursive_rows:BTreeMap::new() };
+    match privilege_inquiry::evaluate(&mut rt,name,values,effective_role)? {
+        Value::Null=>Ok(None),Value::Bool(b)=>Ok(Some(b)),_=>Err(Error::Type),
+    }
 }
 fn admit(rows: &[Vec<Value>], row: &[Value], bytes: &mut usize) -> R<()> {
     let n = row.iter().map(Value::bytes).sum::<usize>();
@@ -4725,154 +4735,9 @@ impl Runtime<'_> {
         }
         Ok(value)
     }
-    fn acl_allows(&mut self, acl: Value, role: i64, requested: &[(String, bool)]) -> R<bool> {
-        let Value::Array(entries) = self.call("_aclexplode", vec![acl], None)? else {
-            return Err(Error::Type);
-        };
-        self.charge(entries.len().saturating_mul(requested.len()))?;
-        Ok(entries.iter().any(|entry| match entry {
-            Value::Record(row) => {
-                (row[1] == Value::Int(role) || row[1] == Value::Int(0))
-                    && requested.iter().any(|(name, grant)| {
-                        row[2] == Value::Text(name.clone())
-                            && (!grant || row[3] == Value::Bool(true))
-                    })
-            }
-            _ => false,
-        }))
-    }
     fn privilege_function(&mut self, name: &str, values: &[Value]) -> R<Value> {
-        use Value::{Bool as B, Int as I, Null as N, Text as S};
-        let column = name == "has_column_privilege";
-        let explicit_role = values.len() == if column { 4 } else { 3 };
-        let table_at = usize::from(explicit_role);
-        let privilege_list = text(values.last().unwrap().clone())?;
-        let mut requested = vec![];
-        for privilege in privilege_list.split(',') {
-            let normalized = privilege.trim().to_ascii_uppercase();
-            let (name, grant) = normalized
-                .strip_suffix(" WITH GRANT OPTION")
-                .map_or((normalized.as_str(), false), |n| (n.trim_end(), true));
-            let valid = if column {
-                matches!(name, "SELECT" | "INSERT" | "UPDATE" | "REFERENCES")
-            } else {
-                matches!(
-                    name,
-                    "SELECT"
-                        | "INSERT"
-                        | "UPDATE"
-                        | "DELETE"
-                        | "TRUNCATE"
-                        | "REFERENCES"
-                        | "TRIGGER"
-                        | "MAINTAIN"
-                )
-            };
-            if !valid {
-                return Err(Error::InvalidPrivilege(format!(
-                    "unrecognized privilege type: \"{}\"",
-                    privilege.trim()
-                )));
-            }
-            requested.push((name.to_owned(), grant));
-        }
-        let role_value = if explicit_role {
-            values[0].clone()
-        } else {
-            S(self.snapshot.user.clone())
-        };
-        self.charge(self.snapshot.roles.len())?;
-        let role = match &role_value {
-            S(name) if name == "public" => 0,
-            S(name) => self
-                .snapshot
-                .roles
-                .iter()
-                .find(|r| r.name == *name)
-                .map(|r| i64::from(r.oid))
-                .ok_or(Error::Unsupported)?,
-            I(oid) => *oid,
-            _ => return Err(Error::Type),
-        };
-        let table_value = &values[table_at];
-        let oid = match table_value {
-            S(name) => match regclass_oid(name, self.snapshot) {
-                Ok(oid) => i64::from(oid),
-                Err(Error::Unsupported) => return Ok(B(false)),
-                Err(e) => return Err(e),
-            },
-            I(oid) => *oid,
-            _ => return Err(Error::Type),
-        };
-        let relations = &self.catalogs["pg_class"];
-        self.charge(relations.rows.len())?;
-        let Some(relation) = relations.rows.iter().find(|r| r[0] == I(oid)).cloned() else {
-            return Ok(if matches!(table_value, S(_)) {
-                B(false)
-            } else {
-                N
-            });
-        };
-        let owner_index = relations
-            .fields
-            .iter()
-            .position(|f| f.name == "relowner")
-            .unwrap();
-        let acl_index = relations
-            .fields
-            .iter()
-            .position(|f| f.name == "relacl")
-            .unwrap();
-        let owner = relation[owner_index].clone();
-        let mut column_acl = N;
-        if column {
-            let attributes = &self.catalogs["pg_attribute"];
-            let at = |name: &str| {
-                attributes
-                    .fields
-                    .iter()
-                    .position(|f| f.name == name)
-                    .unwrap()
-            };
-            let num = at("attnum");
-            let dropped = at("attisdropped");
-            let column_value = &values[table_at + 1];
-            self.charge(attributes.rows.len())?;
-            let attribute = attributes.rows.iter().find(|r| {
-                r[0] == I(oid)
-                    && r[dropped] == B(false)
-                    && match column_value {
-                        S(name) => r[1] == S(name.clone()),
-                        I(n) => r[num] == I(*n),
-                        _ => false,
-                    }
-            });
-            let Some(attribute) = attribute else {
-                return if matches!(column_value, S(_)) {
-                    Err(Error::UnknownColumn)
-                } else {
-                    Ok(N)
-                };
-            };
-            column_acl = attribute[at("attacl")].clone();
-        }
-        if owner == I(role)
-            || self
-                .snapshot
-                .roles
-                .iter()
-                .any(|r| i64::from(r.oid) == role && r.superuser)
-        {
-            return Ok(B(true));
-        }
-        let acl = if relation[acl_index] == N {
-            self.call("acldefault", vec![S("r".into()), owner], None)?
-        } else {
-            relation[acl_index].clone()
-        };
-        Ok(B(self.acl_allows(acl, role, &requested)?
-            || (column
-                && self.acl_allows(column_acl, role, &requested)?)))
+        let snapshot = self.snapshot;
+        privilege_inquiry::evaluate(self, name, values, &snapshot.user)
     }
     fn call(&mut self, n: &str, v: Vec<Value>, remaining: Option<usize>) -> R<Value> {
         use Value::{Bool as B, Int as I, Null as N, Text as S};
@@ -5599,84 +5464,9 @@ impl Runtime<'_> {
                     &self.catalogs["pg_type"].rows,
                 )?)
             }
-            "has_database_privilege" => {
-                let requested = text(v[1].clone())?.to_ascii_uppercase();
-                let privileges = requested.split(',').map(str::trim).collect::<Vec<_>>();
-                if privileges
-                    .iter()
-                    .any(|p| !["CREATE", "CONNECT", "TEMP", "TEMPORARY"].contains(p))
-                {
-                    return Err(Error::Unsupported);
-                }
-                let database = self.catalogs["pg_database"]
-                    .rows
-                    .iter()
-                    .find(|r| r[0] == v[0] || r[1] == v[0]);
-                match database {
-                    None => N,
-                    Some(database) => B(privileges.iter().any(|p| *p != "CREATE")
-                        || self.snapshot.roles.iter().any(|r| {
-                            r.name == self.snapshot.user
-                                && (r.superuser || I(i64::from(r.oid)) == database[2])
-                        })),
-                }
-            }
-            "pg_has_role" => {
-                if v.iter().any(|v| matches!(v, N)) { N } else {
-                    let resolve = |value: &Value| -> Result<Option<String>, Error> {
-                        match value {
-                            I(oid) => Ok(self.snapshot.roles.iter().find(|r| i64::from(r.oid) == *oid).map(|r| r.name.clone())),
-                            _ => {
-                                let name = text(value.clone())?;
-                                if self.snapshot.roles.iter().any(|r| r.name == name) { Ok(Some(name)) }
-                                else { Err(Error::UnknownRole(name)) }
-                            }
-                        }
-                    };
-                    let member = if v.len() == 3 { resolve(&v[0])? } else { Some(self.snapshot.user.clone()) };
-                    let role = resolve(&v[v.len()-2])?;
-                    let option = text(v[v.len()-1].clone())?;
-                    let mut indexes = Vec::new();
-                    for item in option.split(',') {
-                        let normalized = item.trim().to_ascii_uppercase();
-                        let (base, admin) = normalized.strip_suffix(" WITH ADMIN OPTION")
-                            .or_else(|| normalized.strip_suffix(" WITH GRANT OPTION"))
-                            .map_or((normalized.as_str(), false), |base| (base, true));
-                        let index = match base { "MEMBER" => 0, "USAGE" => 1, "SET" => 2,
-                            _ => return Err(Error::InvalidPrivilege(format!("unrecognized privilege type: \"{}\"", item.trim()))) };
-                        indexes.push(if admin { 3 } else { index });
-                    }
-                    let superuser = member.as_ref().is_some_and(|name| self.snapshot.roles.iter().any(|r| &r.name == name && r.superuser));
-                    let privileges = member.zip(role).and_then(|pair| self.snapshot.role_privileges.get(&pair));
-                    B(superuser || privileges.is_some_and(|p| indexes.iter().any(|i| p[*i])))
-                }
-            }
-            "has_table_privilege" | "has_column_privilege" => self.privilege_function(n, &v)?,
-            "has_schema_privilege" | "has_type_privilege" => {
-                let requested = text(v[1].clone())?;
-                let allowed = "USAGE";
-                let privileges = requested
-                    .split(',')
-                    .map(str::trim)
-                    .map(str::to_ascii_uppercase)
-                    .collect::<Vec<_>>();
-                let known = if n == "has_schema_privilege" {
-                    &["USAGE", "CREATE"][..]
-                } else { &["USAGE"][..] };
-                if privileges.iter().any(|p| !known.contains(&p.as_str())) {
-                    return Err(Error::Unsupported);
-                }
-                let relation = if n == "has_schema_privilege" {
-                    "pg_namespace"
-                } else {
-                    "pg_type"
-                };
-                B(privileges.iter().any(|p| p == allowed)
-                    && self.catalogs[relation]
-                        .rows
-                        .iter()
-                        .any(|r| r[0] == v[0] || r[1] == v[0]))
-            }
+            "pg_has_role" | "has_table_privilege" | "has_column_privilege"
+            | "has_any_column_privilege" | "has_sequence_privilege"
+            | "has_schema_privilege" | "has_database_privilege" | "has_type_privilege" => self.privilege_function(n, &v)?,
             "pg_table_is_visible" => {
                 let relations = &self.catalogs["pg_class"].rows;
                 self.charge(relations.len())?;

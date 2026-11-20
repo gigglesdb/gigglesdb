@@ -1124,6 +1124,18 @@ pub(crate) fn scalar(t: ScalarType) -> (u32, &'static str, i64, u32) {
     }
 }
 pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>> {
+    if snapshot.sequences.len() > 128 || snapshot.schema_privileges.len() > MAX_ROWS
+        || snapshot.schema_privileges.keys().any(|(_,name)| name.len() > 63) {return Err(Error::Limit); }
+    let mut sequence_oids = BTreeSet::new();
+    for sequence in &snapshot.sequences {
+        if sequence.name.len() > 128 || sequence.name.is_empty() || sequence.oid < 65536
+            || !sequence_oids.insert(sequence.oid)
+            || snapshot.tables.iter().any(|t| table_oid(t.id).ok() == Some(sequence.oid))
+            || !snapshot.roles.iter().any(|r| r.oid == sequence.owner) {
+            return Err(Error::InvalidSnapshot);
+        }
+        if sequence.acl.as_ref().is_some_and(|entries| entries.iter().map(|e| 1+e.privileges.len()).sum::<usize>() > MAX_ROWS) { return Err(Error::Limit); }
+    }
     if snapshot.primary_names.iter().any(|(id, name)| name.is_empty() || name.len() > 63 || !snapshot.tables.iter().any(|t| t.id == *id)) {
         return Err(Error::InvalidSnapshot);
     }

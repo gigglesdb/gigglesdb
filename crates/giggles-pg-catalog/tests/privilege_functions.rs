@@ -126,7 +126,7 @@ fn grant_option_and_invalid_names() {
 #[test]
 fn missing_hidden_null_and_quoted_resolution() {
     let mut s = snapshot();
-    yes(&s, "has_table_privilege('missing','SELECT')", false);
+    assert!(matches!(run(&s, "has_table_privilege('missing','SELECT')"), Err(Error::UnknownRelation(_))));
     assert_eq!(
         run(&s, "has_table_privilege(999::oid,'SELECT')").unwrap(),
         Value::Null
@@ -146,19 +146,15 @@ fn missing_hidden_null_and_quoted_resolution() {
         "has_table_privilege('public.\"T.with.dot\"','SELECT')",
         true,
     );
-    yes(&s, "has_table_privilege('T.with.dot','SELECT')", false);
+    assert!(matches!(run(&s, "has_table_privilege('T.with.dot','SELECT')"), Err(Error::Unsupported)));
     s.schemas.insert("custom".into(), (70000, 10));
     s.table_schemas.insert(7, "custom".into());
-    yes(&s, "has_table_privilege('\"T.with.dot\"','SELECT')", false);
+    assert!(matches!(run(&s, "has_table_privilege('\"T.with.dot\"','SELECT')"), Err(Error::UnknownRelation(_))));
     s.search_path = vec!["custom".into()];
     yes(&s, "has_table_privilege('\"T.with.dot\"','SELECT')", true);
     s.tables.clear();
     s.table_schemas.clear();
-    yes(
-        &s,
-        "has_table_privilege('custom.\"T.with.dot\"','SELECT')",
-        false,
-    );
+    assert!(matches!(run(&s, "has_table_privilege('custom.\"T.with.dot\"','SELECT')"), Err(Error::UnknownRelation(_))));
     assert_eq!(
         run(&s, "has_table_privilege(65564::oid,'SELECT')").unwrap(),
         Value::Null
@@ -212,7 +208,7 @@ fn column_forms_table_and_column_grants() {
         run(&s, "has_column_privilege(999::oid,'id','SELECT')").unwrap(),
         Value::Null
     );
-    yes(&s, "has_column_privilege('hidden','id','SELECT')", false);
+    assert!(matches!(run(&s, "has_column_privilege('hidden','id','SELECT')"), Err(Error::UnknownRelation(_))));
 }
 #[test]
 fn acl_columns_preserve_null_empty_and_quoted_roles() {
@@ -314,4 +310,70 @@ fn role_privilege_unnest_route() {
     let sql = "SELECT pg_has_role('app', r, 'MEMBER') FROM unnest(ARRAY['app']) r";
     let p = plan_gateway(sql).unwrap().expect("role privilege unnest route");
     assert_eq!(execute(&p, &s, &[]).unwrap().rows, vec![vec![Value::Bool(true)]]);
+}
+
+#[test]
+fn catalog_inquiry_inherited_and_explicit_forms() {
+    let mut s = snapshot();
+    let mut group = s.roles[1].clone();
+    group.oid = 43;
+    group.name = "group_role".into();
+    s.roles.push(group);
+    s.role_memberships.push(vec![Value::Int(100001), Value::Int(43), Value::Int(42), Value::Int(10), Value::Bool(false), Value::Bool(true), Value::Bool(true)]);
+    s.table_acls.insert(7, vec![grant(43, vec![AclPrivilege::Select], false)]);
+    yes(&s, "has_table_privilege('app','t','SELECT')", true);
+    yes(&s, "has_any_column_privilege('app','t','SELECT')", true);
+    yes(&s, "has_schema_privilege('app','public','USAGE')", true);
+    yes(&s, "has_schema_privilege('app','information_schema','USAGE')", true);
+    yes(&s, "has_database_privilege('app','giggles','CONNECT')", true);
+    s.role_memberships[0][5] = Value::Bool(false);
+    yes(&s, "has_table_privilege('app','t','SELECT')", false);
+}
+#[test]
+fn catalog_inquiry_unknown_role_and_equal_oids() {
+    let s = snapshot();
+    assert!(matches!(run(&s, "has_table_privilege('missing_w1c','t','SELECT')"), Err(Error::UnknownRole(_))));
+    yes(&s, "pg_has_role(4294967294::oid,4294967294::oid,'MEMBER')", true);
+    yes(&s, "pg_has_role(4294967294::oid,'giggles'::name,'MEMBER')", false);
+    yes(&s, "pg_has_role('giggles'::name,4294967294::oid,'MEMBER')", true);
+    yes(&s, "has_table_privilege(4294967294::oid,'pg_class','SELECT')", true);
+    assert_eq!(run(&s,"has_table_privilege('giggles'::name,4294967294::oid,'SELECT')").unwrap(),Value::Null);
+    yes(&s,"has_type_privilege('app','int4','USAGE')",true);
+    yes(&s,"has_type_privilege('app','integer','USAGE')",true);
+    yes(&s,"has_type_privilege('app','pg_catalog.int4','USAGE')",true);
+    assert!(matches!(run(&s,"has_schema_privilege('app','missing_w1c','USAGE')"),Err(Error::Inquiry("3F000"))));
+    assert!(matches!(run(&s,"has_database_privilege('app','missing_w1c','CONNECT')"),Err(Error::Inquiry("3D000"))));
+}
+
+#[test]
+fn catalog_inquiry_sequences_and_unknown_oids() {
+    let mut s = snapshot();
+    s.sequences.push(SequenceDef {oid: 65568, schema: "public".into(), name: "seq".into(), owner:42, acl:None});
+    for privilege in ["USAGE", "SELECT", "UPDATE", "USAGE WITH GRANT OPTION"] {
+        yes(&s,&format!("has_sequence_privilege('seq','{privilege}')"),true);
+    }
+    s.sequences[0].owner = 10;
+    s.sequences[0].acl = Some(vec![grant(0,vec![AclPrivilege::Usage],false)]);
+    yes(&s,"has_sequence_privilege('seq','USAGE')",true);
+    yes(&s,"has_sequence_privilege('seq','SELECT')",false);
+    yes(&s,"has_sequence_privilege('seq','USAGE WITH GRANT OPTION')",false);
+    let mut group = s.roles[1].clone(); group.oid=43; group.name="seq_group".into(); s.roles.push(group);
+    s.role_memberships.push(vec![Value::Int(100002),Value::Int(43),Value::Int(42),Value::Int(10),Value::Bool(false),Value::Bool(true),Value::Bool(true)]);
+    s.sequences[0].acl = Some(vec![grant(43,vec![AclPrivilege::Usage],true)]);
+    yes(&s,"has_sequence_privilege('seq','USAGE WITH GRANT OPTION')",true);
+    s.role_memberships[0][5] = Value::Bool(false);
+    yes(&s,"has_sequence_privilege('seq','USAGE')",false);
+    s.schemas.insert("other".into(),(70000,42));
+    s.sequences.push(SequenceDef {oid:65572,schema:"other".into(),name:"seq".into(),owner:42,acl:None});
+    s.search_path=vec!["other".into(),"public".into()];
+    yes(&s,"has_sequence_privilege('seq','USAGE')",true);
+    s.search_path=vec!["public".into(),"other".into()];
+    yes(&s,"has_sequence_privilege('seq','USAGE')",false);
+    assert!(matches!(run(&s,"has_sequence_privilege('t','USAGE')"),Err(Error::Inquiry("42809"))));
+    assert_eq!(run(&s,"has_sequence_privilege(4294967294::oid,'USAGE')").unwrap(),Value::Null);
+    assert_eq!(run(&s,"has_schema_privilege('app',4294967294::oid,'USAGE')").unwrap(),Value::Null);
+    assert_eq!(run(&s,"has_database_privilege('app',4294967294::oid,'CONNECT')").unwrap(),Value::Null);
+    assert!(matches!(run(&s,"has_schema_privilege('app','public','BOGUS')"),Err(Error::InvalidPrivilege(_))));
+    assert_eq!(run(&s,"has_any_column_privilege(NULL,'SELECT')").unwrap(),Value::Null);
+    assert_eq!(privilege_inquiry::evaluate("has_table_privilege",&[Value::Text("t".into()),Value::Text("SELECT".into())],"giggles","app",&s).unwrap(),Some(true));
 }

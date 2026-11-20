@@ -2272,6 +2272,7 @@ impl Admin {
 }
 /// One coherent presentation read for the wire catalog adapter.
 pub struct CatalogMetadata {
+    pub sequences: Vec<(u32, String)>,
     pub presentation: relational::CatalogPresentation,
     pub tables: Vec<relational::TableDef>,
     pub schemas: relational::SchemaMetadata,
@@ -2335,6 +2336,7 @@ impl SqlSession {
             let tables = s.sql.tables.values().cloned().chain(presentation.views.values().map(|v| v.table.clone())).collect();
             Ok(CatalogMetadata {
                 presentation, tables,
+                sequences: s.sql.catalog_ext().sequences.iter().map(|(id,d)| Ok((relational::type_oid(*id).map_err(CoreError::Sql)?,d.name.clone()))).collect::<Result<_,CoreError>>()?,
                 schemas: s.sql.schema_metadata(), types: s.sql.user_type_catalog(),
                 collation_oids:s.sql.collation_oids().map_err(CoreError::Sql)?,
                 collations: s.sql.catalog_ext().collations.iter().map(|(id,c)| Ok((relational::type_oid(*id).map_err(CoreError::Sql)?,c.clone()))).collect::<Result<_,CoreError>>()?,

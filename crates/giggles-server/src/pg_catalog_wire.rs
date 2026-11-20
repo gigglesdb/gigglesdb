@@ -28,6 +28,7 @@ pub(crate) fn value_bytes(value: &Value) -> Result<usize> {
 pub(crate) fn error(error: giggles_pg_catalog::Error) -> &'static str {
     use giggles_pg_catalog::Error as E;
     match error {
+        E::Inquiry(state) => state,
         E::Syntax => "42601",
         E::MixedRelations | E::Mutation => "42501",
         E::UnknownColumn => "42703",
@@ -233,7 +234,24 @@ pub(crate) fn snapshot(
             comment: b.comment.into(), relocatable: b.relocatable, superuser: b.superuser, trusted: b.trusted,
             schema: b.schema.map(str::to_owned), requires: b.requires.iter().map(|s| (*s).into()).collect(), installed }
     }).collect();
+    let sequences = catalog.sequences.into_iter()
+        .filter_map(|(oid,name)| {
+            let owner = session.sql.table_owner(&name).ok().flatten()?;
+            let owner = roles.iter().find(|r| r.name == owner)?.oid;
+            let (schema,name) = name.split_once('\0').unwrap_or(("public",&name));
+            Some(giggles_pg_catalog::SequenceDef {oid,schema:schema.into(),name:name.into(),owner,acl:None})
+        }).collect();
+    let mut schema_privileges = std::collections::BTreeMap::new();
+    for role in &roles {
+        for name in schemas.keys().map(String::as_str).chain(["public"]) {
+            use giggles_core::roles::SchemaPrivilege as P;
+            let granted = session.service.admin.roles().schema_privileges(name,&role.name).map_err(|_| "XX000")?;
+            if !granted.is_empty() {schema_privileges.insert((role.oid,name.to_owned()),[granted.contains(&P::Create),granted.contains(&P::Usage)]);}
+        }
+    }
     let snapshot = giggles_pg_catalog::CatalogSnapshot {
+        schema_privileges,
+        sequences,
         extensions,
         timezone: session.zone().unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0)),
         views: presentation.views.into_iter().map(|(id, v)| (id, v.definition)).collect(),
