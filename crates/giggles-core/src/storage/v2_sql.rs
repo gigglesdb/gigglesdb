@@ -715,8 +715,12 @@ impl SqlSession {
                             // Shared bounded writers still exclude every READ COMMITTED
                             // paged, unsupported conflict/action and COPY writer. Actual
                             // target rows are locked in physical order BEFORE refreshing.
-                            let candidates = (expected_version.is_none()
-                                && self.copy_input.is_none()
+                            // Expected-version point writes join this path under RC:
+                            // the row lock precedes the fresh snapshot, so the point
+                            // UPDATE/DELETE version checks see the latest committed row.
+                            // One row is at most MAX_ROW_BYTES (64 KiB), so production
+                            // retention cannot overflow and upgrade these requests.
+                            let candidates = (self.copy_input.is_none()
                                 && txn.isolation() == Isolation::ReadCommitted)
                                 .then(|| bound.fk_delete_lock_keys(&binding, params)
                                     .or_else(|| bound.mutation_lock_keys(&binding, params, &parts.indexes)))

@@ -73,6 +73,28 @@ fn point_keys(state: &Relational, prepared: &Prepared, params: &[Value],
     point_keys
 }
 
+// Engine statements carry literal predicates instead of a searched Query. This
+// affects prelocking only; execution retains its existing selection path.
+fn native_lock_key(state: &Relational, prepared: &Prepared, table: &TableDef) -> Option<Vec<Vec<Value>>> {
+    if searched::target(prepared).is_some() || table.primary_key.is_empty()
+        || table.hidden_rowid().is_some() { return None; }
+    let predicates = match &prepared.statement {
+        Statement::Update { predicates, search: None, .. }
+        | Statement::Delete { predicates, search: None, .. } => predicates,
+        _ => return None,
+    };
+    if predicates.len() != table.primary_key.len() { return None; }
+    let key = table.primary_key.iter().map(|i| {
+        let column = &table.columns[*i];
+        if !state.deterministic_column(column.id) { return None; }
+        let mut matches = predicates.iter().filter(|p| p.column == column.name);
+        let Predicate { op, value: Expr::Literal(value), .. } = matches.next()? else { return None; };
+        if op != "=" || matches.next().is_some() { return None; }
+        query::primary_key_literal_value(value, column)
+    }).collect::<Option<Vec<_>>>()?;
+    Some(vec![key])
+}
+
 /// Statically resolved conflict witness; the caller supplies runtime lock policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Arbiter { PrimaryKey, Unique(u64) }
@@ -196,7 +218,8 @@ impl Prepared {
         };
         if unique.iter().any(|d| d.columns.iter().any(|id| table.columns.iter()
             .any(|c| c.id == *id && changed.contains(&&c.name)))) { return None; }
-        point_keys(state, self, params, &unique)
+        if searched::target(self).is_none() { native_lock_key(state, self, table) }
+        else { point_keys(state, self, params, &unique) }
     }
 
     /// Bounded incoming-FK DELETE prelocks, independent of publisher eligibility.
@@ -239,7 +262,9 @@ impl Prepared {
             for id in sinks { edges.remove(&id); }
         }
         if !incoming { return None; }
-        let keys = searched::target(self)?.mutation_primary_keys(state, table, params)?;
+        let keys = if let Some(query) = searched::target(self) {
+            query.mutation_primary_keys(state, table, params)?
+        } else { native_lock_key(state, self, table)? };
         (keys.len() <= 200).then_some(keys)
     }
 
@@ -715,3 +740,194 @@ impl ActionWork {
 #[cfg(test)]
 #[path = "upsert_classifier_tests.rs"]
 mod upsert_classifier_tests;
+
+#[cfg(test)]
+mod native_lock_tests {
+    use super::*;
+    fn sql(state: &mut Relational, sql: &str) {
+        let p = Prepared::parse(sql, 1, state.epoch).unwrap();
+        state.execute(&p, &[], None).unwrap();
+    }
+    fn literal_key(ty: &str, value: Value) -> Option<Vec<Vec<Value>>> {
+        let mut state = Relational::default();
+        // DDL rejects some unsupported PK types before the helper can see them.
+        // Build their table descriptor directly to exercise its conservative gate.
+        let unsupported = match ty {
+            "char(3)" => Some(DataType::Bpchar),
+            "date" => Some(DataType::Date),
+            "time" => Some(DataType::Time),
+            "timestamp" => Some(DataType::Timestamp),
+            "timestamptz" => Some(DataType::TimestampTz),
+            _ => None,
+        };
+        let ddl_ty = if unsupported.is_some() { "bigint" } else { ty };
+        sql(&mut state, &format!("CREATE TABLE t(id {ddl_ty} PRIMARY KEY)"));
+        let mut table = state.tables["t"].clone();
+        if let Some(ty) = unsupported { table.columns[0].data_type = ty; }
+        let p = Prepared::engine(Statement::Delete { name: "t".into(),
+            predicates: vec![Predicate { column: "id".into(), op: "=".into(),
+                value: Expr::Literal(value) }], search: None, returning: None }, 1, state.epoch);
+        native_lock_key(&state, &p, &table)
+    }
+    #[test]
+    fn integer_boundaries_unknown_literals_and_numeric_fallback() {
+        for (ty, min, max, outside) in [
+            ("smallint", i16::MIN as i64, i16::MAX as i64, "40000"),
+            ("integer", i32::MIN as i64, i32::MAX as i64, "2147483648"),
+            ("bigint", i64::MIN, i64::MAX, "9223372036854775808"),
+        ] {
+            for n in [min, max, 5] {
+                for value in [Value::Int(n), Value::Text(n.to_string())] {
+                    assert_eq!(literal_key(ty, value), Some(vec![vec![Value::Int(n)]]), "{ty}: {n}");
+                }
+            }
+            for value in [outside.to_string(), (i128::from(min) - 1).to_string()] {
+                assert_eq!(literal_key(ty, Value::Text(value.clone())), None, "{ty}: {value}");
+            }
+            for value in ["1.0", "1.5"] {
+                // Numeric/integer comparison needs its full filter; never round a lock key.
+                assert_eq!(literal_key(ty, Value::Numeric(Numeric::parse(value).unwrap())), None);
+            }
+        }
+        assert_eq!(literal_key("smallint", Value::Int(40000)), None);
+        assert_eq!(literal_key("integer", Value::Int(2147483648)), None);
+    }
+    #[test]
+    fn text_boolean_and_unsupported_key_types() {
+        assert_eq!(literal_key("varchar(8)", Value::Text("a ".into())),
+            Some(vec![vec![Value::Text("a ".into())]]));
+        for b in [false, true] {
+            assert_eq!(literal_key("boolean", Value::Bool(b)), Some(vec![vec![Value::Bool(b)]]));
+            assert_eq!(literal_key("boolean", Value::Text(b.to_string())), Some(vec![vec![Value::Bool(b)]]));
+        }
+        for (ty, value) in [("char(3)", "a "), ("date", "2026-01-01"),
+            ("time", "12:00:00"), ("timestamp", "2026-01-01 12:00:00"),
+            ("timestamptz", "2026-01-01 12:00:00+00")] {
+            assert_eq!(literal_key(ty, Value::Text(value.into())), None, "{ty}");
+        }
+    }
+    #[test]
+    fn numeric_scale_signed_zero_and_nan_key_identity() {
+        for (ty, a, b) in [("numeric", "1.0", "1.00"), ("numeric", "0", "-0"),
+            ("numeric", "NaN", "NaN"), ("real", "0", "-0"),
+            ("double precision", "0", "-0"), ("real", "NaN", "NaN"),
+            ("double precision", "NaN", "NaN")] {
+            let mut encoded = Vec::new();
+            for text in [a, b] {
+                let expected = match ty {
+                    "numeric" => Value::Numeric(Numeric::parse(text).unwrap()),
+                    "real" => Value::Float4(Float4::from_bits(text.parse::<f32>().unwrap().to_bits())),
+                    _ => Value::Float8(Float8::from_bits(text.parse::<f64>().unwrap().to_bits())),
+                };
+                let keys = literal_key(ty, Value::Text(text.into())).unwrap();
+                assert_eq!(keys, vec![vec![expected.clone()]], "{ty}: {text}");
+                assert_eq!(literal_key(ty, expected), Some(keys.clone()));
+                encoded.push(crate::storage::engine::codec::pk_bytes(&keys[0]).unwrap());
+            }
+            // SQL-equal values must acquire the same physical row lock.
+            assert_eq!(encoded[0], encoded[1], "{ty}: {a} = {b}");
+        }
+    }
+    #[test]
+    fn duplicate_partial_and_composite_disjunction_fallback() {
+        let mut state = Relational::default();
+        sql(&mut state, "CREATE TABLE t(id bigint, other bigint, PRIMARY KEY(id,other))");
+        let table = &state.tables["t"];
+        let predicate = |column: &str, n| Predicate { column: column.into(), op: "=".into(),
+            value: Expr::Literal(Value::Int(n)) };
+        for predicates in [vec![predicate("id", 1)],
+            vec![predicate("id", 1), predicate("id", 2)]] {
+            let p = Prepared::engine(Statement::Delete { name: "t".into(), predicates,
+                search: None, returning: None }, 1, state.epoch);
+            assert_eq!(native_lock_key(&state, &p, table), None);
+        }
+        for text in ["DELETE FROM t WHERE (id = 1 AND other = 2) OR (id = 3 AND other = 4)",
+            "DELETE FROM t WHERE id IN (1,3) AND other = 2"] {
+            let p = Prepared::parse(text, 1, state.epoch).unwrap();
+            assert_eq!(native_lock_key(&state, &p, table), None, "{text}");
+        }
+        sql(&mut state, "CREATE TABLE single(id bigint PRIMARY KEY)");
+        let table = &state.tables["single"];
+        let p = Prepared::engine(Statement::Delete { name: "single".into(),
+            predicates: vec![predicate("id", 1), predicate("id", 2)],
+            search: None, returning: None }, 1, state.epoch);
+        assert_eq!(native_lock_key(&state, &p, table), None);
+    }
+    #[test]
+    fn physical_key_identity_and_exact_literal_shape() {
+        for (ty, literal) in [("smallint", "7"), ("integer", "7"), ("bigint", "7"),
+            ("numeric", "7.00"), ("real", "-0.0"), ("double precision", "7.25"),
+            ("text", "'hello'"), ("bytea", "'bytes'")] {
+            let mut state = Relational::default();
+            sql(&mut state, &format!("CREATE TABLE t(a {ty}, b bigint, n bigint, PRIMARY KEY(b,a))"));
+            sql(&mut state, &format!("INSERT INTO t VALUES({literal},2,0)"));
+            let table = state.tables["t"].clone();
+            let row = state.rows[&table.id].values().next().unwrap();
+            let key = table.primary_key.iter().map(|i| row.values[*i].clone()).collect::<Vec<_>>();
+            for delete in [false, true] {
+                let mut p = if delete { Prepared::delete_engine(&table, key.clone(), 1, &state) }
+                    else { Prepared::update_engine(&table, key.clone(), vec![(2, Value::Int(1))], 1, &state) }.unwrap();
+                let keys = p.mutation_lock_keys(&state, &[], &[]).unwrap();
+                assert_eq!(keys, vec![key.clone()], "{ty}");
+                let predicates = match &mut p.statement {
+                    Statement::Update { predicates, .. } | Statement::Delete { predicates, .. } => predicates,
+                    _ => unreachable!(),
+                };
+                predicates.reverse();
+                let bound = bounds(&table, predicates, &[]).unwrap();
+                assert!(bound.point);
+                assert_eq!(crate::storage::engine::codec::pk_bytes(&keys[0]).unwrap(), bound.low);
+                predicates.push(predicates[0].clone());
+                assert!(p.mutation_lock_keys(&state, &[], &[]).is_none());
+                let predicates = match &mut p.statement {
+                    Statement::Update { predicates, .. } | Statement::Delete { predicates, .. } => predicates,
+                    _ => unreachable!(),
+                };
+                predicates.pop(); predicates[0].value = Expr::Literal(Value::Null);
+                assert!(p.mutation_lock_keys(&state, &[], &[]).is_none());
+            }
+        }
+    }
+    #[test]
+    fn nondeterministic_unique_changing_and_cyclic_keep_exclusive() {
+        let mut state = Relational::default();
+        sql(&mut state, "CREATE COLLATION ci(provider=icu,locale='und-u-ks-level2',deterministic=false)");
+        sql(&mut state, "CREATE TABLE t(id text COLLATE ci PRIMARY KEY,n bigint)");
+        let table = state.tables["t"].clone();
+        let p = Prepared::delete_engine(&table, vec![Value::Text("a".into())], 1, &state).unwrap();
+        assert!(native_lock_key(&state, &p, &table).is_none());
+        let mut state = Relational::default();
+        sql(&mut state, "CREATE TABLE t(id bigint PRIMARY KEY,n bigint UNIQUE)");
+        let table = state.tables["t"].clone();
+        let p = Prepared::update_engine(&table, vec![Value::Int(1)], vec![(1,Value::Int(2))], 1, &state).unwrap();
+        assert!(p.mutation_lock_keys(&state, &[], state.secondary_descriptors_engine()).is_none());
+        sql(&mut state, "CREATE TABLE c(id bigint PRIMARY KEY,p bigint REFERENCES t(id))");
+        sql(&mut state, "ALTER TABLE t ADD FOREIGN KEY(n) REFERENCES c(id)");
+        let p = Prepared::delete_engine(&table, vec![Value::Int(1)], 1, &state).unwrap();
+        assert!(p.fk_delete_lock_keys(&state, &[]).is_none());
+    }
+    #[test]
+    fn unsupported_and_fk_admission_gates() {
+        let mut state = Relational::default();
+        sql(&mut state, "CREATE TABLE t(id uuid PRIMARY KEY,n bigint)");
+        let table = state.tables["t"].clone();
+        let p = Prepared::engine(Statement::Delete { name: "t".into(),
+            predicates: vec![Predicate { column: "id".into(), op: "=".into(),
+                value: Expr::Literal(Value::Text("00000000-0000-0000-0000-000000000001".into())) }],
+            search: None, returning: None }, 1, state.epoch);
+        assert!(native_lock_key(&state, &p, &table).is_none());
+        assert!(p.mutation_lock_keys(&state, &[], &[]).is_none());
+        for action in ["RESTRICT", "NO ACTION", "CASCADE", "SET NULL", "SET DEFAULT"] {
+            for deferred in [false, true] {
+                let mut state = Relational::default();
+                sql(&mut state, "CREATE TABLE p(id bigint PRIMARY KEY,n bigint)");
+                sql(&mut state, &format!("CREATE TABLE c(id bigint PRIMARY KEY,p bigint REFERENCES p(id) ON DELETE {action} {} )",
+                    if deferred { "DEFERRABLE INITIALLY DEFERRED" } else { "" }));
+                let table = state.tables["p"].clone();
+                let p = Prepared::delete_engine(&table, vec![Value::Int(1)], 1, &state).unwrap();
+                assert!(p.mutation_lock_keys(&state, &[], &[]).is_none());
+                assert_eq!(p.fk_delete_lock_keys(&state, &[]).is_some(), !deferred && action != "SET DEFAULT");
+            }
+        }
+    }
+}

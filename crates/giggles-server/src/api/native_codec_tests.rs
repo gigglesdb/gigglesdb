@@ -786,3 +786,17 @@ fn catalog_column_defaults_and_generated() {
     for kind in [None, Some("unknown".into())] { assert!(clock_default(p::NativeClockDefault { kind, precision: None }).is_err()); }
     let mut c = catalog_col(); c.generated = Some("unknown".into()); assert!(catalog_column(c).is_err());
 }
+
+#[test]
+fn native_version_mismatch_and_deadlock_keep_wire_kinds() {
+    // Version mismatch is SQL 40001; a lock-manager deadlock is a Core error.
+    let version = encode_error(o::Error::Sql {
+        sqlstate: giggles_core::sqlstate(&giggles_core::CoreError::Sql(
+            giggles_core::relational::SqlError::Version)).into(),
+    });
+    assert_eq!(version.kind, 20);
+    assert_eq!(version.sqlstate.as_deref(), Some("40001"));
+    let deadlock = encode_error(o::Error::Core(giggles_core::CoreError::Deadlock.to_string()));
+    assert_eq!(deadlock.kind, 12);
+    assert_eq!(deadlock.sqlstate, None);
+}

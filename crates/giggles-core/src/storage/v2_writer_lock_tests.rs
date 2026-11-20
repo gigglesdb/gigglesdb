@@ -30,10 +30,18 @@ fn clock() -> relational::StatementClock {
 struct Pending { done: mpsc::Receiver<Result<relational::SqlResult, CoreError>>, worker: JoinHandle<()> }
 impl Pending {
     fn start(f: &Fixture, sql: &str) -> Self {
+        Self::start_expected(f, sql, None, "")
+    }
+    fn start_expected(f: &Fixture, sql: &str, expected: Option<u64>, begin: &str) -> Self {
         let admin = f.admin().clone();
+        let begin = begin.to_owned();
         let sql = sql.to_owned();
         let (send, done) = mpsc::channel();
-        let worker = thread::spawn(move || { let result = admin.sql_session().execute_at(&sql, &[], None, &clock()); send.send(result).unwrap(); });
+        let worker = thread::spawn(move || { let mut s = admin.sql_session();
+            if !begin.is_empty() { begin_isolation(&mut s, &begin); }
+            let result = s.execute_at(&sql, &[], expected, &clock());
+            if !begin.is_empty() && result.is_ok() { run(&mut s, "COMMIT"); }
+            send.send(result).unwrap(); });
         Self { done, worker }
     }
     fn blocked(&self, holder: &SqlSession) {
@@ -228,4 +236,406 @@ fn eight_threads_distinct_updates_and_collisions_have_exact_totals() {
     let rows = run(&mut f.sql(), "SELECT id,n FROM t ORDER BY id").rows;
     assert_eq!(rows[0].values, vec![Int(0), Int(160)]);
     for (i, row) in rows.iter().enumerate().skip(1) { assert_eq!(row.values, vec![Int(i as i64), Int(200)]); }
+}
+
+
+fn begin_isolation(s: &mut SqlSession, level: &str) {
+    s.set_isolation(match level {
+        "BEGIN" | "READ COMMITTED" => crate::SqlIsolation::ReadCommitted,
+        "REPEATABLE READ" => crate::SqlIsolation::RepeatableRead,
+        "SERIALIZABLE" => crate::SqlIsolation::Serializable,
+        _ => panic!("unexpected isolation: {level}"),
+    });
+    run(s, "BEGIN");
+}
+fn version(f: &Fixture, id: i64) -> u64 {
+    run(&mut f.sql(), &format!("SELECT * FROM t WHERE id={id}")).rows[0].version
+}
+fn expected(s: &mut SqlSession, sql: &str, v: u64) -> Result<relational::SqlResult, CoreError> {
+    s.execute_at(sql, &[], Some(v), &clock())
+}
+
+#[test]
+fn expected_distinct_rc_writers_complete_while_holder_open() {
+    for delete in [false, true] {
+        let f = Fixture::new();
+        f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+        f.exec("INSERT INTO t VALUES(1,0),(2,0)");
+        let (v1, v2) = (version(&f, 1), version(&f, 2));
+        let mut a = f.sql();
+        run(&mut a, "BEGIN");
+        expected(&mut a, "UPDATE t SET n=10 WHERE id=1", v1).unwrap();
+        let sql = if delete { "DELETE FROM t WHERE id=2 RETURNING n" }
+            else { "UPDATE t SET n=20 WHERE id=2 RETURNING n" };
+        let b = Pending::start_expected(&f, sql, Some(v2), "BEGIN").finish().unwrap();
+        assert_eq!(b.affected, 1);
+        assert_eq!(b.rows[0].values, vec![Int(if delete { 0 } else { 20 })]);
+        run(&mut a, "COMMIT");
+        let rows = run(&mut f.sql(), "SELECT * FROM t ORDER BY id").rows;
+        assert_eq!(rows.iter().map(|r| r.values.clone()).collect::<Vec<_>>(),
+            if delete { vec![vec![Int(1), Int(10)]] }
+            else { vec![vec![Int(1), Int(10)], vec![Int(2), Int(20)]] });
+    }
+}
+
+#[test]
+fn expected_same_row_rc_waits_then_checks_commit_or_rollback() {
+    for delete in [false, true] {
+        for commit in [false, true] {
+            let f = Fixture::new();
+            f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+            f.exec("INSERT INTO t VALUES(1,0)");
+            let v = version(&f, 1);
+            let mut a = f.sql();
+            run(&mut a, "BEGIN");
+            expected(&mut a, "UPDATE t SET n=10 WHERE id=1", v).unwrap();
+            let sql = if delete { "DELETE FROM t WHERE id=1 RETURNING n" }
+                else { "UPDATE t SET n=n+1 WHERE id=1 RETURNING n" };
+            let b = Pending::start_expected(&f, sql, Some(v), "BEGIN");
+            b.blocked(&a);
+            run(&mut a, if commit { "COMMIT" } else { "ROLLBACK" });
+            let result = b.finish();
+            if commit { assert_eq!(result, Err(CoreError::Sql(SqlError::Version))); }
+            else {
+                let result = result.unwrap();
+                assert_eq!(result.affected, 1);
+                assert_eq!(result.rows[0].values, vec![Int(if delete { 0 } else { 1 })]);
+            }
+        }
+    }
+}
+
+#[test]
+fn expected_mismatch_and_missing_all_isolations() {
+    for isolation in ["READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"] {
+        for delete in [false, true] {
+            for id in [1, 5] {
+                let f = Fixture::new();
+                f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+                f.exec("INSERT INTO t VALUES(1,0)");
+                let v = version(&f, 1) + 999;
+                let mut s = f.sql();
+                begin_isolation(&mut s, isolation);
+                let sql = if delete { format!("DELETE FROM t WHERE id={id}") }
+                    else { format!("UPDATE t SET n=1 WHERE id={id}") };
+                assert_eq!(expected(&mut s, &sql, v), Err(CoreError::Sql(SqlError::Version)));
+                run(&mut s, "ROLLBACK");
+            }
+        }
+    }
+}
+
+#[test]
+fn expected_missing_key_waits_for_insert_commit_or_rollback() {
+    for delete in [false, true] {
+        for commit in [false, true] {
+            let f = Fixture::new();
+            f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+            let mut a = f.sql();
+            run(&mut a, "BEGIN");
+            run(&mut a, "INSERT INTO t VALUES(5,0)");
+            let sql = if delete { "DELETE FROM t WHERE id=5" } else { "UPDATE t SET n=1 WHERE id=5" };
+            let b = Pending::start_expected(&f, sql, Some(0), "BEGIN");
+            b.blocked(&a);
+            run(&mut a, if commit { "COMMIT" } else { "ROLLBACK" });
+            assert_eq!(b.finish(), Err(CoreError::Sql(SqlError::Version)));
+        }
+    }
+}
+
+#[test]
+fn expected_parent_cascade_serializes_child_insert() {
+    for commit in [false, true] {
+        let f = Fixture::new();
+        f.exec("CREATE TABLE t(id bigint PRIMARY KEY)");
+        f.exec("CREATE TABLE c(id bigint PRIMARY KEY,p bigint REFERENCES t(id) ON DELETE CASCADE)");
+        f.exec("INSERT INTO t VALUES(1)");
+        f.exec("INSERT INTO c VALUES(1,1)");
+        let v = version(&f, 1);
+        let mut a = f.sql();
+        run(&mut a, "BEGIN");
+        let before = FK_DELETE_SHARED.get();
+        expected(&mut a, "DELETE FROM t WHERE id=1", v).unwrap();
+        assert_eq!(FK_DELETE_SHARED.get(), before + 1);
+        assert!(run(&mut a, "SELECT * FROM c").rows.is_empty());
+        let b = Pending::start(&f, "INSERT INTO c VALUES(2,1)");
+        b.blocked(&a);
+        run(&mut a, if commit { "COMMIT" } else { "ROLLBACK" });
+        if commit {
+            assert_eq!(b.finish(), Err(CoreError::Sql(SqlError::ForeignKeyViolation)));
+            assert!(run(&mut f.sql(), "SELECT * FROM c").rows.is_empty());
+        } else {
+            assert_eq!(b.finish().unwrap().affected, 1);
+            assert_eq!(run(&mut f.sql(), "SELECT * FROM c ORDER BY id").rows.iter().map(|r| r.values.clone()).collect::<Vec<_>>(),
+                vec![vec![Int(1), Int(1)], vec![Int(2), Int(1)]]);
+        }
+    }
+}
+
+#[test]
+fn expected_rekey_and_nondeterministic_keys_keep_exclusive() {
+    for collated in [false, true] {
+        let f = Fixture::new();
+        if collated {
+            f.exec("CREATE COLLATION ci (provider=icu,locale='und-u-ks-level2',deterministic=false)");
+            f.exec("CREATE TABLE t(id text COLLATE ci PRIMARY KEY,n bigint)");
+            f.exec("INSERT INTO t VALUES('one',0),('two',0)");
+        } else {
+            f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+            f.exec("INSERT INTO t VALUES(1,0),(2,0)");
+        }
+        let v = run(&mut f.sql(), "SELECT * FROM t ORDER BY id").rows[0].version;
+        let mut a = f.sql();
+        run(&mut a, "BEGIN");
+        expected(&mut a, if collated { "UPDATE t SET n=1 WHERE id='one'" }
+            else { "UPDATE t SET id=3 WHERE id=1" }, v).unwrap();
+        let b = Pending::start(&f, if collated { "UPDATE t SET n=2 WHERE id='two'" }
+            else { "UPDATE t SET n=2 WHERE id=2" });
+        b.blocked(&a);
+        run(&mut a, "ROLLBACK");
+        b.finish().unwrap();
+    }
+}
+
+#[test]
+fn expected_fixed_snapshot_same_row_race_remains_conflict() {
+    for isolation in ["REPEATABLE READ", "SERIALIZABLE"] {
+        for delete in [false, true] {
+            let f = Fixture::new();
+            f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+            f.exec("INSERT INTO t VALUES(1,0)");
+            let v = version(&f, 1);
+            let mut a = f.sql();
+            run(&mut a, "BEGIN");
+            run(&mut a, "UPDATE t SET n=10 WHERE id=1");
+            let sql = if delete { "DELETE FROM t WHERE id=1" } else { "UPDATE t SET n=1 WHERE id=1" };
+            let b = Pending::start_expected(&f, sql, Some(v), isolation);
+            b.blocked(&a);
+            run(&mut a, "COMMIT");
+            assert_eq!(b.finish(), Err(CoreError::Sql(SqlError::Conflict)));
+        }
+    }
+}
+
+#[test]
+fn expected_sixteen_threads_distinct_updates_have_exact_totals() {
+    let f = Fixture::new();
+    f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+    for id in 1..=16 { f.exec(&format!("INSERT INTO t VALUES({id},0)")); }
+    let start = Arc::new(Barrier::new(16));
+    let workers = (1..=16).map(|id| {
+        let admin = f.admin().clone();
+        let start = start.clone();
+        thread::spawn(move || {
+            let mut s = admin.sql_session();
+            start.wait();
+            for _ in 0..50 {
+                let v = run(&mut s, &format!("SELECT * FROM t WHERE id={id}")).rows[0].version;
+                assert_eq!(expected(&mut s, &format!("UPDATE t SET n=n+1 WHERE id={id}"), v).unwrap().affected, 1);
+            }
+        })
+    }).collect::<Vec<_>>();
+    for worker in workers { worker.join().unwrap(); }
+    let rows = run(&mut f.sql(), "SELECT * FROM t ORDER BY id").rows;
+    assert_eq!(rows.len(), 16);
+    for (i, row) in rows.iter().enumerate() { assert_eq!(row.values, vec![Int(i as i64 + 1), Int(50)]); }
+}
+
+// Exercise the exact Prepared::*_engine statements used by native operations.
+fn native(s: &mut SqlSession, table: &TableDef, id: i64, version: u64, delete: bool)
+    -> Result<relational::SqlResult, CoreError> {
+    if delete { s.delete_engine(table, vec![Int(id)], version) }
+    else { s.update_engine(table, vec![Int(id)], vec![(1, Int(10))], version) }
+}
+impl Pending {
+    fn native(f: &Fixture, table: TableDef, id: i64, version: u64, delete: bool, level: &str) -> Self {
+        let admin = f.admin().clone();
+        let disabled = DISABLE_MUTATION_POINTS.get();
+        let level = level.to_owned();
+        let (send, done) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            DISABLE_MUTATION_POINTS.set(disabled);
+            let mut s = admin.sql_session();
+            begin_isolation(&mut s, &level);
+            let result = native(&mut s, &table, id, version, delete);
+            if result.is_ok() { run(&mut s, "COMMIT"); }
+            else { run(&mut s, "ROLLBACK"); }
+            send.send(result).unwrap();
+        });
+        Self { done, worker }
+    }
+}
+#[test]
+fn native_distinct_update_and_delete_hold_locks_concurrently() {
+    for first_delete in [false, true] {
+        for second_delete in [false, true] {
+            let f = Fixture::new();
+            f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+            f.exec("INSERT INTO t VALUES(1,0),(2,0)");
+            let table = f.sql().catalog_engine().unwrap().1.remove(0);
+            let (v1, v2) = (version(&f, 1), version(&f, 2));
+            let mut a = f.sql(); run(&mut a, "BEGIN");
+            native(&mut a, &table, 1, v1, first_delete).unwrap();
+            assert_eq!(Pending::native(&f, table, 2, v2, second_delete, "READ COMMITTED")
+                .finish().unwrap().affected, 1);
+            run(&mut a, "ROLLBACK");
+        }
+    }
+}
+#[test]
+fn native_same_row_and_missing_versions_match_exclusive_per_isolation() {
+    for level in ["READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"] {
+        for delete in [false, true] {
+            // Update, delete, and delete/reinsert are separate version histories.
+            for history in [0, 1, 2, 3] {
+                for commit in [false, true] {
+                    let mut outcomes = Vec::new();
+                    for disabled in [true, false] {
+                        DISABLE_MUTATION_POINTS.set(disabled);
+                        let f = Fixture::new();
+                        f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+                        if history != 3 { f.exec("INSERT INTO t VALUES(1,0)"); }
+                        let table = f.sql().catalog_engine().unwrap().1.remove(0);
+                        let v = if history == 3 { 1 } else { version(&f, 1) };
+                        let mut a = f.sql(); run(&mut a, "BEGIN");
+                        if history == 0 { native(&mut a, &table, 1, v, false).unwrap(); }
+                        else if history != 3 {
+                            native(&mut a, &table, 1, v, true).unwrap();
+                            if history == 2 { run(&mut a, "INSERT INTO t VALUES(1,20)"); }
+                        }
+                        let b = Pending::native(&f, table, 1, v, delete, level);
+                        if history != 3 { b.blocked(&a); }
+                        run(&mut a, if commit { "COMMIT" } else { "ROLLBACK" });
+                        let result = b.finish();
+                        if history == 3 || commit && level == "READ COMMITTED" {
+                            assert_eq!(result, Err(CoreError::Sql(SqlError::Version)));
+                        }
+                        outcomes.push(result.map(|r| r.affected));
+                    }
+                    assert_eq!(outcomes[0], outcomes[1], "{level}, delete={delete}, history={history}, commit={commit}");
+                }
+            }
+        }
+    }
+    DISABLE_MUTATION_POINTS.set(false);
+}
+#[test]
+fn native_reverse_order_deadlock_rolls_back_victim() {
+    let f = Fixture::new();
+    f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+    f.exec("INSERT INTO t VALUES(1,0),(2,0)");
+    let table = f.sql().catalog_engine().unwrap().1.remove(0);
+    let versions = [version(&f, 1), version(&f, 2)];
+    let barrier = std::sync::Arc::new(Barrier::new(2));
+    let workers = [false, true].map(|reverse| {
+        let admin = f.admin().clone(); let table = table.clone(); let barrier = barrier.clone();
+        thread::spawn(move || {
+            let mut s = admin.sql_session(); run(&mut s, "BEGIN");
+            let ids = if reverse { [2,1] } else { [1,2] };
+            s.update_engine(&table, vec![Int(ids[0])], vec![(1, Int(if reverse {20} else {10}))], versions[ids[0] as usize-1]).unwrap();
+            barrier.wait();
+            let v = s.row_version_engine(&table, &[Int(ids[1])]).unwrap();
+            let result = s.update_engine(&table, vec![Int(ids[1])], vec![(1, Int(if reverse {20} else {10}))], v);
+            if result.is_ok() { run(&mut s, "COMMIT"); } else { run(&mut s, "ROLLBACK"); }
+            result.map(|_| if reverse {20} else {10})
+        })
+    });
+    let results = workers.map(|w| w.join().unwrap());
+    assert_eq!(results.iter().filter(|r| **r == Err(CoreError::Deadlock)).count(), 1);
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(run(&mut f.sql(), "SELECT n FROM t ORDER BY id").rows.into_iter()
+        .map(|r| r.values).collect::<Vec<_>>(), vec![vec![Int(*results.iter().find_map(|r| r.as_ref().ok()).unwrap())];2]);
+}
+
+#[test]
+fn native_unique_delete_reuse_matches_exclusive() {
+    for commit in [false,true] {
+        let mut outcomes = Vec::new();
+        for disabled in [true,false] {
+            DISABLE_MUTATION_POINTS.set(disabled);
+            let f=Fixture::new(); f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint UNIQUE)");
+            f.exec("INSERT INTO t VALUES(1,10)");
+            let table=f.sql().catalog_engine().unwrap().1.remove(0);
+            let mut a=f.sql(); run(&mut a,"BEGIN");
+            native(&mut a,&table,1,version(&f,1),true).unwrap();
+            let b=Pending::start(&f,"INSERT INTO t VALUES(2,10)"); b.blocked(&a);
+            run(&mut a,if commit {"COMMIT"} else {"ROLLBACK"});
+            outcomes.push(b.finish().map(|r|r.affected));
+        }
+        assert_eq!(outcomes[0],outcomes[1]);
+    }
+    DISABLE_MUTATION_POINTS.set(false);
+}
+#[test]
+fn native_fk_races_match_exclusive() {
+    fn scenario(action: &str, child_first: bool, commit: bool, disabled: bool) -> String {
+        DISABLE_MUTATION_POINTS.set(disabled);
+        let f=Fixture::new();
+        f.exec("CREATE TABLE p(id bigint PRIMARY KEY,n bigint)");
+        f.exec(&format!("CREATE TABLE c(id bigint PRIMARY KEY,p bigint REFERENCES p(id) ON DELETE {action})"));
+        f.exec("INSERT INTO p VALUES(1,0),(2,0)"); f.exec("INSERT INTO c VALUES(1,2)");
+        let tables=f.sql().catalog_engine().unwrap().1;
+        let parent=tables.iter().find(|t|t.name=="p").unwrap().clone();
+        let child=tables.iter().find(|t|t.name=="c").unwrap().clone();
+        let pv=run(&mut f.sql(),"SELECT * FROM p WHERE id=1").rows[0].version;
+        let cv=run(&mut f.sql(),"SELECT * FROM c WHERE id=1").rows[0].version;
+        let mut a=f.sql(); run(&mut a,"BEGIN");
+        // Both native operations use their exact engine-built predicate shape.
+        if child_first { a.update_engine(&child,vec![Int(1)],vec![(1,Int(1))],cv).unwrap(); }
+        else { native(&mut a,&parent,1,pv,true).unwrap(); }
+        let admin=f.admin().clone();
+        let (send,done)=mpsc::channel();
+        let worker=thread::spawn(move || {
+            DISABLE_MUTATION_POINTS.set(disabled);
+            let mut s=admin.sql_session(); run(&mut s,"BEGIN");
+            let result=if child_first { native(&mut s,&parent,1,pv,true) }
+                else { s.update_engine(&child,vec![Int(1)],vec![(1,Int(1))],cv) };
+            if result.is_ok() {run(&mut s,"COMMIT");} else {run(&mut s,"ROLLBACK");}
+            send.send(result).unwrap();
+        });
+        let b=Pending{done,worker}; b.blocked(&a);
+        run(&mut a,if commit {"COMMIT"}else{"ROLLBACK"});
+        let outcome=b.finish().map(|r|r.affected);
+        let parents=run(&mut f.sql(),"SELECT * FROM p ORDER BY id").rows.into_iter().map(|r|r.values).collect::<Vec<_>>();
+        let children=run(&mut f.sql(),"SELECT * FROM c ORDER BY id").rows.into_iter().map(|r|r.values).collect::<Vec<_>>();
+        format!("{outcome:?};{parents:?};{children:?}")
+    }
+    for action in ["RESTRICT","NO ACTION","CASCADE","SET NULL"] {
+        for child_first in [false,true] { for commit in [false,true] {
+            assert_eq!(scenario(action,child_first,commit,false),scenario(action,child_first,commit,true),
+                "{action}, child_first={child_first}, commit={commit}");
+        }}
+    }
+    DISABLE_MUTATION_POINTS.set(false);
+}
+
+#[test]
+fn native_late_failures_roll_back_insert_many_mutation_and_mixed_upsert() {
+    use crate::operations::{self as o, Request, ValueExpr, Expr, Intent, Bindings, ConflictAction};
+    let lit = |v| ValueExpr::Literal(Int(v));
+    let expr = |v| Expr::Value(lit(v));
+    for unique in [false,true] {
+        let f=Fixture::new(); f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint UNIQUE)");
+        f.exec("INSERT INTO t VALUES(1,10),(2,20),(9,90)");
+        let engine=o::Engine::new(f.admin().clone());
+        let table=f.sql().catalog_engine().unwrap().1.remove(0);
+        let mut a=f.sql(); run(&mut a,"BEGIN");
+        a.update_engine(&table,vec![Int(9)],vec![(1,Int(91))],version(&f,9)).unwrap();
+        let request=Request::InsertMany {table:"t".into(),columns:vec!["id".into(),"n".into()],
+            rows:vec![vec![expr(3),expr(30)],vec![expr(if unique {4}else{1}),expr(if unique {10}else{40})]],cap:lit(2)};
+        let admin=f.admin().clone();
+        let worker=thread::spawn(move || o::Engine::new(admin).execute(&request,&Bindings::new()));
+        run(&mut a,"ROLLBACK");
+        assert_eq!(worker.join().unwrap().unwrap_err(), o::Error::Duplicate);
+        assert_eq!(run(&mut f.sql(),"SELECT * FROM t WHERE id=3").rows.len(),0);
+        let request=Request::Update {table:"t".into(),filter:Expr::Value(ValueExpr::Literal(relational::Value::Bool(true))),
+            guard:None,values:vec![("n".into(),lit(30))],intent:Intent::Many{cap:lit(3)}};
+        assert_eq!(engine.execute(&request,&Bindings::new()).unwrap_err(), o::Error::Duplicate);
+        let request=Request::OnConflict {request:Box::new(Request::InsertMany {table:"t".into(),
+            columns:vec!["id".into(),"n".into()],rows:vec![vec![expr(3),expr(30)],vec![expr(1),expr(11)],vec![expr(4),expr(20)]],cap:lit(3)}),
+            target:vec!["id".into()],action:ConflictAction::Update {guard:None,values:vec![("n".into(),expr(11))]}};
+        assert_eq!(engine.execute(&request,&Bindings::new()).unwrap_err(), o::Error::Duplicate);
+        assert_eq!(run(&mut f.sql(),"SELECT id,n FROM t ORDER BY id").rows.into_iter().map(|r|r.values).collect::<Vec<_>>(),
+            vec![vec![Int(1),Int(10)],vec![Int(2),Int(20)],vec![Int(9),Int(90)]]);
+    }
 }

@@ -634,3 +634,36 @@ async fn dd68_f9_native_surface_keeps_authority_for_deferred_routines() {
     drop(client);
     f.stop().await;
 }
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn native_mutation_not_found_unique_and_fk_keep_http_status_and_kind() {
+    let f = Fixture::catalog_empty_engine(giggles_core::Engine::V2).await;
+    let token = f.open_http(&f.app, false).await;
+    let mut setup = f.admin.sql_session();
+    for sql in ["CREATE TABLE n2p(id bigint PRIMARY KEY,n bigint UNIQUE)",
+        "DROP TABLE app",
+        "CREATE TABLE app(id bigint PRIMARY KEY,n bigint UNIQUE,p bigint REFERENCES n2p(id))",
+        "INSERT INTO app(id,n) VALUES(1,10),(2,20)"] {
+        setup.execute(sql, &[], None).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+    let literal = |v: i64| json!({"literal":{"intValue":v.to_string()}});
+    let filter = |v: i64| json!({"compare":{"left":{"field":"id"},"comparison":"NATIVE_COMPARISON_EQ","right":{"value":literal(v)}}});
+    let update = |id, value| json!({"update":{"table":"app","filter":filter(id),"values":[{"column":"n","value":literal(value)}],"intent":{"one":{}}}});
+    for h2 in [false,true] {
+        for (request,kind,state) in [
+            (update(99,30), "NATIVE_ERROR_CLASS_NOT_FOUND", None),
+            (update(1,20), "NATIVE_ERROR_CLASS_DUPLICATE", Some("23505")),
+            (json!({"insert":{"table":"app","values":[{"column":"id","value":literal(3)},{"column":"p","value":literal(99)}]}}),
+                "NATIVE_ERROR_CLASS_SQL", Some("23503")),
+        ] {
+            let (status,bytes)=f.http(&f.app,"POST","/v1/session/execute",Some(&token),
+                serde_json::to_vec(&json!({"operation":{"request":request,"bindings":[]}})).unwrap(),h2).await.unwrap();
+            assert_eq!(status,200);
+            let reply: Value=serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(reply["nativeError"]["kind"],kind,"{reply}");
+            assert_eq!(reply["nativeError"]["sqlstate"].as_str(),state,"{reply}");
+        }
+    }
+    f.stop().await;
+}

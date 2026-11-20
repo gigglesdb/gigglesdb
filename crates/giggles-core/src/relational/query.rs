@@ -188,6 +188,30 @@ pub(super) struct Query {
     order: Vec<(Scalar, bool, bool)>,
     limit: Option<Expr>,
 }
+pub(super) fn primary_key_candidate_supported(ty: &DataType) -> bool {
+    matches!(ty, DataType::Boolean | DataType::SmallInt | DataType::Integer
+        | DataType::BigInt | DataType::Text | DataType::Varchar | DataType::Bytes
+        | DataType::Numeric | DataType::Real | DataType::DoublePrecision)
+}
+pub(super) fn primary_key_literal_value(value: &Value, column: &ColumnDef) -> Option<Value> {
+    primary_key_candidate_value(&Scalar::Literal(value.clone()), column, &[])
+}
+fn primary_key_candidate_value(s: &Scalar, column: &ColumnDef, params: &[Value]) -> Option<Value> {
+    if !primary_key_candidate_supported(&column.data_type) { return None; }
+    let v = match s {
+        Scalar::Literal(v) => match unknown_comparison_literal(v, &column.data_type).ok()? {
+            Some(v) => v?,
+            None => v.clone(),
+        },
+        Scalar::Param(n) => params.get(n.checked_sub(1)?)?.clone(),
+        _ => return None,
+    };
+    if v == Value::Null { return None; }
+    if check(&v, column).is_err()
+        || comparison_requires_filter(&v, &column.data_type).ok()? { return None; }
+    Some(v)
+}
+
 impl Query {
     pub(super) fn from_single_source_read(read: typed_read::SingleSourceRead) -> R<Self> {
         typed_read::lower(read)
@@ -3365,26 +3389,6 @@ impl Query {
     ) -> Option<(Vec<Vec<Value>>, bool)> {
         if table.primary_key.iter().any(|i| !state.deterministic_column(table.columns[*i].id)) { return None; }
         // Keep one candidate page within the existing 200-row staging budgets.
-        fn supported(ty: &DataType) -> bool {
-            matches!(ty, DataType::Boolean | DataType::SmallInt | DataType::Integer
-                | DataType::BigInt | DataType::Text | DataType::Varchar | DataType::Bytes
-                | DataType::Numeric | DataType::Real | DataType::DoublePrecision)
-        }
-        fn value(s: &Scalar, column: &ColumnDef, params: &[Value]) -> Option<Value> {
-            if !supported(&column.data_type) { return None; }
-            let v = match s {
-                Scalar::Literal(v) => match unknown_comparison_literal(v, &column.data_type).ok()? {
-                    Some(v) => v?,
-                    None => v.clone(),
-                },
-                Scalar::Param(n) => params.get(n.checked_sub(1)?)?.clone(),
-                _ => return None,
-            };
-            if v == Value::Null { return None; }
-            if check(&v, column).is_err()
-                || comparison_requires_filter(&v, &column.data_type).ok()? { return None; }
-            Some(v)
-        }
         // Skipping a noncandidate must not skip an error/volatile expression that
         // the old scan would evaluate before a later key test. Restrict residuals
         // to total, exact comparisons and NULL/boolean tests over simple columns.
@@ -3399,9 +3403,9 @@ impl Query {
                 Filter::Compare(a, _, b) => {
                     if let Some(c) = column(a) {
                         if let Some(d) = column(b) {
-                            supported(&c.data_type) && c.data_type == d.data_type
-                        } else { value(b, c, params).is_some() }
-                    } else if let Some(c) = column(b) { value(a, c, params).is_some() }
+                            primary_key_candidate_supported(&c.data_type) && c.data_type == d.data_type
+                        } else { primary_key_candidate_value(b, c, params).is_some() }
+                    } else if let Some(c) = column(b) { primary_key_candidate_value(a, c, params).is_some() }
                     else { false }
                 }
                 Filter::Null(s, _) => matches!(s, Scalar::Column(_) | Scalar::Literal(_)),
@@ -3417,7 +3421,7 @@ impl Query {
                         (Scalar::Column(c), s) | (s, Scalar::Column(c)) if c.name == column.name => s,
                         _ => return None,
                     };
-                    let v = value(s, column, params)?;
+                    let v = primary_key_candidate_value(s, column, params)?;
                     Some(BTreeMap::from([(encode_key(std::slice::from_ref(&v)).ok()?, v)]))
                 }
                 Filter::Logic(a, and, b) => {
@@ -3471,7 +3475,7 @@ impl Query {
                 Expr::Literal(v) => Scalar::Literal(v.clone()),
                 Expr::Param(n) => Scalar::Param(*n),
             };
-            *op == "=" && value(&scalar, &table.columns[*i], params).is_some()
+            *op == "=" && primary_key_candidate_value(&scalar, &table.columns[*i], params).is_some()
         });
         if !exact_bounds && !total(filter, table, params) { return None; }
         // An exact domain contains each key column once, with only ORs within
@@ -3488,7 +3492,7 @@ impl Query {
                         _ => return None,
                     };
                     let i = *table.primary_key.iter().find(|i| table.columns[**i].name == c.name)?;
-                    value(s, &table.columns[i], params)?;
+                    primary_key_candidate_value(s, &table.columns[i], params)?;
                     Some(i)
                 }
                 _ => None,
