@@ -51,6 +51,7 @@ struct SnapshotContext {
     owners: std::collections::BTreeMap<String, String>,
 }
 struct SnapshotIdentity {
+    task: bool,
     registry: giggles_core::roles::RoleCatalog,
     zone: giggles_pg_types::temporal::SessionZone,
     backend_pid: i32,
@@ -61,7 +62,7 @@ struct SnapshotIdentity {
     database: String,
 }
 fn identity(session: &crate::Session) -> SnapshotIdentity {
-    SnapshotIdentity { registry: session.service.admin.roles(),
+    SnapshotIdentity { task: session.task().is_some(), registry: session.service.admin.roles(),
         zone: session.zone().unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0)),
         backend_pid: session.backend_pid, backend_ssl: session.backend_ssl,
         locks: session.sql.held_table_locks().into_iter().map(|(a,b,c,d)| (a,b,c.into(),d)).collect(),
@@ -188,6 +189,22 @@ fn snapshot_owned(
     column_typmods.retain(|id, _| columns.contains(id));
     let visible: std::collections::BTreeSet<_> = tables.iter().map(|table| table.id).collect();
     let (roles, table_owners) = catalog_roles(&context, &tables);
+    let retained_task_names: std::collections::BTreeSet<String> = if context.identity.task {
+        roles.iter().filter(|role| task_retains_role(&context, &tables, &role.name))
+            .map(|role| role.name.clone()).collect()
+    } else { Default::default() };
+    let retained_bootstrap_oid = if context.identity.task && retained_task_names.contains(&roles[0].name) {
+        context.identity.registry.get(&roles[0].name).ok().flatten().map(|role| role.oid)
+    } else { None };
+    let owner_oid = |name: &str| {
+        if context.identity.task {
+            context.identity.registry.get(name).ok().flatten().map(|role| {
+                if role.name == roles[0].name && retained_task_names.contains(name) { 10 } else { role.oid }
+            })
+        } else {
+            roles.iter().find(|role| role.name == name).map(|role| role.oid)
+        }
+    };
     let mut table_acls = std::collections::BTreeMap::new();
     let schemas_for_acl = context.metadata.schemas.clone();
     for table in &tables {
@@ -204,6 +221,10 @@ fn snapshot_owned(
         let mut grants = vec![];
         for (role, privileges) in context.identity.registry.clone().table_acl(&key).map_err(|_| "XX000")? {
             let grantee = if role.is_empty() { 0 } else {
+                if context.identity.task {
+                    let Some(actual) = context.identity.registry.get(&role).map_err(|_| "XX000")? else { continue; };
+                    if !retained_task_names.contains(&actual.name) { continue; }
+                }
                 let Some(role) = roles.iter().find(|r| r.name == role) else { continue; };
                 role.oid
             };
@@ -308,13 +329,13 @@ fn snapshot_owned(
                 .and_then(|id| id.checked_mul(4))
                 .and_then(|id| id.checked_add(65536))
                 .ok_or("54000")?;
-            let owner = roles.iter().find(|r| r.name == owner).map_or(10, |r| r.oid);
+            let owner = owner_oid(&owner).unwrap_or(10);
             Ok((name, (oid, owner)))
         })
         .collect::<Result<_>>()?;
     let collations = catalog.collations.into_iter().map(|(oid,c)| -> Result<Vec<Value>> {
             let ns = if c.schema == "public" { 2200 } else { schemas.get(&c.schema).map(|(oid,_)| *oid).ok_or("XX000")? };
-            let owner = roles.iter().find(|r| r.name == c.owner).map_or(10, |r| r.oid);
+            let owner = owner_oid(&c.owner).unwrap_or(10);
             let text = |v: Option<String>| v.map_or(Value::Null, Value::Text);
             Ok(vec![Value::Int(i64::from(oid)), Value::Text(c.name), Value::Int(i64::from(ns)), Value::Int(i64::from(owner)), Value::Text(c.provider), Value::Bool(c.deterministic), Value::Int(i64::from(c.encoding)), text(c.collate), text(c.ctype), text(c.locale), text(c.rules), text(c.version), text(c.comment)])
         }).collect::<Result<Vec<_>>>()?;
@@ -335,7 +356,8 @@ fn snapshot_owned(
             types.extensions.get(b.name).map(|i| {
                 let namespace = if i.schema == "pg_catalog" { 11 } else if i.schema == "public" { 2200 }
                     else { schemas_for_acl.schemas.get(&i.schema).map_or(2200, |(id,_)| giggles_core::relational::type_oid(*id).unwrap_or(2200)) };
-                (i.oid, i.owner, namespace, i.version.clone())
+                let owner = if retained_bootstrap_oid == Some(i.owner) { 10 } else { i.owner };
+                (i.oid, owner, namespace, i.version.clone())
             })
         };
         giggles_pg_catalog::ExtensionDef { name: b.name.into(), default_version: b.default_version.into(), versions: b.versions.iter().map(|s| (*s).into()).collect(),
@@ -345,12 +367,13 @@ fn snapshot_owned(
     let sequences = catalog.sequences.into_iter()
         .filter_map(|(oid,name)| {
             let owner = context.owners.get(&name).cloned()?;
-            let owner = roles.iter().find(|r| r.name == owner)?.oid;
+            let owner = owner_oid(&owner)?;
             let (schema,name) = name.split_once('\0').unwrap_or(("public",&name));
             Some(giggles_pg_catalog::SequenceDef {oid,schema:schema.into(),name:name.into(),owner,acl:None})
         }).collect();
     let mut schema_privileges = std::collections::BTreeMap::new();
     for role in &roles {
+        if context.identity.task && !retained_task_names.contains(&role.name) { continue; }
         for name in schemas.keys().map(String::as_str).chain(["public"]) {
             use giggles_core::roles::SchemaPrivilege as P;
             let granted = context.identity.registry.clone().schema_privileges(name,&role.name).map_err(|_| "XX000")?;
@@ -408,7 +431,10 @@ fn snapshot_owned(
                 Value::Bool(edge.admin), Value::Bool(edge.inherit), Value::Bool(edge.set),
             ]).collect()
         },
-        role_privileges: {
+        role_privileges: if context.identity.task {
+            // task_filtered rebuilds this over retained edges only.
+            std::collections::BTreeMap::new()
+        } else {
             let catalog = context.identity.registry.clone();
             let listed = catalog.list().map_err(|_| "XX000")?;
             let mut result = std::collections::BTreeMap::new();
@@ -557,20 +583,86 @@ fn task_filtered(
             *grantor = Value::Null;
         }
     }
-    let role_names: std::collections::BTreeSet<&str> = snapshot.roles.iter().map(|r| r.name.as_str()).collect();
-    snapshot.role_privileges.retain(|(member, parent), _|
-        role_names.contains(member.as_str()) && role_names.contains(parent.as_str()));
+    // Membership OIDs are presentation-only. Number task rows from retained
+    // data so hidden registry edges cannot shift a visible row's identity.
+    snapshot.role_memberships.sort_by_key(|edge| {
+        let oid = |column| match edge[column] { Value::Int(oid) => oid, _ => -1 };
+        (oid(1), oid(2), oid(3), matches!(edge[4], Value::Bool(true)),
+            matches!(edge[5], Value::Bool(true)), matches!(edge[6], Value::Bool(true)))
+    });
+    for (n, edge) in snapshot.role_memberships.iter_mut().enumerate() {
+        edge[0] = Value::Int(100000 + n as i64);
+    }
+    // Recompute the closure after removing hidden edges. Keeping full-registry
+    // pairs would expose paths through roles absent from this task's catalog.
+    snapshot.role_privileges.clear();
+    for member in &snapshot.roles {
+        let closure = |option: usize| {
+            let mut seen = std::collections::BTreeSet::from([member.oid]);
+            let mut pending = vec![member.oid];
+            while let Some(current) = pending.pop() {
+                for edge in &snapshot.role_memberships {
+                    if edge[2] == Value::Int(i64::from(current))
+                        && (option == 0 || edge[option] == Value::Bool(true))
+                        && let Value::Int(parent) = edge[1]
+                        && let Ok(parent) = u32::try_from(parent)
+                        && seen.insert(parent) {
+                        pending.push(parent);
+                    }
+                }
+            }
+            seen
+        };
+        let membership = closure(0);
+        let inherited = closure(5);
+        let set = closure(6);
+        for parent in &snapshot.roles {
+            let admin = snapshot.role_memberships.iter().any(|edge|
+                edge[1] == Value::Int(i64::from(parent.oid)) && edge[4] == Value::Bool(true)
+                    && matches!(edge[2], Value::Int(oid) if u32::try_from(oid).is_ok_and(|oid| membership.contains(&oid))));
+            snapshot.role_privileges.insert((member.name.clone(), parent.name.clone()), [
+                member.superuser || membership.contains(&parent.oid),
+                member.superuser || inherited.contains(&parent.oid),
+                member.superuser || set.contains(&parent.oid),
+                member.superuser || admin,
+            ]);
+        }
+    }
+    let safe_owner = |owner: &mut u32| { if !roles.contains(owner) { *owner = 10; } };
+    for (_, owner) in snapshot.schemas.values_mut() { safe_owner(owner); }
+    for extension in &mut snapshot.extensions {
+        if let Some((_, owner, _, _)) = &mut extension.installed { safe_owner(owner); }
+    }
+    // Only shown columns can make a user collation visible.
+    snapshot.collation_oids.retain(|id, _| shown(id));
+    let collations: std::collections::BTreeSet<u32> = snapshot.collation_oids.values().flatten().copied().collect();
+    snapshot.collations.retain(|row| matches!(row.first(), Some(Value::Int(oid))
+        if u32::try_from(*oid).is_ok_and(|oid| collations.contains(&oid))));
+    for row in &mut snapshot.collations {
+        if let Some(owner) = row.get_mut(3)
+            && !matches!(owner, Value::Int(oid) if u32::try_from(*oid).is_ok_and(|oid| roles.contains(&oid))) {
+            *owner = Value::Int(10);
+        }
+    }
     snapshot.schema_privileges.retain(|(role, schema), _|
         roles.contains(role) && snapshot.schemas.contains_key(schema));
     snapshot.table_owners.retain(|table, _| *table == view.table);
-    snapshot.table_acls.retain(|table, _| *table == view.table);
-    for acl in snapshot.table_acls.values_mut() {
-        acl.retain(|entry| roles.contains(&entry.grantee));
-    }
-    snapshot.column_acls.retain(|(table, column), _| *table == view.table && shown(column));
-    for acl in snapshot.column_acls.values_mut() {
-        acl.retain(|entry| roles.contains(&entry.grantee));
-    }
+    snapshot.table_acls.retain(|table, acl| {
+        if *table != view.table { return false; }
+        // The builder prepends exactly one synthetic owner entry when explicit
+        // grants exist. An explicit owner grant is a separate entry, so removing
+        // the synthetic entry alone cannot erase a genuine owner ACL.
+        let synthetic = acl.first().cloned();
+        acl.retain(|entry| entry.grantee == 0 || roles.contains(&entry.grantee));
+        !(acl.is_empty() || (acl.len() == 1 && acl.first() == synthetic.as_ref()
+            && synthetic.as_ref().is_some_and(|entry|
+                Some(&entry.grantee) == snapshot.table_owners.get(table)
+                    && entry.grantor == entry.grantee)))
+    });
+    snapshot.column_acls.retain(|(table, column), acl| {
+        acl.retain(|entry| entry.grantee == 0 || roles.contains(&entry.grantee));
+        *table == view.table && shown(column) && !acl.is_empty()
+    });
     snapshot.column_type_oids.retain(|id, _| shown(id));
     snapshot.column_typmods.retain(|id, _| shown(id));
     let used: std::collections::BTreeSet<u32> = snapshot.column_type_oids.values().copied().collect();
@@ -734,6 +826,16 @@ pub(crate) fn with_application_rows(
     Ok(snapshot)
 }
 
+/// Match actual registry identities before assigning presentation OIDs. In
+/// particular, a stored bootstrap namesake is not the synthetic bootstrap row.
+fn task_retains_role(context: &SnapshotContext, tables: &[giggles_core::relational::TableDef], name: &str) -> bool {
+    name == context.identity.user || tables.iter().any(|table| {
+        let schema = context.metadata.schemas.tables.get(&table.id).map_or("public", String::as_str);
+        let key = giggles_core::relational::relation_key(schema, &table.name);
+        context.owners.get(&key).is_some_and(|owner| owner == name)
+    })
+}
+
 /// Presentation-only role rows and owners of the already authorization-filtered
 /// tables, read from the role registry so `pg_get_userbyid(relowner)` names the
 /// creating role as PostgreSQL does. OID 10 stays the bootstrap row; a registry
@@ -757,7 +859,15 @@ fn catalog_roles(
     oids.insert(bootstrap.clone(), 10u32);
     // Keep role-name bytes well under the catalog's 64 KiB snapshot input bound.
     let mut name_bytes = bootstrap.len();
+    // Task identities and all owner lookups come from the full registry before
+    // applying the presentation budget. Hidden names cannot consume that budget.
+    if context.identity.task {
+        oids.extend(listed.iter().map(|role| (role.name.clone(), if role.name == bootstrap { 10 } else { role.oid })));
+    }
     for role in listed {
+        if context.identity.task && !task_retains_role(context, tables, &role.name) {
+            continue;
+        }
         if role.name == bootstrap {
             roles[0].superuser = role.superuser;
             roles[0].login = role.login;
@@ -1933,4 +2043,168 @@ mod w1e_regressions {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod task_hidden_owners {
+    use super::*;
+    use giggles_pg_catalog::{CatalogSnapshot, ExtensionDef};
+    // Exercise registry identities before task_filtered sees presentation OIDs.
+    #[test]
+    fn stored_bootstrap_identity_policy() {
+        use giggles_core::{Admin, Limits, roles::{NewRole, TablePrivilege}};
+        let path = crate::test_support::fixture_root().join(format!("bootstrap-policy-{}-{}",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let admin = Admin::create(&path, Limits::default()).unwrap();
+        admin.roles().create(NewRole { name: "r".into(), login: true, superuser: true, ..Default::default() }).unwrap();
+        admin.sql_session().execute("CREATE TABLE t (id BIGINT PRIMARY KEY)", &[], None).unwrap();
+        admin.roles().set_table_owner("t", "r").unwrap();
+        let service = crate::Service::new(admin.clone(), vec![], crate::clock::Clock::new(0,3600).unwrap()).unwrap();
+        let mut session = service.role_session("r").unwrap();
+        let read = |session: &mut crate::Session, task, user: &str| {
+            let (epoch, tables, indexes, typmods, types) = session.catalog_snapshot_with_typmods().unwrap();
+            let mut identity = identity(session);
+            identity.task = task;
+            identity.user = user.into();
+            let metadata = session.sql.catalog_metadata().unwrap();
+            let owners = owner_keys(&metadata).into_iter().filter_map(|key|
+                session.sql.table_owner(&key).unwrap().map(|owner| (key, owner))).collect();
+            snapshot_owned(SnapshotContext { identity, metadata, owners }, epoch, tables, indexes, typmods, types).unwrap()
+        };
+        let baseline = read(&mut session, true, "r");
+        admin.roles().create(NewRole { name: "giggles".into(), ..Default::default() }).unwrap();
+        admin.roles().grant_table("t", "giggles", &[TablePrivilege::Select]).unwrap();
+        let ordinary = read(&mut session, false, "r");
+        assert_eq!(ordinary.roles.iter().find(|r| r.name == "giggles").unwrap().oid, 10);
+        assert!(!ordinary.roles[0].superuser);
+        let id = ordinary.tables.iter().find(|t| t.name == "t").unwrap().id;
+        assert_eq!(ordinary.table_acls[&id].len(), 2);
+        assert_eq!(ordinary.table_acls[&id][1].grantee, 10);
+        let hidden = read(&mut session, true, "r");
+        assert_eq!(hidden.roles, baseline.roles);
+        assert_eq!(hidden.table_acls, baseline.table_acls);
+        // A retained session identity keeps the same presentation as ordinary.
+        let retained = read(&mut session, true, "giggles");
+        assert_eq!(retained.roles[0], ordinary.roles[0]);
+        assert_eq!(retained.table_acls, ordinary.table_acls);
+        admin.roles().set_table_owner("t", "giggles").unwrap();
+        let owned = read(&mut session, true, "r");
+        assert_eq!(owned.table_owners[&id], 10);
+        assert_eq!(owned.table_acls[&id][1].grantee, 10);
+        drop(session); drop(service); drop(admin);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    fn fixture() -> (CatalogSnapshot, crate::service::TaskCatalogView) {
+        let mut s = CatalogSnapshot::default();
+        for (oid, name) in [(42, "a"), (43, "b"), (99, "h")] {
+            let mut role = s.roles[0].clone();
+            role.oid = oid; role.name = name.into(); role.superuser = false;
+            s.roles.push(role);
+        }
+        s.user = "a".into();
+        s.tables.push(giggles_pg_catalog::TableDef { id: 7, name: "t".into(), primary_key: vec![], columns: vec![giggles_pg_catalog::ColumnDef { id: 11, name: "c".into(), data_type: giggles_pg_catalog::ScalarType::Text, not_null: false }] });
+        s.table_schemas.insert(7, "s".into());
+        s.table_owners.insert(7, 43);
+        s.schemas.insert("s".into(), (80000, 99));
+        (s, crate::service::TaskCatalogView { table: 7, schema: "s".into(), columns: [11].into(), hidden: vec![] })
+    }
+    fn run(s: &CatalogSnapshot, expr: &str) -> Value {
+        let p = giggles_pg_catalog::plan_gateway(&format!("SELECT {expr}")).unwrap().unwrap();
+        giggles_pg_catalog::execute(&p, s, &[]).unwrap().rows[0][0].clone()
+    }
+    #[test]
+    fn schema_owner() {
+        let (s, v) = fixture();
+        assert_eq!(task_filtered(s, &v).schemas["s"].1, 10);
+    }
+    #[test]
+    fn collations() {
+        let (mut s, v) = fixture();
+        for (oid, owner) in [(81000, 99), (81001, 99), (81002, 42)] {
+            s.collations.push(vec![Value::Int(oid), Value::Text(format!("c{oid}")), Value::Int(80000), Value::Int(owner)]);
+        }
+        s.collation_oids.insert(11, vec![81000, 81002]);
+        s.collation_oids.insert(12, vec![81001]);
+        let s = task_filtered(s, &v);
+        assert_eq!(s.collations.len(), 2);
+        assert_eq!(s.collations[0][3], Value::Int(10));
+        assert_eq!(s.collations[1][3], Value::Int(42));
+        assert!(!s.collation_oids.contains_key(&12));
+    }
+    #[test]
+    fn extensions() {
+        let (mut s, v) = fixture();
+        s.extensions.clear();
+        for owner in [99, 42] {
+            let mut e = ExtensionDef::uuid_ossp();
+            e.installed = Some((82000 + owner, owner, 80000, "1.1".into()));
+            s.extensions.push(e);
+        }
+        let s = task_filtered(s, &v);
+        assert_eq!(s.extensions[0].installed.as_ref().unwrap().1, 10);
+        assert_eq!(s.extensions[1].installed.as_ref().unwrap().1, 42);
+    }
+    fn edge(parent: i64, member: i64, inherit: bool, set: bool, admin: bool) -> Vec<Value> {
+        vec![Value::Int(1), Value::Int(parent), Value::Int(member), Value::Int(10), Value::Bool(admin), Value::Bool(inherit), Value::Bool(set)]
+    }
+    #[test]
+    fn membership_oids_ignore_hidden_edges() {
+        let (mut s, v) = fixture();
+        // Registry name order differs from retained OID order.
+        s.role_memberships = vec![edge(43,42,true,false,true), edge(10,43,false,true,false)];
+        for (n, edge) in s.role_memberships.iter_mut().enumerate() {
+            edge[0] = Value::Int(100000 + n as i64);
+        }
+        let baseline = task_filtered(s.clone(), &v).role_memberships;
+        s.role_memberships.insert(0, edge(99,42,true,true,true));
+        for (n, edge) in s.role_memberships.iter_mut().enumerate() {
+            edge[0] = Value::Int(100000 + n as i64);
+        }
+        assert_eq!(baseline, task_filtered(s, &v).role_memberships);
+        assert_eq!(baseline[0][1], Value::Int(10));
+        assert_eq!(baseline[0][0], Value::Int(100000));
+        assert_eq!(baseline[1][0], Value::Int(100001));
+    }
+    #[test]
+    fn hidden_chain_and_direct_options() {
+        let (mut s, v) = fixture();
+        s.role_memberships = vec![edge(99,42,true,true,true), edge(43,99,true,true,true)];
+        s.role_privileges.insert(("a".into(), "b".into()), [true;4]);
+        let filtered = task_filtered(s.clone(), &v);
+        assert_eq!(filtered.role_privileges[&("a".into(),"b".into())], [false;4]);
+        for p in ["MEMBER","USAGE","SET","MEMBER WITH ADMIN OPTION"] {
+            assert_eq!(run(&filtered, &format!("pg_has_role('a','b','{p}')")), Value::Bool(false));
+        }
+        s.role_memberships.push(edge(43,42,false,true,true));
+        let filtered = task_filtered(s, &v);
+        assert_eq!(filtered.role_privileges[&("a".into(),"b".into())], [true,false,true,true]);
+        assert_eq!(run(&filtered, "pg_has_role('a','b','MEMBER')"), Value::Bool(true));
+        assert_eq!(filtered.role_privileges[&("giggles".into(),"b".into())], [true;4]);
+    }
+    #[test]
+    fn hidden_schema_privilege_equals_absent() {
+        let (s,v) = fixture();
+        let s = task_filtered(s, &v);
+        for p in ["CREATE","USAGE"] {
+            assert_eq!(run(&s, &format!("has_schema_privilege(99::oid,'s','{p}')")), run(&s, &format!("has_schema_privilege(4294967000::oid,'s','{p}')")));
+        }
+    }
+    #[test]
+    fn hidden_acl_footprint() {
+        use giggles_pg_catalog::{AclEntry, AclPrivilege as P};
+        let (mut s, v) = fixture();
+        let owner = AclEntry { grantee: 43, grantor: 43, privileges: vec![P::Insert, P::Select, P::Update, P::Delete, P::Truncate, P::References, P::Trigger, P::Maintain], grant_option: false };
+        let hidden = AclEntry { grantee: 99, grantor: 43, privileges: vec![P::Select], grant_option: false };
+        s.table_acls.insert(7, vec![owner.clone(), hidden.clone()]);
+        s.column_acls.insert((7,11), vec![hidden]);
+        let filtered = task_filtered(s.clone(), &v);
+        assert!(!filtered.table_acls.contains_key(&7));
+        assert!(!filtered.column_acls.contains_key(&(7,11)));
+        // An explicit owner grant is a second entry, even after owner revocation.
+        s.table_acls.get_mut(&7).unwrap().push(AclEntry { privileges: vec![P::Select], ..owner });
+        assert_eq!(task_filtered(s.clone(), &v).table_acls[&7].len(), 2);
+        s.table_acls.get_mut(&7).unwrap().push(AclEntry { grantee: 0, grantor: 43, privileges: vec![P::Select], grant_option: false });
+        assert_eq!(task_filtered(s, &v).table_acls[&7].len(), 3);
+    }
+
 }

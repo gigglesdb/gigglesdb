@@ -379,3 +379,6 @@ mod durable_release;
 
 #[path = "w1e_task_privileges.rs"]
 mod w1e_task_privileges;
+
+#[path = "task_hidden_owners.rs"]
+mod task_hidden_owners;

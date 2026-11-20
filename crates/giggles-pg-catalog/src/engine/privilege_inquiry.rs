@@ -9,11 +9,17 @@ fn role(rt: &mut Runtime<'_>, value: &Value) -> R<i64> {
         _ => Err(Error::Type),
     }
 }
+// Capped ordinary role names may be omitted while their numeric graph remains.
+// Task snapshots remove hidden edges first, so they cannot make a hidden OID known.
+fn known_role(rt: &Runtime<'_>, oid: i64) -> bool {
+    rt.snapshot.roles.iter().any(|r| i64::from(r.oid) == oid)
+        || rt.snapshot.role_memberships.iter().any(|edge|
+            edge.get(1) == Some(&Value::Int(oid)) || edge.get(2) == Some(&Value::Int(oid)))
+}
 fn reachable(rt: &mut Runtime<'_>, member: i64, target: i64, option: usize) -> R<bool> {
     if member == target { return Ok(true); }
     // Unknown OIDs retain PostgreSQL's identity shortcut, but cannot enter the graph.
-    if !rt.snapshot.roles.iter().any(|r| i64::from(r.oid) == member)
-        || !rt.snapshot.roles.iter().any(|r| i64::from(r.oid) == target) {
+    if !known_role(rt, member) || !known_role(rt, target) {
         return Ok(false);
     }
     let mut seen = std::collections::BTreeSet::from([member]);
@@ -85,8 +91,7 @@ pub(super) fn evaluate(rt: &mut Runtime<'_>, name: &str, values: &[Value], effec
     if name == "pg_has_role" {
         let target = role(rt, &values[at])?;
         if superuser { return Ok(B(true)); }
-        if !rt.snapshot.roles.iter().any(|r| i64::from(r.oid) == member)
-            || !rt.snapshot.roles.iter().any(|r| i64::from(r.oid) == target) {
+        if !known_role(rt, member) || !known_role(rt, target) {
             return Ok(B(member == target && requested.iter().any(|(_, admin)| !admin)));
         }
         for (p, admin) in requested {
