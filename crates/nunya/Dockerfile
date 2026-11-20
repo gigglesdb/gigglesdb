@@ -3,7 +3,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends clang libclang-
 ARG FEATURES=""
 WORKDIR /src
 COPY . .
-RUN cargo build --manifest-path crates/nunya/Cargo.toml --release --features "$FEATURES" --bin nunya
+RUN cargo build --manifest-path crates/nunya/Cargo.toml --locked --release --features "$FEATURES" --bin nunya
 FROM debian:bookworm-slim
 RUN useradd --uid 10001 --create-home nunya
 COPY --from=build /src/crates/nunya/target/release/nunya /usr/local/bin/nunya

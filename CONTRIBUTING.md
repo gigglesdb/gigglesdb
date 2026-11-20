@@ -86,3 +86,9 @@ material whose origin or license is unclear.
 ## Reporting security issues
 
 Do not open public issues for vulnerabilities. Follow [SECURITY.md](SECURITY.md).
+
+## CI and container releases
+
+[CI and releases](docs/ci-releases.md) describes the test matrix, GHCR images,
+configuration mounts and tag-based promotion. The remote landing gate remains
+required; GitHub Actions does not replace it.

@@ -1,0 +1,130 @@
+{
+  "include": [
+    {
+      "name": "giggles-pg-conformance-default",
+      "crates": "giggles-pg-conformance",
+      "mode": "default",
+      "main": false
+    },
+    {
+      "name": "giggles-engine-bench-default",
+      "crates": "giggles-engine-bench",
+      "mode": "default",
+      "main": false
+    },
+    {
+      "name": "giggles-cli-default",
+      "crates": "giggles-cli",
+      "mode": "default",
+      "main": false
+    },
+    {
+      "name": "giggles-core-default",
+      "crates": "giggles-core",
+      "mode": "default",
+      "main": false
+    },
+    {
+      "name": "giggles-core-nodef",
+      "crates": "giggles-core",
+      "mode": "nodef",
+      "main": false
+    },
+    {
+      "name": "giggles-export-default",
+      "crates": "giggles-export",
+      "mode": "default",
+      "main": false
+    },
+    {
+      "name": "giggles-ffi-default",
+      "crates": "giggles-ffi",
+      "mode": "default",
+      "main": false
+    },
+    {
+      "name": "giggles-language-default",
+      "crates": "giggles-language",
+      "mode": "default",
+      "main": false
+    },
+    {
+      "name": "giggles-language-nodef",
+      "crates": "giggles-language",
+      "mode": "nodef",
+      "main": false
+    },
+    {
+      "name": "giggles-ledger-default",
+      "crates": "giggles-ledger",
+      "mode": "default",
+      "main": false
+    },
+    {
+      "name": "giggles-migrate-default",
+      "crates": "giggles-migrate",
+      "mode": "default",
+      "main": false
+    },
+    {
+      "name": "giggles-ops-default",
+      "crates": "giggles-ops",
+      "mode": "default",
+      "main": false
+    },
+    {
+      "name": "giggles-outbox-default",
+      "crates": "giggles-outbox",
+      "mode": "default",
+      "main": false
+    },
+    {
+      "name": "giggles-replication-default",
+      "crates": "giggles-replication",
+      "mode": "default",
+      "main": false
+    },
+    {
+      "name": "giggles-server-default",
+      "crates": "giggles-server",
+      "mode": "default",
+      "main": true
+    },
+    {
+      "name": "giggles-server-nodef",
+      "crates": "giggles-server",
+      "mode": "nodef",
+      "main": true
+    },
+    {
+      "name": "nunya-default",
+      "crates": "nunya",
+      "mode": "default",
+      "main": true
+    },
+    {
+      "name": "skedaddle-default",
+      "crates": "skedaddle",
+      "mode": "default",
+      "main": true
+    },
+    {
+      "name": "small-1",
+      "crates": "giggles-glibm-loader giggles-icu giggles-pg-uuid giggles-transactions",
+      "mode": "default",
+      "main": false
+    },
+    {
+      "name": "small-2",
+      "crates": "giggles-faultlab giggles-history giggles-model giggles-pg-json giggles-release",
+      "mode": "default",
+      "main": false
+    },
+    {
+      "name": "small-3",
+      "crates": "giggles-glibm giggles-history-runtime giggles-pg-catalog giggles-pg-types giggles-topology",
+      "mode": "default",
+      "main": false
+    }
+  ]
+}

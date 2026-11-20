@@ -1,0 +1,202 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_BUILD_JOBS: '4'
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.matrix.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: matrix
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          matrix=$(jq -c --arg event "$EVENT" '{include: [.include[] | select($event != "push" or .main)]}' scripts/ci-matrix.json)
+          echo "rust=$matrix" >> "$GITHUB_OUTPUT"
+  rust:
+    needs: matrix
+    name: Rust / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.rust) }}
+    steps:
+      - name: Free runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Native dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake
+      # No Rust target cache: independent RocksDB builds would exceed the 10 GB repo cap.
+      - name: Test and clippy
+        env:
+          CRATES: ${{ matrix.crates }}
+          MODE: ${{ matrix.mode }}
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-target"
+          source scripts/ci-prepare.sh
+          feature=()
+          if [[ $MODE == nodef ]]; then feature=(--no-default-features); fi
+          result=0
+          for crate in $CRATES; do
+            bash scripts/ci-cargo-test.sh "$crate" "$MODE" || result=1
+            cargo clippy --manifest-path "crates/$crate/Cargo.toml" --all-targets --locked "${feature[@]}" -- -D warnings || result=1
+          done
+          exit "$result"
+      - name: Test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-${{ matrix.name }}
+          path: |
+            ${{ runner.temp }}/cargo-*/summary.txt
+            ${{ runner.temp }}/cargo-*/test.log
+            ${{ runner.temp }}/cargo-*/retry-*.log
+          retention-days: 7
+  compat:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pytest==8.4.2
+      - run: python -I -B -m pytest compat/tests -p no:cacheprovider
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          AGENT_LOAD_WORK: ${{ runner.temp }}/agent-load
+  images:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - product: giggles
+            crate: giggles-server
+          - product: nunya
+            crate: nunya
+          - product: skedaddle
+            crate: skedaddle
+    steps:
+      - name: Free runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Image references
+        id: refs
+        env:
+          OWNER: ${{ github.repository_owner }}
+          PRODUCT: ${{ matrix.product }}
+        run: |
+          echo "image=ghcr.io/${OWNER,,}/$PRODUCT" >> "$GITHUB_OUTPUT"
+          echo "sha=sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: crates/${{ matrix.crate }}/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: |
+            ${{ steps.refs.outputs.image }}:${{ steps.refs.outputs.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=${{ matrix.product }}
+      - name: Smoke test
+        env:
+          IMAGE: ${{ steps.refs.outputs.image }}:${{ steps.refs.outputs.sha }}
+        run: |
+          bash scripts/ci-smoke-image.sh "$IMAGE"
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.refs.outputs.image }}
+          SHA_TAG: ${{ steps.refs.outputs.sha }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          printf 'Image: `%s:%s`\n\nDigest: `%s`\n' "$IMAGE" "$SHA_TAG" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+  publish:
+    if: github.event_name == 'push'
+    needs: rust
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - product: giggles
+            crate: giggles-server
+          - product: nunya
+            crate: nunya
+          - product: skedaddle
+            crate: skedaddle
+    steps:
+      - name: Free runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Image references
+        id: refs
+        env:
+          OWNER: ${{ github.repository_owner }}
+          PRODUCT: ${{ matrix.product }}
+        run: |
+          echo "image=ghcr.io/${OWNER,,}/$PRODUCT" >> "$GITHUB_OUTPUT"
+          echo "sha=sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: crates/${{ matrix.crate }}/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.refs.outputs.image }}:${{ steps.refs.outputs.sha }}
+            ${{ steps.refs.outputs.image }}:main
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=${{ matrix.product }}
+          cache-to: type=gha,mode=min,scope=${{ matrix.product }}
+      - name: Smoke test
+        env:
+          IMAGE: ${{ steps.refs.outputs.image }}:${{ steps.refs.outputs.sha }}
+        run: |
+          docker pull "$IMAGE"
+          bash scripts/ci-smoke-image.sh "$IMAGE"
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.refs.outputs.image }}
+          SHA_TAG: ${{ steps.refs.outputs.sha }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          printf 'Image: `%s:%s`\n\nDigest: `%s`\n' "$IMAGE" "$SHA_TAG" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          printf "\nMain: %s:main\n" "$IMAGE" >> "$GITHUB_STEP_SUMMARY"
