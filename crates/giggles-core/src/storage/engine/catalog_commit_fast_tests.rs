@@ -315,3 +315,88 @@ fn concurrent_ddl_and_data_commits_keep_published_catalog_coherent() {
         40
     );
 }
+
+#[test]
+fn durable_reload_failure_retains_cause_and_never_serves_stale_catalog() {
+    let (backend, seq, locks, catalog) = setup();
+    catalog.snapshot(&mut txn(&seq, &locks, 400)).unwrap();
+    assert!(catalog.current.read().unwrap().is_some());
+    let replaced = catalog.cache.lock().unwrap().versions.last().unwrap().0;
+    let mut ddl = txn(&seq, &locks, 401);
+    catalog.create_table(&mut ddl, table("durable_despite_reload"), false, None, &|| false).unwrap();
+    *catalog.load_at_error.lock().unwrap() = Some(CoreError::Storage("injected reload I/O".into()));
+    assert!(matches!(catalog.commit_ddl(ddl), Err(TxnError::CommitAmbiguous)));
+    let committed = seq.visible_ts();
+    {
+        let cache = catalog.cache.lock().unwrap();
+        let cause = cache.poison_cause.as_ref().unwrap();
+        assert!(cause.contains("injected reload I/O"));
+        assert!(cause.contains(&format!("commit_ts={}", committed.0)));
+        assert!(cause.contains(&format!("replaced_version=Some({})", replaced.0)));
+        assert!(!cache.poison_reported.load(Ordering::Relaxed));
+        assert!(cache.view_at(committed).is_none());
+    }
+    let mut later = txn(&seq, &locks, 402);
+    assert!(matches!(catalog.snapshot(&mut later), Err(CoreError::Fenced)));
+    assert!(matches!(catalog.commit_ddl(later), Err(TxnError::Fenced)));
+    assert!(catalog.cache.lock().unwrap().poison_reported.load(Ordering::Relaxed));
+    assert!(catalog.current.read().unwrap().is_none());
+
+    // MemKv crash discards every non-durable write: reopen only its durable image.
+    let kv = Arc::new(Kv::new(Arc::new(backend.mem.crash())));
+    let reopened_seq = Sequencer::open(kv.clone(), Arc::new(ManualClock::new(20)), SequencerConfig::default()).unwrap();
+    let reopened = Catalog::open(reopened_seq.clone(), Arc::new(LockManager::new(LockConfig::default())), Arc::new(SequenceAllocator::new(kv, 64))).unwrap();
+    assert!(reopened.view_at(reopened_seq.visible_ts()).unwrap().by_name.contains_key("durable_despite_reload"));
+}
+
+#[test]
+fn changed_table_revalidates_unchanged_legacy_fk_before_durability() {
+    use crate::relational::catalog_ext::{Action, Constraint, ConstraintKind, Deferral, ReferencedKey};
+    let (backend, seq, locks, catalog) = setup();
+    let mut ddl = txn(&seq, &locks, 501);
+    let parent = catalog.create_table(&mut ddl, table("parent"), false, None, &|| false).unwrap();
+    let mut child_def = table("child");
+    child_def.columns.push(column("parent_id"));
+    let child = catalog.create_table(&mut ddl, child_def, false, None, &|| false).unwrap();
+    let constraint = Constraint {
+        id: 1000,
+        name: "child_parent_fk".into(),
+        kind: ConstraintKind::ForeignKey {
+            columns: vec![child.def.columns[1].id],
+            ref_table: parent.def.id,
+            ref_columns: vec![parent.def.columns[0].id],
+            on_delete: Action::NoAction,
+            on_update: Action::NoAction,
+            not_valid: false,
+            deferral: Deferral::NotDeferrable,
+            target: ReferencedKey::Unknown,
+        },
+    };
+    let key = catalog_codec::constraint_key(child.def.id, constraint.id);
+    let value = catalog_codec::encode_constraint(&constraint, "child").unwrap();
+    assert_eq!(value[0], 1, "exercise the legacy FK path");
+    ddl.require_features(super::super::content_check::required_bits_for_catalog_key(&key).unwrap()
+        | super::super::content_check::required_bits_for_catalog_value(&key, &value).unwrap());
+    ddl.put(Keyspace::Catalog, key, value).unwrap();
+    catalog.commit_ddl(ddl).unwrap();
+    catalog.snapshot(&mut txn(&seq, &locks, 502)).unwrap();
+    assert!(catalog.current.read().unwrap().is_some());
+    let before_ts = seq.visible_ts();
+    let before_versions = catalog.cache_versions();
+    let before_image: Vec<_> = backend.mem.range(Keyspace::Catalog, Bound::Unbounded, Bound::Unbounded, Direction::Forward).unwrap().collect();
+    let mut ddl = txn(&seq, &locks, 503);
+    let mut changed = (*child).clone();
+    changed.def.columns.pop();
+    let key = table_key(child.def.id);
+    ddl.put(Keyspace::Catalog, key, encode_entry(&changed).unwrap()).unwrap();
+    let result = catalog.commit_ddl(ddl);
+    assert!(matches!(result, Err(TxnError::Kv(KvError::Corrupt(_)))), "{result:?}; poisoned={}", catalog.cache.lock().unwrap().poisoned);
+    assert!(!catalog.cache.lock().unwrap().poisoned);
+    assert_eq!(seq.visible_ts(), before_ts);
+    assert_eq!(catalog.cache_versions(), before_versions);
+    let after_image: Vec<_> = backend.mem.range(Keyspace::Catalog, Bound::Unbounded, Bound::Unbounded, Direction::Forward).unwrap().collect();
+    assert_eq!(before_image, after_image);
+    let parts = catalog.parts(&mut txn(&seq, &locks, 504)).unwrap();
+    assert_eq!(parts.tables["child"].columns.len(), 2);
+    assert!(catalog.current.read().unwrap().is_some());
+}

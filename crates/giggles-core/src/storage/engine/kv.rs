@@ -289,6 +289,8 @@ pub(crate) struct Kv {
     backend: Arc<dyn KvBackend>,
     fenced: AtomicBool,
     single_writer: bool,
+    #[cfg(test)]
+    fence_cause: std::sync::Mutex<Option<String>>,
 }
 
 impl Kv {
@@ -297,6 +299,8 @@ impl Kv {
             backend,
             fenced: AtomicBool::new(false),
             single_writer: false,
+            #[cfg(test)]
+            fence_cause: std::sync::Mutex::new(None),
         }
     }
     /// Only for a backend whose versioned writes all pass through this engine's
@@ -354,8 +358,13 @@ impl Kv {
         self.fence_on_error(result)
     }
     fn fence_on_error(&self, result: Result<(), KvError>) -> Result<(), KvError> {
-        if result.is_err() {
-            self.fenced.store(true, Ordering::Release);
+        if let Err(error) = &result
+            && !self.fenced.swap(true, Ordering::AcqRel)
+        {
+            let cause = format!("KV fenced after backend write/flush failure: {}", super::diagnostics::error_text(error));
+            super::diagnostics::error(cause.clone());
+            #[cfg(test)]
+            { *self.fence_cause.lock().unwrap() = Some(cause); }
         }
         result
     }

@@ -135,3 +135,21 @@ fn rejects_malformed_payloads_with_valid_checksums() {
     trailing.push(0);
     corrupt(&checksum(&trailing));
 }
+
+#[test]
+fn failed_write_records_first_fence_cause_only() {
+    use super::{Durability, Kv};
+    use super::super::kv_mem::MemKv;
+    use std::sync::Arc;
+    let backend = Arc::new(MemKv::new());
+    let kv = Kv::new(backend.clone());
+    backend.fail_next_write(KvError::Io("injected first write error".into()));
+    assert_eq!(kv.write(sample(), Durability::Sync), Err(KvError::Io("injected first write error".into())));
+    let cause = kv.fence_cause.lock().unwrap().clone().unwrap();
+    assert!(cause.contains("injected first write error"));
+    assert_eq!(kv.flush_barrier(), Err(KvError::Fenced));
+    assert_eq!(kv.get(Keyspace::Meta, b"k"), Err(KvError::Fenced));
+    // Model another in-flight write failing after the first one fenced.
+    assert_eq!(kv.fence_on_error(Err(KvError::Io("second error".into()))), Err(KvError::Io("second error".into())));
+    assert_eq!(kv.fence_cause.lock().unwrap().as_ref(), Some(&cause));
+}

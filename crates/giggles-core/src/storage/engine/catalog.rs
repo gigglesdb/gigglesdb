@@ -317,6 +317,9 @@ pub(crate) struct CatalogCache {
     /// token it was loaded with and the newest timestamp at which that token was still current.
     tokens: BTreeMap<Ts, (u128, Ts)>,
     poisoned: bool,
+    // Diagnostics only: never persisted or returned in client-visible errors.
+    poison_cause: Option<String>,
+    poison_reported: std::sync::atomic::AtomicBool,
 }
 impl CatalogCache {
     pub(crate) fn load(
@@ -329,6 +332,8 @@ impl CatalogCache {
             snapshots: BTreeMap::new(),
             tokens: BTreeMap::new(),
             poisoned: false,
+            poison_cause: None,
+            poison_reported: std::sync::atomic::AtomicBool::new(false),
         };
         cache.publish(visible, load_view_until(kv, visible, end)?);
         Ok(cache)
@@ -367,6 +372,9 @@ impl CatalogCache {
     }
     fn ensure_live(&self) -> Result<(), TxnError> {
         if self.poisoned {
+            if !self.poison_reported.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                super::diagnostics::error(format!("catalog fenced: {}", self.poison_cause.as_deref().unwrap_or("unknown poison cause")));
+            }
             Err(TxnError::Fenced)
         } else {
             Ok(())
@@ -384,6 +392,8 @@ pub(crate) struct Catalog {
     current_version: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     token_read_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    load_at_error: Mutex<Option<CoreError>>,
     services: TxnServices,
     seq: Arc<SequenceAllocator>,
 }
@@ -420,6 +430,8 @@ impl Catalog {
             current_version: std::sync::atomic::AtomicU64::new(visible.0),
             #[cfg(test)]
             token_read_hook: Mutex::new(None),
+            #[cfg(test)]
+            load_at_error: Mutex::new(None),
             services,
             seq,
         })
@@ -776,6 +788,10 @@ impl Catalog {
 
     /// The committed catalog at `ts` (bounded below the cluster records on a gateway).
     fn load_at(&self, ts: Ts) -> Result<CatalogView, CoreError> {
+        #[cfg(test)]
+        if let Some(error) = self.load_at_error.lock().unwrap().take() {
+            return Err(error);
+        }
         load_view_until(&*self.services.read_view(ts), ts, catalog_end(&self.services))
     }
 
@@ -1322,7 +1338,14 @@ impl Catalog {
                 // next snapshot's generation check reloads; fencing the gateway would turn
                 // one lost read into an outage (delta review D3).
                 Err(_) if token.is_some() => return Ok(()),
-                Err(_) => {
+                Err(error) => {
+                    let cause = format!(
+                        "durable catalog reload failed commit_ts={} replaced_version={:?}: {}",
+                        ts.0, cache.versions.last().map(|(ts, _)| ts.0),
+                        super::diagnostics::error_text(&error)
+                    );
+                    super::diagnostics::error(cause.clone());
+                    cache.poison_cause = Some(cause);
                     // Durability already succeeded. Never expose the previous
                     // view as current; this catalog must be reopened.
                     cache.poisoned = true;
@@ -1490,6 +1513,26 @@ fn overlay_view<'a>(
     }
     for (key, value) in records.iter().filter(|(_, value)| value.is_some()) {
         apply_record(&mut view, &mut names, key, value.as_deref())?;
+    }
+    // Reload decodes every constraint against its owning table. The overlay
+    // otherwise retains already-decoded constraints when only a table changes.
+    // Round-trip unchanged constraints through that same decoder before commit.
+    for (key, value) in &records {
+        if key.first() != Some(&1) || value.is_none() {
+            continue;
+        }
+        let table = decode_id(&key[1..])?;
+        let def = &view.by_id[&table].def;
+        if let Some(constraints) = view.constraints.get(&table) {
+            for constraint in constraints.values() {
+                let constraint_key = catalog_codec::constraint_key(table, constraint.id);
+                if records.iter().any(|(key, _)| **key == constraint_key) {
+                    continue;
+                }
+                let encoded = catalog_codec::encode_constraint(constraint, &def.name)?;
+                catalog_codec::decode_constraint(&encoded, def)?;
+            }
+        }
     }
     finish_view(view, names)
 }

@@ -49,3 +49,5 @@ mod native_content;
 
 #[cfg(test)]
 mod column_collation_tests;
+
+mod diagnostics;
