@@ -39,6 +39,7 @@ fn acquire(lm: &LockManager, txn: u64, key: LockKey, mode: LockMode) {
     );
 }
 
+#[track_caller]
 fn until(mut condition: impl FnMut() -> bool) {
     let end = Instant::now() + BOUND;
     while !condition() {

@@ -357,7 +357,7 @@ fn blocking_covered_group_preserves_member_mode_sets_and_skips_drain() {
         state.waiters.insert(id, Waiter {
             txn: TxnId(2), key: d.clone(), mode: LockMode::Exclusive,
             upgrade: false, group: vec![(d.clone(), LockMode::Exclusive)],
-            cancelled: true, changed: Arc::new(Condvar::new()), sleeping: false,
+            cancelled: true, changed: Arc::new(Condvar::new()), sleeping: false, notified: AtomicBool::new(false),
         });
         state.by_txn.entry(TxnId(2)).or_default().push(id);
         state.keys.get_mut(&d).unwrap().queue.push(id);

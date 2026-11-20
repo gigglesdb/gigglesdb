@@ -22,7 +22,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::{Arc, Condvar, Mutex};
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// `Unique { index: CATALOG_NAME_INDEX, tuple: name }` in `Exclusive` mode
@@ -308,6 +308,13 @@ struct Waiter {
     changed: Arc<Condvar>,
     #[cfg(test)]
     sleeping: bool,
+    // Set by `notify_grant` when it signals this waiter while it sleeps, so
+    // the test-only wake-up counter counts only product-caused wake-ups.
+    // `remove_waiter` and `cancel_wait` are recognised by `completed` and
+    // `cancelled`; any new `changed.notify_one` site must set this flag too,
+    // or its wake-ups are counted as spurious.
+    #[cfg(test)]
+    notified: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -343,8 +350,13 @@ struct GroupContext<'a> {
 pub(crate) struct LockManager {
     config: LockConfig,
     state: Mutex<State>,
+    // Wake-ups caused by this manager: a completion, a `cancel_wait`, or a
+    // `notify_grant` signal. Condvar returns with none of these (std permits
+    // spurious wake-ups) go to `waiter_spurious_wakeups`, which no test asserts.
     #[cfg(test)]
     waiter_wakeups: AtomicUsize,
+    #[cfg(test)]
+    waiter_spurious_wakeups: AtomicUsize,
     #[cfg(test)]
     release_all_calls: AtomicUsize,
 }
@@ -356,6 +368,8 @@ impl LockManager {
             state: Mutex::new(State::default()),
             #[cfg(test)]
             waiter_wakeups: AtomicUsize::new(0),
+            #[cfg(test)]
+            waiter_spurious_wakeups: AtomicUsize::new(0),
             #[cfg(test)]
             release_all_calls: AtomicUsize::new(0),
         }
@@ -469,6 +483,8 @@ impl LockManager {
                 changed: Arc::clone(&changed),
                 #[cfg(test)]
                 sleeping: false,
+                #[cfg(test)]
+                notified: AtomicBool::new(false),
             },
         );
         state
@@ -539,14 +555,23 @@ impl LockManager {
             let (next, _) = changed
                 .wait_timeout(state, interval)
                 .map_err(|_| LockError::Misuse)?;
-            #[cfg(test)]
-            {
-                self.waiter_wakeups.fetch_add(1, Ordering::Relaxed);
-            }
             state = next;
             #[cfg(test)]
-            if let Some(waiter) = state.waiters.get_mut(&id) {
-                waiter.sleeping = false;
+            {
+                // Explained: completed (`remove_waiter`), cancelled
+                // (`cancel_wait`) or signalled by `notify_grant` while asleep.
+                let explained = state.completed.contains_key(&id)
+                    || state.waiters.get(&id).is_some_and(|waiter| {
+                        waiter.cancelled || waiter.notified.swap(false, Ordering::Relaxed)
+                    });
+                if explained {
+                    self.waiter_wakeups.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.waiter_spurious_wakeups.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(waiter) = state.waiters.get_mut(&id) {
+                    waiter.sleeping = false;
+                }
             }
         }
     }
@@ -619,7 +644,7 @@ impl LockManager {
                             state.keys.entry(key.clone()).or_default().holders.insert(txn, previous);
                         } else if state.keys.get_mut(key).is_some_and(|s| s.holders.remove(&txn).is_some()) {
                             if let Some(keys) = state.held_keys.get_mut(&txn) { keys.remove(key); }
-                            if let Some(count) = state.row_counts.get_mut(&txn) { *count -= 1; }
+                            state.uncount(txn, key);
                         }
                         affected.insert(key.clone());
                         let mut cross = Vec::new();
@@ -696,7 +721,7 @@ impl LockManager {
                 locks.holders.remove(&txn);
                 locks.slow.remove(&txn);
                 if let Some(keys) = state.held_keys.get_mut(&txn) { keys.remove(key); }
-                if let Some(count) = state.row_counts.get_mut(&txn) { *count -= 1; }
+                state.uncount(txn, key);
             }
             state.provisional.remove(&(txn, key.clone()));
             affected.insert(key.clone());
@@ -927,6 +952,18 @@ impl State {
             .insert(mode);
         self.index(key, mode);
         Ok(())
+    }
+
+    /// Undo `grant`'s row count for a removed holding. `grant` counts every
+    /// key except `Table`, so only those keys are uncounted here.
+    fn uncount(&mut self, txn: TxnId, key: &LockKey) {
+        if matches!(key, LockKey::Table(_)) {
+            return;
+        }
+        if let Some(count) = self.row_counts.get_mut(&txn) {
+            debug_assert!(*count > 0, "removed counted holding has no row count");
+            *count = count.saturating_sub(1);
+        }
     }
 
     fn remove_waiter(&mut self, id: u64, result: Result<(), LockError>) {
@@ -1162,7 +1199,12 @@ impl State {
             }
         }
         for id in notify {
-            self.waiters[&id].changed.notify_one();
+            let waiter = &self.waiters[&id];
+            #[cfg(test)]
+            if waiter.sleeping {
+                waiter.notified.store(true, Ordering::Relaxed);
+            }
+            waiter.changed.notify_one();
         }
     }
 
@@ -1246,4 +1288,46 @@ fn restore_modes_never_recreates_released_ownership() {
     let state = locks.state.lock().unwrap();
     assert!(!state.held_keys.contains_key(&txn));
     assert!(!state.row_counts.contains_key(&txn));
+}
+
+// `grant` counts every holding except `Table` keys toward
+// `max_row_locks_per_txn`, so restoring a Table holding must not uncount one.
+// Before the fix, restoring a row and a table holding to empty decremented the
+// count twice: a debug build panicked and a release build wrapped to
+// usize::MAX, so the transaction's next row lock failed with `Limit`.
+#[test]
+fn restore_modes_does_not_uncount_table_holdings() {
+    let locks = LockManager::new(LockConfig::default());
+    let txn = TxnId(1);
+    let table = LockKey::Table(7);
+    let first = LockKey::Row { table: 7, pk: vec![1] };
+    let second = LockKey::Row { table: 7, pk: vec![2] };
+    let keys = [(table.clone(), LockMode::RowExclusive), (first.clone(), LockMode::Exclusive)];
+    let before = locks.modes_on(txn, &keys);
+    locks.acquire(txn, second.clone(), LockMode::Exclusive, None, &|| false).unwrap();
+    locks.acquire(txn, table.clone(), LockMode::RowExclusive, None, &|| false).unwrap();
+    locks.acquire(txn, first.clone(), LockMode::Exclusive, None, &|| false).unwrap();
+    assert_eq!(locks.state.lock().unwrap().row_counts.get(&txn), Some(&2));
+    // Restoring only the table holding leaves both row holdings counted.
+    locks.restore_modes(txn, &before[..1]);
+    assert_eq!(locks.state.lock().unwrap().row_counts.get(&txn), Some(&2));
+    locks.acquire(txn, table.clone(), LockMode::RowExclusive, None, &|| false).unwrap();
+    // Restoring the table and one row holding uncounts exactly that row.
+    locks.restore_modes(txn, &before);
+    assert_eq!(locks.state.lock().unwrap().row_counts.get(&txn), Some(&1));
+    locks.restore_modes(txn, &locks.modes_on(TxnId(99), &[(second.clone(), LockMode::Exclusive)]));
+    {
+        let state = locks.state.lock().unwrap();
+        assert!(!state.row_counts.contains_key(&txn));
+        assert!(!state.held_keys.contains_key(&txn));
+    }
+    // The count stays exact, so the limit still admits the next row lock.
+    let limited = LockManager::new(LockConfig { max_row_locks_per_txn: 1, ..LockConfig::default() });
+    let before = limited.modes_on(txn, &keys);
+    limited.acquire(txn, table.clone(), LockMode::RowExclusive, None, &|| false).unwrap();
+    limited.acquire(txn, first.clone(), LockMode::Exclusive, None, &|| false).unwrap();
+    limited.restore_modes(txn, &before);
+    assert!(limited.held(txn).is_empty());
+    assert_eq!(limited.acquire(txn, second, LockMode::Exclusive, None, &|| false), Ok(()));
+    assert_eq!(limited.acquire(txn, first, LockMode::Exclusive, None, &|| false), Err(LockError::Limit));
 }
