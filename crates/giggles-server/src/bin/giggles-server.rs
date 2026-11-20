@@ -65,7 +65,7 @@ struct Config {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let Some(path) = args.next() else {
+    let Some(mut path) = args.next() else {
         eprintln!("{}", giggles_server::dev::USAGE);
         std::process::exit(2);
     };
@@ -85,7 +85,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         return giggles_server::dev::run(options).await;
     }
-    if path.starts_with('-') || args.next().is_some() {
+    let no_stdin_control = path == "--no-stdin-control";
+    if no_stdin_control {
+        path = args.next().unwrap_or_default();
+    }
+    if path.is_empty() || path.starts_with('-') || args.next().is_some() {
         eprintln!("{}", giggles_server::dev::USAGE);
         std::process::exit(2);
     }
@@ -103,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(feature = "engine-rocksdb"))]
         return Err("replication requires the engine-rocksdb feature".into());
         #[cfg(feature = "engine-rocksdb")]
-        return run_replicated(c).await;
+        return run_replicated(c, no_stdin_control).await;
     }
     if c.connections == 0 || c.connections > 128 {
         return Err("connection limit".into());
@@ -214,7 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     io::stdout().flush()?;
     // Trusted local stdin only; bounded command reader, one reload at a time.
     // Certificate reload uses the same trusted local trigger as binding reload.
-    let mut reader = giggles_server::dev::ControlReader::default();
+    let mut reader = giggles_server::dev::ControlReader::with_stdin(!no_stdin_control);
     while let Some(command) = reader.next().await? {
         if command.as_slice() == b"shutdown" {
             break;
@@ -536,7 +540,7 @@ async fn replica_command(args: impl Iterator<Item = String>) -> i32 {
 }
 
 #[cfg(feature = "engine-rocksdb")]
-async fn run_replicated(c: Config) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_replicated(c: Config, no_stdin_control: bool) -> Result<(), Box<dyn std::error::Error>> {
     use giggles_replication::role::Serving;
     use giggles_server::replication::runtime::Replicated;
     use std::{path::Path, sync::Arc, time::Duration};
@@ -583,7 +587,7 @@ async fn run_replicated(c: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut repl = Some(repl);
     let (tx, mut commands) = tokio::sync::mpsc::channel(1);
     let reader = tokio::spawn(async move {
-        let mut reader = giggles_server::dev::ControlReader::default();
+        let mut reader = giggles_server::dev::ControlReader::with_stdin(!no_stdin_control);
         loop {
             match reader.next().await {
                 Ok(Some(command)) => {

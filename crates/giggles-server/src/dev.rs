@@ -20,7 +20,7 @@ const DEFAULT_ENGINE: Engine = Engine::V2;
 #[cfg(not(feature = "engine-rocksdb"))]
 const DEFAULT_ENGINE: Engine = Engine::Legacy;
 
-pub const USAGE: &str = "usage: giggles-server CONFIG.json | --dev [--data DIR] [--port N] [--engine legacy|v2] [--owner NAME] [--database NAME] [--trust-local] [--no-api] [--reset-owner-password] (creation default: v2 with engine-rocksdb, otherwise legacy)";
+pub const USAGE: &str = "usage: giggles-server [--no-stdin-control] CONFIG.json | --dev [--data DIR] [--port N] [--engine legacy|v2] [--owner NAME] [--database NAME] [--trust-local] [--no-api] [--reset-owner-password] (creation default: v2 with engine-rocksdb, otherwise legacy)";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Options {
@@ -395,10 +395,34 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
 #[derive(Default)]
 pub struct ControlReader {
     input: Option<tokio::io::Stdin>,
+    signals_only: bool,
 }
 
 impl ControlReader {
+    /// Disable stdin entirely, including Tokio's blocking stdin worker.
+    pub fn with_stdin(enabled: bool) -> Self {
+        Self {
+            input: None,
+            signals_only: !enabled,
+        }
+    }
+
     pub async fn next(&mut self) -> io::Result<Option<Vec<u8>>> {
+        if self.signals_only {
+            #[cfg(unix)]
+            {
+                let mut terminate = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::terminate(),
+                )?;
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => result?,
+                    _ = terminate.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            tokio::signal::ctrl_c().await?;
+            return Ok(None);
+        }
         let input = self.input.get_or_insert_with(tokio::io::stdin);
         let mut command = Vec::new();
         let mut overflow = false;

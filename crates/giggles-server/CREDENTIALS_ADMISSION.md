@@ -9,7 +9,7 @@ fields (old configurations still start with the documented defaults):
 
 ```json
 {
-  "bindings_file": "K:/trusted/giggles/bindings.json",
+  "bindings_file": "/etc/giggles/bindings.json",
   "service_limits": {"sessions": 16, "burst": 4096, "per_second": 4096}
 }
 ```

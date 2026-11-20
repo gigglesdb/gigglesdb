@@ -34,11 +34,22 @@ impl Case {
         Self { path, config }
     }
     fn spawn(&self, label: &str) -> Child {
+        self.spawn_control(label, true)
+    }
+    fn spawn_control(&self, label: &str, stdin_control: bool) -> Child {
         let file = self.path.join(format!("{label}.TEST-ONLY.json"));
         std::fs::write(&file, serde_json::to_vec_pretty(&self.config).unwrap()).unwrap();
-        Command::new(env!("CARGO_BIN_EXE_giggles-server"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_giggles-server"));
+        if !stdin_control {
+            command.arg("--no-stdin-control");
+        }
+        command
             .arg(file)
-            .stdin(Stdio::piped())
+            .stdin(if stdin_control {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(std::fs::File::create(self.path.join(format!("{label}.stderr.log"))).unwrap())
             .kill_on_drop(true)
@@ -330,4 +341,43 @@ async fn binary_reload_shutdown_and_restart_fence_handles_and_staged_rows() {
     assert_eq!(rows["sql"]["rows"].as_array().unwrap().len(), 1);
     assert_eq!(rows["sql"]["rows"][0]["values"][0]["intValue"], "1");
     p.stop().await;
+}
+
+#[tokio::test]
+async fn no_stdin_control_accepts_connections_with_closed_stdin() {
+    let case = Case::new().await;
+    let mut child = case.spawn_control("no-stdin", false);
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(20), output.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(line.contains("preview=single-host"), "{line}");
+    let address = line
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("native="))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(child.try_wait().unwrap().is_none());
+    let connection = TcpStream::connect(address).await.unwrap();
+    drop(connection);
+    #[cfg(unix)]
+    {
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-TERM", &child.id().unwrap().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status.success(), "{status}");
+    }
+    // Windows has no SIGTERM equivalent; exercise closed stdin and connectivity.
+    #[cfg(not(unix))]
+    child.kill().await.unwrap();
 }

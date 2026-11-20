@@ -394,6 +394,12 @@ stdin `reload`/`shutdown` workflow, binding epochs, identical-authority certific
 overlap, reloadable certificates and restart-required CA changes, aggregate session/rate defaults,
 cancellation saturation behavior and capacity worksheet.
 
+For CONFIG.json mode without stdin control (for example in containers), run
+`giggles-server --no-stdin-control CONFIG.json`. This disables stdin reads;
+SIGINT and, on Unix, SIGTERM use the graceful shutdown path. The image uses
+this flag by default, so `docker stop` drains the server. Reload requires
+stdin control; omit the flag to use the trusted local `reload` command.
+
 Optional HTTP/1.1, HTTP/2 and typed gRPC interfaces expose native reads, guarded
 writes, claims and atomic blocks as structured requests. Native and SQL calls
 share persistent transactions; typed controls let native clients begin, commit
