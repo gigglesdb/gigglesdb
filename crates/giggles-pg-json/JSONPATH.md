@@ -148,3 +148,12 @@ restore on every return. selectors.sql/tsv plus selector-contexts.sql/tsv retain
 31,600 new actual PG18 observations; selectors-manifest.json records exact
 qualification and explicit source/fixture/generator identities. Full JSONPath,
 engine integration and DD68 remain unfinished.
+
+
+The continuations, methods and selectors manifests retain historical
+qualification results and input hashes. Checkout paths in those records are
+repo-relative with forward slashes; external evidence paths are preserved.
+The hashes describe the inputs at the original run, before path normalization.
+To normalize newly imported records, run
+`python -B crates/giggles-pg-json/tests/normalize_manifest_paths.py --source-root <original-checkout>`.
+The oracle generators produce SQL/TSV, not these qualification manifests.

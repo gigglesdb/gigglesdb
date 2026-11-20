@@ -16,7 +16,8 @@
 # It never pushes and never runs the gate: run the full gate first.
 set -euo pipefail
 
-repo=K:/Projects/gigglesdb
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo=${GIGGLES_REPO:-$(dirname "$(git -C "$script_dir" rev-parse --path-format=absolute --git-common-dir)")}
 base='' from='' msgfile='' dry=0
 paths=()
 while [ $# -gt 0 ]; do

@@ -7,13 +7,13 @@
         "--check",
         "--edition",
         "2024",
-        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\src\\jsonpath.rs",
-        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\src\\jsonpath\\predicates.rs",
-        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\tests\\selectors.rs",
-        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\tests\\jsonpath.rs",
-        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\tests\\continuations.rs"
+        "crates/giggles-pg-json/src/jsonpath.rs",
+        "crates/giggles-pg-json/src/jsonpath/predicates.rs",
+        "crates/giggles-pg-json/tests/selectors.rs",
+        "crates/giggles-pg-json/tests/jsonpath.rs",
+        "crates/giggles-pg-json/tests/continuations.rs"
       ],
-      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "cwd": "crates/giggles-pg-json",
       "env": {
         "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
         "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
@@ -30,13 +30,13 @@
         "--offline",
         "--locked",
         "--manifest-path",
-        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\Cargo.toml",
+        "crates/giggles-pg-json/Cargo.toml",
         "--all-targets",
         "--",
         "-D",
         "warnings"
       ],
-      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "cwd": "crates/giggles-pg-json",
       "env": {
         "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
         "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
@@ -53,11 +53,11 @@
         "--offline",
         "--locked",
         "--manifest-path",
-        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\Cargo.toml",
+        "crates/giggles-pg-json/Cargo.toml",
         "--no-run",
         "--message-format=json"
       ],
-      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "cwd": "crates/giggles-pg-json",
       "env": {
         "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
         "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
@@ -71,7 +71,7 @@
       "argv": [
         "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\giggles_pg_json-c53488b3ea73b1bd.exe"
       ],
-      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "cwd": "crates/giggles-pg-json",
       "env": {
         "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
         "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
@@ -85,7 +85,7 @@
       "argv": [
         "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\selectors-1acf8671b77750c6.exe"
       ],
-      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "cwd": "crates/giggles-pg-json",
       "env": {
         "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
         "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
@@ -99,7 +99,7 @@
       "argv": [
         "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\continuations-d9aebd7c3802b40a.exe"
       ],
-      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "cwd": "crates/giggles-pg-json",
       "env": {
         "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
         "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
@@ -113,7 +113,7 @@
       "argv": [
         "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\methods-7a3afc538c6f7533.exe"
       ],
-      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "cwd": "crates/giggles-pg-json",
       "env": {
         "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
         "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
@@ -127,7 +127,7 @@
       "argv": [
         "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\conformance-66bd26e88610b7c2.exe"
       ],
-      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "cwd": "crates/giggles-pg-json",
       "env": {
         "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
         "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
@@ -141,7 +141,7 @@
       "argv": [
         "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\operators-de8c7fc9cde2c113.exe"
       ],
-      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "cwd": "crates/giggles-pg-json",
       "env": {
         "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
         "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
@@ -155,7 +155,7 @@
       "argv": [
         "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\mutation-85facfd44a503b72.exe"
       ],
-      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "cwd": "crates/giggles-pg-json",
       "env": {
         "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
         "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
@@ -169,7 +169,7 @@
       "argv": [
         "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\jsonpath-b59e082a467d996f.exe"
       ],
-      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "cwd": "crates/giggles-pg-json",
       "env": {
         "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
         "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
@@ -308,7 +308,7 @@
       "--manifest-path",
       "crates/giggles-pg-json/Cargo.toml"
     ],
-    "cwd": "K:/Projects/gigglesdb",
+    "cwd": ".",
     "native_exit": 0,
     "log": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\full-second.log"
   },

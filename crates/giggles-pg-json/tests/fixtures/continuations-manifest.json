@@ -13,12 +13,12 @@
         "--check",
         "--edition",
         "2024",
-        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\src\\jsonpath.rs",
-        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\src\\jsonpath\\predicates.rs",
-        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\tests\\continuations.rs",
-        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\tests\\jsonpath.rs"
+        "crates/giggles-pg-json/src/jsonpath.rs",
+        "crates/giggles-pg-json/src/jsonpath/predicates.rs",
+        "crates/giggles-pg-json/tests/continuations.rs",
+        "crates/giggles-pg-json/tests/jsonpath.rs"
       ],
-      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "cwd": "crates/giggles-pg-json",
       "env": {
         "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\tmp",
         "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\tmp",
@@ -34,9 +34,9 @@
         "--offline",
         "--locked",
         "--manifest-path",
-        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\Cargo.toml"
+        "crates/giggles-pg-json/Cargo.toml"
       ],
-      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "cwd": "crates/giggles-pg-json",
       "env": {
         "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\tmp",
         "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\tmp",
@@ -52,13 +52,13 @@
         "--offline",
         "--locked",
         "--manifest-path",
-        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\Cargo.toml",
+        "crates/giggles-pg-json/Cargo.toml",
         "--all-targets",
         "--",
         "-D",
         "warnings"
       ],
-      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "cwd": "crates/giggles-pg-json",
       "env": {
         "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\tmp",
         "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\tmp",
@@ -127,7 +127,7 @@
     "argv": [
       "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\target\\debug\\deps\\continuations-d9aebd7c3802b40a.exe"
     ],
-    "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+    "cwd": "crates/giggles-pg-json",
     "native_exit": 0,
     "exe_before": "2089887f00a8eeb132054b79a52b0199bc60acdc720b38eaa6bf894dfd9ef02e",
     "exe_after": "2089887f00a8eeb132054b79a52b0199bc60acdc720b38eaa6bf894dfd9ef02e",

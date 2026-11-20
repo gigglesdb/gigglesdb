@@ -2,7 +2,7 @@
 -- title: COPY option validation
 -- owner: E1
 -- expect: compatible
-CREATE TABLE t_pgq_copy_options_errors (id int, a text, b text);
+CREATE TABLE t_pgq_copy_options_errors (id int PRIMARY KEY, a text, b text);
 -- @error
 COPY t_pgq_copy_options_errors TO STDOUT WITH (HEADER 2);
 -- @error

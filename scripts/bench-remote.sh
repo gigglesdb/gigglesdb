@@ -47,7 +47,8 @@
 # (summary.md, results.jsonl, meta.json, logs.tar.gz).
 set -euo pipefail
 
-repo=K:/Projects/gigglesdb
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo=${GIGGLES_REPO:-$(dirname "$(git -C "$script_dir" rev-parse --path-format=absolute --git-common-dir)")}
 boatdir=J:/gigglesdb-work/boat
 B=${BOAT:-$HOME/.ascii/bin/boat.exe}
 snapshot=gigglesdb-bench-base
