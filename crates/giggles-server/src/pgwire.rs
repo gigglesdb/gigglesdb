@@ -1560,7 +1560,7 @@ impl State {
                     parameters: vec![],
                 },
             )
-        } else if let Some(options) = crate::auth::statements::copy_stdout_select(sql)? {
+        } else if let Some(options) = self.copy_output_options(sql)? {
             self.copy_destination_privilege(session, &options.destination)?;
             self.prepare_copy_output(&options, session)?;
             (Plan::CopyOut(Box::new(options)), Description { type_oids: vec![], typmods: vec![], columns: vec![], parameters: vec![] })

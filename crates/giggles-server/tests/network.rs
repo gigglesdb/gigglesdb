@@ -435,14 +435,9 @@ async fn pinned_driver_extended_binary_types_describe_and_rollback() {
     tokio::pin!(copy);
     assert_eq!(copy.as_mut().finish().await.unwrap(), 0);
     // STDOUT formats are covered by raw-wire pg_dump tests.
-    assert_eq!(
-        code(
-            c.simple_query("COPY app FROM STDIN WITH (FORMAT csv, HEADER true)")
-                .await
-                .unwrap_err()
-        ),
-        "0A000"
-    );
+    let copy = c.copy_in::<_, bytes::Bytes>("COPY app FROM STDIN WITH (FORMAT csv, HEADER true)").await.unwrap();
+    tokio::pin!(copy);
+    assert_eq!(copy.as_mut().finish().await.unwrap(), 0);
     for query in [
         "COPY app TO 'file' WITH (FORMAT csv)",
         "COPY app FROM 'file'",
@@ -1408,7 +1403,7 @@ async fn raw_wire_text_parameters_binary_results_close_and_error_drain() {
     pg_send(
         &mut s,
         b'P',
-        &parse("bad", "COPY app FROM STDIN WITH (FORMAT csv, HEADER true)"),
+        &parse("bad", "COPY app FROM STDIN WITH (FORMAT csv, HEADER 2)"),
     )
     .await;
     pg_send(
@@ -1424,7 +1419,7 @@ async fn raw_wire_text_parameters_binary_results_close_and_error_drain() {
     .await;
     pg_send(&mut s, b'E', &execute("bad", 0)).await;
     let frames = pg_sync(&mut s).await;
-    assert!(has_code(&frames, "0A000"));
+    assert!(has_code(&frames, "42601"));
     assert_eq!(frames.len(), 2);
     assert_eq!(
         f.admin

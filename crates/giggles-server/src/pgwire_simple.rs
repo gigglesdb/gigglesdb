@@ -2,6 +2,14 @@
 use super::*;
 
 impl State {
+    pub(super) fn copy_output_options(&mut self, sql: &str) -> R<Option<crate::auth::statements::CopyOutput>> {
+        let result = crate::auth::statements::copy_stdout_select(sql);
+        if result.is_err() {
+            self.diagnostic.wire_message = giggles_core::relational::take_sql_error_message();
+        }
+        result
+    }
+
     pub(super) fn simple_query(
         &mut self,
         sql: &str,
@@ -120,7 +128,10 @@ impl State {
         let prepared = self.prepare_copy_output(options, session)?;
         let description = core(session.describe(&prepared))?;
         for name in &options.force_columns {
-            if !description.columns.iter().any(|c| c.name == *name) { return Err("42703"); }
+            if !description.columns.iter().any(|c| c.name == *name) {
+                self.diagnostic.wire_message = Some(format!("column \"{name}\" of relation \"{}\" does not exist", options.table_name.as_deref().unwrap_or("*SELECT*")));
+                return Err("42703");
+            }
         }
         let mut sink = copy_external::Sink::open(&options.destination, session, &mut self.diagnostic)?;
         self.settings.queried = session.in_transaction();
@@ -161,7 +172,11 @@ impl State {
                 }
                 if options.format == 1 {
                     copy_csv_field(column.name.as_bytes(), options, false, &mut data);
-                } else { data.extend(column.name.as_bytes()); }
+                } else {
+                    for b in column.name.as_bytes() {
+                        match *b { b'\\' => data.extend(b"\\\\"), b'\t' => data.extend(b"\\t"), b'\n' => data.extend(b"\\n"), b'\r' => data.extend(b"\\r"), b if b == options.delimiter => { data.push(b'\\'); data.push(b); }, b => data.push(b) }
+                    }
+                }
             }
             data.push(b'\n');
             self.copy_output_data(&mut sink, &data, out)?;
@@ -426,7 +441,7 @@ impl State {
             validate_lock(session, &tables.tables, tables.mode, tables.nowait)?;
             return complete("LOCK TABLE", &empty(), out);
         }
-        if let Some(select) = crate::auth::statements::copy_stdout_select(sql)? {
+        if let Some(select) = self.copy_output_options(sql)? {
             return self.copy_stdout(&select, session, out);
         }
         if is_copy_sql(sql) {

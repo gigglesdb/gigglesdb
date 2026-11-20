@@ -397,3 +397,16 @@ async fn main_format_stored_capability_names_are_ordinary_roles() {
     assert!(!tags(&read).contains(&b'E'), "{read:?}");
     f.stop().await;
 }
+
+#[tokio::test]
+async fn server_input_header_quote_options() {
+    let f = Fixture::with_engine(giggles_core::Engine::Legacy).await;
+    let path = f.path.join("header.csv");
+    std::fs::write(&path, b"i,x,n\n71,~a,b~,2\n").unwrap();
+    let mut s = f.connect().await;
+    let rows = query(&mut s, &format!("COPY t FROM '{}' WITH (FORMAT csv, HEADER MATCH, QUOTE '~')", path.to_string_lossy().replace('\\', "/").replace('\'', "''"))).await;
+    assert!(!rows.iter().any(|r| r.0 == b'E'), "{rows:?}");
+    let rows = query(&mut s, "COPY t FROM PROGRAM 'echo i,x,n&& echo 72,~a,b~,3' WITH (FORMAT csv, HEADER MATCH, QUOTE '~')").await;
+    assert!(!rows.iter().any(|r| r.0 == b'E'), "{rows:?}");
+    drop(s); f.stop().await;
+}

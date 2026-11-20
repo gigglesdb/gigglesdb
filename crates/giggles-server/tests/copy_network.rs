@@ -860,3 +860,85 @@ async fn copy_to_option_profiles() {
     }
     drop(s); f.stop().await;
 }
+
+#[tokio::test]
+async fn copy_option_parity() {
+    let f = Fixture::new().await;
+    let mut s = f.connect().await;
+    for (sql, data) in [
+        ("COPY t FROM STDIN WITH (FORMAT csv, HEADER MATCH, QUOTE '~', ESCAPE '!')", b"i,x,n\n1,~a!~b~,2\n".as_slice()),
+        ("COPY t FROM STDIN CSV HEADER QUOTE '~' FORCE NOT NULL x", b"ignored\n2,,3\n"),
+        ("COPY t FROM STDIN WITH (FORMAT csv, FORCE_NULL (x))", b"3,\"\",4\n"),
+        ("COPY t FROM STDIN WITH (HEADER true, DELIMITER '|', NULL 'NIL')", b"ignored\n4|NIL|5\n"),
+    ] {
+        start(&mut s, sql).await;
+        send(&mut s, b'd', data).await; send(&mut s, b'c', b"").await;
+        assert_eq!(tags(&read(&mut s).await), b"CZ", "{sql}");
+    }
+    let rows = query(&mut s, "COPY t TO STDOUT WITH (FORMAT csv, HEADER, QUOTE '~', FORCE_QUOTE (x))").await;
+    let data = rows.iter().filter(|r| r.0 == b'd').flat_map(|r| r.1.clone()).collect::<Vec<_>>();
+    assert_eq!(data, b"i,x,n\n1,~a~~b~,2\n2,~~,3\n3,,4\n4,,5\n");
+
+    for (sql, expected) in [
+        ("COPY (SELECT 1 AS \"a,b\", 2 AS \"c\"\"d\") TO STDOUT WITH (FORMAT csv, HEADER, FORCE_QUOTE (\"a,b\"))", b"\"a,b\",\"c\"\"d\"\n\"1\",2\n".as_slice()),
+        ("COPY (SELECT 1 AS \"a\tb\") TO STDOUT WITH (FORMAT text, HEADER)", b"a\\tb\n1\n"),
+    ] {
+        let rows = query(&mut s, sql).await;
+        let data = rows.iter().filter(|r| r.0 == b'd').flat_map(|r| r.1.clone()).collect::<Vec<_>>();
+        assert_eq!(data, expected, "{rows:?}");
+    }
+    for (sql, code, message) in [
+        ("COPY t FROM STDIN WITH (FORMAT csv, QUOTE '~~')", "0A000", "COPY quote must be a single one-byte character"),
+        ("COPY t TO STDOUT WITH (FORMAT binary, HEADER)", "0A000", "cannot specify HEADER in BINARY mode"),
+        ("COPY t TO STDOUT WITH (HEADER 2)", "42601", "header requires a Boolean value or \"match\""),
+        ("COPY (SELECT 1 AS a) TO STDOUT WITH (FORMAT csv, FORCE_QUOTE (nosuch))", "42703", "column \"nosuch\" does not exist"),
+        ("COPY t TO STDOUT OIDS", "42601", "syntax error at or near \"OIDS\""),
+        ("COPY t TO STDOUT WITH (bogus 1)", "42601", "option \"bogus\" not recognized"),
+        ("COPY t TO STDOUT WITH (FORMAT xml)", "22023", "COPY format \"xml\" not recognized"),
+        ("COPY t TO STDOUT WITH (HEADER, HEADER false)", "42601", "conflicting or redundant options"),
+        ("COPY t TO STDOUT WITH (FORMAT csv, HEADER MATCH)", "0A000", "cannot use \"match\" with HEADER in COPY TO"),
+        ("COPY t TO STDOUT WITH (QUOTE '~')", "0A000", "COPY QUOTE requires CSV mode"),
+        ("COPY t TO STDOUT WITH (ESCAPE '~')", "0A000", "COPY ESCAPE requires CSV mode"),
+        ("COPY t TO STDOUT WITH (FORMAT csv, ESCAPE '')", "0A000", "COPY escape must be a single one-byte character"),
+        ("COPY t TO STDOUT WITH (DELIMITER '||')", "0A000", "COPY delimiter must be a single one-byte character"),
+        ("COPY t TO STDOUT WITH (FORMAT csv, DELIMITER '~', QUOTE '~')", "22023", "COPY delimiter and quote must be different"),
+        ("COPY t TO STDOUT WITH (DELIMITER '\\')", "22023", "COPY delimiter cannot be \"\\\""),
+        ("COPY t TO STDOUT WITH (FORMAT csv, NULL 'a,b')", "22023", "COPY delimiter character must not appear in the NULL specification"),
+        ("COPY t FROM STDIN WITH (FORMAT csv, FORCE_QUOTE (x))", "0A000", "COPY FORCE_QUOTE cannot be used with COPY FROM"),
+        ("COPY t TO STDOUT WITH (FORMAT csv, FORCE_NULL (x))", "22023", "COPY FORCE_NULL cannot be used with COPY TO"),
+        ("COPY t FROM STDIN WITH (FORMAT csv, FORCE_NULL (nosuch))", "42703", "column \"nosuch\" of relation \"t\" does not exist"),
+        ("COPY t (i) FROM STDIN WITH (FORMAT csv, FORCE_NOT_NULL (x))", "42P10", "FORCE_NOT_NULL column \"x\" not referenced by COPY"),
+        ("COPY t (i) TO STDOUT WITH (FORMAT csv, FORCE_QUOTE (x))", "42P10", "FORCE_QUOTE column \"x\" not referenced by COPY"),
+        ("COPY t TO STDOUT WITH (DEFAULT 'DEF')", "0A000", "COPY DEFAULT cannot be used with COPY TO"),
+        ("COPY t FROM STDIN WITH (FORMAT binary, DEFAULT 'DEF')", "42601", "cannot specify DEFAULT in BINARY mode"),
+        ("COPY t FROM STDIN WITH (FORMAT csv, DEFAULT 'x', NULL 'x')", "0A000", "NULL specification and DEFAULT specification cannot be the same"),
+        ("COPY t FROM STDIN WITH (FORMAT csv, DEFAULT 'a,b')", "0A000", "COPY delimiter character must not appear in the DEFAULT specification"),
+        ("COPY t FROM STDIN WITH (ON_ERROR bogus)", "22023", "COPY ON_ERROR \"bogus\" not recognized"),
+        ("COPY t FROM STDIN WITH (REJECT_LIMIT 1)", "22023", "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE"),
+        ("COPY t FROM STDIN WITH (ON_ERROR ignore, REJECT_LIMIT 0)", "22023", "REJECT_LIMIT (0) must be greater than zero"),
+        ("COPY t TO STDOUT WITH (FREEZE)", "22023", "COPY FREEZE cannot be used with COPY TO"),
+
+    ] {
+        let rows = query(&mut s, sql).await; error(&rows, code);
+        assert!(rows.iter().any(|r| r.0 == b'E' && r.1.windows(message.len()).any(|b| b == message.as_bytes())), "{rows:?}");
+    }
+
+    for (sql, data, code, message) in [
+        ("COPY t FROM STDIN WITH (FORMAT binary)", b"".as_slice(), "22P04", "COPY file signature not recognized"),
+        ("COPY t FROM STDIN WITH (ON_ERROR stop, LOG_VERBOSITY default)", b"q\tx\t1\n", "22P02", "invalid input syntax for type integer: \"q\""),
+    ] {
+        start(&mut s, sql).await;
+        if !data.is_empty() { send(&mut s, b'd', data).await; }
+        if data.is_empty() { send(&mut s, b'c', b"").await; }
+        let rows = read(&mut s).await; error(&rows, code);
+        assert!(rows.iter().any(|r| r.1.windows(message.len()).any(|b| b == message.as_bytes())), "{rows:?}");
+        if !data.is_empty() { send(&mut s, b'c', b"").await; }
+    }
+    start(&mut s, "COPY t FROM STDIN WITH (FORMAT csv, HEADER MATCH)").await;
+    send(&mut s, b'd', b"i,bad,n\n").await;
+    let rows = read(&mut s).await; error(&rows, "22P04");
+    let message = b"column name mismatch in header line field 2: got \"bad\", expected \"x\"";
+    assert!(rows.iter().any(|r| r.1.windows(message.len()).any(|b| b == message)), "{rows:?}");
+    send(&mut s, b'c', b"").await;
+    drop(s); f.stop().await;
+}

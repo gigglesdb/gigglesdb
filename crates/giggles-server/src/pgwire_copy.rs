@@ -16,6 +16,13 @@ pub(super) struct Decoder {
     null: Vec<u8>,
     binary: bool,
     csv: bool,
+    quote: u8,
+    escape: u8,
+    skip_header: bool,
+    match_header: Option<Vec<String>>,
+    force_not_null: Vec<bool>,
+    force_null: Vec<bool>,
+    message: Option<String>,
     csv_at: usize,
     csv_quoted: bool,
     header: bool,
@@ -35,6 +42,8 @@ impl Decoder {
             null,
             binary: false,
             csv: false,
+            quote: b'"', escape: b'"', skip_header: false, match_header: None,
+            force_not_null: vec![], force_null: vec![], message: None,
             csv_at: 0,
             csv_quoted: false,
             header: false,
@@ -55,6 +64,32 @@ impl Decoder {
             binary: true,
             ..Self::text(columns, b'\t', b"\\N".to_vec())
         }
+    }
+    pub(super) fn options(&mut self, o: &giggles_core::relational::CopyOptions, names: Vec<String>) {
+        use giggles_core::relational::CopyHeader;
+        self.quote = o.quote; self.escape = o.escape;
+        self.skip_header = o.header != CopyHeader::Off;
+        self.force_not_null = names.iter().map(|n| o.force_not_null.contains(n)).collect();
+        self.force_null = names.iter().map(|n| o.force_null.contains(n)).collect();
+        if o.header == CopyHeader::Match { self.match_header = Some(names); }
+    }
+    fn accept_header(&mut self, row: &Row) -> Result<bool> {
+        if !self.skip_header { return Ok(true); }
+        self.skip_header = false;
+        if let Some(names) = self.match_header.take() {
+            if row.len() != names.len() {
+                self.message = Some(format!("wrong number of fields in header line: got {}, expected {}", row.len(), names.len()));
+                return Err(bad_format());
+            }
+            for (i, (value, name)) in row.iter().zip(names).enumerate() {
+                if value.as_deref() != Some(name.as_bytes()) {
+                    let got = value.as_ref().map_or_else(|| format!("null value (\"{}\")", String::from_utf8_lossy(&self.null)), |v| format!("\"{}\"", String::from_utf8_lossy(v)));
+                    self.message = Some(format!("column name mismatch in header line field {}: got {got}, expected \"{name}\"", i + 1));
+                    return Err(bad_format());
+                }
+            }
+        }
+        Ok(false)
     }
     pub(super) fn stream(&mut self) { self.streaming = true; }
     pub(super) fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Row>> {
@@ -88,6 +123,7 @@ impl Decoder {
                 // PostgreSQL accepts transport EOF before a complete next tuple
                 // count; pgx CopyFrom ends here without writing a -1 trailer.
                 if !self.header || self.pending.len() >= 2 {
+                    if !self.header && self.pending.len() < 11 { self.message = Some("COPY file signature not recognized".into()); }
                     return Err(bad_format());
                 }
                 self.pending.clear();
@@ -101,6 +137,7 @@ impl Decoder {
         }
     }
     pub(super) fn diagnostic(&self, d: &mut super::Diagnostic) {
+        if let Some(message) = &self.message { d.wire_message = Some(message.clone()); }
         if let Some(b) = self.newline_error {
             let cr = b == b'\r';
             d.wire_message = Some(format!("{} {} found in data", if self.csv { "unquoted" } else { "literal" }, if cr { "carriage return" } else { "newline" }));
@@ -125,9 +162,14 @@ impl Decoder {
         let mut start = 0;
         while self.csv_at < self.pending.len() {
             let b = self.pending[self.csv_at];
-            if b == b'"' {
-                self.csv_quoted = !self.csv_quoted;
+            if self.csv_quoted && b == self.escape {
+                if self.csv_at + 1 == self.pending.len() && !eof { break; }
+                if self.pending.get(self.csv_at + 1).is_some_and(|b| *b == self.quote || *b == self.escape) {
+                    self.csv_at += 2;
+                    continue;
+                }
             }
+            if b == self.quote { self.csv_quoted = !self.csv_quoted; }
             if !self.csv_quoted && matches!(b, b'\n' | b'\r') {
                 if b == b'\r' && self.csv_at + 1 == self.pending.len() && !eof {
                     break;
@@ -142,7 +184,8 @@ impl Decoder {
                 }
                 self.newline(self.csv_at)?;
                 let line = &self.pending[start..self.csv_at];
-                rows.push(self.csv_row(line)?);
+                let row = self.csv_row(line)?;
+                if self.accept_header(&row)? { rows.push(row); }
                 self.rows += 1;
                 self.csv_at += 1;
                 if b == b'\r' && self.pending.get(self.csv_at) == Some(&b'\n') {
@@ -157,13 +200,15 @@ impl Decoder {
             self.pending.clear();
         } else if eof {
             if self.csv_quoted {
+                self.message = Some("unterminated CSV quoted field".into());
                 return Err(bad_format());
             }
             if start < self.pending.len() && &self.pending[start..] != b"\\." {
                 if !self.streaming && self.rows == giggles_core::relational::MAX_ROWS {
                     return Err("54000");
                 }
-                rows.push(self.csv_row(&self.pending[start..])?);
+                let row = self.csv_row(&self.pending[start..])?;
+                if self.accept_header(&row)? { rows.push(row); }
                 self.rows += 1;
             }
             self.pending.clear();
@@ -183,14 +228,10 @@ impl Decoder {
             while at < line.len() && (quoted || line[at] != self.delimiter) {
                 let b = line[at];
                 at += 1;
-                if b == b'"' {
-                    was_quoted = true;
-                    if quoted && line.get(at) == Some(&b'"') {
-                        field.push(b'"');
-                        at += 1;
-                    } else {
-                        quoted = !quoted;
-                    }
+                if quoted && b == self.escape && line.get(at).is_some_and(|b| *b == self.quote || *b == self.escape) {
+                    field.push(line[at]); at += 1;
+                } else if b == self.quote {
+                    was_quoted = true; quoted = !quoted;
                 } else {
                     field.push(b);
                 }
@@ -201,7 +242,10 @@ impl Decoder {
             if field.contains(&0) || std::str::from_utf8(&field).is_err() {
                 return Err("22021");
             }
-            fields.push(if !was_quoted && line[start..at] == self.null {
+            let index = fields.len();
+            let force_not = !self.skip_header && self.force_not_null.get(index) == Some(&true);
+            let force_null = !self.skip_header && self.force_null.get(index) == Some(&true);
+            fields.push(if (!was_quoted && !force_not && line[start..at] == self.null) || (was_quoted && force_null && field == self.null) {
                 None
             } else {
                 Some(field)
@@ -212,7 +256,7 @@ impl Decoder {
             at += 1;
             start = at;
         }
-        if fields.len() > self.columns {
+        if !self.skip_header && fields.len() > self.columns {
             return Err(bad_format());
         }
         Ok(fields)
@@ -244,7 +288,8 @@ impl Decoder {
                 }
                 self.newline(at)?;
                 let line = &self.pending[start..at];
-                rows.push(self.text_row(line)?);
+                let row = self.text_row(line)?;
+                if self.accept_header(&row)? { rows.push(row); }
                 self.rows += 1;
                 at += 1;
                 if cr && self.pending.get(at) == Some(&b'\n') {
@@ -265,7 +310,8 @@ impl Decoder {
                 if !self.streaming && self.rows == giggles_core::relational::MAX_ROWS {
                     return Err("54000");
                 }
-                rows.push(self.text_row(line)?);
+                let row = self.text_row(line)?;
+                if self.accept_header(&row)? { rows.push(row); }
                 self.rows += 1;
             }
             self.pending.clear();
@@ -290,7 +336,7 @@ impl Decoder {
             }
         }
         fields.push(self.field(&line[start..])?);
-        if fields.len() > self.columns {
+        if !self.skip_header && fields.len() > self.columns {
             return Err(bad_format());
         }
         Ok(fields)
@@ -373,6 +419,7 @@ impl Decoder {
                 return Ok(rows);
             }
             if &self.pending[..11] != b"PGCOPY\n\xff\r\n\0" {
+                self.message = Some("COPY file signature not recognized".into());
                 return Err(bad_format());
             }
             let flags = u32::from_be_bytes(self.pending[11..15].try_into().unwrap());
@@ -727,5 +774,30 @@ mod tests {
         assert_eq!(d.feed(&bytes[..split]).unwrap().len(), limit);
         assert_eq!(d.feed(&bytes[split..]).unwrap_err(), "54000");
         assert_eq!(d.rows, limit);
+    }
+}
+
+#[cfg(test)]
+mod option_tests {
+    use super::*;
+    #[test]
+    fn csv_options_at_every_chunk_boundary() {
+        let o = giggles_core::relational::CopyOptions::parse("(FORMAT csv, HEADER MATCH, QUOTE '~', ESCAPE '!', FORCE_NOT_NULL (a), FORCE_NULL (b))", true).unwrap();
+        let data = b"a,b\n,~~\n~x!~y~,~z!!q~\n";
+        for split in 0..=data.len() {
+            let mut d = Decoder::csv(2, b',', vec![]);
+            d.options(&o, vec!["a".into(), "b".into()]);
+            let mut rows = d.feed(&data[..split]).unwrap();
+            rows.extend(d.feed(&data[split..]).unwrap()); rows.extend(d.finish().unwrap());
+            assert_eq!(rows, vec![vec![Some(vec![]), None], vec![Some(b"x~y".to_vec()), Some(b"z!q".to_vec())]], "split {split}");
+        }
+    }
+    #[test]
+    fn header_match_and_empty_input() {
+        let o = giggles_core::relational::CopyOptions::parse("(HEADER MATCH)", true).unwrap();
+        let mut d = Decoder::text(1, b'\t', b"\\N".to_vec()); d.options(&o, vec!["a".into()]);
+        assert!(d.finish().unwrap().is_empty());
+        assert_eq!(d.feed(b"b\n").unwrap_err(), "22P04");
+        assert_eq!(d.message.as_deref(), Some("column name mismatch in header line field 1: got \"b\", expected \"a\""));
     }
 }

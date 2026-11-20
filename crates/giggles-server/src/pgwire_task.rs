@@ -285,7 +285,7 @@ impl State {
         if crate::auth::statements::access_share_tables(sql)?.is_some() {
             return Err(refuse(&mut self.diagnostic, StatementClass::Lock));
         }
-        if is_copy_sql(sql) || crate::auth::statements::copy_stdout_select(sql)?.is_some() {
+        if is_copy_sql(sql) || self.copy_output_options(sql)?.is_some() {
             return Err(refuse(&mut self.diagnostic, StatementClass::Copy));
         }
         if let Some(command) = cursor::parse(sql)? {

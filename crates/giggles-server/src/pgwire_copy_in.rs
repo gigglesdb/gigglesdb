@@ -15,15 +15,40 @@ pub(super) struct CopyIn {
     decoder: copy::Decoder,
     rows: Vec<Vec<Value>>,
     normalized_bytes: usize,
+    input_error_message: Option<String>,
     simple: bool,
     failed: bool,
     pub(super) simple_implicit: bool,
     pub(super) remaining: Vec<String>,
 }
 impl CopyIn {
+    fn normalize_rows(&mut self, rows: Vec<Vec<Value>>, session: &mut Session) -> R<(Prepared, Vec<Vec<Value>>)> {
+        // Legacy scalar errors can be field-less. A syntax error in the first
+        // supplied integer is unambiguously the first conversion failure;
+        // retain its PG diagnostic without replacing assignment coercion.
+        let message = rows.first().and_then(|row| row.first()).and_then(|value| {
+            let Value::Text(value) = value else { return None; };
+            use giggles_core::relational::DataType;
+            use giggles_pg_types::integer;
+            let (name, error) = match self.columns.first()?.data_type {
+                DataType::SmallInt => ("smallint", integer::parse_i16(value).err()),
+                DataType::Integer => ("integer", integer::parse_i32(value).err()),
+                DataType::BigInt => ("bigint", integer::parse_i64(value).err()),
+                _ => return None,
+            };
+            matches!(error, Some(integer::IntegerError::Syntax))
+                .then(|| format!("invalid input syntax for type {name}: \"{value}\""))
+        });
+        let result = session.normalize_copy_rows(&self.prepared, rows, &self.clock);
+        if matches!(result, Err(CoreError::Sql(giggles_core::relational::SqlError::InvalidTextRepresentation))) {
+            self.input_error_message = message;
+        }
+        core(result)
+    }
+
     fn flush_page(&mut self, session: &mut Session, count: usize) -> R<()> {
         let rows = self.rows.drain(..count).collect();
-        let (prepared, rows) = core(session.normalize_copy_rows(&self.prepared, rows, &self.clock))?;
+        let (prepared, rows) = self.normalize_rows(rows, session)?;
         core(session.sql.feed_copy_input_at(&prepared, rows, &self.clock))?;
         self.normalized = Some(prepared);
         Ok(())
@@ -62,7 +87,7 @@ impl CopyIn {
             if missing {
                 // PG converts the supplied prefix before reporting missing data.
                 // Normalization rejects the short row before evaluating defaults.
-                core(session.normalize_copy_rows(&self.prepared, vec![row], &self.clock))?;
+                self.normalize_rows(vec![row], session)?;
                 return Err("22P04");
             }
             converted.push(row);
@@ -83,7 +108,7 @@ impl CopyIn {
         }
         if !converted.is_empty() {
             let (prepared, rows) =
-                core(session.normalize_copy_rows(&self.prepared, converted, &self.clock))?;
+                self.normalize_rows(converted, session)?;
             for value in rows.iter().flatten() {
                 let bytes = match value {
                     Value::Text(s) => s.len(),
@@ -167,6 +192,7 @@ impl State {
                 descriptor.null.as_bytes().to_vec(),
             )
         };
+        decoder.options(&descriptor.options, columns.iter().map(|c| c.name.clone()).collect());
         let mut response = vec![u8::from(binary)];
         response.extend(
             u16::try_from(columns.len())
@@ -192,6 +218,7 @@ impl State {
             decoder,
             rows: vec![],
             normalized_bytes: 0,
+            input_error_message: None,
             simple,
             failed: false,
             simple_implicit: false,
@@ -230,6 +257,7 @@ impl State {
         })();
         drop(reader);
         if let Err(code) = result {
+            if let Some(message) = giggles_core::relational::take_sql_error_message().or_else(|| copy.input_error_message.take()) { self.diagnostic.wire_message = Some(message); }
             if let Some((mut process, _)) = child { let _ = process.kill(); let _ = process.wait(); }
             copy.decoder.diagnostic(&mut self.diagnostic);
             return Err(code);
@@ -314,7 +342,9 @@ impl State {
                 Ok(())
             })();
             if let Err(code) = result {
+                let message = giggles_core::relational::take_sql_error_message().or_else(|| copy.input_error_message.take());
                 session.abort();
+                if message.is_some() { self.diagnostic.wire_message = message; }
                 copy.failed = true;
                 copy.rows.clear();
                 copy.remaining.clear();

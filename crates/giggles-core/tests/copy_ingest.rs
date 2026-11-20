@@ -40,13 +40,11 @@ fn envelope_grammar_and_rejections() {
         CopyFormat::Csv
     );
     for suffix in [
-        "WITH (HEADER true)",
         "WITH (QUOTE 'x')",
         "WITH (ESCAPE 'x')",
         "WITH (FORCE_NULL (a))",
         "WITH (FORCE_NOT_NULL (a))",
         "WITH (FORCE_QUOTE (a))",
-        "WITH (ENCODING 'UTF8')",
         "WITH (FREEZE true)",
         "WHERE a=1",
     ] {
@@ -55,6 +53,9 @@ fn envelope_grammar_and_rejections() {
             Err(E::Unsupported),
             "{suffix}"
         );
+    }
+    for suffix in ["WITH (HEADER true)", "WITH (ENCODING 'UTF8')"] {
+        assert!(Copy::parse(&format!("COPY items FROM STDIN {suffix}")).is_ok());
     }
     assert_eq!(Copy::parse("COPY items TO STDOUT"), Err(E::Unsupported));
     assert!(matches!(Copy::parse("COPY items FROM 'file'").unwrap().source, giggles_core::relational::CopySource::File(path) if path == "file"));
@@ -71,7 +72,7 @@ fn envelope_grammar_and_rejections() {
     assert!(!Copy::is_copy("copycat"));
     assert_eq!(
         Copy::parse("COPY items FROM STDIN (DELIMITER 'xx')"),
-        Err(E::InvalidParameterValue)
+        Err(E::Unsupported)
     );
 }
 #[test]

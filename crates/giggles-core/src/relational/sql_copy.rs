@@ -8,6 +8,473 @@ pub enum CopyFormat {
     Binary,
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CopyHeader {
+    #[default]
+    Off,
+    On,
+    Match,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CopyColumns {
+    pub all: bool,
+    pub names: Vec<String>,
+}
+impl CopyColumns {
+    pub fn contains(&self, name: &str) -> bool {
+        self.all || self.names.iter().any(|n| n == name)
+    }
+}
+/// Runtime-only COPY options, shared by both SQL envelopes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyOptions {
+    pub format: CopyFormat,
+    pub delimiter: u8,
+    pub null: String,
+    pub quote: u8,
+    pub escape: u8,
+    pub header: CopyHeader,
+    pub force_quote: CopyColumns,
+    pub force_not_null: CopyColumns,
+    pub force_null: CopyColumns,
+}
+impl Default for CopyOptions {
+    fn default() -> Self {
+        Self {
+            format: CopyFormat::Text,
+            delimiter: b'\t',
+            null: "\\N".into(),
+            quote: b'"',
+            escape: b'"',
+            header: CopyHeader::Off,
+            force_quote: CopyColumns::default(),
+            force_not_null: CopyColumns::default(),
+            force_null: CopyColumns::default(),
+        }
+    }
+}
+fn copy_error<T>(error: SqlError, message: impl Into<String>) -> R<T> {
+    user_types::view_replace_error(message.into());
+    Err(error)
+}
+impl CopyOptions {
+    pub fn parse(sql: &str, from: bool) -> R<Self> {
+        let mut p = Parser {
+            tokens: lex(sql)?,
+            at: 0,
+            params: BTreeSet::new(),
+            relations: Vec::new(),
+        };
+        Self::parse_tokens(&mut p, from)
+    }
+    fn parse_tokens(p: &mut Parser, from: bool) -> R<Self> {
+        let mut o = Self::default();
+        let mut values = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        p.word("with");
+        let parens = p.sym('(');
+        while p.at < p.tokens.len() && !matches!(p.tokens.get(p.at), Some(Token::Symbol(')' | ';')))
+        {
+            if !parens && p.word("where") { return Err(SqlError::Unsupported); }
+            let mut name = p.name()?;
+            // OIDS was removed from the legacy COPY grammar; it is not a generic option.
+            if !parens && name == "oids" {
+                return copy_error(SqlError::Syntax, "syntax error at or near \"OIDS\"");
+            }
+            if !parens && name == "force" {
+                name = if p.word("quote") {
+                    "force_quote"
+                } else if p.word("not") {
+                    p.need("null")?;
+                    "force_not_null"
+                } else {
+                    p.need("null")?;
+                    "force_null"
+                }
+                .into();
+            }
+            if !parens && matches!(name.as_str(), "csv" | "binary") {
+                if !seen.insert("format".to_owned()) {
+                    return copy_error(SqlError::Syntax, "conflicting or redundant options");
+                }
+                values.insert("format".to_owned(), name);
+            } else {
+                if !seen.insert(name.clone()) {
+                    return copy_error(SqlError::Syntax, "conflicting or redundant options");
+                }
+                match name.as_str() {
+                    "force_quote" | "force_not_null" | "force_null" => {
+                        let cols = match name.as_str() {
+                            "force_quote" => &mut o.force_quote,
+                            "force_not_null" => &mut o.force_not_null,
+                            _ => &mut o.force_null,
+                        };
+                        if p.sym('*') {
+                            cols.all = true;
+                        } else {
+                            if parens {
+                                p.punct('(')?;
+                            }
+                            cols.names.push(p.name()?);
+                            while p.sym(',') {
+                                cols.names.push(p.name()?);
+                            }
+                            if parens {
+                                p.punct(')')?;
+                            }
+                        }
+                    }
+                    "format" | "delimiter" | "null" | "default" | "quote" | "escape"
+                    | "encoding" | "header" | "freeze" | "on_error" | "log_verbosity"
+                    | "reject_limit" => {
+                        if !parens {
+                            p.word("as");
+                        }
+                        let bare = matches!(name.as_str(), "header" | "freeze")
+                            && (matches!(
+                                p.tokens.get(p.at),
+                                None | Some(Token::Symbol(',' | ')' | ';'))
+                            ) || (!parens
+                                && matches!(p.tokens.get(p.at), Some(Token::Word(w)) if !matches!(w.as_str(), "true" | "false" | "on" | "off" | "match"))));
+                        let value = if bare {
+                            "true".into()
+                        } else {
+                            let value = match p.tokens.get(p.at) {
+                                Some(Token::Word(v) | Token::String(v) | Token::Number(v)) => {
+                                    v.clone()
+                                }
+                                _ => return Err(SqlError::Syntax),
+                            };
+                            p.at += 1;
+                            value
+                        };
+                        values.insert(name, value);
+                    }
+                    _ => {
+                        return copy_error(
+                            SqlError::Syntax,
+                            format!("option \"{name}\" not recognized"),
+                        );
+                    }
+                }
+            }
+            if parens && !p.sym(',') {
+                break;
+            }
+        }
+        if parens {
+            p.punct(')')?;
+        }
+        p.sym(';');
+        if p.at != p.tokens.len() {
+            return Err(SqlError::Syntax);
+        }
+        // Process the option values before the cross-option checks.
+        if let Some(v) = values.get("format") {
+            o.format = match v.to_ascii_lowercase().as_str() {
+                "text" => CopyFormat::Text,
+                "csv" => CopyFormat::Csv,
+                "binary" => CopyFormat::Binary,
+                _ => {
+                    return copy_error(
+                        SqlError::InvalidParameterValue,
+                        format!("COPY format \"{v}\" not recognized"),
+                    );
+                }
+            };
+        }
+        if let Some(v) = values.get("header") {
+            o.header = match v.to_ascii_lowercase().as_str() {
+                "true" | "on" | "1" => CopyHeader::On,
+                "false" | "off" | "0" => CopyHeader::Off,
+                "match" => CopyHeader::Match,
+                _ => {
+                    return copy_error(
+                        SqlError::Syntax,
+                        "header requires a Boolean value or \"match\"",
+                    );
+                }
+            };
+        }
+        if !from && o.header == CopyHeader::Match {
+            return copy_error(
+                SqlError::Unsupported,
+                "cannot use \"match\" with HEADER in COPY TO",
+            );
+        }
+        if let Some(v) = values.get("encoding")
+            && !matches!(
+                v.to_ascii_uppercase().replace('-', "").as_str(),
+                "UTF8"
+                    | "LATIN1"
+                    | "LATIN2"
+                    | "LATIN3"
+                    | "LATIN4"
+                    | "LATIN5"
+                    | "LATIN6"
+                    | "LATIN7"
+                    | "LATIN8"
+                    | "LATIN9"
+                    | "LATIN10"
+                    | "SQL_ASCII"
+                    | "WIN1250"
+                    | "WIN1251"
+                    | "WIN1252"
+                    | "WIN1253"
+                    | "WIN1254"
+                    | "WIN1255"
+                    | "WIN1256"
+                    | "WIN1257"
+                    | "WIN1258"
+                    | "EUC_JP"
+                    | "EUC_CN"
+                    | "EUC_KR"
+                    | "EUC_TW"
+                    | "SJIS"
+                    | "BIG5"
+                    | "GBK"
+                    | "GB18030"
+                    | "KOI8R"
+                    | "KOI8U"
+                    | "JOHAB"
+            ) {
+                return copy_error(
+                    SqlError::InvalidParameterValue,
+                    "argument to option \"encoding\" must be a valid encoding name",
+                );
+        }
+        let freeze = if let Some(v) = values.get("freeze") {
+            match v.to_ascii_lowercase().as_str() {
+                "true" | "on" | "1" => true, "false" | "off" | "0" => false,
+                _ => return copy_error(SqlError::Syntax, "freeze requires a Boolean value"),
+            }
+        } else { false };
+        let ignore = if let Some(v) = values.get("on_error") {
+            if !from {
+                return copy_error(
+                    SqlError::InvalidParameterValue,
+                    "COPY ON_ERROR cannot be used with COPY TO",
+                );
+            }
+            match v.to_ascii_lowercase().as_str() {
+                "stop" => false,
+                "ignore" => true,
+                _ => {
+                    return copy_error(
+                        SqlError::InvalidParameterValue,
+                        format!("COPY ON_ERROR \"{v}\" not recognized"),
+                    );
+                }
+            }
+        } else {
+            false
+        };
+        if let Some(v) = values.get("log_verbosity")
+            && !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "default" | "verbose" | "silent"
+            ) {
+                return copy_error(
+                    SqlError::InvalidParameterValue,
+                    format!("COPY LOG_VERBOSITY \"{v}\" not recognized"),
+                );
+        }
+        if let Some(v) = values.get("reject_limit") {
+            let n: i64 = v.parse().map_err(|_| SqlError::InvalidParameterValue)?;
+            if n <= 0 {
+                return copy_error(
+                    SqlError::InvalidParameterValue,
+                    format!("REJECT_LIMIT ({n}) must be greater than zero"),
+                );
+            }
+        }
+        let csv = o.format == CopyFormat::Csv;
+        let binary = o.format == CopyFormat::Binary;
+        if csv {
+            o.delimiter = b',';
+            o.null.clear();
+        }
+        for name in ["delimiter", "null", "default"] {
+            if binary && seen.contains(name) {
+                return copy_error(
+                    SqlError::Syntax,
+                    format!("cannot specify {} in BINARY mode", name.to_uppercase()),
+                );
+            }
+        }
+        if let Some(v) = values.get("delimiter") {
+            if v.len() != 1 {
+                return copy_error(
+                    SqlError::Unsupported,
+                    "COPY delimiter must be a single one-byte character",
+                );
+            }
+            o.delimiter = v.as_bytes()[0];
+        }
+        if matches!(o.delimiter, b'\n' | b'\r') {
+            return copy_error(
+                SqlError::InvalidParameterValue,
+                "COPY delimiter cannot be newline or carriage return",
+            );
+        }
+        if let Some(v) = values.get("null") {
+            o.null = v.clone();
+        }
+        if o.null.contains(['\n', '\r']) {
+            return copy_error(
+                SqlError::InvalidParameterValue,
+                "COPY null representation cannot use newline or carriage return",
+            );
+        }
+        if values.get("default").is_some_and(|v| v.contains(['\n', '\r'])) {
+            return copy_error(SqlError::InvalidParameterValue, "COPY default representation cannot use newline or carriage return");
+        }
+        if !csv
+            && (o.delimiter == b'\\'
+                || o.delimiter == b'.'
+                || o.delimiter.is_ascii_lowercase()
+                || o.delimiter.is_ascii_digit())
+        {
+            return copy_error(
+                SqlError::InvalidParameterValue,
+                format!("COPY delimiter cannot be \"{}\"", o.delimiter as char),
+            );
+        }
+        if binary && o.header != CopyHeader::Off {
+            return copy_error(SqlError::Unsupported, "cannot specify HEADER in BINARY mode");
+        }
+        for name in [
+            "quote",
+            "escape",
+            "force_quote",
+            "force_not_null",
+            "force_null",
+        ] {
+            if seen.contains(name) && !csv {
+                return copy_error(
+                    SqlError::Unsupported,
+                    format!("COPY {} requires CSV mode", name.to_uppercase()),
+                );
+            }
+            if let Some(v) = values.get(name) {
+                if v.len() != 1 {
+                    return copy_error(
+                        SqlError::Unsupported,
+                        format!("COPY {name} must be a single one-byte character"),
+                    );
+                }
+                if name == "quote" {
+                    o.quote = v.as_bytes()[0];
+                } else {
+                    o.escape = v.as_bytes()[0];
+                }
+            }
+            if name == "quote" && csv && o.delimiter == o.quote {
+                return copy_error(SqlError::InvalidParameterValue, "COPY delimiter and quote must be different");
+            }
+            if name == "force_quote" && from && seen.contains(name) {
+                return copy_error(SqlError::Unsupported, "COPY FORCE_QUOTE cannot be used with COPY FROM");
+            }
+            if matches!(name, "force_not_null" | "force_null") && !from && seen.contains(name) {
+                return copy_error(SqlError::InvalidParameterValue, format!("COPY {} cannot be used with COPY TO", name.to_uppercase()));
+            }
+        }
+        if !seen.contains("escape") {
+            o.escape = o.quote;
+        }
+        if o.null.as_bytes().contains(&o.delimiter) {
+            return copy_error(
+                SqlError::InvalidParameterValue,
+                "COPY delimiter character must not appear in the NULL specification",
+            );
+        }
+        if csv && o.null.as_bytes().contains(&o.quote) {
+            return copy_error(
+                SqlError::InvalidParameterValue,
+                "CSV quote character must not appear in the NULL specification",
+            );
+        }
+        if freeze && !from {
+            return copy_error(SqlError::InvalidParameterValue, "COPY FREEZE cannot be used with COPY TO");
+        }
+        if let Some(v) = values.get("default") {
+            if !from {
+                return copy_error(
+                    SqlError::Unsupported,
+                    "COPY DEFAULT cannot be used with COPY TO",
+                );
+            }
+            if v.as_bytes().contains(&o.delimiter) {
+                return copy_error(
+                    SqlError::Unsupported,
+                    "COPY delimiter character must not appear in the DEFAULT specification",
+                );
+            }
+            if csv && v.as_bytes().contains(&o.quote) {
+                return copy_error(
+                    SqlError::Unsupported,
+                    "CSV quote character must not appear in the DEFAULT specification",
+                );
+            }
+            if v == &o.null {
+                return copy_error(
+                    SqlError::Unsupported,
+                    "NULL specification and DEFAULT specification cannot be the same",
+                );
+            }
+        }
+        if binary && ignore {
+            return copy_error(
+                SqlError::Syntax,
+                "only ON_ERROR STOP is allowed in BINARY mode",
+            );
+        }
+        if seen.contains("reject_limit") && !ignore {
+            return copy_error(
+                SqlError::InvalidParameterValue,
+                "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE",
+            );
+        }
+        if seen.contains("default")
+            || ignore
+            || seen.contains("reject_limit")
+            || values
+                .get("log_verbosity")
+                .is_some_and(|v| !v.eq_ignore_ascii_case("default"))
+            || freeze
+            || values.get("encoding").is_some_and(|v| {
+                !v.eq_ignore_ascii_case("utf8") && !v.eq_ignore_ascii_case("utf-8")
+            })
+        {
+            return Err(SqlError::Unsupported);
+        }
+        Ok(o)
+    }
+    pub fn validate_columns(&self, table: &str, all: &[String], selected: &[String]) -> R<()> {
+        for (name, cols) in [
+            ("FORCE_QUOTE", &self.force_quote),
+            ("FORCE_NOT_NULL", &self.force_not_null),
+            ("FORCE_NULL", &self.force_null),
+        ] {
+            for c in &cols.names {
+                if !all.contains(c) {
+                    return copy_error(
+                        SqlError::UnknownColumn,
+                        format!("column \"{c}\" of relation \"{table}\" does not exist"),
+                    );
+                }
+                if !selected.contains(c) {
+                    return copy_error(
+                        SqlError::InvalidColumnReference,
+                        format!("{name} column \"{c}\" not referenced by COPY"),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopySource { Stdin, File(String), Program(String) }
 
@@ -20,6 +487,7 @@ pub struct Copy {
     pub format: CopyFormat,
     pub delimiter: u8,
     pub null: String,
+    pub options: CopyOptions,
 }
 impl Copy {
     /// Recognize COPY even when the remainder cannot be lexed, for authority gates.
@@ -192,93 +660,12 @@ impl Copy {
             format: CopyFormat::Text,
             delimiter: b'\t',
             null: "\\N".into(),
+            options: CopyOptions::default(),
         };
-        let mut seen = BTreeSet::new();
-        if p.word("binary") {
-            copy.format = CopyFormat::Binary;
-            seen.insert("format");
-        } else {
-            let with = p.word("with");
-            if p.sym('(') {
-                loop {
-                    let name = p.name()?;
-                    match name.as_str() {
-                        "format" => {
-                            if !seen.insert("format") {
-                                return Err(SqlError::Syntax);
-                            }
-                            copy.format = if p.word("text") {
-                                CopyFormat::Text
-                            } else if p.word("csv") {
-                                CopyFormat::Csv
-                            } else if p.word("binary") {
-                                CopyFormat::Binary
-                            } else {
-                                return Err(SqlError::Unsupported);
-                            };
-                        }
-                        "delimiter" | "null" => {
-                            let key = if name == "delimiter" {
-                                "delimiter"
-                            } else {
-                                "null"
-                            };
-                            if !seen.insert(key) {
-                                return Err(SqlError::Syntax);
-                            }
-                            let Some(Token::String(value)) = p.tokens.get(p.at) else {
-                                return Err(SqlError::Syntax);
-                            };
-                            let value = value.clone();
-                            p.at += 1;
-                            if name == "delimiter" {
-                                if value.len() != 1
-                                    || matches!(value.as_bytes()[0], 0 | b'\n' | b'\r' | b'\\')
-                                {
-                                    return Err(SqlError::InvalidParameterValue);
-                                }
-                                copy.delimiter = value.as_bytes()[0];
-                            } else {
-                                if value.contains(['\0', '\n', '\r']) {
-                                    return Err(SqlError::InvalidParameterValue);
-                                }
-                                copy.null = value;
-                            }
-                        }
-                        _ => return Err(SqlError::Unsupported),
-                    }
-                    if !p.sym(',') {
-                        break;
-                    }
-                }
-                p.punct(')')?;
-            } else if with {
-                return Err(SqlError::Unsupported);
-            }
-        }
-        p.sym(';');
-        if p.at != p.tokens.len() {
-            return Err(SqlError::Unsupported);
-        }
-        if copy.format == CopyFormat::Csv {
-            if !seen.contains("delimiter") {
-                copy.delimiter = b',';
-            }
-            if !seen.contains("null") {
-                copy.null.clear();
-            }
-            if copy.delimiter == b'"' || copy.null.contains('"') {
-                return Err(SqlError::InvalidParameterValue);
-            }
-        }
-        if copy.format == CopyFormat::Binary
-            && (seen.contains("delimiter") || seen.contains("null"))
-        {
-            return Err(SqlError::Unsupported);
-        }
-        if copy.null.as_bytes().contains(&copy.delimiter) {
-            return Err(SqlError::InvalidParameterValue);
-        }
+        copy.options = CopyOptions::parse_tokens(&mut p, true)?;
+        copy.format = copy.options.format;
+        copy.delimiter = copy.options.delimiter;
+        copy.null = copy.options.null.clone();
         Ok(copy)
     }
     pub(crate) fn columns_in(&self, state: &Relational) -> R<Vec<ColumnDef>> {
@@ -316,6 +703,9 @@ impl Copy {
             copy.table = relation_key(split_key(&self.table).0, split_key(&self.table).1);
         }
         let columns = copy.columns_in(state)?;
+        copy.options.validate_columns(split_key(&copy.table).1,
+            &state.tables[&copy.table].logical_columns().map(|c| c.name.clone()).collect::<Vec<_>>(),
+            &columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())?;
         let width = columns.len();
         let types = columns.into_iter().map(|c| c.data_type).collect();
         Ok(Prepared {
@@ -380,4 +770,38 @@ pub(super) fn copy_text_field(
     clock: Option<&clock::ExecutionClock>,
 ) -> R<Value> {
     query::assignment::literal(Value::Text(text), ty, clock)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn shared_copy_options() {
+        for sql in ["COPY t FROM STDIN CSV HEADER QUOTE AS '~' FORCE NOT NULL a FORCE NULL b", "COPY t FROM STDIN WITH (FORMAT csv, HEADER true, QUOTE '~', FORCE_NOT_NULL (a), FORCE_NULL (b))"] {
+            let c = Copy::parse(sql).unwrap();
+            assert_eq!(c.options.header, CopyHeader::On);
+            assert_eq!(c.options.escape, b'~');
+            assert!(c.options.force_not_null.contains("a"));
+            assert!(c.options.force_null.contains("b"));
+        }
+        assert_eq!(CopyOptions::parse("(HEADER MATCH)", true).unwrap().header, CopyHeader::Match);
+    }
+    #[test]
+    fn option_error_messages() {
+        for (sql, from, error, message) in [
+            ("OIDS", false, SqlError::Syntax, "syntax error at or near \"OIDS\""),
+            ("(HEADER 2)", true, SqlError::Syntax, "header requires a Boolean value or \"match\""),
+            ("(FORMAT xml)", true, SqlError::InvalidParameterValue, "COPY format \"xml\" not recognized"),
+            ("(HEADER, HEADER false)", true, SqlError::Syntax, "conflicting or redundant options"),
+            ("(bogus 1)", true, SqlError::Syntax, "option \"bogus\" not recognized"),
+            ("(FORMAT binary, HEADER)", false, SqlError::Unsupported, "cannot specify HEADER in BINARY mode"),
+            ("(FORMAT csv, QUOTE '~~')", true, SqlError::Unsupported, "COPY quote must be a single one-byte character"),
+            ("(FORMAT csv, FORCE_NULL *)", false, SqlError::InvalidParameterValue, "COPY FORCE_NULL cannot be used with COPY TO"),
+            ("(FORMAT binary, DEFAULT 'x')", true, SqlError::Syntax, "cannot specify DEFAULT in BINARY mode"),
+            ("(REJECT_LIMIT 1)", true, SqlError::InvalidParameterValue, "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE"),
+        ] {
+            assert_eq!(CopyOptions::parse(sql, from), Err(error), "{sql}");
+            assert_eq!(user_types::take_sql_error_message().as_deref(), Some(message), "{sql}");
+        }
+    }
 }

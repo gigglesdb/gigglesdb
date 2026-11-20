@@ -18,7 +18,11 @@ impl State {
         if let Ok(copy) = giggles_core::relational::Copy::parse(sql) {
             self.copy_source_privilege(session, &copy.source)?;
         }
-        core(session.prepare_copy(sql)).inspect_err(|code| {
+        let result = session.prepare_copy(sql);
+        let message = giggles_core::relational::take_sql_error_message();
+        let result = self.diagnostic.core(result);
+        if result.is_err() && message.is_some() { self.diagnostic.wire_message = message; }
+        result.inspect_err(|code| {
             if *code == "42501"
                 && let Ok(Some(table)) = giggles_core::relational::Copy::target(sql)
             {
@@ -34,13 +38,31 @@ impl State {
         options: &crate::auth::statements::CopyOutput,
         session: &mut Session,
     ) -> R<Prepared> {
-        core(session.prepare(&options.select)).inspect_err(|code| {
+        let prepared = core(session.prepare(&options.select)).inspect_err(|code| {
             if *code == "42501"
                 && let Some(table) = &options.table_name
             {
                 self.diagnostic.wire_message = Some(format!("permission denied for table {table}"));
             }
-        })
+        })?;
+        if !options.force_columns.is_empty() {
+            let description = core(session.describe(&prepared))?;
+            let all = if let Some(sql) = &options.all_select {
+                let full = core(session.prepare(sql))?;
+                core(session.describe(&full))?.columns.into_iter().map(|c| c.name).collect::<Vec<_>>()
+            } else { description.columns.iter().map(|c| c.name.clone()).collect() };
+            for name in &options.force_columns {
+                if !all.contains(name) {
+                    self.diagnostic.wire_message = Some(options.table_name.as_ref().map_or_else(|| format!("column \"{name}\" does not exist"), |table| format!("column \"{name}\" of relation \"{table}\" does not exist")));
+                    return Err("42703");
+                }
+                if !description.columns.iter().any(|c| c.name == *name) {
+                    self.diagnostic.wire_message = Some(format!("FORCE_QUOTE column \"{name}\" not referenced by COPY"));
+                    return Err("42P10");
+                }
+            }
+        }
+        Ok(prepared)
     }
 
     pub(super) fn copy_privilege(&mut self, session: &Session, program: bool, from: bool) -> R<()> {

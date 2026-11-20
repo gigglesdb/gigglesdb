@@ -143,13 +143,6 @@ impl Parser {
         while self.comma() { names.push(self.role_spec()?); }
         Ok(names)
     }
-    fn copy_argument(&mut self) -> Result<String, &'static str> {
-        let value = match self.tokens.get(self.pos) {
-            Some(Token::Text(s) | Token::Word(s) | Token::Ident(s)) => s.clone(),
-            _ => return Err("42601"),
-        };
-        self.pos += 1; Ok(value)
-    }
     fn comma(&mut self) -> bool {
         if self.tokens.get(self.pos) == Some(&Token::Comma) {
             self.pos += 1;
@@ -941,6 +934,7 @@ pub(crate) enum CopyDestination { Stdout, File(String), Program(String) }
 pub(crate) struct CopyOutput {
     pub destination: CopyDestination,
     pub table_name: Option<String>,
+    pub all_select: Option<String>,
     pub select: String,
     // 0 = text, 1 = csv, 2 = binary.
     pub format: u8,
@@ -1030,6 +1024,7 @@ pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<CopyOutput>, &'stat
     let mut options = CopyOutput {
         destination,
         table_name: if query.is_some() { None } else { Some(table.rsplit('.').next().unwrap_or(&table).trim_matches('"').replace("\"\"", "\"")) },
+        all_select: query.is_none().then(|| format!("SELECT * FROM {table}")),
         select: String::new(),
         format: 0,
         header: false,
@@ -1040,102 +1035,21 @@ pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<CopyOutput>, &'stat
         force_all: false,
         force_columns: vec![],
     };
-    p.kw("with");
-    let mut delimiter = None;
-    let mut null = None;
-    let mut quote = None;
-    let mut escape = None;
-    let mut seen = std::collections::HashSet::new();
-    let parenthesized = p.tokens.get(p.pos) == Some(&Token::LParen);
-    if parenthesized { p.pos += 1; }
-    while p.pos < p.tokens.len() && p.tokens.get(p.pos) != Some(&Token::RParen) {
-        let mut option = p.ident()?;
-        if !parenthesized && option == "force" { p.need("quote")?; option = "force_quote".into(); }
-        let key = if matches!(option.as_str(), "csv" | "binary") { "format" } else { &option };
-        if !seen.insert(key.to_owned()) { return Err("42601"); }
-        match option.as_str() {
-            "csv" if !parenthesized => options.format = 1,
-            "binary" if !parenthesized => options.format = 2,
-            "format" => options.format = match p.copy_argument()?.to_ascii_lowercase().as_str() {
-                "text" => 0, "csv" => 1, "binary" => 2, _ => return Err("22023"),
-            },
-            "header" => {
-                if p.kw("match") { return Err("0A000"); }
-                options.header = !(p.kw("false") || p.kw("off") || p.kw("0"));
-                p.kw("true"); p.kw("on"); p.kw("1");
-                if let Some(Token::Text(value)) = p.tokens.get(p.pos) {
-                    options.header = match value.to_ascii_lowercase().as_str() {
-                        "true" | "on" | "1" => true, "false" | "off" | "0" => false,
-                        _ => return Err("42601"),
-                    }; p.pos += 1;
-                }
-            }
-            "force_quote" => {
-                if p.tokens.get(p.pos) == Some(&Token::Star) {
-                    // The COPY option grammar admits only '*' here.
-                    p.pos += 1; options.force_all = true;
-                } else {
-                    if parenthesized {
-                        if p.tokens.get(p.pos) != Some(&Token::LParen) { return Err("42601"); }
-                        p.pos += 1;
-                    }
-                    options.force_columns = p.names(false)?;
-                    if parenthesized {
-                        if p.tokens.get(p.pos) != Some(&Token::RParen) { return Err("42601"); }
-                        p.pos += 1;
-                    }
-                }
-            }
-            "delimiter" | "quote" | "escape" | "null" | "default" | "encoding" => {
-                if !parenthesized { p.kw("as"); }
-                if !parenthesized && !matches!(p.tokens.get(p.pos), Some(Token::Text(_))) { return Err("42601"); }
-                let value = p.copy_argument()?.into_bytes();
-                match option.as_str() {
-                    "delimiter" => delimiter = Some(value),
-                    "quote" => quote = Some(value),
-                    "escape" => escape = Some(value),
-                    "null" => null = Some(value),
-                    "default" => return Err("0A000"),
-                    _ => {
-                        if !value.eq_ignore_ascii_case(b"utf8") && !value.eq_ignore_ascii_case(b"utf-8") {
-                            return Err("22023");
-                        }
-                    }
-                }
-            }
-            _ => return Err("42601"),
-        }
-        if parenthesized && !p.comma() { break; }
-    }
-    if parenthesized {
-        if p.tokens.get(p.pos) != Some(&Token::RParen) { return Err("42601"); }
-        p.pos += 1;
-    }
-    if p.pos != p.tokens.len() { return Err("42601"); }
-    if options.format == 2 && (delimiter.is_some() || null.is_some() || seen.contains("header")) { return Err("42601"); }
-    if options.format != 1 && (quote.is_some() || escape.is_some() || seen.contains("force_quote")) { return Err("0A000"); }
-    if options.format == 1 { options.delimiter = b','; options.null.clear(); }
-    if let Some(d) = delimiter {
-        if d.len() != 1 { return Err("0A000"); }
-        if matches!(d[0], b'\n' | b'\r') { return Err("22023"); }
-        if options.format == 0 && (d[0] == b'\\' || d[0] == b'.' || d[0].is_ascii_lowercase() || d[0].is_ascii_digit()) { return Err("22023"); }
-        options.delimiter = d[0];
-    }
-    if let Some(q) = quote {
-        if q.len() != 1 { return Err("0A000"); }
-        options.quote = q[0];
-    }
-    options.escape = options.quote;
-    if let Some(e) = escape {
-        if e.len() != 1 { return Err("0A000"); }
-        options.escape = e[0];
-    }
-    if options.format == 1 && options.quote == options.delimiter { return Err("22023"); }
-    if let Some(n) = null {
-        if n.iter().any(|b| matches!(b, b'\n' | b'\r')) { return Err("22023"); }
-        if n.contains(&options.delimiter) || (options.format == 1 && n.contains(&options.quote)) { return Err("22023"); }
-        options.null = n;
-    }
+    let suffix = p.tokens[p.pos..].iter().map(|t| match t {
+        Token::Word(v) => v.clone(), Token::Ident(v) => format!("\"{}\"", v.replace('"', "\"\"")),
+        Token::Text(v) => format!("'{}'", v.replace('\'', "''")), Token::Comma => ",".into(), Token::Dot => ".".into(),
+        Token::LParen => "(".into(), Token::RParen => ")".into(), Token::Semi => ";".into(), Token::Star => "*".into(), Token::Other => "?".into(),
+    }).collect::<Vec<_>>().join(" ");
+    let shared = giggles_core::relational::CopyOptions::parse(&suffix, false)
+        .map_err(|e| crate::service::sqlstate(&CoreError::Sql(e)))?;
+    options.format = match shared.format { giggles_core::relational::CopyFormat::Text => 0, giggles_core::relational::CopyFormat::Csv => 1, giggles_core::relational::CopyFormat::Binary => 2 };
+    options.header = shared.header != giggles_core::relational::CopyHeader::Off;
+    options.delimiter = shared.delimiter;
+    options.quote = shared.quote;
+    options.escape = shared.escape;
+    options.null = shared.null.as_bytes().to_vec();
+    options.force_all = shared.force_quote.all;
+    options.force_columns = shared.force_quote.names.clone();
     let quoted = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
     let projection = if columns.is_empty() {
         "*".into()
@@ -1359,7 +1273,7 @@ mod tests {
                 "{sql}"
             );
         }
-        for name in ["x".repeat(64), format!("\"{}\"", "ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©".repeat(32))] {
+        for name in ["x".repeat(64), format!("\"{}\"", "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©".repeat(32))] {
             assert!(matches!(
                 parse(&format!("DROP TABLE {name}")),
                 Some(AdminStatement::Error("42601"))
@@ -1398,7 +1312,7 @@ mod tests {
             Some(AdminStatement::Error("42601"))
         ));
         assert!(matches!(
-            parse(&format!("CREATE ROLE \"{}\"", "ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©".repeat(32))),
+            parse(&format!("CREATE ROLE \"{}\"", "ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©".repeat(32))),
             Some(AdminStatement::Error("42601"))
         ));
     }
