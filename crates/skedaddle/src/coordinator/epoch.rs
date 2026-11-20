@@ -658,6 +658,8 @@ mod tests {
         let root = std::path::PathBuf::from(std::env::var_os("TEMP").unwrap())
             .join(format!("refresh-poison-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
+        // TEMP may use the J: alias on Linux; confinement needs a native absolute root.
+        let root = root.canonicalize().unwrap();
         let store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&root).unwrap());
         let j = Journal::new(store, "p2", "poison", Duration::from_secs(2)).unwrap();
         let mut c =
@@ -687,6 +689,8 @@ mod tests {
         let root = std::path::PathBuf::from(std::env::var_os("TEMP").unwrap())
             .join(format!("refresh-clock-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
+        // TEMP may use the J: alias on Linux; confinement needs a native absolute root.
+        let root = root.canonicalize().unwrap();
         let store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&root).unwrap());
         let j = Journal::new(store.clone(), "p2", "periodic", Duration::from_secs(2)).unwrap();
         let mut c =

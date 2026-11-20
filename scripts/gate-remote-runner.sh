@@ -157,12 +157,17 @@ overall=0
 cd /home/user/gigglesdb/crates || exit 1
 # Temp files on tmpfs (RocksDB/fsync-heavy tests ran 3-10x slower on the box
 # disk). Some tests require TEMP to start with j:/gigglesdb-work/ (the Windows
-# storage rule); on Linux that is a relative path, so each crate gets a `j:`
+# storage rule); on Linux that is a relative path, so each crate gets `j:`/`J:`
 # link to the tmpfs root. TMPDIR (std::env::temp_dir) stays absolute.
 jroot=/dev/shm/jroot
-mkdir -p "$jroot/gigglesdb-work/tmp"
+mkdir -p "$jroot/gigglesdb-work/tmp/skedaddle"
 export TEMP=j:/gigglesdb-work/tmp TMP=j:/gigglesdb-work/tmp TMPDIR=$jroot/gigglesdb-work/tmp
-for c in giggles-*; do ln -sfn "$jroot" "$c/j:"; done
+export SKEDADDLE_TEST_ROOT=J:/gigglesdb-work/tmp/skedaddle
+for c in *; do
+  [[ -f $c/Cargo.toml ]] || continue
+  ln -sfn "$jroot" "$c/j:"
+  ln -sfn "$jroot" "$c/J:"
+done
 note "gate at $(git rev-parse HEAD) on $(uname -m) $(rustc --version)"
 s=$(date +%s); progress "ICU provisioning"
 if icu_dir=$(bash ../scripts/icu/provision.sh 2> "$out/icu-provision.log"); then

@@ -868,7 +868,9 @@ mod pre_v1_layout {
 #[test]
 fn verification_metadata_has_explicit_pre_v1_layout_budget_and_reduces_coordinator_stack() {
     use skedaddle::coordinator::Materialized;
-    use std::mem::{size_of, size_of_val};
+    use std::mem::size_of;
+    #[cfg(all(target_os = "windows", target_pointer_width = "64"))]
+    use std::mem::size_of_val;
     let old_transition = size_of::<pre_v1_layout::Transition>();
     let new_transition = size_of::<Transition>();
     let old_state = size_of::<pre_v1_layout::Materialized>();

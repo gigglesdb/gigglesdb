@@ -619,6 +619,7 @@ fn lock_journal_head(f: &Fixture) -> std::fs::File {
         )
         .unwrap()
 }
+#[cfg(windows)]
 fn assert_journal_pause(error: coordinator::Error) {
     let coordinator::Error::Io(error) = error else {
         panic!("not typed journal pause: {error}")
