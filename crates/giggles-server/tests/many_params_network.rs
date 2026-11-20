@@ -48,7 +48,7 @@ impl Fixture {
             .unwrap();
         let service = Service::new(admin, vec![], Clock::new(0, 3600).unwrap()).unwrap();
         let config = PostgresqlConfig {
-            listen: "127.0.0.1:55446".parse().unwrap(),
+            listen: "127.0.0.1:0".parse().unwrap(),
             tls: TlsMode::Disabled,
             certificate: None,
             private_key: None,

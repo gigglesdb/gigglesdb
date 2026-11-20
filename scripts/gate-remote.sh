@@ -201,8 +201,19 @@ log "box $box ready"
 # 5. Ship the bundle, runner and expected-failure list; check out the tip.
 here=$(cd "$(dirname "$0")" && pwd)
 cp "$here/gate-remote-runner.sh" "$here/gate-linux-expected-failures.txt" "$run/" || { log "could not prepare runner upload"; exit 5; }
+upload_file() {
+  local f=$1 attempt output rc
+  for attempt in 1 2; do
+    if output=$(bj scp "$f" "$box:/home/user/$f" 2>&1); then rc=0; else rc=$?; fi
+    printf 'file=%s attempt=%s exit=%s\n%s\n' "$f" "$attempt" "$rc" "$output" >> "$run/upload-scp.log"
+    [ "$rc" -ne 0 ] || return 0
+    log "upload failed: $f exit=$rc (attempt $attempt/2): $(printf '%s\n' "$output" | tail -5)"
+    [ "$attempt" -eq 2 ] || sleep 10
+  done
+  return 1
+}
 ( cd "$run" && for f in stack.bundle gate-remote-runner.sh gate-linux-expected-failures.txt; do
-    bj scp "$f" "$box:/home/user/$f" >/dev/null 2>&1 || exit 1
+    upload_file "$f" || exit 1
   done ) || { log "upload failed"; exit 5; }
 fetch_to=${GATE_FETCH_TIMEOUT:-240}
 checkout_to=${GATE_CHECKOUT_TIMEOUT:-240}
@@ -263,7 +274,13 @@ done
 
 # 7. Copy results back.
 bexec_t 300 "$box" "cd /home/user && tar czf gate-logs.tar.gz gate gate.out" >/dev/null || { log "could not archive gate results on the box"; exit 5; }
-( cd "$run" && bj scp "$box:/home/user/gate-logs.tar.gz" logs.tar.gz >/dev/null 2>&1 ) || log "WARNING: log download failed"
+download_logs() {
+  local output rc
+  if output=$(cd "$run" && bj scp "$box:/home/user/gate-logs.tar.gz" logs.tar.gz 2>&1); then rc=0; else rc=$?; fi
+  printf 'file=gate-logs.tar.gz exit=%s\n%s\n' "$rc" "$output" >> "$run/download-scp.log"
+  [ "$rc" -eq 0 ] || log "WARNING: log download failed: gate-logs.tar.gz exit=$rc: $(printf '%s\n' "$output" | tail -5)"
+}
+download_logs
 bexec_t 60 "$box" "cat /home/user/gate/summary.txt" > "$run/summary.txt" || { log "could not read gate summary from the box"; exit 5; }
 rm -f "$run/stack.bundle"
 cat "$run/summary.txt"

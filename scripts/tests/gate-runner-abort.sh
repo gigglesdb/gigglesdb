@@ -9,7 +9,9 @@ mkdir -p "$root"
 out=$(mktemp -d "$root/gate-runner-abort.XXXXXX")
 trap 'rm -rf "$out"' EXIT
 export TEMP=$out TMP=$out TMPDIR=$out CARGO_TARGET_DIR=$out/target
-expected=$here/gate-linux-expected-failures.txt
+# Keep synthetic expected failures independent of the production exception list.
+expected=$out/expected.txt
+echo 'giggles-core storage::replica::projected_admission::tests::ledger_never_reset' > "$expected"
 summary=$out/summary.txt
 feat=()
 
