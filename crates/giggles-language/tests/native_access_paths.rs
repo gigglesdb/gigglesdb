@@ -228,3 +228,44 @@ fn secondary_index_reads_match_scan_and_sql() {
     assert_eq!(values(actual.unwrap().rows), sql(&reference,
         "select id+1 as next from users where grp=7 order by id limit 3"));
 }
+
+#[test]
+fn bench_http_read_shapes_visit_only_access_candidates() {
+    let (_db, admin) = Database::fresh();
+    sql(&admin, "create table users(id bigserial primary key, email text unique not null, name text, created_at timestamptz default now(), active boolean default true, version integer default 0)");
+    let mut writer = admin.sql_session();
+    writer.execute("begin", &[], None).unwrap();
+    for start in (1..=1000).step_by(100) {
+        let tuples = (start..start+100).map(|id|
+            format!("({id},'user{id}@example.com','User {id}',timestamptz '2026-01-01 00:00:00+00',true,0)")
+        ).collect::<Vec<_>>().join(",");
+        writer.execute(&format!("insert into users(id,email,name,created_at,active,version) values{tuples}"), &[], None).unwrap();
+    }
+    writer.execute("commit", &[], None).unwrap();
+    let engine = engine(&admin);
+    // HTTP native JSON {"intValue":"7"} -> proto IntValue(7) -> Value::Int(7),
+    // and textValue -> Value::Text, through native_codec::bindings.
+    let bindings = Bindings::from_iter([
+        ("id".into(), Value::Int(7)),
+        ("email".into(), Value::Text("user7@example.com".into())),
+        ("after".into(), Value::Int(20)), ("max".into(), Value::Int(40)),
+        ("lo".into(), Value::Int(20)), ("hi".into(), Value::Int(40)),
+    ]);
+    // Variants checked against native_access / primary_native_access: PK
+    // points win before integer ranges; unique email uses the secondary index.
+    for (shape, text, access, visited, matched, returned, complete) in [
+        ("pk", "users where id=$id", "Keys", 1, 1, 1, true),
+        ("email", "users where email=$email", "Index", 1, 1, 1, true),
+        ("keyset", "users where id>$after and id<=$max order by id limit 5 select id", "Range", 20, 20, 5, false),
+        ("range_in", "users where id>=$lo and id<=$hi and (id=$lo or id=$hi) select id", "Keys", 2, 2, 2, true),
+    ] {
+        let bindings = bindings_for(text, &bindings);
+        let before = native_input_rows().0;
+        let actual = engine.execute_text(text, &bindings).unwrap();
+        let decoded = native_input_rows().0 - before;
+        eprintln!("bench {shape}: NativeAccess::{access}, visited={decoded}, matched={}, returned={}, complete={}", actual.matched, actual.rows.len(), actual.complete);
+        assert_eq!(decoded, visited, "{shape}");
+        assert_eq!((actual.matched, actual.rows.len(), actual.complete), (matched, returned, complete), "{shape}");
+        assert_eq!(actual, force_native_full_scan(|| engine.execute_text(text, &bindings).unwrap()), "{shape}");
+    }
+}
