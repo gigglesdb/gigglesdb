@@ -562,3 +562,79 @@ fn unnamed_cache_budget_settings_for_non_superuser() {
         assert_eq!(text_rows(&simple(&mut state, &mut session, &format!("SHOW {name}")).unwrap()), vec![vec![default]]);
     }
 }
+
+// Inject the SQLSTATE at the dispatcher boundary: the local fixture has no
+// replicated engine to fence without starting a cluster.
+#[test]
+fn unknown_outcome_rechecks_leadership_only_on_error() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    for rejects in [false, true] {
+        for tag in *b"PBDESQd" {
+            let mut session = fixture();
+            let mut state = state();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let gate_calls = calls.clone();
+            assert!(
+                session
+                    .service
+                    .set_statement_gate(Arc::new(move || {
+                        gate_calls.fetch_add(1, Ordering::Relaxed);
+                        if rejects {
+                            Err("not leader".into())
+                        } else {
+                            Ok(())
+                        }
+                    }))
+                    .is_ok()
+            );
+            let backend = session
+                .service
+                .cancellations
+                .register(&session.fingerprint, session.epoch)
+                .unwrap();
+            let mut out = Vec::new();
+            let outcome = state
+                .buffered_message(
+                    (tag, &[], std::time::Instant::now()),
+                    &mut session,
+                    &mut out,
+                    backend.begin(true),
+                    Some("08007"),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            assert_eq!(outcome, (!rejects, rejects));
+            let wire = String::from_utf8_lossy(&out);
+            assert_eq!(wire.contains("57P01"), rejects);
+            assert_eq!(
+                wire.contains("08007"),
+                !rejects || !matches!(tag, b'P' | b'B' | b'D')
+            );
+            if !rejects {
+                assert!(
+                    state
+                        .buffered_message(
+                            (b'S', &[], std::time::Instant::now()),
+                            &mut session,
+                            &mut Vec::new(),
+                            backend.begin(true),
+                            None,
+                            None,
+                        )
+                        .unwrap()
+                        .0
+                );
+                assert!(
+                    !extended(&mut state, &mut session, "SELECT 1")
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
+            }
+        }
+    }
+}

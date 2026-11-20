@@ -126,6 +126,7 @@ impl State {
             copy.failed = true;
             copy.rows.clear();
             copy.remaining.clear();
+            self.diagnostic.unknown_outcome = code == "08007";
             if code == "25006" {
                 diagnostic_error(code, GENERIC_MESSAGE, Some(&self.diagnostic), out);
             } else {
@@ -318,6 +319,7 @@ impl State {
                 copy.rows.clear();
                 copy.remaining.clear();
                 copy.decoder.diagnostic(&mut self.diagnostic);
+                self.diagnostic.unknown_outcome = code == "08007";
                 if code == "25006" || self.diagnostic.wire_message.is_some() {
                     diagnostic_error(code, GENERIC_MESSAGE, Some(&self.diagnostic), out);
                 } else {

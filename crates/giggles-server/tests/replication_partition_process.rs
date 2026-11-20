@@ -498,8 +498,7 @@ async fn cut_live_leader(cut: Cut) {
         "write {unknown} on the cut-off leader: {error:?}"
     );
     if error.code() == Some(&SqlState::TRANSACTION_RESOLUTION_UNKNOWN) {
-        // Use simple protocol: the gate checks Q/E; extended Parse on a fenced ex-leader currently answers 08007 (separate follow-up).
-        let error = tokio::time::timeout(WAIT, writer.simple_query("SELECT id FROM t"))
+        let error = tokio::time::timeout(WAIT, writer.query("SELECT id FROM t", &[]))
             .await
             .expect("writer on the cut-off leader neither answered nor failed")
             .expect_err("cut-off leader served a read on the writer session after 08007");
@@ -619,4 +618,121 @@ async fn leader_cut_from_one_follower_keeps_serving() {
         cluster.converged().await,
         acked.into_iter().collect::<Vec<_>>()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stepped_down_leader_ends_extended_protocol_sessions() {
+    let mut cluster = Cluster::new().await;
+    let old = cluster.leader().await;
+    let writer = connect(&cluster.config(&[old])).await;
+    let mut acked = seed(&writer, 0..2).await;
+    let fresh = connect(&cluster.config(&[old])).await;
+    let parse_only = connect(&cluster.config(&[old])).await;
+    let cached = connect(&cluster.config(&[old])).await;
+    let named = connect(&cluster.config(&[old])).await;
+    let probe = "SELECT id FROM t ORDER BY id";
+    assert_eq!(cached.query(probe, &[]).await.unwrap().len(), 2);
+    let statement = named.prepare(probe).await.unwrap();
+
+    // Keep the continuation in the writer's task: waiting for the follower
+    // announcement misses the fencing-to-listener-teardown race entirely.
+    let stream = async {
+        for id in 1000..100_000 {
+            match insert(&writer, id).await {
+                Ok(_) => {
+                    acked.insert(id);
+                }
+                Err(error) => return (id, error),
+            }
+        }
+        panic!("insert stream never failed");
+    };
+    let cut = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cluster.isolate(old, Fault::Partition);
+    };
+    let probes = async {
+        let (unknown, error) = tokio::time::timeout(WAIT, stream).await.unwrap();
+        assert!(write_indeterminate(&error), "stream INSERT: {error:?}");
+        // Unique SQL forces Parse instead of reusing the unnamed-statement
+        // cache. Poll all sessions together before checking any result.
+        let sql = format!("SELECT id FROM t WHERE id = {unknown}");
+        let (writer_error, fresh_error, parse_error, cached_error, named_error) =
+            tokio::time::timeout(WAIT, async {
+                tokio::join!(
+                    writer.query(&sql, &[]),
+                    fresh.query(&sql, &[]),
+                    async {
+                        for attempt in 0.. {
+                            let sql =
+                                format!("SELECT id FROM t WHERE id = {unknown} /* {attempt} */");
+                            match parse_only.prepare(&sql).await {
+                                Ok(_) => continue,
+                                Err(error) => return error,
+                            }
+                        }
+                        unreachable!("Parse-only loop ends at its first error or at WAIT");
+                    },
+                    cached.query(probe, &[]),
+                    named.query(&statement, &[]),
+                )
+            })
+            .await
+            .unwrap();
+        let errors = [
+            (
+                "writer Parse",
+                writer_error.expect_err("writer returned rows after stream failure"),
+            ),
+            (
+                "fresh Parse",
+                fresh_error.expect_err("fresh session returned rows after stream failure"),
+            ),
+            ("prepare", parse_error),
+            (
+                "cache hit",
+                cached_error.expect_err("cached query returned rows after stream failure"),
+            ),
+            (
+                "named",
+                named_error.expect_err("named statement returned rows after stream failure"),
+            ),
+        ];
+        eprintln!(
+            "stream={:?}; probes={:?}",
+            error.code(),
+            errors
+                .iter()
+                .map(|(name, e)| (*name, e.code(), e.is_closed()))
+                .collect::<Vec<_>>()
+        );
+        for (name, error) in errors {
+            assert!(
+                ended(&error),
+                "{name} after stream failure must end session: {error:?}"
+            );
+        }
+        for client in [&writer, &fresh, &parse_only, &cached, &named] {
+            let error = tokio::time::timeout(WAIT, client.query(probe, &[]))
+                .await
+                .unwrap()
+                .expect_err("terminated session remained usable");
+            assert!(error.is_closed(), "follow-up: {error:?}");
+        }
+        unknown
+    };
+    let (unknown, ()) = tokio::join!(probes, cut);
+    cluster.until_follower(old).await;
+    let new = cluster.leader().await;
+    assert_ne!(old, new);
+    let client = connect(&cluster.config(&[new])).await;
+    cluster.heal();
+    insert(&client, 2).await.unwrap();
+    acked.insert(2);
+    cluster.assert_proxies_unsaturated();
+    let stored = cluster.converged().await;
+    if stored.contains(&unknown) {
+        acked.insert(unknown);
+    }
+    assert_eq!(stored, acked.into_iter().collect::<Vec<_>>());
 }

@@ -137,6 +137,7 @@ pub(crate) fn error_message(code: &str, message: &'static str, out: &mut Vec<u8>
 }
 #[derive(Default)]
 struct Diagnostic {
+    unknown_outcome: bool,
     phase: &'static str,
     message: Option<&'static str>,
     wire_message: Option<String>,
@@ -2984,6 +2985,7 @@ async fn read_frontend_body<S: AsyncRead + Unpin>(s: &mut S) -> io::Result<Vec<u
 }
 
 impl State {
+    /// Returns (keep session, leadership shutdown).
     fn buffered_message(
         &mut self,
         message: (u8, &[u8], std::time::Instant),
@@ -2992,10 +2994,11 @@ impl State {
         active: crate::cancel::Active,
         refusal: Option<&'static str>,
         admission_message: Option<String>,
-    ) -> io::Result<bool> {
+    ) -> io::Result<(bool, bool)> {
         let (tag, b, received) = message;
         let context = active.context.clone();
         self.diagnostic = Diagnostic {
+            unknown_outcome: false,
             wire_detail: None,
             wire_hint: None,
             sql_detail: None,
@@ -3052,6 +3055,7 @@ impl State {
                     "42601" => "statement syntax is not supported by this server SQL profile",
                     _ => GENERIC_MESSAGE,
                 });
+                self.diagnostic.unknown_outcome = code == "08007";
                 if self.copy.is_some() {
                     self.copy_error(code, session, out);
                     Ok(true)
@@ -3072,6 +3076,24 @@ impl State {
                 }
             }
         };
+        if self.diagnostic.unknown_outcome
+            && session.service.statement_gate.get().is_some_and(|gate| {
+                !matches!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || context.scope(|| gate())
+                    )),
+                    Ok(Ok(()))
+                )
+            })
+        {
+            // Parse/Bind/Describe cannot have committed. Other messages
+            // retain their unknown-outcome error before the terminal refusal.
+            if matches!(tag, b'P' | b'B' | b'D') {
+                out.clear();
+            }
+            leader_error(out)?;
+            return Ok((false, true));
+        }
         if !session.in_transaction() && !self.implicit {
             session.service.advisory.release(session.backend_pid, true);
         }
@@ -3084,7 +3106,7 @@ impl State {
         } else {
             drop(active);
         }
-        keep
+        keep.map(|keep| (keep, false))
     }
 }
 
@@ -3532,7 +3554,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                         None
                     };
                     // Admission refusal uses the same error/abort/drain path.
-                    keep = state.buffered_message(
+                    let outcome = state.buffered_message(
                         (tag, &b, received),
                         session,
                         &mut out,
@@ -3540,6 +3562,10 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                         refusal.as_ref().map(|e| e.sqlstate()),
                         refusal.as_ref().map(|e| e.message()),
                     );
+                    keep = outcome.map(|(keep, shutdown)| {
+                        leader_shutdown = shutdown;
+                        keep
+                    });
                     state
                         .output
                         .as_ref()

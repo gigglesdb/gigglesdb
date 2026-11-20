@@ -281,6 +281,7 @@ impl State {
             "42601" => "statement syntax is not supported by this server SQL profile",
             _ => "request rejected; consult documented code",
         });
+        self.diagnostic.unknown_outcome = code == "08007";
         diagnostic_error(code, message, Some(&self.diagnostic), &mut error);
         out.extend(error);
     }
