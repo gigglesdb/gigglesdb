@@ -3177,19 +3177,62 @@ fn normalize_insert(
     columns: &[usize],
     values: Vec<Value>,
 ) -> Result<Vec<Value>> {
+    normalize_insert_inner(session, table, columns, values, false)
+}
+fn normalize_insert_inner(
+    session: &mut SqlSession,
+    table: &TableDef,
+    columns: &[usize],
+    values: Vec<Value>,
+    deferred: bool,
+) -> Result<Vec<Value>> {
     let values = columns.iter().zip(values)
         .map(|(index, value)| assign_number(value, &table.columns[*index]))
         .collect::<Result<Vec<_>>>()?;
     let invalid_supplied = columns.iter().zip(&values)
         .filter_map(|(index, value)| check(value, &table.columns[*index]).err())
         .max_by_key(|error| usize::from(*error == Error::Overflow));
-    session.normalize_insert_engine(table, columns, values).map_err(|error| match error {
+    let result = if deferred {
+        session.normalize_insert_engine_deferred(table, columns, values)
+    } else {
+        session.normalize_insert_engine(table, columns, values)
+    };
+    result.map_err(|error| match error {
         CoreError::Sql(SqlError::Limit) => Error::Limit,
         error @ CoreError::Sql(SqlError::Null | SqlError::Type) => invalid_supplied.unwrap_or_else(|| core(error)),
         error => core(error),
     })
 }
 fn insert_many(
+    session: &mut SqlSession,
+    table: &TableDef,
+    columns: Vec<usize>,
+    expressions: Vec<Vec<Bound>>,
+    returning: Option<Vec<BoundProjection>>,
+    existing: Vec<SqlRow>,
+    retained: Option<&mut usize>,
+) -> Result<Outcome> {
+    let result = insert_many_deferred(session, table, columns, expressions, returning, existing, retained);
+    // RETURN rows, versions and value-bearing errors must all be durable-covered.
+    // A settlement failure takes precedence over the original request error.
+    if let Err(error) = session.settle_sequences() {
+        session.abort();
+        return Err(core(error));
+    }
+    // Errors keep their existing abort behaviour (inner failures abort themselves).
+    #[cfg(test)]
+    NATIVE_MANY_ON_EXIT.with(|observer| {
+        if let Some(observer) = observer.get() { observer(session); }
+    });
+    result
+}
+#[cfg(test)]
+thread_local! {
+    // Per-thread crash injection keeps other native requests unaffected.
+    pub(crate) static NATIVE_MANY_ON_EXIT: std::cell::Cell<Option<fn(&SqlSession)>> = const { std::cell::Cell::new(None) };
+    pub(crate) static NATIVE_MANY_CRASH_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+fn insert_many_deferred(
     session: &mut SqlSession,
     table: &TableDef,
     columns: Vec<usize>,
@@ -3207,7 +3250,7 @@ fn insert_many(
         crate::cancellation::check().map_err(core)?;
         let values = expressions.iter().map(|e| e.eval(&[]).map(Cow::into_owned))
             .collect::<Result<Vec<_>>>()?;
-        let row = normalize_insert(session, table, &columns, values)?
+        let row = normalize_insert_inner(session, table, &columns, values, true)?
             .into_iter().map(Cow::Owned).collect::<Vec<_>>();
         let mut remaining_row = crate::relational::MAX_ROW_BYTES;
         for (value, column) in row.iter().zip(&table.columns) {
@@ -3216,6 +3259,12 @@ fn insert_many(
             charge_value(&mut remaining, value)?;
         }
         proposed.push(row);
+        #[cfg(test)]
+        NATIVE_MANY_CRASH_AFTER.with(|after| {
+            if after.get() == Some(proposed.len()) {
+                crate::storage::crash_now();
+            }
+        });
     }
     // The same canonical complete-key codec used by SQL defines identity.
     // Key payload copies happen only after every proposed row was admitted.
@@ -3306,7 +3355,7 @@ fn insert_many(
             .into_iter()
             .map(Cow::into_owned)
             .collect();
-        let result = session.insert_engine(table, values).map_err(core)?;
+        let result = session.insert_engine_deferred(table, values).map_err(core)?;
         if result.affected != 1 {
             return Err(Error::Conflict);
         }

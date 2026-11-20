@@ -1404,3 +1404,235 @@ fn coverage_nonreceiver_survives_ddl_restart() {
     assert_eq!(slot.counter.lock().unwrap().waiting_returns, 0);
     assert_eq!(scalar(&mut s, "SELECT nextval('restart_waiters')"), 1000);
 }
+
+// GD-0084 F1: native request boundaries must cover sequence values even when
+// rows remain provisional or the request fails after allocating some defaults.
+fn native_many_request(count: usize, fail: bool) -> crate::operations::Request {
+    use crate::operations::{Expr, Projection, Request, ValueExpr};
+    let request = Request::InsertMany {
+        table: "native_rows".into(),
+        columns: vec!["payload".into()],
+        rows: (0..count).map(|i| vec![Expr::Value(ValueExpr::Literal(
+            if fail && i == 4 { Value::Null } else { Value::Int(i as i64) }
+        ))]).collect(),
+        cap: ValueExpr::Literal(Value::Int(count as i64)),
+    };
+    Request::Returning {
+        request: Box::new(request),
+        projection: vec![Projection { expression: Expr::Field("id".into()), alias: None }],
+    }
+}
+fn native_many(s: &mut SqlSession, count: usize) -> Vec<i64> {
+    let out = s.execute_native(&native_many_request(count, false), &Default::default()).unwrap();
+    assert_eq!(out.rows.len(), count);
+    assert!(out.rows.iter().all(|r| r.version > 0));
+    assert!(s.sequence_unsettled.lock().unwrap().is_empty());
+    if let Backend::V2(db) = &s.admin.inner.backend {
+        let view = db.catalog().current_local_view().unwrap();
+        let id = *view.sequences.iter().find(|(_, def)| def.name == "native_ids").unwrap().0;
+        let slot = db.sql_counters.lock().unwrap().get(&id).unwrap().clone();
+        let guard = slot.counter.lock_cancellable().unwrap();
+        let max = out.rows.iter().map(|r| match r.values[0] {
+            Value::Int(id) => id,
+            _ => unreachable!(),
+        }).max().unwrap();
+        assert!(guard.durable_hw.is_some_and(|hw| hw >= max));
+    }
+    out.rows.into_iter().map(|r| match r.values[0] {
+        Value::Int(id) => id,
+        ref other => panic!("unexpected id {other:?}"),
+    }).collect()
+}
+fn native_schema(s: &mut SqlSession) {
+    run(s, "CREATE SEQUENCE native_ids");
+    run(s, "CREATE TABLE native_rows(id BIGINT DEFAULT nextval('native_ids') PRIMARY KEY, payload BIGINT NOT NULL)");
+}
+#[test]
+fn native_many_settles_before_return_and_rollback_keeps_sequence() {
+    for engine in engines() {
+        let f = Fixture::new(engine);
+        let mut s = f.session();
+        native_schema(&mut s);
+        run(&mut s, "BEGIN");
+        let ids = native_many(&mut s, 40);
+        assert_eq!(ids, (1..=40).collect::<Vec<_>>());
+        assert_eq!(scalar(&mut s, "SELECT currval('native_ids')"), 40);
+        run(&mut s, "ROLLBACK");
+        assert_eq!(scalar(&mut s, "SELECT count(*) FROM native_rows"), 0);
+        assert_eq!(scalar(&mut s, "SELECT nextval('native_ids')"), 41);
+    }
+}
+#[test]
+fn native_many_partial_error_is_atomic_and_settled() {
+    for engine in engines() {
+        let f = Fixture::new(engine);
+        let mut s = f.session();
+        native_schema(&mut s);
+        assert_eq!(s.execute_native(&native_many_request(10, true), &Default::default()),
+            Err(crate::operations::Error::Sql { sqlstate: "23502".into() }));
+        assert!(s.sequence_unsettled.lock().unwrap().is_empty());
+        assert_eq!(scalar(&mut s, "SELECT count(*) FROM native_rows"), 0);
+        assert_eq!(scalar(&mut s, "SELECT nextval('native_ids')"), 6);
+    }
+}
+#[test]
+fn native_many_crash_worker() {
+    let Some(path) = std::env::var_os("F1_NATIVE_MANY_CRASH_PATH") else { return; };
+    let admin = Admin::open(PathBuf::from(path), Limits::default()).unwrap();
+    let mut s = admin.sql_session();
+    let mode = std::env::var("F1_NATIVE_MANY_CRASH_MODE").unwrap();
+    if mode == "uncommitted" { run(&mut s, "BEGIN"); }
+    if mode == "error" {
+        assert_eq!(s.execute_native(&native_many_request(10, true), &Default::default()),
+            Err(crate::operations::Error::Sql { sqlstate: "23502".into() }));
+        assert!(s.sequence_unsettled.lock().unwrap().is_empty());
+    } else {
+        assert_eq!(native_many(&mut s, 40), (1..=40).collect::<Vec<_>>());
+    }
+    crate::storage::crash_now();
+}
+#[test]
+fn native_many_crash_preserves_committed_uncommitted_and_failed_values() {
+    for engine in engines() {
+        for mode in ["committed", "uncommitted", "error"] {
+            let mut f = Fixture::new(engine);
+            native_schema(&mut f.session());
+            f.admin.take();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "storage::v2_sql::sql_sequences::reservation_tests::native_many_crash_worker", "--nocapture"])
+                .env("F1_NATIVE_MANY_CRASH_PATH", &f.path)
+                .env("F1_NATIVE_MANY_CRASH_MODE", mode).output().unwrap();
+            assert_eq!(output.status.code(), Some(86), "{engine:?}/{mode}: {output:?}");
+            f.reopen();
+            let mut s = f.session();
+            assert_eq!(scalar(&mut s, "SELECT count(*) FROM native_rows"), if mode == "committed" { 40 } else { 0 });
+            let high = if mode == "error" { 5 } else { 40 };
+            assert!(scalar(&mut s, "SELECT nextval('native_ids')") > high);
+            assert!(native_many(&mut s, 40).iter().all(|id| *id > high));
+        }
+    }
+}
+#[test]
+fn native_many_concurrent_ids_are_unique() {
+    use std::time::{Duration, Instant};
+    for engine in engines() {
+        let mut f = Fixture::new(engine);
+        native_schema(&mut f.session());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let workers: Vec<_> = (0..4).map(|writer| {
+            let admin = f.admin.as_ref().unwrap().clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let mut ids = Vec::new();
+                barrier.wait();
+                for _ in 0..5 {
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    let mut conflicts = 0u32;
+                    loop {
+                        let mut s = admin.sql_session();
+                        // Retry only definite conflicts; reservations may leave safe gaps.
+                        match s.execute_native(&native_many_request(40, false), &Default::default()) {
+                            Ok(out) => {
+                                assert!(s.sequence_unsettled.lock().unwrap().is_empty());
+                                ids.extend(out.rows.into_iter().map(|r| match r.values[0] {
+                                    Value::Int(id) => id,
+                                    _ => unreachable!(),
+                                }));
+                                break;
+                            }
+                            Err(crate::operations::Error::Conflict) => {
+                                assert!(Instant::now() < deadline, "{engine:?}: native insert conflicts did not converge");
+                                // Legacy defaults persist outside the optimistic row
+                                // transaction. Let another writer finish rather than
+                                // continuously invalidating every writer's snapshot.
+                                conflicts += 1;
+                                thread::sleep(Duration::from_millis(
+                                    10 * (writer + 1) * (1u64 << conflicts.min(6))));
+                            }
+                            Err(error) => panic!("concurrent native insert: {error:?}"),
+                        }
+                    }
+                }
+                ids
+            })
+        }).collect();
+        let ids: Vec<_> = workers.into_iter().flat_map(|w| w.join().unwrap()).collect();
+        assert_eq!(ids.len(), 800);
+        let high = *ids.iter().max().unwrap();
+        assert_eq!(ids.into_iter().collect::<BTreeSet<_>>().len(), 800);
+        assert_eq!(scalar(&mut f.session(), "SELECT count(*) FROM native_rows"), 800);
+        f.reopen();
+        assert!(scalar(&mut f.session(), "SELECT nextval('native_ids')") > high);
+    }
+}
+
+#[test]
+fn native_many_expression_error_settles_prior_defaults() {
+    use crate::operations::{Arithmetic, Error, Expr, Request, ValueExpr};
+    for engine in engines() {
+        let f = Fixture::new(engine);
+        let mut s = f.session();
+        native_schema(&mut s);
+        let mut request = native_many_request(20, false);
+        let Request::Returning { request: inner, .. } = &mut request else { unreachable!() };
+        let Request::InsertMany { rows, .. } = inner.as_mut() else { unreachable!() };
+        // Cross the first refill threshold so defaults create obligations.
+        let one = Expr::Value(ValueExpr::Literal(Value::Int(1)));
+        let zero = Expr::Value(ValueExpr::Literal(Value::Int(0)));
+        rows[12][0] = Expr::Arithmetic(Box::new(one), Arithmetic::Divide, Box::new(zero));
+        run(&mut s, "BEGIN");
+        // Observe the wrapper exit before native_scope's error cleanup calls
+        // abort(), which would otherwise mask a missing final settlement.
+        crate::operations::NATIVE_MANY_ON_EXIT.with(|observer| observer.set(Some(|session| {
+            assert!(session.sequence_unsettled.lock().unwrap().is_empty(),
+                "insert_many returned unsettled defaults before outer abort");
+        })));
+        let result = s.execute_native(&request, &Default::default());
+        crate::operations::NATIVE_MANY_ON_EXIT.with(|observer| observer.set(None));
+        assert_eq!(result, Err(Error::DivisionByZero));
+        assert!(s.sequence_unsettled.lock().unwrap().is_empty(), "{engine:?}: request returned unsettled defaults");
+        run(&mut s, "ROLLBACK");
+        assert_eq!(scalar(&mut s, "SELECT count(*) FROM native_rows"), 0);
+        assert_eq!(scalar(&mut s, "SELECT nextval('native_ids')"), 13);
+    }
+}
+
+#[test]
+fn native_many_between_rows_crash_worker() {
+    let Some(path) = std::env::var_os("F1_NATIVE_MID_CRASH_PATH") else { return; };
+    let admin = Admin::open(PathBuf::from(path), Limits::default()).unwrap();
+    let mut s = admin.sql_session();
+    let explicit = std::env::var("F1_NATIVE_MID_CRASH_EXPLICIT").unwrap() == "true";
+    // Earlier committed request returned these ids to its client.
+    assert_eq!(native_many(&mut s, 40), (1..=40).collect::<Vec<_>>());
+    if explicit {
+        run(&mut s, "BEGIN");
+        assert_eq!(native_many(&mut s, 40), (41..=80).collect::<Vec<_>>());
+    }
+    crate::operations::NATIVE_MANY_CRASH_AFTER.with(|after| after.set(Some(20)));
+    let _ = s.execute_native(&native_many_request(40, false), &Default::default());
+    panic!("mid-normalization crash hook was not reached");
+}
+
+#[test]
+fn native_many_between_rows_crash_preserves_returned_ids() {
+    for engine in engines() {
+        for explicit in [false, true] {
+            let mut f = Fixture::new(engine);
+            native_schema(&mut f.session());
+            f.admin.take();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "storage::v2_sql::sql_sequences::reservation_tests::native_many_between_rows_crash_worker", "--nocapture"])
+                .env("F1_NATIVE_MID_CRASH_PATH", &f.path)
+                .env("F1_NATIVE_MID_CRASH_EXPLICIT", explicit.to_string()).output().unwrap();
+            assert_eq!(output.status.code(), Some(86), "{engine:?}/{explicit}: {output:?}");
+            f.reopen();
+            let mut s = f.session();
+            assert_eq!(scalar(&mut s, "SELECT count(*) FROM native_rows"), 40);
+            assert_eq!(scalar(&mut s, "SELECT max(id) FROM native_rows"), 40);
+            let returned_high = if explicit { 80 } else { 40 };
+            assert!(scalar(&mut s, "SELECT nextval('native_ids')") > returned_high);
+            assert!(native_many(&mut s, 40).iter().all(|id| *id > returned_high));
+        }
+    }
+}

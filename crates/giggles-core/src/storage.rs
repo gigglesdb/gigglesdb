@@ -2711,7 +2711,7 @@ impl SqlSession {
         }
         result
     }
-    fn settle_sequences(&self) -> Result<(), CoreError> {
+    pub(crate) fn settle_sequences(&self) -> Result<(), CoreError> {
         if let Backend::V2(db) = &self.admin.inner.backend {
             v2_sql::sql_sequences::settle(db, &self.sequence_unsettled)?;
         }
@@ -3520,6 +3520,27 @@ impl SqlSession {
         supplied: &[usize],
         values: Vec<relational::Value>,
     ) -> Result<Vec<relational::Value>, CoreError> {
+        self.normalize_insert_engine_settling(table, supplied, values, true)
+    }
+
+    /// Native INSERT MANY only: the caller must settle on every request exit.
+    /// Failures still abort and attempt settlement here.
+    pub(crate) fn normalize_insert_engine_deferred(
+        &mut self,
+        table: &relational::TableDef,
+        supplied: &[usize],
+        values: Vec<relational::Value>,
+    ) -> Result<Vec<relational::Value>, CoreError> {
+        self.normalize_insert_engine_settling(table, supplied, values, false)
+    }
+
+    fn normalize_insert_engine_settling(
+        &mut self,
+        table: &relational::TableDef,
+        supplied: &[usize],
+        values: Vec<relational::Value>,
+        settle: bool,
+    ) -> Result<Vec<relational::Value>, CoreError> {
         let result = (|| {
             let _ticket = self.admin.inner.enter_sql()?;
             crate::cancellation::check()?;
@@ -3535,7 +3556,10 @@ impl SqlSession {
             if let Some(error) = clock.take_error() { return Err(error); }
             output.map_err(CoreError::Sql)
         })();
-        let result = result.and_then(|value| self.settle_sequences().map(|()| value));
+        let result = result.and_then(|value| {
+            if settle { self.settle_sequences()?; }
+            Ok(value)
+        });
         if result.is_err() { self.abort(); }
         result
     }
@@ -3543,6 +3567,25 @@ impl SqlSession {
         &mut self,
         table: &relational::TableDef,
         values: Vec<relational::Value>,
+    ) -> Result<relational::SqlResult, CoreError> {
+        self.insert_engine_settling(table, values, true)
+    }
+
+    /// Native INSERT MANY only: the caller must settle on every request exit.
+    /// Failures still abort and attempt settlement here.
+    pub(crate) fn insert_engine_deferred(
+        &mut self,
+        table: &relational::TableDef,
+        values: Vec<relational::Value>,
+    ) -> Result<relational::SqlResult, CoreError> {
+        self.insert_engine_settling(table, values, false)
+    }
+
+    fn insert_engine_settling(
+        &mut self,
+        table: &relational::TableDef,
+        values: Vec<relational::Value>,
+        settle: bool,
     ) -> Result<relational::SqlResult, CoreError> {
         if let Backend::V2(db) = &self.admin.inner.backend {
             let db = db.clone();
@@ -3558,7 +3601,10 @@ impl SqlSession {
                 prepared.transaction = self.transaction_id;
                 self.execute_bound_engine(&prepared, &[], None)
             })();
-            let result = result.and_then(|value| self.settle_sequences().map(|()| value));
+            let result = result.and_then(|value| {
+                if settle { self.settle_sequences()?; }
+                Ok(value)
+            });
             if result.is_err() { self.abort(); }
             return result;
         }
