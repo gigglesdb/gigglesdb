@@ -165,7 +165,7 @@ fn incomplete_group_restores_previous_modes_on_every_wait_error() {
         }
         assert_eq!(handle.join().unwrap(), Err(error));
         assert_eq!(lm.held(TxnId(2)).into_iter().collect::<HashSet<_>>(), before);
-        assert!(!lm.state.lock().unwrap().provisional.keys().any(|(txn, _)| *txn == TxnId(2)));
+        assert!(!lm.global().unwrap().guards.slice().iter().any(|s| s.provisional.contains_key(&TxnId(2))));
         lm.release_all(TxnId(1));
         lm.acquire_points(TxnId(4), &[(k.clone(), LockMode::Shared)],
             Some(Instant::now()), &|| false).unwrap();
@@ -266,7 +266,7 @@ fn nowait_group_preserves_all_previous_modes_when_either_member_blocks() {
             let before = lm.held(TxnId(2)).into_iter().collect::<HashSet<_>>();
             assert_eq!(lm.acquire_points(TxnId(2), &group, Some(Instant::now()), &|| false), Err(LockError::Timeout));
             assert_eq!(lm.held(TxnId(2)).into_iter().collect::<HashSet<_>>(), before);
-            assert!(lm.state.lock().unwrap().provisional.is_empty());
+            assert!(lm.global().unwrap().provisional_empty());
         }
     }
 }
@@ -302,7 +302,7 @@ fn grouped_writers_and_key_share_lockers_do_not_lose_wakeups() {
                         Err(LockError::Deadlock) => {
                             // Evidence captured under the detection mutex, before
                             // removal destroys the cycle: every retry had a cycle.
-                            assert!(lm.state.lock().unwrap().deadlock_victims.remove(&TxnId(id)));
+                            assert!(lm.global().unwrap().guards.slice_mut()[0].deadlock_victims.remove(&TxnId(id)));
                             lm.release_all(TxnId(id));
                         }
                         error => { lm.release_all(TxnId(id)); send.send(error).unwrap(); return; }
@@ -315,7 +315,7 @@ fn grouped_writers_and_key_share_lockers_do_not_lose_wakeups() {
     for _ in 0..16 { assert_eq!(recv.recv_timeout(Duration::from_secs(20)).unwrap(), Ok(())); }
     for handle in handles { handle.join().unwrap(); }
     assert_eq!(lm.waiting_count(), 0);
-    assert!(lm.state.lock().unwrap().provisional.is_empty());
+    assert!(lm.global().unwrap().provisional_empty());
 }
 
 #[test]
@@ -351,23 +351,24 @@ fn blocking_covered_group_preserves_member_mode_sets_and_skips_drain() {
     // A cancelled waiter at D's head must stay queued: K's finish_group
     // clears provisional, and D's covered shortcut never drains or notifies.
     let id = {
-        let mut state = lm.state.lock().unwrap();
-        let id = state.next_waiter;
-        state.next_waiter += 1;
-        state.waiters.insert(id, Waiter {
+        let mut state = lm.global().unwrap();
+        let id = lm.next_waiter.fetch_add(1, Ordering::Relaxed);
+        let i = lm.shard(&d);
+        lm.registry.pending(TxnId(2), true);
+        state.guards.slice_mut()[i].waiters.insert(id, Waiter {
             txn: TxnId(2), key: d.clone(), mode: LockMode::Exclusive,
             upgrade: false, group: vec![(d.clone(), LockMode::Exclusive)],
-            cancelled: true, changed: Arc::new(Condvar::new()), sleeping: false, notified: AtomicBool::new(false),
+            cancelled: true, slot: Arc::new(Slot::default()), prepared: PreparedKey::new(&d),
         });
-        state.by_txn.entry(TxnId(2)).or_default().push(id);
-        state.keys.get_mut(&d).unwrap().queue.push(id);
+        state.guards.slice_mut()[i].by_txn.entry(TxnId(2)).or_default().push(id);
+        state.key_mut(&d).unwrap().queue.push(id);
         id
     };
     lm.acquire_points(txn, &[(k.clone(), LockMode::Shared), (d.clone(), LockMode::Shared)], None, &|| false).unwrap();
     assert_eq!(lm.held(txn).into_iter().collect::<HashSet<_>>(), HashSet::from([
         (k.clone(), LockMode::Shared), (k, LockMode::Exclusive), (d, LockMode::Exclusive),
     ]));
-    assert!(lm.state.lock().unwrap().waiters.contains_key(&id));
+    assert!(lm.global().unwrap().waiter(&id).is_some());
 }
 
 #[test]
@@ -384,5 +385,5 @@ fn blocking_group_limit_rolls_back_the_provisional_first_member() {
     let (d, k) = keys();
     assert_eq!(lm.acquire_points(TxnId(1), &[(k, LockMode::Exclusive), (d, LockMode::Exclusive)], None, &|| false), Err(LockError::Limit));
     assert!(lm.held(TxnId(1)).is_empty());
-    assert!(lm.state.lock().unwrap().provisional.is_empty());
+    assert!(lm.global().unwrap().provisional_empty());
 }

@@ -55,8 +55,9 @@ fn until(mut condition: impl FnMut() -> bool) {
 // entered its wait, rather than merely having queued before the notification.
 fn parked(lm: &LockManager, count: usize) {
     until(|| {
-        let state = lm.state.lock().unwrap();
-        state.waiters.len() == count && state.waiters.values().all(|w| w.sleeping)
+        let state = lm.global().unwrap();
+        state.guards.slice().iter().map(|s| s.waiters.len()).sum::<usize>() == count
+            && state.guards.slice().iter().flat_map(|s| s.waiters.values()).all(|w| w.slot.m.lock().unwrap().sleeping)
     });
 }
 
@@ -83,12 +84,12 @@ fn spawn_waiter(
 
 fn assert_clean(lm: &LockManager) {
     assert_eq!(lm.waiting_count(), 0);
-    let state = lm.state.lock().unwrap();
-    assert!(state.by_txn.is_empty());
-    assert!(state.completed.is_empty());
-    assert!(state.keys.is_empty());
-    assert!(state.held_keys.is_empty());
-    assert!(state.row_counts.is_empty());
+    let state = lm.global().unwrap();
+    assert!(state.guards.slice().iter().all(|s| s.by_txn.is_empty()));
+    // Terminal results now belong to the acquiring threads, not manager state.
+    assert!(state.guards.slice().iter().all(|s| s.keys.is_empty()));
+    assert!(state.guards.slice().iter().all(|s| s.held.is_empty()));
+    assert!(lm.registry.stripes.iter().all(|s| s.lock().unwrap().is_empty()));
     assert!(state.intervals.iter().all(HashSet::is_empty));
     assert!(state.points.iter().all(BTreeSet::is_empty));
 }
@@ -287,6 +288,7 @@ fn cancellation_and_release_all_notify_every_request_of_the_transaction() {
             handle.join().unwrap();
         }
         assert_eq!(lm.waiter_wakeups.load(Ordering::Relaxed), 2);
+        lm.release_all(TxnId(2));
         lm.release_all(TxnId(1));
         assert_clean(&lm);
     }
@@ -324,6 +326,7 @@ fn deferred_detection_preserves_deadline_and_cancellation_polling() {
         Err(LockError::Cancelled)
     );
     assert_eq!(polls.load(Ordering::Relaxed), 3);
+    lm.release_all(TxnId(2));
     lm.release_all(TxnId(1));
     assert_clean(&lm);
 }

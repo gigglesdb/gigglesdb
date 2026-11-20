@@ -1,4 +1,4 @@
-//! In-memory transaction locks. All bookkeeping is protected by one mutex.
+//! In-memory transaction locks. Phase 1 operations lock all shards in order.
 //!
 //! Each queued request has its own condition variable and checks its terminal result
 //! under the mutex, so completion cannot be missed or bypass FIFO. Only completed
@@ -18,11 +18,16 @@
 //! FIFO is per key: a request on one key never waits behind queued requests on
 //! another key, so a stream of overlapping intervals can delay a queued writer.
 
+// The same suites intentionally instantiate managers with three shard counts.
+#![cfg_attr(test, allow(clippy::duplicate_mod))]
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Bound;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// `Unique { index: CATALOG_NAME_INDEX, tuple: name }` in `Exclusive` mode
@@ -253,6 +258,9 @@ impl HeldModes {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LockConfig {
+    pub(crate) shards: usize,
+    #[cfg(test)]
+    pub(crate) placement: Option<fn(&LockKey) -> usize>,
     pub(crate) max_row_locks_per_txn: usize,
     pub(crate) deadlock_recheck: Duration,
     pub(crate) deadlock_timeout: Duration,
@@ -261,10 +269,24 @@ pub(crate) struct LockConfig {
 impl Default for LockConfig {
     fn default() -> Self {
         Self {
+            shards: 1,
+            #[cfg(test)]
+            placement: None,
             max_row_locks_per_txn: 1_000_000,
             deadlock_recheck: Duration::from_millis(100),
             deadlock_timeout: Duration::ZERO,
         }
+    }
+}
+
+impl LockConfig {
+    fn sleep_interval(&self, queued_at: Instant, now: Instant, waited: Duration, deadline: Option<Instant>) -> Duration {
+        let mut interval = self.deadlock_recheck;
+        if waited < self.deadlock_timeout {
+            interval = interval.min(self.deadlock_timeout.saturating_sub(now.duration_since(queued_at)));
+        }
+        if let Some(deadline) = deadline { interval = interval.min(deadline.saturating_duration_since(now)); }
+        interval
     }
 }
 
@@ -296,6 +318,14 @@ struct KeyState {
     slow: HashSet<TxnId>,
 }
 
+// Key payload allocations are prepared before taking shard locks. The map
+// copy is consumed only for a new key; the holding copy only for a new owner.
+#[derive(Debug, Default)]
+struct PreparedKey { map: Option<LockKey>, held: Option<LockKey> }
+impl PreparedKey {
+    fn new(key: &LockKey) -> Self { Self { map: Some(key.clone()), held: Some(key.clone()) } }
+}
+
 #[derive(Debug)]
 struct Waiter {
     txn: TxnId,
@@ -305,54 +335,234 @@ struct Waiter {
     group: Vec<(LockKey, LockMode)>,
     // Set by `cancel_wait`: the request ends `Deadlock` instead of being granted.
     cancelled: bool,
-    changed: Arc<Condvar>,
-    #[cfg(test)]
-    sleeping: bool,
-    // Set by `notify_grant` when it signals this waiter while it sleeps, so
-    // the test-only wake-up counter counts only product-caused wake-ups.
-    // `remove_waiter` and `cancel_wait` are recognised by `completed` and
-    // `cancelled`; any new `changed.notify_one` site must set this flag too,
-    // or its wake-ups are counted as spurious.
-    #[cfg(test)]
-    notified: AtomicBool,
+    slot: Arc<Slot>,
+    prepared: PreparedKey,
 }
 
 #[derive(Debug, Default)]
-struct State {
+struct SlotState {
+    result: Option<Result<(), LockError>>,
+    recheck: bool,
+    #[cfg(test)]
+    sleeping: bool,
+    #[cfg(test)]
+    ever_slept: bool,
+    #[cfg(test)]
+    notified: bool,
+}
+#[derive(Debug, Default)]
+struct Slot { m: Mutex<SlotState>, cv: Condvar }
+impl Slot {
+    fn result(&self) -> Option<Result<(), LockError>> {
+        let _order = OrderGuard::leaf();
+        self.m.lock().unwrap_or_else(|p| p.into_inner()).result
+    }
+    fn recheck(&self) {
+        let _order = OrderGuard::leaf();
+        let mut state = self.m.lock().unwrap_or_else(|p| p.into_inner());
+        state.recheck = true;
+        #[cfg(test)]
+        { state.notified = true; }
+        self.cv.notify_one();
+    }
+    fn complete(&self, result: Result<(), LockError>) {
+        let _order = OrderGuard::leaf();
+        let mut state = self.m.lock().unwrap_or_else(|p| p.into_inner());
+        state.result = Some(result);
+        #[cfg(test)]
+        { state.notified = true; }
+        self.cv.notify_one();
+    }
+}
+#[derive(Debug, Default)]
+struct TxnLocal { rows: usize, shard_mask: ShardMask, pending: usize }
+#[derive(Debug, Default)]
+struct ShardMask { first: u64, rest: Vec<u64> }
+impl ShardMask {
+    fn insert(&mut self, index: usize) {
+        if index < 64 { self.first |= 1 << index; }
+        else {
+            let word = index / 64 - 1;
+            if self.rest.len() <= word { self.rest.resize(word + 1, 0); }
+            self.rest[word] |= 1 << (index % 64);
+        }
+    }
+    fn contains(&self, index: usize) -> bool {
+        let word = if index < 64 { self.first } else { self.rest.get(index / 64 - 1).copied().unwrap_or(0) };
+        word & (1 << (index % 64)) != 0
+    }
+}
+#[derive(Debug)]
+struct TxnRegistry { stripes: Box<[Mutex<HashMap<TxnId, TxnLocal>>]> }
+impl Default for TxnRegistry {
+    fn default() -> Self {
+        Self { stripes: (0..64).map(|_| Mutex::default()).collect() }
+    }
+}
+impl TxnRegistry {
+    fn stripe(&self, txn: TxnId) -> LeafGuard<'_, HashMap<TxnId, TxnLocal>> {
+        LeafGuard { guard: self.stripes[txn.0 as usize & 63].lock().unwrap_or_else(|p| p.into_inner()), _order: OrderGuard::leaf() }
+    }
+    fn rows(&self, txn: TxnId) -> usize { self.stripe(txn).get(&txn).map_or(0, |t| t.rows) }
+    fn pending(&self, txn: TxnId, add: bool) {
+        let mut stripe = self.stripe(txn);
+        let local = stripe.entry(txn).or_default();
+        if add { local.pending += 1; } else { local.pending -= 1; }
+    }
+}
+#[derive(Debug, Default)]
+struct GapState {
+    intervals: [HashSet<LockKey>; 2],
+    points: [BTreeSet<Vec<u8>>; 2],
+    indexed: [bool; 2],
+}
+#[derive(Debug, Default)]
+struct ShardState {
     keys: HashMap<LockKey, KeyState>,
     waiters: HashMap<u64, Waiter>,
     by_txn: HashMap<TxnId, Vec<u64>>,
-    // A removed waiter keeps its terminal result until its acquiring thread
-    // observes it. In particular release_all terminates pending calls Cancelled.
-    completed: HashMap<u64, Result<(), LockError>>,
-    row_counts: HashMap<TxnId, usize>,
-    held_keys: HashMap<TxnId, HashSet<LockKey>>,
-    next_waiter: u64,
+    held: HashMap<TxnId, HashSet<LockKey>>,
+    provisional: HashMap<TxnId, HashMap<LockKey, HeldModes>>,
+    // Only shard zero's gap state is used, under all shard locks.
+    gap: GapState,
     #[cfg(test)]
     deadlock_victims: HashSet<TxnId>,
-    // Group grants stay provisional until every member validates atomically.
-    provisional: HashMap<(TxnId, LockKey), HeldModes>,
-    // Per `LockSpace`: interval keys with holders or queued requests.
-    intervals: [HashSet<LockKey>; 2],
-    // Per `LockSpace`: byte forms of point keys with an Exclusive holder or a
-    // queued Exclusive request. Maintained only once the space has seen an
-    // interval (`indexed`), so a manager that never takes a gap lock (every
-    // single-node one) pays nothing for it.
-    points: [BTreeSet<Vec<u8>>; 2],
-    indexed: [bool; 2],
+}
+#[cfg(test)]
+thread_local! {
+    static LOCK_ORDER: std::cell::RefCell<(Vec<usize>, usize)> = const { std::cell::RefCell::new((Vec::new(), 0)) };
+}
+#[derive(Debug)]
+struct OrderGuard { #[cfg(test)] shard: Option<usize> }
+impl OrderGuard {
+    fn shard(index: usize) -> Self {
+        #[cfg(test)]
+        LOCK_ORDER.with(|order| {
+            let mut order = order.borrow_mut();
+            assert_eq!(order.1, 0, "shard acquired while holding a leaf lock");
+            assert!(order.0.iter().all(|&i| i < index), "shards acquired out of order");
+            order.0.push(index);
+        });
+        #[cfg(not(test))]
+        let _ = index;
+        Self { #[cfg(test)] shard: Some(index) }
+    }
+    fn leaf() -> Self {
+        #[cfg(test)]
+        LOCK_ORDER.with(|order| order.borrow_mut().1 += 1);
+        Self { #[cfg(test)] shard: None }
+    }
+}
+impl Drop for OrderGuard {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        LOCK_ORDER.with(|order| {
+            let mut order = order.borrow_mut();
+            if let Some(i) = self.shard { order.0.retain(|&s| s != i); } else { order.1 -= 1; }
+        });
+    }
+}
+struct ShardGuard<'a> { guard: MutexGuard<'a, ShardState>, _order: OrderGuard }
+impl std::ops::Deref for ShardGuard<'_> {
+    type Target = ShardState;
+    fn deref(&self) -> &ShardState { &self.guard }
+}
+impl std::ops::DerefMut for ShardGuard<'_> {
+    fn deref_mut(&mut self) -> &mut ShardState { &mut self.guard }
+}
+struct LeafGuard<'a, T> { guard: MutexGuard<'a, T>, _order: OrderGuard }
+impl<T> std::ops::Deref for LeafGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T { &self.guard }
+}
+impl<T> std::ops::DerefMut for LeafGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T { &mut self.guard }
+}
+// Inline one guard so production N=1 acquires exactly one mutex without allocating.
+enum Guards<'a> { One([ShardGuard<'a>; 1]), Many(Vec<ShardGuard<'a>>) }
+impl<'a> Guards<'a> {
+    fn slice(&self) -> &[ShardGuard<'a>] {
+        match self { Self::One(x) => x, Self::Many(x) => x }
+    }
+    fn slice_mut(&mut self) -> &mut [ShardGuard<'a>] {
+        match self { Self::One(x) => x, Self::Many(x) => x }
+    }
+}
+struct State<'a> { guards: Guards<'a>, manager: &'a LockManager }
+impl std::ops::Deref for State<'_> {
+    type Target = GapState;
+    fn deref(&self) -> &GapState { &self.guards.slice()[0].gap }
+}
+impl std::ops::DerefMut for State<'_> {
+    fn deref_mut(&mut self) -> &mut GapState { &mut self.guards.slice_mut()[0].gap }
+}
+impl State<'_> {
+    fn key(&self, key: &LockKey) -> Option<&KeyState> { self.guards.slice()[self.manager.shard(key)].keys.get(key) }
+    fn key_mut(&mut self, key: &LockKey) -> Option<&mut KeyState> {
+        let i = self.manager.shard(key); self.guards.slice_mut()[i].keys.get_mut(key)
+    }
+    fn key_entry(&mut self, key: LockKey) -> std::collections::hash_map::Entry<'_, LockKey, KeyState> {
+        let i = self.manager.shard(&key); self.guards.slice_mut()[i].keys.entry(key)
+    }
+    fn key_remove(&mut self, key: &LockKey) { let i = self.manager.shard(key); self.guards.slice_mut()[i].keys.remove(key); }
+    fn keys(&self) -> impl Iterator<Item=(&LockKey, &KeyState)> { self.guards.slice().iter().flat_map(|s| s.keys.iter()) }
+    fn waiter(&self, id: &u64) -> Option<&Waiter> { self.guards.slice().iter().find_map(|s| s.waiters.get(id)) }
+    fn waiter_mut(&mut self, id: &u64) -> Option<&mut Waiter> { self.guards.slice_mut().iter_mut().find_map(|s| s.waiters.get_mut(id)) }
+    fn pending(&self, txn: TxnId) -> Vec<u64> { self.guards.slice().iter().flat_map(|s| s.by_txn.get(&txn).into_iter().flatten().copied()).collect() }
+    fn provisional_modes(&self, txn: TxnId, key: &LockKey) -> Option<HeldModes> {
+        self.guards.slice()[self.manager.shard(key)].provisional.get(&txn)?.get(key).copied()
+    }
+    fn provisional_empty(&self) -> bool { self.guards.slice().iter().all(|s| s.provisional.is_empty()) }
+    fn provisional_insert(&mut self, txn: TxnId, key: LockKey, modes: HeldModes) {
+        let i = self.manager.shard(&key); self.guards.slice_mut()[i].provisional.entry(txn).or_default().insert(key, modes);
+    }
+    fn provisional_remove(&mut self, txn: TxnId, key: &LockKey) -> Option<HeldModes> {
+        let i = self.manager.shard(key); let map = &mut self.guards.slice_mut()[i].provisional;
+        let modes = map.get_mut(&txn)?.remove(key);
+        if map[&txn].is_empty() { map.remove(&txn); } modes
+    }
+    fn forget_holding(&mut self, txn: TxnId, key: &LockKey) {
+        let i = self.manager.shard(key);
+        let held = &mut self.guards.slice_mut()[i].held;
+        if let Some(keys) = held.get_mut(&txn) { keys.remove(key); if keys.is_empty() { held.remove(&txn); } }
+        let mut stripe = self.manager.registry.stripe(txn);
+        if !matches!(key, LockKey::Table(_)) && let Some(local) = stripe.get_mut(&txn) {
+            debug_assert!(local.rows > 0, "removed counted holding has no row count");
+            local.rows = local.rows.saturating_sub(1);
+        }
+    }
+    #[cfg(test)]
+    fn victim(&mut self, txn: TxnId) { self.guards.slice_mut()[0].deadlock_victims.insert(txn); }
 }
 
 struct GroupContext<'a> {
     requested: &'a [(LockKey, LockMode)],
 }
 
+#[cfg(test)]
+type RaceHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+#[derive(Default)]
+struct TestHooks { h2: Mutex<Option<RaceHook>>, h3: Mutex<Option<RaceHook>> }
+#[cfg(test)]
+impl std::fmt::Debug for TestHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("TestHooks") }
+}
+#[cfg(test)]
+fn run_hook(hook: &Mutex<Option<RaceHook>>) {
+    let callback = hook.lock().unwrap().clone();
+    if let Some(callback) = callback { callback(); }
+}
+
 #[derive(Debug)]
 pub(crate) struct LockManager {
     config: LockConfig,
-    state: Mutex<State>,
-    // Wake-ups caused by this manager: a completion, a `cancel_wait`, or a
-    // `notify_grant` signal. Condvar returns with none of these (std permits
-    // spurious wake-ups) go to `waiter_spurious_wakeups`, which no test asserts.
+    shards: Box<[Mutex<ShardState>]>,
+    registry: TxnRegistry,
+    next_waiter: AtomicU64,
+    gap_mode: [AtomicBool; 2],
+    #[cfg(test)]
+    hooks: TestHooks,
     #[cfg(test)]
     waiter_wakeups: AtomicUsize,
     #[cfg(test)]
@@ -363,9 +573,15 @@ pub(crate) struct LockManager {
 
 impl LockManager {
     pub(crate) fn new(config: LockConfig) -> Self {
+        assert!(config.shards.is_power_of_two());
         Self {
+            shards: (0..config.shards).map(|_| Mutex::default()).collect(),
+            registry: TxnRegistry::default(),
+            next_waiter: AtomicU64::new(0),
+            gap_mode: [AtomicBool::new(false), AtomicBool::new(false)],
+            #[cfg(test)]
+            hooks: TestHooks::default(),
             config,
-            state: Mutex::new(State::default()),
             #[cfg(test)]
             waiter_wakeups: AtomicUsize::new(0),
             #[cfg(test)]
@@ -388,22 +604,21 @@ impl LockManager {
 
     // Execute precisely one member's immediate protocol, including its notifications.
     fn try_member_locked(
-        &self, state: &mut State, txn: TxnId, key: &LockKey, mode: LockMode,
-        group: &[(LockKey, LockMode)],
+        &self, state: &mut State<'_>, txn: TxnId, key: &LockKey, mode: LockMode,
+        group: &[(LockKey, LockMode)], prepared: &mut PreparedKey,
     ) -> Result<Option<()>, LockError> {
         let held = state
-            .keys
-            .get(key)
+            .key(key)
             .and_then(|k| k.holders.get(&txn))
             .copied();
-        if (state.provisional.is_empty() || !state.provisional.contains_key(&(txn, key.clone())))
+        if (state.provisional_empty() || state.provisional_modes(txn, key).is_none())
             && held.is_some_and(|held| held.iter().any(|held| held.covers(mode))) {
             if mode.is_table() {
-                state.keys.get_mut(key).unwrap().holders.get_mut(&txn).unwrap().insert(mode);
+                state.key_mut(key).unwrap().holders.get_mut(&txn).unwrap().insert(mode);
             }
             return Ok(Some(()));
         }
-        let immediate = state.keys.get(key).is_none_or(|locks| {
+        let immediate = state.key(key).is_none_or(|locks| {
             (locks.queue.is_empty() || held.is_some() || state.row_locker(txn, key) || state.compatible_bypass(txn, key, group))
                 && !locks.holders.iter().any(|(&owner, held)| {
                     state.holder_conflicts(txn, key, mode, owner, *held, group)
@@ -412,7 +627,7 @@ impl LockManager {
         // A zero deadline is a nonblocking attempt: a compatible immediate
         // acquisition, including reentrance and upgrades, still succeeds.
         if immediate {
-            state.grant(txn, key, mode, self.config.max_row_locks_per_txn)?;
+            state.grant(txn, key, mode, self.config.max_row_locks_per_txn, prepared)?;
             state.finish_group(txn, group);
             state.drain_queue(key, self.config.max_row_locks_per_txn);
             state.notify_grant(txn, key);
@@ -442,80 +657,84 @@ impl LockManager {
                 return Ok(());
             }
         }
-        let mut state = self.state.lock().map_err(|_| LockError::Misuse)?;
+        if let LockKey::Interval { space, .. } = &key {
+            self.gap_mode[*space as usize].store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let mut prepared = PreparedKey::new(&key);
+        let mut state = self.global().map_err(|_| LockError::Misuse)?;
         if let LockKey::Interval { space, .. } = &key {
             state.ensure_indexed(*space);
         }
-        if self.try_member_locked(&mut state, txn, &key, mode, group)?.is_some() {
+        if self.try_member_locked(&mut state, txn, &key, mode, group, &mut prepared)?.is_some() {
             return Ok(());
         }
-        let held = state.keys.get(&key).and_then(|k| k.holders.get(&txn)).copied();
+        let held = state.key(&key).and_then(|k| k.holders.get(&txn)).copied();
 
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(LockError::Timeout);
         }
-        let id = state.next_waiter;
-        state.next_waiter = state.next_waiter.checked_add(1).ok_or(LockError::Misuse)?;
+        let id = self.next_waiter.try_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| n.checked_add(1)).map_err(|_| LockError::Misuse)?;
+        // Only requests that actually queue pay for waiter-owned allocations.
+        let slot = Arc::new(Slot::default());
+        let owned_group = group.to_vec();
         let upgrade = held.is_some() || state.row_locker(txn, &key);
         // A request blocked only across keys queues on a fresh entry.
-        state.keys.entry(key.clone()).or_default();
+        if state.key(&key).is_none() { state.key_entry(prepared.map.take().expect("prepared key")).or_default(); }
         let position = if upgrade {
-            state.keys[&key]
+            state.key(&key).unwrap()
                 .queue
                 .iter()
-                .position(|id| !state.waiters[id].upgrade)
-                .unwrap_or(state.keys[&key].queue.len())
+                .position(|id| !state.waiter(id).unwrap().upgrade)
+                .unwrap_or(state.key(&key).unwrap().queue.len())
         } else {
-            state.keys[&key].queue.len()
+            state.key(&key).unwrap().queue.len()
         };
         let queued_at = Instant::now();
-        let changed = Arc::new(Condvar::new());
-        state.by_txn.entry(txn).or_default().push(id);
-        state.waiters.insert(
+        let i = self.shard(&key);
+        self.registry.pending(txn, true);
+        state.guards.slice_mut()[i].by_txn.entry(txn).or_default().push(id);
+        state.guards.slice_mut()[i].waiters.insert(
             id,
             Waiter {
                 txn,
                 key: key.clone(),
                 mode,
                 upgrade,
-                group: group.to_vec(),
+                group: owned_group,
                 cancelled: false,
-                changed: Arc::clone(&changed),
-                #[cfg(test)]
-                sleeping: false,
-                #[cfg(test)]
-                notified: AtomicBool::new(false),
+                slot: Arc::clone(&slot),
+                prepared,
             },
         );
         state
-            .keys
-            .get_mut(&key)
+            .key_mut(&key)
             .expect("blocked key exists")
             .queue
             .insert(position, id);
         state.index(&key, mode);
         if self.config.deadlock_timeout.is_zero() && state.has_cycle(txn) {
             #[cfg(test)]
-            state.deadlock_victims.insert(txn);
+            state.victim(txn);
             state.remove_waiter(id, Err(LockError::Deadlock));
             state.drain_queue(&key, self.config.max_row_locks_per_txn);
         }
 
+        drop(state);
         loop {
-            if let Some(result) = state.completed.remove(&id) {
+            if let Some(result) = self.observe_result(&slot) {
                 return result;
             }
             // User callbacks may inspect this manager without deadlocking it.
-            drop(state);
+            #[cfg(test)]
+            run_hook(&self.hooks.h3);
             let cancelled = cancel();
-            state = self.state.lock().map_err(|_| LockError::Misuse)?;
-            if let Some(result) = state.completed.remove(&id) {
+            let mut state = self.global().map_err(|_| LockError::Misuse)?;
+            if let Some(result) = self.observe_result(&slot) {
                 return result;
             }
             let waited = queued_at.elapsed();
             let error = if state
-                .waiters
-                .get(&id)
+                .waiter(&id)
                 .is_some_and(|waiter| waiter.cancelled)
             {
                 Some(LockError::Deadlock)
@@ -525,7 +744,7 @@ impl LockManager {
                 Some(LockError::Timeout)
             } else if waited >= self.config.deadlock_timeout && state.has_cycle(txn) {
                 #[cfg(test)]
-                state.deadlock_victims.insert(txn);
+                state.victim(txn);
                 Some(LockError::Deadlock)
             } else {
                 None
@@ -533,46 +752,33 @@ impl LockManager {
             if let Some(error) = error {
                 state.remove_waiter(id, Err(error));
                 state.drain_queue(&key, self.config.max_row_locks_per_txn);
-                return state
-                    .completed
-                    .remove(&id)
-                    .expect("removed waiter has result");
+                return slot.result().expect("removed waiter has result");
             }
             let now = Instant::now();
-            let mut interval = self.config.deadlock_recheck;
-            if waited < self.config.deadlock_timeout {
-                interval = interval.min(
-                    self.config.deadlock_timeout.saturating_sub(now.duration_since(queued_at)),
-                );
-            }
-            if let Some(deadline) = deadline {
-                interval = interval.min(deadline.saturating_duration_since(now));
-            }
+            let interval = self.config.sleep_interval(queued_at, now, waited, deadline);
+            drop(state);
             #[cfg(test)]
-            {
-                state.waiters.get_mut(&id).expect("pending waiter").sleeping = true;
-            }
-            let (next, _) = changed
-                .wait_timeout(state, interval)
-                .map_err(|_| LockError::Misuse)?;
-            state = next;
-            #[cfg(test)]
-            {
-                // Explained: completed (`remove_waiter`), cancelled
-                // (`cancel_wait`) or signalled by `notify_grant` while asleep.
-                let explained = state.completed.contains_key(&id)
-                    || state.waiters.get(&id).is_some_and(|waiter| {
-                        waiter.cancelled || waiter.notified.swap(false, Ordering::Relaxed)
-                    });
-                if explained {
-                    self.waiter_wakeups.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    self.waiter_spurious_wakeups.fetch_add(1, Ordering::Relaxed);
-                }
-                if let Some(waiter) = state.waiters.get_mut(&id) {
-                    waiter.sleeping = false;
+            run_hook(&self.hooks.h2);
+            let slot_order = OrderGuard::leaf();
+            let mut parked = slot.m.lock().map_err(|_| LockError::Misuse)?;
+            if parked.result.is_none() && !parked.recheck {
+                #[cfg(test)]
+                { parked.sleeping = true; parked.ever_slept = true; }
+                let (next, _) = slot.cv.wait_timeout(parked, interval).map_err(|_| LockError::Misuse)?;
+                parked = next;
+                #[cfg(test)]
+                {
+                    if parked.result.is_some() || parked.recheck {
+                        self.record_explained(&mut parked);
+                    } else { self.waiter_spurious_wakeups.fetch_add(1, Ordering::Relaxed); }
+                    parked.sleeping = false;
                 }
             }
+            #[cfg(test)]
+            self.record_explained(&mut parked);
+            parked.recheck = false;
+            drop(parked);
+            drop(slot_order);
         }
     }
 
@@ -591,12 +797,13 @@ impl LockManager {
         if deadline.is_none_or(|d| d > Instant::now()) {
             let mut ordered = requested.iter().collect::<Vec<_>>();
             ordered.sort_by_key(|(key, _)| !matches!(key, LockKey::RowKey { .. }));
+            let mut prepared = ordered.iter().map(|(key, _)| PreparedKey::new(key)).collect::<Vec<_>>();
             let provisional_keys = ordered.iter().map(|(key, _)| (txn, key.clone())).collect::<Vec<_>>();
-            let mut state = self.state.lock().map_err(|_| LockError::Misuse)?;
+            let mut state = self.global().map_err(|_| LockError::Misuse)?;
             for ((key, _), provisional_key) in ordered.iter().zip(provisional_keys) {
-                let previous = state.keys.get(key).and_then(|s| s.holders.get(&txn))
+                let previous = state.key(key).and_then(|s| s.holders.get(&txn))
                     .copied().unwrap_or_default();
-                state.provisional.insert(provisional_key, previous);
+                state.provisional_insert(provisional_key.0, provisional_key.1, previous);
             }
             let result = (|| {
                 // Point members have already passed acquire_group_member's type checks.
@@ -605,7 +812,7 @@ impl LockManager {
                 // reject an immediate grant. Keep the same per-member side effects.
                 let mut start = 0;
                 for (i, (key, mode)) in ordered.iter().enumerate() {
-                    if self.try_member_locked(&mut state, txn, key, *mode, requested)?.is_none() {
+                    if self.try_member_locked(&mut state, txn, key, *mode, requested, &mut prepared[i])?.is_none() {
                         start = i;
                         break;
                     }
@@ -618,17 +825,17 @@ impl LockManager {
                             self.acquire_group_member(txn, key.clone(), *mode, deadline, cancel,
                                 GroupContext { requested })?;
                         }
-                        state = self.state.lock().map_err(|_| LockError::Misuse)?;
+                        state = self.global().map_err(|_| LockError::Misuse)?;
                     }
                     // Subsequent passes recheck the whole group after any wait.
                     start = 0;
                     if ordered.iter().any(|(key, mode)| {
-                        state.keys.get(key).is_some_and(|locks| locks.holders.iter().any(|(&owner, held)|
+                        state.key(key).is_some_and(|locks| locks.holders.iter().any(|(&owner, held)|
                             state.holder_conflicts(txn, key, *mode, owner, *held, requested)))
                             || state.cross_blocked(txn, key, *mode)
                     }) { continue; }
                     for (key, _) in &ordered {
-                        state.provisional.remove(&(txn, key.clone()));
+                        state.provisional_remove(txn, key);
                     }
                     return Ok(());
                 }
@@ -636,15 +843,14 @@ impl LockManager {
             if result.is_err() {
                 // Restore precisely the pre-group modes, including upgrades of
                 // existing grants. release_all may already have removed them.
-                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                let mut state = self.global().unwrap_or_else(|p| p.into_inner());
                 let mut affected = HashSet::new();
                 for (key, _) in &ordered {
-                    if let Some(previous) = state.provisional.remove(&(txn, key.clone())) {
+                    if let Some(previous) = state.provisional_remove(txn, key) {
                         if previous.iter().next().is_some() {
-                            state.keys.entry(key.clone()).or_default().holders.insert(txn, previous);
-                        } else if state.keys.get_mut(key).is_some_and(|s| s.holders.remove(&txn).is_some()) {
-                            if let Some(keys) = state.held_keys.get_mut(&txn) { keys.remove(key); }
-                            state.uncount(txn, key);
+                            state.key_entry(key.clone()).or_default().holders.insert(txn, previous);
+                        } else if state.key_mut(key).is_some_and(|s| s.holders.remove(&txn).is_some()) {
+                            state.forget_holding(txn, key);
                         }
                         affected.insert(key.clone());
                         let mut cross = Vec::new();
@@ -660,12 +866,13 @@ impl LockManager {
             return result;
         }
         {
-            let mut state = self.state.lock().map_err(|_| LockError::Misuse)?;
+            let mut prepared = requested.iter().map(|(key, _)| PreparedKey::new(key)).collect::<Vec<_>>();
+            let mut state = self.global().map_err(|_| LockError::Misuse)?;
             let blocked = requested.iter().any(|(key, mode)| {
-                let held = state.keys.get(key).and_then(|k| k.holders.get(&txn));
-                if (state.provisional.is_empty() || !state.provisional.contains_key(&(txn, key.clone())))
+                let held = state.key(key).and_then(|k| k.holders.get(&txn));
+                if (state.provisional_empty() || state.provisional_modes(txn, key).is_none())
                     && held.is_some_and(|h| h.iter().any(|h| h.covers(*mode))) { return false; }
-                state.keys.get(key).is_some_and(|locks| {
+                state.key(key).is_some_and(|locks| {
                     (!locks.queue.is_empty() && held.is_none() && !state.row_locker(txn, key) && !state.compatible_bypass(txn, key, requested)) || locks.holders.iter()
                         .any(|(&owner, held)| state.holder_conflicts(txn, key, *mode, owner, *held, requested))
                 }) || state.cross_blocked(txn, key, *mode)
@@ -674,13 +881,13 @@ impl LockManager {
                 // Count distinct new keys without allocating under the mutex.
                 let extra = requested.iter().enumerate().filter(|(i, (key, _))|
                     !requested[..*i].iter().any(|(earlier, _)| earlier == key)
-                        && state.keys.get(key).is_none_or(|k| !k.holders.contains_key(&txn))).count();
-                if state.row_counts.get(&txn).copied().unwrap_or(0)
+                        && state.key(key).is_none_or(|k| !k.holders.contains_key(&txn))).count();
+                if self.registry.rows(txn)
                     .saturating_add(extra) > self.config.max_row_locks_per_txn {
                     return Err(LockError::Limit);
                 }
-                for (key, mode) in requested {
-                    state.grant(txn, key, *mode, self.config.max_row_locks_per_txn)?;
+                for ((key, mode), prepared) in requested.iter().zip(&mut prepared) {
+                    state.grant(txn, key, *mode, self.config.max_row_locks_per_txn, prepared)?;
                 }
                 for (key, _) in requested {
                     state.drain_queue(key, self.config.max_row_locks_per_txn);
@@ -699,18 +906,18 @@ impl LockManager {
 
     /// Snapshot just the requested keys; callers serialize acquisitions per transaction.
     pub(crate) fn modes_on(&self, txn: TxnId, keys: &[(LockKey, LockMode)]) -> Vec<(LockKey, HeldModes)> {
-        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        keys.iter().map(|(key, _)| (key.clone(), state.keys.get(key)
+        let state = self.global().unwrap_or_else(|p| p.into_inner());
+        keys.iter().map(|(key, _)| (key.clone(), state.key(key)
             .and_then(|s| s.holders.get(&txn)).copied().unwrap_or_default())).collect()
     }
 
     /// Undo acquisitions in reverse journal order, then wake queues only after
     /// every key has reached its final state (including both halves of K/D).
     pub(crate) fn restore_modes(&self, txn: TxnId, undo: &[(LockKey, HeldModes)]) {
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.global().unwrap_or_else(|p| p.into_inner());
         let mut affected = HashSet::new();
         for (key, previous) in undo.iter().rev() {
-            let Some(locks) = state.keys.get_mut(key) else { continue; };
+            let Some(locks) = state.key_mut(key) else { continue; };
             let Some(current) = locks.holders.get_mut(&txn) else { continue; };
             // Cleanup may have removed modes since the journal snapshot.
             // Rollback can only release ownership, never recreate it.
@@ -720,10 +927,9 @@ impl LockManager {
             } else {
                 locks.holders.remove(&txn);
                 locks.slow.remove(&txn);
-                if let Some(keys) = state.held_keys.get_mut(&txn) { keys.remove(key); }
-                state.uncount(txn, key);
+                state.forget_holding(txn, key);
             }
-            state.provisional.remove(&(txn, key.clone()));
+            state.provisional_remove(txn, key);
             affected.insert(key.clone());
             let mut unblocked = Vec::new();
             state.cross_queued(key, &mut unblocked);
@@ -731,12 +937,6 @@ impl LockManager {
             if let LockKey::Row { table, pk } = key {
                 affected.insert(LockKey::RowKey { table: *table, pk: pk.clone() });
             }
-        }
-        if state.held_keys.get(&txn).is_some_and(HashSet::is_empty) {
-            state.held_keys.remove(&txn);
-        }
-        if state.row_counts.get(&txn) == Some(&0) {
-            state.row_counts.remove(&txn);
         }
         for key in affected {
             state.drain_queue(&key, self.config.max_row_locks_per_txn);
@@ -751,35 +951,50 @@ impl LockManager {
         self.release_all_calls.fetch_add(1, Ordering::Relaxed);
         // Cleanup/inspection remain useful after poisoning; acquire reports Misuse.
         let mut state = self
-            .state
-            .lock()
+            .global()
             .unwrap_or_else(|poison| poison.into_inner());
         // Metadata transactions hold no locks. In particular, dropping one must
         // not scan all row/index locks owned by an in-progress COPY statement.
-        let mut affected = state.held_keys.remove(&txn).unwrap_or_default();
+        let local = self.registry.stripe(txn).remove(&txn);
+        // A group can have provisional snapshots before its first grant creates
+        // a registry entry. Keep cleanup for that case (and any indexed state).
+        if local.is_none() && state.guards.slice().iter().all(|s|
+            !s.provisional.contains_key(&txn) && !s.by_txn.contains_key(&txn)
+                && !s.held.contains_key(&txn)) {
+            return;
+        }
+        let local = local.unwrap_or_default();
+        let mut affected = HashSet::new();
+        for (i, shard) in state.guards.slice_mut().iter_mut().enumerate() {
+            if local.shard_mask.contains(i) { affected.extend(shard.held.remove(&txn).unwrap_or_default()); }
+        }
+        // Pending removal updates the registry; retain its count until removal.
+        self.registry.stripe(txn).entry(txn).or_default().pending = local.pending;
         let mut unblocked = Vec::new();
         for key in &affected {
-            if let Some(locks) = state.keys.get_mut(key) {
+            if let Some(locks) = state.key_mut(key) {
                 locks.holders.remove(&txn);
                 locks.slow.remove(&txn);
             }
-            state.provisional.remove(&(txn, key.clone()));
+            state.provisional_remove(txn, key);
             state.cross_queued(key, &mut unblocked);
             // D grants also determine whether queued K groups may bypass.
             if let LockKey::Row { table, pk } = key {
                 let row_key = LockKey::RowKey { table: *table, pk: pk.clone() };
-                if state.keys.get(&row_key).is_some_and(|locks| !locks.queue.is_empty()) {
+                if state.key(&row_key).is_some_and(|locks| !locks.queue.is_empty()) {
                     unblocked.push(row_key);
                 }
             }
         }
         affected.extend(unblocked);
-        state.row_counts.remove(&txn);
-        let pending = state.by_txn.get(&txn).cloned().unwrap_or_default();
+
+        let pending = state.pending(txn);
         for id in pending {
-            affected.insert(state.waiters[&id].key.clone());
+            affected.insert(state.waiter(&id).unwrap().key.clone());
             state.remove_waiter(id, Err(LockError::Cancelled));
         }
+        self.registry.stripe(txn).remove(&txn);
+        for shard in state.guards.slice_mut() { shard.provisional.remove(&txn); }
         // Only releasing a holder or cancelling a queued request can unblock
         // this key's waiters, or (across keys) requests queued on a key that a
         // released lock overlapped. Leave unrelated queues and holders untouched.
@@ -794,8 +1009,7 @@ impl LockManager {
     /// when `txn` is not waiting. Feeds the cross-range deadlock detector.
     pub(crate) fn blockers(&self, txn: TxnId) -> Vec<TxnId> {
         let state = self
-            .state
-            .lock()
+            .global()
             .unwrap_or_else(|poison| poison.into_inner());
         let mut blockers = Vec::new();
         state.txn_blockers(txn, &mut blockers);
@@ -809,63 +1023,92 @@ impl LockManager {
     /// own queue entry. No-op when `txn` is not waiting.
     pub(crate) fn cancel_wait(&self, txn: TxnId) {
         let mut state = self
-            .state
-            .lock()
+            .global()
             .unwrap_or_else(|poison| poison.into_inner());
-        for id in state.by_txn.get(&txn).cloned().unwrap_or_default() {
-            let waiter = state.waiters.get_mut(&id).expect("indexed waiter");
+        for id in state.pending(txn) {
+            let waiter = state.waiter_mut(&id).expect("indexed waiter");
             waiter.cancelled = true;
-            waiter.changed.notify_one();
+            waiter.slot.recheck();
         }
     }
 
     /// Snapshot held locks, recovering the state for inspection after poisoning.
     pub(crate) fn held(&self, txn: TxnId) -> Vec<(LockKey, LockMode)> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .keys
-            .iter()
-            .flat_map(|(key, locks)| {
-                locks
-                    .holders
-                    .get(&txn)
-                    .into_iter()
-                    .flat_map(move |held| held.iter().map(move |mode| (key.clone(), mode)))
-            })
-            .collect()
+        let state = self.global().unwrap_or_else(|p| p.into_inner());
+        state.keys().flat_map(|(key, locks)| locks.holders.get(&txn).into_iter()
+            .flat_map(move |held| held.iter().map(move |mode| (key.clone(), mode)))).collect()
     }
-
     pub(crate) fn fastpath(&self, txn: TxnId, table: u64, mode: LockMode) -> bool {
         matches!(mode, LockMode::AccessShare | LockMode::RowShare | LockMode::RowExclusive)
-            && self.state.lock().unwrap_or_else(|p| p.into_inner()).keys.get(&LockKey::Table(table))
+            && self.global().unwrap_or_else(|p| p.into_inner()).key(&LockKey::Table(table))
                 .is_some_and(|locks| !locks.slow.contains(&txn))
     }
-
-    /// Count live queue entries, recovering state for inspection after poisoning.
     pub(crate) fn waiting_count(&self) -> usize {
-        self.state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .waiters
-            .len()
+        self.global().unwrap_or_else(|p| p.into_inner()).guards.slice().iter().map(|s| s.waiters.len()).sum()
     }
+    // Count a product notification when observed, including one arriving
+    // during an unexplained condvar return before the thread can sleep again.
+    // A coalesced predicate is observed once; self-completion uses Slot::result.
+    fn observe_result(&self, slot: &Slot) -> Option<Result<(), LockError>> {
+        let _order = OrderGuard::leaf();
+        #[allow(unused_mut)]
+        let mut state = slot.m.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(test)]
+        self.record_explained(&mut state);
+        state.result
+    }
+    #[cfg(test)]
+    fn record_explained(&self, state: &mut SlotState) {
+        if state.notified && state.ever_slept && (state.result.is_some() || state.recheck) {
+            self.waiter_wakeups.fetch_add(1, Ordering::Relaxed);
+        }
+        state.notified = false;
+    }
+    fn shard(&self, key: &LockKey) -> usize {
+        if self.shards.len() == 1 { return 0; }
+        #[cfg(test)]
+        if let Some(place) = self.config.placement { return place(key) & (self.shards.len() - 1); }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        match key {
+            LockKey::Row { table, pk } | LockKey::RowKey { table, pk } => (0u8, table, pk).hash(&mut h),
+            LockKey::Unique { index, tuple } => (1u8, index, tuple).hash(&mut h),
+            LockKey::Table(t) => (2u8, t).hash(&mut h),
+            LockKey::Interval { .. } => return 0,
+        }
+        h.finish() as usize & (self.shards.len() - 1)
+    }
+    fn global<'a>(&'a self) -> std::sync::LockResult<State<'a>> {
+        let mut poisoned = false;
+        let mut take = |(i, s): (usize, &'a Mutex<ShardState>)| {
+            let order = OrderGuard::shard(i);
+            let guard = match s.lock() {
+                Ok(g) => g,
+                Err(p) => { poisoned = true; p.into_inner() }
+            };
+            ShardGuard { guard, _order: order }
+        };
+        let guards = if self.shards.len() == 1 { Guards::One([take((0, &self.shards[0]))]) }
+            else { Guards::Many(self.shards.iter().enumerate().map(&mut take).collect()) };
+        let state = State { guards, manager: self };
+        if poisoned { Err(std::sync::PoisonError::new(state)) } else { Ok(state) }
+    }
+
 }
 
-impl State {
+impl State<'_> {
     // Complete a ready group under the granting mutex, before another group
     // can overtake it while the acquiring thread is waking. A retained bypasser
     // keeps every addition provisional, including D, until revalidation succeeds.
     fn finish_group(&mut self, txn: TxnId, group: &[(LockKey, LockMode)]) {
-        if self.provisional.is_empty() || self.by_txn.get(&txn).is_some_and(|ids| !ids.is_empty()) { return; }
+        if self.provisional_empty() || !self.pending(txn).is_empty() { return; }
         if group.iter().any(|(key, mode)| {
-            self.keys.get(key).is_none_or(|locks|
+            self.key(key).is_none_or(|locks|
                 !locks.holders.get(&txn).is_some_and(|h| h.iter().any(|h| h.covers(*mode)))
                     || locks.holders.iter().any(|(&owner, held)|
                         self.holder_conflicts(txn, key, *mode, owner, *held, group)))
                 || self.cross_blocked(txn, key, *mode)
         }) { return; }
-        for (key, _) in group { self.provisional.remove(&(txn, key.clone())); }
+        for (key, _) in group { self.provisional_remove(txn, key); }
     }
 
     fn row_locker(&self, txn: TxnId, key: &LockKey) -> bool {
@@ -874,13 +1117,8 @@ impl State {
             _ => return false,
         };
         [LockKey::RowKey { table, pk: pk.clone() }, LockKey::Row { table, pk: pk.clone() }].iter()
-            .any(|k| self.keys.get(k).and_then(|s| s.holders.get(&txn)).is_some_and(|held|
+            .any(|k| self.key(k).and_then(|s| s.holders.get(&txn)).is_some_and(|held|
                 self.provisional_modes(txn, k).unwrap_or(*held).iter().next().is_some()))
-    }
-
-    fn provisional_modes(&self, owner: TxnId, key: &LockKey) -> Option<HeldModes> {
-        if self.provisional.is_empty() { return None; }
-        self.provisional.get(&(owner, key.clone())).copied()
     }
 
     // Only a whole group compatible with all actual grants can bypass tuple
@@ -894,7 +1132,7 @@ impl State {
             _ => false,
         };
         row_group && group.iter().all(|(key, mode)| {
-            !self.cross_blocked(txn, key, *mode) && self.keys.get(key).is_none_or(|locks|
+            !self.cross_blocked(txn, key, *mode) && self.key(key).is_none_or(|locks|
                 locks.holders.iter().all(|(&owner, held)| owner == txn ||
                     !self.provisional_modes(owner, key).unwrap_or(*held).iter()
                         .any(|h| mode.conflicts(h))))
@@ -917,24 +1155,26 @@ impl State {
         key: &LockKey,
         mode: LockMode,
         limit: usize,
+        prepared: &mut PreparedKey,
     ) -> Result<(), LockError> {
         let previous = self
-            .keys
-            .get(key)
+            .key(key)
             .and_then(|locks| locks.holders.get(&txn))
             .copied();
-        if previous.is_none() && !matches!(key, LockKey::Table(_)) {
-            let count = self.row_counts.entry(txn).or_default();
-            if *count >= limit {
-                return Err(LockError::Limit);
-            }
-            *count += 1;
-        }
         if previous.is_none() {
-            self.held_keys.entry(txn).or_default().insert(key.clone());
+            let i = self.manager.shard(key);
+            let mut stripe = self.manager.registry.stripe(txn);
+            let local = stripe.entry(txn).or_default();
+            if !matches!(key, LockKey::Table(_)) {
+                if local.rows >= limit { return Err(LockError::Limit); }
+                local.rows += 1;
+            }
+            local.shard_mask.insert(i);
+            self.guards.slice_mut()[i].held.entry(txn).or_default().insert(prepared.held.take().expect("prepared holding"));
         }
+        if self.key(key).is_none() { self.key_entry(prepared.map.take().expect("prepared key")).or_default(); }
+        let locks = self.key_mut(key).expect("granted key");
         if matches!(key, LockKey::Table(_)) {
-            let locks = self.keys.entry(key.clone()).or_default();
             if !matches!(mode, LockMode::AccessShare | LockMode::RowShare | LockMode::RowExclusive) {
                 locks.slow.extend(locks.holders.keys().copied());
                 locks.slow.insert(txn);
@@ -943,10 +1183,7 @@ impl State {
                 locks.slow.insert(txn);
             }
         }
-        self.keys
-            .entry(key.clone())
-            .or_default()
-            .holders
+        locks.holders
             .entry(txn)
             .or_default()
             .insert(mode);
@@ -954,32 +1191,17 @@ impl State {
         Ok(())
     }
 
-    /// Undo `grant`'s row count for a removed holding. `grant` counts every
-    /// key except `Table`, so only those keys are uncounted here.
-    fn uncount(&mut self, txn: TxnId, key: &LockKey) {
-        if matches!(key, LockKey::Table(_)) {
-            return;
-        }
-        if let Some(count) = self.row_counts.get_mut(&txn) {
-            debug_assert!(*count > 0, "removed counted holding has no row count");
-            *count = count.saturating_sub(1);
-        }
-    }
-
     fn remove_waiter(&mut self, id: u64, result: Result<(), LockError>) {
-        if let Some(waiter) = self.waiters.remove(&id) {
-            let pending = self.by_txn.get_mut(&waiter.txn).expect("indexed waiter");
-            pending.retain(|&pending| pending != id);
-            if pending.is_empty() {
-                self.by_txn.remove(&waiter.txn);
-            }
-            if let Some(locks) = self.keys.get_mut(&waiter.key) {
-                locks.queue.retain(|&queued| queued != id);
-            }
-            self.settle(&waiter.key);
-            self.completed.insert(id, result);
-            waiter.changed.notify_one();
-        }
+        let Some(i) = self.guards.slice().iter().position(|s| s.waiters.contains_key(&id)) else { return; };
+        let shard = &mut self.guards.slice_mut()[i];
+        let waiter = shard.waiters.remove(&id).unwrap();
+        let pending = shard.by_txn.get_mut(&waiter.txn).expect("indexed waiter");
+        pending.retain(|&pending| pending != id);
+        if pending.is_empty() { shard.by_txn.remove(&waiter.txn); }
+        if let Some(locks) = shard.keys.get_mut(&waiter.key) { locks.queue.retain(|&queued| queued != id); }
+        self.manager.registry.pending(waiter.txn, false);
+        self.settle(&waiter.key);
+        waiter.slot.complete(result);
     }
 
     /// Record a granted or queued `mode` on `key` in the interval indices.
@@ -1004,7 +1226,7 @@ impl State {
             return;
         }
         let mut points = BTreeSet::new();
-        for (key, locks) in &self.keys {
+        for (key, locks) in self.keys() {
             let Some((point_space, id, tail)) = key.point() else {
                 continue;
             };
@@ -1015,7 +1237,7 @@ impl State {
                 || locks
                     .queue
                     .iter()
-                    .any(|id| self.waiters[id].mode == LockMode::Exclusive);
+                    .any(|id| self.waiter(id).unwrap().mode == LockMode::Exclusive);
             if point_space == space && exclusive {
                 points.insert(point_bytes(id, tail));
             }
@@ -1028,20 +1250,19 @@ impl State {
     /// no longer applies.
     fn settle(&mut self, key: &LockKey) {
         if self
-            .keys
-            .get(key)
+            .key(key)
             .is_some_and(|locks| locks.holders.is_empty() && locks.queue.is_empty())
         {
-            self.keys.remove(key);
+            self.key_remove(key);
         }
         if let LockKey::Interval { space, .. } = key {
-            if !self.keys.contains_key(key) {
+            if self.key(key).is_none() {
                 self.intervals[*space as usize].remove(key);
             }
         } else if let Some((space, id, tail)) = key.point()
             && !self.points[space as usize].is_empty()
         {
-            let exclusive = self.keys.get(key).is_some_and(|locks| {
+            let exclusive = self.key(key).is_some_and(|locks| {
                 locks
                     .holders
                     .values()
@@ -1049,7 +1270,7 @@ impl State {
                     || locks
                         .queue
                         .iter()
-                        .any(|id| self.waiters[id].mode == LockMode::Exclusive)
+                        .any(|id| self.waiter(id).unwrap().mode == LockMode::Exclusive)
             });
             if !exclusive {
                 self.points[space as usize].remove(point_bytes(id, tail).as_slice());
@@ -1062,7 +1283,7 @@ impl State {
     /// or Exclusive point holders inside an interval request.
     fn cross_holders(&self, txn: TxnId, key: &LockKey, mode: LockMode, out: &mut Vec<TxnId>) {
         let mut push = |key: &LockKey| {
-            if let Some(locks) = self.keys.get(key) {
+            if let Some(locks) = self.key(key) {
                 for (&owner, held) in &locks.holders {
                     if owner != txn && held.iter().any(|held| mode.conflicts(held)) {
                         out.push(owner);
@@ -1102,8 +1323,7 @@ impl State {
     /// releasing `key` may unblock.
     fn cross_queued(&self, key: &LockKey, out: &mut Vec<LockKey>) {
         let queued = |key: &LockKey| {
-            self.keys
-                .get(key)
+            self.key(key)
                 .is_some_and(|locks| !locks.queue.is_empty())
         };
         if let LockKey::Interval { space, start, end } = key {
@@ -1132,10 +1352,10 @@ impl State {
     }
 
     fn drain_queue(&mut self, key: &LockKey, limit: usize) {
-        if self.keys.get(key).is_none_or(|locks| locks.queue.is_empty()) { return; }
-        while let Some(id) = self.keys.get(key).and_then(|locks| {
+        if self.key(key).is_none_or(|locks| locks.queue.is_empty()) { return; }
+        while let Some(id) = self.key(key).and_then(|locks| {
             locks.queue.iter().copied().find(|id| {
-                let waiter = &self.waiters[id];
+                let waiter = self.waiter(id).unwrap();
                 (locks.queue.first() == Some(id)
                     || self.compatible_bypass(waiter.txn, key, &waiter.group))
                     && (waiter.cancelled || (!locks.holders.iter().any(|(&owner, held)|
@@ -1143,7 +1363,7 @@ impl State {
                         && !self.cross_blocked(waiter.txn, key, waiter.mode)))
             })
         }) {
-            let waiter = &self.waiters[&id];
+            let waiter = self.waiter(&id).unwrap();
             let txn = waiter.txn;
             let mode = waiter.mode;
             // A cancel_wait victim is never granted, even if its thread has not
@@ -1153,7 +1373,8 @@ impl State {
                 continue;
             }
             let group = waiter.group.clone();
-            let result = self.grant(txn, key, mode, limit);
+            let mut prepared = std::mem::take(&mut self.waiter_mut(&id).unwrap().prepared);
+            let result = self.grant(txn, key, mode, limit, &mut prepared);
             self.remove_waiter(id, result);
             if result.is_ok() {
                 self.finish_group(txn, &group);
@@ -1168,14 +1389,14 @@ impl State {
     /// Edges to requests queued on other, overlapping keys are omitted: FIFO is
     /// per key, so a request never waits behind them.
     fn queue_blockers(&self, locks: &KeyState, position: usize, blockers: &mut Vec<TxnId>) {
-        let waiter = &self.waiters[&locks.queue[position]];
+        let waiter = self.waiter(&locks.queue[position]).unwrap();
         for (&owner, held) in &locks.holders {
             if self.holder_conflicts(waiter.txn, &waiter.key, waiter.mode, owner, *held, &waiter.group) {
                 blockers.push(owner);
             }
         }
         for preceding in &locks.queue[..position] {
-            let preceding = &self.waiters[preceding];
+            let preceding = self.waiter(preceding).unwrap();
             if preceding.txn != waiter.txn && waiter.mode.conflicts(preceding.mode)
                 && !self.compatible_bypass(waiter.txn, &waiter.key, &waiter.group) {
                 blockers.push(preceding.txn);
@@ -1187,31 +1408,25 @@ impl State {
     /// A grant can add wait-for edges to its owner. If the owner is itself
     /// waiting, wake both ends of every potentially new edge to recheck cycles.
     fn notify_grant(&self, txn: TxnId, key: &LockKey) {
-        let Some(pending) = self.by_txn.get(&txn) else {
-            return;
-        };
+        let pending = self.pending(txn);
+        if pending.is_empty() { return; }
         let mut notify: HashSet<u64> = pending.iter().copied().collect();
         let mut keys = vec![key.clone()];
         self.cross_queued(key, &mut keys);
         for key in keys {
-            if let Some(locks) = self.keys.get(&key) {
+            if let Some(locks) = self.key(&key) {
                 notify.extend(locks.queue.iter().copied());
             }
         }
         for id in notify {
-            let waiter = &self.waiters[&id];
-            #[cfg(test)]
-            if waiter.sleeping {
-                waiter.notified.store(true, Ordering::Relaxed);
-            }
-            waiter.changed.notify_one();
+            self.waiter(&id).unwrap().slot.recheck();
         }
     }
 
     fn txn_blockers(&self, txn: TxnId, blockers: &mut Vec<TxnId>) {
-        for id in self.by_txn.get(&txn).into_iter().flatten() {
-            let waiter = &self.waiters[id];
-            let locks = &self.keys[&waiter.key];
+        for id in &self.pending(txn) {
+            let waiter = self.waiter(id).unwrap();
+            let locks = self.key(&waiter.key).unwrap();
             if let Some(position) = locks.queue.iter().position(|queued| queued == id) {
                 self.queue_blockers(locks, position, blockers);
             }
@@ -1262,9 +1477,8 @@ mod wakeup_tests;
 #[path = "locks_row_tests.rs"]
 mod row_tests;
 
-#[test]
-fn restore_modes_never_recreates_released_ownership() {
-    let locks = LockManager::new(LockConfig::default());
+fn restore_modes_never_recreates_released_ownership_at(shards: usize) {
+    let locks = LockManager::new(LockConfig { shards, ..Default::default() });
     let txn = TxnId(1);
     let other = TxnId(2);
     let key = LockKey::Row { table: 1, pk: vec![1] };
@@ -1275,29 +1489,54 @@ fn restore_modes_never_recreates_released_ownership() {
     locks.restore_modes(txn, &previous);
     assert!(locks.held(txn).is_empty());
     {
-        let state = locks.state.lock().unwrap();
-        assert!(!state.held_keys.contains_key(&txn));
-        assert!(!state.row_counts.contains_key(&txn));
-        assert!(!state.keys[&key].holders.contains_key(&txn));
+        let state = locks.global().unwrap();
+        assert!(state.guards.slice().iter().all(|s| !s.held.contains_key(&txn)));
+        assert_eq!(locks.registry.rows(txn), 0);
+        assert!(!state.key(&key).unwrap().holders.contains_key(&txn));
     }
     // Even when the key is held again, missing historical modes stay absent.
     locks.release_all(other);
     locks.acquire(txn, key.clone(), LockMode::Exclusive, None, &|| false).unwrap();
     locks.restore_modes(txn, &previous);
     assert!(locks.held(txn).is_empty());
-    let state = locks.state.lock().unwrap();
-    assert!(!state.held_keys.contains_key(&txn));
-    assert!(!state.row_counts.contains_key(&txn));
+    let state = locks.global().unwrap();
+    assert!(state.guards.slice().iter().all(|s| !s.held.contains_key(&txn)));
+    assert_eq!(locks.registry.rows(txn), 0);
 }
+
+#[cfg(test)]
+#[path = "locks_reference.rs"]
+mod reference;
+
+#[cfg(test)]
+#[path = "locks_shards2_tests.rs"]
+mod shards2;
+
+#[cfg(test)]
+#[path = "locks_shards64_tests.rs"]
+mod shards64;
+
+#[cfg(test)]
+#[path = "locks_sharding_tests.rs"]
+mod sharding_tests;
+
+#[test]
+fn restore_modes_never_recreates_released_ownership() { restore_modes_never_recreates_released_ownership_at(1); }
+
+#[test]
+fn restore_modes_never_recreates_released_ownership_shards2() { restore_modes_never_recreates_released_ownership_at(2); }
+
+#[test]
+fn restore_modes_never_recreates_released_ownership_shards64() { restore_modes_never_recreates_released_ownership_at(64); }
 
 // `grant` counts every holding except `Table` keys toward
 // `max_row_locks_per_txn`, so restoring a Table holding must not uncount one.
 // Before the fix, restoring a row and a table holding to empty decremented the
 // count twice: a debug build panicked and a release build wrapped to
 // usize::MAX, so the transaction's next row lock failed with `Limit`.
-#[test]
-fn restore_modes_does_not_uncount_table_holdings() {
-    let locks = LockManager::new(LockConfig::default());
+#[cfg(test)]
+fn restore_modes_does_not_uncount_table_holdings_at(shards: usize) {
+    let locks = LockManager::new(LockConfig { shards, ..LockConfig::default() });
     let txn = TxnId(1);
     let table = LockKey::Table(7);
     let first = LockKey::Row { table: 7, pk: vec![1] };
@@ -1307,22 +1546,22 @@ fn restore_modes_does_not_uncount_table_holdings() {
     locks.acquire(txn, second.clone(), LockMode::Exclusive, None, &|| false).unwrap();
     locks.acquire(txn, table.clone(), LockMode::RowExclusive, None, &|| false).unwrap();
     locks.acquire(txn, first.clone(), LockMode::Exclusive, None, &|| false).unwrap();
-    assert_eq!(locks.state.lock().unwrap().row_counts.get(&txn), Some(&2));
+    assert_eq!(locks.registry.rows(txn), 2);
     // Restoring only the table holding leaves both row holdings counted.
     locks.restore_modes(txn, &before[..1]);
-    assert_eq!(locks.state.lock().unwrap().row_counts.get(&txn), Some(&2));
+    assert_eq!(locks.registry.rows(txn), 2);
     locks.acquire(txn, table.clone(), LockMode::RowExclusive, None, &|| false).unwrap();
     // Restoring the table and one row holding uncounts exactly that row.
     locks.restore_modes(txn, &before);
-    assert_eq!(locks.state.lock().unwrap().row_counts.get(&txn), Some(&1));
+    assert_eq!(locks.registry.rows(txn), 1);
     locks.restore_modes(txn, &locks.modes_on(TxnId(99), &[(second.clone(), LockMode::Exclusive)]));
     {
-        let state = locks.state.lock().unwrap();
-        assert!(!state.row_counts.contains_key(&txn));
-        assert!(!state.held_keys.contains_key(&txn));
+        let state = locks.global().unwrap();
+        assert_eq!(locks.registry.rows(txn), 0);
+        assert!(state.guards.slice().iter().all(|s| !s.held.contains_key(&txn)));
     }
     // The count stays exact, so the limit still admits the next row lock.
-    let limited = LockManager::new(LockConfig { max_row_locks_per_txn: 1, ..LockConfig::default() });
+    let limited = LockManager::new(LockConfig { shards, max_row_locks_per_txn: 1, ..LockConfig::default() });
     let before = limited.modes_on(txn, &keys);
     limited.acquire(txn, table.clone(), LockMode::RowExclusive, None, &|| false).unwrap();
     limited.acquire(txn, first.clone(), LockMode::Exclusive, None, &|| false).unwrap();
@@ -1331,3 +1570,12 @@ fn restore_modes_does_not_uncount_table_holdings() {
     assert_eq!(limited.acquire(txn, second, LockMode::Exclusive, None, &|| false), Ok(()));
     assert_eq!(limited.acquire(txn, first, LockMode::Exclusive, None, &|| false), Err(LockError::Limit));
 }
+
+#[test]
+fn restore_modes_does_not_uncount_table_holdings() { restore_modes_does_not_uncount_table_holdings_at(1); }
+
+#[test]
+fn restore_modes_does_not_uncount_table_holdings_shards2() { restore_modes_does_not_uncount_table_holdings_at(2); }
+
+#[test]
+fn restore_modes_does_not_uncount_table_holdings_shards64() { restore_modes_does_not_uncount_table_holdings_at(64); }

@@ -7,7 +7,7 @@ use super::super::{
 use super::*;
 use crate::relational::scan::RowLock;
 
-fn setup(budget: usize) -> (Arc<Sequencer>, Arc<LockManager>) {
+fn setup(budget: usize, shards: usize) -> (Arc<Sequencer>, Arc<LockManager>) {
     let seq = Sequencer::open(
         Arc::new(Kv::new_single_writer(Arc::new(MemKv::new()))),
         Arc::new(ManualClock::new(10)),
@@ -17,7 +17,7 @@ fn setup(budget: usize) -> (Arc<Sequencer>, Arc<LockManager>) {
         },
     )
     .unwrap();
-    (seq, Arc::new(LockManager::new(LockConfig::default())))
+    (seq, Arc::new(LockManager::new(LockConfig { shards, ..LockConfig::default() })))
 }
 fn txn(seq: &Arc<Sequencer>, locks: &Arc<LockManager>, id: u64) -> Transaction {
     Transaction::begin(seq, locks, TxnId(id), Isolation::ReadCommitted)
@@ -26,9 +26,8 @@ fn key(n: u64) -> Vec<u8> {
     [1u64.to_be_bytes(), n.to_be_bytes()].concat()
 }
 
-#[test]
-fn restores_modes_and_nested_marks_without_losing_outer_journal() {
-    let (seq, locks) = setup(4096);
+fn restores_modes_and_nested_marks_without_losing_outer_journal_at(shards: usize) {
+    let (seq, locks) = setup(4096, shards);
     let mut t = txn(&seq, &locks, 1);
     t.lock_sql_row(1, &1u64.to_be_bytes(), RowLock::KeyShare, None, &|| false)
         .unwrap();
@@ -56,9 +55,8 @@ fn restores_modes_and_nested_marks_without_losing_outer_journal() {
     assert_eq!(locks.held(t.id), original); // mark reusable
 }
 
-#[test]
-fn inner_rollback_frees_only_inner_locks_and_clears_upgrade_cache() {
-    let (seq, locks) = setup(4096);
+fn inner_rollback_frees_only_inner_locks_and_clears_upgrade_cache_at(shards: usize) {
+    let (seq, locks) = setup(4096, shards);
     let mut t = txn(&seq, &locks, 1);
     let outer = t.savepoint();
     t.lock_sql_row(1, &1u64.to_be_bytes(), RowLock::Share, None, &|| false)
@@ -78,11 +76,11 @@ fn inner_rollback_frees_only_inner_locks_and_clears_upgrade_cache() {
     assert!(locks.held(t.id).is_empty());
 }
 
-#[test]
-fn excluded_holds_survive_and_row_budget_is_reusable() {
+fn excluded_holds_survive_and_row_budget_is_reusable_at(shards: usize) {
     use super::super::locks::LockConfig;
-    let (seq, _) = setup(4096);
+    let (seq, _) = setup(4096, shards);
     let locks = Arc::new(LockManager::new(LockConfig {
+        shards,
         max_row_locks_per_txn: 4,
         ..Default::default()
     }));
@@ -105,13 +103,12 @@ fn excluded_holds_survive_and_row_budget_is_reusable() {
         .unwrap();
 }
 
-#[test]
-fn rollback_wakes_queued_waiter_but_retains_outer_conflicts() {
+fn rollback_wakes_queued_waiter_but_retains_outer_conflicts_at(shards: usize) {
     use std::{
         thread,
         time::{Duration, Instant},
     };
-    let (seq, locks) = setup(4096);
+    let (seq, locks) = setup(4096, shards);
     let mut t = txn(&seq, &locks, 1);
     t.lock_row_key(1, &1u64.to_be_bytes(), LockMode::Shared, None, &|| false)
         .unwrap();
@@ -154,9 +151,8 @@ fn rollback_wakes_queued_waiter_but_retains_outer_conflicts() {
     locks.release_all(TxnId(2));
 }
 
-#[test]
-fn all_four_modes_and_fk_key_lock_are_released() {
-    let (seq, locks) = setup(4096);
+fn all_four_modes_and_fk_key_lock_are_released_at(shards: usize) {
+    let (seq, locks) = setup(4096, shards);
     let mut t = txn(&seq, &locks, 1);
     for mode in [
         RowLock::Update,
@@ -178,11 +174,10 @@ fn all_four_modes_and_fk_key_lock_are_released() {
     assert!(locks.held(t.id).is_empty());
 }
 
-#[test]
-fn downgrade_and_release_refresh_point_interval_index() {
+fn downgrade_and_release_refresh_point_interval_index_at(shards: usize) {
     use super::super::locks::{LockError, LockSpace};
     use std::{ops::Bound, time::Instant};
-    let (seq, locks) = setup(4096);
+    let (seq, locks) = setup(4096, shards);
     let mut t = txn(&seq, &locks, 1);
     let row = LockKey::Row {
         table: 1,
@@ -276,9 +271,8 @@ fn downgrade_and_release_refresh_point_interval_index() {
     locks.release_all(TxnId(3));
 }
 
-#[test]
-fn invalid_lock_journal_offset_is_misuse_before_mutation() {
-    let (seq, locks) = setup(4096);
+fn invalid_lock_journal_offset_is_misuse_before_mutation_at(shards: usize) {
+    let (seq, locks) = setup(4096, shards);
     let mut t = txn(&seq, &locks, 1);
     let mut mark = t.savepoint();
     mark.lock_undo_len = 1;
@@ -290,10 +284,9 @@ fn invalid_lock_journal_offset_is_misuse_before_mutation() {
     t.rollback_to_releasing_locks(&mark).unwrap();
 }
 
-#[test]
-fn cancelled_upgrade_cleanup_is_not_undone_by_savepoint_rollback() {
+fn cancelled_upgrade_cleanup_is_not_undone_by_savepoint_rollback_at(shards: usize) {
     use std::{cell::Cell, time::Instant};
-    let (seq, locks) = setup(4096);
+    let (seq, locks) = setup(4096, shards);
     let mut t1 = txn(&seq, &locks, 1);
     let mut t2 = txn(&seq, &locks, 2);
     for t in [&mut t1, &mut t2] {
@@ -323,3 +316,75 @@ fn cancelled_upgrade_cleanup_is_not_undone_by_savepoint_rollback() {
     ).unwrap();
     locks.release_all(TxnId(3));
 }
+
+#[test]
+fn restores_modes_and_nested_marks_without_losing_outer_journal() { restores_modes_and_nested_marks_without_losing_outer_journal_at(1); }
+
+#[test]
+fn restores_modes_and_nested_marks_without_losing_outer_journal_shards2() { restores_modes_and_nested_marks_without_losing_outer_journal_at(2); }
+
+#[test]
+fn restores_modes_and_nested_marks_without_losing_outer_journal_shards64() { restores_modes_and_nested_marks_without_losing_outer_journal_at(64); }
+
+#[test]
+fn inner_rollback_frees_only_inner_locks_and_clears_upgrade_cache() { inner_rollback_frees_only_inner_locks_and_clears_upgrade_cache_at(1); }
+
+#[test]
+fn inner_rollback_frees_only_inner_locks_and_clears_upgrade_cache_shards2() { inner_rollback_frees_only_inner_locks_and_clears_upgrade_cache_at(2); }
+
+#[test]
+fn inner_rollback_frees_only_inner_locks_and_clears_upgrade_cache_shards64() { inner_rollback_frees_only_inner_locks_and_clears_upgrade_cache_at(64); }
+
+#[test]
+fn excluded_holds_survive_and_row_budget_is_reusable() { excluded_holds_survive_and_row_budget_is_reusable_at(1); }
+
+#[test]
+fn excluded_holds_survive_and_row_budget_is_reusable_shards2() { excluded_holds_survive_and_row_budget_is_reusable_at(2); }
+
+#[test]
+fn excluded_holds_survive_and_row_budget_is_reusable_shards64() { excluded_holds_survive_and_row_budget_is_reusable_at(64); }
+
+#[test]
+fn rollback_wakes_queued_waiter_but_retains_outer_conflicts() { rollback_wakes_queued_waiter_but_retains_outer_conflicts_at(1); }
+
+#[test]
+fn rollback_wakes_queued_waiter_but_retains_outer_conflicts_shards2() { rollback_wakes_queued_waiter_but_retains_outer_conflicts_at(2); }
+
+#[test]
+fn rollback_wakes_queued_waiter_but_retains_outer_conflicts_shards64() { rollback_wakes_queued_waiter_but_retains_outer_conflicts_at(64); }
+
+#[test]
+fn all_four_modes_and_fk_key_lock_are_released() { all_four_modes_and_fk_key_lock_are_released_at(1); }
+
+#[test]
+fn all_four_modes_and_fk_key_lock_are_released_shards2() { all_four_modes_and_fk_key_lock_are_released_at(2); }
+
+#[test]
+fn all_four_modes_and_fk_key_lock_are_released_shards64() { all_four_modes_and_fk_key_lock_are_released_at(64); }
+
+#[test]
+fn downgrade_and_release_refresh_point_interval_index() { downgrade_and_release_refresh_point_interval_index_at(1); }
+
+#[test]
+fn downgrade_and_release_refresh_point_interval_index_shards2() { downgrade_and_release_refresh_point_interval_index_at(2); }
+
+#[test]
+fn downgrade_and_release_refresh_point_interval_index_shards64() { downgrade_and_release_refresh_point_interval_index_at(64); }
+
+#[test]
+fn invalid_lock_journal_offset_is_misuse_before_mutation() { invalid_lock_journal_offset_is_misuse_before_mutation_at(1); }
+
+#[test]
+fn invalid_lock_journal_offset_is_misuse_before_mutation_shards2() { invalid_lock_journal_offset_is_misuse_before_mutation_at(2); }
+
+#[test]
+fn invalid_lock_journal_offset_is_misuse_before_mutation_shards64() { invalid_lock_journal_offset_is_misuse_before_mutation_at(64); }
+
+#[test]
+fn cancelled_upgrade_cleanup_is_not_undone_by_savepoint_rollback() { cancelled_upgrade_cleanup_is_not_undone_by_savepoint_rollback_at(1); }
+
+#[test]
+fn cancelled_upgrade_cleanup_is_not_undone_by_savepoint_rollback_shards2() { cancelled_upgrade_cleanup_is_not_undone_by_savepoint_rollback_at(2); }
+
+#[test]
+fn cancelled_upgrade_cleanup_is_not_undone_by_savepoint_rollback_shards64() { cancelled_upgrade_cleanup_is_not_undone_by_savepoint_rollback_at(64); }

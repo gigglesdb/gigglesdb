@@ -647,6 +647,7 @@ fn queued_limit_error_removes_waiter_and_drains_followers() {
         max_row_locks_per_txn: 1,
         deadlock_recheck: Duration::from_millis(5),
         deadlock_timeout: Duration::ZERO,
+        ..Default::default()
     }));
     acquire(&lm, 1, row(1), LockMode::Exclusive);
     acquire(&lm, 2, row(2), LockMode::Shared);
@@ -893,14 +894,14 @@ fn release_all_visits_only_affected_keys_and_releases_queued_grants() {
     second.pending();
     // A grant from drain_queue must be tracked just like an immediate grant.
     lm.release_all(TxnId(3));
-    assert!(!lm.state.lock().unwrap().keys.contains_key(&row(1)));
+    assert!(!lm.global().unwrap().key(&row(1)).is_some());
     assert_eq!(lm.held(TxnId(2)), vec![(row(2), LockMode::Exclusive)]);
     lm.release_all(TxnId(2));
     second.granted();
     lm.release_all(TxnId(4));
-    let state = lm.state.lock().unwrap();
-    assert!(state.keys.is_empty());
-    assert!(state.held_keys.is_empty());
+    let state = lm.global().unwrap();
+    assert!(state.guards.slice().iter().all(|s| s.keys.is_empty()));
+    assert!(state.guards.slice().iter().all(|s| s.held.is_empty()));
     drop(state);
     first.finish();
     second.finish();

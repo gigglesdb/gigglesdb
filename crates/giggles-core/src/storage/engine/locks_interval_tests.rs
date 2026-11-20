@@ -86,9 +86,9 @@ fn still_waiting(result: &mpsc::Receiver<Result<(), LockError>>) {
 
 /// Every key and index entry is gone once all transactions released.
 fn assert_clean(lm: &LockManager) {
-    let state = lm.state.lock().unwrap();
-    assert!(state.keys.is_empty(), "keys left: {:?}", state.keys);
-    assert!(state.waiters.is_empty());
+    let state = lm.global().unwrap();
+    assert!(state.guards.slice().iter().all(|s| s.keys.is_empty()), "keys left: {:?}", state.keys().collect::<Vec<_>>());
+    assert!(state.guards.slice().iter().all(|s| s.waiters.is_empty()));
     assert!(state.intervals.iter().all(HashSet::is_empty));
     assert!(state.points.iter().all(BTreeSet::is_empty));
 }
@@ -475,7 +475,7 @@ fn points_held_before_the_first_interval_still_block_it() {
     acquire(&lm, 1, row(5), LockMode::Exclusive);
     acquire(&lm, 1, unique(5), LockMode::Exclusive);
     {
-        let state = lm.state.lock().unwrap();
+        let state = lm.global().unwrap();
         assert_eq!(state.indexed, [false, false]);
         assert!(state.points.iter().all(BTreeSet::is_empty));
     }
@@ -484,7 +484,7 @@ fn points_held_before_the_first_interval_still_block_it() {
         Err(LockError::Timeout)
     );
     {
-        let state = lm.state.lock().unwrap();
+        let state = lm.global().unwrap();
         assert_eq!(state.indexed, [true, false]);
     }
     // Later points in the indexed space are indexed as they come.

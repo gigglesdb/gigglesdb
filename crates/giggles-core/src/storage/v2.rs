@@ -186,6 +186,7 @@ impl V2Db {
             token,
         )?;
         let locks = Arc::new(engine::locks::LockManager::new(engine::locks::LockConfig {
+            shards: 1,
             // One million rows plus old/new keys for secondary indexes.
             max_row_locks_per_txn: 8_000_000,
             ..Default::default()
