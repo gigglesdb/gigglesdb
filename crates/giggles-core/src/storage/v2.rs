@@ -440,6 +440,17 @@ impl V2Db {
         })
     }
 
+    /// Reuse the immutable, versioned image while preserving every metadata
+    /// acquisition's snapshot, provenance validation and error behavior.
+    pub(super) fn native_metadata_image(
+        &self, txn: Option<&engine::txn::Transaction>,
+    ) -> Result<(u128, Arc<crate::relational::Relational>), CoreError> {
+        self.with_metadata_catalog(txn, |catalog, _, ts| {
+            self.validated_origin_at(ts)?;
+            Ok((u128::from_be_bytes(self.meta.domain), catalog.image().map_err(CoreError::Sql)?))
+        })
+    }
+
     /// The column labels of the catalog snapshot `inspect_metadata` reads
     /// (GD-0061 R3-304: native task requests take their marks from it).
     pub(super) fn column_labels(

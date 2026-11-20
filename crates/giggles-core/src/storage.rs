@@ -3458,30 +3458,28 @@ impl SqlSession {
         relational::coerce_to_column(&state.sql, column, value).map_err(CoreError::Sql)
     }
     /// Share SQL sequence state and callbacks across native entry points.
-    fn native_sequence_callback(&self) -> Result<(State, relational::clock::SequenceCallback), CoreError> {
-        let mut state = match &self.admin.inner.backend {
-            Backend::V2(db) => db.metadata_state(self.v2_transaction.as_ref())?,
-            _ => match &self.staged {
-                Some(state) => state.clone(),
-                None => self.admin.inner.inspect(|state| Ok(state.clone()))?,
-            },
+    fn native_sequence_callback(&self) -> Result<(Arc<relational::Relational>, relational::clock::SequenceCallback), CoreError> {
+        if let Backend::V2(db) = &self.admin.inner.backend {
+            let (_, image) = db.native_metadata_image(self.v2_transaction.as_ref())?;
+            let callback = self.insert_sequence_callback(db, image.clone());
+            return Ok((image, callback));
+        }
+        let mut state = match &self.staged {
+            Some(state) => state.clone(),
+            None => self.admin.inner.inspect(|state| Ok(state.clone()))?,
         };
-        let callback = if let Backend::V2(db) = &self.admin.inner.backend {
-            self.insert_sequence_callback(db, Arc::new(state.sql.clone()))
+        self.admin.inner.merge_live_sequences(&mut state)?;
+        sequences::merge(&mut state, &*self.pending_sequences.lock().map_err(|_| CoreError::Fenced)?);
+        let baseline = if self.staged.is_some() {
+            self.sequence_baseline.clone()
         } else {
-            self.admin.inner.merge_live_sequences(&mut state)?;
-            sequences::merge(&mut state, &*self.pending_sequences.lock().map_err(|_| CoreError::Fenced)?);
-            let baseline = if self.staged.is_some() {
-                self.sequence_baseline.clone()
-            } else {
-                state.sql.catalog_ext().sequences.iter().map(|(&id, d)| (id, d.incarnation)).collect()
-            };
-            self.admin.inner.sequence_callback(
-                state.clone(), baseline, self.pending_sequences.clone(),
-                self.sequence_values.clone(), self.sequence_tables.clone(), self.search_path.clone(),
-            )
+            state.sql.catalog_ext().sequences.iter().map(|(&id, d)| (id, d.incarnation)).collect()
         };
-        Ok((state, callback))
+        let callback = self.admin.inner.sequence_callback(
+            state.clone(), baseline, self.pending_sequences.clone(),
+            self.sequence_values.clone(), self.sequence_tables.clone(), self.search_path.clone(),
+        );
+        Ok((Arc::new(state.sql), callback))
     }
     pub(crate) fn sequence_call_engine(&mut self, operation: &str, name: &str, value: Option<i64>, called: bool) -> Result<i64, CoreError> {
         let _ticket = self.admin.inner.enter_sql()?;
@@ -3490,8 +3488,8 @@ impl SqlSession {
         let quoted = |key: &str| key.split('\0')
             .map(|part| format!("\"{}\"", part.replace('"', "\"\""))).collect::<Vec<_>>().join(".");
         let qualified = if self.is_v2_engine() {
-            let key = state.sql.resolve_relation_key(name, &self.search_path);
-            if !state.sql.catalog_ext().sequences.values().any(|def| def.name == key) {
+            let key = state.resolve_relation_key(name, &self.search_path);
+            if !state.catalog_ext().sequences.values().any(|def| def.name == key) {
                 return Err(CoreError::Sql(relational::SqlError::UnknownTable));
             }
             let key = if key.contains('\0') { key } else { format!("public\0{key}") };
@@ -3552,7 +3550,7 @@ impl SqlSession {
                 unavailable: Some(CoreError::Sql(relational::SqlError::Unsupported)),
                 transaction_us: 0, statement_us: 0, zone: None, wall: None,
             }).with_extra_float_digits(self.extra_float_digits).with_sequences(callback);
-            let output = state.sql.normalize_insert_engine(table, supplied, values, &clock);
+            let output = state.normalize_insert_engine(table, supplied, values, &clock);
             if let Some(error) = clock.take_error() { return Err(error); }
             output.map_err(CoreError::Sql)
         })();
@@ -3593,11 +3591,15 @@ impl SqlSession {
                 if self.aborted {
                     return Err(CoreError::Sql(relational::SqlError::Aborted));
                 }
-                let mut state = db.metadata_state(self.v2_transaction.as_ref())?;
+                let (domain, image) = db.native_metadata_image(self.v2_transaction.as_ref())?;
                 // V2 binds durable metadata at execution; prepared epochs use zero.
-                state.sql.epoch = 0;
                 let mut prepared = relational::Prepared::insert_normalized_engine(
-                    table, values, &[], state.view.domain, &state.sql).map_err(CoreError::Sql)?;
+                    table, values, &[], domain, &image).map_err(CoreError::Sql)?;
+                #[cfg(all(test, feature = "engine-rocksdb"))]
+                native_many_tests::INSERT_PREPARED.with_borrow_mut(|hook| {
+                    if let Some(hook) = hook.as_mut() { hook(&image); }
+                });
+                prepared.epoch = 0;
                 prepared.transaction = self.transaction_id;
                 self.execute_bound_engine(&prepared, &[], None)
             })();
@@ -3627,10 +3629,10 @@ impl SqlSession {
                 if self.aborted {
                     return Err(CoreError::Sql(relational::SqlError::Aborted));
                 }
-                let mut state = db.metadata_state(self.v2_transaction.as_ref())?;
-                state.sql.epoch = 0;
+                let (domain, image) = db.native_metadata_image(self.v2_transaction.as_ref())?;
                 let mut prepared = relational::Prepared::update_engine(
-                    table, key, sets, state.view.domain, &state.sql).map_err(CoreError::Sql)?;
+                    table, key, sets, domain, &image).map_err(CoreError::Sql)?;
+                prepared.epoch = 0;
                 prepared.transaction = self.transaction_id;
                 self.execute_bound_engine(&prepared, &[], Some(expected_version))
             })();
@@ -3655,10 +3657,10 @@ impl SqlSession {
                 if self.aborted {
                     return Err(CoreError::Sql(relational::SqlError::Aborted));
                 }
-                let mut state = db.metadata_state(self.v2_transaction.as_ref())?;
-                state.sql.epoch = 0;
+                let (domain, image) = db.native_metadata_image(self.v2_transaction.as_ref())?;
                 let mut prepared = relational::Prepared::delete_engine(
-                    table, key, state.view.domain, &state.sql).map_err(CoreError::Sql)?;
+                    table, key, domain, &image).map_err(CoreError::Sql)?;
+                prepared.epoch = 0;
                 prepared.transaction = self.transaction_id;
                 self.execute_bound_engine(&prepared, &[], Some(expected_version))
             })();
@@ -6156,3 +6158,6 @@ impl SqlSession {
 #[cfg(test)]
 #[path = "storage/column_collation_format_tests.rs"]
 mod column_collation_format_tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+mod native_many_tests;

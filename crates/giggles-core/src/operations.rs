@@ -3227,7 +3227,11 @@ fn insert_many(
     result
 }
 #[cfg(test)]
+type NativeManyHook = Box<dyn FnMut(&mut SqlSession, usize)>;
+#[cfg(test)]
 thread_local! {
+    pub(crate) static NATIVE_MANY_AFTER_NORMALIZE: std::cell::RefCell<Option<NativeManyHook>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static NATIVE_MANY_BEFORE_WRITE: std::cell::RefCell<Option<NativeManyHook>> = const { std::cell::RefCell::new(None) };
     // Per-thread crash injection keeps other native requests unaffected.
     pub(crate) static NATIVE_MANY_ON_EXIT: std::cell::Cell<Option<fn(&SqlSession)>> = const { std::cell::Cell::new(None) };
     pub(crate) static NATIVE_MANY_CRASH_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -3259,6 +3263,10 @@ fn insert_many_deferred(
             charge_value(&mut remaining, value)?;
         }
         proposed.push(row);
+        #[cfg(test)]
+        NATIVE_MANY_AFTER_NORMALIZE.with_borrow_mut(|hook| {
+            if let Some(hook) = hook.as_mut() { hook(session, proposed.len()); }
+        });
         #[cfg(test)]
         NATIVE_MANY_CRASH_AFTER.with(|after| {
             if after.get() == Some(proposed.len()) {
@@ -3355,6 +3363,10 @@ fn insert_many_deferred(
             .into_iter()
             .map(Cow::into_owned)
             .collect();
+        #[cfg(test)]
+        NATIVE_MANY_BEFORE_WRITE.with_borrow_mut(|hook| {
+            if let Some(hook) = hook.as_mut() { hook(session, output_index); }
+        });
         let result = session.insert_engine_deferred(table, values).map_err(core)?;
         if result.affected != 1 {
             return Err(Error::Conflict);
