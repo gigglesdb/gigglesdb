@@ -457,6 +457,7 @@ struct ShardState {
 }
 #[cfg(test)]
 thread_local! {
+    static PAYLOAD_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LOCK_ORDER: std::cell::RefCell<(Vec<usize>, usize)> = const { std::cell::RefCell::new((Vec::new(), 0)) };
 }
 #[derive(Debug)]
@@ -574,7 +575,7 @@ struct GroupContext<'a> {
 type RaceHook = Arc<dyn Fn() + Send + Sync>;
 #[cfg(test)]
 #[derive(Default)]
-struct TestHooks { h1: Mutex<Option<RaceHook>>, point: Mutex<Option<RaceHook>>, h2: Mutex<Option<RaceHook>>, h3: Mutex<Option<RaceHook>> }
+struct TestHooks { s2_false: Mutex<Option<RaceHook>>, h1: Mutex<Option<RaceHook>>, point: Mutex<Option<RaceHook>>, h2: Mutex<Option<RaceHook>>, h3: Mutex<Option<RaceHook>> }
 #[cfg(test)]
 impl std::fmt::Debug for TestHooks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("TestHooks") }
@@ -680,6 +681,8 @@ impl LockManager {
             if matches!(&key.key, LockKey::Interval { .. }) || self.hashed_shard(key) != index { return false; }
             // S2 must be read under the point's shard lock, after the test hook.
             if key.point().is_some_and(|(space, _, _)| self.gap_mode[space as usize].load(std::sync::atomic::Ordering::SeqCst)) { return false; }
+            #[cfg(test)]
+            run_hook(&self.hooks.s2_false);
             if let Some(locks) = state.key(key) {
                 for id in &locks.queue {
                     let waiter = state.waiter(id).expect("local waiter");
@@ -1198,6 +1201,11 @@ impl LockManager {
         state.notified = false;
     }
     fn hash(&self, key: &LockKey) -> u64 {
+        #[cfg(test)]
+        {
+            LOCK_ORDER.with(|order| assert!(order.borrow().0.is_empty(), "payload hashed while shard held"));
+            PAYLOAD_HASHES.with(|count| count.set(count.get() + 1));
+        }
         let mut h = self.hash_builder.build_hasher();
         match key {
             LockKey::Row { table, pk } | LockKey::RowKey { table, pk } => (0u8, table, pk).hash(&mut h),
@@ -1651,10 +1659,11 @@ fn restore_modes_never_recreates_released_ownership_at(shards: usize) {
     locks.restore_modes(txn, &previous);
     assert!(locks.held(txn).is_empty());
     {
+        let prepared = locks.prepare(key.clone());
         let state = locks.global().unwrap();
         assert!(state.guards.slice().iter().all(|s| !s.held.contains_key(&txn)));
         assert_eq!(locks.registry.rows(txn), 0);
-        assert!(!state.key(&locks.prepare(key.clone())).unwrap().holders.contains_key(&txn));
+        assert!(!state.key(&prepared).unwrap().holders.contains_key(&txn));
     }
     // Even when the key is held again, missing historical modes stay absent.
     locks.release_all(other);

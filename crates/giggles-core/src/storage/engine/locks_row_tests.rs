@@ -350,18 +350,19 @@ fn blocking_covered_group_preserves_member_mode_sets_and_skips_drain() {
     lm.acquire_points(txn, &[(k.clone(), LockMode::Exclusive), (d.clone(), LockMode::Exclusive)], None, &|| false).unwrap();
     // A cancelled waiter at D's head must stay queued: K's finish_group
     // clears provisional, and D's covered shortcut never drains or notifies.
+    let prepared = lm.prepare(d.clone());
+    let i = lm.shard(&d);
     let id = {
         let mut state = lm.global().unwrap();
         let id = lm.next_waiter.fetch_add(1, Ordering::Relaxed);
-        let i = lm.shard(&d);
         lm.registry.pending(TxnId(2), true);
         state.guards.slice_mut()[i].waiters.insert(id, Waiter {
-            txn: TxnId(2), key: lm.prepare(d.clone()), mode: LockMode::Exclusive,
-            upgrade: false, group: vec![(lm.prepare(d.clone()), LockMode::Exclusive)],
-            cancelled: true, slot: Arc::new(Slot::default()), prepared: PreparedKey::new(&lm.prepare(d.clone())),
+            txn: TxnId(2), key: prepared.clone(), mode: LockMode::Exclusive,
+            upgrade: false, group: vec![(prepared.clone(), LockMode::Exclusive)],
+            cancelled: true, slot: Arc::new(Slot::default()), prepared: PreparedKey::new(&prepared.clone()),
         });
         state.guards.slice_mut()[i].by_txn.entry(TxnId(2)).or_default().push(id);
-        state.key_mut(&lm.prepare(d.clone())).unwrap().queue.push(id);
+        state.key_mut(&prepared.clone()).unwrap().queue.push(id);
         id
     };
     lm.acquire_points(txn, &[(k.clone(), LockMode::Shared), (d.clone(), LockMode::Shared)], None, &|| false).unwrap();

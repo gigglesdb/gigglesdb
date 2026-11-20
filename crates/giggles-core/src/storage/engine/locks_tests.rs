@@ -894,7 +894,8 @@ fn release_all_visits_only_affected_keys_and_releases_queued_grants() {
     second.pending();
     // A grant from drain_queue must be tracked just like an immediate grant.
     lm.release_all(TxnId(3));
-    assert!(!lm.global().unwrap().key(&lm.prepare(row(1))).is_some());
+    let prepared = lm.prepare(row(1));
+    assert!(!lm.global().unwrap().key(&prepared).is_some());
     assert_eq!(lm.held(TxnId(2)), vec![(row(2), LockMode::Exclusive)]);
     lm.release_all(TxnId(2));
     second.granted();

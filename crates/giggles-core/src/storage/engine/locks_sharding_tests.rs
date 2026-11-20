@@ -199,6 +199,8 @@ trait ScriptManager: Send + Sync + 'static {
     fn release(&self, txn: TxnId);
     fn waiting(&self) -> usize;
     fn victim(&self, txn: TxnId);
+    fn modes(&self, txn: TxnId, keys: &[(LockKey, LockMode)]) -> Vec<(LockKey, HeldModes)>;
+    fn restore(&self, txn: TxnId, undo: &[(LockKey, HeldModes)]);
 }
 macro_rules! script_manager {
     ($t:ty) => { impl ScriptManager for $t {
@@ -209,6 +211,8 @@ macro_rules! script_manager {
         fn release(&self, txn: TxnId) { self.release_all(txn); }
         fn waiting(&self) -> usize { self.waiting_count() }
         fn victim(&self, txn: TxnId) { self.cancel_wait(txn); }
+        fn modes(&self, txn: TxnId, keys: &[(LockKey, LockMode)]) -> Vec<(LockKey, HeldModes)> { self.modes_on(txn, keys) }
+        fn restore(&self, txn: TxnId, undo: &[(LockKey, HeldModes)]) { self.restore_modes(txn, undo); }
     } };
 }
 script_manager!(LockManager);
@@ -460,6 +464,22 @@ fn terminal_notifications_before_cancel_callback_are_retained() {
     } }
 }
 
+fn park_passes(lm: &LockManager, count: usize) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+    let (send, at) = mpsc::channel(); let (go, resume) = mpsc::channel();
+    let resume = Mutex::new(resume); let calls = AtomicUsize::new(0);
+    *lm.hooks.h2.lock().unwrap() = Some(Arc::new(move || {
+        if calls.fetch_add(1, Ordering::Relaxed) < count {
+            send.send(()).unwrap();
+            resume.lock().unwrap().recv_timeout(Duration::from_secs(15)).unwrap();
+        }
+    }));
+    (at, go)
+}
+fn spawn_without_timer(m: &Arc<LockManager>, txn: u64, key: LockKey, mode: LockMode) -> Pending {
+    let (send, recv) = mpsc::channel(); let m = m.clone();
+    (thread::spawn(move || { send.send(m.acquire(TxnId(txn), key, mode, None, &|| false)).unwrap(); }), recv)
+}
+
 #[test]
 fn phase2_f1_pending_grantee_closes_cycle() {
     for drain in [false, true] {
@@ -469,33 +489,36 @@ fn phase2_f1_pending_grantee_closes_cycle() {
         if drain { lm.acquire(TxnId(3), t.clone(), LockMode::Share, None, &|| false).unwrap(); }
         lm.acquire(TxnId(2), t.clone(), LockMode::RowShare, None, &|| false).unwrap();
         lm.acquire(TxnId(1), row(1), LockMode::Exclusive, None, &|| false).unwrap();
-        let a = spawn(&lm, 1, t.clone(), LockMode::Share);
-        until(|| lm.waiting_count() == 1);
-        let b = spawn(&lm, 2, row(1), LockMode::Exclusive);
-        until(|| lm.waiting_count() == 2);
+        let (at, go) = park_passes(&lm, 2);
+        let a = spawn_without_timer(&lm, 1, t.clone(), LockMode::Share);
+        at.recv_timeout(Duration::from_secs(5)).unwrap();
+        let b = spawn_without_timer(&lm, 2, row(1), LockMode::Exclusive);
+        at.recv_timeout(Duration::from_secs(5)).unwrap();
         if drain {
             // Isolate the release-time notification obligation with a synthetic
             // queued upgrade. Normal enqueue would already detect the cycle
             // from this upgrade's FIFO edge, before its eventual grant.
             let slot = Arc::new(Slot::default());
+            let key = lm.prepare(t.clone());
+            let index = lm.hashed_shard(&key);
             {
                 let mut state = lm.global().unwrap();
                 let id = lm.next_waiter.fetch_add(1, Ordering::Relaxed);
-                let index = lm.shard(&t);
                 lm.registry.pending(TxnId(2), true);
                 state.guards.slice_mut()[index].waiters.insert(id, Waiter {
-                    txn: TxnId(2), key: lm.prepare(t.clone()), mode: LockMode::RowExclusive,
-                    upgrade: true, group: vec![(lm.prepare(t.clone()), LockMode::RowExclusive)],
-                    cancelled: false, slot: slot.clone(), prepared: PreparedKey::new(&lm.prepare(t.clone())),
+                    txn: TxnId(2), key: key.clone(), mode: LockMode::RowExclusive,
+                    upgrade: true, group: vec![(key.clone(), LockMode::RowExclusive)],
+                    cancelled: false, slot: slot.clone(), prepared: PreparedKey::new(&key.clone()),
                 });
                 state.guards.slice_mut()[index].by_txn.entry(TxnId(2)).or_default().push(id);
-                state.key_mut(&lm.prepare(t.clone())).unwrap().queue.insert(0, id);
+                state.key_mut(&key.clone()).unwrap().queue.insert(0, id);
             }
             lm.release_all(TxnId(3));
             assert_eq!(slot.result(), Some(Ok(())));
         } else {
             lm.acquire(TxnId(2), t, LockMode::RowExclusive, None, &|| false).unwrap();
         }
+        go.send(()).unwrap(); go.send(()).unwrap();
         let mut ar = None; let mut br = None;
         until(|| {
             if ar.is_none() { ar = a.1.try_recv().ok(); }
@@ -565,19 +588,19 @@ fn phase2_gap_switch_while_point_shard_is_locked() {
     let lm = Arc::new(LockManager::new(config(64)));
     let (send, at) = mpsc::channel();
     let (go, resume) = mpsc::channel(); let resume = Mutex::new(resume);
-    *lm.hooks.point.lock().unwrap() = Some(Arc::new(move || {
+    *lm.hooks.s2_false.lock().unwrap() = Some(Arc::new(move || {
         send.send(()).unwrap(); resume.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
     }));
     let point = spawn(&lm, 1, row(1), LockMode::Exclusive);
     at.recv_timeout(Duration::from_secs(5)).unwrap();
     let interval = spawn(&lm, 2, LockKey::Interval { space: LockSpace::Row, start: Bound::Unbounded, end: Bound::Unbounded }, LockMode::Shared);
     until(|| lm.gap_mode[0].load(Ordering::SeqCst));
-    *lm.hooks.point.lock().unwrap() = None;
+    *lm.hooks.s2_false.lock().unwrap() = None;
     go.send(()).unwrap();
     until(|| lm.waiting_count() == 1);
     let point_held = !lm.held(TxnId(1)).is_empty();
     let interval_held = !lm.held(TxnId(2)).is_empty();
-    assert_ne!(point_held, interval_held, "conflicting interval and point were both granted");
+    assert!(point_held && !interval_held, "interval must see the point committed after the S2 read");
     lm.release_all(if point_held { TxnId(1) } else { TxnId(2) });
     assert_eq!(finish(point), Ok(())); assert_eq!(finish(interval), Ok(()));
     lm.release_all(TxnId(1));
@@ -769,4 +792,99 @@ fn phase2_s3_escalates_before_a_covered_hit_touches_an_unsafe_queue() {
         if let Some(other) = other { lm.release_all(TxnId(3)); assert_eq!(finish(other), Ok(())); }
         lm.release_all(TxnId(2));
     }
+}
+
+#[test]
+fn phase2_shard_drain_cancelled_head_and_pending_follower() {
+    for other_pending in [false, true] {
+        let lm = Arc::new(LockManager::new(config(64)));
+        let t = LockKey::Table(0);
+        lm.acquire(TxnId(1), t.clone(), LockMode::RowShare, None, &|| false).unwrap();
+        let (at, go) = park_passes(&lm, if other_pending { 3 } else { 2 });
+        let c = spawn_without_timer(&lm, 2, t.clone(), LockMode::AccessExclusive);
+        at.recv_timeout(Duration::from_secs(5)).unwrap();
+        let other = if other_pending {
+            lm.acquire(TxnId(4), row(3), LockMode::Exclusive, None, &|| false).unwrap();
+            let p = spawn_without_timer(&lm, 3, row(3), LockMode::Exclusive);
+            at.recv_timeout(Duration::from_secs(5)).unwrap(); Some(p)
+        } else { None };
+        let f = spawn_without_timer(&lm, 3, t.clone(), LockMode::RowShare);
+        at.recv_timeout(Duration::from_secs(5)).unwrap();
+        let slots = {
+            let state = lm.global().unwrap();
+            [2, 3].into_iter().map(|txn| state.pending(TxnId(txn)).into_iter()
+                .map(|id| { let w = state.waiter(&id).unwrap(); (w.key.key.clone(), w.slot.clone()) }).collect::<Vec<_>>()).collect::<Vec<_>>()
+        };
+        let escalations = Arc::new(AtomicUsize::new(0));
+        *lm.hooks.h1.lock().unwrap() = Some(Arc::new({ let escalations = escalations.clone(); move || { escalations.fetch_add(1, Ordering::Relaxed); } }));
+        lm.cancel_wait(TxnId(2));
+        lm.acquire(TxnId(1), t.clone(), LockMode::RowExclusive, None, &|| false).unwrap();
+        assert_eq!(escalations.load(Ordering::Relaxed), usize::from(other_pending));
+        assert_eq!(slots[0][0].1.result(), Some(Err(LockError::Deadlock)));
+        for (key, slot) in &slots[1] {
+            if *key == t { assert_eq!(slot.result(), Some(Ok(()))); }
+            else { assert!(slot.m.lock().unwrap().recheck, "other shard was not notified"); }
+        }
+        for _ in 0..if other_pending { 3 } else { 2 } { go.send(()).unwrap(); }
+        assert_eq!(finish(c), Err(LockError::Deadlock)); assert_eq!(finish(f), Ok(()));
+        if let Some(other) = other { lm.release_all(TxnId(4)); assert_eq!(finish(other), Ok(())); }
+        for txn in 1..=4 { lm.release_all(TxnId(txn)); }
+        assert_eq!(lm.waiting_count(), 0);
+    }
+}
+
+#[test]
+fn phase2_nowait_limit_leaves_no_reservation_or_provisional() {
+    for shards in [1, 2, 64] {
+        let lm = LockManager::new(LockConfig { max_row_locks_per_txn: 2, ..config(shards) });
+        lm.acquire(TxnId(1), row(1), LockMode::Exclusive, None, &|| false).unwrap();
+        let group = [(row(2), LockMode::Exclusive), (row(3), LockMode::Exclusive)];
+        assert_eq!(lm.acquire_points(TxnId(1), &group, Some(Instant::now()), &|| false), Err(LockError::Limit));
+        assert_eq!(lm.waiting_count(), 0);
+        assert_eq!(lm.held(TxnId(1)), vec![(row(1), LockMode::Exclusive)]);
+        assert_eq!(lm.registry.stripe(TxnId(1))[&TxnId(1)].rows, 1);
+        assert_eq!(lm.registry.stripe(TxnId(1))[&TxnId(1)].pending, 0);
+        assert!(lm.shards.iter().all(|s| s.lock().unwrap().provisional.is_empty()));
+        lm.acquire_points(TxnId(1), &group[..1], Some(Instant::now()), &|| false).unwrap();
+        assert_eq!(lm.registry.stripe(TxnId(1))[&TxnId(1)].rows, 2);
+        lm.release_all(TxnId(1));
+    }
+}
+
+#[test]
+fn phase2_payload_hash_once_outside_shards() {
+    for shards in [1, 2, 64] {
+        let lm = LockManager::new(config(shards));
+        for key in [row(1), LockKey::RowKey { table: 1, pk: vec![2] }, LockKey::Unique { index: 1, tuple: vec![3] }, LockKey::Table(0)] {
+            let mode = if matches!(key, LockKey::Table(_)) { LockMode::RowExclusive } else { LockMode::Exclusive };
+            PAYLOAD_HASHES.with(|count| count.set(0));
+            lm.acquire(TxnId(1), key, mode, None, &|| false).unwrap();
+            assert_eq!(PAYLOAD_HASHES.with(|count| count.get()), 1);
+        }
+        lm.release_all(TxnId(1));
+    }
+}
+
+#[test]
+fn phase2_restore_downgrade_drains_overlapping_interval_and_points() {
+    fn scenario<M: ScriptManager>(m: Arc<M>) -> Vec<Result<(), LockError>> {
+        let interval = LockKey::Interval { space: LockSpace::Row, start: Bound::Included(point_bytes(1, &[1])), end: Bound::Included(point_bytes(1, &[1])) };
+        m.take(TxnId(1), row(1), LockMode::Shared, None, &|| false).unwrap();
+        let undo = m.modes(TxnId(1), &[(row(1), LockMode::Shared)]);
+        m.take(TxnId(1), row(1), LockMode::Exclusive, None, &|| false).unwrap();
+        let gap = spawn(&m, 2, interval.clone(), LockMode::Shared); until(|| m.waiting() == 1);
+        let reader = spawn(&m, 3, row(1), LockMode::Shared); until(|| m.waiting() == 2);
+        let writer = spawn(&m, 4, row(1), LockMode::Exclusive); until(|| m.waiting() == 3);
+        m.restore(TxnId(1), &undo);
+        let mut results = vec![finish(gap), finish(reader)];
+        assert!(m.snapshot(TxnId(2)).contains(&(interval, LockMode::Shared)));
+        assert!(m.snapshot(TxnId(3)).contains(&(row(1), LockMode::Shared)));
+        assert!(writer.1.try_recv().is_err());
+        m.release(TxnId(1)); m.release(TxnId(3));
+        assert!(writer.1.try_recv().is_err(), "interval must still block the writer");
+        m.release(TxnId(2)); results.push(finish(writer)); m.release(TxnId(4)); results
+    }
+    let expected = scenario(Arc::new(ReferenceLockManager::new(config(1))));
+    assert_eq!(expected, vec![Ok(()); 3]);
+    for shards in [1, 2, 64] { assert_eq!(scenario(Arc::new(LockManager::new(config(shards)))), expected); }
 }
