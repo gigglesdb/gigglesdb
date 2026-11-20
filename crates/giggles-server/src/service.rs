@@ -3019,24 +3019,31 @@ impl Session {
     }
     pub(crate) fn bind_prepared_relations(&mut self, p: &Prepared) -> Result<(), CoreError> {
         self.authority_scope(|session| {
-            for attempt in 0..3 {
+            let mut retries = 0u32;
+            loop {
                 let observation = session.sql.prepared_bind_observation()?;
                 // A cancelled wait must still recheck authority after committed
-                // drift. Mask cancellation only for this bounded metadata check;
-                // the next lock attempt still sees the original cancellation.
-                let bound = if attempt == 0 {
+                // drift. Mask cancellation only for this bounded metadata check.
+                let bound = if retries == 0 {
                     session.authorize_prepared_bind(p)?
                 } else {
                     giggles_core::cancellation::Cancellation::default()
                         .scope(|| session.authorize_prepared_bind(p))?
                 };
+                // Drift can return before any lock wait checks cancellation.
+                // Check the original request, after re-authorization, on every
+                // retry so catalog churn cannot hide cancellation or a deadline.
+                giggles_core::cancellation::check()?;
                 if bound.is_ddl() || session.sql.lock_prepared_relations(&bound, observation)? { return Ok(()); }
+                // Unrelated committed DDL is not a stale plan error. Retry until
+                // stable, yielding first and then backing off to at most 8 ms.
+                retries = (retries + 1).min(7);
+                if retries <= 3 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(1 << (retries - 4)));
+                }
             }
-            // Preserve fresh-Parse authorization ordering even on retry exhaustion.
-            let bound = giggles_core::cancellation::Cancellation::default()
-                .scope(|| session.authorize_prepared_bind(p))?;
-            session.sql.describe(&bound)?;
-            Err(CoreError::Sql(relational::SqlError::StaleSchema))
         })
     }
     pub fn open_cursor(&mut self, p: &Prepared, params: &[Value]) -> Result<Cursor, CoreError> {

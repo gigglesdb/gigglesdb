@@ -83,7 +83,10 @@ async fn case(label: &str, setup: &str, sql: &str, change: &str, expected: Optio
             .await
             .unwrap();
     }
-    let result = if label.starts_with("bind-drift") {
+    let result = if label.starts_with("bind-churn") {
+        bind_churn_probe(pg.address, &clients[0], &admin, label).await;
+        None
+    } else if label.starts_with("bind-drift") {
         if label.contains("view") {
             admin.roles().grant_table("v", "r", &[giggles_core::roles::TablePrivilege::Select]).unwrap();
         }
@@ -1052,4 +1055,92 @@ async fn describe_aborted_probe(address: std::net::SocketAddr, owner: &tokio_pos
 #[tokio::test]
 async fn describe_aborted_transaction_precedes_revoked_grants() {
     case("describe-aborted", "CREATE TABLE t(a int); GRANT SELECT ON t TO r", "", "", None).await;
+}
+
+// Force a committed catalog change after authorization on every retry. The
+// handshake is per attempt, so this does not depend on scheduler timing.
+async fn bind_churn_probe(
+    address: std::net::SocketAddr,
+    owner: &tokio_postgres::Client,
+    admin: &Admin,
+    label: &str,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    let startup = b"\0\x03\0\0user\0owner\0database\0postgres\0\0";
+    stream.write_u32((startup.len() + 4) as u32).await.unwrap();
+    stream.write_all(startup).await.unwrap();
+    receive(&mut stream, b'Z').await;
+    let mut parse = b"s\0".to_vec();
+    giggles_server::pgwire::z("INSERT INTO t(a) VALUES ($1)", &mut parse);
+    parse.extend_from_slice(&[0, 0]);
+    send(&mut stream, &[(b'P', &parse), (b'S', b"")]).await;
+    assert_eq!(response_code(&receive(&mut stream, b'Z').await), None);
+    let reached = Arc::new(AtomicUsize::new(0));
+    let released = Arc::new(AtomicUsize::new(0));
+    let interrupt = label != "bind-churn-stable";
+    let deadline = label == "bind-churn-timeout";
+    let (r, done) = (reached.clone(), released.clone());
+    admin.set_decision_hook(Some(Arc::new(move |point| {
+        if point != giggles_core::DecisionPoint::PreparedBindAuthorized { return; }
+        let attempt = r.fetch_add(1, Ordering::SeqCst) + 1;
+        if !interrupt && attempt > 8 { return; }
+        while done.load(Ordering::SeqCst) < attempt { std::thread::yield_now(); }
+        if interrupt && attempt == 8 {
+            let cancel = giggles_core::cancellation::Cancellation::current().unwrap();
+            if deadline { cancel.deadline(std::time::Instant::now()); }
+            else { assert!(cancel.cancel()); }
+        }
+    })));
+    // One text-format int parameter, no result formats.
+    send(&mut stream, &[(b'B', b"p\0s\0\0\0\0\x01\0\0\0\x01\x37\0\0"), (b'H', b"")]).await;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let read = async {
+            let tag = stream.read_u8().await.unwrap();
+            let len = stream.read_u32().await.unwrap();
+            assert!((4..65536).contains(&len));
+            let mut body = vec![0; len as usize - 4];
+            stream.read_exact(&mut body).await.unwrap();
+            assert!(matches!(tag, b'2' | b'E'), "unexpected Bind response: {tag}");
+            vec![(tag, body)]
+        };
+        tokio::pin!(read);
+        let churn = async {
+            for attempt in 1.. {
+                if !interrupt && attempt > 8 { break; }
+                while reached.load(Ordering::SeqCst) < attempt { tokio::task::yield_now().await; }
+                owner.batch_execute(&format!("CREATE TABLE unrelated_{attempt}(a int)")).await.unwrap();
+                released.store(attempt, Ordering::SeqCst);
+            }
+            std::future::pending::<()>().await;
+        };
+        tokio::select! { response = &mut read => response, () = churn => unreachable!() }
+    }).await;
+    // Always unblock a hook on failure, too.
+    released.store(usize::MAX, Ordering::SeqCst);
+    admin.set_decision_hook(None);
+    let response = response.expect("churning Bind must finish promptly");
+    assert_eq!(response_code(&response), if interrupt { Some("57014") } else { None }, "{response:?}");
+    assert!(reached.load(Ordering::SeqCst) >= 8);
+    if !interrupt {
+        send(&mut stream, &[(b'E', b"p\0\0\0\0\0"), (b'S', b"")]).await;
+        assert_eq!(response_code(&receive(&mut stream, b'Z').await), None);
+        let rows = owner.query("SELECT a FROM t", &[]).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<_, i32>(0), 7);
+    }
+    send(&mut stream, &[(b'X', b"")]).await;
+}
+
+#[tokio::test]
+async fn bind_catalog_churn_eventually_inserts() {
+    case("bind-churn-stable", "CREATE TABLE t(a int)", "", "", None).await;
+}
+#[tokio::test]
+async fn bind_catalog_churn_is_cancellable() {
+    case("bind-churn-cancel", "CREATE TABLE t(a int)", "", "", None).await;
+}
+#[tokio::test]
+async fn bind_catalog_churn_checks_statement_deadline() {
+    case("bind-churn-timeout", "CREATE TABLE t(a int)", "", "", None).await;
 }
