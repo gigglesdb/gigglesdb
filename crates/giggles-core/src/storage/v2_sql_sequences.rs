@@ -537,6 +537,11 @@ pub(in crate::storage) fn stage_pending(
     txn: &mut Transaction,
     pending: &sequences::Pending,
 ) -> Result<(), CoreError> {
+    // No counter writes or catalog read tracking are needed for an empty map.
+    // Release this guard before taking catalog locks, as on the nonempty path.
+    if pending.lock().map_err(|_| CoreError::Fenced)?.is_empty() {
+        return Ok(());
+    }
     let parts = db.catalog().parts(txn)?;
     let mut pending = pending.lock().map_err(|_| CoreError::Fenced)?;
     // A savepoint rollback can discard a RESTART's private definition. Exclude

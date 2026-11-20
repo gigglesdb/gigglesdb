@@ -567,3 +567,6 @@ mod sql_row_locks;
 
 #[path = "default_parse_cache.rs"]
 mod default_parse_cache;
+
+#[path = "catalog_read_fast_paths.rs"]
+mod catalog_read_fast_paths;

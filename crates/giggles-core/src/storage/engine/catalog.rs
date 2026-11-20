@@ -210,6 +210,10 @@ impl CatalogSnapshot {
         }
     }
 
+    pub(crate) fn cached_roles(&self) -> Option<Arc<crate::storage::roles::RoleImage>> {
+        self.roles.get().cloned()
+    }
+
     pub(crate) fn roles(
         &self,
         load: impl FnOnce()

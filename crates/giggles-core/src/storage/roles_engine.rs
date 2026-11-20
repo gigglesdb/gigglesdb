@@ -214,6 +214,15 @@ pub(crate) fn load_txn(txn: &mut Transaction) -> Result<RoleTable, RoleError> {
     Ok(image)
 }
 pub(super) fn image(db: &V2Db) -> Result<std::sync::Arc<super::RoleImage>, RoleError> {
+    // Pin the same fresh local timestamp as a READ COMMITTED transaction. Only
+    // reuse an image already loaded for that committed catalog version: loading
+    // through a later transaction could populate this version with newer roles.
+    // Cluster gateways and cold/publication misses retain the routed txn path.
+    if let Some((snapshot, _pin)) = db.catalog().current_local_metadata()?
+        && let Some(image) = snapshot.cached_roles()
+    {
+        return Ok(image);
+    }
     image_txn(db.catalog(), &mut db.begin(Isolation::ReadCommitted))
 }
 

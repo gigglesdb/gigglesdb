@@ -241,3 +241,105 @@ async fn concurrent_grant_revoke_visibility() {
     );
     f.stop().await;
 }
+
+#[tokio::test]
+async fn same_session_revoke_and_transactional_revoke_rejection() {
+    let f = Fixture::new().await;
+    f.flip(true).await;
+    f.admin.batch_execute("SET ROLE r").await.unwrap();
+    assert!(outcome(f.admin.simple_query("SELECT id FROM t").await));
+    f.admin.batch_execute("RESET ROLE").await.unwrap();
+    f.admin.batch_execute("BEGIN").await.unwrap();
+    // Role DDL is currently forbidden in explicit/implicit transactions. Private
+    // catalog overlays are covered by the core image_txn bypass tests instead.
+    let error = f
+        .admin
+        .batch_execute("REVOKE SELECT ON t FROM r")
+        .await
+        .unwrap_err();
+    assert_eq!(error.code().map(|c| c.code()), Some("25001"));
+    f.admin.batch_execute("ROLLBACK").await.unwrap();
+    f.admin.batch_execute("SET ROLE r").await.unwrap();
+    assert!(outcome(f.admin.simple_query("SELECT id FROM t").await));
+    f.admin.batch_execute("RESET ROLE").await.unwrap();
+    f.flip(false).await;
+    f.admin.batch_execute("SET ROLE r").await.unwrap();
+    assert!(!outcome(f.admin.simple_query("SELECT id FROM t").await));
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn other_session_ignores_rejected_private_revoke_then_sees_committed_revoke() {
+    let f = Fixture::new().await;
+    let reader = Fixture::connect(&f.pg, "r").await;
+    f.flip(true).await;
+    assert!(outcome(reader.simple_query("SELECT id FROM t").await));
+    f.admin.batch_execute("BEGIN").await.unwrap();
+    let error = f
+        .admin
+        .batch_execute("REVOKE SELECT ON t FROM r")
+        .await
+        .unwrap_err();
+    assert_eq!(error.code().map(|c| c.code()), Some("25001"));
+    assert!(outcome(reader.simple_query("SELECT id FROM t").await));
+    f.admin.batch_execute("ROLLBACK").await.unwrap();
+    f.flip(false).await;
+    assert!(!outcome(reader.simple_query("SELECT id FROM t").await));
+    drop(reader);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn next_statement_membership_revoke_drop_granted_role_and_nosuperuser() {
+    let f = Fixture::new().await;
+    let reader = Fixture::connect(&f.pg, "r").await;
+    for sql in [
+        "CREATE ROLE readers",
+        "GRANT SELECT ON t TO readers",
+        "GRANT readers TO r",
+    ] {
+        f.admin.batch_execute(sql).await.unwrap();
+    }
+    assert!(outcome(reader.simple_query("SELECT id FROM t").await));
+    f.admin
+        .batch_execute("REVOKE readers FROM r")
+        .await
+        .unwrap();
+    assert!(!outcome(reader.simple_query("SELECT id FROM t").await));
+    f.admin.batch_execute("GRANT readers TO r").await.unwrap();
+    assert!(outcome(reader.simple_query("SELECT id FROM t").await));
+    f.admin
+        .batch_execute("REVOKE SELECT ON t FROM readers")
+        .await
+        .unwrap();
+    // Warm the post-REVOKE version so the DROP below needs its own invalidation.
+    assert!(!outcome(reader.simple_query("SELECT id FROM t").await));
+    f.admin.batch_execute("DROP ROLE readers").await.unwrap();
+    assert!(!outcome(reader.simple_query("SELECT id FROM t").await));
+    drop(reader);
+    f.admin
+        .batch_execute("ALTER ROLE r SUPERUSER")
+        .await
+        .unwrap();
+    let reader = Fixture::connect(&f.pg, "r").await;
+    assert!(outcome(reader.simple_query("SELECT id FROM t").await));
+    f.admin
+        .batch_execute("ALTER ROLE r NOSUPERUSER")
+        .await
+        .unwrap();
+    // Attribute changes can fence the retained login binding before SQL runs,
+    // just as the existing DROP ROLE / NOLOGIN tests above document.
+    let error = reader.simple_query("SELECT id FROM t").await.unwrap_err();
+    assert!(
+        error.is_closed()
+            || error
+                .code()
+                .is_some_and(|c| matches!(c.code(), "28000" | "42501")),
+        "{error}"
+    );
+    drop(reader);
+    let reader = Fixture::connect(&f.pg, "r").await;
+    assert!(!outcome(reader.simple_query("SELECT id FROM t").await));
+    drop(reader);
+    f.stop().await;
+}

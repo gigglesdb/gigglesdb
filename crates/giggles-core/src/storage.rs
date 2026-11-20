@@ -2610,17 +2610,18 @@ impl SqlSession {
     /// Sequence names and owning tables for authorization, without evaluating SQL.
     pub fn sequence_owners(&self) -> Result<Vec<(String, Option<String>)>, CoreError> {
         let owners = |s: &MetadataState<'_>| {
+            let mut tables = std::collections::HashMap::with_capacity(s.sql.tables.len());
+            for table in s.sql.tables.values() {
+                // Preserve the first match used by the previous linear search.
+                tables.entry(table.id).or_insert(table);
+            }
             Ok(s.sql
                 .catalog_ext()
                 .sequences
                 .values()
                 .map(|d| {
                     let owner = d.owned_by.and_then(|(id, _)| {
-                        s.sql
-                            .tables
-                            .values()
-                            .find(|t| t.id == id)
-                            .map(|t| s.sql.table_key(t))
+                        tables.get(&id).map(|t| s.sql.table_key(t))
                     });
                     (d.name.clone(), owner)
                 })

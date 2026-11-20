@@ -20,7 +20,10 @@ fn role_cache_versions_and_reuse() {
     assert_ne!(before, version(db));
     assert!(roles.get("reader").unwrap().is_some());
     let first = roles.image().unwrap();
+    let before_read = crate::storage::engine::txn::engine_ops();
     let second = roles.image().unwrap();
+    assert_eq!(crate::storage::engine::txn::engine_ops(), before_read,
+        "a warm local role image must not open or snapshot a transaction");
     assert!(Arc::ptr_eq(&first.image, &second.image));
     first.get("reader").unwrap();
     assert_eq!(first.image.decoded.get().unwrap().len(), 1);
