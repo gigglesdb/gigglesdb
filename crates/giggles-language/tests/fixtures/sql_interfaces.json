@@ -262,7 +262,7 @@
     {"id":"sql_tables","value":128,"unit":"catalog tables","source":{"path":"crates/giggles-core/src/relational.rs","needle":"pub const MAX_TABLES: usize = 128;"}},
     {"id":"sql_result_bytes","value":1048576,"unit":"raw result value bytes","source":{"path":"crates/giggles-core/src/relational.rs","needle":"pub const MAX_RESULT_BYTES: usize = 1024 * 1024;"}},
     {"id":"sql_transactions","value":8,"unit":"staged transactions shared per legacy database (v2 databases admit relational::MAX_TRANSACTIONS = 128)","source":{"path":"crates/giggles-core/src/relational.rs","needle":"pub const LEGACY_MAX_TRANSACTIONS: usize = 8;"}},
-    {"id":"query_work","value":4096,"unit":"bounded query candidate work","source":{"path":"crates/giggles-core/src/relational/query.rs","needle":"const MAX_WORK: usize = 4096;"}},
+    {"id":"query_work","value":1000000,"unit":"default v2 statement token and query candidate work budget (session configurable)","source":{"path":"crates/giggles-core/src/relational.rs","needle":"pub const DEFAULT_MAX_STATEMENT_TOKENS: usize = MAX_INSERT_TOKENS;"}},
     {"id":"repair_sql_bytes","value":4096,"unit":"finite repair SQL bytes","source":{"path":"crates/giggles-core/src/sql.rs","needle":"sql.len() > 4096"}},
     {"id":"local_input_bytes","value":1048576,"unit":"local JSON input bytes","source":{"path":"crates/giggles-core/src/local.rs","needle":"pub const MAX_INPUT: usize = 1024 * 1024;"}},
     {"id":"local_output_bytes","value":67108864,"unit":"local JSON output bytes","source":{"path":"crates/giggles-core/src/local.rs","needle":"pub const MAX_OUTPUT: usize = 64 * 1024 * 1024;"}},

@@ -83,11 +83,15 @@ fn sum_and_avg_over_300_000_rows_match_postgresql() {
             .collect::<Vec<_>>();
         assert_eq!(got, expect);
         // Computed arguments are limited per value on v2 (DD-0068 Q4): 300k
-        // casts pass, and one value over the row limit still fails.
+        // casts pass. Large values pass at default and fail at a lowered budget.
         let r = s.execute("SELECT sum(length(c::text)) FROM t", &[], None).unwrap();
         assert_eq!(text(&r.rows[0].values[0]), "2588890");
+        let sql = "SELECT sum(length(repeat(c::text, 200000))) FROM t";
+        let r = s.execute(sql, &[], None).unwrap();
+        assert_eq!(text(&r.rows[0].values[0]), "517778000000");
+        s.set_max_value_bytes(65536);
         assert_eq!(
-            s.execute("SELECT sum(length(repeat(c::text, 200000))) FROM t", &[], None),
+            s.execute(sql, &[], None),
             Err(CoreError::Sql(SqlError::Limit))
         );
     }

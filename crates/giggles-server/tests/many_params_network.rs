@@ -124,7 +124,28 @@ async fn query(
     binary_parameters: bool,
     values: &[Option<&[u8]>],
 ) -> Response {
+    query_with_setting(fixture, sql, oids, binary_parameters, values, None).await
+}
+
+async fn query_with_setting(
+    fixture: &Fixture,
+    sql: &str,
+    oids: &[u32],
+    binary_parameters: bool,
+    values: &[Option<&[u8]>],
+    setting: Option<&str>,
+) -> Response {
     let mut stream = fixture.connect().await;
+    if let Some(setting) = setting {
+        let mut body = vec![];
+        cstr(setting, &mut body);
+        send(&mut stream, b'Q', &body).await;
+        loop {
+            let (tag, body) = read(&mut stream).await;
+            assert_ne!(tag, b'E', "SET failed: {body:?}");
+            if tag == b'Z' { break; }
+        }
+    }
     let mut parse = vec![0];
     cstr(sql, &mut parse);
     parse.extend((oids.len() as u16).to_be_bytes());
@@ -242,8 +263,12 @@ async fn many_parameters() {
  let sql=format!("SELECT id FROM t WHERE id IN ({})",(1..=n).map(|i|format!("${i}")).collect::<Vec<_>>().join(","));
  let values=vec![Some(b"1".as_slice());n];
  let response=query(&fixture,&sql,&vec![23;n],false,&values).await;
- // Scalar evaluation has an independent 1 MiB work budget.
- if n>=2045 {assert_eq!(response.errors,vec!["54000"]);} else {assert!(response.errors.is_empty(),"{response:?}");assert_eq!(response.rows.len(),1);}
+ // Legacy retains the fixed cap; v2 uses the session statement budget.
+ if engine==giggles_core::Engine::Legacy && n>=2045 {assert_eq!(response.errors,vec!["54000"]);} else {assert!(response.errors.is_empty(),"{response:?}");assert_eq!(response.rows.len(),1);}
+ if engine!=giggles_core::Engine::Legacy && n==2045 {
+ let response=query_with_setting(&fixture,&sql,&vec![23;n],false,&values,Some("SET gigglesdb.max_statement_tokens = 4096")).await;
+ assert_eq!(response.errors,vec!["54000"]);
+ }
  }
  let response=query(&fixture,"CREATE TABLE batch(a int, b int)",&[],false,&[]).await;
  assert!(response.errors.is_empty());

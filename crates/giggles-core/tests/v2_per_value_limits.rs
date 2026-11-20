@@ -72,8 +72,10 @@ fn v2_computed_and_distinct_aggregate_inputs_are_limited_per_value() {
         // Computed arguments: one length() per row, no shared total.
         assert_eq!(row(&mut s, "SELECT sum(length(w)), count(upper(w)) FROM t"), ["4200000", "200000"]);
         // Each value is limited on its own: 2,000 values of 43 KB (86 MB in all)
-        // pass, and a single value past the row limit still fails.
+        // pass. A 2.1 MB value passes at default, then fails at a lowered budget.
         assert_eq!(row(&mut s, "SELECT max(length(repeat(w, 2048))) FROM t WHERE id < 2000"), ["43008"]);
+        assert_eq!(row(&mut s, "SELECT max(length(repeat(w, 100000))) FROM t"), ["2100000"]);
+        s.set_max_value_bytes(65536);
         assert_eq!(
             s.execute("SELECT max(length(repeat(w, 100000))) FROM t", &[], None),
             Err(CoreError::Sql(SqlError::Limit))

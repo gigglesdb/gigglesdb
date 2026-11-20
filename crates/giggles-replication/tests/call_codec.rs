@@ -402,6 +402,7 @@ fn replies() -> Vec<Result<PeerReply, RangeError>> {
         Err(RangeError::NotLeader { hint: None }),
         Err(RangeError::StaleEpoch { descriptor: desc() }),
         Err(RangeError::Aborted("lease lost".into())),
+        Err(RangeError::Limit),
         Err(RangeError::Deadlock),
         Err(RangeError::LockTimeout),
         Err(RangeError::Cancelled),
@@ -456,7 +457,8 @@ fn unknown_tags_and_huge_counts_are_rejected() {
     assert!(decode_reply(&[1, 0, 49]).is_err());
     assert!(decode_reply(&[1, 0, 49, 2]).is_err());
     assert!(decode_reply(&[1, 0, 0]).is_err());
-    assert!(decode_reply(&[1, 1, 10]).is_err());
+    assert_eq!(decode_reply(&[1, 1, 10]).unwrap(), Err(RangeError::Limit));
+    assert!(decode_reply(&[1, 1, 11]).is_err());
     assert!(decode_reply(&[1, 2]).is_err());
     // A blockers reply claiming 2^32-1 entries fails without allocating them.
     let mut huge = vec![1, 0, 4];

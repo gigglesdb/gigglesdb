@@ -1,4 +1,4 @@
-use giggles_core::{Admin, Engine, Limits, relational::Value};
+use giggles_core::{Admin, CoreError, Engine, Limits, relational::{SqlError, Value}};
 #[test]
 fn parameter_sizes_and_timing() {
  for engine in [Engine::Legacy, #[cfg(feature="engine-rocksdb")] Engine::V2] {
@@ -15,7 +15,14 @@ fn parameter_sizes_and_timing() {
  eprintln!("F13 {engine:?} N={n} prepare+execute {:?}",start.elapsed());assert_eq!(rows.rows.len(),1);
  }
  let sql=format!("SELECT id FROM t WHERE id IN ({})",(1..=2045).map(|i|format!("${i}")).collect::<Vec<_>>().join(","));
+ if engine==Engine::Legacy {
  assert!(s.prepare(&sql).is_err());
+ } else {
+ let p=s.prepare(&sql).unwrap();
+ assert_eq!(s.execute_prepared(&p,&vec![Value::Int(1);2045],None).unwrap().rows.len(),1);
+ s.set_max_statement_tokens(4096);
+ assert_eq!(s.prepare(&sql).err(),Some(CoreError::Sql(SqlError::Limit)));
+ }
  if engine==Engine::Legacy {
  let p=s.prepare("SELECT $1").unwrap();
  assert!(s.execute_prepared(&p,&[Value::Text("x".repeat(65537))],None).is_err());
