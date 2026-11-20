@@ -457,7 +457,7 @@ fn legacy_bincode_exact_and_runtime_persistence_fails_closed() {
         epoch: s.epoch,
         next_id: s.next_id,
         next_version: s.next_version,
-        tables: &s.tables,
+        tables: s.tables.as_ref(),
         rows: &s.rows,
     };
     let bytes = bincode::serialize(&s).unwrap();

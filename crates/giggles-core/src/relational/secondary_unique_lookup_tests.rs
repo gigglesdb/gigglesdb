@@ -70,7 +70,7 @@ fn fixture() -> (Relational, TableDef, Descriptor) {
         )]
         .into(),
     );
-    s.tables.insert(t.name.clone(), t.clone());
+    std::sync::Arc::make_mut(&mut s.tables).insert(t.name.clone(), t.clone());
     let cols = [4, 5];
     s.secondary_configure_test(t.id, "decoy_nonunique", &cols, || false)
         .unwrap();
@@ -104,7 +104,7 @@ fn lookup<'a>(
 }
 fn frozen(s: &Relational) -> (Vec<u8>, Vec<u8>, u64, u64, u64, u64) {
     (
-        bincode::serialize(&(&s.tables, &s.rows)).unwrap(),
+        bincode::serialize(&(s.tables.as_ref(), &s.rows)).unwrap(),
         bincode::serialize(&s.secondary).unwrap(),
         s.epoch,
         s.generation,
@@ -228,7 +228,7 @@ fn all_six_legacy_kinds_and_empty_binary_values() {
         let (mut s, mut t, _) = fixture();
         s.secondary = si::Sidecar::default();
         t.columns[2].data_type = typ;
-        s.tables.insert(t.name.clone(), t.clone());
+        std::sync::Arc::make_mut(&mut s.tables).insert(t.name.clone(), t.clone());
         s.rows
             .get_mut(&1)
             .unwrap()
@@ -439,7 +439,7 @@ fn unsupported_keys_and_pk_refuse_even_valid_empty_source_and_null() {
             let mut s = s.clone();
             let mut t = t.clone();
             t.columns[pos].data_type = typ.clone();
-            s.tables.insert(t.name.clone(), t.clone());
+            std::sync::Arc::make_mut(&mut s.tables).insert(t.name.clone(), t.clone());
             for e in [eq(), [Value::Null, Value::Null]] {
                 let mut calls = 0;
                 assert_eq!(
@@ -461,8 +461,8 @@ fn borrowed_source_shape_admission_and_finite_limit_overflows_precede_callback()
     for which in 0..5 {
         let mut bad = s.clone();
         match which {
-            0 => bad.tables.get_mut("things").unwrap().name = "x".repeat(64),
-            1 => bad.tables.get_mut("things").unwrap().columns[4].name = "x".repeat(64),
+            0 => std::sync::Arc::make_mut(&mut bad.tables).get_mut("things").unwrap().name = "x".repeat(64),
+            1 => std::sync::Arc::make_mut(&mut bad.tables).get_mut("things").unwrap().columns[4].name = "x".repeat(64),
             2 => {
                 bad.rows
                     .get_mut(&1)
@@ -482,7 +482,7 @@ fn borrowed_source_shape_admission_and_finite_limit_overflows_precede_callback()
                     .values = vec![Value::Null; 65]
             }
             _ => {
-                bad.tables.get_mut("things").unwrap().primary_key = vec![0; 65];
+                std::sync::Arc::make_mut(&mut bad.tables).get_mut("things").unwrap().primary_key = vec![0; 65];
             }
         }
         let mut calls = 0;

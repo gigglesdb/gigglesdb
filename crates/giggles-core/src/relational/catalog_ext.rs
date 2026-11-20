@@ -1183,15 +1183,15 @@ impl Relational {
         ext.ext_version = ext.wire_version();
     }
     pub(crate) fn validate_unique_indexes(&self) -> R<()> {
-        super::column_collations::validate_index_bindings(&self.ext,self.secondary_descriptors_engine())?;
+        super::column_collations::validate_index_bindings(self.ext.as_ref(),self.secondary_descriptors_engine())?;
         validate_unique_indexes(
             self.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))),
             self.secondary.descriptors().iter(),
         )?;
-        validate_key_targets(&self.ext, self.tables.values(), self.secondary.descriptors().iter(), self.next_id)
+        validate_key_targets(self.ext.as_ref(), self.tables.values(), self.secondary.descriptors().iter(), self.next_id)
     }
     pub(crate) fn validate_ext(&self) -> R<()> {
-        self.validate_ext_candidate(&self.ext, self.next_id, None)
+        self.validate_ext_candidate(self.ext.as_ref(), self.next_id, None)
     }
     pub(super) fn validate_ext_candidate(
         &self,
@@ -1460,12 +1460,12 @@ impl Relational {
         &mut self,
         f: impl FnOnce(&mut CatalogExt, &mut u64) -> R<()>,
     ) -> R<()> {
-        let mut ext = self.ext.clone();
+        let mut ext = (*self.ext).clone();
         let mut next_id = self.next_id;
         f(&mut ext, &mut next_id)?;
         Self::normalize_ext(&mut ext);
         self.validate_ext_candidate(&ext, next_id, None)?;
-        self.ext = ext;
+        self.ext = Arc::new(ext);
         self.next_id = next_id;
         Ok(())
     }
@@ -1486,9 +1486,7 @@ impl Relational {
     }
     pub(crate) fn set_column_text_kind(&mut self, id: u64, kind: Option<TextKind>) -> R<()> {
         let mut candidate = self.clone();
-        let column = candidate
-            .tables
-            .values_mut()
+        let column = std::sync::Arc::make_mut(&mut candidate.tables).values_mut()
             .flat_map(|t| &mut t.columns)
             .find(|c| c.id == id)
             .ok_or(SqlError::Type)?;
@@ -1504,8 +1502,8 @@ impl Relational {
 
             None => DataType::Text,
         };
-        candidate.ext.columns.entry(id).or_default().text_kind = kind;
-        Self::normalize_ext(&mut candidate.ext);
+        std::sync::Arc::make_mut(&mut candidate.ext).columns.entry(id).or_default().text_kind = kind;
+        Self::normalize_ext(std::sync::Arc::make_mut(&mut candidate.ext));
         candidate.validate_ext()?;
         *self = candidate;
         Ok(())

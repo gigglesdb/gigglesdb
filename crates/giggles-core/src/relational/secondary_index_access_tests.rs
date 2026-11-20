@@ -503,7 +503,7 @@ fn canonical_oracle_all_nullable_range_pairs_and_inclusivity() {
 fn empty_typed_pk_or_index_schema_is_rejected() {
     for pos in [0, 2] {
         let (mut s, _) = setup();
-        s.tables.get_mut("items").unwrap().columns[pos].data_type = DataType::Numeric;
+        std::sync::Arc::make_mut(&mut s.tables).get_mut("items").unwrap().columns[pos].data_type = DataType::Numeric;
         let t = s.tables["items"].clone();
         let p = [t.columns[4].id];
         let eq = [(t.columns[2].id, Value::Null)];

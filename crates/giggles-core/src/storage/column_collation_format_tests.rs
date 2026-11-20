@@ -72,7 +72,7 @@ fn catalog_extension_and_v2_record_roundtrips_reject_malformed() {
         ext.column_collations.insert(id, b.clone());
         assert!(
             crate::relational::Relational::catalog_image(
-                state.sql.tables.clone(),
+                (*state.sql.tables).clone(),
                 ext,
                 u64::MAX,
                 1
@@ -85,7 +85,7 @@ fn catalog_extension_and_v2_record_roundtrips_reject_malformed() {
     ext.column_collations
         .insert(id, Binding::Column(Reference::User(999)));
     assert!(
-        crate::relational::Relational::catalog_image(state.sql.tables.clone(), ext, u64::MAX, 1)
+        crate::relational::Relational::catalog_image((*state.sql.tables).clone(), ext, u64::MAX, 1)
             .is_err()
     );
 }

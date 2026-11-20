@@ -117,7 +117,7 @@ impl Relational {
                 return Err(SqlError::Type);
             }
         }
-        for (key, table) in &self.tables {
+        for (key, table) in self.tables.iter() {
             if Some(table.id) != excluded {
                 ident(&table.name)?;
                 schema_binding::validate_key(key)?;
@@ -153,14 +153,14 @@ impl Relational {
                 || self.ext.collations.values().any(|c| c.schema == ddl.name)
                 || self.ext.sequences.values().any(|s| split_key(&s.name).0 == ddl.name)
             { return Err(SqlError::Unsupported); }
-            for column in self.ext.columns.values_mut() {
+            for column in std::sync::Arc::make_mut(&mut self.ext).columns.values_mut() {
                 if let Some(sql) = &mut column.default {
                     *sql = rename_default_schema(sql, &ddl.name, new)?;
                 }
             }
-            let schema = self.ext.schemas.remove(&ddl.name).unwrap();
-            self.ext.schemas.insert(new.clone(), schema);
-            for extension in self.ext.extensions.values_mut() {
+            let schema = std::sync::Arc::make_mut(&mut self.ext).schemas.remove(&ddl.name).unwrap();
+            std::sync::Arc::make_mut(&mut self.ext).schemas.insert(new.clone(), schema);
+            for extension in std::sync::Arc::make_mut(&mut self.ext).extensions.values_mut() {
                 if extension.schema == ddl.name { extension.schema = new.clone(); }
             }
         } else if ddl.create {
@@ -175,7 +175,7 @@ impl Relational {
                 return Err(SqlError::Limit);
             }
             let id = allocate(&mut self.next_id)?;
-            self.ext.schemas.insert(
+            std::sync::Arc::make_mut(&mut self.ext).schemas.insert(
                 ddl.name.clone(),
                 Schema {
                     id,
@@ -246,7 +246,7 @@ impl Relational {
             }
             let mut cascades: Vec<_> = extensions.iter().map(|n| format!("drop cascades to extension {n}")).collect();
             for (id, description, _) in defaults {
-                self.ext.columns.get_mut(&id).unwrap().default = None;
+                std::sync::Arc::make_mut(&mut self.ext).columns.get_mut(&id).unwrap().default = None;
                 cascades.push(format!("drop cascades to {description}"));
             }
             if cascades.len() == 1 {
@@ -254,18 +254,17 @@ impl Relational {
             } else if !cascades.is_empty() {
                 user_types::sql_notice_detail(format!("drop cascades to {} other objects", cascades.len()), cascades.join("\n"), "00000");
             }
-            for name in extensions { self.ext.extensions.remove(&name); }
+            for name in extensions { std::sync::Arc::make_mut(&mut self.ext).extensions.remove(&name); }
             for table in tables {
                 self.drop_table_with_actions(&table, true)?;
             }
-            self.ext
-                .sequences
-                .retain(|_, sequence| split_key(&sequence.name).0 != ddl.name);
-            self.ext.types.retain(|id, _| !types.contains(id));
-            self.ext.collations.retain(|_,c| c.schema != ddl.name);
-            self.ext.schemas.remove(&ddl.name);
+            std::sync::Arc::make_mut(&mut self.ext)
+                .sequences.retain(|_, sequence| split_key(&sequence.name).0 != ddl.name);
+            std::sync::Arc::make_mut(&mut self.ext).types.retain(|id, _| !types.contains(id));
+            std::sync::Arc::make_mut(&mut self.ext).collations.retain(|_,c| c.schema != ddl.name);
+            std::sync::Arc::make_mut(&mut self.ext).schemas.remove(&ddl.name);
         }
-        Self::normalize_ext(&mut self.ext);
+        Self::normalize_ext(std::sync::Arc::make_mut(&mut self.ext));
         self.epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
         Ok(SqlResult {
             affected: 1,

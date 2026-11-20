@@ -100,7 +100,7 @@ impl Relational {
         cap(self.rows.len(), MAX_TABLES)?;
         let ds = self.secondary.descriptors();
         cap(ds.len(), si::MAX_INDEXES)?;
-        for (name, t) in &self.tables {
+        for (name, t) in self.tables.iter() {
             cap(name.len(), 127)?;
             bytes = add(bytes, table_shape(t)?)?;
         }

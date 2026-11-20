@@ -32,7 +32,7 @@ impl Relational {
     // that exact old spelling; mismatched qualified keys still fail validation.
     pub(super) fn normalize_r1_relation_names(&mut self) -> Result<(), &'static str> {
         let mut tables = BTreeMap::new();
-        for (key, table) in std::mem::take(&mut self.tables) {
+        for (key, table) in std::mem::take(std::sync::Arc::make_mut(&mut self.tables)) {
             let key = if key == table.name {
                 relation_key(self.table_schema(table.id), &table.name)
             } else {
@@ -42,19 +42,20 @@ impl Relational {
                 return Err("duplicate normalized relation key");
             }
         }
-        self.tables = tables;
+        self.tables = Arc::new(tables);
         let mut renamed = BTreeMap::new();
-        for sequence in self.ext.sequences.values_mut() {
+        let ext = std::sync::Arc::make_mut(&mut self.ext);
+        for sequence in ext.sequences.values_mut() {
             if !sequence.name.contains('\0')
                 && let Some((table, _)) = sequence.owned_by
-                && let Some(schema) = self.ext.table_schemas.get(&table)
+                && let Some(schema) = ext.table_schemas.get(&table)
             {
                 let key = relation_key(schema, &sequence.name);
                 renamed.insert(sequence.name.clone(), key.clone());
                 sequence.name = key;
             }
         }
-        defaults::normalize_r1_sequence_defaults(&mut self.ext, &renamed)
+        defaults::normalize_r1_sequence_defaults(std::sync::Arc::make_mut(&mut self.ext), &renamed)
             .map_err(|_| "invalid R1 sequence default")?;
         Ok(())
     }
@@ -286,11 +287,11 @@ mod tests {
         run(&mut state, "CREATE SCHEMA b");
         run(&mut state, "CREATE TABLE a.t(id int PRIMARY KEY)");
         state.validate().unwrap();
-        let table = state.tables.remove("a\0t").unwrap();
-        state.tables.insert("b\0t".into(), table.clone());
+        let table = std::sync::Arc::make_mut(&mut state.tables).remove("a\0t").unwrap();
+        std::sync::Arc::make_mut(&mut state.tables).insert("b\0t".into(), table.clone());
         assert!(state.validate().is_err());
-        state.tables.remove("b\0t");
-        state.tables.insert("t".into(), table);
+        std::sync::Arc::make_mut(&mut state.tables).remove("b\0t");
+        std::sync::Arc::make_mut(&mut state.tables).insert("t".into(), table);
         assert!(state.validate().is_err());
     }
 

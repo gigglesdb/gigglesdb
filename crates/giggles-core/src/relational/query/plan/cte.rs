@@ -492,7 +492,7 @@ pub(super) fn install(
         id = id.checked_add(1).ok_or(SqlError::Limit)?;
         column.id = id;
         if let Some(typmod) = typmods.get(i).filter(|m| **m >= 0) {
-            state.ext.columns.insert(
+            std::sync::Arc::make_mut(&mut state.ext).columns.insert(
                 id,
                 catalog_ext::ColumnExt {
                     typmod: Some(*typmod),
@@ -501,7 +501,7 @@ pub(super) fn install(
             );
         }
     }
-    state.tables.insert(
+    std::sync::Arc::make_mut(&mut state.tables).insert(
         name.into(),
         TableDef {
             id: table_id,
@@ -1364,12 +1364,12 @@ pub(super) fn install_collated(
 ) -> R<()> {
     install(state, name, columns, typmods)?;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 62);
-    let table = state.tables.get_mut(name).unwrap();
+    let table = std::sync::Arc::make_mut(&mut state.tables).get_mut(name).unwrap();
     for c in &mut table.columns {
         let old = c.id;
         c.id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(ext) = state.ext.columns.remove(&old) {
-            state.ext.columns.insert(c.id, ext);
+        if let Some(ext) = std::sync::Arc::make_mut(&mut state.ext).columns.remove(&old) {
+            std::sync::Arc::make_mut(&mut state.ext).columns.insert(c.id, ext);
         }
     }
     functions::collation::register(&table.columns, metadata)

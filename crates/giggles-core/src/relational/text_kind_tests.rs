@@ -32,11 +32,11 @@ fn text_kind_roundtrips_and_old_namespace_tags() {
         (TextKind::Bpchar, DataType::Bpchar, None),
     ] {
         let (mut state, id) = fixture();
-        let old_tables = codec().serialize(&state.tables).unwrap();
+        let old_tables = codec().serialize(state.tables.as_ref()).unwrap();
         state.set_column_text_kind(id, Some(kind)).unwrap();
         state.set_column_typmod(id, typmod).unwrap();
         assert_eq!(state.ext.ext_version, 3);
-        assert_eq!(codec().serialize(&state.tables).unwrap(), old_tables);
+        assert_eq!(codec().serialize(state.tables.as_ref()).unwrap(), old_tables);
         let bytes = codec().serialize(&state).unwrap();
         let decoded = codec().deserialize::<Relational>(&bytes).unwrap();
         assert_eq!(decoded.tables["t"].columns[1].data_type, ty);
@@ -69,18 +69,18 @@ fn text_kind_invariants_and_wire_rejections() {
     state.set_column_typmod(id, Some(9)).unwrap();
     // Retain varchar(5)'s typmod: without its kind the legacy Text wire type
     // cannot accept that typmod. A bare kind-free Text payload remains legacy.
-    state.ext.columns.get_mut(&id).unwrap().text_kind = None;
-    state.ext.ext_version = 1;
+    std::sync::Arc::make_mut(&mut state.ext).columns.get_mut(&id).unwrap().text_kind = None;
+    Arc::make_mut(&mut state.ext).ext_version = 1;
     assert_invalid_catalog(&state);
-    state.ext.columns.get_mut(&id).unwrap().text_kind = Some(TextKind::Varchar);
-    state.ext.ext_version = 3;
-    state.tables.get_mut("t").unwrap().columns[1].data_type = DataType::Integer;
+    std::sync::Arc::make_mut(&mut state.ext).columns.get_mut(&id).unwrap().text_kind = Some(TextKind::Varchar);
+    Arc::make_mut(&mut state.ext).ext_version = 3;
+    std::sync::Arc::make_mut(&mut state.tables).get_mut("t").unwrap().columns[1].data_type = DataType::Integer;
     assert_invalid_catalog(&state);
     let (mut state, id) = fixture();
     state
         .set_column_text_kind(id, Some(TextKind::Varchar))
         .unwrap();
-    let valid = codec().serialize(&state.ext).unwrap();
+    let valid = codec().serialize(state.ext.as_ref()).unwrap();
     let relational = codec().serialize(&state).unwrap();
     let ext_offset = relational.len() - valid.len();
     assert_eq!(&relational[ext_offset..], valid);
@@ -180,7 +180,7 @@ fn all_text_kinds_share_one_catalog_and_legacy_payload() {
     assert_eq!(prefix, legacy);
     for bad in [4, 10_485_765] {
         let mut broken = state.clone();
-        broken.ext.columns.get_mut(&ids[0]).unwrap().typmod = Some(bad);
+        std::sync::Arc::make_mut(&mut broken.ext).columns.get_mut(&ids[0]).unwrap().typmod = Some(bad);
         assert_invalid_catalog(&broken);
     }
 }

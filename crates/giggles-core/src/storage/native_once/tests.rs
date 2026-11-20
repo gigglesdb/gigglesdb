@@ -996,10 +996,10 @@ fn once_replay_precedes_binding_after_a_table_name_disappears_and_is_reused() {
     admin
         .inner
         .change(|state| {
-            let mut table = state.sql.tables.remove("items").unwrap();
+            let mut table = Arc::make_mut(&mut state.sql.tables).remove("items").unwrap();
             assert_eq!(table.id, original_id);
             table.name = "archived".into();
-            assert!(state.sql.tables.insert(table.name.clone(), table).is_none());
+            assert!(Arc::make_mut(&mut state.sql.tables).insert(table.name.clone(), table).is_none());
             state.sql.epoch = state.sql.epoch.checked_add(1).unwrap();
             state.sql.validate().map_err(CoreError::Sql)
         })

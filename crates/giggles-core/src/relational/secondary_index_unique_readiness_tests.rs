@@ -47,7 +47,7 @@ fn fixture(values: Vec<Vec<Value>>) -> (Relational, Descriptor) {
         })
         .collect();
     state.rows.insert(1, rows);
-    state.tables.insert(t.name.clone(), t);
+    std::sync::Arc::make_mut(&mut state.tables).insert(t.name.clone(), t);
     (
         state,
         Descriptor {
@@ -182,7 +182,7 @@ fn boolean_and_integer_boundaries_use_legacy_admission() {
             row(1, Value::Int(lo), Value::Bool(false)),
             row(2, Value::Int(hi), Value::Bool(true)),
         ]);
-        let t = state.tables.get_mut("things").unwrap();
+        let t = std::sync::Arc::make_mut(&mut state.tables).get_mut("things").unwrap();
         t.columns[1].data_type = ty;
         t.columns[2].data_type = DataType::Boolean;
         assert!(result(&state, &d).is_ok());
@@ -192,7 +192,7 @@ fn boolean_and_integer_boundaries_use_legacy_admission() {
         Value::Int(i16::MAX as i64 + 1),
         Value::Bytes(vec![]),
     )]);
-    state.tables.get_mut("things").unwrap().columns[1].data_type = DataType::SmallInt;
+    std::sync::Arc::make_mut(&mut state.tables).get_mut("things").unwrap().columns[1].data_type = DataType::SmallInt;
     assert_eq!(error(&state, &d), SqlError::Type);
 }
 
@@ -210,7 +210,7 @@ fn unsupported_declared_keys_reject_even_empty() {
         DataType::Interval,
     ] {
         let (mut state, d) = fixture(vec![]);
-        state.tables.get_mut("things").unwrap().columns[1].data_type = ty;
+        std::sync::Arc::make_mut(&mut state.tables).get_mut("things").unwrap().columns[1].data_type = ty;
         assert_eq!(error(&state, &d), SqlError::Unsupported);
     }
 }
@@ -233,13 +233,13 @@ fn exact_stable_ownership_and_metadata_reject_mismatch() {
     changed.id = 2;
     assert_eq!(error(&state, &changed), SqlError::Type);
     let mut bad = state.clone();
-    bad.tables.get_mut("things").unwrap().name = "elsewhere".into();
+    std::sync::Arc::make_mut(&mut bad.tables).get_mut("things").unwrap().name = "elsewhere".into();
     assert_eq!(error(&bad, &d), SqlError::Type);
     bad = state.clone();
-    bad.tables.get_mut("things").unwrap().columns[1].id = 2;
+    std::sync::Arc::make_mut(&mut bad.tables).get_mut("things").unwrap().columns[1].id = 2;
     assert_eq!(error(&bad, &d), SqlError::Type);
     bad = state.clone();
-    bad.tables.get_mut("things").unwrap().primary_key = vec![0, 0];
+    std::sync::Arc::make_mut(&mut bad.tables).get_mut("things").unwrap().primary_key = vec![0, 0];
     assert_eq!(error(&bad, &d), SqlError::Type);
     bad = state.clone();
     bad.next_id = 4;
@@ -447,7 +447,7 @@ fn typed_nonkeys_stay_lossless_including_bounded_numeric() {
     {
         let (mut state, mut d) = fixture(vec![row(1, Value::Text("key".into()), value)]);
         d.columns = vec![3];
-        state.tables.get_mut("things").unwrap().columns[2].data_type = ty;
+        std::sync::Arc::make_mut(&mut state.tables).get_mut("things").unwrap().columns[2].data_type = ty;
         let before = raw_state(&state);
         assert!(result(&state, &d).is_ok());
         assert_eq!(before, raw_state(&state));
@@ -487,7 +487,7 @@ fn admission_cancels_before_later_rows_and_numeric_reservation_is_finite() {
     let n = Value::Numeric(Numeric::parse(&"9".repeat(giggles_pg_types::MAX_DIGITS)).unwrap());
     let (mut state, mut d) = fixture(vec![row(1, Value::Text("a".into()), n.clone())]);
     d.columns = vec![3];
-    state.tables.get_mut("things").unwrap().columns[2].data_type = DataType::Numeric;
+    std::sync::Arc::make_mut(&mut state.tables).get_mut("things").unwrap().columns[2].data_type = DataType::Numeric;
     let before = raw_state(&state);
     assert!(result(&state, &d).is_ok());
     assert_eq!(before, raw_state(&state));

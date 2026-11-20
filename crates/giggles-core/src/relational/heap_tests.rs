@@ -96,13 +96,13 @@ fn heap_marker_is_exact_and_invalid_offsets_are_safe() {
     }
     state.validate().unwrap();
     let mut malformed = state.clone();
-    malformed.tables.get_mut("h").unwrap().columns[2].not_null = false;
+    std::sync::Arc::make_mut(&mut malformed.tables).get_mut("h").unwrap().columns[2].not_null = false;
     assert_eq!(malformed.validate(), Err(SqlError::Reserved));
     let mut malformed = state.clone();
-    malformed.tables.get_mut("h").unwrap().primary_key = vec![usize::MAX];
+    std::sync::Arc::make_mut(&mut malformed.tables).get_mut("h").unwrap().primary_key = vec![usize::MAX];
     assert_eq!(malformed.validate(), Err(SqlError::Reserved));
     let mut malformed = state;
-    malformed.tables.get_mut("h").unwrap().columns[0].name = "giggles_other".into();
+    std::sync::Arc::make_mut(&mut malformed.tables).get_mut("h").unwrap().columns[0].name = "giggles_other".into();
     assert_eq!(malformed.validate(), Err(SqlError::Reserved));
 }
 

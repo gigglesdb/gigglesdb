@@ -920,7 +920,7 @@ fn bind_call(
         q.sources[0].name = INPUT.into();
         q.items = vec![(Item::Aggregate(a, call.args.first().cloned()), None)];
         let mut state = Relational::default();
-        state.tables.insert(INPUT.into(), table.clone());
+        std::sync::Arc::make_mut(&mut state.tables).insert(INPUT.into(), table.clone());
         let mut bound = q
             .bind_projection_seeded(&state, parameters.to_vec())?
             .with_clock(clock);

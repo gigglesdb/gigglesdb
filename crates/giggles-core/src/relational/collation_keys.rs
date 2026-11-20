@@ -238,7 +238,7 @@ mod tests {
             before
         );
         let mut byte_catalog = state.clone();
-        byte_catalog.ext.column_collations.clear();
+        std::sync::Arc::make_mut(&mut byte_catalog.ext).column_collations.clear();
         // Namespace 8 contains only the unchanged byte tuples. No new codec revision.
         let raw_sidecar = byte_catalog
             .secondary_build_complete_engine(byte_catalog.secondary.descriptors(), || false)

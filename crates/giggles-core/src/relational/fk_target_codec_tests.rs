@@ -152,9 +152,9 @@ fn legacy_paired_records_validate_targets_after_index_restore() {
     let p = sql.tables["p"].id; let c = sql.tables["c"].id;
     let index = sql.secondary_descriptors_engine()[0].id;
     let birth = sql.next_id; sql.next_id += 1;
-    sql.ext.primary_index_birth.insert(p, birth);
-    if let ConstraintKind::ForeignKey { target, .. } = &mut sql.ext.constraints.get_mut(&c).unwrap()[0].kind { *target = ReferencedKey::Secondary(index); }
-    Relational::normalize_ext(&mut sql.ext);
+    std::sync::Arc::make_mut(&mut sql.ext).primary_index_birth.insert(p, birth);
+    if let ConstraintKind::ForeignKey { target, .. } = &mut std::sync::Arc::make_mut(&mut sql.ext).constraints.get_mut(&c).unwrap()[0].kind { *target = ReferencedKey::Secondary(index); }
+    Relational::normalize_ext(std::sync::Arc::make_mut(&mut sql.ext));
     let (base, payload) = sql.secondary_persistence_engine(|| false).unwrap();
     let mut restored: Relational = bincode::deserialize(&base).unwrap();
     let pending = || secondary_index::codec::decode_pending(&payload, || false).unwrap();
@@ -162,7 +162,7 @@ fn legacy_paired_records_validate_targets_after_index_restore() {
     assert_eq!(restored, sql);
     for target in [ReferencedKey::Secondary(999), ReferencedKey::Secondary(sql.tables["c"].id)] {
         let mut bad: Relational = bincode::deserialize(&base).unwrap();
-        if let ConstraintKind::ForeignKey { target: saved, .. } = &mut bad.ext.constraints.get_mut(&c).unwrap()[0].kind { *saved = target; }
+        if let ConstraintKind::ForeignKey { target: saved, .. } = &mut std::sync::Arc::make_mut(&mut bad.ext).constraints.get_mut(&c).unwrap()[0].kind { *saved = target; }
         let before = bad.clone();
         assert_eq!(bad.secondary_restore_engine(pending(), || false), Err(SqlError::Type));
         assert_eq!(bad, before);

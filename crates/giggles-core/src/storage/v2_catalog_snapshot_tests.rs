@@ -264,3 +264,119 @@ fn legacy_view_bytes_survive_unrelated_ddl_and_reopen() {
     assert_eq!(tx.get(engine::kv::Keyspace::Catalog, &view_key(id)).unwrap(), Some(legacy));
     assert_eq!(db.catalog().parts(&mut tx).unwrap().sql_views, new.sql_views);
 }
+
+#[test]
+fn cow_catalog_write_visibility_across_isolation_levels() {
+    for level in [crate::SqlIsolation::ReadCommitted, crate::SqlIsolation::RepeatableRead, crate::SqlIsolation::Serializable] {
+        for read_table in [false, true] {
+            let f = Fixture::new();
+            let mut own = f.admin().sql_session();
+            let mut other = f.admin().sql_session();
+            own.set_isolation(level);
+            other.execute("CREATE TABLE changing(id bigint PRIMARY KEY)", &[], None).unwrap();
+            own.execute("BEGIN", &[], None).unwrap();
+            let alter = "ALTER TABLE changing ADD COLUMN extra bigint DEFAULT 7";
+            if read_table {
+                // AccessShare prevents concurrent ALTER until transaction end.
+                own.execute("SELECT id FROM changing", &[], None).unwrap();
+                let limits = crate::task::definition::LoadLimits { lock_wait_ms: 1, ..Default::default() };
+                {
+                    let _meter = crate::task::limits::metered(&limits);
+                    assert_eq!(other.execute(alter, &[], None).unwrap_err(), CoreError::LockNotAvailable);
+                }
+                own.execute("ROLLBACK", &[], None).unwrap();
+            } else {
+                own.execute("SELECT 1", &[], None).unwrap();
+            }
+            other.execute(alter, &[], None).unwrap();
+            if read_table { own.execute("BEGIN", &[], None).unwrap(); }
+            let insert = "INSERT INTO changing(id, extra) VALUES(2, 9)";
+            if !read_table && level != crate::SqlIsolation::ReadCommitted {
+                assert_eq!(own.execute(insert, &[], None).unwrap_err(),
+                    CoreError::Sql(crate::relational::SqlError::Conflict), "{level:?}");
+                own.execute("ROLLBACK", &[], None).unwrap();
+                own.execute("BEGIN", &[], None).unwrap();
+            }
+            own.execute(insert, &[], None).unwrap();
+            let p = own.prepare("SELECT id, extra FROM changing").unwrap();
+            let rows = own.open_cursor(&p, &[]).unwrap().fetch(10, 4096).unwrap();
+            assert_eq!(rows.iter().map(|r| r.values.clone()).collect::<Vec<_>>(),
+                vec![vec![Value::Int(2), Value::Int(9)]], "{level:?}");
+            own.execute("ROLLBACK", &[], None).unwrap();
+        }
+    }
+}
+
+#[test]
+fn cow_private_ddl_writes_and_savepoint_visibility() {
+    let f = Fixture::new();
+    let mut own = f.admin().sql_session();
+    let mut other = f.admin().sql_session();
+    own.execute("CREATE TABLE base(id bigint PRIMARY KEY)", &[], None).unwrap();
+    let missing_sequence = other.execute("SELECT nextval('never_created_seq')", &[], None).unwrap_err();
+    let before = other.execute("INSERT INTO base(id, extra) VALUES(1, 9)", &[], None).unwrap_err();
+    own.execute("BEGIN", &[], None).unwrap();
+    own.execute("SAVEPOINT s", &[], None).unwrap();
+    own.execute("CREATE SEQUENCE private_seq START WITH 20", &[], None).unwrap();
+    own.execute("ALTER TABLE base ADD COLUMN extra bigint DEFAULT 7", &[], None).unwrap();
+    own.execute("INSERT INTO base(id) VALUES(1),(2)", &[], None).unwrap();
+    let p = own.prepare("SELECT extra FROM base ORDER BY id").unwrap();
+    assert_eq!(own.open_cursor(&p, &[]).unwrap().fetch(10, 4096).unwrap().iter().map(|r|r.values.clone()).collect::<Vec<_>>(), vec![vec![Value::Int(7)],vec![Value::Int(7)]]);
+    let public = other.prepare("SELECT * FROM base").unwrap();
+    assert_eq!(other.describe(&public).unwrap().columns.len(), 1);
+    own.execute("ROLLBACK TO s", &[], None).unwrap();
+    assert_eq!(own.execute("INSERT INTO base(id, extra) VALUES(3, 9)", &[], None).unwrap_err(), before);
+    own.execute("ROLLBACK TO s", &[], None).unwrap();
+    assert_eq!(own.execute("SELECT nextval('private_seq')", &[], None).unwrap_err(), missing_sequence);
+    own.execute("ROLLBACK TO s", &[], None).unwrap();
+    own.execute("INSERT INTO base VALUES(4)", &[], None).unwrap();
+    own.execute("COMMIT", &[], None).unwrap();
+}
+
+#[test]
+fn cow_v2_template_survives_dml_hydration_cascades_and_upsert() {
+    let f = Fixture::new();
+    let mut sql = f.admin().sql_session();
+    for statement in [
+        "CREATE TABLE parent(id bigint PRIMARY KEY, n bigint)",
+        "CREATE TABLE child(id bigint PRIMARY KEY, pid bigint REFERENCES parent(id) ON DELETE CASCADE)",
+    ] { sql.execute(statement, &[], None).unwrap(); }
+    let db = f.db();
+    let mut tx = db.begin(engine::txn::Isolation::ReadCommitted);
+    let template = db.catalog().snapshot(&mut tx).unwrap().image().unwrap();
+    let before = template.catalog_parts();
+    tx.rollback();
+    for statement in [
+        "INSERT INTO parent VALUES(1,2),(2,3)",
+        "INSERT INTO child VALUES(10,1),(20,2)",
+        "INSERT INTO parent VALUES(1,8) ON CONFLICT(id) DO UPDATE SET n=excluded.n",
+        "UPDATE parent SET n=9 WHERE id=2",
+        "DELETE FROM parent WHERE id=1",
+    ] {
+        sql.execute(statement, &[], None).unwrap();
+        assert_eq!(template.catalog_parts(), before);
+        let mut tx = db.begin(engine::txn::Isolation::ReadCommitted);
+        let after = db.catalog().snapshot(&mut tx).unwrap().image().unwrap();
+        assert!(after.shares_catalog_with(&template), "{statement}");
+        let fork = after.catalog_image_for_statement(u64::MAX, 1);
+        assert!(fork.shares_catalog_with(&template));
+        tx.rollback();
+    }
+    for statement in ["ALTER TABLE parent ADD COLUMN extra bigint DEFAULT 7", "CREATE SEQUENCE seq", "ALTER SEQUENCE seq INCREMENT BY 3"] {
+        sql.execute(statement, &[], None).unwrap();
+        assert_eq!(template.catalog_parts(), before);
+        let mut tx = db.begin(engine::txn::Isolation::ReadCommitted);
+        let after = db.catalog().snapshot(&mut tx).unwrap().image().unwrap();
+        assert!(!after.shares_catalog_with(&template), "{statement}");
+        let (tables, ext, _, _) = after.catalog_parts();
+        assert!(tables["parent"].columns.iter().any(|column| column.name == "extra"));
+        if statement.starts_with("CREATE SEQUENCE") {
+            assert!(ext.sequences.values().any(|seq| seq.name == "seq" && seq.increment == 1));
+        } else if statement.starts_with("ALTER SEQUENCE") {
+            assert!(ext.sequences.values().any(|seq| seq.name == "seq" && seq.increment == 3));
+        }
+        tx.rollback();
+    }
+    let p = sql.prepare("SELECT id FROM child ORDER BY id").unwrap();
+    assert_eq!(sql.open_cursor(&p, &[]).unwrap().fetch(10,4096).unwrap()[0].values, vec![Value::Int(20)]);
+}

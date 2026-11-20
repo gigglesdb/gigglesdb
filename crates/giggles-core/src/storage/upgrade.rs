@@ -436,7 +436,7 @@ fn verify(
         return Err(io("upgrade verification engine"));
     };
     let mut expected = relational::Relational::catalog_image(
-        s.sql.tables.clone(),
+        (*s.sql.tables).clone(),
         s.sql.catalog_ext().clone(),
         u64::MAX,
         u64::MAX,

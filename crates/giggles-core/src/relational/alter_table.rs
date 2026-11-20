@@ -471,11 +471,11 @@ pub(super) fn execute(
                         *key += 1;
                     }
                 }
-                candidate.tables.insert(name.clone(), table.clone());
-                candidate.ext.column_collations.remove(&table.id);
-                if let Some(id)=type_id {candidate.ext.columns.entry(column.id).or_default().type_id=Some(id);}
-                if let Some(r)=reference {candidate.ext.column_collations.insert(column.id,column_collations::Binding::Column(r));}
-                Relational::normalize_ext(&mut candidate.ext);
+                std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(), table.clone());
+                std::sync::Arc::make_mut(&mut candidate.ext).column_collations.remove(&table.id);
+                if let Some(id)=type_id {std::sync::Arc::make_mut(&mut candidate.ext).columns.entry(column.id).or_default().type_id=Some(id);}
+                if let Some(r)=reference {std::sync::Arc::make_mut(&mut candidate.ext).column_collations.insert(column.id,column_collations::Binding::Column(r));}
+                Relational::normalize_ext(std::sync::Arc::make_mut(&mut candidate.ext));
                 let logical = match column.data_type {
                     DataType::Uuid => Some(catalog_ext::LogicalKind::Uuid),
                     DataType::Jsonb => Some(catalog_ext::LogicalKind::Jsonb),
@@ -485,8 +485,8 @@ pub(super) fn execute(
                     _ => None,
                 };
                 if let Some(kind) = logical {
-                    candidate.ext.logical_kinds.insert(column.id, kind);
-                    Relational::normalize_ext(&mut candidate.ext);
+                    std::sync::Arc::make_mut(&mut candidate.ext).logical_kinds.insert(column.id, kind);
+                    Relational::normalize_ext(std::sync::Arc::make_mut(&mut candidate.ext));
                 }
                 let kind = match column.data_type {
                     DataType::Varchar => Some(catalog_ext::TextKind::Varchar),
@@ -495,14 +495,12 @@ pub(super) fn execute(
                     _ => None,
                 };
                 if let Some(kind) = kind {
-                    candidate
-                        .ext
-                        .columns
-                        .entry(column.id)
+                    std::sync::Arc::make_mut(&mut candidate.ext)
+                        .columns.entry(column.id)
                         .or_default()
                         .text_kind = Some(kind);
                     // ext_version follows content (v3 iff any text_kind); validate_ext checks it.
-                    Relational::normalize_ext(&mut candidate.ext);
+                    Relational::normalize_ext(std::sync::Arc::make_mut(&mut candidate.ext));
                 }
                 if let Some(typmod) = typmod {
                     candidate.set_column_typmod(column.id, Some(typmod))?;
@@ -527,13 +525,13 @@ pub(super) fn execute(
                 let reference=column_collations::resolve_column(&candidate,&new,type_id,collation.as_deref(),path)?;
                 let rows=candidate.rows.get(&table.id).ok_or(SqlError::Type)?.clone();
                 table.columns[at]=new.clone();
-                candidate.tables.insert(name.clone(),table.clone());
-                let metadata=candidate.ext.columns.entry(new.id).or_default();
+                std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(),table.clone());
+                let metadata=std::sync::Arc::make_mut(&mut candidate.ext).columns.entry(new.id).or_default();
                 metadata.type_id=type_id;metadata.typmod = *typmod;
                 metadata.text_kind=match new.data_type {DataType::Varchar=>Some(catalog_ext::TextKind::Varchar),DataType::Bpchar=>Some(catalog_ext::TextKind::Bpchar),_=>None};
-                candidate.ext.column_collations.remove(&new.id);
-                if let Some(r)=reference {candidate.ext.column_collations.insert(new.id,column_collations::Binding::Column(r));}
-                Relational::normalize_ext(&mut candidate.ext);
+                std::sync::Arc::make_mut(&mut candidate.ext).column_collations.remove(&new.id);
+                if let Some(r)=reference {std::sync::Arc::make_mut(&mut candidate.ext).column_collations.insert(new.id,column_collations::Binding::Column(r));}
+                Relational::normalize_ext(std::sync::Arc::make_mut(&mut candidate.ext));
 
                 let mut converted=BTreeMap::new();
                 for (_,mut row) in rows {
@@ -556,7 +554,7 @@ pub(super) fn execute(
                 let replace_primary=table.primary_key.contains(&at);
                 if (table.logical_columns().count() <= 1 || replace_primary) && !collation_cascade {return Err(SqlError::Unsupported);}
                 if collation_cascade {
-                    for (owner,cs) in &mut candidate.ext.constraints {
+                    for (owner,cs) in &mut std::sync::Arc::make_mut(&mut candidate.ext).constraints {
                         cs.retain(|c|match &c.kind {
                             ConstraintKind::ForeignKey {columns,ref_table,ref_columns,..}=>!columns.contains(&id) && !(*ref_table==table.id && ref_columns.contains(&id)),
                             ConstraintKind::PrimaryKey=>*owner!=table.id || !replace_primary,
@@ -564,10 +562,10 @@ pub(super) fn execute(
                             _=>true
                         });
                     }
-                    if replace_primary {candidate.ext.primary_index_birth.remove(&table.id);}
+                    if replace_primary {std::sync::Arc::make_mut(&mut candidate.ext).primary_index_birth.remove(&table.id);}
                 }
                 if candidate.ext.constraints.values().flatten().any(|constraint| matches!(&constraint.kind, ConstraintKind::ForeignKey { columns, ref_table, ref_columns, .. } if columns.contains(&id) || (*ref_table == table.id && ref_columns.contains(&id)))) { return Err(SqlError::Unsupported); }
-                if let Some(cs) = candidate.ext.constraints.get_mut(&table.id) {
+                if let Some(cs) = std::sync::Arc::make_mut(&mut candidate.ext).constraints.get_mut(&table.id) {
                     cs.retain(|c| !matches!(&c.kind, ConstraintKind::Unique { columns, .. } if columns.contains(&id)));
                 }
                 let descriptors = candidate
@@ -577,7 +575,7 @@ pub(super) fn execute(
                     .cloned()
                     .collect::<Vec<_>>();
                 let removed_indexes=candidate.secondary_descriptors_engine().iter().filter(|d|d.table==table.id && d.columns.contains(&id)).map(|d|d.id).collect::<Vec<_>>();
-                for id in removed_indexes {candidate.ext.column_collations.remove(&id);}
+                for id in removed_indexes {std::sync::Arc::make_mut(&mut candidate.ext).column_collations.remove(&id);}
                 table.columns.remove(at);
                 if replace_primary {
                     table.primary_key=vec![table.columns.len()];
@@ -591,8 +589,8 @@ pub(super) fn execute(
                     rows.insert(pk(&table,&row.values)?,row);
                 }
                 candidate.rows.insert(table.id,rows);
-                candidate.tables.insert(name.clone(), table.clone());
-                if table.logical_columns().next().is_none() {candidate.ext.column_collations.insert(table.id,column_collations::Binding::EmptyTable);}
+                std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(), table.clone());
+                if table.logical_columns().next().is_none() {std::sync::Arc::make_mut(&mut candidate.ext).column_collations.insert(table.id,column_collations::Binding::EmptyTable);}
                 candidate.drop_column_ext(id)?;
                 candidate.secondary =
                     candidate.secondary_build_complete_engine(&descriptors, &mut *cancel)?;
@@ -604,7 +602,7 @@ pub(super) fn execute(
                     return Err(SqlError::DuplicateColumn);
                 }
                 table.columns[at].name = new.clone();
-                candidate.tables.insert(name.clone(), table.clone());
+                std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(), table.clone());
             }
             Action::RenameTable(new) => {
                 ident::ident(new)?;
@@ -614,10 +612,10 @@ pub(super) fn execute(
                     return Err(SqlError::DuplicateTable);
                 }
                 constraint_primary_key::retain_name_before_rename(&mut candidate, &table)?;
-                candidate.tables.remove(&name);
+                std::sync::Arc::make_mut(&mut candidate.tables).remove(&name);
                 name = relation_key(candidate.table_schema(table.id), new);
                 table.name = new.clone();
-                candidate.tables.insert(name.clone(), table.clone());
+                std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(), table.clone());
             }
             Action::Default(column, default) => {
                 let at = position(&table, column)?;
@@ -644,7 +642,7 @@ pub(super) fn execute(
                     return Err(SqlError::Null);
                 }
                 table.columns[at].not_null = *set;
-                candidate.tables.insert(name.clone(), table.clone());
+                std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(), table.clone());
             }
             Action::Unique(explicit, columns) => {
                 constraints::install_unique(&mut candidate, &table, explicit, columns, cancel)?;

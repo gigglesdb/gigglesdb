@@ -352,9 +352,7 @@ impl Mutation {
     }
     pub(super) fn catalog(&self, state: &Relational) -> R<Relational> {
         let mut catalog = state.clone();
-        let table = catalog
-            .tables
-            .get_mut(&self.target)
+        let table = std::sync::Arc::make_mut(&mut catalog.tables).get_mut(&self.target)
             .ok_or(SqlError::UnknownTable)?;
         table.columns.push(ColumnDef {
             id: 0,

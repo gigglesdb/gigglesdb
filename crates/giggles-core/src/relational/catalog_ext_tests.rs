@@ -74,7 +74,7 @@ fn fixture(ty: DataType) -> (Relational, u64) {
     let mut state = Relational::default();
     let p = Prepared::parse("CREATE TABLE t (id BIGINT PRIMARY KEY, value TEXT)", 1, 0).unwrap();
     state.execute(&p, &[], None).unwrap();
-    let table = state.tables.get_mut("t").unwrap();
+    let table = std::sync::Arc::make_mut(&mut state.tables).get_mut("t").unwrap();
     table.columns[1].data_type = ty;
     let id = table.columns[1].id;
     (state, id)
@@ -88,7 +88,7 @@ fn legacy(state: &Relational) -> Vec<u8> {
             state.epoch,
             state.next_id,
             state.next_version,
-            &state.tables,
+            state.tables.as_ref(),
             &state.rows,
         ))
         .unwrap()
@@ -102,9 +102,9 @@ fn wire(state: &Relational) -> Vec<u8> {
             state.epoch,
             state.next_id,
             state.next_version,
-            &state.tables,
+            state.tables.as_ref(),
             &state.rows,
-            &state.ext,
+            state.ext.as_ref(),
         ))
         .unwrap()
 }
@@ -228,7 +228,7 @@ fn catalog_ext_orphan_identity_and_constraint_reject_decode() {
         let mut seq = sequence(table, column);
         seq.identity = identity_sequence;
         let seq_id = invalid.add_sequence(seq).unwrap();
-        invalid.ext.columns.insert(
+        std::sync::Arc::make_mut(&mut invalid.ext).columns.insert(
             column,
             ColumnExt {
                 identity: Some(Identity {
@@ -241,7 +241,7 @@ fn catalog_ext_orphan_identity_and_constraint_reject_decode() {
         assert!(codec().deserialize::<Relational>(&wire(&invalid)).is_err());
     }
     let mut invalid = state;
-    invalid.ext.constraints.insert(
+    std::sync::Arc::make_mut(&mut invalid.ext).constraints.insert(
         u64::MAX,
         vec![Constraint {
             id: invalid.next_id,
@@ -285,7 +285,7 @@ fn catalog_ext_foreign_keys_owned_sequences_and_ids_are_validated() {
                 .is_err()
         );
         assert_eq!(invalid, before);
-        invalid.ext.constraints.insert(table.id, vec![constraint]);
+        std::sync::Arc::make_mut(&mut invalid.ext).constraints.insert(table.id, vec![constraint]);
         invalid.next_id += 1;
         assert!(codec().deserialize::<Relational>(&wire(&invalid)).is_err());
     }
@@ -296,13 +296,13 @@ fn catalog_ext_foreign_keys_owned_sequences_and_ids_are_validated() {
         let before = invalid.clone();
         assert!(invalid.add_sequence(seq.clone()).is_err());
         assert_eq!(invalid, before);
-        invalid.ext.sequences.insert(invalid.next_id, seq);
+        std::sync::Arc::make_mut(&mut invalid.ext).sequences.insert(invalid.next_id, seq);
         invalid.next_id += 1;
         assert!(codec().deserialize::<Relational>(&wire(&invalid)).is_err());
     }
     for id in [column, state.next_id] {
         let mut invalid = state.clone();
-        invalid.ext.constraints.insert(
+        std::sync::Arc::make_mut(&mut invalid.ext).constraints.insert(
             table.id,
             vec![Constraint {
                 id,
@@ -364,7 +364,7 @@ fn catalog_ext_invalid_typmods_reject_decode_and_mutation_atomically() {
             "{ty:?} {typmod}"
         );
         assert_eq!(state, before);
-        state.ext.columns.insert(
+        std::sync::Arc::make_mut(&mut state.ext).columns.insert(
             column,
             ColumnExt {
                 typmod: Some(typmod),
@@ -394,9 +394,9 @@ fn catalog_ext_orphan_columns_and_empty_format_two_reject_decode() {
             },
         ] {
             let mut invalid = state.clone();
-            invalid.ext.columns.insert(id, ext);
+            std::sync::Arc::make_mut(&mut invalid.ext).columns.insert(id, ext);
             if id == column {
-                invalid.tables.get_mut("t").unwrap().columns.pop();
+                std::sync::Arc::make_mut(&mut invalid.tables).get_mut("t").unwrap().columns.pop();
             }
             assert!(codec().deserialize::<Relational>(&wire(&invalid)).is_err());
         }
@@ -589,8 +589,8 @@ fn unique_origin_v7_roundtrip_and_old_index_has_no_origin() {
     assert!(!s.secondary_descriptors_engine().iter().any(|d| d.name == "ordered"));
     exec(&mut s, "DROP TABLE multi").unwrap();
     assert_eq!(s.ext.ext_version, 7);
-    let ext = codec().serialize(&s.ext).unwrap();
-    assert_eq!(codec().deserialize::<CatalogExt>(&ext).unwrap(), s.ext);
+    let ext = codec().serialize(s.ext.as_ref()).unwrap();
+    assert_eq!(codec().deserialize::<CatalogExt>(&ext).unwrap(), *s.ext);
     let (base, indexes) = s.secondary_persistence_engine(|| false).unwrap();
     let mut restored: Relational = bincode::deserialize(&base).unwrap();
     restored.secondary_restore_engine(secondary_index::codec::decode_pending(&indexes, || false).unwrap(), || false).unwrap();
@@ -606,7 +606,7 @@ fn unique_origin_v7_roundtrip_and_old_index_has_no_origin() {
     exec(&mut s, "ALTER TABLE u ADD CONSTRAINT again UNIQUE (label)").unwrap();
     exec(&mut s, "ALTER TABLE u DROP COLUMN label").unwrap_err(); // last logical column
     // Simulate a pre-v7 image: descriptors retain uniqueness, but origin is unknown.
-    s.ext.constraints.clear(); Relational::normalize_ext(&mut s.ext);
+    std::sync::Arc::make_mut(&mut s.ext).constraints.clear(); Relational::normalize_ext(std::sync::Arc::make_mut(&mut s.ext));
     let (base, indexes) = s.secondary_persistence_engine(|| false).unwrap();
     let mut old: Relational = bincode::deserialize(&base).unwrap();
     old.secondary_restore_engine(secondary_index::codec::decode_pending(&indexes, || false).unwrap(), || false).unwrap();
@@ -628,7 +628,7 @@ fn forged_unique_index_references_fail_legacy_restore_and_save() {
     for name in ["missing", "nonunique", "other_table", "wrongcols", "wrongorder"] {
         let mut bad = s.clone();
         let id = s.secondary_descriptors_engine().iter().find(|d| d.name == name).map_or(999, |d| d.id);
-        let ConstraintKind::Unique { index, .. } = &mut bad.ext.constraints.get_mut(&s.tables["u"].id).unwrap()[0].kind else { panic!() };
+        let ConstraintKind::Unique { index, .. } = &mut std::sync::Arc::make_mut(&mut bad.ext).constraints.get_mut(&s.tables["u"].id).unwrap()[0].kind else { panic!() };
         *index = id;
         assert_eq!(bad.secondary_persistence_engine(|| false), Err(SqlError::Type), "{name}");
         let mut restored: Relational = bincode::deserialize(&base).unwrap();

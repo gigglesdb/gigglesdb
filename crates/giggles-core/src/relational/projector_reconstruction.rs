@@ -351,7 +351,7 @@ impl ScratchRelation {
             epoch: counters.epoch,
             next_id: counters.next_id,
             next_version: counters.next_version,
-            tables: BTreeMap::from([(table.name.clone(), table.clone())]),
+            tables: BTreeMap::from([(table.name.clone(), table.clone())]).into(),
             rows: BTreeMap::from([(table.id, copied_rows)]),
             secondary: Default::default(),
             view_names: BTreeMap::new(),

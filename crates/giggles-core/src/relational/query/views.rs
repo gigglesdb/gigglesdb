@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(projection(&state,"v").unwrap_err(),SqlError::Unsupported);
         assert!(user_types::take_sql_error_message().unwrap().contains("recreate"));
         view.columns[0].source = Some(original_binding);
-        state.tables.get_mut("t").unwrap().columns.iter_mut().find(|c| c.id == original_binding.1).unwrap().id = 2000;
+        std::sync::Arc::make_mut(&mut state.tables).get_mut("t").unwrap().columns.iter_mut().find(|c| c.id == original_binding.1).unwrap().id = 2000;
         state.catalog_views(&definitions(view.clone())).unwrap();
         assert_eq!(projection(&state,"v").unwrap_err(),SqlError::UnknownColumn);
         view.columns[0].source = Some((100,1000));

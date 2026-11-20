@@ -141,7 +141,7 @@ impl Prepared {
             let mut binding = state.clone();
             if let Some(id) = state.view_names.get(source).map(|(id, _)| id) {
                 let view = &parts.sql_views[id];
-                binding.tables.insert(source.clone(), TableDef { id: *id, name: split_key(source).1.into(),
+                std::sync::Arc::make_mut(&mut binding.tables).insert(source.clone(), TableDef { id: *id, name: split_key(source).1.into(),
                     columns: view.columns.iter().map(|c| ColumnDef { id: c.id, name: c.name.clone(), data_type: c.storage_type.clone(), not_null: false }).collect(), primary_key: vec![] });
             }
             let mut outputs = query.view_projection(&binding)?;

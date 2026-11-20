@@ -60,7 +60,7 @@ impl Prepared {
         let ids: BTreeSet<_> = names.iter().map(|name| state.tables[name].id).collect();
         // Incarnation replacement is the existing transactional ALTER SEQUENCE
         // RESTART mechanism; old live reservations cannot overwrite the restart.
-        for sequence in state.ext.sequences.values_mut() {
+        for sequence in std::sync::Arc::make_mut(&mut state.ext).sequences.values_mut() {
             if sequence
                 .owned_by
                 .is_some_and(|(table, _)| ids.contains(&table))

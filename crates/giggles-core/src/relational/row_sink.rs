@@ -292,9 +292,7 @@ impl Relational {
                 clock,
             )
         } else {
-            for constraints in self.ext.constraints.values_mut() {
-                constraints.retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
-            }
+            self.suppress_foreign_keys();
             Ok(())
         }
     }

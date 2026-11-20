@@ -22,7 +22,7 @@ impl Relational {
             return Err(SqlError::Type);
         }
         let mut found = None;
-        for (name, table) in &self.tables {
+        for (name, table) in self.tables.iter() {
             tick(cancel)?;
             if table.id != table_id {
                 continue;
@@ -162,7 +162,7 @@ mod tests {
         };
         Relational {
             next_id: 3,
-            tables: BTreeMap::from([("items".into(), table)]),
+            tables: BTreeMap::from([("items".into(), table)]).into(),
             rows: BTreeMap::from([(1, BTreeMap::new())]),
             ..Relational::default()
         }
@@ -236,13 +236,13 @@ mod tests {
             }),
             Err(SqlError::Aborted)
         );
-        state.tables.get_mut("items").unwrap().primary_key = vec![99];
+        std::sync::Arc::make_mut(&mut state.tables).get_mut("items").unwrap().primary_key = vec![99];
         assert_eq!(
             state.with_complete_table_engine(1, || false, never),
             Err(SqlError::Null)
         );
-        state.tables.get_mut("items").unwrap().primary_key = vec![0];
-        state.tables.get_mut("items").unwrap().name = "other".into();
+        std::sync::Arc::make_mut(&mut state.tables).get_mut("items").unwrap().primary_key = vec![0];
+        std::sync::Arc::make_mut(&mut state.tables).get_mut("items").unwrap().name = "other".into();
         assert_eq!(
             state.with_complete_table_engine(1, || false, never),
             Err(SqlError::StaleSchema)
@@ -378,7 +378,7 @@ mod tests {
                 .canonical_pk_engine(1, &[Value::Int(7)], || false)
                 .is_ok()
         );
-        state.tables.get_mut("items").unwrap().columns[0].data_type = DataType::Text;
+        std::sync::Arc::make_mut(&mut state.tables).get_mut("items").unwrap().columns[0].data_type = DataType::Text;
         assert_eq!(
             state.canonical_pk_engine(1, &[Value::Int(7)], || false),
             Err(SqlError::Type)
@@ -398,7 +398,7 @@ mod tests {
         );
         assert_eq!(state, before);
         let duplicate = state.tables["items"].clone();
-        state.tables.insert("duplicate".into(), duplicate);
+        std::sync::Arc::make_mut(&mut state.tables).insert("duplicate".into(), duplicate);
         state.rows.insert(99, BTreeMap::new());
         assert_eq!(
             state.with_complete_table_engine(1, || false, |_, _| panic!("disclosed")),

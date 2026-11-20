@@ -704,12 +704,10 @@ pub(super) fn install_create(
     candidate.epoch = epoch;
     candidate.rows.insert(table.id, BTreeMap::new());
     if schema != "public" {
-        candidate.ext.table_schemas.insert(table.id, schema.into());
-        Relational::normalize_ext(&mut candidate.ext);
+        std::sync::Arc::make_mut(&mut candidate.ext).table_schemas.insert(table.id, schema.into());
+        Relational::normalize_ext(std::sync::Arc::make_mut(&mut candidate.ext));
     }
-    candidate
-        .tables
-        .insert(relation_key(schema, &table.name), table.clone());
+    std::sync::Arc::make_mut(&mut candidate.tables).insert(relation_key(schema, &table.name), table.clone());
     // Sequence mutators validate the complete catalog, including later columns.
     for (column, typmod) in table.columns.iter().zip(typmods) {
         let logical = match column.data_type {
@@ -721,8 +719,8 @@ pub(super) fn install_create(
             _ => None,
         };
         if let Some(kind) = logical {
-            candidate.ext.logical_kinds.insert(column.id, kind);
-            Relational::normalize_ext(&mut candidate.ext);
+            std::sync::Arc::make_mut(&mut candidate.ext).logical_kinds.insert(column.id, kind);
+            Relational::normalize_ext(std::sync::Arc::make_mut(&mut candidate.ext));
         }
         let kind = match column.data_type {
             DataType::Varchar => Some(catalog_ext::TextKind::Varchar),
@@ -731,17 +729,15 @@ pub(super) fn install_create(
             _ => None,
         };
         if let Some(kind) = kind {
-            candidate
-                .ext
-                .columns
-                .entry(column.id)
+            std::sync::Arc::make_mut(&mut candidate.ext)
+                .columns.entry(column.id)
                 .or_default()
                 .text_kind = Some(kind);
             // ext_version follows content (v3 iff any text_kind); validate_ext checks it.
-            Relational::normalize_ext(&mut candidate.ext);
+            Relational::normalize_ext(std::sync::Arc::make_mut(&mut candidate.ext));
         }
         if let Some(typmod) = typmod {
-            candidate.ext.columns.entry(column.id).or_default().typmod = Some(*typmod);
+            std::sync::Arc::make_mut(&mut candidate.ext).columns.entry(column.id).or_default().typmod = Some(*typmod);
         }
     }
     for (column, spec) in table.columns.iter().zip(sequences) {

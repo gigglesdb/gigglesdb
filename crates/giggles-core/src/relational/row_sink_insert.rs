@@ -113,7 +113,7 @@ pub(super) fn execute(
         // Outgoing FK checks see all input at statement end. Referenced-key
         // updates instead publish through the bounded referential-action queue.
         if foreign_keys && actions.is_none() {
-            page.ext.constraints.get_mut(&table.id).expect("FK constraints")
+            std::sync::Arc::make_mut(&mut page.ext).constraints.get_mut(&table.id).expect("FK constraints")
                 .retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
         }
         let mut batch = template.clone();

@@ -286,9 +286,9 @@ fn domain_state(base: &DataType, typmod: Option<i32>) -> (Relational, TableDef) 
         primary_key: vec![],
     };
     let mut state = Relational::default();
-    state.tables.insert(table.name.clone(), table.clone());
+    std::sync::Arc::make_mut(&mut state.tables).insert(table.name.clone(), table.clone());
     if typmod.is_some() {
-        state.ext.columns.entry(2).or_default().typmod = typmod;
+        std::sync::Arc::make_mut(&mut state.ext).columns.entry(2).or_default().typmod = typmod;
     }
     (state, table)
 }
@@ -412,7 +412,7 @@ pub(super) fn execute(state: &mut Relational, ddl: &Ddl, prepared: &Prepared) ->
                 .filter(|d| !d.columns.iter().any(|id| columns.contains(id)))
                 .cloned()
                 .collect();
-            for (key, original) in &state.tables {
+            for (key, original) in state.tables.iter() {
                 if !original.columns.iter().any(|c| columns.contains(&c.id)) {
                     continue;
                 }
@@ -472,7 +472,7 @@ pub(super) fn execute(state: &mut Relational, ddl: &Ddl, prepared: &Prepared) ->
                     }
                     rows = rebuilt;
                 }
-                candidate.tables.insert(key.clone(), table.clone());
+                std::sync::Arc::make_mut(&mut candidate.tables).insert(key.clone(), table.clone());
                 let constraints = candidate
                     .ext
                     .constraints
@@ -489,14 +489,14 @@ pub(super) fn execute(state: &mut Relational, ddl: &Ddl, prepared: &Prepared) ->
                         _ => true,
                     })
                     .collect();
-                candidate.ext.constraints.insert(table.id, retained);
+                std::sync::Arc::make_mut(&mut candidate.ext).constraints.insert(table.id, retained);
                 candidate.rows.insert(table.id, rows);
             }
-            for constraints in candidate.ext.constraints.values_mut() {
+            for constraints in std::sync::Arc::make_mut(&mut candidate.ext).constraints.values_mut() {
                 constraints.retain(|c| !matches!(&c.kind, ConstraintKind::ForeignKey { columns: local, ref_columns, .. } if local.iter().chain(ref_columns).any(|id| columns.contains(id))));
             }
-            candidate.ext.types.retain(|id, _| !ids.contains(id));
-            Relational::normalize_ext(&mut candidate.ext);
+            std::sync::Arc::make_mut(&mut candidate.ext).types.retain(|id, _| !ids.contains(id));
+            Relational::normalize_ext(std::sync::Arc::make_mut(&mut candidate.ext));
             candidate.secondary =
                 candidate.secondary_build_complete_engine(&descriptors, &mut || false)?;
             if detail.len() == 1 {

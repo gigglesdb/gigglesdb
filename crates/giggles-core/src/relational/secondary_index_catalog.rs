@@ -146,7 +146,7 @@ impl Relational {
         let mut equality_state;
         let equality = if let Some(collations) = collations {
             equality_state = self.clone();
-            equality_state.ext.column_collations.insert(id, column_collations::Binding::Index(collations.to_vec()));
+            std::sync::Arc::make_mut(&mut equality_state.ext).column_collations.insert(id, column_collations::Binding::Index(collations.to_vec()));
             &equality_state
         } else { &*self };
         if unique {
@@ -185,8 +185,8 @@ impl Relational {
         }
         self.secondary = staged;
         if let Some(collations) = collations {
-            self.ext.column_collations.insert(id, column_collations::Binding::Index(collations.to_vec()));
-            self.ext.ext_version = self.ext.ext_version.max(10);
+            std::sync::Arc::make_mut(&mut self.ext).column_collations.insert(id, column_collations::Binding::Index(collations.to_vec()));
+            std::sync::Arc::make_mut(&mut self.ext).ext_version = self.ext.ext_version.max(10);
         }
         self.next_id = next;
         self.epoch = epoch;

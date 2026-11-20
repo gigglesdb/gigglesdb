@@ -404,7 +404,7 @@ fn concurrent_catalog_and_data_commits_share_only_complete_validated_images() {
                     let mut tx = txn(seq, locks, 1000 + client * 100 + n);
                     let snapshot = catalog.snapshot(&mut tx).unwrap();
                     let image = snapshot.image().unwrap();
-                    assert_eq!(image.tables, snapshot.parts.tables);
+                    assert_eq!(*image.tables, snapshot.parts.tables);
                     image.validate().unwrap();
                     tx.lock_for_write(Keyspace::Rows, &[client as u8; 8], None, &|| false)
                         .unwrap();

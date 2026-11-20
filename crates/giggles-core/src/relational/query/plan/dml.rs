@@ -107,14 +107,14 @@ pub(super) fn execute<'e>(
     }
     let mut candidate = snapshot.clone();
     candidate.next_version = target.next_version;
-    candidate.ext.sequences = target.ext.sequences.clone();
-    for (name, table) in &catalog.tables {
+    if !std::sync::Arc::ptr_eq(&candidate.ext, &target.ext) && candidate.ext.sequences != target.ext.sequences { std::sync::Arc::make_mut(&mut candidate.ext).sequences = target.ext.sequences.clone(); }
+    for (name, table) in catalog.tables.iter() {
         if name.starts_with("\0plan_") {
-            candidate.tables.insert(name.clone(), table.clone());
+            std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(), table.clone());
             candidate.rows.insert(table.id, BTreeMap::new());
         }
     }
-    candidate.ext.columns = catalog.ext.columns.clone();
+    if !std::sync::Arc::ptr_eq(&candidate.ext, &catalog.ext) && candidate.ext.columns != catalog.ext.columns { std::sync::Arc::make_mut(&mut candidate.ext).columns = catalog.ext.columns.clone(); }
     // INSERT and MERGE occupancy includes earlier CTE writes, while their source
     // still reads the statement snapshot through the injected RowSource.
     if matches!(p.command(), "INSERT" | "MERGE")
@@ -181,7 +181,7 @@ pub(super) fn execute<'e>(
         rows.extend(changed);
     }
     target.next_version = candidate.next_version;
-    target.ext.sequences = candidate.ext.sequences;
+    if !std::sync::Arc::ptr_eq(&target.ext, &candidate.ext) && target.ext.sequences != candidate.ext.sequences { std::sync::Arc::make_mut(&mut target.ext).sequences = candidate.ext.sequences.clone(); }
     let descriptors = target.secondary_descriptors_engine().to_vec();
     target.secondary =
         target.secondary_build_complete_engine(&descriptors, || execution.cancelled())?;

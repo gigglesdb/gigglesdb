@@ -115,10 +115,10 @@ fn exact_restore_rejects_payload_rows_catalog_and_allocator_mismatches_atomicall
                 sql(&mut target, "INSERT INTO items VALUES (2,'b')");
             }
             2 => {
-                target.tables.get_mut("items").unwrap().columns[1].id += 100;
+                std::sync::Arc::make_mut(&mut target.tables).get_mut("items").unwrap().columns[1].id += 100;
             }
             3 => {
-                target.tables.get_mut("items").unwrap().id += 100;
+                std::sync::Arc::make_mut(&mut target.tables).get_mut("items").unwrap().id += 100;
             }
             _ => {
                 target.next_id = target.secondary.descriptors()[0].id;
@@ -245,7 +245,7 @@ fn empty_tables_require_supported_declared_pk_and_index_types() {
     for ty in [DataType::Numeric, DataType::Real, DataType::DoublePrecision] {
         for column in [0, 1] {
             let mut target: Relational = bincode::deserialize(&base).unwrap();
-            target.tables.get_mut("items").unwrap().columns[column].data_type = ty.clone();
+            std::sync::Arc::make_mut(&mut target.tables).get_mut("items").unwrap().columns[column].data_type = ty.clone();
             let before = target.clone();
             assert_eq!(
                 target.secondary_restore_engine(pending(&payload), || false),

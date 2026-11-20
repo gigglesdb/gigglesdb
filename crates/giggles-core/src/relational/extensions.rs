@@ -254,7 +254,7 @@ pub(super) fn execute(state: &mut Relational, ddl: &Ddl, prepared: &Prepared) ->
             );
         }
         let oid = user_types::type_oid(allocate(&mut state.next_id)?)?;
-        state.ext.extensions.insert(
+        std::sync::Arc::make_mut(&mut state.ext).extensions.insert(
             name.clone(),
             InstalledExtension {
                 schema,
@@ -292,11 +292,11 @@ pub(super) fn execute(state: &mut Relational, ddl: &Ddl, prepared: &Prepared) ->
             );
         }
         for (id, description, _) in defaults {
-            state.ext.columns.get_mut(&id).unwrap().default = None;
+            std::sync::Arc::make_mut(&mut state.ext).columns.get_mut(&id).unwrap().default = None;
             user_types::sql_notice(format!("drop cascades to {description}"), "00000");
         }
         for name in &ddl.names {
-            if state.ext.extensions.remove(name).is_none() {
+            if std::sync::Arc::make_mut(&mut state.ext).extensions.remove(name).is_none() {
                 user_types::sql_notice(
                     format!("extension \"{name}\" does not exist, skipping"),
                     "00000",
@@ -304,7 +304,7 @@ pub(super) fn execute(state: &mut Relational, ddl: &Ddl, prepared: &Prepared) ->
             }
         }
     }
-    state.ext.ext_version = state.ext.wire_version();
+    std::sync::Arc::make_mut(&mut state.ext).ext_version = state.ext.wire_version();
     Ok(())
 }
 
@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn stored_view_dependency_is_restricted() {
         let mut state = Relational::default();
-        state.ext.extensions.insert("uuid-ossp".into(), installed());
+        std::sync::Arc::make_mut(&mut state.ext).extensions.insert("uuid-ossp".into(), installed());
         let p = Prepared::parse("DROP EXTENSION \"uuid-ossp\"", 1, 0).unwrap();
         assert_eq!(
             p.check_extension_views(&state, [("v", "SELECT uuid_nil() AS u")].into_iter()),

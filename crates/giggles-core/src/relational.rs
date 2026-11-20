@@ -5,6 +5,7 @@ mod literal_syntax;
 mod numeric_literal_tests;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 mod alter_table;
 mod comments;
 mod security_label;
@@ -533,10 +534,10 @@ pub(crate) struct Relational {
     pub epoch: u64,
     next_id: u64,
     next_version: u64,
-    pub tables: BTreeMap<String, TableDef>,
+    pub tables: Arc<BTreeMap<String, TableDef>>,
     pub(crate) view_names: BTreeMap<String, (u64, R<query::views::Projection>)>, // Runtime-only; absent from namespace-5.
     rows: BTreeMap<u64, BTreeMap<Vec<u8>, SqlRow>>,
-    ext: CatalogExt,
+    ext: Arc<CatalogExt>,
     secondary: secondary_index::Sidecar,
 }
 impl Default for Relational {
@@ -547,15 +548,28 @@ impl Default for Relational {
             epoch: 0,
             next_id: 1,
             next_version: 1,
-            tables: BTreeMap::new(),
+            tables: Arc::new(BTreeMap::new()),
             view_names: BTreeMap::new(),
             rows: BTreeMap::new(),
-            ext: CatalogExt::default(),
+            ext: Arc::new(CatalogExt::default()),
             secondary: secondary_index::Sidecar::default(),
         }
     }
 }
 impl Relational {
+    /// Page-local FK checking is performed by the physical sink. Avoid copying
+    /// an otherwise immutable catalog when there are no checks to suppress.
+    fn suppress_foreign_keys(&mut self) {
+        if self.ext.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. })) {
+            for constraints in Arc::make_mut(&mut self.ext).constraints.values_mut() {
+                constraints.retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
+            }
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn shares_catalog_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.tables, &other.tables) && Arc::ptr_eq(&self.ext, &other.ext)
+    }
     /// Builds a rows-free v2 catalog image; row access must use RowSource/RowSink only.
     #[allow(dead_code)] // Awaiting v2 catalog integration.
     pub(crate) fn catalog_image(
@@ -572,15 +586,15 @@ impl Relational {
                 .values()
                 .map(|table| (table.id, BTreeMap::new()))
                 .collect(),
-            tables,
-            ext,
+            tables: Arc::new(tables),
+            ext: Arc::new(ext),
             next_id,
             next_version,
             ..Self::default()
         };
         image.validate()?;
-        image.ext.column_collations.extend(index_collations);
-        Self::normalize_ext(&mut image.ext);
+        std::sync::Arc::make_mut(&mut image.ext).column_collations.extend(index_collations);
+        Self::normalize_ext(std::sync::Arc::make_mut(&mut image.ext));
         Ok(image)
     }
     /// Fork a validated rows-free catalog template for a mutable statement.
@@ -601,8 +615,8 @@ impl Relational {
     #[allow(dead_code)] // Awaiting v2 catalog integration.
     pub(crate) fn catalog_parts(&self) -> (BTreeMap<String, TableDef>, CatalogExt, u64, u64) {
         (
-            self.tables.clone(),
-            self.ext.clone(),
+            (*self.tables).clone(),
+            (*self.ext).clone(),
             self.next_id,
             self.next_version,
         )
@@ -3709,7 +3723,7 @@ impl Relational {
         };
         let table_id = table.id;
         let epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
-        let mut ext = self.ext.clone();
+        let mut ext = (*self.ext).clone();
         for column in &table.columns {
             ext.columns.remove(&column.id);
             ext.column_collations.remove(&column.id);
@@ -3733,8 +3747,8 @@ impl Relational {
         self.validate_ext_candidate(&ext, self.next_id, Some(table_id))?;
         self.rows.remove(&table_id);
         self.secondary.drop_table(table_id);
-        self.tables.remove(name);
-        self.ext = ext;
+        std::sync::Arc::make_mut(&mut self.tables).remove(name);
+        self.ext = Arc::new(ext);
         self.epoch = epoch;
         Ok(true)
     }
@@ -3800,7 +3814,7 @@ impl Relational {
         }
         let mut ids = BTreeSet::new();
         let mut versions = BTreeSet::new();
-        for (name, t) in &self.tables {
+        for (name, t) in self.tables.iter() {
             schema_binding::validate_key(name)?;
             if name != &relation_key(self.table_schema(t.id), &t.name)
                 || t.id == 0
@@ -4274,8 +4288,8 @@ impl Relational {
                         .collect::<Vec<_>>();
                     self.secondary =
                         self.secondary_build_complete_engine(&descriptors, &mut cancel)?;
-                    self.ext.column_collations.remove(&descriptor.id);
-                    Self::normalize_ext(&mut self.ext);
+                    std::sync::Arc::make_mut(&mut self.ext).column_collations.remove(&descriptor.id);
+                    Self::normalize_ext(std::sync::Arc::make_mut(&mut self.ext));
                     self.epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
                 } else if sql_index::primary_table(self, &index.name).is_some() {
                     return Err(SqlError::DependentObjects);

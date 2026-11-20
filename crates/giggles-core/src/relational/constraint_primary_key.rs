@@ -114,9 +114,8 @@ pub(super) fn add(
             return Err(SqlError::Duplicate);
         }
     }
-    candidate
-        .tables
-        .insert(candidate.table_key(&keyed), keyed.clone());
+    let key = candidate.table_key(&keyed);
+    std::sync::Arc::make_mut(&mut candidate.tables).insert(key, keyed.clone());
     candidate.rows.insert(keyed.id, rows);
     // Missing births mean the PK precedes every secondary descriptor.
     if candidate.secondary_descriptors_engine().iter()
@@ -154,11 +153,11 @@ mod tests {
         ] {
             let mut state = Relational::default();
             run(&mut state, sql).unwrap();
-            let before = bincode::serialize(&state.ext).unwrap();
+            let before = bincode::serialize(state.ext.as_ref()).unwrap();
             let version = state.ext.wire_version();
             run(&mut state, "CREATE UNIQUE INDEX s ON t(a)").unwrap();
             assert_eq!(state.primary_key_order(state.tables["t"].id), 0);
-            assert_eq!(bincode::serialize(&state.ext).unwrap(), before);
+            assert_eq!(bincode::serialize(state.ext.as_ref()).unwrap(), before);
             assert_eq!(state.ext.wire_version(), version);
             assert!(!state.ext.has_key_dependency_identity()); // feature bit 17
         }
@@ -251,9 +250,9 @@ mod tests {
         run(&mut state, "CREATE TABLE oldname(a int PRIMARY KEY)").unwrap();
         let mut table = state.tables["oldname"].clone();
         retain_name_before_rename(&mut state, &table).unwrap();
-        state.tables.remove("oldname");
+        std::sync::Arc::make_mut(&mut state.tables).remove("oldname");
         table.name = "newname".into();
-        state.tables.insert(table.name.clone(), table.clone());
+        std::sync::Arc::make_mut(&mut state.tables).insert(table.name.clone(), table.clone());
         assert_eq!(
             primary_key_name(&state, &table),
             Some("oldname_pkey".into())
@@ -276,7 +275,7 @@ mod tests {
                 state.epoch,
                 state.next_id,
                 state.next_version,
-                &state.tables,
+                state.tables.as_ref(),
                 &state.rows,
             ))
             .unwrap();

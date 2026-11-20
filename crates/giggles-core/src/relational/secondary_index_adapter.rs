@@ -506,10 +506,10 @@ impl Serialize for StatementNamespace5<'_> {
         s.serialize_field("epoch", &self.source.epoch)?;
         s.serialize_field("next_id", &self.source.next_id)?;
         s.serialize_field("next_version", &self.next_version)?;
-        s.serialize_field("tables", &self.source.tables)?;
+        s.serialize_field("tables", self.source.tables.as_ref())?;
         s.serialize_field("rows", &StatementRows(self))?;
         if extended {
-            s.serialize_field("ext", &self.source.ext)?;
+            s.serialize_field("ext", self.source.ext.as_ref())?;
         }
         s.end()
     }
@@ -975,7 +975,7 @@ impl Relational {
             self.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))),
             staged.descriptors().iter(),
         )?;
-        super::catalog_ext::validate_key_targets(&self.ext, self.tables.values(), staged.descriptors().iter(), self.next_id)?;
+        super::catalog_ext::validate_key_targets(self.ext.as_ref(), self.tables.values(), staged.descriptors().iter(), self.next_id)?;
         tick(&mut cancel)?;
         self.secondary = staged;
         Ok(())
@@ -1197,10 +1197,10 @@ impl Serialize for LegacyNamespace5<'_> {
         s.serialize_field("epoch", &self.0.epoch)?;
         s.serialize_field("next_id", &self.0.next_id)?;
         s.serialize_field("next_version", &self.0.next_version)?;
-        s.serialize_field("tables", &self.0.tables)?;
+        s.serialize_field("tables", self.0.tables.as_ref())?;
         s.serialize_field("rows", &self.0.rows)?;
         if extended {
-            s.serialize_field("ext", &self.0.ext)?;
+            s.serialize_field("ext", self.0.ext.as_ref())?;
         }
         s.end()
     }
@@ -1240,18 +1240,18 @@ impl<'de> Deserialize<'de> for Relational {
                     epoch: field!("epoch"),
                     next_id: field!("next_id"),
                     next_version: field!("next_version"),
-                    tables: field!("tables"),
+                    tables: Arc::new(field!("tables")),
                     rows: field!("rows"),
-                    ext: CatalogExt::default(),
+                    ext: Arc::new(CatalogExt::default()),
                     secondary: Sidecar::default(),
                     view_names: BTreeMap::new(),
                 };
                 if format == 2 {
-                    value.ext = field!("ext");
+                    value.ext = Arc::new(field!("ext"));
                     if value.ext.is_empty() {
                         return Err(A::Error::custom("empty format-2 catalog extension"));
                     }
-                    for table in value.tables.values_mut() {
+                    for table in std::sync::Arc::make_mut(&mut value.tables).values_mut() {
                         for column in &mut table.columns {
                             if let Some(kind) =
                                 value.ext.columns.get(&column.id).and_then(|c| c.text_kind)
@@ -1266,7 +1266,7 @@ impl<'de> Deserialize<'de> for Relational {
                             }
                         }
                     }
-                    for table in value.tables.values_mut() {
+                    for table in std::sync::Arc::make_mut(&mut value.tables).values_mut() {
                         for column in &mut table.columns {
                             if let Some(kind) = value.ext.logical_kinds.get(&column.id) {
                                 if column.data_type != DataType::Text {

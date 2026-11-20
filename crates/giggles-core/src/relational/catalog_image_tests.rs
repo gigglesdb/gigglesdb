@@ -9,6 +9,14 @@ fn run(state: &mut Relational, sql: &str) {
         .unwrap_or_else(|error| panic!("execute {sql}: {error:?}"));
 }
 
+fn serial_clock() -> clock::ExecutionClock {
+    clock::ExecutionClock::new(&clock::ExecutionClock::pinned(0, None))
+        .with_sequences(Arc::new(|function, sequence, _, _| {
+            assert_eq!((function, sequence), ("nextval", "\"public\".t_id_seq"));
+            Ok(Value::Int(1))
+        }))
+}
+
 fn fixture() -> Relational {
     let mut state = Relational::default();
     run(
@@ -39,8 +47,7 @@ fn catalog_image_roundtrip_is_rows_free() {
     original.generation = 42;
     original.epoch = 19;
     let (tables, mut ext, next_id, next_version) = original.catalog_parts();
-    // Normalization uses the existing canonical metadata rules.
-    ext.columns.insert(u64::MAX, ColumnExt::default());
+    // Normalization uses the existing canonical metadata std::sync::Arc::make_mut(&mut rules.ext).columns.insert(u64::MAX, ColumnExt::default());
     ext.constraints.insert(u64::MAX, vec![]);
     ext.ext_version = 99;
     let image = Relational::catalog_image(tables, ext, next_id, next_version).unwrap();
@@ -67,17 +74,15 @@ fn assert_same_validation_error(state: Relational) {
 fn catalog_image_preserves_full_validation_errors() {
     let mut state = fixture();
     let column = state.tables["parent"].columns[0].id;
-    state.ext.columns.entry(column).or_default().identity = Some(Identity {
+    std::sync::Arc::make_mut(&mut state.ext).columns.entry(column).or_default().identity = Some(Identity {
         always: false,
         sequence_id: u64::MAX,
     });
     assert_same_validation_error(state);
 
     let mut state = fixture();
-    let fk = state
-        .ext
-        .constraints
-        .values_mut()
+    let fk = std::sync::Arc::make_mut(&mut state.ext)
+        .constraints.values_mut()
         .flatten()
         .find(|constraint| matches!(constraint.kind, ConstraintKind::ForeignKey { .. }))
         .unwrap();
@@ -87,7 +92,7 @@ fn catalog_image_preserves_full_validation_errors() {
     assert_same_validation_error(state);
 
     let mut state = fixture();
-    let table = state.tables.get_mut("parent").unwrap();
+    let table = std::sync::Arc::make_mut(&mut state.tables).get_mut("parent").unwrap();
     table.columns[1].id = table.columns[0].id;
     assert_same_validation_error(state);
 }
@@ -212,4 +217,84 @@ fn catalog_image_preserves_enforced_check_and_foreign_key() {
             "{sql}"
         );
     }
+}
+
+#[test]
+fn cow_forks_isolate_ddl_and_keep_plain_dml_catalog_shared() {
+    let mut original = Relational::default();
+    run(&mut original, "CREATE TABLE t(id serial PRIMARY KEY, n bigint)");
+    let (tables, ext, next_id, next_version) = original.catalog_parts();
+    let template = Relational::catalog_image(tables, ext, next_id, next_version).unwrap();
+    let before = template.catalog_parts();
+    for ddl in ["ALTER TABLE t ADD COLUMN extra bigint", "CREATE SEQUENCE seq"] {
+        let mut fork = template.catalog_image_for_statement(next_id, next_version);
+        assert!(fork.shares_catalog_with(&template));
+        run(&mut fork, ddl);
+        assert_eq!(template.catalog_parts(), before);
+        assert_ne!(fork, template);
+    }
+    let mut fork = template.catalog_image_for_statement(next_id, next_version);
+    for sql in ["INSERT INTO t VALUES(10,2),(20,3)", "INSERT INTO t(n) VALUES(5)", "UPDATE t SET n=4", "DELETE FROM t"] {
+        let prepared = Prepared::parse(sql, 1, fork.epoch).unwrap();
+        fork.execute_clocked(&prepared, &[], None, || false, Some(&serial_clock())).unwrap();
+        assert!(fork.shares_catalog_with(&template), "{sql}");
+        assert_eq!(template.catalog_parts(), before);
+    }
+    let mut fork = template.clone();
+    run(&mut fork, "CREATE SEQUENCE seq");
+    let before_sequence = fork.catalog_parts();
+    let mut altered = fork.clone();
+    run(&mut altered, "ALTER SEQUENCE seq INCREMENT BY 3");
+    assert_eq!(fork.catalog_parts(), before_sequence);
+    assert_ne!(fork.ext, altered.ext);
+    assert!(Arc::ptr_eq(&fork.tables, &altered.tables));
+}
+
+
+#[test]
+fn cow_sink_dml_forks_keep_catalog_shared() {
+    use crate::CoreError;
+    #[derive(Default)]
+    struct Sink(BTreeMap<Vec<u8>, SqlRow>);
+    impl row_sink::RowSink for Sink {
+        fn scan(&mut self, _: &TableDef, visit: &mut dyn FnMut(SqlRow) -> R<()>) -> Result<(), CoreError> {
+            for row in self.0.values() { visit(row.clone()).map_err(CoreError::Sql)?; }
+            Ok(())
+        }
+        fn lookup(&mut self, table: &TableDef, columns: &[u64], values: Option<&[Value]>, _: bool,
+            visit: &mut dyn FnMut(SqlRow) -> R<()>) -> Result<(), CoreError> {
+            for row in self.0.values() {
+                if values.is_none_or(|values| columns.iter().zip(values).all(|(id, value)| {
+                    let at = table.columns.iter().position(|c| c.id == *id).unwrap();
+                    row.values[at] == *value
+                })) { visit(row.clone()).map_err(CoreError::Sql)?; }
+            }
+            Ok(())
+        }
+        fn streams_index_builds(&self) -> bool { true }
+        fn ddl_pages(&mut self, _: &TableDef, _: &TableDef, _: bool,
+            page: &mut dyn FnMut(row_sink::DdlRows) -> Result<row_sink::DdlRows, CoreError>) -> Result<(), CoreError> {
+            self.0 = page(self.0.clone())?;
+            Ok(())
+        }
+        fn apply(&mut self, _: &TableDef, before: &row_sink::DdlRows, after: &row_sink::DdlRows) -> Result<(), CoreError> {
+            for key in before.keys() { self.0.remove(key); }
+            self.0.extend(after.clone());
+            Ok(())
+        }
+    }
+    let mut template = Relational::default();
+    run(&mut template, "CREATE TABLE t(id serial PRIMARY KEY, n bigint)");
+    let before = template.catalog_parts();
+    let mut sink = Sink::default();
+    for sql in ["INSERT INTO t VALUES(10,2),(20,3)", "INSERT INTO t(n) VALUES(5)", "UPDATE t SET n=4", "DELETE FROM t"] {
+        let next_version = sink.0.values().map(|row| row.version).max().unwrap_or(0) + 1;
+        let mut fork = template.catalog_image_for_statement(u64::MAX, next_version);
+        let p = Prepared::parse(sql, 1, fork.epoch).unwrap();
+        fork.execute_with_sink(&p, &[], None, Some(&serial_clock()), &mut sink, u64::MAX, None)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        assert!(fork.shares_catalog_with(&template), "{sql}");
+        assert_eq!(template.catalog_parts(), before);
+    }
+    assert!(sink.0.is_empty());
 }

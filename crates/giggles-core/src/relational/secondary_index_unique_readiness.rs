@@ -159,7 +159,7 @@ fn admit<F: FnMut() -> bool>(state: &Relational, d: &Descriptor, meter: &mut Met
     meter.bytes(add(d.name.len(), mul(d.columns.len(), 8)?)?)?;
     meter.work(add(1, d.columns.len())?)?;
     meter.checkpoint()?;
-    for (name, t) in &state.tables {
+    for (name, t) in state.tables.iter() {
         cap(name.len(), si::MAX_NAME)?;
         cap(t.name.len(), si::MAX_NAME)?;
         cap(t.columns.len(), MAX_COLUMNS)?;
@@ -224,7 +224,7 @@ fn metadata<'a, F: FnMut() -> bool>(
     )?)?;
     let mut ids = Vec::new();
     let mut selected = None;
-    for (name, t) in &state.tables {
+    for (name, t) in state.tables.iter() {
         meter.checkpoint()?;
         schema_binding::validate_key(name)?;
         ident(&t.name)?;

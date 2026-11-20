@@ -324,9 +324,7 @@ pub(super) fn execute(
         let mut page = state.clone();
         let before = rows.clone();
         page.rows.insert(table.id, rows);
-        for constraints in page.ext.constraints.values_mut() {
-            constraints.retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
-        }
+        page.suppress_foreign_keys();
         // Retain only page-local UNIQUE witnesses for exact immediate error
         // order. Non-unique entries are maintained solely by the physical sink.
         page.secondary = page.secondary_build_complete_engine(&unique,
@@ -484,9 +482,7 @@ pub(super) fn cascade(
         for rows in batches {
             let mut page = state.clone();
             page.rows.insert(table.id, rows.clone());
-            for cs in page.ext.constraints.values_mut() {
-                cs.retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
-            }
+            page.suppress_foreign_keys();
             rebuild(&mut page, &descriptors)?;
             let mut events = Vec::new();
             let batch = page.execute_statement_inner(prepared, params, None,

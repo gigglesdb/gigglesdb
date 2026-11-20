@@ -314,10 +314,10 @@ pub(super) fn install_unique(
     let epoch = state.epoch;
     let index = state.create_secondary_index_populated_engine(table, epoch, &name, &ids, true, None, &mut *cancel)?;
     let id = allocate(&mut state.next_id)?;
-    state.ext.constraints.entry(table.id).or_default().push(Constraint {
+    std::sync::Arc::make_mut(&mut state.ext).constraints.entry(table.id).or_default().push(Constraint {
         id, name, kind: ConstraintKind::Unique { columns: ids, index },
     });
-    Relational::normalize_ext(&mut state.ext);
+    Relational::normalize_ext(std::sync::Arc::make_mut(&mut state.ext));
     // The surrounding CREATE/ALTER owns the single schema epoch advance.
     state.epoch = epoch;
     Ok(())
@@ -483,13 +483,11 @@ pub(super) fn install(
         validate_kind(state, table, &kind, None, cancel)?;
     }
     let id = allocate(&mut state.next_id)?;
-    state
-        .ext
-        .constraints
-        .entry(table.id)
+    std::sync::Arc::make_mut(&mut state.ext)
+        .constraints.entry(table.id)
         .or_default()
         .push(Constraint { id, name, kind });
-    Relational::normalize_ext(&mut state.ext);
+    Relational::normalize_ext(std::sync::Arc::make_mut(&mut state.ext));
     Ok(())
 }
 fn validate_kind(
@@ -528,10 +526,8 @@ pub(super) fn validate_named(
         .ok_or(SqlError::UndefinedObject)?
         .clone();
     validate_kind(state, table, &constraint.kind, None, cancel)?;
-    let constraint = state
-        .ext
-        .constraints
-        .get_mut(&table.id)
+    let constraint = std::sync::Arc::make_mut(&mut state.ext)
+        .constraints.get_mut(&table.id)
         .and_then(|cs| cs.iter_mut().find(|c| c.id == constraint.id))
         .ok_or(SqlError::UndefinedObject)?;
     match &mut constraint.kind {
@@ -608,7 +604,7 @@ pub(super) fn drop_named_cascade(
             .filter(|d| d.id != index).cloned().collect::<Vec<_>>();
         state.secondary = state.secondary_build_complete_engine(&descriptors, &mut || false)?;
     }
-    let cs = state.ext.constraints.entry(table.id).or_default();
+    let cs = std::sync::Arc::make_mut(&mut state.ext).constraints.entry(table.id).or_default();
     if let Some(at) = cs.iter().position(|c| c.name == name) {
         if matches!(cs[at].kind, ConstraintKind::PrimaryKey) {
             return Err(SqlError::Unsupported);
@@ -618,9 +614,9 @@ pub(super) fn drop_named_cascade(
         return Err(SqlError::UndefinedObject);
     }
     if cs.is_empty() {
-        state.ext.constraints.remove(&table.id);
+        std::sync::Arc::make_mut(&mut state.ext).constraints.remove(&table.id);
     }
-    Relational::normalize_ext(&mut state.ext);
+    Relational::normalize_ext(std::sync::Arc::make_mut(&mut state.ext));
     Ok(())
 }
 

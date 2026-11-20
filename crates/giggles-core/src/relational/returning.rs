@@ -105,9 +105,7 @@ impl Returning {
 
     fn image_catalog(&self, state: &Relational) -> R<Relational> {
         let mut catalog = state.clone();
-        let table = catalog
-            .tables
-            .get_mut(self.query.target())
+        let table = std::sync::Arc::make_mut(&mut catalog.tables).get_mut(self.query.target())
             .ok_or(SqlError::UnknownTable)?;
         let columns = table.logical_columns().cloned().collect::<Vec<_>>();
         for image in ["old", "new"] {
