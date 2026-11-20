@@ -4204,6 +4204,26 @@ impl Relational {
                         matches!(&c.kind, ConstraintKind::ForeignKey { ref_table, .. } if ids.contains(ref_table)))) {
                     return Err(SqlError::DependentObjects);
                 }
+                if *cascade {
+                    let mut notices = Vec::new();
+                    for (id, constraints) in &self.ext.constraints {
+                        if ids.contains(id) { continue; }
+                        let Some(table) = self.tables.values().find(|t| t.id == *id) else { continue; };
+                        let schema = self.table_schema(*id);
+                        let table_name = if schema == "public" { table.name.clone() }
+                            else { format!("{schema}.{}", table.name) };
+                        for constraint in constraints {
+                            if matches!(&constraint.kind, ConstraintKind::ForeignKey { ref_table, .. } if ids.contains(ref_table)) {
+                                notices.push(format!("drop cascades to constraint {} on table {table_name}", constraint.name));
+                            }
+                        }
+                    }
+                    if notices.len() == 1 {
+                        user_types::sql_notice(notices.remove(0), "00000");
+                    } else if !notices.is_empty() {
+                        user_types::sql_notice_detail(format!("drop cascades to {} other objects", notices.len()), notices.join("\n"), "00000");
+                    }
+                }
                 for name in names { self.drop_table_with_actions(name, true)?; }
             }
             Statement::SetConstraints(_, _) => return Err(SqlError::NoActiveTransaction),

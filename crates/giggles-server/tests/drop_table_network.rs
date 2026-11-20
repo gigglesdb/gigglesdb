@@ -113,6 +113,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_engine(giggles_core::Engine::Legacy).await
+    }
+    async fn with_engine(engine: giggles_core::Engine) -> Self {
         // Require the task environment rather than silently placing durable fixtures in user TEMP.
         let root = std::path::PathBuf::from(
             std::env::var_os("TEMP").expect("set task TEMP under J:/gigglesdb-work"),
@@ -133,7 +136,7 @@ impl Fixture {
             SERIAL.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&path).unwrap();
-        let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+        let admin = Admin::create_engine(path.join("db.redb"), Limits::default(), engine).unwrap();
         admin
             .roles()
             .create(NewRole {
@@ -527,5 +530,107 @@ async fn builtin_schema_drop_checks_simple_and_extended() {
         drop(alice);
         drop(owner);
         f.pg.shutdown().await.unwrap();
+    }
+}
+
+async fn multi_drop_atomic(protocol: Protocol, engine: giggles_core::Engine) {
+    let f = Fixture::with_engine(engine).await;
+    let owner = f.connect("owner", "owner-pw").await;
+    for sql in [
+        "CREATE TABLE a (id INT PRIMARY KEY, body TEXT)",
+        "INSERT INTO a VALUES (1, 'kept')",
+        "CREATE TABLE b (id INT PRIMARY KEY)",
+        "CREATE TABLE child (id INT REFERENCES b(id))",
+    ] { protocol.ok(&owner, sql).await; }
+    for (sql, state) in [
+        ("DROP TABLE a, b", "2BP01"),
+        ("DROP TABLE a, b RESTRICT", "2BP01"),
+        ("DROP TABLE a, missing", "42P01"),
+        ("DROP TABLE IF EXISTS missing, a, b", "2BP01"),
+    ] {
+        protocol.error(&owner, sql, state).await;
+        assert_eq!(protocol.strings(&owner, "SELECT body FROM a").await, ["kept"]);
+    }
+    protocol.ok(&owner, "CREATE TABLE dup (id INT)").await;
+    protocol.ok(&owner, "DROP TABLE dup, dup").await;
+    protocol.ok(&owner, "DROP TABLE a, b CASCADE").await;
+    assert!(protocol.strings(&owner, "SELECT id FROM child").await.is_empty());
+    drop(owner);
+    f.pg.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn simple_multi_drop_atomic() { multi_drop_atomic(Protocol::Simple, giggles_core::Engine::Legacy).await; }
+#[tokio::test]
+async fn extended_multi_drop_atomic() { multi_drop_atomic(Protocol::Extended, giggles_core::Engine::Legacy).await; }
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn v2_multi_drop_atomic() {
+    for protocol in [Protocol::Simple, Protocol::Extended] {
+        multi_drop_atomic(protocol, giggles_core::Engine::V2).await;
+        let f = Fixture::with_engine(giggles_core::Engine::V2).await;
+        let owner = f.connect("owner", "owner-pw").await;
+        for sql in [
+            "CREATE TABLE a (id INT PRIMARY KEY, body TEXT)",
+            "INSERT INTO a VALUES (1, 'kept')",
+            "CREATE TABLE b (id INT PRIMARY KEY)",
+            "CREATE TABLE child (id INT REFERENCES b(id))",
+        ] { protocol.ok(&owner, sql).await; }
+        for (sql, state) in [
+            ("DROP TABLE a, b", "2BP01"),
+            ("DROP TABLE a, missing", "42P01"),
+        ] {
+            protocol.ok(&owner, "BEGIN").await;
+            protocol.error(&owner, sql, state).await;
+            protocol.ok(&owner, "ROLLBACK").await;
+            assert_eq!(protocol.strings(&owner, "SELECT body FROM a").await, ["kept"]);
+        }
+        protocol.ok(&owner, "BEGIN").await;
+        protocol.ok(&owner, "DROP TABLE a, b CASCADE").await;
+        protocol.ok(&owner, "ROLLBACK").await;
+        assert_eq!(protocol.strings(&owner, "SELECT body FROM a").await, ["kept"]);
+        // The rolled-back CASCADE must retain the dependent FK too.
+        protocol.error(&owner, "DROP TABLE b", "2BP01").await;
+        drop(owner);
+        f.pg.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn multi_drop_notices_simple_and_extended() {
+    let mut engines = vec![giggles_core::Engine::Legacy];
+    if cfg!(feature = "engine-rocksdb") { engines.push(giggles_core::Engine::V2); }
+    for engine in engines {
+        for protocol in [Protocol::Simple, Protocol::Extended] {
+            let f = Fixture::with_engine(engine).await;
+            let (owner, mut connection) = f.config("owner", "owner-pw").connect(NoTls).await.unwrap();
+            let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = notices.clone();
+            tokio::spawn(async move {
+                while let Some(message) = std::future::poll_fn(|cx| connection.poll_message(cx)).await {
+                    match message {
+                        Ok(tokio_postgres::AsyncMessage::Notice(notice)) => captured.lock().unwrap().push(notice.message().to_owned()),
+                        Err(_) => break,
+                        _ => {},
+                    }
+                }
+            });
+            for sql in [
+                "CREATE SCHEMA da",
+                "CREATE TABLE da.a (id INT PRIMARY KEY)",
+                "INSERT INTO da.a VALUES (1)",
+                "CREATE TABLE da.b (id INT PRIMARY KEY)",
+                "CREATE TABLE da.c (id INT, b INT REFERENCES da.b(id))",
+            ] { protocol.ok(&owner, sql).await; }
+            protocol.error(&owner, "DROP TABLE IF EXISTS da.missing, da.a, da.b", "2BP01").await;
+            assert_eq!(*notices.lock().unwrap(), ["table \"missing\" does not exist, skipping"]);
+            assert_eq!(protocol.strings(&owner, "SELECT id::text FROM da.a").await, ["1"]);
+            notices.lock().unwrap().clear();
+            protocol.ok(&owner, "DROP TABLE da.a, da.b CASCADE").await;
+            assert_eq!(*notices.lock().unwrap(), ["drop cascades to constraint c_b_fkey on table da.c"]);
+            drop(owner);
+            f.pg.shutdown().await.unwrap();
+        }
     }
 }

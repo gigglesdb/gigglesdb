@@ -82,13 +82,17 @@ mod tests {
 
     impl Database {
         fn new() -> Self {
+            Self::with_engine(crate::Engine::Legacy)
+        }
+
+        fn with_engine(engine: crate::Engine) -> Self {
             let mut nonce = [0; 16];
             getrandom::fill(&mut nonce).unwrap();
             let path = std::env::temp_dir().join(format!(
                 "gd55-drop-table-{:032x}",
                 u128::from_be_bytes(nonce)
             ));
-            let admin = Some(Admin::create(&path, Limits::default()).unwrap());
+            let admin = Some(Admin::create_engine(&path, Limits::default(), engine).unwrap());
             Self { admin, path }
         }
 
@@ -373,4 +377,29 @@ mod tests {
             })
             .unwrap();
     }
+    fn cascade_notice(engine: crate::Engine) {
+        let db = Database::with_engine(engine);
+        let mut session = db.admin().sql_session();
+        for text in [
+            "CREATE SCHEMA da",
+            "CREATE TABLE da.a (id INT PRIMARY KEY)",
+            "CREATE TABLE da.b (id INT PRIMARY KEY)",
+            "CREATE TABLE da.c (id INT, b INT REFERENCES da.b(id))",
+        ] { sql(&mut session, text); }
+        relational::take_sql_notices();
+        sql(&mut session, "DROP TABLE da.a, da.b CASCADE");
+        let notices = relational::take_sql_notices();
+        assert_eq!(notices, vec![(
+            "drop cascades to constraint c_b_fkey on table da.c".into(),
+            None, Some("00000"),
+        )]);
+    }
+
+    #[test]
+    fn multi_drop_cascade_notice_legacy() { cascade_notice(crate::Engine::Legacy); }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn multi_drop_cascade_notice_v2() { cascade_notice(crate::Engine::V2); }
+
 }

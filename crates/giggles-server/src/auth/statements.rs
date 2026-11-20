@@ -22,7 +22,7 @@ pub(crate) enum AdminStatement {
     Membership { grant: bool, roles: Vec<String>, members: Vec<String>, options: giggles_core::roles::MembershipOptions, revoke: Option<giggles_core::roles::MembershipOption>, grantor: Option<String>, cascade: bool },
     Drop(bool, Vec<String>),
     /// Existence and authorization are validated for all names before dropping.
-    /// Multi-name drops are not atomic: a later conflict can leave earlier names dropped.
+    /// Multi-name drops execute as one core statement after authorization.
     DropTable(bool, Vec<String>),
     Grant {
         grant: bool,
@@ -668,6 +668,48 @@ pub(crate) fn execute(
                 .sql_session()
                 .sequence_owners()
                 .map_err(|e| crate::service::sqlstate(&e))?;
+            if names.len() > 1 {
+                // Preserve the authorization/notice order above, but publish the
+                // complete set once. Per-table autocommits can lose earlier tables
+                // when a later target has dependencies, and reject duplicates.
+                let mut targets = Vec::new();
+                for name in names {
+                    if tables.iter().any(|table| {
+                        giggles_core::relational::relation_key(
+                            schemas.tables.get(&table.id).map_or("public", String::as_str),
+                            &table.name,
+                        ) == *name
+                    }) && !targets.contains(name) {
+                        targets.push(name.clone());
+                    }
+                }
+                if !targets.is_empty() {
+                    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+                    let target = targets.iter().map(|name| {
+                        let (schema, table) = name.split_once('\0').unwrap_or(("public", name.as_str()));
+                        format!("{}.{}", quote(schema), quote(table))
+                    }).collect::<Vec<_>>().join(", ");
+                    admin.sql_session().execute_unreleased(
+                        &format!("DROP TABLE {}{target}", if *if_exists { "IF EXISTS " } else { "" }),
+                        &[], None,
+                    ).and_then(|result| result.untasked()).map_err(|e| match e {
+                        CoreError::Sql(SqlError::Conflict) => "55P03",
+                        _ => crate::service::sqlstate(&e),
+                    })?;
+                    // No role-catalog cleanup until the whole core drop commits.
+                    for name in &targets {
+                        catalog.forget_table(name).map_err(|_| "XX000")?;
+                    }
+                    let live_sequences = admin.sql_session().sequence_owners()
+                        .map_err(|e| crate::service::sqlstate(&e))?;
+                    for (sequence, _) in &sequence_names {
+                        if !live_sequences.iter().any(|(name, _)| name == sequence) {
+                            catalog.forget_table(sequence).map_err(|_| "XX000")?;
+                        }
+                    }
+                }
+                return Ok("DROP TABLE");
+            }
             for name in names {
                 let dropped = admin.drop_table(name, *if_exists).map_err(|e| match e {
                     CoreError::Sql(SqlError::Conflict) => "55P03",
