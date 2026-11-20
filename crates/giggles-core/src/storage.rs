@@ -3979,17 +3979,22 @@ impl SqlSession {
     /// The returned descriptor supplies every logical column so final ingestion
     /// neither reevaluates defaults nor reserves a sequence a second time.
     pub fn normalize_copy_rows_at(
-        &mut self,
-        prepared: &relational::Prepared,
-        rows: Vec<Vec<relational::Value>>,
+        &mut self, prepared: &relational::Prepared, rows: Vec<Vec<relational::Value>>,
         clock: &relational::StatementClock,
     ) -> Result<(relational::Prepared, Vec<Vec<relational::Value>>), CoreError> {
+        let input = relational::CopyInput { rows: rows.into_iter().map(|row| row.into_iter().map(Some).collect()).collect(), options: relational::CopyOptions::default(), first_line: 1, skipped: 0 };
+        self.normalize_copy_cells_at(prepared, input, clock).map(|(p, rows, _)| (p, rows))
+    }
+    pub fn normalize_copy_cells_at(
+        &mut self, prepared: &relational::Prepared, input: relational::CopyInput,
+        clock: &relational::StatementClock,
+    ) -> Result<(relational::Prepared, Vec<Vec<relational::Value>>, u64), CoreError> {
         let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         relational::assert_sql_frontend_allowed();
         if let Backend::V2(db) = &self.admin.inner.backend {
             let db = db.clone();
-            return self.normalize_copy_v2(&db, prepared, rows, clock);
+            return self.normalize_copy_v2(&db, prepared, input, clock);
         }
         self.admin.inner.db(SQL_SESSIONS)?;
         let result = (|| {
@@ -4037,7 +4042,7 @@ impl SqlSession {
                     self.sequence_tables.clone(),
                     self.search_path.clone(),
                 ));
-            let output = state.sql.normalize_copy(prepared, rows, Some(&context));
+            let output = state.sql.normalize_copy(prepared, input, Some(&context));
             crate::cancellation::check()?;
             if let Some(error) = context.take_error() {
                 return Err(error);

@@ -942,3 +942,272 @@ async fn copy_option_parity() {
     send(&mut s, b'c', b"").await;
     drop(s); f.stop().await;
 }
+
+fn w1_field(body: &[u8], field: u8) -> Option<String> {
+    body.split(|b| *b == 0).find(|part| part.first() == Some(&field))
+        .map(|part| String::from_utf8(part[1..].to_vec()).unwrap())
+}
+fn w1_data(rows: &[(u8, Vec<u8>)]) -> Vec<Vec<Option<String>>> {
+    rows.iter().filter(|r| r.0 == b'D').map(|r| {
+        let count = u16::from_be_bytes(r.1[..2].try_into().unwrap());
+        let mut at = 2;
+        (0..count).map(|_| {
+            let length = i32::from_be_bytes(r.1[at..at + 4].try_into().unwrap()); at += 4;
+            if length == -1 { None } else {
+                let value = String::from_utf8(r.1[at..at + length as usize].to_vec()).unwrap(); at += length as usize; Some(value)
+            }
+        }).collect()
+    }).collect()
+}
+fn w1_notices(rows: &[(u8, Vec<u8>)]) -> Vec<String> {
+    rows.iter().filter(|r| r.0 == b'N').map(|r| {
+        assert_eq!(w1_field(&r.1, b'C').as_deref(), Some("00000"));
+        w1_field(&r.1, b'M').unwrap()
+    }).collect()
+}
+async fn w1_copy(s: &mut TcpStream, sql: &str, data: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let r = query(s, sql).await;
+    assert_eq!(tags(&r), b"G", "{r:?}");
+    send(s, b'd', data).await;
+    send(s, b'c', b"").await;
+    let mut replies = read(s).await;
+    while replies.last().is_some_and(|r| r.0 != b'Z') {
+        let next = read(s).await; assert!(!next.is_empty(), "{replies:?}"); replies.extend(next);
+    }
+    replies
+}
+fn w1_tag(rows: &[(u8, Vec<u8>)], count: usize) {
+    assert!(!rows.iter().any(|r| r.0 == b'E'), "{rows:?}");
+    assert_eq!(rows.iter().find(|r| r.0 == b'C').unwrap().1, format!("COPY {count}\0").as_bytes());
+}
+#[tokio::test]
+async fn w1_default_serial_raw_text_and_column_lists() {
+    let f = Fixture::new().await; let mut s = f.connect().await;
+    query(&mut s, "CREATE TABLE w (id serial, a text DEFAULT 'da', b int DEFAULT 7)").await;
+    let r = w1_copy(&mut s, "COPY w (id,a,b) FROM STDIN WITH (DEFAULT 'D')", b"D\tD\tD\n100\txD\t1\nD\ty\t2\n").await;
+    w1_tag(&r, 3);
+    let r = query(&mut s, "SELECT id,a,b FROM w ORDER BY id").await;
+    assert_eq!(w1_data(&r), vec![vec![Some("1".to_owned()), Some("da".to_owned()), Some("7".to_owned())], vec![Some("2".to_owned()), Some("y".to_owned()), Some("2".to_owned())], vec![Some("100".to_owned()), Some("xD".to_owned()), Some("1".to_owned())]]);
+    let r = w1_copy(&mut s, "COPY w (a,b) FROM STDIN WITH (DEFAULT '\\D')", b"\\D\t\\D\n").await; w1_tag(&r, 1);
+    let r = query(&mut s, "SELECT id FROM w WHERE id=3").await;
+    assert_eq!(r.iter().filter(|r| r.0 == b'D').count(), 1);
+    f.stop().await;
+}
+#[tokio::test]
+async fn w1_default_csv_quotes_header_force_and_identity() {
+    let f = Fixture::new().await; let mut s = f.connect().await;
+    query(&mut s, "CREATE TABLE w (id int GENERATED ALWAYS AS IDENTITY, a text DEFAULT 'da')").await;
+    let r = w1_copy(&mut s, "COPY w (id,a) FROM STDIN WITH (FORMAT csv, HEADER, DEFAULT 'DEF', FORCE_NOT_NULL (a), FORCE_NULL (a))", b"id,a\nDEF,DEF\nDEF,\"DEF\"\n").await;
+    w1_tag(&r, 2);
+    let r = query(&mut s, "SELECT a FROM w ORDER BY id").await;
+    let data: Vec<_> = r.iter().filter(|r| r.0 == b'D').map(|r| r.1.clone()).collect();
+    assert_eq!(data, [b"\0\x01\0\0\0\x02da".to_vec(), b"\0\x01\0\0\0\x03DEF".to_vec()]);
+    f.stop().await;
+}
+#[tokio::test]
+async fn w1_default_without_default_is_structural_before_conversion() {
+    let f = Fixture::new().await; let mut s = f.connect().await;
+    let r = w1_copy(&mut s, "COPY t FROM STDIN WITH (DEFAULT 'D', ON_ERROR ignore)", b"bad\tD\t1\n").await;
+    error(&r, "22P04");
+    let e = &r.iter().find(|r| r.0 == b'E').unwrap().1;
+    assert_eq!(w1_field(e, b'M').as_deref(), Some("unexpected default marker in COPY data"));
+    assert_eq!(w1_field(e, b'D').as_deref(), Some("Column \"x\" has no default value."));
+    assert!(w1_notices(&r).is_empty()); f.stop().await;
+}
+#[tokio::test]
+async fn w1_ignore_types_and_transaction_survives() {
+    let f = Fixture::new().await; let mut s = f.connect().await;
+    query(&mut s, "BEGIN").await;
+    let r = w1_copy(&mut s, "COPY t FROM STDIN WITH (ON_ERROR ignore)", b"1\tx\t1\nnotint\tx\t1\n2\tx\t9999999999999999999999\n3\ty\t2\n").await;
+    w1_tag(&r, 2); assert_eq!(tags(&r), b"NCZ");
+    assert_eq!(w1_notices(&r), ["2 rows were skipped due to data type incompatibility"]);
+    assert_eq!(r.last().unwrap().1, b"T");
+    let r = query(&mut s, "SELECT count(*) FROM t").await; assert_eq!(r[1].1, b"\0\x01\0\0\0\x012");
+    assert_eq!(query(&mut s, "COMMIT").await.last().unwrap().1, b"I"); f.stop().await;
+}
+#[tokio::test]
+async fn w1_ignore_verbose_truncation_first_column_and_header() {
+    let f = Fixture::new().await; let mut s = f.connect().await;
+    let long = "9".repeat(120);
+    let data = format!("i,x,n\na,z,b\n{long},z,1\n2,z,b\n");
+    let r = w1_copy(&mut s, "COPY t FROM STDIN WITH (FORMAT csv, HEADER, ON_ERROR ignore, LOG_VERBOSITY verbose)", data.as_bytes()).await;
+    w1_tag(&r, 0); assert_eq!(tags(&r), b"NNNNCZ");
+    assert_eq!(w1_notices(&r), [
+        "skipping row due to data type incompatibility at line 2 for column \"i\": \"a\"".to_owned(),
+        format!("skipping row due to data type incompatibility at line 3 for column \"i\": \"{}...\"", "9".repeat(100)),
+        "skipping row due to data type incompatibility at line 4 for column \"n\": \"b\"".to_owned(),
+        "3 rows were skipped due to data type incompatibility".to_owned(),
+    ]); f.stop().await;
+}
+#[tokio::test]
+async fn w1_ignore_domain_check_and_null_input() {
+    let f = Fixture::new().await; let mut s = f.connect().await;
+    query(&mut s, "CREATE DOMAIN w_pos AS int CHECK (VALUE > 0) NOT NULL").await;
+    query(&mut s, "CREATE TABLE w (p w_pos, t text)").await;
+    let r = w1_copy(&mut s, "COPY w FROM STDIN WITH (ON_ERROR ignore, LOG_VERBOSITY verbose)", b"1\ta\n-1\tb\n\\N\tc\n").await;
+    w1_tag(&r, 1);
+    assert_eq!(w1_notices(&r), ["skipping row due to data type incompatibility at line 2 for column \"p\": \"-1\"", "skipping row due to data type incompatibility at line 3 for column \"p\": null input", "2 rows were skipped due to data type incompatibility"]);
+    query(&mut s, "CREATE DOMAIN w_div AS int CHECK (1 / VALUE > 0)").await;
+    query(&mut s, "CREATE TABLE w_math (i w_div)").await;
+    let r = w1_copy(&mut s, "COPY w_math FROM STDIN WITH (ON_ERROR ignore, LOG_VERBOSITY verbose)", b"0\n1\n").await;
+    error(&r, "22012"); assert!(w1_notices(&r).is_empty());
+    let r = query(&mut s, "SELECT count(*) FROM w_math").await; assert_eq!(r[1].1, b"\0\x01\0\0\0\x010");
+    f.stop().await;
+}
+#[tokio::test]
+async fn w1_reject_limit_and_silent() {
+    let f = Fixture::new().await; let mut s = f.connect().await;
+    let r = w1_copy(&mut s, "COPY t FROM STDIN WITH (ON_ERROR ignore, REJECT_LIMIT 2)", b"a\tx\t1\nb\tx\t1\n1\tx\t1\n").await;
+    w1_tag(&r, 1); assert_eq!(w1_notices(&r), ["2 rows were skipped due to data type incompatibility"]);
+    for verbosity in ["verbose", "silent"] {
+        let r = w1_copy(&mut s, &format!("COPY t FROM STDIN WITH (ON_ERROR ignore, REJECT_LIMIT 1, LOG_VERBOSITY {verbosity})"), b"2\tx\t1\na\tx\t1\nb\tx\t1\n").await;
+        error(&r, "22P02");
+        assert_eq!(w1_field(&r.iter().find(|r| r.0 == b'E').unwrap().1, b'M').as_deref(), Some("skipped more than REJECT_LIMIT (1) rows due to data type incompatibility"));
+        assert_eq!(w1_notices(&r).len(), if verbosity == "verbose" { 2 } else { 0 });
+        let r = query(&mut s, "SELECT count(*) FROM t").await; assert_eq!(r[1].1, b"\0\x01\0\0\0\x011");
+    } f.stop().await;
+}
+#[tokio::test]
+async fn w1_ignore_keeps_constraints_and_structure_fatal() {
+    let f = Fixture::new().await; let mut s = f.connect().await;
+    for (data, code) in [(b"1\tbad\t1\n".as_slice(), "23514"), (b"\\N\tx\t1\n", "23502"), (b"1\tx\t1\n1\ty\t2\n", "23505"), (b"1\tx\n", "22P04"), (b"1\tx\t1\textra\n", "22P04"), (b"1\t\xff\t1\n", "22021")] {
+        let r = w1_copy(&mut s, "COPY t FROM STDIN WITH (ON_ERROR ignore)", data).await; error(&r, code); assert!(w1_notices(&r).is_empty());
+        let r = query(&mut s, "SELECT count(*) FROM t").await; assert_eq!(r[1].1, b"\0\x01\0\0\0\x010");
+    }
+    for (tail, code) in [(b"1\tx\n".as_slice(), "22P04"), (b"1\tx\t1\textra\n", "22P04"), (b"1\t\xff\t1\n", "22021")] {
+        let mut data = b"bad\tx\t1\n".to_vec(); data.extend_from_slice(tail);
+        let r = w1_copy(&mut s, "COPY t FROM STDIN WITH (ON_ERROR ignore, LOG_VERBOSITY verbose)", &data).await;
+        error(&r, code); assert_eq!(w1_notices(&r), ["skipping row due to data type incompatibility at line 1 for column \"i\": \"bad\""]);
+    }
+    f.stop().await;
+}
+#[tokio::test]
+async fn w1_verbosity_without_ignore_is_accepted() {
+    let f = Fixture::new().await; let mut s = f.connect().await;
+    for verbosity in ["verbose", "silent"] {
+        let r = w1_copy(&mut s, &format!("COPY t FROM STDIN WITH (LOG_VERBOSITY {verbosity})"), b"1\tx\t1\n").await;
+        if verbosity == "verbose" { w1_tag(&r, 1); } else { error(&r, "23505"); }
+        assert!(w1_notices(&r).is_empty());
+    } f.stop().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn w1_streaming_defaults_and_skips_cross_pages() {
+    let f = Fixture::with_engine(giggles_core::Engine::V2).await; let mut s = f.connect().await;
+    query(&mut s, "CREATE TABLE w (id serial PRIMARY KEY, a int DEFAULT 7)").await;
+    let mut data = String::new();
+    for i in 0..600 { data.push_str(if i % 100 == 0 { "D,bad\n" } else { "D,D\n" }); }
+    let r = w1_copy(&mut s, "COPY w FROM STDIN WITH (FORMAT csv, DEFAULT 'D', ON_ERROR ignore)", data.as_bytes()).await;
+    w1_tag(&r, 594); assert_eq!(w1_notices(&r), ["6 rows were skipped due to data type incompatibility"]);
+    let r = query(&mut s, "SELECT count(*),max(id),min(a),max(a) FROM w").await;
+    assert!(!r.iter().any(|r| r.0 == b'E'), "{r:?}");
+    assert_eq!(r.iter().find(|r| r.0 == b'D').unwrap().1, b"\0\x04\0\0\0\x03594\0\0\0\x03600\0\0\0\x017\0\0\0\x017");
+    let r = w1_copy(&mut s, "COPY w FROM STDIN WITH (FORMAT csv, DEFAULT 'D')", b"D,D\n\"unterminated\n").await;
+    error(&r, "22P04");
+    let r = w1_copy(&mut s, "COPY w FROM STDIN WITH (FORMAT csv, DEFAULT 'D')", b"D,D\n").await;
+    w1_tag(&r, 1);
+    let r = query(&mut s, "SELECT max(id) FROM w").await;
+    assert_eq!(w1_data(&r), vec![vec![Some("602".to_owned())]]);
+    f.stop().await;
+}
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn w1_streaming_reject_limit_counts_previous_pages() {
+    let f = Fixture::with_engine(giggles_core::Engine::V2).await; let mut s = f.connect().await;
+    let mut data = String::from("bad\tx\t1\n");
+    for i in 1..200 { data.push_str(&format!("{i}\tx\t1\n")); }
+    data.push_str("bad\tx\t1\n");
+    let r = w1_copy(&mut s, "COPY t FROM STDIN WITH (ON_ERROR ignore, REJECT_LIMIT 1, LOG_VERBOSITY verbose)", data.as_bytes()).await;
+    error(&r, "22P02");
+    assert_eq!(w1_field(&r.iter().find(|r| r.0 == b'E').unwrap().1, b'M').as_deref(), Some("skipped more than REJECT_LIMIT (1) rows due to data type incompatibility"));
+    assert_eq!(w1_notices(&r), ["skipping row due to data type incompatibility at line 1 for column \"i\": \"bad\"", "skipping row due to data type incompatibility at line 201 for column \"i\": \"bad\""]);
+    let r = query(&mut s, "SELECT count(*) FROM t").await; assert_eq!(r[1].1, b"\0\x01\0\0\0\x010");
+    f.stop().await;
+}
+#[tokio::test]
+async fn w1_ignore_foreign_key_remains_fatal() {
+    let f = Fixture::new().await; let mut s = f.connect().await;
+    query(&mut s, "CREATE TABLE w (id int PRIMARY KEY, parent int REFERENCES w(id))").await;
+    let r = w1_copy(&mut s, "COPY w FROM STDIN WITH (ON_ERROR ignore)", b"1\t9\n").await;
+    error(&r, "23503"); assert!(w1_notices(&r).is_empty());
+    let r = query(&mut s, "SELECT count(*) FROM w").await; assert_eq!(r[1].1, b"\0\x01\0\0\0\x010"); f.stop().await;
+}
+
+
+#[tokio::test]
+async fn w1_ignore_datetime_smallint_and_silent_success() {
+    let f = Fixture::new().await; let mut s = f.connect().await;
+    query(&mut s, "CREATE TABLE w (i int, d date, s smallint)").await;
+    let r = w1_copy(&mut s, "COPY w FROM STDIN WITH (ON_ERROR ignore)", b"1\t2020-01-01\t1\n99999999999\t2020-01-01\t1\n2\t2020-13-45\t1\n3\t2020-01-01\t70000\n4\t2020-01-01\t2\n").await;
+    w1_tag(&r, 2); assert_eq!(w1_notices(&r), ["3 rows were skipped due to data type incompatibility"]);
+    let r = w1_copy(&mut s, "COPY w FROM STDIN WITH (FORMAT csv, ON_ERROR ignore, LOG_VERBOSITY silent)", b"bad,bad,bad\n5,2020-01-02,3\n").await;
+    w1_tag(&r, 1); assert_eq!(tags(&r), b"CZ");
+    let r = query(&mut s, "SELECT i,d,s FROM w ORDER BY i").await;
+    assert_eq!(w1_data(&r), vec![vec![Some("1".to_owned()),Some("2020-01-01".to_owned()),Some("1".to_owned())],vec![Some("4".to_owned()),Some("2020-01-01".to_owned()),Some("2".to_owned())],vec![Some("5".to_owned()),Some("2020-01-02".to_owned()),Some("3".to_owned())]]);
+    let r = w1_copy(&mut s, "COPY w FROM STDIN WITH (ON_ERROR ignore, LOG_VERBOSITY verbose)", b"bad\n").await;
+    w1_tag(&r, 0); assert_eq!(w1_notices(&r), ["skipping row due to data type incompatibility at line 1 for column \"i\": \"bad\"", "1 row was skipped due to data type incompatibility"]);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn w1_default_marker_sequence_privilege_is_required_only_for_markers() {
+    #[cfg(feature = "engine-rocksdb")]
+    let engines = [giggles_core::Engine::Legacy, giggles_core::Engine::V2];
+    #[cfg(not(feature = "engine-rocksdb"))]
+    let engines = [giggles_core::Engine::Legacy];
+    for engine in engines {
+    let f = Fixture::with_engine(engine).await; let mut owner = f.connect().await;
+    query(&mut owner, "CREATE TABLE w (id serial, a text)").await;
+    let r = query(&mut owner, "GRANT INSERT ON w TO denied").await;
+    assert!(!r.iter().any(|r| r.0 == b'E'), "{r:?}");
+    let mut denied = f.connect_as("denied").await;
+    let r = w1_copy(&mut denied, "COPY w FROM STDIN WITH (FORMAT csv, DEFAULT 'D')", b"100,x\n").await;
+    w1_tag(&r, 1);
+    let r = w1_copy(&mut denied, "COPY w FROM STDIN WITH (FORMAT csv, DEFAULT 'D')", b"D,y\n").await;
+    error(&r, "42501");
+    let r = w1_copy(&mut owner, "COPY w FROM STDIN WITH (FORMAT csv, DEFAULT 'D')", b"D,y\n").await;
+    w1_tag(&r, 1);
+    let r = query(&mut owner, "SELECT id,a FROM w ORDER BY id").await;
+    assert_eq!(w1_data(&r), vec![vec![Some("1".to_owned()),Some("y".to_owned())],vec![Some("100".to_owned()),Some("x".to_owned())]]);
+    f.stop().await;
+    }
+}
+
+
+#[tokio::test]
+async fn w3_order_stop_conversion_before_omitted_defaults_and_constraints() {
+    let f = Fixture::new().await; let mut s = f.connect().await;
+    query(&mut s, "CREATE TABLE worder (i INT CHECK (i > 0), id SERIAL)").await;
+    let r = w1_copy(&mut s, "COPY worder (i) FROM STDIN", b"bad\n").await;
+    error(&r, "22P02");
+    let r = query(&mut s, "SELECT currval('worder_id_seq')").await;
+    error(&r, "55000");
+    let r = w1_copy(&mut s, "COPY worder (i) FROM STDIN", b"-1\nbad\n").await;
+    error(&r, "23514");
+    let r = query(&mut s, "SELECT currval('worder_id_seq')").await;
+    assert_eq!(w1_data(&r), vec![vec![Some("1".into())]]);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn w3_order_ignore_supplied_markers_then_omitted_defaults() {
+    let f = Fixture::new().await; let mut s = f.connect().await;
+    query(&mut s, "CREATE TABLE wo2 (i INT, id SERIAL, j int DEFAULT nextval('wo2_id_seq'))").await;
+    let r = w1_copy(&mut s, "COPY wo2 (i) FROM STDIN WITH (ON_ERROR ignore)", b"bad\n5\n").await;
+    w1_tag(&r, 1);
+    assert_eq!(w1_notices(&r), ["1 row was skipped due to data type incompatibility"]);
+    let r = query(&mut s, "SELECT i,id,j FROM wo2 ORDER BY i").await;
+    assert_eq!(w1_data(&r), vec![vec![Some("5".into()), Some("3".into()), Some("4".into())]]);
+    let r = w1_copy(&mut s, "COPY wo2 (j, i) FROM STDIN WITH (ON_ERROR ignore, DEFAULT 'D')", b"D\tbad\nD\t7\n").await;
+    w1_tag(&r, 1);
+    assert_eq!(w1_notices(&r), ["1 row was skipped due to data type incompatibility"]);
+    let r = query(&mut s, "SELECT i,id,j FROM wo2 ORDER BY i").await;
+    assert_eq!(w1_data(&r), vec![vec![Some("5".into()), Some("3".into()), Some("4".into())], vec![Some("7".into()), Some("8".into()), Some("7".into())]]);
+    // A marker after the first soft error must not consume a sequence value.
+    let r = w1_copy(&mut s, "COPY wo2 (i,j) FROM STDIN WITH (ON_ERROR ignore, DEFAULT 'D')", b"bad\tD\n9\tD\n").await;
+    w1_tag(&r, 1);
+    let r = query(&mut s, "SELECT i,id,j FROM wo2 WHERE i = 9").await;
+    assert_eq!(w1_data(&r), vec![vec![Some("9".into()), Some("11".into()), Some("10".into())]]);
+    f.stop().await;
+}

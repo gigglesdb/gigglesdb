@@ -348,7 +348,19 @@ fn diagnostic_error(
     } else {
         eprintln!("protocol=postgres sqlstate={code} reason={message}");
     }
+    // Notices already produced by COPY input functions precede a later error.
+    // Keep these frames when discarding a partial result response.
+    let mut notices = vec![];
+    let mut at = 0;
+    while at + 5 <= out.len() {
+        let length = u32::from_be_bytes(out[at + 1..at + 5].try_into().unwrap()) as usize;
+        let Some(end) = at.checked_add(1).and_then(|n| n.checked_add(length)) else { break; };
+        if length < 4 || end > out.len() { break; }
+        if out[at] == b'N' { notices.extend_from_slice(&out[at..end]); }
+        at = end;
+    }
     out.clear();
+    out.extend(notices);
     let mut b = vec![b'S'];
     z("ERROR", &mut b);
     b.push(b'C');

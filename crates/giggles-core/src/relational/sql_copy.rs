@@ -26,6 +26,9 @@ impl CopyColumns {
         self.all || self.names.iter().any(|n| n == name)
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CopyLogVerbosity { #[default] Default, Verbose, Silent }
+
 /// Runtime-only COPY options, shared by both SQL envelopes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyOptions {
@@ -38,6 +41,10 @@ pub struct CopyOptions {
     pub force_quote: CopyColumns,
     pub force_not_null: CopyColumns,
     pub force_null: CopyColumns,
+    pub default: Option<String>,
+    pub on_error_ignore: bool,
+    pub reject_limit: Option<u64>,
+    pub log_verbosity: CopyLogVerbosity,
 }
 impl Default for CopyOptions {
     fn default() -> Self {
@@ -51,6 +58,10 @@ impl Default for CopyOptions {
             force_quote: CopyColumns::default(),
             force_not_null: CopyColumns::default(),
             force_null: CopyColumns::default(),
+            default: None,
+            on_error_ignore: false,
+            reject_limit: None,
+            log_verbosity: CopyLogVerbosity::Default,
         }
     }
 }
@@ -438,13 +449,15 @@ impl CopyOptions {
                 "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE",
             );
         }
-        if seen.contains("default")
-            || ignore
-            || seen.contains("reject_limit")
-            || values
-                .get("log_verbosity")
-                .is_some_and(|v| !v.eq_ignore_ascii_case("default"))
-            || freeze
+        o.default = values.get("default").cloned();
+        o.on_error_ignore = ignore;
+        o.reject_limit = values.get("reject_limit").map(|v| v.parse().unwrap());
+        o.log_verbosity = match values.get("log_verbosity").map(|v| v.to_ascii_lowercase()).as_deref() {
+            Some("verbose") => CopyLogVerbosity::Verbose,
+            Some("silent") => CopyLogVerbosity::Silent,
+            _ => CopyLogVerbosity::Default,
+        };
+        if freeze
             || values.get("encoding").is_some_and(|v| {
                 !v.eq_ignore_ascii_case("utf8") && !v.eq_ignore_ascii_case("utf-8")
             })
@@ -759,14 +772,20 @@ impl Prepared {
     }
 }
 
+/// Runtime COPY cells: `None` denotes DEFAULT; SQL NULL is `Some(Value::Null)`.
+#[derive(Debug, Clone)]
+pub struct CopyInput {
+    pub rows: Vec<Vec<Option<Value>>>,
+    pub options: CopyOptions,
+    pub first_line: u64,
+    pub skipped: u64,
+}
 impl Relational {
     pub(crate) fn normalize_copy(
-        &self,
-        prepared: &Prepared,
-        rows: Vec<Vec<Value>>,
+        &self, prepared: &Prepared, input: CopyInput,
         clock: Option<&clock::ExecutionClock>,
-    ) -> R<(Prepared, Vec<Vec<Value>>)> {
-        sql_insert::normalize_copy(self, prepared, rows, clock)
+    ) -> R<(Prepared, Vec<Vec<Value>>, u64)> {
+        sql_insert::normalize_copy(self, prepared, input, clock)
     }
 }
 
@@ -782,6 +801,12 @@ pub(super) fn copy_text_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn runtime_default_and_ignore_options() {
+        let options = CopyOptions::parse("(DEFAULT 'DEF', ON_ERROR ignore, REJECT_LIMIT 2, LOG_VERBOSITY verbose)", true).unwrap();
+        assert_eq!(options.format, CopyFormat::Text);
+        for verbosity in ["verbose", "silent"] { assert!(CopyOptions::parse(&format!("(LOG_VERBOSITY {verbosity})"), true).is_ok()); }
+    }
     #[test]
     fn shared_copy_options() {
         for sql in ["COPY t FROM STDIN CSV HEADER QUOTE AS '~' FORCE NOT NULL a FORCE NULL b", "COPY t FROM STDIN WITH (FORMAT csv, HEADER true, QUOTE '~', FORCE_NOT_NULL (a), FORCE_NULL (b))"] {

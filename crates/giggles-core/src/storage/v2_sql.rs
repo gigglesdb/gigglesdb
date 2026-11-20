@@ -337,9 +337,9 @@ impl SqlSession {
         &mut self,
         db: &Arc<v2::V2Db>,
         prepared: &relational::Prepared,
-        rows: Vec<Vec<relational::Value>>,
+        input: relational::CopyInput,
         clock: &relational::StatementClock,
-    ) -> Result<(relational::Prepared, Vec<Vec<relational::Value>>), CoreError> {
+    ) -> Result<(relational::Prepared, Vec<Vec<relational::Value>>, u64), CoreError> {
         let result = (|| {
             let inner = self.admin.inner.clone();
             let _ticket = inner.enter_sql()?;
@@ -356,23 +356,35 @@ impl SqlSession {
             }
             let mut state = db.metadata_state(self.v2_transaction.as_ref())?;
             state.sql.epoch = 0;
+            let image = Arc::new(state.sql.clone());
+            let callback = sql_sequences::callback(db.clone(), image.clone(),
+                self.sequence_baseline.clone(), self.pending_sequences.clone(),
+                self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone());
+            let allowed = self.sequence_tables.clone();
+            let path = self.search_path.clone();
+            let callback = Arc::new(move |operation: &str, text: &str, value, called| {
+                if let Some(allowed) = &allowed {
+                    if allowed.is_empty() { return Err(CoreError::Policy(Error::Scope)); }
+                    let name = sequences::sequence_name(text).map_err(CoreError::Sql)?;
+                    let name = image.resolve_relation_key(&name, &path);
+                    let definition = image.catalog_ext().sequences.values().find(|s| s.name == name)
+                        .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
+                    let owner = definition.owned_by.and_then(|(id, _)| image.tables.values().find(|t| t.id == id));
+                    if !allowed.contains(&name) && owner.is_none_or(|table| !allowed.contains(&image.table_key(table))) {
+                        return Err(CoreError::Policy(Error::Scope));
+                    }
+                }
+                callback(operation, text, value, called)
+            });
             let context = relational::clock::ExecutionClock::new(clock)
                 .with_extra_float_digits(self.extra_float_digits)
-                .with_sequences(sql_sequences::callback(
-                    db.clone(),
-                    Arc::new(state.sql.clone()),
-                    self.sequence_baseline.clone(),
-                    self.pending_sequences.clone(),
-                    self.sequence_values.clone(),
-                    self.sequence_unsettled.clone(),
-                    self.search_path.clone(),
-                ))
+                .with_sequences(callback)
                 .with_xact(sql_xact::callback(
                     db.clone(),
                     self.xact.clone(),
                     self.v2_transaction.as_ref().map(|txn| txn.id()),
                 ));
-            let output = state.sql.normalize_copy(prepared, rows, Some(&context));
+            let output = state.sql.normalize_copy(prepared, input, Some(&context));
             crate::cancellation::check()?;
             if let Some(error) = context.take_error() {
                 return Err(error);

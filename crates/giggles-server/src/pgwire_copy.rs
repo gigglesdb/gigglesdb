@@ -4,7 +4,15 @@ fn bad_format() -> &'static str {
         giggles_core::relational::SqlError::BadCopyFileFormat,
     ))
 }
-type Row = Vec<Option<Vec<u8>>>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Field { Default, Value(Option<Vec<u8>>) }
+impl From<Option<Vec<u8>>> for Field { fn from(value: Option<Vec<u8>>) -> Self { Self::Value(value) } }
+impl PartialEq<Option<Vec<u8>>> for Field { fn eq(&self, other: &Option<Vec<u8>>) -> bool { matches!(self, Self::Value(value) if value == other) } }
+impl Field {
+    fn as_ref(&self) -> Option<&Vec<u8>> { match self { Self::Value(value) => value.as_ref(), Self::Default => None } }
+    fn as_deref(&self) -> Option<&[u8]> { self.as_ref().map(Vec::as_slice) }
+}
+type Row = Vec<Field>;
 type Result<T> = std::result::Result<T, &'static str>;
 const LIMIT: usize = giggles_core::operations::MAX_INSERT_BYTES;
 pub(super) struct Decoder {
@@ -14,6 +22,7 @@ pub(super) struct Decoder {
     streaming: bool,
     delimiter: u8,
     null: Vec<u8>,
+    default: Option<Vec<u8>>,
     binary: bool,
     csv: bool,
     quote: u8,
@@ -23,6 +32,7 @@ pub(super) struct Decoder {
     force_not_null: Vec<bool>,
     force_null: Vec<bool>,
     message: Option<String>,
+    text_at: usize,
     csv_at: usize,
     csv_quoted: bool,
     header: bool,
@@ -30,6 +40,7 @@ pub(super) struct Decoder {
     total: usize,
     rows: usize,
     pending: Vec<u8>,
+    completed_rows: Vec<Row>,
 }
 impl Decoder {
     pub(super) fn text(columns: usize, delimiter: u8, null: Vec<u8>) -> Self {
@@ -40,10 +51,12 @@ impl Decoder {
             streaming: false,
             delimiter,
             null,
+            default: None,
             binary: false,
             csv: false,
             quote: b'"', escape: b'"', skip_header: false, match_header: None,
             force_not_null: vec![], force_null: vec![], message: None,
+            text_at: 0,
             csv_at: 0,
             csv_quoted: false,
             header: false,
@@ -51,6 +64,7 @@ impl Decoder {
             total: 0,
             rows: 0,
             pending: Vec::new(),
+            completed_rows: Vec::new(),
         }
     }
     pub(super) fn csv(columns: usize, delimiter: u8, null: Vec<u8>) -> Self {
@@ -67,6 +81,7 @@ impl Decoder {
     }
     pub(super) fn options(&mut self, o: &giggles_core::relational::CopyOptions, names: Vec<String>) {
         use giggles_core::relational::CopyHeader;
+        self.default = o.default.as_ref().map(|s| s.as_bytes().to_vec());
         self.quote = o.quote; self.escape = o.escape;
         self.skip_header = o.header != CopyHeader::Off;
         self.force_not_null = names.iter().map(|n| o.force_not_null.contains(n)).collect();
@@ -91,6 +106,8 @@ impl Decoder {
         }
         Ok(false)
     }
+    pub(super) fn take_completed_rows(&mut self) -> Vec<Row> { std::mem::take(&mut self.completed_rows) }
+    pub(super) fn clear_diagnostic(&mut self) { self.message = None; self.newline_error = None; }
     pub(super) fn stream(&mut self) { self.streaming = true; }
     pub(super) fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Row>> {
         self.total = self.total.checked_add(bytes.len()).ok_or("54000")?;
@@ -159,6 +176,7 @@ impl Decoder {
     }
     fn csv_rows(&mut self, eof: bool) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
+        let result = (|| {
         let mut start = 0;
         while self.csv_at < self.pending.len() {
             let b = self.pending[self.csv_at];
@@ -217,7 +235,12 @@ impl Decoder {
             self.pending.drain(..start);
             self.csv_at -= start;
         }
-        Ok(rows)
+        Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(rows),
+            Err(code) => { self.completed_rows = rows; Err(code) }
+        }
     }
     fn csv_row(&self, line: &[u8]) -> Result<Row> {
         let mut fields = Vec::new();
@@ -245,11 +268,13 @@ impl Decoder {
             let index = fields.len();
             let force_not = !self.skip_header && self.force_not_null.get(index) == Some(&true);
             let force_null = !self.skip_header && self.force_null.get(index) == Some(&true);
-            fields.push(if (!was_quoted && !force_not && line[start..at] == self.null) || (was_quoted && force_null && field == self.null) {
+            fields.push(if !self.skip_header && !was_quoted && self.default.as_deref() == Some(field.as_slice()) {
+                Field::Default
+            } else { Field::Value(if (!was_quoted && !force_not && line[start..at] == self.null) || (was_quoted && force_null && field == self.null) {
                 None
             } else {
                 Some(field)
-            });
+            }) });
             if at == line.len() {
                 break;
             }
@@ -263,7 +288,8 @@ impl Decoder {
     }
     fn text_rows(&mut self, eof: bool) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
-        let mut at = 0;
+        let result = (|| {
+        let mut at = self.text_at;
         let mut start = 0;
         while at < self.pending.len() {
             if self.pending[at] == b'\\' {
@@ -302,7 +328,8 @@ impl Decoder {
         }
         if self.ended {
             self.pending.clear();
-            return Ok(rows);
+            self.text_at = 0;
+            return Ok(());
         }
         if eof && start < self.pending.len() {
             let line = &self.pending[start..];
@@ -315,10 +342,17 @@ impl Decoder {
                 self.rows += 1;
             }
             self.pending.clear();
+            self.text_at = 0;
         } else {
             self.pending.drain(..start);
+            self.text_at = at - start;
         }
-        Ok(rows)
+        Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(rows),
+            Err(code) => { self.completed_rows = rows; Err(code) }
+        }
     }
     fn text_row(&self, line: &[u8]) -> Result<Row> {
         let mut fields = Vec::new();
@@ -341,7 +375,8 @@ impl Decoder {
         }
         Ok(fields)
     }
-    fn field(&self, raw: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn field(&self, raw: &[u8]) -> Result<Field> {
+        if !self.skip_header && self.default.as_deref() == Some(raw) { return Ok(Field::Default); }
         let mut marker = 0;
         while marker + 1 < raw.len() {
             if raw[marker] == b'\\' {
@@ -354,7 +389,7 @@ impl Decoder {
             }
         }
         if raw == self.null {
-            return Ok(None);
+            return Ok(Field::Value(None));
         }
         let mut out = Vec::new();
         let mut at = 0;
@@ -410,13 +445,14 @@ impl Decoder {
             out.push(b);
         }
         std::str::from_utf8(&out).map_err(|_| "22021")?;
-        Ok(Some(out))
+        Ok(Field::Value(Some(out)))
     }
     fn binary_rows(&mut self) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
+        let result = (|| {
         if !self.header {
             if self.pending.len() < 19 {
-                return Ok(rows);
+                return Ok(());
             }
             if &self.pending[..11] != b"PGCOPY\n\xff\r\n\0" {
                 self.message = Some("COPY file signature not recognized".into());
@@ -435,7 +471,7 @@ impl Decoder {
                 return Err("54000");
             }
             if self.pending.len() < end {
-                return Ok(rows);
+                return Ok(());
             }
             self.pending.drain(..end);
             self.header = true;
@@ -463,7 +499,7 @@ impl Decoder {
             let mut at = 2;
             for _ in 0..count {
                 if self.pending.len() < at + 4 {
-                    return Ok(rows);
+                    return Ok(());
                 }
                 let len = i32::from_be_bytes(self.pending[at..at + 4].try_into().unwrap());
                 at += 4;
@@ -479,21 +515,47 @@ impl Decoder {
                     return Err("54000");
                 }
                 if self.pending.len() < end {
-                    return Ok(rows);
+                    return Ok(());
                 }
                 row.push(Some(self.pending[at..end].to_vec()));
                 at = end;
             }
             self.pending.drain(..at);
             self.rows += 1;
-            rows.push(row);
+            rows.push(row.into_iter().map(Field::from).collect());
         }
-        Ok(rows)
+        Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(rows),
+            Err(code) => { self.completed_rows = rows; Err(code) }
+        }
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn w2_chunk_errors_retain_completed_rows() {
+        for csv in [false, true] {
+            let mut d = if csv { Decoder::csv(1, b',', vec![]) } else { Decoder::text(1, b'\t', vec![]) };
+            assert_eq!(d.feed(b"first\nsecond\nextra,field\tfield\n").unwrap_err(), "22P04");
+            let rows = d.take_completed_rows();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], Some(b"first".to_vec()));
+            assert_eq!(rows[1][0], Some(b"second".to_vec()));
+            assert!(d.take_completed_rows().is_empty());
+        }
+    }
+    #[test]
+    fn w2_finish_errors_retain_completed_rows() {
+        let mut d = Decoder::csv(1, b',', vec![]);
+        d.feed(b"first\r").unwrap();
+        // At EOF, a complete first row precedes an unterminated field.
+        d.pending.extend_from_slice(b"\"unterminated");
+        assert_eq!(d.finish().unwrap_err(), "22P04");
+        assert_eq!(d.take_completed_rows().len(), 1);
+    }
     #[test]
     fn newline_styles_every_split() {
         for csv in [false, true] {
@@ -780,6 +842,23 @@ mod tests {
 #[cfg(test)]
 mod option_tests {
     use super::*;
+    #[test]
+    fn default_markers_at_every_chunk_boundary() {
+        for csv in [false, true] {
+            let options = giggles_core::relational::CopyOptions::parse(if csv { "(FORMAT csv, HEADER, DEFAULT 'DEF')" } else { "(HEADER, DEFAULT '\\D')" }, true).unwrap();
+            let data = if csv { b"a,b\nDEF,\"DEF\"\nxDEF,DEF\n".as_slice() } else { b"a\tb\n\\D\t\\\\D\nx\\D\t\\D\n".as_slice() };
+            for split in 0..=data.len() {
+                let mut decoder = if csv { Decoder::csv(2, b',', vec![]) } else { Decoder::text(2, b'\t', b"\\N".to_vec()) };
+                decoder.options(&options, vec!["a".into(), "b".into()]);
+                let mut rows = decoder.feed(&data[..split]).unwrap(); rows.extend(decoder.feed(&data[split..]).unwrap()); rows.extend(decoder.finish().unwrap());
+                assert_eq!(rows.len(), 2);
+                assert!(rows[0][0].as_deref().is_none(), "split {split}, csv {csv}");
+                assert!(rows[0][1].as_deref().is_some());
+                assert!(rows[1][1].as_deref().is_none());
+                assert!(rows[1][0].as_deref().is_some());
+            }
+        }
+    }
     #[test]
     fn csv_options_at_every_chunk_boundary() {
         let o = giggles_core::relational::CopyOptions::parse("(FORMAT csv, HEADER MATCH, QUOTE '~', ESCAPE '!', FORCE_NOT_NULL (a), FORCE_NULL (b))", true).unwrap();

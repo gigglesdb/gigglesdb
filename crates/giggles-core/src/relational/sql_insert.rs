@@ -8,6 +8,7 @@ pub(super) struct Insert {
     alias: Option<String>,
     copy_input: Option<Vec<DataType>>,
     normalized: Option<Vec<Vec<Value>>>,
+    copy_precoerced: bool,
     source_types: Option<Vec<Option<DataType>>>,
     columns: Vec<String>,
     rows: Vec<Vec<Expr>>,
@@ -302,7 +303,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
     }
     Ok(Insert {
         copy_input: None,
-        normalized: None,
+        normalized: None, copy_precoerced: false,
         source_types: None,
         table,
         alias,
@@ -542,7 +543,7 @@ impl Insert {
             table: self.table.clone(),
             alias: self.alias.clone(),
             copy_input: self.copy_input.clone(),
-            normalized: None,
+            normalized: None, copy_precoerced: false,
             columns: self.columns.clone(),
             source_types: self.source_types.clone(),
             default_values: self.default_values,
@@ -631,13 +632,13 @@ impl Insert {
         let default_values = values.is_empty();
         let defaults = vec![values.iter().map(Option::is_none).collect()];
         Self { table, columns, source: None, alias: None, copy_input: None,
-            normalized: None, source_types: None,
+            normalized: None, copy_precoerced: false, source_types: None,
             rows: vec![values.into_iter().map(|v| Expr::Literal(v.unwrap_or(Value::Null))).collect()],
             casts: BTreeMap::new(), defaults, default_values, overriding, conflict: None, returning: None }
     }
     pub(super) fn from_query(table: String, columns: Vec<String>, source: query::Query) -> Self {
         Self { table, columns, source: Some(Box::new(source)), alias: None,
-            copy_input: None, normalized: None, source_types: None, rows: vec![],
+            copy_input: None, normalized: None, copy_precoerced: false, source_types: None, rows: vec![],
             casts: BTreeMap::new(), defaults: vec![], default_values: false,
             overriding: None, conflict: None, returning: None }
     }
@@ -663,7 +664,7 @@ impl Insert {
             conflict: None,
             returning: None,
             copy_input: Some(types),
-            normalized: None,
+            normalized: None, copy_precoerced: false,
             source_types: None,
             source: None,
         }
@@ -961,7 +962,6 @@ fn normalize_row(
     clock: Option<&clock::ExecutionClock>,
     source_types: Option<&[Option<DataType>]>,
 ) -> R<Vec<Value>> {
-    let hidden_rowid = table.hidden_rowid();
     let replaced = |index: usize, default: bool| {
         default
             || insert.overriding == Some(false)
@@ -993,8 +993,20 @@ fn normalize_row(
             };
         }
     }
-    for (value, column) in row.iter_mut().zip(&table.columns) {
-        *value = coerce_to_column(state, column, value.clone())?;
+    finish_row(state, table, insert, &supplied, row)
+}
+
+// COPY already has an owned row with defaults resolved in input order. Share
+// INSERT's coercion and checks without rebuilding defaults and literal cells.
+fn finish_row(
+    state: &Relational, table: &TableDef, insert: &Insert,
+    supplied: &[usize], mut row: Vec<Value>,
+) -> R<Vec<Value>> {
+    let hidden_rowid = table.hidden_rowid();
+    for (index, (value, column)) in row.iter_mut().zip(&table.columns).enumerate() {
+        if !insert.copy_precoerced || !supplied.contains(&index) {
+            *value = coerce_to_column(state, column, value.clone())?;
+        }
     }
     Relational::secondary_admit_values(row.iter())?;
     if let Some(hidden) = hidden_rowid {
@@ -1022,62 +1034,128 @@ fn normalize_row(
 }
 
 pub(super) fn normalize_copy(
-    state: &Relational,
-    prepared: &Prepared,
-    rows: Vec<Vec<Value>>,
+    state: &Relational, prepared: &Prepared, input: CopyInput,
     clock: Option<&clock::ExecutionClock>,
-) -> R<(Prepared, Vec<Vec<Value>>)> {
-    let mut prepared = prepared.copy_rows(rows, clock)?;
-    if prepared.epoch != state.epoch {
-        return Err(SqlError::StaleSchema);
-    }
-    let Statement::InsertMulti(insert) = &prepared.statement else {
-        return Err(SqlError::Unsupported);
-    };
-    admit_statement(insert, &[])?;
-    let table = state
-        .tables
-        .get(&insert.table)
-        .ok_or(SqlError::UnknownTable)?;
-    let indexes = indexes(insert, table)?;
-    let mut output = Vec::with_capacity(insert.rows.len());
-    for (row_index, (row, defaults)) in insert.rows.iter().zip(&insert.defaults).enumerate() {
-        if crate::cancellation::check().is_err() {
-            return Err(SqlError::Aborted);
+) -> R<(Prepared, Vec<Vec<Value>>, u64)> {
+    if prepared.epoch != state.epoch { return Err(SqlError::StaleSchema); }
+    if input.rows.len() > MAX_ROWS { return Err(SqlError::Limit); }
+    let Statement::InsertMulti(template) = &prepared.statement else { return Err(SqlError::Unsupported); };
+    let table = state.tables.get(&template.table).ok_or(SqlError::UnknownTable)?;
+    let target_indexes = indexes(template, table)?;
+    let logical = table.logical_offsets();
+    let mut insert = Insert::copy(template.table.clone(),
+        table.logical_columns().map(|c| c.name.clone()).collect(),
+        table.logical_columns().map(|c| c.data_type.clone()).collect(), vec![]);
+    insert.copy_precoerced = true;
+    admit_statement(&insert, &[])?;
+    let mut output = Vec::with_capacity(input.rows.len());
+    let mut admission = InputAdmission::default();
+    let mut skipped = 0;
+    for (offset, row) in input.rows.into_iter().enumerate() {
+        if crate::cancellation::check().is_err() { return Err(SqlError::Aborted); }
+        if row.len() > target_indexes.len() {
+            return Err(SqlError::BadCopyFileFormat);
         }
-        let full = normalize_row(
-            state,
-            table,
-            insert,
-            &indexes,
-            row,
-            row_index,
-            defaults,
-            &[],
-            &[],
-            clock,
-            None,
-        )?;
-        output.push(
-            table
-                .logical_offsets()
-                .into_iter()
-                .map(|i| full[i].clone())
-                .collect(),
-        );
+        // Markers are structural errors, checked before any field conversion.
+        for (cell, index) in row.iter().zip(&target_indexes) {
+            if cell.is_none() && super::defaults::default_sql(state, &table.columns[*index]).is_none() {
+                user_types::sql_error_detail(format!("Column \"{}\" has no default value.", table.columns[*index].name));
+                user_types::view_replace_error("unexpected default marker in COPY data".into());
+                return Err(SqlError::BadCopyFileFormat);
+            }
+        }
+        // Convert supplied fields (including inline markers) first. A stop
+        // error must leave omitted sequences untouched.
+        let mut full = vec![Value::Null; table.columns.len()];
+        let missing = row.len() < target_indexes.len();
+        let mut rejected = false;
+        for (cell, index) in row.into_iter().zip(&target_indexes) {
+            let column = &table.columns[*index];
+            let Some(value) = cell else { full[*index] = super::defaults::evaluate(state, column, clock)?; continue; };
+            let original = (input.options.on_error_ignore && input.options.log_verbosity == CopyLogVerbosity::Verbose).then(|| value.clone());
+            let mut soft = true;
+            let value = match value {
+                Value::Text(text) => sql_copy::copy_text_field(text, &column.data_type, clock),
+                value => Ok(value),
+            }.and_then(|value| if input.options.on_error_ignore {
+                let value = super::coerce_base_to_column(state, column, value)?;
+                user_types::coerce(state, column, &value).inspect_err(|error| {
+                    // A failed domain predicate and domain NOT NULL are input
+                    // errors; exceptions thrown by the predicate itself are not.
+                    soft = match state.column_type(column.id) {
+                        Some(TypeDef::Enum { .. }) => matches!(error, SqlError::InvalidTextRepresentation),
+                        Some(TypeDef::Domain { .. }) => matches!(error, SqlError::Null | SqlError::CheckViolation),
+                        _ => false,
+                    };
+                })?;
+                Ok(value)
+            } else { coerce_to_column(state, column, value) });
+            match value {
+                Ok(value) => full[*index] = value,
+                Err(error) if input.options.on_error_ignore && soft && copy_input_soft_error(&error) => {
+                    user_types::take_sql_error_message();
+                    user_types::take_sql_error_detail();
+                    user_types::take_sql_error_hint();
+                    skipped += 1;
+                    if input.options.log_verbosity == CopyLogVerbosity::Verbose {
+                        let value = match original.as_ref().unwrap() {
+                            Value::Null => "null input".to_owned(),
+                            Value::Text(text) => {
+                                let mut end = text.len().min(100);
+                                while !text.is_char_boundary(end) { end -= 1; }
+                                format!("\"{}{}\"", &text[..end], if end < text.len() { "..." } else { "" })
+                            }
+                            value => format!("{value:?}"),
+                        };
+                        user_types::sql_notice(format!("skipping row due to data type incompatibility at line {} for column \"{}\": {value}", input.first_line + offset as u64, column.name), "00000");
+                    }
+                    if let Some(limit) = input.options.reject_limit && skipped + input.skipped > limit {
+                        user_types::view_replace_error(format!("skipped more than REJECT_LIMIT ({limit}) rows due to data type incompatibility"));
+                        return Err(SqlError::InvalidTextRepresentation);
+                    }
+                    rejected = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !rejected && missing { return Err(SqlError::BadCopyFileFormat); }
+        // NextCopyFrom still evaluates omitted defaults after a soft error,
+        // but never evaluates supplied marker cells after that error.
+        for (index, column) in table.columns.iter().enumerate() {
+            if !target_indexes.contains(&index) && column.name != HIDDEN_ROWID {
+                full[index] = super::defaults::evaluate(state, column, clock)?;
+            }
+        }
+        if rejected { continue; }
+        admission.row();
+        for index in &logical { admission.value(&full[*index])?; }
+        // Preserve the assignment step previously performed by normalize_row
+        // on literal expressions, including omitted and marker defaults.
+        for index in &logical {
+            full[*index] = query::assignment::literal(
+                std::mem::replace(&mut full[*index], Value::Null),
+                &table.columns[*index].data_type, clock)?;
+        }
+        let mut full = finish_row(state, table, &insert, &logical, full)?;
+        output.push(logical.iter().map(|i| std::mem::replace(&mut full[*i], Value::Null)).collect());
     }
-    let columns = table.logical_columns().map(|c| c.name.clone()).collect();
-    let types = table
-        .logical_columns()
-        .map(|c| c.data_type.clone())
-        .collect();
-    prepared.statement = Statement::InsertMulti(Box::new(Insert::copy(
-        table.name.clone(),
-        columns,
-        types,
-        vec![],
-    )));
-    Ok((prepared, output))
+    let mut prepared = prepared.clone();
+    prepared.unbound_statement = None;
+    prepared.relations.clear();
+    prepared.statement = Statement::InsertMulti(Box::new(insert));
+    Ok((prepared, output, skipped))
+}
+
+// These are input conversion/domain errors, never table constraint errors:
+// table constraints are checked later by normalize_row.
+fn copy_input_soft_error(error: &SqlError) -> bool {
+    matches!(error, SqlError::Type | SqlError::Overflow | SqlError::InvalidTextRepresentation
+        | SqlError::InvalidDatetimeFormat | SqlError::DatetimeFieldOverflow
+        | SqlError::IntervalFieldOverflow | SqlError::InvalidTimeZoneDisplacementValue
+        | SqlError::StringDataRightTruncation | SqlError::InvalidParameterValue
+        | SqlError::CheckViolation | SqlError::Null | SqlError::DivisionByZero
+        | SqlError::InvalidEscapeSequence | SqlError::NullValueNotAllowed | SqlError::CannotCoerce)
 }
 
 fn resolved_value(

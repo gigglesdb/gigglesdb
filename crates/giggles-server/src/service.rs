@@ -2805,16 +2805,16 @@ impl Session {
             wall: Some(Arc::new(move || service.clock.sql_micros())),
         }
     }
-    pub(crate) fn normalize_copy_rows(
+    pub(crate) fn normalize_copy_cells(
         &mut self,
         prepared: &Prepared,
-        rows: Vec<Vec<Value>>,
+        input: giggles_core::relational::CopyInput,
         clock: &StatementClock,
-    ) -> Result<(Prepared, Vec<Vec<Value>>), CoreError> {
+    ) -> Result<(Prepared, Vec<Vec<Value>>, u64), CoreError> {
         self.authority_scope(|session| {
             session.reconcile_sequence_owners()?;
             session.authorize(prepared)?;
-            session.sql.normalize_copy_rows_at(prepared, rows, clock)
+            session.sql.normalize_copy_cells_at(prepared, input, clock)
         })
     }
     pub(crate) fn finish_copy_input(
