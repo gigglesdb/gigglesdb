@@ -35,7 +35,7 @@ mysql_common = { version = "=0.37.3", default-features = false, features = ["bin
 google-cloud-spanner = { version = "=0.35.0", default-features = false, features = ["default-rustls-provider"] }
 # Explicit emulator hosts need anonymous credentials without mutating process env.
 google-cloud-auth = { version = "=1.19.0", default-features = false }
-giggles-core = { git = "file:///K:/Projects/gigglesdb", rev = "edc519b05357a6b240c313c0af3c0ced1ed090d5" }
+giggles-core = { path = "../giggles-core" }
 object_store = { version = "=0.14.2", features = ["aws", "gcp", "fs"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "signal"] }
 tokio-postgres = "=0.7.15"

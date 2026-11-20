@@ -459,11 +459,9 @@ def linux_fs():
     for directory in [TASK/'linux-tmp', TASK/'linux-scratch']:
         directory.mkdir(exist_ok=True)
     save('owner-'+RUN+'.json',{'run_id':RUN,'pid':os.getpid(),'task_root':str(TASK)})
-    # Keep the exact file:// git dependency URL usable in Linux. Cargo fetches
-    # its locked revision from this read-only repo into /work/linux-cargo-home;
-    # it never builds the mutable giggles-core working tree.
+    # Mount the repo read-only so Cargo can resolve sibling path dependencies.
     repo = CRATE.parents[1]
-    source = '/K:/Projects/gigglesdb'
+    source = '/src'
     name = 'skedaddle-'+RUN+'-linux-fs'
     try:
         result = docker('run', '--name', name,

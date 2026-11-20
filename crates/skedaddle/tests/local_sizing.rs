@@ -59,6 +59,7 @@ fn stored_row_bytes(row: &SqlRow) -> u64 {
             Value::Int(_) => 12,
             Value::Text(s) => 12 + s.len(),
             Value::Bytes(b) => 12 + b.len(),
+            _ => panic!("unsupported local projection value"),
         })
         .sum();
     (24 + encode_key(&row.values[..1]).unwrap().len() + values) as u64

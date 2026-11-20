@@ -574,14 +574,18 @@ fn row_bytes(values: &[V]) -> Result<usize> {
             .len()
         + values
             .iter()
-            .map(|v| match v {
-                V::Text(s) => 12 + s.len(),
-                V::Bytes(b) => 12 + b.len(),
-                V::Int(_) => 12,
-                V::Bool(_) => 5,
-                V::Null => 4,
+            .map(|v| {
+                Ok(match v {
+                    V::Text(s) => 12 + s.len(),
+                    V::Bytes(b) => 12 + b.len(),
+                    V::Int(_) => 12,
+                    V::Bool(_) => 5,
+                    V::Null => 4,
+                    // The fixed projection schema never emits other core types.
+                    _ => return Err(Error::Rejected("unsupported local projection value".into())),
+                })
             })
-            .sum::<usize>())
+            .sum::<Result<usize>>()?)
 }
 
 fn fragments(value: &str) -> Vec<&str> {
