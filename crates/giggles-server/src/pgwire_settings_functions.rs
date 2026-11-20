@@ -72,6 +72,20 @@ pub(super) fn evaluate(
         diagnostic.replication_role_authorize(session)?;
         diagnostic.replication_role_value(value)?;
     }
+    if function.has_row(settings)
+        && let crate::pg_settings::Function::Set { name, value, .. } = function
+        && name.eq_ignore_ascii_case("gigglesdb.max_value_bytes")
+        && !value.parse::<usize>().is_ok_and(|n| (65536..=1073741819).contains(&n)) {
+        diagnostic.wire_message = Some(format!("{value} is outside the valid range for parameter \"gigglesdb.max_value_bytes\" (65536 .. 1073741819)"));
+        return Err("22023");
+    }
+    if function.has_row(settings)
+        && let crate::pg_settings::Function::Set { name, value, .. } = function
+        && name.eq_ignore_ascii_case("gigglesdb.max_statement_tokens")
+        && !value.parse::<i64>().is_ok_and(|n| (0..=i64::from(i32::MAX)).contains(&n)) {
+        diagnostic.wire_message = Some(format!("{value} is outside the valid range for parameter \"gigglesdb.max_statement_tokens\" (0 .. 2147483647)"));
+        return Err("22023");
+    }
     if let Some(columns) = function.current_columns() {
         let values = columns.iter().map(|call| diagnostic.settings(call.evaluate(settings)).map(|v| v.map(Value::Text).unwrap_or(Value::Null))).collect::<R<Vec<_>>>()?;
         return Ok(SqlResult {

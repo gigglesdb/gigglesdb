@@ -179,7 +179,7 @@ impl Budget {
     fn add(&mut self, bytes: usize, depth: usize) -> R<()> {
         self.nodes += 1;
         self.bytes = self.bytes.checked_add(bytes).ok_or(SqlError::Limit)?;
-        if depth > 32 || self.nodes > MAX_WORK || self.bytes > MAX_SQL {
+        if depth > 32 || self.nodes > max_statement_tokens() || self.bytes > crate::relational::max_value_bytes() {
             return Err(SqlError::Limit);
         }
         Ok(())

@@ -144,7 +144,7 @@ pub(super) fn eval(v: &[Value], budget: &mut usize) -> R<Value> {
             Value::Bytes(b) => b.len(),
             _ => return Err(SqlError::Type),
         };
-        if size > MAX_ROW_BYTES {
+        if size > crate::relational::max_value_bytes() {
             return Err(SqlError::Limit);
         }
     }

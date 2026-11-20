@@ -92,7 +92,7 @@ fn admit(req: &Request<'_>) -> R<usize> {
     ) {
         bytes = add(bytes, raw(v)?)?;
         // Reserve one byte for string successor before any owned endpoint copy.
-        cap(bytes, MAX_ROW_BYTES - 1)?;
+        cap(bytes, crate::relational::max_value_bytes() - 1)?;
     }
     if req.descending || !req.residuals.is_empty() {
         return Err(SqlError::Unsupported);

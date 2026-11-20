@@ -231,7 +231,9 @@ impl RangeStore {
             }
         };
         let _installs = match outcome {
-            Some(BatchCheck { descriptor: true, .. }) => Some(self.installs_lock()?),
+            Some(BatchCheck {
+                descriptor: true, ..
+            }) => Some(self.installs_lock()?),
             _ => None,
         };
         batch.put(
@@ -456,6 +458,29 @@ pub(crate) fn check_batch(
     descriptor: &RangeDescriptor,
     batch: &WriteBatch,
 ) -> Result<BatchCheck, BatchError> {
+    // Check payloads before routing refusals: even a mixed invalid batch must
+    // fail closed instead of advancing the applied position past a wide row.
+    for op in batch.ops() {
+        if let Op::Put {
+            ks: Keyspace::Rows,
+            value,
+            ..
+        } = op
+            && !crate::storage::engine::codec::range_stored_row_fits(value)
+        {
+            return Err(BatchError::Invalid(
+                "row payload exceeds range limit".into(),
+            ));
+        }
+        // Even a Prepared key belonging to another range must be checked
+        // before any ownership refusal can consume the committed input.
+        if let Op::Put { ks: Keyspace::Meta, key, value } = op
+            && let Some((owner, sub @ RangeLocalKey::Prepared(_))) = parse_range_local_key(key)
+        {
+            check_range_value(owner, &sub, value, u64::MAX)
+                .map_err(|e| BatchError::Invalid(e.to_string()))?;
+        }
+    }
     let outside = BatchError::Outside;
     let id = descriptor.id;
     // `applied`, `install` and the split lineage (`child/*`, split.rs) belong to the store; the
@@ -540,7 +565,10 @@ pub(crate) fn check_batch(
                 if !interval_in_range(descriptor, *ks, start, end)
                     .map_err(|e| outside(format!("{e:?}")))?
                 {
-                    return Err(outside(format!("{ks:?} delete-range outside range {}", id.0)));
+                    return Err(outside(format!(
+                        "{ks:?} delete-range outside range {}",
+                        id.0
+                    )));
                 }
             }
         }

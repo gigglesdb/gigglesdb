@@ -145,9 +145,48 @@ pub(crate) fn check_range_value(
             }
             Ok(())
         }
-        RangeLocalKey::Applied
-        | RangeLocalKey::Install
-        | RangeLocalKey::Prepared(_)
-        | RangeLocalKey::Home(_) => Ok(()),
+        RangeLocalKey::Prepared(_) => check_prepared_rows(value),
+        RangeLocalKey::Applied | RangeLocalKey::Install | RangeLocalKey::Home(_) => Ok(()),
     }
+}
+
+/// Validate embedded row lengths before accepting a range prepared record.
+/// The engine's decoder additionally validates locks and the trailing lineage.
+fn check_prepared_rows(mut bytes: &[u8]) -> Result<(), FormatError> {
+    fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Result<&'a [u8], FormatError> {
+        if bytes.len() < n {
+            return Err(corrupt("truncated prepared record"));
+        }
+        let (head, rest) = bytes.split_at(n);
+        *bytes = rest;
+        Ok(head)
+    }
+    fn number(bytes: &mut &[u8]) -> Result<usize, FormatError> {
+        Ok(u32::from_be_bytes(take(bytes, 4)?.try_into().unwrap()) as usize)
+    }
+    fn blob<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8], FormatError> {
+        let n = number(bytes)?;
+        take(bytes, n)
+    }
+    if !matches!(take(&mut bytes, 1)?[0], 1 | 2) {
+        return Err(corrupt("unknown prepared version"));
+    }
+    take(&mut bytes, 16)?;
+    for _ in 0..number(&mut bytes)? {
+        let space = take(&mut bytes, 1)?[0];
+        blob(&mut bytes)?;
+        match take(&mut bytes, 1)?[0] {
+            0 => {}
+            1 => {
+                let value = blob(&mut bytes)?;
+                if space == crate::storage::range_api::RangeSpace::Rows.tag()
+                    && !super::super::codec::range_row_fits(value)
+                {
+                    return Err(corrupt("prepared row payload exceeds range limit"));
+                }
+            }
+            _ => return Err(corrupt("bad prepared value flag")),
+        }
+    }
+    Ok(())
 }

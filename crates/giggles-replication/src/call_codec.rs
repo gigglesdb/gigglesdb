@@ -927,6 +927,7 @@ fn put_error(w: &mut Writer, e: &RangeError) -> Result<(), RangeError> {
         RangeError::Deadlock => w.u8(3),
         RangeError::LockTimeout => w.u8(4),
         RangeError::Cancelled => w.u8(5),
+        RangeError::Limit => w.u8(10),
         RangeError::Conflict(s) => {
             w.u8(6);
             w.str(s)?;
@@ -961,6 +962,7 @@ fn error(r: &mut Reader<'_>) -> Result<RangeError, RangeError> {
         7 => RangeError::Unavailable(r.string()?),
         8 => RangeError::Unknown(r.string()?),
         9 => RangeError::Corrupt(r.string()?),
+        10 => RangeError::Limit,
         _ => return Err(corrupt("unknown error")),
     })
 }
@@ -1344,4 +1346,14 @@ pub fn decode_reply(bytes: &[u8]) -> Result<Result<PeerReply, RangeError>, Range
         })
     };
     r.finish(reply)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn range_limit_error_round_trip() {
+        let encoded = encode_reply(&Err(RangeError::Limit)).unwrap();
+        assert_eq!(decode_reply(&encoded).unwrap(), Err(RangeError::Limit));
+    }
 }

@@ -92,7 +92,7 @@ pub(super) fn eval(name: &str, values: &[Value], budget: &mut usize) -> Option<R
 fn quote(name: &str, input: &str, budget: &mut usize) -> R<Value> {
     // Cap the scan before inspecting any bytes. Only two bounded scans occur:
     // exact-size/classification, then the one admitted output construction.
-    if input.len() > MAX_ROW_BYTES {
+    if input.len() > crate::relational::max_value_bytes() {
         return Err(SqlError::Limit);
     }
     let identifier = name == "quote_ident";

@@ -91,6 +91,45 @@ pub const MAX_STATEMENT_SQL: usize = MAX_SQL;
 pub const MAX_INSERT_TOKENS: usize = 1_000_000;
 pub const MAX_ROWS: usize = 1024;
 pub const MAX_ROW_BYTES: usize = 64 * 1024;
+/// PostgreSQL MaxAllocSize minus the varlena header; the configurable ceiling.
+pub const MAX_VALUE_BYTES: usize = 1_073_741_819;
+/// Matches V2_MAX_SQL, covers ordinary large text/JSON/bytea values, and bounds
+/// per-row scalar temporaries (4 x value) to 256 MiB. Operators can raise this
+/// to MAX_VALUE_BYTES (1073741819).
+pub const DEFAULT_MAX_VALUE_BYTES: usize = V2_MAX_SQL;
+/// Matches MAX_INSERT_TOKENS, bounds planner memory and CPU per statement,
+/// and still admits a 100,000-element IN list. Zero remains unlimited.
+pub const DEFAULT_MAX_STATEMENT_TOKENS: usize = MAX_INSERT_TOKENS;
+thread_local! {
+    static STATEMENT_TOKENS: std::cell::Cell<usize> = const { std::cell::Cell::new(4096) };
+    static WIDE_VALUES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static VALUE_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_ROW_BYTES) };
+}
+pub(crate) fn max_statement_tokens() -> usize { STATEMENT_TOKENS.with(std::cell::Cell::get) }
+pub(crate) struct StatementBudget(usize);
+impl StatementBudget {
+    pub(crate) fn enter(tokens: usize, v2: bool) -> Self {
+        let limit = if v2 { if tokens == 0 { usize::MAX } else { tokens } } else { 4096 };
+        Self(STATEMENT_TOKENS.with(|v| v.replace(limit)))
+    }
+}
+impl Drop for StatementBudget {
+    fn drop(&mut self) { STATEMENT_TOKENS.with(|v| v.set(self.0)); }
+}
+pub(crate) fn max_value_bytes() -> usize { VALUE_LIMIT.with(std::cell::Cell::get) }
+pub(crate) fn wide_values() -> bool { WIDE_VALUES.with(std::cell::Cell::get) }
+pub(crate) struct ValueBudget(usize, bool);
+impl ValueBudget {
+    pub(crate) fn enter(bytes: usize, v2: bool) -> Self { Self(VALUE_LIMIT.with(|v| v.replace(bytes)), WIDE_VALUES.with(|v| v.replace(v2))) }
+}
+impl Drop for ValueBudget {
+    fn drop(&mut self) { VALUE_LIMIT.with(|v| v.set(self.0)); WIDE_VALUES.with(|v| v.set(self.1)); }
+}
+/// Bound one projected row separately from cursor pages and result collectors.
+/// Each column may contain one maximum-sized value plus its fixed overhead.
+pub(crate) fn max_projected_row_bytes(value_bytes: usize) -> usize {
+    value_bytes.saturating_mul(MAX_COLUMNS).saturating_add(MAX_COLUMNS * 32).max(MAX_RESULT_BYTES)
+}
 pub const MAX_COLUMNS: usize = 64;
 pub const MAX_PARAMS: usize = 65_535;
 pub const MAX_TABLES: usize = 128;
@@ -179,7 +218,7 @@ fn payload_bound<'a>(values: impl Iterator<Item = &'a Value>) -> R<()> {
     let mut bytes = 0usize;
     for v in values {
         bytes = bytes.checked_add(value_bytes(v)).ok_or(SqlError::Limit)?;
-        if bytes > MAX_ROW_BYTES {
+        if bytes > max_value_bytes() {
             return Err(SqlError::Limit);
         }
     }
@@ -706,7 +745,7 @@ pub(crate) fn row_check(t: &TableDef, values: &[Value]) -> R<()> {
         check(v, c)?;
         size = size.checked_add(value_bytes(v)).ok_or(SqlError::Limit)?;
     }
-    if size > MAX_ROW_BYTES {
+    if size > max_value_bytes() {
         return Err(SqlError::Limit);
     }
     Ok(())
@@ -847,6 +886,7 @@ fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
             while i < b.len() {
                 if b[i] == b'\'' {
                     if b.get(i + 1) == Some(&b'\'') {
+                        if v.len() >= max_value_bytes() { return Err(SqlError::Limit); }
                         v.push(b'\'');
                         i += 2;
                     } else {
@@ -855,6 +895,7 @@ fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
                         break;
                     }
                 } else {
+                    if v.len() >= max_value_bytes() { return Err(SqlError::Limit); }
                     v.push(b[i]);
                     i += 1;
                 }
@@ -862,7 +903,7 @@ fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
             if !closed {
                 return Err(SqlError::Syntax);
             }
-            if v.len() > MAX_SQL {
+            if v.len() > max_value_bytes() {
                 return Err(SqlError::Limit);
             }
             let text = String::from_utf8(v).map_err(|_| SqlError::Syntax)?;
@@ -916,7 +957,7 @@ fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
                 i += 2;
                 let start = i;
                 let end = s[start..].find("$$").ok_or(SqlError::Syntax)? + start;
-                if end - start > MAX_SQL {
+                if end - start > max_value_bytes() {
                     return Err(SqlError::Limit);
                 }
                 out.push(Token::String(s[start..end].into()));
@@ -974,10 +1015,11 @@ fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
     Ok(())
 }
 fn token_limit(tokens: &[Token], routing: bool) -> usize {
+    if wide_values() { return max_statement_tokens(); }
     if routing || matches!(tokens.first(), Some(Token::Word(word)) if word == "insert") {
         MAX_INSERT_TOKENS
     } else {
-        4096
+        max_statement_tokens()
     }
 }
 #[derive(Debug, Clone)]

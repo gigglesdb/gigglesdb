@@ -1,5 +1,6 @@
 use super::{crc32c::crc32c_parts, hlc::Ts};
-use crate::relational::{MAX_COLUMNS, MAX_ROW_BYTES, SqlError, Value, encode_key};
+use crate::relational::{MAX_COLUMNS, MAX_VALUE_BYTES, SqlError, Value, encode_key};
+use bincode::Options;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CodecError {
@@ -119,6 +120,21 @@ pub(crate) struct RowRecord {
 
 const HEADER: usize = 16;
 
+/// Range protocols cannot publish WIDE_ROWS with a transaction. This checks the
+/// encoded row's payload bound without decoding or allocating its SQL values.
+pub(crate) fn range_row_fits(record: &[u8]) -> bool {
+    record.len() <= crate::relational::MAX_ROW_BYTES + HEADER + 4
+        && (record.len() < HEADER + 4
+            || u32::from_be_bytes(record[12..16].try_into().unwrap()) as usize
+                <= crate::relational::MAX_ROW_BYTES)
+}
+
+/// Stored row versions carry one MVCC envelope byte. Short opaque values used
+/// by KV callers still receive the same size bound.
+pub(crate) fn range_stored_row_fits(value: &[u8]) -> bool {
+    range_row_fits(value.strip_prefix(&[0]).unwrap_or(value))
+}
+
 pub(crate) fn encode_row(
     key: &[u8],
     row_version: u64,
@@ -127,9 +143,17 @@ pub(crate) fn encode_row(
     if values.len() > MAX_COLUMNS {
         return Err(CodecError::Limit);
     }
-    let payload =
-        super::super::encode(&values).map_err(|_| CodecError::Corrupt("row serialization"))?;
-    if payload.len() > MAX_ROW_BYTES {
+    let options = || super::super::codec().with_limit((MAX_VALUE_BYTES + MAX_COLUMNS * 32) as u64);
+    let size = options()
+        .serialized_size(&values)
+        .map_err(|_| CodecError::Limit)?;
+    if size > crate::relational::max_value_bytes() as u64 {
+        return Err(CodecError::Limit);
+    }
+    let payload = options()
+        .serialize(&values)
+        .map_err(|_| CodecError::Corrupt("row serialization"))?;
+    if payload.len() > MAX_VALUE_BYTES + MAX_COLUMNS * 32 {
         return Err(CodecError::Limit);
     }
     encode_record(key, row_version, false, values.len(), &payload)
@@ -171,7 +195,7 @@ pub(crate) fn decode_row(key: &[u8], record: &[u8]) -> Result<RowRecord, CodecEr
     let row_version = u64::from_be_bytes(record[2..10].try_into().unwrap());
     let count = u16::from_be_bytes(record[10..12].try_into().unwrap()) as usize;
     let len = u32::from_be_bytes(record[12..16].try_into().unwrap()) as usize;
-    if count > MAX_COLUMNS || len > MAX_ROW_BYTES {
+    if count > MAX_COLUMNS || len > MAX_VALUE_BYTES + MAX_COLUMNS * 32 {
         return Err(CodecError::Corrupt("row bounds"));
     }
     if record.len() != HEADER + len + 4 {
@@ -188,7 +212,9 @@ pub(crate) fn decode_row(key: &[u8], record: &[u8]) -> Result<RowRecord, CodecEr
     let values: Vec<Value> = if tombstone {
         Vec::new()
     } else {
-        super::super::decode(&record[HEADER..end])
+        super::super::codec()
+            .with_limit((MAX_VALUE_BYTES + MAX_COLUMNS * 32) as u64)
+            .deserialize(&record[HEADER..end])
             .map_err(|_| CodecError::Corrupt("row payload"))?
     };
     if values.len() != count {

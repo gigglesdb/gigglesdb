@@ -61,7 +61,15 @@ fn stale_destination(dir: &Dir) -> RangeStore {
         stale.put(
             Keyspace::Meta,
             range_local_key(B, &RangeLocalKey::Prepared(n)),
-            b"p".to_vec(),
+            crate::storage::range::engine::prepared::Prepared {
+                home: RangeId(2),
+                at: crate::storage::engine::hlc::Ts(1),
+                writes: Default::default(),
+                locks: vec![],
+                children: vec![],
+            }
+            .encode()
+            .unwrap(),
         );
         dest.apply(B, &stale.encode(), pos(n, 1)).unwrap();
         let mut keep = WriteBatch::default();
@@ -222,11 +230,17 @@ fn a_crash_at_each_install_step_recovers_to_a_consistent_range() {
         );
         assert_eq!(rows(&dest, Keyspace::Rows).len(), 3, "range 1 rows survive");
         // The rolled-back range applies nothing until a snapshot is installed, also after reopen.
-        assert!(matches!(dest.apply(B, &batch(1), pos(1, 1)), Err(CoreError::Corrupt(_))));
+        assert!(matches!(
+            dest.apply(B, &batch(1), pos(1, 1)),
+            Err(CoreError::Corrupt(_))
+        ));
         assert!(dest.export(B, &sub.sub("again")).is_err());
         drop(dest);
         let dest = RangeStore::open(sub.sub("dest")).unwrap();
-        assert!(matches!(dest.apply(B, &batch(1), pos(1, 1)), Err(CoreError::Corrupt(_))));
+        assert!(matches!(
+            dest.apply(B, &batch(1), pos(1, 1)),
+            Err(CoreError::Corrupt(_))
+        ));
         assert_eq!(dest.install(B, &dir.sub("snap")).unwrap(), at);
         assert_eq!(range_contents(&dest, B), expect, "{step:?} reinstalled");
     }
@@ -276,4 +290,99 @@ fn install_fences_refuse_before_writing() {
         same.apply(B, &batch(n), pos(n, 1)).unwrap();
     }
     assert_eq!(same.install(B, &dir.sub("snap")).unwrap(), pos(5, 1));
+}
+
+#[test]
+fn snapshot_wide_rows_require_manifest_bit_before_target_changes() {
+    use crate::storage::engine::{codec, meta::WIDE_ROWS, mvcc};
+    let dir = Dir::new("range-snapshot-wide");
+    let source = two_ranges(&dir);
+    source.apply_noop(B, pos(3, 1)).unwrap_err(); // positions cannot skip
+    for n in 1..=3 {
+        source.apply_noop(B, pos(n, 1)).unwrap();
+    }
+    let _budget =
+        crate::relational::ValueBudget::enter(crate::relational::DEFAULT_MAX_VALUE_BYTES, true);
+    let wide = codec::encode_row(
+        b"k",
+        1,
+        &[crate::relational::Value::Text("x".repeat(70_000))],
+    )
+    .unwrap();
+    // Bypass apply to model a snapshot produced by an unprotected old receiver.
+    let mut batch = WriteBatch::default();
+    batch.put(
+        Keyspace::Rows,
+        row(SPLIT_TABLE, 9, 1),
+        mvcc::encode_live(&wide),
+    );
+    source.kv().write(batch, Durability::Sync).unwrap();
+    let snap = dir.sub("wide-snap");
+    source.export(B, &snap).unwrap();
+    let dest = stale_destination(&dir);
+    let before: Vec<_> = Keyspace::ALL
+        .into_iter()
+        .map(|ks| rows(&dest, ks))
+        .collect();
+    assert!(matches!(dest.install(B, &snap), Err(CoreError::Corrupt(_))));
+    assert_eq!(
+        Keyspace::ALL
+            .into_iter()
+            .map(|ks| rows(&dest, ks))
+            .collect::<Vec<_>>(),
+        before
+    );
+    assert!(!dest.needs_snapshot(B).unwrap());
+    // Model a crash from an older receiver that wrote its install marker
+    // without validating the unflagged oversized Rows SST.
+    let recovery_dir = Dir::new("range-snapshot-wide-recovery");
+    let recovery = stale_destination(&recovery_dir);
+    let recovery_manifest = Manifest::decode(&std::fs::read(snap.join(MANIFEST)).unwrap()).unwrap();
+    let source_files: Vec<_> = recovery_manifest.parts.iter()
+        .filter_map(|p| p.file.as_ref().map(|f| snap.join(f))).collect();
+    let mut marker = WriteBatch::default();
+    marker.put(Keyspace::Meta, range_local_key(B, &RangeLocalKey::Install),
+        encode_marker(&descriptors()[1], &snap).unwrap());
+    recovery.kv().write(marker, Durability::Sync).unwrap();
+    drop(recovery);
+    CHECK_SCRATCH_PATHS.with_borrow_mut(Vec::clear);
+    let recovery = RangeStore::open(recovery_dir.sub("dest")).unwrap();
+    assert!(recovery.needs_snapshot(B).unwrap());
+    assert_eq!(recovery.applied(B).unwrap(), None);
+    assert!(recovery.apply(B, &self::batch(1), pos(1, 1)).is_err());
+    CHECK_SCRATCH_PATHS.with_borrow_mut(|paths| {
+        assert!(!paths.is_empty());
+        assert!(paths.iter().all(|path| !path.exists()));
+        paths.clear();
+    });
+    assert!(!source_files.is_empty());
+    assert!(source_files.iter().all(|path| path.is_file()));
+    let bytes = std::fs::read(snap.join(MANIFEST)).unwrap();
+    let mut manifest = Manifest::decode(&bytes).unwrap();
+    let mut values = std::collections::BTreeMap::new();
+    for op in manifest.meta.ops() {
+        if let Op::Put { key, value, .. } = op {
+            values.insert(key.clone(), value.clone());
+        }
+    }
+    let features = values
+        .entry(range_local_key(B, &RangeLocalKey::Features))
+        .or_insert_with(|| 0u64.to_be_bytes().to_vec());
+    *features = (u64::from_be_bytes(features.as_slice().try_into().unwrap()) | WIDE_ROWS)
+        .to_be_bytes()
+        .to_vec();
+    let mut meta = WriteBatch::default();
+    for (key, value) in values {
+        meta.put(Keyspace::Meta, key, value);
+    }
+    manifest.meta = meta;
+    write_synced(&snap.join(MANIFEST), &manifest.encode()).unwrap();
+    dest.install(B, &snap).unwrap();
+    assert!(
+        rows(&dest, Keyspace::Rows)
+            .iter()
+            .any(|(_, v)| v == &mvcc::encode_live(&wide))
+    );
+    let bits = dest.kv().get(Keyspace::Meta, b"features").unwrap().unwrap();
+    assert_ne!(u64::from_be_bytes(bits.try_into().unwrap()) & WIDE_ROWS, 0);
 }

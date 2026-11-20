@@ -1148,3 +1148,42 @@ fn sql_insert_admission_witness_counters_observe_successful_boundaries() {
     assert_eq!(counts[4], 1, "batch publisher invoked");
     state.secondary_validate_engine(|| false).unwrap();
 }
+
+#[test]
+fn wide_input_keeps_multi_row_total_bound() {
+    let _budget = crate::relational::ValueBudget::enter(4 * MAX_RESULT_BYTES, true);
+    let mut input = InputAdmission::default();
+    input.row();
+    input.value(&Value::Text("x".repeat(MAX_RESULT_BYTES + 1))).unwrap();
+    input.row();
+    assert!(matches!(input.value(&Value::Int(1)), Err(SqlError::Limit)));
+    let mut input = InputAdmission::default();
+    for _ in 0..16 {
+        input.row();
+        input.value(&Value::Text("x".repeat(64 * 1024))).unwrap();
+    }
+    input.row();
+    assert!(matches!(input.value(&Value::Int(1)), Err(SqlError::Limit)));
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn v2_single_wide_insert_returning_update_and_scan_cursor() {
+    let mut nonce = [0; 16]; getrandom::fill(&mut nonce).unwrap();
+    let path = std::env::temp_dir().join(format!("budget-single-{:032x}", u128::from_be_bytes(nonce)));
+    let admin = Admin::create_engine(&path, Limits::default(), crate::Engine::V2).unwrap();
+    let mut session = admin.sql_session();
+    session.execute("CREATE TABLE wide (id int PRIMARY KEY, body text)", &[], None).unwrap();
+    for (id, size) in [(1, 1_048_577), (2, 204_800), (3, 2 * 1024 * 1024)] {
+        let result = session.execute("INSERT INTO wide VALUES ($1,$2) RETURNING body",
+            &[Value::Int(id), Value::Text("x".repeat(size))], None).unwrap();
+        assert_eq!(result.rows[0].values, vec![Value::Text("x".repeat(size))]);
+    }
+    session.execute("UPDATE wide SET body=$1 WHERE id=2", &[Value::Text("y".repeat(204_800))], None).unwrap();
+    let p = session.prepare("SELECT body FROM wide WHERE id=3").unwrap();
+    let mut cursor = session.open_cursor(&p, &[]).unwrap();
+    assert_eq!(cursor.fetch(256, 1024 * 1024).unwrap()[0].values,
+        vec![Value::Text("x".repeat(2 * 1024 * 1024))]);
+    drop(cursor); drop(session); drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}

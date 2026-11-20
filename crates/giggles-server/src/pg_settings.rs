@@ -23,6 +23,8 @@ pub(crate) struct Settings {
     pub statement_timeout: u64,
     pub lock_timeout: u64,
     pub extra_float_digits: i32,
+    pub max_value_bytes: usize,
+    pub max_statement_tokens: usize,
     pub timezone: String,
     pub datestyle: String,
     pub intervalstyle: String,
@@ -61,6 +63,8 @@ impl Default for Settings {
             statement_timeout: 0,
             lock_timeout: 0,
             extra_float_digits: 1,
+            max_value_bytes: giggles_core::relational::DEFAULT_MAX_VALUE_BYTES,
+            max_statement_tokens: giggles_core::relational::DEFAULT_MAX_STATEMENT_TOKENS,
             timezone: "UTC".into(),
             datestyle: "ISO, MDY".into(),
             intervalstyle: "postgres".into(),
@@ -235,6 +239,8 @@ impl Settings {
             Show::ExtraFloatDigits => {
                 self.extra_float_digits = value.parse().expect("validated GUC")
             }
+            Show::MaxValueBytes => self.max_value_bytes = value.parse().expect("validated GUC"),
+            Show::MaxStatementTokens => self.max_statement_tokens = value.parse().expect("validated GUC"),
             Show::TimeZone => self.timezone = value,
             Show::DateStyle => self.datestyle = value,
             Show::IntervalStyle => self.intervalstyle = value,
@@ -257,6 +263,8 @@ impl Settings {
     }
 }
 pub(crate) const RESETTABLE: &[Show] = &[
+    Show::MaxValueBytes,
+    Show::MaxStatementTokens,
     Show::ApplicationName,
     Show::ExtraFloatDigits,
     Show::TimeZone,
@@ -294,6 +302,8 @@ pub(crate) const REPORTABLE: &[Show] = &[
 type Result<T> = std::result::Result<T, &'static str>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Show {
+    MaxValueBytes,
+    MaxStatementTokens,
     ApplicationName,
     ExtraFloatDigits,
     TransactionIsolation,
@@ -335,6 +345,8 @@ pub(crate) enum Show {
 impl Show {
     pub fn value(self, settings: &Settings) -> (&'static str, String) {
         let (name, value) = match self {
+            Self::MaxStatementTokens => ("gigglesdb.max_statement_tokens", settings.max_statement_tokens.to_string()),
+            Self::MaxValueBytes => ("gigglesdb.max_value_bytes", settings.max_value_bytes.to_string()),
             Self::ApplicationName => ("application_name", settings.application_name.clone()),
             Self::ExtraFloatDigits => (
                 "extra_float_digits",

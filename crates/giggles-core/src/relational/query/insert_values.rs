@@ -195,7 +195,7 @@ fn bytes(value: &Value) -> usize {
     }
 }
 pub(super) fn shape(value: &Scalar, depth: usize, nodes: &mut usize) -> R<()> {
-    if depth > 32 || *nodes == MAX_WORK {
+    if depth > 32 || *nodes == max_statement_tokens() {
         return Err(SqlError::Limit);
     }
     *nodes += 1;
@@ -421,7 +421,7 @@ impl InsertExpressions {
         let mut total = 0usize;
         for value in self.literals() {
             total = total.checked_add(bytes(value)).ok_or(SqlError::Limit)?;
-            if total > MAX_ROW_BYTES {
+            if total > crate::relational::max_value_bytes() {
                 return Err(SqlError::Limit);
             }
         }
@@ -554,7 +554,7 @@ impl InsertExpressions {
         for value in &values {
             total = total.checked_add(bytes(value)).ok_or(SqlError::Limit)?;
         }
-        if total > MAX_ROW_BYTES {
+        if total > crate::relational::max_value_bytes() {
             return Err(SqlError::Limit);
         }
         if cancel() {

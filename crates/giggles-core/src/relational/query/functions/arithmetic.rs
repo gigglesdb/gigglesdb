@@ -30,7 +30,7 @@ pub(super) fn token_operator(token: Option<&Token>) -> Option<(BinaryOp, u8)> {
     }
 }
 pub(super) fn admit_shape(value: &Scalar, depth: usize, nodes: &mut usize) -> R<()> {
-    if depth > 32 || *nodes == MAX_WORK {
+    if depth > 32 || *nodes == max_statement_tokens() {
         return Err(SqlError::Limit);
     }
     *nodes += 1;

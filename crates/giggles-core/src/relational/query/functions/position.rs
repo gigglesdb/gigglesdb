@@ -111,13 +111,13 @@ fn evaluate(values: &[Value], budget: &mut usize) -> R<Value> {
     }
     let index = match (&values[0], &values[1]) {
         (Value::Text(source), Value::Text(needle)) => {
-            if source.len() > MAX_ROW_BYTES || needle.len() > MAX_ROW_BYTES {
+            if source.len() > crate::relational::max_value_bytes() || needle.len() > crate::relational::max_value_bytes() {
                 return Err(SqlError::Limit);
             }
             source.find(needle).map(|i| source[..i].chars().count())
         }
         (Value::Bytes(source), Value::Bytes(needle)) => {
-            if source.len() > MAX_ROW_BYTES || needle.len() > MAX_ROW_BYTES {
+            if source.len() > crate::relational::max_value_bytes() || needle.len() > crate::relational::max_value_bytes() {
                 return Err(SqlError::Limit);
             }
             byte_index(source, needle)

@@ -24,7 +24,7 @@ fn output_size(out: &str, extra: usize) -> R<()> {
     if out
         .len()
         .checked_add(extra)
-        .is_none_or(|n| n > MAX_ROW_BYTES)
+        .is_none_or(|n| n > crate::relational::max_value_bytes())
     {
         Err(SqlError::Limit)
     } else {

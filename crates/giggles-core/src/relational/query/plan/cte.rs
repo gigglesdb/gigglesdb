@@ -182,7 +182,7 @@ fn parse_scope(
                 cycle,
             },
         ));
-        if definitions.len() > MAX_WORK {
+        if definitions.len() > max_statement_tokens() {
             return Err(SqlError::Limit.into());
         }
         if !p.sym(',') {

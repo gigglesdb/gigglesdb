@@ -1008,7 +1008,7 @@ fn normalize_row(
                 .checked_add(value_bytes(value))
                 .ok_or(SqlError::Limit)?;
         }
-        if size > MAX_ROW_BYTES {
+        if size > crate::relational::max_value_bytes() {
             return Err(SqlError::Limit);
         }
     } else {
@@ -1197,11 +1197,13 @@ impl operations::SqlConflictEvaluation for ConflictPlan<'_> {
 struct InputAdmission {
     total: usize,
     row_bytes: usize,
+    rows: usize,
     work: usize,
 }
 impl InputAdmission {
     fn row(&mut self) {
         self.row_bytes = 0;
+        self.rows += 1;
     }
     fn value(&mut self, value: &Value) -> R<()> {
         let raw = match value {
@@ -1222,8 +1224,8 @@ impl InputAdmission {
                 .ok_or(SqlError::Limit)?;
             self.work = self.work.checked_add(numeric_work).ok_or(SqlError::Limit)?;
         }
-        if self.row_bytes > MAX_ROW_BYTES
-            || self.total > operations::MAX_INSERT_BYTES
+        if self.row_bytes > crate::relational::max_value_bytes()
+            || self.total > if self.rows == 1 { operations::MAX_INSERT_BYTES.max(crate::relational::max_value_bytes()) } else { operations::MAX_INSERT_BYTES }
             || self.work > secondary_index::MAX_WORK
         {
             return Err(SqlError::Limit);
@@ -1476,7 +1478,7 @@ pub(super) fn execute_declared(
                 .checked_add(value_bytes(value))
                 .ok_or(SqlError::Limit)?;
         }
-        if total > MAX_RESULT_BYTES {
+        if total > if insert.rows.len() == 1 { MAX_RESULT_BYTES.max(crate::relational::max_value_bytes()) } else { MAX_RESULT_BYTES } {
             return Err(SqlError::Limit);
         }
         incoming.push(row);

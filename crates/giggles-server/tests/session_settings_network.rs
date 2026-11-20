@@ -116,7 +116,8 @@ struct Fixture {
     path: std::path::PathBuf,
 }
 impl Fixture {
-    async fn new() -> Self {
+    async fn new() -> Self { Self::with_engine(giggles_core::Engine::Legacy).await }
+    async fn with_engine(engine: giggles_core::Engine) -> Self {
         let path = std::env::temp_dir().join(format!(
             "session-settings-{}-{}-{}",
             std::process::id(),
@@ -127,7 +128,7 @@ impl Fixture {
             SERIAL.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&path).unwrap();
-        let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+        let admin = Admin::create_engine(path.join("db.redb"), Limits::default(), engine).unwrap();
         admin
             .roles()
             .create(NewRole {
@@ -1120,5 +1121,86 @@ async fn pgparity_version_datestyle_schemas_and_tags() {
             assert!(messages.iter().any(|(tag, body)| *tag == b'C' && body == format!("{expected}\0").as_bytes()), "{sql} {messages:?}");
         }
     }
+    drop(c); f.stop().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn wide_value_session_budget() {
+    let f = Fixture::with_engine(giggles_core::Engine::V2).await;
+    let c = f.client().await;
+    let show = c.simple_query("SHOW gigglesdb.max_value_bytes").await.unwrap();
+    assert!(show.iter().any(|m| matches!(m, SimpleQueryMessage::Row(r) if r.get(0) == Some("67108864"))));
+    c.batch_execute("SET gigglesdb.max_value_bytes = 1073741819").await.unwrap();
+    c.batch_execute("RESET gigglesdb.max_value_bytes").await.unwrap();
+    c.batch_execute("SET gigglesdb.max_value_bytes = 65536").await.unwrap();
+    let too_wide = c.simple_query("SELECT repeat('x',70000)").await.unwrap_err();
+    assert_eq!(too_wide.as_db_error().unwrap().code().code(), "54000");
+    assert_eq!(too_wide.as_db_error().unwrap().message(), "requested length too large");
+    let err = c.simple_query("SET gigglesdb.max_value_bytes = 65535").await.unwrap_err();
+    assert_eq!(err.as_db_error().unwrap().code().code(), "22023");
+    assert_eq!(err.as_db_error().unwrap().message(), "65535 is outside the valid range for parameter \"gigglesdb.max_value_bytes\" (65536 .. 1073741819)");
+    // Complete RESET before starting the transaction whose SET is rolled back.
+    c.batch_execute("RESET gigglesdb.max_value_bytes").await.unwrap();
+    c.batch_execute("BEGIN; SET gigglesdb.max_value_bytes = 65536; ROLLBACK").await.unwrap();
+    let show = c.simple_query("SHOW gigglesdb.max_value_bytes").await.unwrap();
+    assert!(show.iter().any(|m| matches!(m, SimpleQueryMessage::Row(r) if r.get(0) == Some("67108864"))));
+    c.batch_execute("BEGIN; SAVEPOINT budget; SET LOCAL gigglesdb.max_value_bytes=65536; ROLLBACK TO budget").await.unwrap();
+    let row = c.query_one("SELECT current_setting('gigglesdb.max_value_bytes')", &[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "67108864");
+    c.batch_execute("COMMIT").await.unwrap();
+    let row = c.query_one("SELECT set_config('gigglesdb.max_value_bytes','65536',false)", &[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "65536");
+    c.batch_execute("RESET gigglesdb.max_value_bytes").await.unwrap();
+    let row = c.query_one("SELECT repeat('x',1048577)", &[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0).len(), 1048577);
+    drop(c);
+    f.stop().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn statement_token_session_budget() {
+    fn all_values(messages: &[SimpleQueryMessage]) -> Vec<String> {
+        messages.iter().filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        }).collect()
+    }
+    let f = Fixture::with_engine(giggles_core::Engine::V2).await;
+    let c = f.client().await;
+    assert_eq!(all_values(&c.simple_query("SHOW gigglesdb.max_statement_tokens").await.unwrap()), ["1000000"]);
+    c.batch_execute("CREATE TABLE token_budget(id int); INSERT INTO token_budget VALUES(1),(20000),(20001)").await.unwrap();
+    let literal = format!("SELECT octet_length('{}')", "x".repeat(70000));
+    assert_eq!(all_values(&c.simple_query(&literal).await.unwrap()), ["70000"]);
+    let list = (1..=20000).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT id FROM token_budget WHERE id IN ({list}) ORDER BY id");
+    assert_eq!(all_values(&c.simple_query(&sql).await.unwrap()), ["1", "20000"]);
+    c.batch_execute("SET gigglesdb.max_statement_tokens=4096").await.unwrap();
+    let e = c.simple_query(&sql).await.unwrap_err();
+    assert_eq!(e.as_db_error().unwrap().code().code(), "54000");
+    for value in ["-1", "2147483648"] {
+        let e = c.simple_query(&format!("SET gigglesdb.max_statement_tokens={value}")).await.unwrap_err();
+        let e = e.as_db_error().unwrap();
+        assert_eq!(e.code().code(), "22023");
+        assert_eq!(e.message(), format!("{value} is outside the valid range for parameter \"gigglesdb.max_statement_tokens\" (0 .. 2147483647)"));
+    }
+    let row = c.query_one("SELECT set_config('gigglesdb.max_statement_tokens','2147483647',false)", &[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "2147483647");
+    c.batch_execute("SET gigglesdb.max_statement_tokens=-0").await.unwrap();
+    assert_eq!(all_values(&c.simple_query("SHOW gigglesdb.max_statement_tokens").await.unwrap()), ["0"]);
+    assert_eq!(all_values(&c.simple_query(&sql).await.unwrap()), ["1", "20000"]);
+    c.batch_execute("RESET gigglesdb.max_statement_tokens").await.unwrap();
+    assert_eq!(all_values(&c.simple_query("SHOW gigglesdb.max_statement_tokens").await.unwrap()), ["1000000"]);
+    assert_eq!(all_values(&c.simple_query(&sql).await.unwrap()), ["1", "20000"]);
+    c.batch_execute("BEGIN; SET LOCAL gigglesdb.max_statement_tokens=64").await.unwrap();
+    assert_eq!(all_values(&c.simple_query("SHOW gigglesdb.max_statement_tokens").await.unwrap()), ["64"]);
+    c.batch_execute("COMMIT").await.unwrap();
+    assert_eq!(all_values(&c.simple_query("SHOW gigglesdb.max_statement_tokens").await.unwrap()), ["1000000"]);
+    c.batch_execute("BEGIN; SAVEPOINT budget; SET LOCAL gigglesdb.max_statement_tokens=64; ROLLBACK TO budget").await.unwrap();
+    assert_eq!(all_values(&c.simple_query("SHOW gigglesdb.max_statement_tokens").await.unwrap()), ["1000000"]);
+    c.batch_execute("ROLLBACK; SET gigglesdb.max_statement_tokens=64; SET gigglesdb.max_value_bytes=65536; RESET ALL").await.unwrap();
+    assert_eq!(all_values(&c.simple_query("SHOW gigglesdb.max_statement_tokens").await.unwrap()), ["1000000"]);
+    assert_eq!(all_values(&c.simple_query("SHOW gigglesdb.max_value_bytes").await.unwrap()), ["67108864"]);
     drop(c); f.stop().await;
 }

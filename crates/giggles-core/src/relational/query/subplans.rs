@@ -1,7 +1,7 @@
 //! Query-owned children. Modes describe evaluation, never grammar admission.
 use super::*;
 pub(super) const MAX_DEPTH: usize = 32;
-const MAX_SUBPLANS: usize = MAX_WORK;
+const MAX_SUBPLANS: usize = 4096;
 #[allow(dead_code)] // EXISTS/scalar admission belongs to later slices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SubplanMode {

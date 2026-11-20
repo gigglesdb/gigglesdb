@@ -346,8 +346,11 @@ fn unnamed_cache_sql_byte_bound_and_discard() {
         assert!(state.unnamed_cache.iter().map(|entry| entry.sql_bytes).sum::<usize>() <= 64 * 1024);
     }
     let oversized = format!("SELECT id FROM t{}", " ".repeat(64 * 1024));
-    assert_eq!(parse_sql(&mut state, &mut session, &oversized), Err("54000"));
+    // The v2 SQL budget now admits this statement; the 64 KiB cache
+    // admission bound still excludes it without evicting the prior entry.
+    parse_sql(&mut state, &mut session, &oversized).unwrap();
     assert_eq!(state.unnamed_cache.len(), 1);
+    assert!(state.unnamed_cache.iter().all(|entry| entry.sql != oversized));
     for command in ["DISCARD ALL", "DISCARD PLANS", "RESET ROLE", "SET ROLE owner"] {
         parse_sql(&mut state, &mut session, "SELECT id FROM t").unwrap();
         assert!(!state.unnamed_cache.is_empty());
@@ -525,4 +528,37 @@ fn unnamed_hit_drains_thread_local_error_diagnostics() {
     assert_eq!(giggles_core::relational::take_sql_error_message(), None);
     assert_eq!(giggles_core::relational::take_sql_error_detail(), None);
     assert_eq!(giggles_core::relational::take_sql_error_hint(), None);
+}
+
+#[test]
+fn unnamed_cache_rechecks_lowered_statement_budgets() {
+    let mut session = fixture();
+    session.execute_sql("CREATE TABLE t (id int PRIMARY KEY)", &[]).unwrap();
+    let mut state = state();
+    let sql = "SELECT id FROM t WHERE id IN (1,2,3,4,5,6,7,8,9,10)";
+    parse_sql(&mut state, &mut session, sql).unwrap();
+    assert!(!state.unnamed_cache.is_empty());
+    simple(&mut state, &mut session, "SET gigglesdb.max_statement_tokens=16").unwrap();
+    assert_eq!(parse_sql(&mut state, &mut session, sql), Err("54000"));
+}
+
+#[test]
+fn unnamed_cache_budget_settings_for_non_superuser() {
+    let owner = fixture();
+    owner.service.admin.roles().create(NewRole {
+        name: "budget_reader".into(), login: true, ..Default::default()
+    }).unwrap();
+    let mut session = owner.service.role_session("budget_reader").unwrap();
+    let mut state = state();
+    for (name, value, default) in [
+        ("gigglesdb.max_statement_tokens", "64", "1000000"),
+        ("gigglesdb.max_value_bytes", "65536", "67108864"),
+    ] {
+        simple(&mut state, &mut session, &format!("SET {name}={value}")).unwrap();
+        assert_eq!(text_rows(&simple(&mut state, &mut session, &format!("SHOW {name}")).unwrap()), vec![vec![value]]);
+        assert_eq!(text_rows(&extended(&mut state, &mut session,
+            &format!("SELECT setting FROM pg_settings WHERE name='{name}'")).unwrap()), vec![vec![value]]);
+        simple(&mut state, &mut session, &format!("RESET {name}")).unwrap();
+        assert_eq!(text_rows(&simple(&mut state, &mut session, &format!("SHOW {name}")).unwrap()), vec![vec![default]]);
+    }
 }

@@ -195,7 +195,7 @@ impl Plan {
         if tokens.last() == Some(&Token::Symbol(';')) {
             tokens.pop();
         }
-        if tokens.len() > MAX_WORK {
+        if tokens.len() > max_statement_tokens() {
             return Err(SqlError::Limit.into());
         }
         admit_subquery_depth(&tokens)?;
@@ -372,7 +372,7 @@ fn values(body: &[Token]) -> ParseResult<Plan> {
             return Err(ParseError::Definite(SqlError::Syntax));
         }
         rows.push(row);
-        if rows.len() > MAX_WORK {
+        if rows.len() > max_statement_tokens() {
             return Err(SqlError::Limit.into());
         }
         if !p.sym(',') {

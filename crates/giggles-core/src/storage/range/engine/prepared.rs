@@ -206,6 +206,19 @@ impl Prepared {
         })
     }
 
+    pub(crate) fn check_rows(&self) -> Result<(), RangeError> {
+        for ((ks, _), value) in &self.writes {
+            if *ks == Keyspace::Rows
+                && value
+                    .as_ref()
+                    .is_some_and(|v| !crate::storage::engine::codec::range_row_fits(v))
+            {
+                return Err(corrupt("row payload exceeds range limit"));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>, RangeError> {
         let version = if self.children.is_empty() { V1 } else { V2 };
         let mut out = vec![version];
@@ -309,6 +322,13 @@ impl Prepared {
                 1 => Some(r.bytes()?),
                 _ => return Err(corrupt("bad value flag")),
             };
+            if space == RangeSpace::Rows
+                && value
+                    .as_ref()
+                    .is_some_and(|v| !crate::storage::engine::codec::range_row_fits(v))
+            {
+                return Err(corrupt("row payload exceeds range limit"));
+            }
             if writes.insert((keyspace_of(space), key), value).is_some() {
                 return Err(corrupt("duplicate write"));
             }

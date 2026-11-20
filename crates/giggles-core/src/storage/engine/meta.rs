@@ -38,7 +38,8 @@ pub(crate) const USER_COLLATIONS: u64 = 1 << 23;
 pub(crate) const COLUMN_COLLATIONS: u64 = 1 << 24;
 pub(crate) const BUILTIN_EXTENSIONS: u64 = 1 << 25;
 pub(crate) const ROLE_MEMBERSHIP: u64 = 1 << 27;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 27] = [
+pub(crate) const WIDE_ROWS: u64 = 1 << 28;
+pub(crate) const FEATURE_TABLE: [(u64, &str); 28] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -66,6 +67,7 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 27] = [
     (COLUMN_COLLATIONS, "column_collations"),
     (BUILTIN_EXTENSIONS, "builtin_extensions"),
     (ROLE_MEMBERSHIP, "role_membership"),
+    (WIDE_ROWS, "wide_rows"),
 ];
 #[path = "meta_range.rs"]
 mod range_local;
@@ -368,7 +370,7 @@ pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
             | PROTECTED_RECORDS
             | WRITE_FENCE
             | USER_COLLATIONS
-            | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS | ROLE_MEMBERSHIP,
+            | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS | ROLE_MEMBERSHIP | WIDE_ROWS,
     )
 }
 fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {

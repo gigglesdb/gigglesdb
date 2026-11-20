@@ -153,11 +153,14 @@ fn real_legacy_directory_has_no_rocks_files() {
 fn feature_positions_and_validation() {
     assert_eq!(
         FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit),
-        0x1FFFF | KEY_DEPENDENCY_IDENTITY | RANGES | WIDE_ONCE_RECEIPTS | TASK_CATALOG | PROTECTED_RECORDS | WRITE_FENCE | USER_COLLATIONS | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS | ROLE_MEMBERSHIP
+        0x1FFFF | KEY_DEPENDENCY_IDENTITY | RANGES | WIDE_ONCE_RECEIPTS | TASK_CATALOG | PROTECTED_RECORDS | WRITE_FENCE | USER_COLLATIONS | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS | ROLE_MEMBERSHIP | WIDE_ROWS
     );
-    assert_eq!(FEATURE_TABLE.len(), 27);
+    assert_eq!(FEATURE_TABLE.len(), 28);
     assert_eq!(ROLE_MEMBERSHIP, 1 << 27);
     assert_eq!(FEATURE_TABLE[26], (ROLE_MEMBERSHIP, "role_membership"));
+    assert_eq!(FEATURE_TABLE[27], (WIDE_ROWS, "wide_rows"));
+    assert_eq!(WIDE_ROWS, 1 << 28);
+    assert!(check_features_allowed(WIDE_ROWS, (1 << 26) - 1).is_err());
     assert_eq!(FEATURE_TABLE[25],(BUILTIN_EXTENSIONS,"builtin_extensions"));
     assert_eq!(BUILTIN_EXTENSIONS,1 << 25);
     assert_eq!(FEATURE_TABLE[23],(USER_COLLATIONS,"user_collations"));
@@ -206,7 +209,7 @@ fn feature_positions_and_validation() {
     put(&kv, b"features", &PROTECTED_RECORDS.to_be_bytes());
     assert_eq!(validate_meta(&kv).unwrap().features, PROTECTED_RECORDS);
     assert!(check_features(PROTECTED_RECORDS).is_ok());
-    for i in (26..64).filter(|i| *i != 27) {
+    for i in (26..64).filter(|i| *i != 27 && *i != 28) {
         put(&kv, b"features", &(1u64 << i).to_be_bytes());
         assert!(matches!(
             validate_meta(&kv),
@@ -636,6 +639,12 @@ fn ranged() -> MemKv {
     put(&kv, &raw_range_key(1, b"install"), b"opaque");
     for sub in &RANGE_SUBS[6..] {
         let value: &[u8] = match sub {
+            RangeLocalKey::Prepared(_) => &[
+                1, // v1; home and timestamp, zero writes and locks
+                0, 0, 0, 0, 0, 0, 0, 2,
+                0, 0, 0, 0, 0, 0, 0, 1,
+                0, 0, 0, 0, 0, 0, 0, 0,
+            ],
             RangeLocalKey::Marker(_) => &[1; 8],
             RangeLocalKey::Child(child) => &descriptor(*child),
             _ => b"any",

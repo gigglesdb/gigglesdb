@@ -1371,6 +1371,12 @@ impl Transaction {
     fn commit_inner<F: FnOnce(Ts) -> Result<(), TxnError>>(
         mut self, guard: Option<CommitGuard>, publish: F,
     ) -> Result<Ts, TxnError> {
+        // Inspect the final write set, after statement/savepoint rollback.
+        // The sequencer ORs these bits into metadata in the same durable batch.
+        if self.writes.iter().any(|((ks, _), value)| *ks == Keyspace::Rows && value.as_ref().is_some_and(|v| v.len() >= 20 && u32::from_be_bytes(v[12..16].try_into().unwrap()) as usize > crate::relational::MAX_ROW_BYTES)) {
+            self.require_features(super::meta::WIDE_ROWS);
+        }
+
         if guard.as_ref().is_some_and(|g| g.is_fenced() && self.current_snapshot_ts() != Some(g.fence())) {
             return Err(TxnError::Misuse);
         }

@@ -157,7 +157,7 @@ pub(super) fn decode(s: &Scalar) -> R<Filter> {
     })
 }
 fn expand(s: &mut Scalar, replacements: &[Scalar], depth: usize, work: &mut usize) -> R<()> {
-    if depth > 32 || *work >= MAX_WORK {
+    if depth > 32 || *work >= max_statement_tokens() {
         return Err(SqlError::Limit);
     }
     *work += 1;
@@ -217,7 +217,7 @@ fn expand_filter_inner(
     depth: usize,
     work: &mut usize,
 ) -> R<()> {
-    if depth > 32 || *work >= MAX_WORK {
+    if depth > 32 || *work >= max_statement_tokens() {
         return Err(SqlError::Limit);
     }
     *work += 1;

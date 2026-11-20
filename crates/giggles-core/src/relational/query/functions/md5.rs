@@ -71,7 +71,7 @@ pub(super) fn eval(name: &str, values: &[Value], budget: &mut usize) -> Option<R
         };
         // Bound the linear scan before doing work. The kernel borrows the input;
         // scalar argument cloning before dispatch is outside this allocation proof.
-        if input.len() > MAX_ROW_BYTES {
+        if input.len() > crate::relational::max_value_bytes() {
             return Err(SqlError::Limit);
         }
         reserve(budget, 32)?;

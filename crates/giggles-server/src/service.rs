@@ -1178,6 +1178,12 @@ impl Session {
             }).collect::<Vec<_>>().join(", ")
         };
     }
+    pub(crate) fn set_max_statement_tokens(&mut self, tokens: usize) {
+        self.sql.set_max_statement_tokens(tokens);
+    }
+    pub(crate) fn set_max_value_bytes(&mut self, bytes: usize) {
+        self.sql.set_max_value_bytes(bytes);
+    }
     pub(crate) fn set_extra_float_digits(&mut self, value: i32) {
         self.sql.set_extra_float_digits(value);
     }
@@ -1952,6 +1958,9 @@ impl Session {
                 error
             }
         }
+        // Authorization prechecks lex SQL before SqlSession::prepare, so they
+        // must use the same session budgets as the application statement.
+        let _budgets = self.sql.statement_budgets();
         self.authority_scope(|session| {
             // GD-0061: a task session admits the statement's class before the
             // prepare-time column rules run, as on the agent pgwire path (an
@@ -2034,12 +2043,10 @@ impl Session {
                 // Gateway DDL is forbidden. Bind reusable plans against the
                 // committed catalog, then validate against the active snapshot.
                 // Core's staged-schema handles retain their lifetime fence.
+                let mut committed = session.service.admin.sql_session();
+                session.sql.copy_statement_budgets_to(&mut committed);
                 let p = declared(
-                    session
-                        .service
-                        .admin
-                        .sql_session()
-                        .prepare(sql)
+                    committed.prepare(sql)
                         .map_err(|error| parse_error(session, error))?,
                     declared_types,
                 )?;
@@ -3876,6 +3883,33 @@ mod lifecycle_tests {
         ));
     }
 
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn committed_catalog_preparation_inherits_statement_budgets() {
+        let path = crate::test_support::fixture_root().join(format!("committed-budgets-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let admin = Admin::create_engine(&path, Limits::default(), giggles_core::Engine::V2).unwrap();
+        admin.sql_session().execute("CREATE TABLE app (id BIGINT PRIMARY KEY)", &[], None).unwrap();
+        let binding = Binding { fingerprint: "12".repeat(32), role: Role::Application {
+            domain: admin.authority_metadata().unwrap().0.to_string(),
+            tables: BTreeSet::from(["app".into()]),
+        }};
+        let service = Service::new(admin, vec![binding.clone()], Clock::new(0, 3600).unwrap()).unwrap();
+        let list = (1..=20).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id FROM app WHERE (id+id+id+id) IN ({list})");
+        for transaction in [false, true] {
+            for tokens in [64, 0, giggles_core::relational::DEFAULT_MAX_STATEMENT_TOKENS] {
+                let mut session = service.session(&binding.fingerprint).unwrap();
+                session.set_max_statement_tokens(tokens);
+                if transaction { session.sql.execute("BEGIN", &[], None).unwrap(); }
+                let result = session.prepare(&sql);
+                if tokens != 64 { assert!(result.is_ok(), "{result:?}"); }
+                else { assert!(matches!(result, Err(CoreError::Sql(giggles_core::relational::SqlError::Limit))), "{result:?}"); }
+            }
+        }
+        drop(service);
+        std::fs::remove_dir_all(path).unwrap();
+    }
     #[test]
     fn table_requirements_match_sql_roles_and_live_grants() {
         use roles::TablePrivilege::{Delete, Insert, Select, Update};

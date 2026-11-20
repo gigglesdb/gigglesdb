@@ -219,7 +219,7 @@ pub(super) fn admit_literals(sets: &[(String, Value)]) -> R<()> {
             Value::Scalar(value) => value.admit_assignment_literals(&mut bytes)?,
             Value::Plain(Expr::Param(_)) => {}
         }
-        if bytes > MAX_ROW_BYTES {
+        if bytes > crate::relational::max_value_bytes() {
             return Err(SqlError::Limit);
         }
     }

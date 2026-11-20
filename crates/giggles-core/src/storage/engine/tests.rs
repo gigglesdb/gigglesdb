@@ -319,6 +319,7 @@ fn rows_roundtrip_and_reject_every_single_bit_change_and_truncation() {
 
 #[test]
 fn authenticated_malformed_headers_and_payloads_are_rejected() {
+    let _wide = crate::relational::ValueBudget::enter(crate::relational::DEFAULT_MAX_VALUE_BYTES, true);
     assert!(matches!(
         index_tuple_bytes(
             &vec![Value::Null; crate::relational::MAX_COLUMNS + 1],
@@ -368,14 +369,14 @@ fn authenticated_malformed_headers_and_payloads_are_rejected() {
         )
         .is_err()
     );
-    assert!(
-        encode_row(
-            &key,
-            0,
-            &[Value::Bytes(vec![0; crate::relational::MAX_ROW_BYTES + 1])]
-        )
-        .is_err()
-    );
+    let wide = encode_row(&key, 0, &[Value::Bytes(vec![0; crate::relational::MAX_ROW_BYTES + 1])]).unwrap();
+    {
+        let _small = crate::relational::ValueBudget::enter(crate::relational::MAX_ROW_BYTES, true);
+        // Session limits constrain the serialized payload when writing, while
+        // reading existing records uses the codec's independent hard maximum.
+        assert!(encode_row(&key, 0, &[Value::Bytes(vec![0; crate::relational::MAX_ROW_BYTES])]).is_err());
+        assert!(decode_row(&key, &wide).is_ok());
+    }
 }
 
 #[test]

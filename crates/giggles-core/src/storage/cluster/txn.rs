@@ -238,6 +238,7 @@ pub(crate) fn txn_error(error: RangeError) -> TxnError {
         RangeError::Deadlock => TxnError::Deadlock,
         RangeError::LockTimeout => TxnError::LockTimeout,
         RangeError::Cancelled => TxnError::Cancelled,
+        RangeError::Limit => TxnError::Codec(crate::storage::engine::codec::CodecError::Limit),
         RangeError::Aborted(_) | RangeError::StaleEpoch { .. } => {
             TxnError::Serialization(SerializationReason::WriteConflict)
         }

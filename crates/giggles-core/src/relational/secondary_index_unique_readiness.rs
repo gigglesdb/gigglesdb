@@ -191,7 +191,7 @@ fn admit<F: FnMut() -> bool>(state: &Relational, d: &Descriptor, meter: &mut Met
         let mut size = 0;
         for v in &row.values {
             size = add(size, raw(v))?;
-            cap(size, MAX_ROW_BYTES)?;
+            cap(size, crate::relational::max_value_bytes())?;
             meter.bytes(raw(v))?;
             meter.work(add(1, raw(v))?)?;
             if matches!(v, Value::Numeric(_)) {

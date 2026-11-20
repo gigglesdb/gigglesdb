@@ -25,7 +25,7 @@ pub(super) fn prefixed(sql: &str, start: usize) -> R<Option<(String, usize)>> {
         let delimiter = &sql[start..=end];
         let body = end + 1;
         let close = sql[body..].find(delimiter).ok_or(SqlError::Syntax)? + body;
-        if close - body > MAX_SQL {
+        if close - body > crate::relational::max_value_bytes() {
             return Err(SqlError::Limit);
         }
         return Ok(Some((sql[body..close].into(), close + delimiter.len())));
@@ -94,7 +94,7 @@ pub(super) fn prefixed(sql: &str, start: usize) -> R<Option<(String, usize)>> {
     } else {
         decode_unicode(&raw, marker)?
     };
-    if value.len() > MAX_SQL {
+    if value.len() > crate::relational::max_value_bytes() {
         return Err(SqlError::Limit);
     }
     Ok(Some((value, i)))
@@ -121,7 +121,7 @@ fn character(n: u32, pending: &mut Option<u32>, out: &mut Vec<u8>) -> R<()> {
     let ch = char::from_u32(n)
         .filter(|c| *c != '\0')
         .ok_or(SqlError::Syntax)?;
-    out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+    append(out, ch.encode_utf8(&mut [0; 4]).as_bytes())?;
     Ok(())
 }
 fn finish(out: Vec<u8>, pending: Option<u32>) -> R<String> {
@@ -144,7 +144,7 @@ fn decode_escape(raw: &[u8]) -> R<String> {
             if pending.is_some() {
                 return Err(SqlError::Syntax);
             }
-            out.push(c);
+            append(&mut out, &[c])?;
             continue;
         }
         let c = *raw.get(i).ok_or(SqlError::Syntax)?;
@@ -172,7 +172,7 @@ fn decode_escape(raw: &[u8]) -> R<String> {
                             break;
                         }
                     }
-                    out.push(n as u8);
+                    append(&mut out, &[n as u8])?;
                 }
                 b'x' => {
                     let start = i;
@@ -180,17 +180,17 @@ fn decode_escape(raw: &[u8]) -> R<String> {
                         i += 1;
                     }
                     if i == start {
-                        out.push(b'x');
+                        append(&mut out, b"x")?;
                     } else {
-                        out.push(hex(&raw[start..i]).unwrap() as u8);
+                        append(&mut out, &[hex(&raw[start..i]).unwrap() as u8])?;
                     }
                 }
-                b'n' => out.push(b'\n'),
-                b't' => out.push(b'\t'),
-                b'r' => out.push(b'\r'),
-                b'b' => out.push(8),
-                b'f' => out.push(12),
-                c => out.push(c),
+                b'n' => append(&mut out, b"\n")?,
+                b't' => append(&mut out, b"\t")?,
+                b'r' => append(&mut out, b"\r")?,
+                b'b' => append(&mut out, &[8])?,
+                b'f' => append(&mut out, &[12])?,
+                c => append(&mut out, &[c])?,
             }
         }
     }
@@ -208,14 +208,14 @@ fn decode_unicode(raw: &[u8], marker: char) -> R<String> {
             if pending.is_some() {
                 return Err(SqlError::Syntax);
             }
-            out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+            append(&mut out, c.encode_utf8(&mut [0; 4]).as_bytes())?;
             continue;
         }
         if text[i..].starts_with(marker) {
             if pending.is_some() {
                 return Err(SqlError::Syntax);
             }
-            out.extend_from_slice(marker.encode_utf8(&mut [0; 4]).as_bytes());
+            append(&mut out, marker.encode_utf8(&mut [0; 4]).as_bytes())?;
             i += marker.len_utf8();
             continue;
         }
@@ -232,6 +232,12 @@ fn decode_unicode(raw: &[u8], marker: char) -> R<String> {
     finish(out, pending)
 }
 
+
+fn append(out: &mut Vec<u8>, bytes: &[u8]) -> R<()> {
+    if out.len().checked_add(bytes.len()).is_none_or(|n| n > crate::relational::max_value_bytes()) { return Err(SqlError::Limit); }
+    out.extend_from_slice(bytes);
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;

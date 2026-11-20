@@ -93,7 +93,7 @@ impl Relational {
         let mut eq_bytes = 0;
         for v in equal {
             eq_bytes = add(eq_bytes, raw(v))?;
-            cap(eq_bytes, MAX_ROW_BYTES)?;
+            cap(eq_bytes, crate::relational::max_value_bytes())?;
         }
         bytes = add(bytes, eq_bytes)?;
         cap(self.tables.len(), MAX_TABLES)?;
@@ -117,7 +117,7 @@ impl Relational {
                 let mut rb = 0;
                 for v in &row.values {
                     rb = add(rb, raw(v))?;
-                    cap(rb, MAX_ROW_BYTES)?;
+                    cap(rb, crate::relational::max_value_bytes())?;
                 }
                 bytes = add(bytes, add(key.len(), rb)?)?;
             }

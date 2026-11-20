@@ -171,7 +171,8 @@ fn evaluate(n: &str, v: &[Value], budget: &mut usize) -> R<Value> {
         }
         "repeat" => {
             let count = num(1)?.max(0) as usize;
-            let size = s.len().checked_mul(count).ok_or(SqlError::Limit)?;
+            let size = s.len().checked_mul(count).ok_or_else(requested_length)?;
+            if size > crate::relational::max_value_bytes() { return Err(requested_length()); }
             reserve(budget, size)?;
             Ok(Value::Text(s.repeat(count)))
         }
@@ -250,6 +251,7 @@ fn evaluate(n: &str, v: &[Value], budget: &mut usize) -> R<Value> {
                 .and_then(|x| x.checked_add(tail))
                 .and_then(|x| x.checked_add(s.len()))
                 .ok_or(SqlError::Limit)?;
+            if size > crate::relational::max_value_bytes() { return Err(requested_length()); }
             reserve(budget, size)?;
             let mut out = String::with_capacity(size);
             if n == "rpad" {
@@ -308,6 +310,12 @@ fn text(v: &Value) -> R<&str> {
     } else {
         Err(SqlError::Type)
     }
+}
+
+
+fn requested_length() -> SqlError {
+    if crate::relational::wide_values() { crate::relational::user_types::view_replace_error("requested length too large".into()); }
+    SqlError::Limit
 }
 
 #[cfg(test)]

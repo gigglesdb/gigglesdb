@@ -9,6 +9,19 @@ mod binary;
 mod cast;
 mod character;
 mod comparison;
+#[test]
+#[cfg(test)]
+fn v2_value_ceiling_allows_argument_and_result_accounting() {
+    let limit = crate::relational::DEFAULT_MAX_VALUE_BYTES;
+    let _scope = crate::relational::ValueBudget::enter(limit, true);
+    let mut budget = 10;
+    reserve(&mut budget, limit).unwrap();
+    // Evaluator accounting also visits the returned value; this is not a
+    // second allocation or the statement's retained-row budget.
+    charge(&mut budget, &Value::Int(1)).unwrap();
+    reserve(&mut budget, limit).unwrap();
+    assert_eq!(reserve(&mut 0, limit + 1), Err(SqlError::Limit));
+}
 #[cfg(test)]
 mod cross_binding_tests;
 mod pg18_types;
@@ -2401,7 +2414,7 @@ impl Query {
                         value_bytes(value)
                     };
                     *bytes = bytes.checked_add(bound).ok_or(SqlError::Limit)?;
-                    if *bytes > MAX_ROW_BYTES {
+                    if *bytes > crate::relational::max_value_bytes() {
                         return Err(SqlError::Limit);
                     }
                 }
@@ -2433,9 +2446,21 @@ impl Query {
         admit(value, bytes)
     }
 }
+// Scalar arguments/results have a value bound; the parent charge function
+// is the independent capped result collector used by non-streaming queries.
+fn charge(budget: &mut usize, value: &Value) -> R<()> {
+    if crate::relational::wide_values() { reserve(budget, value_bytes(value)) }
+    else { super::charge(budget, value) }
+}
 fn reserve(budget: &mut usize, bytes: usize) -> R<()> {
     let total = budget.checked_add(bytes).ok_or(SqlError::Limit)?;
-    if bytes > MAX_ROW_BYTES || total > MAX_RESULT_BYTES {
+    // Bound cumulative scalar temporaries per row independently of each value:
+    // four maximum-sized values accommodate arguments plus a constructed result,
+    // while retaining the historical 1 MiB allowance for smaller budgets.
+    let allocation_budget = if crate::relational::wide_values() {
+        crate::relational::max_value_bytes().saturating_mul(4).max(MAX_RESULT_BYTES)
+    } else { MAX_RESULT_BYTES };
+    if bytes > crate::relational::max_value_bytes() || total > allocation_budget {
         return Err(SqlError::Limit);
     }
     *budget = total;
@@ -3477,5 +3502,18 @@ mod xact_tests {
             matches!(clock.take_error(), Some(crate::CoreError::Storage(message)) if message == "xact failure")
         );
         assert!(failing.take_error().is_none());
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn scalar_temporary_budget_is_cumulative_and_separate() {
+        let _budget = crate::relational::ValueBudget::enter(2 * MAX_RESULT_BYTES, true);
+        let mut used = 0;
+        for _ in 0..8 { reserve(&mut used, MAX_RESULT_BYTES).unwrap(); }
+        assert!(matches!(reserve(&mut used, 1), Err(SqlError::Limit)));
+        assert!(matches!(reserve(&mut 0, 2 * MAX_RESULT_BYTES + 1), Err(SqlError::Limit)));
     }
 }

@@ -308,6 +308,8 @@ impl State {
         session.sync_role_settings(&mut self.settings.current)?;
         session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
+        session.set_max_value_bytes(self.settings.current.max_value_bytes);
+        session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
         super::statement_deadline(&self.settings.current);
         let result = self.simple_statement_inner(sql, session, out, received, implicit);
         if !self.copy_receiving() && let Some(admission) = self.execution_admission.as_mut() {
@@ -318,6 +320,8 @@ impl State {
         session.sync_role_settings(&mut self.settings.current)?;
         session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
+        session.set_max_value_bytes(self.settings.current.max_value_bytes);
+        session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
         role_notices(session, &self.settings.current, out)?;
         result
     }
@@ -853,6 +857,18 @@ pub(super) fn parse_settings(
             }
         }
         let result = diagnostic.settings(crate::pg_settings::parse_database(sql));
+        if matches!(result, Err("22023")) && let Ok(tokens) = crate::pg_settings::database::lex(sql) {
+            use crate::pg_settings::database::Token;
+            if tokens.iter().any(|t| matches!(t, Token::Word(n) | Token::Ident(n) if n.eq_ignore_ascii_case("gigglesdb.max_statement_tokens")))
+                && let Some(Token::Word(value) | Token::Text(value)) = tokens.last() {
+                diagnostic.wire_message = Some(format!("{value} is outside the valid range for parameter \"gigglesdb.max_statement_tokens\" (0 .. 2147483647)"));
+            }
+            if tokens.iter().any(|t| matches!(t, Token::Word(n) | Token::Ident(n) if n.eq_ignore_ascii_case("gigglesdb.max_value_bytes")))
+                && let Some(Token::Word(value) | Token::Text(value)) = tokens.last() {
+                diagnostic.wire_message = Some(format!("{value} is outside the valid range for parameter \"gigglesdb.max_value_bytes\" (65536 .. 1073741819)"));
+            }
+        }
+
         if matches!(result, Err("22023"))
             && let Ok(tokens) = crate::pg_settings::database::lex(sql) {
                 use crate::pg_settings::database::Token;

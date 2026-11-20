@@ -1,3 +1,5 @@
+#[path = "catalog_planner_admission.rs"]
+mod catalog_planner_admission;
 #[path = "comment_presentation.rs"]
 mod comment_presentation;
 #[path = "constraint_metadata.rs"]

@@ -1016,3 +1016,136 @@ fn elapsed_leases_are_refused_before_sweeping_and_prepared_leases_survive() {
     assert!(!e.locks.held(txn_id(txn(5))).is_empty());
     e.finalize(txn(5), Outcome::Abort).unwrap();
 }
+
+#[test]
+fn range_wide_rows_refused_without_feature_changes() {
+    let f = fixture();
+    let e = f.open();
+    let before = f.store.kv().get(Keyspace::Meta, b"features").unwrap();
+    let range_before = e.kv.get(Keyspace::Meta, b"features").unwrap();
+    let _budget =
+        crate::relational::ValueBudget::enter(crate::relational::DEFAULT_MAX_VALUE_BYTES, true);
+    for prepare in [false, true] {
+        let t = txn(if prepare { 802 } else { 801 });
+        lock(&e, t, 1, Some(1000)).unwrap();
+        let row = crate::storage::engine::codec::encode_row(
+            &key(1),
+            1,
+            &[crate::relational::Value::Text("x".repeat(70_000))],
+        )
+        .unwrap();
+        let writes = vec![write(1, &row)];
+        let err = if prepare {
+            e.prepare(epoch(&e), t, B, writes, None)
+        } else {
+            e.commit(epoch(&e), t, writes, None, None)
+        }
+        .unwrap_err();
+        assert_eq!(err, RangeError::Limit);
+        let core: crate::CoreError = crate::storage::cluster::txn::txn_error(err).into();
+        assert!(matches!(core, crate::CoreError::Limit)); // pgwire maps Limit to 54000
+        e.finalize(t, Outcome::Abort).unwrap();
+        assert_eq!(
+            f.store.kv().get(Keyspace::Meta, b"features").unwrap(),
+            before
+        );
+        assert_eq!(e.kv.get(Keyspace::Meta, b"features").unwrap(), range_before);
+    }
+    let row = crate::storage::engine::codec::encode_row(
+        &key(2),
+        1,
+        &[crate::relational::Value::Text("x".repeat(60_000))],
+    )
+    .unwrap();
+    commit(&e, txn(803), 2, &row);
+    assert_eq!(
+        f.store.kv().get(Keyspace::Meta, b"features").unwrap(),
+        before
+    );
+    assert_eq!(e.kv.get(Keyspace::Meta, b"features").unwrap(), range_before);
+}
+
+#[test]
+fn finalize_refuses_embedded_wide_row_before_writing() {
+    let f = fixture();
+    let e = f.open();
+    let before = f.store.kv().get(Keyspace::Meta, b"features").unwrap();
+    let range_before = e.kv.get(Keyspace::Meta, b"features").unwrap();
+    let _budget =
+        crate::relational::ValueBudget::enter(crate::relational::DEFAULT_MAX_VALUE_BYTES, true);
+    let wide = crate::storage::engine::codec::encode_row(
+        &key(1),
+        1,
+        &[crate::relational::Value::Text("x".repeat(70_000))],
+    )
+    .unwrap();
+    let t = txn(804);
+    let record = prepared::Prepared {
+        home: B,
+        at: Ts(1),
+        writes: std::collections::BTreeMap::from([((Keyspace::Rows, key(1)), Some(wide))]),
+        locks: vec![],
+        children: vec![],
+    };
+    e.state().prepared.insert(t, record.clone());
+    assert!(matches!(
+        e.finalize(t, Outcome::Commit(Timestamp(2))),
+        Err(RangeError::Corrupt(_))
+    ));
+    assert_eq!(e.state().prepared.get(&t), Some(&record));
+    assert_eq!(
+        e.kv.get(
+            Keyspace::Rows,
+            &crate::storage::engine::codec::user_key_seek_at(&key(1), Ts(2))
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        f.store.kv().get(Keyspace::Meta, b"features").unwrap(),
+        before
+    );
+    assert_eq!(e.kv.get(Keyspace::Meta, b"features").unwrap(), range_before);
+}
+
+#[test]
+fn recovery_refuses_wide_prepared_rows() {
+    let f = fixture();
+    let _budget =
+        crate::relational::ValueBudget::enter(crate::relational::DEFAULT_MAX_VALUE_BYTES, true);
+    let wide = crate::storage::engine::codec::encode_row(
+        &key(1),
+        1,
+        &[crate::relational::Value::Text("x".repeat(70_000))],
+    )
+    .unwrap();
+    let record = prepared::Prepared {
+        home: B,
+        at: Ts(1),
+        writes: std::collections::BTreeMap::from([((Keyspace::Rows, key(1)), Some(wide))]),
+        locks: vec![],
+        children: vec![],
+    };
+    let mut batch = crate::storage::engine::kv::WriteBatch::default();
+    batch.put(
+        Keyspace::Meta,
+        crate::storage::engine::meta::range_local_key(B, &RangeLocalKey::Prepared(txn(805).0)),
+        record.encode().unwrap(),
+    );
+    // Model persisted input from a receiver predating the validation.
+    f.store
+        .kv()
+        .write(batch, crate::storage::engine::kv::Durability::Sync)
+        .unwrap();
+    assert!(matches!(
+        RangeEngine::open(
+            &f.store,
+            f.store.descriptor(B).unwrap().unwrap(),
+            f.sink.clone(),
+            f.oracle.clone(),
+            config(),
+            1
+        ),
+        Err(RangeError::Corrupt(_))
+    ));
+}

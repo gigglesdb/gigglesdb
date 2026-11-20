@@ -69,3 +69,23 @@ fn named_mark_journals_nested_statements_and_tracks_truncation() {
     t.lock_for_write(Keyspace::Rows, &key(3), None, &|| false).unwrap();
     assert!(t.lock_undo.is_empty());
 }
+
+#[test]
+fn statement_rollback_discards_wide_rows_before_feature_detection() {
+    let (seq, locks) = setup(1_000_000);
+    let mut t = txn(&seq, &locks, 1);
+    let mark = t.statement_savepoint();
+    let _budget = crate::relational::ValueBudget::enter(
+        crate::relational::DEFAULT_MAX_VALUE_BYTES, true);
+    let wide = super::super::codec::encode_row(b"k", 1,
+        &[crate::relational::Value::Text("x".repeat(70_000))]).unwrap();
+    t.lock_for_write(Keyspace::Rows, &key(1), None, &|| false).unwrap();
+    t.put(Keyspace::Rows, key(1), wide).unwrap();
+    t.rollback_to(&mark).unwrap();
+    assert!(t.writes.is_empty());
+    t.release(mark).unwrap();
+    t.commit().unwrap();
+    let features = seq.kv().snapshot().unwrap().get(Keyspace::Meta, b"features").unwrap()
+        .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap())).unwrap_or(0);
+    assert_eq!(features & super::super::meta::WIDE_ROWS, 0);
+}

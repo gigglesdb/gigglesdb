@@ -137,6 +137,16 @@ impl RangeEngine {
                 )));
             }
             if write.space == RangeSpace::Rows {
+                // Range commits do not carry WIDE_ROWS atomically with the rows.
+                // Keep the original payload bound here for commit and prepare,
+                // independently of a gateway's configured value budget.
+                if write
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| !codec::range_row_fits(value))
+                {
+                    return Err(RangeError::Limit);
+                }
                 let locked = write.key.len() >= 8
                     && held.contains(&LockKey::Row {
                         table: u64::from_be_bytes(write.key[..8].try_into().unwrap()),
@@ -302,6 +312,7 @@ impl RangeEngine {
                         "commit timestamp not above the prepared timestamp".into(),
                     ));
                 }
+                record.check_rows()?;
                 self.finalize_children(txn, &outcome, &record.children)?;
                 let mut batch = WriteBatch::default();
                 if let Outcome::Commit(c) = &outcome {

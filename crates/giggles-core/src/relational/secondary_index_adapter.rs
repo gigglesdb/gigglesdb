@@ -106,7 +106,7 @@ pub(super) fn tuple_len<'a>(values: impl Iterator<Item = &'a Value>) -> R<usize>
             _ => return Err(SqlError::Unsupported),
         };
         raw = add(raw, n)?;
-        cap(raw, MAX_ROW_BYTES)?;
+        cap(raw, crate::relational::max_value_bytes())?;
         arity += 1;
         cap(arity, MAX_COLUMNS)?;
         encoded = add(encoded, scalar_len(v)?)?;
@@ -186,7 +186,7 @@ fn shape(w: Witness<'_>) -> R<()> {
             _ => 9,
         };
         bytes = add(bytes, n)?;
-        cap(bytes, MAX_ROW_BYTES)?;
+        cap(bytes, crate::relational::max_value_bytes())?;
     }
     Ok(())
 }
@@ -465,7 +465,7 @@ pub(super) struct StatementProposal<'a> {
 // eight conversions per borrowed occurrence, before any formatting or copy.
 const STATEMENT_MAX_WORK: usize = si::MAX_WORK;
 fn exact_witness(a: &SqlRow, b: &SqlRow) -> R<bool> {
-    let limit = MAX_ROW_BYTES + MAX_COLUMNS * 16 + 32;
+    let limit = crate::relational::max_value_bytes() + MAX_COLUMNS * 16 + 32;
     let a_size = bincode::serialized_size(a).map_err(|_| SqlError::Type)?;
     let b_size = bincode::serialized_size(b).map_err(|_| SqlError::Type)?;
     if a_size > limit as u64 || b_size > limit as u64 {
@@ -538,7 +538,7 @@ fn row_bound(key: &[u8], row: &SqlRow, bytes: &mut usize, work: &mut usize) -> R
                 raw_size(value)
             },
         )?;
-        cap(size, MAX_ROW_BYTES)?;
+        cap(size, crate::relational::max_value_bytes())?;
         copy_bytes = add(copy_bytes, raw_size(value))?;
         if matches!(value, Value::Numeric(_)) {
             *work = add(*work, mul(8, mul(raw_size(value), raw_size(value))?)?)?;
@@ -1086,7 +1086,7 @@ impl Relational {
                     raw_size(value)
                 },
             )?;
-            cap(bytes, MAX_ROW_BYTES)?;
+            cap(bytes, crate::relational::max_value_bytes())?;
             work = add(work, raw_size(value))?;
             if matches!(value, Value::Numeric(_)) {
                 work = add(work, mul(8, mul(raw_size(value), raw_size(value))?)?)?;

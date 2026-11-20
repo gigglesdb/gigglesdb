@@ -176,7 +176,8 @@ impl Diagnostic {
         if matches!(
             &result,
             Err(CoreError::Sql(
-                giggles_core::relational::SqlError::CheckViolation
+                giggles_core::relational::SqlError::Limit
+                    | giggles_core::relational::SqlError::CheckViolation
                     | giggles_core::relational::SqlError::InvalidParameterValue
                     | giggles_core::relational::SqlError::Null
                     | giggles_core::relational::SqlError::Unsupported
@@ -1450,6 +1451,8 @@ impl State {
         session.sync_role_settings(&mut self.settings.current)?;
         session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
+        session.set_max_value_bytes(self.settings.current.max_value_bytes);
+        session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
         session.set_default_isolation(&self.settings.current);
         if tag == b'E' { statement_deadline(&self.settings.current); }
         let result = self.handle_inner(tag, b, session, out, received);
@@ -1462,6 +1465,8 @@ impl State {
         session.sync_role_settings(&mut self.settings.current)?;
         session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
+        session.set_max_value_bytes(self.settings.current.max_value_bytes);
+        session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
         simple::role_notices(session, &self.settings.current, out)?;
         result
     }
@@ -3024,6 +3029,8 @@ impl State {
                     session.sync_role_settings(&mut self.settings.current).map_err(std::io::Error::other)?;
         session.set_search_path(&self.settings.current.search_path);
                     session.set_extra_float_digits(self.settings.current.extra_float_digits);
+                    session.set_max_value_bytes(self.settings.current.max_value_bytes);
+                    session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
                     self.implicit = false;
                     self.cursors.transaction_end("ROLLBACK");
                     self.portals.clear();
@@ -3151,6 +3158,8 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
     session.set_time_zone(&state.settings.current.timezone);
     session.set_search_path(&state.settings.current.search_path);
     session.set_extra_float_digits(state.settings.current.extra_float_digits);
+    session.set_max_value_bytes(state.settings.current.max_value_bytes);
+    session.set_max_statement_tokens(state.settings.current.max_statement_tokens);
     let mut admin_sync = false;
     let mut pending_tag = None;
     let mut pending_frames = std::collections::VecDeque::<(u8, Vec<u8>, std::time::Instant)>::new();
@@ -3336,6 +3345,8 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                         session.set_time_zone(&state.settings.current.timezone);
                         session.set_search_path(&state.settings.current.search_path);
                         session.set_extra_float_digits(state.settings.current.extra_float_digits);
+                        session.set_max_value_bytes(state.settings.current.max_value_bytes);
+                        session.set_max_statement_tokens(state.settings.current.max_statement_tokens);
                         state.implicit = false;
                         state.cursors.transaction_end("ROLLBACK");
                         state.portals.clear();

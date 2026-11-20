@@ -1,5 +1,6 @@
 use crate::{catalog, *};
 mod flat_union;
+mod admission;
 mod numeric_literals;
 mod join_selection;
 mod regtype;
@@ -652,7 +653,7 @@ fn plan_inner(
     relations: Option<&BTreeMap<String, Vec<Field>>>,
 ) -> R<Option<Plan>> {
     if sql.len() > MAX_SQL {
-        return Err(Error::Limit);
+        return admission::decline_or_limit(sql);
     }
     let normalized = numeric_literals::normalize(sql)?;
     let sql = normalized.as_ref();
@@ -675,10 +676,13 @@ fn plan_inner(
             constructors += 1;
         }
         if count > 8192 {
-            return Err(Error::Limit);
+            return admission::decline_or_limit(sql);
         }
     }
     if constructors > 256 && !bounded_projection(&tokens) {
+        if !admission::may_own(sql) {
+            return Ok(None);
+        }
         return flat_union::plan(tokens, gateway);
     }
     // Core carries collation derivation through scalar binding and execution.
@@ -755,17 +759,26 @@ fn plan_inner(
         }
         i += 1;
     }
-    let statements = Parser::new(&PostgreSqlDialect {})
+    let statements = match Parser::new(&PostgreSqlDialect {})
         .with_recursion_limit(64)
         .with_tokens(tokens)
         .parse_statements()
-        .map_err(|_| Error::Syntax)?;
+    {
+        Ok(statements) => statements,
+        Err(sqlparser::parser::ParserError::RecursionLimitExceeded)
+            if !admission::may_own(sql) => return Ok(None),
+        Err(_) => return Err(Error::Syntax),
+    };
     if statements.is_empty() {
         return Ok(None);
     }
     let mut scan = Scan::new();
     if let ControlFlow::Break(e) = statements.visit(&mut scan) {
-        return Err(e);
+        return if !admission::may_own(sql) {
+            Ok(None)
+        } else {
+            Err(e)
+        };
     }
     struct CoreConcat(bool);
     impl a::Visitor for CoreConcat {

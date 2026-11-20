@@ -2143,6 +2143,8 @@ pub struct SqlSession {
     transaction_id: Option<u128>,
     transaction_clock_us: Option<i64>,
     extra_float_digits: i32,
+    max_value_bytes: usize,
+    max_statement_tokens: usize,
     search_path: Vec<String>,
     schema_user: String,
     unnamed_plans: Vec<(UnnamedPlanKey, relational::Prepared)>,
@@ -2192,6 +2194,8 @@ impl Admin {
             transaction_id: None,
             transaction_clock_us: None,
             extra_float_digits: 1,
+            max_value_bytes: relational::DEFAULT_MAX_VALUE_BYTES,
+            max_statement_tokens: relational::DEFAULT_MAX_STATEMENT_TOKENS,
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
             unnamed_plans: Vec::new(),
@@ -2529,6 +2533,41 @@ impl SqlSession {
             _ => Ok(()),
         }
     }
+    /// Set the v2 value and row budget; legacy retains its fixed limits.
+    pub fn set_max_value_bytes(&mut self, bytes: usize) {
+        let bytes = bytes.clamp(relational::MAX_ROW_BYTES, relational::MAX_VALUE_BYTES);
+        if self.max_value_bytes != bytes { self.unnamed_plans.clear(); }
+        self.max_value_bytes = bytes;
+    }
+    /// Preserve both SQL budgets in an alternate catalog preparation session.
+    pub fn copy_statement_budgets_to(&self, target: &mut Self) {
+        target.set_max_value_bytes(self.max_value_bytes);
+        target.set_max_statement_tokens(self.max_statement_tokens);
+    }
+    /// Set the v2 statement syntax budget; zero is unlimited.
+    pub fn set_max_statement_tokens(&mut self, tokens: usize) {
+        let tokens = tokens.min(i32::MAX as usize);
+        if self.max_statement_tokens != tokens { self.unnamed_plans.clear(); }
+        self.max_statement_tokens = tokens;
+    }
+    /// Apply this session's lexer budgets to synchronous preparation prechecks.
+    /// Dropping the guard restores the caller's budgets, including on errors.
+    /// Keep the guard on the current thread for the duration of preparation.
+    #[must_use]
+    pub fn statement_budgets(&self) -> impl Sized + use<> {
+        let v2 = matches!(self.admin.inner.backend, Backend::V2(_));
+        (
+            relational::ValueBudget::enter(self.value_budget(), v2),
+            relational::StatementBudget::enter(self.max_statement_tokens, v2),
+            // Thread-local budgets must be restored on the entering thread.
+            std::marker::PhantomData::<std::rc::Rc<()>>,
+        )
+    }
+    fn value_budget(&self) -> usize {
+        #[cfg(feature = "engine-rocksdb")]
+        if matches!(self.admin.inner.backend, Backend::V2(_)) { return self.max_value_bytes; }
+        relational::MAX_ROW_BYTES
+    }
     /// Set the precision used by SQL floating-point text conversions.
     pub fn set_extra_float_digits(&mut self, value: i32) {
         self.extra_float_digits = value;
@@ -2604,6 +2643,8 @@ impl SqlSession {
         &mut self,
         p: &relational::Prepared,
     ) -> Result<relational::Description, CoreError> {
+        let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         let result = (|| {
             if self.aborted && !p.allows_aborted_transaction() {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -2637,6 +2678,8 @@ impl SqlSession {
         &mut self,
         p: &relational::Prepared,
     ) -> Result<(), CoreError> {
+        let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         relational::assert_sql_frontend_allowed();
         let result = (|| {
             if self.aborted && !p.allows_aborted_transaction() {
@@ -2714,6 +2757,8 @@ impl SqlSession {
         ) -> Result<relational::Prepared, relational::SqlError>,
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
+        let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         self.admin.inner.db(SQL_SESSIONS)?;
         if self.aborted {
             return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -3711,6 +3756,8 @@ impl SqlSession {
         })
     }
     fn prepare_unruled(&mut self, sql: &str) -> Result<relational::Prepared, CoreError> {
+        let _value_budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         if let Backend::V2(db) = &self.admin.inner.backend {
             return self.prepare_v2(sql, u128::from_be_bytes(db.meta.domain));
         }
@@ -3821,6 +3868,8 @@ impl SqlSession {
         rows: Vec<Vec<relational::Value>>,
         clock: &relational::StatementClock,
     ) -> Result<(relational::Prepared, Vec<Vec<relational::Value>>), CoreError> {
+        let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         relational::assert_sql_frontend_allowed();
         if let Backend::V2(db) = &self.admin.inner.backend {
             let db = db.clone();
@@ -3889,6 +3938,8 @@ impl SqlSession {
         prepared: &relational::Prepared,
         rows: Vec<Vec<relational::Value>>,
     ) -> Result<relational::SqlResult, CoreError> {
+        let _value_budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         self.refuse_task_session()?;
         let prepared = match prepared.copy_rows(rows, None) {
             Ok(p) => p,
@@ -3905,6 +3956,8 @@ impl SqlSession {
         rows: Vec<Vec<relational::Value>>,
         clock: &relational::StatementClock,
     ) -> Result<relational::SqlResult, CoreError> {
+        let _value_budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         self.refuse_task_session()?;
         let context = relational::clock::ExecutionClock::new(clock);
         let prepared = match prepared.copy_rows(rows, Some(&context)) {
@@ -4091,6 +4144,8 @@ impl SqlSession {
     }
     /// Trusted Admin entry point. Gateways must authorize the typed source first.
     pub fn describe_typed_read(&mut self, read: relational::SingleSourceRead) -> Result<relational::Description, CoreError> {
+        let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         let p = self.prepare_typed_read(vec![read.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_single_source_read(domain, epoch, read))?;
         self.describe_bound_engine(&p)
@@ -4102,6 +4157,8 @@ impl SqlSession {
     }
     pub fn execute_typed_read_unreleased(&mut self, read: relational::SingleSourceRead, expected_version: Option<u64>)
         -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
+        let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         let p = self.prepare_typed_read(vec![read.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_single_source_read(domain, epoch, read))?;
         // Native reads materialise their whole result: keep the result budget.
@@ -4109,6 +4166,8 @@ impl SqlSession {
     }
     /// Trusted Admin entry point; gateways must authorize both source tables first.
     pub fn describe_typed_join(&mut self, read: relational::TwoSourceRead) -> Result<relational::Description, CoreError> {
+        let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         let p = self.prepare_typed_read(vec![read.left.table.replace('.', "\0"), read.right.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_two_source_read(domain, epoch, read))?;
         self.describe_bound_engine(&p)
@@ -4119,6 +4178,8 @@ impl SqlSession {
     }
     pub fn execute_typed_join_unreleased(&mut self, read: relational::TwoSourceRead, expected_version: Option<u64>)
         -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
+        let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         let p = self.prepare_typed_read(vec![read.left.table.replace('.', "\0"), read.right.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_two_source_read(domain, epoch, read))?;
         relational::spill::bounded(|| self.execute_bound_clocked(&p, &[], expected_version, None))
@@ -4126,6 +4187,8 @@ impl SqlSession {
     /// Trusted Admin entry point; gateways authorize the target and every source first.
     pub fn execute_typed_insert_select(&mut self, insert: relational::TypedInsertSelect,
         expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
+        let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         // Counts only, and refused by `admit()`: the guard, no twin (R3-301).
         self.refuse_task_session()?;
         let target = insert.table.replace('.', "\0");
@@ -4329,6 +4392,8 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<relational::SqlResult, CoreError> {
+        let _value_budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         if p.schema_context_differs(&self.search_path, &self.schema_user) {
             let mut bound = p.clone();
             bound.set_schema_context(self.search_path.clone(), self.schema_user.clone());
@@ -5404,6 +5469,63 @@ pub(crate) fn crash_now() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preparation_precheck_budgets_restore_and_preserve_legacy() {
+        use relational::{Prepared, SqlError};
+        let long_value = format!("SELECT '{}'", "x".repeat(70_000));
+        let many_tokens = format!("SELECT 1 IN ({})", vec!["1"; 20_000].join(","));
+        let check = |sql: &str, limited: bool| {
+            let targets = Prepared::sequence_ddl_targets(sql);
+            let references = Prepared::constraint_references(sql);
+            if limited {
+                assert_eq!(targets, Err(SqlError::Limit));
+                assert_eq!(references, Err(SqlError::Limit));
+            } else {
+                assert_eq!(targets, Ok(vec![]));
+                assert_eq!(references, Ok(vec![]));
+            }
+        };
+        let mut engines = vec![Engine::Legacy];
+        if cfg!(feature = "engine-rocksdb") { engines.push(Engine::V2); }
+        for engine in engines {
+            let path = fresh("preparation-precheck-budgets");
+            let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
+            let mut session = admin.sql_session();
+            session.set_max_value_bytes(100_000);
+            session.set_max_statement_tokens(0);
+            for sql in [&long_value, &many_tokens] {
+                check(sql, true);
+                {
+                    let _budgets = session.statement_budgets();
+                    check(sql, engine == Engine::Legacy);
+                    // A nested session scope restores the outer session's limits.
+                    let legacy_path = fresh("preparation-precheck-nested");
+                    let legacy = Admin::create_engine(&legacy_path, Limits::default(), Engine::Legacy).unwrap();
+                    {
+                        let _nested = legacy.sql_session().statement_budgets();
+                        check(sql, true);
+                    }
+                    check(sql, engine == Engine::Legacy);
+                    drop(legacy);
+                    fs::remove_dir_all(legacy_path).unwrap();
+                }
+                check(sql, true);
+            }
+            drop(session);
+            drop(admin);
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+    #[test]
+    fn legacy_statement_token_budget() {
+        let path = fresh("legacy-statement-token-budget");
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::Legacy).unwrap();
+        let mut s = admin.sql_session();
+        s.set_max_statement_tokens(0);
+        let list = (1..=3000).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+        assert_eq!(s.execute(&format!("SELECT 1 IN ({list})"), &[], None), Err(CoreError::Sql(relational::SqlError::Limit)));
+        drop(s); drop(admin); fs::remove_dir_all(path).unwrap();
+    }
     #[test]
     fn v2_catalog_xid_uses_seconds_across_low_bit_wrap_and_clock_restart() {
         use super::engine::hlc::{HlcClock, Ts};

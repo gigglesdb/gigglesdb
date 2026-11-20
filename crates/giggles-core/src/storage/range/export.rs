@@ -31,6 +31,11 @@
 //! Install marker value (persisted, version 1, strict):
 //! `[ver=1][descriptor: len BE4 + bytes][source dir: len BE4 + UTF-8]`; an empty source means
 //! "rolled back, needs a snapshot".
+#[cfg(test)]
+thread_local! {
+    static CHECK_SCRATCH_PATHS: std::cell::RefCell<Vec<std::path::PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 use std::{
     ops::Bound,
     path::{Path, PathBuf},
@@ -47,6 +52,13 @@ use crate::storage::engine::{
 };
 use crate::storage::range_api::{RangeDescriptor, RangeId, RangeSpace};
 use crate::storage::replicated::AppliedPosition;
+
+struct Scratch(PathBuf);
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 const MANIFEST: &str = "range.manifest";
 const VERSION: u8 = 1;
@@ -282,6 +294,60 @@ impl Manifest {
         Ok(())
     }
 
+    /// Validate all row SSTs before even writing an install marker. RocksDB's
+    /// Rust API has no SST reader: ingest into an isolated scratch DB, then
+    /// stream it with a bounded cache, retaining just one entry at a time.
+    /// This also runs when recovery reads the manifest again.
+    fn check_row_files(&self, source: &Path) -> Result<(), CoreError> {
+        let wide = self.meta.ops().iter().any(|op| {
+            matches!(op,
+            Op::Put { key, value, .. }
+                if matches!(parse_range_local_key(key), Some((_, RangeLocalKey::Features)))
+                && value.as_slice().try_into().map(u64::from_be_bytes).unwrap_or(0)
+                    & crate::storage::engine::meta::WIDE_ROWS != 0)
+        });
+        if wide {
+            return Ok(());
+        }
+        for part in &self.parts {
+            if part.space != RangeSpace::Rows {
+                continue;
+            }
+            let Some(file) = &part.file else {
+                continue;
+            };
+            let mut nonce = [0; 16];
+            getrandom::fill(&mut nonce).map_err(corrupt)?;
+            let scratch = Scratch(std::env::temp_dir().join(format!(
+                "range-sst-check-{:032x}",
+                u128::from_be_bytes(nonce)
+            )));
+            #[cfg(test)]
+            CHECK_SCRATCH_PATHS.with_borrow_mut(|paths| paths.push(scratch.0.clone()));
+            let kv = crate::storage::engine::kv_rocksdb::RocksKv::open(&scratch.0, 1024 * 1024)
+                .map_err(kv_error)?;
+            kv.ingest_sst(&[(
+                Keyspace::Rows,
+                Bound::Unbounded,
+                Bound::Unbounded,
+                Some(source.join(file)),
+            )])
+            .map_err(kv_error)?;
+            for item in kv.range(
+                Keyspace::Rows,
+                Bound::Unbounded,
+                Bound::Unbounded,
+                Direction::Forward,
+            )? {
+                let (_, value) = item?;
+                if !crate::storage::engine::codec::range_stored_row_fits(&value) {
+                    return Err(corrupt("row payload exceeds range limit without WIDE_ROWS"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn read(source: &Path) -> Result<Self, CoreError> {
         let bytes = std::fs::read(source.join(MANIFEST)).map_err(crate::storage::io)?;
         let manifest = Self::decode(&bytes)?;
@@ -293,6 +359,7 @@ impl Manifest {
                 }
             }
         }
+        manifest.check_row_files(source)?;
         Ok(manifest)
     }
 }

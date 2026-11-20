@@ -11,6 +11,9 @@ pub const DEFAULT_CURSOR_BUFFER_BYTES: usize = 256 * 1024 * 1024;
 pub struct Cursor {
     data: Data,
     clock: Option<relational::clock::ExecutionClock>,
+    value_budget: usize,
+    statement_tokens: usize,
+    wide_values: bool,
     /// The task statement's release tag (GD-0061 R3-301); `None` outside a task session.
     tag: Option<Arc<crate::task::release::ReleaseTag>>,
     /// The task's visible rows (GD-0061 R3-305); `None` outside a task session
@@ -39,8 +42,8 @@ fn row_size(row: &SqlRow) -> usize {
     row.values.iter().map(relational::value_bytes).sum()
 }
 impl Cursor {
-    /// Fetch a bounded chunk. A row larger than max_bytes returns 54000 without
-    /// dropping that row. Zero budgets are rejected. Exhaustion is sticky.
+    /// Fetch a bounded chunk. V2 admits one oversized row alone; legacy retains
+    /// its hard page limit. Zero budgets are rejected. Exhaustion is sticky.
     ///
     /// Plain exit for trusted local callers: a task session's cursor is refused
     /// before it advances. Task callers use `fetch_unreleased`.
@@ -107,10 +110,13 @@ impl Cursor {
         self.closed = Some(error);
     }
     fn fetch_page(&mut self, max_rows: usize, max_bytes: usize) -> Result<Vec<SqlRow>, CoreError> {
+        let _budget = relational::ValueBudget::enter(self.value_budget, self.wide_values);
+        let _statement_budget = relational::StatementBudget::enter(self.statement_tokens, self.wide_values);
         crate::cancellation::check()?;
         if max_rows == 0 || max_bytes == 0 {
             return Err(CoreError::Sql(SqlError::Limit));
         }
+        let wide = self.wide_values;
         match &mut self.data {
             Data::Buffered(rows) => {
                 let mut result = Vec::new();
@@ -120,7 +126,7 @@ impl Cursor {
                         break;
                     };
                     let size = row_size(row);
-                    if bytes.saturating_add(size) > max_bytes {
+                    if bytes.saturating_add(size) > max_bytes && !(wide && result.is_empty()) {
                         if result.is_empty() {
                             return Err(CoreError::Sql(SqlError::Limit));
                         }
@@ -128,6 +134,7 @@ impl Cursor {
                     }
                     bytes += size;
                     result.push(rows.pop_front().expect("front exists"));
+                    if bytes >= max_bytes { break; }
                 }
                 Ok(result)
             }
@@ -143,7 +150,7 @@ impl Cursor {
                         },
                     };
                     let size = row_size(&row);
-                    if bytes.saturating_add(size) > max_bytes {
+                    if bytes.saturating_add(size) > max_bytes && !(wide && result.is_empty()) {
                         *pending = Some(row);
                         if result.is_empty() {
                             return Err(CoreError::Sql(SqlError::Limit));
@@ -152,6 +159,8 @@ impl Cursor {
                     }
                     bytes += size;
                     result.push(row);
+                    // Do not deserialize another wide row after filling this page.
+                    if bytes >= max_bytes { break; }
                 }
                 Ok(result)
             }
@@ -235,6 +244,8 @@ impl SqlSession {
         clock: Option<&relational::StatementClock>,
         buffer_limit: usize,
     ) -> Result<Cursor, CoreError> {
+        let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         relational::assert_sql_frontend_allowed();
         // The statement's tag, kept until the outcome is known so a failure
         // is logged as the statement's outcome (GD-0061 R3-309).
@@ -417,6 +428,8 @@ impl SqlSession {
                         source,
                         plan: Box::new(plan),
                     },
+                    value_budget: self.value_budget(), statement_tokens: self.max_statement_tokens,
+            wide_values: matches!(self.admin.inner.backend, Backend::V2(_)),
                     clock: context,
                     tag,
                     scope,
@@ -467,6 +480,8 @@ impl SqlSession {
                 Some(rows) => Data::Spilled(rows, None),
                 None => Data::Buffered(result.rows.into()),
             },
+            value_budget: self.value_budget(), statement_tokens: self.max_statement_tokens,
+            wide_values: matches!(self.admin.inner.backend, Backend::V2(_)),
             clock: None,
             tag,
             scope: None,
@@ -648,6 +663,66 @@ impl RowSource for V2Snapshot {
 #[cfg(all(test, feature = "engine-rocksdb"))]
 mod tests {
     use super::*;
+    fn buffered_cursor(rows: Vec<SqlRow>) -> Cursor {
+        Cursor {
+            data: Data::Buffered(rows.into()), clock: None, statement_tokens: 0,
+            value_budget: relational::DEFAULT_MAX_VALUE_BYTES,
+            wide_values: true,
+            tag: None, scope: None, meter: Default::default(), guard: None, closed: None,
+        }
+    }
+    #[test]
+    fn v2_pages_keep_caller_limit_and_admit_one_wide_row() {
+        let row = |size| SqlRow { values: vec![Value::Text("x".repeat(size))], version: 0 };
+        let rows = vec![row(64 * 1024); 256];
+        // Cover both in-memory and disk-backed result pages.
+        let (_, spilled) = relational::spill::streaming(|| relational::spill::statement(|| {
+            let mut result = relational::SqlResult::default();
+            relational::spill::RowBuffer::new(rows.clone())?.finish(&mut result)?;
+            Ok(result)
+        }).unwrap());
+        let mut buffered = buffered_cursor(rows);
+        let mut disk = buffered_cursor(Vec::new());
+        disk.data = Data::Spilled(spilled.expect("16 MiB spills"), None);
+        for cursor in [&mut buffered, &mut disk] {
+            let mut total = 0;
+            let mut pages = 0;
+            while !cursor.is_exhausted() {
+                let page = cursor.fetch(256, 1024 * 1024).unwrap();
+                assert!(page.iter().map(row_size).sum::<usize>() <= 1024 * 1024);
+                total += page.len(); pages += 1;
+            }
+            assert_eq!(total, 256);
+            assert!(pages >= 16);
+        }
+        let mut cursor = buffered_cursor(vec![row(2 * 1024 * 1024), row(2 * 1024 * 1024)]);
+        assert_eq!(cursor.fetch(256, 1024 * 1024).unwrap().len(), 1);
+        assert_eq!(cursor.fetch(256, 1024 * 1024).unwrap().len(), 1);
+        let (_, spilled) = relational::spill::streaming(|| relational::spill::statement(|| {
+            let mut result = relational::SqlResult::default();
+            relational::spill::RowBuffer::new(vec![row(2 * 1024 * 1024); 4])?.finish(&mut result)?;
+            Ok(result)
+        }).unwrap());
+        cursor.data = Data::Spilled(spilled.unwrap(), None);
+        for remaining in (0..4).rev() {
+            assert_eq!(cursor.fetch(256, 1024 * 1024).unwrap().len(), 1);
+            let Data::Spilled(rows, pending) = &cursor.data else { unreachable!() };
+            assert!(pending.is_none(), "no second oversized row retained");
+            assert_eq!(rows.len(), remaining);
+        }
+    }
+    #[test]
+    fn v2_zero_fetch_budget_stays_invalid() {
+        for limit in [relational::MAX_ROW_BYTES, relational::DEFAULT_MAX_VALUE_BYTES] {
+            let mut cursor = Cursor {
+                data: Data::Buffered(VecDeque::from([SqlRow { values: vec![Value::Int(1)], version: 0 }])),
+                clock: None, statement_tokens: 0, value_budget: limit, wide_values: true,
+                tag: None, scope: None, meter: Default::default(), guard: None, closed: None,
+            };
+            assert!(matches!(cursor.fetch(1, 0), Err(CoreError::Sql(SqlError::Limit))));
+            assert_eq!(cursor.fetch(1, 9).unwrap()[0].values, vec![Value::Int(1)]);
+        }
+    }
     #[test]
     fn secondary_cursor_matches_scan_and_resumes() {
         let mut nonce = [0; 16];

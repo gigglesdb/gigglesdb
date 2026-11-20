@@ -50,9 +50,6 @@ pub(super) fn result_typmod(state: &Relational, source: TypmodSource<'_>) -> i32
     }
 }
 
-// Syntax node budget for INSERT expressions and IN/BETWEEN lowering; not a scan work cap.
-const MAX_WORK: usize = 4096;
-
 #[derive(Debug, Clone)]
 struct ColumnRef {
     qualifier: Option<String>,
@@ -302,8 +299,8 @@ enum BoundFilter {
     Logic(Box<BoundFilter>, bool, Box<BoundFilter>),
 }
 /// Lowering IN/BETWEEN clones the lhs once per comparison. Admit the total
-/// cloned Scalar nodes against MAX_WORK and the cloned variable payload
-/// (literal values, column/qualifier and routine names) against MAX_SQL,
+/// cloned Scalar nodes against the session syntax budget and the cloned variable payload
+/// (literal values, column/qualifier and routine names) against the engine statement byte budget,
 /// measured on the borrowed AST, before anything is cloned.
 fn admit_expansion(lhs: &Scalar, copies: usize) -> R<()> {
     fn filter_cost(f: &Filter, nodes: &mut usize, bytes: &mut usize) -> R<()> {
@@ -382,8 +379,8 @@ fn admit_expansion(lhs: &Scalar, copies: usize) -> R<()> {
     }
     let (mut nodes, mut bytes) = (0usize, 0usize);
     cost(lhs, &mut nodes, &mut bytes)?;
-    if nodes.checked_mul(copies).is_none_or(|n| n > MAX_WORK)
-        || bytes.checked_mul(copies).is_none_or(|b| b > MAX_SQL)
+    if nodes.checked_mul(copies).is_none_or(|n| n > max_statement_tokens())
+        || bytes.checked_mul(copies).is_none_or(|b| b > if wide_values() { V2_MAX_SQL } else { MAX_SQL })
     {
         return Err(SqlError::Limit);
     }
@@ -785,7 +782,7 @@ impl Filter {
         self.visit_scalars(&mut |s| s.reject_nested_aggregate())
     }
     fn admit_shape(&self, depth: usize, nodes: &mut usize) -> R<()> {
-        if depth > 32 || *nodes == MAX_WORK {
+        if depth > 32 || *nodes == max_statement_tokens() {
             return Err(SqlError::Limit);
         }
         *nodes += 1;
@@ -4626,6 +4623,16 @@ fn charge(bytes: &mut usize, value: &Value) -> R<()> {
     }
     Ok(())
 }
+// Projection admission is per value/row. Output::Capped and the spill buffers
+// retain their independent aggregate result and retention budgets.
+fn charge_projected(bytes: &mut usize, value: &Value) -> R<()> {
+    if !wide_values() { return charge(bytes, value); }
+    let size = value_bytes(value);
+    if size > max_value_bytes() { return Err(SqlError::Limit); }
+    *bytes = bytes.checked_add(size).ok_or(SqlError::Limit)?;
+    if *bytes > max_projected_row_bytes(max_value_bytes()) { return Err(SqlError::Limit); }
+    Ok(())
+}
 /// Where SELECT rows go: the capped in-memory result, a v2 SqlSession
 /// statement's spilled output (tuplestore), or a captured v2 subquery store.
 enum Output {
@@ -4686,18 +4693,18 @@ impl BoundQuery<'_> {
             .map(|item| match item {
                 BoundItem::Scalar(value) => {
                     let value = value.eval(row, params, work)?;
-                    charge(bytes, &value)?;
+                    charge_projected(bytes, &value)?;
                     Ok(value)
                 }
                 BoundItem::Column(column) => {
                     let value = row.get(*column);
-                    charge(bytes, value)?;
+                    charge_projected(bytes, value)?;
                     Ok(value.clone())
                 }
                 BoundItem::Ctid(column) => match row.get(*column) {
                     Value::Int(rowid) => {
                         let value = Value::Text(super::ctid::format(*rowid)?);
-                        charge(bytes, &value)?;
+                        charge_projected(bytes, &value)?;
                         Ok(value)
                     }
                     Value::Null => Ok(Value::Null),
@@ -4951,13 +4958,13 @@ impl BoundQuery<'_> {
         let mut bytes = 0;
         if let Some(row) = progress.pending.take() {
             bytes = row.values.iter().map(value_bytes).sum();
-            if bytes > max_bytes {
+            if bytes > max_bytes && !wide_values() {
                 progress.pending = Some(row);
                 return Err(SqlError::Limit);
             }
             output.push(row);
         }
-        if progress.done {
+        if progress.done || bytes >= max_bytes {
             return Ok(output);
         }
         let (empty, bounds) = self.base_bounds(params)?;
@@ -5075,7 +5082,7 @@ impl BoundQuery<'_> {
             if let Some(n) = &mut progress.remaining {
                 *n -= 1;
             }
-            if output.len() == max_rows || bytes.saturating_add(size) > max_bytes {
+            if output.len() == max_rows || (bytes.saturating_add(size) > max_bytes && !(wide_values() && output.is_empty())) {
                 progress.pending = Some(row);
                 if output.is_empty() {
                     return Err(SqlError::Limit);
@@ -5084,6 +5091,7 @@ impl BoundQuery<'_> {
             }
             bytes += size;
             output.push(row);
+            if bytes >= max_bytes { break; }
             if progress.remaining == Some(0) {
                 progress.done = true;
                 break;

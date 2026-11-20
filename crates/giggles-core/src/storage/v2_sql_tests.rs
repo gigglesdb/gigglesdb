@@ -1059,6 +1059,7 @@ fn mutation_limits_keep_legacy_cap_but_page_v2_values() {
         s.execute("CREATE TABLE t (id bigint PRIMARY KEY,v text)", &[], None)
             .unwrap();
     }
+    b.set_max_value_bytes(relational::MAX_ROW_BYTES);
     let wide = [Int(1), Text("x".repeat(relational::MAX_ROW_BYTES + 1))];
     for params in [&wide[..], &[Int(1)][..]] {
         let left = a
@@ -1772,3 +1773,81 @@ fn unique_constraint_origin_survives_v2_reopen_and_owned_index_drop() {
 #[cfg(feature = "engine-rocksdb")]
 #[path = "v2_select_points_storage_tests.rs"]
 mod select_points;
+
+#[test]
+fn wide_value_budget_and_durable_feature() {
+    use relational::Value::{Int, Text};
+    let mut f = Fixture::new();
+    let bits = |f: &Fixture| engine::meta::open_checks(f.db().kv.snapshot().unwrap().as_ref()).unwrap().features;
+    let mut s = f.admin().sql_session();
+    assert_eq!(s.max_value_bytes, 67_108_864);
+    s.set_max_value_bytes(relational::MAX_VALUE_BYTES);
+    assert_eq!(s.max_value_bytes, 1_073_741_819);
+    s.set_max_value_bytes(relational::DEFAULT_MAX_VALUE_BYTES);
+    s.execute("CREATE TABLE wide_values(id bigint PRIMARY KEY, v text)", &[], None).unwrap();
+    s.execute("INSERT INTO wide_values VALUES(1,'small')", &[], None).unwrap();
+    assert_eq!(bits(&f) & engine::meta::WIDE_ROWS, 0);
+    s.execute("BEGIN", &[], None).unwrap();
+    s.execute("UPDATE wide_values SET v=repeat('x',204800) WHERE id=1", &[], None).unwrap();
+    s.execute("ROLLBACK", &[], None).unwrap();
+    assert_eq!(bits(&f) & engine::meta::WIDE_ROWS, 0);
+    for sql in ["BEGIN", "SAVEPOINT wide"] { s.execute(sql, &[], None).unwrap(); }
+    s.execute("UPDATE wide_values SET v=repeat('x',204800) WHERE id=1", &[], None).unwrap();
+    for sql in ["ROLLBACK TO wide", "COMMIT"] { s.execute(sql, &[], None).unwrap(); }
+    assert_eq!(bits(&f) & engine::meta::WIDE_ROWS, 0);
+    for size in [204800, 1048577] {
+        let inserted = s.execute("INSERT INTO wide_values VALUES($1,$2) RETURNING v", &[Int(size as i64), Text("x".repeat(size))], None).unwrap_or_else(|e| panic!("insert size {size}: {e:?}"));
+        assert_eq!(inserted.rows[0].values, vec![Text("x".repeat(size))]);
+        assert_ne!(bits(&f) & engine::meta::WIDE_ROWS, 0);
+        let sql = format!("UPDATE wide_values SET v=repeat('x',{size}) WHERE id=1 RETURNING v");
+        assert_eq!(s.execute(&sql, &[], None).unwrap().rows[0].values, vec![Text("x".repeat(size))]);
+        assert_eq!(s.execute("SELECT v FROM wide_values WHERE id=1", &[], None).unwrap().rows[0].values, vec![Text("x".repeat(size))]);
+    }
+    assert_ne!(bits(&f) & engine::meta::WIDE_ROWS, 0);
+    assert_eq!(s.execute("SELECT length(repeat('x',100000) || repeat('y',100000))", &[], None).unwrap().rows[0].values, vec![Int(200000)]);
+    for sql in ["SELECT repeat('x',1073741823)", "SELECT lpad('x',1073741824)"] {
+        assert_eq!(s.execute(sql, &[], None), Err(CoreError::Sql(SqlError::Limit)));
+        assert_eq!(relational::take_sql_error_message().as_deref(), Some("requested length too large"));
+    }
+    for literal in [format!("'{}'", "l".repeat(204800)), format!("$${}$$", "l".repeat(204800))] {
+        assert_eq!(s.execute(&format!("SELECT length({literal})"), &[], None).unwrap().rows[0].values, vec![Int(204800)]);
+    }
+    let described = s.prepare("SELECT repeat('x',1048577)").unwrap();
+    s.describe(&described).unwrap();
+    s.validate_immutable_constants(&described).unwrap();
+    s.set_max_value_bytes(65536);
+    assert_eq!(s.execute("SELECT repeat('x',70000)", &[], None), Err(CoreError::Sql(SqlError::Limit)));
+    drop(s);
+    f.reopen();
+    assert_eq!(f.admin().sql_session().execute("SELECT length(v) FROM wide_values WHERE id=1", &[], None).unwrap().rows[0].values, vec![Int(1048577)]);
+}
+
+#[test]
+fn statement_token_budget() {
+    use relational::Value::{Int, Bool, Null};
+    let f = Fixture::new();
+    let mut s = f.admin().sql_session();
+    assert_eq!(s.max_statement_tokens, 1_000_000);
+    s.execute("CREATE TABLE token_budget(id int)", &[], None).unwrap();
+    s.execute("INSERT INTO token_budget VALUES(1),(20000),(100001)", &[], None).unwrap();
+    for count in [20000, 100000] {
+        let list = (1..=count).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id FROM token_budget WHERE id IN ({list}) ORDER BY id");
+        let start = std::time::Instant::now();
+        let result = s.execute(&sql, &[], None).unwrap();
+        eprintln!("{count} IN: {:?}", start.elapsed());
+        assert_eq!(result.rows.iter().map(|r| r.values.clone()).collect::<Vec<_>>(), vec![vec![Int(1)],vec![Int(20000)]]);
+        if count == 20000 {
+            s.set_max_statement_tokens(4096);
+            assert_eq!(s.execute(&sql, &[], None), Err(CoreError::Sql(SqlError::Limit)));
+            s.set_max_statement_tokens(relational::DEFAULT_MAX_STATEMENT_TOKENS);
+        }
+    }
+    let r = s.execute("SELECT 1 IN (1,NULL), 2 IN (1,NULL), 2 NOT IN (1,NULL), 1 NOT IN (1,NULL), NULL IN (1,2), 2 NOT IN (1,3)", &[], None).unwrap();
+    assert_eq!(r.rows[0].values, vec![Bool(true), Null, Null, Bool(false), Null, Bool(true)]);
+    let rows = (1..=20000).map(|n| format!("({n})")).collect::<Vec<_>>().join(",");
+    let start = std::time::Instant::now();
+    let r = s.execute(&format!("SELECT count(*) FROM (VALUES {rows}) AS v(x)"), &[], None).unwrap();
+    eprintln!("20000 VALUES: {:?}", start.elapsed());
+    assert_eq!(r.rows[0].values, vec![Int(20000)]);
+}

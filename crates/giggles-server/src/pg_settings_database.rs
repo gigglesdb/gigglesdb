@@ -51,7 +51,7 @@ pub(crate) fn lex(sql: &str) -> Result<Vec<Token>> {
                 let mut value = String::from(c);
                 while chars
                     .peek()
-                    .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '$'))
+                    .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '.'))
                 {
                     value.push(chars.next().unwrap());
                 }
@@ -149,6 +149,8 @@ pub(crate) fn lookup_name(name: &str) -> Result<Show> {
         "session_authorization" => Ok(Show::SessionAuthorization),
         "application_name" => Ok(Show::ApplicationName),
         "extra_float_digits" => Ok(Show::ExtraFloatDigits),
+        "gigglesdb.max_statement_tokens" => Ok(Show::MaxStatementTokens),
+        "gigglesdb.max_value_bytes" => Ok(Show::MaxValueBytes),
         "timezone" => Ok(Show::TimeZone),
         "datestyle" => Ok(Show::DateStyle),
         "client_encoding" => Ok(Show::ClientEncoding),
@@ -337,6 +339,8 @@ fn validate(name: Show, values: Vec<Token>) -> Result<String> {
         Show::DefaultTransactionIsolation => crate::pg_transaction::IsolationLevel::parse(&lower)
             .map(|requested| requested.name().into()),
         Show::ApplicationName if value.len() <= 128 => Ok(value),
+        Show::MaxStatementTokens => value.parse::<i64>().ok().filter(|n| (0..=i64::from(i32::MAX)).contains(n)).map(|n| n.to_string()).ok_or("22023"),
+        Show::MaxValueBytes => value.parse::<usize>().ok().filter(|n| (65536..=1073741819).contains(n)).map(|n| n.to_string()).ok_or("22023"),
         Show::ExtraFloatDigits => value
             .parse::<i32>()
             .ok()

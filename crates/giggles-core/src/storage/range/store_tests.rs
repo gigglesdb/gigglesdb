@@ -217,7 +217,15 @@ fn range_local_meta_writes_and_feature_union() {
     batch.put(
         Keyspace::Meta,
         range_local_key(b, &RangeLocalKey::Prepared(4)),
-        b"opaque".to_vec(),
+        crate::storage::range::engine::prepared::Prepared {
+            home: RangeId(2),
+            at: crate::storage::engine::hlc::Ts(1),
+            writes: Default::default(),
+            locks: vec![],
+            children: vec![],
+        }
+        .encode()
+        .unwrap(),
     );
     batch.put(Keyspace::Rows, row(SPLIT_TABLE, 1, 1), b"v".to_vec());
     assert_eq!(
@@ -282,13 +290,26 @@ fn invalid_range_values_stop_the_range_instead_of_being_refused() {
         range_local_key(a, &RangeLocalKey::Features),
         &(1u64 << 60).to_be_bytes(),
     );
-    assert!(matches!(store.apply(a, &unknown, pos(1, 1)), Err(CoreError::Corrupt(_))));
+    assert!(matches!(
+        store.apply(a, &unknown, pos(1, 1)),
+        Err(CoreError::Corrupt(_))
+    ));
     assert_eq!(store.applied(a).unwrap(), None);
-    let short = put(Keyspace::Meta, range_local_key(a, &RangeLocalKey::LastCommitTs), &[0; 7]);
-    assert!(matches!(store.apply(a, &short, pos(1, 1)), Err(CoreError::Corrupt(_))));
+    let short = put(
+        Keyspace::Meta,
+        range_local_key(a, &RangeLocalKey::LastCommitTs),
+        &[0; 7],
+    );
+    assert!(matches!(
+        store.apply(a, &short, pos(1, 1)),
+        Err(CoreError::Corrupt(_))
+    ));
     // An op outside the range is refused and advances the position.
     let outside = put(Keyspace::Rows, row(SPLIT_TABLE, 1, 1), b"x");
-    assert_eq!(store.apply(a, &outside, pos(1, 1)).unwrap(), RangeApplyOutcome::Refused);
+    assert_eq!(
+        store.apply(a, &outside, pos(1, 1)).unwrap(),
+        RangeApplyOutcome::Refused
+    );
     assert_eq!(store.applied(a).unwrap(), Some(pos(1, 1)));
 }
 
@@ -403,4 +424,97 @@ fn directory_looking_keys_outside_system_range_are_unaffected() {
         );
     }
     assert_eq!(rows(&store, Keyspace::Catalog).len(), 2);
+}
+
+#[test]
+fn receiving_batches_refuse_wide_rows_and_prepared_values_atomically() {
+    use crate::storage::engine::{meta::WIDE_ROWS, mvcc};
+    use crate::storage::range::engine::prepared::Prepared;
+    let dir = Dir::new("range-receiving-bound");
+    let store = two_ranges(&dir);
+    let id = RangeId(2);
+    let before = rows(&store, Keyspace::Meta);
+    let _budget =
+        crate::relational::ValueBudget::enter(crate::relational::DEFAULT_MAX_VALUE_BYTES, true);
+    let wide = codec::encode_row(
+        b"k",
+        1,
+        &[crate::relational::Value::Text("x".repeat(70_000))],
+    )
+    .unwrap();
+    let mut prepared = Prepared {
+        home: id,
+        at: Ts(1),
+        writes: Default::default(),
+        locks: vec![],
+        children: vec![],
+    };
+    prepared
+        .writes
+        .insert((Keyspace::Rows, b"k".to_vec()), Some(wide.clone()));
+    let encoded = prepared.encode().unwrap();
+    assert!(matches!(
+        Prepared::decode(&encoded),
+        Err(crate::storage::range_api::RangeError::Corrupt(_))
+    ));
+    for (ks, key, value) in [
+        (
+            Keyspace::Rows,
+            row(SPLIT_TABLE, 1, 1),
+            mvcc::encode_live(&wide),
+        ),
+        (
+            Keyspace::Meta,
+            range_local_key(id, &RangeLocalKey::Prepared(1)),
+            encoded,
+        ),
+    ] {
+        let mut batch = WriteBatch::default();
+        batch.put(Keyspace::Rows, row(SPLIT_TABLE, 2, 1), b"small".to_vec());
+        batch.put(
+            Keyspace::Meta,
+            range_local_key(id, &RangeLocalKey::Features),
+            (node_features(&store) | WIDE_ROWS).to_be_bytes().to_vec(),
+        );
+        batch.put(ks, key, value);
+        assert!(matches!(
+            store.apply(id, &batch.encode(), pos(1, 1)),
+            Err(CoreError::Corrupt(_))
+        ));
+        assert_eq!(rows(&store, Keyspace::Meta), before);
+        assert!(rows(&store, Keyspace::Rows).is_empty());
+        assert_eq!(store.applied(id).unwrap(), None);
+    }
+    for owner in [id, RangeId(1)] {
+        let mut batch = WriteBatch::default();
+        // An earlier routing refusal must not hide the embedded wide row.
+        batch.put(Keyspace::Rows, row(1, 1, 1), b"small".to_vec());
+        batch.put(Keyspace::Meta,
+            range_local_key(owner, &RangeLocalKey::Prepared(1)),
+            prepared.encode().unwrap());
+        assert!(matches!(store.apply(id, &batch.encode(), pos(1, 1)),
+            Err(CoreError::Corrupt(_))));
+        assert_eq!(rows(&store, Keyspace::Meta), before);
+        assert!(rows(&store, Keyspace::Rows).is_empty());
+        assert_eq!(store.applied(id).unwrap(), None);
+    }
+    let small = codec::encode_row(
+        b"k",
+        1,
+        &[crate::relational::Value::Text("x".repeat(60_000))],
+    )
+    .unwrap();
+    store
+        .apply(
+            id,
+            &put(
+                Keyspace::Rows,
+                row(SPLIT_TABLE, 1, 1),
+                &mvcc::encode_live(&small),
+            ),
+            pos(1, 1),
+        )
+        .unwrap();
+    assert_eq!(rows(&store, Keyspace::Rows).len(), 1);
+    assert_eq!(node_features(&store) & WIDE_ROWS, 0);
 }

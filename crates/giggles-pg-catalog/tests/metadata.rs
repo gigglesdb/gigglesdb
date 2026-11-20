@@ -353,7 +353,7 @@ fn three_valued_predicates_and_like() {
 }
 #[test]
 fn bounds() {
-    assert_eq!(plan(&" ".repeat(MAX_SQL + 1)).unwrap_err(), Error::Limit);
+    assert!(plan(&" ".repeat(MAX_SQL + 1)).unwrap().is_none());
     assert!(
         plan(&format!(
             "SELECT {}current_database(){}",

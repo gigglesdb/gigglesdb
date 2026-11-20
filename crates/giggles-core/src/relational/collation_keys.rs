@@ -81,7 +81,7 @@ impl Key {
             bytes = bytes
                 .checked_add(value_bytes(&value))
                 .ok_or(SqlError::Limit)?;
-            if bytes > MAX_ROW_BYTES {
+            if bytes > crate::relational::max_value_bytes() {
                 return Err(SqlError::Limit);
             }
             transformed.push(value);
