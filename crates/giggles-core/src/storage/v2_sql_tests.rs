@@ -15,6 +15,79 @@ use engine::{
 use std::ops::Bound;
 
 #[test]
+fn occupancy_uses_the_statement_catalog_image_including_private_unique_ddl() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE t(id int PRIMARY KEY,k text)");
+    let db = f.db();
+    let mut txn = db.begin(Isolation::ReadCommitted);
+    let committed = db.catalog().snapshot(&mut txn).unwrap().image().unwrap();
+    drop(txn);
+    let mut session = f.admin().sql_session();
+    let insert_case_variant = "INSERT INTO t VALUES (2,'ABC')";
+
+    let shared_check = |committed: Arc<relational::Relational>| {
+        OCCUPANCY_IMAGE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |snapshot, image| {
+                assert!(Arc::ptr_eq(image, &snapshot.image().unwrap()));
+                assert!(Arc::ptr_eq(image, &committed));
+                assert!(snapshot.parts.indexes.is_empty());
+            }));
+        });
+    };
+    let checked = |statement| {
+        OCCUPANCY_IMAGE.with(|hook| assert!(hook.borrow().is_none(), "{statement}"))
+    };
+    // A primary-key move uses the occupancy publisher on a deterministic table.
+    session
+        .execute("INSERT INTO t VALUES (10,'abc')", &[], None)
+        .unwrap();
+    shared_check(committed.clone());
+    session
+        .execute("UPDATE t SET id=1 WHERE id=10", &[], None)
+        .unwrap();
+    checked("committed catalog before private DDL");
+
+    for sql in [
+        "BEGIN",
+        "CREATE COLLATION ci(provider=icu,locale='und-u-ks-level2',deterministic=false)",
+        "CREATE UNIQUE INDEX t_ci ON t(k COLLATE ci)",
+    ] {
+        session.execute(sql, &[], None).unwrap();
+    }
+    let before_ddl = committed.clone();
+    OCCUPANCY_IMAGE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |snapshot, image| {
+            assert!(Arc::ptr_eq(image, &snapshot.image().unwrap()));
+            assert!(!Arc::ptr_eq(image, &before_ddl));
+            assert_eq!(snapshot.parts.indexes[0].name, "t_ci");
+            assert!(image.has_nondeterministic_keys(&snapshot.parts.tables["t"]));
+        }));
+    });
+    let error = session.execute(insert_case_variant, &[], None).unwrap_err();
+    checked("private catalog with a nondeterministic index");
+    assert_eq!(error, CoreError::Sql(SqlError::Duplicate));
+    assert_eq!(crate::sqlstate(&error), "23505");
+    assert_eq!(
+        relational::take_sql_error_message().as_deref(),
+        Some("duplicate key value violates unique constraint \"t_ci\"")
+    );
+
+    session.execute("ROLLBACK", &[], None).unwrap();
+    assert_eq!(
+        session
+            .execute(insert_case_variant, &[], None)
+            .unwrap()
+            .affected,
+        1
+    );
+    shared_check(committed);
+    session
+        .execute("UPDATE t SET id=3 WHERE id=2", &[], None)
+        .unwrap();
+    checked("committed catalog after rollback");
+}
+
+#[test]
 fn with_dml_locks_hold_plain_dml_sentinel_until_commit_or_rollback() {
     use crate::relational::Value;
     use std::sync::mpsc;

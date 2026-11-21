@@ -97,6 +97,38 @@ pub(crate) fn duplicate(name: &str) -> SqlError {
     SqlError::Duplicate
 }
 impl Relational {
+    /// Check the bindings that could require equality keys or make Key::new
+    /// fail before the sidecar validates descriptor columns.
+    pub(super) fn needs_collated_unique_validation(
+        &self,
+        descriptors: &[secondary_index::Descriptor],
+    ) -> bool {
+        use column_collations::{Binding, Reference};
+        let needs_key = |reference: &Reference| {
+            matches!(reference, Reference::User(id)
+                if self.ext.collations.get(id).is_none_or(|c| !c.deterministic))
+        };
+        let mut has_explicit_index_binding = false;
+        for binding in self.ext.column_collations.values() {
+            let required = match binding {
+                Binding::Column(reference) => needs_key(reference),
+                Binding::Index(references) => {
+                    has_explicit_index_binding = true;
+                    references.iter().flatten().any(needs_key)
+                }
+                Binding::EmptyTable => false,
+            };
+            if required {
+                return true;
+            }
+        }
+        has_explicit_index_binding
+            && descriptors.iter().filter(|d| d.unique).any(|d| {
+                matches!(self.ext.column_collations.get(&d.id), Some(Binding::Index(references))
+                    if references.len() != d.columns.len())
+            })
+    }
+
     pub(crate) fn primary_duplicate(&self, table: &TableDef) -> SqlError {
         if table
             .primary_key
@@ -153,20 +185,24 @@ impl Relational {
             .iter()
             .map(|i| table.columns[*i].id)
             .collect::<Vec<_>>();
-        let mut keys = vec![(
-            Key::new(self, table, &primary, None)?,
-            self.primary_key_constraint_name(table).unwrap_or_default(),
-        )];
+        let mut keys = Vec::new();
+        let key = Key::new(self, table, &primary, None)?;
+        if key.nondeterministic() {
+            keys.push((
+                key,
+                self.primary_key_constraint_name(table).unwrap_or_default(),
+            ));
+        }
         for d in descriptors
             .iter()
             .filter(|d| d.table == table.id && d.unique)
         {
-            keys.push((
-                Key::new(self, table, &d.columns, Some(d.id))?,
-                d.name.clone(),
-            ));
+            let key = Key::new(self, table, &d.columns, Some(d.id))?;
+            if key.nondeterministic() {
+                keys.push((key, d.name.clone()));
+            }
         }
-        Ok(keys.into_iter().filter(|(key, _)| key.nondeterministic()).collect())
+        Ok(keys)
     }
 }
 

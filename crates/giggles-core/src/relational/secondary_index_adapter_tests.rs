@@ -4,6 +4,178 @@ fn sql(s: &mut Relational, text: &str, params: &[Value]) -> R<SqlResult> {
     let p = Prepared::parse(text, 1, s.epoch)?;
     s.execute(&p, params, None)
 }
+
+fn previous_keys(
+    state: &Relational,
+    table: &TableDef,
+    ds: &[Descriptor],
+) -> R<Vec<(collation_keys::Key, String)>> {
+    use collation_keys::Key;
+    let primary = table
+        .primary_key
+        .iter()
+        .map(|i| table.columns[*i].id)
+        .collect::<Vec<_>>();
+    let mut keys = vec![(
+        Key::new(state, table, &primary, None)?,
+        state.primary_key_constraint_name(table).unwrap_or_default(),
+    )];
+    for d in ds.iter().filter(|d| d.table == table.id && d.unique) {
+        keys.push((
+            Key::new(state, table, &d.columns, Some(d.id))?,
+            d.name.clone(),
+        ));
+    }
+    Ok(keys
+        .into_iter()
+        .filter(|(key, _)| key.nondeterministic())
+        .collect())
+}
+
+fn previous_build(
+    state: &Relational,
+    ds: &[Descriptor],
+    mut cancel: impl FnMut() -> bool,
+) -> R<Sidecar> {
+    for table in state.tables.values() {
+        state.validate_collated_unique(table, &state.rows[&table.id], ds, &mut cancel)?;
+    }
+    let snap = snapshot(state, ds, NONE, &mut cancel)?;
+    let tuples = snap.tuples();
+    let mut staged = Sidecar::default();
+    staged
+        .build(ds, &snap.rows(&tuples), &CatalogView(state), &mut cancel)
+        .map_err(error)?;
+    Ok(staged)
+}
+
+#[test]
+fn complete_collated_unique_build_matches_previous_algorithm() {
+    for (deterministic, pk, unique, index, names) in [
+        (None, "", "", "", &[][..]),
+        (
+            Some(true),
+            " COLLATE ci",
+            " COLLATE ci",
+            " COLLATE ci",
+            &[][..],
+        ),
+        (Some(false), " COLLATE ci", "", "", &["t_pkey"][..]),
+        (Some(false), "", " COLLATE ci", "", &["t_v_key"][..]),
+        (Some(false), "", "", " COLLATE ci", &["t_w_key"][..]),
+        (
+            Some(false),
+            " COLLATE ci",
+            " COLLATE ci",
+            " COLLATE ci",
+            &["t_pkey", "t_v_key", "t_w_key"][..],
+        ),
+    ] {
+        let mut state = Relational::default();
+        if let Some(deterministic) = deterministic {
+            sql(&mut state, &format!(
+                "CREATE COLLATION ci(provider=icu,locale='und-u-ks-level2',deterministic={deterministic})"
+            ), &[]).unwrap();
+        }
+        sql(
+            &mut state,
+            &format!("CREATE TABLE t(k text{pk} PRIMARY KEY,v text{unique} UNIQUE,w text)"),
+            &[],
+        )
+        .unwrap();
+        sql(
+            &mut state,
+            &format!("CREATE UNIQUE INDEX t_w_key ON t(w{index})"),
+            &[],
+        )
+        .unwrap();
+        sql(&mut state, "INSERT INTO t VALUES('abc','abc','abc')", &[]).unwrap();
+        let table = &state.tables["t"];
+        let ds = state.secondary.descriptors();
+        assert_eq!(
+            state.secondary_build_complete_engine(ds, || false),
+            previous_build(&state, ds, || false)
+        );
+
+        let values = vec![Value::Text("ABC".into()); 3];
+        let summarize = |keys: Vec<(collation_keys::Key, String)>| {
+            keys.into_iter()
+                .map(|(key, name)| {
+                    let tuple = key.tuple(&values).unwrap();
+                    (name, key.columns, tuple)
+                })
+                .collect::<Vec<_>>()
+        };
+        let keys = summarize(state.collated_unique_keys(table, ds).unwrap());
+        assert_eq!(keys, summarize(previous_keys(&state, table, ds).unwrap()));
+        assert_eq!(
+            keys.iter()
+                .map(|(name, _, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            names
+        );
+
+        // Insert byte-distinct witnesses directly to exercise complete rebuilds.
+        let key = encode_key(&values[..1]).unwrap();
+        state
+            .rows
+            .get_mut(&table.id)
+            .unwrap()
+            .insert(key, SqlRow { values, version: 2 });
+        let previous = previous_build(&state, ds, || false);
+        let previous_message = take_sql_error_message();
+        let current = state.secondary_build_complete_engine(ds, || false);
+        assert_eq!(take_sql_error_message(), previous_message);
+        assert_eq!(current, previous);
+        assert_eq!(current.err(), names.first().map(|_| SqlError::Duplicate));
+    }
+}
+
+#[test]
+fn complete_collated_unique_build_preserves_malformed_key_error_precedence() {
+    use column_collations::{Binding, Reference};
+    let mut state = Relational::default();
+    sql(
+        &mut state,
+        "CREATE TABLE t(k text PRIMARY KEY,v text UNIQUE)",
+        &[],
+    )
+    .unwrap();
+    let mut ds = state.secondary.descriptors().to_vec();
+    let assert_error = |state: &Relational, ds: &[Descriptor], expected| {
+        let table = &state.tables["t"];
+        let expected = Some(&expected);
+        assert_eq!(previous_keys(state, table, ds).as_ref().err(), expected);
+        assert_eq!(state.collated_unique_keys(table, ds).as_ref().err(), expected);
+        assert_eq!(previous_build(state, ds, || true).as_ref().err(), expected);
+        assert_eq!(
+            state.secondary_build_complete_engine(ds, || true).as_ref().err(),
+            expected
+        );
+        assert_eq!(
+            state.secondary_build_complete_engine(ds, || false).as_ref().err(),
+            expected
+        );
+    };
+    let mut dangling_index = state.clone();
+    Arc::make_mut(&mut dangling_index.ext)
+        .column_collations
+        .insert(ds[0].id, Binding::Index(vec![Some(Reference::User(u64::MAX))]));
+    assert_error(&dangling_index, &ds, SqlError::Type);
+    ds[0].columns[0] = 0;
+    assert_error(&state, &ds, SqlError::UnknownColumn);
+    let mut wrong_arity = state.clone();
+    Arc::make_mut(&mut wrong_arity.ext)
+        .column_collations
+        .insert(ds[0].id, Binding::Index(vec![]));
+    assert_error(&wrong_arity, &ds, SqlError::Type);
+    let pk = state.tables["t"].columns[0].id;
+    Arc::make_mut(&mut state.ext)
+        .column_collations
+        .insert(pk, Binding::Column(Reference::User(u64::MAX)));
+    assert_error(&state, &ds, SqlError::Type);
+}
+
 fn base() -> Relational {
     let mut s = Relational::default();
     sql(

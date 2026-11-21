@@ -1063,16 +1063,41 @@ impl Relational {
         ds: &[Descriptor],
         mut cancel: impl FnMut() -> bool,
     ) -> R<Sidecar> {
-        for table in self.tables.values() {
-            self.validate_collated_unique(table, &self.rows[&table.id], ds, &mut cancel)?;
+        let check_collations = self.needs_collated_unique_validation(ds);
+        if check_collations {
+            self.validate_catalog_collated_unique(ds, &mut cancel)?;
         }
-        let snap = snapshot(self, ds, NONE, &mut cancel)?;
+        let snap = snapshot(self, ds, NONE, &mut cancel).or_else(|error| {
+            if !check_collations {
+                // Admission checks descriptor columns. On failure, recover
+                // the collation pass's UnknownColumn precedence, including
+                // over cancellation and malformed descriptor shape.
+                for d in ds.iter().filter(|d| d.unique) {
+                    if let Ok(t) = table(self, d.table) {
+                        for id in &d.columns {
+                            column(t, *id)?;
+                        }
+                    }
+                }
+            }
+            Err(error)
+        })?;
         let tuples = snap.tuples();
         let mut staged = Sidecar::default();
         staged
             .build(ds, &snap.rows(&tuples), &CatalogView(self), &mut cancel)
             .map_err(error)?;
         Ok(staged)
+    }
+    fn validate_catalog_collated_unique(
+        &self,
+        ds: &[Descriptor],
+        cancel: &mut impl FnMut() -> bool,
+    ) -> R<()> {
+        for table in self.tables.values() {
+            self.validate_collated_unique(table, &self.rows[&table.id], ds, cancel)?;
+        }
+        Ok(())
     }
     pub(super) fn secondary_admit_values<'a>(values: impl Iterator<Item = &'a Value>) -> R<()> {
         let mut bytes = 0;

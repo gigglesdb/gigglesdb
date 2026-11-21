@@ -48,6 +48,52 @@ fn setup(s: &mut SqlSession) {
     );
 }
 
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn v2_case_insensitive_duplicates_keep_sqlstate_and_constraint_name() {
+    let a = Admin::create_engine(
+        common::fresh("nd-unique-v2-case-variants"),
+        Limits::default(),
+        Engine::V2,
+    )
+    .unwrap();
+    let mut s = a.sql_session();
+    setup(&mut s);
+    assert_eq!(
+        giggles_core::sqlstate(&CoreError::Sql(E::Duplicate)),
+        "23505"
+    );
+
+    for (ddl, name, batch, seed, insert, update, upsert) in [
+        (
+            "CREATE TABLE pk(k text COLLATE ci PRIMARY KEY,n int UNIQUE)",
+            "pk_pkey",
+            "INSERT INTO pk VALUES('abc',1),('ABC',2)",
+            "INSERT INTO pk VALUES('abc',1),('xyz',2)",
+            "INSERT INTO pk VALUES('ABC',3)",
+            "UPDATE pk SET k='ABC' WHERE n=2",
+            "INSERT INTO pk VALUES('ABC',2) ON CONFLICT(n) DO UPDATE SET k=excluded.k",
+        ),
+        (
+            "CREATE TABLE uq(id int PRIMARY KEY,k text COLLATE ci UNIQUE)",
+            "uq_k_key",
+            "INSERT INTO uq VALUES(1,'abc'),(2,'ABC')",
+            "INSERT INTO uq VALUES(1,'abc'),(2,'xyz')",
+            "INSERT INTO uq VALUES(3,'ABC')",
+            "UPDATE uq SET k='ABC' WHERE id=2",
+            "INSERT INTO uq VALUES(2,'ABC') ON CONFLICT(id) DO UPDATE SET k=excluded.k",
+        ),
+    ] {
+        let message = format!("duplicate key value violates unique constraint \"{name}\"");
+        run(&mut s, ddl);
+        fail(&mut s, batch, E::Duplicate, &message);
+        run(&mut s, seed);
+        for sql in [insert, update, upsert] {
+            fail(&mut s, sql, E::Duplicate, &message);
+        }
+    }
+}
+
 #[test]
 fn primary_upsert_update_and_restart() {
     for engine in engines() {

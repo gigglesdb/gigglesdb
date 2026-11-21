@@ -1,6 +1,6 @@
 //! SQL bridge: relational statement checks publish through v2 catalog and row sinks.
 use super::*;
-use engine::{catalog::CatalogParts, txn::Isolation};
+use engine::{catalog::{CatalogParts, CatalogSnapshot}, txn::Isolation};
 use engine::{catalog::TableEntry, codec, kv::Keyspace, locks::LockMode, txn::Transaction};
 use relational::{
     SqlError, SqlRow, TableDef,
@@ -298,7 +298,7 @@ impl SqlSession {
         let prepared = relational::Prepared::scan(scan,
             u128::from_be_bytes(db.meta.domain), &image).map_err(CoreError::Sql)?;
         let result = image.execute_with_sink(&prepared, &[], None, None,
-            &mut SqlRows { db, txn, parts: &catalog.parts, writing: false,
+            &mut SqlRows { db, txn, parts: &catalog.parts, catalog: &catalog, writing: false,
                 conflict_floor: None, prepared: &prepared, params: &[], effects: None, scope: None },
             u64::MAX, None)?;
         crate::cancellation::check()?;
@@ -998,6 +998,7 @@ impl SqlSession {
                                     db,
                                     txn,
                                     parts: old,
+                                    catalog: &catalog,
                                     writing,
                                     prepared: &bound,
                                     params,
@@ -1041,7 +1042,7 @@ impl SqlSession {
                         let reads_view = names.iter().any(|name| binding.view_names.contains_key(name));
                         if !writing && (scope.is_some() || image.streaming_reduction(&bound) || reads_view) {
                             let source = reduction::Source::new(SqlRows {
-                                conflict_floor: None, db, txn, parts: old,
+                                conflict_floor: None, db, txn, parts: old, catalog: &catalog,
                                 writing, prepared: &bound, params, effects: None, scope: None,
                             });
                             let scoped = scope.as_ref().map(|scope|
@@ -1072,6 +1073,7 @@ impl SqlSession {
                                 db,
                                 txn,
                                 parts: old,
+                                catalog: &catalog,
                                 writing,
                                 prepared: &bound,
                                 params,
@@ -1299,6 +1301,7 @@ pub(super) fn validate_pending(
             db,
             txn,
             parts,
+            catalog: &catalog,
             writing: true,
             prepared: &p,
             params: &[],
@@ -1352,6 +1355,8 @@ struct SqlRows<'a> {
     db: &'a v2::V2Db,
     txn: &'a mut Transaction,
     parts: &'a CatalogParts,
+    /// Owns these parts and the immutable occupancy image.
+    catalog: &'a CatalogSnapshot,
     writing: bool,
     conflict_floor: Option<u64>,
     prepared: &'a relational::Prepared,
@@ -1659,7 +1664,7 @@ impl RowSink for SqlRows<'_> {
         read: &mut dyn FnMut(&dyn relational::scan::RowSource) -> Result<(), SqlError>,
     ) -> Result<(), CoreError> {
         let source = reduction::Source::new(SqlRows {
-            conflict_floor: None, db: self.db, txn: &mut *self.txn, parts: self.parts,
+            conflict_floor: None, db: self.db, txn: &mut *self.txn, parts: self.parts, catalog: self.catalog,
             writing: self.writing, prepared: self.prepared, params: self.params,
             // The INSERT source is only read; protected write effects are
             // recorded by the insert pages that follow.
@@ -2159,8 +2164,14 @@ impl RowSink for SqlRows<'_> {
                     .map_err(crate::task::limits::lock_error)?;
             }
         }
-        let mut image = relational::Relational::catalog_image(self.parts.tables.clone(), self.parts.ext.clone(), u64::MAX, 1).map_err(CoreError::Sql)?;
-        image.catalog_indexes(&self.parts.indexes).map_err(CoreError::Sql)?;
+        debug_assert!(std::ptr::eq(self.parts, &self.catalog.parts));
+        let image = self.catalog.image().map_err(CoreError::Sql)?;
+        #[cfg(all(test, feature = "engine-rocksdb"))]
+        OCCUPANCY_IMAGE.with(|hook| {
+            if let Some(check) = hook.borrow_mut().take() {
+                check(self.catalog, &image);
+            }
+        });
         for (key, row) in after {
             if before.contains_key(key) {
                 continue;
@@ -2902,4 +2913,12 @@ mod protected_fk_tests;
 #[cfg(test)]
 thread_local! {
     pub(super) static AFTER_DML_VERSION_RESERVATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+type OccupancyImageCheck = Box<dyn FnOnce(&CatalogSnapshot, &Arc<relational::Relational>)>;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+thread_local! {
+    static OCCUPANCY_IMAGE: std::cell::RefCell<Option<OccupancyImageCheck>> = const { std::cell::RefCell::new(None) };
 }
