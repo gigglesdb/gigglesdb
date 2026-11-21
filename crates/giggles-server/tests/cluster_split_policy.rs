@@ -38,8 +38,8 @@ fn transient(error: &tokio_postgres::Error) -> bool {
 async fn insert_batch(client: &Client, observer: &Client, committed: &mut i64) {
     // One statement is one atomic batch. Resolve an uncertain commit through node 3 before
     // advancing the count; retries use the same primary keys and cannot duplicate a batch.
-    // The size API counts SSTs, not memtables. Fill the production write buffer quickly
-    // with varied 48 KiB text, staying below the 64 KiB row and 1 MiB batch budgets.
+    // The size API includes unflushed writes. Use varied 48 KiB text to exercise size splits,
+    // staying below the 64 KiB row and 1 MiB batch budgets.
     let payloads: Vec<String> = (*committed..*committed + BATCH_ROWS)
         .map(|id| {
             let mut state = id as u64 + 1;

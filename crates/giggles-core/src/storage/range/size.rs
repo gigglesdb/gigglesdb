@@ -1,7 +1,7 @@
 //! Track A owns this module.
 //! Range size and a midpoint split key (GD-0075 R5-83).
 //!
-//! Both are read-only. `approximate_size` asks RocksDB for the approximate stored bytes of the
+//! Both are read-only. `approximate_size` asks RocksDB for approximate memtable and SST bytes of the
 //! range's per-keyspace raw intervals (keys.rs `cf_interval`); range-local Meta keys are not in
 //! those intervals. `split_key` walks the range's raw keys on one snapshot, in range-key order
 //! (keyspaces in tag order, then raw key order), and returns the range key of the first whole
@@ -27,8 +27,7 @@ fn as_slice(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
 
 impl RangeStore {
     /// Approximate bytes of the range's data in every keyspace (RocksDB approximate sizes of its
-    /// cf intervals), not counting range-local Meta keys. rocksdb 0.25 counts SST files only, so
-    /// data still in memtables is not counted until it is flushed.
+    /// cf intervals), including memtables and SST files but not range-local Meta keys.
     pub fn approximate_size(&self, range: RangeId) -> Result<u64, CoreError> {
         let descriptor = self.descriptor(range)?.ok_or_else(|| unknown(range))?;
         Ok(intervals(&descriptor)
@@ -40,8 +39,8 @@ impl RangeStore {
             .sum())
     }
 
-    /// Flush memtables so approximate_size counts recent writes. The size policy does not call
-    /// this (RocksDB flushes on its own in production); tests call it before a policy pass.
+    /// Flush memtables to SST files. Approximate sizes already include unflushed writes;
+    /// the size policy does not need to call this.
     pub fn flush_memtables(&self) -> Result<(), CoreError> {
         Ok(self.kv().flush_memtables()?)
     }
@@ -230,6 +229,19 @@ mod tests {
         put(&store, Keyspace::Rows, SPLIT_TABLE - 1, &ns, 1, 100);
         put(&store, Keyspace::Catalog, 3, &ns, 1, 100);
         assert_eq!(store.split_key(SYSTEM_RANGE).unwrap(), None);
+    }
+
+    #[test]
+    fn approximate_size_counts_unflushed_bytes_of_the_range_only() {
+        let dir = Dir::new("size-approx-unflushed");
+        let store = store_split_at(&dir, table_start());
+        let before = store.approximate_size(RIGHT).unwrap();
+        let ns: Vec<u64> = (0..256).collect();
+        put(&store, Keyspace::Rows, SPLIT_TABLE, &ns, 1, 4096);
+        let after = store.approximate_size(RIGHT).unwrap();
+        let written = 256 * 4096;
+        assert!(after > before && after > written / 2, "{before} -> {after}");
+        assert!(store.approximate_size(SYSTEM_RANGE).unwrap() < 256 << 10);
     }
 
     #[test]

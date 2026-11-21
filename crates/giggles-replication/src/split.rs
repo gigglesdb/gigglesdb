@@ -272,8 +272,8 @@ impl Splitter {
     /// is at least `threshold` and that is out of its cooldown at `store.split_key()`, a whole
     /// user key near its midpoint. Returns the splits made, as `(left, right)`.
     ///
-    /// Sizes count SST files only (`RangeStore::approximate_size`); the pass does not flush
-    /// memtables. A split refused or no longer led here (`NotLeader`, `Identity`, `Apply`, e.g.
+    /// Sizes count memtables and SST files (`RangeStore::approximate_size`); the pass does not
+    /// flush memtables. A split refused or no longer led here (`NotLeader`, `Identity`, `Apply`, e.g.
     /// prepared records draining or a directory record not yet current) is skipped until a later
     /// pass; other errors end the pass.
     ///

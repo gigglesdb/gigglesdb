@@ -1,8 +1,8 @@
 //! Optional RocksDB implementation of the storage-engine KV seam.
 use super::kv::*;
 use rocksdb::{
-    BlockBasedOptions, Cache, DB, DBCompressionType, ErrorKind, IngestExternalFileOptions,
-    IteratorMode, Options, SstFileWriter, WriteOptions,
+    AsColumnFamilyRef, AsRawPtr, BlockBasedOptions, Cache, DB, DBCompressionType, ErrorKind,
+    IngestExternalFileOptions, IteratorMode, Options, SstFileWriter, WriteOptions,
 };
 use std::{
     collections::BTreeMap,
@@ -379,10 +379,8 @@ impl RocksKv {
         })
     }
 
-    /// RocksDB's approximate stored bytes of one column family's raw interval. rocksdb 0.25
-    /// wraps only `get_approximate_sizes_cf`, which counts SST files: data still in memtables
-    /// is not counted until it is flushed. An unbounded start is the empty key, an unbounded
-    /// end `APPROX_END`.
+    /// RocksDB's approximate bytes in memtables and SST files for one column family's raw
+    /// interval. An unbounded start is the empty key, an unbounded end `APPROX_END`.
     pub(crate) fn approximate_size(
         &self,
         ks: Keyspace,
@@ -404,10 +402,36 @@ impl RocksKv {
             return 0;
         }
         let cf = db.cf_handle(ks.name()).unwrap();
-        db.get_approximate_sizes_cf(cf, &[rocksdb::Range::new(&from, &to)])[0]
+        let start = from.as_ptr().cast();
+        let limit = to.as_ptr().cast();
+        let mut size = 0;
+        let mut err = std::ptr::null_mut();
+        let include_flags = (1 << 0) | (1 << 1); // include_memtable | include_files
+        // SAFETY: db and its CF handle remain live through the call. The key buffers,
+        // pointers and lengths describe one valid interval; size and err are writable.
+        // RocksDB owns any returned error, which must be released with rocksdb_free.
+        unsafe {
+            librocksdb_sys::rocksdb_approximate_sizes_cf_with_flags(
+                db.as_raw_ptr(),
+                cf.inner(),
+                1,
+                &start,
+                &from.len(),
+                &limit,
+                &to.len(),
+                include_flags,
+                &mut size,
+                &mut err,
+            );
+            if !err.is_null() {
+                librocksdb_sys::rocksdb_free(err.cast());
+                return 0;
+            }
+        }
+        size
     }
 
-    /// Flush every column family's memtables to SST files, so approximate sizes count them.
+    /// Flush every column family's memtables to SST files.
     pub(crate) fn flush_memtables(&self) -> Result<(), KvError> {
         self.db.clear_points();
         for ks in Keyspace::ALL {

@@ -211,6 +211,7 @@ dependencies = [
  "giggles-model",
  "giggles-pg-types",
  "giggles-transactions",
+ "librocksdb-sys",
  "redb",
  "rocksdb",
  "serde",

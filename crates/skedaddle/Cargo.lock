@@ -853,6 +853,7 @@ dependencies = [
  "giggles-icu",
  "giggles-pg-types",
  "giggles-transactions",
+ "librocksdb-sys",
  "redb",
  "rocksdb",
  "serde",
