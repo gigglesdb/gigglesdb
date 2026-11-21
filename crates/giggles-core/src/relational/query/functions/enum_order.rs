@@ -8,15 +8,30 @@ thread_local! {
 pub(in crate::relational::query) struct Scope(BTreeMap<u64, TypeDef>);
 impl Scope {
     pub(in crate::relational::query) fn enter(state: &Relational) -> Self {
-        let types = state
-            .tables
-            .values()
-            .flat_map(|table| &table.columns)
-            .filter_map(|column| {
-                let ty = state.column_type(column.id)?;
-                matches!(ty, TypeDef::Enum { .. }).then(|| (column.id, ty.clone()))
-            })
-            .collect();
+        let mut types = BTreeMap::new();
+        if !state.ext.types.is_empty() {
+            let mut candidates: BTreeMap<_, _> = state
+                .ext
+                .columns
+                .iter()
+                .filter_map(|(&id, column)| {
+                    let ty = state.ext.types.get(&column.type_id?)?;
+                    matches!(ty, TypeDef::Enum { .. }).then_some((id, ty))
+                })
+                .collect();
+
+            // Private catalog states can contain metadata for absent columns.
+            if !candidates.is_empty() {
+                for column in state.tables.values().flat_map(|table| &table.columns) {
+                    if let Some(ty) = candidates.remove(&column.id) {
+                        types.insert(column.id, ty.clone());
+                        if candidates.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         Self(TYPES.with(|slot| slot.replace(types)))
     }
 }
@@ -78,3 +93,7 @@ impl BoundScalar {
         self.explicit_collation().expect("collation bound").map_or_else(|| cmp(a,b), |n| collation::compare(n,a,b,&self.ty))
     }
 }
+
+#[cfg(test)]
+#[path = "enum_order_tests.rs"]
+mod tests;
