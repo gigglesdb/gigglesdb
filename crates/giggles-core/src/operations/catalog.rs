@@ -576,12 +576,12 @@ fn stage_catalog(
     }
     if let CatalogRequest::CreateView { name, read } = request {
         let table = session.execute_typed_view(native_relation_key(name), Some(read.clone()), false).map_err(core)?;
-        let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+        let catalog_epoch = session.inspect_catalog_engine(|fence, _| fence).map_err(core)?;
         return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
     }
     if let CatalogRequest::DropView { name, cascade } = request {
         let table = session.execute_typed_view(native_relation_key(name), None, *cascade).map_err(core)?;
-        let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+        let catalog_epoch = session.inspect_catalog_engine(|fence, _| fence).map_err(core)?;
         return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
     }
     // Legacy's empty-database policy covers native creates and drops. ALTER
@@ -599,18 +599,18 @@ fn stage_catalog(
     }
     if matches!(request, CatalogRequest::AddConstraint { .. } | CatalogRequest::DropConstraint { .. }) {
         let table = session.constraint_catalog_engine(&constraint_relation_keys(request)).map_err(core)?;
-        let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+        let catalog_epoch = session.inspect_catalog_engine(|fence, _| fence).map_err(core)?;
         return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
     }
     if let CatalogRequest::DropTable { table: name, cascade } | CatalogRequest::DropIndex { name, cascade } = request {
         let is_index = matches!(request, CatalogRequest::DropIndex { .. });
         let (table, index_id) = session.drop_catalog_engine(native_relation_key(name), *cascade, is_index).map_err(core)?;
-        let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+        let catalog_epoch = session.inspect_catalog_engine(|fence, _| fence).map_err(core)?;
         return Ok(CatalogOutcome { catalog_epoch, table, index_id });
     }
     if let CatalogRequest::AlterTable { table, action } = request {
         let table = session.alter_table_engine(native_relation_key(table), action.clone()).map_err(core)?;
-        let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+        let catalog_epoch = session.inspect_catalog_engine(|fence, _| fence).map_err(core)?;
         return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
     }
     let index_id;
@@ -656,7 +656,7 @@ fn stage_catalog(
         table_name = session.native_creation_key_engine(&native_relation_key(table)).map_err(core)?;
         index_id = None;
     }
-    let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+    let catalog_epoch = session.inspect_catalog_engine(|fence, _| fence).map_err(core)?;
     let table = session.native_table_engine(&table_name).map_err(core)?;
     Ok(CatalogOutcome {
         catalog_epoch,

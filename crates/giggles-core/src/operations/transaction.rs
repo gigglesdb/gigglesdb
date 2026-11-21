@@ -547,18 +547,29 @@ impl Engine {
         self.execute_transaction_plan(|session| {
             let description = &prepared.description;
             let (domain, epoch) = session.snapshot_identity_engine().map_err(core)?;
-            let (_, tables) = session.catalog_engine().map_err(core)?;
-            let mut stale = description.contract_version != ENGINE_CONTRACT_VERSION
+            let stale = description.contract_version != ENGINE_CONTRACT_VERSION
                 || domain != description.database_domain
                 || epoch != description.catalog_epoch;
-            for expected in &description.tables {
-                // Only reads bind a view; its descriptor must still be current.
-                stale = stale || (!tables.iter().any(|table| table == expected)
-                    && !(expected.primary_key.is_empty()
-                        && session.native_view_engine_current(expected).map_err(core)?));
-            }
+            let missing = session
+                .inspect_catalog_engine(|_, tables| {
+                    if stale {
+                        return Vec::new();
+                    }
+                    description.tables.iter()
+                        .filter(|expected| !tables.values().any(|table| table == *expected))
+                        .collect::<Vec<_>>()
+                })
+                .map_err(core)?;
             if stale {
                 return Err(core(CoreError::Sql(SqlError::StaleSchema)));
+            }
+            for expected in missing {
+                // Only reads bind a view; its descriptor must still be current.
+                if !(expected.primary_key.is_empty()
+                    && session.native_view_engine_current(expected).map_err(core)?)
+                {
+                    return Err(core(CoreError::Sql(SqlError::StaleSchema)));
+                }
             }
             Ok(prepared.clone())
         })

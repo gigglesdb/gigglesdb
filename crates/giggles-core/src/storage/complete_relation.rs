@@ -414,7 +414,7 @@ impl SqlSession {
                 .ok_or(CoreError::Sql(SqlError::Transaction))?.snapshot_ts();
             let (domain, epoch) = self.snapshot_identity_engine()?;
             let transaction = self.transaction_id.ok_or(CoreError::Sql(SqlError::Transaction))?;
-            if !self.catalog_engine()?.1.contains(table) {
+            if !self.inspect_catalog_engine(|_, tables| tables.values().any(|t| t == table))? {
                 return Err(CoreError::Sql(SqlError::StaleSchema));
             }
             if table.hidden_rowid().is_some() {

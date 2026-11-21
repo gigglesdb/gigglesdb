@@ -1154,3 +1154,427 @@ fn open_refuses_reclaim_write_fence() {
     assert!(matches!(V2Db::from_kv(kv.clone()), Err(CoreError::Fenced)));
     assert!(kv.causes.cause().unwrap().error_text.contains("injected reclaim failure"));
 }
+
+
+mod catalog_inspector {
+    use super::*;
+    #[cfg(feature = "engine-rocksdb")]
+    use relational::Value;
+    use relational::{SqlError, TableDef};
+
+    fn catalog(session: &mut SqlSession) -> (u64, Vec<TableDef>) {
+        let borrowed = session
+            .inspect_catalog_engine(|fence, tables| (fence, tables.values().cloned().collect()))
+            .unwrap();
+        assert_eq!(borrowed, session.catalog_engine().unwrap());
+        borrowed
+    }
+
+    #[test]
+    fn borrowed_catalog_matches_owned_catalog_across_private_ddl_and_rollback() {
+        for backend in [Engine::Legacy, Engine::V2] {
+            if backend == Engine::V2 && !cfg!(feature = "engine-rocksdb") {
+                continue;
+            }
+            let path = directory();
+            let admin = Admin::create_engine(&path, Limits::default(), backend).unwrap();
+            let mut session = admin.sql_session();
+            session
+                .execute("CREATE TABLE existing (id BIGINT PRIMARY KEY)", &[], None)
+                .unwrap();
+            let committed = catalog(&mut session);
+            assert_eq!(committed.1.len(), 1);
+            assert_eq!(committed.1[0].name, "existing");
+
+            session.begin_native().unwrap();
+            session
+                .execute("CREATE TABLE private (id BIGINT PRIMARY KEY)", &[], None)
+                .unwrap();
+            let created = catalog(&mut session);
+            assert_eq!(created.1.len(), 2);
+            assert_eq!(created.1[1].name, "private");
+            assert_eq!(created.1[1].columns.len(), 1);
+
+            session
+                .execute("ALTER TABLE private ADD COLUMN note TEXT", &[], None)
+                .unwrap();
+            let altered = catalog(&mut session);
+            assert_eq!(altered.1[1].columns[1].name, "note");
+            assert_ne!(altered.0, created.0);
+
+            session.execute("DROP TABLE existing", &[], None).unwrap();
+            let dropped = catalog(&mut session);
+            assert_eq!(dropped.1, vec![altered.1[1].clone()]);
+            assert_ne!(dropped.0, altered.0);
+            session.rollback_native().unwrap();
+            assert_eq!(catalog(&mut session), committed);
+
+            session.begin_native().unwrap();
+            let cancelled = crate::Cancellation::default();
+            assert!(cancelled.cancel());
+            assert_eq!(
+                cancelled.scope(|| session.inspect_catalog_engine::<()>(|_, _| unreachable!())),
+                Err(CoreError::Cancelled)
+            );
+            assert!(session.is_aborted());
+            assert_eq!(
+                session.catalog_engine(),
+                Err(CoreError::Sql(SqlError::Aborted))
+            );
+            session.rollback_native().unwrap();
+            assert_eq!(catalog(&mut session), committed);
+            drop(session);
+            drop(admin);
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    fn complete_values(session: &mut SqlSession, table: &TableDef) -> Vec<Vec<Value>> {
+        let input = session.complete_table_engine(table).unwrap();
+        session
+            .consume_complete_engine(input, table)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.values)
+            .collect()
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn native_complete_read_sees_a_privately_created_table() {
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut session = admin.sql_session();
+        session.begin_native().unwrap();
+        session
+            .execute("CREATE TABLE private (id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        session
+            .execute("INSERT INTO private VALUES (1)", &[], None)
+            .unwrap();
+
+        let private = session.native_table_engine("private").unwrap();
+        assert_eq!(
+            complete_values(&mut session, &private),
+            vec![vec![Value::Int(1)]]
+        );
+        assert_eq!(
+            admin.sql_session().native_table_engine("private"),
+            Err(CoreError::Sql(SqlError::UnknownTable))
+        );
+        session.rollback_native().unwrap();
+        assert_eq!(
+            session.native_table_engine("private"),
+            Err(CoreError::Sql(SqlError::UnknownTable))
+        );
+        drop(session);
+        drop(admin);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn native_complete_read_catalog_respects_transaction_isolation() {
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut writer = admin.sql_session();
+        let mut rc = admin.sql_session();
+        let mut rr = admin.sql_session();
+        rc.set_isolation(crate::SqlIsolation::ReadCommitted);
+        rr.set_isolation(crate::SqlIsolation::RepeatableRead);
+        for ddl in ["ALTER TABLE items ADD COLUMN note TEXT", "DROP TABLE items"] {
+            writer
+                .execute("CREATE TABLE items (id BIGINT PRIMARY KEY)", &[], None)
+                .unwrap();
+            writer
+                .execute("INSERT INTO items VALUES (1)", &[], None)
+                .unwrap();
+
+            rc.begin_native().unwrap();
+            rr.begin_native().unwrap();
+            let table = rc.native_table_engine("items").unwrap();
+            let expected = vec![vec![Value::Int(1)]];
+            assert_eq!(complete_values(&mut rc, &table), expected);
+            assert_eq!(complete_values(&mut rr, &table), expected);
+            writer.execute(ddl, &[], None).unwrap();
+
+            rr.begin_native_step().unwrap();
+            assert_eq!(rr.native_table_engine("items").unwrap(), table);
+            assert_eq!(complete_values(&mut rr, &table), expected);
+
+            rc.begin_native_step().unwrap();
+            if ddl.starts_with("ALTER") {
+                let revised = rc.native_table_engine("items").unwrap();
+                assert_eq!(revised.columns[1].name, "note");
+                assert_eq!(
+                    complete_values(&mut rc, &revised),
+                    vec![vec![Value::Int(1), Value::Null]]
+                );
+            } else {
+                assert_eq!(
+                    rc.native_table_engine("items"),
+                    Err(CoreError::Sql(SqlError::UnknownTable))
+                );
+            }
+            assert_eq!(
+                rc.complete_table_engine(&table).unwrap_err(),
+                CoreError::Sql(SqlError::StaleSchema),
+                "{ddl}"
+            );
+            assert!(rc.is_aborted());
+            rc.rollback_native().unwrap();
+            rr.rollback_native().unwrap();
+            if ddl.starts_with("ALTER") {
+                writer.execute("DROP TABLE items", &[], None).unwrap();
+            }
+        }
+        drop(rc);
+        drop(rr);
+        drop(writer);
+        drop(admin);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    fn pk_read(table: &str) -> crate::operations::Request {
+        use crate::operations::{Compare, Expr, Request, ValueExpr};
+
+        Request::Read {
+            table: table.into(),
+            filter: Some(Expr::Compare(
+                Box::new(Expr::Field("id".into())),
+                Compare::Eq,
+                Box::new(Expr::Value(ValueExpr::Literal(Value::Int(1)))),
+            )),
+            order: vec![],
+            limit: None,
+            projection: vec![],
+        }
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    fn assert_pk_read(session: &mut SqlSession, table: &str, columns: &[&str], values: &[Value]) {
+        use crate::operations::{Bindings, native_input_rows};
+
+        session.begin_native_step().unwrap();
+        let (decoded, _) = native_input_rows();
+        let result = session.execute_native(&pk_read(table), &Bindings::new()).unwrap();
+        assert_eq!(native_input_rows().0 - decoded, 1, "one primary-key lookup");
+        assert_eq!(result.columns, columns);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values, values);
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    fn create_items(session: &mut SqlSession) {
+        session
+            .execute("CREATE TABLE items (id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        session.execute("INSERT INTO items VALUES (1), (2)", &[], None).unwrap();
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn native_pk_read_sees_a_privately_created_table() {
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut session = admin.sql_session();
+        session.begin_native().unwrap();
+        create_items(&mut session);
+
+        assert_pk_read(&mut session, "items", &["id"], &[Value::Int(1)]);
+        assert_eq!(
+            admin.sql_session().native_table_engine("items"),
+            Err(CoreError::Sql(SqlError::UnknownTable))
+        );
+        session.rollback_native().unwrap();
+        drop(session);
+        drop(admin);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn native_pk_read_catalog_respects_transaction_isolation() {
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut writer = admin.sql_session();
+        create_items(&mut writer);
+
+        let mut rc = admin.sql_session();
+        let mut rr = admin.sql_session();
+        rc.set_isolation(crate::SqlIsolation::ReadCommitted);
+        rr.set_isolation(crate::SqlIsolation::RepeatableRead);
+        rc.begin_native().unwrap();
+        rr.begin_native().unwrap();
+        assert_pk_read(&mut rc, "items", &["id"], &[Value::Int(1)]);
+        assert_pk_read(&mut rr, "items", &["id"], &[Value::Int(1)]);
+
+        writer
+            .execute("ALTER TABLE items ADD COLUMN note TEXT", &[], None)
+            .unwrap();
+        assert_pk_read(&mut rr, "items", &["id"], &[Value::Int(1)]);
+        assert_pk_read(&mut rc, "items", &["id", "note"], &[Value::Int(1), Value::Null]);
+
+        rc.rollback_native().unwrap();
+        rr.rollback_native().unwrap();
+        drop(rc);
+        drop(rr);
+        drop(writer);
+        drop(admin);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn native_pk_read_rejects_held_descriptor_after_alter_or_drop() {
+        use crate::operations::NativeAccess;
+
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut writer = admin.sql_session();
+        let mut reader = admin.sql_session();
+        for ddl in [
+            "ALTER TABLE items ADD COLUMN note TEXT",
+            "DROP TABLE items",
+        ] {
+            create_items(&mut writer);
+            let old = reader.native_table_engine("items").unwrap();
+            writer.execute(ddl, &[], None).unwrap();
+
+            reader.begin_native().unwrap();
+            let access = NativeAccess::Keys(vec![vec![Value::Int(1)]]);
+            let input = reader.complete_read_table_where(
+                &old,
+                &access,
+                &mut |_| panic!("visited a row with a stale descriptor"),
+                (1, None::<fn(&relational::SqlRow, &relational::SqlRow) -> std::cmp::Ordering>),
+                std::convert::identity,
+            );
+            assert_eq!(input.unwrap_err(), CoreError::Sql(SqlError::StaleSchema), "{ddl}");
+            reader.rollback_native().unwrap();
+            if ddl.starts_with("ALTER") {
+                writer.execute("DROP TABLE items", &[], None).unwrap();
+            }
+        }
+
+        drop(reader);
+        drop(writer);
+        drop(admin);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    fn read_block(request: crate::operations::Request) -> crate::operations::Transaction {
+        use crate::operations::{EmitExpr, Transaction, TransactionStep};
+
+        Transaction {
+            read_only: true,
+            steps: vec![TransactionStep::Let { name: "rows".into(), request }],
+            emit: Some(vec![EmitExpr::Rows("rows".into())]),
+        }
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    fn stale_schema_operation_error() -> crate::operations::Error {
+        crate::operations::Error::Sql {
+            sqlstate: crate::sqlstate(&CoreError::Sql(SqlError::StaleSchema)).into(),
+        }
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn execute_bound_rejects_a_table_changed_by_committed_ddl() {
+        use crate::operations::{Bindings, Engine as Native};
+
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let engine = Native::new(admin.clone());
+        let mut writer = admin.sql_session();
+        create_items(&mut writer);
+        let request = pk_read("items");
+        let bindings = Bindings::new();
+        let bound = engine.prepare_bound(&request, &bindings).unwrap();
+        assert_eq!(engine.execute_bound(&bound).unwrap().columns, ["id"]);
+
+        writer
+            .execute("ALTER TABLE items ADD COLUMN note TEXT", &[], None)
+            .unwrap();
+        assert_eq!(engine.execute_bound(&bound), Err(stale_schema_operation_error()));
+        assert_eq!(engine.execute(&request, &bindings).unwrap().columns, ["id", "note"]);
+
+        drop(writer);
+        drop(engine);
+        drop(admin);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn execute_transaction_bound_rejects_a_table_changed_by_committed_ddl() {
+        use crate::operations::{Bindings, Engine as Native};
+
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let engine = Native::new(admin.clone());
+        let mut writer = admin.sql_session();
+        create_items(&mut writer);
+        let block = read_block(pk_read("items"));
+        let bindings = Bindings::new();
+        let bound = engine.prepare_transaction_bound(&block, &bindings).unwrap();
+        let before = engine.execute_transaction_bound(&bound).unwrap();
+        assert_eq!(before.summaries[0].matched, 1);
+
+        writer
+            .execute("ALTER TABLE items ADD COLUMN note TEXT", &[], None)
+            .unwrap();
+        assert_eq!(
+            engine.execute_transaction_bound(&bound),
+            Err(stale_schema_operation_error())
+        );
+        let after = engine.execute_transaction(&block, &bindings).unwrap();
+        assert_eq!(after.summaries[0].matched, 1);
+
+        drop(writer);
+        drop(engine);
+        drop(admin);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn bound_reads_accept_a_current_view() {
+        use crate::operations::{Bindings, EmittedValue, Engine as Native};
+
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let engine = Native::new(admin.clone());
+        let mut writer = admin.sql_session();
+        create_items(&mut writer);
+        writer.execute("CREATE VIEW v AS SELECT id FROM items", &[], None).unwrap();
+
+        let request = pk_read("v");
+        let bindings = Bindings::new();
+        let bound = engine.prepare_bound(&request, &bindings).unwrap();
+        let block = engine.prepare_transaction_bound(&read_block(request), &bindings).unwrap();
+        let result = engine.execute_bound(&bound).unwrap();
+        assert_eq!(result.columns, ["id"]);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values, [Value::Int(1)]);
+
+        let result = engine.execute_transaction_bound(&block).unwrap();
+        let [EmittedValue::Rows { columns, rows, .. }] = result.emitted.as_slice() else {
+            panic!("expected one emitted row set, got {:?}", result.emitted);
+        };
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, [Value::Int(1)]);
+
+        drop(writer);
+        drop(engine);
+        drop(admin);
+        fs::remove_dir_all(path).unwrap();
+    }
+}

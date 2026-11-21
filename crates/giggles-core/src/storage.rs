@@ -3102,8 +3102,15 @@ impl SqlSession {
         }
         Ok(())
     }
-    /// Catalog binding sees exactly the staged snapshot used for typed reads/writes.
     pub(crate) fn catalog_engine(&mut self) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
+        self.inspect_catalog_engine(|fence, tables| (fence, tables.values().cloned().collect()))
+    }
+
+    /// Catalog binding sees exactly the staged snapshot used for typed reads/writes.
+    pub(crate) fn inspect_catalog_engine<T>(
+        &mut self,
+        inspect: impl FnOnce(u64, &BTreeMap<String, relational::TableDef>) -> T,
+    ) -> Result<T, CoreError> {
         let result = (|| {
             if self.aborted {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -3112,10 +3119,10 @@ impl SqlSession {
             if let Backend::V2(db) = &self.admin.inner.backend {
                 let _ticket = self.admin.inner.enter()?;
                 return db.inspect_binding(self.v2_transaction.as_ref(), |_, fence, tables| {
-                    (fence, tables.values().cloned().collect())
+                    inspect(fence, tables)
                 });
             }
-            let catalog = |s: &State| Ok((s.sql.epoch, s.sql.tables.values().cloned().collect()));
+            let catalog = |s: &State| Ok(inspect(s.sql.epoch, &s.sql.tables));
             if let Some(s) = &self.staged {
                 catalog(s)
             } else {

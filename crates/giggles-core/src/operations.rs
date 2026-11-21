@@ -534,12 +534,16 @@ impl Engine {
         self.execute_operation(|session| {
             let description = &prepared.description;
             let (domain, epoch) = session.snapshot_identity_engine().map_err(core)?;
-            let (_, tables) = session.catalog_engine().map_err(core)?;
-            if description.contract_version != ENGINE_CONTRACT_VERSION
+            let stale = description.contract_version != ENGINE_CONTRACT_VERSION
                 || domain != description.database_domain
-                || epoch != description.catalog_epoch
-                || !(tables.iter().any(|table| table == &description.table)
-                    || current_view(session, &description.table, &prepared.operation)?)
+                || epoch != description.catalog_epoch;
+            let current_table = session
+                .inspect_catalog_engine(|_, tables| {
+                    !stale && tables.values().any(|table| table == &description.table)
+                })
+                .map_err(core)?;
+            if stale
+                || !(current_table || current_view(session, &description.table, &prepared.operation)?)
             {
                 return Err(core(CoreError::Sql(SqlError::StaleSchema)));
             }
