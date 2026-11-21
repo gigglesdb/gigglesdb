@@ -14,6 +14,7 @@ pub mod replication;
 pub mod service;
 pub mod tls;
 pub mod transport;
+pub mod wire;
 pub use service::*;
 pub use transport::*;
 
