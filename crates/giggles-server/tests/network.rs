@@ -17,15 +17,30 @@ use giggles_core::{
     Admin, Limits, relational::Value,
 };
 use giggles_server::{
-    Binding, Client, Request, Response, Role, Running, Service, clock::Clock, serve, serve_pg, tls,
+    Binding, MAX_FRAME, Role, Running, Service,
+    api::{ApiLimits, ApiRuntime, codec, proto},
+    clock::Clock,
+    serve_pg, tls,
+    wire::{
+        client::{Client, ClientTls, Credential, WireError},
+        frame::{
+            Direction, Flags, FrameDecoder, FrameHeader, FrameKind, HEADER_LEN, encode_frame,
+            encode_message, write_preface,
+        },
+        listen::serve_wire_bound,
+        messages::{WireConnError, WireReply},
+    },
 };
+use prost::Message;
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
 };
 use rustls::{ClientConfig, pki_types::PrivatePkcs8KeyDer};
 use std::{
     collections::BTreeSet,
-    path::PathBuf,
+    io,
+    net::SocketAddr,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -34,21 +49,21 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
 };
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test(flavor = "current_thread")]
 async fn single_runtime_thread_native_and_actual_driver_transactions_progress() {
     let f = Fixture::new().await;
-    let mut native = f.native(f.app.clone()).await;
+    let mut native = f.native("app").await;
     let (pg, conn) = f.pg(f.app.clone()).await;
     let native_work = async {
         for id in 0..16 {
-            assert_eq!(native.call(&sql("BEGIN", vec![])).await.unwrap().code, "ok");
+            assert_eq!(native.execute(sql("BEGIN", vec![])).await.unwrap().code, "ok");
             assert_eq!(
                 native
-                    .call(&sql(
+                    .execute(sql(
                         "INSERT INTO app (id, body) VALUES ($1, $2)",
                         vec![Value::Int(id), Value::Text("discard".into())]
                     ))
@@ -58,7 +73,7 @@ async fn single_runtime_thread_native_and_actual_driver_transactions_progress() 
                 "ok"
             );
             assert_eq!(
-                native.call(&sql("ROLLBACK", vec![])).await.unwrap().code,
+                native.execute(sql("ROLLBACK", vec![])).await.unwrap().code,
                 "ok"
             );
         }
@@ -132,6 +147,44 @@ fn client(c: &Cert, ca: &Cert) -> Arc<ClientConfig> {
     )
     .unwrap()
 }
+
+fn wire_tls(path: &Path, identity: Option<&str>) -> io::Result<ClientTls> {
+    Ok(ClientTls {
+        ca: std::fs::read(path.join("ca.pem"))?,
+        cert: identity
+            .map(|name| std::fs::read(path.join(format!("{name}.pem"))))
+            .transpose()?,
+        key: identity
+            .map(|name| std::fs::read(path.join(format!("{name}.key.TEST-ONLY"))))
+            .transpose()?,
+        server_name: "localhost".into(),
+    })
+}
+
+async fn connect_wire(address: SocketAddr, tls: ClientTls) -> io::Result<Client> {
+    Client::connect(
+        address,
+        Some(tls),
+        proto::OpenSessionRequest::default(),
+        Credential::None,
+    )
+    .await
+    .map(|(client, _)| client)
+}
+
+async fn start_wire(
+    service: Arc<Service>,
+    config: Arc<rustls::ServerConfig>,
+    connections: usize,
+) -> Running {
+    let runtime = ApiRuntime::new(service, ApiLimits::default()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_gate, start) = tokio::sync::watch::channel(true);
+    serve_wire_bound(listener, runtime, config, connections, start)
+        .await
+        .unwrap()
+}
+
 struct Fixture {
     path: PathBuf,
     admin: Admin,
@@ -141,7 +194,6 @@ struct Fixture {
     task: Arc<ClientConfig>,
     other: Arc<ClientConfig>,
     unbound: Arc<ClientConfig>,
-    wrong: Arc<ClientConfig>,
     server_config: Arc<rustls::ServerConfig>,
     service: Arc<Service>,
     ca: Cert,
@@ -156,7 +208,7 @@ impl Fixture {
         .await
     }
     async fn with_task_resources(_task_limits: LegacyTaskResources) -> Self {
-        let path = PathBuf::from("artifacts").join(format!(
+        let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
             "network-fixture-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
@@ -239,14 +291,7 @@ impl Fixture {
             vec![ca.cert.der().clone()],
         )
         .unwrap();
-        let native = serve(
-            "127.0.0.1:0".parse().unwrap(),
-            service.clone(),
-            server_config.clone(),
-            32,
-        )
-        .await
-        .unwrap();
+        let native = start_wire(service.clone(), server_config.clone(), 32).await;
         let pg = serve_pg(
             "127.0.0.1:0".parse().unwrap(),
             service.clone(),
@@ -255,7 +300,7 @@ impl Fixture {
         )
         .await
         .unwrap();
-        let config = serde_json::json!({"database":path.join("db.redb"),"native":"127.0.0.1:7432","postgres":"127.0.0.1:7433","certificate":path.join("server.pem"),"private_key":path.join("server.key.TEST-ONLY"),"client_ca":path.join("ca.pem"),"bindings":bindings,"connections":32,"skew_seconds":0,"max_pause_seconds":3600});
+        let config = serde_json::json!({"database":path.join("db.redb"),"native":"127.0.0.1:7432","postgres":"127.0.0.1:7433","wire":"127.0.0.1:7434","certificate":path.join("server.pem"),"private_key":path.join("server.key.TEST-ONLY"),"client_ca":path.join("ca.pem"),"bindings":bindings,"connections":32,"skew_seconds":0,"max_pause_seconds":3600});
         std::fs::write(
             path.join("server.TEST-ONLY.json"),
             serde_json::to_vec_pretty(&config).unwrap(),
@@ -270,16 +315,16 @@ impl Fixture {
             task: client(&task, &ca),
             other: client(&other, &ca),
             unbound: client(&unbound, &ca),
-            wrong: client(&wrong, &ca),
             server_config,
             service,
             ca,
         }
     }
-    async fn native(&self, config: Arc<ClientConfig>) -> Client {
-        Client::connect(self.native.address, "localhost", config)
-            .await
-            .unwrap()
+    async fn try_native(&self, identity: &str) -> io::Result<Client> {
+        connect_wire(self.native.address, wire_tls(&self.path, Some(identity))?).await
+    }
+    async fn native(&self, identity: &str) -> Client {
+        self.try_native(identity).await.unwrap()
     }
     async fn pg(
         &self,
@@ -313,12 +358,45 @@ impl Fixture {
 
 
 
-fn sql(sql: &str, params: Vec<Value>) -> Request {
-    Request::Sql {
-        sql: sql.into(),
-        params,
+fn sql(sql: &str, params: Vec<Value>) -> proto::ExecuteRequest {
+    proto::ExecuteRequest {
+        request: Some(proto::execute_request::Request::Sql(proto::SqlRequest {
+            sql: sql.into(),
+            params: params.into_iter().map(codec::encode_value).collect(),
+        })),
+        ..Default::default()
     }
 }
+
+fn ping() -> proto::ExecuteRequest {
+    proto::ExecuteRequest {
+        request: Some(proto::execute_request::Request::Ping(proto::PingRequest {})),
+        ..Default::default()
+    }
+}
+
+fn row_values(row: &proto::SqlRow) -> Vec<Value> {
+    row.values
+        .iter()
+        .cloned()
+        .map(|value| codec::decode_value(value).unwrap())
+        .collect()
+}
+
+fn wire_error(error: &io::Error) -> &WireError {
+    error
+        .get_ref()
+        .and_then(|error| error.downcast_ref())
+        .unwrap_or_else(|| panic!("expected a wire connection error, got {error:?}"))
+}
+
+fn listening_address<'a>(line: &'a str, protocol: &str) -> &'a str {
+    line.split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .find_map(|(name, address)| (name == protocol).then_some(address))
+        .unwrap()
+}
+
 fn code(e: tokio_postgres::Error) -> String {
     e.code().unwrap().code().into()
 }
@@ -470,50 +548,145 @@ async fn pinned_driver_extended_binary_types_describe_and_rollback() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authentication_tls_downgrade_unknown_certificate_and_spoof() {
     let f = Fixture::new().await;
-    for config in [f.wrong.clone(), f.unbound.clone()] {
-        match Client::connect(f.native.address, "localhost", config).await {
-            Err(_) => {}
-            Ok(mut c) => assert!(c.call(&Request::Ping).await.is_err()),
-        }
-    }
+    assert!(f.try_native("wrong").await.is_err());
+    let unbound = f.try_native("unbound").await.err().expect("unbound certificate");
+    assert_eq!(wire_error(&unbound).code, "UNAUTHENTICATED");
     assert!(
-        Client::connect(f.native.address, "wrong-host", f.app.clone())
+        connect_wire(
+            f.native.address,
+            ClientTls {
+                server_name: "wrong-host".into(),
+                ..wire_tls(&f.path, Some("app")).unwrap()
+            },
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        connect_wire(f.native.address, wire_tls(&f.path, None).unwrap())
             .await
             .is_err()
     );
-    let no_cert = Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(tls::roots(vec![f.ca.cert.der().clone()]).unwrap())
-            .with_no_client_auth(),
-    );
-    match Client::connect(f.native.address, "localhost", no_cert).await {
-        Err(_) => {}
-        Ok(mut c) => assert!(c.call(&Request::Ping).await.is_err()),
-    }
     let mut plain = TcpStream::connect(f.pg.address).await.unwrap();
     plain.write_all(&[0, 0, 0, 8, 0, 3, 0, 0]).await.unwrap();
     assert!(plain.read_u8().await.is_err());
+    for identity in ["task", "other"] {
+        let mut client = f.native(identity).await;
+        assert_eq!(client.execute(ping()).await.unwrap().code, "ok");
+        assert_eq!(
+            client.execute(sql("SELECT id FROM app", vec![])).await.unwrap().code,
+            "42501"
+        );
+    }
+    // Protobuf-valid authority probes (the legacy JSON `principal`/`time`/`task`
+    // fields have no wire form: the wire carries authority only in the
+    // certificate-bound session). A NoSql identity sending the task-prototype
+    // requests must be refused, stay refused, and keep its certificate role.
+    let mut probe = f.native("task").await;
+    for request in task_prototype_probes() {
+        let refused = probe.execute(request).await.unwrap_err();
+        assert_eq!(wire_error(&refused).code, "INVALID_ARGUMENT");
+    }
+    // The refusals are request-scoped: the session keeps its certificate role
+    // (ping only) and no probe selected other authority.
+    assert_eq!(probe.execute(ping()).await.unwrap().code, "ok");
+    assert_eq!(
+        probe.execute(sql("SELECT id FROM app", vec![])).await.unwrap().code,
+        "42501"
+    );
+    drop(probe);
+    // Lost assertion (GD-0091 Stack 5a): the legacy JSON listener rejected
+    // extra `principal`/`time`/`task` keys (deny_unknown_fields, 08P01). The
+    // wire has no such keys, so the replacement is the protobuf-valid probes
+    // above plus these undecodable EXECUTE bodies, which must be refused
+    // request-by-request without closing the connection. The wire authority
+    // tests are wire_basic::wire_agent_forms_only_on_agent_listener and
+    // wire_identity_rechecked_after_binding_change.
     let mut tls_stream = raw_tls(&f, f.task.clone(), false).await;
-    for json in [
+    raw_wire_open(&mut tls_stream).await;
+    for (offset, json) in [
         r#"{"kind":"Status","operation":1,"principal":3}"#,
         r#"{"kind":"Status","operation":1,"time":{"Certified":0}}"#,
         r#"{"kind":"Status","operation":1,"task":2}"#,
         r#"{"kind":"grant","task":3}"#,
-    ] {
-        giggles_server::write_frame(&mut tls_stream, json.as_bytes(), giggles_server::MAX_FRAME)
-            .await
-            .unwrap();
-        let r: Response = serde_json::from_slice(
-            &giggles_server::read_frame(&mut tls_stream, giggles_server::MAX_RESPONSE)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(r.code, "08P01");
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = offset as u32 + 2;
+        raw_wire_execute(&mut tls_stream, id, json.as_bytes()).await;
+        assert_eq!(
+            raw_wire_error(&mut tls_stream, id).await.code,
+            "INVALID_ARGUMENT"
+        );
     }
     drop(tls_stream);
     f.stop().await;
 }
+
+async fn raw_wire_open(stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin)) {
+    let mut request = Vec::new();
+    write_preface(&mut request);
+    encode_message(
+        &mut request,
+        FrameKind::Hello,
+        Flags(0),
+        1,
+        &proto::OpenSessionRequest::default(),
+    );
+    stream.write_all(&request).await.unwrap();
+    let (header, _) = raw_wire_read(stream).await.unwrap();
+    assert_eq!((header.kind, header.request_id), (FrameKind::Ready, 1));
+}
+
+async fn raw_wire_execute(stream: &mut (impl tokio::io::AsyncWrite + Unpin), id: u32, body: &[u8]) {
+    let mut frame = Vec::new();
+    encode_frame(&mut frame, FrameKind::Execute, Flags(0), id, body);
+    stream.write_all(&frame).await.unwrap();
+}
+
+async fn raw_wire_read(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> io::Result<(FrameHeader, Vec<u8>)> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut header = [0; HEADER_LEN];
+        stream.read_exact(&mut header).await?;
+        let mut decoder = FrameDecoder::new(Direction::ServerToClient, MAX_FRAME);
+        decoder.read_buf().extend_from_slice(&header);
+        let decode_error = |error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}"));
+        if let Some((header, _)) = decoder.next_frame().map_err(decode_error)? {
+            return Ok((header, Vec::new()));
+        }
+        // The decoder already validated the length and reserved the body buffer.
+        let body_len = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize - (HEADER_LEN - 4);
+        decoder.read_buf().resize(HEADER_LEN + body_len, 0);
+        stream.read_exact(&mut decoder.read_buf()[HEADER_LEN..]).await?;
+        let (header, body) = decoder.next_frame().map_err(decode_error)?.unwrap();
+        Ok((header, decoder.body(body).to_vec()))
+    })
+    .await?
+}
+
+async fn raw_wire_error(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    id: u32,
+) -> WireConnError {
+    let (header, body) = raw_wire_read(stream).await.unwrap();
+    assert_eq!(
+        (header.kind, header.flags, header.request_id),
+        (FrameKind::ConnError, Flags(0), id)
+    );
+    WireConnError::decode(body.as_slice()).unwrap()
+}
+
+fn wire_header_with_length(length: u32) -> [u8; HEADER_LEN] {
+    let mut header = [0; HEADER_LEN];
+    header[..4].copy_from_slice(&length.to_be_bytes());
+    header[4] = FrameKind::Execute as u8;
+    header[8..].copy_from_slice(&2u32.to_be_bytes());
+    header
+}
+
 async fn raw_tls(
     f: &Fixture,
     config: Arc<ClientConfig>,
@@ -582,28 +755,28 @@ async fn disconnect_reconnect_pool_isolation_and_statement_fences() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn malformed_oversize_frames_and_connection_exhaustion() {
     let f = Fixture::new().await;
-    for n in [0, u32::MAX, giggles_server::MAX_FRAME as u32 + 1] {
+    let max_length = (MAX_FRAME + HEADER_LEN - 4) as u32;
+    for n in [0, u32::MAX, max_length + 1] {
         let mut s = raw_tls(&f, f.task.clone(), false).await;
-        s.write_u32(n).await.unwrap();
-        assert!(s.read_u8().await.is_err());
+        raw_wire_open(&mut s).await;
+        s.write_all(&wire_header_with_length(n)).await.unwrap();
+        assert_eq!(raw_wire_error(&mut s, 0).await.code, "protocol");
+        assert!(connection_closed(&mut s).await);
     }
-    assert!(giggles_server::frame_len(u32::MAX, 256).is_err());
+    let mut decoder = FrameDecoder::new(Direction::ClientToServer, 256);
+    decoder
+        .read_buf()
+        .extend_from_slice(&wire_header_with_length(u32::MAX));
+    assert!(decoder.next_frame().is_err());
     assert!(giggles_server::clock::interval(u64::MAX, 1).is_err());
     assert!(giggles_server::clock::interval(0, 1).is_err());
-    let running = serve(
-        "127.0.0.1:0".parse().unwrap(),
-        f.service.clone(),
-        f.server_config.clone(),
-        1,
-    )
-    .await
-    .unwrap();
-    let mut first = Client::connect(running.address, "localhost", f.task.clone())
+    let running = start_wire(f.service.clone(), f.server_config.clone(), 1).await;
+    let mut first = connect_wire(running.address, wire_tls(&f.path, Some("task")).unwrap())
         .await
         .unwrap();
-    first.call(&Request::Ping).await.unwrap();
+    assert_eq!(first.execute(ping()).await.unwrap().code, "ok");
     assert!(
-        Client::connect(running.address, "localhost", f.task.clone())
+        connect_wire(running.address, wire_tls(&f.path, Some("task")).unwrap())
             .await
             .is_err()
     );
@@ -921,10 +1094,10 @@ async fn extended_cycle_rolls_back_prior_effects_on_parse_failure_and_disconnect
     let frames = pg_sync(&mut s).await;
     assert!(frames.iter().any(|f| f.0 == b'E'));
     assert_eq!(frames.last().unwrap(), &(b'Z', b"I".to_vec()));
-    let mut native = f.native(f.app.clone()).await;
+    let mut native = f.native("app").await;
     assert!(
         native
-            .call(&sql("SELECT id FROM app WHERE id=101", vec![]))
+            .execute(sql("SELECT id FROM app WHERE id=101", vec![]))
             .await
             .unwrap()
             .sql
@@ -945,7 +1118,7 @@ async fn extended_cycle_rolls_back_prior_effects_on_parse_failure_and_disconnect
     for id in [102, 103] {
         assert_eq!(
             native
-                .call(&sql("SELECT id FROM app WHERE id=$1", vec![Value::Int(id)]))
+                .execute(sql("SELECT id FROM app WHERE id=$1", vec![Value::Int(id)]))
                 .await
                 .unwrap()
                 .sql
@@ -962,7 +1135,7 @@ async fn extended_cycle_rolls_back_prior_effects_on_parse_failure_and_disconnect
     assert_eq!(pg_read(&mut s).await.0, b'C');
     assert!(
         native
-            .call(&sql("SELECT id FROM app WHERE id=104", vec![]))
+            .execute(sql("SELECT id FROM app WHERE id=104", vec![]))
             .await
             .unwrap()
             .sql
@@ -974,7 +1147,7 @@ async fn extended_cycle_rolls_back_prior_effects_on_parse_failure_and_disconnect
     assert!(s.read_u8().await.is_err());
     assert!(
         native
-            .call(&sql("SELECT id FROM app WHERE id=104", vec![]))
+            .execute(sql("SELECT id FROM app WHERE id=104", vec![]))
             .await
             .unwrap()
             .sql
@@ -1523,8 +1696,9 @@ async fn executable_server_starts_and_native_client_connects() {
     let mut config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path.join("server.TEST-ONLY.json")).unwrap())
             .unwrap();
-    config["native"] = "127.0.0.1:0".into();
+    config["native"] = "127.0.0.1:0".into(); // Required by the binary until the legacy listener is removed.
     config["postgres"] = "127.0.0.1:0".into();
+    config["wire"] = "127.0.0.1:0".into();
     let config_path = path.join("ephemeral-server.TEST-ONLY.json");
     std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_giggles-server"))
@@ -1541,24 +1715,17 @@ async fn executable_server_starts_and_native_client_connects() {
         .unwrap()
         .unwrap();
     std::fs::write(path.join("server-startup.log"), &line).unwrap();
-    let addr = line
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .strip_prefix("native=")
-        .unwrap()
-        .parse()
-        .unwrap();
+    let addr = listening_address(&line, "wire").parse().unwrap();
     let cfg = tls::client(
         tls::certs(path.join("app.pem")).unwrap(),
         tls::key(path.join("app.key.TEST-ONLY")).unwrap(),
         tls::certs(path.join("ca.pem")).unwrap(),
     )
     .unwrap();
-    let mut c = Client::connect(addr, "localhost", cfg.clone())
+    let mut c = connect_wire(addr, wire_tls(&path, Some("app")).unwrap())
         .await
         .unwrap();
-    assert_eq!(c.call(&Request::Ping).await.unwrap().code, "ok");
+    assert_eq!(c.execute(ping()).await.unwrap().code, "ok");
     drop(c);
     let pg_addr = line
         .split_whitespace()
@@ -1610,7 +1777,7 @@ async fn executable_server_starts_and_native_client_connects() {
 async fn seeded_native_and_pinned_driver_histories_match_independent_map() {
     use std::collections::BTreeMap;
     let f = Fixture::new().await;
-    let mut native = f.native(f.app.clone()).await;
+    let mut native = f.native("app").await;
     let (pg, conn) = f.pg(f.app.clone()).await;
     let mut oracle = BTreeMap::new();
     let mut trace = String::new();
@@ -1631,7 +1798,7 @@ async fn seeded_native_and_pinned_driver_histories_match_independent_map() {
                 if step % 2 == 0 {
                     assert_eq!(
                         native
-                            .call(&sql("DELETE FROM app WHERE id=$1", vec![Value::Int(id)]))
+                            .execute(sql("DELETE FROM app WHERE id=$1", vec![Value::Int(id)]))
                             .await
                             .unwrap()
                             .sql
@@ -1657,7 +1824,7 @@ async fn seeded_native_and_pinned_driver_histories_match_independent_map() {
                 if step % 2 == 0 {
                     assert_eq!(
                         native
-                            .call(&sql(query, vec![Value::Int(id), Value::Text(body)]))
+                            .execute(sql(query, vec![Value::Int(id), Value::Text(body)]))
                             .await
                             .unwrap()
                             .sql
@@ -2398,42 +2565,18 @@ pub(super) async fn raw_task(f: &Fixture) -> tokio_rustls::client::TlsStream<Tcp
 }
 }
 
-async fn ordinary_limited(f: &Fixture, limits: giggles_server::admission::ServiceLimits) -> (Arc<Service>, Running, Running) {
-    let service = Service::with_limits(
-        f.admin.clone(),
-        serde_json::from_slice(&std::fs::read(f.path.join("bindings.json")).unwrap()).unwrap(),
-        Clock::new(0, 3600).unwrap(),
-        limits,
-    )
-    .unwrap();
-    let n = serve(
-        "127.0.0.1:0".parse().unwrap(),
-        service.clone(),
-        f.server_config.clone(),
-        128,
-    )
-    .await
-    .unwrap();
-    let p = serve_pg(
-        "127.0.0.1:0".parse().unwrap(),
-        service.clone(),
-        f.server_config.clone(),
-        128,
-    )
-    .await
-    .unwrap();
-    (service, n, p)
-}
-async fn ordinary_eof<S: tokio::io::AsyncRead + Unpin>(s: &mut S) {
-    assert!(tokio::time::timeout(std::time::Duration::from_secs(5), s.read_u8()).await.unwrap().is_err());
+async fn connection_closed(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> bool {
+    tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_u8())
+        .await
+        .is_ok_and(|result| result.is_err())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_application_crud_denied_table_aborts_transaction() {
     let f = Fixture::new().await;
-    let mut c = f.native(f.app.clone()).await;
+    let mut c = f.native("app").await;
     assert_eq!(
-        c.call(&sql(
+        c.execute(sql(
             "INSERT INTO app (id,body) VALUES ($1,$2)",
             vec![Value::Int(1), Value::Text("hello".into())]
         ))
@@ -2445,36 +2588,44 @@ async fn native_application_crud_denied_table_aborts_transaction() {
         1
     );
     assert_eq!(
-        c.call(&sql(
-            "SELECT body FROM app WHERE id=$1",
-            vec![Value::Int(1)]
-        ))
-        .await
-        .unwrap()
-        .sql
-        .unwrap()
-        .rows[0]
-            .values,
+        row_values(
+            &c.execute(sql("SELECT body FROM app WHERE id=$1", vec![Value::Int(1)]))
+                .await
+                .unwrap()
+                .sql
+                .unwrap()
+                .rows[0]
+        ),
         vec![Value::Text("hello".into())]
     );
-    assert_eq!(c.call(&sql("BEGIN", vec![])).await.unwrap().code, "ok");
+    assert_eq!(c.execute(sql("BEGIN", vec![])).await.unwrap().code, "ok");
     assert_eq!(
-        c.call(&sql("UPDATE app SET body='staged' WHERE id=1", vec![]))
+        c.execute(sql("UPDATE app SET body='staged' WHERE id=1", vec![]))
             .await
             .unwrap()
             .code,
         "ok"
     );
     assert_eq!(
-        c.call(&sql("SELECT * FROM other WHERE id=1", vec![]))
+        c.execute(sql("SELECT * FROM other WHERE id=1", vec![]))
             .await
             .unwrap()
             .code,
         "42501"
     );
-    assert_eq!(c.call(&sql("COMMIT", vec![])).await.unwrap().code, "25P02");
-    assert_eq!(c.call(&sql("ROLLBACK", vec![])).await.unwrap().code, "ok");
-    assert_eq!(c.call(&sql("SELECT body FROM app WHERE id=$1", vec![Value::Int(1)])).await.unwrap().sql.unwrap().rows[0].values, vec![Value::Text("hello".into())]);
+    assert_eq!(c.execute(sql("COMMIT", vec![])).await.unwrap().code, "25P02");
+    assert_eq!(c.execute(sql("ROLLBACK", vec![])).await.unwrap().code, "ok");
+    assert_eq!(
+        row_values(
+            &c.execute(sql("SELECT body FROM app WHERE id=$1", vec![Value::Int(1)]))
+                .await
+                .unwrap()
+                .sql
+                .unwrap()
+                .rows[0]
+        ),
+        vec![Value::Text("hello".into())]
+    );
     drop(c);
     f.stop().await;
 }
@@ -2482,7 +2633,7 @@ async fn native_application_crud_denied_table_aborts_transaction() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn malformed_denied_native_flood_spends_global_rate_without_sql_effects() {
     let f = Fixture::new().await;
-    let (_service, n, p) = ordinary_limited(
+    let (_service, n, p) = lifecycle_network::limited(
         &f,
         giggles_server::admission::ServiceLimits {
             sessions: 8,
@@ -2499,42 +2650,95 @@ async fn malformed_denied_native_flood_spends_global_rate_without_sql_effects() 
         )
         .await
         .unwrap();
-    for payload in [
-        b"{".to_vec(),
-        serde_json::to_vec(&sql("SELECT * FROM other", vec![])).unwrap(),
-        b"[]".to_vec(),
-        b"false".to_vec(),
+    raw_wire_open(&mut s).await;
+    let denied = sql("SELECT * FROM other", vec![]).encode_to_vec();
+    for (id, payload, expected) in [
+        (2, b"{".as_slice(), "INVALID_ARGUMENT"),
+        (3, denied.as_slice(), "42501"),
+        (4, b"[]".as_slice(), "INVALID_ARGUMENT"),
+        (5, b"false".as_slice(), "INVALID_ARGUMENT"),
     ] {
-        giggles_server::write_frame(&mut s, &payload, giggles_server::MAX_FRAME)
-            .await
-            .unwrap();
-        let response: Response = serde_json::from_slice(
-            &giggles_server::read_frame(&mut s, giggles_server::MAX_RESPONSE)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(matches!(response.code.as_str(), "08P01" | "42501"));
+        raw_wire_execute(&mut s, id, payload).await;
+        let code = match expected {
+            "42501" => {
+                let (header, body) = raw_wire_read(&mut s).await.unwrap();
+                assert_eq!(
+                    (header.kind, header.flags, header.request_id),
+                    (FrameKind::Reply, Flags(0), id)
+                );
+                WireReply::decode(body.as_slice()).unwrap().reply.unwrap().code
+            }
+            _ => raw_wire_error(&mut s, id).await.code,
+        };
+        assert_eq!(code, expected);
     }
-    giggles_server::write_frame(
+    // One connection plus four attempts exhaust the shared burst. Wire
+    // reports admission failure with a request-scoped error.
+    raw_wire_execute(
         &mut s,
-        &serde_json::to_vec(&sql("INSERT INTO app (id) VALUES (55)", vec![])).unwrap(),
-        giggles_server::MAX_FRAME,
+        6,
+        &sql("INSERT INTO app (id) VALUES (55)", vec![]).encode_to_vec(),
     )
-    .await
-    .unwrap();
-    ordinary_eof(&mut s).await;
-    assert!(
-        f.admin
-            .sql_session()
-            .execute("SELECT id FROM app LIMIT 1", &[], None)
-            .unwrap()
-            .rows
-            .is_empty()
-    );
+    .await;
+    let (header, body) = raw_wire_read(&mut s).await.unwrap();
+    let insert_code = match header.kind {
+        FrameKind::ConnError => WireConnError::decode(body.as_slice()).unwrap().code,
+        FrameKind::Reply => WireReply::decode(body.as_slice()).unwrap().reply.unwrap().code,
+        _ => panic!("unexpected insert response: {header:?}"),
+    };
+    let rows = f
+        .admin
+        .sql_session()
+        .execute("SELECT id FROM app LIMIT 1", &[], None)
+        .unwrap()
+        .rows;
     let mut reconnect = TcpStream::connect(p.address).await.unwrap();
-    ordinary_eof(&mut reconnect).await;
+    let reconnect_closed = connection_closed(&mut reconnect).await;
     n.shutdown().await.unwrap();
     p.shutdown().await.unwrap();
     f.stop().await;
+    assert_eq!(
+        (
+            header.kind,
+            header.flags,
+            header.request_id,
+            insert_code.as_str(),
+            rows.is_empty(),
+            reconnect_closed,
+        ),
+        (FrameKind::ConnError, Flags(0), 6, "RESOURCE_EXHAUSTED", true, true),
+        "rate witness left rows: {rows:?}"
+    );
+}
+
+/// Protobuf-valid requests that name a task or operation: the wire has no
+/// principal/time/task fields, so these are the forms that could try to
+/// select authority other than the certificate-bound session.
+fn task_prototype_probes() -> Vec<proto::ExecuteRequest> {
+    use proto::execute_request::Request as R;
+    let mut probes: Vec<proto::ExecuteRequest> = [
+        R::Ping(proto::PingRequest {}),
+        R::Sql(proto::SqlRequest { sql: "SELECT id FROM app".into(), params: vec![] }),
+    ]
+    .into_iter()
+    .map(|request| proto::ExecuteRequest {
+        request: Some(request),
+        budget_ms: None,
+        operation_id: Some("task-2".into()),
+    })
+    .collect();
+    probes.extend(
+        [
+            R::TaskPreview(proto::TaskPreviewRequest { change: None }),
+            R::TaskApply(proto::TaskApplyRequest { change_id: Some(3), digest: None }),
+            R::TaskOutcome(proto::TaskOutcomeRequest {}),
+        ]
+        .into_iter()
+        .map(|request| proto::ExecuteRequest {
+            request: Some(request),
+            budget_ms: None,
+            operation_id: Some("task-2".into()),
+        }),
+    );
+    probes
 }

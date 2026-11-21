@@ -15,24 +15,49 @@ async fn eof<S: tokio::io::AsyncRead + Unpin>(s: &mut S) {
             .is_err()
     );
 }
+async fn assert_revoked(client: &mut Client, request: proto::ExecuteRequest) {
+    // Reload wakes idle wire sessions. Read the notification before writing so
+    // a TCP reset from writing during teardown cannot mask the wire error.
+    let rejected = tokio::time::timeout(Duration::from_secs(5), client.recv())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(wire_error(&rejected).code, "UNAUTHENTICATED");
+    let closed = tokio::time::timeout(Duration::from_secs(5), client.execute(request))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(
+            closed.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::NotConnected
+        ),
+        "revoked session should close: {closed:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_overlap_new_certificate_both_transports_and_old_revoked() {
     let f = Fixture::new().await;
-    let mut old = f.native(f.app.clone()).await;
+    let mut old = f.native("app").await;
     let (pg, conn) = f.pg(f.app.clone()).await;
     let prepared = pg.prepare("SELECT id FROM app LIMIT 1").await.unwrap();
-    let mut unbound = f.native(f.unbound.clone()).await;
-    assert!(unbound.call(&Request::Ping).await.is_err());
+    let unbound = f.try_native("unbound").await.err().expect("unbound certificate");
+    assert_eq!(wire_error(&unbound).code, "UNAUTHENTICATED");
     let mut b = bindings(&f);
     b.push(Binding {
         fingerprint: fp(&f, "unbound"),
         role: b[0].role.clone(),
     });
     f.service.reload_bindings(b.clone()).unwrap();
-    let mut rotated = f.native(f.unbound.clone()).await;
+    let mut rotated = f.native("unbound").await;
     let (newpg, newconn) = f.pg(f.unbound.clone()).await;
     assert_eq!(
-        old.call(&sql("INSERT INTO app (id) VALUES (9)", vec![]))
+        old.execute(sql("INSERT INTO app (id) VALUES (9)", vec![]))
             .await
             .unwrap()
             .code,
@@ -46,14 +71,10 @@ async fn live_overlap_new_certificate_both_transports_and_old_revoked() {
             .len(),
         1
     );
-    assert_eq!(rotated.call(&Request::Ping).await.unwrap().code, "ok");
+    assert_eq!(rotated.execute(ping()).await.unwrap().code, "ok");
     b.retain(|entry| entry.fingerprint != fp(&f, "app"));
     f.service.reload_bindings(b).unwrap();
-    assert!(
-        old.call(&sql("DELETE FROM app WHERE id=9", vec![]))
-            .await
-            .is_err()
-    );
+    assert_revoked(&mut old, sql("DELETE FROM app WHERE id=9", vec![])).await;
     assert!(pg.query(&prepared, &[]).await.is_err());
     assert_eq!(
         newpg
@@ -63,7 +84,7 @@ async fn live_overlap_new_certificate_both_transports_and_old_revoked() {
             .len(),
         1
     );
-    assert_eq!(rotated.call(&Request::Ping).await.unwrap().code, "ok");
+    assert_eq!(rotated.execute(ping()).await.unwrap().code, "ok");
     drop(pg);
     drop(newpg);
     conn.await.unwrap();
@@ -113,12 +134,12 @@ async fn revoke_before_bind_and_after_cached_application_page_never_releases_row
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn invalid_reload_retains_live_driver_and_native_and_restart_uses_new_bindings() {
     let f = Fixture::new().await;
-    let mut n = f.native(f.app.clone()).await;
+    let mut n = f.native("app").await;
     let (pg, conn) = f.pg(f.app.clone()).await;
     let mut bad = bindings(&f);
     bad.push(bad[0].clone());
     assert!(f.service.reload_bindings(bad).is_err());
-    assert_eq!(n.call(&Request::Ping).await.unwrap().code, "ok");
+    assert_eq!(n.execute(ping()).await.unwrap().code, "ok");
     assert!(
         pg.query("SELECT id FROM app LIMIT 1", &[])
             .await
@@ -136,7 +157,7 @@ async fn invalid_reload_retains_live_driver_and_native_and_restart_uses_new_bind
     f.stop().await;
 }
 
-async fn limited(f: &Fixture, limits: ServiceLimits) -> (Arc<Service>, Running, Running) {
+pub(super) async fn limited(f: &Fixture, limits: ServiceLimits) -> (Arc<Service>, Running, Running) {
     let service = Service::with_limits(
         f.admin.clone(),
         bindings(f),
@@ -144,14 +165,7 @@ async fn limited(f: &Fixture, limits: ServiceLimits) -> (Arc<Service>, Running, 
         limits,
     )
     .unwrap();
-    let n = serve(
-        "127.0.0.1:0".parse().unwrap(),
-        service.clone(),
-        f.server_config.clone(),
-        128,
-    )
-    .await
-    .unwrap();
+    let n = start_wire(service.clone(), f.server_config.clone(), 128).await;
     let p = serve_pg(
         "127.0.0.1:0".parse().unwrap(),
         service.clone(),
@@ -174,14 +188,14 @@ async fn aggregate_native_session_saturation_caps_postgres_and_cancel_socket() {
         },
     )
     .await;
-    let mut first = Client::connect(n.address, "localhost", f.app.clone())
+    let mut first = connect_wire(n.address, wire_tls(&f.path, Some("app")).unwrap())
         .await
         .unwrap();
-    assert_eq!(first.call(&Request::Ping).await.unwrap().code, "ok");
+    assert_eq!(first.execute(ping()).await.unwrap().code, "ok");
     let mut denied = TcpStream::connect(p.address).await.unwrap();
     // Shared cap rejects before SSL negotiation, including CancelRequest connections.
     eof(&mut denied).await;
-    assert_eq!(first.call(&Request::Ping).await.unwrap().code, "ok");
+    assert_eq!(first.execute(ping()).await.unwrap().code, "ok");
     drop(first);
     n.shutdown().await.unwrap();
     p.shutdown().await.unwrap();
@@ -199,7 +213,7 @@ async fn shared_rate_native_simple_prepared_and_malformed_frames_cannot_evade() 
         },
     )
     .await;
-    let mut native = Client::connect(n.address, "localhost", f.app.clone())
+    let mut native = connect_wire(n.address, wire_tls(&f.path, Some("app")).unwrap())
         .await
         .unwrap(); //1
     let (pg, conn) = prepared_network::connect_at(p.address, f.app.clone()).await; //2+startup3
@@ -208,14 +222,13 @@ async fn shared_rate_native_simple_prepared_and_malformed_frames_cannot_evade() 
         .prepare("INSERT INTO app (id) VALUES ($1)")
         .await
         .unwrap(); //Parse5 Describe6 Sync7
-    assert_eq!(native.call(&Request::Ping).await.unwrap().code, "ok"); //8
+    assert_eq!(native.execute(ping()).await.unwrap().code, "ok"); //8
     assert!(pg.execute(&prepared, &[&44i64]).await.is_err()); //Bind denied, no execution
-    assert!(
-        native
-            .call(&sql("INSERT INTO app (id) VALUES (45)", vec![]))
-            .await
-            .is_err()
-    );
+    let rejected = native
+        .execute(sql("INSERT INTO app (id) VALUES (45)", vec![]))
+        .await
+        .unwrap_err();
+    assert_eq!(wire_error(&rejected).code, "RESOURCE_EXHAUSTED");
     assert!(
         f.admin
             .sql_session()
@@ -281,8 +294,6 @@ async fn executable_trusted_stdin_reload_invalid_atomicity_and_restart_config() 
     use tokio::io::{AsyncBufReadExt, BufReader};
     let f = Fixture::new().await;
     let path = std::fs::canonicalize(&f.path).unwrap();
-    let app = f.app.clone();
-    let task = f.task.clone();
     let mut config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path.join("server.TEST-ONLY.json")).unwrap())
             .unwrap();
@@ -296,6 +307,7 @@ async fn executable_trusted_stdin_reload_invalid_atomicity_and_restart_config() 
     }
     config["native"] = serde_json::json!("127.0.0.1:0");
     config["postgres"] = serde_json::json!("127.0.0.1:0");
+    config["wire"] = serde_json::json!("127.0.0.1:0");
     config["bindings_file"] = serde_json::json!(path.join("bindings.json"));
     let initial = bindings(&f);
     let changed = vec![initial[1].clone(), initial[2].clone()];
@@ -320,20 +332,12 @@ async fn executable_trusted_stdin_reload_invalid_atomicity_and_restart_config() 
             .unwrap()
             .unwrap();
         std::fs::write(path.join(format!("executable-start-{restart}.txt")), &line).unwrap();
-        let address = line
-            .split_whitespace()
-            .next()
-            .unwrap()
-            .strip_prefix("native=")
-            .unwrap()
-            .parse()
-            .unwrap();
+        let address = listening_address(&line, "wire").parse().unwrap();
         let mut input = child.stdin.take().unwrap();
-        let mut native = Client::connect(address, "localhost", app.clone())
-            .await
-            .unwrap();
+        let native = connect_wire(address, wire_tls(&path, Some("app")).unwrap()).await;
         if !restart {
-            assert_eq!(native.call(&Request::Ping).await.unwrap().code, "ok");
+            let mut native = native.unwrap();
+            assert_eq!(native.execute(ping()).await.unwrap().code, "ok");
             // Parse failure is rejected without changing a live connection.
             std::fs::write(path.join("bindings.json"), b"[").unwrap();
             input.write_all(b"reload\n").await.unwrap();
@@ -347,7 +351,7 @@ async fn executable_trusted_stdin_reload_invalid_atomicity_and_restart_config() 
                 .unwrap();
             assert!(rejection.contains("prior bindings retained"));
             std::fs::write(path.join("executable-invalid-reload.txt"), rejection).unwrap();
-            assert_eq!(native.call(&Request::Ping).await.unwrap().code, "ok");
+            assert_eq!(native.execute(ping()).await.unwrap().code, "ok");
             std::fs::write(
                 path.join("bindings.json"),
                 serde_json::to_vec_pretty(&changed).unwrap(),
@@ -362,15 +366,15 @@ async fn executable_trusted_stdin_reload_invalid_atomicity_and_restart_config() 
                 .unwrap();
             assert!(ack.starts_with("bindings reloaded epoch="));
             std::fs::write(path.join("executable-reload-ack.txt"), ack).unwrap();
-            assert!(native.call(&Request::Ping).await.is_err());
+            assert_revoked(&mut native, ping()).await;
         } else {
-            assert!(native.call(&Request::Ping).await.is_err());
+            let rejected = native.err().expect("revoked certificate cannot reopen");
+            assert_eq!(wire_error(&rejected).code, "UNAUTHENTICATED");
         }
-        let mut allowed = Client::connect(address, "localhost", task.clone())
+        let mut allowed = connect_wire(address, wire_tls(&path, Some("task")).unwrap())
             .await
             .unwrap();
-        assert_eq!(allowed.call(&Request::Ping).await.unwrap().code, "ok");
-        drop(native);
+        assert_eq!(allowed.execute(ping()).await.unwrap().code, "ok");
         drop(allowed);
         input.write_all(b"shutdown\n").await.unwrap();
         input.flush().await.unwrap();

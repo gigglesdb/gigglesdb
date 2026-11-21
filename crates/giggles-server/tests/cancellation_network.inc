@@ -10,7 +10,7 @@ use std::{
 const WAIT: Duration = Duration::from_secs(8);
 // Leave scheduling room before each mandatory hook; expiry is still exercised
 // by holding the real request at that hook for its original wire budget.
-const WIRE_DEADLINE_MS: u64 = 2_000;
+const WIRE_DEADLINE_MS: u32 = 2_000;
 fn pause(
     a: &Admin,
     at: DecisionPoint,
@@ -215,13 +215,13 @@ async fn actual_native_deadline_predecision_and_postdecision_preserve_outcomes()
         DecisionPoint::Committed,
     ] {
         let f = Fixture::new().await;
-        let mut client = f.native(f.app.clone()).await;
+        let mut client = f.native("app").await;
         let (rx, release) = pause(&f.admin, point);
         let mut job = tokio::spawn(async move {
             let r = client
-                .call(&Request::Deadline {
-                    budget_ms: WIRE_DEADLINE_MS,
-                    request: Box::new(sql("INSERT INTO app (id) VALUES (1)", vec![])),
+                .execute(proto::ExecuteRequest {
+                    budget_ms: Some(WIRE_DEADLINE_MS),
+                    ..sql("INSERT INTO app (id) VALUES (1)", vec![])
                 })
                 .await
                 .unwrap();
@@ -240,7 +240,7 @@ async fn actual_native_deadline_predecision_and_postdecision_preserve_outcomes()
             cancelled(&c).await;
         } else {
             let held = Instant::now();
-            let budget = Duration::from_millis(WIRE_DEADLINE_MS);
+            let budget = Duration::from_millis(u64::from(WIRE_DEADLINE_MS));
             tokio::time::sleep(budget).await;
             // Receipt preceded hook entry, so this independently proves the
             // original wire deadline elapsed even after decision won the race.
@@ -260,7 +260,7 @@ async fn actual_native_deadline_predecision_and_postdecision_preserve_outcomes()
             }
         );
         let r = client
-            .call(&sql("SELECT id FROM app WHERE id=1", vec![]))
+            .execute(sql("SELECT id FROM app WHERE id=1", vec![]))
             .await
             .unwrap();
         assert_eq!(
@@ -269,7 +269,7 @@ async fn actual_native_deadline_predecision_and_postdecision_preserve_outcomes()
         );
         assert_eq!(
             client
-                .call(&sql("INSERT INTO app (id) VALUES (2)", vec![]))
+                .execute(sql("INSERT INTO app (id) VALUES (2)", vec![]))
                 .await
                 .unwrap()
                 .code,

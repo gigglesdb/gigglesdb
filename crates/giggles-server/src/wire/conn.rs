@@ -778,12 +778,24 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                 let Some(entry) = queued.pop_front() else {
                     break;
                 };
-                let admission = entry.call.and_then(|call| {
-                    call.cancel
+                let admission = match entry.call {
+                    Ok(call) => call
+                        .cancel
                         .check()
-                        .map_err(|_| ApiError::DeadlineExceeded)?;
-                    Ok((call, runtime.admit_call(socket.clone())?))
-                });
+                        .map_err(|_| ApiError::DeadlineExceeded)
+                        .and_then(|()| Ok((call, runtime.admit_call(socket.clone())?))),
+                    // A request that fails to decode is still an API attempt:
+                    // charge the shared rate like HTTP and gRPC do for
+                    // malformed bodies, so a client cannot send unlimited
+                    // undecodable EXECUTE frames. A refused charge wins over
+                    // the decode error; the permit itself is not needed.
+                    // A queued request cancelled before admission is not charged.
+                    Err(ApiError::DeadlineExceeded) => Err(ApiError::DeadlineExceeded),
+                    Err(error) => match runtime.admit_call(socket.clone()) {
+                        Ok(_) => Err(error),
+                        Err(refused) => Err(refused),
+                    },
+                };
                 match admission {
                     Ok((call, ownership)) => {
                         active = Some(ActiveCall {
