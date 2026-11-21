@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, MutexGuard, atomic::{AtomicU64, Ordering}},
 };
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -268,7 +268,8 @@ pub struct Service {
     task_gate: std::sync::Mutex<()>,
     pub(crate) admin: Admin,
     pub(crate) clock: Clock,
-    password_generations: std::sync::Mutex<BTreeMap<String, (u32, u64, u64)>>,
+    password_generations: std::sync::Mutex<PasswordGenerations>,
+    password_generation_revision: AtomicU64,
     pub(crate) authority_gate: std::sync::RwLock<()>,
     pub(crate) binding_changes: tokio::sync::watch::Sender<()>,
     bindings: std::sync::Mutex<Credentials>,
@@ -279,6 +280,7 @@ pub struct Service {
     /// GD-0061 R3-403: agent requests take a slot here before `Blocking::admit`.
     pub(crate) agent_admission: crate::agent::limits::AgentAdmission,
 }
+type PasswordGenerations = BTreeMap<String, (u32, u64, u64)>;
 struct Credentials {
     next: u64,
     entries: BTreeMap<String, (Role, u64)>,
@@ -429,7 +431,8 @@ impl Service {
             #[cfg(feature = "legacy-task")]
             task_gate: std::sync::Mutex::new(()),
             statement_gate: std::sync::OnceLock::new(),
-            password_generations: std::sync::Mutex::new(BTreeMap::new()),
+            password_generations: Default::default(),
+            password_generation_revision: AtomicU64::new(0),
             authority_gate: std::sync::RwLock::new(()),
             binding_changes: tokio::sync::watch::channel(()).0,
             bindings: std::sync::Mutex::new(Credentials { next, entries }),
@@ -655,6 +658,22 @@ impl Service {
                 .cancel(&session.fingerprint, session.epoch, pid, secret);
         }
     }
+    fn update_password_generations<T>(
+        &self,
+        aliases: &mut MutexGuard<'_, PasswordGenerations>,
+        update: impl FnOnce(&mut PasswordGenerations) -> T,
+    ) -> T {
+        // Writers hold the alias mutex across both the catalog commit and
+        // the map update. Publish an odd revision before either can occur.
+        // Only publish another usable (even) revision once both are ready.
+        // Saturation stays odd and permanently disables memoization.
+        let revision = self.password_generation_revision.load(Ordering::Relaxed);
+        self.password_generation_revision.store(revision.saturating_add(1), Ordering::Release);
+        let result = update(aliases);
+        self.password_generation_revision.store(revision.saturating_add(2), Ordering::Release);
+        result
+    }
+
     fn role_generation_matches(&self, role: &giggles_core::roles::CatalogRole, epoch: u64) -> bool {
         role.generation == epoch
             || self.password_generations.lock().is_ok_and(|aliases| {
@@ -797,6 +816,12 @@ impl Service {
             fast_control_calls: 0,
             sequence_owner_candidates: BTreeSet::new(),
             search_path: String::new(),
+            search_path_input: None,
+            authorization_memos: Default::default(),
+            #[cfg(test)]
+            authorization_hits: 0,
+            #[cfg(test)]
+            authorization_full_runs: 0,
             api_path: ApiPathState::default(),
         };
         session.set_search_path("\"$user\", \"public\"");
@@ -855,6 +880,12 @@ impl Service {
             fast_control_calls: 0,
             sequence_owner_candidates: BTreeSet::new(),
             search_path: String::new(),
+            search_path_input: None,
+            authorization_memos: Default::default(),
+            #[cfg(test)]
+            authorization_hits: 0,
+            #[cfg(test)]
+            authorization_full_runs: 0,
             api_path: ApiPathState::default(),
         };
         session.set_search_path("\"$user\", \"public\"");
@@ -1012,6 +1043,12 @@ impl Service {
             fast_control_calls: 0,
             sequence_owner_candidates: BTreeSet::new(),
             search_path: String::new(),
+            search_path_input: None,
+            authorization_memos: Default::default(),
+            #[cfg(test)]
+            authorization_hits: 0,
+            #[cfg(test)]
+            authorization_full_runs: 0,
             api_path: ApiPathState::default(),
         };
         session.set_search_path("\"$user\", \"public\"");
@@ -1120,6 +1157,12 @@ impl Service {
             fast_control_calls: 0,
             sequence_owner_candidates: BTreeSet::new(),
             search_path: String::new(),
+            search_path_input: None,
+            authorization_memos: Default::default(),
+            #[cfg(test)]
+            authorization_hits: 0,
+            #[cfg(test)]
+            authorization_full_runs: 0,
             api_path: ApiPathState::default(),
         };
         session.set_search_path("\"$user\", \"public\"");
@@ -1139,6 +1182,25 @@ pub(crate) struct ApiPathState {
     pub(crate) sql_committed: bool,
     pub(crate) savepoints: Vec<(String, String)>,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AuthorizationContext {
+    latest_catalog: u64,
+    statement_catalog: u64,
+    schema_revision: u64,
+    password_revision: u64,
+}
+
+struct AuthorizationMemo {
+    context: AuthorizationContext,
+    role: Role,
+    effective_role: Option<Role>,
+    effective_session: Option<String>,
+    epoch: u64,
+    role_fence: Option<(u32, u64)>,
+    plan: Option<relational::AuthorizationPlanKey>,
+    sequence_tables: Option<BTreeSet<String>>,
+}
+
 pub struct Session {
     pub(crate) surface: Surface,
     pub(crate) backend_pid: i32,
@@ -1176,6 +1238,14 @@ pub struct Session {
     pub(crate) fast_control_calls: usize,
     sequence_owner_candidates: BTreeSet<String>,
     pub(crate) search_path: String,
+    search_path_input: Option<Arc<str>>,
+    // One SQL plan and one entry for each implicit control. Controls must
+    // not evict the statement that runs between them.
+    authorization_memos: [Option<AuthorizationMemo>; 3],
+    #[cfg(test)]
+    pub(crate) authorization_hits: usize,
+    #[cfg(test)]
+    pub(crate) authorization_full_runs: usize,
     pub(crate) api_path: ApiPathState,
 }
 impl Drop for Session {
@@ -1190,6 +1260,13 @@ pub(crate) fn is_builtin_catalog_schema(schema: &str) -> bool {
 }
 
 impl Session {
+    pub(crate) fn set_postgres_surface(&mut self) {
+        self.surface = Surface::Postgres;
+        if !self.fingerprint_bound && !self.agent && matches!(self.role, Role::Database { .. }) {
+            self.sql.enable_authorization_bindings();
+        }
+    }
+
     fn authority_role_live(&self, role: &roles::CatalogRole) -> bool {
         if self.effective_role.is_some() { !role.task_only }
         else { role.login && self.service.role_generation_matches(role, self.role_epoch()) }
@@ -1273,6 +1350,11 @@ impl Session {
             _ => "giggles",
         };
         self.sql.set_search_path(path, user);
+        let input = self.sql.search_path_input().expect("search path was applied");
+        if self.search_path_input.as_ref().is_some_and(|saved| Arc::ptr_eq(saved, input)) {
+            return;
+        }
+        self.search_path_input = Some(input.clone());
         let names = relational::schema_search_path(path, "$user");
         self.search_path = if names.is_empty() { "\"\"".into() } else {
             names.iter().map(|name| {
@@ -1747,12 +1829,12 @@ impl Session {
                 };
             }
         }
-        let result = crate::auth::statements::execute(&bound, &self.service.admin, &actor, &mut self.role_notices);
-        // Even a multi-role DROP that returns an error may have committed a
-        // preceding drop. Publish only after password aliases are ready.
-        let result = (|| {
-            let result = result?;
-            if let Some(before) = target {
+        let mut execute = || crate::auth::statements::execute(
+            &bound, &self.service.admin, &actor, &mut self.role_notices,
+        );
+        let result = if let Some(before) = target {
+            self.service.update_password_generations(&mut aliases, |aliases| {
+                let result = execute()?;
                 let after = self
                     .service
                     .admin
@@ -1770,9 +1852,13 @@ impl Session {
                         .map_or(before.generation, |&(_, first, _)| first);
                     aliases.insert(before.name, (after.oid, first, after.generation));
                 }
-            }
-            Ok(result)
-        })();
+                Ok(result)
+            })
+        } else {
+            execute()
+        };
+        // Even a multi-role DROP that returns an error may have committed a
+        // preceding drop. Notify binding checks after password aliases are ready.
         drop(aliases);
         self.service.binding_changes.send_replace(());
         result
@@ -2594,8 +2680,73 @@ impl Session {
         if !allowed { self.sql.abort(); return Err(CoreError::Policy(Error::Scope)); }
         Ok(())
     }
+    fn authorization_context(&self) -> Option<AuthorizationContext> {
+        // Only ordinary PostgreSQL database roles. Fingerprint and task
+        // identities can depend on authority outside the SQL role catalog.
+        if self.surface != Surface::Postgres || self.fingerprint_bound || self.agent
+            || !matches!(self.role, Role::Database { .. })
+        {
+            return None;
+        }
+        let (latest_catalog, statement_catalog, schema_revision) =
+            self.sql.authorization_catalog_key(&self.service.admin)?;
+        // Read after the catalog observation so a published password change
+        // also makes the preceding invalidation visible to this reader.
+        let password_revision = self.service.password_generation_revision.load(Ordering::Acquire);
+        if password_revision & 1 != 0 { return None; }
+        Some(AuthorizationContext { latest_catalog, statement_catalog, schema_revision, password_revision })
+    }
+
     fn authorize(&mut self, p: &Prepared) -> Result<(), CoreError> {
         self.admit_backstop(p.task_class())?;
+        let control = p.implicit_authorization_block();
+        let slot = control.map_or(0, |commit| 1 + usize::from(commit));
+        let context = if p.has_authorization_binding() { self.authorization_context() } else { None };
+        #[cfg(all(test, feature = "engine-rocksdb"))]
+        if let Some(observe) = AUTHORIZATION_CONTEXT_OBSERVED.with_borrow_mut(Option::take) {
+            observe(context.is_some());
+        }
+        if let Some(context) = context
+            && let Some(memo) = &self.authorization_memos[slot]
+            && memo.context == context
+            && memo.role == self.role
+            && memo.effective_role.eq(&self.effective_role)
+            && memo.effective_session.eq(&self.effective_session)
+            && memo.epoch == self.epoch
+            && memo.role_fence == self.role_fence
+            && (control.is_some() || memo.plan.as_ref().is_some_and(|key| key.matches(p, context.statement_catalog)))
+            && self.sql.authorization_memo_preflight(p)?
+            && self.authorization_context() == Some(context)
+        {
+            self.sql.set_sequence_tables(memo.sequence_tables.clone());
+            #[cfg(test)]
+            { self.authorization_hits += 1; }
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        { self.authorization_full_runs += 1; }
+        self.authorize_full(p)?;
+        if let Some(context) = context
+            && self.authorization_context() == Some(context)
+        {
+            let plan = p.authorization_plan_key(context.statement_catalog);
+            if control.is_none() && plan.is_none() { return Ok(()); }
+            self.authorization_memos[slot] = Some(AuthorizationMemo {
+                context,
+                role: self.role.clone(),
+                effective_role: self.effective_role.clone(),
+                effective_session: self.effective_session.clone(),
+                epoch: self.epoch,
+                role_fence: self.role_fence,
+                plan,
+                sequence_tables: self.sql.sequence_tables().clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn authorize_full(&mut self, p: &Prepared) -> Result<(), CoreError> {
         if p.is_collation_ddl() {
             let allowed = if let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) {
                 let roles = self.service.admin.roles();
@@ -3692,9 +3843,371 @@ impl Session {
     }
 }
 
+#[cfg(all(test, feature = "engine-rocksdb"))]
+type AuthorizationContextObserver = Box<dyn FnOnce(bool)>;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+thread_local! {
+    static AUTHORIZATION_CONTEXT_OBSERVED: std::cell::RefCell<Option<AuthorizationContextObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn authorization_memo_reuses_a_success_and_keeps_control_entries() {
+        let service = authorization_fixture(Engine::V2);
+        let mut session = service.role_session("owner").unwrap();
+        session.set_postgres_surface();
+        let sql = "SELECT id FROM t";
+        let plan = session.prepare(sql).unwrap();
+        assert_eq!(session.authorization_full_runs, 1);
+
+        let mut fresh = service.role_session("owner").unwrap();
+        let expected = fresh.execute_sql(sql, &[]).unwrap().rows;
+        for _ in 0..3 {
+            session.begin_implicit_block().unwrap();
+            session.authorize_prepared_bind(&plan).unwrap();
+            assert_eq!(session.execute_prepared(&plan, &[]).unwrap().rows, expected);
+            session.commit_implicit_block().unwrap();
+        }
+        assert_eq!(session.authorization_full_runs, 3);
+        assert_eq!(session.authorization_hits, 10);
+    }
+
+    #[test]
+    fn authorization_memo_excludes_legacy() {
+        let service = authorization_fixture(Engine::Legacy);
+        let mut session = service.role_session("owner").unwrap();
+        session.set_postgres_surface();
+        let plan = session.prepare("SELECT id FROM t").unwrap();
+        for _ in 0..2 {
+            session.authorize_prepared_bind(&plan).unwrap();
+        }
+        assert_eq!(session.authorization_full_runs, 3);
+        assert_eq!(session.authorization_hits, 0);
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn authorization_memo_excludes_task_sessions() {
+        let service = credential_fixture();
+        let mut session = service.agent_session(&"aa".repeat(32), None).unwrap();
+        session.set_postgres_surface();
+        assert!(session.task().is_some());
+        let mut ordinary = service.role_session("incident_controller").unwrap();
+        ordinary.set_postgres_surface();
+        let plan = ordinary.prepare("SELECT id FROM shipments").unwrap();
+        assert!(plan.has_authorization_binding());
+
+        for _ in 0..2 {
+            session.authorize(&plan).unwrap();
+        }
+        assert_eq!(session.authorization_full_runs, 2);
+        assert_eq!(session.authorization_hits, 0);
+        assert!(session.sql.authorization_catalog_key(&service.admin).is_none());
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn authorization_memo_rechecks_the_latest_role_catalog_in_a_fixed_snapshot() {
+        use roles::TablePrivilege::Select;
+        let service = authorization_fixture(Engine::V2);
+        let roles = service.admin.roles();
+        roles.grant_table("t", "reader", &[Select]).unwrap();
+        let mut reader = service.role_session("reader").unwrap();
+        reader.set_postgres_surface();
+        reader.sql.set_isolation(SqlIsolation::RepeatableRead);
+        reader.begin_implicit_block().unwrap();
+        // REPEATABLE READ acquires its snapshot on the first executed statement.
+        reader.execute_sql("SELECT 1", &[]).unwrap();
+        let hits = reader.authorization_hits;
+        let plan = reader.prepare("SELECT id FROM t").unwrap();
+        reader.authorize_prepared_bind(&plan).unwrap();
+        assert_eq!(reader.authorization_hits, hits + 1);
+        let context = reader.authorization_context().unwrap();
+
+        roles.revoke_table("t", "reader", &[Select]).unwrap();
+        let changed = reader.authorization_context().unwrap();
+        assert_eq!(changed.statement_catalog, context.statement_catalog);
+        assert_ne!(changed.latest_catalog, context.latest_catalog);
+        assert!(matches!(reader.authorize_prepared_bind(&plan), Err(CoreError::Policy(Error::Scope))));
+        assert_eq!(reader.authorization_hits, hits + 1);
+        reader.sql.rollback();
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn authorization_memo_checks_password_alias_revisions() {
+        let service = authorization_fixture(Engine::V2);
+        let mut reader = service.role_session("reader").unwrap();
+        reader.set_postgres_surface();
+        let old = reader.role_epoch();
+        service.update_password_generations(&mut service.password_generations.lock().unwrap(), |aliases| {
+            let role = service.admin.roles().alter("reader", roles::RoleChanges {
+                password: Some(Some("new verifier".into())), ..Default::default()
+            }).unwrap();
+            assert!(reader.sql.authorization_catalog_key(&service.admin).is_some());
+            assert!(reader.authorization_context().is_none(), "the catalog is visible before the alias");
+            aliases.insert("reader".into(), (role.oid, old, role.generation));
+        });
+
+        let plan = reader.prepare("SELECT 1").unwrap();
+        reader.authorize(&plan).unwrap();
+        assert_eq!(reader.authorization_hits, 1);
+        let before = reader.authorization_context().unwrap();
+        {
+            let _aliases = service.password_generations.lock().unwrap();
+            assert!(reader.authorization_context() == Some(before));
+        }
+        service.update_password_generations(&mut service.password_generations.lock().unwrap(), BTreeMap::clear);
+        let after = reader.authorization_context().unwrap();
+        assert_eq!(before.latest_catalog, after.latest_catalog);
+        assert_ne!(before.password_revision, after.password_revision);
+        assert!(matches!(reader.authorize(&plan), Err(CoreError::Policy(Error::Authentication))));
+        assert_eq!(reader.authorization_hits, 1);
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn authorization_memo_bypasses_private_catalog_until_rollback() {
+        let service = authorization_fixture(Engine::V2);
+        let mut session = service.role_session("owner").unwrap();
+        session.set_postgres_surface();
+        let plan = session.prepare("SELECT id FROM t").unwrap();
+        session.authorize_prepared_bind(&plan).unwrap();
+        assert_eq!(session.authorization_hits, 1);
+
+        session.begin_implicit_block().unwrap();
+        session.execute_sql("CREATE TABLE private_t (id BIGINT PRIMARY KEY)", &[]).unwrap();
+        assert!(session.authorization_context().is_none());
+        let runs = session.authorization_full_runs;
+        for _ in 0..2 {
+            session.authorize_prepared_bind(&plan).unwrap();
+        }
+        assert_eq!(session.authorization_full_runs, runs + 2);
+        assert_eq!(session.authorization_hits, 1);
+        session.sql.rollback();
+        assert!(session.authorization_context().is_some());
+        let same = session.execute_prepared(&plan, &[]).unwrap();
+        assert_eq!(same.rows[0].values, [Value::Int(1)]);
+        assert_eq!(session.authorization_hits, 2);
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn authorization_memo_restores_sequence_scope() {
+        use roles::SchemaPrivilege::Create;
+
+        let service = authorization_fixture(Engine::V2);
+        service.admin.roles().create(roles::NewRole {
+            name: "outsider".into(), login: true, ..Default::default()
+        }).unwrap();
+        service.admin.roles().grant_schema("public", "reader", &[Create]).unwrap();
+        let mut owner = service.role_session("owner").unwrap();
+        owner.execute_sql("CREATE SEQUENCE secret_seq", &[]).unwrap();
+        let mut reader = service.role_session("reader").unwrap();
+        reader.execute_sql("CREATE SEQUENCE mine", &[]).unwrap();
+
+        for (mut session, expected) in [
+            (owner, None),
+            (reader, Some(BTreeSet::from(["mine".into()]))),
+            (service.role_session("outsider").unwrap(), Some(BTreeSet::new())),
+        ] {
+            session.set_postgres_surface();
+            let plan = session.prepare("SELECT 1").unwrap();
+            session.authorize_full(&plan).unwrap();
+            let full_scope = session.sql.sequence_tables().clone();
+            assert_eq!(full_scope, expected);
+
+            session.sql.set_sequence_tables(Some(BTreeSet::from(["unrelated".into()])));
+            let hits = session.authorization_hits;
+            session.authorize(&plan).unwrap();
+            assert_eq!(session.authorization_hits, hits + 1);
+            assert_eq!(session.sql.sequence_tables(), &full_scope);
+        }
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn authorization_memo_excludes_fingerprint_application_and_native_sessions() {
+        let service = authorization_fixture(Engine::V2);
+        service.reload_bindings(vec![
+            Binding { fingerprint: "11".repeat(32), role: Role::Database { name: "owner".into() } },
+            Binding {
+                fingerprint: "22".repeat(32),
+                role: Role::Application {
+                    domain: service.admin.authority_metadata().unwrap().0.to_string(),
+                    tables: BTreeSet::from(["t".into()]),
+                },
+            },
+        ]).unwrap();
+        let mut ordinary = service.role_session("owner").unwrap();
+        ordinary.set_postgres_surface();
+        let plan = ordinary.prepare("SELECT id FROM t").unwrap();
+        ordinary.authorize(&plan).unwrap();
+        assert_eq!(ordinary.authorization_hits, 1);
+
+        let mut fingerprint = service.session(&"11".repeat(32)).unwrap();
+        fingerprint.set_postgres_surface();
+        // Isolate the role-kind guard: an Application session that is neither
+        // fingerprint bound nor on the native surface still never hits.
+        let mut application = service.session(&"22".repeat(32)).unwrap();
+        assert!(matches!(application.role, Role::Application { .. }));
+        application.surface = Surface::Postgres;
+        application.fingerprint_bound = false;
+        let native = service.role_session("owner").unwrap();
+        for mut session in [fingerprint, application, native] {
+            for _ in 0..2 {
+                session.authorize(&plan).unwrap();
+            }
+            assert_eq!(session.authorization_full_runs, 2);
+            assert_eq!(session.authorization_hits, 0);
+            assert!(session.authorization_memos[0].is_none());
+        }
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn authorization_memo_skips_catalog_publication() {
+        let service = authorization_fixture(Engine::V2);
+        let mut session = service.role_session("owner").unwrap();
+        session.set_postgres_surface();
+        let plan = session.prepare("SELECT id FROM t").unwrap();
+        session.authorize(&plan).unwrap();
+        assert_eq!(session.authorization_hits, 1);
+        let original = session.authorization_memos[0].as_ref().unwrap().context;
+
+        let pause = CommitSyncHook::new();
+        service.admin.set_commit_sync_hook(Some(pause.clone()));
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| service.admin.roles().grant_table(
+                "t", "reader", &[roles::TablePrivilege::Select],
+            ));
+            let entered = pause.wait_entered(std::time::Duration::from_secs(10));
+            if !entered {
+                pause.release(false);
+            }
+            assert!(entered, "catalog writer never reached the commit sync boundary");
+
+            // Full authorization can wait for publication. Let it proceed once
+            // the first memo lookup has sampled the actual publication window.
+            let release = pause.clone();
+            AUTHORIZATION_CONTEXT_OBSERVED.with_borrow_mut(|observe| {
+                *observe = Some(Box::new(move |context_available| {
+                    release.release(false);
+                    assert!(!context_available);
+                }));
+            });
+            session.authorize(&plan).unwrap();
+            writer.join().unwrap().unwrap();
+        });
+        service.admin.set_commit_sync_hook(None);
+        assert_ne!(session.authorization_context().unwrap().latest_catalog, original.latest_catalog);
+        assert_eq!(session.authorization_hits, 1);
+        assert_eq!(session.authorization_full_runs, 2);
+        assert!(session.authorization_memos[0].as_ref().unwrap().context == original);
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn authorization_memo_rechecks_stored_defaults_with_changed_budgets() {
+        use relational::MAX_ROW_BYTES;
+
+        let service = authorization_fixture(Engine::V2);
+        service.role_session("owner").unwrap().execute_sql(
+            "CREATE TABLE budget_t (id BIGINT PRIMARY KEY, value BIGINT DEFAULT 42)",
+            &[],
+        ).unwrap();
+
+        for (tokens, bytes) in [
+            (1, relational::DEFAULT_MAX_VALUE_BYTES),
+            (relational::DEFAULT_MAX_STATEMENT_TOKENS, MAX_ROW_BYTES),
+        ] {
+            let mut session = service.role_session("owner").unwrap();
+            session.set_postgres_surface();
+            let _budgets = session.sql.statement_budgets();
+            let plan = session.prepare("INSERT INTO budget_t(id) VALUES (1)").unwrap();
+            session.authorize(&plan).unwrap();
+            assert_eq!(session.authorization_hits, 1);
+            assert_eq!(session.authorization_full_runs, 1);
+
+            // Stored default syntax is thread-local. A fresh worker must lex
+            // the default under its current budgets, despite the prior success.
+            std::thread::spawn(move || {
+                session.set_max_statement_tokens(tokens);
+                session.set_max_value_bytes(bytes);
+                let _budgets = session.sql.statement_budgets();
+                let actual = session.authorize(&plan);
+                let full = session.authorize_full(&plan);
+                assert_eq!(actual.as_ref().map_err(sqlstate), full.as_ref().map_err(sqlstate));
+                if tokens == 1 {
+                    assert!(matches!(actual, Err(CoreError::Sql(relational::SqlError::Limit))));
+                } else {
+                    actual.unwrap();
+                }
+                assert_eq!(session.authorization_hits, 1);
+                assert_eq!(session.authorization_full_runs, 2);
+            }).join().unwrap();
+        }
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn search_path_reuse_preserves_constants_validation_revision() {
+        let service = authorization_fixture(Engine::V2);
+        let mut session = service.role_session("owner").unwrap();
+        session.set_search_path("public");
+        let initial = session.sql.constants_validation_key().unwrap();
+        session.set_search_path("public");
+        assert_eq!(session.sql.constants_validation_key(), Some(initial));
+        session.set_search_path("  public  ");
+        assert_eq!(session.sql.constants_validation_key(), Some(initial));
+        assert_eq!(session.search_path, "public");
+        session.set_search_path("alternate, public");
+        assert_ne!(session.sql.constants_validation_key().unwrap().3, initial.3);
+
+        session.sql.set_search_path("elsewhere", "owner");
+        session.set_search_path("alternate, public");
+        assert!(session.sql.schema_in_search_path("alternate"));
+        assert!(!session.sql.schema_in_search_path("elsewhere"));
+
+        session.sql.set_max_statement_tokens(1);
+        {
+            let _budgets = session.sql.statement_budgets();
+            session.set_search_path("alternate, public");
+            assert_eq!(session.search_path, "\"\"");
+            assert!(!session.sql.schema_in_search_path("alternate"));
+        }
+        session.set_search_path("alternate, public");
+        assert!(session.sql.schema_in_search_path("alternate"));
+        assert_eq!(session.search_path, "alternate, public");
+    }
+
+    fn authorization_fixture(engine: Engine) -> Arc<Service> {
+        let path = crate::test_support::fixture_root().join(format!(
+            "authorization-memo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let admin = Admin::create_engine(path, Limits::default(), engine).unwrap();
+        for (name, superuser) in [("owner", true), ("reader", false)] {
+            admin.roles().create(roles::NewRole {
+                name: name.into(), login: true, superuser, ..Default::default()
+            }).unwrap();
+        }
+        let service = Service::new(admin, vec![], Clock::new(0, 3600).unwrap()).unwrap();
+        let mut owner = service.role_session("owner").unwrap();
+        owner.execute_sql("CREATE TABLE t (id BIGINT PRIMARY KEY)", &[]).unwrap();
+        owner.execute_sql("INSERT INTO t VALUES (1)", &[]).unwrap();
+        service
+    }
 
     #[cfg(feature = "engine-rocksdb")]
     fn credential_fixture() -> Arc<Service> {
@@ -4546,11 +5059,13 @@ mod lifecycle_tests {
                 "generation" | "alias" => { roles.alter("bound", roles::RoleChanges { superuser: Some(false), ..Default::default() }).unwrap(); }
                 _ => {}
             }
-            service.password_generations.lock().unwrap().clear();
-            if let Some(current) = roles.get("bound").unwrap().filter(|_| state == "alias") {
-                service.password_generations.lock().unwrap().insert("bound".into(),
-                    (current.oid, current.generation.saturating_sub(1), current.generation));
-            }
+            service.update_password_generations(&mut service.password_generations.lock().unwrap(), |aliases| {
+                aliases.clear();
+                if let Some(current) = roles.get("bound").unwrap().filter(|_| state == "alias") {
+                    aliases.insert("bound".into(),
+                        (current.oid, current.generation.saturating_sub(1), current.generation));
+                }
+            });
             let current = roles.get("bound").unwrap();
             let mut all_fences = fences.to_vec();
             if let Some(current) = current {

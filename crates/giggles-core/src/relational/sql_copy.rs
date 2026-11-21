@@ -708,6 +708,7 @@ impl Copy {
             unbound_statement: None,
             warnings: vec![],
             authorization_has_views: false,
+            authorization_binding: None,
             privilege_inquiry: false,
             statement: Statement::InsertMulti(Box::new(sql_insert::Insert::copy(
                 format!(

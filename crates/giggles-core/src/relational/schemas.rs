@@ -305,6 +305,9 @@ impl Prepared {
         self.search_path != path || self.schema_user != user
     }
     pub(crate) fn set_schema_context(&mut self, path: Vec<String>, user: String) {
+        if self.schema_context_differs(&path, &user) {
+            self.clear_authorization_binding_version();
+        }
         self.search_path = path;
         self.schema_user = user;
     }

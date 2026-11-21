@@ -2231,7 +2231,9 @@ pub struct SqlSession {
     search_path: Vec<String>,
     schema_user: String,
     schema_context_revision: Option<u64>,
+    search_path_input: Option<(Arc<str>, (usize, usize, bool))>,
     unnamed_plans: Vec<(UnnamedPlanKey, relational::Prepared)>,
+    authorization_bindings: bool,
     authority_managed: bool,
     ddl_owner: Option<String>,
     staged_revision: u64,
@@ -2285,7 +2287,9 @@ impl Admin {
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
             schema_context_revision: Some(0),
+            search_path_input: None,
             unnamed_plans: Vec::new(),
+            authorization_bindings: false,
             authority_managed: false,
             ddl_owner: None,
             staged_revision: 0,
@@ -2553,6 +2557,11 @@ impl SqlSession {
             None => self.inspect_metadata(resolve),
         }
     }
+    /// Retain exact binding identities for a gateway that memoizes SQL authorization.
+    pub fn enable_authorization_bindings(&mut self) {
+        self.authorization_bindings = true;
+    }
+
     /// Bind dependency identities to this session without surfacing semantic errors
     /// before the caller has checked authority.
     pub fn bind_relation_context(
@@ -2561,10 +2570,19 @@ impl SqlSession {
     ) -> Result<relational::Prepared, CoreError> {
         let mut prepared = prepared.clone();
         prepared.set_schema_context(self.search_path.clone(), self.schema_user.clone());
+        prepared.clear_authorization_binding_version();
+        let version = if prepared.has_sql_authorization_binding() { self.statement_catalog_version() } else { None };
         let bind = |s: &MetadataState<'_>| {
-            Ok(prepared
-                .bind_schemas(&s.sql)
-                .unwrap_or_else(|_| prepared.clone()))
+            let Ok(mut bound) = prepared.bind_schemas(&s.sql) else { return Ok(prepared.clone()); };
+            // Outside a fixed snapshot the binder can observe a newer catalog
+            // than the first version read. Monotonic versions bracket the
+            // actual metadata read, so failed binding or drift leaves no proof.
+            if let Some(version) = version
+                && self.statement_catalog_version() == Some(version)
+            {
+                bound.set_authorization_binding_version(version);
+            }
+            Ok(bound)
         };
         match &self.staged {
             Some(s) => bind(&MetadataState::borrow(s)),
@@ -2574,13 +2592,27 @@ impl SqlSession {
     pub fn schema_in_search_path(&self, schema: &str) -> bool {
         self.search_path.iter().any(|s| s == schema)
     }
+    /// Identity of the last parsed input, renewed on a path, user or lexer
+    /// context change. Callers can use pointer equality to reuse a rendering.
+    pub fn search_path_input(&self) -> Option<&Arc<str>> {
+        self.search_path_input.as_ref().map(|(path, _)| path)
+    }
     pub fn set_search_path(&mut self, path: &str, user: &str) {
+        // The path uses the SQL lexer, so a caller with a different ambient
+        // token or value budget must still reparse the same text.
+        let budgets = (relational::max_statement_tokens(), relational::max_value_bytes(), relational::wide_values());
+        if self.schema_user == user && self.search_path_input.as_ref()
+            .is_some_and(|(raw, applied)| **raw == *path && *applied == budgets)
+        {
+            return;
+        }
         let search_path = relational::schema_search_path(path, user);
         if self.schema_user != user || self.search_path != search_path {
             self.schema_context_revision = self.schema_context_revision.and_then(|n| n.checked_add(1));
         }
         self.schema_user = user.into();
         self.search_path = search_path;
+        self.search_path_input = Some((Arc::from(path), budgets));
     }
     pub fn schema_metadata(&self) -> Result<relational::SchemaMetadata, CoreError> {
         let read = |s: &MetadataState<'_>| Ok(s.sql.schema_metadata());
@@ -2753,6 +2785,9 @@ impl SqlSession {
     pub fn set_sequence_tables(&mut self, tables: Option<std::collections::BTreeSet<String>>) {
         self.sequence_tables = tables;
     }
+    pub fn sequence_tables(&self) -> &Option<std::collections::BTreeSet<String>> {
+        &self.sequence_tables
+    }
     pub fn normalize_sequence_reference(&self, text: &str) -> Result<String, CoreError> {
         let name = sequences::sequence_name(text).map_err(CoreError::Sql)?;
         let resolve = |s: &MetadataState<'_>| Ok(s.sql.resolve_relation_key(&name, &self.search_path));
@@ -2853,6 +2888,34 @@ impl SqlSession {
     pub fn constants_validation_key(&self) -> Option<(u64, usize, usize, u64)> {
         if self.staged.is_some() { return None; }
         Some((self.statement_catalog_version()?, self.value_budget(), self.max_statement_tokens, self.schema_context_revision?))
+    }
+
+    /// The latest role catalog, the statement's catalog, and the schema context.
+    /// A catalog publication or private metadata requires ordinary authorization.
+    pub fn authorization_catalog_key(&self, role_admin: &Admin) -> Option<(u64, u64, u64)> {
+        if !Arc::ptr_eq(&self.admin.inner, &role_admin.inner)
+            || self.admin.inner.fenced.load(Ordering::Acquire)
+            || self.staged.is_some() || self.protected.is_some() || self.copy_input.is_some()
+        {
+            return None;
+        }
+        let Backend::V2(db) = &self.admin.inner.backend else { return None; };
+        if db.cluster_services().is_some() || db.kv.is_fenced() { return None; }
+        let latest = db.catalog().current_version()?;
+        let statement = self.statement_catalog_version()?;
+        (db.catalog().current_version() == Some(latest))
+            .then_some((latest, statement, self.schema_context_revision?))
+    }
+
+    /// Recheck metadata admission, provenance and snapshot guards. Stored
+    /// defaults may also need parsing on a different pgwire worker thread;
+    /// a prior success may have used that thread's cached syntax.
+    pub fn authorization_memo_preflight(&self, p: &relational::Prepared) -> Result<bool, CoreError> {
+        self.inspect_metadata(|s| {
+            // On an error in this later check the caller runs the original
+            // sequence and relation checks before reaching the error again.
+            Ok(!p.authorization_may_parse_defaults() || p.implicit_sequences(&s.sql).is_ok())
+        })
     }
 
     /// Recheck the full validation path's lifetime/domain guards on a memo hit.

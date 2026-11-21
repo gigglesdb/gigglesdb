@@ -25,6 +25,7 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let api = ApiFixture::catalog_empty_engine(Engine::V2).await;
+        assert_eq!(api.admin.engine(), Engine::V2);
         for (name, superuser) in [("root", true), ("r", false)] {
             api.admin
                 .roles()
@@ -95,28 +96,109 @@ fn outcome<T>(result: Result<T, tokio_postgres::Error>) -> bool {
         }
     }
 }
+// query_typed sends Parse and Bind with empty statement names.
+async fn unnamed(client: &Client) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+    client.query_typed("SELECT id FROM t", &[]).await
+}
+
 #[tokio::test]
 async fn next_statement_grant_revoke_simple_and_prepared() {
     let f = Fixture::new().await;
     let reader = Fixture::connect(&f.pg, "r").await;
+    assert!(!outcome(unnamed(&reader).await));
+    assert!(!outcome(unnamed(&reader).await));
     f.flip(true).await;
-    let prepared = reader.prepare("SELECT id FROM t").await.unwrap();
+    let named_reader = Fixture::connect(&f.pg, "r").await;
+    let simple_reader = Fixture::connect(&f.pg, "r").await;
+    let named = named_reader.prepare("SELECT id FROM t").await.unwrap();
     for granted in [true, false, true, false, true] {
         f.flip(granted).await;
+        for _ in 0..2 {
+            assert_eq!(outcome(named_reader.query(&named, &[]).await), granted);
+            assert_eq!(outcome(unnamed(&reader).await), granted);
+        }
         assert_eq!(
-            outcome(reader.simple_query("SELECT id FROM t").await),
+            outcome(simple_reader.simple_query("SELECT id FROM t").await),
             granted
         );
-        assert_eq!(outcome(reader.query(&prepared, &[]).await), granted);
     }
+    drop(simple_reader);
+    drop(named_reader);
     drop(reader);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn grants_and_revokes_take_effect_inside_explicit_transactions() {
+    let f = Fixture::new().await;
+    for sql in ["CREATE ROLE readers", "GRANT SELECT ON t TO readers"] {
+        f.admin.batch_execute(sql).await.unwrap();
+    }
+
+    for isolation in ["READ COMMITTED", "REPEATABLE READ"] {
+        for (grant, revoke) in [
+            ("GRANT SELECT ON t TO r", "REVOKE SELECT ON t FROM r"),
+            ("GRANT readers TO r", "REVOKE readers FROM r"),
+        ] {
+            for named in [true, false] {
+                let reader = Fixture::connect(&f.pg, "r").await;
+                reader.batch_execute(&format!("BEGIN ISOLATION LEVEL {isolation}"))
+                    .await.unwrap();
+                // Pin the transaction snapshot and warm authorization before
+                // the other session grants access to the target table.
+                let warm_sql = "SELECT 1::bigint";
+                let warm_plan = if named {
+                    Some(reader.prepare(warm_sql).await.unwrap())
+                } else {
+                    None
+                };
+                for _ in 0..2 {
+                    if let Some(plan) = &warm_plan {
+                        reader.query(plan, &[]).await.unwrap();
+                    } else {
+                        reader.query_typed(warm_sql, &[]).await.unwrap();
+                    }
+                }
+
+                f.admin.batch_execute(grant).await.unwrap();
+                let target = if named {
+                    Some(reader.prepare("SELECT id FROM t").await.unwrap())
+                } else {
+                    None
+                };
+                for _ in 0..2 {
+                    let rows = if let Some(plan) = &target {
+                        reader.query(plan, &[]).await.unwrap()
+                    } else {
+                        unnamed(&reader).await.unwrap()
+                    };
+                    assert_eq!(rows[0].get::<_, i64>(0), 1);
+                }
+
+                f.admin.batch_execute(revoke).await.unwrap();
+                let result = if let Some(plan) = &target {
+                    reader.query(plan, &[]).await
+                } else {
+                    unnamed(&reader).await
+                };
+                assert!(!outcome(result), "{isolation}, {revoke}, named={named}");
+                reader.batch_execute("ROLLBACK").await.unwrap();
+            }
+        }
+    }
     f.stop().await;
 }
 
 async fn fence(drop_role: bool) {
     let f = Fixture::new().await;
-    let reader = Fixture::connect(&f.pg, "r").await;
-    reader.simple_query("SELECT 1").await.unwrap();
+    let sql = "SELECT 1::bigint";
+    let named = Fixture::connect(&f.pg, "r").await;
+    let plan = named.prepare(sql).await.unwrap();
+    let unnamed = Fixture::connect(&f.pg, "r").await;
+    for _ in 0..2 {
+        named.query(&plan, &[]).await.unwrap();
+        unnamed.query_typed(sql, &[]).await.unwrap();
+    }
     f.admin
         .batch_execute(if drop_role {
             "DROP ROLE r"
@@ -125,14 +207,19 @@ async fn fence(drop_role: bool) {
         })
         .await
         .unwrap();
-    let error = reader.simple_query("SELECT 1").await.unwrap_err();
-    // As in write_fence_network, a retained session must be refused. pgwire's
-    // idle binding recheck closes the connection; an in-message check emits 28000.
-    assert!(
-        error.is_closed() || error.code().is_some_and(|c| c.code() == "28000"),
-        "{error}"
-    );
-    drop(reader);
+    for error in [
+        named.query(&plan, &[]).await.unwrap_err(),
+        unnamed.query_typed(sql, &[]).await.unwrap_err(),
+    ] {
+        // Idle binding revalidation closes the connection. An in-flight
+        // binding recheck instead returns the authentication SQLSTATE.
+        assert!(
+            error.is_closed() || error.code().is_some_and(|c| c.code() == "28000"),
+            "{error}"
+        );
+    }
+    drop(named);
+    drop(unnamed);
     f.stop().await;
 }
 #[tokio::test]
@@ -142,6 +229,155 @@ async fn next_statement_nologin() {
 #[tokio::test]
 async fn next_statement_drop_role() {
     fence(true).await;
+}
+
+#[tokio::test]
+async fn next_statement_membership_and_owner_on_both_prepared_paths() {
+    let f = Fixture::new().await;
+    for sql in ["CREATE ROLE readers", "GRANT readers TO r"] {
+        f.admin.batch_execute(sql).await.unwrap();
+    }
+    let roles = f.api.admin.roles();
+    roles.set_table_owner("t", "readers").unwrap();
+    let reader = Fixture::connect(&f.pg, "r").await;
+    let named = Fixture::connect(&f.pg, "r").await;
+    let plan = named.prepare("SELECT id FROM t").await.unwrap();
+    for _ in 0..2 {
+        assert!(outcome(named.query(&plan, &[]).await));
+        assert!(outcome(unnamed(&reader).await));
+    }
+
+    f.admin
+        .batch_execute("REVOKE readers FROM r")
+        .await
+        .unwrap();
+    assert!(!outcome(named.query(&plan, &[]).await));
+    assert!(!outcome(unnamed(&reader).await));
+    f.admin.batch_execute("GRANT readers TO r").await.unwrap();
+    for _ in 0..2 {
+        assert!(outcome(named.query(&plan, &[]).await));
+        assert!(outcome(unnamed(&reader).await));
+    }
+
+    // The native catalog owner API publishes the same authority records as DDL.
+    roles.set_table_owner("t", "root").unwrap();
+    assert!(!outcome(named.query(&plan, &[]).await));
+    assert!(!outcome(unnamed(&reader).await));
+    drop(named);
+    drop(reader);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn prepared_authority_tracks_role_session_authorization_and_search_path() {
+    let f = Fixture::new().await;
+    let root = Fixture::connect(&f.pg, "root").await;
+    let prepared = root.prepare("SELECT id FROM t").await.unwrap();
+    for (setting, reset) in [
+        ("SET ROLE r", "RESET ROLE"),
+        ("SET SESSION AUTHORIZATION r", "RESET SESSION AUTHORIZATION"),
+    ] {
+        assert!(outcome(root.query(&prepared, &[]).await));
+        assert!(outcome(root.query(&prepared, &[]).await));
+        root.batch_execute(setting).await.unwrap();
+        assert!(!outcome(root.query(&prepared, &[]).await));
+        assert!(!outcome(unnamed(&root).await));
+        root.batch_execute(reset).await.unwrap();
+        assert!(outcome(root.query(&prepared, &[]).await));
+        assert!(outcome(unnamed(&root).await));
+    }
+
+    for sql in [
+        "CREATE SCHEMA alternate",
+        "CREATE TABLE alternate.t (id BIGINT PRIMARY KEY)",
+        "INSERT INTO alternate.t VALUES (2)",
+        "GRANT USAGE ON SCHEMA alternate TO r",
+        "GRANT SELECT ON public.t TO r",
+    ] {
+        f.admin.batch_execute(sql).await.unwrap();
+    }
+    let reader = Fixture::connect(&f.pg, "r").await;
+    let prepared = reader.prepare("SELECT id FROM t").await.unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            reader
+                .query_one(&prepared, &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            1
+        );
+    }
+    reader
+        .batch_execute("SET search_path = alternate, public")
+        .await
+        .unwrap();
+    assert!(!outcome(reader.query(&prepared, &[]).await));
+    assert!(!outcome(unnamed(&reader).await));
+    f.admin
+        .batch_execute("GRANT SELECT ON alternate.t TO r")
+        .await
+        .unwrap();
+    assert_eq!(
+        reader
+            .query_one(&prepared, &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        2
+    );
+    f.admin
+        .batch_execute("REVOKE USAGE ON SCHEMA alternate FROM r")
+        .await
+        .unwrap();
+    assert!(!outcome(reader.query(&prepared, &[]).await));
+    reader.batch_execute("RESET search_path").await.unwrap();
+    assert_eq!(
+        reader
+            .query_one(&prepared, &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    drop(root);
+    drop(reader);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn prepared_serial_defaults_recheck_sequence_authority() {
+    let f = Fixture::new().await;
+    for sql in [
+        "CREATE ROLE writers",
+        "CREATE TABLE serial_t (id BIGSERIAL PRIMARY KEY)",
+        "GRANT INSERT ON serial_t TO r",
+    ] {
+        f.admin.batch_execute(sql).await.unwrap();
+    }
+    let reader = Fixture::connect(&f.pg, "r").await;
+    let sql = "INSERT INTO serial_t DEFAULT VALUES";
+    assert!(!outcome(reader.prepare(sql).await));
+    f.api
+        .admin
+        .roles()
+        .set_table_owner("serial_t", "writers")
+        .unwrap();
+    f.admin.batch_execute("GRANT writers TO r").await.unwrap();
+    let prepared = reader.prepare(sql).await.unwrap();
+    for _ in 0..2 {
+        assert_eq!(reader.execute(&prepared, &[]).await.unwrap(), 1);
+    }
+    f.admin
+        .batch_execute("REVOKE writers FROM r")
+        .await
+        .unwrap();
+    assert!(!outcome(reader.execute(&prepared, &[]).await));
+    assert!(!outcome(reader.execute(&prepared, &[]).await));
+    f.admin.batch_execute("GRANT writers TO r").await.unwrap();
+    assert_eq!(reader.execute(&prepared, &[]).await.unwrap(), 1);
+    drop(reader);
+    f.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

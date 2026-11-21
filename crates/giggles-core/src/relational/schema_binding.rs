@@ -128,6 +128,8 @@ impl Prepared {
             extension_owner: self.extension_owner.clone(),
             warnings: self.warnings.clone(),
             authorization_has_views: false,
+            // A caller must witness the catalog version of this binding anew.
+            authorization_binding: self.authorization_binding.map(AuthorizationBinding::without_version),
             privilege_inquiry: self.privilege_inquiry,
         };
         let create = |name: &str| -> R<String> {
@@ -247,6 +249,138 @@ impl Prepared {
         bound.privilege_inquiry |= bound.authorization_tables()?.iter().any(|name|
             state.view_names.get(name).is_some_and(|(_,p)| p.as_ref().is_ok_and(|p| p.has_privilege_inquiry())));
         Ok(bound)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum AuthorizationBinding {
+    Sql(Option<u64>),
+    ImplicitBlock(bool),
+}
+impl AuthorizationBinding {
+    fn without_version(self) -> Self {
+        match self {
+            Self::Sql(_) => Self::Sql(None),
+            control => control,
+        }
+    }
+}
+
+/// Exact identity of an eligible, successfully bound SQL authorization plan.
+pub struct AuthorizationPlanKey {
+    // Hold the allocation identity without retaining a closed statement's
+    // potentially large AST. The allocation cannot be reused while Weak lives.
+    source: std::sync::Weak<Statement>,
+    domain: u128,
+    epoch: u64,
+    transaction: Option<u128>,
+    params: usize,
+    parameter_types: Vec<Option<DataType>>,
+    relations: Vec<schemas::Reference>,
+    search_path: Vec<String>,
+    schema_user: String,
+    has_views: bool,
+    privilege_inquiry: bool,
+    budgets: Option<(usize, usize, bool)>,
+}
+impl AuthorizationPlanKey {
+    pub fn matches(&self, prepared: &Prepared, version: u64) -> bool {
+        prepared.authorization_source(version).is_some_and(|source|
+            std::ptr::eq(self.source.as_ptr(), Arc::as_ptr(source)))
+            && self.domain == prepared.domain
+            && self.epoch == prepared.epoch
+            && self.transaction == prepared.transaction
+            && self.params == prepared.params
+            && self.parameter_types == prepared.parameter_types
+            && self.relations == prepared.relations
+            && self.search_path == prepared.search_path
+            && self.schema_user == prepared.schema_user
+            && self.has_views == prepared.authorization_has_views
+            && self.privilege_inquiry == prepared.privilege_inquiry
+            && self.budgets == prepared.authorization_budgets()
+    }
+}
+impl Prepared {
+    pub(crate) fn enable_sql_authorization_binding(&mut self) {
+        // The other statement variants (including DDL and TRUNCATE) always
+        // take the original path. Constraint references occur only in DDL.
+        if matches!(&self.statement, Statement::Select { .. } | Statement::CompositeSelect(_)
+            | Statement::Query(_) | Statement::Plan(_) | Statement::Insert { .. }
+            | Statement::InsertMulti(_) | Statement::InsertExpressions(_)
+            | Statement::Update { .. } | Statement::UpdateExpressions { .. }
+            | Statement::Delete { .. })
+        {
+            self.authorization_binding = Some(AuthorizationBinding::Sql(None));
+        }
+    }
+
+    pub(crate) fn mark_implicit_authorization_block(&mut self, commit: bool) {
+        self.authorization_binding = Some(AuthorizationBinding::ImplicitBlock(commit));
+    }
+
+    pub fn implicit_authorization_block(&self) -> Option<bool> {
+        match self.authorization_binding {
+            Some(AuthorizationBinding::ImplicitBlock(commit)) => Some(commit),
+            _ => None,
+        }
+    }
+
+    pub fn has_authorization_binding(&self) -> bool {
+        matches!(self.authorization_binding, Some(AuthorizationBinding::Sql(Some(_)) | AuthorizationBinding::ImplicitBlock(_)))
+    }
+
+    pub(crate) fn has_sql_authorization_binding(&self) -> bool {
+        matches!(self.authorization_binding, Some(AuthorizationBinding::Sql(_)))
+    }
+
+    pub(crate) fn clear_authorization_binding_version(&mut self) {
+        self.authorization_binding = self.authorization_binding.map(AuthorizationBinding::without_version);
+    }
+
+    pub(crate) fn set_authorization_binding_version(&mut self, version: u64) {
+        // A table-free statement may have taken bind_schemas' no-op path.
+        self.unbound_statement.get_or_insert_with(|| Arc::new(self.statement.clone()));
+        self.authorization_binding = Some(AuthorizationBinding::Sql(Some(version)));
+    }
+
+    fn authorization_source(&self, version: u64) -> Option<&Arc<Statement>> {
+        match self.authorization_binding {
+            Some(AuthorizationBinding::Sql(Some(bound))) if bound == version => self.unbound_statement.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn authorization_may_parse_defaults(&self) -> bool {
+        matches!(&self.statement, Statement::Plan(_) | Statement::Insert { .. }
+            | Statement::InsertMulti(_) | Statement::InsertExpressions(_)
+            | Statement::UpdateExpressions { .. })
+    }
+
+    fn authorization_budgets(&self) -> Option<(usize, usize, bool)> {
+        // A write or a nested mutation can parse a column's default.
+        self.authorization_may_parse_defaults()
+            .then(|| (max_statement_tokens(), max_value_bytes(), wide_values()))
+    }
+
+    pub fn authorization_plan_key(&self, version: u64) -> Option<AuthorizationPlanKey> {
+        let source = self.authorization_source(version)?;
+        if self.has_privilege_inquiry() {
+            return None;
+        }
+        Some(AuthorizationPlanKey {
+            source: Arc::downgrade(source),
+            domain: self.domain,
+            epoch: self.epoch,
+            transaction: self.transaction,
+            params: self.params,
+            parameter_types: self.parameter_types.clone(),
+            relations: self.relations.clone(),
+            search_path: self.search_path.clone(),
+            schema_user: self.schema_user.clone(),
+            has_views: self.authorization_has_views,
+            privilege_inquiry: self.privilege_inquiry,
+            budgets: self.authorization_budgets(),
+        })
     }
 }
 

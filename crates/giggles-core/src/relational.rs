@@ -39,6 +39,8 @@ pub use clock::StatementClock;
 #[allow(dead_code)]
 pub(crate) mod catalog_ext;
 mod catalog_presentation;
+pub use schema_binding::AuthorizationPlanKey;
+use schema_binding::AuthorizationBinding;
 pub use catalog_presentation::{CatalogConstraint, CatalogPresentation, CatalogView, ForeignKeyTarget};
 use catalog_ext::*;
 mod ident;
@@ -1808,6 +1810,7 @@ pub struct Prepared {
     extension_owner: std::sync::Arc<std::sync::atomic::AtomicU32>,
     warnings: Vec<String>,
     authorization_has_views: bool,
+    authorization_binding: Option<AuthorizationBinding>,
     privilege_inquiry: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2022,6 +2025,7 @@ impl Prepared {
             unbound_statement: None,
             warnings: vec![],
             authorization_has_views: false,
+            authorization_binding: None,
             privilege_inquiry: false,
         }
     }
@@ -3073,6 +3077,7 @@ impl Prepared {
             unbound_statement: None,
             warnings: vec![],
             authorization_has_views: false,
+            authorization_binding: None,
             privilege_inquiry: false,
             statement: Statement::Select {
                 name: scan.table,
@@ -3528,6 +3533,7 @@ impl Prepared {
             unbound_statement: None,
             warnings: take_sql_warnings(),
             authorization_has_views: false,
+            authorization_binding: None,
             privilege_inquiry: p.privilege_seen,
         })
     }
@@ -4171,6 +4177,7 @@ impl Relational {
             unbound_statement: None,
                 warnings: vec![],
             authorization_has_views: false,
+            authorization_binding: None,
             privilege_inquiry: false,
                 statement: Statement::Insert {
                     name: values.name.clone(),

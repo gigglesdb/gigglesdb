@@ -60,8 +60,10 @@ impl SqlSession {
 
     /// Immutable transaction-control syntax for caller authorization, without SQL parsing.
     pub fn block_control(commit: bool) -> relational::Prepared {
-        if commit { relational::Prepared::commit_engine(0, 0) }
-        else { relational::Prepared::begin_engine(0, 0) }
+        let mut prepared = if commit { relational::Prepared::commit_engine(0, 0) }
+        else { relational::Prepared::begin_engine(0, 0) };
+        prepared.mark_implicit_authorization_block(commit);
+        prepared
     }
 
     /// Whether transaction controls can bypass the legacy SQL engine.
@@ -332,6 +334,9 @@ impl SqlSession {
                 }
                 p.transaction = self.transaction_id;
                 p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
+                if self.authorization_bindings && self.task.is_none() {
+                    p.enable_sql_authorization_binding();
+                }
                 // Match legacy preparation: authority sees bound dependency names,
                 // while semantic errors remain deferred until after authorization.
                 if let Ok(bound) = self.bind_relation_context(&p) {

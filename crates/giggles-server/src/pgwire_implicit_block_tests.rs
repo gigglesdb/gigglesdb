@@ -283,6 +283,79 @@ fn unnamed_cache_hit_and_transaction_exclusion() {
 }
 
 #[test]
+fn unnamed_parse_replays_authorization_on_postgres_surface() {
+    let mut session = fixture();
+    assert_eq!(session.service.admin.engine(), Engine::V2);
+    session.execute_sql("CREATE TABLE t (id INT PRIMARY KEY)", &[]).unwrap();
+    session.execute_sql("INSERT INTO t VALUES (1)", &[]).unwrap();
+    session.set_postgres_surface();
+    let mut state = state();
+    let sql = "SELECT id FROM t";
+    assert_eq!(text_rows(&extended(&mut state, &mut session, sql).unwrap()), [["1"]]);
+
+    let hits = session.authorization_hits;
+    let runs = session.authorization_full_runs;
+    parse_sql(&mut state, &mut session, sql).unwrap();
+    assert_eq!(session.authorization_hits, hits + 1);
+    assert_eq!(session.authorization_full_runs, runs);
+}
+
+#[test]
+fn named_and_unnamed_authorization_hit_in_explicit_transactions() {
+    use giggles_core::roles::TablePrivilege::Select;
+
+    let mut owner = fixture();
+    owner.execute_sql("CREATE TABLE t (id INT PRIMARY KEY, v INT)", &[]).unwrap();
+    owner.execute_sql("INSERT INTO t VALUES (1, 7)", &[]).unwrap();
+    let roles = owner.service.admin.roles();
+    roles.create(NewRole { name: "reader".into(), login: true, ..Default::default() }).unwrap();
+    roles.grant_table("t", "reader", &[Select]).unwrap();
+
+    for begin in ["BEGIN ISOLATION LEVEL READ COMMITTED", "BEGIN ISOLATION LEVEL REPEATABLE READ"] {
+        for name in ["named", ""] {
+            let mut reader = owner.service.role_session("reader").unwrap();
+            reader.set_postgres_surface();
+            let mut state = state();
+            simple(&mut state, &mut reader, begin).unwrap();
+            simple(&mut state, &mut reader, "SELECT 1").unwrap();
+            metadata_parse(&mut state, &mut reader, name);
+            metadata_bind(&mut state, &mut reader, name);
+            assert_eq!(text_rows(&metadata_describe_execute(&mut state, &mut reader).unwrap()), [["7"]]);
+
+            let hits = reader.authorization_hits;
+            if name.is_empty() {
+                metadata_parse(&mut state, &mut reader, name);
+            }
+            metadata_bind(&mut state, &mut reader, name);
+            assert_eq!(text_rows(&metadata_describe_execute(&mut state, &mut reader).unwrap()), [["7"]]);
+            assert!(reader.authorization_hits > hits, "{begin}, statement {name:?}");
+
+            // A committed REVOKE by another session reaches the next Bind of the
+            // same warmed statement (no re-Parse), even under REPEATABLE READ.
+            roles.revoke_table("t", "reader", &[Select]).unwrap();
+            let (hits, runs) = (reader.authorization_hits, reader.authorization_full_runs);
+            let mut body = Vec::new();
+            cstr("", &mut body);
+            cstr(name, &mut body);
+            body.extend(0u16.to_be_bytes());
+            body.extend(1u16.to_be_bytes());
+            body.extend(1i32.to_be_bytes());
+            body.push(b'1');
+            body.extend(0u16.to_be_bytes());
+            assert_eq!(
+                state.handle(b'B', &body, &mut reader, &mut Vec::new(), std::time::Instant::now()),
+                Err("42501"),
+                "{begin}, statement {name:?}"
+            );
+            assert_eq!(reader.authorization_hits, hits, "{begin}, statement {name:?}");
+            assert!(reader.authorization_full_runs > runs, "{begin}, statement {name:?}");
+            simple(&mut state, &mut reader, "ROLLBACK").unwrap();
+            roles.grant_table("t", "reader", &[Select]).unwrap();
+        }
+    }
+}
+
+#[test]
 fn unnamed_cache_catalog_and_search_path_invalidation() {
     let mut session = fixture();
     session.execute_sql("CREATE TABLE t (id int PRIMARY KEY, v int)", &[]).unwrap();

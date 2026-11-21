@@ -224,6 +224,38 @@ fn preparation_boundary_advances_only_read_committed() {
 }
 
 #[test]
+fn authorization_binding_identifies_the_exact_source_and_catalog() {
+    let path = directory();
+    let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+    let mut session = admin.sql_session();
+    session.enable_authorization_bindings();
+    run(&mut session, "CREATE TABLE t(a int)");
+    let prepared = session.prepare("SELECT a FROM t WHERE a = $1").unwrap();
+    let version = session.statement_catalog_version().unwrap();
+    let key = prepared.authorization_plan_key(version).unwrap();
+
+    assert!(key.matches(&session.bind_relation_context(&prepared).unwrap(), version));
+    let independent = session.prepare("SELECT a FROM t WHERE a = $1").unwrap();
+    assert!(!key.matches(&independent, version));
+    let typed = prepared.clone().with_parameter_types(&[Some(relational::DataType::BigInt)]).unwrap();
+    assert!(!key.matches(&typed, version));
+
+    session.set_search_path("alternate, public", "giggles");
+    let rebound = session.bind_relation_context(&prepared).unwrap();
+    assert!(!key.matches(&rebound, version));
+    run(&mut session, "ALTER TABLE t ADD COLUMN b int");
+    let next = session.statement_catalog_version().unwrap();
+    assert_ne!(next, version);
+    let rebound = session.bind_relation_context(&prepared).unwrap();
+    assert!(rebound.authorization_plan_key(next).is_some());
+    assert!(!key.matches(&rebound, version));
+
+    drop(session);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn portal_view_locks_expand_from_statement_snapshot() {
     let path = directory();
     let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
