@@ -2073,7 +2073,11 @@ impl Session {
     /// Ownership of the owning table is this profile's analogue of PostgreSQL
     /// sequence USAGE/UPDATE privileges; ordinary table grants do not confer it.
     pub(crate) fn authorize_sequence_sql(&mut self, sql: &str) -> Result<(), CoreError> {
-        let dependencies = Prepared::sequence_dependencies(sql);
+        self.authorize_sequence_dependencies(&Prepared::sequence_dependencies(sql))
+    }
+    pub(crate) fn authorize_sequence_dependencies(
+        &mut self, dependencies: &[Option<String>],
+    ) -> Result<(), CoreError> {
         if dependencies.is_empty() {
             return Ok(());
         }
@@ -2083,7 +2087,7 @@ impl Session {
                 giggles_core::task::DenyRule::Sequence,
             )));
         }
-        self.authority_scope(|session| session.authorize_sequences(&dependencies))
+        self.authority_scope(|session| session.authorize_sequences(dependencies))
     }
     fn authorize_create_sequence(&mut self) -> Result<(), CoreError> {
         let allowed = if let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) {
@@ -2979,14 +2983,14 @@ impl Session {
     }
     /// Recheck fresh application-Parse authority without parsing or describing.
     /// Caller proves this is an unchanged non-DDL SELECT outside a transaction.
-    pub(crate) fn reauthorize_unnamed_parse(&mut self, sql: &str, p: &Prepared) -> Result<(), CoreError> {
+    pub(crate) fn reauthorize_unnamed_parse(&mut self, _sql: &str, dependencies: &[Option<String>], p: &Prepared) -> Result<(), CoreError> {
         #[cfg(test)]
-        if sql.contains("r3_parse_source") && crate::pgwire::UNNAMED_REAUTHORIZE_FAIL.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        if _sql.contains("r3_parse_source") && crate::pgwire::UNNAMED_REAUTHORIZE_FAIL.swap(false, std::sync::atomic::Ordering::SeqCst) {
             return Err(CoreError::Policy(Error::Scope));
         }
         self.authority_scope(|session| {
             session.reconcile_sequence_owners()?;
-            session.authorize_sequence_sql(sql)?;
+            session.authorize_sequence_dependencies(dependencies)?;
             session.authorize(p)
         })
     }

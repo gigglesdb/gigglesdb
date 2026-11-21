@@ -283,7 +283,7 @@ async fn scenario(disabled: bool) -> Vec<Outcome> {
         assert_eq!(super::UNNAMED_REUSE_MISSES.load(Ordering::SeqCst) - misses, usize::from(!hit));
         results.push(response);
     }
-    command(&mut b, "CREATE SEQUENCE r3_parse_source_seq").await;
+    command(&mut b, "CREATE SEQUENCE r3_parse_source_seq OWNED BY r3_parse_source.id").await;
     // Sequence authority in this profile follows inherited ownership, not sequence ACL syntax.
     command(&mut b, "GRANT owner TO r").await;
     command(&mut a, "SET ROLE r").await;
@@ -294,6 +294,47 @@ async fn scenario(disabled: bool) -> Vec<Outcome> {
     let denied = checked(&mut a, sequence_sql, false).await;
     assert_eq!(code(&denied).as_deref(), Some("42501"));
     results.push(denied);
+    // Regrant behind the same cached text: authorization must become live again.
+    command(&mut b, "GRANT owner TO r").await;
+    // A rejected Parse resets the core prepared context, so regrant first
+    // succeeds through the fresh path and the following execution hits again.
+    let granted = checked(&mut a, sequence_sql, false).await;
+    assert_eq!(code(&granted), None);
+    results.push(granted);
+    results.push(checked(&mut a, sequence_sql, true).await);
+    // Sequence authority must also be found below the outer SELECT.
+    for nested in [
+        "SELECT (SELECT nextval('r3_parse_source_seq'))",
+        "SELECT EXISTS (SELECT nextval('r3_parse_source_seq'))",
+        "SELECT 1 IN (SELECT nextval('r3_parse_source_seq'))",
+    ] {
+        results.push(checked(&mut a, nested, false).await);
+        let warm = checked(&mut a, nested, true).await;
+        assert_eq!(code(&warm), None);
+        results.push(warm);
+        command(&mut b, "REVOKE owner FROM r").await;
+        let denied = checked(&mut a, nested, false).await;
+        assert_eq!(code(&denied).as_deref(), Some("42501"));
+        results.push(denied);
+        command(&mut b, "GRANT owner TO r").await;
+    }
+    // DDL may invalidate the entry rather than hit it; both routes must give
+    // precisely the same complete ErrorResponse as a fresh parse.
+    results.push(checked(&mut a, sequence_sql, false).await);
+    results.push(checked(&mut a, sequence_sql, true).await);
+    // Main deliberately rejects sequence rename (also pinned by
+    // sequence_ddl_network); keep that behavior and prove the old text still hits.
+    let rename = extended(&mut b,
+        "ALTER SEQUENCE r3_parse_source_seq RENAME TO r3_parse_source_seq2", true).await;
+    assert_eq!(code(&rename).as_deref(), Some("0A000"));
+    results.push(rename);
+    results.push(checked(&mut a, sequence_sql, true).await);
+    command(&mut b, "DROP SEQUENCE r3_parse_source_seq").await;
+    let dropped = checked(&mut a, sequence_sql, false).await;
+    // With no remaining owned sequence, this profile denies before name lookup.
+    assert_eq!(code(&dropped).as_deref(), Some("42501"));
+    results.push(dropped);
+    command(&mut b, "REVOKE owner FROM r").await;
     command(&mut a, "RESET ROLE").await;
     command(&mut b, "GRANT USAGE ON SCHEMA s TO r").await;
     command(&mut b, "GRANT SELECT ON s.r3_parse_source TO r").await;

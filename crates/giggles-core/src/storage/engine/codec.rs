@@ -97,7 +97,8 @@ pub(crate) fn split_versioned(key: &[u8]) -> Result<(&[u8], Ts), CodecError> {
 }
 
 pub(crate) fn user_key_seek_at(user_key: &[u8], snapshot: Ts) -> Vec<u8> {
-    let mut key = user_key.to_vec();
+    let mut key = Vec::with_capacity(user_key.len() + 8);
+    key.extend_from_slice(user_key);
     key.extend_from_slice(&snapshot.inverted_be());
     key
 }
@@ -105,7 +106,8 @@ pub(crate) fn user_key_seek_at(user_key: &[u8], snapshot: Ts) -> Vec<u8> {
 /// Exclusive upper bound `user_key || [0xff; 8] || [0x00]`, including timestamp zero.
 /// Range isolation assumes prefix-free user keys under the fixed schema.
 pub(crate) fn user_key_upper_bound(user_key: &[u8]) -> Vec<u8> {
-    let mut key = user_key.to_vec();
+    let mut key = Vec::with_capacity(user_key.len() + 9);
+    key.extend_from_slice(user_key);
     key.extend_from_slice(&[0xff; 8]);
     key.push(0);
     key
@@ -230,6 +232,22 @@ pub(crate) fn decode_row(key: &[u8], record: &[u8]) -> Result<RowRecord, CodecEr
 #[cfg(test)]
 mod tests {
     use super::{CodecError, Ts, split_versioned, user_key_seek_at};
+
+    #[test]
+    fn versioned_key_concatenation_equivalence() {
+        for user in [vec![], vec![0x42], b"table/primary/key".to_vec(), vec![0xab; 4096]] {
+            for timestamp in [0, 1, u64::MAX, 0x0123_4567_89ab_cdef] {
+                assert_eq!(user_key_seek_at(&user, Ts(timestamp)),
+                    [user.as_slice(), &(!timestamp).to_be_bytes()].concat());
+                assert_eq!(super::user_key_upper_bound(&user),
+                    [user.as_slice(), &[0xff; 8], &[0]].concat());
+            }
+        }
+        assert_eq!(user_key_seek_at(b"k", Ts(0x0123_4567_89ab_cdef)),
+            vec![0x6b, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10]);
+        assert_eq!(super::user_key_upper_bound(b"k"),
+            vec![0x6b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
+    }
 
     #[test]
     fn versioned_key_requires_a_user_byte_and_timestamp() {

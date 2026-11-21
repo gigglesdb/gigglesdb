@@ -638,3 +638,38 @@ fn unknown_outcome_rechecks_leadership_only_on_error() {
         }
     }
 }
+
+#[test]
+fn unnamed_cache_sequence_dependency_equivalence() {
+    let mut session = fixture();
+    session.execute_sql("CREATE TABLE t (id serial PRIMARY KEY)", &[]).unwrap();
+    session.execute_sql("CREATE SEQUENCE s OWNED BY t.id", &[]).unwrap();
+    let mut state = state();
+    for sql in [
+        "WITH q AS (SELECT nextval('s') AS n) SELECT n FROM q",
+        "SELECT (SELECT currval('s'))",
+        "SELECT EXISTS (SELECT nextval('s'))",
+        "SELECT 1 IN (SELECT nextval('s'))",
+        "SELECT CASE WHEN true THEN nextval('s') ELSE currval('s') END",
+        "SELECT coalesce(setval('s', 7), currval('s'))",
+        "SELECT nextval('public.s')",
+        "SELECT nextval('s'::regclass)",
+    ] {
+        parse_sql(&mut state, &mut session, sql).unwrap();
+        let cached = state.unnamed_cache.iter().find(|entry| entry.sql == sql).unwrap();
+        let unbound = Prepared::sequence_dependencies(sql);
+        assert!(!unbound.is_empty(), "{sql}");
+        assert_eq!(&*cached.sequence_dependencies, unbound.as_slice(), "{sql}");
+        let Plan::Sql(bound) = &cached.p else { panic!("SQL plan expected") };
+        println!("sequence equivalence: {sql}: bound_equal={} unbound={unbound:?} bound={:?}", bound.sequences() == unbound, bound.sequences());
+    }
+    for sql in [
+        "CREATE TABLE defaults (id int DEFAULT nextval('s'))",
+        "INSERT INTO t DEFAULT VALUES",
+        "INSERT INTO t (id) VALUES (DEFAULT)",
+    ] {
+        parse_sql(&mut state, &mut session, sql).unwrap();
+        assert!(state.statements[""].parse_context.is_none(), "{sql}");
+        assert!(state.unnamed_cache.iter().all(|entry| entry.sql != sql));
+    }
+}

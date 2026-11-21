@@ -231,6 +231,7 @@ impl State {
             parameter_oids[i] = o;
         }
         Ok(Statement {
+            sequence_dependencies: Default::default(),
             parse_context: None,
             description_version: None,
             sql_bytes: sql.len(),

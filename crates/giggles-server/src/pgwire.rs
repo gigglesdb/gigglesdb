@@ -1078,6 +1078,8 @@ impl ParseContext {
 }
 #[derive(Clone)]
 struct Statement {
+    // Syntax-only dependencies: binding may qualify names or add defaults.
+    sequence_dependencies: std::sync::Arc<[Option<String>]>,
     // Only an unnamed application SELECT prepared outside a transaction gets a key.
     parse_context: Option<std::sync::Arc<ParseContext>>,
     description_version: Option<u64>,
@@ -1522,6 +1524,7 @@ impl State {
             }
             let d = crate::agent::preview::approver_description(&change);
             return Ok(Statement {
+                sequence_dependencies: Default::default(),
                 parse_context: None,
                 description_version: None,
                 sql_bytes: sql.len(),
@@ -1545,6 +1548,7 @@ impl State {
             }
             let d = crate::task_ddl::description(&stmt);
             return Ok(Statement {
+                sequence_dependencies: Default::default(),
                 parse_context: None,
                 description_version: None,
                 sql_bytes: sql.len(),
@@ -1783,7 +1787,13 @@ impl State {
             && plain_application
             && matches!(&p, Plan::Sql(p) if !p.is_ddl() && p.command() == "SELECT"))
             .then(|| std::sync::Arc::new(ParseContext::current(&self.settings.current, session)));
+        let sequence_dependencies = if parse_context.is_some() {
+            Prepared::sequence_dependencies(sql).into()
+        } else {
+            Default::default()
+        };
         Ok(Statement {
+            sequence_dependencies,
             parse_context,
             description_version,
             sql_bytes: sql.len(),
@@ -1826,13 +1836,13 @@ impl State {
             if let Some(hook) = hook { hook(); }
         }
         // Preserve the dispatch chain's first authorization, including sequence errors.
-        if session.authorize_sequence_sql(sql).is_err() { return Ok(None); }
+        if session.authorize_sequence_dependencies(&old.sequence_dependencies).is_err() { return Ok(None); }
         // SELECT authorization proves visibility of every application dependency;
         // catalog_plan returned None for this unchanged SQL, so skipping it cannot
         // expose catalog relations or bypass their visibility checks.
         // Re-run the application path's live authority checks. Any error or drift
         // takes the full path, which owns error ordering and diagnostic fields.
-        if session.reauthorize_unnamed_parse(sql, p).is_err() {
+        if session.reauthorize_unnamed_parse(sql, &old.sequence_dependencies, p).is_err() {
             self.unnamed_cache.clear();
             return Ok(None);
         }
