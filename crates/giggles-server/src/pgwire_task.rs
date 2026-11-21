@@ -303,46 +303,13 @@ impl State {
         if crate::pg_settings::empty_sql(sql)? {
             return Ok((Plan::Empty, no_shape()));
         }
-        if let Some(command) = parse_control(sql, session, &mut self.diagnostic)? {
-            return Err(refused(&mut self.diagnostic, &Plan::Control(command)));
-        }
-        if let Some(show) = show_settings(sql, session, &mut self.diagnostic)? {
-            admit(&mut self.diagnostic, session, StatementClass::Show)?;
-            let (description, _) = inspect(show, &self.settings.current, session)?;
-            return Ok((Plan::Inspect(show), description));
-        }
-        match parse_settings(sql, session, &mut self.diagnostic) {
-            Ok(Some(settings)) => {
-                admit(&mut self.diagnostic, session, StatementClass::Set)?;
-                if settings.len() != 1 {
-                    return Err("42601");
-                }
-                if !setting_allowed(&settings[0]) {
-                    return Err(refuse(&mut self.diagnostic, StatementClass::Set));
-                }
-                return Ok((Plan::Settings(settings), no_shape()));
-            }
-            Ok(None) => {}
-            Err(code) => return Err(code),
-        }
-        if sql
-            .trim_start_matches(|c: char| c.is_ascii_whitespace())
-            .starts_with("GIGGLES")
-        {
-            return Err(refuse(&mut self.diagnostic, StatementClass::Other));
-        }
-        if let Some(function) = settings_functions::parse(sql, session, &mut self.diagnostic)? {
-            let plan = Plan::SettingsFunction(function);
-            let class = plan_class(&plan).unwrap_or(StatementClass::Other);
-            admit(&mut self.diagnostic, session, class)?;
-            let Plan::SettingsFunction(function) = plan else {
-                unreachable!()
+        if let Some(plan) = detect_task_settings(sql, session, &mut self.diagnostic)? {
+            let description = match &plan {
+                Plan::Inspect(show) => inspect(*show, &self.settings.current, session)?.0,
+                Plan::SettingsFunction(function) => settings_functions::description(function),
+                _ => no_shape(),
             };
-            if !function_allowed(&function) {
-                return Err(refuse(&mut self.diagnostic, class));
-            }
-            let description = settings_functions::description(&function);
-            return Ok((Plan::SettingsFunction(function), description));
+            return Ok((plan, description));
         }
         if let Some(planned) = self.task_catalog_plan(sql, session)? {
             return Ok(planned);
@@ -520,7 +487,13 @@ impl State {
         out: &mut Vec<u8>,
     ) -> R<()> {
         session.sql.set_task_entry(ENTRY_PGWIRE_SIMPLE);
-        let statements = simple::split(sql)?;
+        let statements = match task_simple_statements(sql, &mut self.diagnostic) {
+            Ok(statements) => statements,
+            Err(code) => {
+                self.log_task_refusal(session, sql, 0);
+                return Err(code);
+            }
+        };
         match statements.as_slice() {
             [] => frame(b'I', &[], out),
             [statement] => self.task_statement(statement, session, out),
@@ -922,4 +895,80 @@ impl From<&'static str> for TaskRun {
     fn from(code: &'static str) -> Self {
         TaskRun::Wire(code)
     }
+}
+
+/// The task settings/control detectors, including SET/RESET's refusal fallback.
+/// Admission and diagnostics are shared so the native API cannot drift from pgwire.
+fn detect_task_settings(sql: &str, session: &mut Session, diagnostic: &mut Diagnostic) -> R<Option<Plan>> {
+    let detected = (|| {
+        if let Some(command) = parse_control(sql, session, diagnostic)? {
+            return Err(refuse(diagnostic, plan_class(&Plan::Control(command)).unwrap()));
+        }
+        if let Some(show) = show_settings(sql, session, diagnostic)? {
+            admit(diagnostic, session, StatementClass::Show)?;
+            return Ok(Some(Plan::Inspect(show)));
+        }
+        match parse_settings(sql, session, diagnostic) {
+            Ok(Some(settings)) => {
+                admit(diagnostic, session, StatementClass::Set)?;
+                if settings.len() != 1 {
+                    return Err("42601");
+                }
+                if !setting_allowed(&settings[0]) {
+                    return Err(refuse(diagnostic, StatementClass::Set));
+                }
+                return Ok(Some(Plan::Settings(settings)));
+            }
+            Ok(None) => {}
+            Err(code) => return Err(code),
+        }
+        if sql
+            .trim_start_matches(|c: char| c.is_ascii_whitespace())
+            .starts_with("GIGGLES")
+        {
+            return Err(refuse(diagnostic, StatementClass::Other));
+        }
+        if let Some(function) = settings_functions::parse(sql, session, diagnostic)? {
+            let plan = Plan::SettingsFunction(function);
+            let class = plan_class(&plan).unwrap_or(StatementClass::Other);
+            admit(diagnostic, session, class)?;
+            let Plan::SettingsFunction(function) = plan else {
+                unreachable!()
+            };
+            if !function_allowed(&function) {
+                return Err(refuse(diagnostic, class));
+            }
+            return Ok(Some(Plan::SettingsFunction(function)));
+        }
+        Ok(None)
+    })();
+    match detected {
+        Err(code) if matches!(code, "42601" | "42704" | "0A000")
+            && !is_refusal(code, diagnostic.message)
+            && leading_word_is(sql, &["set", "reset"]) => Err(refuse(diagnostic, StatementClass::Set)),
+        other => other,
+    }
+}
+
+fn task_simple_statements(sql: &str, diagnostic: &mut Diagnostic) -> R<Vec<String>> {
+    let statements = simple::split(sql)?;
+    if statements.len() > 1 {
+        return Err(refuse(diagnostic, StatementClass::TransactionControl));
+    }
+    Ok(statements)
+}
+
+/// API SQL shares pgwire's settings recognition and comment normalization.
+/// Only SET/RESET and set_config refusals use task metadata here; controls,
+/// multi-statements, inspection and other forms keep the legacy SQL route.
+pub(crate) fn api_settings_refusal(sql: &str, session: &mut Session) -> Option<(StatementClass, CoreError)> {
+    let statements = simple::split(sql).ok()?;
+    let [statement] = statements.as_slice() else {
+        return None;
+    };
+    let mut diagnostic = Diagnostic::default();
+    let _ = detect_task_settings(statement, session, &mut diagnostic);
+    diagnostic
+        .task_refusal
+        .filter(|(class, _)| *class == StatementClass::Set)
 }

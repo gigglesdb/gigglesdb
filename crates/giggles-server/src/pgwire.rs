@@ -4012,3 +4012,5 @@ mod unnamed_parse_network;
 static UNNAMED_BEFORE_REAUTHORIZE: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
 #[cfg(test)]
 static UNNAMED_CONTEXT_MISSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) use task_path::api_settings_refusal;

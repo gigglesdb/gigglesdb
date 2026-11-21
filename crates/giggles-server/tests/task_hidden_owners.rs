@@ -267,3 +267,54 @@ async fn stored_bootstrap_owner_is_presented_as_ten() {
         vec![vec![Some("10".into()), Some("giggles".into())]]);
     assert!(!answer(&c, "c.relname, r.rolname, n.nspname FROM pg_class c JOIN pg_roles r ON c.relowner = r.oid JOIN pg_namespace n ON c.relnamespace = n.oid").await.unwrap().is_empty());
 }
+
+/// A real task on a non-public schema must hide that schema's unrelated owner.
+#[tokio::test]
+async fn non_public_task_hides_schema_owner() {
+    use giggles_core::roles::{SchemaPrivilege, TablePrivilege};
+    let f = R3Fixture::start().await;
+    let h = role(&f, "h");
+    f.sql("CREATE SCHEMA s AUTHORIZATION h");
+    let ordinary_owner = answer(&f.controller().await,
+        "nspowner, pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 's'").await.unwrap();
+    assert_eq!(ordinary_owner, vec![vec![Some(h.to_string()), Some("h".into())]]);
+    f.sql("CREATE TABLE s.t (merchant_id bigint, id bigint, status text, failed_at timestamptz, attempt_count int, customer_email text, card_token text, PRIMARY KEY (merchant_id, id))");
+    f.sql("INSERT INTO s.t VALUES (42, 1, 'failed', '2026-11-05 17:01:00+00', 0, 'private', 'secret')");
+    f.admin().roles().set_table_owner("s\0t", support::CONTROLLER).unwrap();
+    for name in [support::CONTROLLER, support::EXECUTOR] {
+        f.admin().roles().grant_schema("s", name, &[SchemaPrivilege::Usage]).unwrap();
+        f.admin().roles().grant_table("s\0t", name, &[TablePrivilege::Select, TablePrivilege::Update]).unwrap();
+    }
+    let create = support::inc_436_sql(&support::agent_support::timestamptz(f.expires_ms))
+        .replace("ON shipments", "ON s.t");
+    f.controller().await.simple_query(&create).await.unwrap();
+    let c = f.agent().await;
+    assert!(!answer(&c, "id FROM s.t").await.unwrap().is_empty());
+    let owners = answer(&c, "nspowner, pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 's'").await.unwrap();
+    assert_eq!(owners.len(), 1);
+    assert_ne!(owners[0][0], Some(h.to_string()));
+    assert_eq!(owners[0][0].as_deref(), Some("10"));
+    assert_ne!(owners[0][1].as_deref(), Some("h"));
+    let names = answer(&c, "schema_owner FROM information_schema.schemata WHERE schema_name = 's'").await.unwrap();
+    assert_eq!(names.len(), 1);
+    assert_ne!(names[0][0].as_deref(), Some("h"));
+    for p in ["CREATE", "USAGE"] {
+        assert_eq!(answer(&c, &format!("has_schema_privilege({h}::oid,'s','{p}')")).await,
+            answer(&c, &format!("has_schema_privilege(4294967000::oid,'s','{p}')")).await, "{p}");
+        assert_eq!(answer(&c, &format!("has_schema_privilege('h','s','{p}')")).await,
+            answer(&c, &format!("has_schema_privilege('absent','s','{p}')")).await, "{p}");
+    }
+    for (table, column) in [
+        ("pg_namespace", "nspowner"), ("pg_class", "relowner"), ("pg_type", "typowner"), ("pg_proc", "proowner"),
+        ("pg_collation", "collowner"), ("pg_extension", "extowner"), ("pg_database", "datdba"),
+        ("pg_roles", "oid"), ("pg_authid", "oid"), ("pg_user", "usesysid"),
+        ("pg_auth_members", "roleid"), ("pg_auth_members", "member"), ("pg_auth_members", "grantor"),
+    ] {
+        let rows = answer(&c, &format!("{column} FROM {table}")).await.unwrap();
+        assert!(rows.iter().all(|r| r[0] != Some(h.to_string())), "{table}.{column}");
+    }
+    for (table, column) in [("pg_tables", "tableowner"), ("information_schema.schemata", "schema_owner")] {
+        let rows = answer(&c, &format!("{column} FROM {table}")).await.unwrap();
+        assert!(rows.iter().all(|r| r[0].as_deref() != Some("h")), "{table}.{column}");
+    }
+}

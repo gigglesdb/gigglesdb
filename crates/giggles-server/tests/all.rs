@@ -384,3 +384,6 @@ mod w1e_task_privileges;
 mod task_hidden_owners;
 #[path = "task_qualified_target.rs"]
 mod task_qualified_target;
+
+#[path = "task_search_path_api.rs"]
+mod task_search_path_api;

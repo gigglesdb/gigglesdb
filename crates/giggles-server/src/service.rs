@@ -3032,6 +3032,17 @@ impl Session {
         }
         Ok(self.sql.read_page(request, after, bindings))
     }
+    /// Share pgwire settings admission and log refusals before API SQL executes.
+    pub(crate) fn admit_api_sql_settings(&mut self, sql: &str, bindings: usize) -> Result<(), CoreError> {
+        if self.task().is_none() {
+            return Ok(());
+        }
+        if let Some((class, error)) = crate::pgwire::api_settings_refusal(sql, self) {
+            self.sql.log_refused_task_statement(sql, class, bindings, &error);
+            return Err(error);
+        }
+        Ok(())
+    }
     /// SQL text over the API (`Request::Sql`), held until `release_page`. In
     /// a task session the statement is prepared and admitted first, and a
     /// refusal there, which never reaches core, is logged once; the read-log
@@ -3051,6 +3062,7 @@ impl Session {
                     .log_refused_task_statement(sql, class, params.len(), &error);
                 Err(error)
             };
+            session.admit_api_sql_settings(sql, params.len())?;
             // Server task DDL must be refused before core's SQL parser, as
             // on pgwire; CREATE TASK is not core SQL grammar.
             if crate::task_ddl::parse(sql).is_some() {

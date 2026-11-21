@@ -324,7 +324,7 @@ async fn agent_api_statements_reach_admission() {
         // privilege intersection (no SELECT grant here).
         (json!({"text": {"text": "shipments where id=1"}}), "42501"),
         (json!({"begin": {}}), "0A000"),
-        (json!({"searchPath": {"set": true, "schemas": ["public"]}}), "ok"),
+        (json!({"searchPath": {"set": true, "schemas": ["public"]}}), "0A000"),
     ] {
         let (status, reply) = f.exec_http(address, &f.agent, &token, body.clone()).await;
         assert_eq!((status, reply["code"].as_str()), (200, Some(code)), "{body}: {reply}");

@@ -260,10 +260,13 @@ pub(crate) fn admit_legacy(
     session: &mut Session,
     request: &crate::Request,
 ) -> Result<(), CoreError> {
-    if session.task().is_none() || matches!(request, crate::Request::Sql { .. }) {
+    if session.task().is_none() {
         return Ok(());
     }
     session.check_binding()?;
+    if let crate::Request::Sql { sql, params } = request {
+        return session.admit_api_sql_settings(sql, params.len());
+    }
     let class = legacy_class(request);
     session.admit(class).inspect_err(|error| {
         session.sql.log_refused_task_statement("", class, 0, error);
@@ -425,6 +428,11 @@ pub(crate) fn run(
         if session.task().is_some() {
             let class = class(&invocation);
             let mut admitted = session.admit(class);
+            // Set remains admitted for pgwire's setting allow-list, but the
+            // native setter must never change a task session's resolution path.
+            if admitted.is_ok() && matches!(invocation, Invocation::SearchPath(Some(_))) {
+                admitted = Err(CoreError::Task(TaskError::NotAllowedInTaskSession(StatementClass::Set)));
+            }
             if admitted.is_ok() && class == StatementClass::Update && operation_id.is_none() {
                 admitted = Err(CoreError::Task(TaskError::OperationIdRequired));
             }
