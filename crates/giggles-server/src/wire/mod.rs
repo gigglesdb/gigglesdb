@@ -1,3 +1,4 @@
+mod auth;
 pub mod client;
 pub(crate) mod conn;
 pub(crate) mod exec;

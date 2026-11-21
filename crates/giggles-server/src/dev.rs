@@ -282,7 +282,9 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             let config = RoleApiConfig {
                 http: (!grpc).then_some(address),
                 grpc: grpc.then_some(address),
+                wire: None,
                 tls: TlsMode::Disabled,
+                wire_tls: None,
                 certificate: None,
                 private_key: None,
                 client_ca: None,

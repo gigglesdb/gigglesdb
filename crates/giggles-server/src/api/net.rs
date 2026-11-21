@@ -162,6 +162,7 @@ async fn serve_bound(
 pub(crate) struct RoleConnection {
     pub peer: SocketAddr,
     pub certificate: Option<String>,
+    pub tls: bool,
 }
 trait RoleIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> RoleIo for T {}
@@ -209,13 +210,14 @@ pub async fn serve_role_bound(
                     let acceptor = acceptor.clone();
                     sockets.spawn(async move {
                         let _local = local;
+                        let tls = acceptor.is_some();
                         let (stream, certificate): (Box<dyn RoleIo>, Option<String>) = if let Some(acceptor) = acceptor {
                             let Ok(Ok(stream)) = timeout(IO_TIMEOUT, acceptor.accept(socket)).await else { return; };
                             if grpc && stream.get_ref().1.alpn_protocol() != Some(b"h2") { return; }
                             let certificate = stream.get_ref().1.peer_certificates().and_then(|chain| chain.first()).map(|cert| tls::fingerprint(cert.as_ref()));
                             (Box::new(stream), certificate)
                         } else { (Box::new(socket), None) };
-                        let identity = Ok(ConnectionIdentity::role_connection(RoleConnection { peer, certificate }));
+                        let identity = Ok(ConnectionIdentity::role_connection(RoleConnection { peer, certificate, tls }));
                         let activity = Arc::new(ConnectionActivity::new());
                         let monitor = activity.clone();
                         let handler = service_fn(move |request| {

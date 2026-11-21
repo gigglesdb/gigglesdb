@@ -11,10 +11,10 @@ use giggles_server::{
         ApiLimits, ApiRuntime,
         net::{serve_grpc_bound, serve_http_bound, serve_role_bound},
     },
-    auth::{PostgresqlConfig, RoleApiConfig, serve_postgresql_bound},
+    auth::{PostgresqlConfig, RoleApiConfig, TlsMode, serve_postgresql_bound},
     clock::Clock,
     serve_bound, serve_pg_bound, tls,
-    wire::listen::serve_wire_bound,
+    wire::listen::{serve_role_wire_bound, serve_wire_bound},
 };
 use serde::Deserialize;
 use std::{
@@ -890,15 +890,24 @@ async fn start_listeners(
         }
         _ => None,
     };
+    enum RoleProtocol {
+        Http,
+        Grpc,
+        Wire,
+    }
     let mut role_sockets = Vec::new();
     if let Some(settings) = &c.role_api {
         let settings = std::sync::Arc::new(settings.build()?);
-        for (grpc, address) in [(false, settings.http), (true, settings.grpc)] {
+        for (protocol, address) in [
+            (RoleProtocol::Http, settings.http),
+            (RoleProtocol::Grpc, settings.grpc),
+            (RoleProtocol::Wire, settings.wire),
+        ] {
             if let Some(address) = address {
                 let socket = bind_listener(address, retry).await?;
                 let runtime =
                     ApiRuntime::new_role(service.clone(), c.api_limits, settings.clone())?;
-                role_sockets.push((grpc, socket, settings.clone(), runtime));
+                role_sockets.push((protocol, socket, settings.clone(), runtime));
             }
         }
     }
@@ -910,12 +919,28 @@ async fn start_listeners(
     let mut listeners = Vec::new();
     let mut addresses = Vec::new();
     let setup: io::Result<()> = async {
-        for (grpc, socket, settings, runtime) in role_sockets {
-            let listener = serve_role_bound(socket, runtime, settings.clone(), gate.clone(), grpc).await?;
-            let protocol = if grpc { "grpc" } else { "http" };
-            if settings.tls == giggles_server::auth::TlsMode::Disabled {
-                eprintln!("role_api {protocol} listener on {} has TLS disabled; sessions and credentials cross the network in clear", listener.address);
-            }
+        for (protocol, socket, settings, runtime) in role_sockets {
+            let (protocol, listener) = match protocol {
+                RoleProtocol::Wire => {
+                    let mode = settings.wire_mode;
+                    let listener = serve_role_wire_bound(socket, runtime, settings, gate.clone()).await?;
+                    if !listener.address.ip().is_loopback() && mode != TlsMode::Required {
+                        let mode = if mode == TlsMode::Disabled { "disabled" } else { "optional" };
+                        eprintln!("role_api wire listener on {} has TLS {mode}; plaintext sessions cross the network in clear", listener.address);
+                    }
+                    ("wire", listener)
+                }
+                RoleProtocol::Http | RoleProtocol::Grpc => {
+                    let grpc = matches!(protocol, RoleProtocol::Grpc);
+                    let protocol = if grpc { "grpc" } else { "http" };
+                    let mode = settings.tls;
+                    let listener = serve_role_bound(socket, runtime, settings, gate.clone(), grpc).await?;
+                    if mode == TlsMode::Disabled {
+                        eprintln!("role_api {protocol} listener on {} has TLS disabled; sessions and credentials cross the network in clear", listener.address);
+                    }
+                    (protocol, listener)
+                }
+            };
             addresses.push(format!("role_{protocol}={}", listener.address));
             listeners.push(listener);
         }
@@ -1170,7 +1195,10 @@ fn check_role_api_addresses(c: &Config) -> io::Result<()> {
         agent.and_then(|a| a.grpc),
         agent.and_then(|a| a.wire),
     ];
-    for address in [role_api.http, role_api.grpc].into_iter().flatten() {
+    for address in [role_api.http, role_api.grpc, role_api.wire]
+        .into_iter()
+        .flatten()
+    {
         if others.contains(&Some(address)) {
             return Err(io::Error::other(
                 "role_api address overlaps http, grpc, wire, postgresql.listen, or agent listeners",
@@ -1252,6 +1280,12 @@ mod tests {
         c.role_api.as_mut().unwrap().http = None;
         c.http = address;
         assert!(check_role_api_addresses(&c).is_err());
+        c.role_api.as_mut().unwrap().wire = address;
+        assert!(validate_role_api_startup(&c).is_err());
+        c.role_api.as_mut().unwrap().grpc = None;
+        assert!(check_role_api_addresses(&c).is_err());
+        c.http = None;
+        assert!(validate_role_api_startup(&c).is_ok());
         c.role_api = None;
         assert!(validate_role_api_startup(&c).is_ok());
         let json = serde_json::json!({
@@ -1338,6 +1372,29 @@ mod tests {
         assert!(validate_agent(&config).is_ok());
         assert_eq!(config.wire.unwrap().port(), 4);
         assert_eq!(config.agent.unwrap().wire.unwrap().port(), 5);
+    }
+
+    #[test]
+    fn agent_wire_requires_tls() {
+        let mut config = serde_json::json!({
+            "database": "db", "native": "127.0.0.1:1", "postgres": "127.0.0.1:2",
+            "certificate": "server.pem", "private_key": "server.key", "client_ca": "ca.pem",
+            "bindings": [], "connections": 32, "skew_seconds": 0, "max_pause_seconds": 3600,
+            "agent": {"wire": "127.0.0.1:3"}
+        });
+        assert!(validate_agent(&serde_json::from_value(config.clone()).unwrap()).is_ok());
+        for option in ["tls", "wire_tls"] {
+            for mode in ["disabled", "optional"] {
+                let mut config = config.clone();
+                config["agent"][option] = mode.into();
+                assert!(serde_json::from_value::<Config>(config).is_err());
+            }
+        }
+        for field in ["certificate", "private_key", "client_ca"] {
+            let value = config.as_object_mut().unwrap().remove(field).unwrap();
+            assert!(serde_json::from_value::<Config>(config.clone()).is_err());
+            config[field] = value;
+        }
     }
 
     #[test]

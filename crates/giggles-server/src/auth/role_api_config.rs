@@ -1,4 +1,4 @@
-//! Validated role-authenticated HTTP and gRPC listener configuration.
+//! Validated role-authenticated HTTP, gRPC and native wire listener configuration.
 use super::config::{
     TlsMode, default_connections, default_databases, valid_fingerprint, valid_name,
 };
@@ -12,7 +12,11 @@ pub struct RoleApiConfig {
     pub http: Option<SocketAddr>,
     #[serde(default)]
     pub grpc: Option<SocketAddr>,
+    #[serde(default)]
+    pub wire: Option<SocketAddr>,
     pub tls: TlsMode,
+    #[serde(default)]
+    pub wire_tls: Option<TlsMode>,
     #[serde(default)]
     pub certificate: Option<String>,
     #[serde(default)]
@@ -38,8 +42,11 @@ pub struct RoleApiConfig {
 pub struct RoleApiListener {
     pub http: Option<SocketAddr>,
     pub grpc: Option<SocketAddr>,
+    pub wire: Option<SocketAddr>,
     pub tls: TlsMode,
     pub tls_config: Option<Arc<rustls::ServerConfig>>,
+    pub wire_mode: TlsMode,
+    pub wire_tls_config: Option<Arc<rustls::ServerConfig>>,
     pub certificates: BTreeMap<String, String>,
     pub databases: Vec<String>,
     pub loopback_trust: bool,
@@ -49,10 +56,14 @@ pub struct RoleApiListener {
 }
 
 impl RoleApiConfig {
+    fn wire_mode(&self) -> TlsMode {
+        self.wire_tls.unwrap_or(self.tls)
+    }
+
     fn validate(&self) -> io::Result<(u32, u32)> {
-        if self.http.is_none() && self.grpc.is_none() {
+        if self.http.is_none() && self.grpc.is_none() && self.wire.is_none() {
             return Err(io::Error::other(
-                "role_api requires at least one of http or grpc",
+                "role_api requires at least one of http, grpc, or wire",
             ));
         }
         if self.http.is_some() && self.http == self.grpc {
@@ -60,11 +71,23 @@ impl RoleApiConfig {
                 "role_api http and grpc addresses must differ",
             ));
         }
+        if self.wire.is_some() && (self.wire == self.http || self.wire == self.grpc) {
+            return Err(io::Error::other(
+                "role_api wire address must differ from http and grpc addresses",
+            ));
+        }
+        if self.wire.is_none() && self.wire_tls.is_some() {
+            return Err(io::Error::other(
+                "role_api wire_tls requires a wire address",
+            ));
+        }
+        let wire_tls = self.wire.is_some() && self.wire_mode() != TlsMode::Disabled;
         match self.tls {
             TlsMode::Disabled => {
-                if self.certificate.is_some()
-                    || self.private_key.is_some()
-                    || self.client_ca.is_some()
+                if !wire_tls
+                    && (self.certificate.is_some()
+                        || self.private_key.is_some()
+                        || self.client_ca.is_some())
                 {
                     return Err(io::Error::other(
                         "role_api disabled TLS cannot configure certificate, private_key, or client_ca",
@@ -80,9 +103,16 @@ impl RoleApiConfig {
                 }
             }
         }
-        if !self.certificates.is_empty()
-            && (self.tls == TlsMode::Disabled || self.client_ca.is_none())
-        {
+        if wire_tls && (self.certificate.is_none() || self.private_key.is_none()) {
+            return Err(io::Error::other(
+                "role_api wire TLS requires certificate and private_key",
+            ));
+        }
+        // A mapping needs an active TLS listener: wire TLS, or required TLS on
+        // an HTTP/gRPC address that is actually configured.
+        let http_tls =
+            self.tls == TlsMode::Required && (self.http.is_some() || self.grpc.is_some());
+        if !self.certificates.is_empty() && (!(wire_tls || http_tls) || self.client_ca.is_none()) {
             return Err(io::Error::other(
                 "role_api certificate mappings require TLS and client_ca",
             ));
@@ -135,10 +165,11 @@ impl RoleApiConfig {
 
     pub fn build(&self) -> io::Result<RoleApiListener> {
         let (idle_timeout_seconds, max_age_seconds) = self.validate()?;
-        let tls_config = match self.tls {
-            TlsMode::Disabled => None,
-            TlsMode::Optional => unreachable!("validated TLS mode"),
-            TlsMode::Required => Some(
+        let wire_mode = self.wire_mode();
+        let wire_tls = self.wire.is_some() && wire_mode != TlsMode::Disabled;
+        let needs_tls = self.tls == TlsMode::Required || wire_tls;
+        let server_config = if needs_tls {
+            Some(
                 (|| -> io::Result<_> {
                     crate::tls::server_optional_client(
                         crate::tls::certs(
@@ -149,19 +180,34 @@ impl RoleApiConfig {
                     )
                 })()
                 .map_err(|error| io::Error::other(format!("role_api TLS: {error}")))?,
-            ),
+            )
+        } else {
+            None
         };
-        let tls_config = tls_config.map(|mut config| {
-            Arc::make_mut(&mut config).alpn_protocols = if self.http.is_some() {
-                vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-            } else {
-                vec![b"h2".to_vec()]
-            };
-            config
-        });
+        let wire_tls_config = if wire_tls {
+            let mut config = server_config.clone().expect("wire TLS configuration");
+            Arc::make_mut(&mut config).alpn_protocols.clear();
+            Some(config)
+        } else {
+            None
+        };
+        let tls_config =
+            server_config
+                .filter(|_| self.tls == TlsMode::Required)
+                .map(|mut config| {
+                    Arc::make_mut(&mut config).alpn_protocols = if self.http.is_some() {
+                        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+                    } else {
+                        vec![b"h2".to_vec()]
+                    };
+                    config
+                });
         Ok(RoleApiListener {
             http: self.http,
             grpc: self.grpc,
+            wire: self.wire,
+            wire_mode,
+            wire_tls_config,
             idle_timeout_seconds,
             max_age_seconds,
             tls: self.tls,
@@ -286,6 +332,67 @@ mod tests {
     }
 
     #[test]
+    fn wire_tls_optional_accepted_only_for_wire() {
+        let mut c = config();
+        c.wire_tls = Some(TlsMode::Optional);
+        assert!(
+            c.build()
+                .unwrap_err()
+                .to_string()
+                .contains("requires a wire address")
+        );
+
+        c.wire = Some("127.0.0.1:8081".parse().unwrap());
+        c.http = None;
+        c.certificate = Some("unused".into());
+        c.private_key = Some("unused".into());
+        assert_eq!(c.wire_mode(), TlsMode::Optional);
+        assert_eq!(c.validate().unwrap(), (60, 900));
+
+        c.tls = TlsMode::Optional;
+        assert!(
+            c.build()
+                .unwrap_err()
+                .to_string()
+                .contains("TLS cannot be optional")
+        );
+    }
+
+    #[test]
+    fn wire_must_differ_from_http_grpc() {
+        let mut c = config();
+        c.grpc = Some("127.0.0.1:8081".parse().unwrap());
+        for address in [c.http, c.grpc] {
+            c.wire = address;
+            let error = c.build().unwrap_err().to_string();
+            assert!(error.contains("wire address must differ"), "{error}");
+        }
+        c.wire = Some("127.0.0.1:8082".parse().unwrap());
+        assert!(c.build().is_ok());
+    }
+
+    #[test]
+    fn wire_tls_required_needs_certificate() {
+        let mut c = config();
+        c.wire = Some("127.0.0.1:8081".parse().unwrap());
+        for mode in [TlsMode::Required, TlsMode::Optional] {
+            c.wire_tls = Some(mode);
+            for (certificate, key) in [
+                (None, None),
+                (Some("unused".into()), None),
+                (None, Some("unused".into())),
+            ] {
+                c.certificate = certificate;
+                c.private_key = key;
+                assert_eq!(
+                    c.build().unwrap_err().to_string(),
+                    "role_api wire TLS requires certificate and private_key"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn lifetime_boundaries_and_required_defaults() {
         let mut c = config();
         c.tls = TlsMode::Required;
@@ -338,6 +445,44 @@ mod tests {
         );
         c.client_ca = c.certificate.clone();
         c.certificates.insert("a".repeat(64), "owner".into());
+        c.wire = Some("127.0.0.1:8082".parse().unwrap());
+        let listener = c.build().unwrap();
+        assert_eq!(listener.wire_mode, TlsMode::Required);
+        assert!(listener.wire_tls_config.unwrap().alpn_protocols.is_empty());
+        assert_eq!(
+            listener.tls_config.unwrap().alpn_protocols,
+            [b"h2".to_vec()]
+        );
+
+        c.tls = TlsMode::Disabled;
+        c.wire_tls = Some(TlsMode::Optional);
+        let listener = c.build().unwrap();
+        assert!(listener.tls_config.is_none());
+        assert_eq!(listener.wire_mode, TlsMode::Optional);
+        assert!(listener.wire_tls_config.unwrap().alpn_protocols.is_empty());
+
+        c.client_ca = None;
+        assert!(
+            c.build()
+                .unwrap_err()
+                .to_string()
+                .contains("require TLS and client_ca")
+        );
+
+        // Required HTTP/gRPC TLS with no HTTP/gRPC address and a plaintext wire
+        // listener leaves no TLS listener for certificate mappings.
+        c.client_ca = c.certificate.clone();
+        c.tls = TlsMode::Required;
+        c.wire_tls = Some(TlsMode::Disabled);
+        c.http = None;
+        c.grpc = None;
+        assert!(
+            c.build()
+                .unwrap_err()
+                .to_string()
+                .contains("require TLS and client_ca")
+        );
+        c.wire_tls = Some(TlsMode::Required);
         assert!(c.build().is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }

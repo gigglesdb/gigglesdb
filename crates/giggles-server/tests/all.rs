@@ -391,3 +391,5 @@ mod task_search_path_api;
 mod prepared_validation_network;
 
 #[path = "wire_basic.rs"] mod wire_basic;
+#[path = "wire_role.rs"]
+mod wire_role;

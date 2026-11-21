@@ -9,11 +9,17 @@ use giggles_server::{
     admission::ServiceLimits,
     api::{
         ApiLimits, ApiRuntime, ListenerKind,
+        json::{decode_execute, encode_reply},
         net::{serve_grpc_bound, serve_http_bound},
         proto,
     },
+    auth::RoleApiConfig,
     clock::Clock,
     tls,
+    wire::{
+        client::{Client, ClientTls, Credential},
+        listen::{serve_role_wire_bound, serve_wire_bound},
+    },
 };
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -27,15 +33,18 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 use tonic::transport::{Certificate as CaCertificate, Channel, ClientTlsConfig, Identity};
 
-/// Ordinary and agent HTTP and gRPC listeners over one service and one CA.
+/// Ordinary and agent HTTP and gRPC, plus role and agent native wire listeners.
 struct Fixture {
     ca: TestCert,
     ordinary_api: Arc<ApiRuntime>,
     agent_api: Arc<ApiRuntime>,
+    role_api: Arc<ApiRuntime>,
     http: Running,
     grpc: Running,
     agent_http: Running,
     agent_grpc: Running,
+    agent_wire: Running,
+    role_wire: Running,
     /// Bound to `incident_controller` in the ordinary map.
     ordinary: TestCert,
     /// Bound to `agent_exec` for `inc-436` in the agent map.
@@ -105,28 +114,58 @@ impl Fixture {
         )
         .await
         .unwrap();
-        let agent_grpc = serve_grpc_bound(bind().await, agent_api.clone(), config, 8, gate)
+        let agent_grpc = serve_grpc_bound(
+            bind().await,
+            agent_api.clone(),
+            config.clone(),
+            8,
+            gate.clone(),
+        )
+        .await
+        .unwrap();
+        let agent_wire = serve_wire_bound(bind().await, agent_api.clone(), config, 8, gate.clone())
+            .await
+            .unwrap();
+        let role_config: RoleApiConfig = serde_json::from_value(json!({
+            "wire": "127.0.0.1:0", "tls": "disabled", "loopback_trust": true,
+        }))
+        .unwrap();
+        let role_settings = Arc::new(role_config.build().unwrap());
+        let role_api =
+            ApiRuntime::new_role(service, ApiLimits::default(), role_settings.clone()).unwrap();
+        let role_wire = serve_role_wire_bound(bind().await, role_api.clone(), role_settings, gate)
             .await
             .unwrap();
         Self {
             ca,
             ordinary_api,
             agent_api,
+            role_api,
             http,
             grpc,
             agent_http,
             agent_grpc,
+            agent_wire,
+            role_wire,
             ordinary,
             agent,
         }
     }
 
     async fn stop(self) {
-        for listener in [self.http, self.grpc, self.agent_http, self.agent_grpc] {
+        for listener in [
+            self.http,
+            self.grpc,
+            self.agent_http,
+            self.agent_grpc,
+            self.agent_wire,
+            self.role_wire,
+        ] {
             listener.shutdown().await.unwrap();
         }
         self.ordinary_api.shutdown().await;
         self.agent_api.shutdown().await;
+        self.role_api.shutdown().await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -140,7 +179,11 @@ impl Fixture {
         body: Value,
         h2: bool,
     ) -> (u16, Value) {
-        let body = serde_json::to_vec(&body).unwrap();
+        let body = if method == "DELETE" {
+            Vec::new()
+        } else {
+            serde_json::to_vec(&body).unwrap()
+        };
         tokio::time::timeout(Duration::from_secs(15), async {
             let config = tls::client(
                 vec![cert.cert.der().clone()],
@@ -315,6 +358,26 @@ fn refusal(reply: &Value, expected: &(String, String)) {
     assert_eq!(reply["message"], expected.1, "{reply}");
 }
 
+fn execute_request(body: &Value) -> proto::ExecuteRequest {
+    decode_execute(&serde_json::to_vec(body).unwrap()).unwrap()
+}
+
+async fn wire_twin(client: &mut Client, body: &Value, http: &Value) -> Value {
+    let reply = client
+        .execute(execute_request(body))
+        .await
+        .unwrap_or_else(|error| panic!("{body}: HTTP {http}, wire {error:?}"));
+    let wire: Value = serde_json::from_slice(&encode_reply(&reply).unwrap()).unwrap();
+    for field in ["code", "taskError", "message"] {
+        assert_eq!(
+            wire.get(field),
+            http.get(field),
+            "{body}: {field}: HTTP {http}, wire {wire}"
+        );
+    }
+    wire
+}
+
 #[tokio::test]
 async fn pgwire_search_path_twins() {
     pg_refusals().await;
@@ -382,6 +445,121 @@ async fn http_search_path_refusals() {
         let shown = execute(json!({"searchPath": {}})).await.1;
         assert_eq!(shown["code"], "ok");
         assert!(shown.to_string().contains("s, public"), "{shown}");
+    }
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn wire_search_path_refusals() {
+    let errors = pg_refusals().await;
+    let refusals: Vec<_> = bodies(&errors)
+        .into_iter()
+        .map(|(body, _)| body)
+        .chain(SETTINGS_SQL.into_iter().map(settings_body))
+        .chain([json!({"sql": {"sql": "BEGIN"}})])
+        .collect();
+    let show = json!({"searchPath": {}});
+    let ping = json!({"ping": {}});
+    let set = json!({"searchPath": {"set": true, "schemas": ["s", "public"]}});
+    let f = Fixture::start(&["inc-436"]).await;
+    for h2 in [false, true] {
+        let address = f.agent_http.address;
+        let token = session_id(&f.open_http(address, &f.agent, json!({}), h2).await);
+        let execute = |body| {
+            f.http(
+                address,
+                &f.agent,
+                "POST",
+                "/v1/session/execute",
+                Some(&token),
+                body,
+                h2,
+            )
+        };
+        let (mut agent, _) = Client::connect(
+            f.agent_wire.address,
+            Some(ClientTls {
+                ca: f.ca.cert.pem().into_bytes(),
+                cert: Some(f.agent.cert.pem().into_bytes()),
+                key: Some(f.agent.key.serialize_pem().into_bytes()),
+                server_name: "localhost".into(),
+            }),
+            proto::OpenSessionRequest::default(),
+            Credential::None,
+        )
+        .await
+        .unwrap();
+        let (status, original) = execute(show.clone()).await;
+        assert_eq!(status, 200);
+        assert_eq!(original["code"], "ok");
+        let wire_original = wire_twin(&mut agent, &show, &original).await;
+        assert_eq!(wire_original, original);
+        let (status, pong) = execute(ping.clone()).await;
+        assert_eq!(status, 200);
+        assert_eq!(pong["code"], "ok");
+        for body in &refusals {
+            let (status, http) = execute(body.clone()).await;
+            assert_eq!(status, 200, "{body}: {http}");
+            assert_ne!(http["code"], "ok", "{body}: {http}");
+            wire_twin(&mut agent, body, &http).await;
+            assert_eq!(
+                wire_twin(&mut agent, &show, &original).await,
+                wire_original,
+                "{body} changed the agent wire search path"
+            );
+            wire_twin(&mut agent, &ping, &pong).await;
+        }
+        agent.goodbye().await.unwrap();
+        let (status, reply) = f
+            .http(
+                address,
+                &f.agent,
+                "DELETE",
+                "/v1/session",
+                Some(&token),
+                json!({}),
+                h2,
+            )
+            .await;
+        assert_eq!(status, 204, "{reply}");
+
+        let address = f.http.address;
+        let token = session_id(&f.open_http(address, &f.ordinary, json!({}), h2).await);
+        let execute = |body| {
+            f.http(
+                address,
+                &f.ordinary,
+                "POST",
+                "/v1/session/execute",
+                Some(&token),
+                body,
+                h2,
+            )
+        };
+        // The role listener signs in the ordinary login used by the HTTP twin.
+        let (mut role, _) = Client::connect(
+            f.role_wire.address,
+            None,
+            proto::OpenSessionRequest {
+                role: Some("incident_controller".into()),
+                database: Some("postgres".into()),
+                ..Default::default()
+            },
+            Credential::None,
+        )
+        .await
+        .unwrap();
+        let (status, http) = execute(set.clone()).await;
+        assert_eq!(status, 200);
+        assert_eq!(http["code"], "ok");
+        wire_twin(&mut role, &set, &http).await;
+        let (status, shown) = execute(show.clone()).await;
+        assert_eq!(status, 200);
+        assert_eq!(shown["code"], "ok");
+        let wire_shown = wire_twin(&mut role, &show, &shown).await;
+        assert_eq!(wire_shown["sql"], shown["sql"]);
+        assert!(wire_shown.to_string().contains("s, public"), "{wire_shown}");
+        role.goodbye().await.unwrap();
     }
     f.stop().await;
 }
@@ -463,32 +641,42 @@ fn session_id(open: &(u16, Value)) -> String {
     open.1["sessionId"].as_str().unwrap().to_owned()
 }
 
+const SETTINGS_SQL: [&str; 22] = [
+    "SET SESSION search_path TO s",
+    "SET \"SEARCH_PATH\" TO s",
+    "SET search_path FROM CURRENT",
+    "SET /*comment*/ search_path TO s",
+    "/*comment*/ SET search_path TO s",
+    "SET search_path TO s; SELECT 1",
+    "SELECT set_config('SEARCH_PATH','s',false)",
+    "SELECT pg_catalog.set_config('search_path','s',false)",
+    "SELECT set_config('search_path','s',false), 1",
+    "SELECT (SELECT set_config('search_path','s',false))",
+    "WITH x AS (SELECT set_config('search_path','s',false)) SELECT * FROM x",
+    "SELECT CASE WHEN true THEN set_config('search_path','s',false) ELSE '' END",
+    "SELECT set_config($1,'s',false)",
+    "SELECT /*comment*/ set_config('search_path','s',false)",
+    "RESET ALL",
+    "SET role TO agent_exec",
+    "SET LOCAL application_name TO x",
+    "SET SESSION AUTHORIZATION agent_exec",
+    "SET giggles.task TO x",
+    "SELECT set_config('search_path', $1, false)",
+    "SET application_name TO x",
+    "SELECT set_config('application_name','x',false)",
+];
+
+fn settings_body(sql: &str) -> Value {
+    let params = if sql == "SELECT set_config('search_path', $1, false)" {
+        json!([{"textValue":"s"}])
+    } else {
+        json!([])
+    };
+    json!({"sql":{"sql":sql,"params":params}})
+}
+
 #[tokio::test]
 async fn settings_recognition_twins() {
-    let cases = [
-        "SET SESSION search_path TO s",
-        "SET \"SEARCH_PATH\" TO s",
-        "SET search_path FROM CURRENT",
-        "SET /*comment*/ search_path TO s",
-        "/*comment*/ SET search_path TO s",
-        "SET search_path TO s; SELECT 1",
-        "SELECT set_config('SEARCH_PATH','s',false)",
-        "SELECT pg_catalog.set_config('search_path','s',false)",
-        "SELECT set_config('search_path','s',false), 1",
-        "SELECT (SELECT set_config('search_path','s',false))",
-        "WITH x AS (SELECT set_config('search_path','s',false)) SELECT * FROM x",
-        "SELECT CASE WHEN true THEN set_config('search_path','s',false) ELSE '' END",
-        "SELECT set_config($1,'s',false)",
-        "SELECT /*comment*/ set_config('search_path','s',false)",
-        "RESET ALL",
-        "SET role TO agent_exec",
-        "SET LOCAL application_name TO x",
-        "SET SESSION AUTHORIZATION agent_exec",
-        "SET giggles.task TO x",
-        "SELECT set_config('search_path', $1, false)",
-        "SET application_name TO x",
-        "SELECT set_config('application_name','x',false)",
-    ];
     let (server, _a, _o, mut wire) = agent_support::agent_wire().await;
     let f = Fixture::start(&["inc-436"]).await;
     let address = f.agent_http.address;
@@ -520,14 +708,9 @@ async fn settings_recognition_twins() {
         .into_inner();
     let pg_original = wire.simple("SHOW search_path").await;
     let mut failures = vec![];
-    for sql in cases {
+    for sql in SETTINGS_SQL {
         let pg = agent_support::error_of(&wire.simple(sql).await);
-        let params = if sql == "SELECT set_config('search_path', $1, false)" {
-            json!([{"textValue":"s"}])
-        } else {
-            json!([])
-        };
-        let body = json!({"sql":{"sql":sql,"params":params}});
+        let body = settings_body(sql);
         let (status, http) = execute(body.clone()).await;
         assert_eq!(status, 200);
         let grpc = client

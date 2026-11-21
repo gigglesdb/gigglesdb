@@ -1,6 +1,9 @@
-//! TLS listener for ordinary and agent native wire sessions.
+//! Listeners for ordinary, agent and role native wire sessions.
 
-use super::conn::{WireLimits, serve_connection};
+use super::{
+    auth::RoleWireAuth,
+    conn::{WireLimits, serve_connection},
+};
 use crate::{
     Running,
     api::{ApiRuntime, ListenerKind, error::ApiError},
@@ -112,6 +115,64 @@ pub async fn serve_wire_bound(
                         let runtime = runtime.clone();
                         let _ = serve_connection(
                             stream, runtime, identity, WireLimits::default(), shared,
+                            #[cfg(feature = "test-hooks")]
+                            observed.stats.clone(),
+                        ).await;
+                    });
+                }
+            }
+        }
+        sockets.shutdown().await;
+        Ok(())
+    });
+    Ok(Running::new(address, stop, task))
+}
+
+/// Serves a pre-bound role wire listener once the common startup gate opens.
+pub async fn serve_role_wire_bound(
+    listener: TcpListener,
+    runtime: Arc<ApiRuntime>,
+    settings: Arc<crate::auth::RoleApiListener>,
+    mut start: watch::Receiver<bool>,
+) -> io::Result<Running> {
+    let connections = settings.connections;
+    if !(1..=128).contains(&connections) {
+        return Err(io::Error::other("connection limit"));
+    }
+    let address = listener.local_addr()?;
+    let auth = RoleWireAuth::new(&settings)?;
+    let (stop, mut stopped) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        while !*start.borrow_and_update() {
+            tokio::select! {
+                _ = &mut stopped => return Ok(()),
+                changed = start.changed() => if changed.is_err() { return Ok(()); },
+            }
+        }
+        let cap = Arc::new(Semaphore::new(connections));
+        let mut sockets = JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = &mut stopped => break,
+                Some(_) = sockets.join_next(), if !sockets.is_empty() => {},
+                incoming = listener.accept() => {
+                    let (socket, peer) = incoming?;
+                    no_delay(&socket);
+                    let Some(shared) = runtime.service().admission.connect() else { continue; };
+                    let Ok(local) = cap.clone().try_acquire_owned() else { continue; };
+                    let runtime = runtime.clone();
+                    let auth = auth.clone();
+                    sockets.spawn(async move {
+                        let _local = local;
+                        let Ok((stream, identity)) = auth.accept(socket, peer).await else {
+                            return;
+                        };
+                        #[cfg(feature = "test-hooks")]
+                        let observed = runtime.wire_stats.register(peer);
+                        #[cfg(feature = "test-hooks")]
+                        let runtime = runtime.clone();
+                        let _ = serve_connection(
+                            stream, runtime, Ok(identity), WireLimits::default(), shared,
                             #[cfg(feature = "test-hooks")]
                             observed.stats.clone(),
                         ).await;

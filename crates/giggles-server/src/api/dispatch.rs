@@ -266,9 +266,7 @@ impl ApiRuntime {
                     credential,
                 } => {
                     // Reject plaintext before lookup or any password derivation, including trust.
-                    if matches!(credential, Credential::Password(_))
-                        && listener.tls_config.is_none()
-                    {
+                    if matches!(credential, Credential::Password(_)) && !connection.tls {
                         return Err(ApiError::Unauthenticated);
                     }
                     let method = signin::choose(
