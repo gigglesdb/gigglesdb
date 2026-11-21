@@ -1684,6 +1684,8 @@ impl RowSink for SqlRows<'_> {
         table: &TableDef,
         after: Option<Vec<u8>>,
     ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        #[cfg(test)]
+        MUTATION_PAGE_READS.set(MUTATION_PAGE_READS.get() + 1);
         let range = self.scope_of(table).and_then(|(scope, _)| scope.key_range()).cloned();
         let page = self.read_page_all(table, after, range.as_ref())?;
         page.map(|(last, mut rows)| {
@@ -2794,7 +2796,8 @@ type TableScanHook = Box<dyn FnMut(&str)>;
 #[cfg(test)]
 thread_local! {
     static DISABLE_MUTATION_POINTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static MUTATION_POINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static MUTATION_PAGE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static MUTATION_POINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static MUTATION_ROWS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static AFTER_MUTATION_PAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_INDEX_CHUNK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };

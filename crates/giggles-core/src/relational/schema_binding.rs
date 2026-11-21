@@ -117,6 +117,8 @@ impl Prepared {
             epoch: self.epoch,
             transaction: self.transaction,
             statement: (*unbound).clone(),
+            native_delete: self.native_delete.clone(),
+            native_insert_many: self.native_insert_many,
             unbound_statement: Some(unbound),
             params: self.params,
             parameter_types: self.parameter_types.clone(),

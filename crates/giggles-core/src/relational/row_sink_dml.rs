@@ -48,8 +48,8 @@ fn point_keys(state: &Relational, prepared: &Prepared, params: &[Value],
     unique: &[secondary_index::Descriptor],
 ) -> Option<Vec<Vec<Value>>> {
     let table = state.tables.get(prepared.table()?)?;
-    let mut point_keys = searched::target(prepared)
-        .and_then(|q| q.mutation_primary_keys(state, table, params));
+    let mut point_keys = if prepared.native_delete.is_some() { native_lock_key(state, prepared, table) } else { searched::target(prepared)
+        .and_then(|q| q.mutation_primary_keys(state, table, params)) };
     // Preserve the page executor's RETURNING and UNIQUE error order.
     let returning = match &prepared.statement {
         Statement::Update { returning, .. } | Statement::UpdateExpressions { returning, .. }
@@ -73,9 +73,19 @@ fn point_keys(state: &Relational, prepared: &Prepared, params: &[Value],
     point_keys
 }
 
-// Engine statements carry literal predicates instead of a searched Query. This
-// affects prelocking only; execution retains its existing selection path.
+// Native batches carry an OR of complete literal keys separately from the
+// searched input-key filter. Validate every arm with the single-key classifier
+// and deduplicate by the canonical codec; any inexact arm keeps the table lock.
 fn native_lock_key(state: &Relational, prepared: &Prepared, table: &TableDef) -> Option<Vec<Vec<Value>>> {
+    if let Some(rows) = &prepared.native_delete {
+        let mut keys = BTreeMap::new();
+        for (key, _) in rows {
+            let single = Prepared::delete_engine(table, key.clone(), prepared.domain, state).ok()?;
+            let key = native_lock_key(state, &single, table)?.pop()?;
+            keys.insert(encode_key(&key).ok()?, key);
+        }
+        return Some(keys.into_values().collect());
+    }
     if searched::target(prepared).is_some() || table.primary_key.is_empty()
         || table.hidden_rowid().is_some() { return None; }
     let predicates = match &prepared.statement {
@@ -218,11 +228,11 @@ impl Prepared {
         };
         if unique.iter().any(|d| d.columns.iter().any(|id| table.columns.iter()
             .any(|c| c.id == *id && changed.contains(&&c.name)))) { return None; }
-        if searched::target(self).is_none() { native_lock_key(state, self, table) }
+        if self.native_delete.is_some() || searched::target(self).is_none() { native_lock_key(state, self, table) }
         else { point_keys(state, self, params, &unique) }
     }
 
-    /// Bounded incoming-FK DELETE prelocks, independent of publisher eligibility.
+    /// Incoming-FK DELETE prelocks, independent of publisher eligibility.
     pub(crate) fn fk_delete_lock_keys(&self, state: &Relational, params: &[Value]) -> Option<Vec<Vec<Value>>> {
         if !matches!(self.statement, Statement::Delete { .. }) { return None; }
         let table = state.tables.get(self.table()?)?;
@@ -262,10 +272,14 @@ impl Prepared {
             for id in sinks { edges.remove(&id); }
         }
         if !incoming { return None; }
-        let keys = if let Some(query) = searched::target(self) {
+        let keys = if self.native_delete.is_some() { native_lock_key(state, self, table)? }
+        else if let Some(query) = searched::target(self) {
             query.mutation_primary_keys(state, table, params)?
         } else { native_lock_key(state, self, table)? };
-        (keys.len() <= 200).then_some(keys)
+        // Native targets were already admitted by the request budget. Keep the
+        // SQL cap; both paths still prelock parents in physical order and use
+        // the storage bridge's retention upgrade and existing child locks.
+        (self.native_delete.is_some() || keys.len() <= 200).then_some(keys)
     }
 
     /// Plain VALUES appends use physical latest-owner PK/UNIQUE checks.
@@ -277,7 +291,7 @@ impl Prepared {
             return false;
         }
         matches!(&self.statement, Statement::Insert { .. } | Statement::InsertExpressions(_))
-            || matches!(&self.statement, Statement::InsertMulti(i) if i.append_only() && i.source.is_none() && i.row_count() <= paged_insert::SHARED_WRITE_ROWS)
+            || matches!(&self.statement, Statement::InsertMulti(i) if i.append_only() && i.source.is_none() && (self.native_insert_many || i.row_count() <= paged_insert::SHARED_WRITE_ROWS))
     }
 }
 
@@ -310,7 +324,8 @@ pub(super) fn execute(
     let mut immediate = DeferralState::default();
     let mut checks = scan::Retention::new(scan::retention_limit());
     let mut output = spill::RowBuffer::new(std::mem::take(&mut result.rows))?;
-    let point_keys = keys.is_none().then(|| point_keys(state, prepared, params, &unique)).flatten();
+    let point_keys = (keys.is_none() || prepared.native_delete.is_some())
+        .then(|| point_keys(state, prepared, params, &unique)).flatten();
     // External UNIQUE witnesses are checked after each old page. Combining keys
     // can mask that error with a later CHECK, and even one row's RETURNING can
     // mask a page-local duplicate. Preserve the old path in those cases.
@@ -456,8 +471,16 @@ pub(super) fn cascade(
     let first_version = state.next_version;
     let mut work = ActionWork::new(pending);
     let mut output = spill::RowBuffer::new(std::mem::take(&mut result.rows))?;
-    let candidates = if !pk_move && keys.is_none() {
-        searched::target(prepared).and_then(|q| q.mutation_primary_keys(state, &table, params))
+    // Native input keys remain present after selection clears the filter. Use
+    // the same canonical, deduplicated keys as prelocking, without its SQL cap.
+    // The sink reads the post-lock statement snapshot; retain no cross-call image.
+    let candidates = if !pk_move && (prepared.native_delete.is_some() || keys.is_none()) {
+        let point_keys = if prepared.native_delete.is_some() {
+            native_lock_key(state, prepared, &table)
+        } else {
+            searched::target(prepared).and_then(|q| q.mutation_primary_keys(state, &table, params))
+        };
+        point_keys
             .map(|keys| sink.mutation_candidates(&table, &keys)).transpose()?.flatten()
     } else { None };
     let point = candidates.is_some();
@@ -764,6 +787,22 @@ mod native_lock_tests {
             predicates: vec![Predicate { column: "id".into(), op: "=".into(),
                 value: Expr::Literal(value) }], search: None, returning: None }, 1, state.epoch);
         native_lock_key(&state, &p, &table)
+    }
+    #[test]
+    fn native_batch_complete_keys_deduplicate_and_keep_fallbacks() {
+        let mut state = Relational::default();
+        sql(&mut state, "CREATE TABLE t(id bigint, other bigint, PRIMARY KEY(id,other))");
+        let table = &state.tables["t"];
+        let rows = vec![(vec![Value::Int(3),Value::Int(4)],1),
+            (vec![Value::Int(1),Value::Int(2)],2),(vec![Value::Int(3),Value::Int(4)],1)];
+        let p = Prepared::delete_many_engine(table,rows,1,&state).unwrap();
+        assert_eq!(native_lock_key(&state,&p,table),Some(vec![vec![Value::Int(1),Value::Int(2)],vec![Value::Int(3),Value::Int(4)]]));
+        let mut inexact = p.clone();
+        inexact.native_delete.as_mut().unwrap()[1].0[0] = Value::Numeric(Numeric::parse("1.5").unwrap());
+        assert_eq!(native_lock_key(&state,&inexact,table),None);
+        let mut partial = p;
+        partial.native_delete.as_mut().unwrap()[1].0.pop();
+        assert_eq!(native_lock_key(&state,&partial,table),None);
     }
     #[test]
     fn integer_boundaries_unknown_literals_and_numeric_fallback() {

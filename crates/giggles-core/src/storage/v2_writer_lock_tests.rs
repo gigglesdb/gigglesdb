@@ -639,3 +639,203 @@ fn native_late_failures_roll_back_insert_many_mutation_and_mixed_upsert() {
             vec![vec![Int(1),Int(10)],vec![Int(2),Int(20)],vec![Int(9),Int(90)]]);
     }
 }
+
+#[test]
+fn native_many_distinct_keys_remain_unblocked() {
+    use crate::operations::{Bindings, Expr, Request, ValueExpr};
+    let literal = |n| Expr::Value(ValueExpr::Literal(Int(n)));
+    for insert in [false, true] {
+        let f = Fixture::new(); f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+        f.exec("INSERT INTO t VALUES(9999,0)");
+        if !insert { f.exec("INSERT INTO t VALUES(1,0),(2,0)"); }
+        let mut a = f.sql(); run(&mut a,"BEGIN");
+        let request = if insert {
+            Request::InsertMany { table: "t".into(), columns: vec!["id".into(),"n".into()],
+                rows: (1..=201).rev().map(|id|vec![literal(id),literal(0)]).collect(),
+                cap: ValueExpr::Literal(Int(201)) }
+        } else {
+            Request::Delete { table: "t".into(), filter: Expr::Compare(
+                Box::new(Expr::Field("id".into())), crate::operations::Compare::Lt, Box::new(literal(3))),
+                guard: None, cap: Some(ValueExpr::Literal(Int(2))) }
+        };
+        assert_eq!(a.execute_native(&request,&Bindings::new()).unwrap().affected,if insert {201} else {2});
+        assert_eq!(Pending::start(&f,"UPDATE t SET n=1 WHERE id=9999").finish().unwrap().affected,1);
+        let blocked = Pending::start(&f,"INSERT INTO t VALUES(1,10)");
+        blocked.blocked(&a);
+        run(&mut a,"ROLLBACK");
+        let result = blocked.finish();
+        if insert { assert!(result.is_ok()); } else { assert!(result.is_err()); }
+    }
+}
+
+#[test]
+fn native_many_stale_version_aborts_all_targets() {
+    for missing in [false,true] {
+        let f = Fixture::new(); f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+        f.exec("CREATE TABLE c(id bigint PRIMARY KEY,p bigint REFERENCES t(id) ON DELETE RESTRICT)");
+        f.exec("INSERT INTO t VALUES(1,0),(2,0)"); f.exec("INSERT INTO c VALUES(10,1)");
+        let table = f.sql().catalog_engine().unwrap().1.into_iter().find(|t|t.name=="t").unwrap();
+        let targets = vec![(vec![Int(1)],version(&f,1)),(vec![Int(2)],version(&f,2))];
+        f.exec(if missing { "DELETE FROM t WHERE id=2" } else { "UPDATE t SET n=1 WHERE id=2" });
+        let mut a=f.sql(); run(&mut a,"BEGIN");
+        assert_eq!(a.delete_many_engine(&table,targets),Err(CoreError::Sql(SqlError::Version)));
+        run(&mut a,"ROLLBACK");
+        assert_eq!(run(&mut f.sql(),"SELECT * FROM t WHERE id=1").rows.len(),1);
+        assert_eq!(run(&mut f.sql(),"SELECT * FROM c").rows.len(),1);
+    }
+}
+
+#[test]
+fn native_many_fixed_snapshot_conflicts_match_sql() {
+    use crate::operations::{Bindings,Expr,Request,ValueExpr};
+    for level in ["REPEATABLE READ","SERIALIZABLE"] {
+        let mut outcomes = Vec::new();
+        for native in [false,true] {
+            let f=Fixture::new(); f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+            f.exec("INSERT INTO t VALUES(1,0),(2,0)");
+            let mut a=f.sql(); begin_isolation(&mut a,level);
+            run(&mut a,"SELECT * FROM t");
+            f.exec("UPDATE t SET n=1 WHERE id=2");
+            let state=if native {
+                let request=Request::Delete { table:"t".into(),filter:Expr::Value(ValueExpr::Literal(relational::Value::Bool(true))),
+                    guard:None,cap:Some(ValueExpr::Literal(Int(2))) };
+                a.execute_native(&request,&Bindings::new()).unwrap_err()
+            } else {
+                match a.execute("DELETE FROM t WHERE id IN (1,2)",&[],None).unwrap_err() {
+                    CoreError::Sql(SqlError::Conflict) => crate::operations::Error::Conflict,
+                    error => crate::operations::Error::Sql { sqlstate:crate::sqlstate(&error).into() },
+                }
+            };
+            outcomes.push(state);
+            run(&mut a,"ROLLBACK");
+            assert_eq!(run(&mut f.sql(),"SELECT * FROM t").rows.len(),2);
+        }
+        assert_eq!(outcomes[0], outcomes[1], "{level}");
+        assert_eq!(outcomes[0], crate::operations::Error::Conflict);
+    }
+}
+
+#[test]
+fn native_many_delete_waits_then_rechecks_all_versions() {
+    use crate::operations::{self as o, Bindings, Expr, Request, ValueExpr};
+    for level in ["READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"] {
+        for history in 0..4 {
+            for commit in [false, true] {
+                let mut outcomes = Vec::new();
+                for batch in [false, true] {
+                    let f = Fixture::new();
+                    f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+                    f.exec("INSERT INTO t VALUES(1,0),(2,0)");
+                    let table = f.sql().catalog_engine().unwrap().1.remove(0);
+                    let targets = [(1,version(&f,1)),(2,version(&f,2))];
+                    let (ready_send, ready) = mpsc::channel();
+                    let (go, proceed) = mpsc::channel();
+                    let (send, done) = mpsc::channel();
+                    let admin = f.admin().clone();
+                    let level_owned = level.to_owned();
+                    let worker = thread::spawn(move || {
+                        let mut s = admin.sql_session();
+                        begin_isolation(&mut s, &level_owned);
+                        run(&mut s,"SELECT * FROM t");
+                        let result = if batch {
+                            o::NATIVE_DELETE_BEFORE_WRITE.with_borrow_mut(|h| *h = Some(Box::new(move || {
+                                ready_send.send(()).unwrap(); proceed.recv().unwrap();
+                            })));
+                            let r = s.execute_native(&Request::Delete { table:"t".into(),
+                                filter:Expr::Value(ValueExpr::Literal(relational::Value::Bool(true))),
+                                guard:None,cap:Some(ValueExpr::Literal(Int(2))) }, &Bindings::new());
+                            o::NATIVE_DELETE_BEFORE_WRITE.with_borrow_mut(|h| *h = None);
+                            r.map(|r| relational::SqlResult { affected:r.affected as u64,..Default::default() })
+                                .map_err(|e| match e {
+                                    o::Error::Sql { sqlstate } if sqlstate == "40001" => CoreError::Sql(SqlError::Version),
+                                    o::Error::Conflict => CoreError::Sql(SqlError::Conflict),
+                                    e => panic!("unexpected native error: {e:?}"),
+                                })
+                        } else {
+                            ready_send.send(()).unwrap(); proceed.recv().unwrap();
+                            targets.into_iter().try_fold(relational::SqlResult::default(), |mut out,(id,v)| {
+                                out.affected += s.delete_engine(&table,vec![Int(id)],v)?.affected;
+                                Ok(out)
+                            })
+                        };
+                        run(&mut s, if result.is_ok() { "COMMIT" } else { "ROLLBACK" });
+                        send.send(result).unwrap();
+                    });
+                    ready.recv_timeout(Duration::from_secs(20)).unwrap();
+                    let mut holder = f.sql();
+                    if history == 3 { f.exec("DELETE FROM t WHERE id=2"); }
+                    run(&mut holder,"BEGIN");
+                    match history {
+                        0 => { run(&mut holder,"UPDATE t SET n=10 WHERE id=2"); }
+                        1 => { run(&mut holder,"DELETE FROM t WHERE id=2"); }
+                        2 => { run(&mut holder,"DELETE FROM t WHERE id=2"); run(&mut holder,"INSERT INTO t VALUES(2,20)"); }
+                        _ => { run(&mut holder,"INSERT INTO t VALUES(2,20)"); }
+                    }
+                    go.send(()).unwrap();
+                    let pending = Pending { done, worker };
+                    pending.blocked(&holder);
+                    run(&mut holder,if commit {"COMMIT"} else {"ROLLBACK"});
+                    let result = pending.finish().map(|r|r.affected);
+                    if result.is_err() {
+                        assert_eq!(run(&mut f.sql(),"SELECT * FROM t WHERE id=1").rows.len(),1);
+                    }
+                    outcomes.push((result,run(&mut f.sql(),"SELECT * FROM t ORDER BY id").rows.into_iter().map(|r|r.values).collect::<Vec<_>>()));
+                }
+                assert_eq!(outcomes[0],outcomes[1],"{level}, history={history}, commit={commit}");
+            }
+        }
+    }
+}
+
+#[test]
+fn native_many_incoming_fk_delete_above_sql_threshold_keeps_row_locks() {
+    use crate::operations::{Bindings, Expr, Request, ValueExpr};
+    for count in [200,201] {
+      for per_row_baseline in [false,true] {
+        let f = Fixture::new();
+        f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+        f.exec("CREATE TABLE c(id bigint PRIMARY KEY,p bigint REFERENCES t(id) ON DELETE CASCADE)");
+        f.exec(&format!("INSERT INTO t VALUES {}",(1..=count).map(|id|format!("({id},0)")).collect::<Vec<_>>().join(",")));
+        f.exec("INSERT INTO t VALUES(9999,0)");
+        f.exec("INSERT INTO c VALUES(10,1),(20,9999)");
+        let mut s = f.sql(); run(&mut s,"BEGIN");
+        if per_row_baseline {
+            let table=f.sql().catalog_engine().unwrap().1.into_iter().find(|t|t.name=="t").unwrap();
+            let targets=run(&mut s,"SELECT * FROM t WHERE id<9999 ORDER BY id").rows;
+            for row in targets { s.delete_engine(&table,vec![row.values[0].clone()],row.version).unwrap(); }
+        } else {
+        s.execute_native(&Request::Delete { table:"t".into(),
+            filter:Expr::Compare(Box::new(Expr::Field("id".into())),crate::operations::Compare::Lt,
+                Box::new(Expr::Value(ValueExpr::Literal(Int(9999))))),
+            guard:None,cap:Some(ValueExpr::Literal(Int(count))) },&Bindings::new()).unwrap();
+        }
+        let other = Pending::start(&f,"UPDATE t SET n=1 WHERE id=9999");
+        other.finish().unwrap(); run(&mut s,"ROLLBACK");
+      }
+    }
+}
+
+#[test]
+fn native_many_fixed_snapshot_insert_conflicts_equal_sql() {
+    use crate::operations::{self as o, Bindings, Expr, Request, ValueExpr};
+    for level in ["REPEATABLE READ","SERIALIZABLE"] {
+        for unique in [false,true] {
+            let mut outcomes=Vec::new();
+            for native in [false,true] {
+                let f=Fixture::new(); f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint UNIQUE)");
+                let mut s=f.sql(); begin_isolation(&mut s,level); run(&mut s,"SELECT * FROM t");
+                f.exec(if unique {"INSERT INTO t VALUES(9,10)"} else {"INSERT INTO t VALUES(1,10)"});
+                let result = if native {
+                    let lit=|n| Expr::Value(ValueExpr::Literal(Int(n)));
+                    s.execute_native(&Request::InsertMany {table:"t".into(),columns:vec!["id".into(),"n".into()],
+                        rows:vec![vec![lit(1),lit(10)],vec![lit(2),lit(20)]],cap:ValueExpr::Literal(Int(2))},&Bindings::new())
+                        .map(|r|r.affected as u64).map_err(|e|match e {o::Error::Conflict=>"40001".into(),o::Error::Duplicate=>"23505".into(), e=>e.sqlstate().unwrap().to_owned()})
+                } else { s.execute("INSERT INTO t VALUES(1,10),(2,20)",&[],None).map(|r|r.affected).map_err(|e|crate::sqlstate(&e).to_owned()) };
+                run(&mut s,"ROLLBACK");
+                assert!(result.is_err());
+                outcomes.push((result,run(&mut f.sql(),"SELECT * FROM t ORDER BY id").rows.into_iter().map(|r|r.values).collect::<Vec<_>>()));
+            }
+            assert_eq!(outcomes[0],outcomes[1],"{level}, unique={unique}");
+        }
+    }
+}

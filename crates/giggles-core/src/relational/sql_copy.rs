@@ -703,6 +703,8 @@ impl Copy {
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
             extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
+            native_delete: None,
+            native_insert_many: false,
             unbound_statement: None,
             warnings: vec![],
             authorization_has_views: false,

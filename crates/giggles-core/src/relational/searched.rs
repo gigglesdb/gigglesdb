@@ -96,6 +96,15 @@ pub(super) fn route(
     let legacy = scan::LegacyRows(&*state);
     let source = injected_source.unwrap_or(&legacy);
     let matched = bound.matching_rows(state, source, params, &mut retention, cancel)?;
+    // Compare against the statement's selected row image, after writer locks.
+    // The sink checks every target (including absent keys) before paging writes.
+    if let Some(expected) = &prepared.native_delete {
+        let versions = expected.iter().map(|(key, version)|
+            Ok((encode_key(key)?, *version))).collect::<R<BTreeMap<_, _>>>()?;
+        for (key, row) in &matched {
+            if versions.get(key) != Some(&row.version) { return Err(SqlError::Version); }
+        }
+    }
     let mut next_version = state.next_version;
     let mut postimages = Vec::with_capacity(matched.len());
     let mut postkeys = Vec::with_capacity(matched.len());
@@ -282,6 +291,22 @@ pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description
             parameters: bound.description(state).parameters,
             typmods: vec![],
         })
+    }
+}
+
+impl Prepared {
+    pub(crate) fn validate_native_delete_image(&self, state: &Relational) -> R<()> {
+        if let Some(targets) = &self.native_delete {
+            let table = &state.tables[self.table().unwrap()];
+            let source = scan::LegacyRows(state);
+            for (key, version) in targets {
+                if scan::RowSource::get(&source, table, &encode_key(key)?)?
+                    .is_none_or(|row| row.row.version != *version) {
+                    return Err(SqlError::Version);
+                }
+            }
+        }
+        Ok(())
     }
 }
 

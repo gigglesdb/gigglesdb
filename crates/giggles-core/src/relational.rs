@@ -1796,6 +1796,9 @@ pub struct Prepared {
     pub(crate) epoch: u64,
     pub(crate) transaction: Option<u128>,
     statement: Statement,
+    // Request targets and version witnesses only; never cached relation rows.
+    native_delete: Option<Vec<(Vec<Value>, u64)>>,
+    native_insert_many: bool,
     unbound_statement: Option<std::sync::Arc<Statement>>,
     params: usize,
     parameter_types: Vec<Option<DataType>>,
@@ -2014,6 +2017,8 @@ impl Prepared {
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
             extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
+            native_delete: None,
+            native_insert_many: false,
             unbound_statement: None,
             warnings: vec![],
             authorization_has_views: false,
@@ -2401,6 +2406,37 @@ impl Prepared {
             table.columns.iter().map(|c| c.data_type.clone()).collect(),
             vec![values],
         )));
+        Ok(prepared)
+    }
+    pub(crate) fn insert_many_normalized_engine(
+        table: &TableDef, rows: Vec<Vec<Value>>, domain: u128, state: &Relational,
+    ) -> R<Self> {
+        Self::engine_table(table, state)?;
+        if table.hidden_rowid().is_some() { return Err(SqlError::Unsupported); }
+        for row in &rows { row_check(table, row)?; }
+        let mut prepared = Self::engine(Statement::InsertMulti(Box::new(sql_insert::Insert::copy(
+            state.table_key(table), table.columns.iter().map(|c| c.name.clone()).collect(),
+            table.columns.iter().map(|c| c.data_type.clone()).collect(), rows,
+        ))), domain, state.epoch);
+        prepared.native_insert_many = true;
+        Ok(prepared)
+    }
+    pub(crate) fn delete_many_engine(
+        table: &TableDef, rows: Vec<(Vec<Value>, u64)>, domain: u128, state: &Relational,
+    ) -> R<Self> {
+        Self::engine_table(table, state)?;
+        if table.hidden_rowid().is_some() { return Err(SqlError::Unsupported); }
+        let mut keys = BTreeSet::new();
+        for (key, _) in &rows {
+            Self::engine_key(table, key.clone())?;
+            keys.insert(encode_key(key)?);
+        }
+        let name = state.table_key(table);
+        let mut prepared = Self::engine(Statement::Delete {
+            search: Some(Box::new(query::Query::mutation_input(&name, keys))),
+            name, predicates: vec![], returning: None,
+        }, domain, state.epoch);
+        prepared.native_delete = Some(rows);
         Ok(prepared)
     }
     pub(crate) fn update_engine(
@@ -3032,6 +3068,8 @@ impl Prepared {
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
             extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
+            native_delete: None,
+            native_insert_many: false,
             unbound_statement: None,
             warnings: vec![],
             authorization_has_views: false,
@@ -3485,6 +3523,8 @@ impl Prepared {
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
             extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
+            native_delete: None,
+            native_insert_many: false,
             unbound_statement: None,
             warnings: take_sql_warnings(),
             authorization_has_views: false,
@@ -4126,7 +4166,9 @@ impl Relational {
                 search_path: vec!["public".into()],
                 schema_user: "giggles".into(),
             extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
-                unbound_statement: None,
+                native_delete: None,
+            native_insert_many: false,
+            unbound_statement: None,
                 warnings: vec![],
             authorization_has_views: false,
             privilege_inquiry: false,

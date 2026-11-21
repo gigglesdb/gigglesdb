@@ -3703,12 +3703,44 @@ impl SqlSession {
 
     /// Native INSERT MANY only: the caller must settle on every request exit.
     /// Failures still abort and attempt settlement here.
-    pub(crate) fn insert_engine_deferred(
-        &mut self,
-        table: &relational::TableDef,
-        values: Vec<relational::Value>,
+    pub(crate) fn insert_many_engine_deferred(
+        &mut self, table: &relational::TableDef, rows: Vec<Vec<relational::Value>>,
     ) -> Result<relational::SqlResult, CoreError> {
-        self.insert_engine_settling(table, values, false)
+        self.execute_native_many(|domain, state|
+            relational::Prepared::insert_many_normalized_engine(table, rows, domain, state))
+    }
+    pub(crate) fn delete_many_engine(
+        &mut self, table: &relational::TableDef, rows: Vec<(Vec<relational::Value>, u64)>,
+    ) -> Result<relational::SqlResult, CoreError> {
+        self.execute_native_many(|domain, state|
+            relational::Prepared::delete_many_engine(table, rows, domain, state))
+    }
+    fn execute_native_many(
+        &mut self, build: impl FnOnce(u128, &relational::Relational) -> Result<relational::Prepared, relational::SqlError>,
+    ) -> Result<relational::SqlResult, CoreError> {
+        if let Backend::V2(db) = &self.admin.inner.backend {
+            let db = db.clone();
+            let result = (|| {
+                if self.aborted { return Err(CoreError::Sql(relational::SqlError::Aborted)); }
+                let (domain, image) = db.native_metadata_image(self.v2_transaction.as_ref())?;
+                let mut prepared = build(domain, &image).map_err(CoreError::Sql)?;
+                #[cfg(all(test, feature = "engine-rocksdb"))]
+                native_many_tests::INSERT_PREPARED.with_borrow_mut(|hook| {
+                    if let Some(hook) = hook.as_mut() { hook(&image); }
+                });
+                prepared.epoch = 0;
+                prepared.transaction = self.transaction_id;
+                self.execute_bound_engine(&prepared, &[], None)
+            })();
+            if result.is_err() { self.abort(); }
+            return result;
+        }
+        self.admin.inner.db(SQL_SESSIONS)?;
+        self.execute_engine(|domain, state| {
+            let prepared = build(domain, state)?;
+            prepared.validate_native_delete_image(state)?;
+            Ok(prepared)
+        }, None)
     }
 
     fn insert_engine_settling(

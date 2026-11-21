@@ -324,6 +324,22 @@ impl Relational {
         let bound = prepared.bind_schemas(self).map_err(CoreError::Sql)?;
         let prepared = &bound;
         prepared.validate_schemas(self).map_err(CoreError::Sql)?;
+        // Native witnesses are request prechecks: stale/missing wins over any
+        // row's constraint error. Read the final post-lock statement snapshot,
+        // before any page can publish, without retaining row images.
+        if let Some(targets) = &prepared.native_delete {
+            let table = &self.tables[prepared.table().unwrap()];
+            sink.with_row_source(&mut |source| {
+                for (key, version) in targets {
+                    let key = encode_key(key)?;
+                    if source.get(table, &key)?.is_none_or(|row| row.row.version != *version) {
+                        return Err(SqlError::Version);
+                    }
+                }
+                Ok(())
+            })?;
+        }
+
         if let Statement::Truncate { restart, .. } = &prepared.statement {
             if !params.is_empty() || expected.is_some() {
                 return Err(CoreError::Sql(SqlError::Parameters));

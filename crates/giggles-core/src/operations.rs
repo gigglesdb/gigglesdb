@@ -3048,6 +3048,18 @@ fn run<C: Context>(
             } else {
                 None
             };
+            if !work.is_empty() && work.iter().all(|(_, evaluated, _)| evaluated.is_none()) {
+                let targets = work.iter().map(|(row, _, _)| (
+                    t.primary_key.iter().map(|i| row.values[*i].clone()).collect(), row.version,
+                )).collect();
+                #[cfg(test)]
+                NATIVE_DELETE_BEFORE_WRITE.with_borrow_mut(|hook| {
+                    if let Some(hook) = hook.as_mut() { hook(); }
+                });
+                let result = s.session()?.delete_many_engine(t, targets).map_err(core)?;
+                if result.affected != work.len() as u64 { return Err(Error::Conflict); }
+                work.clear();
+            }
             for (index, (row, evaluated, changed)) in work.into_iter().enumerate() {
                 if !changed {
                     continue;
@@ -3232,6 +3244,7 @@ type NativeManyHook = Box<dyn FnMut(&mut SqlSession, usize)>;
 thread_local! {
     pub(crate) static NATIVE_MANY_AFTER_NORMALIZE: std::cell::RefCell<Option<NativeManyHook>> = const { std::cell::RefCell::new(None) };
     pub(crate) static NATIVE_MANY_BEFORE_WRITE: std::cell::RefCell<Option<NativeManyHook>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static NATIVE_DELETE_BEFORE_WRITE: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
     // Per-thread crash injection keeps other native requests unaffected.
     pub(crate) static NATIVE_MANY_ON_EXIT: std::cell::Cell<Option<fn(&SqlSession)>> = const { std::cell::Cell::new(None) };
     pub(crate) static NATIVE_MANY_CRASH_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -3355,25 +3368,24 @@ fn insert_many_deferred(
     crate::cancellation::check().map_err(core)?;
     // Move each admitted proposal once; no duplicate full postimage is retained.
     let mut proposed = proposed.into_iter().map(Some).collect::<Vec<_>>();
-    for (output_index, (_, key, proposal_index)) in keys.into_iter().enumerate() {
+    let mut batch = Vec::with_capacity(count);
+    for (_, _, proposal_index) in &keys {
         crate::cancellation::check().map_err(core)?;
-        let values = proposed[proposal_index]
-            .take()
-            .ok_or(Error::DuplicateTarget)?
-            .into_iter()
-            .map(Cow::into_owned)
-            .collect();
+        let values = proposed[*proposal_index].take().ok_or(Error::DuplicateTarget)?
+            .into_iter().map(Cow::into_owned).collect();
         #[cfg(test)]
         NATIVE_MANY_BEFORE_WRITE.with_borrow_mut(|hook| {
-            if let Some(hook) = hook.as_mut() { hook(session, output_index); }
+            if let Some(hook) = hook.as_mut() { hook(session, batch.len()); }
         });
-        let result = session.insert_engine_deferred(table, values).map_err(core)?;
-        if result.affected != 1 {
-            return Err(Error::Conflict);
-        }
-        if returning.is_some() {
-            out.rows[output_index].version =
-                session.row_version_engine(table, &key).map_err(core)?;
+        batch.push(values);
+    }
+    if !batch.is_empty() {
+        let result = session.insert_many_engine_deferred(table, batch).map_err(core)?;
+        if result.affected != count as u64 { return Err(Error::Conflict); }
+    }
+    if returning.is_some() {
+        for (output_index, (_, key, _)) in keys.iter().enumerate() {
+            out.rows[output_index].version = session.row_version_engine(table, key).map_err(core)?;
         }
     }
     Ok(out)
