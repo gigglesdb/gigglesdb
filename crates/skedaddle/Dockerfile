@@ -1,4 +1,4 @@
-FROM rust:1-bookworm AS build
+FROM rust:1.99.1-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends clang libclang-dev cmake && rm -rf /var/lib/apt/lists/*
 ENV CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=4
 WORKDIR /src

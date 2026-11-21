@@ -2,7 +2,9 @@
 # Source on Linux before running Rust tests. Preserve the test storage contract.
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-jroot="$RUNNER_TEMP/jroot"
+# Keep this root short: Unix socket paths built under TMPDIR must fit in
+# 108 bytes (nunya's management socket tests).
+jroot=/tmp/jroot
 mkdir -p "$jroot/gigglesdb-work/tmp/skedaddle"
 export TEMP=j:/gigglesdb-work/tmp TMP=j:/gigglesdb-work/tmp
 export SKEDADDLE_TEST_WORK_ROOT="$jroot/gigglesdb-work"
