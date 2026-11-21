@@ -25,6 +25,7 @@ scripts/*
 !scripts/glibm/**
 **/target
 **/artifacts
+!crates/skedaddle/artifacts/spikes/s3-ddl/fingerprint.sql
 **/site
 **/tests
 **/harness
