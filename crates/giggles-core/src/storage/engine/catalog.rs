@@ -1333,7 +1333,15 @@ impl Catalog {
             *self.current.write().map_err(|_| TxnError::Misuse)? = None;
         }
         finish(txn, guard, |ts| {
-            let view = match self.load_at(ts) {
+            let state = match &self.services {
+                TxnServices::Local { seq, .. } => Some(&*seq.kv().causes),
+                TxnServices::Cluster(_) => None,
+            };
+            let (loaded, read_error) = match state {
+                Some(state) => state.capture_read_error(|| self.load_at(ts)),
+                None => (self.load_at(ts), None),
+            };
+            let view = match loaded {
                 Ok(view) => view,
                 // On a cluster gateway the reload is a network read and may fail
                 // transiently. The commit and its new generation token are durable, so the
@@ -1347,6 +1355,20 @@ impl Catalog {
                         super::diagnostics::error_text(&error)
                     );
                     super::diagnostics::error(cause.clone());
+                    if let Some(state) = state {
+                        use super::kv::{FenceCause, FenceSite};
+                        let follow_kv_fence = read_error.is_none() && error == CoreError::Fenced;
+                        let mut recorded = match read_error {
+                            Some(error) => FenceCause::for_kv(FenceSite::CatalogReload, &error),
+                            None => FenceCause::for_core(FenceSite::CatalogReload, &error),
+                        };
+                        recorded.error_text = cause.clone();
+                        if follow_kv_fence {
+                            state.record_if_empty(recorded);
+                        } else {
+                            state.record(recorded);
+                        }
+                    }
                     cache.poison_cause = Some(cause);
                     // Durability already succeeded. Never expose the previous
                     // view as current; this catalog must be reopened.

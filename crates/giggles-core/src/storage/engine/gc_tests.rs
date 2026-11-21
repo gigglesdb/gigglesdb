@@ -138,6 +138,63 @@ fn sweep(gc: &Gc, ks: Keyspace, budget: usize) {
 }
 
 #[test]
+fn local_no_sync_batches_are_gc_reclaim_or_xact_prune() {
+    use crate::storage::engine::{
+        seq::SequenceAllocator,
+        xact::{XACT_RETAIN, XactIds, marker_key},
+    };
+
+    let backend = Arc::new(RecordingKv::default());
+    let mut batch = WriteBatch::default();
+    version(
+        &mut batch,
+        Keyspace::Rows,
+        &row(7, 0),
+        ts(20),
+        Some(b"latest"),
+    );
+    version(
+        &mut batch,
+        Keyspace::Rows,
+        &row(7, 0),
+        ts(10),
+        Some(b"obsolete"),
+    );
+    seed(backend.as_ref(), ts(100), batch);
+
+    let kv = Arc::new(Kv::new_single_writer(backend.clone()));
+    let seq = sequencer(kv.clone(), Arc::new(ManualClock::new(100_000)));
+    let gc = Gc::open(
+        kv.clone(),
+        seq,
+        GcConfig {
+            retention: Duration::ZERO,
+        },
+    )
+    .unwrap();
+    assert_eq!(gc.step(Keyspace::Rows, 1).unwrap().deleted, 1);
+    assert!(gc.reclaim_table(7, ts(90)).unwrap());
+    let sequences = Arc::new(SequenceAllocator::new(kv.clone(), 64));
+    sequences.ensure_at_least(4, 0, XACT_RETAIN + 4096).unwrap();
+    let _xid = XactIds::new(kv, sequences).assign().unwrap();
+
+    let writes = backend.writes.lock().unwrap();
+    let no_sync: Vec<_> = writes
+        .iter()
+        .filter(|(mode, _)| *mode == Durability::NoSync)
+        .map(|(_, ops)| ops.as_slice())
+        .collect();
+    assert!(
+        matches!(no_sync.as_slice(), [
+        [Op::Delete { ks: Keyspace::Rows, .. }, Op::Put { ks: Keyspace::Gc, .. }],
+        [Op::DeleteRange { ks: Keyspace::Rows, .. }],
+        [Op::DeleteRange { ks: Keyspace::Seq, start, .. }],
+    ] if start == &marker_key(0)),
+        "{no_sync:?}"
+    );
+}
+
+#[test]
 fn keep_rule_and_tombstone_deletion_are_atomic_in_every_versioned_keyspace() {
     for ks in [
         Keyspace::Rows,

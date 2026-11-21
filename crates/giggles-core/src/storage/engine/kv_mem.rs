@@ -130,7 +130,7 @@ fn range(
             .map(|next| Bound::Excluded((next, Vec::new())))
             .unwrap_or(Bound::Unbounded),
     };
-    Box::new(Cursor {
+    KvIter::new(Cursor {
         map,
         ks,
         start,

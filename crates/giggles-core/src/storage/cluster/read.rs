@@ -502,10 +502,10 @@ impl KvRead for RoutedKvRead {
             fresh: true,
         };
         if ks == Keyspace::Catalog {
-            return Ok(Box::new(scan.filter(
+            return Ok(KvIter::new(scan.filter(
                 move |item| !matches!(item, Ok((key, _)) if directory_key(ks, key)),
             )));
         }
-        Ok(Box::new(scan))
+        Ok(KvIter::new(scan))
     }
 }

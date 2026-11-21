@@ -137,19 +137,135 @@ fn rejects_malformed_payloads_with_valid_checksums() {
 }
 
 #[test]
-fn failed_write_records_first_fence_cause_only() {
-    use super::{Durability, Kv};
+fn fence_classification_and_precedence() {
+    use super::{FenceCause, FenceClass as Class, FenceSite as Site, FenceState, RocksStatus};
+
+    for (site, code, subcode, expected) in [
+        (Site::WalWrite, 5, 0, Class::Recoverable),
+        (Site::WalWrite, 5, 4, Class::Recoverable), // NoSpace
+        (Site::WalFlush, 5, 0, Class::Recoverable),
+        (Site::BackgroundError, 5, 4, Class::NotRecoverable),
+        (Site::Write, 5, 0, Class::NotRecoverable),
+        (Site::FlushBarrier, 5, 0, Class::NotRecoverable),
+        (Site::Write, 4, 0, Class::NotRecoverable),
+        (Site::Read, 5, 0, Class::Recoverable),
+        (Site::Open, 5, 0, Class::Recoverable),
+    ] {
+        let status = RocksStatus { code, subcode, severity: None };
+        let error = KvError::RocksIo { message: "native error".into(), status, site };
+        let cause = FenceCause::for_kv(site, &error);
+        assert_eq!(cause.status, Some(status));
+        assert_eq!(cause.class, expected, "{site:?} {code} {subcode}");
+        assert_eq!(error.to_string(), "KV I/O: native error");
+    }
+
+    for (site, error, expected) in [
+        (Site::CatalogReload, crate::CoreError::Storage("catalog read".into()), Class::NotRecoverable),
+        (Site::CatalogReload, crate::CoreError::Corrupt("catalog decode".into()), Class::Data),
+        (Site::NativeOnceLedger, crate::CoreError::Storage("ledger read".into()), Class::Data),
+        (Site::Read, crate::CoreError::Storage("legacy read".into()), Class::NotRecoverable),
+        (Site::LegacyPersist, crate::CoreError::Storage("legacy persist".into()), Class::NotRecoverable),
+        (Site::Open, crate::CoreError::Storage("open error".into()), Class::NotRecoverable),
+    ] {
+        assert_eq!(FenceCause::for_core(site, &error).class, expected);
+    }
+    let disconnected = KvError::Io("RocksDB snapshot worker disconnected".into());
+    for site in [Site::Read, Site::CatalogReload, Site::Open] {
+        assert_eq!(
+            FenceCause::for_kv(site, &disconnected).class,
+            Class::NotRecoverable
+        );
+    }
+    assert_eq!(
+        FenceCause::for_kv(Site::NativeOnceLedger, &disconnected).class,
+        Class::Data
+    );
+
+    let state = FenceState::default();
+    let first = FenceCause::new(Site::WalWrite, Class::Recoverable, &"first");
+    state.record(first.clone());
+    let later = FenceCause::new(Site::WalFlush, Class::Recoverable, &"later");
+    state.record(later.clone());
+    assert_eq!(state.cause(), Some(first.clone()));
+    let bad = FenceCause::for_kv(Site::Read, &KvError::Corrupt("bad bytes".into()));
+    state.record(bad.clone());
+    state.record(later);
+    assert_eq!(state.cause(), Some(bad.clone()));
+    let newer = FenceCause {
+        generation: 1,
+        ..first
+    };
+    state.record(newer.clone());
+    state.record(bad);
+    state.record_if_empty(FenceCause::new(
+        Site::Other,
+        Class::NotRecoverable,
+        &"fallback",
+    ));
+    assert_eq!(state.cause(), Some(newer));
+}
+
+#[test]
+fn failed_write_fences_and_preserves_cause() {
+    use super::{Durability, FenceClass, FenceSite, Kv, RocksStatus};
     use super::super::kv_mem::MemKv;
     use std::sync::Arc;
     let backend = Arc::new(MemKv::new());
     let kv = Kv::new(backend.clone());
-    backend.fail_next_write(KvError::Io("injected first write error".into()));
-    assert_eq!(kv.write(sample(), Durability::Sync), Err(KvError::Io("injected first write error".into())));
-    let cause = kv.fence_cause.lock().unwrap().clone().unwrap();
-    assert!(cause.contains("injected first write error"));
+    let error = KvError::RocksIo {
+        message: "injected first write error".into(),
+        status: RocksStatus {
+            code: RocksStatus::IO_ERROR,
+            subcode: 0,
+            severity: None,
+        },
+        site: FenceSite::Read,
+    };
+    backend.fail_next_write(error.clone());
+    assert_eq!(kv.write(sample(), Durability::Sync), Err(error));
+    let cause = kv.causes.cause().unwrap();
+    assert!(cause.error_text.contains("injected first write error"));
+    assert_eq!(cause.class, FenceClass::NotRecoverable);
+    assert_eq!(cause.site, FenceSite::Write);
     assert_eq!(kv.flush_barrier(), Err(KvError::Fenced));
     assert_eq!(kv.get(Keyspace::Meta, b"k"), Err(KvError::Fenced));
-    // Model another in-flight write failing after the first one fenced.
-    assert_eq!(kv.fence_on_error(Err(KvError::Io("second error".into()))), Err(KvError::Io("second error".into())));
-    assert_eq!(kv.fence_cause.lock().unwrap().as_ref(), Some(&cause));
+}
+
+#[test]
+fn corrupt_read_reports_data_without_fencing() {
+    use super::{Direction, FenceClass, FenceSite, Kv, KvBackend, KvIter, KvRead, KvPair, Durability};
+    use std::{ops::Bound, sync::Arc};
+
+    struct CorruptReader;
+    impl KvRead for CorruptReader {
+        fn get(&self, _: Keyspace, _: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+            Err(KvError::Corrupt("bad block".into()))
+        }
+        fn range(&self, _: Keyspace, _: Bound<&[u8]>, _: Bound<&[u8]>, _: Direction)
+            -> Result<KvIter<'_>, KvError>
+        {
+            Ok(KvIter::new(std::iter::once(Err::<KvPair, _>(KvError::Corrupt("bad scan".into())))))
+        }
+    }
+    impl KvBackend for CorruptReader {
+        fn write(&self, _: WriteBatch, _: Durability) -> Result<(), KvError> { Ok(()) }
+        fn flush_barrier(&self) -> Result<(), KvError> { Ok(()) }
+        fn snapshot(&self) -> Result<Arc<dyn KvRead>, KvError> { Ok(Arc::new(Self)) }
+        fn engine_name(&self) -> &'static str { "corrupt-test" }
+    }
+
+    let live = Kv::new(Arc::new(CorruptReader));
+    assert!(matches!(live.get(Keyspace::Meta, b"key"), Err(KvError::Corrupt(_))));
+    let cause = live.causes.cause().unwrap();
+    assert_eq!((cause.site, cause.class), (FenceSite::Read, FenceClass::Data));
+    assert!(!live.is_fenced());
+    live.flush_barrier().unwrap();
+
+    let kv = Kv::new(Arc::new(CorruptReader));
+    let snapshot = kv.snapshot().unwrap();
+    let mut scan = snapshot.range(Keyspace::Meta, Bound::Unbounded, Bound::Unbounded, Direction::Forward).unwrap();
+    assert!(kv.causes.cause().is_none());
+    assert!(matches!(scan.next(), Some(Err(KvError::Corrupt(_)))));
+    assert_eq!(kv.causes.cause().unwrap().class, FenceClass::Data);
+    assert!(!kv.is_fenced());
 }

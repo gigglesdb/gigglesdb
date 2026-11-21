@@ -442,7 +442,7 @@ impl KvRead for FaultBackend {
         if self.fail_reads {
             Err(self.error.clone())
         } else {
-            Ok(Box::new(std::iter::empty()))
+            Ok(KvIter::new(std::iter::empty()))
         }
     }
     fn seek_ge(&self, _: Keyspace, _: &[u8]) -> Result<Option<Pair>, KvError> {

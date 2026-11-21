@@ -458,6 +458,27 @@ impl Sequencer {
     pub(crate) fn stop_submissions(&self) {
         self.shared.stopped.store(true, Ordering::Release);
     }
+    #[cfg(feature = "engine-rocksdb")]
+    pub(crate) fn is_accepting(&self) -> bool {
+        !self.stopped() && self.worker.lock().unwrap_or_else(|p| p.into_inner())
+            .as_ref().is_some_and(|worker| !worker.is_finished())
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.stop_submissions();
+        // Hold the mutex through the join so concurrent shutdowns all observe
+        // the final published visible timestamp.
+        let mut worker = self.worker.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(worker) = worker.take() {
+            let _ = self.sender.send(Message::Shutdown);
+            // A pending guard can own the last reference under implicit drop.
+            // Explicit engine shutdown always joins from the owner's thread.
+            if worker.thread().id() != thread::current().id() {
+                let _ = worker.join();
+            }
+        }
+    }
+
     fn stopped(&self) -> bool {
         self.shared.stopped.load(Ordering::Acquire)
     }
@@ -525,18 +546,7 @@ impl Sequencer {
         let fence = FenceAccess { record, holder };
         let features = load_features(kv.as_ref())?;
         let subversion = load_subversion(kv.as_ref())?;
-        let seed = match kv
-            .get(Keyspace::Meta, b"last_commit_ts")
-            .map_err(TxnError::Kv)?
-        {
-            Some(bytes) if bytes.len() == 8 => Ts(u64::from_be_bytes(bytes.try_into().unwrap())),
-            Some(_) => {
-                return Err(TxnError::Kv(super::kv::KvError::Corrupt(
-                    "invalid last_commit_ts".into(),
-                )));
-            }
-            None => Ts(0),
-        };
+        let seed = read_last_commit_ts(&kv)?;
         let shared = Arc::new(Shared {
             stopped: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-commit-sync"))]
@@ -740,12 +750,18 @@ fn load_subversion(kv: &dyn KvRead) -> Result<u32, TxnError> {
         .map_err(|_| TxnError::Misuse)?;
     Ok(version)
 }
+pub(crate) fn read_last_commit_ts(kv: &Kv) -> Result<Ts, super::kv::KvError> {
+    match kv.get(Keyspace::Meta, b"last_commit_ts")? {
+        Some(bytes) => bytes.try_into().map(u64::from_be_bytes).map(Ts).map_err(|_| {
+            super::kv::KvError::Corrupt("invalid last_commit_ts".into())
+        }),
+        None => Ok(Ts(0)),
+    }
+}
+
 impl Drop for Sequencer {
     fn drop(&mut self) {
-        let _ = self.sender.send(Message::Shutdown);
-        if let Some(worker) = self.worker.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            let _ = worker.join();
-        }
+        self.shutdown();
     }
 }
 

@@ -262,7 +262,7 @@ impl KvRead for CountingKv<'_> {
     ) -> Result<KvIter<'_>, KvError> {
         let iter = self.inner.range(ks, start, end, dir)?;
         let count = (ks == Keyspace::Kernel).then_some(&self.read);
-        Ok(Box::new(iter.inspect(move |_| {
+        Ok(KvIter::new(iter.inspect(move |_| {
             if let Some(count) = count {
                 count.fetch_add(1, Ordering::Relaxed);
             }

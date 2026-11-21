@@ -380,9 +380,10 @@ impl Inner {
         if self.fenced.load(Ordering::Acquire) {
             return Err(CoreError::Fenced.into());
         }
-        let mut state = self.read().inspect_err(|_| {
-            self.fenced.store(true, Ordering::Release);
-        })?;
+        let site = engine::kv::FenceSite::NativeOnceLedger;
+        let mut state = self
+            .read_at(site)
+            .inspect_err(|error| self.fence_error(site, error))?;
         work(&mut state)
     }
 }

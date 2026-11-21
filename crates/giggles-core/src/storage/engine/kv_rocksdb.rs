@@ -1,7 +1,7 @@
 //! Optional RocksDB implementation of the storage-engine KV seam.
 use super::kv::*;
 use rocksdb::{
-    AsColumnFamilyRef, AsRawPtr, BlockBasedOptions, Cache, DB, DBCompressionType, ErrorKind,
+    AsColumnFamilyRef, AsRawPtr, BlockBasedOptions, Cache, DB, DBCompressionType, DBRecoveryMode,
     IngestExternalFileOptions, IteratorMode, Options, SstFileWriter, WriteOptions,
 };
 use std::{
@@ -10,7 +10,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     ops::{Bound, Deref},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -88,12 +88,64 @@ struct PointPool {
     idle: BTreeMap<Keyspace, Vec<(Instant, rocksdb::DBRawIterator<'static>)>>,
 }
 
+#[derive(Default)]
+struct CloseState {
+    closed: Mutex<bool>,
+    wake: Condvar,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct CloseLatch(Arc<CloseState>);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StillHeld;
+
+#[allow(dead_code, reason = "Used by the later recovery supervisor")]
+impl CloseLatch {
+    pub(crate) fn wait(&self, timeout: Duration) -> Result<(), StillHeld> {
+        let closed = self.0.closed.lock().unwrap_or_else(|p| p.into_inner());
+        let (closed, _) = self.0.wake.wait_timeout_while(closed, timeout, |closed| !*closed)
+            .unwrap_or_else(|p| p.into_inner());
+        if *closed { Ok(()) } else { Err(StillHeld) }
+    }
+}
+
+/// Declared after the native DB and writer lock so neither can outlive the signal.
+struct SignalClose(CloseLatch);
+impl Drop for SignalClose {
+    fn drop(&mut self) {
+        let CloseLatch(state) = &self.0;
+        *state.closed.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        state.wake.notify_all();
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryOpenCrash {
+    BeforeNativeOpen,
+    DuringRecoveryFlush,
+    AfterNativeOpen,
+}
+
+#[cfg(test)]
+pub(crate) const RECOVERY_FLUSH_MARKER: &str = "recovery-flush-fired";
+#[cfg(test)]
+pub(crate) const RECOVERY_FLUSH_MISSED: i32 = 88;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RECOVERY_OPEN_CRASH: std::cell::Cell<Option<RecoveryOpenCrash>> = const { std::cell::Cell::new(None) };
+    pub(crate) static WAL_ONLY_SHUTDOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 struct LockedDb {
     // Must precede db: all lifetime-extended iterators die before their DB.
     points: Mutex<PointPool>,
     // Field order matters: close RocksDB before releasing the explicit lock.
     db: DB,
     _writer_lock: WriterLock,
+    close: SignalClose,
 }
 
 impl LockedDb {
@@ -124,8 +176,20 @@ impl Drop for RocksKv {
 
 impl RocksKv {
     pub(crate) fn open(path: &Path, cache_bytes: usize) -> Result<Self, KvError> {
+        Self::open_in_mode(path, cache_bytes, DBRecoveryMode::PointInTime)
+    }
+
+    pub(crate) fn open_recovery(path: &Path, cache_bytes: usize) -> Result<Self, KvError> {
+        Self::open_in_mode(path, cache_bytes, DBRecoveryMode::TolerateCorruptedTailRecords)
+    }
+
+    fn open_in_mode(path: &Path, cache_bytes: usize, mode: DBRecoveryMode) -> Result<Self, KvError> {
         std::fs::create_dir_all(path).map_err(|error| KvError::Io(error.to_string()))?;
-        Self::open_locked(path, cache_bytes, WriterLock::acquire(path)?)
+        Self::open_locked_in_mode(path, cache_bytes, WriterLock::acquire(path)?, mode)
+    }
+
+    pub(crate) fn close_latch(&self) -> CloseLatch {
+        self.db.close.0.clone()
     }
 
     /// Capture an atomic, reopenable view of every column family.
@@ -161,6 +225,15 @@ impl RocksKv {
         cache_bytes: usize,
         writer_lock: WriterLock,
     ) -> Result<Self, KvError> {
+        Self::open_locked_in_mode(path, cache_bytes, writer_lock, DBRecoveryMode::PointInTime)
+    }
+
+    fn open_locked_in_mode(
+        path: &Path,
+        cache_bytes: usize,
+        writer_lock: WriterLock,
+        mode: DBRecoveryMode,
+    ) -> Result<Self, KvError> {
         let cache = Cache::new_lru_cache(cache_bytes);
         let mut table = BlockBasedOptions::default();
         table.set_block_cache(&cache);
@@ -169,20 +242,89 @@ impl RocksKv {
         options.create_missing_column_families(true);
         options.set_compression_type(DBCompressionType::Lz4);
         options.set_block_based_table_factory(&table);
-        let db = DB::open_cf_with_opts(
-            &options,
-            native_path(path),
-            Keyspace::ALL.map(|ks| (ks.name(), options.clone())),
-        )
-        .map_err(map_error)?;
+        // Fence recovery design note section 6.3. Normal startup keeps point-in-time replay.
+        options.set_recycle_log_file_num(0);
+        options.set_wal_recovery_mode(mode);
+        options.set_manual_wal_flush(false);
+        // SAFETY: the options handle is live and uniquely borrowed here.
+        unsafe { librocksdb_sys::rocksdb_options_set_avoid_flush_during_recovery(options.as_raw_ptr(), 0) };
+        #[cfg(test)]
+        if WAL_ONLY_SHUTDOWN.get() {
+            // SAFETY: the options handle is live and uniquely borrowed here.
+            unsafe { librocksdb_sys::rocksdb_options_set_avoid_flush_during_shutdown(options.as_raw_ptr(), 1) };
+        }
+        #[cfg(test)]
+        if RECOVERY_OPEN_CRASH.get() == Some(RecoveryOpenCrash::BeforeNativeOpen) {
+            crate::storage::crash_now();
+        }
+        let open_native = || {
+            DB::open_cf_with_opts(
+                &options,
+                native_path(path),
+                Keyspace::ALL.map(|ks| (ks.name(), options.clone())),
+            )
+        };
+        #[cfg(test)]
+        let result = if RECOVERY_OPEN_CRASH.get() == Some(RecoveryOpenCrash::DuringRecoveryFlush) {
+            crash_during_recovery_flush(path, open_native)
+        } else {
+            open_native()
+        };
+        #[cfg(not(test))]
+        let result = open_native();
+        let db = result.map_err(|error| map_error_at(error, FenceSite::Open))?;
+        #[cfg(test)]
+        if RECOVERY_OPEN_CRASH.get() == Some(RecoveryOpenCrash::AfterNativeOpen) {
+            crate::storage::crash_now();
+        }
         Ok(Self {
             db: Arc::new(LockedDb {
                 points: Mutex::new(PointPool::default()),
                 db,
                 _writer_lock: writer_lock,
+                close: SignalClose(CloseLatch::default()),
             }),
         })
     }
+}
+
+#[cfg(test)]
+fn crash_during_recovery_flush<T>(path: &Path, open_native: impl FnOnce() -> T) -> T {
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    fn ssts(path: &Path) -> impl Iterator<Item = PathBuf> {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|file| file.extension().is_some_and(|ext| ext == "sst"))
+    }
+
+    let existing: Vec<_> = ssts(path).collect();
+    let mut marker = File::create(path.join(RECOVERY_FLUSH_MARKER)).unwrap();
+    let finished = AtomicBool::new(false);
+    let ready = Barrier::new(2);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            ready.wait();
+            while !finished.load(Ordering::SeqCst) {
+                if ssts(path).any(|path| !existing.contains(&path)) {
+                    marker.write_all(b"new SST during native open").unwrap();
+                    if !finished.load(Ordering::SeqCst) {
+                        std::process::abort();
+                    }
+                    break;
+                }
+                thread::yield_now();
+            }
+        });
+        ready.wait();
+        let result = open_native();
+        finished.store(true, Ordering::SeqCst);
+        result
+    })
 }
 
 /// One exported SST part. `path` is `None` when the interval was empty at the
@@ -440,13 +582,179 @@ impl RocksKv {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn flush_one_memtable(&self, ks: Keyspace) -> Result<(), KvError> {
+        let mut options = rocksdb::FlushOptions::default();
+        options.set_wait(true);
+        self.db
+            .flush_cf_opt(self.db.cf_handle(ks.name()).unwrap(), &options)
+            .map_err(|error| self.map_write_error(error, FenceSite::BackgroundError, false))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_sst(&self, ks: Keyspace) -> bool {
+        self.db
+            .live_files()
+            .unwrap()
+            .iter()
+            .any(|file| file.column_family_name == ks.name())
+    }
 }
 
 fn map_error(error: rocksdb::Error) -> KvError {
-    if error.kind() == ErrorKind::Corruption {
-        KvError::Corrupt(error.to_string())
-    } else {
-        KvError::Io(error.to_string())
+    map_error_at(error, FenceSite::Read)
+}
+
+fn map_error_at(error: rocksdb::Error, site: FenceSite) -> KvError {
+    use rocksdb::ErrorKind::*;
+    let code = match error.kind() {
+        NotFound => 1,
+        Corruption => return KvError::Corrupt(error.into_string()),
+        NotSupported => 3,
+        InvalidArgument => 4,
+        IOError => RocksStatus::IO_ERROR,
+        MergeInProgress => 6,
+        Incomplete => 7,
+        ShutdownInProgress => 8,
+        TimedOut => 9,
+        Aborted => 10,
+        Busy => 11,
+        Expired => 12,
+        TryAgain => 13,
+        CompactionTooLarge => 14,
+        ColumnFamilyDropped => 15,
+        Unknown => u8::MAX,
+    };
+    let message = error.into_string();
+    let (subcode, _) = status_detail(&message);
+    KvError::RocksIo { message, status: RocksStatus { code, subcode, severity: None }, site }
+}
+
+fn status_detail(message: &str) -> (u8, &str) {
+    // Status::ToString emits code and subcode prefixes. It does not serialize severity.
+    // The labels and their order are from the pinned RocksDB util/status.cc.
+    const SUBCODES: [&str; 19] = [
+        "Timeout Acquiring Mutex",
+        "Timeout waiting to lock key",
+        "Failed to acquire lock due to max_num_locks limit",
+        "No space left on device",
+        "Deadlock",
+        "Stale file handle",
+        "Memory limit reached",
+        "Space limit reached",
+        "No such file or directory",
+        "Insufficient capacity for merge operands",
+        "Manual compaction paused",
+        " (overwritten)",
+        "Txn not prepared",
+        "IO fenced off",
+        "Merge operator failed",
+        "Number of operands merged exceeded threshold",
+        "MultiScan reached file prefetch limit",
+        "Not expected code path",
+        "All compactions aborted",
+    ];
+    let detail = message.split_once(": ").map_or("", |(_, detail)| detail);
+    for (index, prefix) in SUBCODES.iter().enumerate() {
+        if detail == *prefix {
+            return ((index + 1) as u8, "");
+        }
+        if let Some(rest) = detail.strip_prefix(prefix).and_then(|rest| rest.strip_prefix(": ")) {
+            return ((index + 1) as u8, rest);
+        }
+    }
+    (0, detail)
+}
+
+fn wal_number(file: &str) -> Option<u64> {
+    let number = file.strip_suffix(".log")?;
+    if !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    number.parse().ok()
+}
+
+fn wal_io(detail: &str) -> Option<(&str, u64)> {
+    // A write can return SST, MANIFEST or background errors as well. Require a
+    // known append/sync diagnostic and a numeric RocksDB WAL filename.
+    const OPERATIONS: [&str; 6] = [
+        "While appending to file: ",
+        "While fdatasync: ",
+        "While fsync: ",
+        "Failed to WriteFile: ",
+        "Failed to write all bytes: ",
+        "FlushFileBuffers failed at Sync() for: ",
+    ];
+    let diagnostic = OPERATIONS.iter().find_map(|op| detail.strip_prefix(op))?;
+    let path = diagnostic
+        .split_once(": ")
+        .map_or(diagnostic, |(path, _)| path);
+    Some((path, wal_number(path.rsplit(['/', '\\']).next()?)?))
+}
+
+fn newest_wal(path: &Path) -> std::io::Result<Option<u64>> {
+    let mut newest = None;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if let Some(number) = entry.file_name().to_str().and_then(wal_number)
+            && entry.file_type()?.is_file()
+        {
+            newest = newest.max(Some(number));
+        }
+    }
+    Ok(newest)
+}
+
+fn write_error_site(
+    site: FenceSite,
+    sync: bool,
+    message: &str,
+    background_errors: Option<u64>,
+    wal_dir: &Path,
+) -> FenceSite {
+    match background_errors {
+        Some(1..) => FenceSite::BackgroundError,
+        Some(0)
+            if sync
+                && let Some((file, number)) = wal_io(status_detail(message).1)
+                && Path::new(file).parent() == Some(wal_dir)
+                && newest_wal(wal_dir).is_ok_and(|newest| newest == Some(number)) =>
+        {
+            match site {
+                FenceSite::Write => FenceSite::WalWrite,
+                FenceSite::FlushBarrier => FenceSite::WalFlush,
+                _ => site,
+            }
+        }
+        _ => site,
+    }
+}
+
+impl RocksKv {
+    // In RocksDB 11.8.1, background SyncClosedWals only syncs older WALs.
+    // Its error can be published before the cumulative background-error count
+    // increments, so require the diagnostic to name the newest live WAL too.
+    // WALs are kept in the DB directory. Re-verify these and the native error
+    // text and property semantics when upgrading RocksDB.
+    fn map_write_error(
+        &self,
+        error: rocksdb::Error,
+        site: FenceSite,
+        sync: bool,
+    ) -> KvError {
+        let mut error = map_error_at(error, site);
+        if let KvError::RocksIo { status, site: error_site, message } = &mut error
+            && status.code == RocksStatus::IO_ERROR
+        {
+            let background_errors = self
+                .db
+                .property_int_value("rocksdb.background-errors")
+                .ok()
+                .flatten();
+            *error_site = write_error_site(site, sync, message, background_errors, self.db.path());
+        }
+        error
     }
 }
 
@@ -513,7 +821,7 @@ fn bounded<'a>(
     dir: Direction,
 ) -> KvIter<'a> {
     let mut done = false;
-    Box::new(std::iter::from_fn(move || {
+    KvIter::new(std::iter::from_fn(move || {
         while !done {
             let pair = match iter.next()? {
                 Ok(pair) => pair,
@@ -630,6 +938,11 @@ impl KvRead for RocksKv {
 }
 
 impl KvBackend for RocksKv {
+    fn close_latch(&self) -> Option<CloseLatch> {
+        Some(self.close_latch())
+    }
+
+
     fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError> {
         let mut native = rocksdb::WriteBatch::default();
         for op in batch.into_ops() {
@@ -649,11 +962,13 @@ impl KvBackend for RocksKv {
         let mut options = WriteOptions::default();
         options.set_sync(durability == Durability::Sync);
         options.disable_wal(false);
-        self.db.write_opt(native, &options).map_err(map_error)
+        self.db.write_opt(native, &options)
+            .map_err(|error| self.map_write_error(error, FenceSite::Write, durability == Durability::Sync))
     }
 
     fn flush_barrier(&self) -> Result<(), KvError> {
-        self.db.flush_wal(true).map_err(map_error)
+        self.db.flush_wal(true)
+            .map_err(|error| self.map_write_error(error, FenceSite::FlushBarrier, true))
     }
 
     fn snapshot(&self) -> Result<Arc<dyn KvRead>, KvError> {
@@ -782,7 +1097,7 @@ impl KvRead for OwnedSnapshot {
         let (reply, receive) = mpsc::sync_channel(0);
         self.send(Request::Range(ks, own(start), own(end), dir, reply))?;
         let id = receive.recv().map_err(|_| disconnected())?;
-        Ok(Box::new(SnapshotIter {
+        Ok(KvIter::new(SnapshotIter {
             snapshot: self,
             id,
             done: false,
@@ -833,6 +1148,7 @@ mod sst_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::v2::recovery_tests::retry_writer_lock;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct TestDir(PathBuf);
@@ -854,12 +1170,233 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writer_lock_is_inherited_until_child_exec() {
+        use std::{
+            io,
+            os::{fd::AsRawFd, unix::process::CommandExt},
+            process::Command,
+        };
+
+        const ISOLATED: &str = "GIGGLES_TEST_WRITER_LOCK_INHERITANCE";
+        if std::env::var_os(ISOLATED).is_none() {
+            // Other tests can fork concurrently. Keep their children out of the control.
+            let (_, module) = module_path!().split_once("::").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("{module}::writer_lock_is_inherited_until_child_exec"),
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success()
+                    && stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed;")),
+                "{}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let dir = TestDir::new();
+        let path = &dir.0;
+        drop(WriterLock::acquire(path).unwrap());
+        let lock = WriterLock::acquire(path).unwrap();
+        let (mut entered, ready) = io::pipe().unwrap();
+        let (resume, allow_exec) = io::pipe().unwrap();
+        let child_release_writer = allow_exec.as_raw_fd();
+        let mut command = Command::new("/bin/true");
+        // SAFETY: the closure owns the pipe ends it reads and writes. The
+        // parent keeps allow_exec live through fork, and close only affects
+        // the child's inherited descriptor. All calls are async-signal-safe.
+        unsafe {
+            command.pre_exec(move || {
+                let mut signal = [1u8];
+                if libc::close(child_release_writer) == -1
+                    || libc::write(ready.as_raw_fd(), signal.as_ptr().cast(), signal.len()) != 1
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                libc::sleep(1);
+                // The parent closes the remaining writer after probing the lock.
+                if libc::read(resume.as_raw_fd(), signal.as_mut_ptr().cast(), signal.len()) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        thread::scope(move |scope| {
+            // status() cannot return while the forked child waits in pre_exec.
+            let status = scope.spawn(move || command.status().unwrap());
+            let ready = entered.read_exact(&mut [0]);
+            drop(lock);
+            let blocked = WriterLock::acquire(path);
+            drop(allow_exec);
+            assert!(status.join().unwrap().success());
+            ready.unwrap();
+            assert!(matches!(
+                blocked,
+                Err(KvError::Io(message)) if message == "database already open by another writer"
+            ));
+        });
+        drop(WriterLock::acquire(path).unwrap());
+    }
+
     fn single() -> WriteBatch {
         let mut batch = WriteBatch::default();
         for ks in Keyspace::ALL {
             batch.put(ks, b"key".to_vec(), b"value".to_vec());
         }
         batch
+    }
+
+    #[test]
+    fn status_detail_and_wal_io_fail_closed() {
+        for (message, subcode, number) in [
+            (
+                "IO error: While appending to file: /db/000042.log: File too large",
+                0,
+                Some(42),
+            ),
+            (
+                "IO error: No space left on device: While fdatasync: /db/000042.log: No space left on device",
+                4,
+                Some(42),
+            ),
+            ("IO error: No space left on device", 4, None),
+            ("IO error: While fsync: /db/000042.log", 0, Some(42)),
+            (
+                r"IO error: Failed to WriteFile: C:\db\000042.log: Error 112",
+                0,
+                Some(42),
+            ),
+            (
+                r"IO error: Failed to write all bytes: C:\db\000042.log",
+                0,
+                Some(42),
+            ),
+            (
+                r"IO error: FlushFileBuffers failed at Sync() for: C:\db\000042.log: Error 112",
+                0,
+                Some(42),
+            ),
+            (
+                "IO error: While appending to file: /db/000042.sst: out of space",
+                0,
+                None,
+            ),
+            (
+                "IO error: While fsync: /db/MANIFEST-000042: out of space",
+                0,
+                None,
+            ),
+            ("IO error: While fsync: /db/: out of space", 0, None),
+            (
+                "IO error: While open a file for appending: /db/000042.log: out of space",
+                0,
+                None,
+            ),
+            (
+                "IO error: While appending to file: /db/000042.log.tmp: out of space",
+                0,
+                None,
+            ),
+            (
+                "IO error: While fsync: /db/123.log/data: path to 42.log",
+                0,
+                None,
+            ),
+            (
+                "IO error: While appending to file: /db/current.log: out of space",
+                0,
+                None,
+            ),
+            (
+                "IO error: While appending to file: /db/.log: out of space",
+                0,
+                None,
+            ),
+            (
+                "IO error: While appending to file: /db/18446744073709551616.log",
+                0,
+                None,
+            ),
+            ("Incomplete", 0, None),
+        ] {
+            let (actual_subcode, detail) = status_detail(message);
+            assert_eq!(actual_subcode, subcode, "{message}");
+            assert_eq!(wal_io(detail).map(|(_, number)| number), number, "{message}");
+        }
+    }
+
+    #[test]
+    fn write_error_requires_newest_live_wal() {
+        let dir = TestDir::new();
+        for name in ["000099.log", "000100.log", "000101.log.tmp"] {
+            File::create(dir.0.join(name)).unwrap();
+        }
+        std::fs::create_dir(dir.0.join("000102.log")).unwrap();
+        let append_error = |path: &Path| format!("IO error: While appending to file: {}: File too large", path.display());
+        let current = append_error(&dir.0.join("000100.log"));
+        let old = append_error(&dir.0.join("000099.log"));
+        let unreadable = dir.0.join("000100.log");
+        let unreadable_error = append_error(&unreadable.join("000100.log"));
+        let classify = |message: &str, sync, count, path| {
+            let site = write_error_site(FenceSite::Write, sync, message, count, path);
+            let error = KvError::RocksIo {
+                message: message.into(),
+                site,
+                status: RocksStatus {
+                    code: RocksStatus::IO_ERROR,
+                    subcode: 0,
+                    severity: None,
+                },
+            };
+            (site, FenceCause::for_kv(FenceSite::Write, &error).class)
+        };
+        use {FenceClass as Class, FenceSite as Site};
+        assert_eq!(newest_wal(&dir.0).unwrap(), Some(100));
+        assert_eq!(
+            classify(&current, true, Some(0), &dir.0),
+            (Site::WalWrite, Class::Recoverable)
+        );
+        assert_eq!(
+            write_error_site(Site::FlushBarrier, true, &current, Some(0), &dir.0),
+            Site::WalFlush
+        );
+        assert_eq!(
+            classify(&current, true, Some(1), &dir.0),
+            (Site::BackgroundError, Class::NotRecoverable)
+        );
+        for (message, sync, count, path) in [
+            (old.as_str(), true, Some(0), dir.0.as_path()),
+            (
+                "IO error: While appending to file: /db/000100.sst",
+                true,
+                Some(0),
+                dir.0.as_path(),
+            ),
+            (
+                "IO error: While appending to file: /db/.log",
+                true,
+                Some(0),
+                dir.0.as_path(),
+            ),
+            ("IO error: While appending to file: /other/000100.log", true, Some(0), dir.0.as_path()),
+            (&unreadable_error, true, Some(0), unreadable.as_path()),
+            (&current, true, None, dir.0.as_path()),
+            (&current, false, Some(0), dir.0.as_path()),
+        ] {
+            assert_eq!(
+                classify(message, sync, count, path),
+                (Site::Write, Class::NotRecoverable),
+                "{message}"
+            );
+        }
     }
 
     #[test]
@@ -895,7 +1432,7 @@ mod tests {
             .unwrap();
             super::super::mvcc::tests::point_versions(&db);
         }
-        let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        let db = retry_writer_lock(|| RocksKv::open(&dir.0, 8 * 1024 * 1024)).unwrap();
         super::super::kv_conformance::assert_first_in_deleted(&db);
         super::super::mvcc::tests::check_point_versions(&db);
         super::super::mvcc::tests::check_point_versions(db.snapshot().unwrap().as_ref());
@@ -910,6 +1447,7 @@ mod tests {
     fn pooled_drop_clears_pins_while_snapshot_owns_db() {
         let dir = TestDir::new();
         let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        let latch = db.close_latch();
         point_put(&db, b"a", b"old");
         let snapshot = db.snapshot().unwrap();
         db.first_in(Keyspace::Rows, b"a", b"b").unwrap();
@@ -922,7 +1460,8 @@ mod tests {
         );
         drop(snapshot);
         drop(owner);
-        let reopened = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        latch.wait(Duration::ZERO).unwrap();
+        let reopened = retry_writer_lock(|| RocksKv::open(&dir.0, 8 * 1024 * 1024)).unwrap();
         assert!(
             reopened
                 .first_in(Keyspace::Rows, b"a", b"b")
@@ -1082,7 +1621,7 @@ mod tests {
                 db.flush_barrier().unwrap();
             }
         }
-        let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        let db = retry_writer_lock(|| RocksKv::open(&dir.0, 8 * 1024 * 1024)).unwrap();
         assert_eq!(db.engine_name(), "rocksdb");
         for ks in Keyspace::ALL {
             assert_eq!(db.get(ks, b"key").unwrap(), Some(b"value".to_vec()));

@@ -121,6 +121,7 @@ fn single_node_creation_preserves_initial_meta() {
 
 #[test]
 fn single_node_open_refuses_replicated_without_meta_changes() {
+    use super::recovery_tests::retry_writer_lock;
     use engine::kv::{KvBackend, KvRead};
     let mut nonce = [0; 16];
     getrandom::fill(&mut nonce).unwrap();
@@ -146,10 +147,10 @@ fn single_node_open_refuses_replicated_without_meta_changes() {
     let before = meta(backend.as_ref());
     drop(backend);
     assert!(matches!(
-        Admin::open(&path, Limits::default()),
+        retry_writer_lock(|| Admin::open(&path, Limits::default())),
         Err(CoreError::Unsupported)
     ));
-    let backend = engine::kv_rocksdb::RocksKv::open(&path, 8 << 20).unwrap();
+    let backend = retry_writer_lock(|| engine::kv_rocksdb::RocksKv::open(&path, 8 << 20)).unwrap();
     assert_eq!(meta(backend.snapshot().unwrap().as_ref()), before);
     drop(backend);
     std::fs::remove_dir_all(path).unwrap();
@@ -178,7 +179,7 @@ fn metadata_origin_cache_uses_exact_snapshot_and_never_caches_errors() {
     // This private backend has no external writers; exercise the native cache path.
     let db = super::V2Db::from_kv_with_limit(
         Arc::new(engine::kv::Kv::new_single_writer(initialized_backend())),
-        DEFAULT_WRITE_SET_BYTES, false, None,
+        DEFAULT_WRITE_SET_BYTES, false, None, None,
     ).unwrap();
     let old = db.begin(Isolation::ReadCommitted);
     let ts = old.current_snapshot_ts().unwrap();

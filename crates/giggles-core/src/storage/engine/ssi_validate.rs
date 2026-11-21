@@ -470,7 +470,7 @@ mod tests {
             _: Direction,
         ) -> Result<KvIter<'_>, KvError> {
             if self.late {
-                Ok(Box::new(std::iter::once(Err(self.error.clone()))))
+                Ok(KvIter::new(std::iter::once(Err(self.error.clone()))))
             } else {
                 Err(self.error.clone())
             }

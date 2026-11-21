@@ -34,6 +34,9 @@ serde_json = { version = "1", features = ["arbitrary_precision"] }
 [dev-dependencies]
 giggles-model = { path = "../giggles-model" }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
 [[test]]
 name = "all"
 path = "tests/all.rs"

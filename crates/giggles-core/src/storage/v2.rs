@@ -91,6 +91,7 @@ pub(crate) struct V2Db {
 pub(super) fn format_error(error: engine::meta::FormatError) -> CoreError {
     match error {
         engine::meta::FormatError::Corrupt(message)
+        | engine::meta::FormatError::WrappedIo { message, .. }
         | engine::meta::FormatError::Incomplete(message) => CoreError::Corrupt(message),
         engine::meta::FormatError::Unsupported(_) => CoreError::Unsupported,
     }
@@ -116,7 +117,102 @@ pub(super) fn has_traces(path: &Path) -> bool {
 #[cfg(feature = "engine-rocksdb")]
 pub(crate) const DEFAULT_WRITE_SET_BYTES: usize = 1024 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CloseReport {
+    pub(crate) ack_hw: engine::hlc::Ts,
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecoveryOpen {
+    pub(crate) ack_hw: engine::hlc::Ts,
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[derive(Debug)]
+#[allow(dead_code, reason = "Used by the later recovery supervisor")]
+pub(crate) struct OpenFailure {
+    pub(crate) error: CoreError,
+    pub(crate) cause: engine::kv::FenceCause,
+}
+
+#[cfg(feature = "engine-rocksdb")]
+impl OpenFailure {
+    fn from_startup_error(error: CoreError, kv: &engine::kv::Kv) -> Self {
+        use engine::kv::FenceClass;
+        let mut failure = Self::from(error);
+        if failure.cause.class != FenceClass::Data
+            && let Some(cause) = kv.causes.cause()
+        {
+            failure.cause = cause;
+        }
+        failure
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+impl From<CoreError> for OpenFailure {
+    fn from(error: CoreError) -> Self {
+        use engine::kv::{FenceCause, FenceSite};
+        let cause = FenceCause::for_core(FenceSite::Open, &error);
+        Self { error, cause }
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+impl From<engine::kv::KvError> for OpenFailure {
+    fn from(error: engine::kv::KvError) -> Self {
+        use engine::kv::{FenceCause, FenceSite};
+        let cause = FenceCause::for_kv(FenceSite::Open, &error);
+        Self { error: error.into(), cause }
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+impl From<engine::txn::TxnError> for OpenFailure {
+    fn from(error: engine::txn::TxnError) -> Self {
+        match error {
+            engine::txn::TxnError::Kv(error) => error.into(),
+            other => CoreError::from(other).into(),
+        }
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+impl From<engine::meta::FormatError> for OpenFailure {
+    fn from(error: engine::meta::FormatError) -> Self {
+        use engine::{kv::{FenceCause, FenceSite}, meta::FormatError};
+        match error {
+            FormatError::WrappedIo { message, source } => Self {
+                error: CoreError::Corrupt(message),
+                cause: FenceCause::for_kv(FenceSite::Open, &source),
+            },
+            other => format_error(other).into(),
+        }
+    }
+}
+
 impl V2Db {
+    /// Called by the owner while it still holds the engine, before its last drop.
+    #[allow(dead_code, reason = "Used by the later recovery supervisor")]
+    pub(crate) fn shutdown(&self) -> CloseReport {
+        self.sequencer.stop_submissions();
+        self.maintenance.shutdown();
+        self.sequencer.shutdown();
+        CloseReport { ack_hw: self.sequencer.visible_ts() }
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[allow(dead_code, reason = "Used by the later recovery supervisor")]
+    pub(crate) fn close_latch(&self) -> Option<engine::kv_rocksdb::CloseLatch> {
+        self.kv.close_latch()
+    }
+
+    pub(crate) fn fence_cause(&self) -> Option<engine::kv::FenceCause> {
+        self.kv.causes.cause()
+    }
+
+
     #[cfg(feature = "engine-rocksdb")]
     pub(crate) fn create(path: &Path) -> Result<Self, CoreError> {
         let mut domain = [0u8; 16];
@@ -135,7 +231,8 @@ impl V2Db {
     }
     #[cfg(feature = "engine-rocksdb")]
     fn from_kv(kv: Arc<engine::kv::Kv>) -> Result<Self, CoreError> {
-        Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false, None)
+        Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false, None, None)
+            .map_err(|failure| failure.error)
     }
     #[cfg(feature = "engine-rocksdb")]
     pub(crate) fn from_backend(
@@ -147,7 +244,9 @@ impl V2Db {
             write_set_bytes,
             true,
             None,
+            None,
         )
+        .map_err(|failure| failure.error)
     }
     #[cfg(feature = "engine-rocksdb")]
     fn from_kv_with_limit(
@@ -155,10 +254,20 @@ impl V2Db {
         write_set_bytes: usize,
         replicated_allowed: bool,
         token: Option<&[u8]>,
-    ) -> Result<Self, CoreError> {
-        let meta = engine::meta::open_checks(kv.as_ref()).map_err(format_error)?;
+        recovery: Option<RecoveryOpen>,
+    ) -> Result<Self, OpenFailure> {
+        if let Some(recovery) = recovery {
+            let on_disk = engine::commit::read_last_commit_ts(&kv)?;
+            if on_disk < recovery.ack_hw {
+                return Err(CoreError::Corrupt(format!(
+                    "last_commit_ts {} is below acknowledged commit {}",
+                    on_disk.0, recovery.ack_hw.0,
+                )).into());
+            }
+        }
+        let meta = engine::meta::open_checks(kv.as_ref())?;
         if meta.features & engine::meta::REPLICATED != 0 && !replicated_allowed {
-            return Err(CoreError::Unsupported);
+            return Err(CoreError::Unsupported.into());
         }
         if !meta.stale_counters.is_empty() {
             let mut batch = engine::kv::WriteBatch::default();
@@ -196,7 +305,8 @@ impl V2Db {
         let sequences = Arc::new(sequences);
         let xacts = engine::xact::XactIds::new(kv.clone(), sequences.clone());
         let catalog =
-            engine::catalog::Catalog::open(sequencer.clone(), locks.clone(), sequences.clone())?;
+            engine::catalog::Catalog::open(sequencer.clone(), locks.clone(), sequences.clone())
+                .map_err(|error| OpenFailure::from_startup_error(error, &kv))?;
         let gc = Arc::new(engine::gc::Gc::open(
             kv.clone(),
             sequencer.clone(),
@@ -205,8 +315,8 @@ impl V2Db {
             },
         )?);
         let replicated = meta.features & engine::meta::REPLICATED != 0;
-        let db = Self {
-            maintenance: maintenance::Maintenance::start(&gc, replicated)?,
+        let mut db = Self {
+            maintenance: maintenance::Maintenance::new(replicated),
             gc,
             kv,
             meta,
@@ -226,7 +336,35 @@ impl V2Db {
             wall_clock: std::sync::RwLock::new(Arc::new(engine::commit::SystemClock)),
             row_predicates: Default::default(),
         };
-        db.reclaim_background()?;
+        #[cfg(test)]
+        let reclaim = TEST_OPEN_RECLAIM.take().unwrap_or(Self::reclaim_background);
+        #[cfg(not(test))]
+        let reclaim = Self::reclaim_background;
+        // Reclaim is inline. Start maintenance only after this check, so a
+        // background GC read cannot decide whether the database opens.
+        let health = reclaim(&db).map_err(|error| OpenFailure::from_startup_error(error, &db.kv)).and_then(|()| {
+            use engine::kv::FenceClass;
+            if let Some(cause) = db.fence_cause() {
+                let error = if db.kv.is_fenced() {
+                    CoreError::Fenced
+                } else if cause.class == FenceClass::Data {
+                    CoreError::Corrupt(cause.error_text.clone())
+                } else {
+                    CoreError::Storage(cause.error_text.clone())
+                };
+                return Err(OpenFailure { error, cause });
+            }
+            if db.kv.is_fenced() || (recovery.is_some() && !db.sequencer.is_accepting()) {
+                return Err(CoreError::Fenced.into());
+            }
+            Ok(())
+        }).and_then(|()| db.maintenance.start(&db.gc).map_err(OpenFailure::from));
+        if let Err(failure) = health {
+            if recovery.is_some() {
+                db.shutdown();
+            }
+            return Err(failure);
+        }
         Ok(db)
     }
 
@@ -258,7 +396,7 @@ impl V2Db {
                 retention: maintenance::RETENTION,
             },
         )?);
-        let maintenance = maintenance::Maintenance::start(&gc, true)?;
+        let maintenance = maintenance::Maintenance::new(true);
         kv.fence();
         let client = services.client();
         let sequences = Arc::new(engine::seq::SequenceAllocator::leased(client.clone(), 0));
@@ -591,29 +729,62 @@ impl V2Db {
         Self::open_with_holder(path, None)
     }
     pub(crate) fn open_with_holder(path: &Path, token: Option<&[u8]>) -> Result<Self, CoreError> {
-        #[cfg(not(feature = "engine-rocksdb"))]
-        let _ = token;
-        if engine::meta::classify_dir(path).map_err(format_error)? != engine::meta::DirClass::V2 {
-            return Err(CoreError::Corrupt("not a v2 directory".into()));
+        #[cfg(feature = "engine-rocksdb")]
+        {
+            Self::open_in_mode(path, token, None).map_err(|failure| failure.error)
         }
         #[cfg(not(feature = "engine-rocksdb"))]
         {
+            let _ = token;
+            if engine::meta::classify_dir(path).map_err(format_error)? != engine::meta::DirClass::V2 {
+                return Err(CoreError::Corrupt("not a v2 directory".into()));
+            }
             Err(CoreError::EngineUnsupported {
                 engine: "v2",
                 feature: super::ROCKSDB_NOT_COMPILED,
             })
         }
-        #[cfg(feature = "engine-rocksdb")]
-        {
-            let kv = Arc::new(engine::kv::Kv::new_single_writer(Arc::new(
-                engine::kv_rocksdb::RocksKv::open(path, 64 * 1024 * 1024)?,
-            )));
-            Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false, token)
-        }
     }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[allow(dead_code, reason = "Used by the later recovery supervisor")]
+    pub(crate) fn open_recovery(
+        path: &Path,
+        token: Option<&[u8]>,
+        recovery: RecoveryOpen,
+    ) -> Result<Self, OpenFailure> {
+        Self::open_in_mode(path, token, Some(recovery))
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    fn open_in_mode(
+        path: &Path,
+        token: Option<&[u8]>,
+        recovery: Option<RecoveryOpen>,
+    ) -> Result<Self, OpenFailure> {
+        use engine::kv_rocksdb::RocksKv;
+        if engine::meta::classify_dir(path)? != engine::meta::DirClass::V2 {
+            return Err(CoreError::Corrupt("not a v2 directory".into()).into());
+        }
+        const CACHE_BYTES: usize = 64 * 1024 * 1024;
+        let rocks = if recovery.is_some() {
+            RocksKv::open_recovery(path, CACHE_BYTES)?
+        } else {
+            RocksKv::open(path, CACHE_BYTES)?
+        };
+        let kv = Arc::new(engine::kv::Kv::new_single_writer(Arc::new(rocks)));
+        Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false, token, recovery)
+    }
+
 }
 #[cfg(all(test, feature = "engine-rocksdb"))]
+type OpenReclaim = fn(&V2Db) -> Result<(), CoreError>;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
 thread_local! {
+    static TEST_OPEN_RECLAIM: std::cell::Cell<Option<OpenReclaim>> = const { std::cell::Cell::new(None) };
+
+
     /// Test hook: the recent-log budget for databases opened on this thread,
     /// so SERIALIZABLE validation takes its durable fallback (R3-610).
     pub(crate) static TEST_RECENT_LOG_BYTES: std::cell::Cell<Option<usize>> =
@@ -638,3 +809,8 @@ mod backend_tests;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "v2_maintenance_tests.rs"]
 mod maintenance_tests;
+
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "v2_recovery_tests.rs"]
+pub(super) mod recovery_tests;

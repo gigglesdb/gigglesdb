@@ -24,7 +24,7 @@ pub(super) struct NativeContent {
 impl NativeContent {
     pub(super) fn load(kv: &dyn KvRead) -> Result<Self, FormatError> {
         let latest = |key: &[u8]| -> Result<Option<Vec<u8>>, FormatError> {
-            match mvcc::latest_version(kv, Keyspace::Kernel, key).map_err(corrupt)? {
+            match mvcc::latest_version(kv, Keyspace::Kernel, key).map_err(FormatError::txn)? {
                 Some((_, None)) if key == [7] || key == records::LEDGER_HEADER_KEY => {
                     Err(corrupt("native MVCC tombstone"))
                 }

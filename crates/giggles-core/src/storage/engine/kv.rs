@@ -1,10 +1,12 @@
 //! Backend-independent KV seam. Keys are byte-lexicographic within a keyspace.
 use std::{
+    cell::Cell,
     ops::Bound,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::SystemTime,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -205,18 +207,31 @@ pub(crate) enum Direction {
     Reverse,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum KvError {
     Io(String),
+    #[cfg_attr(not(any(test, feature = "engine-rocksdb")), allow(dead_code))]
+    RocksIo { message: String, status: RocksStatus, site: FenceSite },
     Corrupt(String),
     Fenced,
     Closed,
 }
 
+impl std::fmt::Debug for KvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(message) | Self::RocksIo { message, .. } => f.debug_tuple("Io").field(message).finish(),
+            Self::Corrupt(message) => f.debug_tuple("Corrupt").field(message).finish(),
+            Self::Fenced => f.write_str("Fenced"),
+            Self::Closed => f.write_str("Closed"),
+        }
+    }
+}
+
 impl std::fmt::Display for KvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(message) => write!(f, "KV I/O: {message}"),
+            Self::Io(message) | Self::RocksIo { message, .. } => write!(f, "KV I/O: {message}"),
             Self::Corrupt(message) => write!(f, "KV corruption: {message}"),
             Self::Fenced => f.write_str("KV fenced"),
             Self::Closed => f.write_str("KV closed"),
@@ -227,7 +242,7 @@ impl std::error::Error for KvError {}
 impl From<KvError> for crate::CoreError {
     fn from(error: KvError) -> Self {
         match error {
-            KvError::Io(message) => Self::Storage(message),
+            KvError::Io(message) | KvError::RocksIo { message, .. } => Self::Storage(message),
             KvError::Corrupt(message) => Self::Corrupt(message),
             KvError::Fenced | KvError::Closed => Self::Fenced,
         }
@@ -235,7 +250,259 @@ impl From<KvError> for crate::CoreError {
 }
 
 pub(crate) type KvPair = (Vec<u8>, Vec<u8>);
-pub(crate) type KvIter<'a> = Box<dyn Iterator<Item = Result<KvPair, KvError>> + Send + 'a>;
+pub(crate) struct KvIter<'a> {
+    inner: Box<dyn Iterator<Item = Result<KvPair, KvError>> + Send + 'a>,
+    causes: Option<&'a FenceState>,
+}
+impl<'a> KvIter<'a> {
+    pub(crate) fn new(iter: impl Iterator<Item = Result<KvPair, KvError>> + Send + 'a) -> Self {
+        Self { inner: Box::new(iter), causes: None }
+    }
+}
+impl Iterator for KvIter<'_> {
+    type Item = Result<KvPair, KvError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.inner.next();
+        if let Some(Err(error)) = &item
+            && let Some(causes) = self.causes
+        {
+            causes.read_error(error);
+        }
+        item
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code, reason = "Some sites are specific to the RocksDB backend")]
+pub(crate) enum FenceSite {
+    Write,
+    WalWrite,
+    FlushBarrier,
+    WalFlush,
+    BackgroundError,
+    Read,
+    Open,
+    WriterLock,
+    CatalogReload,
+    LegacyPersist,
+    NativeOnceCommit,
+    NativeOnceLedger,
+    Other,
+}
+
+/// Status fields from RocksDB 11.8.1. The C API returns Status::ToString()
+/// rather than Status itself, so severity is absent when it was not exported.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RocksStatus {
+    pub code: u8,
+    pub subcode: u8,
+    pub severity: Option<u8>,
+}
+
+impl RocksStatus {
+    pub(crate) const IO_ERROR: u8 = 5;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FenceClass {
+    Recoverable,
+    Data,
+    NotRecoverable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FenceCause {
+    pub site: FenceSite,
+    pub class: FenceClass,
+    pub status: Option<RocksStatus>,
+    pub error_text: String,
+    pub at: SystemTime,
+    pub generation: u64,
+}
+
+impl FenceCause {
+    pub(crate) fn new(site: FenceSite, class: FenceClass, error: &impl std::fmt::Display) -> Self {
+        Self {
+            site,
+            class,
+            status: None,
+            error_text: super::diagnostics::error_text(error),
+            at: SystemTime::now(),
+            generation: 0,
+        }
+    }
+
+    pub(crate) fn for_core(site: FenceSite, error: &crate::CoreError) -> Self {
+        let class = match (site, error) {
+            (FenceSite::NativeOnceLedger, _) | (_, crate::CoreError::Corrupt(_)) => FenceClass::Data,
+            (FenceSite::CatalogReload, crate::CoreError::Storage(_) | crate::CoreError::Fenced) => {
+                FenceClass::NotRecoverable
+            }
+            (FenceSite::CatalogReload, _) => FenceClass::Data,
+            _ => FenceClass::NotRecoverable,
+        };
+        Self::new(site, class, error)
+    }
+
+    pub(crate) fn for_kv(site: FenceSite, error: &KvError) -> Self {
+        let (site, status, io_error) = match error {
+            KvError::RocksIo { status, site: actual, .. } => {
+                let site = match (site, *actual) {
+                    (FenceSite::Open, _)
+                    | (
+                        FenceSite::Write | FenceSite::FlushBarrier,
+                        FenceSite::WalWrite | FenceSite::WalFlush | FenceSite::BackgroundError,
+                    ) => *actual,
+                    _ => site,
+                };
+                (site, Some(*status), status.code == RocksStatus::IO_ERROR)
+            }
+            _ => (site, None, false),
+        };
+        let class = if matches!(error, KvError::Corrupt(_)) || site == FenceSite::NativeOnceLedger {
+            FenceClass::Data
+        } else if io_error && matches!(
+            site,
+            FenceSite::WalWrite | FenceSite::WalFlush | FenceSite::Read
+                | FenceSite::Open | FenceSite::WriterLock | FenceSite::CatalogReload
+        ) {
+            FenceClass::Recoverable
+        } else {
+            FenceClass::NotRecoverable
+        };
+        Self { status, ..Self::new(site, class, error) }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct FenceState(Mutex<Option<FenceCause>>);
+
+thread_local! {
+    static READ_ERROR: Cell<Option<ReadErrorCapture>> = const { Cell::new(None) };
+}
+
+struct ReadErrorCapture {
+    state: usize,
+    error: Option<KvError>,
+}
+
+impl FenceState {
+    pub(crate) fn cause(&self) -> Option<FenceCause> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub(crate) fn record(&self, cause: FenceCause) {
+        self.record_cause(cause, false);
+    }
+
+    pub(crate) fn record_if_empty(&self, cause: FenceCause) {
+        self.record_cause(cause, true);
+    }
+
+    fn record_cause(&self, cause: FenceCause, only_if_empty: bool) {
+        let mut current = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(previous) = current.as_ref()
+            && (only_if_empty
+                || cause.generation < previous.generation
+                || (cause.generation == previous.generation
+                    && (previous.class != FenceClass::Recoverable
+                        || cause.class == FenceClass::Recoverable)))
+        {
+            return;
+        }
+        let text = format!(
+            "engine fence cause site={:?} class={:?} status={:?} generation={}: {}",
+            cause.site, cause.class, cause.status, cause.generation, cause.error_text
+        );
+        *current = Some(cause);
+        drop(current);
+        super::diagnostics::error(text);
+    }
+
+    /// Catalog reload runs on the caller thread. Carry the backend error across
+    /// conversion to CoreError without borrowing another thread's diagnosis.
+    pub(crate) fn capture_read_error<T>(&self, load: impl FnOnce() -> T) -> (T, Option<KvError>) {
+        struct Restore(Option<ReadErrorCapture>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                READ_ERROR.set(self.0.take());
+            }
+        }
+        let _restore = Restore(READ_ERROR.replace(Some(ReadErrorCapture {
+            state: std::ptr::from_ref(self).addr(),
+            error: None,
+        })));
+        let result = load();
+        (result, READ_ERROR.take().and_then(|capture| capture.error))
+    }
+
+    fn read_error(&self, error: &KvError) {
+        if matches!(error, KvError::Fenced) {
+            return;
+        }
+        let captured = READ_ERROR.with(|slot| {
+            let mut capture = slot.take();
+            let matched = capture.as_mut().is_some_and(|capture| {
+                if capture.state != std::ptr::from_ref(self).addr() {
+                    return false;
+                }
+                capture.error = Some(error.clone());
+                true
+            });
+            slot.set(capture);
+            matched
+        });
+        // Report corruption even when catalog reload also sees the typed error.
+        if !captured || matches!(error, KvError::Corrupt(_)) {
+            self.record(FenceCause::for_kv(FenceSite::Read, error));
+        }
+    }
+
+    fn read<T>(&self, result: Result<T, KvError>) -> Result<T, KvError> {
+        result.inspect_err(|error| self.read_error(error))
+    }
+
+    fn range<'a>(&'a self, result: Result<KvIter<'a>, KvError>) -> Result<KvIter<'a>, KvError> {
+        self.read(result).map(|mut iter| {
+            iter.causes = Some(self);
+            iter
+        })
+    }
+}
+
+struct ReportingSnapshot {
+    snapshot: Arc<dyn KvRead>,
+    causes: Arc<FenceState>,
+}
+
+impl KvRead for ReportingSnapshot {
+    fn get(&self, ks: Keyspace, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        self.causes.read(self.snapshot.get(ks, key))
+    }
+
+    fn range(
+        &self,
+        ks: Keyspace,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        dir: Direction,
+    ) -> Result<KvIter<'_>, KvError> {
+        self.causes.range(self.snapshot.range(ks, start, end, dir))
+    }
+
+    fn first_in(&self, ks: Keyspace, start: &[u8], end: &[u8]) -> Result<Option<KvPair>, KvError> {
+        self.causes.read(self.snapshot.first_in(ks, start, end))
+    }
+
+    fn seek_ge(&self, ks: Keyspace, key: &[u8]) -> Result<Option<KvPair>, KvError> {
+        self.causes.read(self.snapshot.seek_ge(ks, key))
+    }
+}
 
 pub(crate) trait KvRead: Send + Sync {
     fn get(&self, ks: Keyspace, key: &[u8]) -> Result<Option<Vec<u8>>, KvError>;
@@ -273,6 +540,12 @@ pub(crate) trait KvRead: Send + Sync {
 }
 
 pub(crate) trait KvBackend: KvRead {
+    #[cfg(feature = "engine-rocksdb")]
+    fn close_latch(&self) -> Option<super::kv_rocksdb::CloseLatch> {
+        None
+    }
+
+
     /// An error can have an ambiguous outcome, including a fully durable commit.
     /// Callers must fence rather than retry the batch on the same handle.
     fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError>;
@@ -289,8 +562,7 @@ pub(crate) struct Kv {
     backend: Arc<dyn KvBackend>,
     fenced: AtomicBool,
     single_writer: bool,
-    #[cfg(test)]
-    fence_cause: std::sync::Mutex<Option<String>>,
+    pub(crate) causes: Arc<FenceState>,
 }
 
 impl Kv {
@@ -299,8 +571,7 @@ impl Kv {
             backend,
             fenced: AtomicBool::new(false),
             single_writer: false,
-            #[cfg(test)]
-            fence_cause: std::sync::Mutex::new(None),
+            causes: Arc::default(),
         }
     }
     /// Only for a backend whose versioned writes all pass through this engine's
@@ -312,12 +583,19 @@ impl Kv {
             ..Self::new(backend)
         }
     }
+    #[cfg(feature = "engine-rocksdb")]
+    pub(crate) fn close_latch(&self) -> Option<super::kv_rocksdb::CloseLatch> {
+        self.backend.close_latch()
+    }
+
     pub(crate) fn is_single_writer(&self) -> bool {
         self.single_writer
     }
     /// Fences the handle: every later call fails without reaching the backend.
     pub(crate) fn fence(&self) {
-        self.fenced.store(true, Ordering::Release);
+        if !self.fenced.swap(true, Ordering::AcqRel) {
+            super::diagnostics::error("KV fenced".into());
+        }
     }
     pub(crate) fn is_fenced(&self) -> bool {
         self.fenced.load(Ordering::Acquire)
@@ -331,7 +609,7 @@ impl Kv {
     }
     pub(crate) fn get(&self, ks: Keyspace, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
         self.check()?;
-        self.backend.get(ks, key)
+        self.causes.read(self.backend.get(ks, key))
     }
     pub(crate) fn range(
         &self,
@@ -341,37 +619,104 @@ impl Kv {
         dir: Direction,
     ) -> Result<KvIter<'_>, KvError> {
         self.check()?;
-        self.backend.range(ks, start, end, dir)
+        self.causes.range(self.backend.range(ks, start, end, dir))
     }
     pub(crate) fn seek_ge(&self, ks: Keyspace, key: &[u8]) -> Result<Option<KvPair>, KvError> {
         self.check()?;
-        self.backend.seek_ge(ks, key)
+        self.causes.read(self.backend.seek_ge(ks, key))
     }
     pub(crate) fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError> {
         self.check()?;
+        #[cfg(test)]
+        if self.single_writer && durability == Durability::NoSync {
+            assert_local_no_sync(&batch);
+        }
         let result = self.backend.write(batch, durability);
-        self.fence_on_error(result)
+        self.fence_on_error(FenceSite::Write, result)
     }
     pub(crate) fn flush_barrier(&self) -> Result<(), KvError> {
         self.check()?;
         let result = self.backend.flush_barrier();
-        self.fence_on_error(result)
+        self.fence_on_error(FenceSite::FlushBarrier, result)
     }
-    fn fence_on_error(&self, result: Result<(), KvError>) -> Result<(), KvError> {
-        if let Err(error) = &result
-            && !self.fenced.swap(true, Ordering::AcqRel)
-        {
-            let cause = format!("KV fenced after backend write/flush failure: {}", super::diagnostics::error_text(error));
-            super::diagnostics::error(cause.clone());
-            #[cfg(test)]
-            { *self.fence_cause.lock().unwrap() = Some(cause); }
+    fn fence_on_error(&self, site: FenceSite, result: Result<(), KvError>) -> Result<(), KvError> {
+        if let Err(error) = &result {
+            self.causes.record(FenceCause::for_kv(site, error));
+            if !self.fenced.swap(true, Ordering::AcqRel) {
+                super::diagnostics::error(format!(
+                    "KV fenced after backend write/flush failure: {}",
+                    super::diagnostics::error_text(error),
+                ));
+            }
         }
         result
     }
     pub(crate) fn snapshot(&self) -> Result<Arc<dyn KvRead>, KvError> {
         self.check()?;
-        self.backend.snapshot()
+        let snapshot = self.causes.read(self.backend.snapshot())?;
+        Ok(Arc::new(ReportingSnapshot {
+            snapshot,
+            causes: self.causes.clone(),
+        }))
     }
+}
+
+// Design note 6.2a(4). Check every local NoSync batch that reaches the test
+// seam, including GC delete chunks that leave the cursor unchanged.
+#[cfg(test)]
+fn assert_local_no_sync(batch: &WriteBatch) {
+    let safe = match batch.ops() {
+        [
+            Op::DeleteRange {
+                ks: Keyspace::Rows,
+                start,
+                end,
+            },
+        ] => <[u8; 8]>::try_from(start.as_slice()).is_ok_and(|prefix| {
+            match u64::from_be_bytes(prefix).checked_add(1) {
+                Some(next) => end.as_slice() == next.to_be_bytes(),
+                None => end.starts_with(&prefix) && end.last() == Some(&0),
+            }
+        }),
+        [
+            Op::DeleteRange {
+                ks: Keyspace::Seq,
+                start,
+                end,
+            },
+        ] => {
+            start == &super::xact::marker_key(0)
+                && end.len() == start.len()
+                && end.first() == start.first()
+                && start < end
+        }
+        ops => [
+            Keyspace::Catalog,
+            Keyspace::Rows,
+            Keyspace::Index,
+            Keyspace::Kernel,
+        ]
+        .into_iter()
+        .any(|ks| {
+            let deletes = |op: &Op| {
+                matches!(op, Op::Delete { ks: target, key }
+                    if *target == ks && super::codec::split_versioned(key).is_ok())
+            };
+            match ops.split_last() {
+                Some((
+                    Op::Put {
+                        ks: Keyspace::Gc,
+                        key,
+                        ..
+                    },
+                    rest,
+                )) => key.as_slice() == [ks as u8] && rest.iter().all(deletes),
+                Some(_) => ops.iter().all(deletes),
+                None => false,
+            }
+        }),
+    };
+    assert!(safe, "unrecognized local NoSync batch: {batch:?}");
 }
 
 impl KvRead for Kv {
@@ -389,7 +734,7 @@ impl KvRead for Kv {
     }
     fn first_in(&self, ks: Keyspace, start: &[u8], end: &[u8]) -> Result<Option<KvPair>, KvError> {
         self.check()?;
-        self.backend.first_in(ks, start, end)
+        self.causes.read(self.backend.first_in(ks, start, end))
     }
     fn seek_ge(&self, ks: Keyspace, key: &[u8]) -> Result<Option<KvPair>, KvError> {
         Kv::seek_ge(self, ks, key)

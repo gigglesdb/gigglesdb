@@ -245,17 +245,17 @@ fn check_protected_kernel(kv: &dyn KvRead, features: u64) -> Result<(), FormatEr
             Bound::Excluded(&[records::NS_MAX + 1]),
             Direction::Forward,
         )
-        .map_err(corrupt)?
+        .map_err(FormatError::kv)?
         .take(PROTECTED_OPEN_SCAN_LIMIT)
     {
-        let (key, value) = item.map_err(corrupt)?;
+        let (key, value) = item.map_err(FormatError::kv)?;
         if features & super::meta::PROTECTED_RECORDS == 0 {
             return Err(corrupt("content requires unset format feature"));
         }
         let (user, _) = codec::split_versioned(&key)
             .map_err(|error| FormatError::Corrupt(format!("{error:?}")))?;
         records::classify_key(user).map_err(corrupt)?;
-        if let Some(value) = mvcc::decode(&value).map_err(corrupt)?
+        if let Some(value) = mvcc::decode(&value).map_err(FormatError::kv)?
             && value.first() != Some(&records::VERSION)
         {
             return Err(corrupt("protected record version"));
@@ -275,8 +275,8 @@ fn check_protected_kernel(kv: &dyn KvRead, features: u64) -> Result<(), FormatEr
                 Bound::Excluded(&[end]),
                 Direction::Forward,
             )
-            .map_err(corrupt)?;
-        if gap.next().transpose().map_err(corrupt)?.is_some() {
+            .map_err(FormatError::kv)?;
+        if gap.next().transpose().map_err(FormatError::kv)?.is_some() {
             return Err(corrupt("unknown kernel namespace"));
         }
     }
@@ -309,9 +309,9 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
             Bound::Unbounded,
             Direction::Forward,
         )
-        .map_err(corrupt)?
+        .map_err(FormatError::kv)?
     {
-        let (key, value) = item.map_err(corrupt)?;
+        let (key, value) = item.map_err(FormatError::kv)?;
         let (user, _) = codec::split_versioned(&key)
             .map_err(|error| FormatError::Corrupt(format!("{error:?}")))?;
         // Classify even historical/tombstoned keys: unknown kinds cannot hide
@@ -322,7 +322,7 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
             continue;
         }
         previous = Some(user.to_vec());
-        let Some(value) = mvcc::decode(&value).map_err(corrupt)? else {
+        let Some(value) = mvcc::decode(&value).map_err(FormatError::kv)? else {
             continue;
         };
         required |= required_bits_for_catalog_value(user, value)?;
@@ -461,9 +461,9 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
             Bound::Excluded(&[3]),
             Direction::Forward,
         )
-        .map_err(corrupt)?
+        .map_err(FormatError::kv)?
     {
-        let (key, value) = item.map_err(corrupt)?;
+        let (key, value) = item.map_err(FormatError::kv)?;
         if !super::commit::valid_counter_key(&key) {
             return Err(corrupt("invalid sequence counter key"));
         }

@@ -741,6 +741,7 @@ struct Inner {
     /// Statement slots of task sessions (GD-0061 R3-401).
     task_load: Arc<crate::task::limits::TaskLoad>,
     fenced: AtomicBool,
+    legacy_fence: engine::kv::FenceState,
     limits: Limits,
     crash: Mutex<CrashPoint>,
     /// The armed protected-commit crash seam (GD-0061 R3-619, D-I).
@@ -767,6 +768,31 @@ impl Drop for Ticket<'_> {
     }
 }
 impl Inner {
+    fn fence_state(&self) -> &engine::kv::FenceState {
+        match &self.backend {
+            Backend::Legacy(_) => &self.legacy_fence,
+            Backend::V2(db) => &db.kv.causes,
+        }
+    }
+
+    fn fence_error(&self, site: engine::kv::FenceSite, error: &CoreError) {
+        self.fence_state().record(engine::kv::FenceCause::for_core(site, error));
+        self.fenced.store(true, Ordering::Release);
+    }
+
+    fn fence_native_commit(&self) {
+        use engine::kv::{FenceCause, FenceClass, FenceSite};
+        let state = self.fence_state();
+        // The sequencer or catalog records the original error before returning
+        // an ambiguous outcome. Preserve its diagnosis.
+        state.record_if_empty(FenceCause::new(
+            FenceSite::NativeOnceCommit,
+            FenceClass::NotRecoverable,
+            &"engine commit outcome unknown",
+        ));
+        self.fenced.store(true, Ordering::Release);
+    }
+
     fn db(&self, feature: &'static str) -> Result<&Database, CoreError> {
         match &self.backend {
             Backend::Legacy(db) => Ok(db),
@@ -833,14 +859,37 @@ impl Inner {
         Ok(Ticket(&self.admitted))
     }
     fn read(&self) -> Result<State, CoreError> {
+        self.read_at(engine::kv::FenceSite::Read)
+    }
+
+    fn legacy_io(
+        &self,
+        site: engine::kv::FenceSite,
+        error: impl Into<redb::Error> + std::fmt::Display,
+    ) -> CoreError {
+        let original = io(&error);
+        if matches!(error.into(), redb::Error::Corrupted(_)) {
+            use engine::kv::{FenceCause, FenceClass};
+            self.legacy_fence
+                .record(FenceCause::new(site, FenceClass::Data, &original));
+        }
+        original
+    }
+
+    fn read_at(&self, site: engine::kv::FenceSite) -> Result<State, CoreError> {
         let db = self.db(LEGACY_STORAGE)?;
+        let storage = |error| self.legacy_io(site, error);
         let out = legacy_redb("reading records", || {
-            let tx = db.begin_read().map_err(io)?;
-            let t = tx.open_table(RECORDS).map_err(io)?;
+            let tx = db
+                .begin_read()
+                .map_err(|error| self.legacy_io(site, error))?;
+            let t = tx
+                .open_table(RECORDS)
+                .map_err(|error| self.legacy_io(site, error))?;
             let mut out = BTreeMap::new();
             let mut total = 0u64;
-            for item in t.iter().map_err(io)? {
-                let (k, v) = item.map_err(io)?;
+            for item in t.iter().map_err(storage)? {
+                let (k, v) = item.map_err(storage)?;
                 total += k.value().len() as u64 + v.value().len() as u64;
                 if total > MAX_BYTES {
                     return Err(CoreError::Limit);
@@ -862,9 +911,7 @@ impl Inner {
         if self.fenced.load(Ordering::Acquire) {
             return Err(CoreError::Fenced);
         }
-        let s = self.read().inspect_err(|_| {
-            self.fenced.store(true, Ordering::Release);
-        })?;
+        let s = self.read().inspect_err(|error| self.fence_error(engine::kv::FenceSite::Read, error))?;
         f(&s)
     }
     fn change<T>(
@@ -893,9 +940,7 @@ impl Inner {
         if self.fenced.load(Ordering::Acquire) {
             return Err(CoreError::Fenced);
         }
-        let mut s = self.read().inspect_err(|_| {
-            self.fenced.store(true, Ordering::Release);
-        })?;
+        let mut s = self.read().inspect_err(|error| self.fence_error(engine::kv::FenceSite::Read, error))?;
         let previous_relations = relation_names(&s);
         // Logical errors can still advance the trusted monotonic decision clock.
         let result = f(&mut s);
@@ -928,9 +973,7 @@ impl Inner {
         if self.fenced.load(Ordering::Acquire) {
             return Err(CoreError::Fenced);
         }
-        let mut s = self.read().inspect_err(|_| {
-            self.fenced.store(true, Ordering::Release);
-        })?;
+        let mut s = self.read().inspect_err(|error| self.fence_error(engine::kv::FenceSite::Read, error))?;
         let previous_relations = relation_names(&s);
         let admitted = admission(&mut s);
         // This write does not decide the business operation. A cancelled or lost
@@ -1032,29 +1075,36 @@ impl Inner {
         let values = records(s)?;
         let point = *self.crash.lock().map_err(|_| CoreError::Fenced)?;
         let persisted = (|| {
-            let mut tx = self.db(LEGACY_STORAGE)?.begin_write().map_err(io)?;
+            let site = engine::kv::FenceSite::LegacyPersist;
+            let storage = |error| self.legacy_io(site, error);
+            let mut tx = self
+                .db(LEGACY_STORAGE)?
+                .begin_write()
+                .map_err(|error| self.legacy_io(site, error))?;
             tx.set_durability(Durability::Immediate).map_err(io)?;
             {
-                let mut t = tx.open_table(RECORDS).map_err(io)?;
+                let mut t = tx
+                    .open_table(RECORDS)
+                    .map_err(|error| self.legacy_io(site, error))?;
                 if !values.contains_key(&vec![8]) {
-                    t.remove(&[8][..]).map_err(io)?;
+                    t.remove(&[8][..]).map_err(storage)?;
                 }
                 if !values.contains_key(&vec![10]) {
-                    t.remove(&[10][..]).map_err(io)?;
+                    t.remove(&[10][..]).map_err(storage)?;
                 }
                 let stale: Vec<Vec<u8>> = t
                     .iter()
-                    .map_err(io)?
-                    .map(|item| item.map(|(key, _)| key.value().to_vec()).map_err(io))
+                    .map_err(storage)?
+                    .map(|item| item.map(|(key, _)| key.value().to_vec()).map_err(storage))
                     .collect::<Result<Vec<_>, _>>()?
                     .into_iter()
                     .filter(|key| key.first() == Some(&11) && !values.contains_key(key))
                     .collect();
                 for key in stale {
-                    t.remove(key.as_slice()).map_err(io)?;
+                    t.remove(key.as_slice()).map_err(storage)?;
                 }
                 for (k, v) in &values {
-                    t.insert(k.as_slice(), v.as_slice()).map_err(io)?;
+                    t.insert(k.as_slice(), v.as_slice()).map_err(storage)?;
                 }
             }
             roles::rename_tables(&tx, &renames)?;
@@ -1078,7 +1128,7 @@ impl Inner {
             } else {
                 crate::cancellation::check()?;
             }
-            tx.commit().map_err(io)?;
+            tx.commit().map_err(|error| self.legacy_io(site, error))?;
             self.accept_sequences(s)?;
             if decision {
                 self.decision_point(DecisionPoint::Committed);
@@ -1097,8 +1147,10 @@ impl Inner {
             Ok(())
         })();
         if let Err(e) = persisted {
-            if matches!(&e, GuardedPersistError::Core(error) if *error != CoreError::Cancelled) {
-                self.fenced.store(true, Ordering::Release);
+            if let GuardedPersistError::Core(error) = &e
+                && *error != CoreError::Cancelled
+            {
+                self.fence_error(engine::kv::FenceSite::LegacyPersist, error);
             }
             return Err(e);
         }
@@ -1160,6 +1212,14 @@ pub use v2::maintenance::MaintenanceStats;
 pub use v2::reclaim::ReclaimStats;
 
 impl Admin {
+    #[allow(dead_code, reason = "Used by the later recovery supervisor")]
+    pub(crate) fn fence_cause(&self) -> Option<engine::kv::FenceCause> {
+        match &self.inner.backend {
+            Backend::Legacy(_) => self.inner.fence_state().cause(),
+            Backend::V2(db) => db.fence_cause(),
+        }
+    }
+
     /// Stop local commit decisions during service shutdown. Idempotent.
     pub fn stop_submissions(&self) {
         if let Backend::V2(db) = &self.inner.backend { db.sequencer.stop_submissions(); }
@@ -1292,6 +1352,7 @@ impl Admin {
                 sql_operations: AtomicUsize::new(0),
                 task_load: Arc::new(crate::task::limits::TaskLoad::new(limits.admitted)),
                 fenced: AtomicBool::new(false),
+                legacy_fence: Default::default(),
                 limits,
                 crash: Mutex::new(CrashPoint::None),
                 protected_point: Mutex::new(None),

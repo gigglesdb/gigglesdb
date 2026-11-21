@@ -1,7 +1,7 @@
 //! No-catalog commits must neither rebuild metadata nor hold its publication mutex.
 use super::super::{
     commit::{ManualClock, SequencerConfig},
-    kv::{Durability, KvBackend, KvIter, KvRead, WriteBatch},
+    kv::{Durability, FenceClass, FenceSite, KvBackend, KvIter, KvRead, RocksStatus, WriteBatch},
     kv_mem::MemKv,
     locks::{LockConfig, TxnId},
 };
@@ -9,6 +9,7 @@ use super::*;
 use crate::relational::DataType;
 use std::{
     sync::{
+        Weak,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -18,11 +19,21 @@ use std::{
 
 type CommitPause = (mpsc::Sender<()>, mpsc::Receiver<()>);
 
+struct CatalogReadFailure {
+    error: KvError,
+    fence_during_read: Option<Weak<Sequencer>>,
+}
+
+fn status(code: u8) -> RocksStatus {
+    RocksStatus { code, subcode: 0, severity: None }
+}
+
 #[derive(Default)]
 struct ObservedKv {
     mem: MemKv,
     catalog_ranges: AtomicUsize,
     pause: Mutex<Option<CommitPause>>,
+    catalog_read_error: Mutex<Option<CatalogReadFailure>>,
 }
 impl KvRead for ObservedKv {
     fn get(&self, ks: Keyspace, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
@@ -37,6 +48,23 @@ impl KvRead for ObservedKv {
     ) -> Result<KvIter<'_>, KvError> {
         if ks == Keyspace::Catalog {
             self.catalog_ranges.fetch_add(1, Ordering::Relaxed);
+            if let Some(failure) = self.catalog_read_error.lock().unwrap().take() {
+                if let Some(seq) = failure.fence_during_read {
+                    // The reload has passed Kv's fence check. Simulate a writer
+                    // fencing the Kv before this in-flight read returns.
+                    let seq = seq.upgrade().unwrap();
+                    let error = KvError::RocksIo {
+                        message: "prior WAL error".into(),
+                        status: status(RocksStatus::IO_ERROR),
+                        site: FenceSite::WalWrite,
+                    };
+                    self.mem.fail_next_write(error.clone());
+                    assert_eq!(seq.kv().write(WriteBatch::default(), Durability::Sync), Err(error));
+                    assert!(seq.kv().is_fenced());
+                    assert_eq!(seq.kv().causes.cause().unwrap().class, FenceClass::Recoverable);
+                }
+                return Ok(KvIter::new(std::iter::once(Err(failure.error))));
+            }
         }
         self.mem.range(ks, start, end, dir)
     }
@@ -327,6 +355,7 @@ fn durable_reload_failure_retains_cause_and_never_serves_stale_catalog() {
     *catalog.load_at_error.lock().unwrap() = Some(CoreError::Storage("injected reload I/O".into()));
     assert!(matches!(catalog.commit_ddl(ddl), Err(TxnError::CommitAmbiguous)));
     let committed = seq.visible_ts();
+    assert_eq!(seq.kv().causes.cause().unwrap().class, FenceClass::NotRecoverable);
     {
         let cache = catalog.cache.lock().unwrap();
         let cause = cache.poison_cause.as_ref().unwrap();
@@ -347,6 +376,51 @@ fn durable_reload_failure_retains_cause_and_never_serves_stale_catalog() {
     let reopened_seq = Sequencer::open(kv.clone(), Arc::new(ManualClock::new(20)), SequencerConfig::default()).unwrap();
     let reopened = Catalog::open(reopened_seq.clone(), Arc::new(LockManager::new(LockConfig::default())), Arc::new(SequenceAllocator::new(kv, 64))).unwrap();
     assert!(reopened.view_at(reopened_seq.visible_ts()).unwrap().by_name.contains_key("durable_despite_reload"));
+}
+
+#[test]
+fn durable_catalog_poison_preserves_native_read_status_and_precedence() {
+    let native_read = |code| KvError::RocksIo {
+        message: "typed backend read failure".into(),
+        status: status(code),
+        site: FenceSite::Read,
+    };
+    for (error, fence_during_read, site, class, code) in [
+        (native_read(7), false, FenceSite::CatalogReload, FenceClass::NotRecoverable, Some(7)), // Incomplete
+        (native_read(7), true, FenceSite::CatalogReload, FenceClass::NotRecoverable, Some(7)),
+        (native_read(RocksStatus::IO_ERROR), false, FenceSite::CatalogReload, FenceClass::Recoverable, Some(RocksStatus::IO_ERROR)),
+        (KvError::Closed, true, FenceSite::CatalogReload, FenceClass::NotRecoverable, None),
+        (KvError::Fenced, true, FenceSite::WalWrite, FenceClass::Recoverable, Some(RocksStatus::IO_ERROR)),
+    ] {
+        let (backend, seq, locks, catalog) = setup();
+        let before = seq.visible_ts();
+        let mut ddl = txn(&seq, &locks, 401);
+        catalog
+            .create_table(
+                &mut ddl,
+                table("durable_despite_reload"),
+                false,
+                None,
+                &|| false,
+            )
+            .unwrap();
+        *backend.catalog_read_error.lock().unwrap() = Some(CatalogReadFailure {
+            error,
+            fence_during_read: fence_during_read.then(|| Arc::downgrade(&seq)),
+        });
+        assert!(matches!(
+            catalog.commit_ddl(ddl),
+            Err(TxnError::CommitAmbiguous)
+        ));
+        assert!(seq.visible_ts() > before);
+        assert!(catalog.cache.lock().unwrap().poisoned);
+        assert_eq!(seq.kv().is_fenced(), fence_during_read);
+        let cause = seq.kv().causes.cause().unwrap();
+        assert_eq!(
+            (cause.site, cause.class, cause.status),
+            (site, class, code.map(status))
+        );
+    }
 }
 
 #[test]

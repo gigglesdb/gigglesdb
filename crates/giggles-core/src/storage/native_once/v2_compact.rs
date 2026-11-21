@@ -46,7 +46,7 @@ impl Admin {
         db.catalog().commit_ddl_guarded(txn, guard).map_err(|error| match error {
             TxnError::Guard(GuardRejection::LeaseExpired) => NativeOnceError::ClockUncertain,
             TxnError::CommitAmbiguous => {
-                inner.fenced.store(true, Ordering::Release);
+                inner.fence_native_commit();
                 CoreError::Storage("engine commit outcome unknown".into()).into()
             }
             other => CoreError::from(other).into(),

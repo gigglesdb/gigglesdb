@@ -89,11 +89,12 @@ pub(crate) enum FormatError {
     Corrupt(String),
     Unsupported(String),
     Incomplete(String),
+    WrappedIo { message: String, source: super::kv::KvError },
 }
 impl std::fmt::Display for FormatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Corrupt(s) => write!(f, "corrupt format: {s}"),
+            Self::Corrupt(s) | Self::WrappedIo { message: s, .. } => write!(f, "corrupt format: {s}"),
             Self::Unsupported(s) => write!(f, "unsupported format: {s}"),
             Self::Incomplete(s) => write!(f, "incomplete format: {s}"),
         }
@@ -102,6 +103,34 @@ impl std::fmt::Display for FormatError {
 impl std::error::Error for FormatError {}
 fn corrupt(error: impl std::fmt::Display) -> FormatError {
     FormatError::Corrupt(error.to_string())
+}
+impl FormatError {
+    pub(super) fn kv(error: super::kv::KvError) -> Self {
+        let message = error.to_string();
+        Self::wrap_io(message, error)
+    }
+
+    pub(super) fn txn(error: super::txn::TxnError) -> Self {
+        let message = format!("{error:?}");
+        match error {
+            super::txn::TxnError::Kv(error) => Self::wrap_io(message, error),
+            _ => Self::Corrupt(message),
+        }
+    }
+
+    fn wrap_io(message: String, source: super::kv::KvError) -> Self {
+        match source {
+            super::kv::KvError::Io(_) | super::kv::KvError::RocksIo { .. } => {
+                Self::WrappedIo { message, source }
+            }
+            _ => Self::Corrupt(message),
+        }
+    }
+
+    fn io(error: std::io::Error) -> Self {
+        let message = error.to_string();
+        Self::WrappedIo { source: super::kv::KvError::Io(message.clone()), message }
+    }
 }
 pub(crate) fn rocks_file(name: &str) -> bool {
     matches!(name, "CURRENT" | "LOCK" | "IDENTITY" | "LOG")
@@ -118,13 +147,13 @@ pub(crate) fn classify_dir(dir: &Path) -> Result<DirClass, FormatError> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(DirClass::Empty),
-        Err(e) => return Err(corrupt(e)),
+        Err(e) => return Err(FormatError::io(e)),
     };
     let (mut marker, mut legacy, mut current, mut rocks, mut unknown) =
         (false, false, false, false, false);
     for entry in entries {
-        let entry = entry.map_err(corrupt)?;
-        if !entry.file_type().map_err(corrupt)?.is_file() {
+        let entry = entry.map_err(FormatError::io)?;
+        if !entry.file_type().map_err(FormatError::io)?.is_file() {
             unknown = true;
             continue;
         }
@@ -149,12 +178,12 @@ pub(crate) fn classify_dir(dir: &Path) -> Result<DirClass, FormatError> {
         return Err(corrupt("marker and data.redb coexist"));
     }
     if marker {
-        let file = fs::File::open(dir.join(MARKER)).map_err(corrupt)?;
-        if file.metadata().map_err(corrupt)?.len() > 64 {
+        let file = fs::File::open(dir.join(MARKER)).map_err(FormatError::io)?;
+        if file.metadata().map_err(FormatError::io)?.len() > 64 {
             return Err(corrupt("oversized marker"));
         }
         let mut bytes = Vec::new();
-        file.take(64).read_to_end(&mut bytes).map_err(corrupt)?;
+        file.take(64).read_to_end(&mut bytes).map_err(FormatError::io)?;
         if bytes != V2 {
             if let Some(n) = bytes
                 .strip_prefix(b"giggles-v")
@@ -202,14 +231,14 @@ pub(crate) struct MetaInfo {
 }
 fn fixed<const N: usize>(kv: &dyn KvRead, key: &[u8]) -> Result<[u8; N], FormatError> {
     kv.get(Keyspace::Meta, key)
-        .map_err(corrupt)?
+        .map_err(FormatError::kv)?
         .ok_or_else(|| corrupt(format!("missing {}", String::from_utf8_lossy(key))))?
         .try_into()
         .map_err(|_| corrupt("wrong metadata length"))
 }
 fn optional(kv: &dyn KvRead, key: &[u8]) -> Result<Option<u64>, FormatError> {
     kv.get(Keyspace::Meta, key)
-        .map_err(corrupt)?
+        .map_err(FormatError::kv)?
         .map(|v| {
             v.try_into()
                 .map(u64::from_be_bytes)
@@ -230,9 +259,9 @@ pub(crate) fn live_role_bootstrap_entries(kv: &dyn KvRead) -> Result<usize, Form
             Bound::Excluded(&[8]),
             Direction::Forward,
         )
-        .map_err(corrupt)?
+        .map_err(FormatError::kv)?
     {
-        let (key, value) = item.map_err(corrupt)?;
+        let (key, value) = item.map_err(FormatError::kv)?;
         if key.len() < 9 {
             return Err(corrupt("short kind-7 versioned key"));
         }
@@ -241,7 +270,7 @@ pub(crate) fn live_role_bootstrap_entries(kv: &dyn KvRead) -> Result<usize, Form
             continue;
         }
         previous = Some(user.to_vec());
-        if super::mvcc::decode(&value).map_err(corrupt)?.is_some() {
+        if super::mvcc::decode(&value).map_err(FormatError::kv)?.is_some() {
             live += 1;
         }
     }
@@ -252,7 +281,7 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
     // nothing and fails below exactly as before.
     let gate = kv
         .get(Keyspace::Meta, b"features")
-        .map_err(corrupt)?
+        .map_err(FormatError::kv)?
         .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
         .map_or(0, u64::from_be_bytes);
     if gate & RANGES != 0 {
@@ -265,9 +294,9 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
             Bound::Unbounded,
             Direction::Forward,
         )
-        .map_err(corrupt)?
+        .map_err(FormatError::kv)?
     {
-        let (key, value) = item.map_err(corrupt)?;
+        let (key, value) = item.map_err(FormatError::kv)?;
         if gate & RANGES != 0
             && let Some((id, sub)) = parse_range_local_key(&key)
         {
@@ -297,7 +326,7 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
     check_subversion(subversion, CURRENT_SUBVERSION)?;
     let features = u64::from_be_bytes(fixed(kv, b"features")?);
     check_features(features)?;
-    if let Some(applied) = kv.get(Keyspace::Meta, b"raft_applied").map_err(corrupt)? {
+    if let Some(applied) = kv.get(Keyspace::Meta, b"raft_applied").map_err(FormatError::kv)? {
         if applied.len() != 16 {
             return Err(corrupt("wrong raft_applied length"));
         }
@@ -307,7 +336,7 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
             ));
         }
     }
-    let fence_bytes = kv.get(Keyspace::Meta, b"write_fence").map_err(corrupt)?;
+    let fence_bytes = kv.get(Keyspace::Meta, b"write_fence").map_err(FormatError::kv)?;
     if (features & WRITE_FENCE != 0) != fence_bytes.is_some() {
         return Err(corrupt("write_fence feature/key mismatch"));
     }
@@ -318,7 +347,7 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
     let domain = fixed(kv, b"domain")?;
     if kv
         .get(Keyspace::Meta, b"engine")
-        .map_err(corrupt)?
+        .map_err(FormatError::kv)?
         .as_deref()
         != Some(b"rocksdb")
     {
@@ -457,7 +486,7 @@ pub(crate) fn write_initial_meta(
         batch.put(Keyspace::Meta, key.to_vec(), value);
     }
     put_features(&mut batch, extra_features)?;
-    kv.write(batch, Durability::Sync).map_err(corrupt)
+    kv.write(batch, Durability::Sync).map_err(FormatError::kv)
 }
 fn create_inner(
     dir: &Path,
@@ -470,7 +499,7 @@ fn create_inner(
         return Err(corrupt("creation requires an empty directory"));
     }
     fs::create_dir_all(dir).map_err(corrupt)?;
-    let kv = open(dir).map_err(corrupt)?;
+    let kv = open(dir).map_err(FormatError::kv)?;
     #[cfg(test)]
     hook(Stage::Open)?;
     write_initial_meta(kv.as_ref(), domain, extra_features)?;

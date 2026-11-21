@@ -15,7 +15,7 @@ impl Inner {
         if self.fenced.load(Ordering::Acquire) {
             return Err(CoreError::Fenced.into());
         }
-        let (ledger, header) = read_v2_view(db).inspect_err(|_| { self.fenced.store(true, Ordering::Release); })?;
+        let (ledger, header) = read_v2_view(db).inspect_err(|error| self.fence_error(engine::kv::FenceSite::NativeOnceLedger, error))?;
         work(&v2_view(db, ledger.as_ref(), header))
     }
 }

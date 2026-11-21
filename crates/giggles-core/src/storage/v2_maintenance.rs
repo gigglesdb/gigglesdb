@@ -71,7 +71,7 @@ impl Retention {
 
 pub(crate) struct Maintenance {
     stop: Arc<Stop>,
-    thread: Option<JoinHandle<()>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
     replicated: bool,
     budget: Arc<AtomicUsize>,
     errors: Arc<AtomicU64>,
@@ -79,58 +79,55 @@ pub(crate) struct Maintenance {
 }
 
 impl Maintenance {
-    /// Starts the GC thread unless the database is replicated.
-    pub(crate) fn start(gc: &Arc<Gc>, replicated: bool) -> Result<Self, CoreError> {
-        let stop = Arc::new(Stop {
-            stopped: Mutex::new(false),
-            wake: Condvar::new(),
-        });
-        let budget = Arc::new(AtomicUsize::new(BUDGET));
-        let errors = Arc::new(AtomicU64::new(0));
-        let retention = Arc::new(Retention::default());
-        let thread = if replicated {
-            None
-        } else {
+    pub(crate) fn new(replicated: bool) -> Self {
+        Self {
+            stop: Arc::new(Stop {
+                stopped: Mutex::new(false),
+                wake: Condvar::new(),
+            }),
+            thread: Mutex::new(None),
+            replicated,
+            budget: Arc::new(AtomicUsize::new(BUDGET)),
+            errors: Arc::new(AtomicU64::new(0)),
+            retention: Arc::new(Retention::default()),
+        }
+    }
+
+    /// Starts the GC thread after the inline startup work passes its health check.
+    pub(crate) fn start(&mut self, gc: &Arc<Gc>) -> Result<(), CoreError> {
+        if !self.replicated {
             let (gc, stop, budget, errors, retention) = (
                 gc.clone(),
-                stop.clone(),
-                budget.clone(),
-                errors.clone(),
-                retention.clone(),
+                self.stop.clone(),
+                self.budget.clone(),
+                self.errors.clone(),
+                self.retention.clone(),
             );
-            Some(
+            *self.thread.get_mut().unwrap() = Some(
                 std::thread::Builder::new()
                     .name("giggles-v2-gc".into())
                     .spawn(move || run(&gc, &stop, &budget, &errors, &retention))
                     .map_err(|error| CoreError::Storage(error.to_string()))?,
-            )
-        };
-        Ok(Self {
-            stop,
-            thread,
-            replicated,
-            budget,
-            errors,
-            retention,
-        })
+            );
+        }
+        Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn running(&self) -> bool {
-        self.thread.is_some()
+        self.thread.lock().unwrap_or_else(|p| p.into_inner()).is_some()
     }
 
     #[cfg(test)]
     pub(crate) fn set_budget(&self, budget: usize) {
         self.budget.store(budget, Ordering::Relaxed);
     }
-}
 
-impl Drop for Maintenance {
-    fn drop(&mut self) {
+    pub(crate) fn shutdown(&self) {
         *self.stop.stopped.lock().unwrap_or_else(|p| p.into_inner()) = true;
         self.stop.wake.notify_all();
-        if let Some(thread) = self.thread.take() {
+        let mut thread = self.thread.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(thread) = thread.take() {
             // The retention sweep upgrades its weak handle; if it held the
             // last reference, the database drops on this very thread, which
             // then exits on the stop flag without joining itself.
@@ -139,6 +136,12 @@ impl Drop for Maintenance {
                 let _ = thread.join();
             }
         }
+    }
+}
+
+impl Drop for Maintenance {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

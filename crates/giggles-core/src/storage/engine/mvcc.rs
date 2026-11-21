@@ -131,7 +131,7 @@ impl<'a> VersionedRange<'a> {
             Bound::Unbounded => Bound::Unbounded,
         };
         let iter = if empty {
-            Box::new(std::iter::empty()) as KvIter<'a>
+            KvIter::new(std::iter::empty())
         } else {
             kv.range(
                 ks,

@@ -364,7 +364,7 @@ impl KvRead for ExportRead {
         }
         // Synthetic metadata is fixed-size; other keyspaces stream from disk.
         if ks == Keyspace::Meta {
-            return Ok(Box::new(std::iter::empty()));
+            return Ok(KvIter::new(std::iter::empty()));
         }
         let tag = match ks {
             Keyspace::Catalog => 1,
@@ -373,12 +373,12 @@ impl KvRead for ExportRead {
             Keyspace::Seq => 4,
             // Exports carry no other keyspace (verify rejects tags above 4), so
             // the open check's Kernel ranges need not stream the whole file.
-            _ => return Ok(Box::new(std::iter::empty())),
+            _ => return Ok(KvIter::new(std::iter::empty())),
         };
         let start = start.map(<[u8]>::to_vec);
         let end = end.map(<[u8]>::to_vec);
         let mut offset = HEADER;
-        Ok(Box::new(std::iter::from_fn(move || {
+        Ok(KvIter::new(std::iter::from_fn(move || {
             loop {
                 let record = match self.record(&mut offset) {
                     Ok(Some(record)) => record,

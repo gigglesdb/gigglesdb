@@ -1018,7 +1018,7 @@ fn mvcc_lazy_cursors_and_strict_envelopes() {
             dir: Direction,
         ) -> Result<KvIter<'_>, KvError> {
             let count = self.count.clone();
-            Ok(Box::new(self.mem.range(ks, start, end, dir)?.inspect(
+            Ok(KvIter::new(self.mem.range(ks, start, end, dir)?.inspect(
                 move |_| {
                     count.fetch_add(1, Ordering::SeqCst);
                 },

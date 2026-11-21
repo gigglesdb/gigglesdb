@@ -1137,3 +1137,20 @@ fn native_v2_catalog_rollback_and_waiting_fence() {
     drop(reopened);
     fs::remove_dir_all(path).unwrap();
 }
+
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn open_refuses_reclaim_write_fence() {
+    use engine::{kv::*, kv_mem::MemKv, meta};
+    let backend = Arc::new(MemKv::new());
+    meta::write_initial_meta(backend.as_ref(), [1; 16], 0).unwrap();
+    let mut orphan = WriteBatch::default();
+    orphan.put(Keyspace::Rows, 100u64.to_be_bytes().to_vec(), vec![1]);
+    backend.write(orphan, Durability::Sync).unwrap();
+    backend.fail_next_write(KvError::Io("injected reclaim failure".into()));
+
+    let kv = Arc::new(Kv::new_single_writer(backend));
+    assert!(matches!(V2Db::from_kv(kv.clone()), Err(CoreError::Fenced)));
+    assert!(kv.causes.cause().unwrap().error_text.contains("injected reclaim failure"));
+}
