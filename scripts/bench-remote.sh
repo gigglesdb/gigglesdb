@@ -45,11 +45,16 @@
 # long, 3 daily start cap reached, 4 no slot free in time, 5 infrastructure
 # error. Results land in J:/gigglesdb-work/boat/bench/<utc>-<tip12>-<who>-<pid>/
 # (summary.md, results.jsonl, meta.json, logs.tar.gz).
+#
+# Start it only as a harness background task, never with a trailing `&` inside
+# a foreground call: a killed process group skips the cleanup trap. A run
+# killed that way is finished by the next gate or bench that takes a slot
+# (scripts/remote-slots.sh).
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=${GIGGLES_REPO:-$(dirname "$(git -C "$script_dir" rev-parse --path-format=absolute --git-common-dir)")}
-boatdir=J:/gigglesdb-work/boat
+boatdir=${GATE_TEST_BOATDIR:-J:/gigglesdb-work/boat}   # override for scripts/tests only
 B=${BOAT:-$HOME/.ascii/bin/boat.exe}
 snapshot=gigglesdb-bench-base
 gate_snapshot=gigglesdb-gate-base
@@ -207,6 +212,8 @@ recover_box() {
   fi
   return 0
 }
+slot_kind=bench
+. "$script_dir/remote-slots.sh"
 jfield() { python -c "import json,sys
 lines=[l for l in sys.stdin.read().splitlines() if l.strip().startswith('{')]
 d=json.loads(lines[-1]) if lines else {}
@@ -256,22 +263,15 @@ cleanup() {
     mins=$(( ($(date +%s) - started + 59) / 60 ))
     echo "$(date -u +%FT%TZ) | $who | $box | $type | $short | END bench rc=$rc ${mins}min" >> "$boatdir/usage.log"
   fi
-  [ -n "$slot" ] && rm -rf "$boatdir/slots/$slot"
+  slot_release
   g update-ref -d "$ref" 2>/dev/null || true
   rm -f "$run/stack.bundle"
   exit $rc
 }
 trap cleanup EXIT
 trap 'exit 5' INT TERM HUP
-deadline=$(( $(date +%s) + slot_wait ))
-while [ -z "$slot" ]; do
-  for n in $(seq 1 "$max_boxes"); do s=slot-$n
-    if mkdir "$boatdir/slots/$s" 2>/dev/null; then slot=$s; break; fi
-  done
-  [ -n "$slot" ] && break
-  [ "$(date +%s)" -lt "$deadline" ] || { log "no free slot within ${slot_wait}s"; exit 4; }
-  sleep 30
-done
+# slot_acquire first reclaims slots whose owner was killed outright.
+slot_acquire "$slot_wait" || { log "no free slot within ${slot_wait}s"; exit 4; }
 echo "pending $who $short $(date -u +%FT%TZ)" > "$boatdir/slots/$slot/owner"
 log "took $slot"
 
@@ -293,6 +293,7 @@ name_who=${who//[^A-Za-z0-9_.-]/_}
 name_suffix="-$short-$stamp-$$"
 name_limit=$(( 120 - ${#name_suffix} ))
 boxname="${name_who:0:name_limit}$name_suffix"
+slot_lease_write "$boatdir/slots/$slot"   # a reclaim can find the box by name
 new_tried=1
 out=$(bj new --from "$from" --type "$type" --no-env --ttl "$ttl" --name "$boxname" --json 2>&1) || {
   log "boat new failed: $(echo "$out" | tail -2)"; recover_box; exit 5; }
@@ -300,6 +301,7 @@ box=$(echo "$out" | grep -o '"id":"bx_[a-z0-9]*"' | head -1 | cut -d'"' -f4) || 
 [ -n "$box" ] || { log "no box id in: $(echo "$out" | tail -2)"; recover_box; exit 5; }
 echo "$(date -u +%FT%TZ) | $who | $box | $type | $short | START bench" >> "$boatdir/usage.log"
 echo "$box $who $short $(date -u +%FT%TZ)" > "$boatdir/slots/$slot/owner"
+slot_lease_write "$boatdir/slots/$slot"
 log "box $box ready"
 
 # 5. Ship the bundle and box-side scripts; check out the tip.

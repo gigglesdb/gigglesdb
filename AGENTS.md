@@ -318,6 +318,12 @@ caps, and the script enforces them.
   secrets, `.env` files or working copies.
 - Only one designated coordinator rebuilds and re-saves the gate snapshot, at
   most once a day, or when the toolchain or native dependencies change.
+- Start `gate-remote.sh` and `bench-remote.sh` only as a harness background
+  task, never with a trailing `&` inside a foreground call. A killed process
+  group skips the cleanup trap, so the box, slot, END line and ref are left
+  behind. The next run that takes a slot reclaims a slot whose owner pid is
+  dead (box deleted, END logged as `rc=reclaimed`, see
+  `J:/gigglesdb-work/boat/reclaim.log`), but until then the box bills.
 
 Benchmarks use `scripts/bench-remote.sh` under the same rules, from the bench
 snapshot, marked `bench` in the usage log. Run one only for a planned

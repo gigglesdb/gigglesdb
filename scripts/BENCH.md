@@ -71,8 +71,13 @@ tasks), staggered by about 30 s. Do not fan out through one parent such as
 EXIT trap. HUP, INT and TERM are trapped and clean up, but a hard kill
 (`kill -9`, `taskkill /F`) cannot be trapped.
 
-If a driver dies, finish its box by hand with these coordinator steps.
-Workers never run `boat`.
+The next gate or bench that takes a slot reclaims a dead driver's slot
+automatically (`scripts/remote-slots.sh`: box deleted, END logged as
+`rc=reclaimed`, ref removed, slot released; see
+`J:/gigglesdb-work/boat/reclaim.log`), but it does not copy results back. To
+keep a dead driver's results, first remove the `lease` file from its slot
+directory (a slot without a lease is never reclaimed), then finish its box by
+hand with these coordinator steps. Workers never run `boat`.
 
 1. Find the box id and slot in
    `J:/gigglesdb-work/boat/slots/slot-*/owner` and `usage.log`; identify the
