@@ -63,7 +63,6 @@ struct Revoked {
     at: Instant,
 }
 #[derive(Clone)]
-#[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
 pub(crate) struct EntryHandle {
     entry: Arc<Entry>,
     token: String,
@@ -93,6 +92,11 @@ struct State {
 }
 
 impl Registry {
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
     pub(crate) fn new(service: Arc<Service>, limits: ApiLimits) -> Arc<Self> {
         Self::with_sources(
             service,
@@ -341,7 +345,6 @@ impl Registry {
         Ok(entry)
     }
 
-    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
     pub(crate) fn entry_handle(
         &self,
         token: &str,
@@ -366,7 +369,6 @@ impl Registry {
         self.lease_resolved_entry(token, entry, cancellation)
     }
 
-    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
     pub(crate) fn lease_entry(
         self: &Arc<Self>,
         entry: &EntryHandle,
@@ -436,7 +438,6 @@ impl Registry {
     /// authenticating anyone. For cleanup of a session this caller just created
     /// when a later step failed, including because the identity itself was
     /// revoked in between (a normal `close` would fail its identity lookup).
-    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
     pub(crate) fn discard(&self, token: &str) {
         let entry = self
             .entries
@@ -449,12 +450,19 @@ impl Registry {
         }
     }
 
-    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
+    pub(crate) fn entry_alive(&self, handle: &EntryHandle) -> bool {
+        // Invalidation always marks the entry closing before removing it.
+        let entry = &handle.entry;
+        entry
+            .state
+            .lock()
+            .is_ok_and(|state| !state.closing && !expired(entry, &state, self.now()))
+    }
+
     pub(crate) fn close_entry(&self, entry: &EntryHandle) {
         self.invalidate(&entry.token, &entry.entry, false);
     }
 
-    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
     pub(crate) fn invalidate_entry(&self, entry: &EntryHandle) {
         self.invalidate(&entry.token, &entry.entry, true);
     }

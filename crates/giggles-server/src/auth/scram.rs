@@ -260,6 +260,70 @@ impl ServerExchange {
         .into_bytes())
     }
 }
+/// Client-side SCRAM using the same raw UTF-8 password rules as the server.
+pub(crate) struct ClientExchange {
+    nonce: String,
+}
+
+impl ClientExchange {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        let mut nonce = [0; 18];
+        getrandom::fill(&mut nonce).map_err(std::io::Error::other)?;
+        Ok(Self {
+            nonce: STANDARD.encode(nonce),
+        })
+    }
+
+    pub(crate) fn first(&self) -> String {
+        // The role in OpenSessionRequest selects the verifier.
+        format!("n,,n=,r={}", self.nonce)
+    }
+
+    pub(crate) fn respond(self, password: &str, first: &str) -> std::io::Result<(String, ServerProof)> {
+        let invalid = || {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid SCRAM challenge")
+        };
+        message(first.as_bytes()).map_err(|_| invalid())?;
+        let attrs = attributes(first).map_err(|_| invalid())?;
+        let [("r", nonce), ("s", salt), ("i", iterations), ..] = attrs.as_slice() else {
+            return Err(invalid());
+        };
+        if !valid_nonce(nonce) || nonce.len() <= self.nonce.len() || !nonce.starts_with(&self.nonce) {
+            return Err(invalid());
+        }
+        let salt = STANDARD.decode(salt).map_err(|_| invalid())?;
+        let iterations = iterations.parse().map_err(|_| invalid())?;
+        if !(1..=64).contains(&salt.len()) || !(1..=MAX_ITERATIONS).contains(&iterations) {
+            return Err(invalid());
+        }
+
+        let salted = pbkdf2(password.as_bytes(), &salt, iterations);
+        let client_key = hmac(&salted, b"Client Key");
+        let stored_key = Sha256::digest(client_key);
+        let final_bare = format!("c=biws,r={nonce}");
+        let auth = format!("n=,r={},{first},{final_bare}", self.nonce);
+        let signature = hmac(&stored_key, auth.as_bytes());
+        let proof: [u8; 32] = std::array::from_fn(|i| client_key[i] ^ signature[i]);
+        let server_key = hmac(&salted, b"Server Key");
+        let server_proof = ServerProof(hmac(&server_key, auth.as_bytes()));
+        Ok((
+            format!("{final_bare},p={}", STANDARD.encode(proof)),
+            server_proof,
+        ))
+    }
+}
+
+pub(crate) struct ServerProof([u8; 32]);
+
+impl ServerProof {
+    pub(crate) fn verify(self, final_message: Option<&str>) -> bool {
+        final_message
+            .and_then(|value| value.strip_prefix("v="))
+            .and_then(|value| STANDARD.decode(value).ok())
+            .is_some_and(|signature| ct_eq(&self.0, &signature))
+    }
+}
+
 fn message(data: &[u8]) -> Result<&str, ScramError> {
     if data.len() > 1024 {
         return Err(ScramError::Malformed);

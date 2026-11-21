@@ -389,3 +389,5 @@ mod task_qualified_target;
 mod task_search_path_api;
 #[path = "prepared_validation_network.rs"]
 mod prepared_validation_network;
+
+#[path = "wire_basic.rs"] mod wire_basic;

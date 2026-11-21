@@ -653,6 +653,7 @@ dependencies = [
  "giggles-pg-catalog",
  "giggles-pg-types",
  "giggles-replication",
+ "giggles-server",
  "hex",
  "http",
  "http-body",

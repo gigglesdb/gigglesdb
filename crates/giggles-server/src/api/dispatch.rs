@@ -7,6 +7,7 @@ use super::{
     native, native_codec, proto,
     session::{EntryHandle, Registry, SessionLease},
 };
+pub(crate) use super::stream::{Receiver as SpillChunks, grpc as spill_chunks};
 use crate::{Response, Service, Session, agent::statement::OperationId};
 use giggles_core::{Cancellation, relational::spill::{self, SpilledRows}};
 use prost::Message;
@@ -40,7 +41,6 @@ pub enum Encoding {
     Protobuf,
 }
 
-#[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
 pub(crate) struct WireSession {
     pub(crate) entry: EntryHandle,
     pub(crate) identity: ConnectionIdentity,
@@ -48,11 +48,17 @@ pub(crate) struct WireSession {
     always_check: bool,
 }
 
-#[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
+impl WireSession {
+    pub(crate) fn binding_changes(&self) -> watch::Receiver<()> {
+        self.bindings.clone()
+    }
+}
+
 pub(crate) struct WireCall {
     pub request: Invocation,
     pub operation_id: Option<OperationId>,
-    pub budget_ms: Option<u32>, // Informational, since cancel already carries the budget.
+    #[allow(dead_code)] // Informational, since cancel already carries the budget.
+    pub budget_ms: Option<u32>,
     pub received: Instant,
     pub cancel: Cancellation,
 }
@@ -111,6 +117,8 @@ pub struct ApiRuntime {
     stopping: AtomicBool,
     stop: watch::Sender<bool>,
     supervisor: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) wire_stats: crate::wire::listen::WireStats,
     #[cfg(test)]
     hook: std::sync::Mutex<Option<tests::WorkerHook>>,
 }
@@ -161,6 +169,8 @@ impl ApiRuntime {
             stopped,
         ));
         Ok(Arc::new(Self {
+            #[cfg(feature = "test-hooks")]
+            wire_stats: Default::default(),
             kind,
             role_listener,
             service,
@@ -388,7 +398,6 @@ impl ApiRuntime {
         self.registry.close(token, identity)
     }
 
-    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
     pub(crate) fn open_wire(
         &self,
         identity: &ConnectionIdentity,
@@ -433,7 +442,6 @@ impl ApiRuntime {
         ))
     }
 
-    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
     pub(crate) fn wire_cancellation(
         &self,
         received: Instant,
@@ -451,13 +459,23 @@ impl ApiRuntime {
 
     /// Certificate and role identities skip re-checking while the bindings watch
     /// is unchanged. Changes to bindings, agent bindings, role aliases, or task
-    /// revocation all notify `service.binding_changes`. The supervisor sweep
-    /// invalidates affected entries, `lease_entry` refuses closing entries, and
-    /// the worker's `authority_scope` revalidates role authority before dispatch.
-    /// Credential identities are time-dependent and are checked on every call.
-    /// The caller rejects malformed requests during decoding before this
-    /// identity check. `execute` checks identity before decoding.
-    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
+    /// revocation all notify `service.binding_changes`. Credential identities
+    /// are time-dependent and are checked on every call.
+    pub(crate) fn wire_recheck(&self, session: &mut WireSession) -> Result<(), ApiError> {
+        if session.always_check || session.bindings.has_changed().unwrap_or(true) {
+            session.bindings.borrow_and_update();
+            if let Err(error) = session.identity.check(&self.service) {
+                self.registry.invalidate_entry(&session.entry);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn wire_session_alive(&self, session: &WireSession) -> bool {
+        self.registry.entry_alive(&session.entry)
+    }
+
     pub(crate) async fn execute_wire(
         &self,
         session: &mut WireSession,
@@ -467,13 +485,11 @@ impl ApiRuntime {
         if self.stopping.load(Ordering::Acquire) {
             return Err(ApiError::Unavailable);
         }
-        if session.always_check || session.bindings.has_changed().unwrap_or(true) {
-            session.bindings.borrow_and_update();
-            if let Err(error) = session.identity.check(&self.service) {
-                self.registry.invalidate_entry(&session.entry);
-                return Err(error);
-            }
-        }
+        // The wire decoder parses bounded request data before the identity
+        // check. The connection also checks identity before returning a
+        // decode error. A parsed request still needs a live lease and the
+        // worker's authority check before dispatch.
+        self.wire_recheck(session)?;
         self.refuse_off_agent_forms(&call.request, &call.operation_id)?;
         let lease =
             self.registry
@@ -485,13 +501,12 @@ impl ApiRuntime {
             call.cancel,
             call.received,
             Encoding::Protobuf,
-            false,
+            true,
             ownership,
         )
         .await
     }
 
-    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
     pub(crate) fn close_wire(&self, session: WireSession) {
         self.registry.close_entry(&session.entry);
     }
@@ -596,6 +611,19 @@ impl ApiRuntime {
     /// trusted library reloads that do not pass through the executable.
     pub fn invalidate_bindings(&self) {
         self.registry.sweep();
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn test_registry_entry_count(&self) -> usize {
+        self.registry.entry_count()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn test_wire_connection(
+        &self,
+        peer: std::net::SocketAddr,
+    ) -> Option<Arc<crate::wire::listen::ConnectionStats>> {
+        self.wire_stats.connection(peer)
     }
 
     pub async fn shutdown(&self) {

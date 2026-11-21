@@ -6,6 +6,7 @@ edition = "2024"
 autotests = false
 
 [features]
+test-hooks = []
 legacy-task = ["giggles-core/legacy-task"]
 default = ["engine-rocksdb", "mimalloc"]
 mimalloc = ["dep:mimalloc"]
@@ -47,6 +48,7 @@ protoc-bin-vendored = "3"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
+giggles-server = { path = ".", default-features = false, features = ["test-hooks"] }
 redb = "3.1"
 futures-core = "0.3"
 giggles-core = { path = "../giggles-core", default-features = false, features = ["test-sql-parser-trap", "test-metadata-counts", "test-commit-sync"] }

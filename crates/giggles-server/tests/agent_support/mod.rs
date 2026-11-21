@@ -756,6 +756,7 @@ pub mod parity {
         auth::{PostgresqlConfig, TlsMode, scram::Verifier, serve_postgresql},
         clock::Clock,
         serve_bound, serve_pg_bound, tls,
+        wire::{client as native_wire, listen::serve_wire_bound},
     };
     use http_body_util::{BodyExt, Full};
     use hyper_util::rt::TokioIo;
@@ -1257,9 +1258,9 @@ pub mod parity {
     ///
     /// - `postgresql`: the PostgreSQL password listener (SCRAM, no TLS) for
     ///   `incident_controller`, `oncall_lead` and `delivery_app`;
-    /// - `legacy_pg`, `native`, `http`, `grpc`: the certificate listeners,
-    ///   where `app` is bound to `delivery_app`;
-    /// - `agent_pg`, `agent_http`, `agent_grpc`: the agent listeners, where
+    /// - `legacy_pg`, `native`, `http`, `grpc`, `wire`: the certificate listeners,
+    ///   where `app` is bound to `delivery_app` and `sql_app` can run SQL on shipments;
+    /// - `agent_pg`, `agent_http`, `agent_grpc`, `agent_wire`: the agent listeners, where
     ///   `agent` is bound to `repair_agent` for `inc-436`.
     pub struct ParityFixture {
         pub auth: AgentAuth,
@@ -1269,6 +1270,7 @@ pub mod parity {
         pub server_cert: TestCert,
         pub agent: TestCert,
         pub app: TestCert,
+        pub sql_app: TestCert,
         pub tls: Arc<ServerConfig>,
         pub ordinary_api: Arc<ApiRuntime>,
         pub agent_api: Arc<ApiRuntime>,
@@ -1277,9 +1279,11 @@ pub mod parity {
         pub native: Running,
         pub http: Running,
         pub grpc: Running,
+        pub wire: Running,
         pub agent_pg: Running,
         pub agent_http: Running,
         pub agent_grpc: Running,
+        pub agent_wire: Running,
         /// `inc-436`'s expiry, Unix ms.
         pub expires_ms: i64,
     }
@@ -1287,6 +1291,10 @@ pub mod parity {
     impl ParityFixture {
         /// The database, roles and rows, every listener, then `inc-436`.
         pub async fn start() -> Self {
+            Self::start_with_api_limits(ApiLimits::default()).await
+        }
+
+        pub async fn start_with_api_limits(ordinary_limits: ApiLimits) -> Self {
             let path = scratch("agent-parity").join("db");
             let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
             let mut session = admin.sql_session();
@@ -1327,6 +1335,7 @@ pub mod parity {
             let server_cert = certificate(Some(&ca), true);
             let agent = certificate(Some(&ca), false);
             let app = certificate(Some(&ca), false);
+            let sql_app = certificate(Some(&ca), false);
             let tls = tls::server(
                 vec![server_cert.cert.der().clone()],
                 PrivatePkcs8KeyDer::from(server_cert.key.serialize_der()).into(),
@@ -1335,10 +1344,19 @@ pub mod parity {
             .unwrap();
             let service = Service::with_agent(
                 admin.clone(),
-                vec![Binding {
-                    fingerprint: app.fingerprint(),
-                    role: Role::Database { name: APP.into() },
-                }],
+                vec![
+                    Binding {
+                        fingerprint: app.fingerprint(),
+                        role: Role::Database { name: APP.into() },
+                    },
+                    Binding {
+                        fingerprint: sql_app.fingerprint(),
+                        role: Role::Application {
+                            domain: admin.authority_metadata().unwrap().0.to_string(),
+                            tables: [TABLE.into()].into(),
+                        },
+                    },
+                ],
                 vec![binding(&agent, EXECUTOR, &[TASK])],
                 Clock::new(0, 3600).unwrap(),
                 ServiceLimits::default(),
@@ -1369,7 +1387,7 @@ pub mod parity {
             let native = serve_bound(bind().await, service.clone(), tls.clone(), 16, gate.clone())
                 .await
                 .unwrap();
-            let ordinary_api = ApiRuntime::new(service.clone(), ApiLimits::default()).unwrap();
+            let ordinary_api = ApiRuntime::new(service.clone(), ordinary_limits).unwrap();
             let agent_api = ApiRuntime::new_agent(service.clone(), ApiLimits::default()).unwrap();
             let http = serve_http_bound(
                 bind().await,
@@ -1381,6 +1399,15 @@ pub mod parity {
             .await
             .unwrap();
             let grpc = serve_grpc_bound(
+                bind().await,
+                ordinary_api.clone(),
+                tls.clone(),
+                16,
+                gate.clone(),
+            )
+            .await
+            .unwrap();
+            let wire = serve_wire_bound(
                 bind().await,
                 ordinary_api.clone(),
                 tls.clone(),
@@ -1415,7 +1442,11 @@ pub mod parity {
             .await
             .unwrap();
             let agent_grpc =
-                serve_grpc_bound(bind().await, agent_api.clone(), agent_tls.clone(), 16, gate)
+                serve_grpc_bound(bind().await, agent_api.clone(), agent_tls.clone(), 16, gate.clone())
+                    .await
+                    .unwrap();
+            let agent_wire =
+                serve_wire_bound(bind().await, agent_api.clone(), agent_tls, 16, gate)
                     .await
                     .unwrap();
             let fixture = Self {
@@ -1426,6 +1457,7 @@ pub mod parity {
                 server_cert,
                 agent,
                 app,
+                sql_app,
                 tls,
                 ordinary_api,
                 agent_api,
@@ -1434,9 +1466,11 @@ pub mod parity {
                 native,
                 http,
                 grpc,
+                wire,
                 agent_pg,
                 agent_http,
                 agent_grpc,
+                agent_wire,
                 expires_ms: next_1730z(now_ms()),
             };
             fixture.create_inc_436();
@@ -1524,9 +1558,11 @@ pub mod parity {
                 self.native,
                 self.http,
                 self.grpc,
+                self.wire,
                 self.agent_pg,
                 self.agent_http,
                 self.agent_grpc,
+                self.agent_wire,
             ] {
                 listener.shutdown().await.unwrap();
             }
@@ -1553,6 +1589,50 @@ pub mod parity {
             password: &str,
         ) -> Result<Client, tokio_postgres::Error> {
             connect_password(self.postgresql.address, user, password).await
+        }
+
+        /// Opens a native wire session with the ordinary or agent certificate.
+        pub async fn wire_client(&self, agent: bool) -> native_wire::Client {
+            self.try_wire_client(agent).await.unwrap()
+        }
+
+        /// Opens a session on the ordinary wire listener with the given certificate.
+        pub async fn wire_client_for(&self, cert: &TestCert) -> native_wire::Client {
+            self.connect_native_wire(self.wire.address, cert, None)
+                .await
+                .unwrap()
+        }
+
+        pub async fn try_wire_client(&self, agent: bool) -> std::io::Result<native_wire::Client> {
+            if agent {
+                self.connect_native_wire(self.agent_wire.address, &self.agent, Some(TASK))
+                    .await
+            } else {
+                self.connect_native_wire(self.wire.address, &self.app, None)
+                    .await
+            }
+        }
+
+        async fn connect_native_wire(
+            &self,
+            address: SocketAddr,
+            cert: &TestCert,
+            task: Option<&str>,
+        ) -> std::io::Result<native_wire::Client> {
+            let tls = native_wire::ClientTls {
+                ca: self.ca.cert.pem().into_bytes(),
+                cert: Some(cert.cert.pem().into_bytes()),
+                key: Some(cert.key.serialize_pem().into_bytes()),
+                server_name: "localhost".into(),
+            };
+            let open = proto::OpenSessionRequest {
+                task: task.map(str::to_owned),
+                ..Default::default()
+            };
+            let (client, _) =
+                native_wire::Client::connect(address, Some(tls), open, native_wire::Credential::None)
+                    .await?;
+            Ok(client)
         }
 
         /// A raw task session on the agent pgwire listener.

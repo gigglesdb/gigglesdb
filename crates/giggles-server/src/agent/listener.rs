@@ -37,6 +37,9 @@ pub struct AgentConfig {
     /// Agent gRPC listener (R3-208).
     #[serde(default)]
     pub grpc: Option<SocketAddr>,
+    /// Agent native wire listener.
+    #[serde(default)]
+    pub wire: Option<SocketAddr>,
     /// CA for agent client certificates; defaults to the top-level `client_ca`.
     #[serde(default)]
     pub client_ca: Option<String>,
@@ -50,7 +53,7 @@ pub struct AgentConfig {
     pub databases: Vec<String>,
     #[serde(default = "default_connections")]
     pub connections: usize,
-    /// Limits for the agent HTTP and gRPC listeners (R3-208).
+    /// Limits for the agent HTTP, gRPC and wire listeners.
     #[serde(default)]
     pub api_limits: ApiLimits,
     /// Statements all agent sessions run at once (R3-403); 1 to
@@ -96,8 +99,12 @@ fn default_connections() -> usize {
 impl AgentConfig {
     /// Checks the section on its own. Bindings are validated by the service.
     pub fn validate(&self) -> Result<(), String> {
-        if self.postgres.is_none() && self.http.is_none() && self.grpc.is_none() {
-            return Err("agent requires at least one of postgres, http, grpc".into());
+        if self.postgres.is_none()
+            && self.http.is_none()
+            && self.grpc.is_none()
+            && self.wire.is_none()
+        {
+            return Err("agent requires at least one of postgres, http, grpc, wire".into());
         }
         if !(1..=128).contains(&self.connections) {
             return Err("agent connections must be 1 to 128".into());

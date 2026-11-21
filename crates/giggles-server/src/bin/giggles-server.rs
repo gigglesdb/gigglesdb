@@ -14,6 +14,7 @@ use giggles_server::{
     auth::{PostgresqlConfig, RoleApiConfig, serve_postgresql_bound},
     clock::Clock,
     serve_bound, serve_pg_bound, tls,
+    wire::listen::serve_wire_bound,
 };
 use serde::Deserialize;
 use std::{
@@ -40,6 +41,8 @@ struct Config {
     http: Option<SocketAddr>,
     #[serde(default)]
     grpc: Option<SocketAddr>,
+    #[serde(default)]
+    wire: Option<SocketAddr>,
     #[serde(default)]
     api_limits: ApiLimits,
     certificate: String,
@@ -826,7 +829,7 @@ async fn stop_role(
 struct StartedListeners {
     listeners: Vec<Running>,
     api: std::sync::Arc<ApiRuntime>,
-    /// GD-0061 R3-208: the agent HTTP/gRPC runtime, with its own registry.
+    /// The agent HTTP, gRPC and wire runtime, with its own registry.
     agent_api: Option<std::sync::Arc<ApiRuntime>>,
     role_api: Vec<std::sync::Arc<ApiRuntime>>,
     addresses: Vec<String>,
@@ -856,6 +859,10 @@ async fn start_listeners(
         Some(address) => Some(bind_listener(address, retry).await?),
         None => None,
     };
+    let wire_socket = match c.wire {
+        Some(address) => Some(bind_listener(address, retry).await?),
+        None => None,
+    };
     let agent_pg_socket = match (c.agent.as_ref().and_then(|a| a.postgres), &agent_tls) {
         (Some(address), Some(_)) => Some(bind_listener(address, retry).await?),
         _ => None,
@@ -868,11 +875,17 @@ async fn start_listeners(
         (Some(address), Some(_)) => Some(bind_listener(address, retry).await?),
         _ => None,
     };
+    let agent_wire_socket = match (c.agent.as_ref().and_then(|a| a.wire), &agent_tls) {
+        (Some(address), Some(_)) => Some(bind_listener(address, retry).await?),
+        _ => None,
+    };
     let api = ApiRuntime::new(service.clone(), c.api_limits)?;
     // The agent listeners get a runtime of their own: a separate registry, so
     // a session token from one runtime is never valid on the other.
     let agent_api = match (&c.agent, &agent_tls) {
-        (Some(agent), Some(_)) if agent.http.is_some() || agent.grpc.is_some() => {
+        (Some(agent), Some(_))
+            if agent.http.is_some() || agent.grpc.is_some() || agent.wire.is_some() =>
+        {
             Some(ApiRuntime::new_agent(service.clone(), agent.api_limits)?)
         }
         _ => None,
@@ -956,6 +969,18 @@ async fn start_listeners(
             addresses.push(format!("grpc={}", grpc.address));
             listeners.push(grpc);
         }
+        if let Some(socket) = wire_socket {
+            let wire = serve_wire_bound(
+                socket,
+                api.clone(),
+                config.clone(),
+                c.connections,
+                gate.clone(),
+            )
+            .await?;
+            addresses.push(format!("wire={}", wire.address));
+            listeners.push(wire);
+        }
         if let (Some(runtime), Some(tls), Some(agent)) = (&agent_api, &agent_tls, &c.agent) {
             if let Some(socket) = agent_http_socket {
                 let http = serve_http_bound(
@@ -980,6 +1005,18 @@ async fn start_listeners(
                 .await?;
                 addresses.push(format!("agent_grpc={}", grpc.address));
                 listeners.push(grpc);
+            }
+            if let Some(socket) = agent_wire_socket {
+                let wire = serve_wire_bound(
+                    socket,
+                    runtime.clone(),
+                    tls.clone(),
+                    agent.connections,
+                    gate.clone(),
+                )
+                .await?;
+                addresses.push(format!("agent_wire={}", wire.address));
+                listeners.push(wire);
             }
         }
         if let (Some(socket), Some(tls), Some(agent)) = (agent_pg_socket, agent_tls, &c.agent) {
@@ -1126,15 +1163,17 @@ fn check_role_api_addresses(c: &Config) -> io::Result<()> {
     let others = [
         c.http,
         c.grpc,
+        c.wire,
         c.postgresql.as_ref().map(|pg| pg.listen),
         agent.and_then(|a| a.postgres),
         agent.and_then(|a| a.http),
         agent.and_then(|a| a.grpc),
+        agent.and_then(|a| a.wire),
     ];
     for address in [role_api.http, role_api.grpc].into_iter().flatten() {
         if others.contains(&Some(address)) {
             return Err(io::Error::other(
-                "role_api address overlaps http, grpc, postgresql.listen, or agent listeners",
+                "role_api address overlaps http, grpc, wire, postgresql.listen, or agent listeners",
             ));
         }
     }
@@ -1195,13 +1234,16 @@ mod tests {
         c.grpc = address;
         assert!(check_role_api_addresses(&c).is_err());
         c.grpc = None;
+        c.wire = address;
+        assert!(check_role_api_addresses(&c).is_err());
+        c.wire = None;
         c.postgresql = Some(
             serde_json::from_value(serde_json::json!({"listen":address, "tls":"disabled"}))
                 .unwrap(),
         );
         assert!(check_role_api_addresses(&c).is_err());
         c.postgresql = None;
-        for field in ["postgres", "http", "grpc"] {
+        for field in ["postgres", "http", "grpc", "wire"] {
             c.agent = Some(serde_json::from_value(serde_json::json!({field:address})).unwrap());
             assert!(check_role_api_addresses(&c).is_err());
         }
@@ -1276,6 +1318,26 @@ mod tests {
         assert!(config.build().is_ok());
         json["postgresql"]["typo"] = true.into();
         assert!(serde_json::from_value::<Config>(json).is_err());
+    }
+
+    #[test]
+    fn wire_addresses_are_optional_and_agent_wire_can_stand_alone() {
+        let mut json = serde_json::json!({
+            "database": "db", "native": "127.0.0.1:1", "postgres": "127.0.0.1:2",
+            "certificate": "server.pem", "private_key": "server.key", "client_ca": "ca.pem",
+            "bindings": [], "connections": 32, "skew_seconds": 0, "max_pause_seconds": 3600,
+            "agent": {"http": "127.0.0.1:3"}
+        });
+        let config = serde_json::from_value::<Config>(json.clone()).unwrap();
+        assert!(config.wire.is_none());
+        assert!(config.agent.unwrap().wire.is_none());
+
+        json["wire"] = "127.0.0.1:4".into();
+        json["agent"] = serde_json::json!({"wire": "127.0.0.1:5"});
+        let config = serde_json::from_value::<Config>(json).unwrap();
+        assert!(validate_agent(&config).is_ok());
+        assert_eq!(config.wire.unwrap().port(), 4);
+        assert_eq!(config.agent.unwrap().wire.unwrap().port(), 5);
     }
 
     #[test]

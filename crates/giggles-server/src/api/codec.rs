@@ -5,6 +5,10 @@ use giggles_core::relational::Value;
 use giggles_core::{ApprovalId, Column, Key, OperationId, RowId, Selection, Status, TenantId};
 use prost::Message;
 
+pub(crate) mod wire_seam {
+    pub(crate) use super::super::dispatch::{SpillChunks, WireCall, WireSession, spill_chunks};
+}
+
 #[derive(Debug)]
 pub enum Invocation {
     Legacy(crate::Request),

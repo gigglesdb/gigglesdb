@@ -25,7 +25,7 @@ use tonic::{
 
 const CHUNK: usize = 64 * 1024;
 
-pub(super) struct Receiver<T>(mpsc::Receiver<T>);
+pub(crate) struct Receiver<T>(mpsc::Receiver<T>);
 impl<T> Stream for Receiver<T> {
     type Item = T;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
@@ -146,7 +146,7 @@ pub(super) fn json_body(
     Ok(tonic::body::Body::new(StreamBody::new(stream)))
 }
 
-pub(super) fn grpc(
+pub(crate) fn grpc(
     head: proto::ExecuteReply,
     spill: Option<SpilledRows>,
 ) -> Receiver<Result<proto::ExecuteReply, Status>> {
