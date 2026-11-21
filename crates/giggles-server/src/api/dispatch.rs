@@ -5,9 +5,9 @@ use super::{
     json,
     limits::*,
     native, native_codec, proto,
-    session::{Registry, SessionLease},
+    session::{EntryHandle, Registry, SessionLease},
 };
-use crate::{Response, Service, Session};
+use crate::{Response, Service, Session, agent::statement::OperationId};
 use giggles_core::{Cancellation, relational::spill::{self, SpilledRows}};
 use prost::Message;
 use std::{
@@ -38,6 +38,23 @@ impl std::fmt::Debug for CallOwnership {
 pub enum Encoding {
     Json,
     Protobuf,
+}
+
+#[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
+pub(crate) struct WireSession {
+    pub(crate) entry: EntryHandle,
+    pub(crate) identity: ConnectionIdentity,
+    bindings: watch::Receiver<()>,
+    always_check: bool,
+}
+
+#[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
+pub(crate) struct WireCall {
+    pub request: Invocation,
+    pub operation_id: Option<OperationId>,
+    pub budget_ms: Option<u32>, // Informational, since cancel already carries the budget.
+    pub received: Instant,
+    pub cancel: Cancellation,
 }
 
 /// Immutable wire reply plus the unique live-session owner for its response body.
@@ -371,6 +388,114 @@ impl ApiRuntime {
         self.registry.close(token, identity)
     }
 
+    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
+    pub(crate) fn open_wire(
+        &self,
+        identity: &ConnectionIdentity,
+        request: &proto::OpenSessionRequest,
+    ) -> Result<(proto::OpenSessionReply, Option<WireSession>), ApiError> {
+        let bindings = self.service.binding_changes.subscribe();
+        let reply = self.open_request(identity, request)?;
+        if reply.session_id.is_empty() {
+            return Ok((reply, None));
+        }
+        // A failure after the session exists must not leave it open until it idles out.
+        let mut owner = match if self.kind == ListenerKind::Role {
+            self.open_delivery_owner(identity, &reply)
+                .and_then(|owner| owner.ok_or(ApiError::Internal))
+        } else {
+            Ok(identity.clone())
+        } {
+            Ok(owner) => owner,
+            Err(error) => {
+                self.registry.discard(&reply.session_id);
+                return Err(error);
+            }
+        };
+        let always_check = identity.credential_secret.is_some();
+        owner.forget_secret();
+        let identity = owner;
+        let entry = match self.registry.entry_handle(&reply.session_id, &identity) {
+            Ok(entry) => entry,
+            Err(error) => {
+                self.registry.discard(&reply.session_id);
+                return Err(error);
+            }
+        };
+        Ok((
+            reply,
+            Some(WireSession {
+                entry,
+                identity,
+                bindings,
+                always_check,
+            }),
+        ))
+    }
+
+    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
+    pub(crate) fn wire_cancellation(
+        &self,
+        received: Instant,
+        budget_ms: Option<u32>,
+    ) -> Result<Cancellation, ApiError> {
+        let budget = budget_ms.unwrap_or(10_000);
+        if budget > 10_000 {
+            return Err(ApiError::InvalidArgument);
+        }
+        let deadline = received
+            .checked_add(Duration::from_millis(u64::from(budget)))
+            .ok_or(ApiError::InvalidArgument)?;
+        Ok(Cancellation::new(Some(deadline)))
+    }
+
+    /// Certificate and role identities skip re-checking while the bindings watch
+    /// is unchanged. Changes to bindings, agent bindings, role aliases, or task
+    /// revocation all notify `service.binding_changes`. The supervisor sweep
+    /// invalidates affected entries, `lease_entry` refuses closing entries, and
+    /// the worker's `authority_scope` revalidates role authority before dispatch.
+    /// Credential identities are time-dependent and are checked on every call.
+    /// The caller rejects malformed requests during decoding before this
+    /// identity check. `execute` checks identity before decoding.
+    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
+    pub(crate) async fn execute_wire(
+        &self,
+        session: &mut WireSession,
+        call: WireCall,
+        ownership: Arc<CallOwnership>,
+    ) -> Result<Completion, ApiError> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(ApiError::Unavailable);
+        }
+        if session.always_check || session.bindings.has_changed().unwrap_or(true) {
+            session.bindings.borrow_and_update();
+            if let Err(error) = session.identity.check(&self.service) {
+                self.registry.invalidate_entry(&session.entry);
+                return Err(error);
+            }
+        }
+        self.refuse_off_agent_forms(&call.request, &call.operation_id)?;
+        let lease =
+            self.registry
+                .lease_entry(&session.entry, &session.identity, call.cancel.clone())?;
+        self.execute_invocation(
+            lease,
+            call.request,
+            call.operation_id,
+            call.cancel,
+            call.received,
+            Encoding::Protobuf,
+            false,
+            ownership,
+        )
+        .await
+    }
+
+    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
+    pub(crate) fn close_wire(&self, session: WireSession) {
+        self.registry.close_entry(&session.entry);
+    }
+
     /// Decode before leasing, so malformed requests never modify transaction state.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute(
@@ -390,13 +515,38 @@ impl ApiRuntime {
         // Bare role connections pass here; registry.lease checks the stored owner.
         identity.check(&self.service)?;
         let decoded = codec::decode_execute(request)?;
+        self.refuse_off_agent_forms(&decoded.request, &decoded.operation_id)?;
+        let deadline = received
+            .checked_add(Duration::from_millis(u64::from(decoded.budget_ms)))
+            .ok_or(ApiError::InvalidArgument)?;
+        let deadline = grpc_deadline.map_or(deadline, |other| other.min(deadline));
+        let context = Cancellation::new(Some(deadline));
+        let lease = self.registry.lease(token, identity, context.clone())?;
+        self.execute_invocation(
+            lease,
+            decoded.request,
+            decoded.operation_id,
+            context,
+            received,
+            encoding,
+            stream,
+            ownership,
+        )
+        .await
+    }
+
+    fn refuse_off_agent_forms(
+        &self,
+        request: &Invocation,
+        operation_id: &Option<OperationId>,
+    ) -> Result<(), ApiError> {
         // GD-0061 R3-209: operation IDs and the protected forms belong to
         // task sessions, which only the agent runtime opens. The ordinary and
         // SQL-role runtimes refuse them as malformed, before any lease.
         if self.kind != ListenerKind::Agent
-            && (decoded.operation_id.is_some()
+            && (operation_id.is_some()
                 || matches!(
-                    decoded.request,
+                    request,
                     Invocation::TaskPreview { .. }
                         | Invocation::TaskApply { .. }
                         | Invocation::TaskOutcome
@@ -404,19 +554,28 @@ impl ApiRuntime {
         {
             return Err(ApiError::InvalidArgument);
         }
-        let deadline = received
-            .checked_add(Duration::from_millis(u64::from(decoded.budget_ms)))
-            .ok_or(ApiError::InvalidArgument)?;
-        let deadline = grpc_deadline.map_or(deadline, |other| other.min(deadline));
-        let context = Cancellation::new(Some(deadline));
-        let lease = self.registry.lease(token, identity, context.clone())?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_invocation(
+        &self,
+        lease: SessionLease,
+        request: Invocation,
+        operation_id: Option<OperationId>,
+        context: Cancellation,
+        received: Instant,
+        encoding: Encoding,
+        stream: bool,
+        ownership: Arc<CallOwnership>,
+    ) -> Result<Completion, ApiError> {
         // Zero/expired budgets can never reach a business worker.
         context.check().map_err(|_| ApiError::DeadlineExceeded)?;
         let (reply, receiver) = oneshot::channel();
         let job = Job {
             lease,
-            request: decoded.request,
-            operation_id: decoded.operation_id,
+            request,
+            operation_id,
             context,
             received,
             encoding,
@@ -900,6 +1059,9 @@ fn prepare_encoded(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod wire_seam_tests;
 
 #[cfg(all(test, feature = "engine-rocksdb"))]
 mod native_release_tests;

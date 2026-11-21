@@ -62,16 +62,29 @@ struct Revoked {
     owner: ConnectionIdentity,
     at: Instant,
 }
+#[derive(Clone)]
+#[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
+pub(crate) struct EntryHandle {
+    entry: Arc<Entry>,
+    token: String,
+}
+
 struct Entry {
     owner: ConnectionIdentity,
     created: Instant,
     idle_timeout: std::time::Duration,
     max_age: std::time::Duration,
-    _slot: OwnedSemaphorePermit,
     state: Mutex<State>,
 }
+
+// Keep the permit until the session has dropped, even when a handle retains the entry.
+struct SlottedSession {
+    session: Session,
+    _slot: OwnedSemaphorePermit,
+}
+
 struct State {
-    session: Option<Session>,
+    session: Option<SlottedSession>,
     busy: bool,
     closing: bool,
     last_completed: Instant,
@@ -243,9 +256,11 @@ impl Registry {
             created: now,
             idle_timeout: self.idle_timeout,
             max_age: self.max_age,
-            _slot: slot,
             state: Mutex::new(State {
-                session: Some(session),
+                session: Some(SlottedSession {
+                    session,
+                    _slot: slot,
+                }),
                 busy: false,
                 closing: false,
                 last_completed: now,
@@ -326,6 +341,18 @@ impl Registry {
         Ok(entry)
     }
 
+    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
+    pub(crate) fn entry_handle(
+        &self,
+        token: &str,
+        identity: &ConnectionIdentity,
+    ) -> Result<EntryHandle, ApiError> {
+        Ok(EntryHandle {
+            entry: self.lookup(token, identity)?,
+            token: token.into(),
+        })
+    }
+
     pub(crate) fn lease(
         self: &Arc<Self>,
         token: &str,
@@ -336,6 +363,31 @@ impl Registry {
             return Err(ApiError::Unavailable);
         }
         let entry = self.lookup(token, owner)?;
+        self.lease_resolved_entry(token, entry, cancellation)
+    }
+
+    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
+    pub(crate) fn lease_entry(
+        self: &Arc<Self>,
+        entry: &EntryHandle,
+        identity: &ConnectionIdentity,
+        context: Cancellation,
+    ) -> Result<SessionLease, ApiError> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(ApiError::Unavailable);
+        }
+        if !self.role_runtime && entry.entry.owner != *identity {
+            return Err(self.missing());
+        }
+        self.lease_resolved_entry(&entry.token, entry.entry.clone(), context)
+    }
+
+    fn lease_resolved_entry(
+        self: &Arc<Self>,
+        token: &str,
+        entry: Arc<Entry>,
+        cancellation: Cancellation,
+    ) -> Result<SessionLease, ApiError> {
         let now = self.now();
         let mut state = entry.state.lock().map_err(|_| ApiError::Internal)?;
         if state.closing || expired(&entry, &state, now) {
@@ -378,6 +430,33 @@ impl Registry {
         } else {
             Err(self.missing())
         }
+    }
+
+    /// Unconditionally closes the entry stored under `token` without
+    /// authenticating anyone. For cleanup of a session this caller just created
+    /// when a later step failed, including because the identity itself was
+    /// revoked in between (a normal `close` would fail its identity lookup).
+    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
+    pub(crate) fn discard(&self, token: &str) {
+        let entry = self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(token)
+            .cloned();
+        if let Some(entry) = entry {
+            self.invalidate(token, &entry, false);
+        }
+    }
+
+    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
+    pub(crate) fn close_entry(&self, entry: &EntryHandle) {
+        self.invalidate(&entry.token, &entry.entry, false);
+    }
+
+    #[allow(dead_code)] // used by the native wire, GD-0091 Stack 3a
+    pub(crate) fn invalidate_entry(&self, entry: &EntryHandle) {
+        self.invalidate(&entry.token, &entry.entry, true);
     }
 
     /// Mark closed before removing the map key; lookups that already copied the Arc
@@ -477,23 +556,28 @@ pub(crate) struct SessionLease {
     registry: Weak<Registry>,
     token: String,
     entry: Arc<Entry>,
-    session: Option<Session>,
+    session: Option<SlottedSession>,
     completed: Option<Instant>,
     invalidate_on_drop: bool,
 }
 
 impl SessionLease {
     pub(crate) fn session(&mut self) -> &mut Session {
-        self.session
+        &mut self
+            .session
             .as_mut()
             .expect("exclusive SessionLease owns its session")
+            .session
     }
 
     pub(crate) fn completed(&mut self) {
         if let Some(registry) = self.registry.upgrade() {
             let now = registry.now();
             self.completed = Some(now);
-            let transaction = self.session.as_ref().is_some_and(Session::in_transaction);
+            let transaction = self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.session.in_transaction());
             let mut state = self.entry.state.lock().unwrap_or_else(|p| p.into_inner());
             if transaction {
                 state.transaction_start.get_or_insert(now);
@@ -524,7 +608,7 @@ impl Drop for SessionLease {
         let Some(mut session) = self.session.take() else {
             return;
         };
-        session.connection = None;
+        session.session.connection = None;
         let Some(registry) = self.registry.upgrade() else {
             return;
         };

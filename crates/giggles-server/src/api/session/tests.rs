@@ -314,3 +314,141 @@ fn sweep_reclaims_expired_entries_and_never_leaves_tombstones() {
     ));
     assert_eq!(f.registry.entries.lock().unwrap().len(), 1);
 }
+
+#[test]
+fn lease_entry_matches_lease_on_expiry() {
+    let mut f = Fixture::new(2);
+    let idle_timeout = Duration::from_secs(1);
+    Arc::get_mut(&mut f.registry).unwrap().idle_timeout = idle_timeout;
+    let token = f.registry.open(&f.owner).unwrap();
+    let cached_token = f.registry.open(&f.owner).unwrap();
+    let entry = f.registry.entry_handle(&cached_token, &f.owner).unwrap();
+    f.clock.advance(idle_timeout + Duration::from_nanos(1));
+
+    let token_error = f
+        .registry
+        .lease(&token, &f.owner, Cancellation::default())
+        .err();
+    let entry_error = f
+        .registry
+        .lease_entry(&entry, &f.owner, Cancellation::default())
+        .err();
+    assert_eq!(token_error, Some(ApiError::SessionNotFound));
+    assert_eq!(entry_error, token_error);
+    assert!(f.registry.entries.lock().unwrap().is_empty());
+}
+
+#[test]
+fn lease_entry_busy_is_session_busy() {
+    let f = Fixture::new(1);
+    let token = f.registry.open(&f.owner).unwrap();
+    let entry = f.registry.entry_handle(&token, &f.owner).unwrap();
+    let _lease = f.lease(&token);
+    assert!(matches!(
+        f.registry
+            .lease_entry(&entry, &f.owner, Cancellation::default()),
+        Err(ApiError::SessionBusy)
+    ));
+}
+
+#[test]
+fn lease_entry_narrows_deadline_like_lease() {
+    let f = Fixture::new(1);
+    // Cancellation reads the real clock. Start the transaction far enough in
+    // the past to fire its deadline without advancing the registry clock.
+    *f.clock.0.lock().unwrap() = Instant::now() - TRANSACTION_TIMEOUT;
+    let token = f.registry.open(&f.owner).unwrap();
+    let entry = f.registry.entry_handle(&token, &f.owner).unwrap();
+    let mut begin = f.lease(&token);
+    assert_eq!(begin.session().handle(sql("BEGIN")).code, "ok");
+    begin.completed();
+    drop(begin);
+
+    let token_context = Cancellation::default();
+    let token_lease = f
+        .registry
+        .lease(&token, &f.owner, token_context.clone())
+        .unwrap();
+    assert!(token_context.check().is_err());
+    drop(token_lease);
+
+    let entry_context = Cancellation::default();
+    let _entry_lease = f
+        .registry
+        .lease_entry(&entry, &f.owner, entry_context.clone())
+        .unwrap();
+    assert!(entry_context.check().is_err());
+}
+
+#[test]
+fn lease_entry_after_close_fails() {
+    let f = Fixture::new(1);
+    let token = f.registry.open(&f.owner).unwrap();
+    let entry = f.registry.entry_handle(&token, &f.owner).unwrap();
+    f.registry.close(&token, &f.owner).unwrap();
+
+    let token_error = f
+        .registry
+        .lease(&token, &f.owner, Cancellation::default())
+        .err();
+    let entry_error = f
+        .registry
+        .lease_entry(&entry, &f.owner, Cancellation::default())
+        .err();
+    assert_eq!(token_error, Some(ApiError::SessionNotFound));
+    assert_eq!(entry_error, token_error);
+}
+
+#[test]
+fn close_entry_frees_slot_and_cancels_running_lease() {
+    let f = Fixture::new(1);
+    let token = f.registry.open(&f.owner).unwrap();
+    let entry = f.registry.entry_handle(&token, &f.owner).unwrap();
+    let context = Cancellation::default();
+    let lease = f
+        .registry
+        .lease_entry(&entry, &f.owner, context.clone())
+        .unwrap();
+    assert!(context.check().is_ok());
+    f.registry.close_entry(&entry);
+    assert!(context.check().is_err());
+    assert_eq!(f.registry.slots.available_permits(), 0);
+    drop(lease);
+    assert_eq!(f.registry.slots.available_permits(), 1);
+    assert!(matches!(
+        f.registry
+            .lease_entry(&entry, &f.owner, Cancellation::default()),
+        Err(ApiError::SessionNotFound)
+    ));
+}
+
+#[test]
+fn invalidate_entry_marks_revoked() {
+    let f = Fixture::new(1);
+    let token = f.registry.open(&f.owner).unwrap();
+    let entry = f.registry.entry_handle(&token, &f.owner).unwrap();
+    f.registry.invalidate_entry(&entry);
+    assert_eq!(f.registry.slots.available_permits(), 1);
+    assert!(matches!(
+        f.registry.lease(&token, &f.owner, Cancellation::default()),
+        Err(ApiError::Unauthenticated)
+    ));
+}
+
+#[test]
+fn discard_frees_slot_of_a_session_whose_identity_was_revoked() {
+    let f = Fixture::new(1);
+    let token = f.registry.open(&f.owner).unwrap();
+    // The identity is revoked before the caller could take its handle: lookup
+    // and close both fail their identity check and leave the entry in place.
+    f.service
+        .reload_bindings(vec![f.bindings[1].clone()])
+        .unwrap();
+    assert!(f.registry.entry_handle(&token, &f.owner).is_err());
+    assert!(f.registry.close(&token, &f.owner).is_err());
+    assert_eq!(f.registry.slots.available_permits(), 0);
+    f.registry.discard(&token);
+    assert_eq!(f.registry.slots.available_permits(), 1);
+    f.registry.discard(&token); // idempotent, unknown token is a no-op
+    f.registry.discard("not-a-token");
+}
