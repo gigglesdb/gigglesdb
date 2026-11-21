@@ -144,8 +144,11 @@ After client checks, the runner executes `compat/corpus/<area>/<case>.sql` in
 one psql session per case per server, sequentially against the same databases.
 The pinned PostgreSQL image and network are reused. Each server session has a
 120-second deadline. `--corpus '*'` selects case IDs, areas, or area/case paths
-by glob; IDs are checked globally for duplicates before filtering. `--no-corpus`
-skips this stage; `--no-checks` runs the corpus without client checks.
+by glob; several globs may be given separated by commas (`--corpus
+'case_a,case_b,pg_types/interval_*'`), and a glob starting with `!` excludes
+(`--corpus '!pg_types,!pg_ddl'` runs every other area). IDs are checked
+globally for duplicates before filtering. `--no-corpus` skips this stage; `--no-checks` runs the corpus
+without client checks.
 
 Cases require `-- case: safe_unique_id`, `-- title: ...`, and `-- owner: A`
 headers. Optional `-- expect: compatible` is the default; `-- expect: intentional
@@ -202,6 +205,79 @@ An empirical PostgreSQL 18.6 CSV probe confirms DDL/DML command tags are printed
 and rows without a SELECT command tag. The transcript therefore also retains a
 canonical ROW_COUNT line derived from each END marker, so SELECT row counts are compared
 without guessing tags from SQL text; actual DDL/DML tags remain compared too.
+
+## Focused runs for one stack
+
+A lead or worker checks only its own cases against a lane build:
+
+```bash
+cd <lane worktree>    # run the harness from the lane, not the shared checkout
+python -I -B compat/harness.py run --server-bin <lane target>/debug/giggles-server.exe   --no-checks --keep-scratch --corpus 'case_a,case_b,case_c'   --out-root J:/gigglesdb-work/pgparity/gap2/runs/<lane>   --cargo-target <lane target>
+```
+
+- `--corpus` takes one glob or several separated by commas. Each glob is
+  matched against the case id, the area, `area/id`, `area/file.sql` and the
+  file path, so ids, whole areas (`pg_types`) and prefixes (`pg_ddl/view_*`)
+  can be mixed; `!glob` excludes. Check the "Differential" table at the end of the output: it
+  lists only the selected cases.
+- `--no-checks` skips client, ORM and GUI tool checks; the Docker oracle still
+  starts once per run.
+- `--cargo-target` only names where the run lock `.gd-r0-run.lock` lives. Pass
+  the lane's own target so a focused run never waits on, or blocks, another
+  lane's run.
+- Output: `<out-root>/r0-<UTC time>-<hex>/` holds `report.json`, `report.md`,
+  `server.stdout.log`, `server.stderr.log`, `oracle.log` and
+  `corpus/<area>/<id>/` with `script.sql`, `pg.stdout.txt`,
+  `giggles.stdout.txt`, both stderr files and `result.json`. With
+  `--keep-scratch` the server's `bin` (a copy of the binary, about 96 MB),
+  `data`, `tmp`, `target` and `cwd` directories stay for debugging. Delete the
+  run folder when the stack lands.
+- Time: 3 cases took 25 seconds end to end (oracle start, server start, both
+  sides, cleanup) with a built binary and the oracle image present. A whole
+  area takes about 6 seconds per case.
+
+## Nightly main measurement
+
+```bash
+bash K:/Projects/gigglesdb/scripts/pgparity-nightly.sh
+```
+
+Where one task may run at most two hours (agent background tasks), run the two
+halves as two tasks, one after the other:
+
+```bash
+bash K:/Projects/gigglesdb/scripts/pgparity-nightly.sh --half a   # pg_types, pg_functions, pg_queries, pg_silent
+bash K:/Projects/gigglesdb/scripts/pgparity-nightly.sh --half b   # every other area
+```
+
+The script resolves `main` once, builds a debug `giggles-server` through the
+build-slot wrapper in the stable worktree `J:/gigglesdb-work/wt/pgp-nightly`
+and target `J:/gigglesdb-work/pgparity/gap2/nightly-target` (sccache hits need
+both to stay the same), runs the corpus with `--no-checks --keep-scratch` in two
+halves split by area (`--half a|b|all`, default all) and writes
+`J:/gigglesdb-work/pgparity/gap2/nightly/<UTC date>-<sha12>/`: `build.log`,
+`timings`, `harness-<half>.log`, `part-<half>/r0-*/report.json` with the
+per-case transcripts, `report.json` (the halves merged with `harness.py
+merge`), `areas.md` (per-area outcome counts and the COMPATIBLE change),
+`delta.md` (`harness.py delta` against the previous run) and `SUMMARY.md`.
+A half that already has a report for this commit is skipped, and whichever
+invocation completes the pair merges and reports.
+`nightly/LATEST` names the newest report; the next run compares against it, or
+against `--previous <report.json>`. A commit that already has a run is a no-op
+unless `--force`; `--with-checks` adds the client, ORM and GUI tool checks
+to half a;
+`--keep-scratch-runs <n>` (default 2) keeps server scratch only for the newest
+runs, while reports, transcripts and logs stay. Exit 0 done, 3 done with
+regressions, 2 failure. A full corpus run takes about 110 minutes.
+
+`watch` is not used for this: it builds without the build-slot wrapper, always
+runs every client check, deletes scratch and writes no per-area table.
+
+`harness.py areas REPORT... [--previous OLD...] [--out FILE]` prints the
+per-area table for any report, merging several part reports on either side.
+`harness.py merge PART... --out FILE` writes one report from parts of the same
+commit's run; it refuses parts of different commits and a case present in two
+parts.
 
 ## H2b source-derived coverage inventory
 

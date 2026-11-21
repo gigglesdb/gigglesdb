@@ -10,7 +10,7 @@ import fnmatch
 import json
 import math
 import secrets
-from compat_lib import checks, cluster, corpus, delta, docker, gigglesdb, oracle, pins, probes, psql_client, report, scratch, util, watch
+from compat_lib import areas, checks, cluster, corpus, delta, docker, gigglesdb, oracle, pins, probes, psql_client, report, scratch, util, watch
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
@@ -19,6 +19,13 @@ def parser():
     comparison.add_argument('old', type=Path)
     comparison.add_argument('new', type=Path)
     comparison.add_argument('--out', type=Path)
+    area_table = sub.add_parser('areas', help='per-area corpus outcome counts of one report or several merged')
+    area_table.add_argument('report', type=Path, nargs='+')
+    area_table.add_argument('--previous', type=Path, nargs='+', help='older report(s) to show the COMPATIBLE change against')
+    area_table.add_argument('--out', type=Path)
+    merging = sub.add_parser('merge', help='merge reports of one commit run in parts (for example by area) into one report')
+    merging.add_argument('reports', type=Path, nargs='+')
+    merging.add_argument('--out', type=Path, required=True)
     run = sub.add_parser('run')
     run.add_argument('--server-bin', type=Path)
     run.add_argument('--server-arg', action='append', default=[], help='extra server argument (use --server-arg=--flag)')
@@ -30,7 +37,7 @@ def parser():
     run.add_argument('--clients', default=','.join(psql_client.REGISTRY))
     run.add_argument('--checks', default='*')
     run.add_argument('--owners', default=','.join(sorted(checks.OWNERS)))
-    run.add_argument('--corpus', default='*')
+    run.add_argument('--corpus', default='*', help='fnmatch globs over id, area, area/id or area/file, separated by commas; !glob excludes')
     run.add_argument('--no-corpus', action='store_true')
     run.add_argument('--no-checks', action='store_true')
     run.add_argument('--client-timeout', type=float, default=60)
@@ -223,10 +230,21 @@ def owner_matches(case, owners):
 
 
 def corpus_matches(case, pattern):
+    """Match comma-separated fnmatch globs; a glob starting with ! excludes.
+
+    With only exclusions, every other case matches.
+    """
     path = Path(case['path'])
     values = (case['id'], case['area'], case['area']+'/'+case['id'],
               case['area']+'/'+path.name, str(path), path.as_posix())
-    return any(fnmatch.fnmatch(value, pattern) for value in values)
+    patterns = [part.strip() for part in pattern.split(',') if part.strip()]
+    excludes = [part[1:].strip() for part in patterns if part.startswith('!')]
+    includes = [part for part in patterns if not part.startswith('!')]
+    if not includes and not any(excludes):
+        return False
+    def hit(globs):
+        return any(fnmatch.fnmatch(value, glob) for glob in globs if glob for value in values)
+    return (hit(includes) if includes else True) and not hit(excludes)
 
 
 def _run(args, capture):
@@ -419,6 +437,10 @@ def main(argv=None):
     args = parser().parse_args(argv)
     if args.action == 'delta':
         return delta.run(args.old, args.new, args.out)
+    if args.action == 'areas':
+        return areas.run(args.report, args.previous, args.out)
+    if args.action == 'merge':
+        return areas.run_merge(args.reports, args.out)
     if args.action == 'watch':
         return watch.run(args, lambda argv: run_once(argv, fail_if_build_busy=True), Path(__file__).resolve().parent.parent)
     try:

@@ -3,7 +3,7 @@
 -- owner: E1
 -- expect: compatible
 BEGIN;
-CREATE TABLE t_pgq_copy_freeze(i int);
+CREATE TABLE t_pgq_copy_freeze(i int PRIMARY KEY);
 COPY t_pgq_copy_freeze FROM PROGRAM 'echo 1' WITH (FREEZE);
 COMMIT;
 SELECT * FROM t_pgq_copy_freeze;
@@ -14,7 +14,7 @@ COMMIT;
 SELECT * FROM t_pgq_copy_freeze;
 BEGIN;
 SAVEPOINT child;
-CREATE TABLE t_pgq_copy_freeze_release(i int);
+CREATE TABLE t_pgq_copy_freeze_release(i int PRIMARY KEY);
 RELEASE child;
 COPY t_pgq_copy_freeze_release FROM PROGRAM 'echo 3' WITH (FREEZE true);
 COMMIT;
