@@ -663,18 +663,41 @@ impl RowSource for V2Snapshot {
         table: &relational::TableDef,
         key: &[u8],
     ) -> Result<Option<scan::SourceRow<'s>>, SqlError> {
-        self.scan(
-            table,
-            &scan::KeyRange {
-                lo: Bound::Included(key.to_vec()),
-                hi: Bound::Included(key.to_vec()),
-            },
-            scan::Direction::Forward,
-        )?
-        .next()
-        .transpose()
+        let prefix = table.id.to_be_bytes();
+        let mut full_key = Vec::with_capacity(prefix.len() + key.len());
+        full_key.extend_from_slice(&prefix);
+        full_key.extend_from_slice(key);
+        let Some(payload) = engine::mvcc::read_at(
+            self.kv.as_ref(),
+            engine::kv::Keyspace::Rows,
+            &full_key,
+            self.ts,
+        )
+        .map_err(|e| self.error(e))?
+        else {
+            return Ok(None);
+        };
+        let row = engine::codec::decode_row(&full_key, &payload).map_err(|e| self.error(e))?;
+        let columns = table.columns.len();
+        if row.tombstone || row.values.len() > columns {
+            return Err(self.error(CoreError::Corrupt("cursor row arity".into())));
+        }
+        let mut values = row.values;
+        values.resize(columns, Value::Null);
+        full_key.drain(..prefix.len());
+        Ok(Some(scan::SourceRow {
+            key: Cow::Owned(full_key),
+            row: Cow::Owned(SqlRow {
+                values,
+                version: row.row_version,
+            }),
+        }))
     }
 }
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "cursor_point_tests.rs"]
+mod point_tests;
 
 #[cfg(all(test, feature = "engine-rocksdb"))]
 mod tests {
