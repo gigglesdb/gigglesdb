@@ -1,0 +1,792 @@
+{
+  "run_id": "r0-20261121T130120Z-9afc95",
+  "results": [
+    {
+      "step": "migrate",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "pg"
+    },
+    {
+      "step": "create_read",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "pg"
+    },
+    {
+      "step": "relations",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "pg"
+    },
+    {
+      "step": "update",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "pg"
+    },
+    {
+      "step": "nested_atomic",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "pg"
+    },
+    {
+      "step": "unique_integrity",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "pg"
+    },
+    {
+      "step": "filter_order_page",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "pg"
+    },
+    {
+      "step": "aggregate_count",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "pg"
+    },
+    {
+      "step": "delete",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "pg"
+    },
+    {
+      "step": "migrate_zero",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "pg"
+    },
+    {
+      "step": "migrate",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "giggles"
+    },
+    {
+      "step": "create_read",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "giggles"
+    },
+    {
+      "step": "relations",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "giggles"
+    },
+    {
+      "step": "update",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "giggles"
+    },
+    {
+      "step": "nested_atomic",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "giggles"
+    },
+    {
+      "step": "unique_integrity",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "giggles"
+    },
+    {
+      "step": "filter_order_page",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "giggles"
+    },
+    {
+      "step": "aggregate_count",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "giggles"
+    },
+    {
+      "step": "delete",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "giggles"
+    },
+    {
+      "step": "migrate_zero",
+      "status": "PASS",
+      "classification": null,
+      "orm": "django",
+      "target": "giggles"
+    },
+    {
+      "step": "upgrade_head",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "pg"
+    },
+    {
+      "step": "create_read",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "pg"
+    },
+    {
+      "step": "relations",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "pg"
+    },
+    {
+      "step": "update",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "pg"
+    },
+    {
+      "step": "nested_atomic",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "pg"
+    },
+    {
+      "step": "unique_integrity",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "pg"
+    },
+    {
+      "step": "filter_order_page",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "pg"
+    },
+    {
+      "step": "aggregate_count",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "pg"
+    },
+    {
+      "step": "delete",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "pg"
+    },
+    {
+      "step": "downgrade_base",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "pg"
+    },
+    {
+      "step": "upgrade_head",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "giggles"
+    },
+    {
+      "step": "create_read",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "giggles"
+    },
+    {
+      "step": "relations",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "giggles"
+    },
+    {
+      "step": "update",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "giggles"
+    },
+    {
+      "step": "nested_atomic",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "giggles"
+    },
+    {
+      "step": "unique_integrity",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "giggles"
+    },
+    {
+      "step": "filter_order_page",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "giggles"
+    },
+    {
+      "step": "aggregate_count",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "giggles"
+    },
+    {
+      "step": "delete",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "giggles"
+    },
+    {
+      "step": "downgrade_base",
+      "status": "PASS",
+      "classification": null,
+      "orm": "sqlalchemy",
+      "target": "giggles"
+    },
+    {
+      "step": "migrate",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "pg"
+    },
+    {
+      "step": "create_read",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "pg"
+    },
+    {
+      "step": "relations",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "pg"
+    },
+    {
+      "step": "update",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "pg"
+    },
+    {
+      "step": "nested_atomic",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "pg"
+    },
+    {
+      "step": "unique_integrity",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "pg"
+    },
+    {
+      "step": "filter_order_page",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "pg"
+    },
+    {
+      "step": "aggregate_count",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "pg"
+    },
+    {
+      "step": "delete",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "pg"
+    },
+    {
+      "step": "migrate_zero",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "pg"
+    },
+    {
+      "step": "migrate",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "giggles"
+    },
+    {
+      "step": "create_read",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "giggles"
+    },
+    {
+      "step": "relations",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "giggles"
+    },
+    {
+      "step": "update",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "giggles"
+    },
+    {
+      "step": "nested_atomic",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "giggles"
+    },
+    {
+      "step": "unique_integrity",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "giggles"
+    },
+    {
+      "step": "filter_order_page",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "giggles"
+    },
+    {
+      "step": "aggregate_count",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "giggles"
+    },
+    {
+      "step": "delete",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "giggles"
+    },
+    {
+      "step": "migrate_zero",
+      "status": "PASS",
+      "classification": null,
+      "orm": "rails",
+      "target": "giggles"
+    },
+    {
+      "step": "migrate_deploy",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "pg"
+    },
+    {
+      "step": "create_read",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "pg"
+    },
+    {
+      "step": "relations",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "pg"
+    },
+    {
+      "step": "update",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "pg"
+    },
+    {
+      "step": "transaction",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "pg"
+    },
+    {
+      "step": "unique_integrity",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "pg"
+    },
+    {
+      "step": "filter_order_page",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "pg"
+    },
+    {
+      "step": "aggregate_count",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "pg"
+    },
+    {
+      "step": "delete",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "pg"
+    },
+    {
+      "step": "down",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "pg"
+    },
+    {
+      "step": "migrate_deploy",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "giggles"
+    },
+    {
+      "step": "create_read",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "giggles"
+    },
+    {
+      "step": "relations",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "giggles"
+    },
+    {
+      "step": "update",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "giggles"
+    },
+    {
+      "step": "transaction",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "giggles"
+    },
+    {
+      "step": "unique_integrity",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "giggles"
+    },
+    {
+      "step": "filter_order_page",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "giggles"
+    },
+    {
+      "step": "aggregate_count",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "giggles"
+    },
+    {
+      "step": "delete",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "giggles"
+    },
+    {
+      "step": "down",
+      "status": "PASS",
+      "classification": null,
+      "orm": "prisma",
+      "target": "giggles"
+    }
+  ],
+  "oracle": {
+    "image": "postgres:18.6",
+    "digest": "sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42",
+    "initdb_args": "--locale=C.UTF-8 --encoding=UTF8",
+    "tz": "UTC",
+    "server_version": "18.6 (Debian 18.6-1.pgdg13+2)",
+    "collation": "C.UTF-8",
+    "timezone": "UTC",
+    "encoding": "UTF8"
+  },
+  "errors": [],
+  "known_divergences": [
+    "No numeric/timestamptz secondary indexes: unsupported by GigglesDB; none of these ORMs requires one by default."
+  ],
+  "images": {
+    "python": {
+      "base": "python@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90",
+      "image": "sha256:fd1a8e37f59805471808e2c73c7f0e887447a071ce9b654d75720bd526753609",
+      "packages": [
+        "alembic==1.20.1",
+        "asgiref==3.13.0",
+        "Django==5.2.17",
+        "greenlet==3.5.6",
+        "Mako==1.4.3",
+        "MarkupSafe==3.0.4",
+        "psycopg==3.3.8",
+        "psycopg-binary==3.3.8",
+        "SQLAlchemy==2.0.57",
+        "sqlparse==0.6.1",
+        "typing_extensions==4.16.0"
+      ],
+      "runtime": "Python 3.13.18"
+    },
+    "rails": {
+      "base": "ruby@sha256:243a066707bcb16e214840d374ae01a886a7fba374bde795834efee4a752b479",
+      "image": "sha256:ace5094516a2379ece9dbd5f728454d2145cc06657e344f1946c186b2dfee22f",
+      "packages": [
+        "abbrev (0.1.2)",
+        "action_text-trix (2.1.19)",
+        "actioncable (8.1.4.1)",
+        "actionmailbox (8.1.4.1)",
+        "actionmailer (8.1.4.1)",
+        "actionpack (8.1.4.1)",
+        "actiontext (8.1.4.1)",
+        "actionview (8.1.4.1)",
+        "activejob (8.1.4.1)",
+        "activemodel (8.1.4.1)",
+        "activerecord (8.1.4.1)",
+        "activestorage (8.1.4.1)",
+        "activesupport (8.1.4.1)",
+        "base64 (0.3.0)",
+        "benchmark (0.5.0)",
+        "bigdecimal (4.0.1)",
+        "builder (3.3.0)",
+        "bundler (default: 4.0.20)",
+        "concurrent-ruby (1.3.8)",
+        "connection_pool (3.0.3)",
+        "crass (1.0.8)",
+        "csv (3.3.5)",
+        "date (default: 3.5.1)",
+        "debug (1.11.1)",
+        "delegate (default: 0.6.1)",
+        "did_you_mean (default: 2.0.0)",
+        "digest (default: 3.2.1)",
+        "drb (2.2.3)",
+        "english (default: 0.8.1)",
+        "erb (default: 6.0.7)",
+        "error_highlight (default: 0.7.2)",
+        "erubi (1.13.1)",
+        "etc (default: 1.4.6)",
+        "fcntl (default: 1.3.0)",
+        "fiddle (1.1.8)",
+        "fileutils (default: 1.8.0)",
+        "find (default: 0.2.0)",
+        "forwardable (default: 1.4.0)",
+        "getoptlong (0.2.1)",
+        "globalid (1.4.0)",
+        "i18n (1.15.2)",
+        "io-console (default: 0.8.2)",
+        "io-nonblock (default: 0.3.2)",
+        "io-wait (default: 0.4.0)",
+        "ipaddr (default: 1.2.8)",
+        "irb (1.16.0)",
+        "json (default: 2.18.0)",
+        "logger (1.7.0)",
+        "loofah (2.25.3)",
+        "mail (2.9.1)",
+        "marcel (1.2.1)",
+        "matrix (0.4.3)",
+        "mini_mime (1.1.5)",
+        "minitest (6.0.0)",
+        "mutex_m (0.3.0)",
+        "net-ftp (0.3.9)",
+        "net-http (default: 0.9.1)",
+        "net-imap (0.6.4.1)",
+        "net-pop (0.1.2)",
+        "net-protocol (default: 0.2.2)",
+        "net-smtp (0.5.1)",
+        "nio4r (2.7.5)",
+        "nkf (0.2.0)",
+        "nokogiri (1.19.7 x86_64-linux-gnu)",
+        "observer (0.1.2)",
+        "open-uri (default: 0.5.0)",
+        "open3 (default: 0.2.1)",
+        "openssl (default: 4.0.2)",
+        "optparse (default: 0.8.1)",
+        "ostruct (0.6.3)",
+        "pg (1.7.0 x86_64-linux)",
+        "power_assert (3.0.1)",
+        "pp (default: 0.6.3)",
+        "prettyprint (default: 0.2.0)",
+        "prime (0.1.4)",
+        "prism (default: 1.8.2)",
+        "pstore (0.2.1)",
+        "psych (default: 5.3.1)",
+        "racc (1.8.1)",
+        "rack (3.2.9)",
+        "rack-session (2.1.2)",
+        "rack-test (2.3.0)",
+        "rackup (2.3.1)",
+        "rails (8.1.4.1)",
+        "rails-dom-testing (2.3.0)",
+        "rails-html-sanitizer (1.7.2)",
+        "railties (8.1.4.1)",
+        "rake (13.3.1)",
+        "rbs (3.10.0)",
+        "rdoc (7.0.4)",
+        "readline (0.0.4)",
+        "reline (0.6.3)",
+        "repl_type_completor (0.1.12)",
+        "resolv (default: 0.7.2)",
+        "resolv-replace (0.1.1)",
+        "rexml (3.4.4)",
+        "rinda (0.2.0)",
+        "rss (0.3.2)",
+        "ruby2_keywords (default: 0.0.5)",
+        "securerandom (default: 0.4.1)",
+        "shellwords (default: 0.2.2)",
+        "singleton (default: 0.3.0)",
+        "stringio (default: 3.2.0)",
+        "strscan (default: 3.1.6)",
+        "syntax_suggest (default: 2.0.3)",
+        "syslog (0.3.0)",
+        "tempfile (default: 0.3.1)",
+        "test-unit (3.7.5)",
+        "thor (1.5.0)",
+        "time (default: 0.4.2)",
+        "timeout (default: 0.6.0)",
+        "tmpdir (default: 0.3.1)",
+        "tsort (default: 0.2.0)",
+        "typeprof (0.31.1)",
+        "tzinfo (2.0.6)",
+        "un (default: 0.3.0)",
+        "uri (default: 1.1.1)",
+        "useragent (0.16.11)",
+        "weakref (default: 0.1.4)",
+        "websocket-driver (0.9.0)",
+        "websocket-extensions (0.2.0)",
+        "yaml (default: 0.4.0)",
+        "zeitwerk (2.8.3)",
+        "zlib (default: 3.2.3)"
+      ],
+      "runtime": "ruby 4.0.9 (2026-10-23 revision 3e93b23afc) +PRISM [x86_64-linux]"
+    },
+    "prisma": {
+      "base": "node@sha256:18a166e2d50578afe933434857ed2d9059bd1aa398a223e9c89eb4302354f079",
+      "image": "sha256:9f8428d1af20a2520d307fde7966baba671132c0426bb50af071a304d3933359",
+      "packages": [
+        "app@1.0.0 /app",
+        "+-- @prisma/client@6.19.3",
+        "`-- prisma@6.19.3"
+      ],
+      "runtime": "v26.13.1"
+    }
+  },
+  "image": "sha256:fd1a8e37f59805471808e2c73c7f0e887447a071ce9b654d75720bd526753609",
+  "packages": [
+    "alembic==1.20.1",
+    "asgiref==3.13.0",
+    "Django==5.2.17",
+    "greenlet==3.5.6",
+    "Mako==1.4.3",
+    "MarkupSafe==3.0.4",
+    "psycopg==3.3.8",
+    "psycopg-binary==3.3.8",
+    "SQLAlchemy==2.0.57",
+    "sqlparse==0.6.1",
+    "typing_extensions==4.16.0"
+  ],
+  "servers": {
+    "django": {
+      "binary_sha256": "30ee9f85dc89c993bb1e6ec70016a3a329c2642f84b9f5e75b644f606fc3e506",
+      "binary_size": 99315200,
+      "stdout_banner": [
+        "postgresql=127.0.0.1:58571 preview=single-host",
+        "[REDACTED_URL]"
+      ],
+      "exit": 0
+    },
+    "sqlalchemy": {
+      "binary_sha256": "30ee9f85dc89c993bb1e6ec70016a3a329c2642f84b9f5e75b644f606fc3e506",
+      "binary_size": 99315200,
+      "stdout_banner": [
+        "postgresql=127.0.0.1:63490 preview=single-host",
+        "[REDACTED_URL]"
+      ],
+      "exit": 0
+    },
+    "rails": {
+      "binary_sha256": "30ee9f85dc89c993bb1e6ec70016a3a329c2642f84b9f5e75b644f606fc3e506",
+      "binary_size": 99315200,
+      "stdout_banner": [
+        "postgresql=127.0.0.1:59670 preview=single-host",
+        "[REDACTED_URL]"
+      ],
+      "exit": 0
+    },
+    "prisma": {
+      "binary_sha256": "30ee9f85dc89c993bb1e6ec70016a3a329c2642f84b9f5e75b644f606fc3e506",
+      "binary_size": 99315200,
+      "stdout_banner": [
+        "postgresql=127.0.0.1:60616 preview=single-host",
+        "[REDACTED_URL]"
+      ],
+      "exit": 0
+    }
+  }
+}
