@@ -667,6 +667,9 @@ impl Sequencer {
         }
     }
     pub(crate) fn submit(&self, request: CommitRequest) -> Result<Ts, TxnError> {
+        self.submit_with_tail(request, None)
+    }
+    pub(crate) fn submit_with_tail(&self, request: CommitRequest, release_admission: Option<&mut dyn FnMut()>) -> Result<Ts, TxnError> {
         if self.stopped() || self.kv.is_fenced() {
             return Err(TxnError::Fenced);
         }
@@ -675,6 +678,7 @@ impl Sequencer {
         self.sender
             .send(Message::Commit(Pending { request, guard: None, reply }))
             .map_err(|_| TxnError::Fenced)?;
+        let _wait = release_admission.and_then(crate::durable::wait);
         receive.recv().unwrap_or(Err(TxnError::Fenced))
     }
     pub(crate) fn submit_guarded(&self, request: CommitRequest, guard: CommitGuard) -> Result<Ts, TxnError> {
@@ -1496,6 +1500,19 @@ mod shutdown_tests {
         let mut req = request(0);
         req.writes.insert((Keyspace::Rows, vec![7]), Some(vec![8]));
         req
+    }
+    #[test]
+    fn non_sql_counter_and_highwater_do_not_release() {
+        let (_, seq) = fixture();
+        let context = crate::Cancellation::default();
+        let _registration = context.register_durability_wait(|_, _| panic!("not SQL publication"));
+        context.scope(|| {
+            assert!(seq.submit(write()).is_ok());
+            let mut key = vec![3]; key.extend_from_slice(&1u64.to_be_bytes());
+            assert!(seq.write_highwater_async(key, 1u64.to_be_bytes().to_vec()).unwrap().recv().unwrap().is_err());
+            let mut key = vec![2]; key.extend_from_slice(&[0; 24]);
+            assert!(seq.write_counter(key, vec![0; 8], 0).is_err());
+        });
     }
     #[test]
     fn stop_is_idempotent_and_new_submissions_are_fenced() {

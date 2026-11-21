@@ -233,6 +233,32 @@ fn savepoint_rollback_of_restart_does_not_publish_stale_pending_counter() {
     }
 }
 
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn durable_release_excludes_pending_sequence_without_catalog_writes() {
+    let fixture = Fixture::new(Engine::V2);
+    let mut session = fixture.session();
+    for sql in [
+        "CREATE SEQUENCE ids",
+        "CREATE TABLE durable_rows(id bigint PRIMARY KEY)",
+        "BEGIN",
+        "SAVEPOINT before_restart",
+        "ALTER SEQUENCE ids RESTART WITH 10",
+        "ROLLBACK TO before_restart",
+        "INSERT INTO durable_rows VALUES (1)",
+    ] {
+        run(&mut session, sql);
+    }
+    assert!(session.v2_transaction.as_ref().unwrap().local_durable_tail_eligible());
+    assert!(!session.pending_sequences.lock().unwrap().is_empty());
+
+    let context = crate::Cancellation::default();
+    let _registration = context.register_durability_wait(|_, _| panic!("pending sequence released admission"));
+    context.scope(|| run(&mut session, "COMMIT"));
+    assert_eq!(scalar(&mut session, "SELECT id FROM durable_rows"), 1);
+    assert_eq!(scalar(&mut session, "SELECT nextval('ids')"), 1);
+}
+
 #[test]
 fn identity_owned_sequence_restart_uses_same_counter_path() {
     for engine in engines() {

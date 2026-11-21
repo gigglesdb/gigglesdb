@@ -761,10 +761,17 @@ impl From<CoreError> for GuardedPersistError {
         Self::Core(error)
     }
 }
-struct Ticket<'a>(&'a AtomicUsize);
+struct Ticket<'a>(Option<&'a AtomicUsize>);
+impl Ticket<'_> {
+    fn release(&mut self) {
+        if let Some(counter) = self.0.take() {
+            counter.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
 impl Drop for Ticket<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.release();
     }
 }
 impl Inner {
@@ -844,7 +851,7 @@ impl Inner {
                 n.checked_add(1).filter(|_| n < self.limits.admitted)
             })
             .map_err(|_| CoreError::Busy)?;
-        Ok(Ticket(&self.sql_operations))
+        Ok(Ticket(Some(&self.sql_operations)))
     }
     fn enter(&self) -> Result<Ticket<'_>, CoreError> {
         crate::cancellation::check()?;
@@ -856,7 +863,7 @@ impl Inner {
                 n.checked_add(1).filter(|_| n < self.limits.admitted)
             })
             .map_err(|_| CoreError::Busy)?;
-        Ok(Ticket(&self.admitted))
+        Ok(Ticket(Some(&self.admitted)))
     }
     fn read(&self) -> Result<State, CoreError> {
         self.read_at(engine::kv::FenceSite::Read)
@@ -1227,6 +1234,12 @@ impl Admin {
     #[cfg(any(test, feature = "test-commit-sync"))]
     pub fn set_commit_sync_hook(&self, hook: Option<Arc<crate::CommitSyncHook>>) {
         if let Backend::V2(db) = &self.inner.backend { db.sequencer.set_sync_hook(hook); }
+    }
+
+    /// SQL admission count for commit-Sync qualification.
+    #[cfg(feature = "test-commit-sync")]
+    pub fn sql_operations_live(&self) -> usize {
+        self.inner.sql_operations.load(Ordering::Acquire)
     }
 
     /// Local database directory, when this administrator is backed by local storage.
@@ -3000,7 +3013,7 @@ impl SqlSession {
             return Err(CoreError::Sql(relational::SqlError::Transaction));
         }
         if self.aborted { return Err(CoreError::Sql(relational::SqlError::Aborted)); }
-        let _ticket = match inner.enter_sql() {
+        let mut ticket = match inner.enter_sql() {
             Ok(ticket) => ticket,
             Err(error) => { self.abort(); return Err(error); }
         };
@@ -3010,7 +3023,7 @@ impl SqlSession {
                 self.staged_revision = 0;
                 Ok(())
             } else {
-                self.commit_v2_transaction(db)
+                self.commit_v2_transaction(db, &mut ticket)
             }
         });
         let result = result.and_then(|value| self.settle_sequences().map(|()| value));

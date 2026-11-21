@@ -1251,13 +1251,20 @@ fn catalog_complete(count: usize, out: &mut Vec<u8>) -> R<()> {
 }
 const CURSOR_ROWS: usize = 256;
 const CURSOR_BYTES: usize = giggles_core::relational::MAX_RESULT_BYTES;
+#[derive(Default)]
+struct OutputStatus {
+    flushed: std::sync::atomic::AtomicBool,
+    released_permits: std::sync::atomic::AtomicBool,
+}
 struct OutputChannel {
+    status: std::sync::Arc<OutputStatus>,
     sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     prefix: std::sync::Mutex<Vec<u8>>,
 }
 type Output = Option<OutputChannel>;
 fn flush_output(output: &Output, out: &mut Vec<u8>) -> R<()> {
     if let Some(output) = output {
+        output.status.flushed.store(true, std::sync::atomic::Ordering::Release);
         let mut prefix = output.prefix.lock().unwrap();
         if !prefix.is_empty() {
             output
@@ -1283,6 +1290,8 @@ struct State {
     diagnostic: Diagnostic,
     admin_completed: bool,
     implicit: bool,
+    // COPY and spilled rows exclude the entire transaction from permit release.
+    retain_durability_permits: bool,
     settings: crate::pg_settings::SessionSettings,
     statements: BTreeMap<String, Statement>,
     unnamed_cache: Vec<Statement>,
@@ -1337,29 +1346,89 @@ mod blocking_owner_tests {
     }
 }
 
-struct ExecutionAdmission {
+#[derive(Default)]
+struct ExecutionPermits {
     role_permit: Option<crate::admission::RolePermit>,
     blocking: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+struct ExecutionAdmission {
+    permits: std::sync::Arc<std::sync::Mutex<ExecutionPermits>>,
     runtime: tokio::runtime::Handle,
+    disconnected: tokio::sync::watch::Receiver<()>,
     context: giggles_core::Cancellation,
     first: bool,
 }
 impl ExecutionAdmission {
+    fn permits(&self) -> std::sync::MutexGuard<'_, ExecutionPermits> {
+        self.permits.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn reacquire(&mut self, session: &Session, needs_role: bool) -> Result<(), crate::admission::StatementRefusal> {
+        use crate::admission::StatementRefusal;
+
+        let old = std::mem::take(&mut *self.permits());
+        drop(old);
+        let permits = self.runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = self.disconnected.changed() => Err(StatementRefusal::Core(CoreError::Cancelled)),
+                admitted = async {
+                    let role_permit = if needs_role {
+                        Some(session.service.admission.statement(&session.role, Some(&self.context)).await?)
+                    } else {
+                        None
+                    };
+                    let blocking = session.service.blocking.admit(&self.context).await.map_err(StatementRefusal::Core)?;
+                    Ok(ExecutionPermits { role_permit, blocking: Some(blocking) })
+                } => admitted,
+            }
+        })?;
+        *self.permits() = permits;
+        Ok(())
+    }
+
     fn statement(&mut self, sql: &str, session: &Session) -> Result<(), crate::admission::StatementRefusal> {
         if std::mem::take(&mut self.first) { return Ok(()); }
-        self.role_permit = None;
-        self.blocking = None;
-        self.runtime.block_on(async {
-            if !session.is_aborted() && !admission_exempt(sql) {
-                self.role_permit = Some(session.service.admission.statement(&session.role, Some(&self.context)).await?);
-            }
-            self.blocking = Some(session.service.blocking.admit(&self.context).await
-                .map_err(crate::admission::StatementRefusal::Core)?);
-            Ok(())
-        })
+        self.reacquire(session, !session.is_aborted() && !admission_exempt(sql))
     }
 }
 impl State {
+    fn durability_registration(&self, context: &giggles_core::Cancellation, session: &Session) -> Option<giggles_core::cancellation::DurabilityRegistration> {
+        if !matches!(session.role, Role::Database { .. })
+            || session.agent
+            || self.retain_durability_permits
+            || self.copy.is_some()
+            || self.portals.values().any(|p| p.spilled.is_some())
+        {
+            return None;
+        }
+        // Simple Query batches and COPY continuations suppress the output channel.
+        let status = self.output.as_ref()?.status.clone();
+        let admission = self.execution_admission.as_ref()?;
+        let holder = admission.permits.clone();
+        let service = session.service.clone();
+        Some(context.register_durability_wait(move |_kind, release_admission| {
+            if status.flushed.load(std::sync::atomic::Ordering::Acquire) {
+                return None;
+            }
+            let permits = {
+                let mut holder = holder.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                holder.blocking.as_ref()?;
+                std::mem::take(&mut *holder)
+            };
+            // A woken worker can enter core as soon as these permits are dropped.
+            release_admission();
+            drop(permits);
+            status.released_permits.store(true, std::sync::atomic::Ordering::Release);
+            let wait = service.local_durability_release();
+            Some(Box::new(wait))
+        }))
+    }
+    fn durability_permits_released(&self) -> bool {
+        self.output.as_ref().is_some_and(|output| {
+            output.status.released_permits.load(std::sync::atomic::Ordering::Acquire)
+        })
+    }
     fn admission_exempt(&self, tag: u8, body: &[u8]) -> bool {
         let mut reader = Reader { b: body, at: 0 };
         let Ok(text) = reader.text() else { return false; };
@@ -1521,7 +1590,10 @@ impl State {
                 .transaction_end(if result.is_ok() { "COMMIT" } else { "ROLLBACK" });
         }
         session.set_time_zone(&self.settings.current.timezone);
-        session.sync_role_settings(&mut self.settings.current)?;
+        // Local data commits cannot invalidate the role profile validated at entry.
+        if !self.durability_permits_released() {
+            session.sync_role_settings(&mut self.settings.current)?;
+        }
         session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
         session.set_max_value_bytes(self.settings.current.max_value_bytes);
@@ -2681,6 +2753,7 @@ impl State {
                         // handle: core materialises it behind the release tag.
                         let (result, spilled) = giggles_core::relational::spill::streaming(
                             || session.execute_prepared_unreleased(prepared, &p.params));
+                        self.retain_durability_permits |= spilled.is_some();
                         let result = self.diagnostic.core(result)?;
                         (self.diagnostic.core(session.release_page(result))?, spilled)
                     };
@@ -3087,6 +3160,12 @@ impl State {
             self.diagnostic.phase = "admission";
             self.diagnostic.wire_message = admission_message;
         }
+        // Sync ends the batch. Execute may have buffered work before Sync.
+        let _durability = if refusal.is_none() && tag == b'S' && self.implicit && !session.is_aborted() {
+            self.durability_registration(&context, session)
+        } else {
+            None
+        };
         let keep = match context.scope(|| {
             if let Some(code) = refusal {
                 return Err(code);
@@ -3162,6 +3241,9 @@ impl State {
             return Ok((false, true));
         }
         if !session.in_transaction() && !self.implicit {
+            if self.copy.is_none() {
+                self.retain_durability_permits = false;
+            }
             session.service.advisory.release(session.backend_pid, true);
         }
         if self.copy_receiving() {
@@ -3169,7 +3251,7 @@ impl State {
             self.copy_permit = self
                 .execution_admission
                 .as_mut()
-                .and_then(|a| a.role_permit.take());
+                .and_then(|a| a.permits().role_permit.take());
         } else {
             drop(active);
         }
@@ -3194,13 +3276,23 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         .service
         .cancellations
         .register(&session.fingerprint, session.epoch)?;
-    struct Close(std::sync::Arc<crate::cancel::Backend>);
+    let (disconnect, disconnected) = tokio::sync::watch::channel(());
+    struct Close {
+        backend: std::sync::Arc<crate::cancel::Backend>,
+        closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _disconnect: tokio::sync::watch::Sender<()>,
+    }
     impl Drop for Close {
         fn drop(&mut self) {
-            self.0.close();
+            self.closed.store(true, std::sync::atomic::Ordering::Release);
+            self.backend.close();
         }
     }
-    let _close = Close(backend.clone());
+    let _close = Close {
+        backend: backend.clone(),
+        closed: session.connection_closed.clone(),
+        _disconnect: disconnect,
+    };
     session.backend_pid = backend.pid as i32;
     if !authenticated_already {
         frame(b'R', &0u32.to_be_bytes(), &mut out).map_err(io::Error::other)?;
@@ -3239,6 +3331,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         diagnostic: Diagnostic::default(),
         admin_completed: false,
         implicit: false,
+        retain_durability_permits: false,
         settings: crate::pg_settings::SessionSettings::default(),
         statements: BTreeMap::new(),
         unnamed_cache: Vec::new(),
@@ -3454,6 +3547,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                         session.set_max_value_bytes(state.settings.current.max_value_bytes);
                         session.set_max_statement_tokens(state.settings.current.max_statement_tokens);
                         state.implicit = false;
+                        state.retain_durability_permits = false;
                         state.cursors.transaction_end("ROLLBACK");
                         state.portals.clear();
                     }
@@ -3519,14 +3613,17 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         }
         let (output, mut chunks) = tokio::sync::mpsc::channel(2);
         state.output = Some(OutputChannel {
+            status: Default::default(),
             sender: output,
             prefix: std::sync::Mutex::new(Vec::new()),
         });
-        let connection_closed = session.connection_closed.clone();
         state.execution_admission = Some(ExecutionAdmission {
-            role_permit,
-            blocking: Some(permit),
+            permits: std::sync::Arc::new(std::sync::Mutex::new(ExecutionPermits {
+                role_permit,
+                blocking: Some(permit),
+            })),
             runtime: tokio::runtime::Handle::current(),
+            disconnected: disconnected.clone(),
             context: active.context.clone(),
             first: state.copy.is_none(),
         });
@@ -3548,6 +3645,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                 let mut last_tag = tag;
                 let mut binding_lost = false;
                 let mut keep = Ok(true);
+                let mut released_permits = false;
                 while let Some((tag, b, received)) = batch.pop_front() {
                     let mut out = Vec::new();
                     last_tag = tag;
@@ -3594,32 +3692,19 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                     let admission = state.execution_admission.as_mut().unwrap();
                     admission.context = active.context.clone();
                     admission.first = state.copy.is_none();
-                    let refusal = if needs_role && admission.role_permit.is_none() {
-                        admission.blocking = None;
-                        admission
-                            .runtime
-                            .block_on(async {
-                                admission.role_permit = Some(
-                                    session
-                                        .service
-                                        .admission
-                                        .statement(&session.role, Some(&active.context))
-                                        .await?,
-                                );
-                                admission.blocking = Some(
-                                    session
-                                        .service
-                                        .blocking
-                                        .admit(&active.context)
-                                        .await
-                                        .map_err(crate::admission::StatementRefusal::Core)?,
-                                );
-                                Ok::<_, crate::admission::StatementRefusal>(())
-                            })
-                            .err()
+                    let refusal = if needs_role && admission.permits().role_permit.is_none() {
+                        // Already admitted frames, including a buffered Sync,
+                        // still run after EOF. Only new admission needs a peer.
+                        if session.connection_closed.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
+                        admission.reacquire(session, true).err()
                     } else {
                         None
                     };
+                    if let Some(output) = &state.output {
+                        output.status.flushed.store(false, std::sync::atomic::Ordering::Release);
+                    }
                     // Admission refusal uses the same error/abort/drain path.
                     let outcome = state.buffered_message(
                         (tag, &b, received),
@@ -3641,6 +3726,13 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                         .lock()
                         .unwrap()
                         .extend(out);
+                    released_permits = state.durability_permits_released();
+                    if released_permits {
+                        // Query and Sync are batch boundaries. Let the socket
+                        // flush their reply before revalidating the binding.
+                        debug_assert!(batch.is_empty());
+                        break;
+                    }
                     binding_lost = session
                         .check_binding()
                         .is_err_and(|e| !crate::service::transient(&e));
@@ -3663,6 +3755,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                     last_tag,
                     binding_lost,
                     leader_shutdown,
+                    released_permits,
                 )
             })
             .await
@@ -3677,9 +3770,8 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                 },
                 result = &mut work => break result?,
                 next = s.read_u8(), if pending_tag.is_none() => match next {
-                    Ok(b'X') => { connection_closed.store(true, std::sync::atomic::Ordering::Release); return Ok(()); }
+                    Ok(b'X') | Err(_) => return Ok(()),
                     Ok(tag) => pending_tag = Some(tag),
-                    Err(_) => { connection_closed.store(true, std::sync::atomic::Ordering::Release); return Ok(()); }
                 },
             }
         };
@@ -3695,6 +3787,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
             tag,
             binding_lost,
             leader_shutdown,
+            released_permits,
         ) = completed;
         pending_frames = remaining.into_iter().chain(pending_frames).collect();
         session = returned_session;
@@ -3715,6 +3808,11 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
             return Ok(());
+        }
+        if released_permits {
+            send(s, &response).await?;
+            binding_check_pending = true;
+            continue;
         }
         // Hold this reply while the client has already pipelined its next
         // message (Parse/Bind/Describe/Execute before Sync). Sync, Query and
@@ -4137,7 +4235,7 @@ mod prepared_validation_tests {
         let mut session = fixture();
         let mut state = State {
             output: None, diagnostic: Diagnostic::default(), admin_completed: false,
-            implicit: false, settings: crate::pg_settings::SessionSettings::default(),
+            implicit: false, retain_durability_permits: false, settings: crate::pg_settings::SessionSettings::default(),
             statements: BTreeMap::new(), unnamed_cache: Vec::new(), named_statement_bytes: 0,
             portals: BTreeMap::new(), cursors: cursor::Cursors::default(), drain: false,
             copy: None, copy_completion: vec![], copy_active: None, copy_permit: None,

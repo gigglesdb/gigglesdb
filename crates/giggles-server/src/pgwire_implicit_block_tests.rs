@@ -25,6 +25,7 @@ fn state() -> State {
         diagnostic: Diagnostic::default(),
         admin_completed: false,
         implicit: false,
+        retain_durability_permits: false,
         settings: crate::pg_settings::SessionSettings::default(),
         statements: BTreeMap::new(),
         unnamed_cache: Vec::new(),

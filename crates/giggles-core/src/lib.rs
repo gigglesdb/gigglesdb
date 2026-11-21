@@ -64,7 +64,7 @@ pub mod metadata_read_counts {
 }
 
 mod durable;
-pub use durable::{DurableTracker, LiveToken};
+pub use durable::{DurabilityKind, DurableTracker, LiveToken};
 
 #[cfg(any(test, feature = "test-commit-sync"))]
 mod commit_sync_hook;

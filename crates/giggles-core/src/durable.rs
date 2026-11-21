@@ -16,6 +16,12 @@ impl Drop for LiveToken {
     fn drop(&mut self) { self.0.0.fetch_sub(1, Ordering::AcqRel); }
 }
 
+#[derive(Clone, Copy)]
+pub enum DurabilityKind { Local }
+pub(crate) fn wait(release_admission: &mut dyn FnMut()) -> Option<Box<dyn Send>> {
+    if crate::relational::spill::durability_output_spilled() { return None; }
+    crate::Cancellation::current()?.durability_wait(DurabilityKind::Local, release_admission)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -33,5 +39,24 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(tracker.live(), 0);
         assert!(crate::Cancellation::current_durable_token().is_none());
+    }
+    #[test]
+    fn declined_wait_retains_core_admission() {
+        let context = crate::Cancellation::default();
+        let registration = context.register_durability_wait(|_, _| None);
+        let mut released = false;
+        context.scope(|| {
+            assert!(wait(&mut || released = true).is_none());
+        });
+        assert!(!released);
+        drop(registration);
+        let _registration = context.register_durability_wait(|_, release_admission| {
+            release_admission();
+            Some(Box::new(()))
+        });
+        context.scope(|| {
+            assert!(wait(&mut || released = true).is_some());
+        });
+        assert!(released);
     }
 }

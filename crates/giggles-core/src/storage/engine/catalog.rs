@@ -1243,12 +1243,15 @@ impl Catalog {
 
     /// Retain the transaction (and therefore its locks) through cache publication.
     pub(crate) fn commit_ddl(&self, txn: Transaction) -> Result<Ts, TxnError> {
-        self.commit_ddl_inner(txn, None)
+        self.commit_ddl_inner(txn, None, None)
+    }
+    pub(crate) fn commit_ddl_with_tail(&self, txn: Transaction, release_admission: Option<&mut dyn FnMut()>) -> Result<Ts, TxnError> {
+        self.commit_ddl_inner(txn, None, release_admission)
     }
     pub(crate) fn commit_ddl_guarded(&self, txn: Transaction, guard: CommitGuard) -> Result<Ts, TxnError> {
-        self.commit_ddl_inner(txn, Some(guard))
+        self.commit_ddl_inner(txn, Some(guard), None)
     }
-    fn commit_ddl_inner(&self, mut txn: Transaction, guard: Option<CommitGuard>) -> Result<Ts, TxnError> {
+    fn commit_ddl_inner(&self, mut txn: Transaction, guard: Option<CommitGuard>, release_admission: Option<&mut dyn FnMut()>) -> Result<Ts, TxnError> {
         fn finish(txn: Transaction, guard: Option<CommitGuard>, publish: impl FnOnce(Ts) -> Result<(), TxnError>) -> Result<Ts, TxnError> {
             match guard { Some(guard) => txn.commit_guarded(guard, publish), None => txn.commit_then(publish) }
         }
@@ -1259,6 +1262,9 @@ impl Catalog {
         // DDL still holds it across sequencer success and publication below:
         // a reader at the newly visible timestamp must never use the old view.
         if txn.catalog_writes().next().is_none() {
+            if let Some(release_admission) = release_admission {
+                return txn.commit_then_with_tail(|_| Ok(()), Some(release_admission));
+            }
             return finish(txn, guard, |_| Ok(()));
         }
         let mut cache = self.cache.lock().map_err(|_| TxnError::Misuse)?;

@@ -1345,11 +1345,16 @@ impl Transaction {
         self.raw.push(RawOp::DeleteCounter { key });
         Ok(())
     }
+    pub(crate) fn local_durable_tail_eligible(&self) -> bool {
+        matches!(self.services, TxnServices::Local { .. })
+            && self.catalog_writes().next().is_none()
+            && !self.reclaim_after_commit
+    }
     pub(crate) fn commit(self) -> Result<Ts, TxnError> {
         if self.writes_keyspace(Keyspace::Catalog) {
             return Err(TxnError::Misuse);
         }
-        self.commit_inner(None, |_| Ok(()))
+        self.commit_inner(None, |_| Ok(()), None)
     }
     /// Runs publication after sequencer success, while this transaction still
     /// owns its locks and snapshot. Catalog writes are allowed on this path.
@@ -1359,19 +1364,24 @@ impl Transaction {
         self,
         publish: F,
     ) -> Result<Ts, TxnError> {
+        self.commit_then_with_tail(publish, None)
+    }
+    pub(crate) fn commit_then_with_tail<F: FnOnce(Ts) -> Result<(), TxnError>>(
+        self, publish: F, release_admission: Option<&mut dyn FnMut()>,
+    ) -> Result<Ts, TxnError> {
         // Publication callers may acquire locks externally by transaction id.
         self.lock_cleanup_needed.store(true, Ordering::Relaxed);
-        self.commit_inner(None, publish)
+        self.commit_inner(None, publish, release_admission)
     }
     pub(crate) fn commit_guarded<F: FnOnce(Ts) -> Result<(), TxnError>>(
         self, guard: CommitGuard, publish: F,
     ) -> Result<Ts, TxnError> {
         // Preserve the same external-lock cleanup contract as commit_then.
         self.lock_cleanup_needed.store(true, Ordering::Relaxed);
-        self.commit_inner(Some(guard), publish)
+        self.commit_inner(Some(guard), publish, None)
     }
     fn commit_inner<F: FnOnce(Ts) -> Result<(), TxnError>>(
-        mut self, guard: Option<CommitGuard>, publish: F,
+        mut self, guard: Option<CommitGuard>, publish: F, release_admission: Option<&mut dyn FnMut()>,
     ) -> Result<Ts, TxnError> {
         // Inspect the final write set, after statement/savepoint rollback.
         // The sequencer ORs these bits into metadata in the same durable batch.
@@ -1456,7 +1466,7 @@ impl Transaction {
         };
         let ts = match guard {
             Some(guard) => seq.submit_guarded(request, guard)?,
-            None => seq.submit(request)?,
+            None => seq.submit_with_tail(request, release_admission)?,
         };
         publish(ts)?;
         Ok(ts)

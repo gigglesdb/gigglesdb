@@ -62,6 +62,8 @@ pub(crate) fn sql_error(error: CoreError) -> SqlError {
     }
 }
 
+pub(crate) fn durability_output_spilled() -> bool { SLOT.with_borrow(Option::is_some) }
+
 /// True inside a SqlSession statement, whose boundary settles a published spill.
 pub(crate) fn armed() -> bool {
     ARMED.get()

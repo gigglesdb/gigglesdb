@@ -283,7 +283,16 @@ struct Credentials {
     next: u64,
     entries: BTreeMap<String, (Role, u64)>,
 }
+pub(crate) struct LocalDurabilityWait(Arc<Service>);
+impl Drop for LocalDurabilityWait {
+    fn drop(&mut self) { self.0.durability[0].awaiting.fetch_sub(1, std::sync::atomic::Ordering::AcqRel); }
+}
 impl Service {
+    pub(crate) fn local_durability_release(self: &Arc<Self>) -> LocalDurabilityWait {
+        self.durability[0].awaiting.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.durability[0].releases.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        LocalDurabilityWait(self.clone())
+    }
     pub fn role_pool_counts(&self) -> Vec<(usize, usize, usize)> { self.admission.role_pool_counts() }
     pub fn pgwire_blocking_live(&self) -> usize { self.pgwire_live.live() }
     pub fn durable_tracker(&self) -> Arc<giggles_core::DurableTracker> { self.durable.clone() }

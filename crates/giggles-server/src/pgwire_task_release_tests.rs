@@ -116,6 +116,7 @@ fn state() -> State {
         diagnostic: Diagnostic::default(),
         admin_completed: false,
         implicit: false,
+        retain_durability_permits: false,
         settings: crate::pg_settings::SessionSettings::default(),
         statements: BTreeMap::new(),
         unnamed_cache: Vec::new(),
@@ -129,6 +130,36 @@ fn state() -> State {
         copy_permit: None,
         execution_admission: None,
     }
+}
+
+#[tokio::test]
+async fn agent_session_does_not_register_for_durability_release() {
+    let (service, session) = fixture(10);
+    let mut state = state();
+    let (sender, _chunks) = tokio::sync::mpsc::channel(1);
+    let (_disconnect, disconnected) = tokio::sync::watch::channel(());
+    let context = giggles_core::Cancellation::default();
+    let blocking = service.blocking.admit(&context).await.unwrap();
+    state.output = Some(OutputChannel {
+        status: Default::default(),
+        sender,
+        prefix: Default::default(),
+    });
+    state.execution_admission = Some(ExecutionAdmission {
+        permits: Arc::new(std::sync::Mutex::new(ExecutionPermits {
+            blocking: Some(blocking),
+            ..ExecutionPermits::default()
+        })),
+        runtime: tokio::runtime::Handle::current(),
+        disconnected,
+        context: context.clone(),
+        first: true,
+    });
+    assert!(session.agent);
+    assert!(state.durability_registration(&context, &session).is_none());
+    assert_eq!(service.blocking_permits_held(), 1);
+    let ordinary = service.role_session("incident_controller").unwrap();
+    assert!(state.durability_registration(&context, &ordinary).is_some());
 }
 
 fn cstr(text: &str, out: &mut Vec<u8>) {

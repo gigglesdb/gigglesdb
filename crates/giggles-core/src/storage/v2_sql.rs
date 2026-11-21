@@ -114,18 +114,18 @@ impl SqlSession {
         Ok(())
     }
 
-    pub(crate) fn commit_v2_transaction(
-        &mut self, db: &Arc<v2::V2Db>,
+    pub(super) fn commit_v2_transaction(
+        &mut self, db: &Arc<v2::V2Db>, ticket: &mut Ticket<'_>,
     ) -> Result<(), CoreError> {
         let inner = self.admin.inner.clone();
         let txn = self.v2_transaction.take().ok_or(CoreError::Sql(SqlError::Transaction))?;
         inner.sql_transactions.fetch_sub(1, Ordering::AcqRel);
-        self.publish_v2_sql(db, &inner, txn, true)
+        self.publish_v2_sql(db, &inner, txn, true, ticket)
     }
 
     // Preserve explicit transaction cleanup before acknowledgement (including a
     // lost response), while sharing publication with statement autocommit.
-    fn publish_v2_sql(&mut self, db: &Arc<v2::V2Db>, inner: &Inner, txn: Transaction, explicit: bool) -> Result<(), CoreError> {
+    fn publish_v2_sql(&mut self, db: &Arc<v2::V2Db>, inner: &Inner, txn: Transaction, explicit: bool, ticket: &mut Ticket<'_>) -> Result<(), CoreError> {
         // Statement autocommit historically samples the crash point before attaching.
         let point = if explicit { None } else { Some(*inner.crash.lock().map_err(|_| CoreError::Fenced)?) };
         let mut txn = txn;
@@ -148,12 +148,24 @@ impl SqlSession {
             Some(point) => point,
             None => *inner.crash.lock().map_err(|_| CoreError::Fenced)?,
         };
-        let committed = if explicit {
-            sql_sequences::stage_pending(db, &mut txn, &self.pending_sequences)
-                .and_then(|()| commit_sql(db, txn, point))
-        } else {
-            commit_sql(db, txn, point)
-        };
+        let eligible = txn.local_durable_tail_eligible()
+            && self.pending_sequences.lock().map_err(|_| CoreError::Fenced)?.is_empty();
+        let committed = (|| {
+            if eligible
+                && !self.sequence_unsettled.lock().map_err(|_| CoreError::Fenced)?.is_empty()
+                && !relational::spill::durability_output_spilled()
+                && crate::Cancellation::durability_wait_registered()
+            {
+                // Settlement can wait for the sequence slot and its durable reservation.
+                // Finish both waits before committing and letting another statement in.
+                sql_sequences::settle(db, &self.sequence_unsettled)?;
+            }
+            if explicit {
+                sql_sequences::stage_pending(db, &mut txn, &self.pending_sequences)?;
+            }
+            let mut release_admission = || ticket.release();
+            commit_sql(db, txn, point, eligible.then_some(&mut release_admission))
+        })();
         if explicit && committed.is_ok() {
             // Pending incarnations enter the live cache only after this
             // transaction's durable ack. Existing live counters can also hold
@@ -451,7 +463,7 @@ impl SqlSession {
             return Err(CoreError::Sql(E::Aborted));
         }
         let inner = self.admin.inner.clone();
-        let _ticket = match inner.enter_sql() {
+        let mut ticket = match inner.enter_sql() {
             Ok(ticket) => ticket,
             Err(error) => {
                 self.abort();
@@ -516,7 +528,7 @@ impl SqlSession {
                             }
                         }
                         "commit" => {
-                            self.commit_v2_transaction(db)?;
+                            self.commit_v2_transaction(db, &mut ticket)?;
                             return Ok(Default::default());
                         }
                         "rollback" => {
@@ -1209,7 +1221,7 @@ impl SqlSession {
                     txn.release(mark).map_err(CoreError::from)?;
                     if self.v2_transaction.is_none() && !protected && result.is_ok() {
                         let txn = implicit.take().expect("implicit transaction");
-                        self.publish_v2_sql(db, &inner, txn, false)?;
+                        self.publish_v2_sql(db, &inner, txn, false, &mut ticket)?;
                     }
                     if explicit && result.is_ok() {
                         self.copy_freeze.last_mut().unwrap().extend(freeze_marks);
@@ -1241,7 +1253,10 @@ impl SqlSession {
 
 // SQL publication only: counter reservations and non-SQL engine commits do not
 // use this seam. None adds only the crash-point read and untaken fault branches.
-fn commit_sql(db: &v2::V2Db, txn: Transaction, point: CrashPoint) -> Result<(), CoreError> {
+fn commit_sql(
+    db: &v2::V2Db, txn: Transaction, point: CrashPoint,
+    release_admission: Option<&mut dyn FnMut()>,
+) -> Result<(), CoreError> {
     if point == CrashPoint::BeforeCommit {
         crash_now();
     }
@@ -1249,7 +1264,7 @@ fn commit_sql(db: &v2::V2Db, txn: Transaction, point: CrashPoint) -> Result<(), 
         return Err(CoreError::Storage("injected before commit".into()));
     }
     let reclaim = txn.reclaim_after_commit;
-    db.catalog().commit_ddl(txn).map_err(CoreError::from)?;
+    db.catalog().commit_ddl_with_tail(txn, release_admission)?;
     if point == CrashPoint::AfterCommit {
         crash_now();
     }

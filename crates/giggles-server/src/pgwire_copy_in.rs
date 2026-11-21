@@ -252,6 +252,7 @@ impl State {
     ) -> R<()> {
         let simple_implicit = simple.unwrap_or(false);
         let simple = simple.is_some();
+        self.retain_durability_permits = true;
         let columns = core(session.copy_columns(&descriptor, &prepared))?;
         let binary = matches!(descriptor.format, CopyFormat::Binary);
         if !binary && let Some(message) = descriptor.options.encoding.and_then(|e| e.missing_conversion(true)) {

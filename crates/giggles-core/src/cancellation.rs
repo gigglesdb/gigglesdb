@@ -12,9 +12,11 @@ use std::{
 /// A single invocation, not a durable operation ID. Clones share its decision.
 #[derive(Clone, Default)]
 pub struct Cancellation(Arc<Context>);
+type DurabilityCallback = Arc<dyn Fn(crate::DurabilityKind, &mut dyn FnMut()) -> Option<Box<dyn Send>> + Send + Sync>;
 #[derive(Default)]
 struct Context {
     durable: Mutex<Option<Arc<crate::DurableTracker>>>,
+    durability_wait: Mutex<Option<DurabilityCallback>>,
     state: AtomicU8,
     deadline: Mutex<Option<Instant>>,
     lock_timeout: Mutex<Option<Duration>>,
@@ -24,6 +26,7 @@ impl Cancellation {
     pub fn new(deadline: Option<Instant>) -> Self {
         Self(Arc::new(Context {
             durable: Mutex::new(None),
+            durability_wait: Mutex::new(None),
             state: AtomicU8::new(0),
             deadline: Mutex::new(deadline),
             lock_timeout: Mutex::new(None),
@@ -42,6 +45,25 @@ impl Cancellation {
             let context = current.as_ref()?;
             let tracker = context.0.durable.lock().expect("durable tracker");
             tracker.as_ref().map(|tracker| tracker.register())
+        })
+    }
+    /// Register for one admitted synchronous SQL statement. Registrations must not nest.
+    /// A callback that gives up caller admission must first invoke the core release action.
+    pub fn register_durability_wait(&self, callback: impl Fn(crate::DurabilityKind, &mut dyn FnMut()) -> Option<Box<dyn Send>> + Send + Sync + 'static) -> DurabilityRegistration {
+        let mut slot = self.0.durability_wait.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(slot.is_none(), "nested durability registration");
+        *slot = Some(Arc::new(callback));
+        DurabilityRegistration(self.clone())
+    }
+    pub(crate) fn durability_wait(&self, kind: crate::DurabilityKind, release_admission: &mut dyn FnMut()) -> Option<Box<dyn Send>> {
+        let callback = self.0.durability_wait.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        callback.and_then(|callback| callback(kind, release_admission))
+    }
+    pub(crate) fn durability_wait_registered() -> bool {
+        CURRENT.with(|current| {
+            current.borrow().as_ref().is_some_and(|context| {
+                context.0.durability_wait.lock().unwrap_or_else(PoisonError::into_inner).is_some()
+            })
         })
     }
     pub fn current() -> Option<Self> {
@@ -117,6 +139,11 @@ impl Cancellation {
         let _restore = Restore(CURRENT.with(|c| c.replace(Some(self.clone()))));
         work()
     }
+}
+/// Clears the per-statement callback, including on unwind.
+pub struct DurabilityRegistration(Cancellation);
+impl Drop for DurabilityRegistration {
+    fn drop(&mut self) { self.0.0.durability_wait.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take(); }
 }
 /// Installs `context` as the current invocation until the returned value
 /// drops, which restores the previous one (LIFO, like `Cancellation::scope`).

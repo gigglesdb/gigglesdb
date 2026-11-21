@@ -30,6 +30,7 @@ impl State {
             return frame(b'I', &[], out);
         }
         if statements.len() == 1 {
+            let was_in_transaction = session.in_transaction();
             let completed = out.len();
             let result = self.simple_statement(&statements[0], session, out, received, &mut implicit);
             if let Err(code) = result {
@@ -39,10 +40,15 @@ impl State {
                 }
                 return Err(code);
             }
-            if implicit && self.copy.is_none()
-                && let Err(code) = execute_implicit_commit(session, &mut implicit, &mut self.settings, out)
-            {
-                self.simple_failure(code, true, completed, session, out);
+            if implicit && self.copy.is_none() {
+                let _durability = if was_in_transaction {
+                    None
+                } else {
+                    giggles_core::Cancellation::current().and_then(|context| self.durability_registration(&context, session))
+                };
+                if let Err(code) = execute_implicit_commit(session, &mut implicit, &mut self.settings, out) {
+                    self.simple_failure(code, true, completed, session, out);
+                }
             }
             return Ok(());
         }
@@ -124,6 +130,7 @@ impl State {
         session: &mut Session,
         out: &mut Vec<u8>,
     ) -> R<()> {
+        self.retain_durability_permits = true;
         self.copy_destination_privilege(session, &options.destination)?;
         let prepared = self.prepare_copy_output(options, session)?;
         let description = core(session.describe(&prepared))?;
@@ -340,11 +347,18 @@ impl State {
         super::statement_deadline(&self.settings.current);
         let result = self.simple_statement_inner(sql, session, out, received, implicit);
         if !self.copy_receiving() && let Some(admission) = self.execution_admission.as_mut() {
-            admission.role_permit = None;
+            admission.permits().role_permit = None;
         }
-        if !session.in_transaction() && !*implicit { session.service.advisory.release(session.backend_pid, true); }
+        if !session.in_transaction() && !*implicit {
+            if self.copy.is_none() {
+                self.retain_durability_permits = false;
+            }
+            session.service.advisory.release(session.backend_pid, true);
+        }
         session.set_time_zone(&self.settings.current.timezone);
-        session.sync_role_settings(&mut self.settings.current)?;
+        if !self.durability_permits_released() {
+            session.sync_role_settings(&mut self.settings.current)?;
+        }
         session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
         session.set_max_value_bytes(self.settings.current.max_value_bytes);
@@ -677,6 +691,13 @@ impl State {
                     catalog_complete(count, out)?;
                     return Ok(());
                 }
+                // Result rows here are materialized before commit. COPY and
+                // cursors never install a callback, including internal commits.
+                let _durability = if !was_transaction {
+                    giggles_core::Cancellation::current().and_then(|context| self.durability_registration(&context, session))
+                } else {
+                    None
+                };
                 // Core's autocommit transaction starts inside execution, too late
                 // to set its transaction-local replica flag. Pin it here instead.
                 if self.settings.replication_role_replica() && !matches!(p.command(), "BEGIN" | "COMMIT" | "ROLLBACK") {
@@ -687,6 +708,7 @@ impl State {
                 // before any row is encoded (a move outside a task session).
                 let (result, spilled) = giggles_core::relational::spill::streaming(
                     || session.execute_prepared_unreleased(&p, &[]));
+                self.retain_durability_permits |= spilled.is_some();
                 let result = self.diagnostic.core(result)?;
                 let result = self.diagnostic.core(session.release_page(result))?;
                 self.settings
