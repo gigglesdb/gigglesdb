@@ -142,6 +142,7 @@ struct Diagnostic {
     message: Option<&'static str>,
     wire_message: Option<String>,
     wire_detail: Option<String>,
+    wire_context: Option<String>,
     wire_hint: Option<&'static str>,
     sql_detail: Option<String>,
     query_id: Option<String>,
@@ -376,6 +377,7 @@ fn diagnostic_error(
         b.push(b'D');
         z(diagnostic.and_then(|d| d.sql_detail.as_deref().or(d.wire_detail.as_deref())).unwrap_or(&detail), &mut b);
     }
+    if let Some(context) = diagnostic.and_then(|d| d.wire_context.as_deref()) { b.push(b'W'); z(context, &mut b); }
     if let Some(hint) = diagnostic.and_then(|d| d.wire_hint) {
         b.push(b'H');
         z(hint, &mut b);
@@ -2299,7 +2301,7 @@ impl State {
                     let copy = copy.clone();
                     let prepared = prepared.clone();
                     p.result = ran();
-                    self.start_copy(copy, prepared, false, session, out)?;
+                    self.start_copy(copy, prepared, None, session, out)?;
                     return Ok(true);
                 }
                 if let Plan::Change(change) = &p.s.p {
@@ -3064,6 +3066,7 @@ impl State {
         self.diagnostic = Diagnostic {
             unknown_outcome: false,
             wire_detail: None,
+            wire_context: None,
             wire_hint: None,
             sql_detail: None,
             wire_message: None,

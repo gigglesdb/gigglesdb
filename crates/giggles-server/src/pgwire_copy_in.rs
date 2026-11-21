@@ -225,11 +225,13 @@ impl State {
             copy.raw_rows.clear();
             copy.remaining.clear();
             self.diagnostic.unknown_outcome = code == "08007";
-            if code == "25006" {
-                diagnostic_error(code, GENERIC_MESSAGE, Some(&self.diagnostic), out);
+            let mut response = Vec::new();
+            if code == "25006" || self.diagnostic.wire_message.is_some() {
+                diagnostic_error(code, GENERIC_MESSAGE, Some(&self.diagnostic), &mut response);
             } else {
-                error(code, out);
+                error(code, &mut response);
             }
+            out.extend(response);
             if copy.simple {
                 if copy.simple_implicit {
                     session.sql.rollback();
@@ -244,12 +246,18 @@ impl State {
         &mut self,
         descriptor: Copy,
         prepared: Box<Prepared>,
-        simple: bool,
+        simple: Option<bool>,
         session: &mut Session,
         out: &mut Vec<u8>,
     ) -> R<()> {
+        let simple_implicit = simple.unwrap_or(false);
+        let simple = simple.is_some();
         let columns = core(session.copy_columns(&descriptor, &prepared))?;
         let binary = matches!(descriptor.format, CopyFormat::Binary);
+        if !binary && let Some(message) = descriptor.options.encoding.and_then(|e| e.missing_conversion(true)) {
+            self.diagnostic.wire_message = Some(message);
+            return Err("42883");
+        }
         let mut decoder = if binary {
             copy::Decoder::binary(columns.len())
         } else if descriptor.format == CopyFormat::Csv {
@@ -296,10 +304,31 @@ impl State {
             input_error_message: None,
             simple,
             failed: false,
-            simple_implicit: false,
+            simple_implicit,
             remaining: vec![],
             descriptor,
         });
+        if self.copy.as_ref().unwrap().descriptor.target_is_view {
+            let name = self.copy.as_ref().unwrap().descriptor.table.rsplit('\0').next().unwrap();
+            self.diagnostic.wire_message = Some(format!("cannot copy to view \"{name}\""));
+            self.diagnostic.wire_hint = Some("To enable copying to a view, provide an INSTEAD OF INSERT trigger.");
+            session.sql.abort();
+            self.copy_error("42809", session, out);
+            return Ok(());
+        }
+        if self.copy.as_ref().unwrap().descriptor.options.freeze {
+            let failure = if self.cursors.has_open() {
+                Some(("25000", "cannot perform COPY FREEZE because of prior transaction activity"))
+            } else if !core(session.sql.copy_freeze_allowed(&self.copy.as_ref().unwrap().descriptor))? {
+                Some(("55000", "cannot perform COPY FREEZE because the table was not created or truncated in the current subtransaction"))
+            } else { None };
+            if let Some((code, message)) = failure {
+                self.diagnostic.wire_message = Some(message.into());
+                session.sql.abort();
+                self.copy_error(code, session, out);
+                return Ok(());
+            }
+        }
         if external { self.external_copy_input(session, out)?; }
         Ok(())
     }
@@ -337,6 +366,9 @@ impl State {
             copy_notices(out)?;
             if let Some((mut process, _)) = child { let _ = process.kill(); let _ = process.wait(); }
             copy.decoder.diagnostic(&mut self.diagnostic);
+            if let Some(line) = copy.decoder.encoding_error_line() {
+                self.diagnostic.wire_context = Some(format!("COPY {}, line {line}", copy.descriptor.table));
+            }
             return Err(code);
         }
         if let Some((mut process, command)) = child { copy_external::wait(&mut process, &command, &mut self.diagnostic)?; }
@@ -427,6 +459,9 @@ impl State {
                 copy.raw_rows.clear();
                 copy.remaining.clear();
                 copy.decoder.diagnostic(&mut self.diagnostic);
+                if let Some(line) = copy.decoder.encoding_error_line() {
+                    self.diagnostic.wire_context = Some(format!("COPY {}, line {line}", copy.descriptor.table));
+                }
                 self.diagnostic.unknown_outcome = code == "08007";
                 copy_notices(out)?;
                 let mut failure = vec![];

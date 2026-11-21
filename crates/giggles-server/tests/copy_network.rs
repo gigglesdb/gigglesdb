@@ -1211,3 +1211,190 @@ async fn w3_order_ignore_supplied_markers_then_omitted_defaults() {
     assert_eq!(w1_data(&r), vec![vec![Some("9".into()), Some("11".into()), Some("10".into())]]);
     f.stop().await;
 }
+
+
+fn encoding_data(rows: &[(u8, Vec<u8>)]) -> Vec<u8> {
+    assert!(!rows.iter().any(|r| r.0 == b'E'), "{rows:?}");
+    rows.iter().filter(|r| r.0 == b'd').flat_map(|r| r.1.clone()).collect()
+}
+fn encoding_field(rows: &[(u8, Vec<u8>)], field: u8) -> String {
+    let bytes = &rows.iter().find(|r| r.0 == b'E').unwrap().1;
+    let mut at = 0;
+    while at < bytes.len() && bytes[at] != 0 {
+        let tag = bytes[at]; at += 1;
+        let end = at + bytes[at..].iter().position(|&b| b == 0).unwrap();
+        if tag == field { return String::from_utf8(bytes[at..end].to_vec()).unwrap(); }
+        at = end + 1;
+    }
+    String::new()
+}
+#[tokio::test]
+async fn encoding_single_byte_roundtrips_and_markers() {
+    let f = Fixture::new().await; let mut s = f.connect().await;
+    query(&mut s, "CREATE TABLE enc (s text)").await;
+    for (name, data) in [("LATIN1", b"caf\xe9\n".as_slice()), ("windows1252", b"\x80\x8a\x9f\n".as_slice())] {
+        query(&mut s, "TRUNCATE enc").await;
+        w1_tag(&w1_copy(&mut s, &format!("COPY enc FROM STDIN (ENCODING '{name}')"), data).await, 1);
+        assert_eq!(encoding_data(&query(&mut s, &format!("COPY enc TO STDOUT (ENCODING '{name}')")).await), data);
+    }
+    query(&mut s, "CREATE TABLE hdr (\"caf\u{e9}\" text DEFAULT 'd')").await;
+    w1_tag(&w1_copy(&mut s, "COPY hdr FROM STDIN (FORMAT csv, HEADER MATCH, ENCODING 'latin-1', DEFAULT '\u{e9}')", b"caf\xe9\n\xe9\n").await, 1);
+    assert_eq!(encoding_data(&query(&mut s, "COPY hdr TO STDOUT (FORMAT csv, HEADER, ENCODING 'ISO_8859_1')").await), b"caf\xe9\nd\n");
+    for alias in ["win", "unicode", "alt", "tcvn"] {
+        assert_eq!(encoding_data(&query(&mut s, &format!("COPY (SELECT 'abc') TO STDOUT (ENCODING '{alias}')")).await), b"abc\n");
+    }
+    // File input and output use exactly the same conversion paths.
+    let path = f.path.join("enc.dat").to_string_lossy().replace('\\', "/");
+    std::fs::write(&path, b"caf\xe9\n").unwrap();
+    query(&mut s, "TRUNCATE enc").await;
+    w1_tag(&query(&mut s, &format!("COPY enc FROM '{path}' (ENCODING 'LATIN1')")).await, 1);
+    let dest = format!("{path}.out");
+    w1_tag(&query(&mut s, &format!("COPY enc TO '{dest}' (ENCODING 'LATIN1')")).await, 1);
+    assert_eq!(std::fs::read(dest).unwrap(), b"caf\xe9\n");
+    f.stop().await;
+}
+#[tokio::test]
+async fn encoding_errors_ascii_binary_and_mule() {
+    let f = Fixture::new().await; let mut s = f.connect().await;
+    query(&mut s, "CREATE TABLE enc (s text)").await;
+    let r = w1_copy(&mut s, "COPY enc FROM STDIN (ENCODING 'WIN1252')", b"ok\na\x81b\n").await;
+    error(&r, "22P05");
+    assert_eq!(encoding_field(&r, b'M'), "character with byte sequence 0x81 in encoding \"WIN1252\" has no equivalent in encoding \"UTF8\"");
+    assert_eq!(encoding_field(&r, b'W'), "COPY enc, line 2");
+    let r = w1_copy(&mut s, "COPY enc FROM STDIN (FORMAT csv, ENCODING 'WIN1252')", b"\"a\nb\x81\"\n").await;
+    error(&r, "22P05");
+    assert_eq!(encoding_field(&r, b'W'), "COPY enc, line 1");
+    let r = query(&mut s, "COPY (SELECT '\u{20ac}') TO STDOUT (ENCODING 'LATIN1')").await;
+    error(&r, "22P05");
+    assert_eq!(encoding_field(&r, b'M'), "character with byte sequence 0xe2 0x82 0xac in encoding \"UTF8\" has no equivalent in encoding \"LATIN1\"");
+    assert_eq!(encoding_field(&r, b'W'), "");
+    w1_tag(&w1_copy(&mut s, "COPY enc FROM STDIN (ENCODING 'SQL_ASCII')", "caf\u{e9}\n".as_bytes()).await, 1);
+    assert_eq!(encoding_data(&query(&mut s, "COPY enc TO STDOUT (ENCODING 'SQL_ASCII')").await), "caf\u{e9}\n".as_bytes());
+    let r = w1_copy(&mut s, "COPY enc FROM STDIN (ENCODING 'SQL_ASCII')", b"\xff\n").await;
+    error(&r, "22021");
+    assert_eq!(encoding_field(&r, b'M'), "invalid byte sequence for encoding \"UTF8\": 0xff");
+    assert_eq!(encoding_field(&r, b'W'), "COPY enc, line 1");
+    let binary = encoding_data(&query(&mut s, "COPY enc TO STDOUT (FORMAT binary)").await);
+    assert_eq!(binary, encoding_data(&query(&mut s, "COPY enc TO STDOUT (FORMAT binary, ENCODING 'LATIN1')").await));
+    query(&mut s, "TRUNCATE enc").await;
+    w1_tag(&w1_copy(&mut s, "COPY enc FROM STDIN (FORMAT binary, ENCODING 'WIN1252')", &binary).await, 1);
+    let r = query(&mut s, "COPY enc FROM STDIN (ENCODING 'MULE_INTERNAL')").await;
+    error(&r, "42883");
+    assert_eq!(encoding_field(&r, b'M'), "default conversion function for encoding \"MULE_INTERNAL\" to \"UTF8\" does not exist");
+    for q in ["SELECT ''::text WHERE false", "SELECT ''::text", "SELECT 'abc'::text"] {
+        error(&query(&mut s, &format!("COPY ({q}) TO STDOUT (ENCODING 'MULE_INTERNAL')")).await, "42883");
+    }
+    for name in ["cp1252", "UTF16"] { error(&query(&mut s, &format!("COPY enc TO STDOUT (ENCODING '{name}')")).await, "22023"); }
+    error(&query(&mut s, "COPY enc TO STDOUT (ENCODING 'EUC_JP')").await, "0A000");
+    f.stop().await;
+}
+
+
+async fn freeze_done(s: &mut TcpStream) {
+    send(s, b'd', b"7\n").await;
+    send(s, b'c', b"").await;
+    let r = read(s).await;
+    assert_eq!(tags(&r), b"CZ", "{r:?}");
+}
+async fn freeze_start(s: &mut TcpStream, sql: &str) {
+    let r = query(s, sql).await;
+    assert_eq!(tags(&r), b"G", "{sql}: {r:?}");
+}
+async fn freeze_error(s: &mut TcpStream, sql: &str, code: &str, message: &str) {
+    let r = query(s, sql).await;
+    assert_eq!(tags(&r), b"GEZ", "{sql}: {r:?}");
+    error(&r, code);
+    assert_eq!(w1_field(&r[1].1, b'M').as_deref(), Some(message));
+    // A client may have queued data before receiving the rejection.
+    send(s, b'd', b"999\n").await;
+    send(s, b'c', b"").await;
+    silent(s).await;
+}
+#[tokio::test]
+async fn freeze_transaction_and_savepoint_preconditions() {
+    #[allow(unused_mut)]
+    let mut engines = vec![giggles_core::Engine::Legacy];
+    #[cfg(feature = "engine-rocksdb")]
+    engines.push(giggles_core::Engine::V2);
+    for engine in engines {
+        let f = Fixture::with_engine(engine).await;
+        let mut s = f.connect().await;
+        let msg = "cannot perform COPY FREEZE because the table was not created or truncated in the current subtransaction";
+        freeze_error(&mut s, "COPY t(i) FROM STDIN (FREEZE)", "55000", msg).await;
+        freeze_start(&mut s, "COPY t(i) FROM STDIN (FREEZE false)").await;
+        freeze_done(&mut s).await;
+        assert_eq!(tags(&query(&mut s, "BEGIN; CREATE TABLE frozen(i int)").await), b"CCZ");
+        freeze_start(&mut s, "COPY frozen FROM STDIN (FREEZE)").await;
+        freeze_done(&mut s).await;
+        assert_eq!(tags(&query(&mut s, "SAVEPOINT parent").await), b"CZ");
+        freeze_error(&mut s, "COPY frozen FROM STDIN (FREEZE)", "55000", msg).await;
+        query(&mut s, "ROLLBACK TO parent; TRUNCATE frozen").await;
+        freeze_start(&mut s, "COPY frozen FROM STDIN FREEZE CSV").await;
+        freeze_done(&mut s).await;
+        query(&mut s, "ROLLBACK TO parent").await;
+        freeze_error(&mut s, "COPY frozen FROM STDIN (FREEZE)", "55000", msg).await;
+        query(&mut s, "ROLLBACK TO parent; RELEASE parent; SAVEPOINT child; CREATE TABLE released(i int); RELEASE child").await;
+        freeze_start(&mut s, "COPY released FROM STDIN (FREEZE true)").await;
+        freeze_done(&mut s).await;
+        assert_eq!(tags(&query(&mut s, "COMMIT").await), b"CZ");
+        let r = query(&mut s, "SELECT i FROM released").await;
+        assert!(r.iter().any(|(t,b)| *t == b'D' && b.ends_with(b"7")), "{r:?}");
+        query(&mut s, "BEGIN; TRUNCATE released").await;
+        freeze_start(&mut s, "COPY released FROM STDIN (FREEZE)").await;
+        freeze_done(&mut s).await;
+        query(&mut s, "COMMIT").await;
+        f.stop().await;
+    }
+}
+#[tokio::test]
+async fn freeze_open_closed_cursor_and_program() {
+    let f = Fixture::new().await;
+    let mut s = f.connect().await;
+    query(&mut s, "BEGIN; DECLARE fc CURSOR FOR SELECT 1").await;
+    freeze_error(&mut s, "COPY t(i) FROM STDIN (FREEZE)", "25000", "cannot perform COPY FREEZE because of prior transaction activity").await;
+    query(&mut s, "ROLLBACK").await;
+    query(&mut s, "BEGIN; CREATE TABLE frozen(i int); DECLARE fc CURSOR FOR SELECT 1").await;
+    freeze_error(&mut s, "COPY frozen FROM STDIN (FREEZE)", "25000", "cannot perform COPY FREEZE because of prior transaction activity").await;
+    query(&mut s, "ROLLBACK; BEGIN; CREATE TABLE frozen(i int); DECLARE fc CURSOR FOR SELECT 1; CLOSE fc").await;
+    freeze_start(&mut s, "COPY frozen FROM STDIN (FREEZE)").await;
+    freeze_done(&mut s).await;
+    query(&mut s, "COMMIT; BEGIN; TRUNCATE frozen").await;
+    let r = query(&mut s, "COPY frozen FROM PROGRAM 'echo 8' WITH (FREEZE)").await;
+    assert_eq!(tags(&r), b"CZ", "{r:?}");
+    query(&mut s, "COMMIT").await;
+    f.stop().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn freeze_view_precedes_cursor_and_table_checks() {
+    let f = Fixture::with_engine(giggles_core::Engine::V2).await;
+    let mut s = f.connect().await;
+    let r = query(&mut s, "CREATE VIEW fv AS SELECT i FROM t; BEGIN; DECLARE fc CURSOR FOR SELECT 1").await;
+    assert_eq!(tags(&r), b"CCCZ", "{r:?}");
+    freeze_error(&mut s, "COPY fv FROM STDIN (FREEZE)", "42809", "cannot copy to view \"fv\"").await;
+    query(&mut s, "ROLLBACK; CREATE SCHEMA fs; CREATE VIEW fs.fv AS SELECT i FROM t; BEGIN").await;
+    freeze_error(&mut s, "COPY fs.fv FROM STDIN (FREEZE)", "42809", "cannot copy to view \"fv\"").await;
+    query(&mut s, "ROLLBACK").await;
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn freeze_extended_input() {
+    let f = Fixture::new().await;
+    let mut s = f.connect().await;
+    query(&mut s, "BEGIN; CREATE TABLE ef(i int)").await;
+    send(&mut s, b'P', b"\0COPY ef FROM STDIN (FREEZE)\0\0\0").await;
+    send(&mut s, b'B', b"\0\0\0\0\0\0\0\0").await;
+    send(&mut s, b'E', b"\0\0\0\0\0").await;
+    send(&mut s, b'H', b"").await;
+    let r = read(&mut s).await;
+    assert_eq!(tags(&r), b"12G", "{r:?}");
+    send(&mut s, b'd', b"9\n").await;
+    send(&mut s, b'c', b"").await;
+    send(&mut s, b'S', b"").await;
+    let r = read(&mut s).await;
+    assert_eq!(tags(&r), b"CZ", "{r:?}");
+    query(&mut s, "COMMIT").await;
+    f.stop().await;
+}

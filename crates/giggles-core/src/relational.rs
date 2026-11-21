@@ -72,6 +72,8 @@ mod secondary_index_catalog;
 mod secondary_index_unique_readiness;
 pub(crate) mod secondary_unique_lookup;
 mod sql_copy;
+mod copy_encoding;
+pub use copy_encoding::CopyEncoding;
 mod sql_index;
 mod sql_insert;
 pub(crate) use giggles_pg_types::temporal::Time;
@@ -3494,6 +3496,20 @@ impl Prepared {
         match &self.statement {
             Statement::SetConstraints(names, deferred) => Some((names, *deferred)),
             _ => None,
+        }
+    }
+    pub(crate) fn copy_freeze_created(&self, state: &Relational) -> Option<u64> {
+        if let Statement::Create { name, .. } = &self.statement {
+            state.tables.get(name).map(|t| t.id)
+        } else { None }
+    }
+    pub(crate) fn copy_freeze_marks(&self, state: &Relational, before: Option<u64>) -> Vec<u64> {
+        match &self.statement {
+            Statement::Create { name, .. } => state.tables.get(name)
+                .filter(|t| Some(t.id) != before).map(|t| vec![t.id]).unwrap_or_default(),
+            Statement::Truncate { .. } => self.truncate_tables(state).unwrap_or_default().iter()
+                .filter_map(|name| state.tables.get(name).map(|t| t.id)).collect(),
+            _ => Vec::new(),
         }
     }
     pub fn savepoint_name(&self) -> Option<&str> {

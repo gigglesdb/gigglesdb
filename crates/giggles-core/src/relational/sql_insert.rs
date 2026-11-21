@@ -705,6 +705,10 @@ impl Insert {
     }
 
     pub(super) fn implicit_sequences(&self, state: &Relational) -> R<Vec<Option<String>>> {
+        // COPY rejects views after its input response; no table defaults run.
+        if self.copy_input.is_some() && state.view_names.contains_key(&self.table) {
+            return Ok(Vec::new());
+        }
         let table = state
             .tables
             .get(&self.table)

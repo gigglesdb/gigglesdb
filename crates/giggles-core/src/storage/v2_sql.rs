@@ -489,6 +489,7 @@ impl SqlSession {
                                 if self.v2_savepoints.len() >= 64 {
                                     return Err(CoreError::Sql(E::Limit));
                                 }
+                                self.copy_freeze.push(Default::default());
                                 self.v2_savepoints.push((
                                     name.to_owned(),
                                     txn.savepoint(),
@@ -503,10 +504,12 @@ impl SqlSession {
                                 let mark = self.v2_savepoints[index].1.clone();
                                 if control == "release" {
                                     txn.release(mark)?;
+                                    self.release_copy_freeze(index);
                                     self.v2_savepoints.truncate(index);
                                 } else {
                                     txn.rollback_to_releasing_locks(&mark)?;
                                     self.deferral = self.v2_savepoints[index].2.clone();
+                                    self.rollback_copy_freeze(index);
                                     self.v2_savepoints.truncate(index + 1);
                                     self.aborted = false;
                                 }
@@ -534,6 +537,7 @@ impl SqlSession {
                     }
                     let mut implicit = None;
                     let protected = self.protected.is_some();
+                    let explicit = self.v2_transaction.is_some() && !protected;
                     let (txn, mut protected_effects) = match (&mut self.protected, &mut self.v2_transaction) {
                         (Some(run), _) => (&mut run.txn, Some(&mut run.effects)),
                         (None, Some(txn)) => (txn, None),
@@ -545,6 +549,7 @@ impl SqlSession {
                     if !self.copy_input.as_ref().is_some_and(|input| input.started) {
                         txn.begin_statement();
                     }
+                    let mut freeze_marks = Vec::new();
                     let mark = txn.statement_savepoint();
                     let result = (|| {
                         // DDL stages a catalog-wide image (including schema cascades and
@@ -1056,6 +1061,7 @@ impl SqlSession {
                             return result.map_err(CoreError::Sql);
                         }
                         bound.check_view_drop(&image).map_err(CoreError::Sql)?;
+                        let freeze_before = bound.copy_freeze_created(&image);
                         let result = if !bound.is_collation_ddl() && matches!(bound.command(), "COMMENT" | "SECURITY LABEL" | "CREATE VIEW" | "DROP VIEW") { Ok(Default::default()) } else { image.execute_with_sink(
                             p,
                             params,
@@ -1192,6 +1198,7 @@ impl SqlSession {
                                 )?;
                             }
                         }
+                        freeze_marks = bound.copy_freeze_marks(&image, freeze_before);
                         Ok(result)
                     })();
                     if result.is_err() {
@@ -1201,6 +1208,9 @@ impl SqlSession {
                     if self.v2_transaction.is_none() && !protected && result.is_ok() {
                         let txn = implicit.take().expect("implicit transaction");
                         self.publish_v2_sql(db, &inner, txn, false)?;
+                    }
+                    if explicit && result.is_ok() {
+                        self.copy_freeze.last_mut().unwrap().extend(freeze_marks);
                     }
                     result
                 }

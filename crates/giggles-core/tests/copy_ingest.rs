@@ -45,7 +45,6 @@ fn envelope_grammar_and_rejections() {
         "WITH (FORCE_NULL (a))",
         "WITH (FORCE_NOT_NULL (a))",
         "WITH (FORCE_QUOTE (a))",
-        "WITH (FREEZE true)",
         "WHERE a=1",
     ] {
         assert_eq!(
@@ -54,7 +53,8 @@ fn envelope_grammar_and_rejections() {
             "{suffix}"
         );
     }
-    for suffix in ["WITH (HEADER true)", "WITH (ENCODING 'UTF8')"] {
+    // PG 18.6 freeze-oracle-pg.out: FREEZE is a runtime precondition.
+    for suffix in ["WITH (HEADER true)", "WITH (ENCODING 'UTF8')", "WITH (FREEZE true)", "WITH (FREEZE false)"] {
         assert!(Copy::parse(&format!("COPY items FROM STDIN {suffix}")).is_ok());
     }
     assert_eq!(Copy::parse("COPY items TO STDOUT"), Err(E::Unsupported));

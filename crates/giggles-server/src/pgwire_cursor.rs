@@ -26,6 +26,9 @@ struct Cursor {
 }
 #[derive(Default)]
 pub(super) struct Cursors(BTreeMap<String, Cursor>);
+impl Cursors {
+    pub(super) fn has_open(&self) -> bool { !self.0.is_empty() }
+}
 
 // Read only the cursor-command prefix; the SELECT is parsed by the SQL engine.
 struct Prefix<'a>(&'a str);

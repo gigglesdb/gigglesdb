@@ -133,6 +133,11 @@ impl State {
                 return Err("42703");
             }
         }
+        if options.format != 2 && let Some(message) = options.encoding.and_then(|e| e.missing_conversion(false)) {
+            self.diagnostic.wire_message = Some(message);
+            return Err("42883");
+        }
+        let converter = if options.format == 2 { None } else { options.encoding.and_then(|e| e.converter()) };
         let mut sink = copy_external::Sink::open(&options.destination, session, &mut self.diagnostic)?;
         self.settings.queried = session.in_transaction();
         // PostgreSQL streams COPY TO STDOUT: a spilled v2 result is read from its
@@ -179,6 +184,9 @@ impl State {
                 }
             }
             data.push(b'\n');
+            if let Some(encoding) = converter {
+                data = encoding.encode(&data).map_err(|message| { self.diagnostic.wire_message = Some(message); "22P05" })?;
+            }
             self.copy_output_data(&mut sink, &data, out)?;
         }
         for row in rows {
@@ -252,6 +260,9 @@ impl State {
             }
             if options.format != 2 {
                 data.push(b'\n');
+            }
+            if let Some(encoding) = converter {
+                data = encoding.encode(&data).map_err(|message| { self.diagnostic.wire_message = Some(message); "22P05" })?;
             }
             self.copy_output_data(&mut sink, &data, out)?;
         }
@@ -451,7 +462,7 @@ impl State {
                 begin_implicit(session, implicit, &mut self.settings)?;
             }
             self.settings.queried = session.in_transaction();
-            self.start_copy(copy, Box::new(prepared), true, session, out)?;
+            self.start_copy(copy, Box::new(prepared), Some(*implicit), session, out)?;
             if let Some(copy) = self.copy.as_mut() {
                 copy.simple_implicit = *implicit;
             }

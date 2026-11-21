@@ -932,6 +932,7 @@ pub(crate) fn access_share_tables(sql: &str) -> Result<Option<TableLockRequest>,
 pub(crate) enum CopyDestination { Stdout, File(String), Program(String) }
 #[derive(Clone)]
 pub(crate) struct CopyOutput {
+    pub encoding: Option<giggles_core::relational::CopyEncoding>,
     pub destination: CopyDestination,
     pub table_name: Option<String>,
     pub all_select: Option<String>,
@@ -1022,6 +1023,7 @@ pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<CopyOutput>, &'stat
         if program { CopyDestination::Program(value) } else { CopyDestination::File(value) }
     };
     let mut options = CopyOutput {
+        encoding: None,
         destination,
         table_name: if query.is_some() { None } else { Some(table.rsplit('.').next().unwrap_or(&table).trim_matches('"').replace("\"\"", "\"")) },
         all_select: query.is_none().then(|| format!("SELECT * FROM {table}")),
@@ -1043,6 +1045,7 @@ pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<CopyOutput>, &'stat
     let shared = giggles_core::relational::CopyOptions::parse(&suffix, false)
         .map_err(|e| crate::service::sqlstate(&CoreError::Sql(e)))?;
     options.format = match shared.format { giggles_core::relational::CopyFormat::Text => 0, giggles_core::relational::CopyFormat::Csv => 1, giggles_core::relational::CopyFormat::Binary => 2 };
+    options.encoding = shared.encoding;
     options.header = shared.header != giggles_core::relational::CopyHeader::Off;
     options.delimiter = shared.delimiter;
     options.quote = shared.quote;

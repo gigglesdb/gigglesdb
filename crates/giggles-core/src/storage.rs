@@ -2141,6 +2141,7 @@ pub struct SqlSession {
     copy_input: Option<CopyInput>,
     savepoints: Vec<SqlSavepoint>,
     v2_savepoints: Vec<(String, engine::txn::Savepoint, relational::DeferralState)>,
+    copy_freeze: Vec<std::collections::BTreeSet<u64>>,
     savepoint_budget: u64,
     aborted: bool,
     transaction_id: Option<u128>,
@@ -2194,6 +2195,7 @@ impl Admin {
             copy_input: None,
             savepoints: Vec::new(),
             v2_savepoints: Vec::new(),
+            copy_freeze: vec![Default::default()],
             savepoint_budget: SAVEPOINT_BYTES,
             aborted: false,
             transaction_id: None,
@@ -3966,14 +3968,19 @@ impl SqlSession {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
             let mut copy = relational::Copy::parse(sql).map_err(CoreError::Sql)?;
-            let resolve = |s: &MetadataState<'_>| Ok(copy.schema_key(&s.sql, &self.search_path));
-            copy.table = match &self.staged {
+            let resolve = |s: &MetadataState<'_>| {
+                let key = copy.schema_key(&s.sql, &self.search_path);
+                let view = s.sql.view_names.contains_key(&key);
+                Ok((key, view))
+            };
+            (copy.table, copy.target_is_view) = match &self.staged {
                 Some(s) => resolve(&MetadataState::borrow(s))?,
                 None => self.inspect_metadata(resolve)?,
             };
             let prepare = |s: &MetadataState<'_>| {
+                let image = self.copy_target_image(&copy, s);
                 let mut p = copy
-                    .prepared(&s.sql, s.view.domain)
+                    .prepared(image.as_ref().unwrap_or(&s.sql), s.view.domain)
                     .map_err(CoreError::Sql)?;
                 p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
                 p.validate_schemas(&s.sql).map_err(CoreError::Sql)?;
@@ -3995,6 +4002,31 @@ impl SqlSession {
         }
         result
     }
+    fn copy_target_image(&self, copy: &relational::Copy, s: &MetadataState<'_>) -> Option<relational::Relational> {
+        if !copy.target_is_view { return None; }
+        let (id, _) = s.sql.view_names.get(&copy.table)?;
+        let view = s.sql.views?.get(id)?;
+        let mut image = s.sql.image.clone();
+        std::sync::Arc::make_mut(&mut image.tables).insert(copy.table.clone(), view_table(*id, view));
+        Some(image)
+    }
+    fn release_copy_freeze(&mut self, index: usize) {
+        let released = self.copy_freeze.split_off(index + 1);
+        self.copy_freeze[index].extend(released.into_iter().flatten());
+    }
+    fn rollback_copy_freeze(&mut self, index: usize) {
+        self.copy_freeze.truncate(index + 2);
+        self.copy_freeze[index + 1].clear();
+    }
+    /// Runtime precondition, called after COPY input response and before reading rows.
+    pub fn copy_freeze_allowed(&mut self, copy: &relational::Copy) -> Result<bool, CoreError> {
+        let id = |s: &MetadataState<'_>| Ok(s.sql.tables.get(&copy.table).map(|t| t.id));
+        let id = match &self.staged {
+            Some(s) => id(&MetadataState::borrow(s))?,
+            None => self.inspect_metadata(id)?,
+        };
+        Ok(self.in_transaction() && id.is_some_and(|id| self.copy_freeze.last().unwrap().contains(&id)))
+    }
     pub fn copy_columns(
         &mut self,
         copy: &relational::Copy,
@@ -4002,7 +4034,10 @@ impl SqlSession {
         let inner = self.admin.inner.clone();
         let _ticket = inner.enter_sql()?;
         relational::assert_sql_frontend_allowed();
-        let columns = |s: &MetadataState<'_>| copy.columns_in(&s.sql).map_err(CoreError::Sql);
+        let columns = |s: &MetadataState<'_>| {
+            let image = self.copy_target_image(copy, s);
+            copy.columns_in(image.as_ref().unwrap_or(&s.sql)).map_err(CoreError::Sql)
+        };
         let result = match &self.staged {
             Some(s) => columns(&MetadataState::borrow(s)),
             None => self.inspect_metadata(columns),
@@ -4703,6 +4738,7 @@ impl SqlSession {
                         {
                             return Err(CoreError::Sql(E::Limit));
                         }
+                        self.copy_freeze.push(Default::default());
                         self.savepoints.push(SqlSavepoint {
                             name: name.to_owned(),
                             state: SqlSavepointState {
@@ -4718,6 +4754,7 @@ impl SqlSession {
                             .rposition(|mark| mark.name == name)
                             .ok_or(CoreError::Sql(E::InvalidSavepoint))?;
                         if control == "release" {
+                            self.release_copy_freeze(index);
                             self.savepoints.truncate(index);
                         } else {
                             let SqlSavepointState {
@@ -4742,6 +4779,7 @@ impl SqlSession {
                             self.staged = Some(restored);
                             self.deferral = deferral;
                             self.staged_revision = revision;
+                            self.rollback_copy_freeze(index);
                             self.savepoints.truncate(index + 1);
                             self.aborted = false;
                         }
@@ -4841,6 +4879,7 @@ impl SqlSession {
         } else {
             None
         };
+        let freeze_before = p.copy_freeze_created(&s.sql);
         let mut deferral = self.deferral.clone();
         let result = if let Some((names, deferred)) = p.set_constraints() {
             // Outside a block PostgreSQL still resolves named constraints;
@@ -4976,6 +5015,7 @@ impl SqlSession {
                     .checked_add(1)
                     .ok_or(CoreError::Sql(E::Overflow))?;
             }
+            self.copy_freeze.last_mut().unwrap().extend(p.copy_freeze_marks(&s.sql, freeze_before));
             self.staged = Some(s);
             self.deferral = deferral;
         } else if !p.is_read() {
@@ -5084,6 +5124,7 @@ impl SqlSession {
             .clear();
         self.sequence_baseline.clear();
         self.deferral = Default::default();
+        self.copy_freeze = vec![Default::default()];
         self.savepoints.clear();
         self.v2_savepoints.clear();
         self.aborted = false;
@@ -6301,3 +6342,7 @@ mod w1e_laziness {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "storage/copy_freeze_tests.rs"]
+mod copy_freeze_tests;

@@ -32,7 +32,9 @@ pub enum CopyLogVerbosity { #[default] Default, Verbose, Silent }
 /// Runtime-only COPY options, shared by both SQL envelopes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyOptions {
+    pub freeze: bool,
     pub format: CopyFormat,
+    pub encoding: Option<CopyEncoding>,
     pub delimiter: u8,
     pub null: String,
     pub quote: u8,
@@ -49,7 +51,9 @@ pub struct CopyOptions {
 impl Default for CopyOptions {
     fn default() -> Self {
         Self {
+            freeze: false,
             format: CopyFormat::Text,
+            encoding: None,
             delimiter: b'\t',
             null: "\\N".into(),
             quote: b'"',
@@ -216,46 +220,11 @@ impl CopyOptions {
                 "cannot use \"match\" with HEADER in COPY TO",
             );
         }
-        if let Some(v) = values.get("encoding")
-            && !matches!(
-                v.to_ascii_uppercase().replace('-', "").as_str(),
-                "UTF8"
-                    | "LATIN1"
-                    | "LATIN2"
-                    | "LATIN3"
-                    | "LATIN4"
-                    | "LATIN5"
-                    | "LATIN6"
-                    | "LATIN7"
-                    | "LATIN8"
-                    | "LATIN9"
-                    | "LATIN10"
-                    | "SQL_ASCII"
-                    | "WIN1250"
-                    | "WIN1251"
-                    | "WIN1252"
-                    | "WIN1253"
-                    | "WIN1254"
-                    | "WIN1255"
-                    | "WIN1256"
-                    | "WIN1257"
-                    | "WIN1258"
-                    | "EUC_JP"
-                    | "EUC_CN"
-                    | "EUC_KR"
-                    | "EUC_TW"
-                    | "SJIS"
-                    | "BIG5"
-                    | "GBK"
-                    | "GB18030"
-                    | "KOI8R"
-                    | "KOI8U"
-                    | "JOHAB"
-            ) {
-                return copy_error(
-                    SqlError::InvalidParameterValue,
-                    "argument to option \"encoding\" must be a valid encoding name",
-                );
+        if let Some(v) = values.get("encoding") {
+            o.encoding = Some(CopyEncoding::lookup(v).ok_or_else(|| {
+                user_types::view_replace_error("argument to option \"encoding\" must be a valid encoding name".into());
+                SqlError::InvalidParameterValue
+            })?);
         }
         let freeze = if let Some(v) = values.get("freeze") {
             match v.to_ascii_lowercase().as_str() {
@@ -457,11 +426,8 @@ impl CopyOptions {
             Some("silent") => CopyLogVerbosity::Silent,
             _ => CopyLogVerbosity::Default,
         };
-        if freeze
-            || values.get("encoding").is_some_and(|v| {
-                !v.eq_ignore_ascii_case("utf8") && !v.eq_ignore_ascii_case("utf-8")
-            })
-        {
+        o.freeze = freeze;
+        if o.encoding.is_some_and(|e| !e.supported()) {
             return Err(SqlError::Unsupported);
         }
         Ok(o)
@@ -495,6 +461,7 @@ pub enum CopySource { Stdin, File(String), Program(String) }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Copy {
+    pub target_is_view: bool,
     pub source: CopySource,
     pub table: String,
     relation: schemas::Reference,
@@ -679,6 +646,7 @@ impl Copy {
             format: CopyFormat::Text,
             delimiter: b'\t',
             null: "\\N".into(),
+            target_is_view: false,
             options: CopyOptions::default(),
         };
         copy.options = CopyOptions::parse_tokens(&mut p, true)?;
@@ -688,10 +656,7 @@ impl Copy {
         Ok(copy)
     }
     pub(crate) fn columns_in(&self, state: &Relational) -> R<Vec<ColumnDef>> {
-        let table = state
-            .tables
-            .get(&self.table)
-            .ok_or(SqlError::UnknownTable)?;
+        let table = state.tables.get(&self.table).ok_or(SqlError::UnknownTable)?;
         if self.columns.is_empty() {
             return Ok(table.logical_columns().cloned().collect());
         }
@@ -722,8 +687,9 @@ impl Copy {
             copy.table = relation_key(split_key(&self.table).0, split_key(&self.table).1);
         }
         let columns = copy.columns_in(state)?;
+        let table = &state.tables[&copy.table];
         copy.options.validate_columns(split_key(&copy.table).1,
-            &state.tables[&copy.table].logical_columns().map(|c| c.name.clone()).collect::<Vec<_>>(),
+            &table.logical_columns().map(|c| c.name.clone()).collect::<Vec<_>>(),
             &columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())?;
         let width = columns.len();
         let types = columns.into_iter().map(|c| c.data_type).collect();
@@ -744,7 +710,7 @@ impl Copy {
             statement: Statement::InsertMulti(Box::new(sql_insert::Insert::copy(
                 format!(
                     "{}\0{}",
-                    state.table_schema(state.tables[&copy.table].id),
+                    if copy.target_is_view { split_key(&copy.table).0 } else { state.table_schema(table.id) },
                     split_key(&copy.table).1
                 ),
                 self.columns.clone(),

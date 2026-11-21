@@ -16,6 +16,8 @@ type Row = Vec<Field>;
 type Result<T> = std::result::Result<T, &'static str>;
 const LIMIT: usize = giggles_core::operations::MAX_INSERT_BYTES;
 pub(super) struct Decoder {
+    encoding: Option<giggles_core::relational::CopyEncoding>,
+    encoding_error_line: Option<usize>,
     newline: Option<u8>,
     newline_error: Option<u8>,
     columns: usize,
@@ -45,6 +47,7 @@ pub(super) struct Decoder {
 impl Decoder {
     pub(super) fn text(columns: usize, delimiter: u8, null: Vec<u8>) -> Self {
         Self {
+            encoding: None, encoding_error_line: None,
             newline: None,
             newline_error: None,
             columns,
@@ -81,6 +84,7 @@ impl Decoder {
     }
     pub(super) fn options(&mut self, o: &giggles_core::relational::CopyOptions, names: Vec<String>) {
         use giggles_core::relational::CopyHeader;
+        self.encoding = if self.binary { None } else { o.encoding.and_then(|e| e.converter()) };
         self.default = o.default.as_ref().map(|s| s.as_bytes().to_vec());
         self.quote = o.quote; self.escape = o.escape;
         self.skip_header = o.header != CopyHeader::Off;
@@ -107,9 +111,28 @@ impl Decoder {
         Ok(false)
     }
     pub(super) fn take_completed_rows(&mut self) -> Vec<Row> { std::mem::take(&mut self.completed_rows) }
-    pub(super) fn clear_diagnostic(&mut self) { self.message = None; self.newline_error = None; }
+    pub(super) fn clear_diagnostic(&mut self) { self.message = None; self.newline_error = None; self.encoding_error_line = None; }
     pub(super) fn stream(&mut self) { self.streaming = true; }
     pub(super) fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Row>> {
+        if let Some(encoding) = self.encoding {
+            match encoding.decode(bytes) {
+                Ok(converted) => {
+                    return self.feed_raw(&converted);
+                }
+                Err((at, message)) => {
+                    let prefix = encoding.decode(&bytes[..at]).expect("valid prefix");
+                    let rows = self.feed_raw(&prefix)?;
+                    self.completed_rows.extend(rows);
+                    self.encoding_error_line = Some(self.rows + 1);
+                    self.message = Some(message);
+                    return Err("22P05");
+                }
+            }
+        }
+        self.feed_raw(bytes)
+    }
+    pub(super) fn encoding_error_line(&self) -> Option<usize> { self.encoding_error_line }
+    fn feed_raw(&mut self, bytes: &[u8]) -> Result<Vec<Row>> {
         self.total = self.total.checked_add(bytes.len()).ok_or("54000")?;
         if (if self.streaming { self.pending.len() + bytes.len() } else { self.total }) > LIMIT {
             return Err("54000");
@@ -122,13 +145,22 @@ impl Decoder {
             };
         }
         self.pending.extend_from_slice(bytes);
-        if self.binary {
+        let result = if self.binary {
             self.binary_rows()
         } else if self.csv {
             self.csv_rows(false)
         } else {
             self.text_rows(false)
+        };
+        if result == Err("22021") && !self.binary
+            && let Err(error) = std::str::from_utf8(&self.pending) {
+                let at = error.valid_up_to();
+                let count = error.error_len().unwrap_or(self.pending.len() - at);
+                let bytes = self.pending[at..at+count].iter().map(|b| format!("0x{b:02x}")).collect::<Vec<_>>().join(" ");
+                self.message = Some(format!("invalid byte sequence for encoding \"UTF8\": {bytes}"));
+                self.encoding_error_line = Some(self.rows + 1);
         }
+        result
     }
     pub(super) fn finish(&mut self) -> Result<Vec<Row>> {
         if self.ended {
@@ -878,5 +910,32 @@ mod option_tests {
         assert!(d.finish().unwrap().is_empty());
         assert_eq!(d.feed(b"b\n").unwrap_err(), "22P04");
         assert_eq!(d.message.as_deref(), Some("column name mismatch in header line field 1: got \"b\", expected \"a\""));
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+    use giggles_core::relational::CopyOptions;
+    #[test]
+    fn single_byte_chunk_boundaries() {
+        let options = CopyOptions::parse("(ENCODING 'WIN1252')", true).unwrap();
+        let mut decoder = Decoder::text(1, b'\t', b"\\N".to_vec());
+        decoder.options(&options, vec!["s".into()]);
+        let mut rows = Vec::new();
+        for b in b"\x80\x8a\x9f\r\n" { rows.extend(decoder.feed(&[*b]).unwrap()); }
+        rows.extend(decoder.finish().unwrap());
+        assert_eq!(rows[0][0], Some("\u{20ac}\u{160}\u{178}".as_bytes().to_vec()));
+    }
+    #[test]
+    fn conversion_error_across_crlf_chunks() {
+        let options = CopyOptions::parse("(ENCODING 'WIN1252')", true).unwrap();
+        let mut decoder = Decoder::text(1, b'\t', b"\\N".to_vec());
+        decoder.options(&options, vec!["s".into()]);
+        decoder.feed(b"a\r").unwrap();
+        decoder.feed(b"\nb\r").unwrap();
+        decoder.feed(b"\n").unwrap();
+        assert_eq!(decoder.feed(b"\x81\n"), Err("22P05"));
+        assert!(decoder.message.as_deref().unwrap().contains("0x81"));
     }
 }
