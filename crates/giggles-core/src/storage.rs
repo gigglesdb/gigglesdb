@@ -2150,6 +2150,7 @@ pub struct SqlSession {
     max_statement_tokens: usize,
     search_path: Vec<String>,
     schema_user: String,
+    schema_context_revision: Option<u64>,
     unnamed_plans: Vec<(UnnamedPlanKey, relational::Prepared)>,
     authority_managed: bool,
     ddl_owner: Option<String>,
@@ -2202,6 +2203,7 @@ impl Admin {
             max_statement_tokens: relational::DEFAULT_MAX_STATEMENT_TOKENS,
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
+            schema_context_revision: Some(0),
             unnamed_plans: Vec::new(),
             authority_managed: false,
             ddl_owner: None,
@@ -2492,8 +2494,12 @@ impl SqlSession {
         self.search_path.iter().any(|s| s == schema)
     }
     pub fn set_search_path(&mut self, path: &str, user: &str) {
+        let search_path = relational::schema_search_path(path, user);
+        if self.schema_user != user || self.search_path != search_path {
+            self.schema_context_revision = self.schema_context_revision.and_then(|n| n.checked_add(1));
+        }
         self.schema_user = user.into();
-        self.search_path = relational::schema_search_path(path, user);
+        self.search_path = search_path;
     }
     pub fn schema_metadata(&self) -> Result<relational::SchemaMetadata, CoreError> {
         let read = |s: &MetadataState<'_>| Ok(s.sql.schema_metadata());
@@ -2741,6 +2747,37 @@ impl SqlSession {
         }
         result
     }
+    /// Inputs to successful immutable-constant validation, excluding the Prepared
+    /// itself. A private catalog or unsupported backend never has a reusable key.
+    pub fn constants_validation_key(&self) -> Option<(u64, usize, usize, u64)> {
+        if self.staged.is_some() { return None; }
+        Some((self.statement_catalog_version()?, self.value_budget(), self.max_statement_tokens, self.schema_context_revision?))
+    }
+
+    /// Recheck the full validation path's lifetime/domain guards on a memo hit.
+    /// Inspecting metadata also preserves admission and snapshot failures.
+    pub fn constants_validated_preflight(&mut self, p: &relational::Prepared) -> Result<(), CoreError> {
+        let _budgets = self.statement_budgets();
+        relational::assert_sql_frontend_allowed();
+        let result = (|| {
+            if self.aborted && !p.allows_aborted_transaction() {
+                return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            if !self.prepared_is_current(p) {
+                return Err(CoreError::Sql(relational::SqlError::StaleSchema));
+            }
+            let check = |s: &MetadataState<'_>| {
+                if p.domain != s.view.domain {
+                    return Err(CoreError::Sql(relational::SqlError::StaleSchema));
+                }
+                Ok(())
+            };
+            if let Some(s) = &self.staged { check(&MetadataState::borrow(s)) }
+            else { self.inspect_metadata(check) }
+        })();
+        if result.is_err() { self.abort(); }
+        result
+    }
     /// Validate dependency-free immutable projection/order constants without executing SQL.
     pub fn validate_immutable_constants(
         &mut self,
@@ -2760,12 +2797,12 @@ impl SqlSession {
                 if p.domain != s.view.domain {
                     return Err(CoreError::Sql(relational::SqlError::StaleSchema));
                 }
-                let mut metadata_plan = p.clone();
-                if matches!(self.admin.inner.backend, Backend::V2(_)) {
-                    metadata_plan.epoch = s.sql.image.epoch;
-                }
-                metadata_plan
-                    .validate_immutable_constants(&s.sql)
+                let epoch = if matches!(self.admin.inner.backend, Backend::V2(_)) {
+                    s.sql.image.epoch
+                } else {
+                    p.epoch
+                };
+                p.validate_immutable_constants_at_epoch(&s.sql, epoch)
                     .map_err(CoreError::Sql)
             };
             if let Some(s) = &self.staged {

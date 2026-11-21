@@ -1083,6 +1083,9 @@ struct Statement {
     // Only an unnamed application SELECT prepared outside a transaction gets a key.
     parse_context: Option<std::sync::Arc<ParseContext>>,
     description_version: Option<u64>,
+    validated: Option<(u64, usize, usize, u64)>,
+    #[cfg(test)]
+    constant_validations: usize,
     sql_bytes: usize,
     sql: String,
     declared_oids: Vec<u32>,
@@ -1092,6 +1095,33 @@ struct Statement {
     query_id: Option<String>,
 }
 impl Statement {
+    // Binding reads the immutable Prepared (including its captured search_path,
+    // types and schema user) and the catalog. Query binding installs catalog enum
+    // and collation scopes; plan_constant excludes runtime/session nodes and only
+    // evaluates immutable calls/casts. The two lexer/value budgets are the only
+    // ambient limits. Keep a schema-context revision as an extra invalidator.
+    fn validate_constants(&mut self, session: &mut Session) -> R<()> {
+        let Plan::Sql(p) = &self.p else { return Ok(()); };
+        let key = session.sql.constants_validation_key();
+        if key.is_some() && self.validated == key && session.sql.prepared_is_current(p) {
+            core(session.sql.constants_validated_preflight(p))?;
+            // The preflight inspected metadata after the key was read. Versions only
+            // grow, so an unchanged key proves that inspection saw the validated
+            // generation; otherwise a concurrent DDL landed in between, so fall
+            // through to the full validation against the current catalog.
+            if session.sql.constants_validation_key() == key {
+                return Ok(());
+            }
+        }
+        self.validated = None;
+        #[cfg(test)]
+        { self.constant_validations += 1; }
+        core(session.sql.validate_immutable_constants(p))?;
+        // Do not publish a success if the visible catalog moved during validation.
+        self.validated = key.filter(|_| key == session.sql.constants_validation_key());
+        Ok(())
+    }
+
     fn authorize_description(&self, session: &mut Session) -> R<()> {
         if let Plan::Sql(p) = &self.p
             && session.task().is_none()
@@ -1527,6 +1557,9 @@ impl State {
                 sequence_dependencies: Default::default(),
                 parse_context: None,
                 description_version: None,
+                validated: None,
+                #[cfg(test)]
+                constant_validations: 0,
                 sql_bytes: sql.len(),
                 sql: sql.to_owned(),
                 declared_oids: oids,
@@ -1551,6 +1584,9 @@ impl State {
                 sequence_dependencies: Default::default(),
                 parse_context: None,
                 description_version: None,
+                validated: None,
+                #[cfg(test)]
+                constant_validations: 0,
                 sql_bytes: sql.len(),
                 sql: sql.to_owned(),
                 declared_oids: oids,
@@ -1796,6 +1832,9 @@ impl State {
             sequence_dependencies,
             parse_context,
             description_version,
+            validated: None,
+            #[cfg(test)]
+            constant_validations: 0,
             sql_bytes: sql.len(),
             sql: sql.to_owned(),
             declared_oids: oids,
@@ -2063,7 +2102,7 @@ impl State {
                 }
                 // One version comparison, after locks have stabilized dependencies.
                 self.refresh_statement(&stmt, session)?;
-                let s = self.statements.get(&stmt).ok_or("26000")?.clone();
+                let mut s = self.statements.get(&stmt).ok_or("26000")?.clone();
                 self.diagnostic.query_id = s.query_id.clone();
                 s.describe(session)?;
                 let fmts = formats(&mut r, s.d.parameters.len())?;
@@ -2135,8 +2174,11 @@ impl State {
                 if bound.checked_add(parameter_bytes).ok_or("54000")? > MAX_RESPONSE {
                     return Err("54000");
                 }
-                if let Plan::Sql(p) = &s.p {
-                    core(session.sql.validate_immutable_constants(p))?;
+                if matches!(&s.p, Plan::Sql(_)) {
+                    s.validate_constants(session)?;
+                    self.statements.get_mut(&stmt).ok_or("26000")?.validated = s.validated;
+                    #[cfg(test)]
+                    { self.statements.get_mut(&stmt).unwrap().constant_validations = s.constant_validations; }
                 }
                 self.portals.insert(
                     name,
@@ -4014,3 +4056,113 @@ static UNNAMED_BEFORE_REAUTHORIZE: std::sync::Mutex<Option<Box<dyn FnOnce() + Se
 static UNNAMED_CONTEXT_MISSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) use task_path::api_settings_refusal;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+mod prepared_validation_tests {
+    use super::*;
+
+    fn fixture() -> Session {
+        let path = crate::test_support::fixture_root().join(format!(
+            "validation-memo-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let admin = giggles_core::Admin::create_engine(path, giggles_core::Limits::default(), giggles_core::Engine::V2).unwrap();
+        admin.roles().create(giggles_core::roles::NewRole {
+            name: "owner".into(), login: true, superuser: true, ..Default::default()
+        }).unwrap();
+        crate::Service::new(admin, vec![], crate::clock::Clock::new(0, 3600).unwrap()).unwrap()
+            .role_session("owner").unwrap()
+    }
+    fn statement(session: &mut Session, sql: &str) -> Statement {
+        let p = session.sql.prepare(sql).unwrap();
+        let d = session.sql.describe(&p).unwrap();
+        Statement { sequence_dependencies: Default::default(), parse_context: None,
+            description_version: None, validated: None, constant_validations: 0,
+            sql_bytes: sql.len(), sql: sql.into(), declared_oids: vec![],
+            p: Plan::Sql(Box::new(p)), d, parameter_oids: vec![], query_id: None }
+    }
+    #[test]
+    fn success_memo_tracks_catalog_budgets_and_private_ddl() {
+        let mut session = fixture();
+        session.execute_sql("CREATE TABLE t(id int PRIMARY KEY, n int)", &[]).unwrap();
+        let mut s = statement(&mut session, "SELECT id FROM t ORDER BY n");
+        for _ in 0..5 { s.validate_constants(&mut session).unwrap(); }
+        assert_eq!(s.constant_validations, 1);
+        for sql in ["ALTER TABLE t ADD COLUMN x int", "ALTER TABLE t DROP COLUMN x",
+            "ALTER TABLE t ALTER COLUMN n TYPE text", "ALTER TABLE t DROP COLUMN n",
+            "ALTER TABLE t ADD COLUMN n int", "DROP TABLE t",
+            "CREATE TABLE t(id int PRIMARY KEY,n int)"] {
+            session.execute_sql(sql, &[]).unwrap();
+            let before = s.constant_validations;
+            let result = s.validate_constants(&mut session);
+            assert_eq!(s.constant_validations, before + 1, "{sql}");
+            if sql == "DROP TABLE t" || sql == "ALTER TABLE t DROP COLUMN n" { assert!(result.is_err()); } else { result.unwrap(); }
+        }
+        session.execute_sql("CREATE SCHEMA earlier", &[]).unwrap();
+        session.sql.set_search_path("earlier, public", "owner");
+        s.validate_constants(&mut session).unwrap();
+        let before = s.constant_validations;
+        session.execute_sql("CREATE TABLE earlier.t(id int PRIMARY KEY)", &[]).unwrap();
+        s.validate_constants(&mut session).unwrap();
+        assert_eq!(s.constant_validations, before + 1);
+        session.sql.set_search_path("public", "owner");
+        s.validate_constants(&mut session).unwrap();
+        assert_eq!(s.constant_validations, before + 2);
+        session.sql.set_max_statement_tokens(1);
+        let before = s.constant_validations;
+        let _ = s.validate_constants(&mut session);
+        assert_eq!(s.constant_validations, before + 1);
+        session.sql.set_max_statement_tokens(0);
+        s.validate_constants(&mut session).unwrap();
+        session.sql.set_max_value_bytes(1024);
+        let before = s.constant_validations;
+        s.validate_constants(&mut session).unwrap();
+        assert_eq!(s.constant_validations, before + 1);
+        session.execute_sql("BEGIN", &[]).unwrap();
+        session.execute_sql("ALTER TABLE t ADD COLUMN x int", &[]).unwrap();
+        assert!(session.sql.constants_validation_key().is_none());
+        let before = s.constant_validations;
+        for _ in 0..2 { s.validate_constants(&mut session).unwrap(); }
+        assert_eq!(s.constant_validations, before + 2);
+        session.execute_sql("ROLLBACK", &[]).unwrap();
+        s.validate_constants(&mut session).unwrap();
+        let before = s.constant_validations;
+        s.validate_constants(&mut session).unwrap();
+        assert_eq!(s.constant_validations, before);
+    }
+    #[test]
+    fn repeated_binds_publish_the_success_memo() {
+        let mut session = fixture();
+        let mut state = State {
+            output: None, diagnostic: Diagnostic::default(), admin_completed: false,
+            implicit: false, settings: crate::pg_settings::SessionSettings::default(),
+            statements: BTreeMap::new(), unnamed_cache: Vec::new(), named_statement_bytes: 0,
+            portals: BTreeMap::new(), cursors: cursor::Cursors::default(), drain: false,
+            copy: None, copy_completion: vec![], copy_active: None, copy_permit: None,
+            execution_admission: None,
+        };
+        let mut out = Vec::new();
+        state.handle(b'P', b"named\0SELECT 1+2\0\0\0", &mut session, &mut out, std::time::Instant::now()).unwrap();
+        let mut bind = b"\0named\0".to_vec();
+        bind.extend([0; 6]);
+        for _ in 0..5 {
+            out.clear();
+            state.handle(b'B', &bind, &mut session, &mut out, std::time::Instant::now()).unwrap();
+            assert_eq!(out[0], b'2');
+            state.handle(b'S', &[], &mut session, &mut out, std::time::Instant::now()).unwrap();
+        }
+        assert_eq!(state.statements["named"].constant_validations, 1);
+    }
+    #[test]
+    fn constant_errors_are_never_memoized() {
+        let mut session = fixture();
+        session.execute_sql("CREATE TABLE t(id int PRIMARY KEY)", &[]).unwrap();
+        for sql in ["SELECT 1/0 FROM t", "SELECT id FROM t ORDER BY 1/0", "SELECT id FROM t WHERE 1/0=1"] {
+            let mut s = statement(&mut session, sql);
+            for n in 1..=3 {
+                assert_eq!(s.validate_constants(&mut session), Err("22012"));
+                assert_eq!(s.constant_validations, n);
+                assert!(s.validated.is_none());
+            }
+        }
+    }
+}

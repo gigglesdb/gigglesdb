@@ -234,6 +234,9 @@ impl State {
             sequence_dependencies: Default::default(),
             parse_context: None,
             description_version: None,
+            validated: None,
+            #[cfg(test)]
+            constant_validations: 0,
             sql_bytes: sql.len(),
             sql: sql.to_owned(),
             declared_oids: oids,

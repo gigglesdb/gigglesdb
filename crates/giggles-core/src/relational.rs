@@ -2472,9 +2472,15 @@ impl Prepared {
         ))
     }
     pub(crate) fn validate_immutable_constants(&self, state: &Relational) -> R<()> {
+        self.validate_immutable_constants_at_epoch(state, self.epoch)
+    }
+    pub(crate) fn validate_immutable_constants_at_epoch(&self, state: &Relational, epoch: u64) -> R<()> {
         let bound = self.bind_schemas(state)?;
         let this = &bound;
-        if this.epoch != state.epoch {
+        // Schema binding copies the epoch but never reads it. Accept the
+        // caller's presentation epoch separately instead of cloning the entire
+        // Prepared merely to replace that field before binding it again.
+        if epoch != state.epoch {
             return Err(SqlError::StaleSchema);
         }
         if let Statement::InsertExpressions(values) = &this.statement {
@@ -4911,3 +4917,6 @@ pub fn row_lock_permission_error(table: &str) -> crate::CoreError {
     user_types::view_replace_error(format!("permission denied for table {name}"));
     crate::CoreError::Policy(crate::Error::Scope)
 }
+
+#[cfg(test)]
+mod prepared_validation_tests;
