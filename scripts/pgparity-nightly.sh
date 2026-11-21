@@ -33,7 +33,6 @@
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-tools=$script_dir/../compat/harness.py
 repo=${GIGGLES_REPO:-$(dirname "$(git -C "$script_dir" rev-parse --path-format=absolute --git-common-dir)")}
 out_base=J:/gigglesdb-work/pgparity/gap2/nightly
 worktree=J:/gigglesdb-work/wt/pgp-nightly
@@ -109,6 +108,8 @@ if ! bash "$buildslot" cargo build --locked --manifest-path "$worktree/crates/gi
 fi
 echo "build $((SECONDS - build_start))s" >> "$run_dir/timings"
 server=$target/debug/giggles-server.exe
+# The measured commit's own harness: a clean tree, unlike the shared checkout.
+tools=$worktree/compat/harness.py
 
 part_report() { ls -d "$run_dir/part-$1"/r0-*/report.json 2>/dev/null | head -1 || true; }
 for h in "${halves[@]}"; do
