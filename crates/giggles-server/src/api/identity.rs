@@ -161,15 +161,11 @@ impl ConnectionIdentity {
             {
                 return Err(ApiError::Unauthenticated);
             }
-            let Role::Database { name } = &self.role else {
+            let Role::Database { .. } = &self.role else {
                 return Err(ApiError::Unauthenticated);
             };
-            let mut session = service
-                .role_session(name)
-                .map_err(|_| ApiError::Unauthenticated)?;
-            session.role_fence = self.role_fence;
-            return session
-                .check_binding()
+            return service
+                .check_native_identity(&self.role, self.epoch, self.role_fence, &self.fingerprint, false)
                 .map_err(|_| ApiError::Unauthenticated);
         }
         if let Some(task) = self.credential {
@@ -211,17 +207,9 @@ impl ConnectionIdentity {
                 _ => Err(ApiError::Unauthenticated),
             };
         }
-        match service.session(&self.fingerprint) {
-            Ok(mut session) if session.role == self.role && session.epoch == self.epoch => {
-                // Revalidate the role lifetime captured at TLS verification, including
-                // the same password-only generation aliases as retained sessions.
-                session.role_fence = self.role_fence;
-                session
-                    .check_binding()
-                    .map_err(|_| ApiError::Unauthenticated)
-            }
-            _ => Err(ApiError::Unauthenticated),
-        }
+        service
+            .check_native_identity(&self.role, self.epoch, self.role_fence, &self.fingerprint, true)
+            .map_err(|_| ApiError::Unauthenticated)
     }
 }
 
