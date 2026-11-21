@@ -477,6 +477,7 @@ impl V2Db {
                 epoch,
                 u128::from_be_bytes(self.meta.domain),
             );
+            state.catalog = Some(&catalog);
             state.sql.comments = Some(&catalog.parts.comments);
             state.sql.views = Some(&catalog.parts.sql_views);
             inspect(&state)

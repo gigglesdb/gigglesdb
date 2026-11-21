@@ -92,6 +92,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::new_engine(giggles_core::Engine::Legacy).await
+    }
+    async fn new_engine(engine: giggles_core::Engine) -> Self {
         // Require the task environment rather than silently placing durable fixtures in user TEMP.
         let root = std::path::PathBuf::from(
             std::env::var_os("TEMP").expect("set task TEMP under J:/gigglesdb-work"),
@@ -112,7 +115,7 @@ impl Fixture {
             SERIAL.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&path).unwrap();
-        let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+        let admin = Admin::create_engine(path.join("db.redb"), Limits::default(), engine).unwrap();
         admin
             .roles()
             .create(NewRole {
@@ -1164,4 +1167,75 @@ async fn extension_scalars_route_through_database_context() {
     drop(owner);
     agent.shutdown().await.unwrap();
     f.pg.shutdown().await.unwrap();
+}
+
+// Keep role checks live while V2 reuses committed ownership metadata.
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn sequence_owner_cache_authorization_between_statements() {
+    for protocol in [Protocol::Simple, Protocol::Extended] {
+        let f = Fixture::new_engine(giggles_core::Engine::V2).await;
+        let owner = f.connect("owner", "owner-pw").await;
+        let alice = f.connect("alice", "pw").await;
+        protocol.ok(&owner, "GRANT CREATE ON SCHEMA public TO alice").await;
+        protocol.ok(&owner, "GRANT CREATE ON SCHEMA public TO bob").await;
+        let bob = f.connect("bob", "pw").await;
+        protocol.ok(&alice, "CREATE TABLE mine (id SERIAL PRIMARY KEY)").await;
+        protocol.ok(&alice, "CREATE SEQUENCE standalone").await;
+        protocol.ok(&bob, "CREATE TABLE secret (id INT PRIMARY KEY)").await;
+        // Warm the shared committed map through successful authorization.
+        for sequence in ["mine_id_seq", "standalone"] {
+            protocol.ok(&alice, &format!("SELECT nextval('{sequence}')")).await;
+        }
+        protocol.ok(&owner, "ALTER SEQUENCE mine_id_seq OWNED BY secret.id").await;
+        protocol.error(&alice, "SELECT nextval('mine_id_seq')", "42501").await;
+
+        // Ownership metadata stays unchanged throughout these live role flips.
+        protocol.ok(&owner, "GRANT bob TO alice").await;
+        protocol.ok(&alice, "SELECT nextval('mine_id_seq')").await;
+        let owners = f.admin.sql_session().sequence_owners_shared().unwrap();
+        protocol.ok(&owner, "REVOKE bob FROM alice").await;
+        protocol.error(&alice, "SELECT nextval('mine_id_seq')", "42501").await;
+        protocol.ok(&owner, "GRANT bob TO alice").await;
+        protocol.ok(&alice, "SELECT nextval('mine_id_seq')").await;
+        assert_eq!(&*owners, &*f.admin.sql_session().sequence_owners_shared().unwrap());
+        protocol.ok(&owner, "REVOKE bob FROM alice").await;
+
+        // A's private map authorizes Alice; B retains the warmed committed map.
+        protocol.ok(&owner, "BEGIN").await;
+        protocol.ok(&owner, "ALTER SEQUENCE mine_id_seq OWNED BY mine.id").await;
+        protocol.ok(&owner, "SET ROLE alice").await;
+        protocol.ok(&owner, "SELECT nextval('mine_id_seq')").await;
+        protocol.error(&alice, "SELECT nextval('mine_id_seq')", "42501").await;
+        protocol.ok(&owner, "COMMIT").await;
+        protocol.ok(&owner, "RESET ROLE").await;
+        protocol.ok(&alice, "SELECT nextval('mine_id_seq')").await;
+
+        // A sees private denial; rollback restores the old authorization.
+        protocol.ok(&owner, "BEGIN").await;
+        protocol.ok(&owner, "ALTER SEQUENCE mine_id_seq OWNED BY secret.id").await;
+        protocol.ok(&owner, "SET ROLE alice").await;
+        protocol.error(&owner, "SELECT nextval('mine_id_seq')", "42501").await;
+        protocol.ok(&alice, "SELECT nextval('mine_id_seq')").await;
+        protocol.ok(&owner, "ROLLBACK").await;
+        protocol.ok(&owner, "RESET ROLE").await;
+        protocol.ok(&owner, "SET ROLE alice").await;
+        protocol.ok(&owner, "SELECT nextval('mine_id_seq')").await;
+        protocol.ok(&owner, "RESET ROLE").await;
+
+        protocol.ok(&owner, "ALTER SEQUENCE standalone OWNED BY secret.id").await;
+        protocol.error(&alice, "SELECT nextval('standalone')", "42501").await;
+        protocol.ok(&owner, "ALTER SEQUENCE standalone OWNED BY NONE").await;
+        protocol.ok(&alice, "SELECT nextval('standalone')").await;
+        protocol.ok(&owner, "ALTER SEQUENCE standalone OWNED BY secret.id").await;
+        protocol.error(&alice, "SELECT nextval('standalone')", "42501").await;
+        protocol.ok(&owner, "DROP TABLE secret").await;
+        // The removed sequence must reach missing-relation resolution rather
+        // than retain the cached denial from its former owning table.
+        protocol.error(&alice, "SELECT nextval('standalone')", "42P01").await;
+        drop(bob);
+        drop(alice);
+        drop(owner);
+        f.pg.shutdown().await.unwrap();
+    }
 }

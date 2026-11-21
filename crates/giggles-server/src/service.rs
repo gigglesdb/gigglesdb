@@ -2210,7 +2210,7 @@ impl Session {
         Ok(())
     }
     fn authorize_sequences(&mut self, dependencies: &[Option<String>]) -> Result<(), CoreError> {
-        let sequences = self.sql.sequence_owners()?;
+        let sequences = self.sql.sequence_owners_shared()?;
         let image = match self.effective_role.as_ref().unwrap_or(&self.role) {
             Role::Database { .. } => Some(self.service.admin.roles().image()
                 .map_err(|_| CoreError::Policy(Error::Authentication))?),

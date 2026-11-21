@@ -257,6 +257,7 @@ pub(crate) struct State {
 pub(super) struct MetadataState<'a> {
     sql: MetadataSql<'a>,
     view: MetadataDomain,
+    catalog: Option<&'a engine::catalog::CatalogSnapshot>,
 }
 struct MetadataDomain {
     domain: u128,
@@ -321,6 +322,7 @@ impl<'a> MetadataState<'a> {
         Self {
             sql: MetadataSql { image, epoch, comments: None, views: None },
             view: MetadataDomain { domain },
+            catalog: None,
         }
     }
     fn borrow(state: &'a State) -> Self {
@@ -2128,6 +2130,9 @@ fn deferral_bytes(state: &relational::DeferralState) -> Result<u64, CoreError> {
 }
 pub(crate) type XactSlot = Arc<Mutex<Option<engine::xact::XactGuard>>>;
 
+/// Sequence names and optional owning table keys, in catalog iteration order.
+pub type SequenceOwners = [(String, Option<String>)];
+
 /// Trusted session only. Dropping a session discards its staged transaction.
 /// No lock or admission ticket lives across client calls.
 pub struct SqlSession {
@@ -2684,23 +2689,43 @@ impl SqlSession {
     }
     /// Sequence names and owning tables for authorization, without evaluating SQL.
     pub fn sequence_owners(&self) -> Result<Vec<(String, Option<String>)>, CoreError> {
+        Ok(self.sequence_owners_shared()?.to_vec())
+    }
+
+    /// Ordered ownership metadata shared by all sessions reading the same committed
+    /// V2 catalog snapshot. Private/unsupported contexts always build fresh.
+    pub fn sequence_owners_shared(&self) -> Result<Arc<SequenceOwners>, CoreError> {
+        let cacheable = self.staged.is_none() && !self.aborted && self.task.is_none()
+            && matches!(&self.admin.inner.backend, Backend::V2(db) if db.cluster_services().is_none())
+            && self.v2_transaction.as_ref().is_none_or(|txn|
+                txn.catalog_writes().next().is_none() && txn.snapshot_error().is_none());
         let owners = |s: &MetadataState<'_>| {
-            let mut tables = std::collections::HashMap::with_capacity(s.sql.tables.len());
-            for table in s.sql.tables.values() {
-                // Preserve the first match used by the previous linear search.
-                tables.entry(table.id).or_insert(table);
-            }
-            Ok(s.sql
-                .catalog_ext()
-                .sequences
-                .values()
-                .map(|d| {
-                    let owner = d.owned_by.and_then(|(id, _)| {
-                        tables.get(&id).map(|t| s.sql.table_key(t))
-                    });
-                    (d.name.clone(), owner)
-                })
-                .collect())
+            let build = || {
+                let mut tables = std::collections::HashMap::with_capacity(s.sql.tables.len());
+                for table in s.sql.tables.values() {
+                    // Preserve the first match used by the previous linear search.
+                    tables.entry(table.id).or_insert(table);
+                }
+                s.sql
+                    .catalog_ext()
+                    .sequences
+                    .values()
+                    .map(|d| {
+                        let owner = d.owned_by.and_then(|(id, _)| {
+                            tables.get(&id).map(|t| s.sql.table_key(t))
+                        });
+                        (d.name.clone(), owner)
+                    })
+                    .collect::<Vec<_>>().into()
+            };
+            // The snapshot is supplied by the SAME metadata read as the image.
+            // No separate current-version read can race with concurrent DDL.
+            // table_key uses only image schema bindings, not comments/views overlays.
+            Ok(if cacheable && let Some(catalog) = s.catalog {
+                catalog.sequence_owners.get_or_init(build).clone()
+            } else {
+                build()
+            })
         };
         match &self.staged {
             Some(s) => owners(&MetadataState::borrow(s)),
@@ -6346,3 +6371,6 @@ mod w1e_laziness {
 #[cfg(test)]
 #[path = "storage/copy_freeze_tests.rs"]
 mod copy_freeze_tests;
+
+#[cfg(test)]
+mod sequence_owners_tests;
