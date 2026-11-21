@@ -16,7 +16,12 @@ to generate or implement the message codec.
 | `wire` | Ordinary, optional bind address | TLS over TCP with a required client certificate | Certificate binding in the ordinary runtime |
 | `agent.wire` | Agent, optional bind address in the `agent` section | TLS over TCP, with a certificate required for sign-in | Certificate binding in the agent runtime, with an optional task selector |
 | `role_api.wire` | SQL role, optional bind address in the `role_api` section | Configurable TLS or plain TCP | SQL-role authentication |
-| `native` | Separate legacy listener, required bind address in this checkout | Legacy JSON framing over TLS | Legacy certificate binding |
+| `native` | Deprecated alias for `wire` | Same as `wire` | Same as `wire` |
+
+`native` is a deprecated alias for `wire`. Setting only `native` starts the
+ordinary wire listener on that address and prints a deprecation warning to
+stderr. Setting both `native` and `wire` is a startup error. The legacy
+JSON-frame listener no longer exists.
 
 All v1 wire listeners are subject to shared admission and a per-listener
 connection limit. The limit accepts 1 through 128. Top-level `connections`
@@ -480,9 +485,6 @@ C -> S   GOODBYE(8) <empty>
 
 ## Known gaps
 
-- The `native` alias for `wire` planned in GD-0091 section 12 is pending.
-  The server configuration still requires `native` and binds it to a
-  separate legacy JSON listener.
 - The connection-loop plan describes stopping reads at the admitted request
   limit. The server uses bounded lookahead at that limit so it can see control
   frames while requests are deferred.

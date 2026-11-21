@@ -391,6 +391,7 @@ mod task_search_path_api;
 mod prepared_validation_network;
 
 #[path = "wire_basic.rs"] mod wire_basic;
+#[path = "wire_batches_faults.rs"] mod wire_batches_faults;
 #[path = "wire_role.rs"]
 mod wire_role;
 #[path = "wire_handles.rs"] mod wire_handles;
