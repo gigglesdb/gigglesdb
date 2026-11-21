@@ -33,7 +33,10 @@ pub use capabilities::{
     DeploymentProfile, EngineRowLimits, EngineRows, ReferenceRevision, TestEvidence, capability_manifest,
     capability_manifest_for,
 };
-pub use execute::{BoundCatalogOperation, BoundOperation, BoundTransaction, Engine, Lowered, lower_text};
+pub use execute::{
+    BoundCatalogOperation, BoundOperation, BoundTransaction, Engine, Lowered, PreparedText,
+    lower_text, prepare_text,
+};
 pub use giggles_core::operations::ReadExplainOutcome;
 pub use preview::{
     ChangeOutcome, ChangeStatement, LoweredUpdate, execute_change, lower_preview_update,

@@ -239,6 +239,7 @@ async fn wire_large_result_more_frames_then_small_reply() {
         .unwrap();
 
     let mut client = f.wire_client_for(&f.sql_app).await;
+    assert_eq!(client.execute(read.clone()).await.unwrap(), expected);
     let large = client.send_execute(read.clone()).await.unwrap();
     let small = client.send_execute(ping()).await.unwrap();
     let mut frames = Vec::new();
@@ -256,19 +257,25 @@ async fn wire_large_result_more_frames_then_small_reply() {
     assert!(!more.is_empty());
     assert!(more.iter().all(|flags| *flags == Flags(Flags::MORE)));
     assert_eq!(*last, Flags(0));
+    let wire = WireReply::decode(encoded.as_slice()).unwrap();
     assert_eq!(
-        WireReply::decode(encoded.as_slice())
-            .unwrap()
-            .reply
-            .unwrap(),
-        expected
+        wire.shapes,
+        [proto::WireShapeRef {
+            position: 0,
+            shape_id: Some(0),
+            columns: vec![],
+        }]
     );
+    expected.sql.as_mut().unwrap().columns.clear();
+    assert_eq!(wire.reply.unwrap(), expected);
     let (id, result) = client.recv().await.unwrap();
     assert_eq!(id, small);
     assert_eq!(result.unwrap().code, "ok");
 
+    let new_shape =
+        sql("SELECT id, status AS renamed FROM shipments WHERE merchant_id=97 ORDER BY id");
     connection_stats(&f, &client).hold_reply_after_first_more();
-    let large = client.send_execute(read).await.unwrap();
+    let large = client.send_execute(new_shape.clone()).await.unwrap();
     let (first, _) = client.recv_raw_frame().await.unwrap();
     assert_eq!(
         (first.request_id, first.kind, first.flags),
@@ -288,6 +295,9 @@ async fn wire_large_result_more_frames_then_small_reply() {
     let (id, result) = client.recv().await.unwrap();
     assert_eq!(id, small);
     assert_eq!(result.unwrap().code, "ok");
+    let retried = client.execute(new_shape).await.unwrap().sql.unwrap();
+    assert_eq!(retried.columns, ["id", "renamed"]);
+    assert_eq!(retried.rows.len(), 192);
     client.goodbye().await.unwrap();
     f.stop().await;
 }
@@ -611,6 +621,36 @@ async fn wire_ping_and_sql_round_trip() {
     let replies = client.pipeline(vec![ping(), ping()]).await.unwrap();
     assert_eq!(replies.len(), 2);
     assert!(replies.iter().all(|reply| reply.code == "ok"));
+    client.goodbye().await.unwrap();
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn wire_reuses_select_shape_and_client_restores_columns() {
+    let f = ParityFixture::start().await;
+    let mut client = f.wire_client_for(&f.sql_app).await;
+    let request = sql("SELECT id AS answer FROM shipments WHERE merchant_id=42 AND id=1");
+    let first = client.execute(request.clone()).await.unwrap();
+    assert_eq!(first.sql.as_ref().unwrap().columns, ["answer"]);
+
+    let id = client.send_execute(request.clone()).await.unwrap();
+    let (header, body) = client.recv_raw_frame().await.unwrap();
+    assert_eq!(
+        (header.kind, header.flags, header.request_id),
+        (FrameKind::Reply, Flags(0), id)
+    );
+    let wire = WireReply::decode(body.as_slice()).unwrap();
+    assert_eq!(
+        wire.shapes,
+        [proto::WireShapeRef {
+            position: 0,
+            shape_id: Some(0),
+            columns: vec![],
+        }]
+    );
+    assert!(wire.reply.unwrap().sql.unwrap().columns.is_empty());
+
+    assert_eq!(client.execute(request).await.unwrap(), first);
     client.goodbye().await.unwrap();
     f.stop().await;
 }

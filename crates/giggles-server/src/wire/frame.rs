@@ -285,6 +285,14 @@ impl FrameDecoder {
         ) {
             return Err(FrameError::WrongDirection(kind));
         }
+        if flags.0 & Flags::SKIPPED != 0 {
+            if kind != FrameKind::Reply || flags.0 != Flags::SKIPPED {
+                return Err(FrameError::UnknownFlags(flags.0));
+            }
+            if body_len != 0 {
+                return Err(FrameError::BadLength);
+            }
+        }
         let request_id = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
         Ok(FrameHeader {
             kind,

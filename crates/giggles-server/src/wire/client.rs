@@ -1,16 +1,21 @@
 //! Reference client for native wire protocol version 1.
 
 use super::{
+    conn::MAX_BATCH_ENTRIES,
     frame::{
         Direction, Flags, FrameDecoder, FrameHeader, FrameKind, encode_message, write_preface,
     },
-    messages::{WireCancel, WireConnError, WireReady, WireReply},
+    messages::{
+        WireBatch, WireBatchEntry, WireBatchMode, WireCancel, WireCloseHandle, WireConnError,
+        WirePrepare, WirePrepared, WireReady, WireReply, WireRun, wire_batch_entry,
+    },
+    shapes::expand,
 };
 use crate::{
     MAX_FRAME,
     api::proto::{
-        ExecuteReply, ExecuteRequest, OpenSessionRequest, ScramChallenge, ScramContinue,
-        ScramStart, open_session_request,
+        ExecuteReply, ExecuteRequest, NativeBinding, OpenSessionRequest, ScramChallenge,
+        ScramContinue, ScramStart, open_session_request,
     },
     auth::scram::ClientExchange,
     tls,
@@ -97,6 +102,26 @@ impl fmt::Display for WireError {
 
 impl std::error::Error for WireError {}
 
+/// An EXECUTE or RUN request carried inside a BATCH frame.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant, reason = "the batch API takes ExecuteRequest by value")]
+pub enum BatchEntry {
+    Execute(ExecuteRequest),
+    Run {
+        handle: u32,
+        bindings: Vec<NativeBinding>,
+    },
+}
+
+/// The result of one batch entry. SQL errors are carried in `Reply.code`.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant, reason = "the batch API returns ExecuteReply by value")]
+pub enum BatchOutcome {
+    Reply(ExecuteReply),
+    Error(WireConnError),
+    Skipped,
+}
+
 fn server_error(error: WireConnError) -> io::Error {
     io::Error::other(WireError {
         code: error.code,
@@ -119,6 +144,7 @@ struct Reader {
     stream: ReadHalf<Box<dyn Connection>>,
     decoder: FrameDecoder,
     reply: Vec<u8>,
+    shapes: Vec<Vec<String>>,
 }
 
 impl Reader {
@@ -146,10 +172,39 @@ impl Reader {
         .await?
     }
 
+    async fn prepared(&mut self, expected: u32) -> io::Result<Result<u32, WireConnError>> {
+        let (head, body) = self.next_frame().await?;
+        let bytes = self.decoder.body(body);
+        match (head.kind, head.flags.0, head.request_id) {
+            (FrameKind::Prepared, 0, id) if id == expected => {
+                Ok(Ok(WirePrepared::decode(bytes)?.handle))
+            }
+            (FrameKind::ConnError, 0, 0) => Err(server_error(WireConnError::decode(bytes)?)),
+            (FrameKind::ConnError, 0, id) if id == expected => {
+                Ok(Err(WireConnError::decode(bytes)?))
+            }
+            _ => Err(invalid_data("unexpected prepared reply frame")),
+        }
+    }
+
     async fn reply(
         &mut self,
         expected: Option<u32>,
     ) -> io::Result<(u32, Result<ExecuteReply, WireConnError>)> {
+        let (id, outcome) = self.reply_outcome(expected, false).await?;
+        match outcome {
+            BatchOutcome::Reply(reply) => Ok((id, Ok(reply))),
+            BatchOutcome::Error(error) => Ok((id, Err(error))),
+            BatchOutcome::Skipped => unreachable!("ordinary reply cannot be skipped"),
+        }
+    }
+
+    async fn reply_outcome(
+        &mut self,
+        expected: Option<u32>,
+        allow_skipped: bool,
+    ) -> io::Result<(u32, BatchOutcome)> {
+        let mut has_more = false;
         loop {
             let (head, body) = self.next_frame().await?;
             let bytes = self.decoder.body(body);
@@ -161,8 +216,16 @@ impl Reader {
                     return Err(server_error(error));
                 }
                 if expected == Some(id) {
-                    return Ok((id, Err(error)));
+                    return Ok((id, BatchOutcome::Error(error)));
                 }
+            }
+            if allow_skipped
+                && head.kind == FrameKind::Reply
+                && head.flags.0 == Flags::SKIPPED
+                && expected == Some(id)
+                && !has_more
+            {
+                return Ok((id, BatchOutcome::Skipped));
             }
             if head.kind != FrameKind::Reply
                 || head.flags.0 & !Flags::MORE != 0
@@ -173,11 +236,15 @@ impl Reader {
             self.reply.extend_from_slice(bytes);
             if head.flags.0 == 0 {
                 // A spill contributes multiple protobuf messages to one logical reply.
-                let reply = WireReply::decode(std::mem::take(&mut self.reply).as_slice())?
+                let wire = WireReply::decode(std::mem::take(&mut self.reply).as_slice())?;
+                let mut reply = wire
                     .reply
                     .ok_or_else(|| invalid_data("missing wire reply"))?;
-                return Ok((id, Ok(reply)));
+                expand(&mut self.shapes, &mut reply, &wire.shapes)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                return Ok((id, BatchOutcome::Reply(reply)));
             }
+            has_more = true;
         }
     }
 }
@@ -216,11 +283,16 @@ pub struct Client {
     reader: Reader,
     writer: Writer,
     next_id: u32,
-    pending: VecDeque<u32>,
+    pending: VecDeque<PendingReply>,
     #[cfg(feature = "test-hooks")]
     local_addr: SocketAddr,
     #[cfg(feature = "test-hooks")]
     max_in_flight: usize,
+}
+
+struct PendingReply {
+    id: u32,
+    batch: bool,
 }
 
 impl Client {
@@ -274,6 +346,7 @@ impl Client {
             stream: read,
             decoder: FrameDecoder::new(Direction::ServerToClient, MAX_FRAME),
             reply: Vec::new(),
+            shapes: Vec::new(),
         };
         let mut writer = Writer {
             stream: write,
@@ -352,11 +425,126 @@ impl Client {
         self.recv().await?.1.map_err(server_error)
     }
 
+    /// Prepare native text for reuse on this connection.
+    pub async fn prepare(
+        &mut self,
+        text: &str,
+        language_version: Option<&str>,
+    ) -> io::Result<Result<u32, WireConnError>> {
+        self.require_idle()?;
+        let request = WirePrepare {
+            text: text.into(),
+            language_version: language_version.map(str::to_owned),
+        };
+        let id = self.send_request(FrameKind::Prepare, &request).await?;
+        let reply = self.reader.prepared(id).await?;
+        self.pending.pop_front();
+        Ok(reply)
+    }
+
+    /// Execute a handle with the default budget and no operation ID.
+    pub async fn run(
+        &mut self,
+        handle: u32,
+        bindings: Vec<NativeBinding>,
+    ) -> io::Result<ExecuteReply> {
+        self.require_idle()?;
+        self.send_run(WireRun {
+            handle,
+            bindings,
+            ..Default::default()
+        })
+        .await?;
+        self.recv().await?.1.map_err(server_error)
+    }
+
+    pub async fn close_handle(&mut self, handle: u32) -> io::Result<()> {
+        self.require_idle()?;
+        self.send_request(FrameKind::CloseHandle, &WireCloseHandle { handle })
+            .await?;
+        let reply = self.recv().await?.1.map_err(server_error)?;
+        if reply.code != "ok" {
+            return Err(invalid_data("unexpected close handle reply"));
+        }
+        Ok(())
+    }
+
     /// Send requests in order and collect their replies in order. Drain
     /// request errors before returning the first one.
     pub async fn pipeline(
         &mut self,
         requests: Vec<ExecuteRequest>,
+    ) -> io::Result<Vec<ExecuteReply>> {
+        self.pipeline_requests(FrameKind::Execute, requests).await
+    }
+
+    /// Run handles in order and collect replies, draining request errors.
+    pub async fn pipeline_run(&mut self, requests: Vec<WireRun>) -> io::Result<Vec<ExecuteReply>> {
+        self.pipeline_requests(FrameKind::Run, requests).await
+    }
+
+    /// Send one batch and collect its outcomes in entry order.
+    pub async fn batch(
+        &mut self,
+        mode: WireBatchMode,
+        entries: Vec<BatchEntry>,
+    ) -> io::Result<Vec<BatchOutcome>> {
+        self.require_idle()?;
+        let ids = self.send_batch(mode, entries).await?;
+        let mut replies = Vec::with_capacity(ids.len());
+        for _ in ids {
+            replies.push(self.recv_batch_entry().await?.1);
+        }
+        Ok(replies)
+    }
+
+    /// Send one BATCH frame and return the entry IDs in order. Read its
+    /// outstanding replies with `recv_batch_entry`.
+    pub async fn send_batch(
+        &mut self,
+        mode: WireBatchMode,
+        entries: Vec<BatchEntry>,
+    ) -> io::Result<Vec<u32>> {
+        if entries.is_empty() || entries.len() > MAX_BATCH_ENTRIES {
+            return Err(invalid_input("wire batch entry count is outside the limit"));
+        }
+        let mut ids = self.reserve_ids(entries.len() as u32 + 1)?;
+        let header_id = ids.next().expect("reserved batch header ID");
+        let request = WireBatch {
+            mode: mode as i32,
+            entries: ids
+                .clone()
+                .zip(entries)
+                .map(|(request_id, entry)| {
+                    let entry = match entry {
+                        BatchEntry::Execute(request) => wire_batch_entry::Entry::Execute(request),
+                        BatchEntry::Run { handle, bindings } => {
+                            wire_batch_entry::Entry::Run(WireRun {
+                                handle,
+                                bindings,
+                                ..Default::default()
+                            })
+                        }
+                    };
+                    WireBatchEntry {
+                        request_id,
+                        entry: Some(entry),
+                    }
+                })
+                .collect(),
+        };
+        self.writer
+            .send(FrameKind::Batch, header_id, &request)
+            .await?;
+        self.pending
+            .extend(ids.clone().map(|id| PendingReply { id, batch: true }));
+        Ok(ids.collect())
+    }
+
+    async fn pipeline_requests(
+        &mut self,
+        kind: FrameKind,
+        requests: Vec<impl Message>,
     ) -> io::Result<Vec<ExecuteReply>> {
         self.require_idle()?;
         for request in &requests {
@@ -367,7 +555,7 @@ impl Client {
         let ids = self.reserve_ids(count)?;
         let send = async {
             for (id, request) in ids.clone().zip(requests) {
-                self.writer.send(FrameKind::Execute, id, &request).await?;
+                self.writer.send(kind, id, &request).await?;
             }
             Ok::<_, io::Error>(())
         };
@@ -391,10 +579,19 @@ impl Client {
     }
 
     pub async fn send_execute(&mut self, request: ExecuteRequest) -> io::Result<u32> {
-        self.writer.check(&request)?;
+        self.send_request(FrameKind::Execute, &request).await
+    }
+
+    /// Queue a RUN, with optional budget and operation ID, for `recv`.
+    pub async fn send_run(&mut self, request: WireRun) -> io::Result<u32> {
+        self.send_request(FrameKind::Run, &request).await
+    }
+
+    async fn send_request(&mut self, kind: FrameKind, request: &impl Message) -> io::Result<u32> {
+        self.writer.check(request)?;
         let id = self.reserve_ids(1)?.start;
-        self.writer.send(FrameKind::Execute, id, &request).await?;
-        self.pending.push_back(id);
+        self.writer.send(kind, id, request).await?;
+        self.pending.push_back(PendingReply { id, batch: false });
         Ok(id)
     }
 
@@ -412,7 +609,28 @@ impl Client {
     }
 
     pub async fn recv(&mut self) -> io::Result<(u32, Result<ExecuteReply, WireConnError>)> {
-        let reply = self.reader.reply(self.pending.front().copied()).await?;
+        let expected = self.pending.front();
+        if expected.is_some_and(|pending| pending.batch) {
+            return Err(invalid_input(
+                "receive the next batch entry with recv_batch_entry",
+            ));
+        }
+        let reply = self
+            .reader
+            .reply(expected.map(|pending| pending.id))
+            .await?;
+        self.pending.pop_front();
+        Ok(reply)
+    }
+
+    /// Read the next outstanding reply for a pipelined batch entry.
+    pub async fn recv_batch_entry(&mut self) -> io::Result<(u32, BatchOutcome)> {
+        let expected = self
+            .pending
+            .front()
+            .filter(|pending| pending.batch)
+            .ok_or_else(|| invalid_input("the next pending reply must be a batch entry"))?;
+        let reply = self.reader.reply_outcome(Some(expected.id), true).await?;
         self.pending.pop_front();
         Ok(reply)
     }
@@ -432,7 +650,12 @@ impl Client {
     #[cfg(feature = "test-hooks")]
     pub async fn recv_raw_frame(&mut self) -> io::Result<(FrameHeader, Vec<u8>)> {
         let (head, body) = self.reader.next_frame().await?;
-        if head.flags.0 & Flags::MORE == 0 && self.pending.front() == Some(&head.request_id) {
+        if head.flags.0 & Flags::MORE == 0
+            && self
+                .pending
+                .front()
+                .is_some_and(|pending| pending.id == head.request_id)
+        {
             self.pending.pop_front();
         }
         Ok((head, self.reader.decoder.body(body).to_vec()))

@@ -57,7 +57,7 @@ fn header_round_trip() {
         value: u32,
     }
 
-    let flags = Flags(Flags::MORE | Flags::SKIPPED);
+    let flags = Flags(Flags::MORE);
     let mut encoded = bytes;
     encode_message(
         &mut encoded,
@@ -314,17 +314,58 @@ fn seeded_mutation_never_panics() {
 
 #[test]
 fn decoder_accepts_more_and_skipped_flags() {
-    for flags in [Flags::MORE, Flags::SKIPPED, Flags::MORE | Flags::SKIPPED] {
+    for (flags, body) in [(Flags::MORE, &b"xy"[..]), (Flags::SKIPPED, &b""[..])] {
         let mut bytes = Vec::new();
-        encode_frame(&mut bytes, FrameKind::Reply, Flags(flags), 9, b"xy");
+        encode_frame(&mut bytes, FrameKind::Reply, Flags(flags), 9, body);
         let mut decoder = FrameDecoder::new(Direction::ServerToClient, MAX_FRAME);
         decoder.read_buf().extend_from_slice(&bytes);
         let (header, range) = decoder.next_frame().unwrap().unwrap();
         assert_eq!(header.flags, Flags(flags));
         assert_eq!(header.kind, FrameKind::Reply);
         assert_eq!(header.request_id, 9);
-        assert_eq!(decoder.body(range), b"xy");
+        assert_eq!(decoder.body(range), body);
         assert_eq!(decoder.next_frame(), Ok(None));
+    }
+}
+
+#[test]
+fn decoder_rejects_invalid_skipped_frames() {
+    for (direction, kind, flags, body, error) in [
+        (
+            Direction::ClientToServer,
+            FrameKind::Batch,
+            Flags::SKIPPED,
+            &b""[..],
+            FrameError::UnknownFlags(Flags::SKIPPED),
+        ),
+        (
+            Direction::ServerToClient,
+            FrameKind::ConnError,
+            Flags::SKIPPED,
+            &b""[..],
+            FrameError::UnknownFlags(Flags::SKIPPED),
+        ),
+        (
+            Direction::ServerToClient,
+            FrameKind::Reply,
+            Flags::MORE | Flags::SKIPPED,
+            &b""[..],
+            FrameError::UnknownFlags(Flags::MORE | Flags::SKIPPED),
+        ),
+        (
+            Direction::ServerToClient,
+            FrameKind::Reply,
+            Flags::SKIPPED,
+            &b"x"[..],
+            FrameError::BadLength,
+        ),
+    ] {
+        let mut bytes = Vec::new();
+        encode_frame(&mut bytes, kind, Flags(flags), 9, body);
+        assert_eq!(
+            decode_error(&mut FrameDecoder::new(direction, MAX_FRAME), &bytes),
+            error
+        );
     }
 }
 

@@ -2,7 +2,10 @@ use super::{
     conn::{ConnectionStats, WireLimits, read_handshake, serve},
     exec::CallHook,
     frame::{Flags, FrameKind, HEADER_LEN, encode_message, write_preface},
-    messages::{WireCancel, WireConnError, WireReady, WireReply},
+    messages::{
+        WireBatch, WireBatchEntry, WireBatchMode, WireCancel, WireConnError, WireReady, WireReply,
+        wire_batch_entry,
+    },
 };
 use crate::{
     Binding, Role, Service,
@@ -270,7 +273,7 @@ async fn recv(stream: &mut DuplexStream) -> (u8, u8, u32, Vec<u8>) {
     .unwrap()
 }
 
-async fn reply(stream: &mut DuplexStream, id: u32) -> (proto::ExecuteReply, usize) {
+async fn wire_reply(stream: &mut DuplexStream, id: u32) -> (WireReply, usize) {
     let mut bytes = Vec::new();
     let mut frames = 0;
     loop {
@@ -279,13 +282,15 @@ async fn reply(stream: &mut DuplexStream, id: u32) -> (proto::ExecuteReply, usiz
         frames += 1;
         bytes.extend(body);
         if flags == 0 {
-            return (
-                WireReply::decode(bytes.as_slice()).unwrap().reply.unwrap(),
-                frames,
-            );
+            return (WireReply::decode(bytes.as_slice()).unwrap(), frames);
         }
         assert_eq!(flags, Flags::MORE);
     }
+}
+
+async fn reply(stream: &mut DuplexStream, id: u32) -> (proto::ExecuteReply, usize) {
+    let (wire, frames) = wire_reply(stream, id).await;
+    (wire.reply.unwrap(), frames)
 }
 
 async fn error(stream: &mut DuplexStream, id: u32, code: &str) {
@@ -315,6 +320,21 @@ async fn until(mut condition: impl FnMut() -> bool) {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn sequential_replies_skip_batch_timer() {
+    let fixture = Fixture::new(0);
+    let mut connection = fixture.ready(4096, WireLimits::default(), None).await;
+    let mut bytes = Vec::new();
+    for id in 2..22 {
+        bytes.clear();
+        ping(&mut bytes, id);
+        send(&mut connection.client, &bytes).await;
+        assert_eq!(reply(&mut connection.client, id).await.0.code, "ok");
+    }
+    assert_eq!(connection.stats.timer_waits.load(Relaxed), 0);
+    connection.finish().await;
 }
 
 #[tokio::test]
@@ -445,6 +465,69 @@ async fn idle_connection_ends_after_session_is_closed() {
         .unwrap();
     error(&mut connection.client, 0, "SESSION_NOT_FOUND").await;
     eof(&mut connection.client).await;
+    connection.finish().await;
+}
+
+#[tokio::test]
+async fn batch_entries_count_against_in_flight() {
+    let fixture = Fixture::new(0);
+    let hook = Arc::new(CallHook::new(true));
+    let mut connection = fixture
+        .ready(
+            4096,
+            WireLimits {
+                max_in_flight: 4,
+                ..WireLimits::default()
+            },
+            Some(hook.clone()),
+        )
+        .await;
+    let mut bytes = Vec::new();
+    for (header_id, ids) in [(2, 2..12), (22, 12..22)] {
+        encode_message(
+            &mut bytes,
+            FrameKind::Batch,
+            Flags(0),
+            header_id,
+            &WireBatch {
+                mode: WireBatchMode::StopOnError as i32,
+                entries: ids
+                    .map(|request_id| WireBatchEntry {
+                        request_id,
+                        entry: Some(wire_batch_entry::Entry::Execute(ExecuteRequest {
+                            request: Some(Request::Ping(proto::PingRequest {})),
+                            ..Default::default()
+                        })),
+                    })
+                    .collect(),
+            },
+        );
+    }
+    cancel(&mut bytes, 23, 16);
+    ping(&mut bytes, 22);
+    send(&mut connection.client, &bytes).await;
+    until(|| {
+        connection.stats.in_flight.load(Relaxed) == 4
+            && hook.calls.load(Relaxed) == 1
+            && connection.stats.decoder_len.load(Relaxed) == 0
+            && connection.stats.read_bytes.load(Relaxed) == bytes.len()
+    })
+    .await;
+    hook.release();
+    for id in 2..16 {
+        assert_eq!(reply(&mut connection.client, id).await.0.code, "ok");
+    }
+    error(&mut connection.client, 16, "DEADLINE_EXCEEDED").await;
+    for id in 17..22 {
+        assert_eq!(
+            recv(&mut connection.client).await,
+            (FrameKind::Reply as u8, Flags::SKIPPED, id, vec![])
+        );
+    }
+    assert_eq!(reply(&mut connection.client, 22).await.0.code, "ok");
+    #[cfg(feature = "test-hooks")]
+    assert_eq!(connection.stats.peak_in_flight(), 4);
+    assert_eq!(hook.calls.load(Relaxed), 15);
     connection.finish().await;
 }
 
@@ -800,11 +883,22 @@ async fn spilled_reply_is_reassembled_before_next_reply() {
     sql(&mut bytes, 2, "SELECT body FROM app ORDER BY id");
     ping(&mut bytes, 3);
     send(&mut connection.client, &bytes).await;
-    let (large, frames) = reply(&mut connection.client, 2).await;
+    let (wire, frames) = wire_reply(&mut connection.client, 2).await;
     assert!(
         frames > 5,
         "expected streamed row chunks, got {frames} frames"
     );
+    assert_eq!(
+        wire.shapes,
+        [proto::WireShapeRef {
+            position: 0,
+            shape_id: Some(0),
+            columns: vec!["body".into()],
+        }]
+    );
+    let mut large = wire.reply.unwrap();
+    assert!(large.sql.as_ref().unwrap().columns.is_empty());
+    super::shapes::expand(&mut Vec::new(), &mut large, &wire.shapes).unwrap();
     let sql = large.sql.unwrap();
     assert_eq!(sql.columns, ["body"]);
     assert_eq!(sql.rows.len(), 140);

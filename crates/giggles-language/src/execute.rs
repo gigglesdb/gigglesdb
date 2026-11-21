@@ -42,6 +42,60 @@ pub fn lower_text(text: &str, bindings: &Bindings, version: LanguageVersion) -> 
     }
 }
 
+/// Parsed and lowered data text with no catalog or captured bindings.
+pub struct PreparedText {
+    request: PreparedRequest,
+    version: LanguageVersion,
+}
+
+enum PreparedRequest {
+    Operation(Box<(Statement, operations::Request)>),
+    Transaction(Transaction, operations::Transaction),
+}
+
+/// Prepare native data text, deferring parameter admission to each run.
+///
+/// Syntax and lowering are checked immediately. If both lowering and the
+/// bindings would fail, preparation reports the lowering error. [`lower_text`]
+/// checks the bindings before lowering and preserves its original error order.
+pub fn prepare_text(text: &str, version: LanguageVersion) -> Result<PreparedText> {
+    let request = match parse_input_with_version(text, version)? {
+        ParsedInput::Statement(statement) => {
+            let request = lower_checked(&statement, version)?;
+            PreparedRequest::Operation(Box::new((statement, request)))
+        }
+        ParsedInput::Transaction(transaction) => {
+            let lowered = lower_transaction_checked(&transaction, version)?;
+            PreparedRequest::Transaction(transaction, lowered)
+        }
+        _ => return Err(Error::Unsupported),
+    };
+    Ok(PreparedText { request, version })
+}
+
+impl PreparedText {
+    /// Check this run's bindings and copy them without substituting parameters.
+    pub fn lower(&self, bindings: &Bindings) -> Result<Lowered> {
+        match &self.request {
+            PreparedRequest::Operation(operation) => {
+                let (statement, request) = operation.as_ref();
+                validate_parameter_admission(statement, bindings, self.version)?;
+                Ok(Lowered::Operation {
+                    request: request.clone(),
+                    bindings: bindings.clone(),
+                })
+            }
+            PreparedRequest::Transaction(transaction, lowered) => {
+                validate_transaction_parameters(transaction, bindings, self.version)?;
+                Ok(Lowered::Transaction {
+                    transaction: lowered.clone(),
+                    bindings: bindings.clone(),
+                })
+            }
+        }
+    }
+}
+
 /// Trusted embedded native frontend for the common typed operation engine.
 /// Independent Admin holders retain unrestricted SQL authority.
 #[derive(Clone)]
@@ -2462,3 +2516,74 @@ mod numeric_profile_tests {
     }
 }
 fn sequence_row(value: i64) -> SqlRow { SqlRow { values: vec![Value::Int(value)], version: 0 } }
+
+
+#[cfg(test)]
+mod prepared_text_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_text_matches_direct_lowering() {
+        let cases = [
+            "missing where id=$id select id",
+            "insert missing set id=$id",
+            "update missing where id=$id set name=$name",
+            "delete missing where id=$id",
+            "transaction { insert missing set id=$id; delete missing where id=$id }",
+            "create table t (id int64,primary key(id))",
+            "show tables",
+            "describe table t",
+            "explain t where id=1",
+            "insert t set id=",
+        ];
+        let bindings = Bindings::from([
+            ("id".into(), Value::Int(7)),
+            ("name".into(), Value::Text("new".into())),
+        ]);
+        let version = LanguageVersion::Embedded016;
+        for text in cases {
+            let prepared = prepare_text(text, version);
+            assert_eq!(
+                prepared.and_then(|prepared| prepared.lower(&bindings)),
+                lower_text(text, &bindings, version),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_lowering_keeps_parameter_errors_before_lowering_errors() {
+        let prefix = "insert t set body=\"";
+        let text = format!("{prefix}{}\"", "a".repeat(MAX_INPUT - prefix.len() - 1));
+        let version = LanguageVersion::Embedded016;
+        let bindings = Bindings::from([(
+            "n".into(),
+            Value::Float8(giggles_core::relational::Float8::from_bits(1.0_f64.to_bits())),
+        )]);
+
+        assert!(matches!(prepare_text(&text, version), Err(Error::Limit)));
+        assert_eq!(lower_text(&text, &bindings, version), Err(Error::Unsupported));
+    }
+
+    #[test]
+    fn prepared_text_checks_each_runs_bindings() {
+        let version = LanguageVersion::Embedded016;
+        let bindings = [
+            Bindings::from([("n".into(), Value::Int(7))]),
+            Bindings::from([(
+                "n".into(),
+                Value::Numeric(giggles_core::relational::Numeric::parse("1.25").unwrap()),
+            )]),
+        ];
+        for text in [
+            "insert t set amount=$n",
+            "t where amount=$n",
+            "transaction { t where amount=$n }",
+        ] {
+            let prepared = prepare_text(text, version).unwrap();
+            for bindings in &bindings {
+                assert_eq!(prepared.lower(bindings), lower_text(text, bindings, version), "{text}");
+            }
+        }
+    }
+}

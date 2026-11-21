@@ -7,13 +7,19 @@
 use super::{
     exec::run_call,
     frame::{
-        Direction, Flags, FrameDecoder, FrameHeader, FrameKind, HEADER_LEN, PREFACE_LEN,
-        PROTOCOL_MAJOR, PrefaceError, encode_frame, encode_message, parse_preface,
+        Direction, Flags, FrameDecoder, FrameKind, HEADER_LEN, PREFACE_LEN, PROTOCOL_MAJOR,
+        PrefaceError, encode_frame, encode_message, parse_preface,
     },
-    messages::{WireCancel, WireConnError, WireReady, WireReply},
+    handles::HandleTable,
+    messages::{
+        WireBatch, WireBatchMode, WireCancel, WireCloseHandle, WireConnError, WirePrepare,
+        WirePrepared, WireReady, WireReply, WireRun, wire_batch_entry,
+    },
+    shapes::ShapeTable,
 };
 use crate::{
     MAX_FRAME, MAX_RESPONSE,
+    agent::statement::OperationId,
     api::{
         ApiRuntime, CallOwnership, Completion, ConnectionIdentity, ResponseLease,
         codec::{
@@ -21,7 +27,7 @@ use crate::{
             wire_seam::{SpillChunks, WireCall, WireSession, spill_chunks},
         },
         error::ApiError,
-        proto,
+        native_codec, proto,
     },
     transport::IO_TIMEOUT,
 };
@@ -33,7 +39,10 @@ use std::{
     future::Future,
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering::Relaxed},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -43,10 +52,8 @@ use tokio::{
 };
 use tonic::{Code, Status, codegen::tokio_stream::StreamExt};
 
-#[cfg(feature = "test-hooks")]
-use std::sync::atomic::AtomicBool;
 #[cfg(any(test, feature = "test-hooks"))]
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::AtomicUsize;
 
 const READ_CHUNK: usize = 8 * 1024;
 const LOOKAHEAD_BYTES: usize = 1024 * 1024 + MAX_FRAME;
@@ -54,6 +61,7 @@ const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const RETAIN_CAPACITY: usize = 64 * 1024;
 const REPLY_BATCH_GAP: Duration = Duration::from_millis(1);
 const MAX_AUTH_ROUNDS: usize = 4;
+pub(crate) const MAX_BATCH_ENTRIES: usize = 1024;
 
 pub(crate) struct WireLimits {
     pub max_in_flight: usize,
@@ -112,6 +120,8 @@ pub struct ConnectionStats {
     pub(super) pending_bytes: AtomicUsize,
     #[cfg(test)]
     pub(super) write_capacity: AtomicUsize,
+    #[cfg(test)]
+    pub(super) timer_waits: AtomicUsize,
     #[cfg(feature = "test-hooks")]
     peak_pending_bytes: AtomicUsize,
     #[cfg(feature = "test-hooks")]
@@ -345,7 +355,7 @@ struct Session<'a> {
 }
 
 impl Session<'_> {
-    fn check_idle(&mut self) -> Result<(), ApiError> {
+    fn check_live(&mut self) -> Result<(), ApiError> {
         let session = self.value.as_mut().expect("open session");
         self.runtime.wire_recheck(session)?;
         if !self.runtime.wire_session_alive(session) {
@@ -365,45 +375,188 @@ impl Drop for Session<'_> {
 
 struct Queued {
     id: u32,
-    call: Result<WireCall, ApiError>,
+    request: Result<QueuedRequest, ApiError>,
+    batch: Option<Arc<BatchState>>,
+}
+
+struct BatchState {
+    stop_on_error: bool,
+    failed: AtomicBool,
+}
+
+enum QueuedRequest {
+    Execute(Box<WireCall>),
+    Prepare(WirePrepare),
+    Run(QueuedRun),
+    CloseHandle(WireCloseHandle),
+}
+
+struct QueuedRun {
+    handle: u32,
+    bindings: giggles_language::Bindings,
+    budget_ms: Option<u32>,
+    operation_id: Option<OperationId>,
+    received: Instant,
+}
+
+impl QueuedRun {
+    fn decode(run: WireRun, received: Instant) -> Result<Self, ApiError> {
+        codec::decode_budget(run.budget_ms)?;
+        let operation_id = codec::decode_operation_id(run.operation_id.as_deref())?;
+        Ok(Self {
+            handle: run.handle,
+            bindings: native_codec::bindings(run.bindings)?,
+            budget_ms: run.budget_ms,
+            operation_id,
+            received,
+        })
+    }
+
+    fn resolve(self, handles: &HandleTable, runtime: &ApiRuntime) -> Result<WireCall, ApiError> {
+        let request = handles.invocation(self.handle, self.bindings)?;
+        codec::validate_operation_id(&request, self.operation_id.as_ref())?;
+        wire_call(
+            runtime,
+            request,
+            self.operation_id,
+            self.budget_ms,
+            self.received,
+        )
+    }
 }
 
 struct Deferred {
-    header: FrameHeader,
-    body: Vec<u8>,
+    id: u32,
+    request: DeferredRequest,
+    batch: Option<Arc<BatchState>>,
     received: Instant,
     cancelled: bool,
+    bytes: usize,
+    ends_frame: bool,
+}
+
+enum DeferredRequest {
+    Frame(FrameKind, Vec<u8>),
+    BatchEntry(Box<wire_batch_entry::Entry>),
+}
+
+impl Deferred {
+    fn admit(self, runtime: &ApiRuntime) -> Queued {
+        let request = if self.cancelled {
+            Err(ApiError::DeadlineExceeded)
+        } else {
+            match self.request {
+                DeferredRequest::Frame(kind, body) => {
+                    QueuedRequest::decode_frame(runtime, kind, &body, self.received)
+                }
+                DeferredRequest::BatchEntry(entry) => {
+                    QueuedRequest::decode_entry(runtime, *entry, self.received)
+                }
+            }
+        };
+        Queued {
+            id: self.id,
+            request,
+            batch: self.batch,
+        }
+    }
+}
+
+impl QueuedRequest {
+    fn decode_frame(
+        runtime: &ApiRuntime,
+        kind: FrameKind,
+        body: &[u8],
+        received: Instant,
+    ) -> Result<Self, ApiError> {
+        match kind {
+            FrameKind::Execute => proto::ExecuteRequest::decode(body)
+                .map_err(|_| ApiError::InvalidArgument)
+                .and_then(|request| decode_call(runtime, request, received))
+                .map(Box::new)
+                .map(Self::Execute),
+            FrameKind::Prepare => WirePrepare::decode(body)
+                .map(Self::Prepare)
+                .map_err(|_| ApiError::InvalidArgument),
+            FrameKind::Run => WireRun::decode(body)
+                .map_err(|_| ApiError::InvalidArgument)
+                .and_then(|run| QueuedRun::decode(run, received))
+                .map(Self::Run),
+            FrameKind::CloseHandle => WireCloseHandle::decode(body)
+                .map(Self::CloseHandle)
+                .map_err(|_| ApiError::InvalidArgument),
+            _ => unreachable!("only ordinary request frames can be queued"),
+        }
+    }
+
+    fn decode_entry(
+        runtime: &ApiRuntime,
+        entry: wire_batch_entry::Entry,
+        received: Instant,
+    ) -> Result<Self, ApiError> {
+        match entry {
+            wire_batch_entry::Entry::Execute(request) => decode_call(runtime, request, received)
+                .map(Box::new)
+                .map(Self::Execute),
+            wire_batch_entry::Entry::Run(run) => QueuedRun::decode(run, received).map(Self::Run),
+        }
+    }
 }
 
 impl Queued {
-    fn decode(runtime: &ApiRuntime, header: FrameHeader, body: &[u8], received: Instant) -> Self {
-        let call = if header.kind == FrameKind::Execute {
-            decode_call(runtime, body, received)
-        } else {
-            // Operation handles and batches are implemented in Stack 4.
-            Err(ApiError::InvalidArgument)
-        };
-        Self {
-            id: header.request_id,
-            call,
-        }
-    }
-
     fn cancel(&mut self) {
-        if let Ok(call) = &self.call {
+        if let Ok(QueuedRequest::Execute(call)) = &self.request {
             call.cancel.cancel();
         }
-        self.call = Err(ApiError::DeadlineExceeded);
+        self.request = Err(ApiError::DeadlineExceeded);
     }
 }
 
-fn decode_call(runtime: &ApiRuntime, body: &[u8], received: Instant) -> Result<WireCall, ApiError> {
-    let request = proto::ExecuteRequest::decode(body).map_err(|_| ApiError::InvalidArgument)?;
+fn decode_call(
+    runtime: &ApiRuntime,
+    request: proto::ExecuteRequest,
+    received: Instant,
+) -> Result<WireCall, ApiError> {
     let budget_ms = request.budget_ms;
     let decoded = codec::decode_execute(request)?;
+    wire_call(
+        runtime,
+        decoded.request,
+        decoded.operation_id,
+        budget_ms,
+        received,
+    )
+}
+
+fn decode_batch(
+    body: &[u8],
+    ids: &HashSet<u32>,
+) -> Option<(WireBatchMode, Vec<proto::WireBatchEntry>)> {
+    let batch = WireBatch::decode(body).ok()?;
+    let mode = WireBatchMode::try_from(batch.mode).ok()?;
+    if batch.entries.is_empty() || batch.entries.len() > MAX_BATCH_ENTRIES {
+        return None;
+    }
+    let mut seen = HashSet::with_capacity(batch.entries.len());
+    for entry in &batch.entries {
+        let id = entry.request_id;
+        if id == 0 || entry.entry.is_none() || ids.contains(&id) || !seen.insert(id) {
+            return None;
+        }
+    }
+    Some((mode, batch.entries))
+}
+
+fn wire_call(
+    runtime: &ApiRuntime,
+    request: codec::Invocation,
+    operation_id: Option<OperationId>,
+    budget_ms: Option<u32>,
+    received: Instant,
+) -> Result<WireCall, ApiError> {
     Ok(WireCall {
-        request: decoded.request,
-        operation_id: decoded.operation_id,
+        request,
+        operation_id,
         budget_ms,
         received,
         cancel: runtime.wire_cancellation(received, budget_ms)?,
@@ -414,36 +567,51 @@ struct ActiveCall {
     id: u32,
     cancel: Cancellation,
     _ownership: Arc<CallOwnership>,
+    batch: Option<Arc<BatchState>>,
 }
 
 struct Delivery {
     call: ActiveCall,
     lease: ResponseLease,
     chunks: Option<SpillChunks<Result<proto::ExecuteReply, Status>>>,
+    shape_checkpoint: usize,
     part: Vec<u8>,
     offset: usize,
     next: Option<Vec<u8>>,
+    failed: bool,
 }
 
 impl Delivery {
-    fn new(call: ActiveCall, completion: Completion) -> Self {
+    fn new(call: ActiveCall, completion: Completion, shapes: &mut ShapeTable) -> Self {
         let Completion {
             reply,
             spill,
             lease,
             ..
         } = completion;
+        // A shape definition becomes visible to the client when the final
+        // frame completes the logical reply. Discard tentative IDs on abort.
+        let shape_checkpoint = shapes.checkpoint();
+        // Legacy task preview, decision, and status have distinct success
+        // codes. SQL failures are carried here as SQLSTATEs, e.g. 23505.
+        let failed = call.batch.is_some()
+            && !matches!(
+                reply.code.as_str(),
+                "ok" | "preview" | "committed" | "absent"
+            );
         let (part, chunks) = match spill {
             Some(spill) => (Vec::new(), Some(spill_chunks(reply, Some(spill)))),
-            None => (encode_reply(reply), None),
+            None => (encode_reply(shapes, reply), None),
         };
         Self {
             call,
             lease,
             chunks,
+            shape_checkpoint,
             part,
             offset: 0,
             next: None,
+            failed,
         }
     }
 
@@ -462,6 +630,12 @@ impl Delivery {
             self.call.id,
             &self.part[self.offset..end],
         );
+        if !more
+            && self.failed
+            && let Some(batch) = &self.call.batch
+        {
+            batch.failed.store(true, Relaxed);
+        }
         self.offset = end;
         if self.offset == self.part.len()
             && let Some(next) = self.next.take()
@@ -476,9 +650,11 @@ impl Delivery {
         self.chunks.as_mut().expect("active spill").next().await
     }
 
-    fn accept_chunk(&mut self, chunk: Option<proto::ExecuteReply>) {
+    fn accept_chunk(&mut self, shapes: &mut ShapeTable, chunk: Option<proto::ExecuteReply>) {
         if let Some(reply) = chunk {
-            let bytes = encode_reply(reply);
+            // Only the spill head carries columns. Continuations have rows
+            // alone, so concatenating their envelopes preserves positions.
+            let bytes = encode_reply(shapes, reply);
             if self.part.is_empty() {
                 self.part = bytes;
             } else {
@@ -491,10 +667,11 @@ impl Delivery {
     }
 }
 
-fn encode_reply(reply: proto::ExecuteReply) -> Vec<u8> {
+fn encode_reply(shapes: &mut ShapeTable, mut reply: proto::ExecuteReply) -> Vec<u8> {
+    let refs = shapes.compress(&mut reply);
     WireReply {
         reply: Some(reply),
-        shapes: Vec::new(),
+        shapes: refs,
     }
     .encode_to_vec()
 }
@@ -527,6 +704,7 @@ fn request_error(
     ids: &mut HashSet<u32>,
     id: u32,
     error: ApiError,
+    batch: Option<&BatchState>,
 ) -> bool {
     let fatal = matches!(error, ApiError::Unauthenticated | ApiError::SessionNotFound);
     let recheck_error = if fatal {
@@ -539,6 +717,9 @@ fn request_error(
             .err()
     };
     append_api_error(out, id, recheck_error.unwrap_or(error));
+    if let Some(batch) = batch {
+        batch.failed.store(true, Relaxed);
+    }
     ids.remove(&id);
     fatal || recheck_error.is_some()
 }
@@ -625,12 +806,17 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
     let mut queued: VecDeque<Queued> = VecDeque::new();
     let mut deferred: VecDeque<Deferred> = VecDeque::new();
     let mut deferred_bytes = 0;
+    let mut deferred_frames = 0;
     let mut lookahead_frames = 0;
-    // Both admitted and deferred request IDs stay reserved until their reply.
+    // All reply IDs stay reserved. ids.len() - deferred.len() counts admitted
+    // entries and never exceeds max_in_flight. Lookahead counts source frames,
+    // including one slot for a batch until its last deferred entry is promoted.
     let mut ids = HashSet::new();
     let mut running = None;
     let mut active: Option<ActiveCall> = None;
     let mut delivery: Option<Delivery> = None;
+    let mut shapes = ShapeTable::new(limits.max_shapes);
+    let mut handles = HandleTable::new(limits.max_handles);
     let mut pending = Vec::new();
     let mut writing = None;
     let mut writing_bytes = 0;
@@ -647,23 +833,16 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                 let slots = limits.max_in_flight - (ids.len() - deferred.len());
                 if slots > 0 {
                     for _ in 0..slots {
-                        let Some(frame) = deferred.pop_front() else {
+                        let Some(entry) = deferred.pop_front() else {
                             break;
                         };
-                        deferred_bytes -= HEADER_LEN + frame.body.len();
-                        let entry = if frame.cancelled {
-                            Queued {
-                                id: frame.header.request_id,
-                                call: Err(ApiError::DeadlineExceeded),
-                            }
-                        } else {
-                            Queued::decode(runtime, frame.header, &frame.body, frame.received)
-                        };
-                        queued.push_back(entry);
+                        deferred_bytes -= entry.bytes;
+                        deferred_frames -= usize::from(entry.ends_frame);
+                        queued.push_back(entry.admit(runtime));
                     }
                     // A freed slot starts a new lookahead window. Held frames
                     // continue to count against it.
-                    lookahead_frames = deferred.len();
+                    lookahead_frames = deferred_frames;
                 }
                 if lookahead_frames == limits.max_in_flight {
                     break;
@@ -673,7 +852,8 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                     Ok(None) => break,
                     Err(_) => break 'connection Exit::Protocol("invalid frame header"),
                 };
-                let full = ids.len() - deferred.len() == limits.max_in_flight;
+                let available = limits.max_in_flight - (ids.len() - deferred.len());
+                let full = available == 0;
                 lookahead_frames += usize::from(full);
                 let id = header.request_id;
                 if id == 0 || ids.contains(&id) || header.flags.0 != 0 {
@@ -683,21 +863,89 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                     FrameKind::Execute
                     | FrameKind::Prepare
                     | FrameKind::Run
-                    | FrameKind::CloseHandle
-                    | FrameKind::Batch => {
-                        ids.insert(id);
+                    | FrameKind::CloseHandle => {
                         let received = Instant::now();
                         let body = decoder.body(body);
                         if full {
-                            deferred_bytes += HEADER_LEN + body.len();
+                            let bytes = HEADER_LEN + body.len();
+                            deferred_bytes += bytes;
+                            deferred_frames += 1;
                             deferred.push_back(Deferred {
-                                header,
-                                body: body.to_vec(),
+                                id,
+                                request: DeferredRequest::Frame(header.kind, body.to_vec()),
+                                batch: None,
                                 received,
                                 cancelled: false,
+                                bytes,
+                                ends_frame: true,
                             });
                         } else {
-                            queued.push_back(Queued::decode(runtime, header, body, received));
+                            queued.push_back(Queued {
+                                id,
+                                request: QueuedRequest::decode_frame(
+                                    runtime,
+                                    header.kind,
+                                    body,
+                                    received,
+                                ),
+                                batch: None,
+                            });
+                        }
+                        ids.insert(id);
+                    }
+                    FrameKind::Batch => {
+                        let received = Instant::now();
+                        let Some((mode, entries)) = decode_batch(decoder.body(body), &ids) else {
+                            break 'connection Exit::Protocol("invalid BATCH frame");
+                        };
+                        // The header ID passed the common check but only
+                        // entry IDs are reserved and appear in replies.
+                        let count = entries.len();
+                        if count > available {
+                            deferred_frames += 1;
+                            lookahead_frames += usize::from(!full);
+                        }
+                        let batch = Arc::new(BatchState {
+                            stop_on_error: mode == WireBatchMode::StopOnError,
+                            failed: AtomicBool::new(false),
+                        });
+                        for (index, entry) in entries.into_iter().enumerate() {
+                            let id = entry.request_id;
+                            let entry_len = entry.encoded_len();
+                            let request = entry.entry.expect("validated batch entry");
+                            if index < available {
+                                queued.push_back(Queued {
+                                    id,
+                                    request: QueuedRequest::decode_entry(
+                                        runtime, request, received,
+                                    ),
+                                    batch: Some(batch.clone()),
+                                });
+                            } else {
+                                let ends_frame = index + 1 == count;
+                                // Charge the protobuf entry's field key, length
+                                // and payload. Keep shared framing bytes with
+                                // the final entry while any of the batch is held.
+                                let bytes = 1
+                                    + prost::length_delimiter_len(entry_len)
+                                    + entry_len
+                                    + if ends_frame {
+                                        HEADER_LEN + 2 * usize::from(batch.stop_on_error)
+                                    } else {
+                                        0
+                                    };
+                                deferred_bytes += bytes;
+                                deferred.push_back(Deferred {
+                                    id,
+                                    request: DeferredRequest::BatchEntry(Box::new(request)),
+                                    batch: Some(batch.clone()),
+                                    received,
+                                    cancelled: false,
+                                    bytes,
+                                    ends_frame,
+                                });
+                            }
+                            ids.insert(id);
                         }
                     }
                     FrameKind::Cancel => {
@@ -714,6 +962,7 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                             .is_some_and(|reply| reply.call.id == target)
                         {
                             let reply = delivery.take().expect("matching delivery");
+                            shapes.rollback(reply.shape_checkpoint);
                             reply.call.cancel.cancel();
                             close_after_reply = request_error(
                                 &mut session,
@@ -721,6 +970,7 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                                 &mut ids,
                                 target,
                                 ApiError::DeadlineExceeded,
+                                reply.call.batch.as_deref(),
                             );
                             // The error frees a slot and may use the last reply space.
                             if close_after_reply
@@ -732,10 +982,10 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                             queued.iter_mut().find(|entry| entry.id == target)
                         {
                             entry.cancel();
-                        } else if let Some(frame) =
-                            deferred.iter_mut().find(|frame| frame.header.request_id == target)
+                        } else if let Some(entry) =
+                            deferred.iter_mut().find(|entry| entry.id == target)
                         {
-                            frame.cancelled = true;
+                            entry.cancelled = true;
                         }
                     }
                     FrameKind::Goodbye if body.is_empty() => break 'connection Exit::Goodbye,
@@ -754,7 +1004,9 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
         }
         let filled_queue = ids.len() - deferred.len() == limits.max_in_flight;
         #[cfg(feature = "test-hooks")]
-        stats.peak_in_flight.fetch_max(ids.len() - deferred.len(), Relaxed);
+        stats
+            .peak_in_flight
+            .fetch_max(ids.len() - deferred.len(), Relaxed);
         while !close_after_reply && writing_bytes + pending.len() < limits.max_pending_reply_bytes {
             if let Some(reply) = delivery.as_mut() {
                 #[cfg(feature = "test-hooks")]
@@ -776,8 +1028,15 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                         ids.remove(&reply.call.id);
                     }
                     Err(error) => {
-                        close_after_reply =
-                            request_error(&mut session, &mut pending, &mut ids, reply.call.id, error);
+                        shapes.rollback(reply.shape_checkpoint);
+                        close_after_reply = request_error(
+                            &mut session,
+                            &mut pending,
+                            &mut ids,
+                            reply.call.id,
+                            error,
+                            reply.call.batch.as_deref(),
+                        );
                     }
                 }
                 delivery = None;
@@ -789,12 +1048,100 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                 let Some(entry) = queued.pop_front() else {
                     break;
                 };
-                let admission = match entry.call {
+                // A session runs one entry at a time. Its error is recorded
+                // when the reply is queued, before the next entry is popped.
+                if entry
+                    .batch
+                    .as_ref()
+                    .is_some_and(|batch| batch.stop_on_error && batch.failed.load(Relaxed))
+                {
+                    encode_frame(
+                        &mut pending,
+                        FrameKind::Reply,
+                        Flags(Flags::SKIPPED),
+                        entry.id,
+                        &[],
+                    );
+                    ids.remove(&entry.id);
+                    continue;
+                }
+                // Handle controls reply directly. Check liveness, then charge
+                // the shared rate before touching the handle table.
+                let handle_control = matches!(
+                    &entry.request,
+                    Ok(QueuedRequest::Prepare(_) | QueuedRequest::CloseHandle(_))
+                );
+                if handle_control
+                    && let Err(error) = session
+                        .as_mut()
+                        .expect("open session")
+                        .check_live()
+                        .and_then(|()| runtime.admit_call(socket.clone()).map(drop))
+                {
+                    close_after_reply = request_error(
+                        &mut session,
+                        &mut pending,
+                        &mut ids,
+                        entry.id,
+                        error,
+                        entry.batch.as_deref(),
+                    );
+                    continue;
+                }
+                // Resolve connection-local handles in request order, after
+                // the preceding requests have run or modified the table.
+                let call = match entry.request {
+                    Ok(QueuedRequest::Execute(call)) => Ok(*call),
+                    Ok(QueuedRequest::Run(run)) => run.resolve(&handles, runtime),
+                    Ok(QueuedRequest::Prepare(prepare)) => {
+                        match handles.prepare(&prepare.text, prepare.language_version.as_deref()) {
+                            Ok(handle) => {
+                                encode_message(
+                                    &mut pending,
+                                    FrameKind::Prepared,
+                                    Flags(0),
+                                    entry.id,
+                                    &WirePrepared { handle },
+                                );
+                                ids.remove(&entry.id);
+                                continue;
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Ok(QueuedRequest::CloseHandle(close)) => {
+                        if handles.close(close.handle) {
+                            // REPLY acknowledges the close without reporting a
+                            // transaction state. Closing only changes the table.
+                            encode_message(
+                                &mut pending,
+                                FrameKind::Reply,
+                                Flags(0),
+                                entry.id,
+                                &WireReply {
+                                    reply: Some(proto::ExecuteReply {
+                                        version: 1,
+                                        code: "ok".into(),
+                                        ..Default::default()
+                                    }),
+                                    shapes: vec![],
+                                },
+                            );
+                            ids.remove(&entry.id);
+                            continue;
+                        }
+                        Err(ApiError::InvalidArgument)
+                    }
+                    Err(error) => Err(error),
+                };
+                let admission = match call {
                     Ok(call) => call
                         .cancel
                         .check()
                         .map_err(|_| ApiError::DeadlineExceeded)
                         .and_then(|()| Ok((call, runtime.admit_call(socket.clone())?))),
+                    // Handle controls were charged before the table operation.
+                    Err(error) if handle_control => Err(error),
                     // A request that fails to decode is still an API attempt:
                     // charge the shared rate like HTTP and gRPC do for
                     // malformed bodies, so a client cannot send unlimited
@@ -813,6 +1160,7 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                             id: entry.id,
                             cancel: call.cancel.clone(),
                             _ownership: ownership.clone(),
+                            batch: entry.batch,
                         });
                         running = Some(Box::pin(execute(
                             session.take().expect("open session"),
@@ -823,7 +1171,14 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                         )));
                     }
                     Err(error) => {
-                        close_after_reply = request_error(&mut session, &mut pending, &mut ids, entry.id, error);
+                        close_after_reply = request_error(
+                            &mut session,
+                            &mut pending,
+                            &mut ids,
+                            entry.id,
+                            error,
+                            entry.batch.as_deref(),
+                        );
                     }
                 }
             } else {
@@ -870,10 +1225,10 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
         }
         // Read controls and detect EOF even with every request slot occupied.
         // The shared byte cap includes both deferred frames and unread bytes.
-        let read_limit = READ_CHUNK.min(LOOKAHEAD_BYTES - deferred_bytes - decoder_len);
-        let can_read = can_decode
-            && read_limit > 0
-            && (has_slot || lookahead_frames < limits.max_in_flight);
+        let read_limit =
+            READ_CHUNK.min(LOOKAHEAD_BYTES.saturating_sub(deferred_bytes + decoder_len));
+        let can_read =
+            can_decode && read_limit > 0 && (has_slot || lookahead_frames < limits.max_in_flight);
         let can_pull_chunk = below_cap
             && delivery
                 .as_ref()
@@ -912,7 +1267,7 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                 if stats.hold_idle_checks.load(Relaxed) {
                     continue;
                 }
-                if let Err(error) = session.as_mut().expect("open session").check_idle() {
+                if let Err(error) = session.as_mut().expect("open session").check_live() {
                     break Exit::Session(error);
                 }
             }
@@ -928,9 +1283,11 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                     Ok(completion) => {
                         #[cfg(feature = "test-hooks")]
                         { paused_stream = false; }
-                        delivery = Some(Delivery::new(call, completion));
+                        delivery = Some(Delivery::new(call, completion, &mut shapes));
                     }
-                    Err(error) => close_after_reply = request_error(&mut session, &mut pending, &mut ids, call.id, error),
+                    Err(error) => close_after_reply = request_error(
+                        &mut session, &mut pending, &mut ids, call.id, error, call.batch.as_deref(),
+                    ),
                 }
                 last_reply = tokio::time::Instant::now();
             }
@@ -938,16 +1295,29 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                 match chunk {
                     Some(Err(status)) => {
                         let reply = delivery.take().expect("active spill");
+                        shapes.rollback(reply.shape_checkpoint);
                         let error = match status.code() {
                             Code::ResourceExhausted => ApiError::ResourceExhausted,
                             _ => ApiError::Internal,
                         };
-                        close_after_reply = request_error(&mut session, &mut pending, &mut ids, reply.call.id, error);
+                        close_after_reply = request_error(
+                            &mut session, &mut pending, &mut ids, reply.call.id, error, reply.call.batch.as_deref(),
+                        );
                     }
-                    chunk => delivery.as_mut().expect("active spill").accept_chunk(chunk.transpose().expect("successful chunk")),
+                    chunk => delivery.as_mut().expect("active spill").accept_chunk(
+                        &mut shapes,
+                        chunk.transpose().expect("successful chunk"),
+                    ),
                 }
             }
-            _ = sleep_until(write_at), if writing.is_none() && !pending.is_empty() => {
+            _ = async {
+                // A sleep for an elapsed deadline can still wait for the next timer tick.
+                if write_at > tokio::time::Instant::now() {
+                    #[cfg(test)]
+                    stats.timer_waits.fetch_add(1, Relaxed);
+                    sleep_until(write_at).await;
+                }
+            }, if writing.is_none() && !pending.is_empty() => {
                 writing_bytes = pending.len();
                 writing = Some(Box::pin(write_batch(writer.take().expect("idle writer"), std::mem::take(&mut pending))));
             }

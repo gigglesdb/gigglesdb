@@ -67,25 +67,36 @@ impl Invocation {
         };
         // GD-0061 R3-113: task statements come first in the profiles that
         // have them; their head words are never data operations.
-        if language_version.supports_tasks()
-            && let Ok(statement) = giggles_language::parse_task_with_version(&text, language_version)
-        {
+        if let Some(statement) = text_task_statement(&text, language_version) {
             return Ok(Self::TaskDdl(statement));
         }
-        match giggles_language::lower_text(&text, &bindings, language_version)
-            .map_err(|_| ApiError::InvalidArgument)?
-        {
+        giggles_language::lower_text(&text, &bindings, language_version)
+            .map(Self::from)
+            .map_err(|_| ApiError::InvalidArgument)
+    }
+}
+
+impl From<giggles_language::Lowered> for Invocation {
+    fn from(lowered: giggles_language::Lowered) -> Self {
+        match lowered {
             giggles_language::Lowered::Operation { request, bindings } => {
-                Ok(Self::Operation { request, bindings })
+                Self::Operation { request, bindings }
             }
-            giggles_language::Lowered::Transaction {
-                transaction,
-                bindings,
-            } => Ok(Self::Transaction {
-                transaction,
-                bindings,
-            }),
+            giggles_language::Lowered::Transaction { transaction, bindings } => {
+                Self::Transaction { transaction, bindings }
+            }
         }
+    }
+}
+
+pub(crate) fn text_task_statement(
+    text: &str,
+    version: giggles_language::LanguageVersion,
+) -> Option<giggles_core::task::statements::TaskStatement> {
+    if version.supports_tasks() {
+        giggles_language::parse_task_with_version(text, version).ok()
+    } else {
+        None
     }
 }
 
@@ -98,26 +109,36 @@ pub struct DecodedExecute {
     pub operation_id: Option<crate::agent::statement::OperationId>,
 }
 
-pub fn decode_execute(mut input: proto::ExecuteRequest) -> Result<DecodedExecute, ApiError> {
-    super::native_codec::validate(&input)?;
+pub(crate) fn validate_execute(input: &proto::ExecuteRequest) -> Result<(), ApiError> {
+    super::native_codec::validate(input)?;
     if input.encoded_len() > crate::MAX_FRAME {
         return Err(ApiError::PayloadTooLarge);
     }
-    let budget_ms = input.budget_ms.unwrap_or(10_000);
+    Ok(())
+}
+
+pub(crate) fn decode_budget(budget_ms: Option<u32>) -> Result<u32, ApiError> {
+    let budget_ms = budget_ms.unwrap_or(10_000);
     if budget_ms > 10_000 {
         return Err(ApiError::InvalidArgument);
     }
-    let operation_id = input
-        .operation_id
-        .take()
-        .map(|id| {
-            crate::agent::statement::OperationId::new(&id).ok_or(ApiError::InvalidArgument)
-        })
-        .transpose()?;
-    let request = decode_request(input.request.ok_or(ApiError::InvalidArgument)?)?;
-    // design-2 section 5: the ID is required with an update and task_apply,
-    // read by task_outcome, and invalid with anything else.
-    let takes_id = match &request {
+    Ok(budget_ms)
+}
+
+pub(crate) fn decode_operation_id(
+    id: Option<&str>,
+) -> Result<Option<crate::agent::statement::OperationId>, ApiError> {
+    id.map(|id| crate::agent::statement::OperationId::new(id).ok_or(ApiError::InvalidArgument))
+        .transpose()
+}
+
+pub(crate) fn validate_operation_id(
+    request: &Invocation,
+    operation_id: Option<&crate::agent::statement::OperationId>,
+) -> Result<(), ApiError> {
+    // Task dispatch requires an ID for protected updates. At decoding time
+    // updates may carry one, and task_apply and task_outcome must carry one.
+    let takes_id = match request {
         Invocation::Operation { request, .. } => {
             super::native::request_class(request) == giggles_core::task::StatementClass::Update
         }
@@ -132,6 +153,15 @@ pub fn decode_execute(mut input: proto::ExecuteRequest) -> Result<DecodedExecute
     if operation_id.is_some() && !takes_id {
         return Err(ApiError::InvalidArgument);
     }
+    Ok(())
+}
+
+pub fn decode_execute(input: proto::ExecuteRequest) -> Result<DecodedExecute, ApiError> {
+    validate_execute(&input)?;
+    let budget_ms = decode_budget(input.budget_ms)?;
+    let operation_id = decode_operation_id(input.operation_id.as_deref())?;
+    let request = decode_request(input.request.ok_or(ApiError::InvalidArgument)?)?;
+    validate_operation_id(&request, operation_id.as_ref())?;
     Ok(DecodedExecute {
         request,
         budget_ms,
@@ -139,15 +169,20 @@ pub fn decode_execute(mut input: proto::ExecuteRequest) -> Result<DecodedExecute
     })
 }
 
-fn text_invocation(v: proto::NativeTextRequest) -> Result<Invocation, ApiError> {
-    let language_version = v
-        .language_version
-        .map(|v| {
-            serde_json::from_value(serde_json::Value::String(v))
+pub(crate) fn decode_language_version(
+    version: Option<&str>,
+) -> Result<giggles_language::LanguageVersion, ApiError> {
+    Ok(version
+        .map(|version| {
+            serde_json::from_value(serde_json::Value::String(version.into()))
                 .map_err(|_| ApiError::InvalidArgument)
         })
         .transpose()?
-        .unwrap_or(giggles_language::LanguageVersion::Embedded01);
+        .unwrap_or(giggles_language::LanguageVersion::Embedded01))
+}
+
+fn text_invocation(v: proto::NativeTextRequest) -> Result<Invocation, ApiError> {
+    let language_version = decode_language_version(v.language_version.as_deref())?;
     Invocation::Text {
         text: v.text,
         bindings: super::native_codec::bindings(v.bindings)?,
