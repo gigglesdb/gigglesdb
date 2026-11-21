@@ -31,9 +31,9 @@ choose another task subdirectory of that root.
 1. Run **01 Setup local demo**. The first run builds the server smoke test, creates
    development TLS credentials and an application database, and creates a separate
    embedded database containing a `notes` table and one example row.
-2. Run **02 Server**. Wait for `native=127.0.0.1:7432 postgres=127.0.0.1:7433`.
+2. Run **02 Server**. Wait for `wire=127.0.0.1:7432 postgres=127.0.0.1:7433`.
 3. While it stays running, run **03 Client Ping**, then **04 Client SQL query**.
-   The query reads the initially empty `app` table over authenticated native JSON.
+   The query reads the initially empty `app` table over authenticated native wire.
 
 Type `shutdown` and Enter in the server console to stop gracefully. The IDE Stop
 button terminates the process. Only one server can bind these ports. If startup

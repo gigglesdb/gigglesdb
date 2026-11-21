@@ -4,6 +4,14 @@ mod api_support;
 use giggles_core::{Admin, Limits, roles::NewRole};
 #[cfg(feature = "legacy-task")]
 use giggles_core::{CoreError, Error};
+#[cfg(feature = "legacy-task")]
+use giggles_server::{
+    api::proto,
+    wire::{
+        client::{Client, ClientTls, Credential},
+        listen::serve_wire_bound,
+    },
+};
 use giggles_server::{
     Running, Service,
     auth::{PostgresqlConfig, TlsMode, serve_postgresql},
@@ -594,46 +602,45 @@ async fn copy_authority_precedes_classification_on_native_and_non_sql_surfaces()
         vec![f.ca.cert.der().clone()],
     )
     .unwrap();
-    let native = giggles_server::serve(
-        "127.0.0.1:0".parse().unwrap(),
-        f.service.clone(),
-        config,
-        16,
-    )
-    .await
-    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_open, gate) = tokio::sync::watch::channel(true);
+    let native = serve_wire_bound(listener, f.runtime.clone(), config, 16, gate)
+        .await
+        .unwrap();
     for (cert, task) in [(&f.app, false), (&f.task, true)] {
-        let mut config = (*f.client_config(cert, false)).clone();
-        config.alpn_protocols.clear();
-        let mut client =
-            giggles_server::Client::connect(native.address, "localhost", Arc::new(config))
-                .await
-                .unwrap();
+        let tls = ClientTls {
+            ca: f.ca.cert.pem().into_bytes(),
+            cert: Some(cert.cert.pem().into_bytes()),
+            key: Some(cert.key.serialize_pem().into_bytes()),
+            server_name: "localhost".into(),
+        };
+        let (mut client, _) = Client::connect(
+            native.address,
+            Some(tls),
+            proto::OpenSessionRequest::default(),
+            Credential::None,
+        )
+        .await
+        .unwrap();
         for sql in statements {
-            let response = client
-                .call(&giggles_server::Request::Sql {
-                    sql: sql.into(),
-                    params: vec![],
-                })
-                .await
-                .unwrap();
+            let response = client.execute(api_support::sql(sql)).await.unwrap();
             assert_eq!(
                 response.code, "42501",
                 "native task={task}, {sql}: {response:?}"
             );
             assert!(response.sql.is_none(), "{response:?}");
             let usable = if task {
-                giggles_server::Request::Status {
-                    operation: giggles_core::OperationId(1),
+                proto::ExecuteRequest {
+                    request: Some(proto::execute_request::Request::Status(proto::StatusRequest {
+                        operation: Some(1),
+                    })),
+                    ..Default::default()
                 }
             } else {
-                giggles_server::Request::Sql {
-                    sql: "SELECT id FROM app".into(),
-                    params: vec![],
-                }
+                api_support::sql("SELECT id FROM app")
             };
             assert_eq!(
-                client.call(&usable).await.unwrap().code,
+                client.execute(usable).await.unwrap().code,
                 if task { "absent" } else { "ok" }
             );
         }

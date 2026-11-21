@@ -1,6 +1,6 @@
 # giggles-server
 
-The GigglesDB server exposes SQL over the PostgreSQL wire protocol and optional native, HTTP and gRPC interfaces. Use it to connect database clients to a configured service.
+The GigglesDB server exposes SQL over the PostgreSQL wire protocol and optional framed native wire, HTTP and gRPC interfaces. Use it to connect database clients to a configured service.
 
 **Status:** Supports local development and configured services; PostgreSQL compatibility is bounded and listener capabilities differ.
 
@@ -82,8 +82,8 @@ WARNING: --trust-local lets any local process connect as any role without a pass
 ## Configured mTLS service
 
 Run `giggles-server CONFIG.json`. It opens an existing
-embedded database and exposes a JSON protocol and a bounded PostgreSQL wire
-interface. These configured mTLS listeners require server and client
+embedded database and exposes a bounded PostgreSQL wire interface and an optional
+framed native wire listener. These configured mTLS listeners require server and client
 certificates; they do not offer password fallback or plaintext connections.
 
 Optional HTTPS/JSON and typed gRPC listeners expose structured native reads,
@@ -137,7 +137,7 @@ cargo run --locked --bin giggles-server -- "$fixture/server.TEST-ONLY.json"
 Successful startup prints:
 
 ```text
-native=127.0.0.1:7432 postgres=127.0.0.1:7433 preview=single-host
+wire=127.0.0.1:7432 postgres=127.0.0.1:7433 preview=single-host
 ```
 
 Leave this terminal running. Type `shutdown` and press Enter, or press Ctrl-C,
@@ -171,9 +171,10 @@ This `giggles-client` binary belongs to **`giggles-server`**. Each invocation
 of the helper above opens a new connection, so use a persistent client connection
 for multi-statement transactions.
 
-Here, “native” means the framed JSON transport; `Sql` requests still contain SQL.
-See the [native language guide](../giggles-language/README.md) for the separate
-embedded language frontend.
+The client sends SQL over framed native wire, including when it reads a local
+JSON request file. Use `--ping`, `--sql TEXT`, or `--native-text TEXT` in place
+of the file path. See the [native language guide](../giggles-language/README.md)
+for native language syntax.
 
 ### PostgreSQL clients and configuration for the mTLS listener
 
@@ -182,7 +183,7 @@ In the mTLS fixture above, port **7433** implements a bounded PostgreSQL wire su
 query/transaction cases. TLS is required, hostname
 `localhost`, user/database `giggles`, and the same application certificate/key/CA.
 The certificate binding determines authority. General `psql`, JDBC and ORM
-compatibility has not been qualified; use the bundled JSON client above for the
+compatibility has not been qualified; use the bundled wire client above for the
 quickstart. See the [network compatibility matrix](COMPATIBILITY.md)
 and the protocol reference below for supported messages and driver examples.
 
@@ -194,9 +195,11 @@ GUI introspection is not yet qualified. To check capabilities before configuring
 databases and reports each passing, failing and untested case. Failed or untested
 cases deliberately produce a nonzero exit code.
 
-The JSON configuration specifies `database`, `native`, `postgres`, `certificate`,
+The JSON configuration specifies `database`, `postgres`, `certificate`,
 `private_key`, `client_ca`, `bindings`, `connections`, `skew_seconds` and
-`max_pause_seconds`. Paths inside it resolve against the **process working
+`max_pause_seconds`. Set `wire` to enable the framed native wire listener.
+`native` is a deprecated alias for `wire` and keeps the `native=<addr>` startup
+label. Setting both keys fails at startup. Paths resolve against the **process working
 directory**, not the configuration file's directory. Keep using
 `crates/giggles-server`, or convert those paths to absolute paths when moving the
 configuration.
@@ -210,7 +213,7 @@ for adding bindings and certificate rotation.
 
 ### Troubleshooting
 
-- **Address already in use:** change `native` and `postgres` in your configuration
+- **Address already in use:** change `wire` and `postgres` in your configuration
   to unused loopback ports, and update the client address accordingly.
 - **File not found:** check your working directory and fixture path. A missing
   database is an error, not a request to create one.
@@ -223,7 +226,7 @@ for adding bindings and certificate rotation.
   table permissions in the binding. PostgreSQL wire support does not imply all
   PostgreSQL SQL is implemented.
 
-## Details: legacy single-host service
+## Details: single-host service
 
 Rust server and native client over the existing giggles-core/redb database. This
 is local implementation evidence, not production, cloud, ORM or general
@@ -252,7 +255,7 @@ With the test finished, use its printed directory in these commands:
 cargo run --bin giggles-server -- artifacts/NETWORK-FIXTURE/server.TEST-ONLY.json
 ```
 
-The fixture configuration binds native to `127.0.0.1:7432` and pgwire to
+The fixture configuration binds `wire` to `127.0.0.1:7432` and pgwire to
 `127.0.0.1:7433`. Startup prints actual addresses. If those ports are occupied,
 edit a copy of the configuration to unused loopback ports. The database must
 already exist. The server never creates or silently replaces a missing database.
@@ -265,38 +268,9 @@ Create a local request file containing `{"kind":"Ping"}` and run:
 cargo run --bin giggles-client -- 127.0.0.1:7432 localhost artifacts/NETWORK-FIXTURE/app.pem artifacts/NETWORK-FIXTURE/app.key.TEST-ONLY artifacts/NETWORK-FIXTURE/ca.pem REQUEST.json
 ```
 
-Native protocol: one big-endian u32 payload length followed by UTF8 JSON. Responses
-are framed the same way. Request examples:
-
-```json
-{"kind":"Sql","sql":"INSERT INTO app (id,body) VALUES ($1,$2)","params":[{"Int":9},{"Text":"hello"}]}
-```
-
-```json
-{"kind":"Status","operation":700}
-```
-
-```json
-{"kind":"RepairSql","operation":701,"sql":"UPDATE deliveries SET status = 'queued' WHERE tenant = 42 AND id = 7","approval":null}
-```
-
-Finite repair SQL requires whitespace around operators; it is the core's existing
-repair parser, not generic application SQL. Preview and Execute use the existing
-typed repair Request. Approval IDs come from a separate trusted local approver.
-Remote Preview returns only count/digest; an approver independently obtains the
-exact full preview through trusted local APIs. Network clients cannot approve.
-
-An optional `{"kind":"Deadline","budget_ms":0,"request":{...}}` supplies a
-cooperative decision budget (maximum10000ms) from complete-frame receipt. Frame
-reading retains its separate10s timeout. One envelope only. Expiry before the
-atomic business decision returns57014 without that invocation publishing business
-rows, approvals, budgets or receipts. Checks include task/core lock waits and the
-final redb commit fence. Native decode still awaits blocking admission; the budget
-includes that wait and is checked once decoded, without a queue latency promise.
-After decision wins, expiry cannot replace success or ambiguous storage errors.
-No unsafe interruption or automatic retry is used. Task OperationId identifies the
-original durable operation, not the current invocation:57014 on a retry never
-proves an earlier attempt rolled back; reconcile its status.
+The framed native wire protocol uses protobuf messages. The old length-prefixed
+JSON transport has been removed. Local JSON request files still support parameterized
+SQL and a single `Deadline` wrapper with a cooperative `budget_ms` up to 10000.
 
 PostgreSQL BackendKeyData is generated with OS crypto randomness. Use the pinned
 driver's `cancel_token().cancel_query(...)` with the same mTLS client certificate

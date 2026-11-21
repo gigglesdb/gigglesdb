@@ -643,6 +643,41 @@ async fn frame_before_hello_is_protocol_error() {
     connection.finish().await;
 }
 
+/// The preface and HELLO share one IO_TIMEOUT (spec section 2). A client that
+/// finishes the preface late and then drips the HELLO header is closed at the
+/// first deadline (about 10 s), not 10 s after the preface (about 18 s).
+#[tokio::test]
+async fn dripping_preface_and_hello_share_one_deadline() {
+    let fixture = Fixture::new(0);
+    let mut connection = fixture.connect(
+        4096,
+        WireLimits::default(),
+        None,
+        Ok(fixture.identity.clone()),
+    );
+    let started = std::time::Instant::now();
+    let bytes = hello();
+    send(&mut connection.client, &bytes[..7]).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    send(&mut connection.client, &bytes[7..9]).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    send(&mut connection.client, &bytes[9..10]).await;
+    let closed = timeout(Duration::from_secs(3), connection.client.read(&mut [0]))
+        .await
+        .expect("the connection is closed by the shared deadline");
+    assert!(matches!(closed, Ok(0) | Err(_)), "{closed:?}");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(9500) && elapsed < Duration::from_secs(12),
+        "{elapsed:?}"
+    );
+    let result = timeout(TEST_TIMEOUT, connection.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+}
+
 #[tokio::test]
 async fn unexpected_frame_during_auth_is_protocol_error() {
     let (mut client, mut server) = duplex(64);
@@ -650,8 +685,12 @@ async fn unexpected_frame_during_auth_is_protocol_error() {
     ping(&mut bytes, 3);
     send(&mut client, &bytes).await;
     assert!(
-        read_handshake::<_, proto::ScramContinue>(&mut server, FrameKind::Auth)
-            .await
+        read_handshake::<_, proto::ScramContinue>(
+            &mut server,
+            FrameKind::Auth,
+            tokio::time::Instant::now() + TEST_TIMEOUT,
+        )
+        .await
             .unwrap_err()
             .is_protocol()
     );

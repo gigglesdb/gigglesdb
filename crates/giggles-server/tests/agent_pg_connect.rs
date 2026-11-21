@@ -7,8 +7,15 @@ use agent_support::{
     AgentServer, Startup, admin, binding, certificate, create_task, raw_startup, revoke,
 };
 use giggles_server::{
-    Binding, Request, Role, agent::AgentConfig, pgwire::AGENT_REFUSAL, serve_bound,
-    serve_pg_bound, transport::Client,
+    Binding, Role,
+    agent::AgentConfig,
+    api::{ApiLimits, ApiRuntime, proto},
+    pgwire::AGENT_REFUSAL,
+    serve_pg_bound,
+    wire::{
+        client::{Client, Credential},
+        listen::serve_wire_bound,
+    },
 };
 use tokio::sync::watch;
 use tokio_postgres::config::SslMode;
@@ -267,9 +274,10 @@ async fn agent_cert_refused_on_legacy_postgres_native_listeners() {
     )
     .await
     .unwrap();
-    let native = serve_bound(
+    let runtime = ApiRuntime::new(server.service.clone(), ApiLimits::default()).unwrap();
+    let native = serve_wire_bound(
         tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
-        server.service.clone(),
+        runtime,
         server.tls.clone(),
         8,
         gate,
@@ -286,13 +294,24 @@ async fn agent_cert_refused_on_legacy_postgres_native_listeners() {
             Startup::Dropped
         );
     }
-    // The native framed listener drops it as well; an ordinary certificate works.
+    // The ordinary wire listener also refuses the agent certificate.
     let call = |cert: &agent_support::TestCert| {
-        let config = std::sync::Arc::new(cert.client(&server.ca));
+        let tls = cert.wire_tls(&server.ca);
         let address = native.address;
         async move {
-            let mut client = Client::connect(address, "localhost", config).await?;
-            client.call(&Request::Ping).await
+            let (mut client, _) = Client::connect(
+                address,
+                Some(tls),
+                proto::OpenSessionRequest::default(),
+                Credential::None,
+            )
+            .await?;
+            client
+                .execute(proto::ExecuteRequest {
+                    request: Some(proto::execute_request::Request::Ping(proto::PingRequest {})),
+                    ..Default::default()
+                })
+                .await
         }
     };
     assert!(call(&agent).await.is_err());

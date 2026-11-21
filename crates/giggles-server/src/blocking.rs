@@ -59,6 +59,7 @@ impl Blocking {
         .map_err(io::Error::other)
     }
 
+    #[cfg(test)]
     pub(crate) async fn run<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> T + Send + 'static,

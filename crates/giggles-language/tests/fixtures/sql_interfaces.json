@@ -117,7 +117,7 @@
       "id": "server_native_application",
       "state": "restricted",
       "sql_support": "relational",
-      "endpoint": "giggles-server configured native TLS listener; framed Request::Sql { sql, params }; optional Request::Deadline",
+      "endpoint": "giggles-server configured native wire TLS listener; ExecuteRequest with SqlRequest and optional budget_ms",
       "authority": "Mandatory mTLS leaf certificate binding to Application role, database domain and whole application tables; current credential authority is checked before execution. Task role cannot use generic SQL.",
       "implemented": ["One inherited bounded relational statement per Sql request with typed parameters and session transactions."],
       "restrictions": ["No network DDL or row-level tenant sharing; tables require trusted local provisioning. No expected_version field in the remote Sql request.", "Distinct-table joins are denied by the giggles_join authorization sentinel; local core query support is not blanket remote support.", "Generic application writes have no durable operation-ID status/idempotency API. A lost reply requires business-state reconciliation."],
@@ -242,15 +242,15 @@
       "id": "server_bundled_client",
       "state": "implemented",
       "sql_support": "transport_only",
-      "endpoint": "giggles_server::Client::{connect,call}; giggles-server package binary named giggles-client",
+      "endpoint": "giggles_server::wire::client::Client::{connect,execute}; giggles-server package binary named giggles-client",
       "authority": "TLS server-name validation plus supplied client certificate; server-side role binding determines permitted requests. The client does not grant SQL authority.",
-      "implemented": ["Frames the server Request enum, including Sql, over the single-host server native TLS protocol."],
+      "implemented": ["Translates local Request JSON into protobuf requests and sends them over native wire with TLS."],
       "restrictions": ["Uses server frame/response/timeout limits and inherited request authority. It is not the separate consensus SDK crate."],
       "unverified": ["No general application automatic retry/idempotency or independent SQL dialect implementation is claimed."],
       "limit_ids": ["server_frame_bytes", "server_response_bytes", "server_io_timeout_seconds"],
       "docs": ["crates/giggles-server/README.md", "crates/giggles-server/COMPATIBILITY.md"],
-      "sources": [{"path":"crates/giggles-server/src/transport.rs","needle":"pub async fn call(&mut self, r: &Request)"}, {"path":"crates/giggles-server/src/bin/giggles-client.rs","needle":"Client::connect"}],
-      "evidence": [{"path":"crates/giggles-server/tests/network.rs","test":"executable_server_starts_and_native_client_connects","scope":"Actual executable server and bundled native client connection."}]
+      "sources": [{"path":"crates/giggles-server/src/wire/client.rs","needle":"pub async fn execute(&mut self, request: ExecuteRequest)"}, {"path":"crates/giggles-server/src/bin/giggles-client.rs","needle":"Client::connect"}],
+      "evidence": [{"path":"crates/giggles-server/tests/network.rs","test":"executable_server_starts_and_native_client_connects","scope":"Actual executable server and native wire client connection."}]
     }
   ],
   "limits": [
@@ -275,7 +275,7 @@
     {"id":"server_frame_bytes","value":262144,"unit":"native request bytes; pgwire post-startup frame including four-byte length","source":{"path":"crates/giggles-server/src/transport.rs","needle":"pub const MAX_FRAME: usize = 256 * 1024;"}},
     {"id":"server_response_bytes","value":8388608,"unit":"aggregate server response bytes; also each portal parameter/result retention budget","source":{"path":"crates/giggles-server/src/transport.rs","needle":"pub const MAX_RESPONSE: usize = 8 * 1024 * 1024;"}},
     {"id":"server_io_timeout_seconds","value":10,"unit":"seconds per framed IO operation","source":{"path":"crates/giggles-server/src/transport.rs","needle":"pub const IO_TIMEOUT: Duration = Duration::from_secs(10);"}},
-    {"id":"server_deadline_ms","value":10000,"unit":"maximum native Deadline budget milliseconds","source":{"path":"crates/giggles-server/src/service.rs","needle":"budget_ms > 10_000"}},
+    {"id":"server_deadline_ms","value":10000,"unit":"maximum native wire request budget milliseconds","source":{"path":"crates/giggles-server/src/api/codec.rs","needle":"budget_ms > 10_000"}},
     {"id":"pg_startup_bytes","value":8192,"unit":"maximum pgwire startup bytes including length","source":{"path":"crates/giggles-server/src/pgwire_startup.rs","needle":"!(8..=8192).contains(&n)"}},
     {"id":"pg_objects","value":1024,"unit":"prepared statements and separately portals per session","source":{"path":"crates/giggles-server/src/pgwire.rs","needle":"const MAX_NAMED_STATEMENTS: usize = 1024;"}},
     {"id":"pg_name_bytes","value":63,"unit":"prepared statement/portal name bytes","source":{"path":"crates/giggles-server/src/pgwire.rs","needle":"name.len() > 63"}}

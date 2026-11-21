@@ -300,7 +300,7 @@ impl Fixture {
         )
         .await
         .unwrap();
-        let config = serde_json::json!({"database":path.join("db.redb"),"native":"127.0.0.1:7432","postgres":"127.0.0.1:7433","wire":"127.0.0.1:7434","certificate":path.join("server.pem"),"private_key":path.join("server.key.TEST-ONLY"),"client_ca":path.join("ca.pem"),"bindings":bindings,"connections":32,"skew_seconds":0,"max_pause_seconds":3600});
+        let config = serde_json::json!({"database":path.join("db.redb"),"wire":"127.0.0.1:7432","postgres":"127.0.0.1:7433","certificate":path.join("server.pem"),"private_key":path.join("server.key.TEST-ONLY"),"client_ca":path.join("ca.pem"),"bindings":bindings,"connections":32,"skew_seconds":0,"max_pause_seconds":3600});
         std::fs::write(
             path.join("server.TEST-ONLY.json"),
             serde_json::to_vec_pretty(&config).unwrap(),
@@ -1696,7 +1696,6 @@ async fn executable_server_starts_and_native_client_connects() {
     let mut config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path.join("server.TEST-ONLY.json")).unwrap())
             .unwrap();
-    config["native"] = "127.0.0.1:0".into(); // Required by the binary until the legacy listener is removed.
     config["postgres"] = "127.0.0.1:0".into();
     config["wire"] = "127.0.0.1:0".into();
     let config_path = path.join("ephemeral-server.TEST-ONLY.json");

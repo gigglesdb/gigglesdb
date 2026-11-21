@@ -5,12 +5,15 @@ use serde_json::{Value, json};
 
 #[tokio::test]
 async fn native_postgres_http_and_grpc_share_physical_socket_admission() {
-    use giggles_server::{admission::ServiceLimits, serve, serve_pg, tls};
+    use giggles_server::{
+        admission::ServiceLimits, serve_pg, tls, wire::listen::serve_wire_bound,
+    };
     use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
     use std::{io, net::SocketAddr, time::Duration};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpStream,
+        net::{TcpListener, TcpStream},
+        sync::watch,
     };
     use tokio_rustls::{TlsConnector, client::TlsStream};
     let f = Fixture::with_service_limits(
@@ -27,14 +30,11 @@ async fn native_postgres_http_and_grpc_share_physical_socket_admission() {
         vec![f.ca.cert.der().clone()],
     )
     .unwrap();
-    let native = serve(
-        "127.0.0.1:0".parse().unwrap(),
-        f.service.clone(),
-        config.clone(),
-        32,
-    )
-    .await
-    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_open, gate) = watch::channel(true);
+    let native = serve_wire_bound(listener, f.runtime.clone(), config.clone(), 32, gate)
+        .await
+        .unwrap();
     let pg = serve_pg(
         "127.0.0.1:0".parse().unwrap(),
         f.service.clone(),

@@ -7,10 +7,10 @@ use agent_support::{Msg, Startup, TestCert, binding, certificate, error_of, raw_
 use bytes::Bytes;
 use giggles_server::api::json as wire_json;
 use giggles_server::{
-    Binding, Request, Role, Running,
+    Binding, Role, Running,
     api::proto,
     auth::{PostgresListener, TlsMode, serve_postgresql},
-    transport::Client,
+    wire::client::WireError,
 };
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
@@ -209,12 +209,14 @@ async fn agent_cert_on_legacy_postgres_native_http_grpc_refused() {
         raw_startup(f.legacy_pg.address, &f.ca, &f.agent, parity::AGENT_STARTUP).await,
         Startup::Dropped
     );
-    let native = async {
-        let mut client = Client::connect(f.native.address, "localhost", Arc::new(f.agent.client(&f.ca))).await?;
-        client.call(&Request::Ping).await
-    }
-    .await;
-    assert!(native.is_err(), "agent identity must not enter framed listener");
+    let Err(error) = f.try_wire_client_for(&f.agent).await else {
+        panic!("agent identity must be refused when opening an ordinary wire session");
+    };
+    let refusal = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<WireError>())
+        .expect("wire authentication error");
+    assert_eq!(refusal.code, "UNAUTHENTICATED");
     let (status, body) = http_call(
         f.http.address,
         (&f.ca, &f.agent),

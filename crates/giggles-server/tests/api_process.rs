@@ -2,15 +2,22 @@ mod api_support;
 
 use api_support::Fixture;
 use bytes::Bytes;
-use giggles_server::tls;
+use giggles_server::{
+    api::proto::{ExecuteRequest, OpenSessionRequest, PingRequest, execute_request},
+    tls,
+    wire::{
+        client::{Client, ClientTls, Credential},
+        frame::FrameKind,
+    },
+};
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, process::Stdio, time::Duration};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::TcpStream,
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream},
     process::{Child, Command},
 };
 use tokio_rustls::TlsConnector;
@@ -227,6 +234,116 @@ async fn legacy_config_and_each_optional_listener_start_and_shutdown() {
             assert!(TcpStream::connect(address).await.is_err());
         }
     }
+}
+
+#[tokio::test]
+async fn bin_config_native_alias_starts_wire_listener() {
+    let case = Case::new().await;
+    let process = case.start("native-alias").await;
+    let address = process.addresses["native"];
+    assert!(!process.addresses.contains_key("wire"));
+
+    let ca = case.path.join("ca.pem");
+    let cert = case.path.join("app.pem");
+    let key = case.path.join("app.key.TEST-ONLY");
+    let (mut client, _) = Client::connect(
+        address,
+        Some(ClientTls {
+            ca: std::fs::read(&ca).unwrap(),
+            cert: Some(std::fs::read(&cert).unwrap()),
+            key: Some(std::fs::read(&key).unwrap()),
+            server_name: "localhost".into(),
+        }),
+        OpenSessionRequest::default(),
+        Credential::None,
+    )
+    .await
+    .unwrap();
+    let reply = client
+        .execute(ExecuteRequest {
+            request: Some(execute_request::Request::Ping(PingRequest {})),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(reply.code, "ok");
+    client.goodbye().await.unwrap();
+
+    let cfg = tls::client(
+        tls::certs(&cert).unwrap(),
+        tls::key(&key).unwrap(),
+        tls::certs(&ca).unwrap(),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let socket = TcpStream::connect(address).await.unwrap();
+        let mut stream = TlsConnector::from(cfg)
+            .connect(ServerName::try_from("localhost").unwrap(), socket)
+            .await
+            .unwrap();
+        let body = br#"{"kind":"Ping"}"#;
+        stream
+            .write_u32(body.len().try_into().unwrap())
+            .await
+            .unwrap();
+        stream.write_all(body).await.unwrap();
+        stream.flush().await.unwrap();
+        // The wire error's header starts with the old frame's length field.
+        // Its next byte is the wire error kind, where JSON would start with '{'.
+        let length = stream.read_u32().await.unwrap();
+        assert!((8..=1024).contains(&length));
+        let mut frame = vec![0; length as usize];
+        stream.read_exact(&mut frame).await.unwrap();
+        assert_eq!(frame[0], FrameKind::ConnError as u8);
+        match stream.read_u8().await {
+            Err(error) => assert!(matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+            )),
+            Ok(byte) => panic!("legacy probe received more data: {byte}"),
+        }
+    })
+    .await
+    .expect("legacy probe must be rejected and disconnected");
+
+    process.stop().await;
+    let stderr = std::fs::read_to_string(case.path.join("native-alias.stderr.log")).unwrap();
+    let warning = r#"warning: config key "native" is deprecated; use "wire""#;
+    assert_eq!(
+        stderr.lines().filter(|line| *line == warning).count(),
+        1,
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn bin_config_native_and_wire_conflict() {
+    let mut case = Case::new().await;
+    let native_socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let wire_socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let native = native_socket.local_addr().unwrap();
+    let wire = wire_socket.local_addr().unwrap();
+    drop((native_socket, wire_socket));
+    case.config["native"] = json!(native);
+    case.config["wire"] = json!(wire);
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        case.spawn("native-wire-conflict").wait_with_output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr =
+        std::fs::read_to_string(case.path.join("native-wire-conflict.stderr.log")).unwrap();
+    assert!(
+        stderr.contains("native is a deprecated alias for wire; set only wire"),
+        "{stderr}"
+    );
+    assert!(TcpStream::connect(native).await.is_err());
+    assert!(TcpStream::connect(wire).await.is_err());
 }
 
 #[tokio::test]

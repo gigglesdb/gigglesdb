@@ -305,7 +305,6 @@ async fn executable_trusted_stdin_reload_invalid_atomicity_and_restart_config() 
     ] {
         config[field] = serde_json::json!(path.join(file));
     }
-    config["native"] = serde_json::json!("127.0.0.1:0");
     config["postgres"] = serde_json::json!("127.0.0.1:0");
     config["wire"] = serde_json::json!("127.0.0.1:0");
     config["bindings_file"] = serde_json::json!(path.join("bindings.json"));

@@ -57,6 +57,15 @@ impl TestCert {
             )
             .unwrap()
     }
+
+    pub fn wire_tls(&self, ca: &TestCert) -> giggles_server::wire::client::ClientTls {
+        giggles_server::wire::client::ClientTls {
+            ca: ca.cert.pem().into_bytes(),
+            cert: Some(self.cert.pem().into_bytes()),
+            key: Some(self.key.serialize_pem().into_bytes()),
+            server_name: "localhost".into(),
+        }
+    }
 }
 
 /// A TLS client trusting the fixture CA without presenting a certificate.
@@ -755,7 +764,7 @@ pub mod parity {
         },
         auth::{PostgresqlConfig, TlsMode, scram::Verifier, serve_postgresql},
         clock::Clock,
-        serve_bound, serve_pg_bound, tls,
+        serve_pg_bound, tls,
         wire::{client as native_wire, listen::serve_wire_bound},
     };
     use http_body_util::{BodyExt, Full};
@@ -1258,7 +1267,7 @@ pub mod parity {
     ///
     /// - `postgresql`: the PostgreSQL password listener (SCRAM, no TLS) for
     ///   `incident_controller`, `oncall_lead` and `delivery_app`;
-    /// - `legacy_pg`, `native`, `http`, `grpc`, `wire`: the certificate listeners,
+    /// - `legacy_pg`, `http`, `grpc`, `wire`: the certificate listeners,
     ///   where `app` is bound to `delivery_app` and `sql_app` can run SQL on shipments;
     /// - `agent_pg`, `agent_http`, `agent_grpc`, `agent_wire`: the agent listeners, where
     ///   `agent` is bound to `repair_agent` for `inc-436`.
@@ -1276,7 +1285,6 @@ pub mod parity {
         pub agent_api: Arc<ApiRuntime>,
         pub postgresql: Running,
         pub legacy_pg: Running,
-        pub native: Running,
         pub http: Running,
         pub grpc: Running,
         pub wire: Running,
@@ -1384,9 +1392,6 @@ pub mod parity {
                 serve_pg_bound(bind().await, service.clone(), tls.clone(), 16, gate.clone())
                     .await
                     .unwrap();
-            let native = serve_bound(bind().await, service.clone(), tls.clone(), 16, gate.clone())
-                .await
-                .unwrap();
             let ordinary_api = ApiRuntime::new(service.clone(), ordinary_limits).unwrap();
             let agent_api = ApiRuntime::new_agent(service.clone(), ApiLimits::default()).unwrap();
             let http = serve_http_bound(
@@ -1463,7 +1468,6 @@ pub mod parity {
                 agent_api,
                 postgresql,
                 legacy_pg,
-                native,
                 http,
                 grpc,
                 wire,
@@ -1555,7 +1559,6 @@ pub mod parity {
             for listener in [
                 self.postgresql,
                 self.legacy_pg,
-                self.native,
                 self.http,
                 self.grpc,
                 self.wire,
@@ -1598,9 +1601,14 @@ pub mod parity {
 
         /// Opens a session on the ordinary wire listener with the given certificate.
         pub async fn wire_client_for(&self, cert: &TestCert) -> native_wire::Client {
-            self.connect_native_wire(self.wire.address, cert, None)
-                .await
-                .unwrap()
+            self.try_wire_client_for(cert).await.unwrap()
+        }
+
+        pub async fn try_wire_client_for(
+            &self,
+            cert: &TestCert,
+        ) -> std::io::Result<native_wire::Client> {
+            self.connect_native_wire(self.wire.address, cert, None).await
         }
 
         pub async fn try_wire_client(&self, agent: bool) -> std::io::Result<native_wire::Client> {
@@ -1608,8 +1616,7 @@ pub mod parity {
                 self.connect_native_wire(self.agent_wire.address, &self.agent, Some(TASK))
                     .await
             } else {
-                self.connect_native_wire(self.wire.address, &self.app, None)
-                    .await
+                self.try_wire_client_for(&self.app).await
             }
         }
 
@@ -1619,12 +1626,7 @@ pub mod parity {
             cert: &TestCert,
             task: Option<&str>,
         ) -> std::io::Result<native_wire::Client> {
-            let tls = native_wire::ClientTls {
-                ca: self.ca.cert.pem().into_bytes(),
-                cert: Some(cert.cert.pem().into_bytes()),
-                key: Some(cert.key.serialize_pem().into_bytes()),
-                server_name: "localhost".into(),
-            };
+            let tls = cert.wire_tls(&self.ca);
             let open = proto::OpenSessionRequest {
                 task: task.map(str::to_owned),
                 ..Default::default()

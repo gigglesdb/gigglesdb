@@ -17,11 +17,7 @@ use giggles_core::{
     task::{StatementClass, TaskError},
 };
 use giggles_server::api::proto;
-use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
 use serde_json::json;
-use std::sync::Arc;
-use tokio::net::TcpStream;
-use tokio_rustls::TlsConnector;
 
 /// Every listener of the fixture answers its own client.
 async fn listeners_answer(f: &ParityFixture) {
@@ -39,20 +35,8 @@ async fn listeners_answer(f: &ParityFixture) {
     let mut legacy = f.legacy_wire().await;
     let answer = legacy.simple("SELECT 1").await;
     assert_eq!(agent_support::error_of(&answer), None, "{answer:?}");
-    // Framed native listener: the mTLS handshake completes.
-    let config = giggles_server::tls::client(
-        vec![f.app.cert.der().clone()],
-        PrivatePkcs8KeyDer::from(f.app.key.serialize_der()).into(),
-        vec![f.ca.cert.der().clone()],
-    )
-    .unwrap();
-    TlsConnector::from(Arc::new((*config).clone()))
-        .connect(
-            ServerName::try_from("localhost").unwrap(),
-            TcpStream::connect(f.native.address).await.unwrap(),
-        )
-        .await
-        .expect("native listener handshake");
+    // Framed native listener: the application certificate opens a session.
+    drop(f.wire_client(false).await);
     // Ordinary HTTP and gRPC listeners open sessions for `app`.
     let (status, reply) = http_call(
         f.http.address,

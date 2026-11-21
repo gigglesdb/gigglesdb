@@ -13,7 +13,7 @@ use giggles_server::{
     },
     auth::{PostgresqlConfig, RoleApiConfig, TlsMode, serve_postgresql_bound},
     clock::Clock,
-    serve_bound, serve_pg_bound, tls,
+    serve_pg_bound, tls,
     wire::listen::{serve_role_wire_bound, serve_wire_bound},
 };
 use serde::Deserialize;
@@ -31,7 +31,8 @@ struct Config {
     replication: Option<giggles_server::replication::config::ReplicationConfig>,
     #[serde(default)]
     cluster: Option<giggles_server::cluster::config::ClusterConfig>,
-    native: SocketAddr,
+    #[serde(default)]
+    native: Option<SocketAddr>,
     postgres: SocketAddr,
     #[serde(default)]
     postgresql: Option<PostgresqlConfig>,
@@ -98,6 +99,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let bytes = bounded_file(&path)?;
     let c: Config = serde_json::from_slice(&bytes)?;
+    if c.native.is_some() {
+        if c.wire.is_some() {
+            return Err("native is a deprecated alias for wire; set only wire".into());
+        }
+        eprintln!(r#"warning: config key "native" is deprecated; use "wire""#);
+    }
     validate_agent(&c)?;
     let cluster = match &c.cluster {
         Some(cluster) => Some(cluster_validate(&c, cluster)?),
@@ -845,7 +852,6 @@ async fn start_listeners(
 ) -> Result<StartedListeners, Box<dyn std::error::Error>> {
     // Bind every requested socket before any accept loop can process traffic.
     // Dropping these listeners rolls back a partial bind failure automatically.
-    let native_socket = bind_listener(c.native, retry).await?;
     let pg_socket = bind_listener(c.postgres, retry).await?;
     let postgresql_socket = match &c.postgresql {
         Some(config) => Some(bind_listener(config.listen, retry).await?),
@@ -859,7 +865,7 @@ async fn start_listeners(
         Some(address) => Some(bind_listener(address, retry).await?),
         None => None,
     };
-    let wire_socket = match c.wire {
+    let wire_socket = match c.wire.or(c.native) {
         Some(address) => Some(bind_listener(address, retry).await?),
         None => None,
     };
@@ -944,16 +950,19 @@ async fn start_listeners(
             addresses.push(format!("role_{protocol}={}", listener.address));
             listeners.push(listener);
         }
-        let native = serve_bound(
-            native_socket,
-            service.clone(),
-            config.clone(),
-            c.connections,
-            gate.clone(),
-        )
-        .await?;
-        addresses.push(format!("native={}", native.address));
-        listeners.push(native);
+        if let Some(socket) = wire_socket {
+            let wire = serve_wire_bound(
+                socket,
+                api.clone(),
+                config.clone(),
+                c.connections,
+                gate.clone(),
+            )
+            .await?;
+            let label = if c.native.is_some() { "native" } else { "wire" };
+            addresses.push(format!("{label}={}", wire.address));
+            listeners.push(wire);
+        }
         let pg = serve_pg_bound(
             pg_socket,
             service.clone(),
@@ -993,18 +1002,6 @@ async fn start_listeners(
             .await?;
             addresses.push(format!("grpc={}", grpc.address));
             listeners.push(grpc);
-        }
-        if let Some(socket) = wire_socket {
-            let wire = serve_wire_bound(
-                socket,
-                api.clone(),
-                config.clone(),
-                c.connections,
-                gate.clone(),
-            )
-            .await?;
-            addresses.push(format!("wire={}", wire.address));
-            listeners.push(wire);
         }
         if let (Some(runtime), Some(tls), Some(agent)) = (&agent_api, &agent_tls, &c.agent) {
             if let Some(socket) = agent_http_socket {
@@ -1188,7 +1185,7 @@ fn check_role_api_addresses(c: &Config) -> io::Result<()> {
     let others = [
         c.http,
         c.grpc,
-        c.wire,
+        c.wire.or(c.native),
         c.postgresql.as_ref().map(|pg| pg.listen),
         agent.and_then(|a| a.postgres),
         agent.and_then(|a| a.http),
@@ -1265,6 +1262,10 @@ mod tests {
         c.wire = address;
         assert!(check_role_api_addresses(&c).is_err());
         c.wire = None;
+        let native = c.native;
+        c.native = address;
+        assert!(check_role_api_addresses(&c).is_err());
+        c.native = native;
         c.postgresql = Some(
             serde_json::from_value(serde_json::json!({"listen":address, "tls":"disabled"}))
                 .unwrap(),
@@ -1357,12 +1358,13 @@ mod tests {
     #[test]
     fn wire_addresses_are_optional_and_agent_wire_can_stand_alone() {
         let mut json = serde_json::json!({
-            "database": "db", "native": "127.0.0.1:1", "postgres": "127.0.0.1:2",
+            "database": "db", "postgres": "127.0.0.1:2",
             "certificate": "server.pem", "private_key": "server.key", "client_ca": "ca.pem",
             "bindings": [], "connections": 32, "skew_seconds": 0, "max_pause_seconds": 3600,
             "agent": {"http": "127.0.0.1:3"}
         });
         let config = serde_json::from_value::<Config>(json.clone()).unwrap();
+        assert!(config.native.is_none());
         assert!(config.wire.is_none());
         assert!(config.agent.unwrap().wire.is_none());
 

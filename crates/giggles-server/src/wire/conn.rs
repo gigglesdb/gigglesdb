@@ -39,7 +39,7 @@ use std::{
 use tokio::{
     io::{self as tokio_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::OwnedSemaphorePermit,
-    time::{MissedTickBehavior, interval_at, sleep_until, timeout},
+    time::{self as tokio_time, MissedTickBehavior, interval_at, sleep_until, timeout, timeout_at},
 };
 use tonic::{Code, Status, codegen::tokio_stream::StreamExt};
 
@@ -232,8 +232,9 @@ impl HandshakeError {
 pub(super) async fn read_handshake<R: AsyncRead + Unpin, M: Message + Default>(
     reader: &mut R,
     expected: FrameKind,
+    deadline: tokio_time::Instant,
 ) -> Result<(u32, M), HandshakeError> {
-    timeout(IO_TIMEOUT, async {
+    timeout_at(deadline, async {
         // Read exactly one frame so a pipelined request stays on the socket.
         let mut header = [0; HEADER_LEN];
         reader.read_exact(&mut header).await?;
@@ -277,8 +278,13 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     identity: Result<ConnectionIdentity, ApiError>,
     limits: &WireLimits,
 ) -> Result<(WireSession, Vec<u8>), HandshakeError> {
+    // The preface and HELLO share one IO_TIMEOUT (spec section 2), so a client
+    // that drips bytes cannot spend a fresh timeout on each. The transport
+    // phase (TLS handshake, sniff) has its own deadline in the listener, and
+    // each AUTH round answers a server challenge under its own IO_TIMEOUT.
+    let deadline = tokio_time::Instant::now() + IO_TIMEOUT;
     let mut preface = [0; PREFACE_LEN];
-    timeout(IO_TIMEOUT, stream.read_exact(&mut preface))
+    timeout_at(deadline, stream.read_exact(&mut preface))
         .await
         .map_err(io::Error::from)??;
     parse_preface(&preface).map_err(|error| match error {
@@ -287,7 +293,7 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
             HandshakeError::Protocol("unsupported wire version", true)
         }
     })?;
-    let (mut id, mut request) = read_handshake(stream, FrameKind::Hello).await?;
+    let (mut id, mut request) = read_handshake(stream, FrameKind::Hello, deadline).await?;
     let identity = identity.map_err(HandshakeError::SignIn)?;
     for round in 0..=MAX_AUTH_ROUNDS {
         let (reply, session) = runtime
@@ -316,7 +322,12 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
             .ok_or(HandshakeError::SignIn(ApiError::Internal))?;
         encode_message(&mut out, FrameKind::Auth, Flags(0), id, &challenge);
         write_output(stream, &out).await?;
-        let (auth_id, response) = read_handshake(stream, FrameKind::Auth).await?;
+        let (auth_id, response) = read_handshake(
+            stream,
+            FrameKind::Auth,
+            tokio_time::Instant::now() + IO_TIMEOUT,
+        )
+        .await?;
         id = auth_id;
         request = proto::OpenSessionRequest {
             credential: Some(proto::open_session_request::Credential::ScramContinue(
