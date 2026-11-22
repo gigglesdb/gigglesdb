@@ -119,6 +119,80 @@ async fn simple_fetch_move_and_close_tags() {
     f.stop().await;
 }
 #[tokio::test]
+async fn repeated_fetch_preserves_scalar_subqueries_and_volatile_calls() {
+    let f = Fixture::new().await;
+    let c = f.client().await;
+    c.batch_execute(
+        "CREATE TABLE items(id bigint PRIMARY KEY);
+         INSERT INTO items VALUES (1),(2),(3);
+         CREATE SEQUENCE fetch_sequence;
+         BEGIN;
+         DECLARE subquery_cursor CURSOR FOR SELECT id, (SELECT 42::bigint) FROM items ORDER BY id;
+         DECLARE volatile_cursor CURSOR FOR SELECT id, nextval('fetch_sequence') FROM items ORDER BY id",
+    )
+    .await
+    .unwrap();
+    for id in 1..=3 {
+        for (fetch, value) in [
+            ("FETCH 1 FROM subquery_cursor", 42i64),
+            ("FETCH 1 FROM volatile_cursor", id),
+        ] {
+            let row = c.query_one(fetch, &[]).await.unwrap();
+            assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (id, value));
+        }
+        let current = c.query_one("SELECT currval('fetch_sequence')", &[]).await.unwrap();
+        assert_eq!(current.get::<_, i64>(0), id);
+    }
+    for fetch in ["FETCH 1 FROM subquery_cursor", "FETCH 1 FROM volatile_cursor"] {
+        assert!(c.query(fetch, &[]).await.unwrap().is_empty());
+    }
+    c.batch_execute("COMMIT").await.unwrap();
+    drop(c);
+    f.stop().await;
+}
+#[tokio::test]
+async fn repeated_fetch_sees_the_clock_and_live_settings_of_each_fetch() {
+    let f = Fixture::new().await;
+    let c = f.client().await;
+    c.batch_execute(
+        "CREATE TABLE items(id bigint PRIMARY KEY);
+         INSERT INTO items VALUES (1),(2),(3);
+         CREATE SCHEMA other;
+         BEGIN",
+    )
+    .await
+    .unwrap();
+    for (name, expression) in [
+        ("clock_cursor", "now()::text"),
+        ("privilege_cursor", "has_table_privilege('public.items', 'SELECT')::text"),
+        ("setting_cursor", "has_table_privilege('items', 'SELECT')::text"),
+    ] {
+        c.batch_execute(&format!(
+            "DECLARE {name} CURSOR FOR SELECT id, {expression} FROM items ORDER BY id"
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+    }
+    let mut clock = None;
+    for (id, path) in [(1i64, "public"), (2, "other, public"), (3, "other")] {
+        c.batch_execute(&format!("SET search_path = {path}")).await.unwrap();
+        let fetch = |name: &str| format!("FETCH 1 FROM {name}");
+        let row = c.query_one(&fetch("clock_cursor"), &[]).await.unwrap();
+        assert_eq!(row.get::<_, i64>(0), id);
+        let now = row.get::<_, String>(1);
+        assert_eq!(clock.get_or_insert_with(|| now.clone()), &now);
+        let row = c.query_one(&fetch("privilege_cursor"), &[]).await.unwrap();
+        assert_eq!((row.get::<_, i64>(0), row.get::<_, String>(1)), (id, "true".to_owned()));
+        let row = c.query_one(&fetch("setting_cursor"), &[]).await;
+        // The privilege callback keeps the search_path captured at DECLARE (unchanged by binding once).
+        let row = row.unwrap();
+        assert_eq!((row.get::<_, i64>(0), row.get::<_, String>(1)), (id, "true".to_owned()), "{path}");
+    }
+    c.batch_execute("COMMIT").await.unwrap();
+    drop(c);
+    f.stop().await;
+}
+#[tokio::test]
 async fn cursor_errors_match_postgres() {
     let f = Fixture::new().await;
     let c = f.client().await;

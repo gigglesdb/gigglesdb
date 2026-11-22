@@ -1174,6 +1174,7 @@ impl ParseContext {
 }
 #[derive(Clone)]
 struct Statement {
+    id: u64,
     // Syntax-only dependencies: binding may qualify names or add defaults.
     sequence_dependencies: std::sync::Arc<[Option<String>]>,
     // Only an unnamed application SELECT prepared outside a transaction gets a key.
@@ -1387,6 +1388,7 @@ struct State {
     // COPY and spilled rows exclude the entire transaction from permit release.
     retain_durability_permits: bool,
     settings: crate::pg_settings::SessionSettings,
+    next_statement_id: u64,
     statements: BTreeMap<String, Statement>,
     unnamed_cache: Vec<Statement>,
     named_statement_bytes: usize,
@@ -1747,6 +1749,7 @@ impl State {
                 .set_task_entry(giggles_core::task::readlog::ENTRY_PGWIRE_EXTENDED);
             return self.task_prepare(sql, oids, session);
         }
+        let id = self.allocate_statement_id();
         // GD-0061 R3-707: an approver form, before any other grammar reads it.
         if let Some(change) = crate::agent::preview::approver_statement(sql)? {
             // The forms take no parameters.
@@ -1755,6 +1758,7 @@ impl State {
             }
             let d = crate::agent::preview::approver_description(&change);
             return Ok(Statement {
+                id,
                 sequence_dependencies: Default::default(),
                 parse_context: None,
                 description_version: None,
@@ -1782,6 +1786,7 @@ impl State {
             }
             let d = crate::task_ddl::description(&stmt);
             return Ok(Statement {
+                id,
                 sequence_dependencies: Default::default(),
                 parse_context: None,
                 description_version: None,
@@ -2030,6 +2035,7 @@ impl State {
             Default::default()
         };
         Ok(Statement {
+            id,
             sequence_dependencies,
             parse_context,
             description_version,
@@ -2044,6 +2050,11 @@ impl State {
             parameter_oids,
             query_id: self.diagnostic.query_id.clone(),
         })
+    }
+    fn allocate_statement_id(&mut self) -> u64 {
+        let id = self.next_statement_id;
+        self.next_statement_id = id.checked_add(1).expect("statement ID exhausted");
+        id
     }
     fn reuse_unnamed(&mut self, sql: &str, oids: &[u32], session: &mut Session) -> R<Option<Statement>> {
         #[cfg(test)]
@@ -2392,10 +2403,34 @@ impl State {
                     return Err("54000");
                 }
                 if matches!(&s.p, Plan::Sql(_)) {
-                    s.validate_constants(session, &mut self.diagnostic)?;
-                    self.statements.get_mut(&stmt).ok_or("26000")?.validated = s.validated;
-                    #[cfg(test)]
-                    { self.statements.get_mut(&stmt).unwrap().constant_validations = s.constant_validations; }
+                    let validation = s.validate_constants(session, &mut self.diagnostic);
+                    if stmt.is_empty() {
+                        if validation.is_err() {
+                            s.validated = None;
+                        }
+                        // A Bind refresh can replace the live statement while
+                        // the Parse cache still holds its earlier preparation.
+                        if let Some(entry) = self.unnamed_cache.iter_mut().find(|entry| {
+                            entry.id == s.id
+                                && entry.sql == s.sql
+                                && entry.declared_oids == s.declared_oids
+                        }) {
+                            entry.validated = s.validated;
+                            #[cfg(test)]
+                            {
+                                entry.constant_validations = s.constant_validations;
+                            }
+                        }
+                    }
+                    if validation.is_ok() || stmt.is_empty() {
+                        let statement = self.statements.get_mut(&stmt).ok_or("26000")?;
+                        statement.validated = s.validated;
+                        #[cfg(test)]
+                        {
+                            statement.constant_validations = s.constant_validations;
+                        }
+                    }
+                    validation?;
                 }
                 self.portals.insert(
                     name,
@@ -3497,6 +3532,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         settings: crate::pg_settings::SessionSettings::default(),
         statements: BTreeMap::new(),
         unnamed_cache: Vec::new(),
+        next_statement_id: 0,
         named_statement_bytes: 0,
         portals: BTreeMap::new(),
         cursors: cursor::Cursors::default(),
@@ -4344,10 +4380,48 @@ mod prepared_validation_tests {
     fn statement(session: &mut Session, sql: &str) -> Statement {
         let p = session.sql.prepare(sql).unwrap();
         let d = session.sql.describe(&p).unwrap();
-        Statement { sequence_dependencies: Default::default(), parse_context: None,
+        Statement { id: 0, sequence_dependencies: Default::default(), parse_context: None,
             description_version: None, validated: None, constant_validations: 0,
             sql_bytes: sql.len(), sql: sql.into(), declared_oids: vec![],
             p: Plan::Sql(Box::new(p)), d, parameter_oids: vec![], query_id: None }
+    }
+    fn wire_state() -> State {
+        State {
+            output: None, diagnostic: Diagnostic::default(), admin_completed: false,
+            implicit: false, retain_durability_permits: false, settings: crate::pg_settings::SessionSettings::default(),
+            statements: BTreeMap::new(), unnamed_cache: Vec::new(), named_statement_bytes: 0,
+            next_statement_id: 0,
+            portals: BTreeMap::new(), cursors: cursor::Cursors::default(), drain: false,
+            copy: None, copy_completion: vec![], copy_active: None, copy_permit: None,
+            execution_admission: None,
+        }
+    }
+    fn message(state: &mut State, session: &mut Session, tag: u8, body: &[u8]) -> R<Vec<u8>> {
+        let mut out = Vec::new();
+        state.handle(tag, body, session, &mut out, std::time::Instant::now())?;
+        Ok(out)
+    }
+    fn parse_unnamed(state: &mut State, session: &mut Session, sql: &str, declared_oids: &[u32]) {
+        let mut parse = vec![0];
+        z(sql, &mut parse);
+        parse.extend((declared_oids.len() as u16).to_be_bytes());
+        for oid in declared_oids {
+            parse.extend(oid.to_be_bytes());
+        }
+        assert_eq!(message(state, session, b'P', &parse).unwrap()[0], b'1');
+    }
+    fn bind_unnamed(state: &mut State, session: &mut Session, params: &[&str]) -> R<()> {
+        let mut bind = vec![0; 4]; // Unnamed portal and statement, default text format.
+        bind.extend((params.len() as u16).to_be_bytes());
+        for param in params {
+            bind.extend((param.len() as u32).to_be_bytes());
+            bind.extend(param.as_bytes());
+        }
+        bind.extend([0; 2]); // Default output format.
+        let result = message(state, session, b'B', &bind);
+        message(state, session, b'S', &[]).unwrap();
+        assert_eq!(result?[0], b'2');
+        Ok(())
     }
     #[test]
     fn success_memo_tracks_catalog_budgets_and_private_ddl() {
@@ -4401,14 +4475,7 @@ mod prepared_validation_tests {
     #[test]
     fn repeated_binds_publish_the_success_memo() {
         let mut session = fixture();
-        let mut state = State {
-            output: None, diagnostic: Diagnostic::default(), admin_completed: false,
-            implicit: false, retain_durability_permits: false, settings: crate::pg_settings::SessionSettings::default(),
-            statements: BTreeMap::new(), unnamed_cache: Vec::new(), named_statement_bytes: 0,
-            portals: BTreeMap::new(), cursors: cursor::Cursors::default(), drain: false,
-            copy: None, copy_completion: vec![], copy_active: None, copy_permit: None,
-            execution_admission: None,
-        };
+        let mut state = wire_state();
         let mut out = Vec::new();
         state.handle(b'P', b"named\0SELECT 1+2\0\0\0", &mut session, &mut out, std::time::Instant::now()).unwrap();
         let mut bind = b"\0named\0".to_vec();
@@ -4420,6 +4487,111 @@ mod prepared_validation_tests {
             state.handle(b'S', &[], &mut session, &mut out, std::time::Instant::now()).unwrap();
         }
         assert_eq!(state.statements["named"].constant_validations, 1);
+    }
+    #[test]
+    fn unnamed_bind_memo_survives_parse_and_tracks_validation_context() {
+        let mut session = fixture();
+        let mut state = wire_state();
+        session.execute_sql("CREATE TABLE t(id int PRIMARY KEY)", &[]).unwrap();
+        let sql = "SELECT id, 1+2 FROM t";
+        let prepare_calls = PREPARE_CALLS.get();
+        for _ in 0..5 {
+            parse_unnamed(&mut state, &mut session, sql, &[]);
+            bind_unnamed(&mut state, &mut session, &[]).unwrap();
+            assert_eq!(state.statements[""].constant_validations, 1);
+            assert_eq!(state.unnamed_cache[0].constant_validations, 1);
+        }
+        assert_eq!(PREPARE_CALLS.get(), prepare_calls + 1);
+        let old_id = state.statements[""].id;
+        let old_key = state.unnamed_cache[0].validated.unwrap();
+        assert_eq!(state.statements[""].validated, Some(old_key));
+
+        // Bind refreshes the live statement after a catalog change. A stale
+        // cached parse with the same text and OIDs must keep its own memo.
+        session.execute_sql("CREATE TABLE other(id int PRIMARY KEY)", &[]).unwrap();
+        bind_unnamed(&mut state, &mut session, &[]).unwrap();
+        assert_ne!(state.statements[""].id, old_id);
+        assert_eq!(state.statements[""].constant_validations, 1);
+        assert_ne!(state.statements[""].validated.unwrap().0, old_key.0);
+        assert_eq!(state.unnamed_cache[0].id, old_id);
+        assert_eq!(state.unnamed_cache[0].validated, Some(old_key));
+        parse_unnamed(&mut state, &mut session, sql, &[]);
+        bind_unnamed(&mut state, &mut session, &[]).unwrap();
+        let after_ddl = state.unnamed_cache[0].validated.unwrap();
+        assert_ne!(after_ddl.0, old_key.0);
+        assert_eq!(state.unnamed_cache[0].constant_validations, 1);
+
+        message(&mut state, &mut session, b'Q', b"SET search_path TO public\0").unwrap();
+        parse_unnamed(&mut state, &mut session, sql, &[]);
+        bind_unnamed(&mut state, &mut session, &[]).unwrap();
+        let after_path = state.unnamed_cache[0].validated.unwrap();
+        assert_ne!(after_path.3, after_ddl.3);
+        assert_eq!(state.unnamed_cache[0].constant_validations, 1);
+
+        state.settings.current.max_value_bytes = giggles_core::relational::MAX_ROW_BYTES;
+        bind_unnamed(&mut state, &mut session, &[]).unwrap();
+        let after_budget = state.unnamed_cache[0].validated.unwrap();
+        assert_ne!(after_budget.1, after_path.1);
+        assert_eq!(state.statements[""].constant_validations, 2);
+        assert_eq!(state.unnamed_cache[0].constant_validations, 2);
+    }
+    #[test]
+    fn unnamed_bind_memo_distinguishes_text_and_declared_oids() {
+        let mut session = fixture();
+        let mut state = wire_state();
+        session.execute_sql("CREATE TABLE t(id int PRIMARY KEY)", &[]).unwrap();
+        let sql = "SELECT id FROM t WHERE id = $1";
+        let other_sql = "SELECT id+1 FROM t WHERE id = $1";
+        let mut ids = BTreeMap::new();
+        for (sql, oid) in [(sql, 23), (other_sql, 23), (sql, 0), (sql, 23)] {
+            parse_unnamed(&mut state, &mut session, sql, &[oid]);
+            let s = &state.statements[""];
+            if let Some(id) = ids.insert((sql, oid), s.id) {
+                assert_eq!(s.id, id);
+                assert!(s.validated.is_some());
+            } else {
+                assert_eq!(s.validated, None);
+                assert_eq!(s.constant_validations, 0);
+            }
+            bind_unnamed(&mut state, &mut session, &["1"]).unwrap();
+            assert_eq!(state.statements[""].constant_validations, 1);
+        }
+        assert_eq!(state.unnamed_cache.len(), 3);
+    }
+    #[test]
+    fn unnamed_bind_errors_stay_unmemoized_after_reparse() {
+        let mut session = fixture();
+        let mut state = wire_state();
+        session.execute_sql("CREATE TABLE t(id int PRIMARY KEY)", &[]).unwrap();
+        let prepare_calls = PREPARE_CALLS.get();
+        for attempts in 1..=3 {
+            parse_unnamed(&mut state, &mut session, "SELECT 1/0 FROM t", &[]);
+            assert_eq!(bind_unnamed(&mut state, &mut session, &[]), Err("22012"));
+            assert!(state.statements[""].validated.is_none());
+            assert!(state.unnamed_cache[0].validated.is_none());
+            assert_eq!(state.statements[""].constant_validations, attempts);
+            assert_eq!(state.unnamed_cache[0].constant_validations, attempts);
+        }
+        assert_eq!(PREPARE_CALLS.get(), prepare_calls + 1);
+    }
+    #[test]
+    fn failed_unnamed_revalidation_clears_a_previous_memo() {
+        let mut session = fixture();
+        let mut state = wire_state();
+        session.execute_sql("CREATE TABLE t(id int PRIMARY KEY)", &[]).unwrap();
+        parse_unnamed(&mut state, &mut session, "SELECT repeat('x', 70000) FROM t", &[]);
+        bind_unnamed(&mut state, &mut session, &[]).unwrap();
+        let entry = state.unnamed_cache.last().unwrap();
+        assert!(entry.validated.is_some());
+        let id = entry.id;
+        state.settings.current.max_value_bytes = giggles_core::relational::MAX_ROW_BYTES;
+        assert_eq!(bind_unnamed(&mut state, &mut session, &[]), Err("54000"));
+        let entry = state.unnamed_cache.last().unwrap();
+        assert_eq!(state.statements[""].id, id);
+        assert_eq!(entry.id, id);
+        assert_eq!(entry.constant_validations, 2);
+        assert!(entry.validated.is_none());
+        assert!(state.statements[""].validated.is_none());
     }
     #[test]
     fn constant_errors_are_never_memoized() {
