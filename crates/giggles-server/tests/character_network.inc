@@ -20,7 +20,7 @@ async fn character_pg18_utf8_c_describe_repeated_binary_bind_and_errors() {
     assert_eq!(initcap.params()[0].oid(), 25);
     assert_eq!(initcap.columns()[0].type_().oid(), 25);
     for (input, expected) in [
-        (Some("éHELLO_123ABC"), Some("éHello_123abc")),
+        (Some("éHELLO_123ABC"), Some("Éhello_123abc")),
         (Some("áBC Z"), Some("ÁBc Z")),
         (None, None),
     ] {
@@ -111,7 +111,7 @@ async fn character_pg18_utf8_c_describe_repeated_binary_bind_and_errors() {
         .await
         .unwrap();
     assert_eq!(row.get::<_, i32>(0), 233);
-    assert_eq!(row.get::<_, String>(1), "éHello");
+    assert_eq!(row.get::<_, String>(1), "Éhello");
     assert_eq!(row.get::<_, String>(2), "😀");
     drop(pg);
     connection.await.unwrap();

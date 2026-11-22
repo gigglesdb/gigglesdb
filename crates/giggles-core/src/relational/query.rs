@@ -862,16 +862,16 @@ impl Filter {
                 negated: false,
             }
         } else {
-            // A comma at the outer parenthesis level distinguishes a row from
-            // scalar grouping. Lower rows here, keeping scalar and wire types unchanged.
-            let a = if Self::starts_row(p) {
-                Scalar::Predicate(Box::new(Self::row_filter(p, depth, aggregate_argument)?))
-            } else if aggregate_argument {
-                Scalar::parse_aggregate_argument(p, depth)?
+            if Self::starts_row(p) {
+                Self::row_filter(p, depth, aggregate_argument)?
             } else {
-                Scalar::parse(p, depth)?
-            };
-            Self::parse_comparison(p, a, depth, aggregate_argument)?
+                let a = if aggregate_argument {
+                    Scalar::parse_aggregate_argument(p, depth)?
+                } else {
+                    Scalar::parse(p, depth)?
+                };
+                Self::parse_comparison(p, a, depth, aggregate_argument)?
+            }
         };
         f = Self::parse_is_suffix(p, f, depth, aggregate_argument)?;
         loop {
@@ -961,23 +961,29 @@ impl Filter {
                 Self::membership(&a, &values, not)
             }
         } else if p.word("between") {
-            if p.word("symmetric") {
-                return Err(SqlError::Unsupported);
-            }
-            p.word("asymmetric");
+            let symmetric = p.word("symmetric");
+            if !symmetric { p.word("asymmetric"); }
             let lower = parse_scalar(p, depth + 1)?;
             p.need("and")?;
             let upper = parse_scalar(p, depth + 1)?;
-            admit_expansion(&a, 2)?;
-            Self::Logic(
-                Box::new(Self::Compare(
-                    a.clone(),
-                    if not { "<" } else { ">=" }.into(),
-                    lower,
-                )),
+            admit_expansion(&a, if symmetric { 4 } else { 2 })?;
+            let (low_op, high_op) = if not { ("<", ">") } else { (">=", "<=") };
+            let range = |a: Scalar, lower, upper| Self::Logic(
+                Box::new(Self::Compare(a.clone(), low_op.into(), lower)),
                 !not,
-                Box::new(Self::Compare(a, if not { ">" } else { "<=" }.into(), upper)),
-            )
+                Box::new(Self::Compare(a, high_op.into(), upper)),
+            );
+            if symmetric {
+                admit_expansion(&lower, 2)?;
+                admit_expansion(&upper, 2)?;
+                Self::Logic(
+                    Box::new(range(a.clone(), lower.clone(), upper.clone())),
+                    not,
+                    Box::new(range(a, upper, lower)),
+                )
+            } else {
+                range(a, lower, upper)
+            }
         } else if let Some(Token::Op(op)) = p.tokens.get(p.at).cloned() {
             if !["=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()) {
                 return Err(SqlError::Unsupported);
@@ -1032,27 +1038,15 @@ impl Filter {
                 } else {
                     Scalar::parse(p, depth + 1)?
                 };
-                if a.has_volatile_call() || b.has_volatile_call() {
-                    return Err(SqlError::Unsupported);
-                }
-                admit_expansion(&a, 2)?;
-                admit_expansion(&b, 2)?;
-                let equal = Self::Is(
-                    Box::new(Self::Compare(a.clone(), "=".into(), b.clone())),
-                    Some(true),
-                    false,
-                );
-                let both_null = Self::Logic(
-                    Box::new(Self::Null(a, false)),
-                    true,
-                    Box::new(Self::Null(b, false)),
-                );
-                let same = Self::Logic(Box::new(equal), false, Box::new(both_null));
-                f = if negated {
-                    same
-                } else {
-                    Self::Not(Box::new(same))
-                };
+                f = Self::distinct(a, b, negated)?;
+            } else if let Some(form) = functions::unicode::take_form(p)
+                .map(Some)
+                .or_else(|| matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "normalized").then_some(None))
+            {
+                p.need("normalized")?;
+                let a = match f { Self::Scalar(a) => a, f => Scalar::Predicate(Box::new(f)) };
+                let test = Self::Scalar(Scalar::Call("is_normalized".into(), std::iter::once(a).chain(form).collect()));
+                f = if negated { Self::Not(Box::new(test)) } else { test };
             } else {
                 let target = if p.word("true") {
                     Some(true)
@@ -1075,48 +1069,112 @@ impl Filter {
         Ok(f)
     }
 
+    fn distinct(a: Scalar, b: Scalar, negated: bool) -> R<Self> {
+        if a.has_volatile_call() || b.has_volatile_call() {
+            return Err(SqlError::Unsupported);
+        }
+        admit_expansion(&a, 2)?;
+        admit_expansion(&b, 2)?;
+        let equal = Self::Is(
+            Box::new(Self::Compare(a.clone(), "=".into(), b.clone())),
+            Some(true),
+            false,
+        );
+        let both_null = Self::Logic(
+            Box::new(Self::Null(a, false)), true, Box::new(Self::Null(b, false)),
+        );
+        let same = Self::Logic(Box::new(equal), false, Box::new(both_null));
+        Ok(if negated { same } else { Self::Not(Box::new(same)) })
+    }
+
+    fn row_pairs(a: Vec<Scalar>, b: Vec<Scalar>) -> R<impl ExactSizeIterator<Item = (Scalar, Scalar)>> {
+        if a.len() != b.len() {
+            user_types::view_replace_error("unequal number of entries in row expressions".into());
+            return Err(SqlError::Syntax);
+        }
+        Ok(a.into_iter().zip(b))
+    }
+
+    fn row_compare(a: Vec<Scalar>, op: &str, b: Vec<Scalar>) -> R<Self> {
+        let pairs = Self::row_pairs(a, b)?;
+        let distinct = match op {
+            "distinct" => Some(true),
+            "not_distinct" => Some(false),
+            _ => None,
+        };
+        if pairs.len() == 0 {
+            if let Some(distinct) = distinct {
+                return Ok(Self::Scalar(Scalar::Literal(Value::Bool(!distinct))));
+            }
+            user_types::view_replace_error("cannot compare rows of zero length".into());
+            return Err(SqlError::Unsupported);
+        }
+        if ["=", "<>", "!="].contains(&op) {
+            let fields = pairs.map(|(a, b)| Self::Compare(a, "=".into(), b)).collect::<Vec<_>>();
+            let equal = Self::combine(&fields, true);
+            return Ok(if op == "=" { equal } else { Self::Not(Box::new(equal)) });
+        }
+        // Reuse ordinary comparison binding for every pair. Execution inspects
+        // each ordering directly and stops at the first unequal or NULL pair.
+        let pair_op = if distinct.is_some() { "=" } else { op };
+        let args = pairs.map(|(a, b)| Scalar::Predicate(Box::new(Self::Compare(a, pair_op.into(), b))))
+            .collect();
+        Ok(Self::Scalar(Scalar::Call(format!("{}{op}", functions::ROW_ORDER_PREFIX), args)))
+    }
+
     fn row_filter(p: &mut Parser, depth: usize, aggregate_argument: bool) -> R<Self> {
         let a = Self::row(p, depth, aggregate_argument)?;
         let not = p.word("not");
-        let mut rows = Vec::new();
-        let inequality = if p.word("in") {
+        let f = if p.word("in") {
             p.punct('(')?;
+            let mut rows = Vec::new();
             loop {
                 rows.push(Self::row(p, depth, aggregate_argument)?);
                 if !p.sym(',') { break; }
             }
             p.punct(')')?;
-            false
+            admit_expansion(&Scalar::Call(String::new(), a.clone()), rows.len())?;
+            let comparisons = rows.into_iter().map(|b| Self::row_compare(a.clone(), "=", b))
+                .collect::<R<Vec<_>>>()?;
+            let f = Self::combine(&comparisons, false);
+            if not { Self::Not(Box::new(f)) } else { f }
+        } else if not {
+            return Err(SqlError::Syntax);
+        } else if p.word("is") {
+            let negated = p.word("not");
+            if p.word("null") {
+                let fields = a.into_iter().map(|a| Self::Null(a, negated)).collect::<Vec<_>>();
+                if fields.is_empty() { Self::Scalar(Scalar::Literal(Value::Bool(true))) }
+                else { Self::combine(&fields, true) }
+            } else {
+                p.need("distinct")?;
+                p.need("from")?;
+                let b = Self::row(p, depth, aggregate_argument)?;
+                Self::row_compare(a, if negated { "not_distinct" } else { "distinct" }, b)?
+            }
         } else {
-            if not { return Err(SqlError::Syntax); }
-            let Some(Token::Op(op)) = p.tokens.get(p.at) else { return Err(SqlError::Syntax); };
-            let inequality = match op.as_str() {
-                "=" => false, "<>" | "!=" => true, _ => return Err(SqlError::Unsupported),
-            };
+            let Some(Token::Op(op)) = p.tokens.get(p.at).cloned() else { return Err(SqlError::Unsupported); };
+            if !["=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()) {
+                return Err(SqlError::Unsupported);
+            }
             p.at += 1;
-            rows.push(Self::row(p, depth, aggregate_argument)?);
-            inequality
+            let b = Self::row(p, depth, aggregate_argument)?;
+            Self::row_compare(a, &op, b)?
         };
-        let mut comparisons = Vec::new();
-        admit_expansion(&Scalar::Call(String::new(), a.clone()), rows.len())?;
-        for b in rows {
-            if a.len() != b.len() { return Err(SqlError::Syntax); }
-            let fields = a.iter().cloned().zip(b).map(|(a, b)| Self::Compare(a, "=".into(), b)).collect::<Vec<_>>();
-            comparisons.push(Self::combine(&fields, true));
-        }
-        let f = Self::combine(&comparisons, false);
-        let f = if not || inequality { Self::Not(Box::new(f)) } else { f };
         f.admit_shape(depth, &mut 0)?;
-        // Reuse the normal IS / AND / OR suffix parser without scalar changes.
         Ok(f)
     }
+
     fn starts_row(p: &Parser) -> bool {
+        if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "row") {
+            return p.tokens.get(p.at + 1) == Some(&Token::Symbol('('));
+        }
         if p.tokens.get(p.at) != Some(&Token::Symbol('(')) { return false; }
         let mut level = 0;
         for token in &p.tokens[p.at..] {
             match token {
-                Token::Symbol('(') => level += 1,
-                Token::Symbol(')') => { level -= 1; if level == 0 { break; } }
+                Token::Symbol('(' | '[') => level += 1,
+                Token::Symbol(')' | ']') => { level -= 1; if level == 0 { break; } }
                 Token::Symbol(',') if level == 1 => return true,
                 _ => {}
             }
@@ -1124,9 +1182,14 @@ impl Filter {
         false
     }
     fn row(p: &mut Parser, depth: usize, aggregate: bool) -> R<Vec<Scalar>> {
+        let explicit = p.word("row");
         p.punct('(')?;
+        if explicit && p.sym(')') { return Ok(vec![]); }
         let mut fields = vec![Scalar::parse_expr(p, depth + 1, aggregate)?];
-        while p.sym(',') { fields.push(Scalar::parse_expr(p, depth + 1, aggregate)?); }
+        while p.sym(',') {
+            if fields.len() == MAX_COLUMNS { return Err(SqlError::Limit); }
+            fields.push(Scalar::parse_expr(p, depth + 1, aggregate)?);
+        }
         p.punct(')')?;
         Ok(fields)
     }
@@ -1683,7 +1746,7 @@ impl BoundFilter {
                 insensitive,
                 negated,
             } => {
-                if value.explicit_collation()?.is_some() {return Ok(None);}
+                let args = [value, pattern];
                 let pattern = pattern.plan_constant(budget)?;
                 let escape = match escape {
                     Some(a) => a.plan_constant(budget)?,
@@ -1698,14 +1761,11 @@ impl BoundFilter {
                 };
                 let value = value.plan_constant(budget)?;
                 match (value, pattern, escape) {
-                    (Some(value), Some(pattern), Some(escape)) => Ok(Some(eval_like(
-                        value,
-                        pattern,
-                        escape,
-                        *insensitive,
-                        *negated,
-                        budget,
-                    )?)),
+                    (Some(value), Some(pattern), Some(escape)) => Ok(Some(
+                        functions::collation::like(
+                            args, &value, &pattern, escape, (*insensitive, *negated), budget,
+                        )?,
+                    )),
                     _ => Ok(None),
                 }
             }
@@ -1749,6 +1809,7 @@ impl BoundFilter {
                 insensitive,
                 negated,
             } => {
+                let args = [value, pattern];
                 let pattern = pattern.eval(row, params, bytes)?;
                 let escape = match escape {
                     Some(a) => a.eval(row, params, bytes)?,
@@ -1757,11 +1818,10 @@ impl BoundFilter {
                 let Some(escape) = parse_like_escape(&pattern, &escape)? else {
                     return Ok(None);
                 };
-                let input=value;
                 let value = value.eval(row, params, bytes)?;
-                match functions::collation::like(input,&value,&pattern,escape,*insensitive,*negated,bytes)? {
-                    Some(result)=>result,None=>eval_like(value, pattern, escape, *insensitive, *negated, bytes)?
-                }
+                functions::collation::like(
+                    args, &value, &pattern, escape, (*insensitive, *negated), bytes,
+                )?
             }
             Self::Compare(a, op, b) => {
                 let (ascalar, bscalar) = (a,b);
@@ -2327,7 +2387,8 @@ impl Query {
             };
             if matches!(item, Item::Aggregate(..))
                 && (p.tokens.get(p.at) == Some(&Token::Symbol(':'))
-                    || matches!(p.tokens.get(p.at), Some(Token::Op(op)) if ["+", "-", "*", "/", "%", "||", "=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()))
+                    || functions::binary_operator(p.tokens.get(p.at))
+                    || matches!(p.tokens.get(p.at), Some(Token::Op(op)) if ["=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()))
                     || matches!(p.tokens.get(p.at), Some(Token::Word(w)) if ["and", "or", "is", "not", "between", "in", "like", "ilike"].contains(&w.as_str())))
             {
                 let mut skip_until = item_start;
@@ -2919,7 +2980,8 @@ impl Query {
                         || scalar(call))
                         && aggregate_filter::decode(condition).is_ok_and(|f| filter(&f))
                 }
-                Scalar::Call(name, args) if name == functions::CAST_TYPMOD || functions::collation::internal(name) => {
+                Scalar::Call(name, args) if name == functions::CAST_TYPMOD || functions::collation::internal(name)
+                    || name.starts_with(functions::ROW_ORDER_PREFIX) => {
                     args.iter().all(scalar)
                 }
                 Scalar::Call(name, args) => {
@@ -2938,6 +3000,15 @@ impl Query {
                             | "current_time"
                             | "localtime"
                             | "coalesce"
+                            | "nullif"
+                            | "num_nulls"
+                            | "num_nonnulls"
+                            | functions::NULLS_VARIADIC
+                            | functions::NONNULLS_VARIADIC
+                            | "width_bucket"
+                            | "normalize"
+                            | "is_normalized"
+                            | "unistr"
                             | "format"
                             | "greatest"
                             | "least"
@@ -6008,25 +6079,6 @@ fn parse_like_escape(pattern: &Value, escape: &Value) -> R<Option<super::like::E
         return Err(SqlError::UndefinedFunction);
     };
     Ok(Some(super::like::Escape::parse(escape)?))
-}
-
-fn eval_like(
-    value: Value,
-    pattern: Value,
-    escape: super::like::Escape,
-    insensitive: bool,
-    negated: bool,
-    work: &mut usize,
-) -> R<Option<bool>> {
-    if value == Value::Null {
-        return Ok(None);
-    }
-    let (Value::Text(value), Value::Text(pattern)) = (value, pattern) else {
-        return Err(SqlError::UndefinedFunction);
-    };
-    Ok(Some(
-        super::like::like(&value, &pattern, escape, insensitive, work)? != negated,
-    ))
 }
 
 struct AggregateAuxiliary {

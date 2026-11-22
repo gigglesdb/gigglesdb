@@ -579,12 +579,14 @@ fn user_sql_cannot_name_internal_nul_routines() {
         ("SELECT \"\0cast:typmod\"('x', 3)", E::Syntax),
         ("SELECT \"\0aggregate-filter:apply\"(1,2)", E::Syntax),
         // Our lexer has no U& escape processing: U&"\0000x" lexes as the word u, the operator &, and a
-        // quoted identifier holding the literal text \0000x, so it can never produce a NUL byte. The
-        // unsupported & operator rejects it (0A000); PG18.6 rejects \0000 in the scanner with 42601.
-        (r#"SELECT U&"\0000cast:typmod"('x', 3)"#, E::Unsupported),
+        // quoted identifier holding the literal text \0000x, so it can never produce a NUL byte. Since
+        // GD-0092 W0-6 `&` is the integer bitwise operator, so the call to that literal (non-NUL)
+        // name is an unknown routine (42883); PG18.6 rejects \0000 in the scanner with 42601
+        // ("invalid Unicode escape value"). No NUL-named internal routine is reachable.
+        (r#"SELECT U&"\0000cast:typmod"('x', 3)"#, E::UndefinedFunction),
         (
             r#"SELECT U&"\0000aggregate-filter:apply"(1)"#,
-            E::Unsupported,
+            E::UndefinedFunction,
         ),
         ("SELECT \"cast:typmod\"('x', 3)", E::UndefinedFunction),
     ] {

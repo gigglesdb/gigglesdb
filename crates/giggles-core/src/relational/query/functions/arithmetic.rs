@@ -2,6 +2,32 @@
 use super::*;
 
 const PREFIX: &str = "\u{1}operator:";
+const UNKNOWN_PREFIX: &str = "\0unknown_operator:";
+
+pub(super) fn unknown_operator(op: &str) -> String {
+    format!("{UNKNOWN_PREFIX}{op}")
+}
+
+pub(super) fn is_unknown_operator(name: &str) -> bool {
+    name.starts_with(UNKNOWN_PREFIX)
+}
+
+pub(super) fn bind_unknown_operator(
+    name: &str,
+    args: &[Scalar],
+    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+    tables: &[&TableDef],
+    parameters: &[Option<DataType>],
+) -> R<BoundScalar> {
+    let op = name.strip_prefix(UNKNOWN_PREFIX).ok_or(SqlError::InternalError)?;
+    let ty = |arg| known(arg, resolve, tables, parameters);
+    let (left, right) = match args {
+        [right] => (None, ty(right)?),
+        [left, right] => (Some(ty(left)?), ty(right)?),
+        _ => return Err(SqlError::InternalError),
+    };
+    Err(operator_error(op, left.as_ref().map(Option::as_ref), right.as_ref()))
+}
 pub(super) fn internal_name(name: &str) -> bool {
     name.starts_with(PREFIX)
 }
@@ -13,6 +39,26 @@ fn name(op: BinaryOp) -> &'static str {
         BinaryOp::Div => "\u{1}operator:/",
         BinaryOp::Mod => "\u{1}operator:%",
         BinaryOp::Concat => "\u{1}operator:||",
+        BinaryOp::Pow => "\u{1}operator:^",
+        BinaryOp::BitAnd => "\u{1}operator:&",
+        BinaryOp::BitOr => "\u{1}operator:|",
+        BinaryOp::BitXor => "\u{1}operator:#",
+        BinaryOp::ShiftLeft => "\u{1}operator:<<",
+        BinaryOp::ShiftRight => "\u{1}operator:>>",
+        BinaryOp::Like => "\u{1}operator:~~",
+        BinaryOp::NotLike => "\u{1}operator:!~~",
+        BinaryOp::Ilike => "\u{1}operator:~~*",
+        BinaryOp::NotIlike => "\u{1}operator:!~~*",
+        BinaryOp::StartsWith => "\u{1}operator:^@",
+        BinaryOp::InfixCbrt => "\u{1}operator:||/",
+        BinaryOp::JsonPath => "\u{1}operator:#>",
+        BinaryOp::JsonPathText => "\u{1}operator:#>>",
+        BinaryOp::Contains => "\u{1}operator:@>",
+        BinaryOp::ContainedBy => "\u{1}operator:<@",
+        BinaryOp::Regex => "\u{1}operator:~",
+        BinaryOp::NotRegex => "\u{1}operator:!~",
+        BinaryOp::RegexInsensitive => "\u{1}operator:~*",
+        BinaryOp::NotRegexInsensitive => "\u{1}operator:!~*",
     }
 }
 pub(super) fn token_operator(token: Option<&Token>) -> Option<(BinaryOp, u8)> {
@@ -24,6 +70,26 @@ pub(super) fn token_operator(token: Option<&Token>) -> Option<(BinaryOp, u8)> {
             "/" => (BinaryOp::Div, 3),
             "%" => (BinaryOp::Mod, 3),
             "||" => (BinaryOp::Concat, 1),
+            "^" => (BinaryOp::Pow, 4),
+            "&" => (BinaryOp::BitAnd, 1),
+            "|" => (BinaryOp::BitOr, 1),
+            "#" => (BinaryOp::BitXor, 1),
+            "<<" => (BinaryOp::ShiftLeft, 1),
+            ">>" => (BinaryOp::ShiftRight, 1),
+            "~~" => (BinaryOp::Like, 1),
+            "!~~" => (BinaryOp::NotLike, 1),
+            "~~*" => (BinaryOp::Ilike, 1),
+            "!~~*" => (BinaryOp::NotIlike, 1),
+            "^@" => (BinaryOp::StartsWith, 1),
+            "||/" => (BinaryOp::InfixCbrt, 1),
+            "#>" => (BinaryOp::JsonPath, 1),
+            "#>>" => (BinaryOp::JsonPathText, 1),
+            "@>" => (BinaryOp::Contains, 1),
+            "<@" => (BinaryOp::ContainedBy, 1),
+            "~" => (BinaryOp::Regex, 1),
+            "!~" => (BinaryOp::NotRegex, 1),
+            "~*" => (BinaryOp::RegexInsensitive, 1),
+            "!~*" => (BinaryOp::NotRegexInsensitive, 1),
             _ => return None,
         }),
         _ => None,
@@ -61,7 +127,7 @@ pub(super) fn admit_shape(value: &Scalar, depth: usize, nodes: &mut usize) -> R<
         _ => Ok(()),
     }
 }
-fn known(
+pub(super) fn known(
     a: &Scalar,
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     tables: &[&TableDef],
@@ -174,6 +240,12 @@ fn temporal_signature(
     Ok(Some((at, bt, out)))
 }
 fn unary_type(op: UnaryOp, ty: &DataType) -> R<DataType> {
+    if matches!(op, UnaryOp::Sqrt | UnaryOp::Cbrt) && number(ty) {
+        return Ok(DataType::DoublePrecision);
+    }
+    if op == UnaryOp::BitNot && !integer(ty) {
+        return Err(SqlError::UndefinedFunction);
+    }
     if *ty == DataType::Bpchar {
         return Err(SqlError::Unsupported);
     }
@@ -215,6 +287,55 @@ fn signature(
         }
         return Err(SqlError::UndefinedFunction);
     }
+    use BinaryOp::*;
+    if matches!(op, JsonPath | JsonPathText) {
+        return if matches!(a, None | Some(Jsonb)) && matches!(b, None | Some(TextArray)) {
+            Ok((Jsonb, TextArray, if op == JsonPath { Jsonb } else { Text }))
+        } else {
+            Err(undefined_operator(op, [a.as_ref(), b.as_ref()]))
+        };
+    }
+    if matches!(op, Contains | ContainedBy) {
+        return Err(SqlError::Unsupported);
+    }
+    if matches!(op, Like | NotLike | Ilike | NotIlike | StartsWith | Regex | NotRegex
+        | RegexInsensitive | NotRegexInsensitive) {
+        return if [a, b].iter().flatten().all(|ty| *ty == Text) {
+            Ok((Text, Text, Boolean))
+        } else {
+            Err(SqlError::UndefinedFunction)
+        };
+    }
+    if op == Pow {
+        if ![&a, &b].into_iter().flatten().all(number) {
+            return Err(SqlError::UndefinedFunction);
+        }
+        // PG18: numeric ^ numeric when no operand is real/double; numeric with a float
+        // operand resolves to float8 ^ float8 (oracle: 1::numeric ^ 2::real is double precision).
+        let float = [&a, &b].into_iter().flatten().any(|ty| matches!(ty, Real | DoublePrecision));
+        let ty = if !float && (a == Some(Numeric) || b == Some(Numeric)) { Numeric } else { DoublePrecision };
+        return Ok((ty.clone(), ty.clone(), ty));
+    }
+    if op == InfixCbrt {
+        return Err(undefined_operator(op, [a.as_ref(), b.as_ref()]));
+    }
+    if matches!(op, BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight) {
+        let spelling = name(op).strip_prefix(PREFIX).unwrap();
+        let shift = matches!(op, ShiftLeft | ShiftRight);
+        let types = [a.as_ref(), b.as_ref()];
+        if a.is_none() && b.is_none() {
+            user_types::view_replace_error(format!("operator is not unique: unknown {spelling} unknown"));
+            user_types::sql_error_hint("Could not choose a best candidate operator. You might need to add explicit type casts.");
+            return Err(SqlError::AmbiguousFunction);
+        }
+        if !types.into_iter().flatten().all(integer) || shift && b == Some(BigInt) {
+            return Err(undefined_operator(op, types));
+        }
+        let left = a.clone().unwrap_or_else(|| if shift { Integer } else { b.clone().unwrap() });
+        let right = if shift { Integer } else { b.unwrap_or_else(|| left.clone()) };
+        let result = if shift { left.clone() } else { common_result_type([left.clone(), right.clone()])? };
+        return Ok((left, right, result));
+    }
     if let Some(signature) = temporal_signature(op, a.as_ref(), b.as_ref())? {
         return Ok(signature);
     }
@@ -247,6 +368,31 @@ fn signature(
     };
     Ok((result.clone(), result.clone(), result))
 }
+fn undefined_operator(op: BinaryOp, types: [Option<&DataType>; 2]) -> SqlError {
+    let spelling = name(op).strip_prefix(PREFIX).unwrap();
+    operator_error(spelling, Some(types[0]), types[1])
+}
+
+fn operator_error(spelling: &str, left: Option<Option<&DataType>>, right: Option<&DataType>) -> SqlError {
+    let label = |ty: Option<&DataType>| ty.map_or("unknown", typeof_expr::name);
+    let right = label(right);
+    let signature = left.map_or_else(
+        || format!("{spelling} {right}"),
+        |left| format!("{} {spelling} {right}", label(left)),
+    );
+    user_types::view_replace_error(format!("operator does not exist: {signature}"));
+    user_types::sql_error_hint("No operator matches the given name and argument types. You might need to add explicit type casts.");
+    SqlError::UndefinedFunction
+}
+
+fn unary_source(op: UnaryOp, ty: Option<DataType>) -> R<DataType> {
+    ty.or(match op {
+        UnaryOp::Abs | UnaryOp::Sqrt | UnaryOp::Cbrt => Some(DataType::DoublePrecision),
+        _ => None,
+    })
+    .ok_or(SqlError::AmbiguousFunction)
+}
+
 pub(super) fn infer(
     value: &Scalar,
     parameters: &mut [Option<DataType>],
@@ -256,9 +402,12 @@ pub(super) fn infer(
     match value {
         Scalar::Unary(op, a) => {
             a.infer(None, parameters, resolve, tables)?;
-            let ty = known(a, resolve, tables, parameters)?.ok_or(SqlError::AmbiguousFunction)?;
-            unary_type(*op, &ty)?;
-            a.infer(Some(&ty), parameters, resolve, tables)
+            let source = known(a, resolve, tables, parameters)?;
+            let ty = unary_type(*op, &unary_source(*op, source.clone())?)?;
+            if source.is_none() {
+                a.infer(Some(&ty), parameters, resolve, tables)?;
+            }
+            Ok(())
         }
         Scalar::Binary(op, a, b) => {
             a.infer(None, parameters, resolve, tables)?;
@@ -280,7 +429,7 @@ pub(super) fn infer(
         _ => unreachable!(),
     }
 }
-fn operand(
+pub(super) fn operand(
     a: &Scalar,
     target: &DataType,
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
@@ -323,19 +472,20 @@ pub(super) fn bind(
 ) -> R<BoundScalar> {
     match value {
         Scalar::Unary(op, a) => {
-            let source =
-                known(a, resolve, tables, parameters)?.ok_or(SqlError::AmbiguousFunction)?;
+            let source = unary_source(*op, known(a, resolve, tables, parameters)?)?;
             let ty = unary_type(*op, &source)?;
             let a = operand(a, &ty, resolve, tables, parameters)?;
             Ok(BoundScalar {
                 ty,
                 node: Node::Call(
-                    if *op == UnaryOp::Neg {
-                        "\u{1}operator:neg"
-                    } else {
-                        "\u{1}operator:plus"
-                    }
-                    .into(),
+                    match op {
+                        UnaryOp::Neg => "\u{1}operator:neg",
+                        UnaryOp::Plus => "\u{1}operator:plus",
+                        UnaryOp::Abs => "\u{1}operator:@",
+                        UnaryOp::Sqrt => "\u{1}operator:|/",
+                        UnaryOp::Cbrt => "\u{1}operator:||/",
+                        UnaryOp::BitNot => "\u{1}operator:~",
+                    }.into(),
                     vec![a],
                 ),
             })
@@ -384,7 +534,9 @@ fn checked_integer(value: i64, ty: &DataType) -> R<Value> {
     }
     Ok(Value::Int(value))
 }
-pub(super) fn eval(name: &str, ty: &DataType, values: &[Value], budget: &mut usize) -> R<Value> {
+pub(super) fn eval(
+    name: &str, ty: &DataType, args: &[BoundScalar], values: &[Value], budget: &mut usize,
+) -> R<Value> {
     if let Some(result) = concat::eval(name, values, budget) {
         return result;
     }
@@ -394,6 +546,49 @@ pub(super) fn eval(name: &str, ty: &DataType, values: &[Value], budget: &mut usi
     let op = name
         .strip_prefix(PREFIX)
         .ok_or(SqlError::UndefinedFunction)?;
+    if let Some(function) = match op {
+        "^" => Some("power"),
+        "|/" => Some("sqrt"),
+        "||/" => Some("cbrt"),
+        _ => None,
+    } {
+        let value = numeric::eval(function, values).ok_or(SqlError::InternalError)?
+            .inspect_err(|error| {
+                if *error == SqlError::Overflow && *ty == DataType::Numeric {
+                    user_types::view_replace_error("value overflows numeric format".into());
+                }
+            })?;
+        charge(budget, &value)?;
+        return Ok(value);
+    }
+    if op == "@" {
+        return eval_abs(ty, &values[0], budget);
+    }
+    if op == "~" && let Value::Int(n) = values[0] {
+        reserve(budget, 8)?;
+        return Ok(Value::Int(!n));
+    }
+    if matches!(op, "#>" | "#>>") {
+        let value = logical_types::eval(op, &args[0].ty, values)?;
+        charge(budget, &value)?;
+        return Ok(value);
+    }
+    if matches!(op, "~" | "!~" | "~*" | "!~*")
+        && let [Value::Text(value), Value::Text(pattern)] = values
+    {
+        return collation::regex(op, args, value, pattern, budget);
+    }
+    if op == "^@" {
+        return collation::starts_with(args, values, budget);
+    }
+    if matches!(op, "~~" | "!~~" | "~~*" | "!~~*") {
+        let escape = super::super::super::like::Escape::parse("\\")?;
+        return collation::like(
+            [&args[0], &args[1]], &values[0], &values[1], escape,
+            (op.ends_with('*'), op.starts_with('!')), budget,
+        )
+        .map(|value| value.map_or(Value::Null, Value::Bool));
+    }
     if op == "plus" {
         if let Value::Numeric(a) = &values[0] {
             reserve(budget, a.display_byte_bound())?;
@@ -464,6 +659,19 @@ pub(super) fn eval(name: &str, ty: &DataType, values: &[Value], budget: &mut usi
                 return Err(SqlError::DivisionByZero);
             }
             let out = match op {
+                "&" => Some(a & b),
+                "|" => Some(a | b),
+                "#" => Some(a ^ b),
+                "<<" | ">>" => {
+                    let count = *b as u32;
+                    Some(match (op, ty) {
+                        ("<<", DataType::BigInt) => a.wrapping_shl(count),
+                        (">>", DataType::BigInt) => a.wrapping_shr(count),
+                        ("<<", DataType::SmallInt) => i64::from((*a as i32).wrapping_shl(count) as i16),
+                        ("<<", _) => i64::from((*a as i32).wrapping_shl(count)),
+                        _ => i64::from((*a as i32).wrapping_shr(count)),
+                    })
+                }
                 "+" => a.checked_add(*b),
                 "-" => a.checked_sub(*b),
                 "*" => a.checked_mul(*b),
@@ -523,6 +731,22 @@ pub(super) fn eval(name: &str, ty: &DataType, values: &[Value], budget: &mut usi
         _ => Err(SqlError::UndefinedFunction),
     }
 }
+pub(super) fn eval_abs(ty: &DataType, value: &Value, budget: &mut usize) -> R<Value> {
+    let out = match value {
+        Value::Numeric(n) => Value::Numeric(
+            Numeric::parse(n.to_string().trim_start_matches('-')).map_err(pg_error)?,
+        ),
+        Value::Float4(n) => Value::Float4(Float4::from_bits(n.value().abs().to_bits())),
+        Value::Float8(n) => Value::Float8(Float8::from_bits(n.value().abs().to_bits())),
+        Value::Int(n) => n.checked_abs().ok_or(SqlError::Overflow)
+            .and_then(|n| checked_integer(n, ty))
+            .inspect_err(|_| user_types::view_replace_error(format!("{} out of range", typeof_expr::name(ty))))?,
+        _ => return Err(SqlError::UndefinedFunction),
+    };
+    charge(budget, &out)?;
+    Ok(out)
+}
+
 fn float_check(op: &str, a: f64, b: f64, result: f64) -> R<()> {
     if result.is_infinite() && a.is_finite() && b.is_finite()
         || matches!(op, "*" | "/") && result == 0.0 && a != 0.0 && b != 0.0 && b.is_finite()

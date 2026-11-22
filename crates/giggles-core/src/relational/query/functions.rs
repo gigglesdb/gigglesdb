@@ -9,6 +9,12 @@ mod binary;
 mod cast;
 mod character;
 mod comparison;
+mod conditional;
+pub(super) use conditional::{NONNULLS_VARIADIC, NULLS_VARIADIC};
+pub(super) const ROW_ORDER_PREFIX: &str = "\0row_order:";
+pub(super) fn binary_operator(token: Option<&Token>) -> bool {
+    arithmetic::token_operator(token).is_some()
+}
 #[test]
 #[cfg(test)]
 fn v2_value_ceiling_allows_argument_and_result_accounting() {
@@ -78,6 +84,10 @@ mod format;
 mod substring_order;
 mod temporal;
 mod text;
+pub(super) mod unicode;
+mod unicode_data;
+#[cfg(test)]
+mod w06_tests;
 // Preserve failed routine lookup until argument and source analysis finishes.
 pub(super) const CAST_TYPMOD: &str = "\0cast:typmod";
 const UNDEFINED_ROUTINE_PREFIX: &str = "public.\0";
@@ -107,6 +117,10 @@ pub(super) fn deferred_routine_binds_for_sql_role(name: &str) -> bool {
 pub(super) enum UnaryOp {
     Neg,
     Plus,
+    Abs,
+    Sqrt,
+    Cbrt,
+    BitNot,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BinaryOp {
@@ -116,6 +130,26 @@ pub(super) enum BinaryOp {
     Div,
     Mod,
     Concat,
+    Pow,
+    BitAnd,
+    BitOr,
+    BitXor,
+    ShiftLeft,
+    ShiftRight,
+    Like,
+    NotLike,
+    Ilike,
+    NotIlike,
+    StartsWith,
+    InfixCbrt,
+    JsonPath,
+    JsonPathText,
+    Contains,
+    ContainedBy,
+    Regex,
+    NotRegex,
+    RegexInsensitive,
+    NotRegexInsensitive,
 }
 #[derive(Debug, Clone)]
 pub(super) enum Scalar {
@@ -583,6 +617,7 @@ impl Scalar {
                         | "setval"
                         | "currval"
                         | "random"
+                        | "gen_random_uuid"
                         | "clock_timestamp"
                         | "pg_current_xact_id"
                         | "pg_current_xact_id_if_assigned"
@@ -612,13 +647,31 @@ impl Scalar {
             return Err(SqlError::Limit);
         }
         let mut value = Self::parse_unary(p, depth, aggregate_argument)?;
-        while let Some((op, precedence)) = arithmetic::token_operator(p.tokens.get(p.at)) {
+        loop {
+            let token = p.tokens.get(p.at);
+            let (operator, precedence) = if let Some((op, precedence)) = arithmetic::token_operator(token) {
+                (Ok(op), precedence)
+            } else if let Some(Token::Op(op)) = token
+                && !matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "=>")
+            {
+                let name = match op.as_str() {
+                    "->" => "\0json_get".into(),
+                    "->>" => "\0json_text".into(),
+                    _ => arithmetic::unknown_operator(op),
+                };
+                (Err(name), 1)
+            } else {
+                break;
+            };
             if precedence < minimum {
                 break;
             }
             p.at += 1;
             let right = Self::parse_binary(p, depth + 1, aggregate_argument, precedence + 1)?;
-            value = Self::Binary(op, Box::new(value), Box::new(right));
+            value = match operator {
+                Ok(op) => Self::Binary(op, Box::new(value), Box::new(right)),
+                Err(name) => Self::Call(name, vec![value, right]),
+            };
             arithmetic::admit_shape(&value, depth, &mut 0)?;
         }
         Ok(value)
@@ -630,6 +683,10 @@ impl Scalar {
         let sign = match p.tokens.get(p.at) {
             Some(Token::Op(op)) if op == "-" => Some(UnaryOp::Neg),
             Some(Token::Op(op)) if op == "+" => Some(UnaryOp::Plus),
+            Some(Token::Op(op)) if op == "@" => Some(UnaryOp::Abs),
+            Some(Token::Op(op)) if op == "|/" => Some(UnaryOp::Sqrt),
+            Some(Token::Op(op)) if op == "||/" => Some(UnaryOp::Cbrt),
+            Some(Token::Op(op)) if op == "~" => Some(UnaryOp::BitNot),
             _ => None,
         };
         let value = if let Some(sign) = sign {
@@ -653,8 +710,21 @@ impl Scalar {
             }
             Self::Unary(
                 sign,
-                Box::new(Self::parse_unary(p, depth + 1, aggregate_argument)?),
+                Box::new(if matches!(sign, UnaryOp::Neg | UnaryOp::Plus) {
+                    Self::parse_unary(p, depth + 1, aggregate_argument)?
+                } else {
+                    // PostgreSQL's generic prefix operators have the same
+                    // precedence as generic infix operators.
+                    Self::parse_binary(p, depth + 1, aggregate_argument, 2)?
+                }),
             )
+        } else if let Some(Token::Op(op)) = p.tokens.get(p.at)
+            && !matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "=>")
+        {
+            let name = arithmetic::unknown_operator(op);
+            p.at += 1;
+            let right = Self::parse_binary(p, depth + 1, aggregate_argument, 2)?;
+            Self::Call(name, vec![right])
         } else {
             let value = Self::primary_context(p, depth, aggregate_argument)?;
             return Self::parse_casts(p, depth, value);
@@ -668,28 +738,6 @@ impl Scalar {
                 let index = Self::parse_expr(p, depth + 1, false)?;
                 p.punct(']')?;
                 value = Self::Call("\0array_subscript".into(), vec![value, index]);
-            } else if matches!(p.tokens.get(p.at), Some(Token::Op(op)) if op=="->" || op=="->>") {
-                let Some(Token::Op(op)) = p.tokens.get(p.at).cloned() else {
-                    unreachable!()
-                };
-                p.at += 1;
-                let negative = matches!(p.tokens.get(p.at),Some(Token::Op(op)) if op=="-");
-                if negative {
-                    p.at += 1;
-                }
-                let mut key = Self::primary_context(p, depth + 1, false)?;
-                if negative {
-                    key = Self::Unary(UnaryOp::Neg, Box::new(key));
-                }
-                value = Self::Call(
-                    if op == "->" {
-                        "\0json_get"
-                    } else {
-                        "\0json_text"
-                    }
-                    .into(),
-                    vec![value, key],
-                );
             } else if p.word("collate") {
                 value = collation::parse(p, value)?;
             } else if p.sym(':') {
@@ -883,6 +931,15 @@ impl Scalar {
                 // MERGE RETURNING rewrites this contextual expression before scalar parsing.
                 if name == "merge_action" { return Err(SqlError::Syntax); }
                 p.punct('(')?;
+                if name == "normalize" && !qualified_call && !quoted {
+                    let input = Self::parse_expr(p, depth + 1, aggregate_argument)?;
+                    let mut args = vec![input];
+                    if p.sym(',') {
+                        args.push(unicode::take_form(p).ok_or_else(|| unicode::invalid_form(p))?);
+                    }
+                    p.punct(')')?;
+                    return Ok(Self::Call(name, args));
+                }
                 if name == "position" && !qualified_call && !quoted {
                     if matches!(
                         p.tokens.get(p.at),
@@ -949,6 +1006,16 @@ impl Scalar {
                         {
                             return Err(SqlError::Syntax);
                         }
+                        if matches!(name.as_str(), "num_nulls" | "num_nonnulls") && p.word("variadic") {
+                            args.push(Self::parse_expr(p, depth + 1, aggregate_argument)?);
+                            p.punct(')')?;
+                            let variadic = if name == "num_nulls" {
+                                conditional::NULLS_VARIADIC
+                            } else {
+                                conditional::NONNULLS_VARIADIC
+                            };
+                            return Ok(Self::Call(variadic.into(), args));
+                        }
                         let previous_casts = p.privilege_casts;
                         p.privilege_casts = privilege_name(&name);
                         // regclass is an object reference only in the first sequence
@@ -965,6 +1032,10 @@ impl Scalar {
                             };
                             p.at += 4;
                             args.push(Self::Literal(Value::Text(value)));
+                        } else if name == "width_bucket" && args.len() < 3
+                            && let Some(literal) = conditional::parse_wide_bucket_literal(p)
+                        {
+                            args.push(literal);
                         } else {
                             args.push(
                                 if !qualified_call
@@ -1050,6 +1121,10 @@ impl Scalar {
                             break;
                         }
                     }
+                }
+                if name == "nullif" && !qualified_call && !quoted && args.len() != 2 {
+                    user_types::view_replace_error("syntax error at or near \")\"".into());
+                    return Err(SqlError::Syntax);
                 }
                 Ok(Self::Call(name, args))
             } else {
@@ -1273,6 +1348,12 @@ impl Scalar {
         tables: &[&TableDef],
         parameters: &[Option<DataType>],
     ) -> R<BoundScalar> {
+        if let Self::Call(name, args) = a
+            && name == array_constructor::NAME
+            && array_constructor::element_type(ty).is_some()
+        {
+            return array_constructor::bind(args, Some(ty), resolve, tables, parameters);
+        }
         if let Self::Literal(v @ (Value::Text(_) | Value::Null)) = a
             && datetime_input::target(ty)
         {
@@ -1317,6 +1398,11 @@ impl Scalar {
         }
         if !(number(&a.ty) && number(ty)
             || a.ty == *ty
+            || matches!(
+                (&a.ty, ty),
+                (DataType::IntArray, DataType::BigIntArray)
+                    | (DataType::BigIntArray, DataType::IntArray)
+            )
             || integer(&a.ty) && (integer(ty) || *ty == DataType::Bytes)
             || a.ty == DataType::Bytes && integer(ty)
             || matches!(a.ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
@@ -1383,7 +1469,7 @@ impl Scalar {
         parameters: &[Option<DataType>],
     ) -> R<BoundScalar> {
         match name {
-            array_constructor::NAME => array_constructor::bind(args, resolve, tables, parameters),
+            array_constructor::NAME => array_constructor::bind(args, None, resolve, tables, parameters),
             "\0plan_cardinality" if args.len() == 1 => {
                 Self::bind_plan_cardinality(name, args, resolve, tables, parameters)
             }
@@ -1409,7 +1495,10 @@ impl Scalar {
                 Err(error)
             }
             "overlay" => Self::bind_overlay(args, resolve, tables, parameters),
-            "pg_typeof" => typeof_expr::bind(args, resolve, tables, parameters),
+            typeof_expr::NAME => typeof_expr::bind(args, resolve, tables, parameters),
+            name if arithmetic::is_unknown_operator(name) => {
+                arithmetic::bind_unknown_operator(name, args, resolve, tables, parameters)
+            }
             name if greatest::known_name(name) => {
                 greatest::bind(name, args, resolve, tables, parameters)
             }
@@ -1423,8 +1512,34 @@ impl Scalar {
                 Self::bind_clock(name, args, ty)
             }
             "position" => Self::bind_position(args, resolve, tables, parameters),
+            name if let Some(op) = name.strip_prefix(ROW_ORDER_PREFIX) => {
+                Self::bind_row_order(name, op, args, resolve, tables, parameters)
+            }
+            name if matches!(name, "nullif" | "width_bucket") || conditional::count_nulls(name) => {
+                conditional::bind(name, args, resolve, tables, parameters)
+            }
             _ => Self::bind_regular_call(name, args, resolve, tables, parameters),
         }
+    }
+
+    #[inline(never)]
+    fn bind_row_order(
+        name: &str,
+        op: &str,
+        args: &[Self],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        let args = args
+            .iter()
+            .map(|arg| arg.bind(resolve, tables, parameters))
+            .collect::<R<Vec<_>>>()?;
+        comparison::check_row_order(op, &args)?;
+        Ok(BoundScalar {
+            ty: DataType::Boolean,
+            node: Node::Call(name.to_owned(), args),
+        })
     }
 
     #[inline(never)]
@@ -1842,6 +1957,7 @@ impl Scalar {
         .or_else(|| uuid_ossp::signature(name, args.len()))
         .or_else(|| md5::signature(name, args.len(), args.first().map(|a| &a.ty)))
         .or_else(|| character::signature(name, args.len()))
+        .or_else(|| unicode::signature(name, args.len()))
         .or_else(|| quoting::signature(name, args.len(), args.first().map(|a| &a.ty)))
         .or_else(|| text::signature(name, args.len()))
         .or_else(|| temporal::signature(name, &args))
@@ -1856,6 +1972,7 @@ impl Scalar {
                     node: cast_node(date, &DataType::TimestampTz),
                 });
             }
+            let count = args.len();
             for ((a, original), ty) in args.iter_mut().zip(original).zip(types) {
                 if let Some(ty) = ty {
                     if (name == "octet_length" || name == "bit_length") && a.ty == DataType::Bytes {
@@ -1875,6 +1992,12 @@ impl Scalar {
                             && (ty == DataType::BigInt
                                 || ty == DataType::Integer && a.ty == DataType::SmallInt))
                     {
+                        if name == "normalize" && count == 2 && ty == DataType::Text {
+                            user_types::view_replace_error(format!(
+                                "function pg_catalog.normalize({}, unknown) does not exist",
+                                typeof_expr::name(&a.ty),
+                            ));
+                        }
                         return Err(SqlError::UndefinedFunction);
                     }
                 }
@@ -2256,7 +2379,7 @@ impl BoundScalar {
             Node::Call(name, _) if name == array_constructor::NAME => Some("array"),
             Node::Call(name, args) if collation::internal(name) || aggregate_order::internal(name) || name == "\0array_subscript" => args[0].strong_name(),
             Node::Call(name, _) if name.starts_with("\0json_") => None,
-            Node::Call(name, _) if arithmetic::internal_name(name) => None,
+            Node::Call(name, _) if arithmetic::internal_name(name) || name.starts_with(ROW_ORDER_PREFIX) => None,
             Node::Column(_, name)
             | Node::Call(name, _)
             | Node::Clock(name, ..)
@@ -2312,7 +2435,9 @@ impl BoundScalar {
             Node::Literal(_) => "?column?",
             Node::Call(n, _) if n == array_constructor::NAME => "array",
             Node::Call(n, args) if collation::internal(n) || aggregate_order::internal(n) || n == "\0array_subscript" => args[0].name(),
-            Node::Call(n, _) if n.starts_with("\0json_") => "?column?",
+            Node::Call(n, _) if n.starts_with("\0json_") || n.starts_with(ROW_ORDER_PREFIX) => "?column?",
+            Node::Call(n, _) if n == conditional::NULLS_VARIADIC => "num_nulls",
+            Node::Call(n, _) if n == conditional::NONNULLS_VARIADIC => "num_nonnulls",
             Node::Call(n, _) if arithmetic::internal_name(n) => "?column?",
             Node::Call(n, _) | Node::Clock(n, ..) | Node::Sequence(n, ..) | Node::Xact(n, ..) | Node::Privilege(n, ..) => n,
         }
@@ -2523,15 +2648,19 @@ impl BoundScalar {
             Node::Call(n, _) if n == "\0plan_cardinality" => Err(SqlError::CardinalityViolation),
             Node::Call(n, args) => {
                 if collation::internal(n) || aggregate_order::internal(n) { return args[0].eval(row, params, budget); }
-                if n == "pg_typeof" {
-                    return args[0].eval(row, params, budget);
+                if n == typeof_expr::NAME {
+                    args[0].eval(row, params, budget)?;
+                    return args[1].eval(row, params, budget);
+                }
+                if let Some(op) = n.strip_prefix(ROW_ORDER_PREFIX) {
+                    return comparison::eval_row_order(op, args, row, params, budget);
                 }
                 if arithmetic::internal_name(n) {
                     let values = args
                         .iter()
                         .map(|a| a.eval(row, params, budget))
                         .collect::<R<Vec<_>>>()?;
-                    return arithmetic::eval(n, &self.ty, &values, budget);
+                    return arithmetic::eval(n, &self.ty, args, &values, budget);
                 }
                 if matches!(
                     n.as_str(),
@@ -2562,6 +2691,9 @@ impl BoundScalar {
                 if greatest::known_name(n) {
                     return greatest::eval(n, values, self);
                 }
+                if matches!(n.as_str(), "nullif" | "width_bucket") || conditional::count_nulls(n) {
+                    return conditional::eval(n, args, values, budget);
+                }
                 if n == array_constructor::NAME { return array_constructor::eval(&values,budget); }
                 if n != "concat"
                     && n != "format"
@@ -2582,6 +2714,9 @@ impl BoundScalar {
                 if n == "overlay" {
                     return overlay::eval(&values, budget);
                 }
+                if n == "starts_with" {
+                    return collation::starts_with(args, &values, budget);
+                }
                 if n == "format" {
                     return format::eval(&values, args, budget);
                 }
@@ -2599,6 +2734,9 @@ impl BoundScalar {
                 if values.contains(&Value::Null) {
                     return Ok(Value::Null);
                 }
+                if let Some(value) = unicode::eval(n, &values, budget) {
+                    return value;
+                }
                 if let Some(v) = numeric::eval(n, &values).or_else(|| numeric_function(n, &values))
                 {
                     let v = cast_value(v?, &self.ty, budget)?;
@@ -2606,36 +2744,11 @@ impl BoundScalar {
                     return Ok(v);
                 }
                 let v = match (n.as_str(), &values[0]) {
-                    ("abs", Value::Numeric(n)) => Value::Numeric(
-                        Numeric::parse(n.to_string().trim_start_matches('-')).map_err(pg_error)?,
-                    ),
-                    ("abs", Value::Float4(n)) => {
-                        Value::Float4(Float4::from_bits(n.value().abs().to_bits()))
-                    }
-                    ("abs", Value::Float8(n)) => {
-                        Value::Float8(Float8::from_bits(n.value().abs().to_bits()))
-                    }
-                    ("abs", Value::Int(v)) => {
-                        let v = v.checked_abs().ok_or(SqlError::Overflow)?;
-                        if (self.ty == DataType::SmallInt && i16::try_from(v).is_err())
-                            || (self.ty == DataType::Integer && i32::try_from(v).is_err())
-                        {
-                            return Err(SqlError::Overflow);
-                        }
-                        Value::Int(v)
-                    }
+                    ("abs", value) => return arithmetic::eval_abs(&self.ty, value, budget),
                     ("length", Value::Text(s)) => Value::Int(
                         i32::try_from(s.chars().count()).map_err(|_| SqlError::Overflow)? as i64,
                     ),
-                    ("lower" | "upper", Value::Text(s)) => {
-                        // PostgreSQL 18.0 libc C locale only changes ASCII case.
-                        reserve(budget, s.len())?;
-                        return Ok(Value::Text(if n == "lower" {
-                            s.to_ascii_lowercase()
-                        } else {
-                            s.to_ascii_uppercase()
-                        }));
-                    }
+                    ("lower" | "upper", Value::Text(s)) => return unicode::casing(n, s, budget),
                     ("substring" | "substr", Value::Text(s)) => {
                         let Value::Int(start) = values[1] else {
                             return Err(SqlError::Type);
@@ -3194,7 +3307,13 @@ impl Scalar {
                 };
                 args[1].infer(hint, parameters, resolve, tables)?;
             }
-            Self::Call(n, args) if n == array_constructor::NAME => array_constructor::infer(args,parameters,resolve,tables)?,
+            Self::Call(n, args) if arithmetic::is_unknown_operator(n) => {
+                for arg in args {
+                    arg.infer(None, parameters, resolve, tables)?;
+                }
+                arithmetic::bind_unknown_operator(n, args, resolve, tables, parameters)?;
+            }
+            Self::Call(n, args) if n == array_constructor::NAME => array_constructor::infer(args, expected, parameters, resolve, tables)?,
             Self::Call(n, args) if n == "\0plan_cardinality" && args.len() == 1 => {
                 args[0].infer(expected, parameters, resolve, tables)?;
             }
@@ -3309,6 +3428,9 @@ impl Scalar {
             Self::Call(n, args) if n == "position" => {
                 Self::infer_position(args, parameters, resolve, tables)?;
             }
+            Self::Call(n, args) if matches!(n.as_str(), "nullif" | "width_bucket") || conditional::count_nulls(n) => {
+                conditional::infer(n, args, parameters, resolve, tables)?;
+            }
             Self::Call(n, args) if quoting::known_name(n) && args.len() == 1 => {
                 args[0].infer(None, parameters, resolve, tables)?;
                 let ty = if args[0].aggregate_unknown(parameters) {
@@ -3380,6 +3502,7 @@ impl Scalar {
                                 character::signature(n, args.len())
                                     .filter(|signature| signature.is_ok())
                             })
+                            .or_else(|| unicode::signature(n, args.len()))
                             .or_else(|| text::signature(n, args.len()))
                     {
                         sig?.0[i].clone()

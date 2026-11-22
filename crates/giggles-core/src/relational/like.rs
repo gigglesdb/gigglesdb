@@ -21,26 +21,25 @@ fn charge(work: &mut usize, amount: usize) -> R<()> {
     *work = total;
     Ok(())
 }
-fn fold(c: char, insensitive: bool) -> char {
-    if !insensitive {
-        return c;
-    }
+// Preserve the one-character case folding used by the legacy ILIKE matcher.
+pub(super) fn legacy_fold(c: char) -> char {
     let mut lower = c.to_lowercase();
     let first = lower.next().unwrap_or(c);
     if lower.next().is_none() { first } else { c }
 }
+
 pub(super) fn like(
     value: &str,
     pattern: &str,
     escape: Escape,
-    insensitive: bool,
+    fold: impl Fn(char) -> char,
     work: &mut usize,
 ) -> R<bool> {
     // Account for scanning before allocating character vectors. The same work
     // counter also bounds scalar evaluation's accumulated result bytes.
     charge(work, value.len())?;
     charge(work, pattern.len())?;
-    let value: Vec<char> = value.chars().map(|c| fold(c, insensitive)).collect();
+    let value: Vec<char> = value.chars().map(&fold).collect();
     let pattern: Vec<char> = pattern.chars().collect();
     let (mut v, mut p) = (0, 0);
     let mut star = None;
@@ -54,7 +53,7 @@ pub(super) fn like(
                 .get(p + 1)
                 .copied()
                 .ok_or(SqlError::InvalidEscapeSequence)?;
-            (Some(fold(next, insensitive)), 2)
+            (Some(fold(next)), 2)
         } else if current == Some('%') {
             // A wildcard run reserves its mandatory characters before choosing
             // a retry point. Inspect its following literal even if those
@@ -86,7 +85,7 @@ pub(super) fn like(
             p += 1;
             continue;
         } else {
-            (current.map(|c| fold(c, insensitive)), 1)
+            (current.map(&fold), 1)
         };
         if literal == Some(value[v]) {
             v += 1;
@@ -144,7 +143,9 @@ pub(super) fn collated(value:&str,pattern:&str,escape:Escape,work:&mut usize,eq:
 mod tests {
     use super::*;
     fn matches(value: &str, pattern: &str, escape: &str, insensitive: bool) -> R<bool> {
-        like(value, pattern, Escape::parse(escape)?, insensitive, &mut 0)
+        like(value, pattern, Escape::parse(escape)?, |c| {
+            if insensitive { legacy_fold(c) } else { c }
+        }, &mut 0)
     }
     #[test]
     fn unicode_wildcards_and_escapes() {
@@ -302,14 +303,14 @@ mod tests {
             &"a".repeat(2000),
             "%a%a%a%a%a%b",
             Escape(None),
-            false,
+            std::convert::identity,
             &mut work,
         );
         assert!(matches!(result, Ok(false) | Err(SqlError::Limit)));
         assert!(work <= MAX_RESULT_BYTES);
         let mut work = MAX_RESULT_BYTES;
         assert_eq!(
-            like("a", "a", Escape(None), false, &mut work),
+            like("a", "a", Escape(None), std::convert::identity, &mut work),
             Err(SqlError::Limit)
         );
     }

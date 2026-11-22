@@ -49,8 +49,12 @@ fn paging_round_trips_match_sql() {
         let (_ldb, left) = Database::fresh(storage); let (_rdb, right) = Database::fresh(storage);
         setup(&left); setup(&right);
         let before = equal(&left, &right);
-        // Core SQL does not yet admit row-value comparisons; PG18.6 does.
-        assert_eq!(giggles_core::sqlstate(&left.sql_session().execute("select id,v from t where (grp,id)>($1,$2)", &[Value::Int(0),Value::Int(0)], None).unwrap_err()), "0A000");
+        // Core SQL admits row-value comparisons since GD-0092 W0-6, with PG18.6's lexicographic
+        // rule: (grp,id) > (a,b) selects the same rows as grp > a OR (grp = a AND id > b).
+        let params = [Value::Int(0), Value::Int(0)];
+        let row_form = left.sql_session().execute("select id,v from t where (grp,id)>($1,$2) order by id", &params, None).unwrap();
+        let expanded = left.sql_session().execute("select id,v from t where grp>$1 or (grp=$1 and id>$2) order by id", &params, None).unwrap();
+        assert_eq!(row_form.rows.iter().map(|r| &r.values).collect::<Vec<_>>(), expanded.rows.iter().map(|r| &r.values).collect::<Vec<_>>());
         let engine = Engine::with_version(right.clone(), VERSION);
         let mut bindings = Bindings::new(); let mut after = None; let mut all = vec![];
         for (index, length) in [7,7,7,7,2].into_iter().enumerate() {
@@ -84,7 +88,8 @@ fn paging_round_trips_match_sql() {
             key = page.next; if key.is_none() { break; }
         }
         assert_eq!(descending, left.sql_session().execute("select id from t where grp=1 order by id desc", &[], None).unwrap().rows);
-        assert_eq!(giggles_core::sqlstate(&left.sql_session().execute("select id from t where (grp,id)>(2,10) order by grp,id limit 7", &[], None).unwrap_err()), "0A000");
+        // Row-value comparison (GD-0092 W0-6) matches the expanded lexicographic predicate.
+        assert_eq!(left.sql_session().execute("select id from t where (grp,id)>(2,10) order by grp,id limit 7", &[], None).unwrap().rows, left.sql_session().execute("select id from t where grp>2 or (grp=2 and id>10) order by grp,id limit 7", &[], None).unwrap().rows);
         let literal = with_sql_parser_forbidden(|| engine.read_page_text("page t order by grp,id limit 7 after (2,10) select id", &Bindings::new())).unwrap();
         assert_eq!(literal.outcome.rows, left.sql_session().execute("select id from t where grp>2 or (grp=2 and id>10) order by grp,id limit 7", &[], None).unwrap().rows);
         let zero = with_sql_parser_forbidden(|| engine.read_page_text("page t order by id limit 0", &Bindings::new())).unwrap();

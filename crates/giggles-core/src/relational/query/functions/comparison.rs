@@ -150,6 +150,73 @@ pub(in crate::relational::query) fn compare_cross(
     Err(SqlError::UndefinedFunction)
 }
 
+fn row_operands(
+    arg: &BoundScalar,
+) -> R<(&BoundScalar, &BoundScalar, Option<&ExecutionClock>)> {
+    use super::super::BoundFilter;
+    let Node::Predicate(filter) = &arg.node else {
+        return Err(SqlError::InternalError);
+    };
+    match filter.as_ref() {
+        BoundFilter::Compare(a, _, b) => Ok((a, b, None)),
+        BoundFilter::Scalar(BoundScalar { node: Node::CrossCompare(_, a, b, clock), .. }) => {
+            Ok((a, b, clock.as_ref()))
+        }
+        _ => Err(SqlError::InternalError),
+    }
+}
+
+pub(super) fn check_row_order(op: &str, args: &[BoundScalar]) -> R<()> {
+    if matches!(op, "<" | "<=" | ">" | ">=") {
+        for arg in args {
+            let (left, right, _) = row_operands(arg)?;
+            if [left, right].iter().any(|arg| matches!(
+                arg.ty,
+                DataType::IntArray | DataType::BigIntArray | DataType::TextArray
+                    | DataType::Jsonb | DataType::RegType
+            )) {
+                return Err(SqlError::Unsupported);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn eval_row_order(
+    op: &str,
+    args: &[BoundScalar],
+    row: &Tuple,
+    params: &[Value],
+    budget: &mut usize,
+) -> R<Value> {
+    let distinct = match op {
+        "distinct" => Some(true),
+        "not_distinct" => Some(false),
+        _ => None,
+    };
+    for arg in args {
+        let (a, b, clock) = row_operands(arg)?;
+        let left = a.eval(row, params, budget)?;
+        let right = b.eval(row, params, budget)?;
+        if left == Value::Null || right == Value::Null {
+            match distinct {
+                None => return Ok(Value::Null),
+                Some(result) if left != right => return Ok(Value::Bool(result)),
+                Some(_) => continue,
+            }
+        }
+        let order = if temporal_pair(&a.ty, &b.ty) {
+            compare_cross(&left, &right, clock)?
+        } else {
+            collation::compare_pair(a, b, &left, &right)?
+        };
+        if !order.is_eq() {
+            return Ok(Value::Bool(distinct.unwrap_or(order.is_lt() == op.starts_with('<'))));
+        }
+    }
+    Ok(Value::Bool(distinct.map_or_else(|| op.ends_with('='), |result| !result)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

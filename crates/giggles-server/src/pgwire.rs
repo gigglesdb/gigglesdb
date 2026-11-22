@@ -206,7 +206,12 @@ impl Diagnostic {
     fn core<T>(&mut self, result: Result<T, CoreError>) -> R<T> {
         let message = giggles_core::relational::take_sql_error_message();
         if result.is_err() && message.as_deref().is_some_and(|m|
-            m.starts_with("FOR ") || m.starts_with("syntax error at or near ") || m.starts_with("could not obtain lock on row ")
+            m.starts_with("FOR ") || m.starts_with("syntax error at or near ")
+                || matches!(m, "invalid Unicode escape" | "invalid Unicode surrogate pair" | "unequal number of entries in row expressions")
+                || m.starts_with("operator does not exist: ") || m.starts_with("operator is not unique: ")
+                || m == "VARIADIC argument must be an array"
+                || m.starts_with("function pg_catalog.normalize(") || m.starts_with("function num_nulls(")
+                || m.starts_with("function num_nonnulls(") || m.starts_with("invalid input syntax for type ") || m.starts_with("could not obtain lock on row ")
                 || m == "canceling statement due to lock timeout"
                 || m.starts_with("permission denied for table ") || m.starts_with("view ") || m.starts_with("sequence ") || m.starts_with("index ")
                 || m.starts_with("relation ") && m.contains(" clause not found in FROM clause")) {
@@ -227,6 +232,8 @@ impl Diagnostic {
                     | giggles_core::relational::SqlError::Overflow
                     | giggles_core::relational::SqlError::InvalidArgumentForLogarithm
                     | giggles_core::relational::SqlError::InvalidArgumentForPowerFunction
+                    | giggles_core::relational::SqlError::InvalidArgumentForWidthBucket
+                    | giggles_core::relational::SqlError::NullValueNotAllowed
             ))
         ) || matches!(
             &result,
@@ -1189,7 +1196,7 @@ impl Statement {
     // and collation scopes; plan_constant excludes runtime/session nodes and only
     // evaluates immutable calls/casts. The two lexer/value budgets are the only
     // ambient limits. Keep a schema-context revision as an extra invalidator.
-    fn validate_constants(&mut self, session: &mut Session) -> R<()> {
+    fn validate_constants(&mut self, session: &mut Session, diagnostic: &mut Diagnostic) -> R<()> {
         let Plan::Sql(p) = &self.p else { return Ok(()); };
         let key = session.sql.constants_validation_key();
         if key.is_some() && self.validated == key && session.sql.prepared_is_current(p) {
@@ -1205,7 +1212,7 @@ impl Statement {
         self.validated = None;
         #[cfg(test)]
         { self.constant_validations += 1; }
-        core(session.sql.validate_immutable_constants(p))?;
+        diagnostic.core(session.sql.validate_immutable_constants(p))?;
         // Do not publish a success if the visible catalog moved during validation.
         self.validated = key.filter(|_| key == session.sql.constants_validation_key());
         Ok(())
@@ -2385,7 +2392,7 @@ impl State {
                     return Err("54000");
                 }
                 if matches!(&s.p, Plan::Sql(_)) {
-                    s.validate_constants(session)?;
+                    s.validate_constants(session, &mut self.diagnostic)?;
                     self.statements.get_mut(&stmt).ok_or("26000")?.validated = s.validated;
                     #[cfg(test)]
                     { self.statements.get_mut(&stmt).unwrap().constant_validations = s.constant_validations; }
@@ -4347,7 +4354,7 @@ mod prepared_validation_tests {
         let mut session = fixture();
         session.execute_sql("CREATE TABLE t(id int PRIMARY KEY, n int)", &[]).unwrap();
         let mut s = statement(&mut session, "SELECT id FROM t ORDER BY n");
-        for _ in 0..5 { s.validate_constants(&mut session).unwrap(); }
+        for _ in 0..5 { s.validate_constants(&mut session, &mut Diagnostic::default()).unwrap(); }
         assert_eq!(s.constant_validations, 1);
         for sql in ["ALTER TABLE t ADD COLUMN x int", "ALTER TABLE t DROP COLUMN x",
             "ALTER TABLE t ALTER COLUMN n TYPE text", "ALTER TABLE t DROP COLUMN n",
@@ -4355,40 +4362,40 @@ mod prepared_validation_tests {
             "CREATE TABLE t(id int PRIMARY KEY,n int)"] {
             session.execute_sql(sql, &[]).unwrap();
             let before = s.constant_validations;
-            let result = s.validate_constants(&mut session);
+            let result = s.validate_constants(&mut session, &mut Diagnostic::default());
             assert_eq!(s.constant_validations, before + 1, "{sql}");
             if sql == "DROP TABLE t" || sql == "ALTER TABLE t DROP COLUMN n" { assert!(result.is_err()); } else { result.unwrap(); }
         }
         session.execute_sql("CREATE SCHEMA earlier", &[]).unwrap();
         session.sql.set_search_path("earlier, public", "owner");
-        s.validate_constants(&mut session).unwrap();
+        s.validate_constants(&mut session, &mut Diagnostic::default()).unwrap();
         let before = s.constant_validations;
         session.execute_sql("CREATE TABLE earlier.t(id int PRIMARY KEY)", &[]).unwrap();
-        s.validate_constants(&mut session).unwrap();
+        s.validate_constants(&mut session, &mut Diagnostic::default()).unwrap();
         assert_eq!(s.constant_validations, before + 1);
         session.sql.set_search_path("public", "owner");
-        s.validate_constants(&mut session).unwrap();
+        s.validate_constants(&mut session, &mut Diagnostic::default()).unwrap();
         assert_eq!(s.constant_validations, before + 2);
         session.sql.set_max_statement_tokens(1);
         let before = s.constant_validations;
-        let _ = s.validate_constants(&mut session);
+        let _ = s.validate_constants(&mut session, &mut Diagnostic::default());
         assert_eq!(s.constant_validations, before + 1);
         session.sql.set_max_statement_tokens(0);
-        s.validate_constants(&mut session).unwrap();
+        s.validate_constants(&mut session, &mut Diagnostic::default()).unwrap();
         session.sql.set_max_value_bytes(1024);
         let before = s.constant_validations;
-        s.validate_constants(&mut session).unwrap();
+        s.validate_constants(&mut session, &mut Diagnostic::default()).unwrap();
         assert_eq!(s.constant_validations, before + 1);
         session.execute_sql("BEGIN", &[]).unwrap();
         session.execute_sql("ALTER TABLE t ADD COLUMN x int", &[]).unwrap();
         assert!(session.sql.constants_validation_key().is_none());
         let before = s.constant_validations;
-        for _ in 0..2 { s.validate_constants(&mut session).unwrap(); }
+        for _ in 0..2 { s.validate_constants(&mut session, &mut Diagnostic::default()).unwrap(); }
         assert_eq!(s.constant_validations, before + 2);
         session.execute_sql("ROLLBACK", &[]).unwrap();
-        s.validate_constants(&mut session).unwrap();
+        s.validate_constants(&mut session, &mut Diagnostic::default()).unwrap();
         let before = s.constant_validations;
-        s.validate_constants(&mut session).unwrap();
+        s.validate_constants(&mut session, &mut Diagnostic::default()).unwrap();
         assert_eq!(s.constant_validations, before);
     }
     #[test]
@@ -4421,7 +4428,7 @@ mod prepared_validation_tests {
         for sql in ["SELECT 1/0 FROM t", "SELECT id FROM t ORDER BY 1/0", "SELECT id FROM t WHERE 1/0=1"] {
             let mut s = statement(&mut session, sql);
             for n in 1..=3 {
-                assert_eq!(s.validate_constants(&mut session), Err("22012"));
+                assert_eq!(s.validate_constants(&mut session, &mut Diagnostic::default()), Err("22012"));
                 assert_eq!(s.constant_validations, n);
                 assert!(s.validated.is_none());
             }

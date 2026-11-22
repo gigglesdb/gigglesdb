@@ -155,3 +155,87 @@ mod tests {
         );
     }
 }
+
+/// A width_bucket operand can borrow a regular value or use a wider SQL literal.
+pub enum BucketOperand<'a> {
+    Numeric(&'a Numeric),
+    Literal(&'a str),
+}
+
+#[derive(Debug)]
+pub enum BucketError {
+    Input(Error),
+    InvalidCount,
+    Nan,
+    InfiniteBound,
+    EqualBounds,
+    BucketOverflow,
+}
+
+/// Compute floor(count * distance / span) with unbounded intermediates.
+/// All inputs are bounded before expansion and the result fits in an integer.
+pub fn numeric_width_bucket(
+    [x, low, high]: [BucketOperand<'_>; 3],
+    count: i32,
+) -> Result<i32, BucketError> {
+    use std::borrow::Cow;
+    let parse = |value| match value {
+        BucketOperand::Numeric(value) => Ok(Cow::Borrowed(value)),
+        BucketOperand::Literal(value) => Numeric::parse_with_width(value, Some(131_072))
+            .map(Cow::Owned)
+            .map_err(BucketError::Input),
+    };
+    let (x, low, high) = (parse(x)?, parse(low)?, parse(high)?);
+    if count <= 0 {
+        return Err(BucketError::InvalidCount);
+    }
+    if [&x, &low, &high].iter().any(|v| matches!(v.0, Repr::NaN)) {
+        return Err(BucketError::Nan);
+    }
+    let (Some(low_scale), Some(high_scale)) = (low.scale(), high.scale()) else {
+        return Err(BucketError::InfiniteBound);
+    };
+    if low == high {
+        return Err(BucketError::EqualBounds);
+    }
+    let descending = low > high;
+    if (!descending && x < low) || (descending && x > low) {
+        return Ok(0);
+    }
+    if (!descending && x >= high) || (descending && x <= high) {
+        return count.checked_add(1).ok_or(BucketError::BucketOverflow);
+    }
+    let scale = low_scale.max(high_scale).max(x.scale().expect("finite in range"));
+    let coefficient = |v: &Numeric| {
+        let Repr::Finite { coefficient, scale: own } = &v.0 else {
+            unreachable!("bounds and an in-range operand are finite");
+        };
+        if *own == scale {
+            coefficient.clone()
+        } else {
+            coefficient * super::pow(scale - own)
+        }
+    };
+    let (x, low, high) = (coefficient(&x), coefficient(&low), coefficient(&high));
+    // In a descending range both differences are negative and cancel.
+    let index = ((x - &low) * count) / (high - low);
+    use num_traits::ToPrimitive;
+    Ok(index.to_i32().expect("in-range bucket is below count") + 1)
+}
+
+#[cfg(test)]
+#[test]
+fn wide_bucket_literals_do_not_expand_the_numeric_storage_domain() {
+    use BucketOperand::{Literal, Numeric as Number};
+    let low = "-9e131071";
+    let high = "9e131071";
+    let one = Numeric::parse("1").unwrap();
+    assert!(matches!(Numeric::parse(low), Err(Error::Limit)));
+    assert!(matches!(Numeric::parse(high), Err(Error::Limit)));
+    assert_eq!(numeric_width_bucket([Number(&one), Literal(low), Literal(high)], 4).unwrap(), 3);
+    assert_eq!(numeric_width_bucket([Number(&one), Literal(high), Literal(low)], 4).unwrap(), 2);
+    assert!(matches!(
+        numeric_width_bucket([Number(&one), Literal(low), Literal("9e131072")], 4),
+        Err(BucketError::Input(Error::Limit))
+    ));
+}

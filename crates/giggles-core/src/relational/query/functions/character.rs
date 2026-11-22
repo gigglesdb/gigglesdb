@@ -1,4 +1,4 @@
-//! PostgreSQL 18 UTF8 character operations with libc C character classification.
+//! PostgreSQL 18 UTF8 character operations.
 use super::*;
 
 type Signature = (Vec<Option<DataType>>, DataType);
@@ -51,24 +51,7 @@ fn evaluate(name: &str, value: &Value, budget: &mut usize) -> R<Value> {
             output.push(character);
             Ok(Value::Text(output))
         }
-        ("initcap", Value::Text(input)) => {
-            // C locale changes only ASCII case and recognizes only ASCII alnum words.
-            // Every replacement has identical UTF8 width, so the exact output size is
-            // known without allocating or scanning an intermediate representation.
-            // This also bounds the following scan to MAX_ROW_BYTES before it starts.
-            reserve(budget, input.len())?;
-            let mut output = String::with_capacity(input.len());
-            let mut in_word = false;
-            for character in input.chars() {
-                output.push(if in_word {
-                    character.to_ascii_lowercase()
-                } else {
-                    character.to_ascii_uppercase()
-                });
-                in_word = character.is_ascii_alphanumeric();
-            }
-            Ok(Value::Text(output))
-        }
+        ("initcap", Value::Text(input)) => unicode::casing(name, input, budget),
         _ => Err(SqlError::UndefinedFunction),
     }
 }
@@ -86,7 +69,7 @@ mod tests {
         let mut budget = MAX_RESULT_BYTES - input.len();
         assert_eq!(
             eval("initcap", std::slice::from_ref(&value), &mut budget).unwrap(),
-            Ok(Value::Text("éHello_123abc".into()))
+            Ok(Value::Text("Éhello_123abc".into()))
         );
         assert_eq!(budget, MAX_RESULT_BYTES);
         let mut rejected = MAX_RESULT_BYTES - input.len() + 1;

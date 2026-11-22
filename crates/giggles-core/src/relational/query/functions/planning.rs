@@ -48,6 +48,15 @@ fn signature(name: &str, args: &[DataType], result: &DataType) -> Option<(bool, 
         .then_some((false, false));
     }
     match (name, args, result) {
+        ("nullif", [first, _], result) if first == result => Some((true, false)),
+        (name, args, Integer) if conditional::count_nulls(name) && !args.is_empty() => Some((true, false)),
+        ("width_bucket", &[DoublePrecision, DoublePrecision, DoublePrecision, Integer], Integer)
+        | ("width_bucket", &[Numeric | Text, Numeric | Text, Numeric | Text, Integer], Integer)
+        | ("width_bucket", &[SmallInt | Integer | BigInt | Numeric | Real | DoublePrecision, IntArray | BigIntArray], Integer)
+        | ("width_bucket", &[Text, TextArray], Integer) => Some((true, true)),
+        ("normalize", &[Text] | &[Text, Text], Text)
+        | ("is_normalized", &[Text] | &[Text, Text], Boolean)
+        | ("unistr", &[Text], Text) => Some((true, true)),
         ("overlay", &[Text, Text, Integer], Text)
         | ("overlay", &[Text, Text, Integer, Integer], Text)
         | ("overlay", &[Bytes, Bytes, Integer], Bytes)
@@ -437,6 +446,13 @@ impl BoundScalar {
                     node: Node::Cast(Box::new(literal(value, a.ty.clone()))),
                 };
                 expression.eval(&empty, &[], budget).map(Some)
+            }
+            Node::Call(name, args) if name == typeof_expr::NAME => {
+                // The result is fixed by the binder, but evaluating the argument can fail.
+                if args[0].plan_constant(budget)?.is_none() {
+                    return Ok(None);
+                }
+                args[1].plan_constant(budget)
             }
             Node::Call(name, args) if name == "coalesce" => {
                 for a in args {

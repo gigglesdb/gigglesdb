@@ -432,7 +432,7 @@ fn thousand_literal_membership_list_keeps_bounded_filter_depth() {
 }
 
 #[test]
-fn membership_and_between_reject_empty_lists_subqueries_and_symmetric_ranges() {
+fn membership_and_between_cover_empty_lists_subqueries_and_symmetric_ranges() {
     let (_a, mut s) = db();
     fixture(&mut s, 3);
     assert_eq!(
@@ -456,17 +456,16 @@ fn membership_and_between_reject_empty_lists_subqueries_and_symmetric_ranges() {
             "{predicate}"
         );
     }
-    for predicate in [
-        "id BETWEEN SYMMETRIC 3 AND 7",
-        "id NOT BETWEEN SYMMETRIC 3 AND 7",
-        "id ! 1",
-    ] {
-        assert_eq!(
-            s.execute(&format!("SELECT id FROM scan_rows WHERE {predicate}"), &[], None),
-            Err(CoreError::Sql(E::Unsupported)),
-            "{predicate}"
-        );
-    }
+    assert!(run(&mut s, "SELECT id FROM scan_rows WHERE id BETWEEN SYMMETRIC 3 AND 7").is_empty());
+    assert_eq!(
+        run(&mut s, "SELECT id FROM scan_rows WHERE id NOT BETWEEN SYMMETRIC 3 AND 7 ORDER BY id"),
+        ids(0..3)
+    );
+    assert_eq!(
+        s.execute("SELECT id FROM scan_rows WHERE id ! 1", &[], None),
+        // PG 18.6: "operator does not exist: integer ! integer" (42883), GD-0092 W0-6 lexer.
+        Err(CoreError::Sql(E::UndefinedFunction))
+    );
 }
 
 #[test]

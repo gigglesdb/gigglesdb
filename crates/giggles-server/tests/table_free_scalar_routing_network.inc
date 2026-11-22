@@ -90,6 +90,7 @@ async fn table_free_scalar_routing_database_role() {
     let cases = [
         (TYPEOF_INTEGER, &["integer"][..]),
         ("SELECT pg_typeof(NULL::text)", &["text"][..]),
+        ("SELECT pg_typeof('today'::text::date)", &["date"][..]),
         ("SELECT pg_typeof(ARRAY[1,2])", &["integer[]"][..]),
         (
             "SELECT pg_typeof(timestamp with time zone '2024-01-01 00:00+00')",
@@ -183,7 +184,8 @@ async fn table_free_scalar_routing_database_role() {
 
     // A statement core genuinely does not evaluate reaches core on the
     // changed path and keeps core's 0A000; the session stays usable.
-    for sql in ["SELECT width_bucket(5, 0, 10, 5)", "SELECT pg_typeof(1), to_char(1,'9')"] {
+    {
+        let sql = "SELECT pg_typeof(1), to_char(1,'9')";
         assert_eq!(code(pg.simple_query(sql).await.unwrap_err()), "0A000", "{sql}");
         assert_eq!(code(pg.prepare(sql).await.unwrap_err()), "0A000", "{sql}");
         let frames = scalar_routing_extended(&mut wire, sql, &[]).await;
@@ -192,6 +194,8 @@ async fn table_free_scalar_routing_database_role() {
         let frames = scalar_routing_extended(&mut wire, TYPEOF_INTEGER, &[]).await;
         assert_scalar_routing_row(&frames, &["integer"], TYPEOF_INTEGER);
     }
+
+    assert_pg_typeof_evaluates_arguments(&pg).await;
 
     // An ordinary (non-superuser) database role keeps main's 0A000 for every
     // table-free scalar the catalog declines, on both protocols; so does a
@@ -217,12 +221,20 @@ async fn table_free_scalar_routing_database_role() {
         TYPEOF_INTEGER,
         "SELECT pg_typeof($1::int)",
         "SELECT pg_typeof(1), to_char(1,'9')",
-        "SELECT width_bucket(5, 0, 10, 5)",
     ] {
         if !sql.contains('$') {
             assert_eq!(code(plain.simple_query(sql).await.unwrap_err()), "0A000", "plain {sql}");
         }
         assert_eq!(code(plain.prepare(sql).await.unwrap_err()), "0A000", "plain {sql}");
+    }
+    let bucket = "SELECT width_bucket(5, 0, 10, 5)";
+    let frames = scalar_routing_extended(&mut wire, bucket, &[]).await;
+    assert_scalar_routing_row(&frames, &["3"], bucket);
+    for client in [&pg, &plain] {
+        let messages = client.simple_query(bucket).await.unwrap();
+        assert!(messages.iter().any(|m| matches!(m, SimpleQueryMessage::Row(row) if row.get(0) == Some("3"))));
+        let prepared = client.prepare(bucket).await.unwrap();
+        assert_eq!(client.query_one(&prepared, &[]).await.unwrap().get::<_, i32>(0), 3);
     }
     assert_eq!(
         plain.query_one("SELECT lower('ABC')", &[]).await.unwrap().get::<_, String>(0),
@@ -244,6 +256,70 @@ async fn table_free_scalar_routing_database_role() {
     conn.await.unwrap().unwrap();
     server.shutdown().await.unwrap();
     f.stop().await;
+}
+
+async fn assert_pg_typeof_evaluates_arguments(pg: &tokio_postgres::Client) {
+    use tokio_postgres::SimpleQueryMessage;
+
+    let divide = "SELECT pg_typeof(1/0)";
+    assert_eq!(code(pg.simple_query(divide).await.unwrap_err()), "22012");
+    assert_eq!(code(pg.query(divide, &[]).await.unwrap_err()), "22012");
+
+    pg.simple_query("BEGIN").await.unwrap();
+    assert_eq!(code(pg.simple_query(divide).await.unwrap_err()), "22012");
+    assert_eq!(
+        code(pg.simple_query("SELECT 1").await.unwrap_err()),
+        "25P02"
+    );
+    pg.simple_query("ROLLBACK").await.unwrap();
+
+    pg.batch_execute("BEGIN").await.unwrap();
+    assert_eq!(code(pg.query(divide, &[]).await.unwrap_err()), "22012");
+    assert_eq!(code(pg.query("SELECT 1", &[]).await.unwrap_err()), "25P02");
+    pg.batch_execute("ROLLBACK").await.unwrap();
+
+    pg.batch_execute("CREATE TABLE typeof_rows (id int primary key, x int)")
+        .await
+        .unwrap();
+    pg.batch_execute("INSERT INTO typeof_rows VALUES (1, 0), (2, 5)")
+        .await
+        .unwrap();
+    let table_divide = "SELECT id, pg_typeof(10/x) FROM typeof_rows ORDER BY id";
+    assert_eq!(
+        code(pg.simple_query(table_divide).await.unwrap_err()),
+        "22012"
+    );
+    assert_eq!(
+        code(pg.query(table_divide, &[]).await.unwrap_err()),
+        "22012"
+    );
+    let no_rows = "SELECT pg_typeof(1/0) FROM typeof_rows WHERE false";
+    assert_eq!(code(pg.query(no_rows, &[]).await.unwrap_err()), "22012");
+
+    pg.batch_execute("CREATE SEQUENCE typeof_seq")
+        .await
+        .unwrap();
+    let messages = pg
+        .simple_query("SELECT pg_typeof(nextval('typeof_seq'))")
+        .await
+        .unwrap();
+    assert!(messages.iter().any(|message| {
+        matches!(message, SimpleQueryMessage::Row(row) if row.get(0) == Some("bigint"))
+    }));
+    let currval = "SELECT currval('typeof_seq')";
+    assert_eq!(
+        pg.query_one(currval, &[]).await.unwrap().get::<_, i64>(0),
+        1
+    );
+    let row = pg
+        .query_one("SELECT pg_typeof(nextval('typeof_seq'))::text", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, &str>(0), "bigint");
+    assert_eq!(
+        pg.query_one(currval, &[]).await.unwrap().get::<_, i64>(0),
+        2
+    );
 }
 
 async fn scalar_routing_simple(wire: &mut TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {

@@ -221,19 +221,36 @@ pub fn eval(name: &str, ty: &DataType, values: &[Value]) -> R<Value> {
     }
     let json: serde_json::Value =
         serde_json::from_str(s).map_err(|_| SqlError::InvalidTextRepresentation)?;
-    let found = match (&json, &values[1]) {
-        (serde_json::Value::Object(m), Value::Text(k)) => m.get(k),
-        (serde_json::Value::Array(a), Value::Int(i)) => {
-            let i = if *i < 0 { a.len() as i64 + *i } else { *i };
-            usize::try_from(i).ok().and_then(|i| a.get(i))
+    let found = if matches!(name, "#>" | "#>>") {
+        let Value::Text(path) = &values[1] else {
+            return Err(SqlError::InternalError);
+        };
+        let mut current = Some(&json);
+        for key in array_values(path)? {
+            current = match (current, key) {
+                (Some(serde_json::Value::Object(object)), Some(key)) => object.get(&key),
+                (Some(serde_json::Value::Array(array)), Some(key)) => {
+                    key.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c'])
+                        .parse::<i32>()
+                        .ok()
+                        .and_then(|i| json_index(array, i64::from(i)))
+                }
+                _ => None,
+            };
         }
-        (v, Value::Int(0 | -1)) if !v.is_object() && !v.is_array() => Some(v),
-        _ => None,
+        current
+    } else {
+        match (&json, &values[1]) {
+            (serde_json::Value::Object(m), Value::Text(k)) => m.get(k),
+            (serde_json::Value::Array(a), Value::Int(i)) => json_index(a, *i),
+            (v, Value::Int(0 | -1)) if !v.is_object() && !v.is_array() => Some(v),
+            _ => None,
+        }
     };
     let Some(found) = found else {
         return Ok(Value::Null);
     };
-    Ok(if name == "\0json_get" {
+    Ok(if matches!(name, "\0json_get" | "#>") {
         Value::Text(json_output(found)?)
     } else {
         match found {
@@ -242,6 +259,11 @@ pub fn eval(name: &str, ty: &DataType, values: &[Value]) -> R<Value> {
             _ => Value::Text(json_output(found)?),
         }
     })
+}
+
+fn json_index(array: &[serde_json::Value], index: i64) -> Option<&serde_json::Value> {
+    let index = if index < 0 { array.len() as i64 + index } else { index };
+    usize::try_from(index).ok().and_then(|i| array.get(i))
 }
 
 fn integer_input_error(error: giggles_pg_types::integer::IntegerError) -> SqlError {

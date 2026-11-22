@@ -156,6 +156,7 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::InvalidTablesampleArgument => 66,
                 relational::SqlError::InvalidArgumentForLogarithm => 67,
                 relational::SqlError::InvalidArgumentForPowerFunction => 68,
+                relational::SqlError::InvalidArgumentForWidthBucket => 70,
                 relational::SqlError::InternalError => 69,
             }
         }

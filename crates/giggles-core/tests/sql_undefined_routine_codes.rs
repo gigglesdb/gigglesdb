@@ -125,7 +125,6 @@ fn catalog_and_syntax_names_keep_existing_dispatch() {
     for sql in [
         "SELECT to_char(1,'9')",
         "SELECT jsonb_path_query_first('{}','$')",
-        "SELECT nullif(1,2)",
         "SELECT row(1,2)",
         "SELECT information_schema._pg_expandarray(1)",
     ] {
@@ -135,6 +134,10 @@ fn catalog_and_syntax_names_keep_existing_dispatch() {
             "{sql}"
         );
     }
+    assert_eq!(
+        s.execute("SELECT nullif(1,2)", &[], None).unwrap().rows[0].values,
+        vec![V::Int(1)]
+    );
     // PostgreSQL 18.6: pg_typeof(1) is integer (GD-0079 1A; DD-0068 notice).
     assert_eq!(
         s.execute("SELECT pg_typeof(1)", &[], None).unwrap().rows[0].values,

@@ -1,6 +1,8 @@
 //! Expression-only PostgreSQL type introspection. Values remain textual.
 use super::*;
 
+pub(super) const NAME: &str = "pg_typeof";
+
 pub(super) fn name(ty: &DataType) -> &'static str {
     match ty {
         DataType::Boolean => "boolean",
@@ -38,10 +40,13 @@ pub(super) fn bind(
     let [arg] = args else {
         return Err(SqlError::UndefinedFunction);
     };
-    // pg_typeof needs only this PG18 routine's declared return type. Its
-    // volatile value is never generated, just as clock arguments aren't run.
+    // Retain support for gen_random_uuid here using the existing v4 evaluator.
+    // Core does not expose gen_random_uuid as a standalone scalar routine.
     let bound = if matches!(arg, Scalar::Call(name, args) if name == "gen_random_uuid" && args.is_empty()) {
-        BoundScalar { ty: DataType::Uuid, node: Node::Literal(Value::Null) }
+        BoundScalar {
+            ty: DataType::Uuid,
+            node: Node::Call("uuid_generate_v4".into(), vec![]),
+        }
     } else {
         arg.bind(resolve, tables, parameters)?
     };
@@ -55,11 +60,14 @@ pub(super) fn bind(
     Ok(BoundScalar {
         ty: DataType::RegType,
         node: Node::Call(
-            "pg_typeof".into(),
-            vec![BoundScalar {
-                ty: DataType::Text,
-                node: Node::Literal(Value::Text(display)),
-            }],
+            NAME.into(),
+            vec![
+                bound,
+                BoundScalar {
+                    ty: DataType::Text,
+                    node: Node::Literal(Value::Text(display)),
+                },
+            ],
         ),
     })
 }
@@ -82,4 +90,84 @@ pub(super) fn regtype(value: Value) -> R<Value> {
         return Err(SqlError::InvalidTextRepresentation);
     }
     Ok(Value::Text(name(&ty).into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(sql: &str) -> Scalar {
+        let mut parser = Parser {
+            privilege_seen: false,
+            privilege_casts: false,
+            tokens: lex(sql).unwrap(),
+            at: 0,
+            params: BTreeSet::new(),
+            relations: vec![],
+        };
+        let expression = Scalar::parse(&mut parser, 0).unwrap();
+        assert_eq!(parser.at, parser.tokens.len());
+        expression
+    }
+
+    #[test]
+    fn volatile_argument_is_not_plan_constant() {
+        let expression = parse("pg_typeof(nextval('ts'))");
+        assert!(expression.has_volatile_call());
+        let bound = expression
+            .bind(&|_, _| Err(SqlError::UnknownColumn), &[], &[])
+            .unwrap();
+        assert_eq!(bound.plan_constant(&mut 0), Ok(None));
+        assert!(!bound.constraint_immutable());
+    }
+
+    #[test]
+    fn constant_argument_raises_during_planning() {
+        let bound = parse("pg_typeof(1/0)")
+            .bind(&|_, _| Err(SqlError::UnknownColumn), &[], &[])
+            .unwrap();
+        assert_eq!(bound.plan_constant(&mut 0), Err(SqlError::DivisionByZero));
+    }
+
+    #[test]
+    fn row_argument_uses_each_rows_value_and_budget() {
+        let table = TableDef {
+            id: 0,
+            name: "t".into(),
+            columns: vec![crate::relational::ColumnDef {
+                id: 0,
+                name: "x".into(),
+                data_type: DataType::Integer,
+                not_null: false,
+            }],
+            primary_key: vec![],
+        };
+        let expression = parse("pg_typeof(x)")
+            .bind(
+                &|_, _| {
+                    Ok(BoundColumn {
+                        source: 0,
+                        column: 0,
+                    })
+                },
+                &[&table],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(expression.plan_constant(&mut 0), Ok(None));
+        let mut row = Tuple {
+            source_versions: vec![],
+            values: vec![vec![Value::Int(5)]],
+            version: 0,
+        };
+        let mut budget = 0;
+        let display = Value::Text("integer".into());
+        assert_eq!(expression.eval(&row, &[], &mut budget), Ok(display.clone()));
+        assert_eq!(
+            budget,
+            value_bytes(&row.values[0][0]) + value_bytes(&display)
+        );
+        row.values[0][0] = Value::Null;
+        assert_eq!(expression.eval(&row, &[], &mut 0), Ok(display));
+    }
 }

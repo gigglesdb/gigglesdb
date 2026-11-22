@@ -507,60 +507,116 @@ pub(super) fn casing(
             }
         }
     } else {
-        // C.UTF-8 uses simple Unicode mappings: expansions such as sharp s -> SS are excluded.
-        let mut start = true;
-        text.chars()
-            .map(|c| {
-                let up = name == "upper" || name == "initcap" && start;
-                start = !c.is_alphanumeric();
-                let mapped: String = if up {
-                    c.to_uppercase().collect()
-                } else {
-                    c.to_lowercase().collect()
-                };
-                if mapped.chars().count() == 1 {
-                    mapped.chars().next().unwrap()
-                } else {
-                    c
-                }
-            })
-            .collect()
+        return unicode::casing(name, text, budget).map(Some);
     };
     let value = Value::Text(output);
     charge(budget, &value)?;
     Ok(Some(value))
 }
 
+fn comparison_locale<'a>(a: &'a BoundScalar, b: &'a BoundScalar) -> R<Option<&'a str>> {
+    let d = merge([a, b].into_iter())?;
+    if d.conflict.is_some() {
+        return indeterminate();
+    }
+    if let Some(n) = d.name {
+        ready(n)?;
+    }
+    Ok(d.name)
+}
+
+fn nondeterministic(n: &str) -> bool {
+    user(n).is_some_and(|(_, deterministic, _, _)| !deterministic)
+}
+
+pub(super) fn starts_with(args: &[BoundScalar], values: &[Value], budget: &mut usize) -> R<Value> {
+    let [Value::Text(value), Value::Text(prefix)] = values else {
+        return Err(SqlError::UndefinedFunction);
+    };
+    if comparison_locale(&args[0], &args[1])?.is_some_and(nondeterministic) {
+        user_types::view_replace_error(
+            "nondeterministic collations are not supported for substring searches".into(),
+        );
+        return Err(SqlError::Unsupported);
+    }
+    let result = Value::Bool(value.starts_with(prefix));
+    charge(budget, &result)?;
+    Ok(result)
+}
+
 pub(in crate::relational::query) fn like(
-    input: &BoundScalar,
+    args: [&BoundScalar; 2],
     value: &Value,
     pattern: &Value,
     escape: crate::relational::like::Escape,
-    insensitive: bool,
-    negated: bool,
+    flags: (bool, bool),
     work: &mut usize,
-) -> R<Option<Option<bool>>> {
-    if *value != Value::Null && *pattern != Value::Null {
-        input.check_comparison_collation()?;
-    }
-    let Some(n) = input.explicit_collation()? else {
-        return Ok(None);
+) -> R<Option<bool>> {
+    let (insensitive, negated) = flags;
+    let (Value::Text(value), Value::Text(pattern)) = (value, pattern) else {
+        return if *value == Value::Null || *pattern == Value::Null {
+            Ok(None)
+        } else {
+            Err(SqlError::UndefinedFunction)
+        };
     };
-    if !user(n).is_some_and(|(_, d, _, _)| !d) {
-        return Ok(None);
+    // LIKE has historically taken its matching collation from the value. In
+    // particular a pattern-only collation must not select the costlier matcher.
+    args[0].check_comparison_collation()?;
+    let input_locale = args[0].explicit_collation()?;
+    if let Some(n) = input_locale.filter(|n| nondeterministic(n)) {
+        if insensitive {
+            user_types::view_replace_error(
+                "nondeterministic collations are not supported for ILIKE".into(),
+            );
+            return Err(SqlError::Unsupported);
+        }
+        ready(n)?;
+        return Ok(Some(
+            crate::relational::like::collated(value, pattern, escape, work, |a, b| {
+                compare(n, &Value::Text(a.into()), &Value::Text(b.into()), &DataType::Text)
+                    .is_eq()
+            })? != negated,
+        ));
     }
-    if insensitive {
+    let locale = input_locale.or(args[1].explicit_collation()?);
+    let fold = |c: char| {
+        if !insensitive {
+            return c;
+        }
+        match locale {
+            None | Some("default") => unicode::simple_case(c, false),
+            Some("C" | "POSIX") => c.to_ascii_lowercase(),
+            Some(_) => crate::relational::like::legacy_fold(c),
+        }
+    };
+    Ok(Some(crate::relational::like::like(value, pattern, escape, fold, work)? != negated))
+}
+
+pub(super) fn regex(
+    op: &str,
+    args: &[BoundScalar],
+    value: &str,
+    pattern: &str,
+    budget: &mut usize,
+) -> R<Value> {
+    let locale = comparison_locale(&args[0], &args[1])?;
+    if locale.is_some_and(nondeterministic) {
+        user_types::view_replace_error(
+            "nondeterministic collations are not supported for regular expressions".into(),
+        );
         return Err(SqlError::Unsupported);
     }
-    let (Value::Text(v), Value::Text(p)) = (value, pattern) else {
-        return Ok(Some(None));
-    };
-    ready(n)?;
-    Ok(Some(Some(
-        crate::relational::like::collated(v, p, escape, work, |a, b| {
-            compare(n, &Value::Text(a.into()), &Value::Text(b.into()), &DataType::Text) == Ordering::Equal
-        })? != negated,
-    )))
+    let expression = regex::RegexBuilder::new(pattern)
+        .case_insensitive(op.ends_with('*'))
+        .dot_matches_new_line(true)
+        .size_limit(1 << 20)
+        .dfa_size_limit(1 << 20)
+        .build()
+        .map_err(|_| SqlError::Unsupported)?;
+    let result = Value::Bool(expression.is_match(value) != op.starts_with('!'));
+    charge(budget, &result)?;
+    Ok(result)
 }
 
 pub(in crate::relational::query) fn comparison_binding<'a>(

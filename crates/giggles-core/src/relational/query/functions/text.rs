@@ -160,7 +160,6 @@ fn evaluate(n: &str, v: &[Value], budget: &mut usize) -> R<Value> {
                 i32::try_from(count).map_err(|_| SqlError::Overflow)? as i64,
             ))
         }
-        "starts_with" => Ok(Value::Bool(s.starts_with(text(&v[1])?))),
         "strpos" => Ok(Value::Int(
             s.find(text(&v[1])?)
                 .map_or(0, |i| s[..i].chars().count() as i64 + 1),

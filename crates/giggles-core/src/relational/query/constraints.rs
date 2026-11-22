@@ -99,7 +99,7 @@ fn scalar(s: &Scalar) -> R<String> {
                 format!("'-{n}'::integer")
             }
             (functions::UnaryOp::Neg, Scalar::Literal(_)) => return Err(SqlError::Unsupported),
-            (_, Scalar::Column(_) | Scalar::Literal(Value::Int(_))) => format!(
+            (functions::UnaryOp::Neg | functions::UnaryOp::Plus, Scalar::Column(_) | Scalar::Literal(Value::Int(_))) => format!(
                 "({} {})",
                 if matches!(op, functions::UnaryOp::Neg) {
                     "-"
@@ -118,8 +118,19 @@ fn scalar(s: &Scalar) -> R<String> {
                 functions::BinaryOp::Div => "/",
                 functions::BinaryOp::Mod => "%",
                 functions::BinaryOp::Concat => "||",
+                _ => return Err(SqlError::Unsupported),
             };
             format!("({} {op} {})", scalar(a)?, scalar(b)?)
+        }
+        Scalar::Call(name, args) if name == "nullif" => {
+            let [left, right] = args.as_slice() else {
+                return Err(SqlError::Unsupported);
+            };
+            format!("NULLIF({}, {})", scalar(left)?, scalar(right)?)
+        }
+        // These calls require PostgreSQL-specific deparsing before they can be stored.
+        Scalar::Call(name, _) if matches!(name.as_str(), "width_bucket" | "normalize" | "is_normalized") => {
+            return Err(SqlError::Unsupported);
         }
         Scalar::Call(name, args) if !name.contains('.') && !name.contains('\0') => format!(
             "{}({})",

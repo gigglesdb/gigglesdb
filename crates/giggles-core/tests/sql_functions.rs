@@ -43,7 +43,7 @@ fn nested_rows_literals_null_and_unicode() {
         ]
     );
     assert_eq!(run(&mut s,"SELECT length(NULL),lower(NULL),upper(NULL),substring(NULL,1),coalesce(NULL,NULL) FROM f").rows[0].values,vec![V::Null;5]);
-    assert_eq!(run(&mut s,"SELECT substring(txt,0,2),substring(txt,-3,2),substring(txt,99),upper('ß'),lower('İ') FROM f").rows[0].values,vec![V::Text("é".into()),V::Text("".into()),V::Text("".into()),V::Text("ß".into()),V::Text("İ".into())]);
+    assert_eq!(run(&mut s,"SELECT substring(txt,0,2),substring(txt,-3,2),substring(txt,99),upper('ß'),lower('İ') FROM f").rows[0].values,vec![V::Text("é".into()),V::Text("".into()),V::Text("".into()),V::Text("ß".into()),V::Text("i".into())]); // PG 18.6 C.UTF-8: lower('İ') = i (GD-0092 W0-6)
 }
 #[test]
 fn describe_preserves_width_and_never_evaluates() {
@@ -202,7 +202,9 @@ fn c_locale_ascii_and_nonascii_reference() {
         )
         .rows[0]
             .values,
-        vec![V::Text("abcßİΣσςΐÉ".into()), V::Text("ABCßİΣσςΐé".into())]
+        // PG 18.6 oracle, C.UTF-8 default collation (GD-0092 W0-6, lane-f/lead/tripwire.out):
+        // simple Unicode case mappings; İ lowers to i, ß has no simple uppercase.
+        vec![V::Text("abcßiσσςΐé".into()), V::Text("ABCßİΣΣΣΐÉ".into())]
     );
 }
 #[test]

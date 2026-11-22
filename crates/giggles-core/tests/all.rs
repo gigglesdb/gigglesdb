@@ -578,3 +578,6 @@ mod default_parse_cache;
 
 #[path = "catalog_read_fast_paths.rs"]
 mod catalog_read_fast_paths;
+
+#[path = "pgparity_scalars_w06.rs"]
+mod pgparity_scalars_w06;

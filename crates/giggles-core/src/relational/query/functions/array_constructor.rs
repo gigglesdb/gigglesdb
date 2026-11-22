@@ -20,6 +20,14 @@ pub(super) fn parse(p: &mut Parser, depth: usize, aggregate: bool) -> R<Scalar> 
     }
     Ok(Scalar::Call(NAME.into(), args))
 }
+pub(super) fn element_type(array: &DataType) -> Option<DataType> {
+    Some(match array {
+        DataType::IntArray => DataType::Integer,
+        DataType::BigIntArray => DataType::BigInt,
+        DataType::TextArray => DataType::Text,
+        _ => return None,
+    })
+}
 fn hint(
     args: &[Scalar],
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
@@ -35,6 +43,7 @@ fn hint(
 }
 pub(super) fn infer(
     args: &[Scalar],
+    target: Option<&DataType>,
     parameters: &mut [Option<DataType>],
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     tables: &[&TableDef],
@@ -42,7 +51,11 @@ pub(super) fn infer(
     for a in args {
         a.infer(None, parameters, resolve, tables)?;
     }
-    let ty = hint(args, resolve, tables, parameters)?;
+    let ty = if let Some(ty) = target.and_then(element_type) {
+        ty
+    } else {
+        hint(args, resolve, tables, parameters)?
+    };
     for a in args {
         let expected = a.aggregate_unknown(parameters).then_some(&ty);
         a.infer(expected, parameters, resolve, tables)?;
@@ -51,11 +64,16 @@ pub(super) fn infer(
 }
 pub(super) fn bind(
     args: &[Scalar],
+    target: Option<&DataType>,
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     tables: &[&TableDef],
     parameters: &[Option<DataType>],
 ) -> R<BoundScalar> {
-    let element = hint(args, resolve, tables, parameters)?;
+    let element = if let Some(ty) = target.and_then(element_type) {
+        ty
+    } else {
+        hint(args, resolve, tables, parameters)?
+    };
     let ty = match element {
         DataType::Integer => DataType::IntArray,
         DataType::BigInt => DataType::BigIntArray,
@@ -65,6 +83,13 @@ pub(super) fn bind(
     let args = args
         .iter()
         .map(|a| {
+            if target.is_some()
+                && arithmetic::known(a, resolve, tables, parameters)?
+                    .as_ref().and_then(element_type).is_some()
+            {
+                // The flat array codec cannot store a nested constructor.
+                return Err(SqlError::Unsupported);
+            }
             Scalar::Cast(Box::new(a.clone()), element.clone()).bind(resolve, tables, parameters)
         })
         .collect::<R<Vec<_>>>()?;

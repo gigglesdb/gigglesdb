@@ -855,10 +855,12 @@ dependencies = [
  "giggles-transactions",
  "librocksdb-sys",
  "redb",
+ "regex",
  "rocksdb",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "unicode-normalization",
 ]
 
 [[package]]

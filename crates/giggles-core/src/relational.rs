@@ -341,6 +341,9 @@ pub enum SqlError {
     /// 2201F invalid_argument_for_power_function: transient, never persisted.
     #[serde(skip)]
     InvalidArgumentForPowerFunction,
+    /// 2201G invalid_argument_for_width_bucket_function: transient, never persisted.
+    #[serde(skip)]
+    InvalidArgumentForWidthBucket,
     /// XX000: transient executor invariant failure, never persisted.
     #[serde(skip)]
     InternalError,
@@ -858,6 +861,8 @@ fn lex(s: &str) -> R<Vec<Token>> {
     lex_into(s, &mut out, false)?;
     Ok(out)
 }
+const SPECIAL_OPERATOR_BYTES: &[u8] = b"~!@#%^&|`?";
+const OPERATOR_BYTES: &[u8] = b"+-*/<>=~!@#%^&|`?";
 fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
     if s.len() > MAX_STATEMENT_SQL {
         return Err(SqlError::Limit);
@@ -997,32 +1002,38 @@ fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
                 return Err(SqlError::Parameters);
             }
             out.push(Token::Param(n));
-        } else if b"(),*;.:[]".contains(&c) {
+        } else if b"(),;.:[]".contains(&c) {
             out.push(Token::Symbol(c as char));
             i += 1;
-        } else if c == b'-' && b.get(i + 1) == Some(&b'>') {
-            let start = i;
-            i += 2;
-            if b.get(i) == Some(&b'>') {
-                i += 1;
-            }
-            out.push(Token::Op(s[start..i].into()));
-        } else if b"+-/%".contains(&c) {
-            out.push(Token::Op((c as char).to_string()));
-            i += 1;
-        } else if c == b'|' && b.get(i + 1) == Some(&b'|') {
-            out.push(Token::Op("||".into()));
-            i += 2;
-        } else if b"=<>!".contains(&c) {
-            if c == b'!' && b.get(i + 1) != Some(&b'=') {
-                return Err(SqlError::Unsupported);
-            }
+        } else if OPERATOR_BYTES.contains(&c) {
             let start = i;
             i += 1;
-            if b.get(i) == Some(&b'=') || (c == b'<' && b.get(i) == Some(&b'>')) {
+            while let Some(next) = b.get(i).filter(|next| OPERATOR_BYTES.contains(next)) {
+                if matches!((*next, b.get(i + 1)), (b'-', Some(b'-')) | (b'/', Some(b'*'))) {
+                    break;
+                }
                 i += 1;
             }
-            out.push(Token::Op(s[start..i].into()));
+            let end = i;
+            if !b[start..i].iter().any(|c| SPECIAL_OPERATOR_BYTES.contains(c)) {
+                while i > start + 1 && matches!(b[i - 1], b'+' | b'-') {
+                    i -= 1;
+                }
+            }
+            let op = &s[start..i];
+            if op == "*" {
+                out.push(Token::Symbol('*'));
+            } else {
+                out.push(Token::Op(op.into()));
+            }
+            // Emit the split suffix in one pass, even for long runs of signs.
+            while i < end {
+                if out.len() >= token_limit(out, routing) {
+                    return Err(SqlError::Limit);
+                }
+                out.push(Token::Op(char::from(b[i]).to_string()));
+                i += 1;
+            }
         } else {
             return Err(SqlError::Unsupported);
         }

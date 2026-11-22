@@ -54,6 +54,63 @@ fn roles(f: &Fixture) {
     }
 }
 #[tokio::test]
+async fn native_sql_pg_typeof_evaluates_its_argument() {
+    let f = Fixture::catalog_empty().await;
+    roles(&f);
+    let (listener, runtime) = start(&f, true, false).await;
+    let addr = listener.address;
+    let (status, session) = http(
+        addr,
+        "POST",
+        "/v1/sessions",
+        None,
+        json!({"role":"role_admin","database":"postgres"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{session}");
+    let token = session["sessionId"].as_str().unwrap();
+
+    for (sql, params, expected) in [
+        ("SELECT pg_typeof(1/0)", vec![], Err("22012")),
+        ("SELECT pg_typeof('today'::text::date)", vec![], Ok("date")),
+        (
+            "SELECT pg_typeof(10 / $1)",
+            vec![json!({"intValue":"2"})],
+            Ok("integer"),
+        ),
+        (
+            "SELECT pg_typeof(10 / $1)",
+            vec![json!({"intValue":"0"})],
+            Err("22012"),
+        ),
+    ] {
+        let (status, reply) = http(
+            addr,
+            "POST",
+            "/v1/session/execute",
+            Some(token),
+            json!({"sql":{"sql":sql,"params":params}}),
+        )
+        .await;
+        assert_eq!(status, 200, "{sql}: {reply}");
+        match expected {
+            Ok(value) => {
+                assert_eq!(reply["code"], "ok", "{sql}: {reply}");
+                assert_eq!(
+                    reply["sql"]["rows"][0]["values"],
+                    json!([{"textValue":value}])
+                );
+            }
+            Err(state) => assert_eq!(reply["code"], state, "{sql}: {reply}"),
+        }
+    }
+
+    listener.shutdown().await.unwrap();
+    runtime.shutdown().await;
+    f.stop().await;
+}
+
+#[tokio::test]
 async fn http_role_signin_reconnect_revocation_and_expiry() {
     let f = Fixture::catalog_empty().await;
     roles(&f);

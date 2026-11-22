@@ -41,6 +41,8 @@ fn character_curated_pg18_utf8_c_oracle_values_metadata_and_errors() {
         .unwrap(),
     )
     .unwrap();
+    let casing: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/dd68/character-c-utf8-w06.json")).unwrap();
     for case in corpus["cases"].as_array().unwrap() {
         let query = case["query"].as_str().unwrap();
         let reference = &case["observation"];
@@ -98,8 +100,11 @@ fn character_curated_pg18_utf8_c_oracle_values_metadata_and_errors() {
             };
             assert_eq!(result.unwrap_err(), CoreError::Sql(expected), "{case}");
         } else {
-            let expected: Vec<_> = reference["rows"]
-                .as_array()
+            let rows = case["params"][0].as_str()
+                .filter(|_| case["kind"] == "initcap-text")
+                .and_then(|input| casing["curated"].get(input))
+                .unwrap_or(&reference["rows"]);
+            let expected: Vec<_> = rows.as_array()
                 .unwrap()
                 .iter()
                 .map(|row| {
@@ -235,7 +240,7 @@ fn character_functions_work_in_rows_aggregates_filters_and_repeated_parameters()
         result.rows[0].values,
         vec![
             Value::Int(233),
-            Value::Text("éHello".into()),
+            Value::Text("Éhello".into()),
             Value::Text("😀".into())
         ]
     );
@@ -252,7 +257,7 @@ fn character_functions_work_in_rows_aggregates_filters_and_repeated_parameters()
             .values,
         vec![
             Value::Int(233),
-            Value::Text("éHello".into()),
+            Value::Text("Éhello".into()),
             Value::Text("😀".into())
         ]
     );

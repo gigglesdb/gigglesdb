@@ -40,6 +40,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::Overflow) => "22003",
         CoreError::Sql(S::InvalidArgumentForLogarithm) => "2201E",
         CoreError::Sql(S::InvalidArgumentForPowerFunction) => "2201F",
+        CoreError::Sql(S::InvalidArgumentForWidthBucket) => "2201G",
         CoreError::Sql(S::StringDataRightTruncation) => "22001",
         CoreError::Sql(S::UndefinedFunction) => "42883",
         CoreError::Sql(S::InvalidParameterValue) => "22023",
@@ -119,6 +120,7 @@ mod tests {
         for (error, state, code) in [
             (S::InvalidArgumentForLogarithm, "2201E", 267),
             (S::InvalidArgumentForPowerFunction, "2201F", 268),
+            (S::InvalidArgumentForWidthBucket, "2201G", 270),
         ] {
             assert!(bincode::serialize(&error).is_err());
             let error = CoreError::Sql(error);

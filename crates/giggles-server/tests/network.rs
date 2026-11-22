@@ -2458,6 +2458,7 @@ include!("filter_planning_network.inc");
 include!("aggregate_scalar_network.inc");
 include!("count_parameter_network.inc");
 include!("character_network.inc");
+include!("pgparity_scalars_w06_network.inc");
 include!("integer_formats_network.inc");
 include!("trim_syntax_network.inc");
 include!("substring_order_network.inc");

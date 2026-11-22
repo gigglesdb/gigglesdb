@@ -14,6 +14,7 @@ pub use numeric_syntax::numeric_literal;
 pub mod temporal;
 pub mod typmod;
 pub use float::{Float4, Float8};
+pub use numeric_arith::{BucketError, BucketOperand, numeric_width_bucket};
 
 /// Deliberate resource ceiling, smaller than PostgreSQL's maximum integral width.
 pub const MAX_DIGITS: usize = 16_384;
@@ -63,6 +64,12 @@ impl Numeric {
         Ok(Self(Repr::Finite { coefficient, scale }))
     }
     pub fn parse(text: &str) -> Result<Self, Error> {
+        Self::parse_with_width(text, None)
+    }
+
+    // Wider SQL literals are admitted only as scratch operands for width_bucket.
+    // The normal parser and every Numeric input/output encoding keep their limits.
+    fn parse_with_width(text: &str, integral_width: Option<usize>) -> Result<Self, Error> {
         if text.len() > MAX_TEXT {
             return Err(Error::Limit);
         }
@@ -170,7 +177,11 @@ impl Numeric {
         }
         let digits = digits.trim_start_matches('0');
         let scale = frac - i64::from(exp);
-        if scale > i64::from(MAX_SCALE) || scale < -(MAX_DIGITS as i64) || digits.len() > MAX_DIGITS
+        let width = integral_width.unwrap_or(MAX_DIGITS);
+        if scale > i64::from(MAX_SCALE)
+            || scale < -(width as i64)
+            || integral_width.is_none() && digits.len() > MAX_DIGITS
+            || integral_width.is_some() && digits.len() as i64 - scale > width as i64
         {
             return Err(Error::Limit);
         }
@@ -183,14 +194,23 @@ impl Numeric {
             c = -c
         }
         if scale < 0 {
-            if digits.len() + (-scale) as usize > MAX_DIGITS {
+            if digits.len() + (-scale) as usize > width {
                 return Err(Error::Limit);
             }
             if !c.is_zero() {
-                c *= pow((-scale) as u32);
+                c *= if integral_width.is_some() {
+                    BigInt::from(10u8).pow((-scale) as u32)
+                } else {
+                    pow((-scale) as u32)
+                };
             }
         }
-        Self::finite(c, scale.max(0) as u32)
+        let scale = scale.max(0) as u32;
+        if integral_width.is_some() {
+            Ok(Self(Repr::Finite { coefficient: c, scale }))
+        } else {
+            Self::finite(c, scale)
+        }
     }
     /// PostgreSQL REL_18_0 select_div_scale: base-10000 weight estimate,
     /// at least 16 significant digits, capped at 1000 fractional digits.

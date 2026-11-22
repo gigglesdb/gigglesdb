@@ -25,6 +25,7 @@ existing notices and provenance; it does not modify them.
 | [crates/giggles-pg-types/src/temporal/tzdata/](crates/giggles-pg-types/src/temporal/tzdata/) | IANA Time Zone Database 2026f, via Debian/PostgreSQL; version and hashes in manifest.json | Public-domain tz database data |
 | [crates/giggles-glibm/COPYING.LIB](crates/giggles-glibm/COPYING.LIB) | Portable binary64 math routines derived from GNU C Library (glibc) 2.41 (Debian 2.41-12+deb13u4), including Sun Microsystems and IBM routines; source notices retained in each module | LGPL-2.1-or-later; retained Sun Microsystems permission notices also apply |
 | [crates/giggles-glibm-loader/](crates/giggles-glibm-loader/) | First-party runtime loader for the giggles-glibm dynamic library | MIT |
+| [Unicode case and normalization tables](crates/giggles-core/src/relational/query/functions/unicode_data.rs) | Unicode Character Database and unicode-normalization | [Unicode-3.0](crates/giggles-core/UNICODE-LICENSE); unicode-normalization Rust code MIT OR Apache-2.0 |
 | [scripts/icu/](scripts/icu/) | Unicode ICU 76.1 runtime, fetched separately; provision.sh retains upstream LICENSE beside installed libraries | Unicode-3.0; accompanying third-party notices in upstream LICENSE apply |
 | [crates/nunya/Cargo.toml](crates/nunya/Cargo.toml) | Optional `kubernetes` feature: kube 5.1 and k8s-openapi 0.29, fetched by Cargo, not vendored; permissive transitive dependencies including webpki-root-certs | Apache-2.0; transitive licenses include CDLA-Permissive-2.0 |
 
