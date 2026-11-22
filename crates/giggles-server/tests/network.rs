@@ -2474,6 +2474,7 @@ mod text_nul_network {
 }
 
 include!("routing_rejection_network.inc");
+include!("table_free_scalar_routing_network.inc");
 include!("deferred_routine_surface_network.inc");
 
 include!("sql_upsert_network.inc");

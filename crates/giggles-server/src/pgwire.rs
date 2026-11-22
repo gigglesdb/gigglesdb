@@ -920,7 +920,16 @@ fn catalog_plan(
         other => other,
     };
     match planned {
-        Ok(None) if Prepared::rejects_unsupported_table_free_scalar(sql) => {
+        // A table-free expression the catalog declines goes to core only for a
+        // database role core authorizes as superuser (effective role, as in
+        // Session::authorize), so core evaluates it or returns its own
+        // per-routine SQLSTATE. Core still parses and authorizes the whole
+        // statement. Other roles keep 0A000: core's conservative
+        // table-authorization target would turn it into 42501.
+        Ok(None)
+            if !matches!(session.table_privilege_superuser(), Ok(true))
+                && Prepared::rejects_unsupported_table_free_scalar(sql) =>
+        {
             Err(catalog_wire::error(giggles_pg_catalog::Error::Unsupported))
         }
         // Preserve the finite application grammar's own diagnostics (for
