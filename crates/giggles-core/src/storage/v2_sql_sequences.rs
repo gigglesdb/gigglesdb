@@ -238,6 +238,8 @@ struct GuardState {
 
 #[cfg(any(test, feature = "test-metadata-counts"))]
 thread_local! {
+    // Count resolution attempts in ColumnDefault, Call, ReferentialAction order.
+    static SEQUENCE_RESOLUTIONS: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
     static DEFAULT_GRANT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -328,10 +330,14 @@ impl Guard {
         }
     }
     pub(in crate::storage) fn pin_default_images(&mut self, txn: &Transaction) {
-        self.pin_default_images = txn.catalog_writes().next().is_none()
+        self.pin_default_images = self.can_pin_default_images(txn);
+    }
+
+    pub(super) fn can_pin_default_images(&self, txn: &Transaction) -> bool {
+        txn.catalog_writes().next().is_none()
             && self.private_owners.is_empty()
             && self.private_sequences.is_empty()
-            && self.private_tables.is_empty();
+            && self.private_tables.is_empty()
     }
 
     /// The authority key (owner record name) of table `id`, found by stable id. A
@@ -598,37 +604,81 @@ pub(super) fn callback(
     unsettled: Unsettled,
     search_path: Vec<String>,
     guard: Arc<Guard>,
+    cache_defaults: bool,
 ) -> relational::clock::SequenceCallback {
+    use relational::clock::SequenceOrigin;
     let db = db.into();
+    // Only the statement executor opts in, after acquiring Table(0). Local
+    // sequence DDL holds that barrier exclusively through catalog publication.
+    let defaults = cache_defaults.then(|| Mutex::new(BTreeMap::<String, (u64, bool)>::new()));
     Arc::new(move |operation, name, value, called, origin| {
         let db = db.lease(Holder::Sequence)?;
         crate::cancellation::check()?;
-        let name = sequences::sequence_name(name).map_err(CoreError::Sql)?;
-        let name = image.resolve_relation_key(&name, &search_path);
-        let (&id, def) = image
-            .catalog_ext()
-            .sequences
-            .iter()
-            .find(|(_, def)| def.name == name)
-            .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
-        let committed = if db.cluster_services().is_some() {
-            // Gateways retain the routed fresh read; their cache can lag remote DDL.
-            let mut check = db.begin(Isolation::ReadCommitted);
-            check
-                .get(Keyspace::Catalog, &engine::catalog_codec::sequence_key(id))?
-                .map(|bytes| engine::catalog_codec::decode_sequence(&bytes))
-                .transpose()?
-                .is_some_and(|current| current.incarnation == def.incarnation)
+        let mut cache = defaults.as_ref()
+            .filter(|_| origin == SequenceOrigin::ColumnDefault && !db.catalog().is_poisoned())
+            .map(|cache| cache.lock().map_err(|_| CoreError::Fenced))
+            .transpose()?;
+        let (id, def, committed) = if let Some(&(id, committed)) =
+            cache.as_ref().and_then(|cache| cache.get(name))
+        {
+            (id, &image.catalog_ext().sequences[&id], committed)
         } else {
-            db.catalog()
-                .current_local_view()?
+            #[cfg(any(test, feature = "test-metadata-counts"))]
+            {
+                let index = match origin {
+                    SequenceOrigin::ColumnDefault => 0,
+                    SequenceOrigin::Call => 1,
+                    SequenceOrigin::ReferentialAction(_) => 2,
+                };
+                let mut counts = SEQUENCE_RESOLUTIONS.get();
+                counts[index] += 1;
+                SEQUENCE_RESOLUTIONS.set(counts);
+            }
+            let parsed = sequences::sequence_name(name).map_err(CoreError::Sql)?;
+            let key = image.resolve_relation_key(&parsed, &search_path);
+            let (&id, def) = image
+                .catalog_ext()
                 .sequences
-                .get(&id)
-                .is_some_and(|current| current.incarnation == def.incarnation)
+                .iter()
+                .find(|(_, def)| def.name == key)
+                .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
+            let committed = if db.cluster_services().is_some() {
+                // Gateways retain the routed fresh read; their cache can lag remote DDL.
+                let mut check = db.begin(Isolation::ReadCommitted);
+                check
+                    .get(Keyspace::Catalog, &engine::catalog_codec::sequence_key(id))?
+                    .map(|bytes| engine::catalog_codec::decode_sequence(&bytes))
+                    .transpose()?
+                    .is_some_and(|current| current.incarnation == def.incarnation)
+            } else {
+                // Reuse the authority image when it is already pinned. The
+                // first draw still checks committedness before Guard::check.
+                let latest = if cache.is_some() {
+                    let state = guard.state.lock().map_err(|_| CoreError::Fenced)?;
+                    state.latest.as_ref().map(|(image, _)| Arc::clone(image))
+                } else {
+                    None
+                };
+                if let Some(latest) = latest {
+                    latest.catalog_ext().sequences.get(&id)
+                        .is_some_and(|current| current.incarnation == def.incarnation)
+                } else {
+                    db.catalog()
+                        .current_local_view()?
+                        .sequences
+                        .get(&id)
+                        .is_some_and(|current| current.incarnation == def.incarnation)
+                }
+            };
+            if !committed && baseline.get(&id) == Some(&def.incarnation) {
+                return Err(CoreError::Sql(SqlError::UnknownTable));
+            }
+            if let Some(cache) = cache.as_mut() {
+                cache.insert(name.to_owned(), (id, committed));
+            }
+            (id, def, committed)
         };
-        if !committed && baseline.get(&id) == Some(&def.incarnation) {
-            return Err(CoreError::Sql(SqlError::UnknownTable));
-        }
+        drop(cache);
         // Authority on this resolved id and incarnation, before session values,
         // counters or the cluster sequence RPC; every use below names the same pair.
         guard.check(&db, &image, operation, origin, id, def, committed)?;

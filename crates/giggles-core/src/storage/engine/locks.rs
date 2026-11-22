@@ -1138,12 +1138,19 @@ impl LockManager {
 
     /// Snapshot just the requested keys; callers serialize acquisitions per transaction.
     pub(crate) fn modes_on(&self, txn: TxnId, keys: &[(LockKey, LockMode)]) -> Vec<(LockKey, HeldModes)> {
-        keys.iter().map(|(key, _)| {
-            let hashed = self.prepare(key.clone());
-            let index = self.hashed_shard(&hashed);
-            let state = self.single(index).unwrap_or_else(|p| p.into_inner());
-            (key.clone(), state.key(&hashed).and_then(|s| s.holders.get(&txn)).copied().unwrap_or_default())
-        }).collect()
+        keys.iter().map(|(key, _)| (key.clone(), self.modes_for_key(txn, key.clone()))).collect()
+    }
+
+    fn modes_for_key(&self, txn: TxnId, key: LockKey) -> HeldModes {
+        let hashed = self.prepare(key);
+        let index = self.hashed_shard(&hashed);
+        let state = self.single(index).unwrap_or_else(|p| p.into_inner());
+        state.key(&hashed).and_then(|s| s.holders.get(&txn)).copied().unwrap_or_default()
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn holds_mode(&self, txn: TxnId, key: LockKey, mode: LockMode) -> bool {
+        self.modes_for_key(txn, key).iter().any(|held| held == mode)
     }
 
     /// Undo acquisitions in reverse journal order, then wake queues only after

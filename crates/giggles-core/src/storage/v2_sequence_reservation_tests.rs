@@ -1206,7 +1206,7 @@ fn callback(
 ) -> relational::clock::SequenceCallback {
     let unsettled = Unsettled::default();
     let callback = super::callback(db.child(Holder::Sequence).unwrap(), image, baseline, pending, values, unsettled.clone(), search_path,
-        Arc::new(super::Guard::unrestricted()));
+        Arc::new(super::Guard::unrestricted()), false);
     Arc::new(move |operation, name, value, called, origin| {
         let result = callback(operation, name, value, called, origin);
         settle(&db, &unsettled)?;
@@ -1625,6 +1625,180 @@ fn native_many_between_rows_crash_preserves_returned_ids() {
 mod default_memo_tests {
     use super::*;
     use crate::relational::clock::SequenceOrigin;
+
+    fn session_with_bindings(fixture: &Fixture) -> SqlSession {
+        let mut session = fixture.session();
+        session.enable_authorization_bindings();
+        session
+    }
+
+    fn resolutions_since(before: [usize; 3]) -> [usize; 3] {
+        let after = SEQUENCE_RESOLUTIONS.get();
+        std::array::from_fn(|i| after[i] - before[i])
+    }
+
+    #[test]
+    fn column_default_resolution_is_per_statement() {
+        let values = ["(1)"; 100].join(",");
+        let insert = format!("INSERT INTO resolved (payload) VALUES {values}");
+        for bindings in [true, false] {
+            let f = Fixture::new(Engine::V2);
+            let mut sql = f.session();
+            if bindings {
+                sql.enable_authorization_bindings();
+            }
+            run(&mut sql, "CREATE TABLE resolved (id BIGSERIAL PRIMARY KEY, payload INT)");
+
+            let before = SEQUENCE_RESOLUTIONS.get();
+            run(&mut sql, &insert);
+            let first = resolutions_since(before);
+            run(&mut sql, &insert);
+            assert_eq!((first, resolutions_since(before)), ([1, 0, 0], [2, 0, 0]), "bindings={bindings}");
+        }
+    }
+
+    #[test]
+    fn column_default_resolution_keeps_two_sequences_separate_under_role_authority() {
+        let f = Fixture::new(Engine::V2);
+        let roles = f.admin.as_ref().unwrap().roles();
+        for name in ["member", "second_owner"] {
+            roles.create(roles::NewRole { name: name.into(), ..Default::default() }).unwrap();
+        }
+        let mut admin = f.session();
+        for statement in [
+            "CREATE SEQUENCE first_seq",
+            "CREATE SEQUENCE second_seq START 100",
+            "CREATE TABLE two_defaults (slot INT PRIMARY KEY,
+                 a BIGINT DEFAULT nextval('first_seq'), b BIGINT DEFAULT nextval('second_seq'))",
+        ] {
+            run(&mut admin, statement);
+        }
+        roles.set_table_owner("first_seq", "member").unwrap();
+        roles.set_table_owner("second_seq", "second_owner").unwrap();
+        roles.grant_membership("second_owner", "member").unwrap();
+
+        let mut member = session_with_bindings(&f);
+        member.set_sequence_authority(SequenceAuthority::Role("member".into()));
+        run(&mut member, "BEGIN");
+        let before = SEQUENCE_RESOLUTIONS.get();
+        let result = run(&mut member,
+            "INSERT INTO two_defaults (slot) VALUES (1), (2), (3) RETURNING a, b");
+        assert_eq!(resolutions_since(before), [2, 0, 0]);
+        let drawn = result.rows.into_iter().map(|row| row.values).collect::<Vec<_>>();
+        assert_eq!(drawn, [
+            vec![Value::Int(1), Value::Int(100)],
+            vec![Value::Int(2), Value::Int(101)],
+            vec![Value::Int(3), Value::Int(102)],
+        ]);
+        run(&mut member, "COMMIT");
+
+        roles.revoke_membership("second_owner", "member").unwrap();
+        let error = member.execute_at(
+            "INSERT INTO two_defaults (slot) VALUES (4), (5)", &[], None, &clock(),
+        ).unwrap_err();
+        assert_eq!(crate::sqlstate(&error), "42501");
+        assert_eq!(scalar(&mut admin, "SELECT count(*) FROM two_defaults"), 3);
+        assert_eq!(scalar(&mut admin, "SELECT nextval('second_seq')"), 103);
+        roles.grant_membership("second_owner", "member").unwrap();
+        assert_eq!(scalar(&mut member, "SELECT currval('second_seq')"), 102);
+    }
+
+    #[test]
+    fn column_default_resolution_rejects_restarted_sequence_in_repeatable_read() {
+        let f = Fixture::new(Engine::V2);
+        let mut reader = session_with_bindings(&f);
+        let mut writer = f.session();
+        run(&mut writer, "CREATE TABLE restarted (id BIGSERIAL PRIMARY KEY, payload INT)");
+        reader.set_isolation(crate::SqlIsolation::RepeatableRead);
+        run(&mut reader, "BEGIN");
+        // Pin the snapshot without taking a relation lock that could block DDL.
+        reader.v2_transaction.as_mut().unwrap().snapshot_ts();
+        run(&mut writer, "ALTER SEQUENCE restarted_id_seq RESTART WITH 700");
+
+        // The snapshot resolves the old incarnation, which the latest catalog rejects.
+        let before = SEQUENCE_RESOLUTIONS.get();
+        assert_eq!(reader.execute_at(
+            "INSERT INTO restarted (payload) VALUES (1), (2)", &[], None, &clock(),
+        ), Err(CoreError::Sql(SqlError::UnknownTable)));
+        assert_eq!(resolutions_since(before), [1, 0, 0]);
+        run(&mut reader, "ROLLBACK");
+        assert_eq!(scalar(&mut writer, "SELECT count(*) FROM restarted"), 0);
+        assert_eq!(scalar(&mut writer, "SELECT nextval('restarted_id_seq')"), 700);
+    }
+
+    #[test]
+    fn column_default_resolution_bypasses_private_catalog() {
+        let f = Fixture::new(Engine::V2);
+        let mut sql = session_with_bindings(&f);
+        run(&mut sql, "BEGIN");
+        run(&mut sql, "CREATE TABLE private_resolved (id BIGSERIAL PRIMARY KEY, payload INT)");
+
+        let before = SEQUENCE_RESOLUTIONS.get();
+        run(&mut sql, "INSERT INTO private_resolved (payload) VALUES (1), (2), (3)");
+        assert_eq!(resolutions_since(before), [3, 0, 0]);
+        run(&mut sql, "ROLLBACK");
+    }
+
+    #[test]
+    fn column_default_resolution_bypasses_explicit_nextval() {
+        let f = Fixture::new(Engine::V2);
+        let mut sql = session_with_bindings(&f);
+        run(&mut sql, "CREATE SEQUENCE explicit_seq");
+        run(&mut sql, "CREATE TABLE resolved (id BIGSERIAL PRIMARY KEY, a BIGINT, b BIGINT)");
+
+        let before = SEQUENCE_RESOLUTIONS.get();
+        sql.execute_at(
+            "INSERT INTO resolved (a, b) VALUES
+                 (nextval('explicit_seq'), nextval($1)),
+                 (nextval('explicit_seq'), nextval($1)),
+                 (nextval('explicit_seq'), nextval($1))",
+            &[Value::Text("explicit_seq".into())],
+            None,
+            &clock(),
+        ).unwrap();
+        assert_eq!(resolutions_since(before), [1, 6, 0]);
+    }
+
+    #[test]
+    fn column_default_resolution_bypasses_referential_action() {
+        let f = Fixture::new(Engine::V2);
+        let mut sql = session_with_bindings(&f);
+        for statement in [
+            "CREATE SEQUENCE fk_defaults",
+            "CREATE TABLE parent (id BIGINT PRIMARY KEY)",
+            "INSERT INTO parent VALUES (1), (2), (3), (9)",
+            "CREATE TABLE child (id BIGINT PRIMARY KEY,
+                 parent_id BIGINT DEFAULT nextval('fk_defaults')
+                     REFERENCES parent(id) ON DELETE SET DEFAULT)",
+            "INSERT INTO child VALUES (10, 9), (20, 9), (30, 9)",
+        ] {
+            run(&mut sql, statement);
+        }
+        let before = SEQUENCE_RESOLUTIONS.get();
+        run(&mut sql, "DELETE FROM parent WHERE id = 9");
+        assert_eq!(resolutions_since(before), [0, 0, 3]);
+    }
+
+    #[test]
+    fn column_default_resolution_preserves_sequence_values() {
+        let f = Fixture::new(Engine::V2);
+        let mut sql = session_with_bindings(&f);
+        run(&mut sql, "CREATE TABLE resolved (slot INT PRIMARY KEY, id BIGSERIAL)");
+        run(&mut sql, "INSERT INTO resolved (slot) VALUES (1), (2), (3)");
+        let drawn = run(&mut sql, "SELECT id FROM resolved ORDER BY slot").rows
+            .into_iter().map(|row| row.values[0].clone()).collect::<Vec<_>>();
+        let current = scalar(&mut sql, "SELECT currval('resolved_id_seq')");
+        // lastval() is currently unsupported, including after default draws.
+        let last = sql.execute_at("SELECT lastval()", &[], None, &clock());
+        assert_eq!(
+            (drawn, current, last),
+            (
+                vec![Value::Int(1), Value::Int(2), Value::Int(3)],
+                3,
+                Err(CoreError::Sql(SqlError::Unsupported)),
+            ),
+        );
+    }
 
     #[test]
     fn replay_requires_the_default_origin_and_matching_catalog() {

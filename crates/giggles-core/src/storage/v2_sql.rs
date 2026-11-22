@@ -305,7 +305,7 @@ impl SqlSession {
             self.v2_transaction.as_ref(), &image);
         Ok(sql_sequences::callback(CallbackLease::new(db, self.v2_transaction.as_ref()), image, self.sequence_baseline.clone(),
             self.pending_sequences.clone(), self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone(),
-            Arc::new(guard)))
+            Arc::new(guard), false))
     }
 
     // Typed scans deliberately retain the active statement snapshot. In
@@ -397,7 +397,7 @@ impl SqlSession {
                 self.v2_transaction.as_ref(), &image);
             let callback = sql_sequences::callback(CallbackLease::new(db, self.v2_transaction.as_ref()), image.clone(),
                 self.sequence_baseline.clone(), self.pending_sequences.clone(),
-                self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone(), Arc::new(guard));
+                self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone(), Arc::new(guard), false);
             let allowed = self.sequence_tables.clone();
             let path = self.search_path.clone();
             let callback = Arc::new(move |operation: &str, text: &str, value, called, origin| {
@@ -622,6 +622,11 @@ impl SqlSession {
                     let mut freeze_marks = Vec::new();
                     let mark = txn.statement_savepoint();
                     let result = (|| {
+                        let catalog_lock_mode = if ddl {
+                            LockMode::AccessExclusive
+                        } else {
+                            LockMode::RowExclusive
+                        };
                         // DDL stages a catalog-wide image (including schema cascades and
                         // new FK edges), so retain its exclusive catalog barrier. DML
                         // shares this sentinel regardless of whether any FK exists.
@@ -636,11 +641,7 @@ impl SqlSession {
                             }
                             txn.acquire_lock(
                                 engine::locks::LockKey::Table(0),
-                                if ddl {
-                                    LockMode::AccessExclusive
-                                } else {
-                                    LockMode::RowExclusive
-                                },
+                                catalog_lock_mode,
                                 crate::task::limits::lock_deadline(),
                                 &cancelled,
                             ).map_err(crate::task::limits::lock_error)?;
@@ -1039,6 +1040,18 @@ impl SqlSession {
                                 self.authorization_bindings && self.copy_input.is_none(),
                                 self.sequence_default_execution.as_mut(),
                             );
+                            // DML holds Table(0) RowExclusive and DDL holds it AccessExclusive
+                            // through execution, keeping committed sequence incarnations stable.
+                            // COPY normalization and gateways use their live path.
+                            let cache_defaults = writing && self.copy_input.is_none()
+                                && db.cluster_services().is_none() && guard.can_pin_default_images(txn);
+                            #[cfg(debug_assertions)]
+                            debug_assert!(!cache_defaults || matches!(
+                                txn.services(),
+                                engine::txn::TxnServices::Local { locks, .. } if locks.holds_mode(
+                                    txn.id(), engine::locks::LockKey::Table(0), catalog_lock_mode,
+                                )
+                            ));
                             clock.with_sequences(sql_sequences::callback(
                                 CallbackLease::new(db, Some(txn)),
                                 catalog_image.clone(),
@@ -1048,6 +1061,7 @@ impl SqlSession {
                                 self.sequence_unsettled.clone(),
                                 self.search_path.clone(),
                                 guard,
+                                cache_defaults,
                             ))
                             .with_xact(sql_xact::callback(
                                 CallbackLease::new(db, Some(txn)),
