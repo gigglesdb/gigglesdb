@@ -325,7 +325,8 @@ impl NativeResponse {
 fn native_code(error: &CoreError) -> &'static str {
     match error {
         CoreError::Policy(Error::Authentication | Error::UnknownTask) => "28000",
-        CoreError::Policy(Error::Revoked | Error::Expired | Error::Scope) => "42501",
+        CoreError::Policy(Error::Revoked | Error::Expired | Error::Scope)
+        | CoreError::SequencePrivilege => "42501",
         CoreError::Policy(Error::UncertainTime | Error::TimeRegression) => "55000",
         CoreError::Policy(Error::Budget) | CoreError::Limit => "54000",
         CoreError::Policy(

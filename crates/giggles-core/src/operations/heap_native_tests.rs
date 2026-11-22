@@ -1,26 +1,10 @@
 //! SQL-only heap boundaries and keyed controls, GD-0058 WO-B3n.
 use super::*;
-use crate::relational::{Prepared, Relational};
-use crate::storage::State;
+use crate::relational::Prepared;
+use crate::storage::{State, empty};
 
 fn state() -> State {
-    let mut state = State {
-        seq: BTreeMap::new(),
-        accounting: BTreeMap::new(),
-        native_outcomes: None,
-        sql: Relational::default(),
-        view: crate::Snapshot {
-            domain: 1,
-            schema: 0,
-            rows: BTreeMap::new(),
-            tasks: BTreeMap::new(),
-            operations: BTreeMap::new(),
-            approvals: BTreeMap::new(),
-        },
-        last_time: 0,
-        next_approval: 0,
-        origin: None,
-    };
+    let mut state = empty(1);
     for sql in [
         "CREATE TABLE heap (id BIGINT, n BIGINT)",
         "CREATE TABLE keyed (id BIGINT PRIMARY KEY, n BIGINT)",

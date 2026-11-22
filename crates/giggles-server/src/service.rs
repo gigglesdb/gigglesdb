@@ -2269,8 +2269,11 @@ impl Session {
                     session.authorize_create_sequence()?;
                 } else {
                     for sequence in sequence_targets {
-                        if sql.trim_start().to_ascii_lowercase().starts_with("drop") { session.authorize_drop_target(&sequence)?; }
-                        else { session.authorize_alter_table(&sequence)?; }
+                        if sql.trim_start().to_ascii_lowercase().starts_with("drop") {
+                            session.authorize_drop_relation(&sequence, true)?;
+                        } else {
+                            session.authorize_alter_relation(&sequence, true)?;
+                        }
                     }
                 }
                 if let Some(table) = Prepared::sequence_owned_by(sql).map_err(CoreError::Sql)? {
@@ -2470,6 +2473,9 @@ impl Session {
         Ok(())
     }
     fn authorize_drop_target(&mut self, table: &str) -> Result<(), CoreError> {
+        self.authorize_drop_relation(table, false)
+    }
+    fn authorize_drop_relation(&mut self, table: &str, sequence: bool) -> Result<(), CoreError> {
         // Ordinary database roles get PostgreSQL's missing-object diagnostics.
         // Task and gateway admission still runs before object lookup.
         if matches!(self.role, Role::Database { .. }) && self.sql.task().is_none() {
@@ -2477,9 +2483,12 @@ impl Session {
             self.authorize_drop_schema(&key)?;
             if !Prepared::reserved_relation_name(&key) && !self.sql.relation_exists(&key)? { return Ok(()); }
         }
-        self.authorize_alter_table(table)
+        self.authorize_alter_relation(table, sequence)
     }
     fn authorize_alter_table(&mut self, table: &str) -> Result<(), CoreError> {
+        self.authorize_alter_relation(table, false)
+    }
+    fn authorize_alter_relation(&mut self, table: &str, sequence: bool) -> Result<(), CoreError> {
         let resolved = self.sql.resolve_relation_reference(table)?;
         let table = resolved.as_str();
         let allowed = if let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) {
@@ -2495,7 +2504,18 @@ impl Session {
                 // The durable key follows staged renames; missing names remain
                 // ordinary absent ownership records and cannot leak 42P01.
                 let name_at_commit = self.sql.table_authority_name(table)?;
-                self.table_privilege_allowed(&name_at_commit, name, None)?
+                if sequence {
+                    let schema = name_at_commit.split_once('\0').map_or("public", |(schema, _)| schema);
+                    self.schema_privilege_allowed(schema, name, roles::SchemaPrivilege::Usage)?
+                        && match self.sql.sequence_ddl_authority_key(table)? {
+                            Some(key) => self.relation_privilege_allowed(
+                                &self.sql.table_authority_name(&key)?, name, None,
+                            )?,
+                            None => false,
+                        }
+                } else {
+                    self.table_privilege_allowed(&name_at_commit, name, None)?
+                }
             }
         } else {
             false
@@ -2703,7 +2723,11 @@ impl Session {
         // Same rules as SQL CREATE SEQUENCE / DROP SEQUENCE in `authorize`.
         match request {
             C::CreateSequence { .. } => return self.authorize_create_sequence(),
-            C::DropSequence { name, .. } | C::DropView { name, .. } => {
+            C::DropSequence { name, .. } => {
+                let key = self.sql.native_relation_reference(name)?;
+                return self.authorize_drop_relation(&key, true);
+            }
+            C::DropView { name, .. } => {
                 let key = self.sql.native_relation_reference(name)?;
                 return self.authorize_drop_target(&key);
             }
@@ -2898,8 +2922,11 @@ impl Session {
                 self.authorize_create_sequence()?;
             } else {
                 for sequence in p.sequence_ddl_names() {
-                    if p.command() == "DROP SEQUENCE" { self.authorize_drop_target(sequence)?; }
-                    else { self.authorize_alter_table(sequence)?; }
+                    if p.command() == "DROP SEQUENCE" {
+                        self.authorize_drop_relation(sequence, true)?;
+                    } else {
+                        self.authorize_alter_relation(sequence, true)?;
+                    }
                 }
             }
             if let Some(table) = p.sequence_owned_by_table() {
@@ -3517,35 +3544,28 @@ impl Session {
                     } else { session.sql.execute_prepared_at_unreleased(p, params, None, &clock) };
                     if !session.sql.in_transaction() { session.transaction_us = None; }
                     else if clock.unavailable.is_none() { session.transaction_us = Some(transaction_us); }
-                    // DDL bookkeeping reads a plain result only; a task
-                    // session runs no DDL (admission refuses the class).
-                    result.map(|result| {
-                        let affected = result.untasked_ref().is_some_and(|r| r.affected != 0);
-                        (result, affected, true)
-                    })
+                    result.map(|result| (result, true))
                 })
         })
     }
     fn execute_with_ddl_authority<T>(
         &mut self, command: &str, table: Option<&str>, ddl: bool, sequence_ddl: bool,
-        sequences: Vec<String>, execute: impl FnOnce(&mut Self) -> Result<(T, bool, bool), CoreError>,
+        sequences: Vec<String>, execute: impl FnOnce(&mut Self) -> Result<(T, bool), CoreError>,
     ) -> Result<T, CoreError> {
         if ddl && self.sql.in_transaction() { self.implicit_ddl = true; }
         let transactional = self.sql.set_ddl_owner(match self.effective_role.as_ref().unwrap_or(&self.role) { Role::Database { name } => Some(name), _ => None });
         let candidates = if ddl && !transactional { self.sql.sequence_owners()?.into_iter().map(|(name, _)| name).collect::<Vec<_>>() } else { vec![] };
         let preexisting = command == "CREATE TABLE" && table.map(|t| self.sql.relation_exists(t)).transpose()?.unwrap_or(false);
         // Native errors stay in the result envelope; failed execution must skip bookkeeping.
-        let (result, affected, succeeded) = execute(self)?;
+        let (result, succeeded) = execute(self)?;
         if transactional || !succeeded { return Ok(result); }
         self.sequence_owner_candidates.extend(candidates.iter().cloned());
-        self.sequence_owner_candidates.extend(sequences.iter().cloned());
+        self.sequence_owner_candidates.extend(sequences);
         let roles = self.service.admin.roles();
-        let mut created = if command == "CREATE SEQUENCE" && affected { sequences } else { vec![] };
-        if command == "CREATE TABLE" && !preexisting { created.extend(table.map(str::to_owned)); }
-        for name in created {
-            roles.forget_table(&name).map_err(|_| CoreError::Policy(Error::Scope))?;
+        if command == "CREATE TABLE" && !preexisting && let Some(table) = table {
+            roles.forget_table(table).map_err(|_| CoreError::Policy(Error::Scope))?;
             if let Role::Database { name: owner } = self.effective_role.as_ref().unwrap_or(&self.role) {
-                roles.set_table_owner(&name, owner).map_err(|_| CoreError::Policy(Error::Scope))?;
+                roles.set_table_owner(table, owner).map_err(|_| CoreError::Policy(Error::Scope))?;
             }
         }
         if ddl && !sequence_ddl {
@@ -3578,7 +3598,7 @@ impl Session {
         self.execute_with_ddl_authority(command, None, true, true, vec![key], |session| {
             let result = session.sql.execute_sequence_catalog_native(request);
             let succeeded = result.is_ok();
-            Ok((result, succeeded, succeeded))
+            Ok((result, succeeded))
         })
     }
     pub(crate) fn execute_native_catalog(&mut self, request: &giggles_core::operations::CatalogRequest)
@@ -3591,7 +3611,7 @@ impl Session {
             Some(relational::relation_key(&schema, name))
         } else { None };
         self.execute_with_ddl_authority(if table.is_some() { "CREATE TABLE" } else { "" }, table.as_deref(), true, false, vec![],
-            |session| { let result = session.sql.execute_catalog_native(request); let succeeded = result.is_ok(); Ok((result, true, succeeded)) })
+            |session| { let result = session.sql.execute_catalog_native(request); let succeeded = result.is_ok(); Ok((result, succeeded)) })
     }
     /// Plain exit, for tests only: a task session is refused before the
     /// statement runs (GD-0061 R3-310). Server sources never call it

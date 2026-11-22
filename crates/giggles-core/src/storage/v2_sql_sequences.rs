@@ -81,6 +81,87 @@ struct Decision {
     key: DecisionKey,
 }
 
+/// Resolve the owner key by stable table id, following this transaction's own
+/// table name when it moved the owner record. Otherwise prefer the live name.
+fn table_authority_key(
+    id: u64,
+    image: &relational::Relational,
+    latest: Option<&relational::Relational>,
+    private: bool,
+) -> Option<String> {
+    let named = |source: &relational::Relational| {
+        source.tables.values()
+            .find(|table| table.id == id)
+            .map(|table| source.table_key(table))
+    };
+    if let Some(latest) = latest.filter(|_| !private) {
+        named(latest).or_else(|| named(image))
+    } else {
+        named(image)
+    }
+}
+
+impl SqlSession {
+    /// The relation key whose owner record authorizes DDL on a resolved sequence.
+    /// Its snapshot names the object, while its link and the owning table's name
+    /// come from the latest committed catalog overlaid with its own DDL.
+    pub fn sequence_ddl_authority_key(&self, name: &str) -> Result<Option<String>, CoreError> {
+        let lease = self.statement_lease()?;
+        self.inspect_metadata_leased(lease.as_deref(), |state| {
+            let image = state.sql.image;
+            let Some((&id, definition)) = image.catalog_ext().sequences.iter()
+                .find(|(_, def)| def.name == name)
+            else {
+                // Keep the ordinary authorization and classification path for
+                // absent names and names belonging to another kind of object.
+                return Ok(Some(name.to_owned()));
+            };
+            if let Some(staged) = &self.staged {
+                return self.admin.inner.inspect_metadata(|committed| {
+                    let latest = committed.sql.image;
+                    let private_link = staged.sequence_owner_updates.contains_key(&id)
+                        || !self.sequence_baseline.contains_key(&id);
+                    let current = if private_link {
+                        definition
+                    } else if let Some(current) = latest.catalog_ext().sequences.get(&id) {
+                        current
+                    } else {
+                        return Ok(None);
+                    };
+                    match current.owned_by {
+                        None => Ok(Some(current.name.clone())),
+                        // Legacy moves role records only when the staged DDL commits.
+                        Some((table, _)) => Ok(table_authority_key(table, image, Some(latest), false)),
+                    }
+                });
+            }
+            let latest = match (lease.as_deref(), &self.v2_transaction) {
+                (Some(db), Some(_)) => Some(db.native_metadata_image(None)?.1),
+                _ => None,
+            };
+            let own_catalog = |key: &[u8]| {
+                self.v2_transaction.as_ref().is_some_and(|txn| txn.catalog_own(key).is_some())
+            };
+            let current = if let Some(latest) = &latest
+                && !own_catalog(&engine::catalog_codec::sequence_key(id))
+            {
+                let Some(current) = latest.catalog_ext().sequences.get(&id) else {
+                    return Ok(None);
+                };
+                current
+            } else {
+                definition
+            };
+            match current.owned_by {
+                None => Ok(Some(current.name.clone())),
+                Some((table, _)) => Ok(table_authority_key(
+                    table, image, latest.as_deref(), own_catalog(&engine::catalog::table_key(table)),
+                )),
+            }
+        })
+    }
+}
+
 /// Execution-time sequence authority for one statement (GD-0084 Q24).
 ///
 /// The statement authorizer can only judge names it sees. A dynamic name
@@ -166,13 +247,7 @@ impl Guard {
         image: &relational::Relational,
         latest: Option<&relational::Relational>,
     ) -> Option<String> {
-        let named = |source: &relational::Relational| {
-            source.tables.values().find(|t| t.id == id).map(|t| source.table_key(t))
-        };
-        match latest {
-            Some(latest) if !self.private_tables.contains(&id) => named(latest).or_else(|| named(image)),
-            _ => named(image),
-        }
+        table_authority_key(id, image, latest, self.private_tables.contains(&id))
     }
     /// The owner record that answers for `def`: its owning table's (resolved by id
     /// as in `table_key`), or its own for a standalone sequence.
@@ -244,7 +319,7 @@ impl Guard {
         }
         // Only the unrestricted test guard has no catalog; never allow a
         // restricted principal without one.
-        let Some(catalog) = &self.roles else { return Err(CoreError::Policy(Error::Scope)) };
+        let Some(catalog) = &self.roles else { return Err(CoreError::SequencePrivilege) };
         // Roles and the latest catalog are read through the statement's own lease,
         // never a fresh admission (which could reach another generation).
         let roles = catalog.image_leased(Some(db)).map_err(role_error)?;
@@ -319,7 +394,7 @@ impl Guard {
             None => false,
         };
         if !allowed {
-            return Err(CoreError::Policy(Error::Scope));
+            return Err(CoreError::SequencePrivilege);
         }
         *self.cache.lock().map_err(|_| CoreError::Fenced)? = Some(Decision { roles, latest, key });
         Ok(())

@@ -316,17 +316,21 @@ async fn repeatable_read_follows_a_committed_owned_by_transfer() {
     assert_eq!(code(alice.query_one(&dynamic, &[&"x_s"]).await), "42501", "dynamic after transfer");
     run(&alice, "ROLLBACK").await;
     assert_eq!(f.next("x_s").await, before + 1, "alice moved x_s after the transfer (dynamic)");
-    // The same with a literal name: back to standalone (alice's), warm, transfer again.
-    run(&f.root, "ALTER SEQUENCE x_s OWNED BY NONE").await;
+    // PostgreSQL 18.6 keeps the owner across OWNED BY NONE. Use a fresh
+    // standalone sequence of alice's for the literal-name transfer.
+    run(&alice, "CREATE SEQUENCE literal_s").await;
+    let literal = alice.prepare("SELECT nextval('literal_s')").await.unwrap();
     run(&alice, "BEGIN ISOLATION LEVEL REPEATABLE READ").await;
     assert_eq!(code(alice.query_one(&literal, &[]).await), "ok", "literal warm");
-    run(&f.root, "ALTER SEQUENCE x_s OWNED BY b_t.id").await;
-    let before = f.next("x_s").await;
+    run(&f.root, "ALTER SEQUENCE literal_s OWNED BY b_t.id").await;
+    let before = f.next("literal_s").await;
     assert_eq!(code(alice.query_one(&literal, &[]).await), "42501", "literal after transfer");
     run(&alice, "ROLLBACK").await;
-    assert_eq!(f.next("x_s").await, before + 1, "alice moved x_s after the transfer (literal)");
-    // bob now owns it through b_t.
-    assert_eq!(code(bob.query_one("SELECT nextval($1)", &[&"x_s"]).await), "ok");
+    assert_eq!(f.next("literal_s").await, before + 1, "alice moved literal_s after the transfer");
+    // bob now owns both through b_t.
+    for sequence in ["x_s", "literal_s"] {
+        assert_eq!(code(bob.query_one("SELECT nextval($1)", &[&sequence]).await), "ok");
+    }
     f.stop().await;
 }
 
@@ -483,8 +487,7 @@ async fn native_sequence_calls_follow_the_sequence_owner() {
     for grpc in [false, true] {
         let before = sql_next(&f, "n_s");
         let token = native_session(&f, "bob").await;
-        // Core operations report a refusal (Policy::Scope) as the opaque core class.
-        assert_eq!(native(&f, &token, insert(if grpc { 2 } else { 1 }), grpc).await, "NATIVE_ERROR_CLASS_CORE",
+        assert_eq!(native(&f, &token, insert(if grpc { 2 } else { 1 }), grpc).await, "42501",
             "bob native INSERT grpc={grpc}");
         assert_eq!(sql_next(&f, "n_s"), before + 1, "bob's native INSERT drew n_s grpc={grpc}");
         let token = native_session(&f, "alice").await;
@@ -513,7 +516,8 @@ async fn repeatable_read_insert_default_follows_a_committed_owned_by_transfer() 
         protocol.error(&alice, "INSERT INTO d (v) VALUES (2)", "42501").await;
         run(&alice, "ROLLBACK").await;
         assert_eq!(f.next("d_s").await, before + 1, "{protocol:?}: the denied default drew from d_s");
-        run(&f.root, "ALTER SEQUENCE d_s OWNED BY NONE").await;
+        // Restore alice as the effective owner before unlinking.
+        run(&f.root, "ALTER SEQUENCE d_s OWNED BY d.id; ALTER SEQUENCE d_s OWNED BY NONE").await;
         protocol.ok(&alice, "INSERT INTO d (v) VALUES (3)").await;
     }
     f.stop().await;
@@ -689,8 +693,9 @@ async fn native_application_identity_follows_its_tables() {
     let token = f.open_http(&f.app, false).await;
     let bare = json!({"operation":{"request":{"insert":{"table":"app","values":[
         {"column":"id","value":{"literal":{"intValue":"500"}}}]}},"bindings":[]}});
-    // Core operations report a refusal (Policy::Scope) as the opaque core class.
-    assert_eq!(native(&f, &token, bare, false).await, "NATIVE_ERROR_CLASS_CORE", "Application INSERT drawing fk_s");
+    for grpc in [false, true] {
+        assert_eq!(native(&f, &token, bare.clone(), grpc).await, "42501", "Application INSERT drawing fk_s grpc={grpc}");
+    }
     // The refusals drew nothing.
     f.admin.roles().create(NewRole { name: "root".into(), login: true, superuser: true, ..Default::default() }).unwrap();
     assert_eq!((sql_next(&f, "other_s"), sql_next(&f, "other_t_id_seq"), sql_next(&f, "fk_s")), (1, 1, 1));
@@ -767,5 +772,97 @@ async fn set_default_actions_on_the_general_constraint_path_keep_their_principal
     assert_eq!(Protocol::Extended.value(&alice, "SELECT count(*) FROM cf1 WHERE pid <= 4").await.unwrap(), 4);
     assert_eq!(f.next("rf_s").await, 1, "a refused action drew from rf_s");
     assert_eq!(f.next("of_s").await, 5, "a refused action drew from of_s");
+    f.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "seqauth2: CREATE VIEW rejects sequence expressions in the projection with 0A000"]
+async fn seqauth2_views_check_the_callers_sequence_privilege() {
+    let f = Fixture::new().await;
+    let alice = f.connect("alice").await;
+    let bob = f.connect("bob").await;
+    run(&bob, "CREATE TABLE view_owned_by (id BIGINT PRIMARY KEY)").await;
+    run(
+        &alice,
+        "CREATE VIEW seq_view AS SELECT nextval('a_s') AS n; \
+         GRANT SELECT ON seq_view TO bob",
+    )
+    .await;
+    let sql = "SELECT * FROM seq_view";
+    for protocol in PROTOCOLS {
+        let before = f.next("a_s").await;
+        protocol.error(&bob, sql, "42501").await;
+        assert_eq!(protocol.value(&alice, sql).await.unwrap(), before + 1, "{protocol:?}: {sql}");
+    }
+
+    run(&f.root, "ALTER SEQUENCE a_s OWNED BY view_owned_by.id").await;
+    for protocol in PROTOCOLS {
+        let before = f.next("a_s").await;
+        protocol.error(&alice, sql, "42501").await;
+        assert_eq!(protocol.value(&bob, sql).await.unwrap(), before + 1, "{protocol:?}: {sql}");
+    }
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn seqauth2_insert_returning_checks_sequence_privilege_before_inserting() {
+    let f = Fixture::new().await;
+    let alice = f.connect("alice").await;
+    let bob = f.connect("bob").await;
+    run(
+        &alice,
+        "CREATE TABLE seq_returning (id BIGINT PRIMARY KEY, v BIGINT); \
+         GRANT SELECT, INSERT ON seq_returning TO bob",
+    )
+    .await;
+    // Supplying an id lets bob use the table without drawing its serial sequence.
+    run(&bob, "INSERT INTO a_t (id, v) VALUES (1000, 0)").await;
+
+    for (round, protocol) in PROTOCOLS.into_iter().enumerate() {
+        let v = round + 1;
+        let serial_insert = format!("INSERT INTO a_t (v) VALUES ({v}) RETURNING id");
+        let serial_count = format!("SELECT count(*) FROM a_t WHERE v = {v}");
+        let before = f.next("a_t_id_seq").await;
+        protocol.error(&bob, &serial_insert, "42501").await;
+        assert_eq!(protocol.value(&alice, &serial_count).await.unwrap(), 0);
+        assert_eq!(protocol.value(&alice, &serial_insert).await.unwrap(), before + 1);
+
+        for (form, sequence) in ["'a_s'", "'a_' || 's'"].into_iter().enumerate() {
+            let next_id = 1 + round * 4 + form * 2;
+            let current_id = next_id + 1;
+            let next = format!("INSERT INTO seq_returning VALUES ({next_id}, 1) RETURNING nextval({sequence})");
+            let current = format!("INSERT INTO seq_returning VALUES ({current_id}, 1) RETURNING currval({sequence})");
+            let count = format!("SELECT count(*) FROM seq_returning WHERE id IN ({next_id}, {current_id})");
+
+            let before = f.next("a_s").await;
+            protocol.error(&bob, &next, "42501").await;
+            assert_eq!(protocol.value(&alice, &count).await.unwrap(), 0);
+            let drawn = protocol.value(&alice, &next).await.unwrap();
+            assert_eq!(drawn, before + 1, "{protocol:?}: {next}");
+
+            protocol.error(&bob, &current, "42501").await;
+            assert_eq!(protocol.value(&alice, &count).await.unwrap(), 1);
+            assert_eq!(protocol.value(&alice, &current).await.unwrap(), drawn, "{protocol:?}: {current}");
+            assert_eq!(f.next("a_s").await, drawn + 1, "{protocol:?}: {current}");
+        }
+    }
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn seqauth2_scalar_subquery_checks_the_resolved_sequence() {
+    let f = Fixture::new().await;
+    let alice = f.connect("alice").await;
+    let bob = f.connect("bob").await;
+    for protocol in PROTOCOLS {
+        for sql in [
+            "SELECT (SELECT nextval('a_s'))",
+            "SELECT (SELECT nextval('a_' || 's'))",
+        ] {
+            let before = f.next("a_s").await;
+            protocol.error(&bob, sql, "42501").await;
+            assert_eq!(protocol.value(&alice, sql).await.unwrap(), before + 1, "{protocol:?}: {sql}");
+        }
+    }
     f.stop().await;
 }

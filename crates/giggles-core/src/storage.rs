@@ -138,6 +138,8 @@ pub enum CoreError {
     Cancelled,
     Limit,
     Policy(Error),
+    /// Execution-time refusal to use a sequence.
+    SequencePrivilege,
     Sql(relational::SqlError),
     /// Schema DDL error outside the frozen, persisted scalar-error enum.
     DuplicateSchema,
@@ -248,6 +250,9 @@ fn recovery(
 pub(crate) struct State {
     #[serde(skip)]
     pub(crate) seq: BTreeMap<u64, sequences::SeqCounter>,
+    // Legacy SQL stages these with its catalog, including across savepoints.
+    #[serde(skip)]
+    sequence_owner_updates: BTreeMap<u64, Option<String>>,
     pub accounting: BTreeMap<TaskId, TaskAccounting>,
     pub native_outcomes: Option<native_once::NativeOutcomes>,
     pub sql: relational::Relational,
@@ -360,9 +365,10 @@ struct Metadata {
     next_approval: u64,
     origin: Option<u128>,
 }
-fn empty(domain: u128) -> State {
+pub(crate) fn empty(domain: u128) -> State {
     State {
         seq: BTreeMap::new(),
+        sequence_owner_updates: BTreeMap::new(),
         accounting: BTreeMap::new(),
         native_outcomes: None,
         sql: Default::default(),
@@ -914,6 +920,13 @@ impl Inner {
         let s = self.read().inspect_err(|error| self.fence_error(engine::kv::FenceSite::Read, error))?;
         f(&s)
     }
+    fn legacy_statement_snapshot(&self) -> Result<State, CoreError> {
+        self.inspect(|committed| {
+            let mut snapshot = committed.clone();
+            snapshot.sequence_owner_updates.clear();
+            Ok(snapshot)
+        })
+    }
     fn change<T>(
         &self,
         f: impl FnOnce(&mut State) -> Result<T, CoreError>,
@@ -1109,6 +1122,7 @@ impl Inner {
             }
             roles::rename_tables(&tx, &renames)?;
             roles::forget_relations(&tx, &forgotten)?;
+            roles::write_sequence_owners(&tx, s)?;
             if point == CrashPoint::BeforeCommit {
                 crash_now();
             }
@@ -1129,6 +1143,7 @@ impl Inner {
                 crate::cancellation::check()?;
             }
             tx.commit().map_err(|error| self.legacy_io(site, error))?;
+            s.sequence_owner_updates.clear();
             self.accept_sequences(s)?;
             if decision {
                 self.decision_point(DecisionPoint::Committed);
@@ -2759,15 +2774,27 @@ impl SqlSession {
         self.authority_managed = managed;
     }
 
-    /// Configure the creator for atomic v2 DDL authority. Returns whether this
-    /// engine maintains DDL authority itself; legacy callers retain bookkeeping.
+    /// Set the creator for SQL DDL. V2 maintains all ownership records itself.
+    /// Legacy maintains explicit sequence owners and leaves table bookkeeping to callers.
     pub fn set_ddl_owner(&mut self, owner: Option<&str>) -> bool {
         self.ddl_owner = owner.map(str::to_owned);
         matches!(self.admin.inner.backend, Backend::V2(_))
     }
 
-    /// Read authority including this session's uncommitted v2 DDL changes.
+    fn staged_sequence_owner(&self, name: &str) -> Option<&Option<String>> {
+        let staged = self.staged.as_ref()?;
+        staged.sequence_owner_updates.iter().find_map(|(id, owner)| {
+            staged.sql.catalog_ext().sequences.get(id)
+                .filter(|sequence| sequence.name == name)
+                .map(|_| owner)
+        })
+    }
+
+    /// Read authority including this session's uncommitted DDL changes.
     pub fn table_owner(&self, table: &str) -> Result<Option<String>, roles::RoleError> {
+        if let Some(owner) = self.staged_sequence_owner(table) {
+            return Ok(owner.clone());
+        }
         if let Some(txn) = &self.v2_transaction
             && let Some(owner) = roles::engine::own_owner(txn, table)?
         {
@@ -2783,6 +2810,9 @@ impl SqlSession {
         image: &roles::RoleCatalogImage,
         table: &str,
     ) -> Result<Option<String>, roles::RoleError> {
+        if let Some(owner) = self.staged_sequence_owner(table) {
+            return Ok(owner.clone());
+        }
         if let Some(txn) = &self.v2_transaction
             && let Some(owner) = roles::engine::own_owner(txn, table)?
         {
@@ -3909,7 +3939,7 @@ impl SqlSession {
         }
         let mut state = match &self.staged {
             Some(state) => state.clone(),
-            None => self.admin.inner.inspect(|state| Ok(state.clone()))?,
+            None => self.admin.inner.legacy_statement_snapshot()?,
         };
         self.admin.inner.merge_live_sequences(&mut state)?;
         sequences::merge(&mut state, &*self.pending_sequences.lock().map_err(|_| CoreError::Fenced)?);
@@ -4505,7 +4535,7 @@ impl SqlSession {
             }
             let mut state = match &self.staged {
                 Some(s) => s.clone(),
-                None => self.admin.inner.inspect(|s| Ok(s.clone()))?,
+                None => self.admin.inner.legacy_statement_snapshot()?,
             };
             if prepared.domain != state.view.domain {
                 return Err(CoreError::Sql(relational::SqlError::StaleSchema));
@@ -5178,7 +5208,7 @@ impl SqlSession {
                             }
                         })
                         .map_err(|_| CoreError::Busy)?;
-                    match self.admin.inner.inspect(|s| Ok(s.clone())) {
+                    match self.admin.inner.legacy_statement_snapshot() {
                         Ok(s) => {
                             self.sequence_baseline = s
                                 .sql
@@ -5306,7 +5336,7 @@ impl SqlSession {
         }
         let mut s = match &self.staged {
             Some(s) => s.clone(),
-            None => self.admin.inner.inspect(|s| Ok(s.clone()))?,
+            None => self.admin.inner.legacy_statement_snapshot()?,
         };
         if p.domain != s.view.domain {
             return Err(CoreError::Sql(E::StaleSchema));
@@ -5343,6 +5373,11 @@ impl SqlSession {
             }
         });
         let clock = context.as_ref();
+        let sequence_links = p.is_sequence_ddl().then(|| {
+            s.sql.catalog_ext().sequences.iter()
+                .map(|(&id, def)| (id, def.owned_by))
+                .collect::<BTreeMap<_, _>>()
+        });
         let sequence_before = if p.is_sequence_ddl() || p.truncate_restarts_identity() {
             Some(
                 s.sql
@@ -5477,6 +5512,29 @@ impl SqlSession {
             for (id, counter) in &mut s.seq {
                 let definition = &s.sql.catalog_ext().sequences[id];
                 counter.log_hw = counter.log_hw.clamp(definition.min, definition.max);
+            }
+        }
+        if let Some(links) = sequence_links {
+            for (&id, sequence) in &s.sql.catalog_ext().sequences {
+                let previous = links.get(&id);
+                if previous == Some(&sequence.owned_by) {
+                    continue;
+                }
+                let owner = match sequence.owned_by.or_else(|| previous.copied().flatten()) {
+                    Some((table, _)) => {
+                        let key = s.sql.tables.values()
+                            .find(|def| def.id == table)
+                            .map(|def| s.sql.table_key(def))
+                            .ok_or(CoreError::Sql(E::UnknownTable))?;
+                        let key = self.table_authority_name(&key)?;
+                        self.table_owner(&key).map_err(|error| match error {
+                            roles::RoleError::Core(error) => error,
+                            _ => CoreError::Policy(Error::Scope),
+                        })?
+                    }
+                    None => self.ddl_owner.clone(),
+                };
+                s.sequence_owner_updates.insert(id, owner);
             }
         }
         // Reserve the complete durable/export envelope before accepting a stage.

@@ -69,6 +69,7 @@ pub fn failure(e: CoreError) -> Reply {
     let code = match &e {
         CoreError::PrivilegeInquiry(_) => 12,
         CoreError::Policy(e) => policy_code(*e),
+        CoreError::SequencePrivilege => policy_code(Error::Scope),
         CoreError::Storage(_) => 10,
         CoreError::Corrupt(_) => 11,
         CoreError::Unsupported | CoreError::EngineUnsupported { .. } => 12,

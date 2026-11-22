@@ -474,7 +474,7 @@ fn core(e: CoreError) -> Error {
         CoreError::Sql(SqlError::Conflict) => Error::Conflict,
         CoreError::Sql(SqlError::Duplicate) => Error::Duplicate,
         CoreError::Sql(SqlError::Overflow) => Error::Overflow,
-        CoreError::Sql(_) => Error::Sql {
+        CoreError::Sql(_) | CoreError::SequencePrivilege => Error::Sql {
             sqlstate: crate::sqlstate(&e).into(),
         },
         // A task statement stopped by a limit inside the read (rows scanned,

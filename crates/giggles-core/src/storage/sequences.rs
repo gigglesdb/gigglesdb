@@ -295,7 +295,7 @@ impl Inner {
                 .as_ref()
                 .is_some_and(|tables| tables.is_empty())
             {
-                return Err(CoreError::Policy(Error::Scope));
+                return Err(CoreError::SequencePrivilege);
             }
             let name = sequence_name(text).map_err(CoreError::Sql)?;
             let name = snapshot.sql.resolve_relation_key(&name, &search_path);
@@ -313,7 +313,7 @@ impl Inner {
                 if !allowed.contains(&name)
                     && owner.is_none_or(|t| !allowed.contains(&snapshot.sql.table_key(t)))
                 {
-                    return Err(CoreError::Policy(Error::Scope));
+                    return Err(CoreError::SequencePrivilege);
                 }
             }
             let _guard = inner.gate.lock_cancellable()?;

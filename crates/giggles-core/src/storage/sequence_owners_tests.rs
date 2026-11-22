@@ -138,3 +138,97 @@ fn committed_and_private_ownership_equivalence() {
         std::fs::remove_dir_all(path).unwrap();
     }
 }
+
+#[test]
+fn legacy_sequence_owner_updates_are_transaction_scoped() {
+    let root = crate::test_artifact_root();
+    fs::create_dir_all(&root).unwrap();
+    let mut token = [0u8; 16];
+    getrandom::fill(&mut token).unwrap();
+    let path = root.join(format!(
+        "legacy-sequence-owners-{:032x}",
+        u128::from_be_bytes(token)
+    ));
+    let admin = Admin::create_engine(&path, Limits::default(), Engine::Legacy).unwrap();
+    let roles = admin.roles();
+    for name in ["bob", "carol"] {
+        roles
+            .create(roles::NewRole {
+                name: name.into(),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    let mut writer = admin.sql_session();
+    for sql in [
+        "CREATE TABLE t (id INT PRIMARY KEY)",
+        "CREATE TABLE u (id INT PRIMARY KEY)",
+        "CREATE SEQUENCE s",
+    ] {
+        run(&mut writer, sql);
+    }
+    roles.set_table_owner("t", "bob").unwrap();
+    roles.set_table_owner("u", "carol").unwrap();
+
+    for sql in [
+        "BEGIN",
+        "ALTER SEQUENCE s OWNED BY t.id",
+        "SAVEPOINT sp",
+        "ALTER SEQUENCE s OWNED BY u.id",
+    ] {
+        run(&mut writer, sql);
+    }
+    assert_eq!(writer.table_owner("s").unwrap().as_deref(), Some("carol"));
+    run(&mut writer, "ROLLBACK TO SAVEPOINT sp");
+    assert_eq!(writer.table_owner("s").unwrap().as_deref(), Some("bob"));
+    run(&mut writer, "COMMIT");
+    assert_eq!(roles.table_owner("s").unwrap().as_deref(), Some("bob"));
+
+    roles.set_table_owner("s", "carol").unwrap();
+    assert_eq!(
+        writer.sequence_call_engine("nextval", "s", None, true).unwrap(),
+        1
+    );
+    assert_eq!(roles.table_owner("s").unwrap().as_deref(), Some("carol"));
+
+    let mut reader = admin.sql_session();
+    reader.set_isolation(SqlIsolation::RepeatableRead);
+    run(&mut reader, "BEGIN");
+    assert!(reader.staged_sequence_owner("s").is_none());
+    assert_eq!(
+        reader.sequence_ddl_authority_key("s").unwrap().as_deref(),
+        Some("t")
+    );
+    run(&mut writer, "ALTER SEQUENCE s OWNED BY u.id");
+    assert_eq!(
+        reader.sequence_ddl_authority_key("s").unwrap().as_deref(),
+        Some("u")
+    );
+    run(&mut reader, "ROLLBACK");
+
+    // Exercise the persistence boundary directly while retaining its input state.
+    run(&mut writer, "BEGIN");
+    run(&mut writer, "ALTER SEQUENCE s OWNED BY t.id");
+    let mut staged = writer.staged.as_ref().unwrap().clone();
+    assert!(!staged.sequence_owner_updates.is_empty());
+    {
+        let _guard = admin.inner.gate.lock_cancellable().unwrap();
+        assert!(
+            admin
+                .inner
+                .persist_checked(&mut staged, None, true, &mut || true)
+                .is_ok()
+        );
+    }
+    assert_eq!(roles.table_owner("s").unwrap().as_deref(), Some("bob"));
+    drop(reader);
+    drop(writer);
+    drop(roles);
+    drop(admin);
+    fs::remove_dir_all(path).unwrap();
+    assert!(
+        staged.sequence_owner_updates.is_empty(),
+        "successful legacy persistence retained staged sequence owners: {:?}",
+        staged.sequence_owner_updates
+    );
+}

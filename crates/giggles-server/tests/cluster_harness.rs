@@ -400,9 +400,14 @@ impl Drop for ClusterProcs {
 /// A session as `owner` (loopback trust) to a PostgreSQL listener or a relay in front of one,
 /// retried while the role propagates to a non-bootstrap gateway.
 pub(crate) async fn connect(address: SocketAddr) -> Client {
+    connect_as(address, "owner").await
+}
+
+/// A loopback-trust session as a named login role, with the same propagation retry.
+pub(crate) async fn connect_as(address: SocketAddr, role: &str) -> Client {
     let mut config = Config::new();
     config
-        .user("owner")
+        .user(role)
         .dbname("postgres")
         .ssl_mode(SslMode::Disable)
         .connect_timeout(Duration::from_secs(5))
@@ -419,9 +424,9 @@ pub(crate) async fn connect(address: SocketAddr) -> Client {
             }
             Ok(Err(error)) => assert!(
                 tokio::time::Instant::now() < deadline,
-                "could not connect to {address}: {error}"
+                "could not connect to {address} as {role}: {error}"
             ),
-            Err(_) => panic!("connecting to {address} timed out"),
+            Err(_) => panic!("connecting to {address} as {role} timed out"),
         }
         tokio::time::sleep(POLL).await;
     }

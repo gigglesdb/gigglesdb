@@ -318,6 +318,8 @@ mod sort_spill_network;
 #[path = "cluster_harness.rs"] pub(crate) mod cluster_harness;
 #[path = "cluster_process.rs"] mod cluster_process;
 #[cfg(feature = "engine-rocksdb")]
+#[path = "cluster_sequence_authority.rs"] mod cluster_sequence_authority;
+#[cfg(feature = "engine-rocksdb")]
 #[path = "cluster_split_policy.rs"] mod cluster_split_policy;
 #[path = "cluster_peer_calls.rs"] mod cluster_peer_calls;
 #[path = "cluster_isolation.rs"] mod cluster_isolation;
@@ -336,6 +338,7 @@ mod cluster_replace;
 mod write_fence_holder_network;
 #[path = "role_cache_network.rs"] mod role_cache_network;
 #[path = "sequence_execution_authority_network.rs"] mod sequence_execution_authority_network;
+#[path = "sequence_owner_authority_network.rs"] mod sequence_owner_authority_network;
 #[path = "user_collation_network.rs"]
 mod user_collation_network;
 

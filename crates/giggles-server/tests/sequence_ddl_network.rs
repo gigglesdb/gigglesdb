@@ -1226,7 +1226,8 @@ async fn sequence_owner_cache_authorization_between_statements() {
         protocol.ok(&owner, "ALTER SEQUENCE standalone OWNED BY secret.id").await;
         protocol.error(&alice, "SELECT nextval('standalone')", "42501").await;
         protocol.ok(&owner, "ALTER SEQUENCE standalone OWNED BY NONE").await;
-        protocol.ok(&alice, "SELECT nextval('standalone')").await;
+        protocol.ok(&bob, "SELECT nextval('standalone')").await;
+        protocol.error(&alice, "SELECT nextval('standalone')", "42501").await;
         protocol.ok(&owner, "ALTER SEQUENCE standalone OWNED BY secret.id").await;
         protocol.error(&alice, "SELECT nextval('standalone')", "42501").await;
         protocol.ok(&owner, "DROP TABLE secret").await;
@@ -1238,4 +1239,42 @@ async fn sequence_owner_cache_authorization_between_statements() {
         drop(owner);
         f.pg.shutdown().await.unwrap();
     }
+}
+
+// Legacy stages sequence owners with the SQL catalog and restores them on rollback.
+#[tokio::test]
+async fn legacy_sequence_relinks_publish_owner_records_on_commit() {
+    let f = Fixture::new().await;
+    let protocol = Protocol::Extended;
+    let root = f.connect("owner", "owner-pw").await;
+    let alice = f.connect("alice", "pw").await;
+    let bob = f.connect("bob", "pw").await;
+    protocol.ok(&root, "GRANT CREATE ON SCHEMA public TO alice, bob").await;
+    protocol.ok(&alice, "CREATE SEQUENCE s").await;
+    protocol.ok(&bob, "CREATE TABLE t (id BIGINT)").await;
+    protocol.ok(&root, "ALTER SEQUENCE s OWNED BY t.id").await;
+    protocol.error(&alice, "ALTER SEQUENCE s RESTART", "42501").await;
+    f.admin.roles().set_table_owner("s", "alice").unwrap();
+
+    protocol.ok(&bob, "BEGIN").await;
+    protocol.ok(&bob, "ALTER SEQUENCE s OWNED BY NONE").await;
+    protocol.ok(&bob, "ALTER SEQUENCE s RESTART").await;
+    protocol.ok(&bob, "ROLLBACK").await;
+    assert_eq!(f.admin.roles().table_owner("s").unwrap().as_deref(), Some("alice"));
+    assert!(
+        f.admin.sql_session().sequence_owners().unwrap()
+            .contains(&("s".into(), Some("t".into())))
+    );
+
+    protocol.ok(&bob, "BEGIN").await;
+    protocol.ok(&bob, "ALTER SEQUENCE s OWNED BY NONE").await;
+    protocol.ok(&bob, "COMMIT").await;
+    assert_eq!(f.admin.roles().table_owner("s").unwrap().as_deref(), Some("bob"));
+    protocol.error(&alice, "DROP SEQUENCE s", "42501").await;
+    protocol.ok(&bob, "DROP SEQUENCE s").await;
+
+    protocol.ok(&root, "CREATE SEQUENCE linked OWNED BY t.id").await;
+    assert_eq!(f.admin.roles().table_owner("linked").unwrap().as_deref(), Some("bob"));
+    drop((root, alice, bob));
+    f.pg.shutdown().await.unwrap();
 }

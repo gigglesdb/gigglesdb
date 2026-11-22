@@ -323,7 +323,7 @@ pub(super) fn write<T>(
     Ok(result)
 }
 
-/// Keep table authority in the same DDL commit as renames, drops and name reuse.
+/// Keep authority in the same DDL commit as renames, drops, name reuse and sequence relinks.
 pub(crate) fn reconcile_tables(
     txn: &mut Transaction,
     kv: &dyn crate::storage::engine::kv::KvRead,
@@ -334,7 +334,11 @@ pub(crate) fn reconcile_tables(
 ) -> Result<(), CoreError> {
     let old_objects = authority_objects(old);
     let new_objects = authority_objects(new);
-    if old_objects == new_objects {
+    let relinked: Vec<_> = new.ext.sequences.iter().filter_map(|(id, next)| {
+        let previous = old.ext.sequences.get(id)?;
+        (next.owned_by != previous.owned_by).then_some((previous, next))
+    }).collect();
+    if old_objects == new_objects && relinked.is_empty() {
         return Ok(());
     }
     let new_names: BTreeMap<_, _> = new_objects.iter().map(|(name, id)| (*id, name)).collect();
@@ -354,7 +358,7 @@ pub(crate) fn reconcile_tables(
         .cloned()
         .collect();
     clear.extend(renames.iter().map(|(_, new)| new.clone()));
-    if clear.is_empty() {
+    if clear.is_empty() && relinked.is_empty() {
         return Ok(());
     }
     lock(txn, deadline, cancel)?;
@@ -399,6 +403,18 @@ pub(crate) fn reconcile_tables(
                 }
             }
         }
+        for (previous, next) in relinked {
+            let owner = match next.owned_by {
+                Some((table, _)) => owner_by_table_id(new, table, &after),
+                None => previous.owned_by.and_then(|(table, _)| owner_by_table_id(old, table, &before)),
+            };
+            let key = super::key(b"owner/", &next.name);
+            if let Some(owner) = owner {
+                after.0.insert(key, owner);
+            } else {
+                after.0.remove(&key);
+            }
+        }
         stage(txn, &before, &after)
     };
     operation().map_err(|error| match error {
@@ -431,6 +447,11 @@ fn authority_objects(parts: &CatalogParts) -> BTreeMap<String, u64> {
         .collect()
 }
 
+fn owner_by_table_id(parts: &CatalogParts, id: u64, roles: &RoleTable) -> Option<Vec<u8>> {
+    let (name, _) = parts.tables.iter().find(|(_, table)| table.id == id)?;
+    roles.0.get(&super::key(b"owner/", name)).cloned()
+}
+
 /// apply_diff already holds the role lock and has cleared obsolete authority.
 /// Stage creator ownership in that same transaction before its implicit commit.
 pub(crate) fn assign_created(
@@ -439,39 +460,36 @@ pub(crate) fn assign_created(
     new: &CatalogParts,
     owner: Option<&str>,
 ) -> Result<(), CoreError> {
-    let Some(owner) = owner else {
-        return Ok(());
-    };
     let old_ids: BTreeSet<_> = authority_objects(old).into_values().collect();
     let created: Vec<_> = authority_objects(new)
         .into_iter()
-        .filter(|(_, id)| !old_ids.contains(id))
+        .filter(|(_, id)| !old_ids.contains(id)
+            && (owner.is_some() || new.ext.sequences.get(id).is_some_and(|seq| seq.owned_by.is_some())))
         .collect();
     if created.is_empty() {
         return Ok(());
     }
     let mut operation = || -> Result<(), RoleError> {
         let before = load_txn(txn)?;
-        require_role(&before, owner)?;
         let mut after = before.clone();
         // Tables precede their dependent sequences when inheriting authority.
-        for (name, id) in &created {
-            if new.tables.values().any(|def| def.id == *id) || new.sql_views.contains_key(id) {
-                after
-                    .0
-                    .insert(super::key(b"owner/", name), owner.as_bytes().to_vec());
+        if let Some(owner) = owner {
+            require_role(&before, owner)?;
+            for (name, id) in &created {
+                if !new.ext.sequences.contains_key(id) {
+                    after.0.insert(super::key(b"owner/", name), owner.as_bytes().to_vec());
+                }
             }
         }
         for (name, id) in &created {
             if let Some(sequence) = new.ext.sequences.get(id) {
-                let inherited = sequence
-                    .owned_by
-                    .and_then(|(table_id, _)| {
-                        let (table, _) = new.tables.iter().find(|(_, def)| def.id == table_id)?;
-                        after.0.get(&super::key(b"owner/", table)).cloned()
-                    })
-                    .unwrap_or_else(|| owner.as_bytes().to_vec());
-                after.0.insert(super::key(b"owner/", name), inherited);
+                let effective_owner = match sequence.owned_by {
+                    Some((table, _)) => owner_by_table_id(new, table, &after),
+                    None => owner.map(|owner| owner.as_bytes().to_vec()),
+                };
+                if let Some(owner) = effective_owner {
+                    after.0.insert(super::key(b"owner/", name), owner);
+                }
             }
         }
         stage(txn, &before, &after)

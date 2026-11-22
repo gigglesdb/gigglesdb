@@ -6,7 +6,8 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
     match e {
         CoreError::PrivilegeInquiry(state) => state,
         CoreError::Policy(Error::Authentication | Error::UnknownTask) => "28000",
-        CoreError::Policy(Error::Revoked | Error::Expired | Error::Scope) => "42501",
+        CoreError::Policy(Error::Revoked | Error::Expired | Error::Scope)
+        | CoreError::SequencePrivilege => "42501",
         CoreError::Policy(Error::UncertainTime | Error::TimeRegression) => "55000",
         CoreError::Policy(Error::Budget) => "54000",
         CoreError::Policy(

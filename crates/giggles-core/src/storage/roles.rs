@@ -1416,6 +1416,32 @@ pub(super) fn forget_relations(
     Ok(())
 }
 
+/// Publish the owner records staged by Legacy sequence DDL with its catalog.
+pub(super) fn write_sequence_owners(
+    tx: &redb::WriteTransaction,
+    state: &super::State,
+) -> Result<(), CoreError> {
+    if state.sequence_owner_updates.is_empty() {
+        return Ok(());
+    }
+    let mut roles = tx.open_table(ROLES).map_err(io)?;
+    for (id, owner) in &state.sequence_owner_updates {
+        let Some(sequence) = state.sql.catalog_ext().sequences.get(id) else { continue };
+        let owner_key = key(b"owner/", &sequence.name);
+        if let Some(owner) = owner {
+            if predefined(owner).is_none()
+                && roles.get(key(b"role/", owner).as_slice()).map_err(io)?.is_none()
+            {
+                return Err(CoreError::Policy(crate::Error::Scope));
+            }
+            roles.insert(owner_key.as_slice(), owner.as_bytes()).map_err(io)?;
+        } else {
+            roles.remove(owner_key.as_slice()).map_err(io)?;
+        }
+    }
+    Ok(())
+}
+
 /// Move name-keyed table authority in the same transaction as schema publication.
 /// Collect all values before removing keys so swaps cannot overwrite one another.
 pub(super) fn rename_tables(
