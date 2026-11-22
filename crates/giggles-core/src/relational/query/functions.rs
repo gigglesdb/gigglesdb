@@ -1114,871 +1114,1078 @@ impl Scalar {
         Ok(Self::Call(name.into(), args))
     }
 
+    // Keep recursive binding frames small in the unoptimized profile.
     pub(super) fn bind(
         &self,
         resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
         tables: &[&TableDef],
         parameters: &[Option<DataType>],
     ) -> R<BoundScalar> {
-        if matches!(self, Self::Unary(..) | Self::Binary(..)) {
-            return arithmetic::bind(self, resolve, tables, parameters);
-        }
-        let expression_parameter_error = |error| {
-            if matches!(error, SqlError::Parameters) && parameters.iter().any(Option::is_none) {
-                SqlError::IndeterminateDatatype
-            } else {
-                error
+        match self {
+            Self::Predicate(filter) => Self::bind_predicate(filter, resolve, tables, parameters),
+            Self::Case(case) => Self::bind_case(case, resolve, tables, parameters),
+            Self::Unary(..) | Self::Binary(..) => {
+                arithmetic::bind(self, resolve, tables, parameters)
             }
-        };
-        let (ty, node) = match self {
-            Self::Predicate(filter) => (
-                DataType::Boolean,
-                Node::Predicate(Box::new(
-                    filter
-                        .bind(parameters, resolve, tables)
-                        .map_err(expression_parameter_error)?,
-                )),
-            ),
-            Self::Case(case) => {
-                let originals: Vec<_> = case
-                    .arms
-                    .iter()
-                    .map(|(_, result)| result)
-                    .chain(case.otherwise.iter())
-                    .collect();
-                let ty = common_result_type(
-                    originals
-                        .iter()
-                        .filter(|result| {
-                            !matches!(result, Self::Literal(Value::Null | Value::Text(_)))
-                        })
-                        .map(|result| {
-                            result
-                                .bind(resolve, tables, parameters)
-                                .map_err(expression_parameter_error)
-                                .map(|bound| bound.ty)
-                        })
-                        .collect::<R<Vec<_>>>()?,
-                )?;
-                let result = |value: &Scalar| -> R<BoundScalar> {
-                    if let Self::Literal(value @ (Value::Text(_) | Value::Null)) = value {
-                        return Ok(BoundScalar {
-                            ty: ty.clone(),
-                            node: literal_cast_node(value.clone(), &ty)?,
-                        });
-                    }
-                    let bound = value
-                        .bind(resolve, tables, parameters)
-                        .map_err(expression_parameter_error)?;
-                    if bound.ty == ty {
-                        Ok(bound)
-                    } else {
-                        Ok(BoundScalar {
-                            ty: ty.clone(),
-                            node: cast_node(bound, &ty),
-                        })
-                    }
-                };
-                let arms = case
-                    .arms
-                    .iter()
-                    .map(|(condition, value)| {
-                        Ok((
-                            condition
-                                .bind(parameters, resolve, tables)
-                                .map_err(expression_parameter_error)?,
-                            result(value)?,
-                        ))
-                    })
-                    .collect::<R<Vec<_>>>()?;
-                let otherwise = case
-                    .otherwise
-                    .as_ref()
-                    .map(result)
-                    .transpose()?
-                    .map(Box::new);
-                collation::derive(arms.iter().map(|(_, v)| v).chain(otherwise.iter().map(|v| v.as_ref())))?;
-                (ty, Node::Case(arms, otherwise))
-            }
-            Self::Unary(..) | Self::Binary(..) => unreachable!(),
             // Grouping identity probes omit parameter types before inference.
             // Report an unresolved binding so those probes retain the syntax.
-            Self::Param(n) => (
-                parameters
+            Self::Param(n) => Ok(BoundScalar {
+                ty: parameters
                     .get(n - 1)
                     .and_then(Clone::clone)
                     .ok_or(SqlError::Parameters)?,
-                Node::Param(*n),
-            ),
-            Self::Domain(a, _, target) => {
-                let ty = target.as_ref().as_ref().map_err(Clone::clone)?;
-                let TypeDef::Domain { base, typmod, .. } = ty else {
-                    return Err(SqlError::Unsupported);
-                };
-                let inner = cast::expression(*a.clone(), (base.clone(), *typmod))
-                    .bind(resolve, tables, parameters)?;
-                (base.clone(), Node::Domain(Box::new(inner), ty.clone()))
-            }
-            Self::Cast(a, ty) => {
-                if let Self::Literal(v @ (Value::Text(_) | Value::Null)) = a.as_ref()
-                    && datetime_input::target(ty)
-                {
-                    return Ok(BoundScalar {
-                        ty: ty.clone(),
-                        node: match literal_cast_node(v.clone(), ty)? {
-                            Node::Literal(value) => Node::Cast(Box::new(BoundScalar {
-                                ty: ty.clone(),
-                                node: Node::Literal(value),
-                            })),
-                            node => node,
-                        },
-                    });
-                }
-                if let Self::Literal(Value::Text(_) | Value::Null) = a.as_ref()
-                    && *ty != DataType::TimestampTz
-                {
-                    let Self::Literal(v) = a.as_ref() else {
-                        unreachable!()
-                    };
-                    let v = cast_value(v.clone(), ty, &mut 0)?;
-                    return Ok(BoundScalar {
-                        ty: ty.clone(),
-                        node: Node::Cast(Box::new(BoundScalar {
-                            ty: ty.clone(),
-                            node: Node::Literal(v),
-                        })),
-                    });
-                }
-                let a = a.bind(resolve, tables, parameters)?;
-                if a.ty != *ty && a.ty.is_temporal() && ty.is_temporal() {
-                    if !assignment::compatible(&a.ty, ty) {
-                        return Err(SqlError::CannotCoerce);
-                    }
-                    return Ok(BoundScalar {
-                        ty: ty.clone(),
-                        node: cast_node(a, ty),
-                    });
-                }
-                if a.ty == DataType::Bpchar
-                    && !matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
-                {
-                    return Err(SqlError::Unsupported);
-                }
-                if !(number(&a.ty) && number(ty)
-                    || a.ty == *ty
-                    || integer(&a.ty) && (integer(ty) || *ty == DataType::Bytes)
-                    || a.ty == DataType::Bytes && integer(ty)
-                    || matches!(a.ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
-                    || matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
-                    || a.ty == DataType::Boolean && *ty == DataType::Integer
-                    || a.ty == DataType::Integer && *ty == DataType::Boolean
-                    || session_sensitive(&a.ty, ty))
-                {
-                    return Err(SqlError::Type);
-                }
-                (ty.clone(), cast_node(a, ty))
-            }
-            Self::Column(c) => {
-                let c = resolve(c, tables.len())?;
-                let column=&tables[c.source].columns[c.column];
-                return collation::column(BoundScalar { ty:column.data_type.clone(),node:Node::Column(c,column.name.clone()) },column.id);
-
-            }
-            Self::Literal(v) => (
-                match v {
-                    Value::Int(n) if i32::try_from(*n).is_ok() => DataType::Integer,
-                    Value::Int(_) => DataType::BigInt,
-                    Value::Bool(_) => DataType::Boolean,
-                    Value::Bytes(_) => DataType::Bytes,
-                    Value::Numeric(_) => DataType::Numeric,
-                    Value::Float4(_) => DataType::Real,
-                    Value::Float8(_) => DataType::DoublePrecision,
-                    Value::Date(_) => DataType::Date,
-                    Value::Time(_) => DataType::Time,
-                    Value::TimeTz(_) => DataType::TimeTz,
-                    Value::Timestamp(_) => DataType::Timestamp,
-                    Value::TimestampTz(_) => DataType::TimestampTz,
-                    Value::Interval(_) => DataType::Interval,
-
-                    _ => DataType::Text,
-                },
-                Node::Literal(v.clone()),
-            ),
+                node: Node::Param(*n),
+            }),
+            Self::Domain(a, _, target) => Self::bind_domain(a, target, resolve, tables, parameters),
+            Self::Cast(a, ty) => Self::bind_cast(a, ty, resolve, tables, parameters),
+            Self::Column(c) => Self::bind_column(c, resolve, tables),
+            Self::Literal(v) => Ok(Self::bind_literal(v)),
             Self::SubstringOrder(args) => {
-                return Self::bind_substring_order(args, resolve, tables, parameters);
+                Self::bind_substring_order(args, resolve, tables, parameters)
             }
-            Self::Call(name, args) if name == array_constructor::NAME => return array_constructor::bind(args,resolve,tables,parameters),
-            Self::Call(name, args) if name == "\0plan_cardinality" && args.len() == 1 => {
-                let inner = args[0].bind(resolve, tables, parameters)?;
-                (inner.ty.clone(), Node::Call(name.clone(), vec![inner]))
-            }
-            Self::Call(name, args) if aggregate_order::internal(name) => {
-                let args = args.iter().map(|a| {
-                    let bound = a.bind(resolve,tables,parameters)?;
-                    Ok(if let Some(ty) = bound.enum_type(tables) {bound.with_enum(&ty)} else {bound})
-                }).collect::<R<Vec<_>>>()?;
-                for scalar in &args[1..] {
-                    scalar.require_collation()?;
-                }
-                return Ok(BoundScalar {ty:args[0].ty.clone(),node:Node::Call(name.clone(),args)});
-            }
-            Self::Call(name, args) if aggregate_order::deferred(name).is_some() => {
-                let distinct = aggregate_order::deferred(name).unwrap();
-                for arg in args {
-                    let bound = arg.bind(resolve, tables, parameters)?;
-                    if distinct { bound.require_collation()?; }
-                }
-                return Err(SqlError::Unsupported);
-            }
-            Self::Call(name, args) if collation::internal(name) => {
-                let value = args[0].bind(resolve, tables, parameters)?;
-                if let Some(TypeDef::Enum { name, .. }) = value.enum_type(tables) {
-                    user_types::view_replace_error(format!("collations are not supported by type {name}"));
-                    return Err(SqlError::Type);
-                }
-                return collation::bind(name, value);
-            }
-            Self::Call(name, args) if name == "pg_collation_for" => {
-                if args.len() != 1 { return Err(SqlError::UndefinedFunction); }
-                let a = args[0].bind(resolve, tables, parameters)?;
-                let value = if let Some(n) = a.explicit_collation()? {Value::Text(collation::display_name(n))}
-                    else if matches!(args[0], Scalar::Literal(Value::Text(_) | Value::Null)) || !matches!(a.ty, DataType::Text | DataType::Varchar | DataType::Bpchar) { Value::Null }
-                    else { Value::Text("\"default\"".into()) };
-                return Ok(BoundScalar { ty: DataType::Text, node: Node::Literal(value) });
-            }
-            Self::Call(name, args) if name == CAST_TYPMOD => {
-                let [inner, Self::Literal(Value::Int(modifier))] = args.as_slice() else {
-                    return Err(SqlError::Syntax);
-                };
-                let inner = inner.bind(resolve, tables, parameters)?;
+            Self::Call(name, args) => Self::bind_call(name, args, resolve, tables, parameters),
+        }
+    }
+
+    fn expression_parameter_error(error: SqlError, parameters: &[Option<DataType>]) -> SqlError {
+        if matches!(error, SqlError::Parameters) && parameters.iter().any(Option::is_none) {
+            SqlError::IndeterminateDatatype
+        } else {
+            error
+        }
+    }
+
+    #[inline(never)]
+    fn bind_predicate(
+        filter: &super::Filter,
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        Ok(BoundScalar {
+            ty: DataType::Boolean,
+            node: Node::Predicate(Box::new(
+                filter
+                    .bind(parameters, resolve, tables)
+                    .map_err(|error| Self::expression_parameter_error(error, parameters))?,
+            )),
+        })
+    }
+
+    #[inline(never)]
+    fn bind_case(
+        case: &CaseExpr,
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        let originals: Vec<_> = case
+            .arms
+            .iter()
+            .map(|(_, result)| result)
+            .chain(case.otherwise.iter())
+            .collect();
+        let ty = common_result_type(
+            originals
+                .iter()
+                .filter(|result| !matches!(result, Self::Literal(Value::Null | Value::Text(_))))
+                .map(|result| {
+                    result
+                        .bind(resolve, tables, parameters)
+                        .map_err(|error| Self::expression_parameter_error(error, parameters))
+                        .map(|bound| bound.ty)
+                })
+                .collect::<R<Vec<_>>>()?,
+        )?;
+        let result = |value: &Scalar| -> R<BoundScalar> {
+            if let Self::Literal(value @ (Value::Text(_) | Value::Null)) = value {
                 return Ok(BoundScalar {
-                    ty: inner.ty.clone(),
-                    node: Node::TypmodCast(
-                        Box::new(inner),
-                        i32::try_from(*modifier).map_err(|_| SqlError::Type)?,
-                    ),
+                    ty: ty.clone(),
+                    node: literal_cast_node(value.clone(), &ty)?,
                 });
             }
-            Self::Call(name, args) if matches!(name.as_str(), "\0inquiry_oid" | "\0inquiry_name") => {
-                let value = args[0].bind(resolve, tables, parameters)?;
-                return Ok(BoundScalar {
-                    ty: if name == "\0inquiry_oid" { DataType::BigInt } else { DataType::Text },
-                    node: Node::Privilege(name.clone(), vec![value], None),
-                });
+            let bound = value
+                .bind(resolve, tables, parameters)
+                .map_err(|error| Self::expression_parameter_error(error, parameters))?;
+            if bound.ty == ty {
+                Ok(bound)
+            } else {
+                Ok(BoundScalar {
+                    ty: ty.clone(),
+                    node: cast_node(bound, &ty),
+                })
             }
-            Self::Call(name, args) if privilege_name(name) => {
-                let arity = if name == "has_column_privilege" { 3 } else { 2 };
-                if args.len() != arity && args.len() != arity + 1 {
+        };
+        let arms = case
+            .arms
+            .iter()
+            .map(|(condition, value)| {
+                Ok((
+                    condition
+                        .bind(parameters, resolve, tables)
+                        .map_err(|error| Self::expression_parameter_error(error, parameters))?,
+                    result(value)?,
+                ))
+            })
+            .collect::<R<Vec<_>>>()?;
+        let otherwise = case
+            .otherwise
+            .as_ref()
+            .map(result)
+            .transpose()?
+            .map(Box::new);
+        collation::derive(
+            arms.iter()
+                .map(|(_, v)| v)
+                .chain(otherwise.iter().map(|v| v.as_ref())),
+        )?;
+        Ok(BoundScalar {
+            ty,
+            node: Node::Case(arms, otherwise),
+        })
+    }
+
+    #[inline(never)]
+    fn bind_domain(
+        a: &Self,
+        target: &R<TypeDef>,
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        let ty = target.as_ref().map_err(Clone::clone)?;
+        let TypeDef::Domain { base, typmod, .. } = ty else {
+            return Err(SqlError::Unsupported);
+        };
+        let inner = cast::expression(a.clone(), (base.clone(), *typmod))
+            .bind(resolve, tables, parameters)?;
+        Ok(BoundScalar {
+            ty: base.clone(),
+            node: Node::Domain(Box::new(inner), ty.clone()),
+        })
+    }
+
+    #[inline(never)]
+    fn bind_cast(
+        a: &Self,
+        ty: &DataType,
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        if let Self::Literal(v @ (Value::Text(_) | Value::Null)) = a
+            && datetime_input::target(ty)
+        {
+            return Ok(BoundScalar {
+                ty: ty.clone(),
+                node: match literal_cast_node(v.clone(), ty)? {
+                    Node::Literal(value) => Node::Cast(Box::new(BoundScalar {
+                        ty: ty.clone(),
+                        node: Node::Literal(value),
+                    })),
+                    node => node,
+                },
+            });
+        }
+        if let Self::Literal(Value::Text(_) | Value::Null) = a
+            && *ty != DataType::TimestampTz
+        {
+            let Self::Literal(v) = a else { unreachable!() };
+            let v = cast_value(v.clone(), ty, &mut 0)?;
+            return Ok(BoundScalar {
+                ty: ty.clone(),
+                node: Node::Cast(Box::new(BoundScalar {
+                    ty: ty.clone(),
+                    node: Node::Literal(v),
+                })),
+            });
+        }
+        let a = a.bind(resolve, tables, parameters)?;
+        if a.ty != *ty && a.ty.is_temporal() && ty.is_temporal() {
+            if !assignment::compatible(&a.ty, ty) {
+                return Err(SqlError::CannotCoerce);
+            }
+            return Ok(BoundScalar {
+                ty: ty.clone(),
+                node: cast_node(a, ty),
+            });
+        }
+        if a.ty == DataType::Bpchar
+            && !matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
+        {
+            return Err(SqlError::Unsupported);
+        }
+        if !(number(&a.ty) && number(ty)
+            || a.ty == *ty
+            || integer(&a.ty) && (integer(ty) || *ty == DataType::Bytes)
+            || a.ty == DataType::Bytes && integer(ty)
+            || matches!(a.ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
+            || matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
+            || a.ty == DataType::Boolean && *ty == DataType::Integer
+            || a.ty == DataType::Integer && *ty == DataType::Boolean
+            || session_sensitive(&a.ty, ty))
+        {
+            return Err(SqlError::Type);
+        }
+        Ok(BoundScalar {
+            ty: ty.clone(),
+            node: cast_node(a, ty),
+        })
+    }
+
+    #[inline(never)]
+    fn bind_column(
+        c: &ColumnRef,
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+    ) -> R<BoundScalar> {
+        let c = resolve(c, tables.len())?;
+        let column = &tables[c.source].columns[c.column];
+        collation::column(
+            BoundScalar {
+                ty: column.data_type.clone(),
+                node: Node::Column(c, column.name.clone()),
+            },
+            column.id,
+        )
+    }
+
+    #[inline(never)]
+    fn bind_literal(v: &Value) -> BoundScalar {
+        BoundScalar {
+            ty: match v {
+                Value::Int(n) if i32::try_from(*n).is_ok() => DataType::Integer,
+                Value::Int(_) => DataType::BigInt,
+                Value::Bool(_) => DataType::Boolean,
+                Value::Bytes(_) => DataType::Bytes,
+                Value::Numeric(_) => DataType::Numeric,
+                Value::Float4(_) => DataType::Real,
+                Value::Float8(_) => DataType::DoublePrecision,
+                Value::Date(_) => DataType::Date,
+                Value::Time(_) => DataType::Time,
+                Value::TimeTz(_) => DataType::TimeTz,
+                Value::Timestamp(_) => DataType::Timestamp,
+                Value::TimestampTz(_) => DataType::TimestampTz,
+                Value::Interval(_) => DataType::Interval,
+
+                _ => DataType::Text,
+            },
+            node: Node::Literal(v.clone()),
+        }
+    }
+
+    #[inline(never)]
+    fn bind_call(
+        name: &str,
+        args: &[Self],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        match name {
+            array_constructor::NAME => array_constructor::bind(args, resolve, tables, parameters),
+            "\0plan_cardinality" if args.len() == 1 => {
+                Self::bind_plan_cardinality(name, args, resolve, tables, parameters)
+            }
+            name if aggregate_order::internal(name) => {
+                Self::bind_aggregate_order(name, args, resolve, tables, parameters)
+            }
+            name if let Some(distinct) = aggregate_order::deferred(name) => {
+                Self::bind_deferred_aggregate(distinct, args, resolve, tables, parameters)
+            }
+            name if collation::internal(name) => {
+                Self::bind_collation(name, args, resolve, tables, parameters)
+            }
+            "pg_collation_for" => Self::bind_collation_for(args, resolve, tables, parameters),
+            CAST_TYPMOD => Self::bind_typmod(args, resolve, tables, parameters),
+            "\0inquiry_oid" | "\0inquiry_name" => {
+                Self::bind_inquiry(name, args, resolve, tables, parameters)
+            }
+            name if privilege_name(name) => {
+                Self::bind_privilege(name, args, resolve, tables, parameters)
+            }
+            name if let Some(error) = deferred_routine_error(name) => {
+                uuid_ossp::missing_diagnostic(name, args, resolve, tables, parameters)?;
+                Err(error)
+            }
+            "overlay" => Self::bind_overlay(args, resolve, tables, parameters),
+            "pg_typeof" => typeof_expr::bind(args, resolve, tables, parameters),
+            name if greatest::known_name(name) => {
+                greatest::bind(name, args, resolve, tables, parameters)
+            }
+            "pg_current_xact_id" | "pg_current_xact_id_if_assigned" | "pg_xact_status" => {
+                Self::bind_xact(name, args, resolve, tables, parameters)
+            }
+            name if planning::sequence_volatility(name).is_some() => {
+                Self::bind_sequence(name, args, resolve, tables, parameters)
+            }
+            name if let Some((ty, _volatility)) = planning::clock_signature(name) => {
+                Self::bind_clock(name, args, ty)
+            }
+            "position" => Self::bind_position(args, resolve, tables, parameters),
+            _ => Self::bind_regular_call(name, args, resolve, tables, parameters),
+        }
+    }
+
+    #[inline(never)]
+    fn bind_plan_cardinality(
+        name: &str,
+        args: &[Self],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        let inner = args[0].bind(resolve, tables, parameters)?;
+        Ok(BoundScalar {
+            ty: inner.ty.clone(),
+            node: Node::Call(name.to_owned(), vec![inner]),
+        })
+    }
+
+    #[inline(never)]
+    fn bind_aggregate_order(
+        name: &str,
+        args: &[Self],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        let args = args
+            .iter()
+            .map(|a| {
+                let bound = a.bind(resolve, tables, parameters)?;
+                Ok(if let Some(ty) = bound.enum_type(tables) {
+                    bound.with_enum(&ty)
+                } else {
+                    bound
+                })
+            })
+            .collect::<R<Vec<_>>>()?;
+        for scalar in &args[1..] {
+            scalar.require_collation()?;
+        }
+        Ok(BoundScalar {
+            ty: args[0].ty.clone(),
+            node: Node::Call(name.to_owned(), args),
+        })
+    }
+
+    #[inline(never)]
+    fn bind_deferred_aggregate(
+        distinct: bool,
+        args: &[Self],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        for arg in args {
+            let bound = arg.bind(resolve, tables, parameters)?;
+            if distinct {
+                bound.require_collation()?;
+            }
+        }
+        Err(SqlError::Unsupported)
+    }
+
+    #[inline(never)]
+    fn bind_collation(
+        name: &str,
+        args: &[Self],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        let value = args[0].bind(resolve, tables, parameters)?;
+        if let Some(TypeDef::Enum { name, .. }) = value.enum_type(tables) {
+            user_types::view_replace_error(format!("collations are not supported by type {name}"));
+            return Err(SqlError::Type);
+        }
+        collation::bind(name, value)
+    }
+
+    #[inline(never)]
+    fn bind_collation_for(
+        args: &[Self],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        if args.len() != 1 {
+            return Err(SqlError::UndefinedFunction);
+        }
+        let a = args[0].bind(resolve, tables, parameters)?;
+        let value = if let Some(n) = a.explicit_collation()? {
+            Value::Text(collation::display_name(n))
+        } else if matches!(args[0], Scalar::Literal(Value::Text(_) | Value::Null))
+            || !matches!(a.ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
+        {
+            Value::Null
+        } else {
+            Value::Text("\"default\"".into())
+        };
+        Ok(BoundScalar {
+            ty: DataType::Text,
+            node: Node::Literal(value),
+        })
+    }
+
+    #[inline(never)]
+    fn bind_typmod(
+        args: &[Self],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        let [inner, Self::Literal(Value::Int(modifier))] = args else {
+            return Err(SqlError::Syntax);
+        };
+        let inner = inner.bind(resolve, tables, parameters)?;
+        Ok(BoundScalar {
+            ty: inner.ty.clone(),
+            node: Node::TypmodCast(
+                Box::new(inner),
+                i32::try_from(*modifier).map_err(|_| SqlError::Type)?,
+            ),
+        })
+    }
+
+    #[inline(never)]
+    fn bind_inquiry(
+        name: &str,
+        args: &[Self],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        let value = args[0].bind(resolve, tables, parameters)?;
+        Ok(BoundScalar {
+            ty: if name == "\0inquiry_oid" {
+                DataType::BigInt
+            } else {
+                DataType::Text
+            },
+            node: Node::Privilege(name.to_owned(), vec![value], None),
+        })
+    }
+
+    #[inline(never)]
+    fn bind_privilege(
+        name: &str,
+        args: &[Self],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        let arity = if name == "has_column_privilege" { 3 } else { 2 };
+        if args.len() != arity && args.len() != arity + 1 {
+            return Err(SqlError::UndefinedFunction);
+        }
+        let bound = args
+            .iter()
+            .enumerate()
+            .map(|(position, arg)| {
+                let value = arg.bind(resolve, tables, parameters)?;
+                if !matches!(
+                    value.ty,
+                    DataType::Text
+                        | DataType::Varchar
+                        | DataType::Bpchar
+                        | DataType::SmallInt
+                        | DataType::Integer
+                        | DataType::BigInt
+                ) {
                     return Err(SqlError::UndefinedFunction);
                 }
-                let bound = args.iter().enumerate().map(|(position, arg)| {
-                    let value = arg.bind(resolve, tables, parameters)?;
-                    if !matches!(value.ty, DataType::Text | DataType::Varchar | DataType::Bpchar
-                        | DataType::SmallInt | DataType::Integer | DataType::BigInt) {
-                        return Err(SqlError::UndefinedFunction);
-                    }
-                    if position + 1 == args.len() && !matches!(value.ty,
-                        DataType::Text | DataType::Varchar | DataType::Bpchar) {
-                        return Err(SqlError::UndefinedFunction);
-                    }
-                    Ok(value)
-                }).collect::<R<Vec<_>>>()?;
-                return Ok(BoundScalar { ty: DataType::Boolean,
-                    node: Node::Privilege(name.clone(), bound, None) });
-            }
-            Self::Call(name, args) if deferred_routine_error(name).is_some() => {
-                uuid_ossp::missing_diagnostic(name, args, resolve, tables, parameters)?;
-                return Err(deferred_routine_error(name).unwrap());
-            }
-            Self::Call(name, args) if name == "overlay" => {
-                return Self::bind_overlay(args, resolve, tables, parameters);
-            }
-            Self::Call(name, args) if name == "pg_typeof" => {
-                return typeof_expr::bind(args, resolve, tables, parameters);
-            }
-            Self::Call(name, args) if greatest::known_name(name) => {
-                return greatest::bind(name, args, resolve, tables, parameters);
-            }
-            Self::Call(name, args) => {
-                if matches!(
-                    name.as_str(),
-                    "pg_current_xact_id" | "pg_current_xact_id_if_assigned" | "pg_xact_status"
-                ) {
-                    let status = name == "pg_xact_status";
-                    if args.len() != usize::from(status) {
-                        return Err(SqlError::UndefinedFunction);
-                    }
-                    let mut bound = Vec::with_capacity(args.len());
-                    for arg in args {
-                        let mut value = arg.bind(resolve, tables, parameters)?;
-                        if value.ty != DataType::BigInt {
-                            if let Self::Literal(raw @ (Value::Text(_) | Value::Null)) = arg {
-                                value = BoundScalar {
-                                    ty: DataType::BigInt,
-                                    node: literal_cast_node(raw.clone(), &DataType::BigInt)?,
-                                };
-                            } else if integer(&value.ty) {
-                                value = BoundScalar {
-                                    ty: DataType::BigInt,
-                                    node: Node::Cast(Box::new(value)),
-                                };
-                            } else {
-                                return Err(SqlError::UndefinedFunction);
-                            }
-                        }
-                        bound.push(value);
-                    }
-                    return Ok(BoundScalar {
-                        ty: if status {
-                            DataType::Text
-                        } else {
-                            DataType::BigInt
-                        },
-                        node: Node::Xact(name.clone(), bound, None),
-                    });
+                if position + 1 == args.len()
+                    && !matches!(
+                        value.ty,
+                        DataType::Text | DataType::Varchar | DataType::Bpchar
+                    )
+                {
+                    return Err(SqlError::UndefinedFunction);
                 }
-                if planning::sequence_volatility(name).is_some() {
-                    if !(matches!(name.as_str(), "nextval" | "currval") && args.len() == 1
-                        || name == "setval" && matches!(args.len(), 2 | 3))
+                Ok(value)
+            })
+            .collect::<R<Vec<_>>>()?;
+        Ok(BoundScalar {
+            ty: DataType::Boolean,
+            node: Node::Privilege(name.to_owned(), bound, None),
+        })
+    }
+
+    #[inline(never)]
+    fn bind_xact(
+        name: &str,
+        args: &[Self],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        let status = name == "pg_xact_status";
+        if args.len() != usize::from(status) {
+            return Err(SqlError::UndefinedFunction);
+        }
+        let mut bound = Vec::with_capacity(args.len());
+        for arg in args {
+            let mut value = arg.bind(resolve, tables, parameters)?;
+            if value.ty != DataType::BigInt {
+                if let Self::Literal(raw @ (Value::Text(_) | Value::Null)) = arg {
+                    value = BoundScalar {
+                        ty: DataType::BigInt,
+                        node: literal_cast_node(raw.clone(), &DataType::BigInt)?,
+                    };
+                } else if integer(&value.ty) {
+                    value = BoundScalar {
+                        ty: DataType::BigInt,
+                        node: Node::Cast(Box::new(value)),
+                    };
+                } else {
+                    return Err(SqlError::UndefinedFunction);
+                }
+            }
+            bound.push(value);
+        }
+        Ok(BoundScalar {
+            ty: if status {
+                DataType::Text
+            } else {
+                DataType::BigInt
+            },
+            node: Node::Xact(name.to_owned(), bound, None),
+        })
+    }
+
+    #[inline(never)]
+    fn bind_sequence(
+        name: &str,
+        args: &[Self],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        if !(matches!(name, "nextval" | "currval") && args.len() == 1
+            || name == "setval" && matches!(args.len(), 2 | 3))
+        {
+            return Err(SqlError::UndefinedFunction);
+        }
+        let mut bound = Vec::with_capacity(args.len());
+        for (i, arg) in args.iter().enumerate() {
+            let target = match i {
+                0 => DataType::Text,
+                1 => DataType::BigInt,
+                _ => DataType::Boolean,
+            };
+            let mut value = arg.bind(resolve, tables, parameters)?;
+            if value.ty != target {
+                if matches!(arg, Self::Literal(Value::Text(_) | Value::Null)) {
+                    let Self::Literal(raw) = arg else {
+                        unreachable!()
+                    };
+                    value = BoundScalar {
+                        ty: target.clone(),
+                        node: literal_cast_node(raw.clone(), &target)?,
+                    };
+                } else if i == 1 && integer(&value.ty) {
+                    value = BoundScalar {
+                        ty: target.clone(),
+                        node: Node::Cast(Box::new(value)),
+                    };
+                } else {
+                    return Err(SqlError::UndefinedFunction);
+                }
+            }
+            bound.push(value);
+        }
+        Ok(BoundScalar {
+            ty: DataType::BigInt,
+            node: Node::Sequence(name.to_owned(), bound, None),
+        })
+    }
+
+    #[inline(never)]
+    fn bind_clock(name: &str, args: &[Self], ty: DataType) -> R<BoundScalar> {
+        let keyword = matches!(
+            name,
+            "current_timestamp" | "localtimestamp" | "current_time" | "localtime"
+        );
+        let precision = match args {
+            [] => -1,
+            [Self::Literal(Value::Int(p))] if keyword && *p >= 0 => (*p as i32).min(6),
+            _ => return Err(SqlError::UndefinedFunction),
+        };
+        Ok(BoundScalar {
+            ty,
+            node: Node::Clock(name.to_owned(), precision, None),
+        })
+    }
+
+    #[inline(never)]
+    fn bind_regular_call(
+        name: &str,
+        args: &[Self],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        if integer_formats::known_name(name)
+            && args.len() == 1
+            && args[0].aggregate_unknown(parameters)
+        {
+            return Err(SqlError::AmbiguousFunction);
+        }
+        let bound = args
+            .iter()
+            .map(|a| a.bind(resolve, tables, parameters))
+            .collect::<R<Vec<_>>>()
+            .map_err(|e| {
+                if name == "format" {
+                    Self::expression_parameter_error(e, parameters)
+                } else {
+                    e
+                }
+            })?;
+        Self::finish_call(name, args, bound, parameters)
+    }
+
+    // Overload resolution and coercion run after the argument binds return.
+    #[inline(never)]
+    fn finish_call(
+        name: &str,
+        original: &[Self],
+        mut args: Vec<BoundScalar>,
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
+        if args
+            .iter()
+            .enumerate()
+            .any(|(index, arg)| arg.ty == DataType::Bpchar && !(name == "format" && index > 0))
+        {
+            return Err(SqlError::Unsupported);
+        }
+        if name == "format"
+            && args
+                .first()
+                .is_some_and(|a| !matches!(a.ty, DataType::Text | DataType::Varchar))
+            && !matches!(original.first(), Some(Self::Literal(Value::Null)))
+        {
+            return Err(SqlError::UndefinedFunction);
+        }
+        if let Some(arity) = degree_math::arity(name)
+            && (args.len() != arity
+                || args.iter().zip(original).any(|(a, source)| {
+                    !number(&a.ty) && !matches!(source, Self::Literal(Value::Text(_) | Value::Null))
+                }))
+        {
+            return Err(SqlError::UndefinedFunction);
+        }
+        for arg in &mut args {
+            if arg.ty == DataType::Varchar {
+                arg.ty = DataType::Text;
+            }
+        }
+        let null = |a: &BoundScalar| matches!(a.node, Node::Literal(Value::Null));
+        let ty = if matches!(
+            name,
+            "\0array_subscript" | "array_length" | "\0json_get" | "\0json_text"
+        ) {
+            if args.len() != 2 {
+                return Err(SqlError::UndefinedFunction);
+            }
+            match name {
+                "array_length" | "\0array_subscript" => {
+                    if !integer(&args[1].ty) {
+                        return Err(SqlError::UndefinedFunction);
+                    }
+                    let element = match args[0].ty {
+                        DataType::IntArray => DataType::Integer,
+                        DataType::BigIntArray => DataType::BigInt,
+                        DataType::TextArray => DataType::Text,
+                        _ => return Err(SqlError::UndefinedFunction),
+                    };
+                    if name == "array_length" {
+                        DataType::Integer
+                    } else {
+                        element
+                    }
+                }
+                _ => {
+                    if args[0].ty != DataType::Jsonb
+                        || !(integer(&args[1].ty) || args[1].ty == DataType::Text)
                     {
                         return Err(SqlError::UndefinedFunction);
                     }
-                    let mut bound = Vec::with_capacity(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        let target = match i {
-                            0 => DataType::Text,
-                            1 => DataType::BigInt,
-                            _ => DataType::Boolean,
-                        };
-                        let mut value = arg.bind(resolve, tables, parameters)?;
-                        if value.ty != target {
-                            if matches!(arg, Self::Literal(Value::Text(_) | Value::Null)) {
-                                let Self::Literal(raw) = arg else {
-                                    unreachable!()
-                                };
-                                value = BoundScalar {
-                                    ty: target.clone(),
-                                    node: literal_cast_node(raw.clone(), &target)?,
-                                };
-                            } else if i == 1 && integer(&value.ty) {
-                                value = BoundScalar {
-                                    ty: target.clone(),
-                                    node: Node::Cast(Box::new(value)),
-                                };
-                            } else {
-                                return Err(SqlError::UndefinedFunction);
-                            }
-                        }
-                        bound.push(value);
+                    if name == "\0json_get" {
+                        DataType::Jsonb
+                    } else {
+                        DataType::Text
                     }
-                    return Ok(BoundScalar {
-                        ty: DataType::BigInt,
-                        node: Node::Sequence(name.clone(), bound, None),
-                    });
                 }
-                if let Some((ty, _volatility)) = planning::clock_signature(name) {
-                    let keyword = matches!(
-                        name.as_str(),
-                        "current_timestamp" | "localtimestamp" | "current_time" | "localtime"
-                    );
-                    let precision = match args.as_slice() {
-                        [] => -1,
-                        [Self::Literal(Value::Int(p))] if keyword && *p >= 0 => (*p as i32).min(6),
-                        _ => return Err(SqlError::UndefinedFunction),
-                    };
-                    return Ok(BoundScalar {
-                        ty,
-                        node: Node::Clock(name.clone(), precision, None),
-                    });
+            }
+        } else if integer_formats::known_name(name) {
+            if args.len() != 1 {
+                return Err(SqlError::UndefinedFunction);
+            }
+            integer_formats::argument_type(Some(&args[0].ty))?;
+            DataType::Text
+        } else if let Some(result) = binary::signature(
+            name,
+            args.len(),
+            args.iter()
+                .enumerate()
+                .find(|(i, a)| {
+                    (*i == 0 || matches!(name, "btrim" | "ltrim" | "rtrim"))
+                        && a.ty == DataType::Bytes
+                })
+                .map(|(_, a)| &a.ty)
+                .or_else(|| args.first().map(|a| &a.ty)),
+        )
+        .or_else(|| uuid_ossp::signature(name, args.len()))
+        .or_else(|| md5::signature(name, args.len(), args.first().map(|a| &a.ty)))
+        .or_else(|| character::signature(name, args.len()))
+        .or_else(|| quoting::signature(name, args.len(), args.first().map(|a| &a.ty)))
+        .or_else(|| text::signature(name, args.len()))
+        .or_else(|| temporal::signature(name, &args))
+        {
+            let (types, result) = result?;
+            let date_trunc =
+                name == "date_trunc" && args.len() == 2 && args[1].ty == DataType::Date;
+            if date_trunc {
+                let date = args.pop().expect("date_trunc date argument");
+                args.push(BoundScalar {
+                    ty: DataType::TimestampTz,
+                    node: cast_node(date, &DataType::TimestampTz),
+                });
+            }
+            for ((a, original), ty) in args.iter_mut().zip(original).zip(types) {
+                if let Some(ty) = ty {
+                    if (name == "octet_length" || name == "bit_length") && a.ty == DataType::Bytes {
+                        continue;
+                    }
+                    if let Self::Literal(Value::Text(s)) = original
+                        && ty != DataType::Text
+                    {
+                        a.node = literal_cast_node(Value::Text(s.clone()), &ty)?;
+                        a.ty = ty.clone();
+                    }
+                    if null(a) {
+                        a.ty = ty.clone();
+                    }
+                    if a.ty != ty
+                        && !(integer(&a.ty)
+                            && (ty == DataType::BigInt
+                                || ty == DataType::Integer && a.ty == DataType::SmallInt))
+                    {
+                        return Err(SqlError::UndefinedFunction);
+                    }
                 }
-                if name == "position" {
-                    return Self::bind_position(args, resolve, tables, parameters);
-                }
-                let original = args;
-                if integer_formats::known_name(name)
+            }
+            if date_trunc {
+                return Ok(BoundScalar {
+                    ty: result,
+                    node: Node::ZonedOperator(name.to_owned(), args, None),
+                });
+            }
+            result
+        } else {
+            match name {
+                "pi" if args.is_empty() => DataType::DoublePrecision,
+                n if matches!(n, "sqrt" | "exp" | "ln" | "log" | "log10")
                     && args.len() == 1
-                    && args[0].aggregate_unknown(parameters)
+                    && args[0].ty == DataType::Numeric =>
                 {
-                    return Err(SqlError::AmbiguousFunction);
+                    DataType::Numeric
                 }
-                let mut args = args
-                    .iter()
-                    .map(|a| a.bind(resolve, tables, parameters))
-                    .collect::<R<Vec<_>>>()
-                    .map_err(|e| {
-                        if name == "format" {
-                            expression_parameter_error(e)
-                        } else {
-                            e
-                        }
-                    })?;
-                if args.iter().enumerate().any(|(index, arg)| {
-                    arg.ty == DataType::Bpchar && !(name == "format" && index > 0)
-                }) {
-                    return Err(SqlError::Unsupported);
-                }
-                if name == "format"
-                    && args
-                        .first()
-                        .is_some_and(|a| !matches!(a.ty, DataType::Text | DataType::Varchar))
-                    && !matches!(original.first(), Some(Self::Literal(Value::Null)))
+                n if args.len() == 2
+                    && (n == "log"
+                        || n == "power"
+                            && args.iter().any(|a| a.ty == DataType::Numeric)
+                            && args.iter().all(|a| {
+                                integer(&a.ty) || matches!(a.ty, DataType::Numeric | DataType::Text)
+                            })) =>
                 {
-                    return Err(SqlError::UndefinedFunction);
-                }
-                if let Some(arity) = degree_math::arity(name)
-                    && (args.len() != arity
-                        || args.iter().zip(original).any(|(a, source)| {
-                            !number(&a.ty)
-                                && !matches!(source, Self::Literal(Value::Text(_) | Value::Null))
-                        }))
-                {
-                    return Err(SqlError::UndefinedFunction);
-                }
-                for arg in &mut args {
-                    if arg.ty == DataType::Varchar {
-                        arg.ty = DataType::Text;
-                    }
-                }
-                let null = |a: &BoundScalar| matches!(a.node, Node::Literal(Value::Null));
-                let ty = if matches!(
-                    name.as_str(),
-                    "\0array_subscript" | "array_length" | "\0json_get" | "\0json_text"
-                ) {
-                    if args.len() != 2 {
-                        return Err(SqlError::UndefinedFunction);
-                    }
-                    match name.as_str() {
-                        "array_length" | "\0array_subscript" => {
-                            if !integer(&args[1].ty) {
-                                return Err(SqlError::UndefinedFunction);
-                            }
-                            let element = match args[0].ty {
-                                DataType::IntArray => DataType::Integer,
-                                DataType::BigIntArray => DataType::BigInt,
-                                DataType::TextArray => DataType::Text,
-                                _ => return Err(SqlError::UndefinedFunction),
-                            };
-                            if name == "array_length" {
-                                DataType::Integer
-                            } else {
-                                element
-                            }
-                        }
-                        _ => {
-                            if args[0].ty != DataType::Jsonb
-                                || !(integer(&args[1].ty) || args[1].ty == DataType::Text)
-                            {
-                                return Err(SqlError::UndefinedFunction);
-                            }
-                            if name == "\0json_get" {
-                                DataType::Jsonb
-                            } else {
-                                DataType::Text
-                            }
-                        }
-                    }
-                } else if integer_formats::known_name(name) {
-                    if args.len() != 1 {
-                        return Err(SqlError::UndefinedFunction);
-                    }
-                    integer_formats::argument_type(Some(&args[0].ty))?;
-                    DataType::Text
-                } else if let Some(result) = binary::signature(
-                    name,
-                    args.len(),
-                    args.iter()
-                        .enumerate()
-                        .find(|(i, a)| {
-                            (*i == 0 || matches!(name.as_str(), "btrim" | "ltrim" | "rtrim"))
-                                && a.ty == DataType::Bytes
-                        })
-                        .map(|(_, a)| &a.ty)
-                        .or_else(|| args.first().map(|a| &a.ty)),
-                )
-                .or_else(|| uuid_ossp::signature(name, args.len()))
-                .or_else(|| md5::signature(name, args.len(), args.first().map(|a| &a.ty)))
-                .or_else(|| character::signature(name, args.len()))
-                .or_else(|| quoting::signature(name, args.len(), args.first().map(|a| &a.ty)))
-                .or_else(|| text::signature(name, args.len()))
-                .or_else(|| temporal::signature(name, &args))
-                {
-                    let (types, result) = result?;
-                    let date_trunc = name == "date_trunc"
-                        && args.len() == 2
-                        && args[1].ty == DataType::Date;
-                    if date_trunc {
-                        let date = args.pop().expect("date_trunc date argument");
-                        args.push(BoundScalar {
-                            ty: DataType::TimestampTz,
-                            node: cast_node(date, &DataType::TimestampTz),
-                        });
-                    }
-                    for ((a, original), ty) in args.iter_mut().zip(original).zip(types) {
-                        if let Some(ty) = ty {
-                            if (name == "octet_length" || name == "bit_length")
-                                && a.ty == DataType::Bytes
-                            {
-                                continue;
-                            }
-                            if let Self::Literal(Value::Text(s)) = original
-                                && ty != DataType::Text
-                            {
-                                a.node = literal_cast_node(Value::Text(s.clone()), &ty)?;
-                                a.ty = ty.clone();
-                            }
-                            if null(a) {
-                                a.ty = ty.clone();
-                            }
-                            if a.ty != ty
-                                && !(integer(&a.ty)
-                                    && (ty == DataType::BigInt
-                                        || ty == DataType::Integer && a.ty == DataType::SmallInt))
-                            {
-                                return Err(SqlError::UndefinedFunction);
-                            }
-                        }
-                    }
-                    if date_trunc {
-                        return Ok(BoundScalar {
-                            ty: result,
-                            node: Node::ZonedOperator(name.clone(), args, None),
-                        });
-                    }
-                    result
-                } else {
-                    match name.as_str() {
-                        "pi" if args.is_empty() => DataType::DoublePrecision,
-                        n if matches!(n, "sqrt" | "exp" | "ln" | "log" | "log10")
-                            && args.len() == 1
-                            && args[0].ty == DataType::Numeric =>
+                    for (i, a) in args.iter_mut().enumerate() {
+                        if !(integer(&a.ty)
+                            || a.ty == DataType::Numeric
+                            || matches!(original[i], Self::Literal(Value::Text(_) | Value::Null)))
                         {
-                            DataType::Numeric
-                        }
-                        n if args.len() == 2
-                            && (n == "log"
-                                || n == "power"
-                                    && args.iter().any(|a| a.ty == DataType::Numeric)
-                                    && args.iter().all(|a| {
-                                        integer(&a.ty)
-                                            || matches!(a.ty, DataType::Numeric | DataType::Text)
-                                    })) =>
-                        {
-                            for (i, a) in args.iter_mut().enumerate() {
-                                if !(integer(&a.ty)
-                                    || a.ty == DataType::Numeric
-                                    || matches!(
-                                        original[i],
-                                        Self::Literal(Value::Text(_) | Value::Null)
-                                    ))
-                                {
-                                    return Err(SqlError::UndefinedFunction);
-                                }
-                                if let Self::Literal(v @ (Value::Text(_) | Value::Null)) =
-                                    &original[i]
-                                {
-                                    *a = BoundScalar {
-                                        ty: DataType::Numeric,
-                                        node: literal_cast_node(v.clone(), &DataType::Numeric)?,
-                                    };
-                                    continue;
-                                }
-                                let old = std::mem::replace(
-                                    a,
-                                    BoundScalar {
-                                        ty: DataType::Numeric,
-                                        node: Node::Literal(Value::Null),
-                                    },
-                                );
-                                *a = BoundScalar {
-                                    ty: DataType::Numeric,
-                                    node: Node::Cast(Box::new(old)),
-                                };
-                            }
-                            DataType::Numeric
-                        }
-                        n if numeric::float_arity(n).is_some_and(|arity| arity == args.len()) => {
-                            for (i, a) in args.iter_mut().enumerate() {
-                                if let Self::Literal(v @ (Value::Text(_) | Value::Null)) =
-                                    &original[i]
-                                {
-                                    *a = BoundScalar {
-                                        ty: DataType::DoublePrecision,
-                                        node: literal_cast_node(
-                                            v.clone(),
-                                            &DataType::DoublePrecision,
-                                        )?,
-                                    };
-                                } else {
-                                    if !number(&a.ty) {
-                                        return Err(SqlError::UndefinedFunction);
-                                    }
-                                    let old = std::mem::replace(
-                                        a,
-                                        BoundScalar {
-                                            ty: DataType::DoublePrecision,
-                                            node: Node::Literal(Value::Null),
-                                        },
-                                    );
-                                    a.node = Node::Cast(Box::new(old));
-                                }
-                            }
-                            DataType::DoublePrecision
-                        }
-                        "scale" | "min_scale" | "trim_scale" | "factorial" if args.len() == 1 => {
-                            let target = if name == "factorial" {
-                                DataType::BigInt
-                            } else {
-                                DataType::Numeric
-                            };
-                            if let Self::Literal(v @ (Value::Text(_) | Value::Null)) = &original[0]
-                            {
-                                args[0] = BoundScalar {
-                                    ty: target.clone(),
-                                    node: literal_cast_node(v.clone(), &target)?,
-                                };
-                            } else {
-                                if !(integer(&args[0].ty) || args[0].ty == target) {
-                                    return Err(SqlError::UndefinedFunction);
-                                }
-                                let old = args.remove(0);
-                                args.push(BoundScalar {
-                                    ty: target.clone(),
-                                    node: Node::Cast(Box::new(old)),
-                                });
-                            }
-                            if matches!(name.as_str(), "scale" | "min_scale") {
-                                DataType::Integer
-                            } else {
-                                DataType::Numeric
-                            }
-                        }
-                        "div" | "mod" | "gcd" | "lcm" if args.len() == 2 => {
-                            if name != "div"
-                                && original.iter().all(|a| a.aggregate_unknown(parameters))
-                            {
-                                return Err(SqlError::AmbiguousFunction);
-                            }
-                            if matches!(name.as_str(), "gcd" | "lcm")
-                                && args.iter().all(|a| {
-                                    !matches!(
-                                        a.ty,
-                                        DataType::Integer | DataType::BigInt | DataType::Numeric
-                                    )
-                                })
-                            {
-                                return Err(
-                                    if args.iter().zip(original).all(|(a, source)| {
-                                        a.ty == DataType::SmallInt
-                                            || matches!(
-                                                source,
-                                                Self::Literal(Value::Text(_) | Value::Null)
-                                            )
-                                    }) {
-                                        SqlError::AmbiguousFunction
-                                    } else {
-                                        SqlError::UndefinedFunction
-                                    },
-                                );
-                            }
-                            let target = if name == "div"
-                                || args.iter().any(|a| a.ty == DataType::Numeric)
-                            {
-                                DataType::Numeric
-                            } else if name == "mod"
-                                && args.iter().all(|a| {
-                                    !matches!(
-                                        a.ty,
-                                        DataType::Integer | DataType::BigInt | DataType::Numeric
-                                    )
-                                })
-                            {
-                                DataType::SmallInt
-                            } else if args.iter().any(|a| a.ty == DataType::BigInt) {
-                                DataType::BigInt
-                            } else {
-                                DataType::Integer
-                            };
-                            for (i, a) in args.iter_mut().enumerate() {
-                                if !integer(&a.ty)
-                                    && a.ty != DataType::Numeric
-                                    && !matches!(
-                                        original[i],
-                                        Self::Literal(Value::Text(_) | Value::Null)
-                                    )
-                                {
-                                    return Err(SqlError::UndefinedFunction);
-                                }
-                                if let Self::Literal(v @ (Value::Text(_) | Value::Null)) =
-                                    &original[i]
-                                {
-                                    a.node = literal_cast_node(v.clone(), &target)?;
-                                    a.ty = target.clone();
-                                    continue;
-                                }
-                                let old = std::mem::replace(
-                                    a,
-                                    BoundScalar {
-                                        ty: target.clone(),
-                                        node: Node::Literal(Value::Null),
-                                    },
-                                );
-                                a.ty = target.clone();
-                                a.node = Node::Cast(Box::new(old));
-                            }
-                            target
-                        }
-                        "round" | "ceil" | "ceiling" | "floor" | "trunc" | "sign"
-                            if args.len() == 1
-                                || (matches!(name.as_str(), "round" | "trunc")
-                                    && args.len() == 2) =>
-                        {
-                            let target = if args.len() == 2 || args[0].ty == DataType::Numeric {
-                                DataType::Numeric
-                            } else {
-                                DataType::DoublePrecision
-                            };
-                            if args.len() == 2
-                                && let Self::Literal(v @ (Value::Text(_) | Value::Null)) =
-                                    &original[1]
-                            {
-                                args[1] = BoundScalar {
-                                    ty: DataType::Integer,
-                                    node: literal_cast_node(v.clone(), &DataType::Integer)?,
-                                };
-                            }
-                            if args.len() == 2
-                                && ((!integer(&args[1].ty) || args[1].ty == DataType::BigInt)
-                                    || matches!(
-                                        args[0].ty,
-                                        DataType::Real | DataType::DoublePrecision
-                                    ))
-                            {
-                                return Err(SqlError::UndefinedFunction);
-                            }
-                            if args[0].ty != target {
-                                if !number(&args[0].ty)
-                                    && !matches!(
-                                        original[0],
-                                        Self::Literal(Value::Text(_) | Value::Null)
-                                    )
-                                {
-                                    return Err(SqlError::UndefinedFunction);
-                                }
-                                if let Self::Literal(v @ (Value::Text(_) | Value::Null)) =
-                                    &original[0]
-                                {
-                                    args[0].node = literal_cast_node(v.clone(), &target)?;
-                                    args[0].ty = target.clone();
-                                }
-                                let old = std::mem::replace(
-                                    &mut args[0],
-                                    BoundScalar {
-                                        ty: target.clone(),
-                                        node: Node::Literal(Value::Null),
-                                    },
-                                );
-                                args[0] = BoundScalar {
-                                    ty: target,
-                                    node: Node::Cast(Box::new(old)),
-                                };
-                            }
-                            args[0].ty.clone()
-                        }
-                        "abs" if args.len() == 1 => {
-                            if null(&args[0])
-                                || matches!(&self, Self::Call(_, a) if matches!(a[0], Self::Literal(Value::Text(_))))
-                            {
-                                let v = if let Self::Literal(v) = &original[0] {
-                                    v.clone()
-                                } else {
-                                    Value::Null
-                                };
-                                args[0].node = literal_cast_node(v, &DataType::DoublePrecision)?;
-                                args[0].ty = DataType::DoublePrecision;
-                            }
-                            if !number(&args[0].ty) {
-                                return Err(SqlError::UndefinedFunction);
-                            }
-                            args[0].ty.clone()
-                        }
-                        "length" | "lower" | "upper" if args.len() == 1 => {
-                            if !null(&args[0]) && args[0].ty != DataType::Text {
-                                return Err(SqlError::UndefinedFunction);
-                            }
-                            if name == "length" {
-                                DataType::Integer
-                            } else {
-                                DataType::Text
-                            }
-                        }
-                        "substring" | "substr" if (2..=3).contains(&args.len()) => {
-                            if name == "substring"
-                                && args.iter().all(|a| a.ty == DataType::Text)
-                                && original[1..]
-                                    .iter()
-                                    .any(|a| !a.aggregate_unknown(parameters))
-                            {
-                                // PostgreSQL regex overloads exist but are not implemented here.
-                                return Err(SqlError::Type);
-                            }
-                            for (i, a) in args.iter_mut().enumerate() {
-                                let ty = if i == 0 {
-                                    DataType::Text
-                                } else {
-                                    DataType::Integer
-                                };
-                                if let Self::Literal(Value::Text(s)) = &original[i] {
-                                    a.node = literal_cast_node(Value::Text(s.clone()), &ty)?;
-                                    a.ty = ty.clone();
-                                }
-                                if null(a) {
-                                    a.ty = ty.clone();
-                                }
-                                if a.ty != ty {
-                                    return Err(SqlError::UndefinedFunction);
-                                }
-                            }
-                            DataType::Text
-                        }
-                        "coalesce" if !args.is_empty() => {
-                            let ty = common_result_type(
-                                args.iter()
-                                    .zip(original)
-                                    .filter(|(a, original)| {
-                                        !matches!(original, Self::Literal(Value::Text(_)))
-                                            && !null(a)
-                                    })
-                                    .map(|(a, _)| a.ty.clone()),
-                            )?;
-                            for (a, original) in args.iter_mut().zip(original) {
-                                if let Self::Literal(Value::Text(s)) = original {
-                                    a.node = literal_cast_node(Value::Text(s.clone()), &ty)?;
-                                    a.ty = ty.clone();
-                                }
-                                if null(a) {
-                                    a.ty = ty.clone();
-                                }
-                            }
-                            ty
-                        }
-                        "coalesce" => return Err(SqlError::Type),
-                        "abs" | "length" | "lower" | "upper" | "substring" | "substr" => {
                             return Err(SqlError::UndefinedFunction);
                         }
-                        _ => return Err(SqlError::Unsupported),
+                        if let Self::Literal(v @ (Value::Text(_) | Value::Null)) = &original[i] {
+                            *a = BoundScalar {
+                                ty: DataType::Numeric,
+                                node: literal_cast_node(v.clone(), &DataType::Numeric)?,
+                            };
+                            continue;
+                        }
+                        let old = std::mem::replace(
+                            a,
+                            BoundScalar {
+                                ty: DataType::Numeric,
+                                node: Node::Literal(Value::Null),
+                            },
+                        );
+                        *a = BoundScalar {
+                            ty: DataType::Numeric,
+                            node: Node::Cast(Box::new(old)),
+                        };
                     }
-                };
-                if matches!(name.as_str(), "concat" | "concat_ws" | "format") {
-                    args.iter_mut().for_each(attach_text_cast);
+                    DataType::Numeric
                 }
-                collation::derive(args.iter())?;
-                if matches!(name.as_str(), "lower" | "upper" | "initcap") {
-                    for a in &args { a.require_collation()?; }
+                n if numeric::float_arity(n).is_some_and(|arity| arity == args.len()) => {
+                    for (i, a) in args.iter_mut().enumerate() {
+                        if let Self::Literal(v @ (Value::Text(_) | Value::Null)) = &original[i] {
+                            *a = BoundScalar {
+                                ty: DataType::DoublePrecision,
+                                node: literal_cast_node(v.clone(), &DataType::DoublePrecision)?,
+                            };
+                        } else {
+                            if !number(&a.ty) {
+                                return Err(SqlError::UndefinedFunction);
+                            }
+                            let old = std::mem::replace(
+                                a,
+                                BoundScalar {
+                                    ty: DataType::DoublePrecision,
+                                    node: Node::Literal(Value::Null),
+                                },
+                            );
+                            a.node = Node::Cast(Box::new(old));
+                        }
+                    }
+                    DataType::DoublePrecision
                 }
-                (ty, Node::Call(name.clone(), args))
+                "scale" | "min_scale" | "trim_scale" | "factorial" if args.len() == 1 => {
+                    let target = if name == "factorial" {
+                        DataType::BigInt
+                    } else {
+                        DataType::Numeric
+                    };
+                    if let Self::Literal(v @ (Value::Text(_) | Value::Null)) = &original[0] {
+                        args[0] = BoundScalar {
+                            ty: target.clone(),
+                            node: literal_cast_node(v.clone(), &target)?,
+                        };
+                    } else {
+                        if !(integer(&args[0].ty) || args[0].ty == target) {
+                            return Err(SqlError::UndefinedFunction);
+                        }
+                        let old = args.remove(0);
+                        args.push(BoundScalar {
+                            ty: target.clone(),
+                            node: Node::Cast(Box::new(old)),
+                        });
+                    }
+                    if matches!(name, "scale" | "min_scale") {
+                        DataType::Integer
+                    } else {
+                        DataType::Numeric
+                    }
+                }
+                "div" | "mod" | "gcd" | "lcm" if args.len() == 2 => {
+                    if name != "div" && original.iter().all(|a| a.aggregate_unknown(parameters)) {
+                        return Err(SqlError::AmbiguousFunction);
+                    }
+                    if matches!(name, "gcd" | "lcm")
+                        && args.iter().all(|a| {
+                            !matches!(
+                                a.ty,
+                                DataType::Integer | DataType::BigInt | DataType::Numeric
+                            )
+                        })
+                    {
+                        return Err(
+                            if args.iter().zip(original).all(|(a, source)| {
+                                a.ty == DataType::SmallInt
+                                    || matches!(source, Self::Literal(Value::Text(_) | Value::Null))
+                            }) {
+                                SqlError::AmbiguousFunction
+                            } else {
+                                SqlError::UndefinedFunction
+                            },
+                        );
+                    }
+                    let target = if name == "div" || args.iter().any(|a| a.ty == DataType::Numeric)
+                    {
+                        DataType::Numeric
+                    } else if name == "mod"
+                        && args.iter().all(|a| {
+                            !matches!(
+                                a.ty,
+                                DataType::Integer | DataType::BigInt | DataType::Numeric
+                            )
+                        })
+                    {
+                        DataType::SmallInt
+                    } else if args.iter().any(|a| a.ty == DataType::BigInt) {
+                        DataType::BigInt
+                    } else {
+                        DataType::Integer
+                    };
+                    for (i, a) in args.iter_mut().enumerate() {
+                        if !integer(&a.ty)
+                            && a.ty != DataType::Numeric
+                            && !matches!(original[i], Self::Literal(Value::Text(_) | Value::Null))
+                        {
+                            return Err(SqlError::UndefinedFunction);
+                        }
+                        if let Self::Literal(v @ (Value::Text(_) | Value::Null)) = &original[i] {
+                            a.node = literal_cast_node(v.clone(), &target)?;
+                            a.ty = target.clone();
+                            continue;
+                        }
+                        let old = std::mem::replace(
+                            a,
+                            BoundScalar {
+                                ty: target.clone(),
+                                node: Node::Literal(Value::Null),
+                            },
+                        );
+                        a.ty = target.clone();
+                        a.node = Node::Cast(Box::new(old));
+                    }
+                    target
+                }
+                "round" | "ceil" | "ceiling" | "floor" | "trunc" | "sign"
+                    if args.len() == 1
+                        || (matches!(name, "round" | "trunc") && args.len() == 2) =>
+                {
+                    let target = if args.len() == 2 || args[0].ty == DataType::Numeric {
+                        DataType::Numeric
+                    } else {
+                        DataType::DoublePrecision
+                    };
+                    if args.len() == 2
+                        && let Self::Literal(v @ (Value::Text(_) | Value::Null)) = &original[1]
+                    {
+                        args[1] = BoundScalar {
+                            ty: DataType::Integer,
+                            node: literal_cast_node(v.clone(), &DataType::Integer)?,
+                        };
+                    }
+                    if args.len() == 2
+                        && ((!integer(&args[1].ty) || args[1].ty == DataType::BigInt)
+                            || matches!(args[0].ty, DataType::Real | DataType::DoublePrecision))
+                    {
+                        return Err(SqlError::UndefinedFunction);
+                    }
+                    if args[0].ty != target {
+                        if !number(&args[0].ty)
+                            && !matches!(original[0], Self::Literal(Value::Text(_) | Value::Null))
+                        {
+                            return Err(SqlError::UndefinedFunction);
+                        }
+                        if let Self::Literal(v @ (Value::Text(_) | Value::Null)) = &original[0] {
+                            args[0].node = literal_cast_node(v.clone(), &target)?;
+                            args[0].ty = target.clone();
+                        }
+                        let old = std::mem::replace(
+                            &mut args[0],
+                            BoundScalar {
+                                ty: target.clone(),
+                                node: Node::Literal(Value::Null),
+                            },
+                        );
+                        args[0] = BoundScalar {
+                            ty: target,
+                            node: Node::Cast(Box::new(old)),
+                        };
+                    }
+                    args[0].ty.clone()
+                }
+                "abs" if args.len() == 1 => {
+                    if null(&args[0]) || matches!(original[0], Self::Literal(Value::Text(_))) {
+                        let v = if let Self::Literal(v) = &original[0] {
+                            v.clone()
+                        } else {
+                            Value::Null
+                        };
+                        args[0].node = literal_cast_node(v, &DataType::DoublePrecision)?;
+                        args[0].ty = DataType::DoublePrecision;
+                    }
+                    if !number(&args[0].ty) {
+                        return Err(SqlError::UndefinedFunction);
+                    }
+                    args[0].ty.clone()
+                }
+                "length" | "lower" | "upper" if args.len() == 1 => {
+                    if !null(&args[0]) && args[0].ty != DataType::Text {
+                        return Err(SqlError::UndefinedFunction);
+                    }
+                    if name == "length" {
+                        DataType::Integer
+                    } else {
+                        DataType::Text
+                    }
+                }
+                "substring" | "substr" if (2..=3).contains(&args.len()) => {
+                    if name == "substring"
+                        && args.iter().all(|a| a.ty == DataType::Text)
+                        && original[1..]
+                            .iter()
+                            .any(|a| !a.aggregate_unknown(parameters))
+                    {
+                        // PostgreSQL regex overloads exist but are not implemented here.
+                        return Err(SqlError::Type);
+                    }
+                    for (i, a) in args.iter_mut().enumerate() {
+                        let ty = if i == 0 {
+                            DataType::Text
+                        } else {
+                            DataType::Integer
+                        };
+                        if let Self::Literal(Value::Text(s)) = &original[i] {
+                            a.node = literal_cast_node(Value::Text(s.clone()), &ty)?;
+                            a.ty = ty.clone();
+                        }
+                        if null(a) {
+                            a.ty = ty.clone();
+                        }
+                        if a.ty != ty {
+                            return Err(SqlError::UndefinedFunction);
+                        }
+                    }
+                    DataType::Text
+                }
+                "coalesce" if !args.is_empty() => {
+                    let ty = common_result_type(
+                        args.iter()
+                            .zip(original)
+                            .filter(|(a, original)| {
+                                !matches!(original, Self::Literal(Value::Text(_))) && !null(a)
+                            })
+                            .map(|(a, _)| a.ty.clone()),
+                    )?;
+                    for (a, original) in args.iter_mut().zip(original) {
+                        if let Self::Literal(Value::Text(s)) = original {
+                            a.node = literal_cast_node(Value::Text(s.clone()), &ty)?;
+                            a.ty = ty.clone();
+                        }
+                        if null(a) {
+                            a.ty = ty.clone();
+                        }
+                    }
+                    ty
+                }
+                "coalesce" => return Err(SqlError::Type),
+                "abs" | "length" | "lower" | "upper" | "substring" | "substr" => {
+                    return Err(SqlError::UndefinedFunction);
+                }
+                _ => return Err(SqlError::Unsupported),
             }
         };
-        Ok(BoundScalar { ty, node })
+        if matches!(name, "concat" | "concat_ws" | "format") {
+            args.iter_mut().for_each(attach_text_cast);
+        }
+        collation::derive(args.iter())?;
+        if matches!(name, "lower" | "upper" | "initcap") {
+            for a in &args {
+                a.require_collation()?;
+            }
+        }
+        Ok(BoundScalar {
+            ty,
+            node: Node::Call(name.to_owned(), args),
+        })
     }
 }
 impl BoundScalar {
