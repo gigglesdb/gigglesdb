@@ -267,6 +267,7 @@ fn session_sensitive(source: &DataType, target: &DataType) -> bool {
         (source, target),
         (TimestampTz | Real | DoublePrecision, Text)
             | (Text | Date | Timestamp, TimestampTz)
+            | (Time, TimeTz)
             | (TimestampTz, Date | Timestamp | Time | TimeTz)
     )
 }
@@ -1184,6 +1185,15 @@ impl Scalar {
                     });
                 }
                 let a = a.bind(resolve, tables, parameters)?;
+                if a.ty != *ty && a.ty.is_temporal() && ty.is_temporal() {
+                    if !assignment::compatible(&a.ty, ty) {
+                        return Err(SqlError::CannotCoerce);
+                    }
+                    return Ok(BoundScalar {
+                        ty: ty.clone(),
+                        node: cast_node(a, ty),
+                    });
+                }
                 if a.ty == DataType::Bpchar
                     && !matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
                 {
@@ -1528,6 +1538,16 @@ impl Scalar {
                 .or_else(|| temporal::signature(name, &args))
                 {
                     let (types, result) = result?;
+                    let date_trunc = name == "date_trunc"
+                        && args.len() == 2
+                        && args[1].ty == DataType::Date;
+                    if date_trunc {
+                        let date = args.pop().expect("date_trunc date argument");
+                        args.push(BoundScalar {
+                            ty: DataType::TimestampTz,
+                            node: cast_node(date, &DataType::TimestampTz),
+                        });
+                    }
                     for ((a, original), ty) in args.iter_mut().zip(original).zip(types) {
                         if let Some(ty) = ty {
                             if (name == "octet_length" || name == "bit_length")
@@ -1552,6 +1572,12 @@ impl Scalar {
                                 return Err(SqlError::UndefinedFunction);
                             }
                         }
+                    }
+                    if date_trunc {
+                        return Ok(BoundScalar {
+                            ty: result,
+                            node: Node::ZonedOperator(name.clone(), args, None),
+                        });
                     }
                     result
                 } else {
@@ -1963,6 +1989,7 @@ impl BoundScalar {
     }
     fn strong_name(&self) -> Option<&str> {
         match &self.node {
+            Node::ZonedOperator(name, ..) if name == "date_trunc" => Some(name),
             Node::EnumSort(..) | Node::Predicate(_) | Node::ZonedOperator(..) => None,
             Node::Case(..) => Some("case"),
             Node::Call(name, _) if name == array_constructor::NAME => Some("array"),
@@ -1983,6 +2010,7 @@ impl BoundScalar {
         match &self.node {
             Node::EnumSort(..) | Node::Predicate(_) => "?column?",
             Node::Case(..) => "case",
+            Node::ZonedOperator(name, ..) if name == "date_trunc" => name,
             Node::CrossCompare(..) | Node::ZonedOperator(..) => "?column?",
             Node::Param(_) => "?column?",
             Node::Domain(_, ty) => ty.name(),
@@ -2071,6 +2099,15 @@ impl BoundScalar {
                     .iter()
                     .map(|a| a.eval(row, params, budget))
                     .collect::<R<Vec<_>>>()?;
+                if name == "date_trunc" {
+                    use giggles_pg_types::temporal::SessionZone;
+                    let zone = clock.as_ref().and_then(|clock| clock.zone());
+                    return temporal::trunc_date(
+                        &values,
+                        zone.unwrap_or(SessionZone::Fixed(0)),
+                        budget,
+                    );
+                }
                 arithmetic::eval_zoned(name, &values, clock.as_ref(), budget)
             }
             Node::CrossCompare(op, a, b, clock) => {
@@ -2179,6 +2216,11 @@ impl BoundScalar {
             ),
             Node::Cast(a) => {
                 let mut v = a.eval(row, params, budget)?;
+                if a.ty != self.ty && a.ty.is_temporal() && self.ty.is_temporal() {
+                    let value = assignment::convert(v, &a.ty, &self.ty, None)?;
+                    charge(budget, &value)?;
+                    return Ok(value);
+                }
                 if a.ty == DataType::Bpchar
                     && matches!(self.ty, DataType::Text | DataType::Varchar)
                     && let Value::Text(text) = &mut v
@@ -3077,6 +3119,15 @@ impl Scalar {
                         sig?.0[i].clone()
                     } else {
                         match n.as_str() {
+                            "date_trunc"
+                                if args.len() == 2
+                                    && i == 0
+                                    && (cast::explicit_target(&args[1]) == Some(&DataType::Date)
+                                        || user_types::probe_preserving_error_message(|| args[1].bind(resolve, tables, parameters))
+                                            .is_ok_and(|a| a.ty == DataType::Date)) =>
+                            {
+                                Some(DataType::Text)
+                            }
                             "date_trunc"
                                 if args.len() == 3
                                     && i != 1

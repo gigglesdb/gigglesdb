@@ -223,20 +223,28 @@ impl SessionZone {
         if instant.0 == i64::MIN || instant.0 == i64::MAX {
             return Timestamp::from_microseconds(instant.0);
         }
-        let off = match self {
-            Self::Fixed(v) => session_offset(v)?,
-            Self::Named(Tz::UTC) => 0,
-            Self::Named(tz) => offset(
-                database(tz)?.as_ref(),
-                instant.0.div_euclid(1_000_000) + UNIX_EPOCH_DELTA,
-            )?,
-        };
+        let off = self.instant_offset(instant)?;
         Timestamp::from_microseconds(
             instant
                 .0
                 .checked_add(i64::from(off) * 1_000_000)
                 .ok_or(Error::Range)?,
         )
+    }
+
+    /// Return seconds east of UTC at a finite instant.
+    pub fn instant_offset(self, instant: TimestampTz) -> Result<i32, Error> {
+        if matches!(instant, TimestampTz::NEG_INFINITY | TimestampTz::INFINITY) {
+            return Err(Error::Range);
+        }
+        match self {
+            Self::Fixed(v) => session_offset(v),
+            Self::Named(Tz::UTC) => Ok(0),
+            Self::Named(tz) => offset(
+                database(tz)?.as_ref(),
+                instant.0.div_euclid(1_000_000) + UNIX_EPOCH_DELTA,
+            ),
+        }
     }
 }
 #[derive(Clone, Copy, Debug)]

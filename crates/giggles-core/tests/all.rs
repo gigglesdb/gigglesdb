@@ -237,6 +237,8 @@ mod sql_session_zone_float_text;
 mod sql_substring_order;
 #[path = "sql_temporal_arithmetic.rs"]
 mod sql_temporal_arithmetic;
+#[path = "sql_temporal_cast_matrix.rs"]
+mod sql_temporal_cast_matrix;
 #[path = "sql_temporal_functions.rs"]
 mod sql_temporal_functions;
 #[path = "sql_temporal_inference.rs"]

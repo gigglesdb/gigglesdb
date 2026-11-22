@@ -106,13 +106,25 @@ pub(in crate::relational) fn convert(
         };
         Date::from_days(days).map_err(pg_error)
     };
-    let time = |micros: i64| {
-        if micros == i64::MIN || micros == i64::MAX {
-            return Err(SqlError::DatetimeFieldOverflow);
-        }
-        Time::from_microseconds(micros.rem_euclid(DAY)).map_err(pg_error)
-    };
+    let time = |micros: i64| Time::from_microseconds(micros.rem_euclid(DAY)).map_err(pg_error);
     let context = || clock.ok_or(SqlError::Unsupported)?.comparison_context();
+    let zone_error = |error| match error {
+        giggles_pg_types::Error::Range => SqlError::DatetimeFieldOverflow,
+        error => pg_error(error),
+    };
+    let local_parts = |t: TimestampTz| -> R<(i64, i32)> {
+        let zone = context()?.1;
+        if matches!(t, TimestampTz::NEG_INFINITY | TimestampTz::INFINITY) {
+            return Ok((t.microseconds(), 0));
+        }
+        let offset = zone.instant_offset(t).map_err(zone_error)?;
+        // A local date or time can be valid outside the local timestamp range.
+        let local = t
+            .microseconds()
+            .checked_add(i64::from(offset) * 1_000_000)
+            .ok_or(SqlError::DatetimeFieldOverflow)?;
+        Ok((local, offset))
+    };
     let timestamp = |d: Date| {
         let micros = if d == Date::NEG_INFINITY {
             i64::MIN
@@ -123,42 +135,34 @@ pub(in crate::relational) fn convert(
                 .checked_mul(DAY)
                 .ok_or(SqlError::DatetimeFieldOverflow)?
         };
-        Timestamp::from_microseconds(micros).map_err(pg_error)
+        Timestamp::from_microseconds(micros).map_err(|_| SqlError::DatetimeFieldOverflow)
     };
     Ok(match (value, target) {
         (Value::Date(d), DataType::Timestamp) => Value::Timestamp(timestamp(d)?),
         (Value::Date(d), DataType::TimestampTz) => {
-            Value::TimestampTz(context()?.1.to_instant(timestamp(d)?).map_err(pg_error)?)
+            Value::TimestampTz(context()?.1.to_instant(timestamp(d)?).map_err(zone_error)?)
         }
         (Value::Timestamp(t), DataType::Date) => Value::Date(date(t.microseconds())?),
+        (Value::Timestamp(Timestamp::NEG_INFINITY | Timestamp::INFINITY), DataType::Time)
+        | (
+            Value::TimestampTz(TimestampTz::NEG_INFINITY | TimestampTz::INFINITY),
+            DataType::Time | DataType::TimeTz,
+        ) => Value::Null,
         (Value::Timestamp(t), DataType::Time) => Value::Time(time(t.microseconds())?),
         (Value::Timestamp(t), DataType::TimestampTz) => {
-            Value::TimestampTz(context()?.1.to_instant(t).map_err(pg_error)?)
+            Value::TimestampTz(context()?.1.to_instant(t).map_err(zone_error)?)
         }
         (Value::TimestampTz(t), DataType::Timestamp) => {
-            Value::Timestamp(context()?.1.to_local(t).map_err(pg_error)?)
+            Value::Timestamp(context()?.1.to_local(t).map_err(zone_error)?)
         }
-        (Value::TimestampTz(t), DataType::Date) => Value::Date(date(
-            context()?.1.to_local(t).map_err(pg_error)?.microseconds(),
-        )?),
-        (Value::TimestampTz(t), DataType::Time) => Value::Time(time(
-            context()?.1.to_local(t).map_err(pg_error)?.microseconds(),
-        )?),
+        (Value::TimestampTz(t), DataType::Date) => Value::Date(date(local_parts(t)?.0)?),
+        (Value::TimestampTz(t), DataType::Time) => Value::Time(time(local_parts(t)?.0)?),
         (value @ (Value::Float4(_) | Value::Float8(_)), DataType::Text) => {
             session_cast(value, source, target, clock)?
         }
         (Value::TimestampTz(t), DataType::TimeTz) => {
-            let local = context()?.1.to_local(t).map_err(pg_error)?;
-            let time = time(local.microseconds())?;
-            let offset =
-                (i128::from(local.microseconds()) - i128::from(t.microseconds())) / 1_000_000;
-            Value::TimeTz(
-                TimeTz::new(
-                    time,
-                    i32::try_from(offset).map_err(|_| SqlError::DatetimeFieldOverflow)?,
-                )
-                .map_err(pg_error)?,
-            )
+            let (local, offset) = local_parts(t)?;
+            Value::TimeTz(TimeTz::new(time(local)?, offset).map_err(pg_error)?)
         }
         (Value::Time(t), DataType::TimeTz) => {
             let (transaction, zone) = context()?;
@@ -170,9 +174,12 @@ pub(in crate::relational) fn convert(
             )
         }
         (Value::TimeTz(t), DataType::Time) => Value::Time(t.time()),
-        (Value::Interval(i), DataType::Time) => Value::Time(
-            Time::from_microseconds(i.microseconds().rem_euclid(DAY)).map_err(pg_error)?,
-        ),
+        (Value::Interval(i), DataType::Time) => {
+            if i.same_components(Interval::INFINITY) || i.same_components(Interval::NEG_INFINITY) {
+                return Err(SqlError::DatetimeFieldOverflow);
+            }
+            Value::Time(time(i.microseconds())?)
+        }
         (Value::Time(t), DataType::Interval) => {
             Value::Interval(Interval::new(0, 0, t.microseconds()))
         }

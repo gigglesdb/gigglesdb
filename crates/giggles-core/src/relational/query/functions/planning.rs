@@ -544,6 +544,10 @@ impl BoundScalar {
             Node::Cast(value) => {
                 value.insert_input_only()
                     && (immutable_cast(&value.ty, &self.ty)
+                        || value.ty.is_temporal()
+                            && self.ty.is_temporal()
+                            && assignment::compatible(&value.ty, &self.ty)
+                            && !session_sensitive(&value.ty, &self.ty)
                         || value.ty == DataType::Text && number(&self.ty)
                         || self.ty == DataType::Text
                             && (number(&value.ty) || value.ty == DataType::Boolean))

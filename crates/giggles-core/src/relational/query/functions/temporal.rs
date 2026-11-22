@@ -99,6 +99,10 @@ pub(super) fn signature(
             vec![Some(DataType::Text), Some(a[1].ty.clone())],
             DataType::DoublePrecision,
         )),
+        ("date_trunc", 2) if a[1].ty == DataType::Date => Ok((
+            vec![Some(DataType::Text), Some(DataType::TimestampTz)],
+            DataType::TimestampTz,
+        )),
         ("date_trunc", 2)
             if matches!(
                 a[1].ty,
@@ -423,6 +427,43 @@ fn zone_interval_error(
         function_error(e)
     }
 }
+fn date_trunc_field(unit: &str) -> R<F> {
+    // PostgreSQL's deltatktbl compares the first ten bytes of the lowercased unit.
+    let unit = unit.as_bytes();
+    Ok(match unit[..unit.len().min(10)].to_ascii_lowercase().as_slice() {
+        b"microsecon" | b"us" | b"usec" | b"usecs" | b"usecond" | b"useconds" => F::Microseconds,
+        b"millisecon" | b"ms" | b"msec" | b"msecs" | b"msecond" | b"mseconds" => F::Milliseconds,
+        b"s" | b"sec" | b"secs" | b"second" | b"seconds" => F::Second,
+        b"m" | b"min" | b"mins" | b"minute" | b"minutes" => F::Minute,
+        b"h" | b"hr" | b"hrs" | b"hour" | b"hours" => F::Hour,
+        b"d" | b"day" | b"days" => F::Day,
+        b"w" | b"week" | b"weeks" => F::Week,
+        b"mon" | b"mons" | b"month" | b"months" => F::Month,
+        b"qtr" | b"quarter" => F::Quarter,
+        b"y" | b"yr" | b"yrs" | b"year" | b"years" => F::Year,
+        b"dec" | b"decs" | b"decade" | b"decades" => F::Decade,
+        b"c" | b"cent" | b"century" | b"centuries" => F::Century,
+        b"mil" | b"mils" | b"millennium" | b"millennia" => F::Millennium,
+        b"timezone" | b"timezone_h" | b"timezone_m" => return Err(SqlError::Unsupported),
+        _ => return Err(SqlError::InvalidParameterValue),
+    })
+}
+
+pub(super) fn trunc_date(values: &[Value], zone: SessionZone, budget: &mut usize) -> R<Value> {
+    match values {
+        [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+        [Value::Text(f), Value::TimestampTz(t)] => {
+            let value = Value::TimestampTz(
+                t.date_trunc(date_trunc_field(f)?, zone)
+                    .map_err(function_error)?,
+            );
+            charge(budget, &value)?;
+            Ok(value)
+        }
+        _ => Err(SqlError::UndefinedFunction),
+    }
+}
+
 fn trunc_error(f: &str, e: giggles_pg_types::temporal::TemporalFunctionError) -> SqlError {
     if matches!(
         field(f),

@@ -101,6 +101,8 @@ mod session_settings_network;
 mod session_zone_float_network;
 #[path = "startup_params_network.rs"]
 mod startup_params_network;
+#[path = "temporal_cast_network.rs"]
+mod temporal_cast_network;
 #[path = "timetz_bind_session_zone_network.rs"]
 mod timetz_bind_session_zone_network;
 #[path = "transaction_modes_network.rs"]
