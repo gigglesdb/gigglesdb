@@ -112,6 +112,10 @@ impl RoleCatalogImage {
     pub fn table_owner(&self, table: &str) -> Result<Option<String>, RoleError> {
         self.check_fenced()?;
         self.catalog.validate_relation_name(table)?;
+        self.owner_in_image(table)
+    }
+
+    fn owner_in_image(&self, table: &str) -> Result<Option<String>, RoleError> {
         raw_get(&self.image.table, &key(b"owner/", table))?
             .map(|value| {
                 String::from_utf8(value)
@@ -157,6 +161,12 @@ impl RoleCatalogImage {
         self.check_fenced()?;
         self.catalog.validate_relation_name(table)?;
         table_acl(Some(&self.image.table), table)
+    }
+
+    /// The caller has already resolved the table in this authority image's catalog snapshot.
+    pub(super) fn bound_table_authority(&self, table: &str) -> Result<(Option<String>, TableAcl), RoleError> {
+        self.check_fenced()?;
+        Ok((self.owner_in_image(table)?, table_acl(Some(&self.image.table), table)?))
     }
 
     pub fn schema_privileges(&self, schema: &str, role: &str) -> Result<BTreeSet<SchemaPrivilege>, RoleError> {
@@ -638,6 +648,33 @@ impl RoleCatalog {
             db.check()?;
         }
         self.capture_image(db)
+    }
+
+    pub(super) fn image_from_v2_read(
+        &self,
+        db: &super::EngineLease,
+        txn: &mut super::engine::txn::Transaction,
+        private: Option<&super::engine::txn::Transaction>,
+    ) -> Result<RoleCatalogImage, RoleError> {
+        db.check()?;
+        let image = engine::image_with_catalog_writes(db, txn, private)?;
+        let result = RoleCatalogImage { catalog: self.clone(), image, generation: Some(db.tag()) };
+        result.check_fenced()?;
+        Ok(result)
+    }
+
+    pub(super) fn image_from_legacy_read(&self, txn: &redb::ReadTransaction) -> Result<RoleCatalogImage, RoleError> {
+        self.check_fenced()?;
+        let table = match txn.open_table(ROLES) {
+            Ok(table) => RoleTable::load(&table)?,
+            Err(redb::TableError::TableDoesNotExist(_)) => RoleTable::default(),
+            Err(error) => return Err(io(error).into()),
+        };
+        Ok(RoleCatalogImage {
+            catalog: self.clone(),
+            image: Arc::new(RoleImage::new(table)),
+            generation: None,
+        })
     }
 
     fn capture_image(&self, db: Option<&super::EngineLease>) -> Result<RoleCatalogImage, RoleError> {
@@ -1334,7 +1371,9 @@ fn builtin_capabilities(table: Option<&RoleTable>, member: &str) -> Result<BTree
     Ok(names)
 }
 
-fn table_acl(image: Option<&RoleTable>, table: &str) -> Result<BTreeMap<String, BTreeSet<TablePrivilege>>, RoleError> {
+type TableAcl = BTreeMap<String, BTreeSet<TablePrivilege>>;
+
+fn table_acl(image: Option<&RoleTable>, table: &str) -> Result<TableAcl, RoleError> {
     let mut result = BTreeMap::new();
     if let Some(image) = image {
         let prefix = grant_key(b"tgrant/", table, "");

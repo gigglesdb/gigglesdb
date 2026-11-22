@@ -24,6 +24,7 @@ mod task_predicate_tests;
 pub(crate) use constraints::{DeferralState, Event as ConstraintEvent};
 pub(crate) mod assign;
 pub(crate) mod clock;
+pub(crate) mod volatile;
 mod constraint_lookup;
 mod constraint_primary_key;
 mod ddl_type;
@@ -32,7 +33,8 @@ mod user_types;
 pub use extensions::{InstalledExtension, BuiltinExtension, ExtensionFunction, BUILTINS as BUILTIN_EXTENSIONS};
 pub use user_types::take_sql_error_hint;
 pub use user_types::{
-    TypeDef, UserTypeCatalog, take_sql_error_detail, take_sql_error_message, take_sql_notices, type_oid,
+    DuplicateKeyDetail, SqlErrorDetail, TypeDef, UserTypeCatalog, take_sql_diagnostic_detail,
+    retain_sql_duplicate_key_detail, take_sql_error_detail, take_sql_error_message, take_sql_notices, type_oid,
 };
 pub(crate) mod defaults;
 pub use clock::StatementClock;
@@ -564,6 +566,10 @@ impl Default for Relational {
     }
 }
 impl Relational {
+    pub(crate) fn next_catalog_id(&self) -> u64 {
+        self.next_id
+    }
+
     /// Page-local FK checking is performed by the physical sink. Avoid copying
     /// an otherwise immutable catalog when there are no checks to suppress.
     fn suppress_foreign_keys(&mut self) {
@@ -4672,7 +4678,7 @@ impl Relational {
                 let legacy = scan::LegacyRows(&*self);
                 let source = injected_source.unwrap_or(&legacy);
                 if source.contains(t, &key)? {
-                    return Err(self.primary_duplicate(t));
+                    return Err(self.primary_duplicate(t, &row));
                 }
                 let version = match heap_version {
                     Some(version) => version,

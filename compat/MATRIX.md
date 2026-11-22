@@ -61,6 +61,7 @@ The cases below are the INTENTIONAL outcomes included in the corpus totals above
 
 | Behavior | GigglesDB SQLSTATE | Corpus case |
 | --- | --- | --- |
+| `gen_random_uuid()` returns a UUIDv7 (PostgreSQL 18.6: v4). v7 is better for indexes: time-ordered keys keep B-tree inserts local instead of scattering them, so we prefer it. `uuidv4()` gives PostgreSQL's v4 behaviour. | none (succeeds) | [pgf_uuid_gen_random_v7](corpus/pg_functions/pgf_uuid_gen_random_v7.sql) |
 
 ## ORM results
 

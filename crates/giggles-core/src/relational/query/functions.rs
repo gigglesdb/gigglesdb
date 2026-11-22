@@ -52,7 +52,7 @@ mod overlay_tests;
 mod pg18_routines;
 mod planning;
 mod position;
-mod quoting;
+pub(in crate::relational) mod quoting;
 
 pub(super) fn keyword_requires_quotes(name: &str) -> bool {
     quoting::keyword_requires_quotes(name)
@@ -82,6 +82,7 @@ pub(in crate::relational) fn output_text_with_clock(
     }
 }
 mod format;
+pub(in crate::relational) mod random_uuid;
 mod substring_order;
 mod temporal;
 mod text;
@@ -612,7 +613,7 @@ impl Scalar {
                 }) || case.otherwise.as_ref().is_some_and(Self::has_volatile_call)
             }
             Self::Call(name, args) => {
-                uuid_ossp::volatile_name(name) || matches!(
+                uuid_ossp::volatile_name(name) || random_uuid::volatile(name) || matches!(
                     name.as_str(),
                     "uuid_generate_v1" | "uuid_generate_v1mc" | "uuid_generate_v4" | "nextval"
                         | "setval"
@@ -913,7 +914,13 @@ impl Scalar {
                         "information_schema" => UNDEFINED_ROUTINE_PREFIX,
                         _ => INVALID_SCHEMA_ROUTINE_PREFIX,
                     };
-                    if uuid_ossp::known(&routine) { (format!("\0uuid-ossp:{name}\0{routine}"), quoted) } else { (format!("{prefix}{routine}"), quoted) }
+                    if uuid_ossp::known(&routine) {
+                        (format!("\0uuid-ossp:{name}\0{routine}"), quoted)
+                    } else if name == "pg_catalog" && random_uuid::known(&routine) {
+                        (format!("pg_catalog.{routine}"), quoted)
+                    } else {
+                        (format!("{prefix}{routine}"), quoted)
+                    }
                 } else if uuid_ossp::known(&name) {
                     (format!("\0uuid-ossp:{name}"), quoted)
                 } else if pg18_routines::PG_CATALOG
@@ -1867,6 +1874,9 @@ impl Scalar {
         mut args: Vec<BoundScalar>,
         parameters: &[Option<DataType>],
     ) -> R<BoundScalar> {
+        if random_uuid::known(name) {
+            return random_uuid::bind(name, original, args);
+        }
         if args
             .iter()
             .enumerate()
@@ -2309,6 +2319,14 @@ impl Scalar {
     }
 }
 impl BoundScalar {
+    pub(super) fn result_oid(&self) -> u32 {
+        if matches!(&self.node, Node::Call(name, _) if name == "setseed") {
+            random_uuid::VOID_OID
+        } else {
+            0
+        }
+    }
+
     pub(in crate::relational) fn attach_clock(
         &mut self,
         clock: Option<&crate::relational::clock::ExecutionClock>,
@@ -2370,7 +2388,7 @@ impl BoundScalar {
     }
     fn strong_name(&self) -> Option<&str> {
         match &self.node {
-            Node::ZonedOperator(name, ..) if name == "date_trunc" => Some(name),
+            Node::ZonedOperator(name, ..) if matches!(name.as_str(), "date_trunc" | "uuidv7") => Some(name),
             Node::EnumSort(..) | Node::Predicate(_) | Node::ZonedOperator(..) => None,
             Node::Case(..) => Some("case"),
             Node::Call(name, _) if name == array_constructor::NAME => Some("array"),
@@ -2391,7 +2409,7 @@ impl BoundScalar {
         match &self.node {
             Node::EnumSort(..) | Node::Predicate(_) => "?column?",
             Node::Case(..) => "case",
-            Node::ZonedOperator(name, ..) if name == "date_trunc" => name,
+            Node::ZonedOperator(name, ..) if matches!(name.as_str(), "date_trunc" | "uuidv7") => name,
             Node::CrossCompare(..) | Node::ZonedOperator(..) => "?column?",
             Node::Param(_) => "?column?",
             Node::Domain(_, ty) => ty.name(),
@@ -2490,6 +2508,12 @@ impl BoundScalar {
                         zone.unwrap_or(SessionZone::Fixed(0)),
                         budget,
                     );
+                }
+                if name == "uuidv7" {
+                    let zone = clock.as_ref().and_then(|clock| clock.zone());
+                    let value = random_uuid::v7_interval(&values, zone)?;
+                    charge(budget, &value)?;
+                    return Ok(value);
                 }
                 arithmetic::eval_zoned(name, &values, clock.as_ref(), budget)
             }
@@ -2699,6 +2723,11 @@ impl BoundScalar {
                     && values.contains(&Value::Null)
                 {
                     return Ok(Value::Null);
+                }
+                if random_uuid::known(n) {
+                    let value = random_uuid::eval(n, &values)?;
+                    charge(budget, &value)?;
+                    return Ok(value);
                 }
                 if let Some(result) = integer_formats::eval(
                     n,
@@ -3421,6 +3450,9 @@ impl Scalar {
                     };
                     arg.infer(expected, parameters, resolve, tables)?;
                 }
+            }
+            Self::Call(n, args) if random_uuid::known(n) => {
+                random_uuid::infer(n, args, parameters, resolve, tables)?;
             }
             Self::Call(n, args) if n == "position" => {
                 Self::infer_position(args, parameters, resolve, tables)?;

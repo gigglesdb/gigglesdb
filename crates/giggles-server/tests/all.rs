@@ -89,6 +89,8 @@ mod role_admission_network;
 mod savepoints_network;
 #[path = "secondary_index_catalog_network.rs"]
 mod secondary_index_catalog_network;
+#[path = "volatile_uuid_network.inc"]
+mod volatile_uuid_network;
 #[path = "sequence_authority_network.rs"]
 mod sequence_authority_network;
 #[path = "sequence_ddl_network.rs"]

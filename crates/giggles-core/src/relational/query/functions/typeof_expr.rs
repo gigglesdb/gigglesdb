@@ -40,17 +40,10 @@ pub(super) fn bind(
     let [arg] = args else {
         return Err(SqlError::UndefinedFunction);
     };
-    // Retain support for gen_random_uuid here using the existing v4 evaluator.
-    // Core does not expose gen_random_uuid as a standalone scalar routine.
-    let bound = if matches!(arg, Scalar::Call(name, args) if name == "gen_random_uuid" && args.is_empty()) {
-        BoundScalar {
-            ty: DataType::Uuid,
-            node: Node::Call("uuid_generate_v4".into(), vec![]),
-        }
-    } else {
-        arg.bind(resolve, tables, parameters)?
-    };
-    let display = if let Some(ty) = bound.enum_type(tables) {
+    let bound = arg.bind(resolve, tables, parameters)?;
+    let display = if bound.result_oid() == random_uuid::VOID_OID {
+        "void".into()
+    } else if let Some(ty) = bound.enum_type(tables) {
         ty.name().to_owned()
     } else if matches!(arg, Scalar::Literal(Value::Text(_) | Value::Null)) {
         "unknown".into()

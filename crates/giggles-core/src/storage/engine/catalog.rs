@@ -602,16 +602,26 @@ impl Catalog {
         &self,
         txn: &mut Transaction,
     ) -> Result<Arc<CatalogSnapshot>, CoreError> {
+        self.snapshot_with_catalog_writes(txn, None)
+    }
+
+    /// Read one committed snapshot with an optional session's private DDL overlay.
+    pub(crate) fn snapshot_with_catalog_writes(
+        &self,
+        txn: &mut Transaction,
+        private: Option<&Transaction>,
+    ) -> Result<Arc<CatalogSnapshot>, CoreError> {
         let ts = txn.snapshot_ts();
-        if let Some((_, snapshot)) = self.current_for(txn, ts) {
-            return Ok(snapshot);
-        }
-        self.check().map_err(CoreError::from)?;
         if let Some(error) = txn.snapshot_error() {
             return Err(error.clone().into());
         }
+        let writes = private.unwrap_or(txn);
+        if let Some((_, snapshot)) = self.current_for(writes, ts) {
+            return Ok(snapshot);
+        }
+        self.check().map_err(CoreError::from)?;
         let mut cache = self.snapshot_cache(ts)?;
-        self.snapshot_locked(&mut cache, txn, ts)
+        self.snapshot_locked(&mut cache, writes, ts)
     }
 
     /// Does not refresh or assign a transaction snapshot; metadata preserves the

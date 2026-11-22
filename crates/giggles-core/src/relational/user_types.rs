@@ -2,19 +2,57 @@
 pub use super::catalog_ext::TypeDef;
 use super::*;
 
+/// Key values are supplied to a trusted consumer, which must authorize their disclosure.
+pub struct DuplicateKeyDetail {
+    pub table_id: u64,
+    pub schema: String,
+    pub table: String,
+    pub constraint: String,
+    pub values: String,
+}
+
+pub enum SqlErrorDetail {
+    Text(String),
+    DuplicateKey(DuplicateKeyDetail),
+}
+
 type SqlNotice = (String, Option<String>, Option<&'static str>);
 thread_local! {
     static SQL_NOTICES: std::cell::RefCell<Vec<SqlNotice>> = const { std::cell::RefCell::new(Vec::new()) };
     static SQL_ERROR_HINT: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
-    static SQL_ERROR_DETAIL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static SQL_ERROR_DETAIL: std::cell::RefCell<Option<SqlErrorDetail>> = const { std::cell::RefCell::new(None) };
     static SQL_ERROR_MESSAGE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 /// Consume the diagnostic immediately after a synchronous SQL call on this thread.
 /// SQLSTATE remains the stable, field-less SqlError contract.
 pub fn take_sql_error_hint() -> Option<&'static str> { SQL_ERROR_HINT.with(|v| v.borrow_mut().take()) }
 pub(super) fn sql_error_hint(hint: &'static str) { SQL_ERROR_HINT.with(|v| *v.borrow_mut()=Some(hint)); }
-pub fn take_sql_error_detail() -> Option<String> { SQL_ERROR_DETAIL.with(|v| v.borrow_mut().take()) }
-pub(super) fn sql_error_detail(detail: String) { SQL_ERROR_DETAIL.with(|v| *v.borrow_mut()=Some(detail)); }
+pub fn take_sql_error_detail() -> Option<String> {
+    take_sql_diagnostic_detail().map(|detail| match detail {
+        SqlErrorDetail::Text(text) => text,
+        SqlErrorDetail::DuplicateKey(detail) => detail.values,
+    })
+}
+pub fn take_sql_diagnostic_detail() -> Option<SqlErrorDetail> {
+    SQL_ERROR_DETAIL.with(|v| v.borrow_mut().take())
+}
+/// Keep ordinary details and discard key values when the caller cannot read them.
+pub fn retain_sql_duplicate_key_detail(allowed: impl FnOnce(&DuplicateKeyDetail) -> bool) {
+    let detail = take_sql_diagnostic_detail();
+    if let Some(SqlErrorDetail::DuplicateKey(key)) = &detail
+        && !allowed(key)
+    {
+        return;
+    }
+    SQL_ERROR_DETAIL.with(|v| *v.borrow_mut() = detail);
+}
+
+pub(super) fn sql_duplicate_key_detail(detail: DuplicateKeyDetail) {
+    SQL_ERROR_DETAIL.with(|v| *v.borrow_mut() = Some(SqlErrorDetail::DuplicateKey(detail)));
+}
+pub(super) fn sql_error_detail(detail: String) {
+    SQL_ERROR_DETAIL.with(|v| *v.borrow_mut() = Some(SqlErrorDetail::Text(detail)));
+}
 pub fn take_sql_error_message() -> Option<String> {
     SQL_ERROR_MESSAGE.with(|message| message.borrow_mut().take())
 }
@@ -69,7 +107,7 @@ pub(super) fn truncate_reference_error() {
 pub(super) fn clear_sql_error_message() {
     take_sql_notices();
     take_sql_error_hint();
-    take_sql_error_detail();
+    take_sql_diagnostic_detail();
     take_sql_error_message();
 }
 

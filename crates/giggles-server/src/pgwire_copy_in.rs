@@ -220,6 +220,7 @@ impl State {
         session: &mut Session,
         out: &mut Vec<u8>,
     ) {
+        self.diagnostic.authorize_duplicate_key(code, session);
         if let Some(copy) = self.copy.as_mut() {
             if copy.failed {
                 return;
@@ -367,7 +368,7 @@ impl State {
         drop(reader);
         if let Err(code) = result {
             if let Some(message) = giggles_core::relational::take_sql_error_message().or_else(|| copy.input_error_message.take()) { self.diagnostic.wire_message = Some(message); }
-            self.diagnostic.wire_detail = giggles_core::relational::take_sql_error_detail();
+            self.diagnostic.wire_detail = self.diagnostic.read_core_detail();
             copy_notices(out)?;
             if let Some((mut process, _)) = child { let _ = process.kill(); let _ = process.wait(); }
             copy.decoder.diagnostic(&mut self.diagnostic);
@@ -467,9 +468,10 @@ impl State {
             })();
             if let Err(code) = result {
                 let message = giggles_core::relational::take_sql_error_message().or_else(|| copy.input_error_message.take());
-                session.abort();
                 if message.is_some() { self.diagnostic.wire_message = message; }
-                self.diagnostic.wire_detail = giggles_core::relational::take_sql_error_detail();
+                self.diagnostic.wire_detail = self.diagnostic.read_core_detail();
+                self.diagnostic.authorize_duplicate_key(code, session);
+                session.abort();
                 copy.failed = true;
                 copy.rows.clear();
                 copy.raw_rows.clear();

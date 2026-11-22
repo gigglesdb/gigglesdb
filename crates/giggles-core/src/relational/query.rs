@@ -7,6 +7,7 @@ mod row_locks;
 mod aggregate_filter;
 mod aggregate_order;
 mod functions;
+pub(super) use functions::{quoting::quote_identifier, random_uuid};
 pub(super) mod plan;
 pub(super) mod typed_read;
 pub(super) use functions::assignment;
@@ -2992,7 +2993,7 @@ impl Query {
                     args.iter().all(scalar)
                 }
                 Scalar::Call(name, args) => {
-                    matches!(
+                    (random_uuid::known(name) || matches!(
                         name.as_str(),
                         "abs"
                             | "pg_collation_for"
@@ -3131,7 +3132,7 @@ impl Query {
                             | "justify_days"
                             | "justify_hours"
                             | "justify_interval"
-                    ) && args.iter().all(scalar)
+                    )) && args.iter().all(scalar)
                         || (Aggregate::from_name(name).is_some() && args.iter().all(scalar))
                 }
             }
@@ -4926,9 +4927,14 @@ impl BoundQuery<'_> {
         }).collect()
     }
     pub(super) fn description(&self, state: &Relational) -> Description {
+        let oid = |item: &BoundItem| match item {
+            BoundItem::Ctid(_) => 27,
+            BoundItem::Scalar(value) => value.result_oid(),
+            _ => 0,
+        };
         Description {
-            type_oids: if self.items.iter().any(|item| matches!(item, BoundItem::Ctid(_))) {
-                self.items.iter().map(|item| if matches!(item, BoundItem::Ctid(_)) { 27 } else { 0 }).collect()
+            type_oids: if !self.query.explain && self.items.iter().map(oid).any(|oid| oid != 0) {
+                self.items.iter().map(oid).collect()
             } else {
                 vec![]
             },
@@ -6716,7 +6722,7 @@ mod deferred_routine_only_tests {
         ] {
             assert!(!query(sql).rejects_unsupported_table_free_scalar(), "{sql}");
         }
-        assert!(query("SELECT random()").rejects_unsupported_table_free_scalar());
+        assert!(query("SELECT random_normal()").rejects_unsupported_table_free_scalar());
     }
 
     fn query(sql: &str) -> Query {

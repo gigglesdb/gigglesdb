@@ -57,6 +57,7 @@ impl CursorEngine {
 enum Data {
     Scan {
         image: Arc<relational::Relational>,
+        volatile: Arc<Mutex<relational::volatile::SessionVolatile>>,
         source: Option<V2Snapshot>,
         plan: Box<Plan>,
     },
@@ -210,9 +211,11 @@ impl Cursor {
             }
             Data::Scan {
                 image,
+                volatile,
                 source,
                 plan,
             } => {
+                let _volatile = relational::volatile::Scope::enter(volatile);
                 let legacy = scan::LegacyRows(image);
                 let inner = source
                     .as_ref()
@@ -485,6 +488,7 @@ impl SqlSession {
                         .transpose()?,
                     data: Data::Scan {
                         image,
+                        volatile: self.volatile.clone(),
                         source,
                         plan: Box::new(plan),
                     },

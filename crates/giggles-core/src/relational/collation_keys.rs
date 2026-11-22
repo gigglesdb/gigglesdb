@@ -96,6 +96,58 @@ pub(crate) fn duplicate(name: &str) -> SqlError {
     ));
     SqlError::Duplicate
 }
+pub(crate) fn primary_has_uuid(table: &TableDef) -> bool {
+    has_uuid_columns(table, &table.primary_key)
+}
+
+fn has_uuid_columns(table: &TableDef, positions: &[usize]) -> bool {
+    positions.iter().any(|i| table.columns[*i].data_type == DataType::Uuid)
+}
+
+pub(crate) fn uuid_duplicate(
+    table: &TableDef,
+    name: &str,
+    positions: &[usize],
+    values: &[Value],
+    build: bool,
+) -> Option<SqlError> {
+    if !primary_has_uuid(table) && !has_uuid_columns(table, positions) {
+        return None;
+    }
+    let columns = positions.iter().map(|i| query::quote_identifier(&table.columns[*i].name))
+        .collect::<Vec<_>>().join(", ");
+    let values = positions.iter()
+        .map(|i| query::output_text(values.get(*i)?).ok().flatten())
+        .collect::<Option<Vec<_>>>()?.join(", ");
+    let (schema, name) = split_key(name);
+    let outcome = if build {
+        user_types::view_replace_error(format!("could not create unique index \"{name}\""));
+        "is duplicated."
+    } else {
+        duplicate(name);
+        "already exists."
+    };
+    user_types::sql_duplicate_key_detail(DuplicateKeyDetail {
+        table_id: table.id,
+        schema: schema.to_owned(),
+        table: table.name.clone(),
+        constraint: name.to_owned(),
+        values: format!("Key ({columns})=({values}) {outcome}"),
+    });
+    Some(SqlError::Duplicate)
+}
+
+pub(crate) fn index_duplicate(
+    table: &TableDef,
+    index: &secondary_index::Descriptor,
+    values: &[Value],
+    build: bool,
+) -> SqlError {
+    let positions = index.columns.iter().filter_map(|id| table.columns.iter()
+        .position(|column| column.id == *id)).collect::<Vec<_>>();
+    uuid_duplicate(table, &index.name, &positions, values, build).unwrap_or(SqlError::Duplicate)
+}
+
 impl Relational {
     /// Check the bindings that could require equality keys or make Key::new
     /// fail before the sidecar validates descriptor columns.
@@ -129,7 +181,20 @@ impl Relational {
             })
     }
 
-    pub(crate) fn primary_duplicate(&self, table: &TableDef) -> SqlError {
+    pub(super) fn primary_collision_name(&self, table: &TableDef) -> String {
+        let name = self.primary_key_constraint_name(table).unwrap_or_default();
+        if primary_has_uuid(table) {
+            schema_binding::relation_key(self.table_schema(table.id), &name)
+        } else {
+            name
+        }
+    }
+
+    pub(crate) fn primary_duplicate(&self, table: &TableDef, row: &[Value]) -> SqlError {
+        if primary_has_uuid(table) {
+            return uuid_duplicate(table, &self.primary_collision_name(table), &table.primary_key, row, false)
+                .unwrap_or(SqlError::Duplicate);
+        }
         if table
             .primary_key
             .iter()
@@ -167,7 +232,44 @@ impl Relational {
                         return Err(SqlError::Limit);
                     }
                     if !occupied.insert(tuple) {
-                        return Err(duplicate(&name));
+                        return Err(uuid_duplicate(table, &name, &key.columns, &row.values, false)
+                            .unwrap_or_else(|| duplicate(&name)));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // The legacy sidecar reports collisions without column context. Check UUID
+    // index keys while their table and losing row are available for diagnostics.
+    pub(super) fn validate_uuid_indexes(
+        &self,
+        table: &TableDef,
+        rows: &BTreeMap<Vec<u8>, SqlRow>,
+        descriptors: &[secondary_index::Descriptor],
+        build: bool,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> R<()> {
+        for index in descriptors.iter().filter(|d| d.unique && d.table == table.id) {
+            if !primary_has_uuid(table) && !index.columns.iter().any(|id| table.columns.iter()
+                .any(|column| column.id == *id && column.data_type == DataType::Uuid)) {
+                continue;
+            }
+            let key = Key::new(self, table, &index.columns, Some(index.id))?;
+            let mut occupied = BTreeSet::new();
+            let mut bytes = 0usize;
+            for row in rows.values() {
+                if cancel() {
+                    return Err(SqlError::Aborted);
+                }
+                if let Some(tuple) = key.tuple(&row.values)? {
+                    bytes = bytes.checked_add(tuple.len()).ok_or(SqlError::Limit)?;
+                    if bytes > secondary_index::MAX_BYTES {
+                        return Err(SqlError::Limit);
+                    }
+                    if !occupied.insert(tuple) {
+                        return Err(index_duplicate(table, index, &row.values, build));
                     }
                 }
             }
@@ -190,7 +292,7 @@ impl Relational {
         if key.nondeterministic() {
             keys.push((
                 key,
-                self.primary_key_constraint_name(table).unwrap_or_default(),
+                self.primary_collision_name(table),
             ));
         }
         for d in descriptors

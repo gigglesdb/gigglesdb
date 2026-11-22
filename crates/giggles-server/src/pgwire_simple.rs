@@ -514,6 +514,7 @@ impl State {
             .pre_rollback_settings
             .take()
             .map_or_else(|| self.settings.current.clone(), |before| *before);
+        self.diagnostic.authorize_duplicate_key(code, session);
         session.abort();
         if implicit {
             session.sql.rollback();

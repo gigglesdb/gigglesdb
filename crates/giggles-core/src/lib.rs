@@ -23,7 +23,7 @@ pub use storage::{
     RecoveryPoint, SqlIsolation, UpgradePoint, UpgradeReport, WriteFenceStatus,
 };
 pub use storage::{SequenceDefaultContext, SequenceDefaultGrants};
-pub use storage::{CatalogMetadata, PrivilegeCallback, PrivilegeMetadata, SequenceAuthority, Cursor, PreparedCatalogState, SqlReplyCheck, SqlSession, SqlTableLockMode};
+pub use storage::{CatalogMetadata, PrivilegeCallback, PrivilegeMetadata, SequenceAuthority, Cursor, PreparedCatalogState, SqlReplyCheck, SqlSession, SqlTableLockMode, TableAuthoritySnapshot};
 mod sqlstate;
 pub use sqlstate::sqlstate;
 #[cfg(feature = "legacy-task")]

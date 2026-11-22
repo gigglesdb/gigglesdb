@@ -94,7 +94,7 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::{Read, Write},
     path::Path,
@@ -2288,6 +2288,7 @@ pub struct SqlSession {
     privilege_callback: Option<PrivilegeCallback>,
     admin: Admin,
     staged: Option<State>,
+    legacy_catalog_id_at_begin: u64,
     v2_transaction: Option<engine::txn::Transaction>,
     /// A typed operation reuses its checked transaction during binding and execution.
     pub(crate) native_generation: Option<Arc<engine::txn::TxnLifetime>>,
@@ -2302,6 +2303,7 @@ pub struct SqlSession {
     aborted: bool,
     transaction_id: Option<u128>,
     transaction_clock_us: Option<i64>,
+    volatile: Arc<Mutex<relational::volatile::SessionVolatile>>,
     extra_float_digits: i32,
     date_style: giggles_pg_types::temporal::DateStyleSettings,
     bytea_output: giggles_pg_types::bytea::ByteaOutput,
@@ -2357,6 +2359,7 @@ impl Admin {
             privilege_callback: None,
             admin: self.clone(),
             staged: None,
+            legacy_catalog_id_at_begin: 0,
             v2_transaction: None,
             native_generation: None,
             sequence_generation: None,
@@ -2369,6 +2372,7 @@ impl Admin {
             aborted: false,
             transaction_id: None,
             transaction_clock_us: None,
+            volatile: Default::default(),
             extra_float_digits: 1,
             date_style: Default::default(),
             bytea_output: Default::default(),
@@ -2486,6 +2490,15 @@ fn catalog_metadata_from(s: &MetadataState<'_>, path: &[String], generation: u64
                 }).collect(),
             })
     }
+
+/// Authority for one verified table identity in a single catalog snapshot.
+pub struct TableAuthoritySnapshot {
+    pub roles: roles::RoleCatalogImage,
+    pub schema: String,
+    pub schema_owner: Option<String>,
+    pub owner: Option<String>,
+    pub grants: BTreeMap<String, BTreeSet<roles::TablePrivilege>>,
+}
 
 /// Owned execution metadata. Projection is deferred until the first inquiry.
 pub struct PrivilegeMetadata {
@@ -4087,6 +4100,7 @@ impl SqlSession {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
             let (state, callback) = self.native_sequence_callback(lease.as_deref())?;
+            let _volatile = relational::volatile::Scope::enter(&self.volatile);
             let clock = relational::clock::ExecutionClock::new(&relational::StatementClock {
                 unavailable: Some(CoreError::Sql(relational::SqlError::Unsupported)),
                 transaction_us: 0, statement_us: 0, zone: None, wall: None,
@@ -4636,6 +4650,7 @@ impl SqlSession {
                     self.sequence_tables.clone(),
                     self.search_path.clone(),
                 ));
+            let _volatile = relational::volatile::Scope::enter(&self.volatile);
             let output = state.sql.normalize_copy(prepared, input, Some(&context));
             crate::cancellation::check()?;
             if let Some(error) = context.take_error() {
@@ -5166,6 +5181,7 @@ impl SqlSession {
         db: Option<&EngineLease>,
         check_reply: Option<&mut SqlReplyCheck<'_>>,
     ) -> Result<relational::SqlResult, CoreError> {
+        let _volatile = relational::volatile::Scope::enter(&self.volatile);
         // A spilled v2 RETURNING or SELECT result is materialised here unless the
         // caller streams it (`relational::spill::streaming`); errors and unwinds drop it.
         relational::spill::statement(|| {
@@ -5305,6 +5321,7 @@ impl SqlSession {
                                 .iter()
                                 .map(|(&id, d)| (id, d.incarnation))
                                 .collect();
+                            self.legacy_catalog_id_at_begin = s.sql.next_catalog_id();
                             self.staged = Some(s);
                             self.deferral = Default::default();
                             self.transaction_id = Some(u128::from_be_bytes(token));
@@ -5721,6 +5738,58 @@ impl SqlSession {
                 .unwrap_or_else(|| name.to_owned()))
         })
     }
+    /// Capture current SELECT authority for an exact relation identity.
+    /// Read name-keyed ACLs at the same snapshot as the table, with private DDL overlaid.
+    pub fn table_authority_snapshot(
+        &self,
+        name: &str,
+        id: u64,
+    ) -> Result<Option<TableAuthoritySnapshot>, roles::RoleError> {
+        let catalog = self.admin.roles();
+        let capture = |sql: &relational::Relational, roles: roles::RoleCatalogImage, key: &str| {
+            let (schema, _) = relational::split_key(key);
+            let schema_owner = sql.catalog_ext().schemas.get(schema).map(|s| s.owner.clone());
+            let (owner, grants) = roles.bound_table_authority(key)?;
+            Ok(Some(TableAuthoritySnapshot { roles, schema: schema.to_owned(), schema_owner, owner, grants }))
+        };
+        if let Some(db) = self.statement_lease()? {
+            let _ticket = self.admin.inner.enter()?;
+            let mut read = db.begin(engine::txn::Isolation::ReadCommitted);
+            let private = self.v2_transaction.as_ref();
+            let snapshot = db.catalog().snapshot_with_catalog_writes(&mut read, private)?;
+            let sql = snapshot.image().map_err(CoreError::Sql)?;
+            if sql.tables.get(name).is_none_or(|table| table.id != id) {
+                return Ok(None);
+            }
+            let roles = catalog.image_from_v2_read(&db, &mut read, private)?;
+            return capture(&sql, roles, name);
+        }
+
+        let _ticket = self.admin.inner.enter()?;
+        let read = self.admin.inner.db(SQL_SESSIONS)?.begin_read().map_err(io)?;
+        // Private creates and concurrent commits can allocate the same ID.
+        if let Some(staged) = &self.staged
+            && (id >= self.legacy_catalog_id_at_begin
+                || staged.sql.tables.get(name).is_none_or(|table| table.id != id))
+        {
+            return Ok(None);
+        }
+        let roles = catalog.image_from_legacy_read(&read)?;
+        // Read the legacy SQL namespace and roles from the same redb transaction.
+        let records = read.open_table(RECORDS).map_err(io)?;
+        let Some(payload) = records.get(&[5][..]).map_err(io)? else { return Ok(None) };
+        let sql = feature_envelope::decode_relational(payload.value())?;
+        if self.staged.is_some() {
+            // A preexisting table may have been renamed in this session.
+            let Some((key, _)) = sql.tables.iter().find(|(_, table)| table.id == id) else { return Ok(None) };
+            capture(&sql, roles, key)
+        } else if sql.tables.get(name).is_some_and(|table| table.id == id) {
+            capture(&sql, roles, name)
+        } else {
+            Ok(None)
+        }
+    }
+
     fn publish(&self, staged: State) -> Result<(), CoreError> {
         self.admin.inner.db(SQL_SESSIONS)?;
         self.admin
@@ -5759,6 +5828,7 @@ impl SqlSession {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.sequence_baseline.clear();
+        self.legacy_catalog_id_at_begin = 0;
         self.deferral = Default::default();
         self.copy_freeze = vec![Default::default()];
         self.savepoints.clear();

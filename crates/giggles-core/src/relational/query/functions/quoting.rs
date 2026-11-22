@@ -89,6 +89,18 @@ pub(super) fn eval(name: &str, values: &[Value], budget: &mut usize) -> Option<R
     })())
 }
 
+pub(in crate::relational) fn quote_identifier(input: &str) -> String {
+    let mut bytes = input.bytes();
+    if bytes.next().is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        && !keyword_requires_quotes(input)
+    {
+        input.to_owned()
+    } else {
+        format!("\"{}\"", input.replace('"', "\"\""))
+    }
+}
+
 fn quote(name: &str, input: &str, budget: &mut usize) -> R<Value> {
     // Cap the scan before inspecting any bytes. Only two bounded scans occur:
     // exact-size/classification, then the one admitted output construction.

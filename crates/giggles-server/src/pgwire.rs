@@ -7,7 +7,7 @@ use crate::{
 use crate::Request;
 use giggles_core::{
     CoreError,
-    relational::{DataType, Description, Prepared, SqlResult, Value},
+    relational::{DataType, Description, DuplicateKeyDetail, Prepared, SqlErrorDetail, SqlResult, Value},
     task::Released,
 };
 use giggles_pg_types::temporal::SessionZone;
@@ -181,6 +181,8 @@ struct Diagnostic {
     wire_context: Option<String>,
     wire_hint: Option<&'static str>,
     sql_detail: Option<String>,
+    duplicate_key: Option<DuplicateKeyDetail>,
+    duplicate_key_visible: Option<bool>,
     query_id: Option<String>,
     /// GD-0061 R3-310: a task-session refusal (class, error) not yet written
     /// to the read log; the task path logs it with the statement text.
@@ -203,6 +205,27 @@ impl Diagnostic {
         self.wire_message = Some(error.message);
         error.sqlstate
     }
+    fn read_core_detail(&mut self) -> Option<String> {
+        match giggles_core::relational::take_sql_diagnostic_detail() {
+            Some(SqlErrorDetail::DuplicateKey(detail)) => {
+                self.duplicate_key = Some(detail);
+                self.duplicate_key_visible = None;
+                None
+            }
+            Some(SqlErrorDetail::Text(detail)) => Some(detail),
+            None => None,
+        }
+    }
+
+    fn authorize_duplicate_key(&mut self, code: &str, session: &mut Session) {
+        if code == "23505"
+            && self.duplicate_key_visible.is_none()
+            && let Some(detail) = &self.duplicate_key
+        {
+            self.duplicate_key_visible = Some(session.can_read_duplicate_key(detail));
+        }
+    }
+
     fn core<T>(&mut self, result: Result<T, CoreError>) -> R<T> {
         let message = giggles_core::relational::take_sql_error_message();
         if result.is_err() && message.as_deref().is_some_and(|m|
@@ -218,8 +241,32 @@ impl Diagnostic {
                 || m.starts_with("ORDER BY \"") && m.ends_with("\" is ambiguous")) {
             self.wire_message = message.clone();
         }
-        self.sql_detail = giggles_core::relational::take_sql_error_detail();
+        self.sql_detail = self.read_core_detail();
         self.wire_hint = giggles_core::relational::take_sql_error_hint();
+        use giggles_core::relational::SqlError;
+        let postgres_diagnostic = match (&result, message.as_deref()) {
+            (Err(CoreError::Sql(SqlError::Duplicate)), Some(m)) if self.duplicate_key.is_some() => {
+                m.starts_with("duplicate key value violates unique constraint ")
+                    || m.starts_with("could not create unique index ")
+            }
+            (Err(CoreError::Sql(SqlError::UndefinedFunction | SqlError::AmbiguousFunction)), Some(m)) => {
+                m.strip_prefix("function ")
+                    .and_then(|m| m.split_once('('))
+                    .is_some_and(|(name, _)| matches!(
+                        name.strip_prefix("pg_catalog.").unwrap_or(name),
+                        "gen_random_uuid" | "uuidv4" | "uuidv7" | "random" | "setseed"
+                            | "uuid_extract_version" | "uuid_extract_timestamp"
+                    ))
+            }
+            (Err(CoreError::Sql(SqlError::DatetimeFieldOverflow)), Some(m)) => matches!(
+                m, "timestamp out of range" | "timestamp out of range for UUID version 7"
+                    | "interval out of range for UUID version 7"
+            ),
+            _ => false,
+        };
+        if postgres_diagnostic {
+            self.wire_message = message.clone();
+        }
         if result.is_err() && message.as_deref().is_some_and(|m| m.starts_with("function uuid_") || m.starts_with("extension ") || m.starts_with("cannot drop extension ") || m.starts_with("schema ")) { self.wire_message = message.clone(); }
         if matches!(
             &result,
@@ -443,7 +490,19 @@ fn diagnostic_error(
             .unwrap_or(message),
         &mut b,
     );
-    if let Some(detail) = detail {
+    if let Some((diagnostic, key)) = diagnostic
+        .filter(|_| code == "23505")
+        .and_then(|d| d.duplicate_key.as_ref().map(|key| (d, key)))
+    {
+        if diagnostic.duplicate_key_visible == Some(true) {
+            b.push(b'D');
+            z(&key.values, &mut b);
+        }
+        for (field, name) in [(b's', &key.schema), (b't', &key.table), (b'n', &key.constraint)] {
+            b.push(field);
+            z(name, &mut b);
+        }
+    } else if let Some(detail) = detail {
         b.push(b'D');
         z(diagnostic.and_then(|d| d.sql_detail.as_deref().or(d.wire_detail.as_deref())).unwrap_or(&detail), &mut b);
     }
@@ -3329,6 +3388,8 @@ impl State {
             wire_context: None,
             wire_hint: None,
             sql_detail: None,
+            duplicate_key: None,
+            duplicate_key_visible: None,
             wire_message: None,
             message: None,
             phase: match tag {
@@ -3364,6 +3425,7 @@ impl State {
         }) {
             Ok(keep) => Ok(keep),
             Err(code) => {
+                self.diagnostic.authorize_duplicate_key(code, session);
                 session.abort();
                 // A CopyDone rejected during post-dispatch refresh must not
                 // leave a successful COPY completion queued for Flush or Sync.

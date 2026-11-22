@@ -637,6 +637,7 @@ fn plan_unique_conflict_evaluated<'s>(
                 .collect::<Vec<_>>();
             unique
                 .visit(
+                    table,
                     resolved[index].winner,
                     &final_keys[index],
                     &values,
@@ -647,7 +648,7 @@ fn plan_unique_conflict_evaluated<'s>(
             if old_key != Some(final_keys[index].as_slice())
                 && occupied.contains(&final_keys[index])
             {
-                return Err(PlanError::Sql(SqlError::Duplicate));
+                return Err(PlanError::Sql(src.primary_duplicate(table, &values)));
             }
             if let Some(old_key) = old_key {
                 occupied.remove(old_key);

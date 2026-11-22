@@ -66,6 +66,7 @@ fn legacy(c: &ColumnDef) -> R<()> {
         | DataType::BigInt
         | DataType::Text
         | DataType::Varchar
+        | DataType::Uuid
         | DataType::Bytes => Ok(()),
         _ => Err(SqlError::Unsupported),
     }

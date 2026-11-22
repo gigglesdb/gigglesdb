@@ -104,6 +104,23 @@ pub(crate) fn entries(
     rows: &BTreeMap<Vec<u8>, SqlRow>,
     ds: &[Descriptor],
 ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
+    entries_for(table, rows, ds, false)
+}
+
+pub(crate) fn build_entries(
+    table: &TableDef,
+    rows: &BTreeMap<Vec<u8>, SqlRow>,
+    index: &Descriptor,
+) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
+    entries_for(table, rows, std::slice::from_ref(index), true)
+}
+
+fn entries_for(
+    table: &TableDef,
+    rows: &BTreeMap<Vec<u8>, SqlRow>,
+    ds: &[Descriptor],
+    build: bool,
+) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
     let mut entries = BTreeMap::new();
     for d in ds.iter().filter(|d| d.table == table.id) {
         validate_descriptor(d, table)?;
@@ -142,12 +159,33 @@ pub(crate) fn entries(
                 key.extend(&pk);
             }
             if entries.insert(key, pk).is_some() {
-                return Err(CoreError::Sql(SqlError::Duplicate));
+                return Err(CoreError::Sql(relational::collation_keys::index_duplicate(
+                    table, d, &row.values, build,
+                )));
             }
         }
     }
     Ok(entries)
 }
+pub(crate) fn occupancy_duplicate(
+    table: &TableDef,
+    rows: &BTreeMap<Vec<u8>, SqlRow>,
+    ds: &[Descriptor],
+    key: &[u8],
+    pk: &[u8],
+    build: bool,
+) -> CoreError {
+    let index = ds.iter().find(|d| d.unique && key.starts_with(&d.id.to_be_bytes()));
+    // The native single-row publisher uses an empty key for its one row.
+    let row = rows.get(pk).or_else(|| rows.get(&[][..]));
+    CoreError::Sql(match (index, row) {
+        (Some(index), Some(row)) => relational::collation_keys::index_duplicate(
+            table, index, &row.values, build,
+        ),
+        _ => SqlError::Duplicate,
+    })
+}
+
 /// Lock in physical order, then check the latest committed owner after waiting.
 /// Callers own the statement savepoint, so row and index failures roll back together.
 #[allow(clippy::too_many_arguments)]
@@ -178,7 +216,10 @@ pub(crate) fn apply(
             .lock_for_write(Keyspace::Index, key, deadline, cancel)
             .map_err(crate::task::limits::lock_error)?;
         if target.current.is_some() && target.current.as_ref() != old.get(key) {
-            return Err(CoreError::Sql(SqlError::Duplicate));
+            return Err(match (after_table, new.get(key)) {
+                (Some(table), Some(pk)) => occupancy_duplicate(table, after, new_ds, key, pk, false),
+                _ => CoreError::Sql(SqlError::Duplicate),
+            });
         }
     }
     if !changes.is_empty() {
@@ -205,7 +246,7 @@ pub(crate) fn check_occupancy(
                 &|| crate::cancellation::check().is_err())
             .map_err(crate::task::limits::lock_error)?;
         if target.current.is_some() && target.current.as_ref() != old.get(&key) {
-            return Err(CoreError::Sql(SqlError::Duplicate));
+            return Err(occupancy_duplicate(table, after, ds, &key, &pk, false));
         }
     }
     Ok(())

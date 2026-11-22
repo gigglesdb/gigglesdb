@@ -40,7 +40,7 @@ fn kind(t: &DataType) -> Option<Kind> {
         DataType::SmallInt => Kind::SmallInt,
         DataType::Integer => Kind::Integer,
         DataType::BigInt => Kind::BigInt,
-        DataType::Text | DataType::Varchar => Kind::Text,
+        DataType::Text | DataType::Varchar | DataType::Uuid => Kind::Text,
         DataType::Bpchar => return None,
         DataType::Bytes => Kind::Bytes,
         _ => return None,
@@ -580,7 +580,7 @@ impl UpdateUnique {
         let primary = collation_keys::Key::new(state, table, &primary, None)?;
         let mut keys = Vec::new();
         if primary.nondeterministic() {
-            keys.push((primary, state.primary_key_constraint_name(table).unwrap_or_default()));
+            keys.push((primary, state.primary_collision_name(table)));
         }
         for d in state.secondary.descriptors().iter().filter(|d| d.table == table.id && d.unique) {
             keys.push((collation_keys::Key::new(state, table, &d.columns, Some(d.id))?, d.name.clone()));
@@ -597,6 +597,7 @@ impl UpdateUnique {
     }
     pub(crate) fn visit(
         &mut self,
+        table: &TableDef,
         old: Option<(&[u8], &SqlRow)>,
         key: &[u8],
         values: &[Value],
@@ -610,7 +611,8 @@ impl UpdateUnique {
                     .get(tuple)
                     .is_some_and(|owner| old.is_none_or(|(old_key, _)| owner.as_slice() != old_key))
             {
-                return Err(if equality.nondeterministic() { collation_keys::duplicate(name) } else { SqlError::Duplicate });
+                return Err(collation_keys::uuid_duplicate(table, name, &equality.columns, values, false)
+                    .unwrap_or_else(|| if equality.nondeterministic() { collation_keys::duplicate(name) } else { SqlError::Duplicate }));
             }
             if let Some((_, old)) = old
                 && let Some(tuple) = equality.tuple(&old.values)?
@@ -746,7 +748,8 @@ impl Relational {
                         .or(prior.new)
                         .is_some_and(|(k, _)| Some(k) == identity)
             }) {
-                return Err(self.primary_duplicate(table(self, change.table)?));
+                let row = change.new.or(change.old).expect("matching row identity").1;
+                return Err(self.primary_duplicate(table(self, change.table)?, &row.values));
             }
             if let Some((key, old)) = change.old {
                 if !rows
@@ -757,10 +760,10 @@ impl Relational {
                 {
                     return Err(SqlError::Conflict);
                 }
-            } else if let Some((key, _)) = change.new
+            } else if let Some((key, row)) = change.new
                 && rows.contains_key(key)
             {
-                return Err(self.primary_duplicate(table(self, change.table)?));
+                return Err(self.primary_duplicate(table(self, change.table)?, &row.values));
             }
             if let (Some((old, _)), Some((new, _))) = (change.old, change.new)
                 && old != new
@@ -897,7 +900,20 @@ impl Relational {
         let mut secondary = Sidecar::default();
         secondary
             .build(ds, &snap.rows(&tuples), &CatalogView(self), &mut *cancel)
-            .map_err(error)?;
+            .map_err(|failure| {
+                let failure = error(failure);
+                if failure == SqlError::Duplicate {
+                    for (id, map) in &rows {
+                        let table = table(self, *id).expect("projected table");
+                        if self.validate_uuid_indexes(table, map, ds, false, cancel)
+                            == Err(SqlError::Duplicate)
+                        {
+                            break;
+                        }
+                    }
+                }
+                failure
+            })?;
         let result = SqlResult {
             affected: proposal
                 .changes

@@ -8,7 +8,8 @@ fn kind(t: &DataType) -> Option<Kind> {
         DataType::SmallInt => Kind::SmallInt,
         DataType::Integer => Kind::Integer,
         DataType::BigInt => Kind::BigInt,
-        DataType::Text | DataType::Varchar => Kind::Text,
+        // Canonical lowercase UUID text has the same byte order as the UUID.
+        DataType::Text | DataType::Varchar | DataType::Uuid => Kind::Text,
         DataType::Bytes => Kind::Bytes,
         _ => return None,
     })
@@ -150,20 +151,31 @@ impl Relational {
             &equality_state
         } else { &*self };
         if unique {
-            equality.validate_collated_unique(table, &self.rows[&table.id], std::slice::from_ref(&descriptor), &mut cancel)
-                .map_err(|e| {
-                    if e == SqlError::Duplicate {
-                        user_types::view_replace_error(format!("could not create unique index \"{}\"", split_key(name).1));
-                    }
-                    e
-                })?;
+            let duplicate = |error, cancel: &mut _| {
+                if error == SqlError::Duplicate {
+                    let _ = equality.validate_uuid_indexes(
+                        table, &self.rows[&table.id], std::slice::from_ref(&descriptor), true, cancel,
+                    );
+                }
+                error
+            };
+            equality.validate_collated_unique(
+                table, &self.rows[&table.id], std::slice::from_ref(&descriptor), &mut cancel,
+            ).map_err(|e| {
+                if e == SqlError::Duplicate {
+                    user_types::view_replace_error(format!(
+                        "could not create unique index \"{}\"", split_key(name).1,
+                    ));
+                }
+                duplicate(e, &mut cancel)
+            })?;
             let proof = self.unique_readiness_engine(
                 &descriptor,
                 self.epoch,
                 self.generation,
                 super::secondary_index_unique_readiness::HARD,
                 &mut cancel,
-            )?;
+            ).map_err(|e| duplicate(e, &mut cancel))?;
             proof.consume_for(self, &descriptor, self.epoch, self.generation)?;
         }
         descriptors.push(descriptor);

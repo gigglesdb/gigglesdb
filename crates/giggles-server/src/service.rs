@@ -2718,6 +2718,53 @@ impl Session {
         }
         Ok(true)
     }
+    pub(crate) fn can_read_duplicate_key(
+        &mut self,
+        detail: &giggles_core::relational::DuplicateKeyDetail,
+    ) -> bool {
+        let table = giggles_core::relational::relation_key(&detail.schema, &detail.table);
+        self.authority_scope(|session| {
+            let Some(authority) = session.sql.table_authority_snapshot(&table, detail.table_id)
+                .map_err(role_lookup_error)? else { return Ok(false) };
+            match session.authority_role() {
+                Role::Database { name } => session.duplicate_key_select_allowed(name, &authority),
+                Role::Application { tables, .. } => Ok(table != "giggles_join" && tables.contains(&table)),
+                _ => Ok(false),
+            }
+        }).unwrap_or(false)
+    }
+
+    fn duplicate_key_select_allowed(
+        &self,
+        name: &str,
+        authority: &giggles_core::TableAuthoritySnapshot,
+    ) -> Result<bool, CoreError> {
+        use roles::{SchemaPrivilege::Usage, TablePrivilege::Select};
+
+        let roles = &authority.roles;
+        let superuser = roles.with_role(name, |role| role
+            .filter(|role| self.authority_role_live(role))
+            .map(|role| role.superuser))
+            .map_err(role_lookup_error)?
+            .ok_or(CoreError::Policy(Error::Authentication))?;
+        if superuser {
+            return Ok(true);
+        }
+        let privileges = roles.privileges_of(name).map_err(role_lookup_error)?;
+        let capabilities = roles.builtin_capabilities_of(name).map_err(role_lookup_error)?;
+        let schema_usage = authority.schema == "public" || privileges.iter().any(|name| {
+            authority.schema_owner.as_ref() == Some(name)
+                || (capabilities.contains(name) && matches!(name.as_str(), "pg_read_all_data" | "pg_write_all_data"))
+                || roles.schema_privileges(&authority.schema, name).is_ok_and(|grants| grants.contains(&Usage))
+        });
+        Ok(schema_usage && (authority.grants.get("").is_some_and(|grants| grants.contains(&Select))
+            || privileges.iter().any(|name| {
+                authority.owner.as_ref() == Some(name)
+                    || (name == "pg_read_all_data" && capabilities.contains(name))
+                    || authority.grants.get(name).is_some_and(|grants| grants.contains(&Select))
+            })))
+    }
+
     /// Check ordered table requirements before binding or classifying a request.
     /// Names are SQL authority keys (including staged names); only authority
     /// metadata is read. Sequence and DDL authority remain separate checks.
@@ -3540,7 +3587,8 @@ impl Session {
         plain: bool,
         check_reply: Option<&mut giggles_core::SqlReplyCheck<'_>>,
     ) -> Result<Unreleased<SqlResult>, CoreError> {
-        self.authority_scope(|session| {
+        self.clear_native_duplicate_key_detail();
+        let result = self.authority_scope(|session| {
             let bound = session.sql.bind_relation_context(p)?;
             let p = &bound;
             session.reconcile_sequence_owners()?;
@@ -3593,7 +3641,18 @@ impl Session {
                     else if clock.unavailable.is_none() { session.transaction_us = Some(transaction_us); }
                     result.map(|result| (result, true))
                 })
-        })
+        });
+        if self.surface == Surface::Native {
+            relational::retain_sql_duplicate_key_detail(|detail|
+                matches!(result, Err(CoreError::Sql(relational::SqlError::Duplicate)))
+                    && self.can_read_duplicate_key(detail));
+        }
+        result
+    }
+    fn clear_native_duplicate_key_detail(&self) {
+        if self.surface == Surface::Native {
+            relational::retain_sql_duplicate_key_detail(|_| false);
+        }
     }
     #[inline(never)]
     fn execute_with_sequence_defaults(
@@ -3707,6 +3766,7 @@ impl Session {
     /// `execute_sql_unreleased` and `release_page`, or `run_control`. It
     /// stays public for the integration tests.
     pub fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<SqlResult, CoreError> {
+        self.clear_native_duplicate_key_detail();
         self.authority_scope(|session| session.execute_sql_authorized(sql, params, true, None))?
             .untasked()
     }
@@ -3772,6 +3832,7 @@ impl Session {
         sql: &str,
         params: &[Value],
     ) -> Result<Unreleased<SqlResult>, CoreError> {
+        self.clear_native_duplicate_key_detail();
         self.authority_scope(|session| session.execute_sql_authorized(sql, params, false, None))
     }
     fn execute_sql_authorized(
@@ -3834,6 +3895,7 @@ impl Session {
         self.handle_received(request, received)
     }
     pub fn handle_received(&mut self, request: Request, received: std::time::Instant) -> Response {
+        self.clear_native_duplicate_key_detail();
         self.handle_with_reply_check(request, received, None)
     }
     pub(crate) fn handle_with_reply_check(
@@ -4416,6 +4478,127 @@ mod lifecycle_tests {
         session.set_search_path("alternate, public");
         assert!(session.sql.schema_in_search_path("alternate"));
         assert_eq!(session.search_path, "alternate, public");
+    }
+
+    const DUPLICATE_SQL: &str =
+        "INSERT INTO duplicate_test VALUES ('00000000-0000-0000-0000-000000000001')";
+    const KEY_DETAIL: &str =
+        "Key (id)=(00000000-0000-0000-0000-000000000001) already exists.";
+    const CREATE_DUPLICATE_TABLE: &str = "CREATE TABLE duplicate_test (id uuid PRIMARY KEY)";
+
+    fn duplicate_key_test_engines() -> impl Iterator<Item = Engine> {
+        [
+            Engine::Legacy,
+            #[cfg(feature = "engine-rocksdb")]
+            Engine::V2,
+        ]
+        .into_iter()
+    }
+
+    #[test]
+    fn duplicate_key_detail_rejects_replaced_table_identity() {
+        use relational::{SqlErrorDetail, take_sql_diagnostic_detail};
+        use roles::TablePrivilege::{Insert, Select};
+
+        for engine in duplicate_key_test_engines() {
+            let service = authorization_fixture(engine);
+            let mut trusted = service.admin.sql_session();
+            let mut reader = service.role_session("reader").unwrap();
+            let roles = service.admin.roles();
+            let capture = |trusted: &mut SqlSession| {
+                trusted.execute(CREATE_DUPLICATE_TABLE, &[], None).unwrap();
+                trusted.execute(DUPLICATE_SQL, &[], None).unwrap();
+                assert_eq!(
+                    trusted.execute(DUPLICATE_SQL, &[], None),
+                    Err(CoreError::Sql(relational::SqlError::Duplicate)),
+                );
+                let Some(SqlErrorDetail::DuplicateKey(key)) = take_sql_diagnostic_detail() else {
+                    panic!("expected trusted duplicate-key detail");
+                };
+                assert_eq!(key.values, KEY_DETAIL);
+                key
+            };
+
+            let old = capture(&mut trusted);
+            roles.grant_table("duplicate_test", "reader", &[Insert]).unwrap();
+            let authority = reader.sql.table_authority_snapshot("duplicate_test", old.table_id)
+                .unwrap().unwrap();
+            assert!(!reader.can_read_duplicate_key(&old));
+
+            trusted.execute("DROP TABLE duplicate_test", &[], None).unwrap();
+            let replacement = capture(&mut trusted);
+            roles.set_table_owner("duplicate_test", "reader").unwrap();
+            roles.grant_table("duplicate_test", "reader", &[Select]).unwrap();
+            assert_ne!(old.table_id, replacement.table_id);
+            assert!(!reader.duplicate_key_select_allowed("reader", &authority).unwrap());
+            assert!(!reader.can_read_duplicate_key(&old));
+            assert!(reader.can_read_duplicate_key(&replacement));
+        }
+    }
+
+    #[test]
+    fn duplicate_key_detail_for_uncommitted_table_owner() {
+        use relational::take_sql_error_detail;
+        use roles::SchemaPrivilege::{Create, Usage};
+
+        for engine in duplicate_key_test_engines() {
+            let service = authorization_fixture(engine);
+            let mut owner = service.role_session("owner").unwrap();
+            owner.execute_sql("CREATE SCHEMA duplicate_schema", &[]).unwrap();
+            let roles = service.admin.roles();
+            roles.grant_schema("duplicate_schema", "reader", &[Create, Usage]).unwrap();
+            let mut reader = service.role_session("reader").unwrap();
+            reader.set_search_path("duplicate_schema, public");
+            reader.execute_sql("BEGIN", &[]).unwrap();
+            reader.execute_sql(CREATE_DUPLICATE_TABLE, &[]).unwrap();
+            let table = relational::relation_key("duplicate_schema", "duplicate_test");
+            let legacy = matches!(engine, Engine::Legacy);
+            let registry_owner = if legacy { Some("reader") } else { None };
+            assert_eq!(roles.table_owner(&table).unwrap().as_deref(), registry_owner);
+            reader.execute_sql(DUPLICATE_SQL, &[]).unwrap();
+            reader.execute_sql("SAVEPOINT before_duplicate", &[]).unwrap();
+            assert_eq!(
+                reader.execute_sql(DUPLICATE_SQL, &[]),
+                Err(CoreError::Sql(relational::SqlError::Duplicate)),
+            );
+            let expected_detail = if legacy { None } else { Some(KEY_DETAIL) };
+            assert_eq!(take_sql_error_detail().as_deref(), expected_detail);
+            reader.execute_sql("ROLLBACK TO SAVEPOINT before_duplicate", &[]).unwrap();
+            reader.execute_sql("COMMIT", &[]).unwrap();
+            assert_eq!(roles.table_owner(&table).unwrap().as_deref(), Some("reader"));
+        }
+    }
+
+    #[test]
+    fn duplicate_key_detail_on_role_bound_session_sql_exits() {
+        use relational::{SqlErrorDetail, take_sql_diagnostic_detail, take_sql_error_detail};
+        use roles::TablePrivilege::{Insert, Select};
+
+        for engine in duplicate_key_test_engines() {
+            let service = authorization_fixture(engine);
+            let mut owner = service.role_session("owner").unwrap();
+            owner.execute_sql(CREATE_DUPLICATE_TABLE, &[]).unwrap();
+            owner.execute_sql(DUPLICATE_SQL, &[]).unwrap();
+            let roles = service.admin.roles();
+            roles.grant_table("duplicate_test", "reader", &[Insert]).unwrap();
+            let mut reader = service.role_session("reader").unwrap();
+
+            let duplicate = Err(CoreError::Sql(relational::SqlError::Duplicate));
+            assert_eq!(reader.execute_sql(DUPLICATE_SQL, &[]), duplicate);
+            assert!(take_sql_error_detail().is_none());
+            let prepared = reader.prepare(DUPLICATE_SQL).unwrap();
+            assert!(matches!(reader.execute_prepared_unreleased(&prepared, &[]),
+                Err(CoreError::Sql(relational::SqlError::Duplicate))));
+            assert!(take_sql_diagnostic_detail().is_none());
+
+            roles.grant_table("duplicate_test", "reader", &[Select]).unwrap();
+            assert_eq!(reader.execute_sql(DUPLICATE_SQL, &[]), duplicate);
+            assert_eq!(take_sql_error_detail().as_deref(), Some(KEY_DETAIL));
+            assert!(matches!(reader.execute_prepared_unreleased(&prepared, &[]),
+                Err(CoreError::Sql(relational::SqlError::Duplicate))));
+            assert!(matches!(take_sql_diagnostic_detail(),
+                Some(SqlErrorDetail::DuplicateKey(key)) if key.values == KEY_DETAIL));
+        }
     }
 
     fn authorization_fixture(engine: Engine) -> Arc<Service> {

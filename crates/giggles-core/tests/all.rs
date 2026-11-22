@@ -561,6 +561,8 @@ mod planner_collations;
 mod sql_float_glibc;
 #[path = "sql_extensions.rs"]
 mod sql_extensions;
+#[path = "sql_volatile_uuid.rs"]
+mod sql_volatile_uuid;
 
 #[path = "sql_array_ordering.rs"]
 mod sql_array_ordering;

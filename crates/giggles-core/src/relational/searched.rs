@@ -131,9 +131,10 @@ pub(super) fn route(
                     && source.contains(table, &new_key)?
                     && !vacated.contains(new_key.as_slice())
             {
-                return Err(state.primary_duplicate(table));
+                return Err(state.primary_duplicate(table, &row.values));
             }
             unique.as_mut().expect("UPDATE occupancy").visit(
+                table,
                 Some((key, old)),
                 &new_key,
                 &row.values,

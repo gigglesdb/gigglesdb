@@ -910,7 +910,7 @@ fn parse_dependencies(sql: &str) -> R<Vec<String>> {
     Ok(values)
 }
 
-fn type_name(ty: &DataType) -> &'static str {
+pub(super) fn type_name(ty: &DataType) -> &'static str {
     match ty {
         DataType::SmallInt => "smallint",
         DataType::Integer => "integer",
@@ -938,7 +938,7 @@ fn type_name(ty: &DataType) -> &'static str {
         DataType::Interval => "interval",
     }
 }
-fn quoted(s: &str) -> String {
+pub(super) fn quoted(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 fn sequence_reference(name: &str) -> String {
@@ -970,6 +970,7 @@ enum Expression {
     Boolean(bool),
     Null,
     Clock(String, DataType),
+    Builtin(String, DataType),
     Negative(Box<Expression>),
     Cast(Box<Expression>, DataType),
 }
@@ -1046,7 +1047,7 @@ impl Expression {
             Self::Number(n) => number_type(n),
             Self::String(_) | Self::Null => DataType::Text,
             Self::Boolean(_) => DataType::Boolean,
-            Self::Clock(_, ty) | Self::Cast(_, ty) => ty.clone(),
+            Self::Clock(_, ty) | Self::Builtin(_, ty) | Self::Cast(_, ty) => ty.clone(),
             Self::Negative(value) => value.ty(),
         }
     }
@@ -1059,6 +1060,7 @@ impl Expression {
             Self::Boolean(b) => b.to_string(),
             Self::Null => "NULL".into(),
             Self::Clock(s, _) => s.clone(),
+            Self::Builtin(sql, _) => sql.clone(),
             Self::Negative(value) => format!("-({})", value.sql()),
             Self::Cast(value, ty) => format!("({})::{}", value.sql(), type_name(ty)),
         }
@@ -1072,6 +1074,7 @@ impl Expression {
             Self::Boolean(b) => Ok(b.to_string()),
             Self::Null => Ok("NULL".into()),
             Self::Clock(s, _) => Ok(s.clone()),
+            Self::Builtin(..) => Ok(self.sql()),
             Self::Negative(value) => {
                 if let Self::Number(n) = value.as_ref() {
                     number_text(&format!("-{n}"))
@@ -1201,17 +1204,22 @@ fn expression(p: &mut Parser, depth: usize) -> R<Expression> {
         return Ok(Expression::Negative(Box::new(value)));
     }
     let start=p.at;
-    let mut extension=None;
+    let mut call = None;
     if matches!(p.tokens.get(p.at),Some(Token::Word(_) | Token::QuotedIdent(_))) {
         let first=alter_table::raw_name(p)?;
         let (schema,routine)=if p.sym('.') {(Some(first),alter_table::raw_name(p)?)} else {(None,first)};
-        if super::extensions::BUILTINS.iter().flat_map(|b|b.functions).any(|f|f.name==routine) && p.sym('(') {
+        if query::random_uuid::default_candidate(schema.as_deref(), &routine) && p.sym('(') {
+            let (sql, ty) = query::random_uuid::parse_default(p, schema.as_deref(), &routine, depth + 1)?;
+            call = Some(Expression::Builtin(sql, ty));
+        } else if super::extensions::BUILTINS.iter().flat_map(|b|b.functions).any(|f|f.name==routine) && p.sym('(') {
             let mut args=Vec::new();
             if !p.sym(')') { loop {args.push(expression(p,depth+1)?);if p.sym(')'){break;} p.punct(',')?;} }
-            extension=Some(Expression::Extension(schema.map_or_else(||routine.clone(),|s|format!("{s}\0{routine}")),args));
+            call=Some(Expression::Extension(schema.map_or_else(||routine.clone(),|s|format!("{s}\0{routine}")),args));
         } else {p.at=start;}
     }
-    let mut value = if let Some(ext)=extension {ext} else if p.sym('(') {
+    let mut value = if let Some(call) = call {
+        call
+    } else if p.sym('(') {
         let value = expression(p, depth + 1)?;
         p.punct(')')?;
         value

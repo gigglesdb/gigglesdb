@@ -198,21 +198,44 @@ pub(crate) fn load_txn(txn: &mut Transaction) -> Result<RoleTable, RoleError> {
         .map_err(CoreError::from)?
     {
         let (key, value) = entry.map_err(CoreError::from)?;
-        validate_record(&key, &value)?;
-        let index = (key[0] - 8) as usize;
-        let mut raw = PREFIXES[index].to_vec();
-        if index != 5 {
-            let start = if matches!(index, 2 | 3) && key[1] == 0 {
-                2
-            } else {
-                1
-            };
-            raw.extend(&key[start..key.len() - 1]);
-        }
-        image.0.insert(raw, value[1..].to_vec());
+        apply_read_record(&mut image, &key, Some(&value))?;
     }
     Ok(image)
 }
+fn apply_read_record(image: &mut RoleTable, key: &[u8], value: Option<&[u8]>) -> Result<(), RoleError> {
+    classify_key(key)?;
+    let index = (key[0] - 8) as usize;
+    let mut raw = PREFIXES[index].to_vec();
+    if index != 5 {
+        let start = if matches!(index, 2 | 3) && key[1] == 0 { 2 } else { 1 };
+        raw.extend(&key[start..key.len() - 1]);
+    }
+    if let Some(value) = value {
+        validate_record(key, value)?;
+        image.0.insert(raw, value[1..].to_vec());
+    } else {
+        image.0.remove(&raw);
+    }
+    Ok(())
+}
+
+pub(super) fn image_with_catalog_writes(
+    db: &V2Db,
+    txn: &mut Transaction,
+    private: Option<&Transaction>,
+) -> Result<Arc<super::RoleImage>, RoleError> {
+    if let Some(private) = private
+        && private.catalog_writes().any(|(key, _)| matches!(key.first(), Some(8..=13)))
+    {
+        let mut table = load_txn(txn)?;
+        for (key, value) in private.catalog_writes().filter(|(key, _)| matches!(key.first(), Some(8..=13))) {
+            apply_read_record(&mut table, key, value.as_deref())?;
+        }
+        return Ok(Arc::new(super::RoleImage::new(table)));
+    }
+    image_txn(db.catalog(), txn)
+}
+
 pub(super) fn image(db: &V2Db) -> Result<std::sync::Arc<super::RoleImage>, RoleError> {
     // Pin the same fresh local timestamp as a READ COMMITTED transaction. Only
     // reuse an image already loaded for that committed catalog version: loading

@@ -157,6 +157,12 @@ pub(super) fn populate(
             N,
         ]);
     }
+    let defaults = all["pg_attrdef"].rows.iter().map(|row| {
+        let (I(relation), I(position)) = (&row[1], &row[2]) else {
+            return Err(Error::InvalidSnapshot);
+        };
+        Ok(((*relation, *position), &row[3]))
+    }).collect::<R<BTreeMap<_, _>>>()?;
     for relation in &all["pg_class"].rows {
         if !matches!(&relation[3], Value::Text(kind) if kind == "r" || kind == "v") {
             continue;
@@ -192,7 +198,7 @@ pub(super) fn populate(
             if attribute[0] != relation[0] {
                 continue;
             }
-            let (I(oid), I(position)) = (&attribute[2], &attribute[4]) else {
+            let (I(relation_id), I(oid), I(position)) = (&relation[0], &attribute[2], &attribute[4]) else {
                 return Err(Error::InvalidSnapshot);
             };
             if *position <= 0 {
@@ -210,6 +216,9 @@ pub(super) fn populate(
                 !view,
                 all,
             );
+            if let Some(default) = defaults.get(&(*relation_id, *position)) {
+                column[5] = (*default).clone();
+            }
             if attribute[19] != I(0) && attribute[19] != I(100)
                 && let Some(coll)=all["pg_collation"].rows.iter().find(|c|c[0]==attribute[19]) {
                     column[19]=s(&snapshot.database);

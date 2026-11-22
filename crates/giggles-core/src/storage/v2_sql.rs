@@ -423,6 +423,7 @@ impl SqlSession {
                     self.xact.clone(),
                     self.v2_transaction.as_ref().map(|txn| txn.id()),
                 ));
+            let _volatile = relational::volatile::Scope::enter(&self.volatile);
             let output = state.sql.normalize_copy(prepared, input, Some(&context));
             crate::cancellation::check()?;
             if let Some(error) = context.take_error() {
@@ -1972,7 +1973,7 @@ impl RowSink for SqlRows<'_> {
                 break;
             };
             lower = Bound::Excluded(last);
-            let entries = engine::indexes::entries(table, &rows, std::slice::from_ref(index))?;
+            let entries = engine::indexes::build_entries(table, &rows, index)?;
             // The outer transaction holds the DDL table locks. Chunk commits
             // publish only entries under a fresh, durably reserved ID; queries
             // cannot discover it until the outer catalog commit succeeds.
@@ -1985,7 +1986,9 @@ impl RowSink for SqlRows<'_> {
                     crate::cancellation::check().is_err()
                 }).map_err(crate::task::limits::lock_error)?;
                 if target.current.is_some() {
-                    return Err(CoreError::Sql(SqlError::Duplicate));
+                    return Err(engine::indexes::occupancy_duplicate(
+                        table, &rows, std::slice::from_ref(index), &key, &pk, true,
+                    ));
                 }
                 chunk.put(Keyspace::Index, key, pk)?;
             }
@@ -2291,7 +2294,7 @@ impl RowSink for SqlRows<'_> {
                 .current
                 .is_some()
             {
-                return Err(CoreError::Sql(image.primary_duplicate(table)));
+                return Err(CoreError::Sql(image.primary_duplicate(table, &row.values)));
             }
         }
         if image.has_nondeterministic_keys(table) {
@@ -2301,9 +2304,12 @@ impl RowSink for SqlRows<'_> {
                 &mut || crate::cancellation::check().is_err()).map_err(CoreError::Sql)?;
             let keys = image.collated_unique_keys(table, &self.parts.indexes).map_err(CoreError::Sql)?
                 .into_iter().map(|(key, name)| {
-                    let tuples = after.iter().filter(|(pk, row)| before.get(*pk) != Some(*row))
-                        .map(|(_, row)| key.tuple(&row.values)).collect::<Result<Vec<_>, _>>()?
-                        .into_iter().flatten().collect::<BTreeSet<_>>();
+                    let mut tuples = BTreeMap::new();
+                    for (_, row) in after.iter().filter(|(pk, row)| before.get(*pk) != Some(*row)) {
+                        if let Some(tuple) = key.tuple(&row.values)? {
+                            tuples.insert(tuple, &row.values);
+                        }
+                    }
                     Ok((key, name, tuples))
                 }).collect::<Result<Vec<_>, SqlError>>().map_err(CoreError::Sql)?;
             // Scan without retaining the table: only this publication page's
@@ -2314,8 +2320,12 @@ impl RowSink for SqlRows<'_> {
                 // snapshot witness may have different values in latest state.
                 if before.get(&pk) != after.get(&pk) { return Ok(()); }
                 for (key, name, tuples) in &keys {
-                    if key.tuple(&row.values)?.is_some_and(|tuple| tuples.contains(&tuple)) {
-                        return Err(relational::collation_keys::duplicate(name));
+                    if let Some(tuple) = key.tuple(&row.values)?
+                        && let Some(proposed) = tuples.get(&tuple)
+                    {
+                        return Err(relational::collation_keys::uuid_duplicate(
+                            table, name, &key.columns, proposed, false,
+                        ).unwrap_or_else(|| relational::collation_keys::duplicate(name)));
                     }
                 }
                 Ok(())
@@ -2364,7 +2374,14 @@ impl RowSink for SqlRows<'_> {
                 crate::cancellation::check().is_err()
             }).map_err(crate::task::limits::lock_error)?;
             match (old, target.current) {
-                (None, Some(_)) => return Err(CoreError::Sql(SqlError::Duplicate)),
+                (None, Some(_)) => {
+                    if !relational::collation_keys::primary_has_uuid(table) {
+                        return Err(CoreError::Sql(SqlError::Duplicate));
+                    }
+                    let row = new.expect("appended row");
+                    let image = self.catalog.image().map_err(CoreError::Sql)?;
+                    return Err(CoreError::Sql(image.primary_duplicate(table, &row.values)));
+                }
                 (Some(old), Some(bytes)) => {
                     let record = codec::decode_row(key, &bytes)?;
                     let mut values = record.values;
@@ -2988,6 +3005,7 @@ impl SqlSession {
         // its partial effects (earlier pages) must be dropped too.
         let before = (!run.effects.is_empty()).then(|| run.effects.clone());
         self.protected = Some(run);
+        let _volatile = relational::volatile::Scope::enter(&self.volatile);
         let result = self.execute_v2(db, p, params, expected_version, clock, None);
         let mut run = self.protected.take().expect("parked protected run");
         if result.is_err() {

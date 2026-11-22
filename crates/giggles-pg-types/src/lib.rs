@@ -1,6 +1,6 @@
 //! Bounded PostgreSQL numeric and bit-preserving floating representations.
 use num_bigint::BigInt;
-use num_traits::{Signed, Zero};
+use num_traits::{Signed, ToPrimitive, Zero};
 use std::{cmp::Ordering, fmt};
 pub mod bytea;
 pub mod character;
@@ -295,6 +295,66 @@ impl Numeric {
             _ => None,
         }
     }
+    /// Sample uniformly at the greater bound scale. The callback samples an
+    /// inclusive range starting at zero and must come from the SQL session.
+    pub fn random_between(
+        &self,
+        upper: &Self,
+        mut inclusive: impl FnMut(u64) -> u64,
+    ) -> Result<Self, Error> {
+        let (Repr::Finite { coefficient: lo, scale: x },
+            Repr::Finite { coefficient: hi, scale: y }) = (&self.0, &upper.0)
+        else {
+            return Err(Error::Range);
+        };
+        let scale = (*x).max(*y);
+        let lo = lo * pow(scale - x);
+        let span = hi * pow(scale - y) - &lo;
+        if span.is_negative() {
+            return Err(Error::Range);
+        }
+        if span.is_zero() {
+            return Self::finite(lo, scale);
+        }
+
+        // PostgreSQL groups the scaled decimal coefficient into base-10000
+        // digits. Draw the high group against the bound and reject only the
+        // excess in the final high group.
+        const BASE: u64 = 10_000;
+        let padding = (4 - scale % 4) % 4;
+        let pad = 10_u64.pow(padding);
+        let padded = &span * pad;
+        let digits = padded.to_str_radix(10).len().div_ceil(4);
+        if digits <= 4 {
+            return Self::finite(lo + inclusive(span.to_u64().expect("at most 16 digits")), scale);
+        }
+
+        let remaining = digits - 4;
+        let high = (&padded / pow(4 * remaining as u32))
+            .to_u64()
+            .expect("at most 16 digits");
+        let whole = remaining - usize::from(padding != 0);
+        loop {
+            let mut result = BigInt::from(inclusive(high));
+            for _ in 0..whole / 4 {
+                let mut bits = inclusive(BASE.pow(4) - 1);
+                for _ in 0..4 {
+                    result = result * BASE + bits % BASE;
+                    bits /= BASE;
+                }
+            }
+            for _ in 0..whole % 4 {
+                result = result * BASE + inclusive(BASE - 1);
+            }
+            if padding != 0 {
+                result = result * BASE + inclusive(BASE / pad - 1) * pad;
+            }
+            if result <= padded {
+                return Self::finite(lo + result / pad, scale);
+            }
+        }
+    }
+
     pub fn checked_add(&self, b: &Self) -> Result<Self, Error> {
         match (&self.0, &b.0) {
             (

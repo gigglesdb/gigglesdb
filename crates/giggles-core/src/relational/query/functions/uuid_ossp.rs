@@ -123,25 +123,32 @@ pub(super) fn eval(name: &str, values: &[Value]) -> Option<R<Value>> {
                     };
                 bytes[8] = (bytes[8] & 63) | 128;
             }
-            "uuid_generate_v4" => {
-                getrandom::fill(&mut bytes).map_err(|_| SqlError::Unsupported)?;
-                bytes[6] = (bytes[6] & 15) | 0x40;
-                bytes[8] = (bytes[8] & 63) | 128;
-            }
+            "uuid_generate_v4" => return v4(),
             _ => {
                 bytes = time_uuid(name == "uuid_generate_v1mc")?;
             }
         }
-        let digits = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        Ok(Value::Text(format!(
-            "{}-{}-{}-{}-{}",
-            &digits[..8],
-            &digits[8..12],
-            &digits[12..16],
-            &digits[16..20],
-            &digits[20..]
-        )))
+        Ok(format_uuid(bytes))
     })())
+}
+pub(super) fn v4() -> R<Value> {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes).map_err(|_| SqlError::Unsupported)?;
+    bytes[6] = (bytes[6] & 15) | 0x40;
+    bytes[8] = (bytes[8] & 63) | 0x80;
+    Ok(format_uuid(bytes))
+}
+
+pub(super) fn format_uuid(bytes: [u8; 16]) -> Value {
+    let digits = u128::from_be_bytes(bytes);
+    Value::Text(format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (digits >> 96) as u32,
+        (digits >> 80) as u16,
+        (digits >> 64) as u16,
+        (digits >> 48) as u16,
+        digits & 0xffff_ffff_ffff
+    ))
 }
 fn time_uuid(fresh_node: bool) -> R<[u8; 16]> {
     use std::sync::{Mutex, OnceLock};

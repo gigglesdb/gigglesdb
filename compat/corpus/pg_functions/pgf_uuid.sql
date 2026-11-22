@@ -8,7 +8,6 @@ INSERT INTO r0c_pgf_uuid VALUES (1,'019535d9-3df7-79fb-b466-fa907fa17f9e'),(2,'5
 SELECT id, uuid_extract_version(u) FROM r0c_pgf_uuid ORDER BY id;
 SELECT id, uuid_extract_timestamp(u) FROM r0c_pgf_uuid ORDER BY id;
 SELECT id, u::text FROM r0c_pgf_uuid ORDER BY id;
-SELECT gen_random_uuid()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
 SELECT uuidv4()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
 SELECT uuidv7()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
 SELECT uuidv7() IS NOT NULL;
