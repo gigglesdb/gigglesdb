@@ -62,7 +62,31 @@ pub(crate) fn sql_error(error: CoreError) -> SqlError {
     }
 }
 
+pub(crate) fn mark_committed() {
+    SLOT.with_borrow_mut(|slot| {
+        if let Some(spill) = slot {
+            spill.after_commit = true;
+        }
+    });
+}
+
 pub(crate) fn durability_output_spilled() -> bool { SLOT.with_borrow(Option::is_some) }
+
+/// Check the current statement's reply and reset its spill for the caller.
+pub(crate) fn check_pending(
+    check: impl FnOnce(Option<&mut SpilledRows>) -> Result<(), CoreError>,
+) -> Result<(), CoreError> {
+    let Some(mut spill) = SLOT.take() else { return check(None); };
+    let remaining = spill.remaining;
+    check(Some(&mut spill))?;
+    if let Some(error) = spill.failed.take() {
+        return Err(error);
+    }
+    spill.reader.seek(SeekFrom::Start(0)).map_err(io)?;
+    spill.remaining = remaining;
+    SLOT.set(Some(spill));
+    Ok(())
+}
 
 /// True inside a SqlSession statement, whose boundary settles a published spill.
 pub(crate) fn armed() -> bool {
@@ -237,7 +261,14 @@ fn settle(result: Result<SqlResult, CoreError>, stream: bool) -> Result<SqlResul
     if stream && SLOT.with_borrow(Option::is_some) {
         STREAMING.set(false);
     } else if let Some(spilled) = SLOT.take() {
-        result.rows = spilled.materialise()?;
+        let after_commit = spilled.after_commit();
+        result.rows = spilled.materialise().map_err(|error| {
+            if after_commit {
+                CoreError::Storage(error.to_string())
+            } else {
+                error
+            }
+        })?;
     }
     Ok(result)
 }
@@ -298,7 +329,7 @@ impl RowBuffer {
         };
         let mut file = writer.into_inner().map_err(|e| io(e.into_error()))?;
         file.seek(SeekFrom::Start(0)).map_err(io)?;
-        let spilled = SpilledRows { reader: BufReader::new(file), remaining: self.count, temp, failed: None };
+        let spilled = SpilledRows { reader: BufReader::new(file), remaining: self.count, temp, failed: None, after_commit: false };
         result.rows = if armed() { SLOT.set(Some(spilled)); Vec::new() } else { spilled.materialise()? };
         Ok(())
     }
@@ -346,6 +377,7 @@ pub struct SpilledRows {
     remaining: u64,
     temp: TempPath,
     failed: Option<CoreError>,
+    after_commit: bool,
 }
 
 impl std::fmt::Debug for SpilledRows {
@@ -355,6 +387,11 @@ impl std::fmt::Debug for SpilledRows {
 }
 
 impl SpilledRows {
+    /// Whether a successful autocommit write produced these rows.
+    pub fn after_commit(&self) -> bool {
+        self.after_commit
+    }
+
     /// Rows not yet read.
     pub fn len(&self) -> u64 {
         self.remaining

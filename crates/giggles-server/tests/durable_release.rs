@@ -557,6 +557,133 @@ mod mechanism_a {
         finish(path, admin, service, running, client, connection).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn returning_reply_spilled_serial_settles_before_late_cancel() {
+        let _serial = crate::api_result_stream::SERIAL.lock().await;
+        let (path, admin, service, running, client, connection) = fixture().await;
+        client
+            .batch_execute("CREATE TABLE serial_tail(id serial PRIMARY KEY)")
+            .await
+            .unwrap();
+        client
+            .batch_execute("ALTER SEQUENCE serial_tail_id_seq MAXVALUE 34")
+            .await
+            .unwrap();
+        client
+            .batch_execute("INSERT INTO serial_tail DEFAULT VALUES")
+            .await
+            .unwrap();
+        let values = vec!["(DEFAULT)"; 33].join(",");
+        let (mut wire, cancel_key) = connect_cancellable(running.address).await;
+        let reservation = giggles_core::CommitSyncHook::new();
+        let _reservation_release = ReleaseOnDrop(reservation.clone());
+        let commit = giggles_core::CommitSyncHook::new();
+        let _commit_release = ReleaseOnDrop(commit.clone());
+        admin.set_commit_sync_hook(Some(reservation.clone()));
+        query(
+            &mut wire,
+            &format!("INSERT INTO serial_tail VALUES {values} RETURNING id, repeat('r', 40000)"),
+        )
+        .await;
+        entered(&reservation).await;
+        admin.set_commit_sync_hook(Some(commit.clone()));
+        reservation.release(false);
+        entered(&commit).await;
+
+        cancel(running.address, &cancel_key).await;
+        commit.release(false);
+        let replies = until_ready(&mut wire).await;
+        let written = client
+            .query("SELECT id FROM serial_tail", &[])
+            .await
+            .unwrap()
+            .len();
+        let error = replies
+            .iter()
+            .find(|(tag, _)| *tag == b'E')
+            .map(|(_, body)| String::from_utf8_lossy(body).into_owned());
+        let rows = replies.iter().filter(|(tag, _)| *tag == b'D').count();
+        drop(wire);
+        finish(path, admin, service, running, client, connection).await;
+        assert_eq!(written, 34);
+        assert!(error.is_none(), "write committed with {error:?}");
+        assert_eq!(rows, 33);
+        assert_eq!(
+            replies[replies.len() - 2],
+            (b'C', b"INSERT 0 33\0".to_vec())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn returning_reply_w4_implicit_batch_settles_serial_before_late_cancel() {
+        serial_batch_settles_before_late_cancel(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn returning_reply_w5_explicit_commit_settles_serial_before_late_cancel() {
+        serial_batch_settles_before_late_cancel(true).await;
+    }
+
+    async fn serial_batch_settles_before_late_cancel(explicit: bool) {
+        let (path, admin, service, running, client, connection) = fixture().await;
+        client
+            .batch_execute("CREATE TABLE serial_tail(id serial PRIMARY KEY)")
+            .await
+            .unwrap();
+        client
+            .batch_execute("ALTER SEQUENCE serial_tail_id_seq MAXVALUE 34")
+            .await
+            .unwrap();
+        client
+            .batch_execute("INSERT INTO serial_tail DEFAULT VALUES")
+            .await
+            .unwrap();
+        let (mut wire, cancel_key) = connect_cancellable(running.address).await;
+        let reservation = giggles_core::CommitSyncHook::new();
+        let _reservation_release = ReleaseOnDrop(reservation.clone());
+        let commit = giggles_core::CommitSyncHook::new();
+        let _commit_release = ReleaseOnDrop(commit.clone());
+        let values = vec!["(DEFAULT)"; if explicit { 33 } else { 32 }].join(",");
+        let (sql, completion) = if explicit {
+            (
+                format!("BEGIN; INSERT INTO serial_tail VALUES {values}; COMMIT"),
+                b"COMMIT\0".as_slice(),
+            )
+        } else {
+            (
+                format!(
+                    "INSERT INTO serial_tail DEFAULT VALUES RETURNING id;
+                     INSERT INTO serial_tail VALUES {values}"
+                ),
+                b"INSERT 0 32\0".as_slice(),
+            )
+        };
+        admin.set_commit_sync_hook(Some(reservation.clone()));
+        query(&mut wire, &sql).await;
+        entered(&reservation).await;
+        admin.set_commit_sync_hook(Some(commit.clone()));
+        reservation.release(false);
+        entered(&commit).await;
+
+        cancel(running.address, &cancel_key).await;
+        commit.release(false);
+        let replies = until_ready(&mut wire).await;
+        let written = client
+            .query("SELECT id FROM serial_tail", &[])
+            .await
+            .unwrap()
+            .len();
+        drop(wire);
+        finish(path, admin, service, running, client, connection).await;
+        assert_eq!(written, 34);
+        assert_eq!(replies.last().unwrap().1, b"I");
+        assert_eq!(
+            replies[replies.len() - 2],
+            (b'C', completion.to_vec()),
+            "write committed with {replies:?}"
+        );
+    }
+
     async fn cancel_while_reservation_is_pending(extended: bool) {
         let (path, admin, service, running, client, connection) = fixture().await;
         client.batch_execute("CREATE TABLE cancel_serial(id serial PRIMARY KEY); \

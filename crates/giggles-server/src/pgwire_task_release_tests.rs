@@ -488,7 +488,9 @@ fn copy_out_released_before_first_byte() {
     let (service, mut session) = fixture(10_000);
     let mut state = self::state();
     let mut out = Vec::new();
-    state.copy_stdout(&options, &mut session, &mut out).unwrap();
+    state
+        .copy_stdout(&options, &mut session, &mut out, &mut false)
+        .unwrap();
     assert_eq!(out.first(), Some(&b'H'));
     let text = String::from_utf8_lossy(&out);
     assert!(text.contains("1\t***\n") && text.contains("600\t***\n"), "masked");
@@ -499,7 +501,7 @@ fn copy_out_released_before_first_byte() {
     let mut state = self::state();
     let mut out = Vec::new();
     assert_eq!(
-        state.copy_stdout(&options, &mut session, &mut out),
+        state.copy_stdout(&options, &mut session, &mut out, &mut false),
         Err("54T01")
     );
     assert!(out.is_empty(), "nothing before the release: {out:?}");
@@ -530,7 +532,9 @@ fn non_task_simple_cursor_and_copy_release_is_a_move() {
             .unwrap()
             .unwrap();
     let mut out = Vec::new();
-    state.copy_stdout(&options, &mut session, &mut out).unwrap();
+    state
+        .copy_stdout(&options, &mut session, &mut out, &mut false)
+        .unwrap();
     assert!(String::from_utf8_lossy(&out).contains("600\tfailed\n"));
     assert_eq!(debits(&service), Vec::<u64>::new());
 }

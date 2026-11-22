@@ -19,7 +19,7 @@ pub(super) struct CopyIn {
     skipped: u64,
     normalized_bytes: usize,
     input_error_message: Option<String>,
-    simple: bool,
+    pub(super) simple: bool,
     failed: bool,
     pub(super) simple_implicit: bool,
     pub(super) remaining: Vec<String>,
@@ -182,25 +182,29 @@ impl CopyIn {
     }
 }
 fn copy_notices(out: &mut Vec<u8>) -> R<()> {
+    copy_notices_with_limit(out, ReplyLimit::Checked)
+}
+
+fn copy_notices_with_limit(out: &mut Vec<u8>, limit: ReplyLimit) -> R<()> {
     for (message, detail, code) in giggles_core::relational::take_sql_notices() {
         let mut body = vec![];
         for (field, value) in [(b'S', "NOTICE"), (b'V', "NOTICE"), (b'C', code.unwrap_or("00000")), (b'M', message.as_str())] {
             body.push(field); z(value, &mut body);
         }
         if let Some(detail) = detail { body.push(b'D'); z(&detail, &mut body); }
-        body.push(0); frame(b'N', &body, out)?;
+        body.push(0); limit.frame(b'N', &body, out)?;
     }
     Ok(())
 }
 impl CopyIn {
-    fn summary(&self, out: &mut Vec<u8>) -> R<()> {
-        copy_notices(out)?;
+    fn summary(&self, out: &mut Vec<u8>, limit: ReplyLimit) -> R<()> {
+        copy_notices_with_limit(out, limit)?;
         if self.skipped > 0 && self.descriptor.options.log_verbosity != giggles_core::relational::CopyLogVerbosity::Silent {
             let message = if self.skipped == 1 { "1 row was skipped due to data type incompatibility".into() }
                 else { format!("{} rows were skipped due to data type incompatibility", self.skipped) };
             let mut body = vec![];
             for (field, value) in [(b'S', "NOTICE"), (b'V', "NOTICE"), (b'C', "00000"), (b'M', message.as_str())] { body.push(field); z(value, &mut body); }
-            body.push(0); frame(b'N', &body, out)?;
+            body.push(0); limit.frame(b'N', &body, out)?;
         }
         Ok(())
     }
@@ -378,8 +382,11 @@ impl State {
         } else {
             self.diagnostic.core(session.ingest_normalized_copy(&copy.prepared, copy.normalized.as_ref().unwrap_or(&copy.prepared), std::mem::take(&mut copy.rows), &copy.clock))?
         };
-        copy.summary(out)?;
-        complete(&format!("COPY {}", result.affected), &empty(), out)
+        let committed = !session.in_transaction();
+        self.diagnostic.committed |= committed;
+        let limit = ReplyLimit::after_commit(committed);
+        copy.summary(out, limit)?;
+        completion_frames(&format!("COPY {}", result.affected), &empty(), out, limit)
     }
     pub(super) fn copy_message(
         &mut self,
@@ -388,6 +395,7 @@ impl State {
         session: &mut Session,
         out: &mut Vec<u8>,
         received: std::time::Instant,
+        output: &Output,
     ) -> R<bool> {
         let mut copy = self.copy.take().unwrap();
         if tag == b'X' {
@@ -402,6 +410,7 @@ impl State {
             return Ok(true);
         }
         let done = matches!(tag, b'c' | b'f');
+        let mut completed = out.len();
         if !copy.failed {
             let result = (|| {
                 match tag {
@@ -431,11 +440,17 @@ impl State {
                                 &copy.clock,
                             ))?
                         };
-                        copy.summary(out)?;
+                        // Core-owned COPY commits leave no transaction. The
+                        // wire-owned simple block commits below instead.
+                        let committed = !session.in_transaction();
+                        self.diagnostic.committed |= committed;
+                        let limit = ReplyLimit::after_commit(committed);
+                        copy.summary(out, limit)?;
+                        completed = out.len();
                         let mut body = vec![];
                         z(&format!("COPY {}", result.affected), &mut body);
                         if copy.simple {
-                            frame(b'C', &body, out)?;
+                            limit.frame(b'C', &body, out)?;
                         } else {
                             frame(b'C', &body, &mut self.copy_completion)?;
                         }
@@ -496,34 +511,25 @@ impl State {
             self.portals.clear();
         }
         if !copy.failed {
-            let mut implicit = copy.simple_implicit;
-            let mut remaining = copy.remaining.into_iter();
-            while let Some(sql) = remaining.next() {
-                if let Err(code) =
-                    self.simple_statement(&sql, session, out, received, &mut implicit)
-                {
-                    session.abort();
-                    error(code, out);
-                    if implicit {
-                        session.sql.rollback();
-                        self.settings.transaction(true, false, "ROLLBACK");
-                    }
-                    break;
+            if copy.remaining.is_empty() {
+                if copy.simple_implicit {
+                    // A terminal CopyDone keeps COPY n only if the simple
+                    // block commits. The commit's control suffix is uncapped.
+                    self.finish_simple_batch(session, out, completed);
                 }
-                if let Some(next) = self.copy.as_mut() {
-                    next.remaining = remaining.collect();
-                    return Ok(true);
-                }
+            } else {
+                self.continue_simple_batch(
+                    copy.remaining.into_iter(),
+                    session,
+                    out,
+                    received,
+                    output,
+                    copy.simple_implicit,
+                )?;
             }
-            if self.copy.is_some() {
-                return Ok(true);
+            if self.copy.is_none() {
+                ready(session, out)?;
             }
-            if implicit {
-                execute_implicit_commit(session, &mut implicit, &mut self.settings, out)?;
-            }
-        }
-        if !copy.failed {
-            ready(session, out)?;
         }
         Ok(true)
     }

@@ -538,9 +538,9 @@ impl SqlSession {
             scan::with_cursor_limit(limit, || match clock {
                 Some(clock) => {
                     self.guard_clock(clock)?;
-                    self.execute_prepared_at_leased(p, params, None, clock, db)
+                    self.execute_prepared_at_leased(p, params, None, clock, db, None)
                 },
-                None => self.execute_bound_clocked_leased(p, params, None, None, db),
+                None => self.execute_bound_clocked_leased(p, params, None, None, db, None),
             })
         });
         let (result, tag) = result?.into_parts();

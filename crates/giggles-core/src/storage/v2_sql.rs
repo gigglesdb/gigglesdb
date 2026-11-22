@@ -159,49 +159,51 @@ impl SqlSession {
         let eligible = txn.local_durable_tail_eligible()
             && self.pending_sequences.lock().map_err(|_| CoreError::Fenced)?.is_empty();
         let committed = (|| {
-            if eligible
-                && !self.sequence_unsettled.lock().map_err(|_| CoreError::Fenced)?.is_empty()
-                && !relational::spill::durability_output_spilled()
-                && crate::Cancellation::durability_wait_registered()
-            {
-                // Settlement can wait for the sequence slot and its durable reservation.
-                // Finish both waits before committing and letting another statement in.
-                sql_sequences::settle(db, &self.sequence_unsettled)?;
-            }
+            // Settlement can wait for a sequence slot or durable reservation.
+            // Finish it before publishing both statements and transaction blocks.
+            sql_sequences::settle(db, &self.sequence_unsettled)?;
             if explicit {
                 sql_sequences::stage_pending(db, &mut txn, &self.pending_sequences)?;
             }
             let mut release_admission = || ticket.release();
-            commit_sql(db, txn, point, eligible.then_some(&mut release_admission))
+            commit_sql(db, txn, point, eligible.then_some(&mut release_admission))?;
+            let installed = if explicit {
+                self.install_committed_sequence_counters(db).map_err(|error| {
+                    CoreError::Storage(format!("could not install committed sequence counters: {error}"))
+                })
+            } else {
+                Ok(())
+            };
+            Ok::<_, CoreError>(installed)
         })();
-        if explicit && committed.is_ok() {
-            // Pending incarnations enter the live cache only after this
-            // transaction's durable ack. Existing live counters can also hold
-            // queued reservations, whose returns carry settlement obligations.
-            // Pending incarnations were not committed before this txn.
-            // A session finding no live entry reads the durable Seq
-            // counter, now equal to our staged counter, and may advance it.
-            // Keep any same-incarnation entry: it is at least as new.
-            for (id, counter) in self.pending_sequences
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-            {
-                let slot = {
-                    let mut live = db.sql_counters.lock_cancellable()?;
-                    live.entry(*id).or_default().clone()
-                };
-                let mut current = slot.counter.lock_cancellable()?;
-                if db.catalog().current_local_view()?.sequences.get(id)
-                    .is_some_and(|def| def.incarnation == counter.incarnation)
-                    && current.counter.as_ref().is_none_or(|current| current.incarnation != counter.incarnation) {
-                    sql_sequences::install_and_wake(&slot, &mut current, counter.clone())?;
-                }
+        if explicit { self.rollback_without_settling(); }
+        let installed = committed?;
+        // Publication reached the acknowledgement seam even if cache installation failed.
+        let acknowledged = acknowledge_sql_commit(point);
+        installed.and(acknowledged)
+    }
+
+    fn install_committed_sequence_counters(&self, db: &v2::V2Db) -> Result<(), CoreError> {
+        // Pending incarnations enter the live cache only after durable ack.
+        // A session finding no live entry may already have loaded and advanced
+        // the durable counter. Keep any such same-incarnation entry.
+        for (id, counter) in self.pending_sequences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            let slot = {
+                let mut live = db.sql_counters.lock().map_err(|_| CoreError::Fenced)?;
+                live.entry(*id).or_default().clone()
+            };
+            // Cancellation after publication cannot prevent cache maintenance.
+            let mut current = slot.counter.lock().map_err(|_| CoreError::Fenced)?;
+            if db.catalog().current_local_view()?.sequences.get(id)
+                .is_some_and(|def| def.incarnation == counter.incarnation)
+                && current.counter.as_ref().is_none_or(|current| current.incarnation != counter.incarnation) {
+                sql_sequences::install_and_wake(&slot, &mut current, counter.clone())?;
             }
         }
-        if explicit { self.rollback(); }
-        committed?;
-        acknowledge_sql_commit(point)?;
         Ok(())
     }
 
@@ -447,17 +449,25 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
+        check_reply: Option<&mut SqlReplyCheck<'_>>,
     ) -> Result<relational::SqlResult, CoreError> {
         Self::check_prepared_generation(p, Some(db))?;
-        let result = self.execute_v2_inner(db, p, params, expected_version, clock);
+        let autocommit =
+            self.v2_transaction.is_none() && self.protected.is_none() && p.control().is_none();
+        let result = self.execute_v2_inner(db, p, params, expected_version, clock, check_reply);
+        if result.is_ok() && (autocommit || p.control() == Some("commit")) {
+            // publish_v2_sql settled all obligations before submitting the commit.
+            return result;
+        }
         // Result columns also identify spilled/streamed rows absent from rows.
-        if result.as_ref().is_err() || result.as_ref().is_ok_and(|result| !result.columns.is_empty() || !result.rows.is_empty())
-            || self.v2_transaction.is_none() || p.control() == Some("commit")
-            || p.control() == Some("rollback")
+        let should_settle = result.is_err()
+            || result.as_ref().is_ok_and(|result| !result.columns.is_empty() || !result.rows.is_empty())
+            || self.v2_transaction.is_none()
+            || p.control() == Some("rollback");
+        if should_settle && let Err(error) = sql_sequences::settle(db, &self.sequence_unsettled)
         {
-            // Failure after a successful commit is a lost commit response.
-            if let Err(error) = sql_sequences::settle(db, &self.sequence_unsettled) {
-                self.abort();
+            self.abort();
+            if !result.as_ref().is_err_and(|error| crate::sqlstate(error) == "08007") {
                 return Err(error);
             }
         }
@@ -471,6 +481,7 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
+        check_reply: Option<&mut SqlReplyCheck<'_>>,
     ) -> Result<relational::SqlResult, CoreError> {
         use relational::{SqlError as E, V2Class};
         p.clear_view_diagnostics();
@@ -1248,9 +1259,15 @@ impl SqlSession {
                         txn.rollback_to(&mark).map_err(CoreError::from)?;
                     }
                     txn.release(mark).map_err(CoreError::from)?;
-                    if self.v2_transaction.is_none() && !protected && result.is_ok() {
+                    if self.v2_transaction.is_none() && !protected && let Ok(result) = &result {
+                        if writing {
+                            check_autocommit_reply(check_reply, result)?;
+                        }
                         let txn = implicit.take().expect("implicit transaction");
                         self.publish_v2_sql(db, &inner, txn, false, &mut ticket)?;
+                        if writing && result.rows.is_empty() && !result.columns.is_empty() {
+                            relational::spill::mark_committed();
+                        }
                     }
                     if explicit && result.is_ok() {
                         self.copy_freeze.last_mut().unwrap().extend(freeze_marks);
@@ -2933,7 +2950,7 @@ impl SqlSession {
         // its partial effects (earlier pages) must be dropped too.
         let before = (!run.effects.is_empty()).then(|| run.effects.clone());
         self.protected = Some(run);
-        let result = self.execute_v2(db, p, params, expected_version, clock);
+        let result = self.execute_v2(db, p, params, expected_version, clock, None);
         let mut run = self.protected.take().expect("parked protected run");
         if result.is_err() {
             run.effects = before.unwrap_or_default();

@@ -23,6 +23,24 @@ pub(crate) struct SpillProbe {
     known: BTreeSet<PathBuf>,
 }
 impl SpillProbe {
+    pub(crate) fn new(marker: String) -> Self {
+        Self {
+            marker,
+            known: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn truncate(&mut self) {
+        let files = self.spill_files();
+        assert_eq!(files.len(), 1);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&files[0])
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+    }
+
     pub(crate) fn spill_files(&mut self) -> Vec<PathBuf> {
         let prefix = format!("giggles-returning-{}-", std::process::id());
         for entry in std::fs::read_dir(std::env::temp_dir()).unwrap().flatten() {
@@ -436,4 +454,238 @@ async fn small_v2_and_legacy_replies_are_byte_identical_and_stream_once() {
         probe.cleaned().await;
         stop(f).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn returning_reply_native_http_and_grpc_deliver_written_rows() {
+    let f = Fixture::catalog_empty_engine(Engine::V2).await;
+    let token = f.open_http(&f.app, false).await;
+    let observer = f.open_http(&f.app, false).await;
+    let request = |id: i64| {
+        json!({"operation":{"request":{"returning":{
+        "request":{"insert":{"table":"app","values":[
+            {"column":"id","value":{"literal":{"intValue":id.to_string()}}},
+            {"column":"body","value":{"literal":{"textValue":"written"}}}
+        ]}},
+        "projection":[{"expression":{"field":"id"},"alias":"id"}]
+    }},"bindings":[]}})
+    };
+    let stored_ids = |reply: Value| {
+        reply["sql"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["values"][0]["intValue"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let select = json!({"sql":{"sql":"SELECT id FROM app ORDER BY id"}});
+    let reply = f.exec_http(&f.app, &token, request(1), false).await;
+    assert_eq!(reply["code"], "ok");
+    assert_eq!(
+        reply["operationOutcome"]["rows"][0]["values"][0]["intValue"],
+        "1"
+    );
+    assert_eq!(
+        stored_ids(f.exec_http(&f.app, &observer, select.clone(), false).await),
+        ["1"]
+    );
+
+    let mut client = f.grpc_client(&f.app).await;
+    let token = client
+        .open_session(proto::OpenSessionRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .session_id;
+    let request = wire_json::decode_execute(&serde_json::to_vec(&request(2)).unwrap()).unwrap();
+    let mut stream = client
+        .execute_stream(rpc(&token, request))
+        .await
+        .unwrap()
+        .into_inner();
+    let reply = stream.message().await.unwrap().unwrap();
+    assert_eq!(reply.code, "ok");
+    let Some(proto::execute_reply::NativeResult::OperationOutcome(outcome)) = reply.native_result
+    else {
+        panic!("missing operation outcome");
+    };
+    let rows = outcome.rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values[0].value,
+        Some(proto::value::Value::IntValue(2))
+    );
+    assert!(stream.message().await.unwrap().is_none());
+    assert_eq!(
+        stored_ids(f.exec_http(&f.app, &observer, select, false).await),
+        ["1", "2"]
+    );
+    stop(f).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn returning_reply_http_spill_fault_reports_unknown_outcome() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::catalog_empty_engine(Engine::V2).await;
+    let mut probe = seed(&f, 1000, 128).await;
+    let http_token = f.open_http(&f.app, true).await;
+    let observer = f.open_http(&f.app, true).await;
+    let query = "UPDATE app SET body = body || '!' RETURNING id, repeat(body, 100)";
+    let count =
+        |len| json!({"sql":{"sql":format!("SELECT count(*) FROM app WHERE length(body) = {len}")}});
+    let (mut body, task) = http_stream(&f, &http_token, json!({"sql":{"sql":query}}), true).await;
+    let mut bytes = body
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap()
+        .to_vec();
+    probe.truncate();
+    let mut failed = false;
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => bytes.extend_from_slice(&frame.into_data().unwrap()),
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed);
+    let reply = serde_json::from_slice::<Value>(&bytes).unwrap();
+    let http_code = reply["sql"]["streamError"]["code"].clone();
+    task.abort();
+    probe.cleaned().await;
+    let reply = f.exec_http(&f.app, &observer, count(129), true).await;
+    assert_eq!(
+        reply["sql"]["rows"][0]["values"][0]["intValue"], "1000",
+        "{reply}"
+    );
+
+    stop(f).await;
+    assert_eq!(http_code, "08007");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn returning_reply_grpc_spill_fault_reports_unknown_outcome() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::catalog_empty_engine(Engine::V2).await;
+    let mut probe = seed(&f, 1000, 128).await;
+    let observer = f.open_http(&f.app, true).await;
+    let query = "UPDATE app SET body = body || '!' RETURNING id, repeat(body, 100)";
+    let mut client = f.grpc_client(&f.app).await;
+    let token = client
+        .open_session(proto::OpenSessionRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .session_id;
+    let mut stream = client
+        .execute_stream(rpc(&token, sql(query)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(stream.message().await.unwrap().unwrap().code, "ok");
+    probe.truncate();
+    let error = loop {
+        match stream.message().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("truncated spill succeeded"),
+            Err(error) => break error,
+        }
+    };
+    probe.cleaned().await;
+    let reply = f
+        .exec_http(
+            &f.app,
+            &observer,
+            json!({"sql":{"sql":"SELECT count(*) FROM app WHERE length(body) = 129"}}),
+            true,
+        )
+        .await;
+    assert_eq!(
+        reply["sql"]["rows"][0]["values"][0]["intValue"], "1000",
+        "{reply}"
+    );
+    stop(f).await;
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert!(error.message().contains("08007"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn returning_reply_grpc_oversized_continuation_rolls_back() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::catalog_empty_engine(Engine::V2).await;
+    let observer = f.open_http(&f.app, true).await;
+    let mut client = f.grpc_client(&f.app).await;
+    let token = client
+        .open_session(proto::OpenSessionRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .session_id;
+    let mut stream = client
+        .execute_stream(rpc(
+            &token,
+            sql("INSERT INTO app(id,body) VALUES (1,'') RETURNING repeat('x', 9000000)"),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let head = stream.message().await.unwrap().unwrap();
+    let tail = stream.message().await;
+    let stored = f
+        .exec_http(
+            &f.app,
+            &observer,
+            json!({"sql":{"sql":"SELECT count(*) FROM app"}}),
+            true,
+        )
+        .await;
+    stop(f).await;
+    assert_eq!(
+        stored["sql"]["rows"][0]["values"][0]["intValue"], "0",
+        "head: {}; tail: {tail:?}",
+        head.code
+    );
+    assert_eq!(head.code, "54000");
+    assert!(tail.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn returning_reply_http_stream_delivers_large_row() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::catalog_empty_engine(Engine::V2).await;
+    let observer = f.open_http(&f.app, true).await;
+    let token = f.open_http(&f.app, true).await;
+    let (body, task) = http_stream(
+        &f,
+        &token,
+        json!({"sql":{"sql":
+            "INSERT INTO app(id,body) VALUES (1,'') RETURNING repeat('x', 9000000)"
+        }}),
+        true,
+    )
+    .await;
+    let bytes = body.collect().await.unwrap().to_bytes();
+    let reply = serde_json::from_slice::<Value>(&bytes).unwrap();
+    assert_eq!(reply["code"], "ok");
+    let text = reply["sql"]["rows"][0]["values"][0]["textValue"]
+        .as_str()
+        .unwrap();
+    assert_eq!(text.len(), 9000000);
+    assert!(text.as_bytes().iter().all(|&byte| byte == b'x'));
+    task.abort();
+    let stored = f
+        .exec_http(
+            &f.app,
+            &observer,
+            json!({"sql":{"sql":"SELECT count(*) FROM app"}}),
+            true,
+        )
+        .await;
+    assert_eq!(stored["sql"]["rows"][0]["values"][0]["intValue"], "1");
+    stop(f).await;
 }

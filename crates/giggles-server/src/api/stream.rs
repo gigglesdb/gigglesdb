@@ -1,10 +1,6 @@
 //! Bounded delivery of rows retained in a v2 result spill.
-use super::{
-    codec,
-    error::ApiError,
-    json::{self, JsonRow},
-    proto,
-};
+use super::{codec, error::ApiError, json::JsonRow, proto};
+use crate::transport::MAX_RESPONSE;
 use bytes::Bytes;
 use giggles_core::{
     CoreError,
@@ -52,6 +48,14 @@ fn rows(reply: &mut proto::ExecuteReply) -> Option<&mut Vec<proto::SqlRow>> {
     }
 }
 
+fn replay_error(error: CoreError, after_commit: bool) -> CoreError {
+    if after_commit {
+        CoreError::Storage(error.to_string())
+    } else {
+        error
+    }
+}
+
 fn status(error: &CoreError) -> Status {
     let code = crate::sqlstate(error);
     let message = format!("{code}: {error}");
@@ -62,36 +66,53 @@ fn status(error: &CoreError) -> Status {
     }
 }
 
-/// Successful bodies preserve the unary JSON document. On a spill read error,
-/// close the rows array, insert `streamError: {code, message}` in its object,
-/// then fail the body (no final HTTP chunk), so buffered clients also fail.
-pub(super) fn json_body(
-    mut head: proto::ExecuteReply,
-    spill: SpilledRows,
-) -> Result<tonic::body::Body, ApiError> {
-    let mut nonce = [0; 32];
-    getrandom::fill(&mut nonce).map_err(|_| ApiError::Internal)?;
-    let placeholder = proto::SqlRow {
-        values: vec![codec::encode_value(giggles_core::relational::Value::Text(
-            hex::encode(nonce),
-        ))],
-        version: 0,
-    };
-    rows(&mut head)
-        .ok_or(ApiError::Internal)?
-        .push(placeholder.clone());
-    let encoded = json::encode_reply(&head)?;
-    let marker = serde_json::to_vec(&JsonRow(&placeholder)).map_err(|_| ApiError::Internal)?;
+pub(super) fn sql_reply_error(error: ApiError) -> CoreError {
+    CoreError::SqlReplyEncoding(match error {
+        ApiError::PayloadTooLarge => "54000",
+        _ => "XX000",
+    })
+}
+
+fn json_rows_offset(encoded: &[u8]) -> Result<usize, ApiError> {
+    // The head serializes exactly one empty rows array. Quoted strings cannot
+    // contain this token unescaped.
+    let key = b"\"rows\":[";
+    let marker = b"\"rows\":[]";
     let mut matches = encoded
         .windows(marker.len())
         .enumerate()
         .filter(|(_, bytes)| *bytes == marker);
-    let at = matches.next().ok_or(ApiError::Internal)?.0;
+    let (at, _) = matches.next().ok_or(ApiError::Internal)?;
     if matches.next().is_some() {
         return Err(ApiError::Internal);
     }
-    let prefix = encoded[..at].to_vec();
-    let suffix = encoded[at + marker.len()..].to_vec();
+    Ok(at + key.len())
+}
+
+fn json_row(value: SqlRow) -> Result<Vec<u8>, ApiError> {
+    serde_json::to_vec(&JsonRow(&row(value))).map_err(|_| ApiError::Internal)
+}
+
+pub(super) fn check_json_spill(head: &[u8], spill: &mut SpilledRows) -> Result<(), CoreError> {
+    json_rows_offset(head).map_err(sql_reply_error)?;
+    // The chunked body has no per-row cap. Use its exact JSON row encoder.
+    for item in spill {
+        giggles_core::cancellation::check()?;
+        json_row(item?).map_err(sql_reply_error)?;
+    }
+    Ok(())
+}
+
+/// Insert spilled rows into the serialized empty array. On a spill read error,
+/// close the array, insert a streamError diagnostic and fail the body.
+pub(super) fn json_body(
+    mut encoded: Vec<u8>,
+    spill: SpilledRows,
+) -> Result<tonic::body::Body, ApiError> {
+    let at = json_rows_offset(&encoded)?;
+    let after_commit = spill.after_commit();
+    let suffix = encoded.split_off(at);
+    let prefix = encoded;
     let (sender, receiver) = mpsc::channel(4);
     tokio::task::spawn_blocking(move || {
         let send = |bytes: Vec<u8>| {
@@ -105,9 +126,10 @@ pub(super) fn json_body(
         let mut chunk = Vec::with_capacity(CHUNK);
         let mut first = true;
         for item in spill {
-            let value = match item {
-                Ok(value) => value,
+            let encoded = match item.and_then(|value| json_row(value).map_err(sql_reply_error)) {
+                Ok(encoded) => encoded,
                 Err(error) => {
+                    let error = replay_error(error, after_commit);
                     let diagnostic = serde_json::json!({"code":crate::sqlstate(&error),"message":error.to_string()});
                     chunk.extend_from_slice(b"],\"streamError\":");
                     chunk.extend_from_slice(
@@ -120,7 +142,6 @@ pub(super) fn json_body(
                     return;
                 }
             };
-            let encoded = serde_json::to_vec(&JsonRow(&row(value))).expect("validated SQL row");
             if chunk.len() + encoded.len() + 1 > CHUNK
                 && !chunk.is_empty()
                 && !send(std::mem::take(&mut chunk))
@@ -146,9 +167,89 @@ pub(super) fn json_body(
     Ok(tonic::body::Body::new(StreamBody::new(stream)))
 }
 
-pub(crate) fn grpc(
+struct GrpcRows {
+    reply: proto::ExecuteReply,
+    size: usize,
+    native: bool,
+}
+
+impl GrpcRows {
+    fn new(native: bool) -> Self {
+        let mut reply = proto::ExecuteReply::default();
+        if native {
+            reply.native_result = Some(proto::execute_reply::NativeResult::OperationOutcome(
+                proto::NativeOutcome::default(),
+            ));
+        } else {
+            reply.sql = Some(proto::SqlResult::default());
+        }
+        Self {
+            reply,
+            size: 0,
+            native,
+        }
+    }
+
+    fn push(&mut self, value: SqlRow) -> Option<proto::ExecuteReply> {
+        let value = row(value);
+        let len = value.encoded_len() + 8;
+        let full = (self.size > 0 && self.size + len > CHUNK - 16)
+            .then(|| std::mem::replace(self, Self::new(self.native)).reply);
+        rows(&mut self.reply)
+            .expect("continuation rows")
+            .push(value);
+        self.size += len;
+        full
+    }
+
+    fn finish(self) -> Option<proto::ExecuteReply> {
+        (self.size > 0).then_some(self.reply)
+    }
+}
+
+fn check_grpc_envelope(reply: &proto::ExecuteReply) -> Result<(), CoreError> {
+    if reply.encoded_len() > MAX_RESPONSE {
+        return Err(CoreError::SqlReplyEncoding("54000"));
+    }
+    Ok(())
+}
+
+pub(super) fn check_grpc_spill(spill: &mut SpilledRows) -> Result<(), CoreError> {
+    let mut chunk = GrpcRows::new(false);
+    for item in spill {
+        giggles_core::cancellation::check()?;
+        if let Some(reply) = chunk.push(item?) {
+            check_grpc_envelope(&reply)?;
+        }
+    }
+    if let Some(reply) = chunk.finish() {
+        check_grpc_envelope(&reply)?;
+    }
+    Ok(())
+}
+
+pub(super) fn grpc(
     head: proto::ExecuteReply,
     spill: Option<SpilledRows>,
+    report_committed: bool,
+) -> Receiver<Result<proto::ExecuteReply, Status>> {
+    protobuf_chunks(head, spill, report_committed, true)
+}
+
+pub(crate) fn spill_chunks(
+    head: proto::ExecuteReply,
+    spill: Option<SpilledRows>,
+    report_committed: bool,
+) -> Receiver<Result<proto::ExecuteReply, Status>> {
+    // Native wire splits a reply across wire frames.
+    protobuf_chunks(head, spill, report_committed, false)
+}
+
+fn protobuf_chunks(
+    head: proto::ExecuteReply,
+    spill: Option<SpilledRows>,
+    report_committed: bool,
+    grpc_cap: bool,
 ) -> Receiver<Result<proto::ExecuteReply, Status>> {
     let (sender, receiver) = mpsc::channel(4);
     tokio::task::spawn_blocking(move || {
@@ -159,43 +260,37 @@ pub(crate) fn grpc(
         let Some(spill) = spill else {
             return;
         };
-        let empty = || {
-            let mut reply = proto::ExecuteReply::default();
-            if native {
-                reply.native_result = Some(proto::execute_reply::NativeResult::OperationOutcome(
-                    proto::NativeOutcome::default(),
-                ));
-            } else {
-                reply.sql = Some(proto::SqlResult::default());
+        let after_commit = report_committed && spill.after_commit();
+        let send = |reply| {
+            if grpc_cap && after_commit && let Err(error) = check_grpc_envelope(&reply) {
+                let _ = sender.blocking_send(Err(status(&replay_error(error, true))));
+                return false;
             }
-            reply
+            sender.blocking_send(Ok(reply)).is_ok()
         };
-        let mut reply = empty();
-        let mut size = 0;
+        let mut chunk = GrpcRows::new(native);
         for item in spill {
-            let value = match item {
-                Ok(value) => row(value),
-                Err(error) => {
-                    if size > 0 && sender.blocking_send(Ok(reply)).is_err() {
+            match item {
+                Ok(value) => {
+                    if let Some(reply) = chunk.push(value)
+                        && !send(reply)
+                    {
                         return;
                     }
-                    let _ = sender.blocking_send(Err(status(&error)));
+                }
+                Err(error) => {
+                    if let Some(reply) = chunk.finish()
+                        && !send(reply)
+                    {
+                        return;
+                    }
+                    let _ = sender.blocking_send(Err(status(&replay_error(error, after_commit))));
                     return;
                 }
-            };
-            let len = value.encoded_len() + 8;
-            if size > 0 && size + len > CHUNK - 16 {
-                if sender.blocking_send(Ok(reply)).is_err() {
-                    return;
-                }
-                reply = empty();
-                size = 0;
             }
-            rows(&mut reply).expect("continuation rows").push(value);
-            size += len;
         }
-        if size > 0 {
-            let _ = sender.blocking_send(Ok(reply));
+        if let Some(reply) = chunk.finish() {
+            send(reply);
         }
     });
     Receiver(receiver)

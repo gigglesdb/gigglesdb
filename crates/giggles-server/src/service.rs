@@ -3312,9 +3312,12 @@ impl Session {
         &mut self,
         sql: &str,
         params: &[Value],
+        check_reply: Option<&mut giggles_core::SqlReplyCheck<'_>>,
     ) -> Result<Unreleased<SqlResult>, CoreError> {
         if self.sql.task().is_none() {
-            return self.execute_sql_unreleased(sql, params);
+            return self.authority_scope(|session| {
+                session.execute_sql_authorized(sql, params, false, check_reply)
+            });
         }
         self.authority_scope(|session| {
             let refused = |session: &Session, class, error: CoreError| {
@@ -3346,7 +3349,7 @@ impl Session {
                 return refused(session, p.task_class(), error);
             }
             session.sql.set_task_statement_text(sql);
-            session.run_prepared(&p, params, false)
+            session.run_prepared(&p, params, false, None)
         })
     }
     /// Validity only (revoked, expired, definition changed), for re-serving
@@ -3458,14 +3461,14 @@ impl Session {
         p: &Prepared,
         params: &[Value],
     ) -> Result<SqlResult, CoreError> {
-        self.run_prepared(p, params, true)?.untasked()
+        self.run_prepared(p, params, true, None)?.untasked()
     }
     /// The plan facts of an `EXPLAIN` read the server prepared itself: the
     /// first value of the unreleased result, taken with `untasked`. A task
     /// session is refused before the statement runs, as by the plain exit,
     /// and no core row leaves this function (GD-0061 R3-314).
     pub(crate) fn explain_facts(&mut self, p: &Prepared) -> Result<Option<Value>, CoreError> {
-        let result = self.run_prepared(p, &[], true)?.untasked()?;
+        let result = self.run_prepared(p, &[], true, None)?.untasked()?;
         Ok(result.rows.into_iter().next().and_then(|row| row.values.into_iter().next()))
     }
     /// Inspect a mutation's access path under the mutation's own privileges.
@@ -3489,7 +3492,14 @@ impl Session {
         p: &Prepared,
         params: &[Value],
     ) -> Result<Unreleased<SqlResult>, CoreError> {
-        self.run_prepared(p, params, false)
+        self.run_prepared(p, params, false, None)
+    }
+    pub(crate) fn execute_prepared_checked_unreleased(
+        &mut self,
+        p: &Prepared,
+        check_reply: &mut giggles_core::SqlReplyCheck<'_>,
+    ) -> Result<Unreleased<SqlResult>, CoreError> {
+        self.run_prepared(p, &[], false, Some(check_reply))
     }
     /// The body of both prepared exits. `plain` refuses a task session where
     /// the statement would reach core, after the same checks as before.
@@ -3498,6 +3508,7 @@ impl Session {
         p: &Prepared,
         params: &[Value],
         plain: bool,
+        check_reply: Option<&mut giggles_core::SqlReplyCheck<'_>>,
     ) -> Result<Unreleased<SqlResult>, CoreError> {
         self.authority_scope(|session| {
             let bound = session.sql.bind_relation_context(p)?;
@@ -3538,10 +3549,13 @@ impl Session {
                     if plain && session.sql.task().is_some() {
                         return Err(task_session_refusal());
                     }
+                    let execute = |sql: &mut giggles_core::SqlSession| {
+                        sql.execute_prepared_at_checked_unreleased(p, params, None, &clock, check_reply)
+                    };
                     let result = if p.has_privilege_inquiry() {
                         let callback = crate::pg_catalog_wire::privilege_callback(session);
-                        session.sql.with_privilege_callback(callback, |sql| sql.execute_prepared_at_unreleased(p, params, None, &clock))
-                    } else { session.sql.execute_prepared_at_unreleased(p, params, None, &clock) };
+                        session.sql.with_privilege_callback(callback, execute)
+                    } else { execute(&mut session.sql) };
                     if !session.sql.in_transaction() { session.transaction_us = None; }
                     else if clock.unavailable.is_none() { session.transaction_us = Some(transaction_us); }
                     result.map(|result| (result, true))
@@ -3619,7 +3633,7 @@ impl Session {
     /// `execute_sql_unreleased` and `release_page`, or `run_control`. It
     /// stays public for the integration tests.
     pub fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<SqlResult, CoreError> {
-        self.authority_scope(|session| session.execute_sql_authorized(sql, params, true))?
+        self.authority_scope(|session| session.execute_sql_authorized(sql, params, true, None))?
             .untasked()
     }
     /// Open a pgwire implicit block, retaining the ordinary authorization scope.
@@ -3674,7 +3688,7 @@ impl Session {
     pub(crate) fn run_control(&mut self, sql: &str) -> Result<(), CoreError> {
         #[cfg(test)]
         { self.control_calls += 1; }
-        self.authority_scope(|session| session.execute_sql_authorized(sql, &[], true))?
+        self.authority_scope(|session| session.execute_sql_authorized(sql, &[], true, None))?
             .untasked()
             .map(drop)
     }
@@ -3684,13 +3698,14 @@ impl Session {
         sql: &str,
         params: &[Value],
     ) -> Result<Unreleased<SqlResult>, CoreError> {
-        self.authority_scope(|session| session.execute_sql_authorized(sql, params, false))
+        self.authority_scope(|session| session.execute_sql_authorized(sql, params, false, None))
     }
     fn execute_sql_authorized(
         &mut self,
         sql: &str,
         params: &[Value],
         plain: bool,
+        check_reply: Option<&mut giggles_core::SqlReplyCheck<'_>>,
     ) -> Result<Unreleased<SqlResult>, CoreError> {
         // Core's aborted-state ROLLBACK escape must remain reachable.
         if self.sql.is_aborted()
@@ -3710,7 +3725,7 @@ impl Session {
             return result;
         }
         let p = self.prepare(sql)?;
-        let result = self.run_prepared(&p, params, plain);
+        let result = self.run_prepared(&p, params, plain, check_reply);
         self.api_path.sql_committed = result.is_ok() && p.command() == "COMMIT";
         result
     }
@@ -3745,16 +3760,31 @@ impl Session {
         self.handle_received(request, received)
     }
     pub fn handle_received(&mut self, request: Request, received: std::time::Instant) -> Response {
-        self.authority_scope(|session| Ok(session.handle_authorized(request, received)))
-            .unwrap_or_else(|error| Response::error(&error))
+        self.handle_with_reply_check(request, received, None)
     }
-    fn handle_authorized(&mut self, request: Request, received: std::time::Instant) -> Response {
+    pub(crate) fn handle_with_reply_check(
+        &mut self,
+        request: Request,
+        received: std::time::Instant,
+        check_reply: Option<&mut giggles_core::SqlReplyCheck<'_>>,
+    ) -> Response {
+        self.authority_scope(|session| {
+            Ok(session.handle_authorized(request, received, check_reply))
+        })
+        .unwrap_or_else(|error| Response::error(&error))
+    }
+    fn handle_authorized(
+        &mut self,
+        request: Request,
+        received: std::time::Instant,
+        check_reply: Option<&mut giggles_core::SqlReplyCheck<'_>>,
+    ) -> Response {
         if self.service.check_statement_gate().is_err() {
             return Response::code("57P01");
         }
         let context = Cancellation::current().unwrap_or_default();
         context.scope(|| {
-            let response = self.handle_scoped(request, received, &context);
+            let response = self.handle_scoped(request, received, &context, check_reply);
             #[cfg(feature = "legacy-task")]
             {
                 if !matches!(self.role, Role::Task { .. }) {
@@ -3792,6 +3822,7 @@ impl Session {
         request: Request,
         received: std::time::Instant,
         context: &Cancellation,
+        check_reply: Option<&mut giggles_core::SqlReplyCheck<'_>>,
     ) -> Response {
         if matches!(&self.role, Role::NoSql { .. }) {
             return Response::code(if matches!(request, Request::Ping) { "ok" } else { "42501" });
@@ -3881,7 +3912,7 @@ impl Session {
                 // GD-0061 R3-313: the result is released before the Response
                 // that both transports encode is built.
                 Request::Sql { sql, params } => {
-                    let result = self.execute_api_sql(&sql, &params)?;
+                    let result = self.execute_api_sql(&sql, &params, check_reply)?;
                     Ok(Response::released_sql(self.release_page(result)?))
                 }
                 #[cfg(feature = "legacy-task")]

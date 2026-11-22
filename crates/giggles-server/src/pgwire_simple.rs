@@ -1,8 +1,224 @@
 //! Simple Query dispatch. Agent requests retain the original whole-query path.
 use super::*;
+use giggles_core::relational::spill::SpilledRows;
+
+struct SimpleRows<'a> {
+    settings: &'a crate::pg_settings::Settings,
+    zone: SessionZone,
+    description: &'a Description,
+}
+
+impl SimpleRows<'_> {
+    fn encode(&self, result: &Released<impl Borrow<SqlResult>>, out: &mut Vec<u8>) -> R<()> {
+        data_row_frames(
+            self.settings,
+            self.zone,
+            result,
+            self.description,
+            &[],
+            0..result.get().borrow().rows.len(),
+            out,
+        )
+    }
+
+    fn spilled(
+        &self,
+        spilled: &mut SpilledRows,
+        out: &mut Vec<u8>,
+        mut finish_chunk: impl FnMut(&mut Vec<u8>) -> Result<(), CoreError>,
+    ) -> Result<(), CoreError> {
+        row_description(self.description, &[], out).map_err(CoreError::SqlReplyEncoding)?;
+        while !spilled.is_empty() {
+            let rows = spilled.by_ref().take(CURSOR_ROWS).collect::<Result<Vec<_>, _>>()?;
+            // Only plain sessions hand the caller a spill without a release tag.
+            let chunk = Released::synthetic(SqlResult { rows, ..SqlResult::default() });
+            self.encode(&chunk, out).map_err(CoreError::SqlReplyEncoding)?;
+            finish_chunk(out)?;
+        }
+        Ok(())
+    }
+}
+
+struct CopyRows<'a> {
+    options: &'a crate::auth::statements::CopyOutput,
+    description: &'a Description,
+    settings: &'a crate::pg_settings::Settings,
+    zone: SessionZone,
+}
+
+impl CopyRows<'_> {
+    fn encode(
+        &self,
+        rows: impl Iterator<Item = Result<impl Borrow<giggles_core::relational::SqlRow>, CoreError>>,
+        sink: &mut Option<copy_external::Sink>,
+        diagnostic: &mut Diagnostic,
+        out: &mut Vec<u8>,
+        mut flush: impl FnMut(&mut Vec<u8>) -> R<()>,
+    ) -> R<()> {
+        let Self {
+            options,
+            description,
+            settings,
+            zone,
+        } = *self;
+        let converter = if options.format == 2 {
+            None
+        } else {
+            options.encoding.and_then(|e| e.converter())
+        };
+        let mut count = 0usize;
+        let mut header = vec![u8::from(options.format == 2)];
+        header.extend(
+            u16::try_from(description.columns.len())
+                .map_err(|_| "54000")?
+                .to_be_bytes(),
+        );
+        for _ in &description.columns {
+            header.extend(i16::from(options.format == 2).to_be_bytes());
+        }
+        if sink.is_none() { frame(b'H', &header, out)?; }
+        if options.format == 2 {
+            copy_output_data(sink, diagnostic, b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0", out)?;
+        }
+        if options.header {
+            let mut data = Vec::new();
+            for (i, column) in description.columns.iter().enumerate() {
+                if i > 0 {
+                    data.push(options.delimiter);
+                }
+                if options.format == 1 {
+                    copy_csv_field(column.name.as_bytes(), options, false, &mut data);
+                } else {
+                    for b in column.name.as_bytes() {
+                        match *b { b'\\' => data.extend(b"\\\\"), b'\t' => data.extend(b"\\t"), b'\n' => data.extend(b"\\n"), b'\r' => data.extend(b"\\r"), b if b == options.delimiter => { data.push(b'\\'); data.push(b); }, b => data.push(b) }
+                    }
+                }
+            }
+            data.push(b'\n');
+            if let Some(encoding) = converter {
+                data = encoding.encode(&data).map_err(|message| {
+                    diagnostic.wire_message = Some(message);
+                    "22P05"
+                })?;
+            }
+            copy_output_data(sink, diagnostic, &data, out)?;
+        }
+        for row in rows {
+            let row = core(row)?;
+            count += 1;
+            if sink.is_none() && count.is_multiple_of(CURSOR_ROWS) {
+                flush(out)?;
+            }
+            let mut data = Vec::new();
+            if options.format == 2 {
+                data.extend((description.columns.len() as i16).to_be_bytes());
+            }
+            for (i, (value, column)) in row
+                .borrow()
+                .values
+                .iter()
+                .zip(&description.columns)
+                .enumerate()
+            {
+                if i > 0 && options.format != 2 {
+                    data.push(options.delimiter);
+                }
+                match encode(
+                    value,
+                    &column.data_type,
+                    u16::from(options.format == 2),
+                    settings,
+                    zone,
+                )? {
+                    None if options.format == 2 => data.extend((-1i32).to_be_bytes()),
+                    Some(value) if options.format == 2 => {
+                        data.extend(
+                            i32::try_from(value.len())
+                                .map_err(|_| "54000")?
+                                .to_be_bytes(),
+                        );
+                        data.extend(value);
+                    }
+                    None => data.extend(&options.null),
+                    Some(value) if options.format == 1 => {
+                        copy_csv_field(&value, options, options.force_all || options.force_columns.contains(&column.name), &mut data)
+                    }
+                    Some(value) => {
+                        let escaped = value
+                            .iter()
+                            .filter(|b| **b == options.delimiter || matches!(b, b'\\' | b'\t' | b'\n' | b'\r' | 8 | 12 | 11))
+                            .count();
+                        let size = data
+                            .len()
+                            .checked_add(value.len())
+                            .and_then(|n| n.checked_add(escaped))
+                            .and_then(|n| n.checked_add(1))
+                            .ok_or("54000")?;
+                        if size > MAX_RESPONSE.saturating_sub(out.len()).saturating_sub(5) {
+                            return Err("54000");
+                        }
+                        data.try_reserve_exact(size - data.len())
+                            .map_err(|_| "54000")?;
+                        for b in value {
+                            match b {
+                                b'\\' => data.extend(b"\\\\"),
+                                b'\t' => data.extend(b"\\t"),
+                                b'\n' => data.extend(b"\\n"),
+                                b'\r' => data.extend(b"\\r"),
+                                8 => data.extend(b"\\b"),
+                                12 => data.extend(b"\\f"),
+                                11 => data.extend(b"\\v"),
+                                b if b == options.delimiter => {
+                                    data.push(b'\\');
+                                    data.push(b);
+                                }
+                                _ => data.push(b),
+                            }
+                        }
+                    }
+                }
+            }
+            if options.format != 2 {
+                data.push(b'\n');
+            }
+            if let Some(encoding) = converter {
+                data = encoding.encode(&data).map_err(|message| {
+                    diagnostic.wire_message = Some(message);
+                    "22P05"
+                })?;
+            }
+            copy_output_data(sink, diagnostic, &data, out)?;
+        }
+        if options.format == 2 {
+            copy_output_data(sink, diagnostic, &(-1i16).to_be_bytes(), out)?;
+        }
+        if let Some(sink) = sink.take() {
+            sink.finish(diagnostic)?;
+        } else {
+            frame(b'c', &[], out)?;
+        }
+        complete(&format!("COPY {count}"), &empty(), out)
+    }
+}
+
+fn copy_output_data(
+    sink: &mut Option<copy_external::Sink>,
+    diagnostic: &mut Diagnostic,
+    data: &[u8],
+    out: &mut Vec<u8>,
+) -> R<()> {
+    if let Some(sink) = sink {
+        sink.data(data, diagnostic)
+    } else {
+        frame(b'd', data, out)
+    }
+}
 
 impl State {
-    pub(super) fn copy_output_options(&mut self, sql: &str) -> R<Option<crate::auth::statements::CopyOutput>> {
+    pub(super) fn copy_output_options(
+        &mut self,
+        sql: &str,
+    ) -> R<Option<crate::auth::statements::CopyOutput>> {
         let result = crate::auth::statements::copy_stdout_select(sql);
         if result.is_err() {
             self.diagnostic.wire_message = giggles_core::relational::take_sql_error_message();
@@ -32,7 +248,8 @@ impl State {
         if statements.len() == 1 {
             let was_in_transaction = session.in_transaction();
             let completed = out.len();
-            let result = self.simple_statement(&statements[0], session, out, received, &mut implicit);
+            let result =
+                self.simple_statement(&statements[0], session, out, received, &mut implicit);
             if let Err(code) = result {
                 if implicit {
                     self.simple_failure(code, true, completed, session, out);
@@ -44,16 +261,15 @@ impl State {
                 let _durability = if was_in_transaction {
                     None
                 } else {
-                    giggles_core::Cancellation::current().and_then(|context| self.durability_registration(&context, session))
+                    giggles_core::Cancellation::current()
+                        .and_then(|context| self.durability_registration(&context, session))
                 };
-                if let Err(code) = execute_implicit_commit(session, &mut implicit, &mut self.settings, out) {
-                    self.simple_failure(code, true, completed, session, out);
-                }
+                self.finish_simple_batch(session, out, completed);
             }
             return Ok(());
         }
         let output = self.output.take();
-        let result = self.simple_batch(statements, session, out, received);
+        let result = self.simple_batch(statements, session, out, received, &output);
         self.output = output;
         result
     }
@@ -64,8 +280,8 @@ impl State {
         session: &mut Session,
         out: &mut Vec<u8>,
         received: std::time::Instant,
+        output: &Output,
     ) -> R<()> {
-        let mut implicit = false;
         // Role/ACL and DROP TABLE operations publish outside the SQL snapshot.
         // Like CREATE DATABASE in PostgreSQL, these must be the sole statement
         // in a Query message, even if the message contains explicit COMMITs.
@@ -78,26 +294,45 @@ impl State {
         }) {
             return Err("25001");
         }
-        let mut statements = statements.into_iter();
+        self.continue_simple_batch(
+            statements.into_iter(),
+            session,
+            out,
+            received,
+            output,
+            false,
+        )
+    }
+
+    pub(super) fn continue_simple_batch(
+        &mut self,
+        mut statements: impl Iterator<Item = String>,
+        session: &mut Session,
+        out: &mut Vec<u8>,
+        received: std::time::Instant,
+        output: &Output,
+        mut implicit: bool,
+    ) -> R<()> {
+        use crate::pg_transaction::Command;
+
+        let mut published_commit = false;
         while let Some(sql) = statements.next() {
+            // A publishing COMMIT ends the previous checked reply budget.
+            // Send its reply before framing the next statement on this socket.
+            if published_commit || out.len() > MAX_RESPONSE {
+                flush_output(output, out).map_err(|code| self.diagnostic.reply_error(code))?;
+            }
             let completed = out.len();
             let result = (|| {
-                if parse_control(&sql, session, &mut self.diagnostic)?.is_none_or(|command| {
-                    matches!(
-                        command,
-                        crate::pg_transaction::Command::Set(_)
-                            | crate::pg_transaction::Command::Session(_)
-                    )
-                }) {
+                let command = parse_control(&sql, session, &mut self.diagnostic)?;
+                published_commit = matches!(command, Some(Command::Commit))
+                    && session.in_transaction()
+                    && !session.is_aborted();
+                if command.is_none_or(|command| matches!(command, Command::Set(_) | Command::Session(_)))
+                {
                     begin_implicit(session, &mut implicit, &mut self.settings)?;
                 }
-                self.simple_statement(&sql, session, out, received, &mut implicit)?;
-                // Reserve space for an error and ReadyForQuery before publishing
-                // the implicit transaction, even near the aggregate wire cap.
-                if out.len() > MAX_RESPONSE - 1024 {
-                    return Err("54000");
-                }
-                Ok(())
+                self.simple_statement(&sql, session, out, received, &mut implicit)
             })();
             if let Err(code) = result {
                 self.simple_failure(code, implicit, completed, session, out);
@@ -115,13 +350,30 @@ impl State {
         }
         if implicit {
             let completed = out.len();
-            if let Err(code) =
-                execute_implicit_commit(session, &mut implicit, &mut self.settings, out)
-            {
-                self.simple_failure(code, true, completed, session, out);
-            }
+            self.finish_simple_batch(session, out, completed);
         }
         Ok(())
+    }
+
+    pub(super) fn finish_simple_batch(
+        &mut self,
+        session: &mut Session,
+        out: &mut Vec<u8>,
+        completed: usize,
+    ) {
+        // All rows are already checked, including when CopyDone resumes the
+        // batch. execute_implicit_commit appends its control suffix on success.
+        let mut implicit = true;
+        match execute_implicit_commit(
+            session,
+            &mut implicit,
+            &mut self.settings,
+            &mut self.diagnostic,
+            out,
+        ) {
+            Ok(actual) => self.diagnostic.committed |= actual == "COMMIT",
+            Err(code) => self.simple_failure(code, true, completed, session, out),
+        }
     }
 
     pub(super) fn copy_stdout(
@@ -129,163 +381,124 @@ impl State {
         options: &crate::auth::statements::CopyOutput,
         session: &mut Session,
         out: &mut Vec<u8>,
+        implicit: &mut bool,
     ) -> R<()> {
         self.retain_durability_permits = true;
         self.copy_destination_privilege(session, &options.destination)?;
         let prepared = self.prepare_copy_output(options, session)?;
         let description = core(session.describe(&prepared))?;
+        let writes = prepared.write_tables();
+        let writing = !writes.is_empty();
+        if writing {
+            let command = prepared
+                .row_lock_command()
+                .filter(|_| !prepared.row_lock_tables().is_empty())
+                .unwrap_or_else(|| {
+                    writes
+                        .first()
+                        .map_or(prepared.command(), |(_, command)| *command)
+                });
+            read_only_check(command, &self.settings, session, &mut self.diagnostic)?;
+        }
         for name in &options.force_columns {
             if !description.columns.iter().any(|c| c.name == *name) {
-                self.diagnostic.wire_message = Some(format!("column \"{name}\" of relation \"{}\" does not exist", options.table_name.as_deref().unwrap_or("*SELECT*")));
+                self.diagnostic.wire_message = Some(format!(
+                    "column \"{name}\" of relation \"{}\" does not exist",
+                    options.table_name.as_deref().unwrap_or("*SELECT*")
+                ));
                 return Err("42703");
             }
         }
-        if options.format != 2 && let Some(message) = options.encoding.and_then(|e| e.missing_conversion(false)) {
+        if options.format != 2
+            && let Some(message) = options.encoding.and_then(|e| e.missing_conversion(false))
+        {
             self.diagnostic.wire_message = Some(message);
             return Err("42883");
         }
-        let converter = if options.format == 2 { None } else { options.encoding.and_then(|e| e.converter()) };
-        let mut sink = copy_external::Sink::open(&options.destination, session, &mut self.diagnostic)?;
+        let mut sink =
+            copy_external::Sink::open(&options.destination, session, &mut self.diagnostic)?;
+        if writing {
+            // An external destination must finish writing before this block commits.
+            if sink.is_some() || self.settings.replication_role_replica() {
+                begin_implicit(session, implicit, &mut self.settings)?;
+            }
+            self.diagnostic
+                .core(session.sync_replication_role(&self.settings))?;
+        }
         self.settings.queried = session.in_transaction();
-        // PostgreSQL streams COPY TO STDOUT: a spilled v2 result is read from its
-        // temp file in chunks and flushed as it goes, never materialised.
-        let (result, spilled) = giggles_core::relational::spill::streaming(
-            || session.execute_prepared_unreleased(&prepared, &[]));
-        // GD-0061 R3-311: the whole result is one page, released (masked,
-        // checked and charged) before the CopyOut header is written. A task
-        // session's spill never reaches this handle: core materialises it
-        // behind the release tag. Outside a task session this is a move.
-        let result = core(result)?;
-        let result = core(session.release_page(result))?.into_inner();
-        let rows: Box<dyn Iterator<Item = Result<giggles_core::relational::SqlRow, giggles_core::CoreError>>> =
-            match spilled {
-                Some(spilled) => Box::new(spilled),
-                None => Box::new(result.rows.into_iter().map(Ok)),
-            };
-        let mut count = 0usize;
-        let mut header = vec![u8::from(options.format == 2)];
-        header.extend(
-            u16::try_from(description.columns.len())
-                .map_err(|_| "54000")?
-                .to_be_bytes(),
-        );
-        for _ in &description.columns {
-            header.extend(i16::from(options.format == 2).to_be_bytes());
-        }
-        if sink.is_none() { frame(b'H', &header, out)?; }
-        if options.format == 2 {
-            self.copy_output_data(&mut sink, b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0", out)?;
-        }
-        if options.header {
-            let mut data = Vec::new();
-            for (i, column) in description.columns.iter().enumerate() {
-                if i > 0 {
-                    data.push(options.delimiter);
-                }
-                if options.format == 1 {
-                    copy_csv_field(column.name.as_bytes(), options, false, &mut data);
-                } else {
-                    for b in column.name.as_bytes() {
-                        match *b { b'\\' => data.extend(b"\\\\"), b'\t' => data.extend(b"\\t"), b'\n' => data.extend(b"\\n"), b'\r' => data.extend(b"\\r"), b if b == options.delimiter => { data.push(b'\\'); data.push(b); }, b => data.push(b) }
-                    }
-                }
+        let encoder = CopyRows {
+            options,
+            description: &description,
+            settings: &self.settings.current,
+            zone: session.zone().unwrap_or(SessionZone::Fixed(0)),
+        };
+        let can_flush = self.output.is_some();
+        let completed = out.len();
+        let mut checked = false;
+        let mut checked_spill = false;
+        let (result, spilled) = giggles_core::relational::spill::streaming(|| {
+            if sink.is_some() || session.in_transaction() || !writing {
+                return session.execute_prepared_unreleased(&prepared, &[]);
             }
-            data.push(b'\n');
-            if let Some(encoding) = converter {
-                data = encoding.encode(&data).map_err(|message| { self.diagnostic.wire_message = Some(message); "22P05" })?;
-            }
-            self.copy_output_data(&mut sink, &data, out)?;
-        }
-        for row in rows {
-            let row = core(row)?;
-            count += 1;
-            if sink.is_none() && count.is_multiple_of(CURSOR_ROWS) {
-                flush_output(&self.output, out)?;
-            }
-            let mut data = Vec::new();
-            if options.format == 2 {
-                data.extend((description.columns.len() as i16).to_be_bytes());
-            }
-            for (i, (value, column)) in row.values.iter().zip(&description.columns).enumerate() {
-                if i > 0 && options.format != 2 {
-                    data.push(options.delimiter);
-                }
-                match encode(
-                    value,
-                    &column.data_type,
-                    u16::from(options.format == 2),
-                    &self.settings.current,
-                    session.zone().unwrap_or(SessionZone::Fixed(0)),
-                )? {
-                    None if options.format == 2 => data.extend((-1i32).to_be_bytes()),
-                    Some(value) if options.format == 2 => {
-                        data.extend(
-                            i32::try_from(value.len())
-                                .map_err(|_| "54000")?
-                                .to_be_bytes(),
-                        );
-                        data.extend(value);
-                    }
-                    None => data.extend(&options.null),
-                    Some(value) if options.format == 1 => {
-                        copy_csv_field(&value, options, options.force_all || options.force_columns.contains(&column.name), &mut data)
-                    }
-                    Some(value) => {
-                        let escaped = value
-                            .iter()
-                            .filter(|b| **b == options.delimiter || matches!(b, b'\\' | b'\t' | b'\n' | b'\r' | 8 | 12 | 11))
-                            .count();
-                        let size = data
-                            .len()
-                            .checked_add(value.len())
-                            .and_then(|n| n.checked_add(escaped))
-                            .and_then(|n| n.checked_add(1))
-                            .ok_or("54000")?;
-                        if size > MAX_RESPONSE.saturating_sub(out.len()).saturating_sub(32) {
-                            return Err("54000");
-                        }
-                        data.try_reserve_exact(size - data.len())
-                            .map_err(|_| "54000")?;
-                        for b in value {
-                            match b {
-                                b'\\' => data.extend(b"\\\\"),
-                                b'\t' => data.extend(b"\\t"),
-                                b'\n' => data.extend(b"\\n"),
-                                b'\r' => data.extend(b"\\r"),
-                                8 => data.extend(b"\\b"),
-                                12 => data.extend(b"\\f"),
-                                11 => data.extend(b"\\v"),
-                                b if b == options.delimiter => {
-                                    data.push(b'\\');
-                                    data.push(b);
-                                }
-                                _ => data.push(b),
+            let mut check = |result: Released<&SqlResult>, spill: Option<&mut SpilledRows>| {
+                checked = true;
+                let diagnostic = &mut self.diagnostic;
+                if let Some(spill) = spill {
+                    checked_spill = true;
+                    let mut scratch = out.clone();
+                    encoder
+                        .encode(spill, &mut None, diagnostic, &mut scratch, |buf| {
+                            if can_flush {
+                                buf.clear();
                             }
-                        }
-                    }
+                            core(giggles_core::cancellation::check())
+                        })
+                        .map_err(CoreError::SqlReplyEncoding)
+                } else {
+                    // The COPY reply stays private until publication succeeds.
+                    encoder
+                        .encode(
+                            result.get().rows.iter().map(Ok),
+                            &mut None,
+                            diagnostic,
+                            out,
+                            |_| Ok(()),
+                        )
+                        .map_err(CoreError::SqlReplyEncoding)
                 }
-            }
-            if options.format != 2 {
-                data.push(b'\n');
-            }
-            if let Some(encoding) = converter {
-                data = encoding.encode(&data).map_err(|message| { self.diagnostic.wire_message = Some(message); "22P05" })?;
-            }
-            self.copy_output_data(&mut sink, &data, out)?;
+            };
+            session.execute_prepared_checked_unreleased(&prepared, &mut check)
+        });
+        if checked && result.is_err() {
+            out.truncate(completed);
         }
-        if options.format == 2 {
-            self.copy_output_data(&mut sink, &(-1i16).to_be_bytes(), out)?;
+        let result = self.diagnostic.core(result)?;
+        self.diagnostic.committed |= checked;
+        // GD-0061 R3-311: release the whole page before emitting the COPY header.
+        let result = core(session.release_page(result))
+            .map_err(|code| self.diagnostic.reply_error(code))?;
+        debug_assert!(
+            !checked_spill || spilled.is_some(),
+            "checked COPY spill disappeared"
+        );
+        if checked_spill && spilled.is_none() {
+            return Err("08007");
         }
-        if let Some(sink) = sink { sink.finish(&mut self.diagnostic)?; } else { frame(b'c', &[], out)?; }
-        complete(
-            &format!("COPY {count}"),
-            &empty(),
-            out,
-        )
-    }
-
-    fn copy_output_data(&mut self, sink: &mut Option<copy_external::Sink>, data: &[u8], out: &mut Vec<u8>) -> R<()> {
-        if let Some(sink) = sink { sink.data(data, &mut self.diagnostic) } else { frame(b'd', data, out) }
+        let mut flush = |out: &mut Vec<u8>| flush_output(&self.output, out);
+        if let Some(spilled) = spilled {
+            let after_commit = spilled.after_commit();
+            let sent = encoder.encode(spilled, &mut sink, &mut self.diagnostic, out, &mut flush);
+            sent.map_err(|code| if after_commit { "08007" } else { code })?;
+        } else if !checked {
+            encoder.encode(
+                result.get().rows.iter().map(Ok),
+                &mut sink,
+                &mut self.diagnostic,
+                out,
+                &mut flush,
+            )?;
+        }
+        Ok(())
     }
 
     fn simple_failure(
@@ -296,7 +509,11 @@ impl State {
         session: &mut Session,
         out: &mut Vec<u8>,
     ) {
-        let before = self.settings.current.clone();
+        let before = self
+            .diagnostic
+            .pre_rollback_settings
+            .take()
+            .map_or_else(|| self.settings.current.clone(), |before| *before);
         session.abort();
         if implicit {
             session.sql.rollback();
@@ -307,7 +524,9 @@ impl State {
         // Keep successful statements' responses; discard only a partially
         // encoded failing statement. The caller emits exactly one ReadyForQuery.
         out.truncate(completed);
-        let _ = settings_status(&before, &self.settings, session, out);
+        let _ = settings_status_with_limit(
+            &before, &self.settings, session, out, ReplyLimit::Control,
+        );
         let mut error = Vec::new();
         let message = self.diagnostic.message.unwrap_or(match code {
             "0A000" => "unsupported SQL feature or parameter type in this server profile",
@@ -356,14 +575,24 @@ impl State {
             session.service.advisory.release(session.backend_pid, true);
         }
         session.set_time_zone(&self.settings.current.timezone);
-        if !self.durability_permits_released() {
-            session.sync_role_settings(&mut self.settings.current)?;
+        if !self.durability_permits_released()
+            && let Err(code) = session.sync_role_settings(&mut self.settings.current)
+            && result.is_ok()
+        {
+            return Err(self.diagnostic.reply_error(code));
         }
         session.set_search_path(&self.settings.current.search_path);
         session.set_text_settings(&self.settings.current);
         session.set_max_value_bytes(self.settings.current.max_value_bytes);
         session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
-        if result.is_ok() { role_notices(session, &self.settings.current, out)?; }
+        if result.is_ok() {
+            role_notices(
+                session,
+                &self.settings.current,
+                out,
+                ReplyLimit::after_commit(self.diagnostic.committed),
+            )?;
+        }
         result
     }
 
@@ -467,12 +696,18 @@ impl State {
             return complete("LOCK TABLE", &empty(), out);
         }
         if let Some(select) = self.copy_output_options(sql)? {
-            return self.copy_stdout(&select, session, out);
+            return self.copy_stdout(&select, session, out, implicit);
         }
         if is_copy_sql(sql) {
             let (copy, prepared) = self.prepare_copy_checked(sql, session)?;
             read_only_check("INSERT", &self.settings, session, &mut self.diagnostic)?;
-            if self.settings.replication_role_replica() {
+            // Keep standalone V2 database COPY input private until CopyDone
+            // can publish through the ordinary simple batch commit path.
+            if self.settings.replication_role_replica()
+                || (matches!(session.role, Role::Database { .. })
+                    && session.sql.has_native_transaction_blocks()
+                    && matches!(copy.source, giggles_core::relational::CopySource::Stdin))
+            {
                 begin_implicit(session, implicit, &mut self.settings)?;
             }
             self.settings.queried = session.in_transaction();
@@ -536,7 +771,7 @@ impl State {
                 &mut self.diagnostic,
             )?;
             let tag = session.execute_admin(&stmt).map_err(|code| self.diagnostic.role_admin_error(session, &stmt, code))?;
-            role_notices(session, &self.settings.current, out)?;
+            role_notices(session, &self.settings.current, out, ReplyLimit::Checked)?;
             self.admin_completed = true;
             complete(tag, &empty(), out)?;
         } else if crate::pg_settings::empty_sql(sql)? {
@@ -553,7 +788,6 @@ impl State {
             if !session.in_transaction() {
                 self.cursors.transaction_end(actual);
             }
-            complete(actual, &empty(), out)?;
         } else if let Some(show) = show_settings(sql, session, &mut self.diagnostic)? {
             let (description, result) = inspect(show, &self.settings.current, session)?;
             let result = &result;
@@ -654,9 +888,14 @@ impl State {
             } else {
                 let p = self.diagnostic.core(session.prepare(sql))?;
                 let d = self.diagnostic.core(session.describe(&p))?;
-                read_only_check(p.row_lock_command().filter(|_| !p.row_lock_tables().is_empty()).unwrap_or_else(|| p.write_tables().first().map_or(p.command(), |(_, command)| *command)), &self.settings, session, &mut self.diagnostic)?;
+                let writes = p.write_tables();
+                let command = p
+                    .row_lock_command()
+                    .filter(|_| !p.row_lock_tables().is_empty())
+                    .unwrap_or_else(|| writes.first().map_or(p.command(), |(_, command)| *command));
+                read_only_check(command, &self.settings, session, &mut self.diagnostic)?;
                 self.settings.queried = session.in_transaction();
-                if p.command() == "SELECT" && p.write_tables().is_empty() {
+                if p.command() == "SELECT" && writes.is_empty() {
                     let mut cursor = self.diagnostic.core(session.open_cursor(&p, &[]))?;
                     row_description(&d, &[], out)?;
                     let mut count = 0;
@@ -691,8 +930,7 @@ impl State {
                     catalog_complete(count, out)?;
                     return Ok(());
                 }
-                // Result rows here are materialized before commit. COPY and
-                // cursors never install a callback, including internal commits.
+                // Keep the durability registration through the checked reply.
                 let _durability = if !was_transaction {
                     giggles_core::Cancellation::current().and_then(|context| self.durability_registration(&context, session))
                 } else {
@@ -704,48 +942,110 @@ impl State {
                     begin_implicit(session, implicit, &mut self.settings)?;
                 }
                 self.diagnostic.core(session.sync_replication_role(&self.settings))?;
-                // GD-0061 R3-311: the whole result is released once, here,
-                // before any row is encoded (a move outside a task session).
-                let (result, spilled) = giggles_core::relational::spill::streaming(
-                    || session.execute_prepared_unreleased(&p, &[]));
-                self.retain_durability_permits |= spilled.is_some();
-                let result = self.diagnostic.core(result)?;
-                let result = self.diagnostic.core(session.release_page(result))?;
-                self.settings
-                    .transaction(was_transaction, session.in_transaction(), p.command());
-                if let Some(mut spilled) = spilled {
-                    // A task session never reaches this path (`task_statement`
-                    // above), and its spill is materialised behind its release
-                    // tag (core): a spill handle holds a plain session's rows
-                    // (GD-0061 R3-314).
-                    if session.task().is_some() {
-                        return Err("XX000");
-                    }
-                    // v2 RETURNING past the in-memory threshold streams from its spill file.
-                    row_description(&d, &[], out)?;
-                    while !spilled.is_empty() {
-                        let chunk = spilled.by_ref().take(CURSOR_ROWS).collect::<Result<Vec<_>, _>>();
-                        // Released as a plain session's release is: a move.
-                        let chunk = Released::synthetic(SqlResult { rows: self.diagnostic.core(chunk)?, ..SqlResult::default() });
-                        rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
-                            &chunk, &d, &[], 0, chunk.get().rows.len(), out)?;
-                        flush_output(&self.output, out)?;
-                    }
-                } else if !d.columns.is_empty() {
-                    row_description(&d, &[], out)?;
-                    rows(
-                        &self.settings.current,
-                        session.zone().unwrap_or(SessionZone::Fixed(0)),
-                        &result,
-                        &d,
-                        &[],
-                        0,
-                        result.get().rows.len(),
-                        out,
-                    )?;
-                }
-                complete(p.command(), &result, out)?;
+                let autocommit_write = !session.in_transaction() && (!writes.is_empty() || p.is_ddl());
+                self.simple_prepared_reply(&p, &d, session, out, was_transaction, autocommit_write)?;
             }
+        }
+        Ok(())
+    }
+    fn simple_prepared_reply(
+        &mut self,
+        p: &Prepared,
+        d: &Description,
+        session: &mut Session,
+        out: &mut Vec<u8>,
+        was_transaction: bool,
+        autocommit_write: bool,
+    ) -> R<()> {
+        // GD-0061 R3-311: only untasked results participate in the reply
+        // check. The normal release still guards the returned page.
+        let mut checked = false;
+        let mut spill_completion = Vec::new();
+        let completed = out.len();
+        let zone = session.zone().unwrap_or(SessionZone::Fixed(0));
+        let encoder = SimpleRows {
+            settings: &self.settings.current,
+            zone,
+            description: d,
+        };
+        let (result, spilled) = giggles_core::relational::spill::streaming(|| {
+            if session.in_transaction() || d.columns.is_empty() {
+                return session.execute_prepared_unreleased(p, &[]);
+            }
+            let mut check = |result: Released<&SqlResult>, spill: Option<&mut SpilledRows>| {
+                checked = true;
+                if let Some(spill) = spill {
+                    // Mirror delivery's buffer limits without sending any bytes.
+                    let mut scratch = out.clone();
+                    encoder.spilled(spill, &mut scratch, |buf| {
+                        if self.output.is_some() {
+                            buf.clear();
+                        }
+                        giggles_core::cancellation::check()
+                    })?;
+                    let suffix = scratch.len();
+                    completion_frames(p.command(), &result, &mut scratch, ReplyLimit::Checked)
+                        .map_err(CoreError::SqlReplyEncoding)?;
+                    spill_completion.extend_from_slice(&scratch[suffix..]);
+                    Ok(())
+                } else {
+                    // The per-message output is private until execution succeeds.
+                    row_description(d, &[], out).map_err(CoreError::SqlReplyEncoding)?;
+                    encoder.encode(&result, out).map_err(CoreError::SqlReplyEncoding)?;
+                    completion_frames(p.command(), &result, out, ReplyLimit::Checked)
+                        .map_err(CoreError::SqlReplyEncoding)
+                }
+            };
+            session.execute_prepared_checked_unreleased(p, &mut check)
+        });
+        if checked && result.is_err() {
+            out.truncate(completed);
+        }
+        self.retain_durability_permits |= spilled.is_some();
+        let result = self.diagnostic.core(result)?;
+        self.diagnostic.committed |= checked || autocommit_write;
+        let result = self.diagnostic.core(session.release_page(result))
+            .map_err(|code| if checked || autocommit_write { "08007" } else { code })?;
+        debug_assert!(
+            spill_completion.is_empty() || spilled.is_some(),
+            "checked spill disappeared"
+        );
+        if !spill_completion.is_empty() && spilled.is_none() {
+            return Err("08007");
+        }
+        self.settings
+            .transaction(was_transaction, session.in_transaction(), p.command());
+        let encoder = SimpleRows {
+            settings: &self.settings.current,
+            zone,
+            description: d,
+        };
+        debug_assert!(checked || !autocommit_write || d.columns.is_empty());
+        if let Some(mut spilled) = spilled {
+            if session.task().is_some() {
+                return Err("XX000");
+            }
+            let after_commit = spilled.after_commit();
+            let sent = encoder.spilled(&mut spilled, out, |out| {
+                flush_output(&self.output, out).map_err(CoreError::SqlReplyEncoding)
+            });
+            self.diagnostic.core(sent.map_err(|error| {
+                if after_commit {
+                    CoreError::Storage(error.to_string())
+                } else {
+                    error
+                }
+            }))?;
+            if checked {
+                out.extend(spill_completion);
+            }
+        } else if !checked && !d.columns.is_empty() {
+            row_description(d, &[], out)
+                .and_then(|()| encoder.encode(&result, out))
+                .map_err(|code| if autocommit_write { "08007" } else { code })?;
+        }
+        if !checked {
+            completion_frames(p.command(), &result, out, ReplyLimit::after_commit(autocommit_write))?;
         }
         Ok(())
     }
@@ -961,19 +1261,56 @@ pub(super) fn settings_status(
     session: &Session,
     out: &mut Vec<u8>,
 ) -> R<()> {
+    settings_status_with_limit(before, settings, session, out, ReplyLimit::Checked)
+}
+
+pub(super) fn settings_status_with_limit(
+    before: &crate::pg_settings::Settings,
+    settings: &crate::pg_settings::SessionSettings,
+    session: &Session,
+    out: &mut Vec<u8>,
+    limit: ReplyLimit,
+) -> R<()> {
     if matches!(session.role, Role::Database { .. }) {
         for show in crate::pg_settings::REPORTABLE {
             let (name, value) = show.value(&settings.current);
             if value != show.value(before).1 {
-                let mut body = Vec::new();
-                z(name, &mut body);
-                z(&value, &mut body);
-                frame(b'S', &body, out)?;
+                parameter_status(name, &value, out, limit)?;
             }
         }
     }
     Ok(())
 }
+
+fn parameter_status(name: &str, value: &str, out: &mut Vec<u8>, limit: ReplyLimit) -> R<()> {
+    let mut body = Vec::new();
+    z(name, &mut body);
+    z(value, &mut body);
+    limit.frame(b'S', &body, out)
+}
+
+pub(super) fn commit_reply(
+    settings: &crate::pg_settings::SessionSettings,
+    session: &Session,
+    command_complete: bool,
+    out: &mut Vec<u8>,
+) -> R<()> {
+    if matches!(session.role, Role::Database { .. }) {
+        for &show in crate::pg_settings::REPORTABLE {
+            if let Some(value) = settings.post_commit_value(show) {
+                let (name, current) = show.value(&settings.current);
+                if value != current {
+                    parameter_status(name, value, out, ReplyLimit::Control)?;
+                }
+            }
+        }
+    }
+    if command_complete {
+        completion_frames("COMMIT", &empty(), out, ReplyLimit::Control)?;
+    }
+    Ok(())
+}
+
 pub(super) fn warning(
     message: &str,
     settings: &crate::pg_settings::Settings,
@@ -1139,14 +1476,19 @@ pub(super) fn validate_lock(
     core(session.sql.lock_tables(tables, mode, nowait))
 }
 
-pub(super) fn role_notices(session: &mut Session, settings: &crate::pg_settings::Settings, out: &mut Vec<u8>) -> R<()> {
+pub(super) fn role_notices(
+    session: &mut Session,
+    settings: &crate::pg_settings::Settings,
+    out: &mut Vec<u8>,
+    limit: ReplyLimit,
+) -> R<()> {
     for (warning, message) in std::mem::take(&mut session.role_notices) {
         if settings.client_min_messages == "error" || (!warning && settings.client_min_messages == "warning") { continue; }
         let mut body = Vec::new();
         for (field, value) in [(b'S', if warning { "WARNING" } else { "NOTICE" }), (b'C', if warning { "01000" } else { "00000" }), (b'M', message.as_str())] {
             body.push(field); z(value, &mut body);
         }
-        body.push(0); frame(b'N', &body, out)?;
+        body.push(0); limit.frame(b'N', &body, out)?;
     }
     Ok(())
 }

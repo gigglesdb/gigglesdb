@@ -6,10 +6,18 @@ use super::{
     limits::*,
     native, native_codec, proto,
     session::{EntryHandle, Registry, SessionLease},
+    stream,
 };
-pub(crate) use super::stream::{Receiver as SpillChunks, grpc as spill_chunks};
+pub(crate) use super::stream::{Receiver as SpillChunks, spill_chunks};
 use crate::{Response, Service, Session, agent::statement::OperationId};
-use giggles_core::{Cancellation, relational::spill::{self, SpilledRows}};
+use giggles_core::{
+    Cancellation, CoreError,
+    relational::{
+        SqlResult,
+        spill::{self, SpilledRows},
+    },
+    task::release::Released,
+};
 use prost::Message;
 #[cfg(feature = "test-hooks")]
 use std::sync::atomic::AtomicU8;
@@ -93,6 +101,13 @@ pub(crate) struct StatementPanic {
     armed: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplyMode {
+    Buffered,
+    ApiStream,
+    WireStream,
+}
+
 struct Job {
     lease: SessionLease,
     request: Invocation,
@@ -100,7 +115,7 @@ struct Job {
     context: Cancellation,
     received: Instant,
     encoding: Encoding,
-    stream: bool,
+    mode: ReplyMode,
     ownership: Arc<CallOwnership>,
     reply: oneshot::Sender<Result<Completion, ApiError>>,
     #[cfg(feature = "test-hooks")]
@@ -529,7 +544,7 @@ impl ApiRuntime {
             call.cancel,
             call.received,
             Encoding::Protobuf,
-            true,
+            ReplyMode::WireStream,
             ownership,
         )
         .await
@@ -608,7 +623,7 @@ impl ApiRuntime {
                     context,
                     received,
                     Encoding::Protobuf,
-                    true,
+                    ReplyMode::WireStream,
                     ownership,
                     StatementPanic {
                         #[cfg(feature = "test-hooks")]
@@ -669,7 +684,11 @@ impl ApiRuntime {
             context,
             received,
             encoding,
-            stream,
+            if stream {
+                ReplyMode::ApiStream
+            } else {
+                ReplyMode::Buffered
+            },
             ownership,
         )
         .await
@@ -706,7 +725,7 @@ impl ApiRuntime {
         context: Cancellation,
         received: Instant,
         encoding: Encoding,
-        stream: bool,
+        mode: ReplyMode,
         ownership: Arc<CallOwnership>,
     ) -> Result<Completion, ApiError> {
         // Zero/expired budgets can never reach a business worker.
@@ -719,7 +738,7 @@ impl ApiRuntime {
             context,
             received,
             encoding,
-            stream,
+            mode,
             ownership,
             reply,
             #[cfg(test)]
@@ -876,7 +895,7 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
         context,
         received,
         encoding,
-        stream,
+        mode,
         ownership,
         reply,
         #[cfg(test)]
@@ -912,7 +931,7 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
                 context,
                 received,
                 encoding,
-                stream,
+                mode,
                 ownership,
                 StatementPanic {
                     #[cfg(feature = "test-hooks")]
@@ -967,7 +986,7 @@ pub(crate) fn run_admitted_job<H>(
     context: Cancellation,
     received: Instant,
     encoding: Encoding,
-    stream: bool,
+    mode: ReplyMode,
     ownership: Arc<CallOwnership>,
     StatementPanic {
         #[cfg(feature = "test-hooks")]
@@ -984,34 +1003,48 @@ pub(crate) fn run_admitted_job<H>(
                 // encoding, so it never takes the streaming path. Agent sessions are
                 // `Role::Database` with `agent` set (Service::agent_session), so the
                 // role check alone does not cover them.
-                let stream = stream
+                let stream = mode != ReplyMode::Buffered
                     && !session.agent
                     && session.task().is_none();
                 #[cfg(feature = "legacy-task")]
                 let stream = stream && !matches!(session.role, crate::Role::Task { .. });
+                let execute = || {
+                    execute_reply(
+                        session,
+                        request,
+                        operation_id,
+                        received,
+                        encoding,
+                        stream && mode == ReplyMode::ApiStream,
+                    )
+                };
                 let (result, spill) = spill::bounded(|| {
                     #[cfg(feature = "test-hooks")]
                     if panic_in_statement {
                         panic!("injected statement panic");
                     }
                     if stream {
-                        spill::streaming(|| execute_reply(session, request, operation_id, received, encoding))
+                        spill::streaming(execute)
                     } else {
-                        (execute_reply(session, request, operation_id, received, encoding), None)
+                        (execute(), None)
                     }
                 });
                 Ok(result.and_then(|(mut reply, json)| {
-                    if let Some(rows) = &spill {
-                        if let Some(proto::execute_reply::NativeResult::OperationOutcome(outcome)) = &mut reply.native_result {
-                            outcome.matched = rows.len();
-                        }
+                    if let Some(rows) = &spill
+                        && let Some(proto::execute_reply::NativeResult::OperationOutcome(
+                            outcome,
+                        )) = &mut reply.native_result
+                    {
+                        outcome.matched = rows.len();
                         let state = proto::TransactionState::try_from(reply.transaction_state)
                             .map_err(|_| ApiError::Internal)?;
                         let (reply, json) = prepare_encoded(Ok(reply), state, encoding)?;
-                        Ok((reply, json, spill))
-                    } else {
-                        Ok((reply, json, None))
+                        let spill = spill.filter(|_| reply.code == "ok");
+                        return Ok((reply, json, spill));
                     }
+                    // A fallback error envelope has no continuation.
+                    let spill = spill.filter(|_| reply.code == "ok");
+                    Ok((reply, json, spill))
                 }))
             })
         })
@@ -1106,6 +1139,7 @@ fn execute_reply(
     operation_id: Option<crate::agent::statement::OperationId>,
     received: Instant,
     encoding: Encoding,
+    check_stream_reply: bool,
 ) -> Result<(proto::ExecuteReply, Option<Vec<u8>>), ApiError> {
     // GD-0061 R3-309/R3-313: the transport a task statement arrived on (HTTP
     // carries JSON only; gRPC carries protobuf). No-op without a task.
@@ -1113,7 +1147,14 @@ fn execute_reply(
         Encoding::Json => giggles_core::task::readlog::ENTRY_HTTP,
         Encoding::Protobuf => giggles_core::task::readlog::ENTRY_GRPC,
     });
-    let reply = execute_released(session, request, operation_id, received, encoding);
+    let reply = execute_released(
+        session,
+        request,
+        operation_id,
+        received,
+        encoding,
+        check_stream_reply,
+    );
     // After the reply is encoded: charges any rows_read no release charged
     // and finalizes the statement's read-log record (no-op without a task).
     session.sql.finish_task_statement(match &reply {
@@ -1132,6 +1173,7 @@ fn execute_released(
     operation_id: Option<crate::agent::statement::OperationId>,
     received: Instant,
     encoding: Encoding,
+    check_stream_reply: bool,
 ) -> Result<(proto::ExecuteReply, Option<Vec<u8>>), ApiError> {
     enum Executed {
         Legacy(Response),
@@ -1148,12 +1190,23 @@ fn execute_released(
         _ => None,
     };
     session.api_path.sql_committed = false;
+    let mut prepared_reply = None;
     let executed = match request {
         // GD-0061 R3-209: on a task session the legacy surface admits only
         // `Ping` (and `Sql`, whose statement is admitted on the SQL route).
         // A refusal is a native error reply, so it carries its task fields.
         Invocation::Legacy(request) => match native::admit_legacy(session, &request) {
-            Ok(()) => Executed::Legacy(session.handle_received(request, received)),
+            Ok(()) => {
+                let mut check = |result: Released<&SqlResult>, spill: Option<&mut SpilledRows>| {
+                    prepared_reply = Some(check_sql_stream_reply(result, spill, encoding)?);
+                    Ok(())
+                };
+                Executed::Legacy(session.handle_with_reply_check(
+                    request,
+                    received,
+                    check_stream_reply.then_some(&mut check),
+                ))
+            }
             Err(error) => {
                 session.abort();
                 Executed::Native(Err(error))
@@ -1223,7 +1276,14 @@ fn execute_released(
         proto::TransactionState::Idle
     };
     let native = match executed {
-        Executed::Legacy(response) => return prepare_reply(response, state, encoding),
+        Executed::Legacy(response) => {
+            if response.code == "ok"
+                && let Some(reply) = prepared_reply
+            {
+                return Ok(reply);
+            }
+            return prepare_reply(response, state, encoding);
+        }
         Executed::Native(result) => result,
     };
     let result = (|| match native {
@@ -1277,31 +1337,54 @@ fn execute_released(
     prepare_encoded(result, state, encoding)
 }
 
+fn check_sql_stream_reply(
+    result: Released<&SqlResult>,
+    spill: Option<&mut SpilledRows>,
+    encoding: Encoding,
+) -> Result<(proto::ExecuteReply, Option<Vec<u8>>), CoreError> {
+    let response = Response::released_sql(result.map(SqlResult::clone));
+    let reply = codec::encode_reply(response, proto::TransactionState::Idle)
+        .and_then(|reply| encode(reply, encoding))
+        .map_err(stream::sql_reply_error)?;
+    if let Some(spill) = spill {
+        if let Some(json) = &reply.1 {
+            stream::check_json_spill(json, spill)?;
+        } else {
+            stream::check_grpc_spill(spill)?;
+        }
+    }
+    Ok(reply)
+}
+
+fn encode(
+    reply: proto::ExecuteReply,
+    encoding: Encoding,
+) -> Result<(proto::ExecuteReply, Option<Vec<u8>>), ApiError> {
+    if reply.encoded_len() > crate::transport::MAX_RESPONSE {
+        return Err(ApiError::PayloadTooLarge);
+    }
+    let json = match encoding {
+        Encoding::Json => Some(json::encode_reply(&reply)?),
+        Encoding::Protobuf => None,
+    };
+    Ok((reply, json))
+}
+
+pub(super) fn unknown_reply(
+    state: proto::TransactionState,
+) -> Result<proto::ExecuteReply, ApiError> {
+    codec::encode_reply(Response::code("08007"), state)
+}
+
 fn prepare_encoded(
     result: Result<proto::ExecuteReply, ApiError>,
     state: proto::TransactionState,
     encoding: Encoding,
 ) -> Result<(proto::ExecuteReply, Option<Vec<u8>>), ApiError> {
-    fn encode(
-        reply: proto::ExecuteReply,
-        encoding: Encoding,
-    ) -> Result<(proto::ExecuteReply, Option<Vec<u8>>), ApiError> {
-        if reply.encoded_len() > crate::transport::MAX_RESPONSE {
-            return Err(ApiError::PayloadTooLarge);
-        }
-        let json = match encoding {
-            Encoding::Json => Some(json::encode_reply(&reply)?),
-            Encoding::Protobuf => None,
-        };
-        Ok((reply, json))
-    }
     match result.and_then(|reply| encode(reply, encoding)) {
         Ok(result) => Ok(result),
         // Execution already happened; a serialization failure is not a rollback.
-        Err(_) => encode(
-            codec::encode_reply(Response::code("08007"), state)?,
-            encoding,
-        ),
+        Err(_) => encode(unknown_reply(state)?, encoding),
     }
 }
 

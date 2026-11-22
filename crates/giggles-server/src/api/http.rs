@@ -1,12 +1,12 @@
 //! Strict JSON routes; execution and session ownership live in the shared runtime.
 use super::{
     body::{self, ResponseBody},
-    dispatch::{ApiRuntime, CallOwnership, Encoding, ResponseLease},
+    dispatch::{ApiRuntime, CallOwnership, Encoding, ResponseLease, unknown_reply},
     error::ApiError,
     identity::ConnectionIdentity,
     json,
     net::{self, ActivityTicket},
-    stream,
+    proto, stream,
 };
 use crate::transport::{IO_TIMEOUT, MAX_FRAME};
 use ::http::{HeaderMap, Method, Request, Response, StatusCode, header};
@@ -132,7 +132,20 @@ pub(crate) async fn handle(
                         Ok((
                             StatusCode::OK,
                             match completion.spill {
-                                Some(spill) => stream::json_body(completion.reply, spill)?,
+                                Some(spill) => {
+                                    let after_commit = spill.after_commit();
+                                    let body = completion
+                                        .json
+                                        .ok_or(ApiError::Internal)
+                                        .and_then(|json| stream::json_body(json, spill));
+                                    match body {
+                                        Ok(body) => body,
+                                        Err(_) if after_commit => full(json::encode_reply(
+                                            &unknown_reply(proto::TransactionState::Idle)?,
+                                        )?),
+                                        Err(error) => return Err(error),
+                                    }
+                                }
                                 None => full(completion.json.ok_or(ApiError::Internal)?),
                             },
                             Some(completion.lease),

@@ -610,7 +610,7 @@ impl Delivery {
                 "ok" | "preview" | "committed" | "absent"
             );
         let (part, chunks) = match spill {
-            Some(spill) => (Vec::new(), Some(spill_chunks(reply, Some(spill)))),
+            Some(spill) => (Vec::new(), Some(spill_chunks(reply, Some(spill), /* report_committed */ true))),
             None => (encode_reply(shapes, reply), None),
         };
         Self {

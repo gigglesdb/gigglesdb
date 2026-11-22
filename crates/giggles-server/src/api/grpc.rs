@@ -138,6 +138,7 @@ impl Giggles for Rpc {
         Ok(RpcResponse::new(stream::grpc(
             completion.reply,
             completion.spill,
+            /* report_committed */ true,
         )))
     }
 

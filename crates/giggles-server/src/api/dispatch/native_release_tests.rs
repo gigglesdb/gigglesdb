@@ -128,7 +128,7 @@ fn invocation(request: &Json) -> Invocation {
 /// One request through `execute_reply`; the reply and its JSON view.
 fn exec(session: &mut Session, request: &Json, encoding: Encoding) -> (proto::ExecuteReply, Json) {
     let (reply, _) =
-        execute_reply(session, invocation(request), None, std::time::Instant::now(), encoding).unwrap();
+        execute_reply(session, invocation(request), None, std::time::Instant::now(), encoding, false).unwrap();
     let view = serde_json::from_slice(&json::encode_reply(&reply).unwrap()).unwrap();
     (reply, view)
 }

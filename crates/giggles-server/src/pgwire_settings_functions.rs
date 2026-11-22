@@ -209,9 +209,9 @@ impl State {
         })();
         if own_transaction {
             let ending = if result.is_ok() {
-                execute_implicit_commit(session, implicit, &mut self.settings, out)
+                execute_implicit_commit(session, implicit, &mut self.settings, &mut self.diagnostic, out)
             } else {
-                execute_control("ROLLBACK", session, implicit, &mut self.settings, out)
+                execute_control("ROLLBACK", session, implicit, &mut self.settings, &mut self.diagnostic, out)
             };
             if result.is_ok() {
                 ending?;

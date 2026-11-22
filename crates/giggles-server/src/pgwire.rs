@@ -11,7 +11,7 @@ use giggles_core::{
     task::Released,
 };
 use giggles_pg_types::temporal::SessionZone;
-use std::{collections::BTreeMap, io};
+use std::{borrow::Borrow, collections::BTreeMap, io};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     time::timeout,
@@ -106,17 +106,50 @@ pub fn frame(tag: u8, b: &[u8], out: &mut Vec<u8>) -> R<()> {
     if total > MAX_RESPONSE {
         return Err("54000");
     }
-    out.push(tag);
-    out.extend(u32::try_from(len).map_err(|_| "54000")?.to_be_bytes());
-    out.extend(b);
+    append_frame(tag, b, u32::try_from(len).map_err(|_| "54000")?, out);
     Ok(())
 }
+
+fn append_frame(tag: u8, body: &[u8], length: u32, out: &mut Vec<u8>) {
+    out.push(tag);
+    out.extend(length.to_be_bytes());
+    out.extend(body);
+}
+
+#[derive(Clone, Copy)]
+enum ReplyLimit {
+    Checked,
+    Control,
+}
+
+impl ReplyLimit {
+    fn after_commit(committed: bool) -> Self {
+        if committed { Self::Control } else { Self::Checked }
+    }
+
+    fn frame(self, tag: u8, body: &[u8], out: &mut Vec<u8>) -> R<()> {
+        match self {
+            Self::Checked => frame(tag, body, out),
+            Self::Control => {
+                // The reply size limit applies before publication. After a commit
+                // (or when ending an aborted reply), send bounded control frames
+                // even if the buffer is full. Data frames must pass the checked
+                // encoder before commit, including spills validated before replay.
+                debug_assert!(matches!(tag, b'C' | b'N' | b'S' | b'Z' | b'E'));
+                let length = u32::try_from(body.len() + 4).expect("bounded control frame");
+                append_frame(tag, body, length, out);
+                Ok(())
+            }
+        }
+    }
+}
+
 pub fn z(s: &str, b: &mut Vec<u8>) {
     b.extend(s.as_bytes());
     b.push(0);
 }
 fn ready(session: &Session, out: &mut Vec<u8>) -> R<()> {
-    frame(
+    ReplyLimit::Control.frame(
         b'Z',
         &[if session.is_aborted() {
             b'E'
@@ -138,6 +171,9 @@ pub(crate) fn error_message(code: &str, message: &'static str, out: &mut Vec<u8>
 #[derive(Default)]
 struct Diagnostic {
     unknown_outcome: bool,
+    committed: bool,
+    // A failed commit restores session settings before its error is framed.
+    pre_rollback_settings: Option<Box<crate::pg_settings::Settings>>,
     phase: &'static str,
     message: Option<&'static str>,
     wire_message: Option<String>,
@@ -158,6 +194,10 @@ fn replication_role_allowed(session: &Session) -> R<bool> {
     }
 }
 impl Diagnostic {
+    fn reply_error(&self, code: &'static str) -> &'static str {
+        if self.committed { "08007" } else { code }
+    }
+
     /// GD-0061 R3-110: a task statement's error keeps its SQLSTATE and message.
     fn task_ddl(&mut self, error: giggles_core::task::catalog::TaskDdlError) -> &'static str {
         self.wire_message = Some(error.message);
@@ -409,7 +449,7 @@ fn diagnostic_error(
         z("Recreate the view to store projection bindings.", &mut b);
     }
     b.push(0);
-    let _ = frame(b'E', &b, out);
+    let _ = ReplyLimit::Control.frame(b'E', &b, out);
 }
 pub fn oid(t: &DataType) -> u32 {
     match t {
@@ -840,7 +880,20 @@ fn rows(
     end: usize,
     out: &mut Vec<u8>,
 ) -> R<()> {
-    for row in &result.get().rows[start..end] {
+    data_row_frames(settings, zone, result, d, formats, start..end, out)
+}
+
+// The pre-publication check borrows a released result rather than copying it.
+fn data_row_frames(
+    settings: &crate::pg_settings::Settings,
+    zone: SessionZone,
+    result: &Released<impl Borrow<SqlResult>>,
+    d: &Description,
+    formats: &[u16],
+    range: std::ops::Range<usize>,
+    out: &mut Vec<u8>,
+) -> R<()> {
+    for row in &result.get().borrow().rows[range] {
         let mut b = vec![];
         b.extend((row.values.len() as u16).to_be_bytes());
         for (i, v) in row.values.iter().enumerate() {
@@ -864,7 +917,16 @@ fn rows(
 }
 /// The notices and CommandComplete of a released result (GD-0061 R3-314).
 fn complete(command: &str, r: &Released<SqlResult>, out: &mut Vec<u8>) -> R<()> {
-    let r = r.get();
+    completion_frames(command, r, out, ReplyLimit::Checked)
+}
+
+fn completion_frames(
+    command: &str,
+    r: &Released<impl Borrow<SqlResult>>,
+    out: &mut Vec<u8>,
+    limit: ReplyLimit,
+) -> R<()> {
+    let r = r.get().borrow();
     for message in giggles_core::relational::take_sql_warnings() {
         let mut body = vec![];
         for (field, value) in [
@@ -875,7 +937,7 @@ fn complete(command: &str, r: &Released<SqlResult>, out: &mut Vec<u8>) -> R<()> 
             z(value, &mut body);
         }
         body.push(0);
-        frame(b'N', &body, out)?;
+        limit.frame(b'N', &body, out)?;
     }
     for (message, detail, code) in giggles_core::relational::take_sql_notices() {
         let severity = if matches!(code, Some("22023" | "01000")) { "WARNING" } else { "NOTICE" };
@@ -894,7 +956,7 @@ fn complete(command: &str, r: &Released<SqlResult>, out: &mut Vec<u8>) -> R<()> 
             z(&detail, &mut body);
         }
         body.push(0);
-        frame(b'N', &body, out)?;
+        limit.frame(b'N', &body, out)?;
     }
     let tag = match command {
         "SELECT" => format!("SELECT {}", r.rows.len()),
@@ -904,7 +966,7 @@ fn complete(command: &str, r: &Released<SqlResult>, out: &mut Vec<u8>) -> R<()> 
     };
     let mut b = vec![];
     z(&tag, &mut b);
-    frame(b'C', &b, out)
+    limit.frame(b'C', &b, out)
 }
 fn core<T>(r: Result<T, CoreError>) -> R<T> {
     r.map_err(|e| crate::service::sqlstate(&e))
@@ -1539,21 +1601,22 @@ fn inspect(
 }
 fn execute_control(
     command: &'static str, session: &mut Session, implicit: &mut bool,
-    settings: &mut crate::pg_settings::SessionSettings, out: &mut Vec<u8>,
+    settings: &mut crate::pg_settings::SessionSettings, diagnostic: &mut Diagnostic, out: &mut Vec<u8>,
 ) -> R<&'static str> {
-    execute_control_inner(command, session, implicit, settings, out, false)
+    execute_control_inner(command, session, implicit, settings, diagnostic, out, false)
 }
 fn execute_implicit_commit(
     session: &mut Session, implicit: &mut bool,
-    settings: &mut crate::pg_settings::SessionSettings, out: &mut Vec<u8>,
+    settings: &mut crate::pg_settings::SessionSettings, diagnostic: &mut Diagnostic, out: &mut Vec<u8>,
 ) -> R<&'static str> {
-    execute_control_inner("COMMIT", session, implicit, settings, out, true)
+    execute_control_inner("COMMIT", session, implicit, settings, diagnostic, out, true)
 }
 fn execute_control_inner(
     command: &'static str,
     session: &mut Session,
     implicit: &mut bool,
     settings: &mut crate::pg_settings::SessionSettings,
+    diagnostic: &mut Diagnostic,
     out: &mut Vec<u8>,
     implicit_commit: bool,
 ) -> R<&'static str> {
@@ -1567,6 +1630,8 @@ fn execute_control_inner(
     } else {
         command
     };
+    let explicit_commit = command == "COMMIT" && !implicit_commit;
+    let publishing = was && actual == "COMMIT";
     if actual == "BEGIN" {
         if session.is_aborted() {
             return Err("25P02");
@@ -1580,13 +1645,23 @@ fn execute_control_inner(
     } else { session.run_control(actual) } {
         session.sql.rollback();
         settings.transaction(true, false, "ROLLBACK");
+        diagnostic.pre_rollback_settings = Some(Box::new(before));
         *implicit = false;
         return Err(crate::service::sqlstate(&error));
+    }
+    if publishing {
+        // Explicit COMMIT and simple implicit commits use the post-commit control path.
+        simple::commit_reply(settings, session, explicit_commit, out)?;
     }
     *implicit = false;
     settings.transaction(was, session.in_transaction(), actual);
     if !session.in_transaction() { session.service.advisory.release(session.backend_pid, true); }
-    settings_status(&before, settings, session, out)?;
+    if !publishing {
+        settings_status(&before, settings, session, out)?;
+        if explicit_commit {
+            complete(actual, &empty(), out)?;
+        }
+    }
     Ok(actual)
 }
 impl State {
@@ -1617,13 +1692,33 @@ impl State {
         session.set_time_zone(&self.settings.current.timezone);
         // Local data commits cannot invalidate the role profile validated at entry.
         if !self.durability_permits_released() {
-            session.sync_role_settings(&mut self.settings.current)?;
+            #[cfg(all(test, feature = "engine-rocksdb"))]
+            let refreshed = implicit_block_tests::post_dispatch_role_refresh(session, tag)
+                .and_then(|()| session.sync_role_settings(&mut self.settings.current));
+            #[cfg(not(all(test, feature = "engine-rocksdb")))]
+            let refreshed = session.sync_role_settings(&mut self.settings.current);
+            if let Err(code) = refreshed
+                && result.is_ok()
+            {
+                return Err(self.diagnostic.reply_error(code));
+            }
         }
         session.set_search_path(&self.settings.current.search_path);
         session.set_text_settings(&self.settings.current);
         session.set_max_value_bytes(self.settings.current.max_value_bytes);
         session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
-        if result.is_ok() { simple::role_notices(session, &self.settings.current, out)?; }
+        if result.is_ok() {
+            simple::role_notices(
+                session,
+                &self.settings.current,
+                out,
+                ReplyLimit::after_commit(self.diagnostic.committed),
+            )?;
+            // Simple Query ends after its late role notices.
+            if tag == b'Q' && !self.drain && self.copy.is_none() {
+                ready(session, out)?;
+            }
+        }
         result
     }
     fn prepare_statement(
@@ -2084,7 +2179,7 @@ impl State {
         if self.copy.is_some() {
             // Remaining statements after COPY belong to the same bounded batch.
             let output = self.output.take();
-            let result = self.copy_message(tag, b, session, out, received);
+            let result = self.copy_message(tag, b, session, out, received, &output);
             self.output = output;
             return result;
         }
@@ -2104,6 +2199,7 @@ impl State {
                 r.end()?;
                 self.drain = false;
                 let before = self.settings.current.clone();
+                let publishing = self.implicit && !session.is_aborted() && session.in_transaction();
                 if self.implicit {
                     self.implicit = false;
                     if session.is_aborted() {
@@ -2116,11 +2212,17 @@ impl State {
                             session.sql.rollback();
                             self.cursors.transaction_end("ROLLBACK");
                             self.settings.transaction(true, false, "ROLLBACK");
+                            self.diagnostic.pre_rollback_settings = Some(Box::new(before));
                             self.portals.clear();
                             if matches!(&error, CoreError::WriteFenced { .. }) {
                                 self.diagnostic.wire_message = Some(error.to_string());
                             }
                             return Err(crate::service::sqlstate(&error));
+                        }
+                        if publishing {
+                            self.diagnostic.committed = true;
+                            // Execute checked its rows. Sync adds only post-commit control.
+                            simple::commit_reply(&self.settings, session, false, out)?;
                         }
                         self.settings.transaction(true, false, "COMMIT");
                     }
@@ -2128,7 +2230,11 @@ impl State {
                 if !session.in_transaction() {
                     self.portals.clear();
                 }
-                settings_status(&before, &self.settings, session, out)?;
+                if !publishing {
+                    simple::settings_status_with_limit(
+                        &before, &self.settings, session, out, ReplyLimit::Control,
+                    )?;
+                }
                 ready(session, out)?;
             }
             b'H' => {
@@ -2144,9 +2250,6 @@ impl State {
                 self.simple_query(&sql, session, out, received)?;
                 if !session.in_transaction() {
                     self.portals.clear();
-                }
-                if self.copy.is_none() {
-                    ready(session, out)?;
                 }
             }
             b'P' => {
@@ -2394,7 +2497,10 @@ impl State {
                     if p.result.is_some() { return Err("55000"); }
                     let options = options.clone();
                     p.result = ran();
-                    self.copy_stdout(&options, session, out)?;
+                    let mut implicit = self.implicit;
+                    let result = self.copy_stdout(&options, session, out, &mut implicit);
+                    self.implicit = implicit;
+                    result?;
                     return Ok(true);
                 }
                 if let Plan::Copy(copy, prepared) = &p.s.p {
@@ -2494,7 +2600,7 @@ impl State {
                         &mut self.diagnostic,
                     )?;
                     let tag = session.execute_admin(stmt).map_err(|code| self.diagnostic.role_admin_error(session, stmt, code))?;
-                    simple::role_notices(session, &self.settings.current, out)?;
+                    simple::role_notices(session, &self.settings.current, out, ReplyLimit::Checked)?;
                     self.admin_completed = true;
                     p.result = ran();
                     complete(tag, &empty(), out)?;
@@ -2626,7 +2732,6 @@ impl State {
                         self.cursors.transaction_end(actual);
                     }
                     p.result = ran();
-                    complete(actual, &empty(), out)?;
                     if !session.in_transaction() {
                         self.portals.clear();
                     }
@@ -3136,7 +3241,8 @@ fn leader_error(out: &mut Vec<u8>) -> io::Result<()> {
         &mut body,
     );
     body.push(0);
-    frame(b'E', &body, out).map_err(io::Error::other)
+    // This terminal frame can follow a buffered 08007 reply.
+    ReplyLimit::Control.frame(b'E', &body, out).map_err(io::Error::other)
 }
 
 async fn read_frontend_body<S: AsyncRead + Unpin>(s: &mut S) -> io::Result<Vec<u8>> {
@@ -3168,9 +3274,14 @@ impl State {
         admission_message: Option<String>,
     ) -> io::Result<(bool, bool)> {
         let (tag, b, received) = message;
+        // CopyDone and CopyFail consume the COPY state before role refresh.
+        let simple = tag == b'Q'
+            || (matches!(tag, b'c' | b'f') && self.copy.as_ref().is_some_and(|c| c.simple));
         let context = active.context.clone();
         self.diagnostic = Diagnostic {
             unknown_outcome: false,
+            committed: false,
+            pre_rollback_settings: None,
             wire_detail: None,
             wire_context: None,
             wire_hint: None,
@@ -3211,9 +3322,12 @@ impl State {
             Ok(keep) => Ok(keep),
             Err(code) => {
                 session.abort();
+                // A CopyDone rejected during post-dispatch refresh must not
+                // leave a successful COPY completion queued for Flush or Sync.
+                self.copy_completion.clear();
                 // COMMIT may fail and finish rollback before returning
                 // its error. No portal can outlive that transaction.
-                if tag == b'Q' && !session.in_transaction() {
+                if simple && !session.in_transaction() {
                     self.portals.clear();
                 }
                 if tag == b'S' && self.implicit {
@@ -3243,9 +3357,16 @@ impl State {
                     // Error formatting discards partial result frames, but role
                     // diagnostics produced before a rollback must reach the client.
                     let error = std::mem::take(out);
-                    simple::role_notices(session, &self.settings.current, out).map_err(io::Error::other)?;
+                    simple::role_notices(session, &self.settings.current, out, ReplyLimit::Control)
+                        .map_err(io::Error::other)?;
+                    if let Some(before) = self.diagnostic.pre_rollback_settings.take() {
+                        simple::settings_status_with_limit(
+                            &before, &self.settings, session, out, ReplyLimit::Control,
+                        )
+                        .map_err(io::Error::other)?;
+                    }
                     out.extend(error);
-                    if matches!(tag, b'Q' | b'S') {
+                    if simple || tag == b'S' {
                         self.drain = false;
                         ready(session, out).map(|()| true).map_err(io::Error::other)
                     } else {
@@ -3834,6 +3955,12 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
             return Ok(());
         }
         if binding_lost {
+            // The dispatch may already have produced a terminal outcome
+            // for a write that reached publication before the binding failed.
+            if state.diagnostic.unknown_outcome {
+                send(s, &response).await?;
+                return Ok(());
+            }
             if state.admin_completed {
                 send(s, &response).await?;
                 if tag == b'E' {

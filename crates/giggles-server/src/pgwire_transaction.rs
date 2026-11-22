@@ -39,11 +39,11 @@ pub(super) fn execute_mode(
     if !session.role.is_sql() {
         return Err("42501");
     }
-    match command {
+    let actual = match command {
         Command::Begin(modes) | Command::Start(modes) => {
             let start_tag = matches!(command, Command::Start(_));
             let starting = !session.in_transaction() || *implicit;
-            let actual = execute_control("BEGIN", session, implicit, settings, out)?;
+            let actual = execute_control("BEGIN", session, implicit, settings, diagnostic, out)?;
             if starting {
                 if let Some(isolation) = modes.isolation {
                     // Re-level the transaction BEGIN just opened (GD-0075 R5-76). An
@@ -58,10 +58,16 @@ pub(super) fn execute_mode(
                     settings.current.transaction_read_only = read_only;
                 }
             }
-            Ok(if start_tag { "START TRANSACTION" } else { actual })
+            if start_tag { "START TRANSACTION" } else { actual }
         }
-        Command::Commit => execute_control("COMMIT", session, implicit, settings, out),
-        Command::Rollback => execute_control("ROLLBACK", session, implicit, settings, out),
+        Command::Commit => {
+            let was = session.in_transaction();
+            // execute_control appends the bounded control reply after publication.
+            let actual = execute_control("COMMIT", session, implicit, settings, diagnostic, out)?;
+            diagnostic.committed |= was && actual == "COMMIT";
+            return Ok(actual);
+        }
+        Command::Rollback => execute_control("ROLLBACK", session, implicit, settings, diagnostic, out)?,
         Command::Savepoint(ref name)
         | Command::Release(ref name)
         | Command::RollbackTo(ref name) => {
@@ -107,7 +113,7 @@ pub(super) fn execute_mode(
                 _ => settings.rollback_to(name),
             }
             settings_status(&before, settings, session, out)?;
-            Ok(tag)
+            tag
         }
         Command::Set(modes) => {
             if session.is_aborted() {
@@ -141,7 +147,7 @@ pub(super) fn execute_mode(
                     settings.current.transaction_read_only = read_only;
                 }
             }
-            Ok("SET")
+            "SET"
         }
         Command::Session(modes) => {
             use crate::pg_settings::{Setting, Show};
@@ -172,9 +178,11 @@ pub(super) fn execute_mode(
                     );
                 }
             }
-            Ok("SET")
+            "SET"
         }
-    }
+    };
+    complete(actual, &empty(), out)?;
+    Ok(actual)
 }
 pub(super) fn admin_command(stmt: &crate::auth::statements::AdminStatement) -> &'static str {
     use crate::auth::statements::AdminStatement;

@@ -310,6 +310,8 @@ mod task_release_native;
 mod task_release_simple;
 #[path = "task_safe_read_network.rs"]
 mod task_safe_read_network;
+#[path = "returning_reply_network.rs"]
+mod returning_reply_network;
 #[path = "returning_spill_network.rs"]
 mod returning_spill_network;
 #[path = "sort_spill_network.rs"]

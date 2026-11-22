@@ -142,6 +142,10 @@ impl SessionSettings {
             self.savepoints.truncate(at + 1);
         }
     }
+    pub(crate) fn post_commit_value(&self, show: Show) -> Option<&str> {
+        self.local.get(&show).map(|(value, _)| value.as_str())
+    }
+
     pub fn transaction(&mut self, was: bool, now: bool, command: &str) {
         if !was && now {
             self.saved = Some(self.current.clone());

@@ -145,6 +145,8 @@ pub enum CoreError {
     DuplicateSchema,
     /// Execution-only privilege inquiry error; never persisted.
     PrivilegeInquiry(&'static str),
+    /// A gateway could not encode the reply while an autocommit write was staged.
+    SqlReplyEncoding(&'static str),
     /// Task-session error (GD-0061). Never stored in `SqlError`, which is persisted.
     Task(crate::task::TaskError),
     /// A query temp (spill) file failed: 53100 when the device is full, else 58030.
@@ -159,6 +161,27 @@ impl std::fmt::Display for CoreError {
     }
 }
 impl std::error::Error for CoreError {}
+
+/// Checks an untasked autocommit write's result set while its effects are still
+/// private. A spill is borrowed for the check and rewound for delivery.
+pub type SqlReplyCheck<'a> = dyn FnMut(
+    crate::task::Released<&relational::SqlResult>,
+    Option<&mut relational::spill::SpilledRows>,
+) -> Result<(), CoreError> + 'a;
+
+fn check_autocommit_reply(
+    check: Option<&mut SqlReplyCheck<'_>>,
+    result: &relational::SqlResult,
+) -> Result<(), CoreError> {
+    if let Some(check) = check
+        && (!result.columns.is_empty() || !result.rows.is_empty())
+    {
+        // The statement kernel passes the check only outside the task release
+        // path. Releasing this plain result is just a wrapper around the borrow.
+        relational::spill::check_pending(|spill| check(crate::task::Released::synthetic(result), spill))?;
+    }
+    Ok(())
+}
 fn io(e: impl std::fmt::Display) -> CoreError {
     CoreError::Storage(e.to_string())
 }
@@ -3258,7 +3281,6 @@ impl SqlSession {
                 Ok(())
             } else {
                 self.commit_v2_transaction(&db, &mut ticket)
-                    .and_then(|()| v2_sql::sql_sequences::settle(&db, &self.sequence_unsettled))
             }
         });
 
@@ -3275,7 +3297,7 @@ impl SqlSession {
             let db = self.v2_lease(Holder::Sql)?;
             let prepared =
                 relational::Prepared::begin_engine(u128::from_be_bytes(db.meta.domain), 0);
-            return self.execute_bound_kernel(&prepared, &[], None, None, Some(&db)).map(|_| ());
+            return self.execute_bound_kernel(&prepared, &[], None, None, Some(&db), None).map(|_| ());
         }
         self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
@@ -3289,7 +3311,7 @@ impl SqlSession {
             let db = self.v2_lease(Holder::Sql)?;
             let prepared =
                 relational::Prepared::commit_engine(u128::from_be_bytes(db.meta.domain), 0);
-            return self.execute_bound_kernel(&prepared, &[], None, None, Some(&db)).map(|_| ());
+            return self.execute_bound_kernel(&prepared, &[], None, None, Some(&db), None).map(|_| ());
         }
         self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
@@ -3308,7 +3330,7 @@ impl SqlSession {
             Err(error) => return Err(error),
         };
         let prepared = relational::Prepared::rollback_engine(u128::from_be_bytes(db.meta.domain), 0);
-        self.execute_bound_kernel(&prepared, &[], None, None, Some(&db)).map(|_| ())
+        self.execute_bound_kernel(&prepared, &[], None, None, Some(&db), None).map(|_| ())
     }
     pub(crate) fn named_control_engine(
         &mut self,
@@ -3328,7 +3350,7 @@ impl SqlSession {
         };
         let mut prepared = make(name, domain, epoch).map_err(CoreError::Sql)?;
         prepared.transaction = self.transaction_id;
-        self.execute_bound_kernel(&prepared, &[], None, None, lease.as_deref()).map(|_| ())
+        self.execute_bound_kernel(&prepared, &[], None, None, lease.as_deref(), None).map(|_| ())
     }
     /// Native block steps are separate RC statements; legacy keeps its block snapshot.
     pub(crate) fn begin_native_step(&mut self) -> Result<(), CoreError> {
@@ -3402,7 +3424,7 @@ impl SqlSession {
         let lease = self.statement_lease()?;
         let p = self.prepare_typed_read(lease.as_deref(), vec![key.clone()], |domain, epoch|
             relational::Prepared::from_relation_read(domain, epoch, key))?;
-        let rows = relational::spill::bounded(|| self.execute_bound_kernel(&p, &[], None, None, lease.as_deref()))?.rows;
+        let rows = relational::spill::bounded(|| self.execute_bound_kernel(&p, &[], None, None, lease.as_deref(), None))?.rows;
         if rows.len() > relational::MAX_ROWS { return Err(CoreError::Limit); }
         Ok(Some(rows))
     }
@@ -3426,7 +3448,7 @@ impl SqlSession {
             let lease = self.statement_lease().map_err(map)?;
             let p = self.prepare_typed_read(lease.as_deref(), vec![key.clone()], |domain, epoch|
                 relational::Prepared::from_relation_read(domain, epoch, key)).map_err(map)?;
-            let (result, spilled) = relational::spill::streaming(|| self.execute_bound_kernel(&p, &[], None, None, lease.as_deref()));
+            let (result, spilled) = relational::spill::streaming(|| self.execute_bound_kernel(&p, &[], None, None, lease.as_deref(), None));
             let result = result.map_err(map)?;
             complete_relation::retain_native_rows(keep, bound, map, |visit| {
                 if let Some(spilled) = spilled {
@@ -3820,7 +3842,7 @@ impl SqlSession {
             p.engine_generation = db.map(EngineLease::prepared_generation);
             p.transaction = self.transaction_id;
             p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
-            self.execute_bound_kernel(&p, &[], None, None, db)?;
+            self.execute_bound_kernel(&p, &[], None, None, db, None)?;
             let table = if dropping { before } else { self.inspect_metadata_leased(db, definition)? };
             table.ok_or(CoreError::Sql(relational::SqlError::UnknownTable))
         })();
@@ -4073,7 +4095,7 @@ impl SqlSession {
                 });
                 prepared.epoch = 0;
                 prepared.transaction = self.transaction_id;
-                self.execute_bound_kernel(&prepared, &[], None, None, Some(&db))
+                self.execute_bound_kernel(&prepared, &[], None, None, Some(&db), None)
             })();
             if result.is_err() { self.abort(); }
             return result;
@@ -4108,7 +4130,7 @@ impl SqlSession {
                 });
                 prepared.epoch = 0;
                 prepared.transaction = self.transaction_id;
-                self.execute_bound_kernel(&prepared, &[], None, None, Some(&db))
+                self.execute_bound_kernel(&prepared, &[], None, None, Some(&db), None)
             })();
             let result = result.and_then(|value| {
                 if settle { self.settle_sequences()?; }
@@ -4141,7 +4163,7 @@ impl SqlSession {
                     table, key, sets, domain, &image).map_err(CoreError::Sql)?;
                 prepared.epoch = 0;
                 prepared.transaction = self.transaction_id;
-                self.execute_bound_kernel(&prepared, &[], Some(expected_version), None, Some(&db))
+                self.execute_bound_kernel(&prepared, &[], Some(expected_version), None, Some(&db), None)
             })();
             if result.is_err() { self.abort(); }
             return result;
@@ -4169,7 +4191,7 @@ impl SqlSession {
                     table, key, domain, &image).map_err(CoreError::Sql)?;
                 prepared.epoch = 0;
                 prepared.transaction = self.transaction_id;
-                self.execute_bound_kernel(&prepared, &[], Some(expected_version), None, Some(&db))
+                self.execute_bound_kernel(&prepared, &[], Some(expected_version), None, Some(&db), None)
             })();
             if result.is_err() { self.abort(); }
             return result;
@@ -4682,7 +4704,7 @@ impl SqlSession {
             }
         }
         let (p, lease) = self.prepare_for_execution(sql)?;
-        self.execute_bound_clocked_leased(&p, params, expected_version, None, lease.as_deref())
+        self.execute_bound_clocked_leased(&p, params, expected_version, None, lease.as_deref(), None)
     }
     /// Execute using caller-supplied transaction, statement and wall time.
     pub fn execute_at(
@@ -4707,7 +4729,7 @@ impl SqlSession {
             relational::assert_sql_frontend_allowed();
             self.guard_clock(clock)?;
             let (p, lease) = self.prepare_for_execution(sql)?;
-            self.execute_prepared_at_leased(&p, params, expected_version, clock, lease.as_deref())
+            self.execute_prepared_at_leased(&p, params, expected_version, clock, lease.as_deref(), None)
         })();
         if let Err(error) = &result {
             self.log_text_failure(sql, params.len(), error);
@@ -4739,10 +4761,22 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: &relational::StatementClock,
     ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
+        self.execute_prepared_at_checked_unreleased(p, params, expected_version, clock, None)
+    }
+    /// Runs a gateway reply check before publishing an untasked autocommit
+    /// write with a result set. A failed check discards the staged write.
+    pub fn execute_prepared_at_checked_unreleased(
+        &mut self,
+        p: &relational::Prepared,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+        clock: &relational::StatementClock,
+        check_reply: Option<&mut SqlReplyCheck<'_>>,
+    ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         relational::assert_sql_frontend_allowed();
         self.guard_clock(clock)?;
         let lease = self.execution_lease(p)?;
-        self.execute_prepared_at_leased(p, params, expected_version, clock, lease.as_deref())
+        self.execute_prepared_at_leased(p, params, expected_version, clock, lease.as_deref(), check_reply)
     }
 
     fn execute_prepared_at_leased(
@@ -4752,11 +4786,12 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: &relational::StatementClock,
         db: Option<&EngineLease>,
+        check_reply: Option<&mut SqlReplyCheck<'_>>,
     ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         let context = relational::clock::ExecutionClock::new(clock)
             .with_text_settings(self.date_style, self.bytea_output)
             .with_extra_float_digits(self.extra_float_digits);
-        let result = self.execute_bound_clocked_leased(p, params, expected_version, Some(&context), db);
+        let result = self.execute_bound_clocked_leased(p, params, expected_version, Some(&context), db, check_reply);
         // A BEGIN under an unavailable clock stays unpinned, so the first available clocked statement
         // becomes the pin. That is acceptable: the server clock stays latched until restart.
         if result.is_ok() && p.control() == Some("begin") && clock.unavailable.is_none() {
@@ -4811,7 +4846,7 @@ impl SqlSession {
         expected_version: Option<u64>,
     ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         relational::assert_sql_frontend_allowed();
-        self.execute_bound_clocked(p, params, expected_version, None)
+        self.execute_bound_clocked(p, params, expected_version, None, None)
     }
     /// Trusted Admin entry point. Gateways must authorize the typed source first.
     pub fn describe_typed_read(&mut self, read: relational::SingleSourceRead) -> Result<relational::Description, CoreError> {
@@ -4835,7 +4870,7 @@ impl SqlSession {
         let p = self.prepare_typed_read(lease.as_deref(), vec![read.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_single_source_read(domain, epoch, read))?;
         // Native reads materialise their whole result: keep the result budget.
-        relational::spill::bounded(|| self.execute_bound_clocked_leased(&p, &[], expected_version, None, lease.as_deref()))
+        relational::spill::bounded(|| self.execute_bound_clocked_leased(&p, &[], expected_version, None, lease.as_deref(), None))
     }
     /// Trusted Admin entry point; gateways must authorize both source tables first.
     pub fn describe_typed_join(&mut self, read: relational::TwoSourceRead) -> Result<relational::Description, CoreError> {
@@ -4857,7 +4892,7 @@ impl SqlSession {
         let lease = self.statement_lease()?;
         let p = self.prepare_typed_read(lease.as_deref(), vec![read.left.table.replace('.', "\0"), read.right.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_two_source_read(domain, epoch, read))?;
-        relational::spill::bounded(|| self.execute_bound_clocked_leased(&p, &[], expected_version, None, lease.as_deref()))
+        relational::spill::bounded(|| self.execute_bound_clocked_leased(&p, &[], expected_version, None, lease.as_deref(), None))
     }
     /// Trusted Admin entry point; gateways authorize the target and every source first.
     pub fn execute_typed_insert_select(&mut self, insert: relational::TypedInsertSelect,
@@ -4870,7 +4905,7 @@ impl SqlSession {
         let lease = self.statement_lease()?;
         let p = self.prepare_typed_read(lease.as_deref(), vec![target], |domain, epoch|
             relational::Prepared::from_typed_insert_select(domain, epoch, insert))?;
-        self.execute_bound_kernel(&p, &[], expected_version, None, lease.as_deref())
+        self.execute_bound_kernel(&p, &[], expected_version, None, lease.as_deref(), None)
     }
     fn prepare_typed_read(&mut self, db: Option<&EngineLease>, tables: Vec<String>,
         prepare: impl FnOnce(u128, u64) -> Result<relational::Prepared, relational::SqlError>) -> Result<relational::Prepared, CoreError> {
@@ -4908,7 +4943,7 @@ impl SqlSession {
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
         let lease = self.execution_lease(p)?;
-        self.execute_bound_kernel(p, params, expected_version, None, lease.as_deref())
+        self.execute_bound_kernel(p, params, expected_version, None, lease.as_deref(), None)
     }
     /// The statement kernel. Its result carries the task's release tag
     /// (GD-0061 R3-301); only `release` or `untasked` take the value out.
@@ -4918,9 +4953,10 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
+        check_reply: Option<&mut SqlReplyCheck<'_>>,
     ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         let lease = self.execution_lease(p)?;
-        self.execute_bound_clocked_leased(p, params, expected_version, clock, lease.as_deref())
+        self.execute_bound_clocked_leased(p, params, expected_version, clock, lease.as_deref(), check_reply)
     }
 
     fn execute_bound_clocked_leased(
@@ -4930,6 +4966,7 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
         db: Option<&EngineLease>,
+        check_reply: Option<&mut SqlReplyCheck<'_>>,
     ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         Self::check_prepared_generation(p, db)?;
         let (tag, expanded) = self.statement_tag_leased(p, db)?;
@@ -4945,9 +4982,11 @@ impl SqlSession {
             let _active = guard.as_ref().map(crate::task::limits::StatementGuard::activate);
             match tag {
                 Some(_) => relational::spill::task_statement(|| {
-                    self.execute_bound_kernel(p, params, expected_version, clock, db)
+                    self.execute_bound_kernel(p, params, expected_version, clock, db, None)
                 }),
-                None => self.execute_bound_kernel(p, params, expected_version, clock, db),
+                None => self.execute_bound_kernel(
+                    p, params, expected_version, clock, db, check_reply.filter(|_| self.task.is_none()),
+                ),
             }
         });
         match result {
@@ -5081,10 +5120,13 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
         db: Option<&EngineLease>,
+        check_reply: Option<&mut SqlReplyCheck<'_>>,
     ) -> Result<relational::SqlResult, CoreError> {
         // A spilled v2 RETURNING or SELECT result is materialised here unless the
         // caller streams it (`relational::spill::streaming`); errors and unwinds drop it.
-        relational::spill::statement(|| self.execute_bound_clocked_once(p, params, expected_version, clock, db))
+        relational::spill::statement(|| {
+            self.execute_bound_clocked_once(p, params, expected_version, clock, db, check_reply)
+        })
     }
     fn execute_bound_clocked_once(
         &mut self,
@@ -5093,6 +5135,7 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
         db: Option<&EngineLease>,
+        check_reply: Option<&mut SqlReplyCheck<'_>>,
     ) -> Result<relational::SqlResult, CoreError> {
         let _date_order = relational::clock::LiteralDateOrder::enter(p.literal_date_order);
         let _value_budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
@@ -5100,7 +5143,7 @@ impl SqlSession {
         if p.schema_context_differs(&self.search_path, &self.schema_user) {
             let mut bound = p.clone();
             bound.set_schema_context(self.search_path.clone(), self.schema_user.clone());
-            return self.execute_bound_clocked_once(&bound, params, expected_version, clock, db);
+            return self.execute_bound_clocked_once(&bound, params, expected_version, clock, db, check_reply);
         }
         if self.is_v2_engine() {
             let Some(db) = db else {
@@ -5122,7 +5165,7 @@ impl SqlSession {
                 };
                 Some(revision)
             } else { None };
-            let result = self.execute_v2(db, p, params, expected_version, clock);
+            let result = self.execute_v2(db, p, params, expected_version, clock, check_reply);
             if result.is_ok() {
                 if let Some(revision) = revision { self.staged_revision = revision; }
                 if p.control() == Some("begin") { self.staged_revision = 0; }
@@ -5144,7 +5187,7 @@ impl SqlSession {
             }
         };
         let result = crate::cancellation::check()
-            .and_then(|()| self.run(p, params, expected_version, clock))
+            .and_then(|()| self.run(p, params, expected_version, clock, check_reply))
             .map_err(|e| {
                 if p.schema_ddl().is_some_and(|(_, _, create)| create)
                     && e == CoreError::Sql(relational::SqlError::DuplicateObject)
@@ -5170,6 +5213,7 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
+        check_reply: Option<&mut SqlReplyCheck<'_>>,
     ) -> Result<relational::SqlResult, CoreError> {
         self.admin.inner.db(SQL_SESSIONS)?;
         use relational::SqlError as E;
@@ -5562,6 +5606,7 @@ impl SqlSession {
             self.staged = Some(s);
             self.deferral = deferral;
         } else if !p.is_read() {
+            check_autocommit_reply(check_reply, &result)?;
             self.publish(s)?;
         }
         Ok(result)

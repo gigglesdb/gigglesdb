@@ -59,26 +59,36 @@ fn simple(state: &mut State, session: &mut Session, sql: &str) -> R<Vec<u8>> {
 /// unnamed statement and portal; the bytes answered, or the first error.
 fn extended(state: &mut State, session: &mut Session, sql: &str) -> R<Vec<u8>> {
     let mut out = Vec::new();
+    extended_execute(state, session, sql, &mut out)?;
+    state.handle(b'S', &[], session, &mut out, std::time::Instant::now())?;
+    Ok(out)
+}
+
+fn extended_execute(
+    state: &mut State,
+    session: &mut Session,
+    sql: &str,
+    out: &mut Vec<u8>,
+) -> R<()> {
     let now = std::time::Instant::now();
     let mut parse = Vec::new();
     cstr("", &mut parse);
     cstr(sql, &mut parse);
     parse.extend(0u16.to_be_bytes());
-    state.handle(b'P', &parse, session, &mut out, now)?;
+    state.handle(b'P', &parse, session, out, now)?;
     let mut bind = Vec::new();
     cstr("", &mut bind);
     cstr("", &mut bind);
     bind.extend([0, 0, 0, 0, 0, 0]);
-    state.handle(b'B', &bind, session, &mut out, now)?;
+    state.handle(b'B', &bind, session, out, now)?;
     let mut describe = vec![b'P'];
     cstr("", &mut describe);
-    state.handle(b'D', &describe, session, &mut out, now)?;
+    state.handle(b'D', &describe, session, out, now)?;
     let mut execute = Vec::new();
     cstr("", &mut execute);
     execute.extend(0u32.to_be_bytes());
-    state.handle(b'E', &execute, session, &mut out, now)?;
-    state.handle(b'S', &[], session, &mut out, now)?;
-    Ok(out)
+    state.handle(b'E', &execute, session, out, now)?;
+    Ok(())
 }
 
 /// The DataRow messages in `out`, as their text values.
@@ -748,4 +758,332 @@ fn unnamed_cache_sequence_dependency_equivalence() {
         assert!(state.statements[""].parse_context.is_none(), "{sql}");
         assert!(state.unnamed_cache.iter().all(|entry| entry.sql != sql));
     }
+}
+
+#[test]
+fn returning_reply_w6_sync_sends_parameter_status_over_reply_limit() {
+    let mut session = fixture();
+    let mut observer = session.service.role_session("owner").unwrap();
+    let mut state = state();
+    simple(
+        &mut state,
+        &mut session,
+        "CREATE TABLE sync_status (id int PRIMARY KEY)",
+    )
+    .unwrap();
+    let path = format!("{}, public", vec!["s".repeat(63); 80].join(", "));
+    simple(
+        &mut state,
+        &mut session,
+        &format!("SET search_path TO {path}"),
+    )
+    .unwrap();
+
+    let mut out = Vec::new();
+    extended_execute(
+        &mut state,
+        &mut session,
+        "INSERT INTO sync_status VALUES (1)",
+        &mut out,
+    )
+    .unwrap();
+    extended_execute(
+        &mut state,
+        &mut session,
+        "SELECT set_config('search_path', 'public', true)",
+        &mut out,
+    )
+    .unwrap();
+    assert!(state.implicit);
+    assert_eq!(state.settings.current.search_path, "public");
+
+    // Supply a nearly full reply to the Sync handler. A normal wire Sync has
+    // its own message buffer, so this boundary is exercised directly.
+    let mut out = vec![0; MAX_RESPONSE - 800];
+    let before = out.len();
+    state
+        .handle(b'S', &[], &mut session, &mut out, std::time::Instant::now())
+        .unwrap();
+    assert_eq!(&out[before..before + 1], b"S");
+    assert!(
+        out[before..]
+            .windows(path.len())
+            .any(|bytes| bytes == path.as_bytes())
+    );
+    assert!(out.len() > MAX_RESPONSE);
+    assert!(out.ends_with(b"Z\0\0\0\x05I"));
+    let seen = observer
+        .execute_sql("SELECT id FROM sync_status", &[])
+        .unwrap();
+    assert_eq!(seen.rows.len(), 1);
+}
+
+#[test]
+fn returning_reply_w7_end_of_query_notice_after_commit_and_begin() {
+    let mut session = fixture();
+    let mut observer = session.service.role_session("owner").unwrap();
+    let mut state = state();
+    simple(&mut state, &mut session, "CREATE TABLE t (id int PRIMARY KEY)").unwrap();
+    let values = (1..=256).map(|id| format!("({id})")).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "BEGIN; INSERT INTO t VALUES {values} RETURNING \
+         repeat('x', CASE WHEN id = 256 THEN 32906 ELSE 32756 END); COMMIT; BEGIN"
+    );
+    NOTICE_ON_ROLE_REFRESH.with(|notice| notice.set(true));
+    let reply = simple(&mut state, &mut session, &sql);
+    let seen = observer.execute_sql("SELECT id FROM t", &[]).unwrap();
+    assert_eq!(seen.rows.len(), 256);
+    let reply = reply.expect("end-of-query notice failed after durable COMMIT");
+    assert!(!NOTICE_ON_ROLE_REFRESH.with(|notice| notice.get()));
+    assert!(reply.len() > MAX_RESPONSE);
+
+    let mut tail = Vec::new();
+    let mut at = 0;
+    while at < reply.len() {
+        let length = u32::from_be_bytes(reply[at + 1..at + 5].try_into().unwrap()) as usize;
+        let end = at + 1 + length;
+        if matches!(reply[at], b'C' | b'N' | b'Z') {
+            tail.push((reply[at], &reply[at + 5..end]));
+        }
+        at = end;
+    }
+    assert_eq!(tail.len(), 6);
+    assert_eq!(tail[2], (b'C', b"COMMIT\0".as_slice()));
+    assert_eq!(tail[3], (b'C', b"BEGIN\0".as_slice()));
+    assert_eq!(tail[4].0, b'N');
+    assert!(tail[4].1.ends_with(b"role reset after dispatch\0\0"));
+    assert_eq!(tail[5], (b'Z', b"T".as_slice()));
+}
+
+thread_local! {
+    static FAIL_ROLE_REFRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NOTICE_ON_ROLE_REFRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// The socket worker runs on a blocking thread. Scope its fault to this
+// service and CopyDone, after the transaction commits.
+static DROP_COPY_ROLE: std::sync::Mutex<Option<std::sync::Weak<crate::Service>>> =
+    std::sync::Mutex::new(None);
+
+pub(super) fn post_dispatch_role_refresh(session: &mut Session, tag: u8) -> R<()> {
+    if NOTICE_ON_ROLE_REFRESH.with(|notice| notice.replace(false)) {
+        session.role_notices.push((true, "role reset after dispatch".into()));
+    }
+    if FAIL_ROLE_REFRESH.with(|fail| fail.replace(false)) {
+        return Err("XX000");
+    }
+    if tag == b'c' {
+        let mut fault = DROP_COPY_ROLE.lock().unwrap();
+        if fault.as_ref().is_some_and(|service| {
+            std::ptr::eq(service.as_ptr(), std::sync::Arc::as_ptr(&session.service))
+        }) {
+            fault.take();
+            drop(fault);
+            let Role::Database { name } = &session.role else {
+                unreachable!()
+            };
+            session.service.admin.roles().drop(name).unwrap();
+        }
+    }
+    Ok(())
+}
+
+fn check_copy_refresh(simple_query: Option<&str>, fail_on: u8, written: usize) {
+    let mut session = fixture();
+    let mut observer = session.service.role_session("owner").unwrap();
+    let mut state = state();
+    simple(
+        &mut state,
+        &mut session,
+        "CREATE TABLE copy_refresh (id int PRIMARY KEY)",
+    )
+    .unwrap();
+    let backend = crate::cancel::Registry::default().register("", 0).unwrap();
+    let dispatch = |state: &mut State, session: &mut Session, tag, body: &[u8]| {
+        let mut out = Vec::new();
+        let active = state
+            .copy_active
+            .take()
+            .unwrap_or_else(|| backend.begin(true));
+        assert_eq!(
+            state
+                .buffered_message(
+                    (tag, body, std::time::Instant::now()),
+                    session,
+                    &mut out,
+                    active,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            (true, false)
+        );
+        out
+    };
+    if let Some(query) = simple_query {
+        let mut body = Vec::new();
+        cstr(query, &mut body);
+        assert_eq!(dispatch(&mut state, &mut session, b'Q', &body)[0], b'G');
+    } else {
+        extended_execute(
+            &mut state,
+            &mut session,
+            "COPY copy_refresh FROM STDIN",
+            &mut Vec::new(),
+        )
+        .unwrap();
+    }
+    assert!(state.copy_receiving());
+    dispatch(&mut state, &mut session, b'd', b"1\n");
+    if fail_on == b'S' {
+        assert!(dispatch(&mut state, &mut session, b'c', &[]).is_empty());
+        assert!(
+            observer
+                .execute_sql("SELECT id FROM copy_refresh", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+
+    FAIL_ROLE_REFRESH.with(|fail| fail.set(true));
+    let body = if fail_on == b'f' { b"client cancelled\0".as_slice() } else { &[] };
+    let out = dispatch(&mut state, &mut session, fail_on, body);
+    let seen = observer
+        .execute_sql("SELECT id FROM copy_refresh", &[])
+        .unwrap();
+    assert_eq!(seen.rows.len(), written);
+    assert_eq!(out[0], b'E');
+    let end = 1 + u32::from_be_bytes(out[1..5].try_into().unwrap()) as usize;
+    let expected = if written == 0 {
+        b"CXX000\0"
+    } else {
+        b"C08007\0"
+    };
+    assert!(
+        out[5..end].windows(7).any(|field| field == expected),
+        "{out:?}"
+    );
+    if written == 0 && simple_query.is_none() {
+        assert_eq!(end, out.len());
+        let sync = dispatch(&mut state, &mut session, b'S', &[]);
+        let seen = observer
+            .execute_sql("SELECT id FROM copy_refresh", &[])
+            .unwrap();
+        assert!(seen.rows.is_empty());
+        assert_eq!(sync, b"Z\0\0\0\x05I");
+    } else {
+        assert_eq!(&out[end..], b"Z\0\0\0\x05I");
+    }
+    assert!(!state.drain);
+}
+
+#[test]
+fn returning_reply_w4_copy_done_role_refresh_reports_unknown_and_readies_once() {
+    check_copy_refresh(
+        Some("COPY copy_refresh FROM STDIN; INSERT INTO copy_refresh VALUES (2)"),
+        b'c',
+        2,
+    );
+}
+
+#[test]
+fn returning_reply_w5_standalone_copy_done_role_refresh_reports_unknown_and_readies_once() {
+    check_copy_refresh(Some("COPY copy_refresh FROM STDIN"), b'c', 1);
+}
+
+#[test]
+fn returning_reply_w5_extended_copy_sync_role_refresh_reports_unknown_and_readies_once() {
+    check_copy_refresh(None, b'S', 1);
+}
+
+#[test]
+fn returning_reply_w6_extended_copy_done_error_discards_completion() {
+    check_copy_refresh(None, b'c', 0);
+}
+
+#[test]
+fn returning_reply_w7_simple_copy_fail_refresh_readies_once() {
+    check_copy_refresh(Some("COPY copy_refresh FROM STDIN"), b'f', 0);
+}
+
+#[tokio::test]
+async fn returning_reply_w5_socket_flushes_unknown_outcome_on_binding_loss() {
+    let mut observer = fixture();
+    observer
+        .execute_sql("CREATE TABLE copy_refresh (id int PRIMARY KEY)", &[])
+        .unwrap();
+    let service = &observer.service;
+    service
+        .admin
+        .roles()
+        .create(NewRole {
+            name: "copy_writer".into(),
+            login: true,
+            superuser: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let writer = service.role_session("copy_writer").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let startup = crate::pgwire_startup::Startup {
+            user: "copy_writer".into(),
+            database: "postgres".into(),
+            settings: Default::default(),
+            timezone: "UTC".into(),
+            task: None,
+        };
+        serve_buffered(&mut socket, writer, startup, false, &[])
+            .await
+            .unwrap();
+    });
+    async fn read(client: &mut tokio::net::TcpStream) -> Option<(u8, Vec<u8>)> {
+        timeout(std::time::Duration::from_secs(10), async {
+            let tag = match client.read_u8().await {
+                Ok(tag) => tag,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return None,
+                Err(error) => panic!("{error}"),
+            };
+            let mut body = vec![0; client.read_u32().await.unwrap() as usize - 4];
+            client.read_exact(&mut body).await.unwrap();
+            Some((tag, body))
+        })
+        .await
+        .unwrap()
+    }
+    while read(&mut client).await.unwrap().0 != b'Z' {}
+
+    let mut request = Vec::new();
+    frame(
+        b'Q',
+        b"COPY copy_refresh FROM STDIN; INSERT INTO copy_refresh VALUES (2)\0",
+        &mut request,
+    )
+    .unwrap();
+    client.write_all(&request).await.unwrap();
+    assert_eq!(read(&mut client).await.unwrap().0, b'G');
+
+    *DROP_COPY_ROLE.lock().unwrap() = Some(std::sync::Arc::downgrade(service));
+    request.clear();
+    frame(b'd', b"1\n", &mut request).unwrap();
+    frame(b'c', &[], &mut request).unwrap();
+    client.write_all(&request).await.unwrap();
+    let mut reply = Vec::new();
+    while let Some(message) = read(&mut client).await {
+        reply.push(message);
+    }
+    server.await.unwrap();
+    let seen = observer
+        .execute_sql("SELECT id FROM copy_refresh", &[])
+        .unwrap();
+    assert_eq!(seen.rows.len(), 2);
+    assert_eq!(reply.len(), 2, "{reply:?}");
+    assert_eq!(reply[0].0, b'E');
+    assert!(reply[0].1.windows(7).any(|field| field == b"C08007\0"));
+    assert_eq!(reply[1], (b'Z', b"I".to_vec()));
 }

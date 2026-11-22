@@ -59,13 +59,6 @@ impl Cancellation {
         let callback = self.0.durability_wait.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         callback.and_then(|callback| callback(kind, release_admission))
     }
-    pub(crate) fn durability_wait_registered() -> bool {
-        CURRENT.with(|current| {
-            current.borrow().as_ref().is_some_and(|context| {
-                context.0.durability_wait.lock().unwrap_or_else(PoisonError::into_inner).is_some()
-            })
-        })
-    }
     pub fn current() -> Option<Self> {
         CURRENT.with(|c| c.borrow().clone())
     }
@@ -271,7 +264,6 @@ impl<T> WaitMutex<T> {
     }
 
     /// Plain blocking lock, preserving std's poison recovery semantics.
-    #[allow(dead_code)] // Compatibility API; production callers use cancellable locking.
     pub(crate) fn lock(&self) -> LockResult<WaitGuard<'_, T>> {
         match self.inner.lock() {
             Ok(guard) => Ok(self.guard(guard)),

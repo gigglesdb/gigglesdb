@@ -4,7 +4,7 @@ use crate::{CoreError, Error};
 pub fn sqlstate(e: &CoreError) -> &'static str {
     use crate::relational::SqlError as S;
     match e {
-        CoreError::PrivilegeInquiry(state) => state,
+        CoreError::PrivilegeInquiry(state) | CoreError::SqlReplyEncoding(state) => state,
         CoreError::Policy(Error::Authentication | Error::UnknownTask) => "28000",
         CoreError::Policy(Error::Revoked | Error::Expired | Error::Scope)
         | CoreError::SequencePrivilege => "42501",
