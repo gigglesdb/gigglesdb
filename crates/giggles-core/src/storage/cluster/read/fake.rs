@@ -104,6 +104,15 @@ impl FakeRange {
     }
 }
 
+#[test]
+fn lock_release_mode_fake_read_managers_use_all_shards() {
+    let cluster = FakeCluster::new(&[]);
+    let state = cluster.state.lock().unwrap();
+    for range in state.ranges.values() {
+        assert!(!range.locks.per_shard_release(), "range {:?}", range.desc.id);
+    }
+}
+
 #[derive(Default)]
 struct State {
     ranges: BTreeMap<RangeId, FakeRange>,

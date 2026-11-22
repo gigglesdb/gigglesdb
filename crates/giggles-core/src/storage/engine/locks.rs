@@ -26,9 +26,9 @@ use std::ops::Bound;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::collections::hash_map::RandomState;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
 /// Production shard count; explicit 1/2/64 suites exercise the same protocol.
@@ -264,6 +264,13 @@ impl HeldModes {
 #[derive(Clone, Debug)]
 pub(crate) struct LockConfig {
     pub(crate) shards: usize,
+    /// Allow release_all to detach a transaction's registry entry before
+    /// visiting its shards. Only enable when release_all is serialized with
+    /// every other operation for the same transaction, including other releases.
+    /// On the local V2 manager, IDs come only from V2Db::begin. Transaction is
+    /// not Clone, releases only in Drop, and makes all other calls through
+    /// &Transaction or &mut Transaction.
+    pub(crate) per_shard_release: bool,
     #[cfg(test)]
     pub(crate) placement: Option<fn(&LockKey) -> usize>,
     pub(crate) max_row_locks_per_txn: usize,
@@ -275,6 +282,7 @@ impl Default for LockConfig {
     fn default() -> Self {
         Self {
             shards: DEFAULT_LOCK_SHARDS,
+            per_shard_release: false,
             #[cfg(test)]
             placement: None,
             max_row_locks_per_txn: 1_000_000,
@@ -379,11 +387,36 @@ impl Slot {
         self.cv.notify_one();
     }
 }
+// Every held key has a shard bit (including table locks), every by_txn
+// waiter counts toward pending, and every provisional snapshot is counted
+// even before its first grant. An absent entry therefore needs no cleanup
+// unless an opt-in release has detached it and still owns the shard mask.
 #[derive(Debug, Default)]
-struct TxnLocal { rows: usize, shard_mask: ShardMask, pending: usize }
+struct TxnLocal {
+    rows: usize,
+    shard_mask: ShardMask,
+    pending: usize,
+    provisional: usize,
+}
 #[derive(Debug, Default)]
 struct ShardMask { first: u64, rest: Vec<u64> }
 impl ShardMask {
+    fn indices(&self) -> impl Iterator<Item = usize> + '_ {
+        std::iter::once(self.first)
+            .chain(self.rest.iter().copied())
+            .enumerate()
+            .flat_map(|(word, mut bits)| {
+                std::iter::from_fn(move || {
+                    if bits == 0 {
+                        return None;
+                    }
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    Some(word * 64 + bit)
+                })
+            })
+    }
+
     fn insert(&mut self, index: usize) {
         if index < 64 { self.first |= 1 << index; }
         else {
@@ -411,8 +444,11 @@ impl TxnRegistry {
     fn rows(&self, txn: TxnId) -> usize { self.stripe(txn).get(&txn).map_or(0, |t| t.rows) }
     fn pending(&self, txn: TxnId, add: bool) {
         let mut stripe = self.stripe(txn);
-        let local = stripe.entry(txn).or_default();
-        if add { local.pending += 1; } else { local.pending -= 1; }
+        if add {
+            stripe.entry(txn).or_default().pending += 1;
+        } else {
+            stripe.get_mut(&txn).expect("registered waiter").pending -= 1;
+        }
     }
 }
 #[derive(Debug, Default)]
@@ -426,6 +462,12 @@ struct GapState {
 // Shard selection mixes it separately so bucket bits retain their entropy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HashedKey { hash: u64, key: LockKey }
+impl HashedKey {
+    fn row_key_twin(&self) -> Option<Self> {
+        let LockKey::Row { table, pk } = &self.key else { return None; };
+        Some(Self { hash: self.hash, key: LockKey::RowKey { table: *table, pk: pk.clone() } })
+    }
+}
 impl Hash for HashedKey {
     fn hash<H: Hasher>(&self, h: &mut H) { h.write_u64(self.hash); }
 }
@@ -457,6 +499,8 @@ struct ShardState {
 }
 #[cfg(test)]
 thread_local! {
+    static SHARD_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SHARD_RELEASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PAYLOAD_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LOCK_ORDER: std::cell::RefCell<(Vec<usize>, usize)> = const { std::cell::RefCell::new((Vec::new(), 0)) };
 }
@@ -464,6 +508,8 @@ thread_local! {
 struct OrderGuard { #[cfg(test)] shard: Option<usize> }
 impl OrderGuard {
     fn shard(index: usize) -> Self {
+        #[cfg(test)]
+        SHARD_LOCKS.with(|count| count.set(count.get() + 1));
         #[cfg(test)]
         LOCK_ORDER.with(|order| {
             let mut order = order.borrow_mut();
@@ -546,12 +592,42 @@ impl State<'_> {
     }
     fn provisional_empty(&self) -> bool { self.guards.slice().iter().all(|s| s.provisional.is_empty()) }
     fn provisional_insert(&mut self, txn: TxnId, key: HashedKey, modes: HeldModes) {
-        let i = self.position(&key); self.guards.slice_mut()[i].provisional.entry(txn).or_default().insert(key, modes);
+        let i = self.position(&key);
+        let mut stripe = self.manager.registry.stripe(txn);
+        if self.guards.slice_mut()[i].provisional.entry(txn).or_default().insert(key, modes).is_none() {
+            stripe.entry(txn).or_default().provisional += 1;
+        }
     }
     fn provisional_remove(&mut self, txn: TxnId, key: &HashedKey) -> Option<HeldModes> {
-        let i = self.position(key); let map = &mut self.guards.slice_mut()[i].provisional;
-        let modes = map.get_mut(&txn)?.remove(key);
-        if map[&txn].is_empty() { map.remove(&txn); } modes
+        let i = self.position(key);
+        let map = &mut self.guards.slice_mut()[i].provisional;
+        let modes = map.get_mut(&txn)?.remove(key)?;
+        if map[&txn].is_empty() {
+            map.remove(&txn);
+        }
+        self.manager.registry.stripe(txn).get_mut(&txn).expect("registered provisional key").provisional -= 1;
+        Some(modes)
+    }
+
+    #[cfg(test)]
+    fn assert_registry_covers(&self, txn: TxnId) {
+        assert!(self.local.is_none());
+        let stripe = self.manager.registry.stripe(txn);
+        let local = stripe.get(&txn);
+        let mut pending = 0;
+        let mut provisional = 0;
+        let mut rows = 0;
+        for (index, shard) in self.guards.slice().iter().enumerate() {
+            pending += shard.by_txn.get(&txn).map_or(0, Vec::len);
+            provisional += shard.provisional.get(&txn).map_or(0, KeyMap::len);
+            if let Some(held) = shard.held.get(&txn) {
+                assert!(local.is_some_and(|entry| entry.shard_mask.contains(index)));
+                rows += held.iter().filter(|key| !matches!(key.key, LockKey::Table(_))).count();
+            }
+        }
+        assert_eq!(pending, local.map_or(0, |entry| entry.pending));
+        assert_eq!(provisional, local.map_or(0, |entry| entry.provisional));
+        assert_eq!(rows, local.map_or(0, |entry| entry.rows));
     }
     fn forget_holding(&mut self, txn: TxnId, key: &HashedKey) {
         let i = self.position(key);
@@ -575,7 +651,16 @@ struct GroupContext<'a> {
 type RaceHook = Arc<dyn Fn() + Send + Sync>;
 #[cfg(test)]
 #[derive(Default)]
-struct TestHooks { s2_false: Mutex<Option<RaceHook>>, h1: Mutex<Option<RaceHook>>, point: Mutex<Option<RaceHook>>, h2: Mutex<Option<RaceHook>>, h3: Mutex<Option<RaceHook>> }
+struct TestHooks {
+    s2_false: Mutex<Option<RaceHook>>,
+    h1: Mutex<Option<RaceHook>>,
+    point: Mutex<Option<RaceHook>>,
+    h2: Mutex<Option<RaceHook>>,
+    h3: Mutex<Option<RaceHook>>,
+    h4: Mutex<Option<RaceHook>>,
+    release_global: Mutex<Option<RaceHook>>,
+    before_release_drain: Mutex<Option<RaceHook>>,
+}
 #[cfg(test)]
 impl std::fmt::Debug for TestHooks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("TestHooks") }
@@ -672,28 +757,43 @@ impl LockManager {
         Ok(None)
     }
 
-    // S1-S3 are checked without changing any shard or registry state. Enqueue
-    // requires every shard, so pending cannot rise while this guard is held.
+    fn requires_global(&self, key: &HashedKey) -> bool {
+        matches!(key.key, LockKey::Interval { .. })
+            || key.point().is_some_and(|(space, _, _)| {
+                self.gap_mode[space as usize].load(Ordering::SeqCst)
+            })
+    }
+
+    // Check even waiters that become grantable only after ownership changes.
+    // Enqueue requires all shards, so pending cannot rise under this guard.
+    fn shard_safe_queue(&self, state: &State<'_>, key: &HashedKey) -> bool {
+        let index = state.local.expect("shard preflight");
+        state.key(key).is_none_or(|locks| {
+            locks.queue.iter().all(|id| {
+                let waiter = state.waiter(id).expect("local waiter");
+                let no_other_pending = self.registry.stripe(waiter.txn)
+                    .get(&waiter.txn).is_some_and(|entry| entry.pending == 1);
+                no_other_pending && waiter.group.iter().all(|(key, _)| {
+                    self.hashed_shard(key) == index && !self.requires_global(key)
+                })
+            })
+        })
+    }
+
+    // S1-S3 are checked without changing any shard or registry state.
     fn shard_safe(&self, state: &State<'_>, txn: TxnId, group: &[(HashedKey, LockMode)]) -> bool {
         let index = state.local.expect("shard preflight");
-        if self.registry.stripe(txn).get(&txn).is_some_and(|t| t.pending != 0) { return false; } // S1
+        if self.registry.stripe(txn).get(&txn).is_some_and(|t| t.pending != 0) {
+            return false; // S1
+        }
         for (key, _) in group {
-            if matches!(&key.key, LockKey::Interval { .. }) || self.hashed_shard(key) != index { return false; }
-            // S2 must be read under the point's shard lock, after the test hook.
-            if key.point().is_some_and(|(space, _, _)| self.gap_mode[space as usize].load(std::sync::atomic::Ordering::SeqCst)) { return false; }
+            if self.hashed_shard(key) != index || self.requires_global(key) {
+                return false; // S2
+            }
             #[cfg(test)]
             run_hook(&self.hooks.s2_false);
-            if let Some(locks) = state.key(key) {
-                for id in &locks.queue {
-                    let waiter = state.waiter(id).expect("local waiter");
-                    // Conservatively inspect every waiter, including ones that
-                    // become grantable after this operation changes ownership.
-                    if self.registry.stripe(waiter.txn).get(&waiter.txn).is_some_and(|t| t.pending > 1)
-                        || waiter.group.iter().any(|(k, _)| self.hashed_shard(k) != index
-                            || k.point().is_some_and(|(space, _, _)| self.gap_mode[space as usize].load(std::sync::atomic::Ordering::SeqCst))) {
-                        return false; // S3: drop the shard before any mutation.
-                    }
-                }
+            if !self.shard_safe_queue(state, key) {
+                return false; // S3
             }
         }
         true
@@ -1031,6 +1131,11 @@ impl LockManager {
         self.release_all_calls.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn per_shard_release(&self) -> bool {
+        self.config.per_shard_release
+    }
+
     /// Snapshot just the requested keys; callers serialize acquisitions per transaction.
     pub(crate) fn modes_on(&self, txn: TxnId, keys: &[(LockKey, LockMode)]) -> Vec<(LockKey, HeldModes)> {
         keys.iter().map(|(key, _)| {
@@ -1076,61 +1181,136 @@ impl LockManager {
     }
 
     /// Release held locks and terminate this transaction's pending calls with
-    /// `Cancelled`. Cleanup still operates if the bookkeeping mutex is poisoned.
+    /// `Cancelled`. Cleanup still operates if a shard mutex is poisoned.
+    ///
+    /// The default release is atomic under all shard guards. With per-shard
+    /// release, held() and probes by other transactions can observe a partial
+    /// release across shards. Another session's FOR UPDATE NOWAIT can lock
+    /// row a and then fail on row b, and SKIP LOCKED can return a and skip b.
+    /// We accept this PostgreSQL difference because GigglesDB is not a drop-in
+    /// replacement, the row versions are committed before release, and lock
+    /// waiters are still woken. The local engine's K+D groups share a shard,
+    /// pg_locks shows only the current session's table locks, and savepoint
+    /// restore still takes all shards.
     pub(crate) fn release_all(&self, txn: TxnId) {
         #[cfg(test)]
         self.release_all_calls.fetch_add(1, Ordering::Relaxed);
-        // Cleanup/inspection remain useful after poisoning; acquire reports Misuse.
-        let mut state = self
-            .global()
-            .unwrap_or_else(|poison| poison.into_inner());
-        // Metadata transactions hold no locks. In particular, dropping one must
-        // not scan all row/index locks owned by an in-progress COPY statement.
-        let local = self.registry.stripe(txn).remove(&txn);
-        // A group can have provisional snapshots before its first grant creates
-        // a registry entry. Keep cleanup for that case (and any indexed state).
-        if local.is_none() && state.guards.slice().iter().all(|s|
-            !s.provisional.contains_key(&txn) && !s.by_txn.contains_key(&txn)
-                && !s.held.contains_key(&txn)) {
+        if !self.config.per_shard_release {
+            self.release_all_global(txn, None);
             return;
         }
-        let local = local.unwrap_or_default();
-        let mut affected = HashSet::new();
-        let mut released_hashes = Vec::new();
-        for (i, shard) in state.guards.slice_mut().iter_mut().enumerate() {
-            if local.shard_mask.contains(i) { released_hashes.extend(shard.held.remove(&txn).unwrap_or_default()); }
-        }
-        affected.extend(released_hashes);
-        // Pending removal updates the registry; retain its count until removal.
-        self.registry.stripe(txn).entry(txn).or_default().pending = local.pending;
-        let mut unblocked = Vec::new();
-        for key in &affected {
-            if let Some(locks) = state.key_mut(key) {
-                locks.holders.remove(&txn);
-                locks.slow.remove(&txn);
+        let local = {
+            let mut stripe = self.registry.stripe(txn);
+            let Some(entry) = stripe.get(&txn) else { return; };
+            if entry.pending == 0 && entry.provisional == 0 {
+                // Detaching the entry is the linearization point for registry
+                // ownership. Callers serialize release with all operations on
+                // this txn, and no pending or provisional grant can change it.
+                // Each shard's holders disappear under its guard. Drop the
+                // stripe before taking any shard lock.
+                stripe.remove(&txn)
+            } else {
+                None
             }
-            state.provisional_remove(txn, key);
-            state.cross_queued(key, &mut unblocked);
-            // D grants also determine whether queued K groups may bypass.
-            if let LockKey::Row { table, pk } = &key.key {
-                let row_key = HashedKey { hash: key.hash, key: LockKey::RowKey { table: *table, pk: pk.clone() } };
-                if state.key(&row_key).is_some_and(|locks| !locks.queue.is_empty()) {
-                    unblocked.push(row_key);
+        };
+        let Some(local) = local else {
+            self.release_all_global(txn, None);
+            return;
+        };
+        for index in local.shard_mask.indices() {
+            #[cfg(test)]
+            run_hook(&self.hooks.h4);
+            let mut state = self.single(index).unwrap_or_else(|poison| poison.into_inner());
+            if !self.try_release_shard(&mut state, txn) {
+                drop(state);
+                self.release_all_global(txn, Some((&local.shard_mask, index)));
+                return;
+            }
+            #[cfg(test)]
+            SHARD_RELEASES.with(|count| count.set(count.get() + 1));
+        }
+    }
+
+    fn try_release_shard(&self, state: &mut State<'_>, txn: TxnId) -> bool {
+        let shard = &state.guards.slice()[0];
+        if shard.by_txn.contains_key(&txn) || shard.provisional.contains_key(&txn) {
+            return false;
+        }
+        let Some(keys) = shard.held.get(&txn) else { return true; };
+        let mut twins = Vec::new();
+        for key in keys {
+            // Read gap mode under the shard lock. An interval that enables it
+            // after this read must acquire this shard before building its index.
+            if self.requires_global(key) || !self.shard_safe_queue(state, key) {
+                return false;
+            }
+            // Removing D can make a group queued on K eligible for bypass.
+            if let Some(twin) = key.row_key_twin() {
+                if self.hashed_shard(&twin) != state.local.expect("shard preflight") {
+                    return false;
+                }
+                if state.has_queue(&twin) && !keys.contains(&twin) {
+                    if !self.shard_safe_queue(state, &twin) {
+                        return false;
+                    }
+                    twins.push(twin);
                 }
             }
         }
+
+        let keys = state.guards.slice_mut()[0].held.remove(&txn).expect("preflighted holdings");
+        for key in &keys {
+            state.remove_holder(txn, key);
+        }
+        for key in keys.into_iter().chain(twins) {
+            state.drain_queue(&key, self.config.max_row_locks_per_txn);
+            state.settle(&key);
+        }
+        true
+    }
+
+    fn release_all_global(&self, txn: TxnId, remainder: Option<(&ShardMask, usize)>) {
+        let mut state = self.global().unwrap_or_else(|poison| poison.into_inner());
+        #[cfg(test)]
+        run_hook(&self.hooks.release_global);
+        // Re-read the registry under all shard guards. It may have changed
+        // while we acquired them, or been recreated after a per-shard detach.
+        // Keep the entry for waiter cancellation.
+        let current_mask = self.registry.stripe(txn).get_mut(&txn)
+            .map(|local| std::mem::take(&mut local.shard_mask));
+        if current_mask.is_none() && remainder.is_none() {
+            return;
+        }
+        let mut affected = HashSet::new();
+        for (index, shard) in state.guards.slice_mut().iter_mut().enumerate() {
+            if current_mask.as_ref().is_some_and(|mask| mask.contains(index))
+                || remainder.is_some_and(|(mask, first)| index >= first && mask.contains(index))
+            {
+                affected.extend(shard.held.remove(&txn).unwrap_or_default());
+            }
+        }
+        let mut unblocked = Vec::new();
+        for key in &affected {
+            state.remove_holder(txn, key);
+            state.cross_queued(key, &mut unblocked);
+            unblocked.extend(key.row_key_twin().filter(|twin| state.has_queue(twin)));
+        }
         affected.extend(unblocked);
 
-        let pending = state.pending(txn);
-        for id in pending {
-            affected.insert(state.waiter(&id).unwrap().key.clone());
-            state.remove_waiter(id, Err(LockError::Cancelled));
+        if current_mask.is_some() {
+            for id in state.pending(txn) {
+                affected.insert(state.waiter(&id).unwrap().key.clone());
+                state.remove_waiter(id, Err(LockError::Cancelled));
+            }
+            for shard in state.guards.slice_mut() {
+                shard.provisional.remove(&txn);
+            }
+            self.registry.stripe(txn).remove(&txn);
         }
-        self.registry.stripe(txn).remove(&txn);
-        for shard in state.guards.slice_mut() { shard.provisional.remove(&txn); }
+        #[cfg(test)]
+        run_hook(&self.hooks.before_release_drain);
         // Only releasing a holder or cancelling a queued request can unblock
-        // this key's waiters, or (across keys) requests queued on a key that a
-        // released lock overlapped. Leave unrelated queues and holders untouched.
+        // its queue or a queue on an overlapping key.
         for key in affected {
             state.drain_queue(&key, self.config.max_row_locks_per_txn);
             state.settle(&key);
@@ -1267,6 +1447,17 @@ impl State<'_> {
                 || self.cross_blocked(txn, key, *mode)
         }) { return; }
         for (key, _) in group { self.provisional_remove(txn, key); }
+    }
+
+    fn remove_holder(&mut self, txn: TxnId, key: &HashedKey) {
+        if let Some(locks) = self.key_mut(key) {
+            locks.holders.remove(&txn);
+            locks.slow.remove(&txn);
+        }
+    }
+
+    fn has_queue(&self, key: &HashedKey) -> bool {
+        self.key(key).is_some_and(|locks| !locks.queue.is_empty())
     }
 
     fn row_locker(&self, txn: TxnId, key: &HashedKey) -> bool {

@@ -1142,6 +1142,26 @@ fn native_v2_catalog_rollback_and_waiting_fence() {
 
 #[cfg(feature = "engine-rocksdb")]
 #[test]
+fn lock_release_mode_only_local_v2_enables_per_shard_release() {
+    use crate::storage::cluster::{
+        db::local::LocalCluster,
+        txn::{ClusterConfig, ClusterTxnServices},
+    };
+    use engine::{kv::Kv, kv_mem::MemKv, meta};
+
+    let domain = [1; 16];
+    let backend = Arc::new(MemKv::new());
+    meta::write_initial_meta(backend.as_ref(), domain, 0).unwrap();
+    let local = V2Db::from_kv(Arc::new(Kv::new_single_writer(backend))).unwrap();
+    assert!(local.locks.per_shard_release());
+
+    let services = ClusterTxnServices::new(LocalCluster::new(&[]), ClusterConfig::default());
+    let gateway = V2Db::cluster(services, domain).unwrap();
+    assert!(!gateway.locks.per_shard_release());
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
 fn open_refuses_reclaim_write_fence() {
     use engine::{kv::*, kv_mem::MemKv, meta};
     let backend = Arc::new(MemKv::new());

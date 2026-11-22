@@ -566,6 +566,8 @@ mod sql_array_validation;
 #[path = "sql_numeric_domain.rs"]
 mod sql_numeric_domain;
 
+#[path = "lock_release_sessions.rs"]
+mod lock_release_sessions;
 #[path = "fk_row_locks.rs"]
 mod fk_row_locks;
 #[path = "sql_row_locks.rs"]

@@ -72,6 +72,13 @@ pub(super) fn fixture() -> Fixture {
         sink,
     }
 }
+#[test]
+fn lock_release_mode_range_engine_uses_all_shards() {
+    let fixture = fixture();
+    let engine = fixture.open();
+    assert!(!engine.locks.per_shard_release());
+}
+
 pub(super) fn config() -> EngineConfig {
     EngineConfig {
         lease: Duration::from_millis(300),

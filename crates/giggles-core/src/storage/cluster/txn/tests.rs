@@ -51,6 +51,12 @@ fn services(cluster: &Arc<LocalCluster>, config: ClusterConfig) -> Arc<ClusterTx
     ClusterTxnServices::new(cluster.clone(), config)
 }
 
+#[test]
+fn lock_release_mode_gateway_uses_all_shards() {
+    let gateway = services(&cluster(), ClusterConfig::default());
+    assert!(!gateway.gateway.per_shard_release());
+}
+
 fn begin(services: &Arc<ClusterTxnServices>, isolation: Isolation) -> Transaction {
     Transaction::begin_with(
         TxnServices::Cluster(services.clone()),
