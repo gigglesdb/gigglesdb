@@ -1052,6 +1052,7 @@ fn real_writer_lock_contention_retries_within_and_beyond_attempt_bound() {
         let delays_for_wait = Arc::clone(&delays);
         let opens = Arc::new(AtomicUsize::new(0));
         let opens_for_thread = Arc::clone(&opens);
+        let opens_for_wait = Arc::clone(&opens);
         let _worker = Worker::start(
             &admin,
             settings(),
@@ -1063,6 +1064,12 @@ fn real_writer_lock_contention_retries_within_and_beyond_attempt_bound() {
                     request.open()
                 })),
                 wait: Some(Box::new(move |delay| {
+                    // Drain and close run before the first reopen and use the
+                    // real wake. On a slow box the drain can wait, and that
+                    // delay (up to drain_timeout) is not a lock retry delay.
+                    if opens_for_wait.load(Ordering::Relaxed) == 0 {
+                        return false;
+                    }
                     delays_for_wait.lock().unwrap().push(delay);
                     if !hold_past_bound || delay > Duration::from_secs(1) {
                         drop(holder.lock().unwrap().take());
