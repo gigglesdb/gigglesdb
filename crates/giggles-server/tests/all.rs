@@ -97,6 +97,8 @@ mod sequence_ddl_network;
 mod session_identity_network;
 #[path = "session_settings_network.rs"]
 mod session_settings_network;
+#[path = "presentation_settings_network.rs"]
+mod presentation_settings_network;
 #[path = "session_zone_float_network.rs"]
 mod session_zone_float_network;
 #[path = "startup_params_network.rs"]

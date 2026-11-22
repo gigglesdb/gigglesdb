@@ -2246,6 +2246,8 @@ pub struct SqlSession {
     transaction_id: Option<u128>,
     transaction_clock_us: Option<i64>,
     extra_float_digits: i32,
+    date_style: giggles_pg_types::temporal::DateStyleSettings,
+    bytea_output: giggles_pg_types::bytea::ByteaOutput,
     max_value_bytes: usize,
     max_statement_tokens: usize,
     search_path: Vec<String>,
@@ -2287,6 +2289,7 @@ struct UnnamedPlanKey {
     generation: u64,
     search_path: Vec<String>,
     schema_user: String,
+    date_order: giggles_pg_types::temporal::DateOrder,
 }
 
 impl Admin {
@@ -2308,6 +2311,8 @@ impl Admin {
             transaction_id: None,
             transaction_clock_us: None,
             extra_float_digits: 1,
+            date_style: Default::default(),
+            bytea_output: Default::default(),
             max_value_bytes: relational::DEFAULT_MAX_VALUE_BYTES,
             max_statement_tokens: relational::DEFAULT_MAX_STATEMENT_TOKENS,
             search_path: vec!["public".into()],
@@ -2855,6 +2860,14 @@ impl SqlSession {
     /// Set the precision used by SQL floating-point text conversions.
     pub fn set_extra_float_digits(&mut self, value: i32) {
         self.extra_float_digits = value;
+    }
+    pub fn set_text_settings(
+        &mut self,
+        date_style: giggles_pg_types::temporal::DateStyleSettings,
+        bytea_output: giggles_pg_types::bytea::ByteaOutput,
+    ) {
+        self.date_style = date_style;
+        self.bytea_output = bytea_output;
     }
 
     /// Tables cleared by TRUNCATE, including its transitive CASCADE closure.
@@ -4254,6 +4267,7 @@ impl SqlSession {
         }).and_then(|db| self.committed_catalog_key(db)).map(|(catalog_version, generation)| UnnamedPlanKey {
             sql: sql.into(), declared_types: declared_types.into(), catalog_version, generation,
             search_path: self.search_path.clone(), schema_user: self.schema_user.clone(),
+            date_order: self.date_style.order,
         });
         if let Some(key) = &key
             && let Some(index) = self.unnamed_plans.iter().position(|(saved, _)| saved == key)
@@ -4316,6 +4330,7 @@ impl SqlSession {
     }
 
     fn prepare_unruled(&mut self, sql: &str, db: Option<&EngineLease>) -> Result<relational::Prepared, CoreError> {
+        let _date_order = relational::clock::LiteralDateOrder::enter(self.date_style.order);
         let _value_budget = relational::ValueBudget::enter(self.value_budget(), self.is_v2_engine());
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, self.is_v2_engine());
         if self.is_v2_engine() {
@@ -4515,6 +4530,7 @@ impl SqlSession {
                     .collect()
             };
             let context = relational::clock::ExecutionClock::new(clock)
+                .with_text_settings(self.date_style, self.bytea_output)
                 .with_extra_float_digits(self.extra_float_digits)
                 .with_sequences(self.admin.inner.sequence_callback(
                     Arc::new(state.clone()),
@@ -4562,7 +4578,8 @@ impl SqlSession {
         let _value_budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         self.refuse_task_session()?;
-        let context = relational::clock::ExecutionClock::new(clock);
+        let context = relational::clock::ExecutionClock::new(clock)
+            .with_text_settings(self.date_style, self.bytea_output);
         let prepared = match prepared.copy_rows(rows, Some(&context)) {
             Ok(p) => p,
             Err(e) => {
@@ -4707,6 +4724,7 @@ impl SqlSession {
         db: Option<&EngineLease>,
     ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         let context = relational::clock::ExecutionClock::new(clock)
+            .with_text_settings(self.date_style, self.bytea_output)
             .with_extra_float_digits(self.extra_float_digits);
         let result = self.execute_bound_clocked_leased(p, params, expected_version, Some(&context), db);
         // A BEGIN under an unavailable clock stays unpinned, so the first available clocked statement
@@ -5046,6 +5064,7 @@ impl SqlSession {
         clock: Option<&relational::clock::ExecutionClock>,
         db: Option<&EngineLease>,
     ) -> Result<relational::SqlResult, CoreError> {
+        let _date_order = relational::clock::LiteralDateOrder::enter(p.literal_date_order);
         let _value_budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         if p.schema_context_differs(&self.search_path, &self.schema_user) {

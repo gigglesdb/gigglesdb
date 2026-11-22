@@ -27,6 +27,7 @@ use subplans::{SubplanMode, Subplans};
 use exists::RetentionScope;
 pub(super) use functions::comparison_requires_filter;
 pub(crate) use functions::output_text;
+pub(super) use functions::output_text_with_clock;
 use functions::{BoundScalar, Scalar};
 pub(super) use insert_values::InsertExpressions;
 

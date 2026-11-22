@@ -1,5 +1,7 @@
 // Each file keeps its own `mod common;`, exactly as when it was its own binary.
 #![allow(clippy::duplicate_mod)]
+#[path = "datetime_input_grammar.rs"]
+mod datetime_input_grammar;
 #[path = "write_fence_embedded.rs"]
 mod write_fence_embedded;
 #[path = "native_paging.rs"]
@@ -135,6 +137,8 @@ mod sql_character_adversarial;
 mod sql_character_functions;
 #[path = "sql_clock.rs"]
 mod sql_clock;
+#[path = "presentation_settings.rs"]
+mod presentation_settings;
 #[path = "sql_constraints.rs"]
 mod sql_constraints;
 #[path = "sql_copy_literal_parity.rs"]

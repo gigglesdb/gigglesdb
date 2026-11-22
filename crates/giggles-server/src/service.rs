@@ -1413,8 +1413,9 @@ impl Session {
     pub(crate) fn set_max_value_bytes(&mut self, bytes: usize) {
         self.sql.set_max_value_bytes(bytes);
     }
-    pub(crate) fn set_extra_float_digits(&mut self, value: i32) {
-        self.sql.set_extra_float_digits(value);
+    pub(crate) fn set_text_settings(&mut self, settings: &crate::pg_settings::Settings) {
+        self.sql.set_extra_float_digits(settings.extra_float_digits);
+        self.sql.set_text_settings(settings.datestyle, settings.bytea_output);
     }
     /// The level of transactions this session begins next (BEGIN without a
     /// level, and statements outside a block): `default_transaction_isolation`.

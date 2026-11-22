@@ -381,6 +381,7 @@ pub(super) fn parse_error(e: giggles_pg_types::Error, interval: bool) -> SqlErro
     match e {
         E::Syntax | E::Binary => SqlError::InvalidDatetimeFormat,
         E::TimeZoneDisplacement => SqlError::InvalidTimeZoneDisplacementValue,
+        E::UnknownTimeZone => SqlError::InvalidParameterValue,
         E::Range if interval => SqlError::IntervalFieldOverflow,
         E::Range => SqlError::DatetimeFieldOverflow,
         E::Limit => SqlError::Limit,
@@ -391,7 +392,7 @@ pub(super) fn parse_error(e: giggles_pg_types::Error, interval: bool) -> SqlErro
 fn zone_error(e: giggles_pg_types::Error) -> SqlError {
     use giggles_pg_types::Error as E;
     match e {
-        E::Syntax => SqlError::InvalidParameterValue,
+        E::Syntax | E::UnknownTimeZone => SqlError::InvalidParameterValue,
         E::Range | E::TimeZoneDisplacement => SqlError::DatetimeFieldOverflow,
         E::Limit => SqlError::Limit,
         E::DivisionByZero => SqlError::DivisionByZero,

@@ -1,6 +1,6 @@
 //! Session-aware input for unknown datetime literals.
 use super::*;
-use giggles_pg_types::temporal::{ParserSettings, SessionSettings};
+use giggles_pg_types::temporal::{DateOrder, ParserSettings, SessionSettings};
 
 pub(super) fn target(ty: &DataType) -> bool {
     matches!(
@@ -20,56 +20,24 @@ pub(super) fn clock_word(text: &str) -> bool {
     )
 }
 
-pub(super) fn timetz(text: &str, offset_east: i32) -> R<TimeTz> {
-    TimeTz::parse(
-        text,
-        &ParserSettings {
-            offset_east,
-            ..ParserSettings::default()
-        },
-    )
-    .map_err(|e| temporal::parse_error(e, false))
-}
-
-/// Classify malformed zone words without changing parser acceptance or other errors.
-pub(super) fn zone_word_error(text: &str, target: &DataType, error: SqlError) -> SqlError {
-    if error != SqlError::InvalidDatetimeFormat || !self::target(target) {
-        return error;
+pub(super) fn timetz_needs_session(text: &str, date_order: DateOrder) -> bool {
+    // An abbreviation may be specific to the execution zone.
+    if text.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return true;
     }
-    let tokens: Vec<_> = text.trim_ascii().split_ascii_whitespace().collect();
-    let clock_only = matches!(target, DataType::Time | DataType::TimeTz);
-    let zone_word = tokens.iter().enumerate().any(|(index, token)| {
-        if index == 0 && (!clock_only || tokens.len() >= 2) {
-            return false;
-        }
-        let bytes = token.as_bytes();
-        let letters = bytes.iter().take_while(|b| b.is_ascii_alphabetic()).count();
-        if letters == 0 || !matches!(bytes.get(letters), Some(b'-' | b'/' | b'.')) {
-            return false;
-        }
-        if giggles_pg_types::temporal::SessionZone::named(token).is_ok() {
-            return false;
-        }
-        let offset = letters + usize::from(matches!(bytes.get(letters), Some(b'+' | b'-')));
-        let posix = letters >= 3 && bytes.get(offset).is_some_and(u8::is_ascii_digit);
-        !posix
-    });
-    if zone_word {
-        SqlError::InvalidParameterValue
-    } else {
-        error
-    }
+    let parse = |offset_east| {
+        TimeTz::parse(
+            text,
+            &ParserSettings {
+                date_order,
+                offset_east,
+            },
+        )
+    };
+    matches!((parse(0), parse(3600)), (Ok(a), Ok(b)) if a != b)
 }
 
 pub(super) fn parse(
-    text: String,
-    target: &DataType,
-    clock: &crate::relational::clock::ExecutionClock,
-) -> R<Value> {
-    parse_inner(text.clone(), target, clock).map_err(|error| zone_word_error(&text, target, error))
-}
-
-fn parse_inner(
     text: String,
     target: &DataType,
     clock: &crate::relational::clock::ExecutionClock,
@@ -159,7 +127,7 @@ fn parse_inner(
         return TimestampTz::parse_in_session(
             &text,
             &SessionSettings {
-                date_order: Default::default(),
+                date_order: clock.date_style().order,
                 zone: clock
                     .zone()
                     .unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0)),
@@ -169,35 +137,31 @@ fn parse_inner(
         .map_err(|e| temporal::parse_error(e, false));
     }
     if *target == DataType::TimeTz {
-        let parsed = timetz(&text, 0)?;
-        if parsed == timetz(&text, 3600)? {
-            return Ok(Value::TimeTz(parsed));
+        let order = clock.date_style().order;
+        // An explicit numeric offset needs no zone or clock (and records no zone observation).
+        if !timetz_needs_session(&text, order) {
+            return TimeTz::parse(&text, &ParserSettings { date_order: order, offset_east: 0 })
+                .map(Value::TimeTz)
+                .map_err(|e| temporal::parse_error(e, false));
         }
-        return assignment::convert(
-            Value::Time(parsed.time()),
-            &DataType::Time,
-            target,
-            Some(clock),
-        );
+        let (transaction_us, zone) = clock.comparison_context()?;
+        return TimeTz::parse_in_session(
+            &text,
+            &SessionSettings {
+                date_order: clock.date_style().order,
+                zone,
+            },
+            transaction_us,
+        )
+        .map(Value::TimeTz)
+        .map_err(|e| temporal::parse_error(e, false));
     }
     if *target == DataType::Date {
-        return Date::parse(&text, &ParserSettings::default())
+        return Date::parse(&text, &ParserSettings { date_order: clock.date_style().order, offset_east: 0 })
             .map(Value::Date)
-            .map_err(|error| {
-                // The date parser reserves short year fields before checking
-                // their syntax. Bare alphabetic junk is not a short year.
-                let input = text.trim_ascii();
-                if matches!(error, giggles_pg_types::Error::Unimplemented)
-                    && (1..4).contains(&input.len())
-                    && input.bytes().all(|byte| byte.is_ascii_alphabetic())
-                {
-                    SqlError::InvalidDatetimeFormat
-                } else {
-                    temporal::parse_error(error, false)
-                }
-            });
+            .map_err(|e| temporal::parse_error(e, false));
     }
-    cast_value(Value::Text(text), target, &mut 0)
+    cast_with_date_order(Value::Text(text), target, &mut 0, clock.date_style().order)
 }
 
 #[cfg(test)]
@@ -205,40 +169,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zone_word_classifier_preserves_errors_and_token_boundaries() {
-        for (text, ty, remap) in [
-            ("  12:00\tfoo-bar  ", DataType::Time, true),
-            ("foo-bar 12:00", DataType::Time, false),
-            ("noon-ish", DataType::Time, true),
-            ("noon-ish", DataType::Date, false),
-            ("12:00 UTC-5", DataType::Time, false),
-            ("12:00 ab-5", DataType::Time, true),
-            ("12:00 eUrOpE/pArIs", DataType::Time, false),
-            ("12:00 foo_bar", DataType::Time, false),
-            ("12:00 foo-bar", DataType::Interval, false),
-        ] {
-            assert_eq!(
-                zone_word_error(text, &ty, SqlError::InvalidDatetimeFormat),
-                if remap {
-                    SqlError::InvalidParameterValue
-                } else {
-                    SqlError::InvalidDatetimeFormat
-                },
-                "{text}"
-            );
-            for error in [
-                SqlError::Unsupported,
-                SqlError::DatetimeFieldOverflow,
-                SqlError::InvalidTimeZoneDisplacementValue,
-                SqlError::Type,
-            ] {
-                assert_eq!(zone_word_error(text, &ty, error.clone()), error, "{text}");
-            }
-        }
-    }
-
-    #[test]
-    fn malformed_short_date_words_are_not_unsupported_years() {
+    fn short_dates_expand_years_and_words_return_syntax_errors() {
         let clock =
             crate::relational::clock::ExecutionClock::new(&crate::relational::StatementClock {
                 unavailable: None,
@@ -254,12 +185,39 @@ mod tests {
                     Err(SqlError::InvalidDatetimeFormat)
                 );
             }
-            for text in ["01-01-01", "1/2/3"] {
-                assert_eq!(
-                    coerce_clocked(Value::Text(text.into()), &DataType::Date, context),
-                    Err(SqlError::Unsupported)
-                );
-            }
+            assert_eq!(
+                coerce_clocked(Value::Text("01-01-01".into()), &DataType::Date, context),
+                Ok(Value::Date(Date::from_ymd(2001, 1, 1).unwrap()))
+            );
         }
+        // Exact PostgreSQL 18.6 ISO, MDY output: 01-01-01|2001-01-01; 1/2/3|2003-01-02.
+        let mdy = ParserSettings {
+            date_order: giggles_pg_types::temporal::DateOrder::Mdy,
+            ..ParserSettings::default()
+        };
+        assert_eq!(Date::parse("1/2/3", &mdy), Date::from_ymd(2003, 1, 2));
+    }
+
+    #[test]
+    fn timetz_with_numeric_offset_needs_no_session_zone() {
+        // No zone and no clock: an explicit offset still converts (PostgreSQL 18.6:
+        // '03:04:05+02'::timetz -> 03:04:05+02); zone-dependent input still needs the zone.
+        let clock =
+            crate::relational::clock::ExecutionClock::new(&crate::relational::StatementClock {
+                unavailable: None,
+                transaction_us: 0,
+                statement_us: 0,
+                zone: None,
+                wall: None,
+            });
+        let expected = TimeTz::parse("03:04:05+02", &ParserSettings::default()).unwrap();
+        assert_eq!(
+            coerce_clocked(Value::Text("03:04:05+02".into()), &DataType::TimeTz, Some(&clock)),
+            Ok(Value::TimeTz(expected))
+        );
+        assert_eq!(
+            coerce_clocked(Value::Text("03:04:05".into()), &DataType::TimeTz, Some(&clock)),
+            Err(SqlError::Unsupported)
+        );
     }
 }

@@ -881,7 +881,7 @@ async fn jdbc_startup_presentation_hints_are_bounded_and_do_not_grant_authority(
             true,
         ),
         ("TimeZone\0UTC\0extra_float_digits\0-15\0", true),
-        ("DateStyle\0SQL\0", false),
+        ("DateStyle\0SQL\0", true),
         ("TimeZone\0\0", false),
         ("TimeZone\0UTC\nforged-log\0", false),
         ("extra_float_digits\x004\0", false),
@@ -911,7 +911,12 @@ async fn jdbc_startup_presentation_hints_are_bounded_and_do_not_grant_authority(
                     break;
                 }
             }
-            assert!(statuses.iter().any(|v| v == "DateStyle\0ISO, MDY\0"));
+            let date_style = if hints.starts_with("DateStyle\0SQL\0") {
+                "DateStyle\0SQL, MDY\0"
+            } else {
+                "DateStyle\0ISO, MDY\0"
+            };
+            assert!(statuses.iter().any(|v| v == date_style));
             let expected_timezone = statuses
                 .iter()
                 .find_map(|v| v.strip_prefix("TimeZone\0"))

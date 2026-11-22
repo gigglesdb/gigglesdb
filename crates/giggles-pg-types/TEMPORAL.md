@@ -15,27 +15,27 @@ Settings never read the local clock, process timezone, locale, filesystem tzdata
 or environment variables. Output is ISO dates/times, UTC timestamptz and PostgreSQL
 interval style. Explicit numeric offsets are supported up to 15:59:59.
 
-Supported text: numeric `YYYY-MM-DD` dates (BC suffix, no year zero), slash dates
-with explicit YMD/MDY/DMY order (year field at least four digits), `HH:MM[:SS[.fraction]]`, date/time separated by
-space or T, numeric colon offsets, Z and UTC. BC follows the whole timestamp.
-Fractional seconds round to microseconds with ties to even; 24:00 is preserved
-for time and rolls forward for timestamps. Date/timestamp/interval accept signed
-infinities (positive spelling `infinity`). Interval grammar supports signed integer
+Date and timestamp input follows PostgreSQL 18.6 field decoding for ISO and
+DateStyle-dependent numeric dates, compact dates, English month and weekday
+names, ordinal days, Julian days, and BC/AD. One- and two-digit AD years expand
+to 1970?2069. Clock fields accept colon and compact forms, AM/PM, and the ISO T
+separator. Input accepts explicit numeric offsets, case-insensitive IANA zone
+names, POSIX zone strings, and PostgreSQL's Default abbreviations.
+`TimestampTz::parse_in_session` checks the session's TZif abbreviations first.
+Fractional seconds round to microseconds with ties to even. The 24:00 endpoint
+is preserved for time and rolls forward for timestamps. Date and timestamp
+input accepts epoch and signed infinities. Interval grammar supports signed integer
 years/mons/days and signed wide HH:MM:SS; components may have independent signs.
 `parse_with_style(..., SqlStandard)` applies a lone leading minus to all fields;
 other explicit signs suppress that propagation. `parse` uses Postgres semantics.
 Every parser rejects input over 256 bytes before copying/tokenizing. No input-sized
 allocation occurs in binary decoding. Integer/component overflow is checked.
 
-This is a narrower grammar than PostgreSQL, not full temporal function coverage.
-Named IANA zones, DST resolution, timezone abbreviations other than UTC, POSIX
-zones, locale month names, AM/PM, relative/current-time keywords, leap seconds,
-week/ordinal dates, compact offsets, typmods, ISO8601/SQL year-month interval
-syntax, fractional interval units, verbose/ago interval syntax and alternate
-output DateStyles/IntervalStyles are not implemented. Named zones fail rather
-than being treated as UTC; no timezone dependency has been added. DST and named
-zone support must use a maintained pinned timezone database with explicit
-ambiguity/gap policy and its own live PG qualification. FullPG remains unfinished.
+The deterministic type parsers take no current date or time. SQL evaluates
+relative keywords against the execution clock. Date-less time input accepts
+fixed offsets and abbreviations. A dated input can resolve DST and historical
+abbreviations from the pinned TZif database. See TEMPORAL_COMPAT.md for the
+remaining compatibility gaps and interval grammar extensions.
 
 Verification uses the existing pinned PG18.0 image:
 `postgres@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c`.

@@ -1,10 +1,11 @@
 //! Session presentation settings. `parse`/`show` retain the locked agent grammar.
 #[path = "pg_settings_database.rs"]
 pub(crate) mod database;
-pub(crate) use database::{parse_database, show_database};
+pub(crate) use database::show_database;
 #[path = "pg_settings_functions.rs"]
 mod functions;
-pub(crate) use functions::{Function, parse_function};
+pub(crate) use functions::{Function, parse_function, presentation_inventory_rows};
+use giggles_pg_types::{bytea::ByteaOutput, temporal::DateStyleSettings};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Setting {
     ApplicationName(String),
@@ -26,7 +27,8 @@ pub(crate) struct Settings {
     pub max_value_bytes: usize,
     pub max_statement_tokens: usize,
     pub timezone: String,
-    pub datestyle: String,
+    pub datestyle: DateStyleSettings,
+    pub bytea_output: ByteaOutput,
     pub intervalstyle: String,
     pub session_replication_role: String,
     pub selected_role: String,
@@ -66,7 +68,8 @@ impl Default for Settings {
             max_value_bytes: giggles_core::relational::DEFAULT_MAX_VALUE_BYTES,
             max_statement_tokens: giggles_core::relational::DEFAULT_MAX_STATEMENT_TOKENS,
             timezone: "UTC".into(),
-            datestyle: "ISO, MDY".into(),
+            datestyle: DateStyleSettings::default(),
+            bytea_output: ByteaOutput::default(),
             intervalstyle: "postgres".into(),
             session_replication_role: "origin".into(),
             selected_role: "none".into(),
@@ -242,7 +245,12 @@ impl Settings {
             Show::MaxValueBytes => self.max_value_bytes = value.parse().expect("validated GUC"),
             Show::MaxStatementTokens => self.max_statement_tokens = value.parse().expect("validated GUC"),
             Show::TimeZone => self.timezone = value,
-            Show::DateStyle => self.datestyle = value,
+            Show::DateStyle => {
+                self.datestyle = database::date_style(&value, self.datestyle).expect("validated GUC");
+            }
+            Show::ByteaOutput => {
+                self.bytea_output = database::bytea_output(&value).expect("validated GUC");
+            }
             Show::IntervalStyle => self.intervalstyle = value,
             Show::SessionReplicationRole => self.session_replication_role = value,
             Show::Role => self.selected_role = value,
@@ -401,13 +409,13 @@ impl Show {
             Self::BlockSize => ("block_size", "8192".into()),
             Self::IntegerDatetimes => ("integer_datetimes", "on".into()),
             Self::MaxIndexKeys => ("max_index_keys", "32".into()),
-            Self::DateStyle => ("DateStyle", settings.datestyle.clone()),
+            Self::DateStyle => ("DateStyle", settings.datestyle.to_string()),
             Self::TimeZone => ("TimeZone", settings.timezone.clone()),
             Self::IntervalStyle => ("IntervalStyle", settings.intervalstyle.clone()),
             Self::Role => ("role", settings.selected_role.clone()),
             Self::SessionAuthorization => ("session_authorization", settings.session_authorization.clone()),
             Self::SessionReplicationRole => ("session_replication_role", settings.session_replication_role.clone()),
-            Self::ByteaOutput => ("bytea_output", "hex".into()),
+            Self::ByteaOutput => ("bytea_output", settings.bytea_output.name().into()),
             Self::TransactionTimeout => ("transaction_timeout", "0".into()),
             Self::ClientMinMessages => {
                 ("client_min_messages", settings.client_min_messages.clone())
@@ -639,8 +647,85 @@ pub(crate) fn parse(sql: &str) -> Result<Option<Vec<Setting>>> {
     Ok(Some(result))
 }
 #[cfg(test)]
+fn parse_database(sql: &str) -> Result<Option<Vec<Setting>>> {
+    database::parse_database(sql, &mut None)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn datestyle_check_hook_and_session_state_match_the_postgres_oracle() {
+        let mut state = SessionSettings::default();
+        fn set(state: &mut SessionSettings, sql: &str, in_transaction: bool, expected: &str) {
+            let settings = parse_database(sql).unwrap().unwrap();
+            for setting in &settings {
+                assert!(!state.apply(setting, in_transaction), "{sql}");
+            }
+            assert_eq!(Show::DateStyle.value(&state.current).1, expected, "{sql}");
+        }
+        for (sql, expected) in [
+            ("SET DateStyle='ISO'", "ISO, MDY"),
+            ("SET DateStyle='SQL'", "SQL, MDY"),
+            ("SET DateStyle='Postgres'", "Postgres, MDY"),
+            ("SET DateStyle='German'", "German, DMY"),
+            ("RESET DateStyle", "ISO, MDY"),
+            ("SET DateStyle='DMY'", "ISO, DMY"),
+            ("SET DateStyle='YMD'", "ISO, YMD"),
+            ("SET DateStyle='MDY'", "ISO, MDY"),
+            ("SET DateStyle='European'", "ISO, DMY"),
+            ("SET DateStyle='US'", "ISO, MDY"),
+            ("SET DateStyle='NonEuropean'", "ISO, MDY"),
+            ("SET DateStyle='Euro'", "ISO, DMY"),
+            ("SET DateStyle='NonEuro'", "ISO, MDY"),
+            ("SET DateStyle='SQL, DMY'", "SQL, DMY"),
+            ("SET DateStyle='DMY, SQL'", "SQL, DMY"),
+            ("SET DateStyle='Postgres'", "Postgres, DMY"),
+            ("SET DateStyle='YMD'", "Postgres, YMD"),
+            ("SET DateStyle='German'", "German, DMY"),
+            ("SET DateStyle='MDY'", "German, MDY"),
+            ("SET DateStyle='German, YMD'", "German, YMD"),
+            ("SET DateStyle='sql,european'", "SQL, DMY"),
+            ("SET DateStyle=sql, dmy", "SQL, DMY"),
+            ("SET DateStyle TO postgres, ymd", "Postgres, YMD"),
+            ("SET DateStyle='  iso ,  dmy  '", "ISO, DMY"),
+            ("SET DateStyle='ISO, ISO'", "ISO, DMY"),
+            ("SET DateStyle='DMY, DMY'", "ISO, DMY"),
+            ("SET DateStyle=''", "ISO, DMY"),
+            ("SET DateStyle='default'", "ISO, MDY"),
+            ("SET DateStyle='SQL, default'", "SQL, MDY"),
+            ("SET DateStyle TO DEFAULT", "ISO, MDY"),
+            ("SET DateStyle='Postgres, DMY'", "Postgres, DMY"),
+            ("RESET DateStyle", "ISO, MDY"),
+        ] {
+            set(&mut state, sql, false, expected);
+        }
+        for (invalid, expected) in [
+            ("ISO, SQL", r#"Conflicting "DateStyle" specifications."#),
+            ("DMY, YMD", r#"Conflicting "DateStyle" specifications."#),
+            ("foo", r#"Unrecognized key word: "foo"."#),
+            ("ISO,", "List syntax is invalid."),
+        ] {
+            let error = database::date_style(invalid, state.current.datestyle).unwrap_err();
+            assert_eq!(error.detail(), expected, "{invalid}");
+        }
+        state.transaction(false, true, "BEGIN");
+        set(&mut state, "SET LOCAL DateStyle='German'", true, "German, DMY");
+        state.transaction(true, false, "COMMIT");
+        assert_eq!(Show::DateStyle.value(&state.current).1, "ISO, MDY");
+        state.transaction(false, true, "BEGIN");
+        set(&mut state, "SET DateStyle='German'", true, "German, DMY");
+        state.transaction(true, false, "ROLLBACK");
+        assert_eq!(Show::DateStyle.value(&state.current).1, "ISO, MDY");
+        for sql in [
+            "SELECT set_config('datestyle','SQL, DMY',false)",
+            "SELECT current_setting('DateStyle')",
+        ] {
+            let call = parse_function(sql).unwrap().unwrap();
+            assert_eq!(call.evaluate(&mut state), Ok(Some("SQL, DMY".into())));
+        }
+    }
+
     #[test]
     fn intervalstyle_tracks_reset_local_and_rollback() {
         let mut state = SessionSettings::default();
@@ -727,6 +812,11 @@ mod tests {
         ] {
             assert_eq!(show(sql), Err("42601"));
         }
+        // SET on the PostgreSQL listener uses the database GUC grammar.
+        let mut session = SessionSettings::default();
+        let settings = parse_database("SET DateStyle='SQL'").unwrap().unwrap();
+        assert!(!session.apply(&settings[0], false));
+        assert_eq!(session.current.datestyle.to_string(), "SQL, MDY");
         assert_eq!(parse("SET DateStyle='SQL'"), Err("0A000"));
     }
     #[test]

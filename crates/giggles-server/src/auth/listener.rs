@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     Service,
-    pgwire_startup::{StartupPolicy, parse_startup, read_startup_packet, reject_startup},
+    pgwire_startup::{StartupPolicy, parse_startup_with_diagnostics, read_startup_packet, reject_invalid_startup, reject_startup},
     transport::{IO_TIMEOUT, Running},
 };
 use std::{collections::BTreeMap, io, net::SocketAddr, sync::Arc};
@@ -152,16 +152,16 @@ async fn connection(
         eprintln!("protocol=postgresql rejected stage=startup reason=TLS_required");
         return reject_startup(&mut stream, "28000", "TLS is required").await;
     }
-    let startup = match parse_startup(
+    let startup = match parse_startup_with_diagnostics(
         &body,
         &StartupPolicy::Postgresql {
             databases: &listener.databases,
         },
     ) {
         Ok(startup) => startup,
-        Err((code, reason)) => {
+        Err(error) => {
             eprintln!("protocol=postgresql rejected stage=startup reason=invalid_startup");
-            return reject_startup(&mut stream, code, reason).await;
+            return reject_invalid_startup(&mut stream, error).await;
         }
     };
     if let Method::Password(verifier) = signin::choose(

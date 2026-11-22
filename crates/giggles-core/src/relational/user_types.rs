@@ -693,6 +693,7 @@ impl CompositeSelect {
         state: &Relational,
         params: &[Value],
         path: &[String],
+        clock: Option<&super::clock::ExecutionClock>,
     ) -> R<SqlResult> {
         self.describe(state, params.len(), path)?;
         let mut output = Vec::new();
@@ -706,29 +707,10 @@ impl CompositeSelect {
             let mut parts = Vec::new();
             for (expr, (_, ty, typmod)) in values.iter().zip(fields) {
                 let (domain_state, table) = domain_state(ty, *typmod);
-                let value = query::assignment::literal(expr.value(params)?, ty, None)?;
+                let value = query::assignment::literal(expr.value(params)?, ty, clock)?;
                 let value = coerce_to_column(&domain_state, &table.columns[0], value)?;
-                let text = match value {
-                    Value::Null => {
-                        parts.push(String::new());
-                        continue;
-                    }
-                    Value::Text(s) => s,
-                    Value::Int(n) => n.to_string(),
-                    Value::Bool(b) => if b { "t" } else { "f" }.into(),
-                    _ => return Err(SqlError::Unsupported),
-                };
-                parts.push(
-                    if text.is_empty()
-                        || text
-                            .chars()
-                            .any(|c| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '"' | '\\'))
-                    {
-                        format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\"\""))
-                    } else {
-                        text
-                    },
-                );
+                let text = query::output_text_with_clock(&value, clock)?;
+                parts.push(text.map_or_else(String::new, |text| record_field(&text)));
             }
             output.push(Value::Text(format!("({})", parts.join(","))));
         }
@@ -740,6 +722,16 @@ impl CompositeSelect {
             }],
             affected: 0,
         })
+    }
+}
+
+fn record_field(text: &str) -> String {
+    if text.is_empty()
+        || text.chars().any(|c| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '"' | '\\'))
+    {
+        format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\"\""))
+    } else {
+        text.into()
     }
 }
 

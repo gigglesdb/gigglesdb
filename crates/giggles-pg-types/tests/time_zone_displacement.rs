@@ -79,16 +79,16 @@ fn maximum_valid_numeric_offsets_are_accepted() {
 }
 
 #[test]
-fn negative_fields_and_extra_fields_remain_range() {
-    // The first '+' is the offset sign; the following '-' makes the hour negative.
+fn negative_fields_and_extra_fields_match_pg18() {
     for time in [
-        "12:00+-5",
         "12:00+5:-1",
         "12:00+5:30:-1",
-        "12:00+5:30:00:00",
         "12:00+16:-1",
         "12:00+16:00:00:00",
     ] {
-        assert_parsers_error(time, Error::Range);
+        assert_parsers_error(time, Error::TimeZoneDisplacement);
+    }
+    for time in ["12:00+-5", "12:00+5:30:00:00"] {
+        assert_parsers_error(time, Error::Syntax);
     }
 }

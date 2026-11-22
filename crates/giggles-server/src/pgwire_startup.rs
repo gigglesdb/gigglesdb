@@ -54,7 +54,25 @@ pub(crate) fn parse_startup(
     body: &[u8],
     policy: &StartupPolicy<'_>,
 ) -> Result<Startup, (&'static str, &'static str)> {
+    parse_startup_with_diagnostics(body, policy).map_err(|error| (error.code, error.reason))
+}
+
+pub(crate) struct StartupError {
+    code: &'static str,
+    reason: &'static str,
+    message: Option<String>,
+    detail: Option<String>,
+    hint: Option<&'static str>,
+}
+
+pub(crate) fn parse_startup_with_diagnostics(
+    body: &[u8],
+    policy: &StartupPolicy<'_>,
+) -> Result<Startup, StartupError> {
     let mut reason = "malformed PostgreSQL startup packet";
+    let mut message = None;
+    let mut detail = None;
+    let mut hint = None;
     let mut timezone = String::from("UTC");
     let mut startup_settings = crate::pg_settings::Settings::default();
     let validate = (|| -> Result<Startup, &'static str> {
@@ -180,14 +198,23 @@ pub(crate) fn parse_startup(
             reason = "startup client_encoding must be UTF8";
             return Err("0A000");
         }
-        // Driver presentation hints have no effect on the current integer/text/
-        // boolean/bytes type set. They never change clock or task authority.
-        if fields
-            .get("DateStyle")
-            .is_some_and(|v| !v.eq_ignore_ascii_case("ISO"))
-        {
-            reason = "startup DateStyle must be ISO";
-            return Err("0A000");
+        if let Some(value) = fields.get("DateStyle") {
+            reason = "invalid value for parameter DateStyle";
+            startup_settings.datestyle =
+                crate::pg_settings::database::date_style(value, startup_settings.datestyle)
+                    .map_err(|error| {
+                        message = Some(format!("invalid value for parameter \"DateStyle\": \"{value}\""));
+                        detail = Some(error.detail());
+                        "22023"
+                    })?;
+        }
+        if let Some(value) = fields.get("bytea_output") {
+            reason = "invalid value for parameter bytea_output";
+            startup_settings.bytea_output = crate::pg_settings::database::bytea_output(value)
+                .inspect_err(|_| {
+                    message = Some(format!("invalid value for parameter \"bytea_output\": \"{value}\""));
+                    hint = Some("Available values: escape, hex.");
+                })?;
         }
         if let Some(value) = fields.get("TimeZone") {
             if value.is_empty()
@@ -224,7 +251,7 @@ pub(crate) fn parse_startup(
         }
         if matches!(policy, StartupPolicy::Postgresql { .. }) {
             for (name, value) in &fields {
-                if matches!(name.as_str(), "user" | "database" | "client_encoding" | "application_name" | "DateStyle" | "IntervalStyle" | "TimeZone" | "extra_float_digits") {
+                if matches!(name.as_str(), "user" | "database" | "client_encoding" | "application_name" | "DateStyle" | "IntervalStyle" | "TimeZone" | "extra_float_digits" | "bytea_output") {
                     continue;
                 }
                 reason = "invalid startup configuration parameter";
@@ -244,7 +271,35 @@ pub(crate) fn parse_startup(
             task,
         })
     })();
-    validate.map_err(|code| (code, reason))
+    validate.map_err(|code| StartupError { code, reason, message, detail, hint })
+}
+
+pub(crate) async fn reject_invalid_startup<S: AsyncWrite + Unpin>(
+    s: &mut S,
+    error: StartupError,
+) -> io::Result<()> {
+    let Some(message) = error.message else {
+        return reject_startup(s, error.code, error.reason).await;
+    };
+    use crate::pgwire::{frame, z};
+    let mut body = Vec::new();
+    for (tag, field) in [
+        (b'S', Some("FATAL")),
+        (b'V', Some("FATAL")),
+        (b'C', Some(error.code)),
+        (b'M', Some(message.as_str())),
+        (b'D', error.detail.as_deref()),
+        (b'H', error.hint),
+    ] {
+        if let Some(field) = field {
+            body.push(tag);
+            z(field, &mut body);
+        }
+    }
+    body.push(0);
+    let mut out = Vec::new();
+    frame(b'E', &body, &mut out).map_err(io::Error::other)?;
+    write_startup_error(s, out).await
 }
 
 pub(crate) async fn reject_startup<S: AsyncWrite + Unpin>(
@@ -254,6 +309,10 @@ pub(crate) async fn reject_startup<S: AsyncWrite + Unpin>(
 ) -> io::Result<()> {
     let mut out = vec![];
     error_message(code, reason, &mut out);
+    write_startup_error(s, out).await
+}
+
+async fn write_startup_error<S: AsyncWrite + Unpin>(s: &mut S, out: Vec<u8>) -> io::Result<()> {
     timeout(IO_TIMEOUT, async {
         s.write_all(&out).await?;
         s.flush().await
@@ -265,6 +324,18 @@ pub(crate) async fn reject_startup<S: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn datestyle_startup_accepts_styles_and_reports_invalid_values() {
+        let databases = vec!["postgres".into()];
+        let policy = StartupPolicy::Postgresql { databases: &databases };
+        for (value, canonical) in [("SQL, DMY", "SQL, DMY"), ("german", "German, DMY"), ("postgres, ymd", "Postgres, YMD")] {
+            let startup = parse_startup(&body(&[("user", "owner"), ("database", "postgres"), ("datestyle", value)]), &policy).unwrap();
+            assert_eq!(startup.settings.datestyle.to_string(), canonical);
+        }
+        assert_eq!(error(&[("user", "owner"), ("database", "postgres"), ("DateStyle", "ISO, SQL")], &policy),
+            ("22023", "invalid value for parameter DateStyle"));
+    }
 
     #[test]
     fn intervalstyle_startup_validates_all_styles_and_case_folded_duplicates() {

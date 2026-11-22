@@ -1,9 +1,36 @@
 //! Caller-supplied time; this module never reads a host clock.
 use super::{SqlError, Value};
 use crate::CoreError;
-use giggles_pg_types::temporal::{Date, SessionZone, Time, TimeTz, Timestamp, TimestampTz};
+use giggles_pg_types::{
+    bytea::ByteaOutput,
+    temporal::{Date, DateOrder, DateStyleSettings, SessionZone, Time, TimeTz, Timestamp, TimestampTz},
+};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+
+thread_local! {
+    static LITERAL_DATE_ORDER: std::cell::Cell<DateOrder> = const { std::cell::Cell::new(DateOrder::Mdy) };
+}
+
+/// Bind-time order for unknown datetime literals. Binding may be repeated
+/// against a new catalog, but always uses the statement's original order.
+pub(crate) struct LiteralDateOrder(DateOrder);
+
+impl LiteralDateOrder {
+    pub(crate) fn enter(order: DateOrder) -> Self {
+        Self(LITERAL_DATE_ORDER.replace(order))
+    }
+
+    pub(crate) fn current() -> DateOrder {
+        LITERAL_DATE_ORDER.get()
+    }
+}
+
+impl Drop for LiteralDateOrder {
+    fn drop(&mut self) {
+        LITERAL_DATE_ORDER.set(self.0);
+    }
+}
 
 /// Observation bits (D7.4): which statement-time sources an execution read.
 /// Transaction and statement instants: now, transaction_timestamp,
@@ -89,6 +116,8 @@ pub(crate) struct ExecutionClock {
     xact: Option<XactCallback>,
     privilege: Option<Arc<PrivilegeExecution>>,
     extra_float_digits: i32,
+    date_style: DateStyleSettings,
+    bytea_output: ByteaOutput,
     /// OBS_* bits, shared by every clone made from one execution.
     observed: Arc<AtomicU8>,
 }
@@ -101,6 +130,8 @@ impl ExecutionClock {
             xact: None,
             privilege: None,
             extra_float_digits: 1,
+            date_style: DateStyleSettings::default(),
+            bytea_output: ByteaOutput::default(),
             error: Arc::new(Mutex::new(None)),
             observed: Arc::new(AtomicU8::new(0)),
         }
@@ -133,6 +164,17 @@ impl ExecutionClock {
     }
     pub(crate) fn extra_float_digits(&self) -> i32 {
         self.extra_float_digits
+    }
+    pub(crate) fn with_text_settings(mut self, date_style: DateStyleSettings, bytea_output: ByteaOutput) -> Self {
+        self.date_style = date_style;
+        self.bytea_output = bytea_output;
+        self
+    }
+    pub(crate) fn date_style(&self) -> DateStyleSettings {
+        self.date_style
+    }
+    pub(crate) fn bytea_output(&self) -> ByteaOutput {
+        self.bytea_output
     }
     pub(crate) fn with_sequences(&self, callback: SequenceCallback) -> Self {
         let mut context = self.clone();

@@ -164,7 +164,7 @@ fn datetime_input_cast_zone_word_oracles() {
     expect_error(
         &mut session,
         "SELECT CAST('foo-bar 2024-01-01' AS date)",
-        SqlError::Unsupported,
+        SqlError::InvalidDatetimeFormat, // PostgreSQL 18.6 returns 22007.
     );
 }
 

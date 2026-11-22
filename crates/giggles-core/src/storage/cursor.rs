@@ -288,6 +288,7 @@ impl SqlSession {
         clock: Option<&relational::StatementClock>,
         buffer_limit: usize,
     ) -> Result<Cursor, CoreError> {
+        let _date_order = relational::clock::LiteralDateOrder::enter(p.literal_date_order);
         let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         relational::assert_sql_frontend_allowed();
@@ -334,6 +335,7 @@ impl SqlSession {
             };
             let context = clock.map(|c| {
                 relational::clock::ExecutionClock::new(c)
+                    .with_text_settings(self.date_style, self.bytea_output)
                     .with_extra_float_digits(self.extra_float_digits)
             });
             let (image, source, context, scope) = match &self.admin.inner.backend {

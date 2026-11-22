@@ -21,7 +21,7 @@ pub(super) fn description(function: &crate::pg_settings::Function) -> Descriptio
             }).collect(),
         };
     }
-    if let crate::pg_settings::Function::Inventory(result) = function {
+    if let crate::pg_settings::Function::Inventory { result, .. } = function {
         return Description {
             type_oids: result.fields.iter().map(|f| f.data_type.oid()).collect(),
             typmods: vec![-1; result.fields.len()], parameters: vec![],
@@ -57,14 +57,21 @@ pub(super) fn evaluate(
     if session.is_aborted() {
         return Err("25P02");
     }
-    if let crate::pg_settings::Function::Inventory(result) = function {
+    if let crate::pg_settings::Function::Inventory { result, presentation, projection } = function {
+        let live = crate::pg_settings::presentation_inventory_rows(presentation, projection, settings);
         return Ok(SqlResult {
             columns: result.fields.iter().map(|f| f.name.clone()).collect(), affected: 0,
-            rows: result.rows.iter().map(|r| giggles_core::relational::SqlRow { version: 0, values: r.iter().map(|v| match v {
+            rows: result.rows.iter().chain(&live).map(|r| giggles_core::relational::SqlRow { version: 0, values: r.iter().map(|v| match v {
                 giggles_pg_catalog::Value::Text(s) => Value::Text(s.clone()), giggles_pg_catalog::Value::Numeric(n) => Value::Numeric(n.clone()),
                 giggles_pg_catalog::Value::Bool(b) => Value::Bool(*b), _ => Value::Null,
             }).collect() }).collect(),
         });
+    }
+    if function.has_row(settings)
+        && let crate::pg_settings::Function::Set { name, value, .. } = function
+        && let Ok(name) = crate::pg_settings::database::lookup_name(name)
+    {
+        diagnostic.presentation_setting(name, value, &settings.current)?;
     }
     if function.has_row(settings)
         && let crate::pg_settings::Function::Set { name, value, .. } = function

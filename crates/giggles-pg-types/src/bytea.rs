@@ -101,3 +101,86 @@ impl ByteaTextPlan<'_> {
         Ok(out)
     }
 }
+
+/// PostgreSQL's bytea output setting, independent of the encode() function.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ByteaOutput {
+    #[default]
+    Hex,
+    Escape,
+}
+
+impl ByteaOutput {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Hex => "hex",
+            Self::Escape => "escape",
+        }
+    }
+
+    pub fn text_len(self, bytes: &[u8]) -> usize {
+        match self {
+            Self::Hex => bytes.len().saturating_mul(2).saturating_add(2),
+            Self::Escape => bytes.iter().fold(0usize, |len, &byte| {
+                len.saturating_add(match byte {
+                    b'\\' => 2,
+                    b' '..=b'~' => 1,
+                    _ => 4,
+                })
+            }),
+        }
+    }
+
+    pub fn format(self, bytes: &[u8]) -> String {
+        let mut text = String::with_capacity(self.text_len(bytes));
+        self.append(bytes, &mut text);
+        text
+    }
+
+    fn append(self, bytes: &[u8], text: &mut String) {
+        match self {
+            Self::Hex => {
+                const DIGITS: &[u8] = b"0123456789abcdef";
+                text.push_str("\\x");
+                for &byte in bytes {
+                    text.push(char::from(DIGITS[usize::from(byte >> 4)]));
+                    text.push(char::from(DIGITS[usize::from(byte & 15)]));
+                }
+            }
+            Self::Escape => {
+                for &byte in bytes {
+                    match byte {
+                        b'\\' => text.push_str("\\\\"),
+                        b' '..=b'~' => text.push(char::from(byte)),
+                        _ => {
+                            text.push('\\');
+                            text.push(char::from(b'0' + (byte >> 6)));
+                            text.push(char::from(b'0' + ((byte >> 3) & 7)));
+                            text.push(char::from(b'0' + (byte & 7)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    #[test]
+    fn bytea_output_escape_uses_octal_outside_printable_ascii() {
+        let bytes = [0, 255, b'\\', b'A', b'\'', b'\n', 127, 128];
+        assert_eq!(ByteaOutput::Escape.format(&bytes), r"\000\377\\A'\012\177\200");
+        assert_eq!(ByteaOutput::Hex.format(&bytes), r"\x00ff5c41270a7f80");
+        assert_eq!(ByteaOutput::Escape.format(b""), "");
+        assert_eq!(ByteaOutput::Hex.format(b""), r"\x");
+        let all: Vec<u8> = (0..=255).collect();
+        for output in [ByteaOutput::Escape, ByteaOutput::Hex] {
+            let text = output.format(&all);
+            assert_eq!(text.len(), output.text_len(&all));
+            assert_eq!(prepare_bytea_text(&text, all.len()).unwrap().decode().unwrap(), all);
+        }
+    }
+}

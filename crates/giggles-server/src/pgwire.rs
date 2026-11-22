@@ -307,6 +307,28 @@ impl Diagnostic {
             self.wire_hint = Some("Available values: origin, replica, local.");
         })
     }
+    fn presentation_setting(
+        &mut self,
+        name: crate::pg_settings::Show,
+        value: &str,
+        current: &crate::pg_settings::Settings,
+    ) -> R<()> {
+        use crate::pg_settings::{Show, database};
+        match name {
+            Show::DateStyle => database::date_style(value, current.datestyle)
+                .map(|_| ())
+                .map_err(|error| {
+                    self.wire_message = Some(format!("invalid value for parameter \"DateStyle\": \"{value}\""));
+                    self.wire_detail = Some(error.detail());
+                    "22023"
+                }),
+            Show::ByteaOutput => database::bytea_output(value).map(|_| ()).inspect_err(|_| {
+                self.wire_message = Some(format!("invalid value for parameter \"bytea_output\": \"{value}\""));
+                self.wire_hint = Some("Available values: escape, hex.");
+            }),
+            _ => Ok(()),
+        }
+    }
     fn replication_role_authorize(&mut self, session: &Session) -> R<()> {
         // The registry has table owners only; CatalogSnapshot.database_owner is
         // a presentation default (OID 10), not database ownership authority.
@@ -504,6 +526,17 @@ pub fn decode_in_zone(
     zone: SessionZone,
     transaction_us: i64,
 ) -> R<Value> {
+    decode_with_order(b, ty, format, zone, transaction_us, giggles_pg_types::temporal::DateOrder::Mdy)
+}
+
+fn decode_with_order(
+    b: &[u8],
+    ty: &DataType,
+    format: u16,
+    zone: SessionZone,
+    transaction_us: i64,
+    date_order: giggles_pg_types::temporal::DateOrder,
+) -> R<Value> {
     if format == 0 {
         let s = std::str::from_utf8(b).map_err(|_| "22021")?;
         return match ty {
@@ -550,7 +583,7 @@ pub fn decode_in_zone(
             DataType::Date => giggles_core::relational::Date::parse(
                 s,
                 &giggles_pg_types::temporal::ParserSettings {
-                    date_order: giggles_pg_types::temporal::DateOrder::Ymd,
+                    date_order,
                     offset_east: 0,
                 },
             )
@@ -559,42 +592,17 @@ pub fn decode_in_zone(
             DataType::Time => giggles_core::relational::PgTime::parse(s)
                 .map(Value::Time)
                 .map_err(temporal_error),
-            DataType::TimeTz => {
-                use giggles_pg_types::temporal::{
-                    Date, DateOrder, ParserSettings, TimeTz, TimestampTz,
-                };
-                let settings = ParserSettings {
-                    date_order: DateOrder::Ymd,
-                    offset_east: 0,
-                };
-                let parsed = TimeTz::parse(s, &settings).map_err(temporal_error)?;
-                let other = TimeTz::parse(
-                    s,
-                    &ParserSettings {
-                        offset_east: 3600,
-                        ..settings
-                    },
-                )
-                .map_err(temporal_error)?;
-                if parsed == other {
-                    Ok(Value::TimeTz(parsed))
-                } else {
-                    // StatementClock uses PostgreSQL-epoch microseconds, like TimestampTz.
-                    let instant =
-                        TimestampTz::from_microseconds(transaction_us).map_err(temporal_error)?;
-                    let local = zone.to_local(instant).map_err(temporal_error)?;
-                    let days = i32::try_from(local.microseconds().div_euclid(86_400_000_000))
-                        .map_err(|_| "22008")?;
-                    let date = Date::from_days(days).map_err(temporal_error)?;
-                    TimeTz::in_zone_on_date(parsed.time(), date, zone)
-                        .map(Value::TimeTz)
-                        .map_err(temporal_error)
-                }
-            }
+            DataType::TimeTz => giggles_pg_types::temporal::TimeTz::parse_in_session(
+                s,
+                &giggles_pg_types::temporal::SessionSettings { date_order, zone },
+                transaction_us,
+            )
+            .map(Value::TimeTz)
+            .map_err(temporal_error),
             DataType::Timestamp => giggles_core::relational::Timestamp::parse(
                 s,
                 &giggles_pg_types::temporal::ParserSettings {
-                    date_order: giggles_pg_types::temporal::DateOrder::Ymd,
+                    date_order,
                     offset_east: 0,
                 },
             )
@@ -603,7 +611,7 @@ pub fn decode_in_zone(
             DataType::TimestampTz => giggles_core::relational::TimestampTz::parse_in_session(
                 s,
                 &giggles_pg_types::temporal::SessionSettings {
-                    date_order: giggles_pg_types::temporal::DateOrder::Ymd,
+                    date_order,
                     zone,
                 },
             )
@@ -712,6 +720,7 @@ fn temporal_error(e: giggles_pg_types::Error) -> &'static str {
     match e {
         giggles_pg_types::Error::Range => "22008",
         giggles_pg_types::Error::TimeZoneDisplacement => "22009",
+        giggles_pg_types::Error::UnknownTimeZone => "22023",
         giggles_pg_types::Error::Binary => "22P03",
         giggles_pg_types::Error::Limit => "54000",
         giggles_pg_types::Error::Syntax
@@ -727,6 +736,7 @@ fn numeric_error(e: giggles_pg_types::Error) -> &'static str {
         giggles_pg_types::Error::Binary => "22P03",
         giggles_pg_types::Error::Syntax
         | giggles_pg_types::Error::DivisionByZero
+        | giggles_pg_types::Error::UnknownTimeZone
         | giggles_pg_types::Error::Unimplemented => "22P02",
     }
 }
@@ -753,11 +763,12 @@ fn encode(
                     b"f".to_vec()
                 }
             }
-            Value::Date(v) => v.to_string().into_bytes(),
+            Value::Date(v) => v.format_with_style(settings.datestyle.style, settings.datestyle.order).into_bytes(),
             Value::Time(v) => v.to_string().into_bytes(),
             Value::TimeTz(v) => v.to_string().into_bytes(),
-            Value::Timestamp(v) => v.to_string().into_bytes(),
-            Value::TimestampTz(v) => v.format_in_zone(zone).map_err(temporal_error)?.into_bytes(),
+            Value::Timestamp(v) => v.format_with_style(settings.datestyle.style, settings.datestyle.order).into_bytes(),
+            Value::TimestampTz(v) => v.format_with_style(zone, settings.datestyle.style, settings.datestyle.order)
+                .map_err(temporal_error)?.into_bytes(),
             Value::Interval(v) => {
                 use giggles_pg_types::temporal::IntervalOutputStyle as Style;
                 let style = match settings.intervalstyle.as_str() {
@@ -779,7 +790,12 @@ fn encode(
                 .into_bytes(),
             Value::Int(v) => v.to_string().into_bytes(),
             Value::Text(s) => s.as_bytes().to_vec(),
-            Value::Bytes(b) => format!("\\x{}", hex::encode(b)).into_bytes(),
+            Value::Bytes(b) => {
+                if settings.bytea_output.text_len(b) > MAX_RESPONSE {
+                    return Err("54000");
+                }
+                settings.bytea_output.format(b).into_bytes()
+            }
         }));
     }
     Ok(Some(match (v, ty) {
@@ -1107,7 +1123,7 @@ struct Statement {
 }
 impl Statement {
     // Binding reads the immutable Prepared (including its captured search_path,
-    // types and schema user) and the catalog. Query binding installs catalog enum
+    // types, schema user and literal DateOrder) and the catalog. Query binding installs catalog enum
     // and collation scopes; plan_constant excludes runtime/session nodes and only
     // evaluates immutable calls/casts. The two lexer/value budgets are the only
     // ambient limits. Keep a schema-context revision as an extra invalidator.
@@ -1587,7 +1603,7 @@ impl State {
         session.set_time_zone(&self.settings.current.timezone);
         session.sync_role_settings(&mut self.settings.current)?;
         session.set_search_path(&self.settings.current.search_path);
-        session.set_extra_float_digits(self.settings.current.extra_float_digits);
+        session.set_text_settings(&self.settings.current);
         session.set_max_value_bytes(self.settings.current.max_value_bytes);
         session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
         session.set_default_isolation(&self.settings.current);
@@ -1604,7 +1620,7 @@ impl State {
             session.sync_role_settings(&mut self.settings.current)?;
         }
         session.set_search_path(&self.settings.current.search_path);
-        session.set_extra_float_digits(self.settings.current.extra_float_digits);
+        session.set_text_settings(&self.settings.current);
         session.set_max_value_bytes(self.settings.current.max_value_bytes);
         session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
         if result.is_ok() { simple::role_notices(session, &self.settings.current, out)?; }
@@ -2030,7 +2046,14 @@ impl State {
             return Ok(());
         }
         let old = old.clone();
-        let new = self.prepare_statement(&old.sql, old.declared_oids.clone(), session, false)?;
+        let mut preparation = self.settings.current.clone();
+        if let Plan::Sql(prepared) = &old.p {
+            preparation.datestyle.order = prepared.literal_date_order();
+        }
+        session.set_text_settings(&preparation);
+        let new = self.prepare_statement(&old.sql, old.declared_oids.clone(), session, false);
+        session.set_text_settings(&self.settings.current);
+        let new = new?;
         if old.parameter_oids != new.parameter_oids
             || old.d.columns.len() != new.d.columns.len()
             || old.d.columns.iter().zip(&new.d.columns).any(|(old, new)| {
@@ -2219,7 +2242,7 @@ impl State {
                     params.push(if n == u32::MAX {
                         Value::Null
                     } else {
-                        decode_in_zone(
+                        decode_with_order(
                             r.take(usize::try_from(n).map_err(|_| "54000")?)?,
                             ty,
                             format_at(&fmts, i),
@@ -2230,6 +2253,7 @@ impl State {
                             } else {
                                 0
                             },
+                            self.settings.current.datestyle.order,
                         )?
                     });
                 }
@@ -2524,7 +2548,7 @@ impl State {
                         p.at.saturating_add(max as usize).min(total)
                     };
                     catalog_wire::rows(
-                        self.settings.current.extra_float_digits,
+                        &self.settings.current,
                         result,
                         &p.formats,
                         p.at,
@@ -3198,7 +3222,7 @@ impl State {
                     session.set_time_zone(&self.settings.current.timezone);
                     session.sync_role_settings(&mut self.settings.current).map_err(std::io::Error::other)?;
         session.set_search_path(&self.settings.current.search_path);
-                    session.set_extra_float_digits(self.settings.current.extra_float_digits);
+                    session.set_text_settings(&self.settings.current);
                     session.set_max_value_bytes(self.settings.current.max_value_bytes);
                     session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
                     self.implicit = false;
@@ -3308,13 +3332,14 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
     }
     let key = [backend.pid.to_be_bytes(), backend.secret.to_be_bytes()].concat();
     frame(b'K', &key, &mut out).map_err(io::Error::other)?;
+    let datestyle = startup_settings.datestyle.to_string();
     for (key, value) in [
         ("server_version", "18.6"),
         ("client_encoding", "UTF8"),
         ("server_encoding", "UTF8"),
         ("standard_conforming_strings", "on"),
         ("integer_datetimes", "on"),
-        ("DateStyle", "ISO, MDY"),
+        ("DateStyle", &datestyle),
         ("TimeZone", timezone.as_str()),
     ]
     .into_iter()
@@ -3365,7 +3390,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
     state.settings.current = startup_settings;
     session.set_time_zone(&state.settings.current.timezone);
     session.set_search_path(&state.settings.current.search_path);
-    session.set_extra_float_digits(state.settings.current.extra_float_digits);
+    session.set_text_settings(&state.settings.current);
     session.set_max_value_bytes(state.settings.current.max_value_bytes);
     session.set_max_statement_tokens(state.settings.current.max_statement_tokens);
     let mut admin_sync = false;
@@ -3552,7 +3577,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                         state.settings.transaction(true, false, "ROLLBACK");
                         session.set_time_zone(&state.settings.current.timezone);
                         session.set_search_path(&state.settings.current.search_path);
-                        session.set_extra_float_digits(state.settings.current.extra_float_digits);
+                        session.set_text_settings(&state.settings.current);
                         session.set_max_value_bytes(state.settings.current.max_value_bytes);
                         session.set_max_statement_tokens(state.settings.current.max_statement_tokens);
                         state.implicit = false;

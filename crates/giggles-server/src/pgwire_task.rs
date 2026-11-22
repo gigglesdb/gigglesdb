@@ -47,7 +47,7 @@ pub(super) fn plan_class(plan: &Plan) -> Option<StatementClass> {
         Plan::SettingsFunction(Function::Current { .. }) => StatementClass::Show,
         Plan::SettingsFunction(Function::Set { .. }) => StatementClass::Set,
         Plan::SettingsFunction(Function::Advisory { .. }) => StatementClass::Lock,
-        Plan::SettingsFunction(Function::Inventory(_)) => StatementClass::Catalog,
+        Plan::SettingsFunction(Function::Inventory { .. }) => StatementClass::Catalog,
         Plan::Catalog(plan, _, _) if !plan.depends_on_relations() => StatementClass::Show,
         Plan::Catalog(..) => StatementClass::Catalog,
         Plan::Copy(..) | Plan::CopyOut(_) => StatementClass::Copy,
@@ -106,7 +106,7 @@ fn function_allowed(function: &Function) -> bool {
                 .any(|allowed| name.eq_ignore_ascii_case(allowed))
         }
         Function::Current { .. } => true,
-        Function::Advisory { .. } | Function::Inventory(_) => false,
+        Function::Advisory { .. } | Function::Inventory { .. } => false,
     }
 }
 
@@ -690,7 +690,7 @@ impl State {
                 // A relation-free catalog result: built from no application
                 // row, so there is nothing to release.
                 catalog_wire::rows(
-                    self.settings.current.extra_float_digits,
+                    &self.settings.current,
                     &Released::synthetic(result),
                     formats,
                     0,
@@ -719,7 +719,7 @@ impl State {
                     catalog_wire::description(&result.get().fields, &[], out)?;
                 }
                 catalog_wire::rows(
-                    self.settings.current.extra_float_digits,
+                    &self.settings.current,
                     &result,
                     formats,
                     0,

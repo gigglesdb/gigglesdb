@@ -34,13 +34,7 @@ fn boundaries_and_semantics() {
     );
     assert_eq!(Time::parse("00:00:00.0000005").unwrap().microseconds(), 0);
     assert_eq!(Time::parse("00:00:00.0000015").unwrap().microseconds(), 2);
-    for s in [
-        "24:00:00.000001",
-        "-01:00",
-        "12:60",
-        "12:00:60",
-        "12:00:00.a",
-    ] {
+    for s in ["24:00:00.000001", "-01:00", "12:60", "12:00:00.a"] {
         assert!(Time::parse(s).is_err(), "{s}");
     }
     let m = Interval::new(1, 0, 0);
@@ -67,7 +61,12 @@ fn boundaries_and_semantics() {
         -3_600_000_000
     );
     assert_eq!(Time::parse(&"1".repeat(257)), Err(Error::Limit));
-    assert!(TimestampTz::parse("2000-01-01 00:00 America/New_York", &p).is_err());
+    assert_eq!(
+        TimestampTz::parse("2000-01-01 00:00 America/New_York", &p)
+            .unwrap()
+            .to_string(),
+        "2000-01-01 05:00:00+00"
+    );
 }
 proptest! {
  #![proptest_config(ProptestConfig::with_cases(1024))]

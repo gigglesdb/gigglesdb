@@ -1,9 +1,13 @@
 //! Literal configuration SELECTs and the bounded pg_dump pg_settings lookup.
-use super::{Result, SessionSettings, database};
+use super::{Result, SessionSettings, Show, database};
 
 #[derive(Clone)]
 pub(crate) enum Function {
-    Inventory(giggles_pg_catalog::ResultSet),
+    Inventory {
+        result: giggles_pg_catalog::ResultSet,
+        presentation: Vec<Show>,
+        projection: Vec<usize>,
+    },
     Advisory { name: String, key: (bool, i64), column: String },
     Set {
         name: String,
@@ -30,7 +34,7 @@ impl Function {
     }
     pub fn column(&self) -> &str {
         match self {
-            Self::Inventory(_) => "setting",
+            Self::Inventory { .. } => "setting",
             Self::Set { column, .. } | Self::Current { column, .. } | Self::Advisory { column, .. } => column,
         }
     }
@@ -57,12 +61,21 @@ impl Function {
     /// the wire dispatcher restores it at that transaction's end, without WARNING.
     pub fn evaluate(&self, settings: &mut SessionSettings) -> Result<Option<String>> {
         match self {
-            Self::Inventory(_) => unreachable!("settings inventory"),
+            Self::Inventory { .. } => unreachable!("settings inventory"),
             Self::Advisory { .. } => unreachable!("wire session function"),
             Self::Set {
                 name, value, local, ..
             } => {
                 let (name, assignment) = database::function_assignment(name, value, *local)?;
+                match name {
+                    Show::DateStyle => {
+                        database::date_style(value, settings.current.datestyle).map_err(|_| "22023")?;
+                    }
+                    Show::ByteaOutput => {
+                        database::bytea_output(value)?;
+                    }
+                    _ => {}
+                }
                 settings.apply(&assignment, true);
                 Ok(Some(name.value(&settings.current).1))
             }
@@ -75,6 +88,31 @@ impl Function {
             },
         }
     }
+}
+
+pub(crate) fn presentation_inventory_rows(
+    presentation: &[Show],
+    projection: &[usize],
+    settings: &SessionSettings,
+) -> Vec<Vec<giggles_pg_catalog::Value>> {
+    use giggles_pg_catalog::Value;
+    let boot = super::Settings::default();
+    presentation.iter().map(|&setting| {
+        let (name, current) = setting.value(&settings.current);
+        let (_, reset) = setting.value(&settings.defaults);
+        let (_, boot) = setting.value(&boot);
+        let kind = if setting == Show::ByteaOutput { "enum" } else { "string" };
+        let source = if current == reset { "default" } else { "session" };
+        let fields = [Some(name), Some(&current), None, None, None, Some(kind), Some("user"),
+            Some(source), Some(&boot), Some(&reset)];
+        projection.iter().map(|&index| {
+            if index == 10 {
+                Value::Bool(false)
+            } else {
+                fields[index].map_or(Value::Null, |text| Value::Text(text.into()))
+            }
+        }).collect()
+    }).collect()
 }
 #[derive(Clone, PartialEq)]
 enum Token {
@@ -213,16 +251,26 @@ fn inventory(tokens: Vec<Token>) -> Option<Function> {
     else if relation != "pg_settings" { return None; }
     p.token(Token::Word("where".into()))?;
     p.token(Token::Word("name".into()))?;
-    p.token(Token::Word("in".into()))?;
-    p.token(Token::Left)?;
-    let mut filter = Vec::new();
-    loop {
-        filter.push(p.text()?);
-        if filter.len() > 256 { return None; }
-        if p.tokens.get(p.at) != Some(&Token::Comma) { break; }
+    let filter = if p.tokens.get(p.at) == Some(&Token::Equals) {
         p.at += 1;
-    }
-    p.token(Token::Right)?;
+        let name = p.text()?;
+        if !matches!(name.as_str(), "DateStyle" | "bytea_output") {
+            return None;
+        }
+        vec![name]
+    } else {
+        p.token(Token::Word("in".into()))?;
+        p.token(Token::Left)?;
+        let mut names = Vec::new();
+        loop {
+            names.push(p.text()?);
+            if names.len() > 256 { return None; }
+            if p.tokens.get(p.at) != Some(&Token::Comma) { break; }
+            p.at += 1;
+        }
+        p.token(Token::Right)?;
+        names
+    };
     if p.at != p.tokens.len() {
         for word in ["order","by","name"] { p.token(Token::Word(word.into()))?; }
     }
@@ -247,8 +295,15 @@ fn inventory(tokens: Vec<Token>) -> Option<Function> {
             else { values[*i].map(|s| Value::Text(s.into())).unwrap_or(Value::Null) }
         }).collect());
     }
+    let presentation: Vec<_> = [("DateStyle", Show::DateStyle), ("bytea_output", Show::ByteaOutput)]
+        .into_iter().filter(|(name, _)| filter.iter().any(|value| value == name))
+        .map(|(_, setting)| setting).collect();
+    if !presentation.is_empty() && columns.iter().any(|(_, numeric, _)| *numeric) {
+        return None;
+    }
+    let projection = columns.iter().map(|(i, _, _)| *i).collect();
     let fields = columns.into_iter().map(|(i,numeric,name)| Field { name, data_type: if numeric { PgType::Numeric } else if i == 10 { PgType::Bool } else { PgType::Text } }).collect();
-    Some(Function::Inventory(ResultSet { fields, rows }))
+    Some(Function::Inventory { result: ResultSet { fields, rows }, presentation, projection })
 }
 fn parse(sql: &str) -> Option<Function> {
     let tokens = lex(sql)?;
@@ -378,7 +433,7 @@ fn parse_tokens(tokens: Vec<Token>) -> Option<Function> {
         p.at += 1;
         match &mut call {
             Function::Set { column: c, .. } | Function::Current { column: c, .. } | Function::Advisory { column: c, .. } => *c = column,
-            Function::Inventory(_) => unreachable!("separate inventory grammar"),
+            Function::Inventory { .. } => unreachable!("separate inventory grammar"),
         }
     }
     if from_settings || p.tokens.get(p.at) == Some(&Token::Word("from".into())) {
@@ -458,7 +513,7 @@ mod tests {
     fn numeric_inventory_defaults_are_bounded_and_case_sensitive() {
         let names = "'autovacuum_analyze_scale_factor','autovacuum_analyze_threshold','autovacuum_freeze_max_age','autovacuum_vacuum_cost_delay','autovacuum_vacuum_cost_limit','autovacuum_vacuum_scale_factor','autovacuum_vacuum_threshold','vacuum_freeze_min_age','vacuum_freeze_table_age'";
         let sql = format!("SELECT name,setting::numeric AS setting FROM pg_show_all_settings() WHERE name IN ({names}) ORDER BY name");
-        let Function::Inventory(result) = parse_function(&sql).unwrap().unwrap() else { panic!("inventory") };
+        let Function::Inventory { result, .. } = parse_function(&sql).unwrap().unwrap() else { panic!("inventory") };
         let expected = ["0.1","50","200000000","2","-1","0.2","50","50000000","150000000"];
         assert_eq!(result.rows.iter().map(|r| r[1].clone()).collect::<Vec<_>>(), expected.into_iter().map(|s| giggles_pg_catalog::Value::Numeric(giggles_pg_types::Numeric::parse(s).unwrap())).collect::<Vec<_>>());
         assert!(parse_function(&(sql.clone() + "; DELETE FROM x")).unwrap().is_none());

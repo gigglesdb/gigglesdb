@@ -101,6 +101,7 @@ impl Relational {
 
 impl Prepared {
     pub(crate) fn bind_schemas(&self, state: &Relational) -> R<Self> {
+        let _date_order = super::clock::LiteralDateOrder::enter(self.literal_date_order);
         if self.relations.is_empty()
             && !matches!(&self.statement, Statement::Plan(_))
             && !matches!(&self.statement, Statement::Query(q) if q.has_domain_expression())
@@ -117,6 +118,7 @@ impl Prepared {
             epoch: self.epoch,
             transaction: self.transaction,
             engine_generation: self.engine_generation,
+            literal_date_order: self.literal_date_order,
             statement: (*unbound).clone(),
             native_delete: self.native_delete.clone(),
             native_insert_many: self.native_insert_many,
@@ -275,6 +277,7 @@ pub struct AuthorizationPlanKey {
     domain: u128,
     epoch: u64,
     transaction: Option<u128>,
+    literal_date_order: giggles_pg_types::temporal::DateOrder,
     params: usize,
     parameter_types: Vec<Option<DataType>>,
     relations: Vec<schemas::Reference>,
@@ -291,6 +294,7 @@ impl AuthorizationPlanKey {
             && self.domain == prepared.domain
             && self.epoch == prepared.epoch
             && self.transaction == prepared.transaction
+            && self.literal_date_order == prepared.literal_date_order
             && self.params == prepared.params
             && self.parameter_types == prepared.parameter_types
             && self.relations == prepared.relations
@@ -373,6 +377,7 @@ impl Prepared {
             domain: self.domain,
             epoch: self.epoch,
             transaction: self.transaction,
+            literal_date_order: self.literal_date_order,
             params: self.params,
             parameter_types: self.parameter_types.clone(),
             relations: self.relations.clone(),

@@ -1799,6 +1799,7 @@ pub struct Prepared {
     pub(crate) transaction: Option<u128>,
     // Process-local identity set when V2 binds this plan to an engine.
     pub(crate) engine_generation: Option<crate::storage::PreparedGeneration>,
+    pub(crate) literal_date_order: giggles_pg_types::temporal::DateOrder,
     statement: Statement,
     // Request targets and version witnesses only; never cached relation rows.
     native_delete: Option<Vec<(Vec<Value>, u64)>>,
@@ -1949,6 +1950,11 @@ fn native_check_tokens(expression: &crate::operations::Expr, parent: u8) -> R<Ve
     Ok(tokens)
 }
 impl Prepared {
+    /// The date order used to bind unknown datetime literals in this statement.
+    pub fn literal_date_order(&self) -> giggles_pg_types::temporal::DateOrder {
+        self.literal_date_order
+    }
+
     #[allow(dead_code)] // Awaiting v2 dispatch integration.
     pub(crate) fn v2_class(&self) -> V2Class {
         match &self.statement {
@@ -2026,6 +2032,7 @@ impl Prepared {
             native_delete: None,
             native_insert_many: false,
             unbound_statement: None,
+            literal_date_order: clock::LiteralDateOrder::current(),
             warnings: vec![],
             authorization_has_views: false,
             authorization_binding: None,
@@ -2520,6 +2527,7 @@ impl Prepared {
         self.validate_immutable_constants_at_epoch(state, self.epoch)
     }
     pub(crate) fn validate_immutable_constants_at_epoch(&self, state: &Relational, epoch: u64) -> R<()> {
+        let _date_order = clock::LiteralDateOrder::enter(self.literal_date_order);
         let bound = self.bind_schemas(state)?;
         let this = &bound;
         // Schema binding copies the epoch but never reads it. Accept the
@@ -2547,6 +2555,7 @@ impl Prepared {
         Ok(())
     }
     pub(crate) fn describe(&self, state: &Relational) -> R<Description> {
+        let _date_order = clock::LiteralDateOrder::enter(self.literal_date_order);
         let bound = self.bind_schemas(state)?;
         let this = &bound;
         this.validate_schemas(state)?;
@@ -3079,6 +3088,7 @@ impl Prepared {
             native_delete: None,
             native_insert_many: false,
             unbound_statement: None,
+            literal_date_order: clock::LiteralDateOrder::current(),
             warnings: vec![],
             authorization_has_views: false,
             authorization_binding: None,
@@ -3536,6 +3546,7 @@ impl Prepared {
             native_delete: None,
             native_insert_many: false,
             unbound_statement: None,
+            literal_date_order: clock::LiteralDateOrder::current(),
             warnings: take_sql_warnings(),
             authorization_has_views: false,
             authorization_binding: None,
@@ -4181,6 +4192,7 @@ impl Relational {
                 native_delete: None,
             native_insert_many: false,
             unbound_statement: None,
+                literal_date_order: prepared.literal_date_order,
                 warnings: vec![],
             authorization_has_views: false,
             authorization_binding: None,
@@ -4204,7 +4216,7 @@ impl Relational {
                 user_types::execute(self, ddl, prepared)?;
             }
             Statement::CompositeSelect(select) => {
-                return select.execute(self, params, &prepared.search_path);
+                return select.execute(self, params, &prepared.search_path, clock);
             }
             Statement::Plan(plan) => {
                 if expected.is_some() { return Err(SqlError::Unsupported); }

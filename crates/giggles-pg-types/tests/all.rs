@@ -35,6 +35,8 @@ mod temporal_calendar;
 mod temporal_compat;
 #[path = "temporal_functions.rs"]
 mod temporal_functions;
+#[path = "temporal_input_grammar.rs"]
+mod temporal_input_grammar;
 #[path = "temporal_interval_rounding.rs"]
 mod temporal_interval_rounding;
 #[path = "temporal_overloads.rs"]

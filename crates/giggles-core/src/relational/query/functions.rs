@@ -63,6 +63,17 @@ pub(crate) fn output_text(value: &Value) -> R<Option<String>> {
         _ => Err(SqlError::Type),
     }
 }
+
+pub(in crate::relational) fn output_text_with_clock(
+    value: &Value,
+    clock: Option<&crate::relational::clock::ExecutionClock>,
+) -> R<Option<String>> {
+    if let Some(text) = presentation_text(value, clock) {
+        text.map(Some)
+    } else {
+        output_text(value)
+    }
+}
 mod format;
 mod substring_order;
 mod temporal;
@@ -174,19 +185,37 @@ enum Node {
     TypmodCast(Box<BoundScalar>, i32),
     SessionCast(
         Box<BoundScalar>,
-        Option<crate::relational::clock::ExecutionClock>,
+        SessionCastContext,
     ),
     Column(BoundColumn, String),
     Literal(Value),
     Call(String, Vec<BoundScalar>),
 }
+
+#[derive(Clone, Debug, Default)]
+struct SessionCastContext {
+    clock: Option<crate::relational::clock::ExecutionClock>,
+    literal_order: Option<giggles_pg_types::temporal::DateOrder>,
+}
+
 fn cast_node(value: BoundScalar, target: &DataType) -> Node {
     if session_sensitive(&value.ty, target) {
-        Node::SessionCast(Box::new(value), None)
+        Node::SessionCast(Box::new(value), SessionCastContext::default())
     } else {
         Node::Cast(Box::new(value))
     }
 }
+
+fn attach_text_cast(argument: &mut BoundScalar) {
+    if session_sensitive(&argument.ty, &DataType::Text) {
+        let old = std::mem::replace(argument, BoundScalar {
+            ty: DataType::Text,
+            node: Node::Literal(Value::Null),
+        });
+        argument.node = Node::SessionCast(Box::new(old), SessionCastContext::default());
+    }
+}
+
 /// Shared result selection for COALESCE and CASE, with unknown literals omitted.
 fn common_result_type(types: impl IntoIterator<Item = DataType>) -> R<DataType> {
     let mut common = None;
@@ -265,60 +294,106 @@ fn session_sensitive(source: &DataType, target: &DataType) -> bool {
     use DataType::*;
     matches!(
         (source, target),
-        (TimestampTz | Real | DoublePrecision, Text)
-            | (Text | Date | Timestamp, TimestampTz)
+        (Date | Timestamp | TimestampTz | Real | DoublePrecision | Bytes, Text | Varchar | Bpchar)
+            | (Text | Varchar | Bpchar, Date | Time | TimeTz | Timestamp | TimestampTz)
+            | (Date | Timestamp, TimestampTz)
             | (Time, TimeTz)
             | (TimestampTz, Date | Timestamp | Time | TimeTz)
     )
 }
 fn literal_cast_node(value: Value, target: &DataType) -> R<Node> {
+    use crate::relational::clock::LiteralDateOrder;
+    let date_order = LiteralDateOrder::current();
+    let deferred = |value| Node::SessionCast(
+        Box::new(BoundScalar { ty: DataType::Text, node: Node::Literal(value) }),
+        SessionCastContext { literal_order: Some(date_order), clock: None },
+    );
     if let Value::Text(text) = &value
         && datetime_input::target(target)
         && (datetime_input::clock_word(text)
             || *target == DataType::TimeTz
-                && match (
-                    datetime_input::timetz(text, 0),
-                    datetime_input::timetz(text, 3600),
-                ) {
-                    (Ok(a), Ok(b)) => a != b,
-                    _ => false,
-                })
+                && datetime_input::timetz_needs_session(text, date_order))
     {
-        return Ok(Node::SessionCast(
-            Box::new(BoundScalar {
-                ty: DataType::Text,
-                node: Node::Literal(value),
-            }),
-            None,
-        ));
+        return Ok(deferred(value));
     }
     if let Value::Text(text) = &value
         && *target == DataType::TimestampTz
     {
-        use giggles_pg_types::temporal::{DateOrder, SessionSettings, SessionZone};
+        use giggles_pg_types::temporal::{SessionSettings, SessionZone};
         let parse = |offset| {
             TimestampTz::parse_in_session(
                 text,
                 &SessionSettings {
-                    date_order: DateOrder::default(),
+                    date_order,
                     zone: SessionZone::Fixed(offset),
                 },
             )
         };
-        if let (Ok(a), Ok(b)) = (parse(0), parse(3600))
+        // Alphabetic zone tokens can mean something different in the execution zone.
+        // Only fold numeric input (including the ISO T date/time separator).
+        if text
+            .bytes()
+            .all(|b| !b.is_ascii_alphabetic() || b.eq_ignore_ascii_case(&b'T'))
+            && let (Ok(a), Ok(b)) = (parse(0), parse(3600))
             && a == b
         {
             return Ok(Node::Literal(Value::TimestampTz(a)));
         }
-        return Ok(Node::SessionCast(
-            Box::new(BoundScalar {
-                ty: DataType::Text,
-                node: Node::Literal(value),
-            }),
-            None,
-        ));
+        return Ok(deferred(value));
     }
-    Ok(Node::Literal(coerce_clocked(value, target, None)?))
+    let value = match value {
+        Value::Text(text) if datetime_input::target(target) => {
+            datetime_input::parse(text, target, &fallback_clock(date_order))?
+        }
+        value => coerce_clocked(value, target, None)?,
+    };
+    Ok(Node::Literal(value))
+}
+
+fn fallback_clock(
+    order: giggles_pg_types::temporal::DateOrder,
+) -> crate::relational::clock::ExecutionClock {
+    use crate::relational::clock::{ExecutionClock, StatementClock};
+    ExecutionClock::new(&StatementClock {
+        unavailable: None,
+        transaction_us: 0,
+        statement_us: 0,
+        zone: Some(giggles_pg_types::temporal::SessionZone::Fixed(0)),
+        wall: None,
+    })
+    .with_text_settings(
+        giggles_pg_types::temporal::DateStyleSettings {
+            order,
+            ..Default::default()
+        },
+        Default::default(),
+    )
+}
+
+fn presentation_text(
+    value: &Value,
+    clock: Option<&crate::relational::clock::ExecutionClock>,
+) -> Option<R<String>> {
+    use crate::relational::clock::ExecutionClock;
+    let settings = clock.map_or_else(Default::default, ExecutionClock::date_style);
+    Some(match value {
+        Value::Date(date) => Ok(date.format_with_style(settings.style, settings.order)),
+        Value::Timestamp(timestamp) => Ok(timestamp.format_with_style(settings.style, settings.order)),
+        Value::TimestampTz(timestamp) => {
+            let zone = clock.and_then(ExecutionClock::zone)
+                .unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0));
+            timestamp.format_with_style(zone, settings.style, settings.order).map_err(pg_error)
+        }
+        Value::Bytes(bytes) => {
+            let output = clock.map_or_else(Default::default, ExecutionClock::bytea_output);
+            if output.text_len(bytes) > crate::relational::max_value_bytes() {
+                Err(SqlError::Limit)
+            } else {
+                Ok(output.format(bytes))
+            }
+        }
+        _ => return None,
+    })
 }
 fn session_cast(
     value: Value,
@@ -330,16 +405,14 @@ fn session_cast(
     let clock = match clock {
         Some(clock) => clock,
         None => {
-            fallback =
-                crate::relational::clock::ExecutionClock::new(&crate::relational::StatementClock {
-                    unavailable: None,
-                    transaction_us: 0,
-                    statement_us: 0,
-                    zone: Some(giggles_pg_types::temporal::SessionZone::Fixed(0)),
-                    wall: None,
-                });
+            fallback = fallback_clock(crate::relational::clock::LiteralDateOrder::current());
             &fallback
         }
+    };
+    let target = if matches!(target, DataType::Varchar | DataType::Bpchar) {
+        &DataType::Text
+    } else {
+        target
     };
     match (value, target) {
         (Value::Float4(n), DataType::Text) => Ok(Value::Text(
@@ -353,14 +426,6 @@ fn session_cast(
         (Value::Text(text), target) if datetime_input::target(target) => {
             datetime_input::parse(text, target, clock)
         }
-        (Value::TimestampTz(t), DataType::Text) => Ok(Value::Text(
-            t.format_in_zone(
-                clock
-                    .zone()
-                    .unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0)),
-            )
-            .map_err(pg_error)?,
-        )),
         (value, target) => assignment::convert(value, source, target, Some(clock)),
     }
 }
@@ -1904,18 +1969,7 @@ impl Scalar {
                     }
                 };
                 if matches!(name.as_str(), "concat" | "concat_ws" | "format") {
-                    for argument in &mut args {
-                        if session_sensitive(&argument.ty, &DataType::Text) {
-                            let old = std::mem::replace(
-                                argument,
-                                BoundScalar {
-                                    ty: DataType::Text,
-                                    node: Node::Literal(Value::Null),
-                                },
-                            );
-                            argument.node = Node::SessionCast(Box::new(old), None);
-                        }
-                    }
+                    args.iter_mut().for_each(attach_text_cast);
                 }
                 collation::derive(args.iter())?;
                 if matches!(name.as_str(), "lower" | "upper" | "initcap") {
@@ -1944,7 +1998,7 @@ impl BoundScalar {
                 }
             }
             Node::SessionCast(value, target) => {
-                *target = clock.cloned();
+                target.clock = clock.cloned();
                 value.attach_clock(clock);
             }
             Node::CrossCompare(_, a, b, target) => {
@@ -2197,12 +2251,21 @@ impl BoundScalar {
                 user_types::coerce_domain(ty, &value)?;
                 Ok(value)
             }
-            Node::SessionCast(a, clock) => {
+            Node::SessionCast(a, cast) => {
                 let value = a.eval(row, params, budget)?;
                 if value == Value::Null {
                     return Ok(value);
                 }
-                let value = session_cast(value, &a.ty, &self.ty, clock.as_ref())?;
+                let literal_clock = cast.literal_order.map(|order| {
+                    let Some(clock) = &cast.clock else {
+                        return fallback_clock(order);
+                    };
+                    let mut style = clock.date_style();
+                    style.order = order;
+                    clock.clone().with_text_settings(style, clock.bytea_output())
+                });
+                let clock = literal_clock.as_ref().or(cast.clock.as_ref());
+                let value = session_cast(value, &a.ty, &self.ty, clock)?;
                 charge(budget, &value)?;
                 Ok(value)
             }
@@ -2591,6 +2654,20 @@ fn integer_from_float(value: f64, ty: &DataType) -> R<i64> {
 }
 
 pub(super) fn cast_value(v: Value, ty: &DataType, budget: &mut usize) -> R<Value> {
+    cast_with_date_order(
+        v,
+        ty,
+        budget,
+        crate::relational::clock::LiteralDateOrder::current(),
+    )
+}
+
+fn cast_with_date_order(
+    v: Value,
+    ty: &DataType,
+    budget: &mut usize,
+    date_order: giggles_pg_types::temporal::DateOrder,
+) -> R<Value> {
     if v == Value::Null {
         return Ok(v);
     }
@@ -2608,6 +2685,7 @@ pub(super) fn cast_value(v: Value, ty: &DataType, budget: &mut usize) -> R<Value
     } else {
         ty
     };
+    let parser = giggles_pg_types::temporal::ParserSettings { date_order, offset_east: 0 };
     let out = match (v, ty) {
         (Value::Date(v), DataType::Date) => Value::Date(v),
         (Value::Date(v), DataType::Timestamp) => Value::Timestamp(
@@ -2627,34 +2705,26 @@ pub(super) fn cast_value(v: Value, ty: &DataType, budget: &mut usize) -> R<Value
         (Value::Interval(v), DataType::Interval) => Value::Interval(v),
         (Value::Interval(v), DataType::Text) => Value::Text(v.to_string()),
         (Value::Text(s), DataType::Date) => Value::Date(
-            Date::parse(&s, &giggles_pg_types::temporal::ParserSettings::default()).map_err(
-                |e| datetime_input::zone_word_error(&s, ty, temporal::parse_error(e, false)),
-            )?,
+            Date::parse(&s, &parser).map_err(|e| temporal::parse_error(e, false))?,
         ),
-        (Value::Text(s), DataType::Time) => Value::Time(Time::parse(&s).map_err(|e| {
-            datetime_input::zone_word_error(&s, ty, temporal::parse_error(e, false))
-        })?),
+        (Value::Text(s), DataType::Time) => Value::Time(
+            Time::parse(&s).map_err(|e| temporal::parse_error(e, false))?,
+        ),
         (Value::Text(s), DataType::TimeTz) => Value::TimeTz(
-            TimeTz::parse(&s, &giggles_pg_types::temporal::ParserSettings::default()).map_err(
-                |e| datetime_input::zone_word_error(&s, ty, temporal::parse_error(e, false)),
-            )?,
+            TimeTz::parse(&s, &parser).map_err(|e| temporal::parse_error(e, false))?,
         ),
         (Value::Text(s), DataType::Timestamp) => Value::Timestamp(
-            Timestamp::parse(&s, &giggles_pg_types::temporal::ParserSettings::default()).map_err(
-                |e| datetime_input::zone_word_error(&s, ty, temporal::parse_error(e, false)),
-            )?,
+            Timestamp::parse(&s, &parser).map_err(|e| temporal::parse_error(e, false))?,
         ),
         (Value::Text(s), DataType::TimestampTz) => Value::TimestampTz(
             TimestampTz::parse_in_session(
                 &s,
                 &giggles_pg_types::temporal::SessionSettings {
-                    date_order: giggles_pg_types::temporal::DateOrder::default(),
+                    date_order,
                     zone: giggles_pg_types::temporal::SessionZone::Fixed(0),
                 },
             )
-            .map_err(|e| {
-                datetime_input::zone_word_error(&s, ty, temporal::parse_error(e, false))
-            })?,
+            .map_err(|e| temporal::parse_error(e, false))?,
         ),
         (Value::Text(s), DataType::Interval) => {
             Value::Interval(Interval::parse(&s).map_err(|e| temporal::parse_error(e, true))?)
@@ -2776,20 +2846,9 @@ pub(super) fn cast_value(v: Value, ty: &DataType, budget: &mut usize) -> R<Value
         (Value::Bytes(b), DataType::Bytes) => Value::Bytes(b),
         (Value::Int(n), DataType::Text) => Value::Text(n.to_string()),
         (Value::Bytes(bytes), DataType::Text) => {
-            reserve(
-                budget,
-                bytes
-                    .len()
-                    .checked_mul(2)
-                    .and_then(|n| n.checked_add(2))
-                    .ok_or(SqlError::Limit)?,
-            )?;
-            let mut s = String::from("\\x");
-            use std::fmt::Write;
-            for b in bytes {
-                write!(s, "{b:02x}").map_err(|_| SqlError::Type)?;
-            }
-            return Ok(Value::Text(s));
+            use giggles_pg_types::bytea::ByteaOutput;
+            reserve(budget, ByteaOutput::Hex.text_len(&bytes))?;
+            return Ok(Value::Text(ByteaOutput::Hex.format(&bytes)));
         }
         (Value::Text(s), DataType::Bytes) => {
             use giggles_pg_types::bytea::{ByteaInputError as E, prepare_bytea_text};
@@ -3215,7 +3274,9 @@ fn float_input_error(error: giggles_pg_types::Error) -> SqlError {
 fn numeric_input_error(text: &str, error: giggles_pg_types::Error) -> SqlError {
     use giggles_pg_types::Error;
     match error {
-        Error::Syntax | Error::Unimplemented | Error::Binary => SqlError::InvalidTextRepresentation,
+        Error::Syntax | Error::Unimplemented | Error::Binary | Error::UnknownTimeZone => {
+            SqlError::InvalidTextRepresentation
+        }
         Error::Range | Error::TimeZoneDisplacement => SqlError::Overflow,
         Error::Limit if text.len() > giggles_pg_types::MAX_TEXT => SqlError::Limit,
         Error::Limit => {
@@ -3469,7 +3530,7 @@ impl BoundScalar {
         {
             cast_node(self, target)
         } else if assignment::compatible(&self.ty, target) {
-            Node::SessionCast(Box::new(self), None)
+            Node::SessionCast(Box::new(self), SessionCastContext::default())
         } else {
             return Err(SqlError::Type);
         };

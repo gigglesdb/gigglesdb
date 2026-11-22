@@ -351,19 +351,8 @@ pub(super) fn bind(
                 operand(b, &bt, resolve, tables, parameters)?,
             ];
             collation::derive(args.iter())?;
-            if *op == BinaryOp::Concat {
-                for argument in &mut args {
-                    if session_sensitive(&argument.ty, &DataType::Text) {
-                        let old = std::mem::replace(
-                            argument,
-                            BoundScalar {
-                                ty: DataType::Text,
-                                node: Node::Literal(Value::Null),
-                            },
-                        );
-                        argument.node = Node::SessionCast(Box::new(old), None);
-                    }
-                }
+            if *op == BinaryOp::Concat && ty == DataType::Text {
+                args.iter_mut().for_each(attach_text_cast);
             }
             Ok(BoundScalar {
                 ty: ty.clone(),

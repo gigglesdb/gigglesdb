@@ -1120,13 +1120,14 @@ pub(crate) fn description(fields: &[Field], formats: &[u16], out: &mut Vec<u8>) 
 }
 
 pub(crate) fn encode(value: &Value, ty: PgType, format: u16) -> Result<Option<Vec<u8>>> {
-    encode_with_extra(value, ty, format, 0)
+    encode_with_settings(value, ty, format, 0, Default::default())
 }
-fn encode_with_extra(
+fn encode_with_settings(
     value: &Value,
     ty: PgType,
     format: u16,
     extra: i32,
+    bytea_output: giggles_pg_types::bytea::ByteaOutput,
 ) -> Result<Option<Vec<u8>>> {
     if format > 1 {
         return Err("08P01");
@@ -1142,7 +1143,7 @@ fn encode_with_extra(
             if format == 1 {
                 return Err("42883");
             }
-            return encode_with_extra(value, PgType::TextArray, 0, extra);
+            return encode_with_settings(value, PgType::TextArray, 0, extra, bytea_output);
         }
         (Value::Numeric(v), PgType::Numeric) => {
             if format == 1 {
@@ -1238,12 +1239,15 @@ fn encode_with_extra(
             }
         }
         (Value::Bytes(v), PgType::Bytea) => {
-            if v.len() > MAX_RESPONSE / 2 {
-                return Err("54000");
-            }
             if format == 0 {
-                format!("\\x{}", hex::encode(v)).into_bytes()
+                if bytea_output.text_len(v) > MAX_RESPONSE {
+                    return Err("54000");
+                }
+                bytea_output.format(v).into_bytes()
             } else {
+                if v.len() > MAX_RESPONSE / 2 {
+                    return Err("54000");
+                }
                 v.clone()
             }
         }
@@ -1264,7 +1268,7 @@ fn encode_with_extra(
                     if i != 0 {
                         encoded.push(if is_vector(array) { b' ' } else { b',' });
                     }
-                    match encode(value, scalar, 0)? {
+                    match encode_with_settings(value, scalar, 0, 0, bytea_output)? {
                         None => encoded.extend(b"NULL"),
                         Some(item) => {
                             if encoded
@@ -1278,7 +1282,7 @@ fn encode_with_extra(
                             // array_out quotes empty, NULL-like and delimiter-bearing elements.
                             let quote = item.is_empty() || item.eq_ignore_ascii_case(b"NULL")
                                 || item.iter().any(|b| b.is_ascii_whitespace() || matches!(b, b',' | b'{' | b'}' | b'"' | b'\\'));
-                            if quote || matches!(scalar, PgType::Text | PgType::Varchar | PgType::Char | PgType::Bytea) {
+                            if quote || matches!(scalar, PgType::Text | PgType::Varchar | PgType::Char) {
                                 encoded.push(b'"');
                                 for byte in item {
                                     if matches!(byte, b'"' | b'\\') {
@@ -1375,7 +1379,7 @@ pub(crate) fn retained_bytes(result: &ResultSet) -> Result<usize> {
 /// Encodes rows `start..end` of a released catalog result as DataRow
 /// messages. It takes only `Released` (GD-0061 R3-314).
 pub(crate) fn rows(
-    extra: i32,
+    settings: &crate::pg_settings::Settings,
     result: &Released<ResultSet>,
     formats: &[u16],
     start: usize,
@@ -1390,7 +1394,8 @@ pub(crate) fn rows(
         }
         let mut bytes = (row.len() as u16).to_be_bytes().to_vec();
         for (i, (value, field)) in row.iter().zip(&result.fields).enumerate() {
-            match encode_with_extra(value, field.data_type, pgwire::format_at(formats, i), extra)? {
+            match encode_with_settings(value, field.data_type, pgwire::format_at(formats, i),
+                settings.extra_float_digits, settings.bytea_output)? {
                 None => bytes.extend((-1i32).to_be_bytes()),
                 Some(value) => {
                     bytes.extend((value.len() as i32).to_be_bytes());
@@ -1979,7 +1984,7 @@ mod tests {
             assert_eq!(actual, expected);
             let mut actual = vec![];
             rows(
-                0,
+                &Default::default(),
                 &Released::synthetic(ResultSet {
                     fields: fields.clone(),
                     rows: vec![vec![Value::Null, Value::Null]],

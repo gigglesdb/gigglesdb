@@ -73,9 +73,19 @@ exact component binary images, trailing fields/precision, AMPM and24h carry,
 invalid inputs and interval equality/order versus component identity.
 This is broad differential evidence, not an exhaustive every-transition proof.
 
-Explicit remaining gaps: general PG date/time grammar (month names, abbreviation
-configuration, POSIX zone strings, case-insensitive zone lookup, leap seconds,
-relative keywords); alternate timestamp/timetz DateStyle output; ISO alternative
+Date/time input decodes compact and delimited dates, English names, ordinal and
+Julian days, abbreviations, and case-insensitive named and POSIX zones. The
+embedded PostgreSQL 18.6 Default table retains its license in
+`src/temporal/timezone_abbreviations.txt`. Dynamic entries resolve against
+embedded TZif transitions. Timestamptz input checks the session zone's
+abbreviations before that table.
+
+- POSIX session zone strings such as `UTC+3` print a numeric offset in place of the abbreviation in SQL, Postgres, and German styles.
+- Timestamptz literals with zone words, and timetz literals whose offset depends on the session zone, are converted at execution time in prepared statements (PostgreSQL converts them at prepare).
+- A named statement rebound after DDL on a relation it references keeps the DateOrder it was prepared under; PostgreSQL re-analyses it under the DateOrder current at that point.
+
+Explicit remaining gaps include runtime selection of abbreviation tables,
+current-date-dependent input in the clock-free type APIs, alternate timestamp/timetz DateStyle output; ISO alternative
 compact/extended interval syntax; bare SQL day-time interval grammar; complete
 SQL-standard input sign propagation; submicrosecond fractional-unit parsing and
 higher-precision decimals (PG's double-based rounding differs from exact decimal);

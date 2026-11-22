@@ -95,50 +95,7 @@ impl Date {
         Self::from_days(i32::try_from(v).map_err(|_| Error::Range)?)
     }
     pub fn parse(s: &str, settings: &ParserSettings) -> Result<Self, Error> {
-        let s = bounded(s)?;
-        if s.eq_ignore_ascii_case("infinity") {
-            return Ok(Self::INFINITY);
-        }
-        if s.eq_ignore_ascii_case("-infinity") {
-            return Ok(Self::NEG_INFINITY);
-        }
-        let (s, bc) = if s.len() > 3 && s[s.len() - 3..].eq_ignore_ascii_case(" BC") {
-            (&s[..s.len() - 3], true)
-        } else {
-            (s, false)
-        };
-        // Deliberately exclude PG's context-sensitive one/two digit years.
-        let year_field = if s.contains('/') && settings.date_order != DateOrder::Ymd {
-            s.rsplit('/').next().ok_or(Error::Syntax)?
-        } else {
-            s.split(['/', '-']).next().ok_or(Error::Syntax)?
-        };
-        if year_field.len() < 4 {
-            return Err(Error::Unimplemented);
-        }
-        let delim = if s.contains('/') { '/' } else { '-' };
-        let mut p = s.split(delim);
-        let a = number(p.next().ok_or(Error::Syntax)?)?;
-        let b = number(p.next().ok_or(Error::Syntax)?)?;
-        let c = number(p.next().ok_or(Error::Syntax)?)?;
-        if p.next().is_some() {
-            return Err(Error::Syntax);
-        }
-        let (y, m, d) = if delim == '-' || settings.date_order == DateOrder::Ymd {
-            (a, b, c)
-        } else if settings.date_order == DateOrder::Mdy {
-            (c, a, b)
-        } else {
-            (c, b, a)
-        };
-        if y <= 0 {
-            return Err(Error::Range);
-        }
-        Self::from_ymd(
-            i32::try_from(if bc { -y } else { y }).map_err(|_| Error::Range)?,
-            u32::try_from(m).map_err(|_| Error::Range)?,
-            u32::try_from(d).map_err(|_| Error::Range)?,
-        )
+        input::date(s, settings.date_order)
     }
     pub fn to_binary(self) -> [u8; 4] {
         self.0.to_be_bytes()
@@ -179,27 +136,7 @@ impl Time {
         self.0
     }
     pub fn parse(s: &str) -> Result<Self, Error> {
-        let s = bounded(s)?;
-        let (s, _) = split_offset(s, 0)?;
-        let (s, pm) = if s.len() >= 3 && s[s.len() - 3..].eq_ignore_ascii_case(" PM") {
-            (&s[..s.len() - 3], Some(true))
-        } else if s.len() >= 3 && s[s.len() - 3..].eq_ignore_ascii_case(" AM") {
-            (&s[..s.len() - 3], Some(false))
-        } else {
-            (s, None)
-        };
-        let mut us = clock(s, false)?;
-        if let Some(pm) = pm {
-            let hour = number(s.split(':').next().ok_or(Error::Syntax)?)?;
-            if !(0..=12).contains(&hour) {
-                return Err(Error::Range);
-            }
-            us -= (hour / 12) * 43_200_000_000;
-            if pm {
-                us += 43_200_000_000;
-            }
-        }
-        Self::from_microseconds(us)
+        input::time(s, &ParserSettings::default(), false).map(|(time, _)| time)
     }
     pub fn to_binary(self) -> [u8; 8] {
         self.0.to_be_bytes()
@@ -223,7 +160,8 @@ fn clock(s: &str, wide: bool) -> Result<i64, Error> {
     }
     let (sec, frac) = sec.split_once('.').unwrap_or((sec, ""));
     let sec = number(sec)?;
-    if !(0..60).contains(&sec) || !frac.bytes().all(|c| c.is_ascii_digit()) {
+    if !(0..=if wide { 59 } else { 60 }).contains(&sec) || !frac.bytes().all(|c| c.is_ascii_digit())
+    {
         return Err(Error::Range);
     }
     let mut us = 0i128;
@@ -295,68 +233,14 @@ macro_rules! timestamp_type {
 }
 timestamp_type!(Timestamp);
 timestamp_type!(TimestampTz);
-fn stamp(s: &str, settings: &ParserSettings, tz: bool) -> Result<i64, Error> {
-    let s = bounded(s)?;
-    if s.eq_ignore_ascii_case("infinity") {
-        return Ok(i64::MAX);
-    }
-    if s.eq_ignore_ascii_case("-infinity") {
-        return Ok(i64::MIN);
-    }
-    let (s, bc) = if let Some(s) = s.strip_suffix(" BC") {
-        (s, true)
-    } else {
-        (s, false)
-    };
-    let (d, t) = s.split_once([' ', 'T']).unwrap_or((s, "00:00:00"));
-    let date = Date::parse(&format!("{d}{}", if bc { " BC" } else { "" }), settings)?;
-    if date == Date::INFINITY || date == Date::NEG_INFINITY {
-        return Err(Error::Syntax);
-    }
-    let (t, off) = split_offset(t, settings.offset_east)?;
-    let us = Time::parse(t)?.0;
-    let v = i128::from(date.0) * i128::from(USECS_PER_DAY) + i128::from(us)
-        - if tz { i128::from(off) * 1_000_000 } else { 0 };
-    i64::try_from(v).map_err(|_| Error::Range)
-}
-fn split_offset(s: &str, default: i32) -> Result<(&str, i32), Error> {
-    if let Some(t) = s.strip_suffix('Z').or_else(|| s.strip_suffix(" UTC")) {
-        return Ok((t, 0));
-    }
-    if let Some(pos) = s.find(['+', '-']) {
-        let (t, z) = s.split_at(pos);
-        let sign = if z.starts_with('-') { -1 } else { 1 };
-        let raw = &z[1..];
-        let compact;
-        let raw = if !raw.contains(':') && raw.len() == 4 {
-            compact = format!("{}:{}", &raw[..2], &raw[2..]);
-            compact.as_str()
-        } else {
-            raw
-        };
-        let mut p = raw.split(':');
-        let h = number(p.next().ok_or(Error::Syntax)?)?;
-        let m = number(p.next().unwrap_or("0"))?;
-        let sec = number(p.next().unwrap_or("0"))?;
-        if p.next().is_some() || h < 0 || m < 0 || sec < 0 {
-            return Err(Error::Range);
-        }
-        if h >= 16 || m >= 60 || sec >= 60 {
-            return Err(Error::TimeZoneDisplacement);
-        }
-        Ok((t, offset_valid((sign * (h * 3600 + m * 60 + sec)) as i32)?))
-    } else {
-        Ok((s, offset_valid(default)?))
-    }
-}
 impl Timestamp {
     pub fn parse(s: &str, p: &ParserSettings) -> Result<Self, Error> {
-        Self::from_microseconds(stamp(s, p, false)?)
+        Self::from_microseconds(input::stamp(s, p.date_order, SessionZone::Fixed(0), false)?)
     }
 }
 impl TimestampTz {
     pub fn parse(s: &str, p: &ParserSettings) -> Result<Self, Error> {
-        Self::from_microseconds(stamp(s, p, true)?)
+        input::zoned_stamp(s, p.date_order, p.offset_east)
     }
 }
 fn stamp_text(v: i64, tz: bool, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -406,8 +290,8 @@ impl TimeTz {
         self.offset_east
     }
     pub fn parse(s: &str, p: &ParserSettings) -> Result<Self, Error> {
-        let (t, o) = split_offset(bounded(s)?, p.offset_east)?;
-        Self::new(Time::parse(t)?, o)
+        let (time, offset) = input::time(s, p, true)?;
+        Self::new(time, offset)
     }
     pub fn to_binary(self) -> [u8; 12] {
         let mut b = [0; 12];
@@ -718,7 +602,8 @@ fn interval_tokens(s: &str) -> Vec<&str> {
         let mut start = 0;
         for i in 1..b.len() {
             let sign = matches!(b[i - 1], b'+' | b'-');
-            if b[i] == b'+' || (!sign && b[i].is_ascii_alphabetic() != b[i - 1].is_ascii_alphabetic())
+            if b[i] == b'+'
+                || (!sign && b[i].is_ascii_alphabetic() != b[i - 1].is_ascii_alphabetic())
             {
                 runs.push(&t[start..i]);
                 start = i;
@@ -727,9 +612,9 @@ fn interval_tokens(s: &str) -> Vec<&str> {
         runs.push(&t[start..]);
         if simple
             && runs.len() > 1
-            && runs.iter().all(|r| {
-                !r.as_bytes()[0].is_ascii_alphabetic() || interval_unit(r).is_some()
-            })
+            && runs
+                .iter()
+                .all(|r| !r.as_bytes()[0].is_ascii_alphabetic() || interval_unit(r).is_some())
         {
             out.extend(runs);
         } else {
@@ -792,12 +677,13 @@ impl fmt::Display for Interval {
     }
 }
 
+mod input;
 mod zones;
 pub use zones::*;
 mod precision;
 
 mod compatibility;
-pub use compatibility::DateStyle;
+pub use compatibility::{DateStyle, DateStyleSettings};
 pub use compatibility::IntervalField;
 pub use compatibility::IntervalOutputStyle;
 

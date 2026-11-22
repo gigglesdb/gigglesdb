@@ -341,7 +341,7 @@ impl State {
         session.set_time_zone(&self.settings.current.timezone);
         session.sync_role_settings(&mut self.settings.current)?;
         session.set_search_path(&self.settings.current.search_path);
-        session.set_extra_float_digits(self.settings.current.extra_float_digits);
+        session.set_text_settings(&self.settings.current);
         session.set_max_value_bytes(self.settings.current.max_value_bytes);
         session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
         super::statement_deadline(&self.settings.current);
@@ -360,7 +360,7 @@ impl State {
             session.sync_role_settings(&mut self.settings.current)?;
         }
         session.set_search_path(&self.settings.current.search_path);
-        session.set_extra_float_digits(self.settings.current.extra_float_digits);
+        session.set_text_settings(&self.settings.current);
         session.set_max_value_bytes(self.settings.current.max_value_bytes);
         session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
         if result.is_ok() { role_notices(session, &self.settings.current, out)?; }
@@ -627,7 +627,7 @@ impl State {
             // Built from the catalog snapshot, whose application rows were
             // released as they were read (`with_application_rows`, R3-312).
             catalog_wire::rows(
-                self.settings.current.extra_float_digits,
+                &self.settings.current,
                 &Released::synthetic(result),
                 &[],
                 0,
@@ -905,7 +905,14 @@ pub(super) fn parse_settings(
                 }
             }
         }
-        let result = diagnostic.settings(crate::pg_settings::parse_database(sql));
+        let mut syntax_at = None;
+        let result = diagnostic.settings(crate::pg_settings::database::parse_database(
+            sql,
+            &mut syntax_at,
+        ));
+        if let Some(token) = syntax_at {
+            diagnostic.wire_message = Some(format!(r#"syntax error at or near "{token}""#));
+        }
         if matches!(result, Err("22023")) && let Ok(tokens) = crate::pg_settings::database::lex(sql) {
             use crate::pg_settings::database::Token;
             if tokens.iter().any(|t| matches!(t, Token::Word(n) | Token::Ident(n) if n.eq_ignore_ascii_case("gigglesdb.max_statement_tokens")))
@@ -1011,6 +1018,9 @@ pub(super) fn execute_settings(
         }
     }
     for assignment in assignments {
+        if let crate::pg_settings::Setting::Database { name, value: Some(value), .. } = assignment {
+            diagnostic.presentation_setting(*name, value, &settings.current)?;
+        }
         if matches!(assignment, crate::pg_settings::Setting::Database { name: crate::pg_settings::Show::SessionReplicationRole, .. }) {
             diagnostic.replication_role_authorize(session)?;
         }

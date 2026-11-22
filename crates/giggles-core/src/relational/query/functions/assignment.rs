@@ -137,6 +137,11 @@ pub(in crate::relational) fn convert(
         };
         Timestamp::from_microseconds(micros).map_err(|_| SqlError::DatetimeFieldOverflow)
     };
+    if *target == DataType::Text
+        && let Some(text) = presentation_text(&value, clock)
+    {
+        return text.map(Value::Text);
+    }
     Ok(match (value, target) {
         (Value::Date(d), DataType::Timestamp) => Value::Timestamp(timestamp(d)?),
         (Value::Date(d), DataType::TimestampTz) => {
@@ -182,9 +187,6 @@ pub(in crate::relational) fn convert(
         }
         (Value::Time(t), DataType::Interval) => {
             Value::Interval(Interval::new(0, 0, t.microseconds()))
-        }
-        (Value::TimestampTz(t), DataType::Text) => {
-            Value::Text(t.format_in_zone(context()?.1).map_err(pg_error)?)
         }
         (value, target) => cast_value(value, target, &mut 0)?,
     })

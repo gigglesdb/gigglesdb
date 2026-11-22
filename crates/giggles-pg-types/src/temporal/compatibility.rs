@@ -228,6 +228,35 @@ pub enum DateStyle {
     Postgres,
     German,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DateStyleSettings {
+    pub style: DateStyle,
+    pub order: DateOrder,
+}
+
+impl Default for DateStyleSettings {
+    fn default() -> Self {
+        Self { style: DateStyle::Iso, order: DateOrder::Mdy }
+    }
+}
+
+impl std::fmt::Display for DateStyleSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let style = match self.style {
+            DateStyle::Iso => "ISO",
+            DateStyle::Sql => "SQL",
+            DateStyle::Postgres => "Postgres",
+            DateStyle::German => "German",
+        };
+        let order = match self.order {
+            DateOrder::Mdy => "MDY",
+            DateOrder::Dmy => "DMY",
+            DateOrder::Ymd => "YMD",
+        };
+        write!(f, "{style}, {order}")
+    }
+}
 impl Date {
     pub fn format_with_style(self, style: DateStyle, order: DateOrder) -> String {
         if self == Self::INFINITY || self == Self::NEG_INFINITY {
@@ -250,7 +279,7 @@ impl Date {
 }
 impl Timestamp {
     pub fn format_with_style(self, style: DateStyle, order: DateOrder) -> String {
-        if self == Self::INFINITY || self == Self::NEG_INFINITY {
+        if style == DateStyle::Iso || self == Self::INFINITY || self == Self::NEG_INFINITY {
             return self.to_string();
         }
         let day = self.0.div_euclid(USECS_PER_DAY);

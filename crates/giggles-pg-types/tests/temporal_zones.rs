@@ -6,6 +6,70 @@ fn p() -> ParserSettings {
 fn local(s: &str) -> Timestamp {
     Timestamp::parse(s, &p()).unwrap()
 }
+
+#[test]
+fn datestyle_uses_historical_timezone_designations() {
+    use DateOrder::{Dmy, Mdy};
+    use DateStyle::{German, Iso, Postgres, Sql};
+    let instants = [
+        "2024-01-02 03:04:05.678+00",
+        "0044-03-15 03:04:05+00 BC",
+        "2024-07-04 12:00:00+00",
+    ].map(|s| TimestampTz::parse(s, &p()).unwrap());
+    for (name, style, order, expected) in [
+        ("America/Los_Angeles", Iso, Mdy, [
+            "2024-01-01 19:04:05.678-08", "0044-03-14 19:11:07-07:52:58 BC", "2024-07-04 05:00:00-07"]),
+        ("America/Los_Angeles", Sql, Mdy, [
+            "01/01/2024 19:04:05.678 PST", "03/14/0044 19:11:07 LMT BC", "07/04/2024 05:00:00 PDT"]),
+        ("America/Los_Angeles", Sql, Dmy, [
+            "01/01/2024 19:04:05.678 PST", "14/03/0044 19:11:07 LMT BC", "04/07/2024 05:00:00 PDT"]),
+        ("America/Los_Angeles", Postgres, Mdy, [
+            "Mon Jan 01 19:04:05.678 2024 PST", "Thu Mar 14 19:11:07 0044 LMT BC", "Thu Jul 04 05:00:00 2024 PDT"]),
+        ("America/Los_Angeles", Postgres, Dmy, [
+            "Mon 01 Jan 19:04:05.678 2024 PST", "Thu 14 Mar 19:11:07 0044 LMT BC", "Thu 04 Jul 05:00:00 2024 PDT"]),
+        ("America/Los_Angeles", German, Dmy, [
+            "01.01.2024 19:04:05.678 PST", "14.03.0044 19:11:07 LMT BC", "04.07.2024 05:00:00 PDT"]),
+        ("Asia/Kolkata", Sql, Mdy, [
+            "01/02/2024 08:34:05.678 IST", "03/15/0044 08:57:33 LMT BC", "07/04/2024 17:30:00 IST"]),
+        ("America/Sao_Paulo", Sql, Mdy, [
+            "01/02/2024 00:04:05.678 -03", "03/14/0044 23:57:37 LMT BC", "07/04/2024 09:00:00 -03"]),
+        ("America/Sao_Paulo", Postgres, Mdy, [
+            "Tue Jan 02 00:04:05.678 2024 -03", "Thu Mar 14 23:57:37 0044 LMT BC", "Thu Jul 04 09:00:00 2024 -03"]),
+        ("Europe/Berlin", Sql, Mdy, [
+            "01/02/2024 04:04:05.678 CET", "03/15/0044 03:57:33 LMT BC", "07/04/2024 14:00:00 CEST"]),
+        ("Europe/Berlin", German, Dmy, [
+            "02.01.2024 04:04:05.678 CET", "15.03.0044 03:57:33 LMT BC", "04.07.2024 14:00:00 CEST"]),
+    ] {
+        let zone = SessionZone::setting(name).unwrap().0;
+        assert_eq!(instants.map(|instant| instant.format_with_style(zone, style, order).unwrap()),
+            expected, "{name} {style:?} {order:?}");
+        for special in ["infinity", "-infinity"] {
+            let value = TimestampTz::parse(special, &p()).unwrap();
+            assert_eq!(value.format_with_style(zone, style, order).unwrap(), special);
+        }
+    }
+}
+
+#[test]
+fn datestyle_formats_fixed_offsets_and_named_standard_and_dst_zones() {
+    use DateStyle::{German, Postgres, Sql};
+    let instants = ["2024-01-02 03:04:05+00", "2024-07-02 03:04:05+00"]
+        .map(|s| TimestampTz::parse(s, &p()).unwrap());
+    let fixed = SessionZone::interval_setting(19_800).unwrap().1;
+    for (name, style, expected) in [
+        (fixed.as_str(), Sql, ["01/02/2024 08:34:05 +05:30", "07/02/2024 08:34:05 +05:30"]),
+        (fixed.as_str(), Postgres, ["Tue Jan 02 08:34:05 2024 +05:30", "Tue Jul 02 08:34:05 2024 +05:30"]),
+        (fixed.as_str(), German, ["02.01.2024 08:34:05 +05:30", "02.07.2024 08:34:05 +05:30"]),
+        ("-7", Sql, ["01/01/2024 20:04:05 -07", "07/01/2024 20:04:05 -07"]),
+        ("EST5EDT", Sql, ["01/01/2024 22:04:05 EST", "07/01/2024 23:04:05 EDT"]),
+        ("Etc/GMT+3", Sql, ["01/02/2024 00:04:05 -03", "07/02/2024 00:04:05 -03"]),
+        ("GMT", Sql, ["01/02/2024 03:04:05 GMT", "07/02/2024 03:04:05 GMT"]),
+    ] {
+        let zone = SessionZone::setting(name).unwrap().0;
+        assert_eq!(instants.map(|instant| instant.format_with_style(zone, style, DateOrder::Mdy).unwrap()),
+            expected, "{name} {style:?}");
+    }
+}
 #[test]
 fn explicit_context_and_limits() {
     assert_eq!(TZDATA_VERSION, "2026f");

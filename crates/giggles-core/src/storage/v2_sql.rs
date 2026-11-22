@@ -413,6 +413,7 @@ impl SqlSession {
                 callback(operation, text, value, called, origin)
             });
             let context = relational::clock::ExecutionClock::new(clock)
+                .with_text_settings(self.date_style, self.bytea_output)
                 .with_extra_float_digits(self.extra_float_digits)
                 .with_sequences(callback)
                 .with_xact(sql_xact::callback(

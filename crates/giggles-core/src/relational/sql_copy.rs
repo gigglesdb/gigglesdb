@@ -707,6 +707,7 @@ impl Copy {
             native_delete: None,
             native_insert_many: false,
             unbound_statement: None,
+            literal_date_order: clock::LiteralDateOrder::current(),
             warnings: vec![],
             authorization_has_views: false,
             authorization_binding: None,

@@ -110,14 +110,14 @@ async fn catalog_introspection_table_free_and_derived_both_protocols() {
     f.stop().await;
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     service: Arc<Service>,
-    pg: Running,
+    pub(super) pg: Running,
     path: std::path::PathBuf,
 }
 impl Fixture {
-    async fn new() -> Self { Self::with_engine(giggles_core::Engine::Legacy).await }
-    async fn with_engine(engine: giggles_core::Engine) -> Self {
+    pub(super) async fn new() -> Self { Self::with_engine(giggles_core::Engine::Legacy).await }
+    pub(super) async fn with_engine(engine: giggles_core::Engine) -> Self {
         let path = std::env::temp_dir().join(format!(
             "session-settings-{}-{}-{}",
             std::process::id(),
@@ -156,7 +156,7 @@ impl Fixture {
             .unwrap();
         Self { service, pg, path }
     }
-    async fn client(&self) -> Client {
+    pub(super) async fn client(&self) -> Client {
         let (client, connection) = Config::new()
             .host("localhost")
             .hostaddr(self.pg.address.ip())
@@ -173,7 +173,7 @@ impl Fixture {
         });
         client
     }
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         self.pg.shutdown().await.unwrap();
         drop(self.service);
         // Listener shutdown waits for active connections to release the file.
@@ -488,7 +488,7 @@ async fn agent_settings_surface_is_unchanged() {
     std::fs::remove_dir_all(path).unwrap();
 }
 
-async fn wire_cycle(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
+pub(super) async fn wire_cycle(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let mut messages = Vec::new();
         loop {
@@ -506,7 +506,7 @@ async fn wire_cycle(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
     .await
     .unwrap()
 }
-async fn wire_query(stream: &mut TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {
+pub(super) async fn wire_query(stream: &mut TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {
     let mut body = Vec::new();
     giggles_server::pgwire::z(sql, &mut body);
     let mut packet = Vec::new();
@@ -538,6 +538,7 @@ async fn common_gucs_simple_and_extended_and_invalid_values() {
         ("IntervalStyle", "sql_standard", "sql_standard"),
         ("IntervalStyle", "ISO_8601", "iso_8601"),
         ("bytea_output", "hex", "hex"),
+        ("bytea_output", "escape", "escape"),
         ("statement_timeout", "0", "0"),
         ("lock_timeout", "0", "0"),
         ("idle_in_transaction_session_timeout", "0", "0"),
@@ -562,9 +563,10 @@ async fn common_gucs_simple_and_extended_and_invalid_values() {
             .unwrap();
     }
     for (input, expected) in [
-        ("ISO", "ISO, MDY"),
+        ("ISO", "ISO, DMY"),
         ("ISO, MDY", "ISO, MDY"),
         ("ISO, YMD", "ISO, YMD"),
+        ("SQL", "SQL, YMD"),
     ] {
         c.query(&format!("SET DateStyle TO {input}"), &[])
             .await
@@ -586,11 +588,11 @@ async fn common_gucs_simple_and_extended_and_invalid_values() {
         "SET extra_float_digits=4",
         "SET extra_float_digits=-16",
         "SET TimeZone='bad zone'",
-        "SET DateStyle='SQL'",
+        "SET DateStyle='ISO, SQL'",
         "SET client_encoding=LATIN1",
         "SET standard_conforming_strings=off",
         "SET IntervalStyle=invalid",
-        "SET bytea_output=escape",
+        "SET bytea_output=base64",
         "SET statement_timeout=-1",
         "SET lock_timeout=-1",
         "SET lock_timeout='abc'",

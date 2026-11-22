@@ -60,6 +60,7 @@ impl Plan {
         max_rows: usize,
         max_bytes: usize,
     ) -> R<Vec<SqlRow>> {
+        let _date_order = clock::LiteralDateOrder::enter(self.prepared.literal_date_order);
         let Statement::Query(query) = &self.prepared.statement else {
             unreachable!()
         };

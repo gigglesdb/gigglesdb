@@ -30,6 +30,8 @@ pub enum Error {
     /// SQLSTATE 22009: PostgreSQL 18.6 rejects an explicit numeric UTC offset in
     /// text datetime input when its hour is >=16 or minute/second is >=60.
     TimeZoneDisplacement,
+    /// SQLSTATE 22023 for an unrecognized full time zone in datetime input.
+    UnknownTimeZone,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

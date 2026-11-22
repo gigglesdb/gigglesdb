@@ -98,13 +98,11 @@ impl SessionZone {
     }
     pub fn named(name: &str) -> Result<Self, Error> {
         let name = bounded(name)?;
-        let zone = named_zone(name)
-            .map(|(zone, _)| zone)
-            .or(match name {
-                "EST5EDT" => Some(Tz::America__New_York),
-                "PST8PDT" => Some(Tz::America__Los_Angeles),
-                _ => None,
-            });
+        let zone = named_zone(name).map(|(zone, _)| zone).or(match name {
+            "EST5EDT" => Some(Tz::America__New_York),
+            "PST8PDT" => Some(Tz::America__Los_Angeles),
+            _ => None,
+        });
         match zone {
             Some(zone) => Ok(Self::Named(zone)),
             None => posix_offset(name).map(Self::Fixed).ok_or(Error::Syntax),
@@ -147,65 +145,20 @@ impl SessionZone {
         Ok((Self::Fixed(seconds), format!("<{east}>{west}")))
     }
     fn local_offset(self, local: Timestamp) -> Result<i32, Error> {
-        let tz = match self {
-            Self::Fixed(v) => return session_offset(v),
-            Self::Named(tz) => database(tz)?,
-        };
         let unix = local.0.div_euclid(1_000_000) + UNIX_EPOCH_DELTA;
-        let view = tz.as_ref().as_ref();
-        let mut offsets: Vec<i32> = view
-            .local_time_types()
-            .iter()
-            .map(|t| t.ut_offset())
-            .collect();
-        // Tail types are normally in the TZif type table, but include them explicitly.
-        if let Some(rule) = view.extra_rule() {
-            use tz::timezone::TransitionRule;
-            match rule {
-                TransitionRule::Fixed(t) => offsets.push(t.ut_offset()),
-                TransitionRule::Alternate(t) => {
-                    offsets.push(t.std().ut_offset());
-                    offsets.push(t.dst().ut_offset());
-                }
+        match self {
+            Self::Fixed(east) => session_offset(east),
+            Self::Named(tz) => offset_valid(database_local_offset(database(tz)?.as_ref(), unix)?),
+        }
+    }
+    pub(super) fn input_offset(self, date: Option<Date>, time: Option<Time>) -> Result<i32, Error> {
+        match self {
+            Self::Fixed(east) => session_offset(east),
+            Self::Named(tz) => {
+                let date = date.ok_or(Error::Syntax)?;
+                database_local_offset(database(tz)?.as_ref(), local_unix(date, time))
             }
         }
-        offsets.sort_unstable();
-        offsets.dedup();
-        let mut valid = None;
-        let mut gap = None;
-        for off in offsets {
-            let candidate = unix - i64::from(off);
-            let actual = offset(&tz, candidate)?;
-            if actual == off {
-                // Larger UTC instant wins an overlap (PG's post-transition side).
-                if valid.is_none_or(|(v, _)| candidate > v) {
-                    valid = Some((candidate, off));
-                }
-            } else if actual > off {
-                let mut lo = unix - i64::from(actual);
-                let mut hi = candidate;
-                if offset(&tz, lo)? != off {
-                    continue;
-                }
-                while hi - lo > 1 {
-                    let mid = lo + (hi - lo) / 2;
-                    if offset(&tz, mid)? == off {
-                        lo = mid;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                let after = offset(&tz, hi)?;
-                if after > off && unix >= hi + i64::from(off) && unix < hi + i64::from(after) {
-                    gap = Some(off);
-                }
-            }
-        }
-        valid
-            .map(|(_, off)| off)
-            .or(gap)
-            .ok_or(Error::Unimplemented)
-            .and_then(offset_valid)
     }
     pub fn to_instant(self, local: Timestamp) -> Result<TimestampTz, Error> {
         if local.0 == i64::MIN || local.0 == i64::MAX {
@@ -247,6 +200,222 @@ impl SessionZone {
         }
     }
 }
+fn database_local_offset(tz: &tz::TimeZone, unix: i64) -> Result<i32, Error> {
+    let mut offsets: Vec<i32> = zone_types(tz).map(tz::LocalTimeType::ut_offset).collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    let mut valid = None;
+    let mut gap = None;
+    for off in offsets {
+        let candidate = unix - i64::from(off);
+        let actual = offset(tz, candidate)?;
+        if actual == off {
+            // Larger UTC instant wins an overlap (PG's post-transition side).
+            if valid.is_none_or(|(v, _)| candidate > v) {
+                valid = Some((candidate, off));
+            }
+        } else if actual > off {
+            let mut lo = unix - i64::from(actual);
+            let mut hi = candidate;
+            if offset(tz, lo)? != off {
+                continue;
+            }
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if offset(tz, mid)? == off {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            let after = offset(tz, hi)?;
+            if after > off && unix >= hi + i64::from(off) && unix < hi + i64::from(after) {
+                gap = Some(off);
+            }
+        }
+    }
+    valid
+        .map(|(_, off)| off)
+        .or(gap)
+        .ok_or(Error::Unimplemented)
+}
+
+// DecodeTimezoneAbbrev distinguishes fixed standard/daylight abbreviations
+// from abbreviations whose meaning must be looked up in a TZif history.
+pub(super) enum InputZone {
+    Fixed(i32, bool),
+    Named(std::sync::Arc<tz::TimeZone>),
+    Dynamic(std::sync::Arc<tz::TimeZone>, String),
+}
+
+fn zone_types(zone: &tz::TimeZone) -> impl Iterator<Item = &tz::LocalTimeType> {
+    use tz::timezone::TransitionRule;
+    let view = zone.as_ref();
+    let tail = match view.extra_rule() {
+        Some(TransitionRule::Fixed(t)) => [Some(t), None],
+        Some(TransitionRule::Alternate(t)) => [Some(t.std()), Some(t.dst())],
+        None => [None, None],
+    };
+    view.local_time_types()
+        .iter()
+        .chain(tail.into_iter().flatten())
+}
+
+// PostgreSQL allows POSIX designations shorter or longer than TZif names.
+// Offset resolution only uses the rules, so normalize the labels for tz-rs.
+fn canonical_posix_designations(name: &str) -> Option<String> {
+    let std_len = name.bytes().take_while(u8::is_ascii_alphabetic).count();
+    let offset = name.get(std_len..)?;
+    if std_len == 0 || !offset.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '+' | '-')) {
+        return None;
+    }
+    let Some(dst_start) = offset.find(|c: char| c.is_ascii_alphabetic()) else {
+        return Some(format!("STD{offset}"));
+    };
+    let (offset, dst) = offset.split_at(dst_start);
+    let dst_len = dst.bytes().take_while(u8::is_ascii_alphabetic).count();
+    Some(format!("STD{offset}DST{}", &dst[dst_len..]))
+}
+
+impl InputZone {
+    pub(super) fn named(name: &str) -> Option<Self> {
+        if let Some(tz) = named_zone(name).map(|(tz, _)| tz) {
+            return database(tz).ok().map(Self::Named);
+        }
+        // The POSIX decoder may try a file first. Supply no host directories
+        // and a reader that never opens a file.
+        let settings = tz::TimeZoneSettings::new(&[], |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
+        });
+        let posix = canonical_posix_designations(name)?;
+        let zone = settings
+            .parse_posix_tz(&posix)
+            .or_else(|_| settings.parse_posix_tz(&format!("{posix},M3.2.0,M11.1.0")))
+            .ok()?;
+        Some(Self::Named(std::sync::Arc::new(zone)))
+    }
+
+    pub(super) fn standard_offset(&self) -> bool {
+        matches!(self, Self::Fixed(_, false))
+    }
+
+    pub(super) fn resolve(&self, date: Option<Date>, time: Option<Time>) -> Result<i32, Error> {
+        match self {
+            Self::Fixed(east, _) => Ok(*east),
+            Self::Named(zone) => {
+                if let Some(date) = date {
+                    return database_local_offset(zone, local_unix(date, time));
+                }
+                let mut types = zone_types(zone);
+                let east = types.next().ok_or(Error::Syntax)?.ut_offset();
+                if types.all(|ty| ty.ut_offset() == east) {
+                    Ok(east)
+                } else {
+                    Err(Error::Syntax)
+                }
+            }
+            Self::Dynamic(zone, name) => {
+                let date = date.ok_or(Error::Syntax)?;
+                let unix = local_unix(date, time);
+                let local_offset = database_local_offset(zone, unix)?;
+                let instant = unix - i64::from(local_offset);
+                Ok(abbreviation_at(zone, name, instant).unwrap_or(local_offset))
+            }
+        }
+    }
+}
+
+fn local_unix(date: Date, time: Option<Time>) -> i64 {
+    i64::from(date.days()) * 86_400
+        + time.map_or(0, Time::microseconds).div_euclid(1_000_000)
+        + UNIX_EPOCH_DELTA
+}
+
+// pg_interpret_timezone_abbrev: look backward for the latest matching
+// transition, then check the initial type and finally future transitions.
+fn abbreviation_at(zone: &tz::TimeZone, name: &str, unix: i64) -> Option<i32> {
+    let view = zone.as_ref();
+    let types = view.local_time_types();
+    let transitions = view.transitions();
+    let matches = |ty: &tz::LocalTimeType| {
+        ty.time_zone_designation()
+            .eq_ignore_ascii_case(name)
+            .then(|| ty.ut_offset())
+    };
+    let cutoff = transitions.partition_point(|t| t.unix_leap_time() <= unix);
+    if cutoff == transitions.len()
+        && let Ok(ty) = zone.find_local_time_type(unix)
+        && let Some(east) = matches(ty)
+    {
+        return Some(east);
+    }
+    transitions[..cutoff]
+        .iter()
+        .rev()
+        .map(|t| &types[t.local_time_type_index()])
+        .find_map(matches)
+        .or_else(|| types.first().and_then(matches))
+        .or_else(|| {
+            transitions[cutoff..]
+                .iter()
+                .find_map(|t| matches(&types[t.local_time_type_index()]))
+        })
+}
+
+enum DefaultAbbreviation {
+    Fixed(i32, bool),
+    Dynamic(&'static str),
+}
+
+fn default_abbreviations() -> &'static std::collections::HashMap<String, DefaultAbbreviation> {
+    static TABLE: OnceLock<std::collections::HashMap<String, DefaultAbbreviation>> =
+        OnceLock::new();
+    TABLE.get_or_init(|| {
+        include_str!("timezone_abbreviations.txt")
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split('#').next()?.split_ascii_whitespace();
+                let name = fields.next()?.to_ascii_lowercase();
+                let value = fields.next()?;
+                let zone = match value.parse() {
+                    Ok(offset) => DefaultAbbreviation::Fixed(offset, fields.next() == Some("D")),
+                    Err(_) => DefaultAbbreviation::Dynamic(value),
+                };
+                Some((name, zone))
+            })
+            .collect()
+    })
+}
+
+pub(super) fn input_abbreviation(
+    name: &str,
+    session: SessionZone,
+) -> Result<Option<InputZone>, Error> {
+    if let SessionZone::Named(tz) = session {
+        let zone = database(tz)?;
+        let mut types =
+            zone_types(&zone).filter(|ty| ty.time_zone_designation().eq_ignore_ascii_case(name));
+        if let Some(first) = types.next() {
+            let (east, dst) = (first.ut_offset(), first.is_dst());
+            return Ok(Some(
+                if types.all(|ty| (ty.ut_offset(), ty.is_dst()) == (east, dst)) {
+                    InputZone::Fixed(east, dst)
+                } else {
+                    InputZone::Dynamic(zone.clone(), name.into())
+                },
+            ));
+        }
+    }
+    Ok(match default_abbreviations().get(name) {
+        Some(DefaultAbbreviation::Fixed(east, dst)) => Some(InputZone::Fixed(*east, *dst)),
+        Some(DefaultAbbreviation::Dynamic(zone)) => {
+            let (tz, _) = named_zone(zone).ok_or(Error::UnknownTimeZone)?;
+            Some(InputZone::Dynamic(database(tz)?, name.into()))
+        }
+        None => None,
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SessionSettings {
     pub date_order: DateOrder,
@@ -254,36 +423,52 @@ pub struct SessionSettings {
 }
 impl TimestampTz {
     pub fn parse_in_session(s: &str, settings: &SessionSettings) -> Result<Self, Error> {
-        let s = bounded(s)?;
-        let p = ParserSettings {
-            date_order: settings.date_order,
-            offset_east: 0,
-        };
-        if let Some((local, name)) = s.rsplit_once(' ')
-            && (name.contains('/') || name.eq_ignore_ascii_case("UTC"))
-        {
-            return SessionZone::named(name)?.to_instant(Timestamp::parse(local, &p)?);
-        }
-        let time = s.split_once([' ', 'T']).map(|(_, t)| t).unwrap_or("");
-        if time.contains(['+', '-']) || time.ends_with('Z') {
-            return Self::parse(s, &p);
-        }
-        settings.zone.to_instant(Timestamp::parse(s, &p)?)
+        Self::from_microseconds(input::stamp(s, settings.date_order, settings.zone, true)?)
     }
     pub fn format_in_zone(self, zone: SessionZone) -> Result<String, Error> {
+        self.format_with_style(zone, DateStyle::Iso, DateOrder::Mdy)
+    }
+
+    pub fn format_with_style(
+        self,
+        zone: SessionZone,
+        style: DateStyle,
+        order: DateOrder,
+    ) -> Result<String, Error> {
         let local = zone.to_local(self)?;
         if self.0 == i64::MIN || self.0 == i64::MAX {
             return Ok(local.to_string());
         }
         let off = ((i128::from(local.0) - i128::from(self.0)) / 1_000_000) as i32;
-        let text = local.to_string();
+        let text = local.format_with_style(style, order);
         let (text, bc) = text
             .strip_suffix(" BC")
             .map_or((text.as_str(), ""), |v| (v, " BC"));
-        Ok(format!("{text}{}{bc}", zone_suffix(off)))
+        if style == DateStyle::Iso {
+            return Ok(format!("{text}{}{bc}", zone_suffix(off)));
+        }
+        let abbreviation = match zone {
+            SessionZone::Fixed(seconds) => zone_suffix(seconds),
+            SessionZone::Named(zone) => {
+                let database = database(zone)?;
+                let unix = self.0.div_euclid(1_000_000) + UNIX_EPOCH_DELTA;
+                let info = database.find_local_time_type(unix).map_err(|_| Error::Range)?;
+                info.time_zone_designation().into()
+            }
+        };
+        Ok(format!("{text} {abbreviation}{bc}"))
     }
 }
 impl TimeTz {
+    /// Parse with session abbreviations and a caller-supplied transaction instant.
+    pub fn parse_in_session(
+        s: &str,
+        settings: &SessionSettings,
+        transaction_us: i64,
+    ) -> Result<Self, Error> {
+        input::time_in_session(s, settings, transaction_us)
+    }
+
     /// Date is mandatory for named zones; no current-date fallback.
     pub fn in_zone_on_date(time: Time, date: Date, zone: SessionZone) -> Result<Self, Error> {
         if date == Date::INFINITY || date == Date::NEG_INFINITY {

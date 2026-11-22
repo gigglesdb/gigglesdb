@@ -1,5 +1,118 @@
 //! PostgreSQL-listener GUC grammar; deliberately separate from the agent parser.
 use super::{Result, Setting, Show};
+use giggles_pg_types::{
+    bytea::ByteaOutput,
+    temporal::{DateOrder, DateStyle, DateStyleSettings},
+};
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DateStyleError {
+    List,
+    Conflict,
+    Keyword(String),
+}
+
+impl DateStyleError {
+    pub(crate) fn detail(&self) -> String {
+        match self {
+            Self::List => "List syntax is invalid.".into(),
+            Self::Conflict => "Conflicting \"DateStyle\" specifications.".into(),
+            Self::Keyword(value) => format!("Unrecognized key word: \"{value}\"."),
+        }
+    }
+}
+
+fn date_style_keywords(value: &str) -> std::result::Result<Vec<String>, DateStyleError> {
+    let mut rest = value.trim();
+    let mut words = Vec::new();
+    if rest.is_empty() {
+        return Ok(words);
+    }
+    loop {
+        let word = if let Some(after_quote) = rest.strip_prefix('"') {
+            rest = after_quote;
+            let mut word = String::new();
+            loop {
+                let (text, after) = rest.split_once('"').ok_or(DateStyleError::List)?;
+                word.push_str(text);
+                if let Some(after_escape) = after.strip_prefix('"') {
+                    word.push('"');
+                    rest = after_escape;
+                } else {
+                    rest = after;
+                    break;
+                }
+            }
+            word
+        } else {
+            let end = rest.find(|c: char| c == ',' || c.is_whitespace()).unwrap_or(rest.len());
+            let (word, after) = rest.split_at(end);
+            rest = after;
+            if word.is_empty() {
+                return Err(DateStyleError::List);
+            }
+            word.to_ascii_lowercase()
+        };
+        words.push(word);
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return Ok(words);
+        }
+        rest = rest.strip_prefix(',').ok_or(DateStyleError::List)?.trim_start();
+        if rest.is_empty() {
+            return Err(DateStyleError::List);
+        }
+    }
+}
+
+pub(crate) fn date_style(
+    value: &str,
+    current: DateStyleSettings,
+) -> std::result::Result<DateStyleSettings, DateStyleError> {
+    use DateOrder::*;
+    use DateStyle::*;
+    let mut style = None;
+    let mut order = None;
+    let mut use_default = false;
+    for keyword in date_style_keywords(value)? {
+        let (new_style, new_order) = match keyword.to_ascii_lowercase().as_str() {
+            "iso" => (Some(Iso), None),
+            "sql" => (Some(Sql), None),
+            "postgres" => (Some(Postgres), None),
+            "german" => (Some(German), None),
+            "ymd" => (None, Some(Ymd)),
+            "dmy" | "euro" | "european" => (None, Some(Dmy)),
+            "mdy" | "us" | "noneuro" | "noneuropean" => (None, Some(Mdy)),
+            "default" => {
+                use_default = true;
+                continue;
+            }
+            _ => return Err(DateStyleError::Keyword(keyword)),
+        };
+        if new_style.is_some_and(|next| style.is_some_and(|old| old != next))
+            || new_order.is_some_and(|next| order.is_some_and(|old| old != next))
+        {
+            return Err(DateStyleError::Conflict);
+        }
+        style = new_style.or(style);
+        order = new_order.or(order);
+    }
+    let fallback = if use_default { DateStyleSettings::default() } else { current };
+    Ok(DateStyleSettings {
+        style: style.unwrap_or(fallback.style),
+        order: order.unwrap_or(if style == Some(German) { Dmy } else { fallback.order }),
+    })
+}
+
+pub(crate) fn bytea_output(value: &str) -> Result<ByteaOutput> {
+    if value.eq_ignore_ascii_case("hex") {
+        Ok(ByteaOutput::Hex)
+    } else if value.eq_ignore_ascii_case("escape") {
+        Ok(ByteaOutput::Escape)
+    } else {
+        Err("22023")
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Token {
@@ -208,7 +321,10 @@ pub(crate) fn show_database(sql: &str) -> Result<Option<Show>> {
     p.end()?;
     Ok(Some(name))
 }
-pub(crate) fn parse_database(sql: &str) -> Result<Option<Vec<Setting>>> {
+pub(crate) fn parse_database(
+    sql: &str,
+    syntax_at: &mut Option<String>,
+) -> Result<Option<Vec<Setting>>> {
     if !first(sql, "SET") && !first(sql, "RESET") {
         return Ok(None);
     }
@@ -284,6 +400,9 @@ pub(crate) fn parse_database(sql: &str) -> Result<Option<Vec<Setting>>> {
             }
         }
         if p.kw("DEFAULT") || (name == Show::TimeZone && p.kw("LOCAL")) {
+            if p.tokens.get(p.at) == Some(&Token::Comma) {
+                *syntax_at = Some(",".into());
+            }
             p.end()?;
             None
         } else if name == Show::TimeZone && p.kw("INTERVAL") {
@@ -301,7 +420,15 @@ pub(crate) fn parse_database(sql: &str) -> Result<Option<Vec<Setting>>> {
             Some(giggles_pg_types::temporal::SessionZone::interval_setting(seconds)
                 .map_err(|_| "22023")?.1)
         } else {
-            Some(validate(name, p.values()?)?)
+            let values = p.values()?;
+            if let Some(word) = values.iter().find_map(|value| match value {
+                Token::Word(word) if word.eq_ignore_ascii_case("default") => Some(word),
+                _ => None,
+            }) {
+                *syntax_at = Some(word.clone());
+                return Err("42601");
+            }
+            Some(validate(name, values)?)
         }
     };
     Ok(Some(vec![Setting::Database {
@@ -349,22 +476,15 @@ fn validate(name: Show, values: Vec<Token>) -> Result<String> {
             .ok_or("22023"),
         Show::TimeZone => giggles_pg_types::temporal::SessionZone::setting(&value)
             .map(|(_, label)| label).map_err(|_| "22023"),
-        Show::DateStyle => {
-            let parts: Vec<_> = lower.split(',').map(str::trim).collect();
-            match parts.as_slice() {
-                ["iso"] | ["iso", "mdy"] => Ok("ISO, MDY".into()),
-                ["iso", "dmy"] => Ok("ISO, DMY".into()),
-                ["iso", "ymd"] => Ok("ISO, YMD".into()),
-                _ => Err("22023"),
-            }
-        }
+        // These accept raw input here. The execution-time check has the
+        // current DateStyle and can attach the PostgreSQL diagnostic fields.
+        Show::DateStyle | Show::ByteaOutput => Ok(value),
         Show::ClientEncoding if matches!(lower.as_str(), "utf8" | "utf-8" | "unicode") => {
             Ok("UTF8".into())
         }
         Show::StandardConformingStrings if lower == "on" => Ok("on".into()),
         Show::IntervalStyle => interval_style(&value),
         Show::SessionReplicationRole => replication_role(&value),
-        Show::ByteaOutput if lower == "hex" => Ok("hex".into()),
         Show::ClientMinMessages
             if matches!(
                 lower.as_str(),
