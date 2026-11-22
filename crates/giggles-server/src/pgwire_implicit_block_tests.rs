@@ -697,7 +697,7 @@ fn measure_bind_authorization_cost() {
     cstr("SELECT * FROM timing_t", &mut parse);
     parse.extend([0;2]);
     state.handle(b'P', &parse, &mut reader, &mut Vec::new(), std::time::Instant::now()).unwrap();
-    let Plan::Sql(prepared) = &state.statements["timed"].p else { panic!("SQL plan") };
+    let Plan::Sql(prepared) = &*state.statements["timed"].p else { panic!("SQL plan") };
     let prepared = prepared.clone();
     reader.begin_implicit_block().unwrap();
     reader.sql.begin_prepared_statement();
@@ -875,7 +875,7 @@ fn unnamed_cache_sequence_dependency_equivalence() {
         let unbound = Prepared::sequence_dependencies(sql);
         assert!(!unbound.is_empty(), "{sql}");
         assert_eq!(&*cached.sequence_dependencies, unbound.as_slice(), "{sql}");
-        let Plan::Sql(bound) = &cached.p else { panic!("SQL plan expected") };
+        let Plan::Sql(bound) = &*cached.p else { panic!("SQL plan expected") };
         println!("sequence equivalence: {sql}: bound_equal={} unbound={unbound:?} bound={:?}", bound.sequences() == unbound, bound.sequences());
     }
     for sql in [

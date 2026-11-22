@@ -134,7 +134,7 @@ pub(super) fn execute(
     retained: usize,
     out: &mut Vec<u8>,
 ) -> R<()> {
-    let Plan::SettingsFunction(function) = &portal.s.p else {
+    let Plan::SettingsFunction(function) = &*portal.s.p else {
         unreachable!()
     };
     if !matches!(session.role, Role::Database { .. }) {

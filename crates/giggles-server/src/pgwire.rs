@@ -11,7 +11,7 @@ use giggles_core::{
     task::Released,
 };
 use giggles_pg_types::temporal::SessionZone;
-use std::{borrow::Borrow, collections::BTreeMap, io};
+use std::{borrow::Borrow, collections::BTreeMap, io, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     time::timeout,
@@ -1186,7 +1186,6 @@ fn prepare_protected_sql(
     Ok((prepared, description))
 }
 
-#[derive(Clone)]
 enum Plan {
     Explain(giggles_pg_catalog::ExplainQuery),
     Empty,
@@ -1246,8 +1245,9 @@ struct Statement {
     sql_bytes: usize,
     sql: String,
     declared_oids: Vec<u32>,
-    p: Plan,
-    d: Description,
+    // Parse finishes building both before a statement can be cached or bound.
+    p: Arc<Plan>,
+    d: Arc<Description>,
     parameter_oids: Vec<u32>,
     query_id: Option<String>,
 }
@@ -1258,7 +1258,7 @@ impl Statement {
     // evaluates immutable calls/casts. The two lexer/value budgets are the only
     // ambient limits. Keep a schema-context revision as an extra invalidator.
     fn validate_constants(&mut self, session: &mut Session, diagnostic: &mut Diagnostic) -> R<()> {
-        let Plan::Sql(p) = &self.p else { return Ok(()); };
+        let Plan::Sql(p) = &*self.p else { return Ok(()); };
         let key = session.sql.constants_validation_key();
         if key.is_some() && self.validated == key && session.sql.prepared_is_current(p) {
             core(session.sql.constants_validated_preflight(p))?;
@@ -1280,7 +1280,7 @@ impl Statement {
     }
 
     fn authorize_description(&self, session: &mut Session) -> R<()> {
-        if let Plan::Sql(p) = &self.p
+        if let Plan::Sql(p) = &*self.p
             && session.task().is_none()
         {
             // An aborted transaction reports 25P02 before any authorization,
@@ -1297,25 +1297,25 @@ impl Statement {
         Ok(())
     }
 
-    fn describe(&self, session: &mut Session) -> R<Description> {
-        match &self.p {
+    fn describe(&self, session: &mut Session) -> R<Arc<Description>> {
+        match &*self.p {
             #[cfg(feature = "legacy-task")]
-            Plan::Task(_) => Ok(self.d.clone()),
+            Plan::Task(_) => Ok(Arc::clone(&self.d)),
             // A task session holds only relation-free catalog plans, which
             // read no catalog (R3-206).
-            Plan::Catalog(..) if session.task().is_some() => Ok(self.d.clone()),
+            Plan::Catalog(..) if session.task().is_some() => Ok(Arc::clone(&self.d)),
             Plan::Catalog(plan, _, epoch) => {
                 let (current, _, _) = core(session.catalog_snapshot())?;
                 if current != *epoch && !plan.refreshes_view_definitions() {
                     return Err("0A000");
                 }
-                Ok(self.d.clone())
+                Ok(Arc::clone(&self.d))
             }
             Plan::Sql(p) => {
                 if self.description_version.is_some()
                     && self.description_version == session.sql.statement_catalog_version()
                     && session.sql.prepared_is_current(p)
-                { return Ok(self.d.clone()); }
+                { return Ok(Arc::clone(&self.d)); }
                 let d = core(session.describe(p))?;
                 if self.d.columns.len() != d.columns.len()
                     || self.d.columns.iter().zip(&d.columns).any(|(old, new)| {
@@ -1325,11 +1325,11 @@ impl Statement {
                 {
                     return Err("0A000");
                 }
-                Ok(d)
+                Ok(Arc::new(d))
             },
             Plan::Copy(copy, p) => {
                 core(session.copy_columns(copy, p))?;
-                Ok(self.d.clone())
+                Ok(Arc::clone(&self.d))
             }
             Plan::CopyOut(_) | Plan::Explain(_) | Plan::Cursor(_)
             | Plan::AccessShare(_)
@@ -1341,7 +1341,7 @@ impl Statement {
             | Plan::Inspect(_)
             | Plan::Protected(_)
             | Plan::Change(_)
-            | Plan::TaskDdl(_) => Ok(self.d.clone()),
+            | Plan::TaskDdl(_) => Ok(Arc::clone(&self.d)),
         }
     }
 }
@@ -1594,7 +1594,7 @@ impl State {
             });
         }
         self.portals.get(&text).is_some_and(|portal| {
-            matches!(&portal.s.p, Plan::Control(command) if crate::admission::control_exempt(command))
+            matches!(&*portal.s.p, Plan::Control(command) if crate::admission::control_exempt(command))
         })
     }
 }
@@ -1828,8 +1828,8 @@ impl State {
                 sql_bytes: sql.len(),
                 sql: sql.to_owned(),
                 declared_oids: oids,
-                p: Plan::Change(Box::new(change)),
-                d,
+                p: Arc::new(Plan::Change(Box::new(change))),
+                d: Arc::new(d),
                 parameter_oids: vec![],
                 query_id: self.diagnostic.query_id.clone(),
             });
@@ -1856,8 +1856,8 @@ impl State {
                 sql_bytes: sql.len(),
                 sql: sql.to_owned(),
                 declared_oids: oids,
-                p: Plan::TaskDdl(Box::new(stmt)),
-                d,
+                p: Arc::new(Plan::TaskDdl(Box::new(stmt))),
+                d: Arc::new(d),
                 parameter_oids: vec![],
                 query_id: self.diagnostic.query_id.clone(),
             });
@@ -2105,8 +2105,8 @@ impl State {
             sql_bytes: sql.len(),
             sql: sql.to_owned(),
             declared_oids: oids,
-            p,
-            d,
+            p: Arc::new(p),
+            d: Arc::new(d),
             parameter_oids,
             query_id: self.diagnostic.query_id.clone(),
         })
@@ -2127,7 +2127,7 @@ impl State {
         let Some(index) = self.unnamed_cache.iter().position(|entry|
             entry.sql == sql && entry.declared_oids == oids) else { return Ok(None); };
         let old = &self.unnamed_cache[index];
-        let Plan::Sql(p) = &old.p else { return Ok(None); };
+        let Plan::Sql(p) = &*old.p else { return Ok(None); };
         if !old.parse_context.as_ref().is_some_and(|context| context.matches(&self.settings.current, session))
             || p.is_ddl() || !session.sql.prepared_is_current(p) {
             #[cfg(test)]
@@ -2194,7 +2194,7 @@ impl State {
     }
     fn refresh_statement(&mut self, name: &str, session: &mut Session) -> R<()> {
         let old = self.statements.get(name).ok_or("26000")?;
-        let stale = match &old.p {
+        let stale = match &*old.p {
             Plan::Sql(p) if session.task().is_none() && !p.is_ddl() => {
                 !session.sql.prepared_is_current(p)
                     || match session.sql.prepared_catalog_state() {
@@ -2220,7 +2220,7 @@ impl State {
         }
         let old = old.clone();
         let mut preparation = self.settings.current.clone();
-        if let Plan::Sql(prepared) = &old.p {
+        if let Plan::Sql(prepared) = &*old.p {
             preparation.datestyle.order = prepared.literal_date_order();
         }
         session.set_text_settings(&preparation);
@@ -2377,7 +2377,7 @@ impl State {
                 let name = r.text()?;
                 let stmt = r.text()?;
                 let s = self.statements.get(&stmt).ok_or("26000")?;
-                if let Plan::Sql(p) = &s.p
+                if let Plan::Sql(p) = &*s.p
                     && session.task().is_none()
                     && needs_implicit_transaction(p)
                 {
@@ -2403,7 +2403,7 @@ impl State {
                 let mut transaction_us = None;
                 for (i, ty) in s.d.parameters.iter().enumerate() {
                     let n = r.u32()?;
-                    if matches!(s.p, Plan::Catalog(..)) {
+                    if matches!(&*s.p, Plan::Catalog(..)) {
                         let value = if n == u32::MAX {
                             giggles_pg_catalog::Value::Null
                         } else {
@@ -2439,7 +2439,7 @@ impl State {
                     });
                 }
                 #[cfg(feature = "legacy-task")]
-                if let Plan::Task(task) = s.p {
+                if let Plan::Task(task) = &*s.p {
                     task.bind(&params)?;
                 }
                 let output = formats(&mut r, s.d.columns.len())?;
@@ -2462,7 +2462,7 @@ impl State {
                 if bound.checked_add(parameter_bytes).ok_or("54000")? > MAX_RESPONSE {
                     return Err("54000");
                 }
-                if matches!(&s.p, Plan::Sql(_)) {
+                if matches!(&*s.p, Plan::Sql(_)) {
                     let validation = s.validate_constants(session, &mut self.diagnostic);
                     if stmt.is_empty() {
                         if validation.is_err() {
@@ -2529,7 +2529,7 @@ impl State {
                             b.extend(oid.to_be_bytes());
                         }
                         frame(b't', &b, out)?;
-                        if let Plan::Catalog(_, fields, _) = &s.p {
+                        if let Plan::Catalog(_, fields, _) = &*s.p {
                             catalog_wire::description(fields, &[], out)?;
                         } else {
                             row_description(&d, &[], out)?;
@@ -2550,7 +2550,7 @@ impl State {
                         self.diagnostic.query_id = p.s.query_id.clone();
                         p.s.authorize_description(session)?;
                         let d = p.s.describe(session)?;
-                        if let Plan::Catalog(_, fields, _) = &p.s.p {
+                        if let Plan::Catalog(_, fields, _) = &*p.s.p {
                             catalog_wire::description(fields, &p.formats, out)?;
                         } else {
                             row_description(&d, &p.formats, out)?;
@@ -2577,7 +2577,7 @@ impl State {
                 let p = self.portals.get_mut(&name).ok_or("34000")?;
                 self.diagnostic.query_id = p.s.query_id.clone();
                 p.s.describe(session)?;
-                if let Plan::Cursor(command) = &p.s.p {
+                if let Plan::Cursor(command) = &*p.s.p {
                     if p.result.is_some() {
                         return Err("55000");
                     }
@@ -2595,7 +2595,7 @@ impl State {
                     p.result = ran();
                     return Ok(true);
                 }
-                if let Plan::CopyOut(options) = &p.s.p {
+                if let Plan::CopyOut(options) = &*p.s.p {
                     if p.result.is_some() { return Err("55000"); }
                     let options = options.clone();
                     p.result = ran();
@@ -2605,7 +2605,7 @@ impl State {
                     result?;
                     return Ok(true);
                 }
-                if let Plan::Copy(copy, prepared) = &p.s.p {
+                if let Plan::Copy(copy, prepared) = &*p.s.p {
                     if p.result.is_some() {
                         return Err("55000");
                     }
@@ -2617,7 +2617,7 @@ impl State {
                     self.start_copy(copy, prepared, None, session, out)?;
                     return Ok(true);
                 }
-                if let Plan::Change(change) = &p.s.p {
+                if let Plan::Change(change) = &*p.s.p {
                     // Runs once; a suspended portal hands out the rest of its
                     // rows (PostgreSQL's rows of a utility statement).
                     if p.result.is_none() {
@@ -2639,12 +2639,12 @@ impl State {
                     if end < total {
                         frame(b's', &[], out)?;
                     } else {
-                        let Plan::Change(change) = &p.s.p else { unreachable!() };
+                        let Plan::Change(change) = &*p.s.p else { unreachable!() };
                         complete(crate::agent::preview::approver_command(change), result, out)?;
                     }
                     return Ok(true);
                 }
-                if let Plan::TaskDdl(stmt) = &p.s.p {
+                if let Plan::TaskDdl(stmt) = &*p.s.p {
                     let stmt = stmt.clone();
                     if p.result.is_none() {
                         if crate::task_ddl::writes(&stmt) {
@@ -2691,7 +2691,7 @@ impl State {
                     }
                     return Ok(true);
                 }
-                if let Plan::Admin(stmt) = &p.s.p {
+                if let Plan::Admin(stmt) = &*p.s.p {
                     if p.result.is_some() {
                         return Err("55000");
                     }
@@ -2708,7 +2708,7 @@ impl State {
                     complete(tag, &empty(), out)?;
                     return Ok(true);
                 }
-                if let Plan::Catalog(plan, fields, epoch) = &p.s.p {
+                if let Plan::Catalog(plan, fields, epoch) = &*p.s.p {
                     self.diagnostic.phase = "catalog execution";
                     begin_implicit(session, &mut self.implicit, &mut self.settings)?;
                     let (current, tables, indexes, typmods, types) =
@@ -2771,7 +2771,7 @@ impl State {
                     }
                     return Ok(true);
                 }
-                if let Plan::Explain(query) = &p.s.p {
+                if let Plan::Explain(query) = &*p.s.p {
                     begin_implicit(session, &mut self.implicit, &mut self.settings)?;
                     if p.result.is_none() {
                         // Plan text the server builds (its core reads use the
@@ -2791,11 +2791,11 @@ impl State {
                     else { complete("EXPLAIN", result, out)?; }
                     return Ok(true);
                 }
-                if matches!(p.s.p, Plan::Empty) {
+                if matches!(&*p.s.p, Plan::Empty) {
                     frame(b'I', &[], out)?;
                     return Ok(true);
                 }
-                if matches!(p.s.p, Plan::SettingsFunction(_)) {
+                if matches!(&*p.s.p, Plan::SettingsFunction(_)) {
                     settings_functions::execute(
                         p,
                         session,
@@ -2807,7 +2807,7 @@ impl State {
                     )?;
                     return Ok(true);
                 }
-                if let Plan::AccessShare(tables) = &p.s.p {
+                if let Plan::AccessShare(tables) = &*p.s.p {
                     if !session.in_transaction() || self.implicit {
                         return Err("25P01");
                     }
@@ -2815,7 +2815,7 @@ impl State {
                     complete("LOCK TABLE", &empty(), out)?;
                     return Ok(true);
                 }
-                if let Plan::Control(command) = &p.s.p {
+                if let Plan::Control(command) = &*p.s.p {
                     if p.result.is_some() {
                         return Err("55000");
                     }
@@ -2839,7 +2839,7 @@ impl State {
                     }
                     return Ok(true);
                 }
-                if let Plan::Settings(settings) = &p.s.p {
+                if let Plan::Settings(settings) = &*p.s.p {
                     if !session.role.is_sql() {
                         return Err("42501");
                     }
@@ -2868,9 +2868,9 @@ impl State {
                 }
                 // Task results are never retained in a portal. Each Execute is a
                 // fresh native invocation, including completed-portal replays.
-                if let Plan::Inspect(show) = p.s.p {
+                if let Plan::Inspect(show) = &*p.s.p {
                     // Recheck role/transaction even when releasing cached rows.
-                    let (_, current) = inspect(show, &self.settings.current, session)?;
+                    let (_, current) = inspect(*show, &self.settings.current, session)?;
                     if p.result.is_none() {
                         let bytes = serde_json::to_vec(current.get()).map_err(|_| "54000")?.len();
                         if retained.checked_add(bytes).ok_or("54000")? > MAX_RESPONSE {
@@ -2895,7 +2895,7 @@ impl State {
                     return Ok(true);
                 }
                 #[cfg(feature = "legacy-task")]
-                if let Plan::Task(task) = p.s.p {
+                if let Plan::Task(task) = &*p.s.p {
                     let request = task.bind(&p.params)?;
                     let response = session.handle_prepared_task(request, received);
                     let value = serde_json::to_string(&response).map_err(|_| "XX000")?;
@@ -2922,7 +2922,7 @@ impl State {
                     complete("SELECT", result, out)?;
                     return Ok(true);
                 }
-                let Plan::Sql(prepared) = &p.s.p else {
+                let Plan::Sql(prepared) = &*p.s.p else {
                     unreachable!()
                 };
                 if prepared.command() == "SELECT" && prepared.write_tables().is_empty() {
@@ -4446,7 +4446,7 @@ mod prepared_validation_tests {
         Statement { id: 0, sequence_dependencies: Default::default(), parse_context: None,
             description_version: None, validated: None, constant_validations: 0,
             sql_bytes: sql.len(), sql: sql.into(), declared_oids: vec![],
-            p: Plan::Sql(Box::new(p)), d, parameter_oids: vec![], query_id: None }
+            p: Arc::new(Plan::Sql(Box::new(p))), d: Arc::new(d), parameter_oids: vec![], query_id: None }
     }
     fn wire_state() -> State {
         State {

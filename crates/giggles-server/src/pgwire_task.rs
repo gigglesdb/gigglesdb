@@ -241,8 +241,8 @@ impl State {
             sql_bytes: sql.len(),
             sql: sql.to_owned(),
             declared_oids: oids,
-            p,
-            d,
+            p: Arc::new(p),
+            d: Arc::new(d),
             parameter_oids,
             query_id: self.diagnostic.query_id.clone(),
         })
@@ -621,7 +621,7 @@ impl State {
             }
             Ok(())
         };
-        match &s.p {
+        match &*s.p {
             Plan::Inspect(show) => {
                 let (description, result) = inspect(*show, &self.settings.current, session)?;
                 let result = &result;
