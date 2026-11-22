@@ -402,6 +402,10 @@ impl V2Db {
         )?;
         let locks = Arc::new(engine::locks::LockManager::new(engine::locks::LockConfig {
             shards: engine::locks::DEFAULT_LOCK_SHARDS,
+            // V2Db::begin alone issues IDs for this manager. Transaction is
+            // not Clone, releases only in Drop, and makes all other calls
+            // synchronously through &Transaction or &mut Transaction.
+            per_shard_release: true,
             // One million rows plus old/new keys for secondary indexes.
             max_row_locks_per_txn: 8_000_000,
             ..Default::default()
