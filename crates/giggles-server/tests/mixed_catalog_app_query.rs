@@ -9,7 +9,10 @@ use giggles_server::{
 };
 use std::{
     collections::BTreeMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, config::SslMode};
@@ -21,13 +24,15 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "mixed-catalog-{}-{}",
+            "mixed-catalog-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
         ));
         std::fs::create_dir_all(&path).unwrap();
         let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
@@ -154,6 +159,46 @@ async fn mixed_catalog_checks_table_privileges_and_counts_outer_rows() {
         sqlstate(reader.query(&prepared, &[]).await.unwrap_err()),
         "42501"
     );
+    drop((reader, owner));
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn simple_application_read_hint_preserves_catalog_routes_and_authorization() {
+    let fixture = Fixture::new().await;
+    let owner = fixture.client("owner").await;
+    let reader = fixture.client("reader").await;
+    owner
+        .batch_execute("CREATE TABLE t (id integer PRIMARY KEY); INSERT INTO t VALUES (7)")
+        .await
+        .unwrap();
+
+    let sql = "SELECT * FROM t WHERE id=7";
+    assert!(giggles_pg_catalog::application_read_hint(sql));
+    for (sql, column, expected) in [
+        (sql, "id", "7"),
+        ("SELECT * FROM pg_class LIMIT 1", "relname", ""),
+        ("SELECT current_user FROM t", "current_user", "owner"),
+        ("SELECT version()", "version", "PostgreSQL 18.6 (GigglesDB "),
+    ] {
+        let messages = owner.simple_query(sql).await.unwrap();
+        let rows: Vec<_> = messages
+            .iter()
+            .filter_map(|message| match message {
+                SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "{sql}");
+        let value = rows[0].get(column).unwrap();
+        match column {
+            "relname" => assert!(!value.is_empty(), "{sql}"),
+            "version" => assert!(value.starts_with(expected), "{value}"),
+            _ => assert_eq!(value, expected, "{sql}"),
+        }
+    }
+
+    assert_eq!(sqlstate(reader.simple_query(sql).await.unwrap_err()), "42501");
     drop((reader, owner));
     fixture.stop().await;
 }

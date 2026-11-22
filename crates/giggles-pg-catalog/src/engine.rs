@@ -2,6 +2,7 @@ mod privilege_inquiry;
 use crate::{catalog, *};
 mod flat_union;
 mod admission;
+pub use admission::application_read_hint;
 mod numeric_literals;
 mod join_selection;
 mod introspection;
@@ -231,7 +232,8 @@ pub fn catalog_identifier(name: &str) -> bool {
     ) || unqualified_catalog(name)
 }
 fn unqualified_catalog(name: &str) -> bool {
-    catalog::relation_namespace(name) == "pg_catalog" && catalog::schema(name).is_some()
+    catalog::relation_namespace(name) == "pg_catalog"
+        && (name == "pg_tables" || catalog::pg_schema_columns(name).is_some())
 }
 fn regclass_oid(value: &str, snapshot: &CatalogSnapshot) -> R<u32> {
     if let Ok(oid) = value.parse::<u32>() {

@@ -42,7 +42,8 @@ pub fn quote_explain_identifier(name: &str) -> String { catalog::quote_identifie
 mod engine;
 pub mod privilege_inquiry;
 pub use engine::{
-    Plan, describe, execute, execute_with_startup, plan, plan_gateway, plan_gateway_with_relations,
+    Plan, application_read_hint, describe, execute, execute_with_startup, plan, plan_gateway,
+    plan_gateway_with_relations,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

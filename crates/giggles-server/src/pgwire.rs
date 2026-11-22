@@ -1052,6 +1052,11 @@ fn catalog_plan(
     if Prepared::application_dml(sql, giggles_pg_catalog::catalog_identifier) {
         return Ok(None);
     }
+    // This routing hint skips catalog planning. Core still parses,
+    // authorizes and classifies the original statement.
+    if giggles_pg_catalog::application_read_hint(sql) {
+        return Ok(None);
+    }
     // Sequence and extension calls use the database execution context, never
     // the immutable catalog evaluator or the positive table-free allowlist.
     if !Prepared::sequence_dependencies(sql).is_empty() || Prepared::extension_routine_call(sql) {

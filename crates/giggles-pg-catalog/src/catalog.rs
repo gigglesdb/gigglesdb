@@ -157,7 +157,21 @@ fn storage_schema(name: &str) -> Option<Vec<Field>> {
     if let Some(fields) = information_schema::schema(name) {
         return Some(fields);
     }
-    let mut result = fields(match name {
+    if name == "pg_tables" {
+        return Some(pg_tables::schema());
+    }
+    let mut result = fields(pg_schema_columns(name)?);
+    if tableoid(name).is_some() && !result.iter().any(|f| f.name == "xmin") {
+        result.push(Field {
+            name: "xmin".into(),
+            data_type: T::Xid,
+        });
+    }
+    Some(result)
+}
+
+pub(crate) fn pg_schema_columns(name: &str) -> Option<&'static [(&'static str, PgType)]> {
+    Some(match name {
         "pg_views" => &[("schemaname", T::Name), ("viewname", T::Name), ("viewowner", T::Name), ("definition", T::Text)],
         "pg_namespace" => &[
             ("oid", T::Oid),
@@ -277,7 +291,6 @@ fn storage_schema(name: &str) -> Option<Vec<Field>> {
             ("indcheckxmin", T::Bool),
             ("indnullsnotdistinct", T::Bool),
         ],
-        "pg_tables" => return Some(pg_tables::schema()),
         "pg_indexes" => &[
             ("schemaname", T::Name),
             ("tablename", T::Name),
@@ -904,14 +917,7 @@ fn storage_schema(name: &str) -> Option<Vec<Field>> {
         ],
 
         _ => return None,
-    });
-    if tableoid(name).is_some() && !result.iter().any(|f| f.name == "xmin") {
-        result.push(Field {
-            name: "xmin".into(),
-            data_type: T::Xid,
-        });
-    }
-    Some(result)
+    })
 }
 pub(crate) fn known_names() -> &'static [&'static str] {
     &[
