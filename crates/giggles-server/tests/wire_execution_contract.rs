@@ -1,7 +1,8 @@
 #![cfg(feature = "engine-rocksdb")]
 mod agent_support;
 
-use agent_support::parity::{APP, APPROVER, ParityFixture, http_call};
+pub(super) use agent_support::parity::ParityFixture;
+use agent_support::parity::{APP, APPROVER, http_call};
 use giggles_core::SqlSession;
 use giggles_server::{
     admission::RoleStatementLimits,
@@ -26,22 +27,22 @@ use tokio::{
 };
 
 const STALL_LIMIT: Duration = Duration::from_secs(5);
-const WAIT_LIMIT: Duration = Duration::from_secs(3);
-const LOCK_BUDGET_MS: u32 = 10_000;
+pub(super) const WAIT_LIMIT: Duration = Duration::from_secs(3);
+pub(super) const LOCK_BUDGET_MS: u32 = 10_000;
 const CANCEL_BUDGET_MS: u32 = 5_000;
 const BLOCKING_CAP: usize = 32;
 const CONNECTIONS: usize = 40;
-const UPDATE_ROW: &str =
+pub(super) const UPDATE_ROW: &str =
     "UPDATE shipments SET attempt_count=attempt_count+1 WHERE merchant_id=42 AND id=1";
 
-fn execute(request: Request) -> proto::ExecuteRequest {
+pub(super) fn execute(request: Request) -> proto::ExecuteRequest {
     proto::ExecuteRequest {
         request: Some(request),
         ..Default::default()
     }
 }
 
-fn sql(statement: &str, budget_ms: u32) -> proto::ExecuteRequest {
+pub(super) fn sql(statement: &str, budget_ms: u32) -> proto::ExecuteRequest {
     proto::ExecuteRequest {
         budget_ms: Some(budget_ms),
         ..execute(Request::Sql(proto::SqlRequest {
@@ -55,20 +56,20 @@ fn ping() -> proto::ExecuteRequest {
     execute(Request::Ping(proto::PingRequest {}))
 }
 
-async fn ok(client: &mut Client, request: proto::ExecuteRequest) -> proto::ExecuteReply {
+pub(super) async fn ok(client: &mut Client, request: proto::ExecuteRequest) -> proto::ExecuteReply {
     let reply = client.execute(request).await.unwrap();
     assert_eq!(reply.code, "ok", "{reply:?}");
     reply
 }
 
-async fn start_holder(f: &ParityFixture) -> Client {
+pub(super) async fn start_holder(f: &ParityFixture) -> Client {
     let mut holder = f.wire_client_for(&f.sql_app).await;
     ok(&mut holder, execute(Request::Begin(proto::BeginRequest {}))).await;
     ok(&mut holder, sql(UPDATE_ROW, LOCK_BUDGET_MS)).await;
     holder
 }
 
-async fn release_holder(holder: &mut Client) {
+pub(super) async fn release_holder(holder: &mut Client) {
     ok(
         holder,
         execute(Request::Rollback(proto::RollbackRequest {})),
@@ -76,7 +77,11 @@ async fn release_holder(holder: &mut Client) {
     .await;
 }
 
-async fn wait_for(limit: Duration, description: &str, mut condition: impl FnMut() -> bool) {
+pub(super) async fn wait_for(
+    limit: Duration,
+    description: &str,
+    mut condition: impl FnMut() -> bool,
+) {
     timeout(limit, async {
         while !condition() {
             sleep(Duration::from_millis(5)).await;
@@ -86,7 +91,10 @@ async fn wait_for(limit: Duration, description: &str, mut condition: impl FnMut(
     .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
 }
 
-async fn reply(client: &mut Client, id: u32) -> Result<proto::ExecuteReply, WireConnError> {
+pub(super) async fn reply(
+    client: &mut Client,
+    id: u32,
+) -> Result<proto::ExecuteReply, WireConnError> {
     let (received, reply) = client.recv().await.unwrap();
     assert_eq!(received, id);
     reply
@@ -282,7 +290,7 @@ async fn blocking_cap_holds() {
     f.stop().await;
 }
 
-async fn cancel_waiter(f: &ParityFixture, waiter: &mut Client, limit: Duration) {
+pub(super) async fn cancel_waiter(f: &ParityFixture, waiter: &mut Client, limit: Duration) {
     let started = Instant::now();
     let id = waiter
         .send_execute(sql(UPDATE_ROW, CANCEL_BUDGET_MS))
@@ -293,22 +301,28 @@ async fn cancel_waiter(f: &ParityFixture, waiter: &mut Client, limit: Duration) 
     })
     .await;
 
+    let sent = Instant::now();
     let result = timeout(limit, async {
         waiter.send_cancel(id).await.unwrap();
         reply(waiter, id).await
     })
     .await
     .expect("CANCEL reached the running request");
+    eprintln!("CANCEL reply after {:?}", sent.elapsed());
     assert!(
         started.elapsed() < Duration::from_millis(u64::from(CANCEL_BUDGET_MS) - 500),
         "the reply must arrive well before the request budget"
     );
+    assert_cancelled(result);
+    assert_eq!(f.admin.waiting_lock_count(), 0);
+    assert_eq!(f.ordinary_api.test_blocking_permits_in_use(), 0);
+}
+
+pub(super) fn assert_cancelled(result: Result<proto::ExecuteReply, WireConnError>) {
     match result {
         Ok(reply) => assert_eq!(reply.code, "57014"),
         Err(error) => assert_eq!(error.code, ApiError::DeadlineExceeded.code()),
     }
-    assert_eq!(f.admin.waiting_lock_count(), 0);
-    assert_eq!(f.ordinary_api.test_blocking_permits_in_use(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

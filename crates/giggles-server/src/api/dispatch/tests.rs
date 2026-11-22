@@ -56,12 +56,12 @@ impl WorkerHook {
         }
     }
 }
-struct Gate {
-    entered: oneshot::Receiver<()>,
-    release: std::sync::mpsc::Sender<()>,
-    finished: oneshot::Receiver<()>,
+pub(super) struct Gate {
+    pub(super) entered: oneshot::Receiver<()>,
+    pub(super) release: std::sync::mpsc::Sender<()>,
+    pub(super) finished: oneshot::Receiver<()>,
 }
-fn gate(runtime: &ApiRuntime, after: bool) -> Gate {
+pub(super) fn gate(runtime: &ApiRuntime, after: bool) -> Gate {
     let (entered, observed) = oneshot::channel();
     let (release, waiting) = std::sync::mpsc::channel();
     let (finished, done) = oneshot::channel();
@@ -80,7 +80,7 @@ fn gate(runtime: &ApiRuntime, after: bool) -> Gate {
         finished: done,
     }
 }
-async fn signal(receiver: oneshot::Receiver<()>) {
+pub(super) async fn signal(receiver: oneshot::Receiver<()>) {
     tokio::time::timeout(Duration::from_secs(5), receiver)
         .await
         .unwrap()

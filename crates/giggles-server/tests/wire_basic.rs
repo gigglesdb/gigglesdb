@@ -119,6 +119,7 @@ async fn wire_disconnect_mid_pipeline_rolls_back() {
             "ok"
         );
         let stats = connection_stats(&f, &client);
+        let received_before = stats.received_frames();
         if !blocked {
             stats.hold_queued_requests();
         }
@@ -126,10 +127,10 @@ async fn wire_disconnect_mid_pipeline_rolls_back() {
             client.send_execute(insert_shipment(id)).await.unwrap();
         }
         if blocked {
-            wait_for("a running insert and nine queued inserts", || {
+            wait_for("a running insert and the full insert pipeline received", || {
                 f.admin.waiting_lock_count() == 1
                     && f.service.blocking_permits_held() == 1
-                    && stats.queued_requests() == 9
+                    && stats.received_frames() == received_before + 10
             })
             .await;
         } else {
@@ -179,14 +180,15 @@ async fn wire_never_reading_client_is_capped() {
         unread.send_execute(read.clone()).await.unwrap();
     }
     wait_for(
-        "the unread connection to reach the pending reply cap",
-        || stats.peak_pending_reply_bytes() >= 2 * MAX_RESPONSE,
+        "an outstanding write to back up the unread connection",
+        || stats.pending_reply_bytes() > 0 && stats.queued_requests() > 0,
     )
     .await;
     for _ in 0..50 {
         assert_eq!(pinger.execute(ping()).await.unwrap().code, "ok");
     }
     assert!(Arc::ptr_eq(&stats, &connection_stats(&f, &unread)));
+    assert!(stats.pending_reply_bytes() > 0 && stats.queued_requests() > 0);
     let peak = stats.peak_pending_reply_bytes();
     assert!(
         peak <= 2 * MAX_RESPONSE + MAX_FRAME + HEADER_LEN,
@@ -431,8 +433,8 @@ async fn wire_cancel_with_full_pipeline() {
         for _ in 1..64 {
             waiter.send_execute(ping()).await.unwrap();
         }
-        wait_for("a locked request and 63 queued requests", || {
-            f.admin.waiting_lock_count() == 1 && stats.queued_requests() == 63
+        wait_for("a locked request and the full pipeline received", || {
+            f.admin.waiting_lock_count() == 1 && stats.received_frames() == 64
         })
         .await;
 

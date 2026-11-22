@@ -5,12 +5,13 @@
 //! sign-in or idle session failures use request ID zero and terminate the connection.
 
 use super::{
-    exec::run_call,
+    exec::{catch_call_panic, run_call},
     frame::{
         Direction, Flags, FrameDecoder, FrameKind, HEADER_LEN, PREFACE_LEN, PROTOCOL_MAJOR,
         PrefaceError, encode_frame, encode_message, parse_preface,
     },
     handles::HandleTable,
+    inbox::{CancelObservation, Inbound, Inbox},
     messages::{
         WireBatch, WireBatchMode, WireCancel, WireCloseHandle, WireConnError, WirePrepare,
         WirePrepared, WireReady, WireReply, WireRun, wire_batch_entry,
@@ -31,7 +32,6 @@ use crate::{
     },
     transport::IO_TIMEOUT,
 };
-use bytes::BufMut;
 use giggles_core::Cancellation;
 use prost::Message;
 use std::{
@@ -55,8 +55,7 @@ use tonic::{Code, Status, codegen::tokio_stream::StreamExt};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicUsize;
 
-const READ_CHUNK: usize = 8 * 1024;
-const LOOKAHEAD_BYTES: usize = 1024 * 1024 + MAX_FRAME;
+pub(super) const LOOKAHEAD_BYTES: usize = 1024 * 1024 + MAX_FRAME;
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const RETAIN_CAPACITY: usize = 64 * 1024;
 const REPLY_BATCH_GAP: Duration = Duration::from_millis(1);
@@ -81,7 +80,7 @@ impl Default for WireLimits {
     }
 }
 
-pub(crate) async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
+pub(crate) async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     runtime: Arc<ApiRuntime>,
     identity: Result<ConnectionIdentity, ApiError>,
@@ -115,9 +114,12 @@ pub struct ConnectionStats {
     #[cfg(test)]
     pub(super) read_bytes: AtomicUsize,
     #[cfg(test)]
-    pub(super) in_flight: AtomicUsize,
+    pub(super) reader_tasks: AtomicUsize,
     #[cfg(test)]
+    pub(super) in_flight: AtomicUsize,
     pub(super) pending_bytes: AtomicUsize,
+    #[cfg(feature = "test-hooks")]
+    pub(super) received_frames: AtomicUsize,
     #[cfg(test)]
     pub(super) write_capacity: AtomicUsize,
     #[cfg(test)]
@@ -138,6 +140,14 @@ pub struct ConnectionStats {
 
 #[cfg(feature = "test-hooks")]
 impl ConnectionStats {
+    pub fn pending_reply_bytes(&self) -> usize {
+        self.pending_bytes.load(Relaxed)
+    }
+
+    pub fn received_frames(&self) -> usize {
+        self.received_frames.load(Relaxed)
+    }
+
     pub fn peak_pending_reply_bytes(&self) -> usize {
         self.peak_pending_bytes.load(Relaxed)
     }
@@ -167,7 +177,7 @@ impl ConnectionStats {
     }
 }
 
-pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
+pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
     runtime: Arc<ApiRuntime>,
     identity: Result<ConnectionIdentity, ApiError>,
@@ -191,7 +201,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
         Err(error) => return write_output(&mut stream, &error.into_frame()).await,
     };
     let session = Session {
-        runtime: &runtime,
+        runtime,
         value: Some(session),
     };
     write_output(&mut stream, &ready).await?;
@@ -201,9 +211,9 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
         &limits,
         &socket,
         #[cfg(any(test, feature = "test-hooks"))]
-        &stats,
+        stats,
         #[cfg(test)]
-        hook.as_deref(),
+        hook,
     )
     .await
 }
@@ -349,12 +359,12 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     unreachable!("last authentication round returns")
 }
 
-struct Session<'a> {
-    runtime: &'a ApiRuntime,
+struct Session {
+    runtime: Arc<ApiRuntime>,
     value: Option<WireSession>,
 }
 
-impl Session<'_> {
+impl Session {
     fn check_live(&mut self) -> Result<(), ApiError> {
         let session = self.value.as_mut().expect("open session");
         self.runtime.wire_recheck(session)?;
@@ -365,7 +375,7 @@ impl Session<'_> {
     }
 }
 
-impl Drop for Session<'_> {
+impl Drop for Session {
     fn drop(&mut self) {
         if let Some(session) = self.value.take() {
             self.runtime.close_wire(session);
@@ -699,7 +709,7 @@ fn append_error(out: &mut Vec<u8>, id: u32, code: &str, message: &str, show_vers
 }
 
 fn request_error(
-    session: &mut Option<Session<'_>>,
+    session: &mut Option<Session>,
     out: &mut Vec<u8>,
     ids: &mut HashSet<u32>,
     id: u32,
@@ -749,12 +759,12 @@ async fn poll_active<F: Future>(future: &mut Option<Pin<Box<F>>>) -> F::Output {
     future.as_mut().expect("active future").await
 }
 
-async fn execute<'a>(
-    mut session: Session<'a>,
+async fn execute(
+    mut session: Session,
     call: WireCall,
     ownership: Arc<CallOwnership>,
-    #[cfg(test)] hook: Option<&super::exec::CallHook>,
-) -> (Session<'a>, Result<Completion, ApiError>) {
+    #[cfg(test)] hook: Option<Arc<super::exec::CallHook>>,
+) -> (Session, Result<Completion, ApiError>) {
     #[cfg(test)]
     if let Some(hook) = hook
         && let Err(error) = hook.before(&call.cancel).await
@@ -762,7 +772,7 @@ async fn execute<'a>(
         return (session, Err(error));
     }
     let result = run_call(
-        session.runtime,
+        &session.runtime,
         session.value.as_mut().expect("open session"),
         call,
         ownership,
@@ -778,15 +788,16 @@ enum Exit {
     Session(ApiError),
 }
 
-async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
+async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
-    session: Session<'_>,
+    session: Session,
     limits: &WireLimits,
     socket: &Arc<OwnedSemaphorePermit>,
-    #[cfg(any(test, feature = "test-hooks"))] stats: &ConnectionStats,
-    #[cfg(test)] hook: Option<&super::exec::CallHook>,
+    #[cfg(any(test, feature = "test-hooks"))] stats: Arc<ConnectionStats>,
+    #[cfg(test)] hook: Option<Arc<super::exec::CallHook>>,
 ) -> io::Result<()> {
-    let runtime = session.runtime;
+    let runtime = &Arc::clone(&session.runtime);
+    let inline = ApiRuntime::wire_runs_inline();
     // Keep a separate receiver for waiting. changed() marks its update seen,
     // leaving the session's receiver to drive the actual identity re-check.
     let mut binding_changes = session
@@ -800,9 +811,15 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
     );
     idle_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut session = Some(session);
-    let (mut reader, writer) = tokio_io::split(stream);
+    let (reader, writer) = tokio_io::split(stream);
+    let mut reader = Inbox::start(
+        reader,
+        limits.max_in_flight,
+        #[cfg(any(test, feature = "test-hooks"))]
+        stats.clone(),
+    );
+    let inbox = reader.inbox.clone();
     let mut writer = Some(writer);
-    let mut decoder = FrameDecoder::new(Direction::ClientToServer, MAX_FRAME);
     let mut queued: VecDeque<Queued> = VecDeque::new();
     let mut deferred: VecDeque<Deferred> = VecDeque::new();
     let mut deferred_bytes = 0;
@@ -825,7 +842,7 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
     #[cfg(feature = "test-hooks")]
     let mut paused_stream = false;
 
-    let exit = 'connection: loop {
+    let mut exit = 'connection: loop {
         let before = pending.len();
         let below_cap = writing_bytes + pending.len() < limits.max_pending_reply_bytes;
         if !close_after_reply && below_cap {
@@ -844,15 +861,23 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                     // continue to count against it.
                     lookahead_frames = deferred_frames;
                 }
-                if lookahead_frames == limits.max_in_flight {
-                    break;
-                }
-                let (header, body) = match decoder.next_frame() {
-                    Ok(Some(frame)) => frame,
-                    Ok(None) => break,
-                    Err(_) => break 'connection Exit::Protocol("invalid frame header"),
-                };
                 let available = limits.max_in_flight - (ids.len() - deferred.len());
+                let read_frames = available + (limits.max_in_flight - lookahead_frames);
+                let (header, body, cancel_observation) =
+                    match inbox.advance(deferred_bytes, available, read_frames, read_frames != 0) {
+                        Some(Inbound::Frame {
+                            header,
+                            body,
+                            cancel_observation,
+                            ..
+                        }) => (header, body, cancel_observation),
+                        Some(Inbound::Eof) => break 'connection Exit::Io(Ok(())),
+                        Some(Inbound::Io(error)) => break 'connection Exit::Io(Err(error)),
+                        Some(Inbound::Protocol(message)) => {
+                            break 'connection Exit::Protocol(message);
+                        }
+                        None => break,
+                    };
                 let full = available == 0;
                 lookahead_frames += usize::from(full);
                 let id = header.request_id;
@@ -865,14 +890,13 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                     | FrameKind::Run
                     | FrameKind::CloseHandle => {
                         let received = Instant::now();
-                        let body = decoder.body(body);
                         if full {
                             let bytes = HEADER_LEN + body.len();
                             deferred_bytes += bytes;
                             deferred_frames += 1;
                             deferred.push_back(Deferred {
                                 id,
-                                request: DeferredRequest::Frame(header.kind, body.to_vec()),
+                                request: DeferredRequest::Frame(header.kind, body),
                                 batch: None,
                                 received,
                                 cancelled: false,
@@ -885,7 +909,7 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                                 request: QueuedRequest::decode_frame(
                                     runtime,
                                     header.kind,
-                                    body,
+                                    &body,
                                     received,
                                 ),
                                 batch: None,
@@ -895,7 +919,7 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     FrameKind::Batch => {
                         let received = Instant::now();
-                        let Some((mode, entries)) = decode_batch(decoder.body(body), &ids) else {
+                        let Some((mode, entries)) = decode_batch(&body, &ids) else {
                             break 'connection Exit::Protocol("invalid BATCH frame");
                         };
                         // The header ID passed the common check but only
@@ -949,18 +973,22 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                         }
                     }
                     FrameKind::Cancel => {
-                        let Ok(cancel) = WireCancel::decode(decoder.body(body)) else {
+                        let Ok(cancel) = WireCancel::decode(body.as_slice()) else {
                             break 'connection Exit::Protocol("invalid CANCEL frame");
                         };
                         let target = cancel.target_request_id;
+                        if let Some(CancelObservation::Early(target)) = cancel_observation {
+                            inbox.consume_early_cancel(target);
+                        }
                         if let Some(call) = active.as_ref().filter(|call| call.id == target) {
                             // Keep the dispatcher result, including SQLSTATE 57014
                             // when a running SQL statement is cancelled.
                             call.cancel.cancel();
-                        } else if delivery
-                            .as_ref()
-                            .is_some_and(|reply| reply.call.id == target)
+                        } else if !matches!(cancel_observation, Some(CancelObservation::Running))
+                            && delivery.as_ref().is_some_and(|reply| reply.call.id == target)
                         {
+                            // A CANCEL received during execution may reach this
+                            // pass after the join. Preserve that execution's reply.
                             let reply = delivery.take().expect("matching delivery");
                             shapes.rollback(reply.shape_checkpoint);
                             reply.call.cancel.cancel();
@@ -991,15 +1019,6 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                     FrameKind::Goodbye if body.is_empty() => break 'connection Exit::Goodbye,
                     _ => break 'connection Exit::Protocol("unexpected client frame"),
                 }
-            }
-            let before = decoder.read_buf().len();
-            decoder.consume_decoded();
-            let buf = decoder.read_buf();
-            if buf.len() < before
-                && buf.len() <= RETAIN_CAPACITY
-                && buf.capacity() > RETAIN_CAPACITY
-            {
-                *buf = bytes::BytesMut::from(buf.as_ref());
             }
         }
         let filled_queue = ids.len() - deferred.len() == limits.max_in_flight;
@@ -1041,6 +1060,11 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 delivery = None;
             } else if running.is_none() {
+                // Inline work can block the connection task. Finish any
+                // earlier write before starting a request that can do so.
+                if inline && (!pending.is_empty() || writing.is_some()) {
+                    break;
+                }
                 #[cfg(feature = "test-hooks")]
                 if stats.hold_queue.load(Relaxed) {
                     break;
@@ -1156,19 +1180,22 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                 };
                 match admission {
                     Ok((call, ownership)) => {
+                        let cancel = call.cancel.clone();
                         active = Some(ActiveCall {
                             id: entry.id,
-                            cancel: call.cancel.clone(),
+                            cancel: cancel.clone(),
                             _ownership: ownership.clone(),
                             batch: entry.batch,
                         });
-                        running = Some(Box::pin(execute(
+                        let request = execute(
                             session.take().expect("open session"),
                             call,
                             ownership,
                             #[cfg(test)]
-                            hook,
-                        )));
+                            hook.clone(),
+                        );
+                        inbox.register(entry.id, cancel);
+                        running = Some(Box::pin(catch_call_panic(request)));
                     }
                     Err(error) => {
                         close_after_reply = request_error(
@@ -1195,13 +1222,11 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
 
         #[cfg(test)]
         {
-            let decoder_len = decoder.read_buf().len();
-            stats.decoder_len.store(decoder_len, Relaxed);
-            stats.peak_decoder_len.fetch_max(decoder_len, Relaxed);
             stats.in_flight.store(ids.len() - deferred.len(), Relaxed);
             stats.write_capacity.store(pending.capacity(), Relaxed);
-            stats.pending_bytes.store(pending_bytes, Relaxed);
         }
+        #[cfg(any(test, feature = "test-hooks"))]
+        stats.pending_bytes.store(pending_bytes, Relaxed);
         #[cfg(feature = "test-hooks")]
         {
             stats.queued.store(queued.len(), Relaxed);
@@ -1209,26 +1234,24 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
         }
 
         let below_cap = pending_bytes < limits.max_pending_reply_bytes;
-        let decoder_len = decoder.read_buf().len();
         let idle = ids.is_empty() && pending_bytes == 0;
         let can_check_idle = idle && !close_after_reply;
         let can_decode = !close_after_reply && below_cap;
-        let has_slot = ids.len() - deferred.len() < limits.max_in_flight;
-        // A reply may free a slot after the decoding pass. Promote deferred
-        // frames first, then consume any bytes already in the decoder.
+        let available = limits.max_in_flight - (ids.len() - deferred.len());
+        // A reply may free a slot after decoding. Promote deferred frames
+        // and reset the lookahead window before selecting again.
         if can_decode
-            && has_slot
-            && (!deferred.is_empty()
-                || (filled_queue && (decoder_len != 0 || lookahead_frames != 0)))
+            && available > 0
+            && (!deferred.is_empty() || (filled_queue && lookahead_frames != 0))
         {
             continue;
         }
-        // Read controls and detect EOF even with every request slot occupied.
-        // The shared byte cap includes both deferred frames and unread bytes.
-        let read_limit =
-            READ_CHUNK.min(LOOKAHEAD_BYTES.saturating_sub(deferred_bytes + decoder_len));
-        let can_read =
-            can_decode && read_limit > 0 && (has_slot || lookahead_frames < limits.max_in_flight);
+        let read_frames = if can_decode {
+            available + (limits.max_in_flight - lookahead_frames)
+        } else {
+            0
+        };
+        inbox.advance(deferred_bytes, available, read_frames, false);
         let can_pull_chunk = below_cap
             && delivery
                 .as_ref()
@@ -1237,26 +1260,14 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
         let can_pull_chunk = can_pull_chunk && !paused_stream;
         // Collect adjacent small replies while their executions are completing.
         // A full buffer, idle pipeline or spill can write immediately.
-        let write_at = if below_cap && delivery.is_none() && running.is_some() {
+        let write_at = if !inline && below_cap && delivery.is_none() && running.is_some() {
             last_reply + REPLY_BATCH_GAP
         } else {
             last_reply
         };
 
         tokio::select! {
-            read = async { reader.read_buf(&mut decoder.read_buf().limit(read_limit)).await }, if can_read => {
-                match read {
-                    Ok(0) => break Exit::Io(Ok(())),
-                    Ok(_bytes) => {
-                        #[cfg(test)]
-                        {
-                            stats.read_bytes.fetch_add(_bytes, Relaxed);
-                            stats.peak_decoder_len.fetch_max(decoder.read_buf().len(), Relaxed);
-                        }
-                    }
-                    Err(error) => break Exit::Io(Err(error)),
-                }
-            }
+            _ = inbox.wait(), if read_frames != 0 => {}
             _ = async {
                 tokio::select! {
                     _ = binding_changes.changed() => {}
@@ -1271,9 +1282,13 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
                     break Exit::Session(error);
                 }
             }
-            (returned, result) = poll_active(&mut running), if running.is_some() => {
-                session = Some(returned);
+            joined = poll_active(&mut running), if running.is_some() => {
                 running = None;
+                inbox.clear_running();
+                let Ok((returned, result)) = joined else {
+                    break Exit::Session(ApiError::Internal);
+                };
+                session = Some(returned);
                 let call = active.take().expect("running call");
                 let result = result.and_then(|completion| {
                     completion.lease.check_release()?;
@@ -1335,13 +1350,22 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
 
+    if !matches!(exit, Exit::Goodbye)
+        && let Some(call) = &active
+    {
+        call.cancel.cancel();
+    }
+    reader.stop().await;
     if let Some(running) = running {
-        if !matches!(exit, Exit::Goodbye) {
-            active.as_ref().expect("running call").cancel.cancel();
+        let joined = running.await;
+        inbox.clear_running();
+        match joined {
+            Ok((returned, completion)) => {
+                drop(completion);
+                session = Some(returned);
+            }
+            Err(_) => exit = Exit::Session(ApiError::Internal),
         }
-        let (returned, completion) = running.await;
-        drop(completion);
-        session = Some(returned);
     }
     let stream_call = delivery.take().map(|reply| {
         if !matches!(exit, Exit::Goodbye) {

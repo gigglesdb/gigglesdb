@@ -396,6 +396,7 @@ mod prepared_validation_network;
 #[path = "wire_basic.rs"] mod wire_basic;
 #[path = "wire_batches_faults.rs"] mod wire_batches_faults;
 #[path = "wire_execution_contract.rs"] mod wire_execution_contract;
+#[path = "wire_inline.rs"] mod wire_inline;
 #[path = "wire_role.rs"]
 mod wire_role;
 #[path = "wire_handles.rs"] mod wire_handles;

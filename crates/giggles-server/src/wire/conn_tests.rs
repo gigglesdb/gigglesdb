@@ -21,7 +21,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
     },
     task::{Context, Poll},
     time::Duration,
@@ -96,12 +96,14 @@ impl Fixture {
     ) -> Connection {
         let (client, server) = duplex(capacity);
         let writes = Arc::new(AtomicUsize::new(0));
+        let panic_read = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(ConnectionStats::default());
         let socket = self.runtime.service().admission.connect().unwrap();
         let task = tokio::spawn(serve(
             CountingWriter {
                 stream: server,
                 writes: writes.clone(),
+                panic_read: panic_read.clone(),
             },
             self.runtime.clone(),
             identity,
@@ -114,6 +116,7 @@ impl Fixture {
             client,
             task,
             writes,
+            panic_read,
             stats,
         }
     }
@@ -142,6 +145,7 @@ impl Fixture {
 struct CountingWriter {
     stream: DuplexStream,
     writes: Arc<AtomicUsize>,
+    panic_read: Arc<AtomicBool>,
 }
 
 impl AsyncRead for CountingWriter {
@@ -150,6 +154,7 @@ impl AsyncRead for CountingWriter {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        assert!(!self.panic_read.load(Relaxed), "injected wire read panic");
         Pin::new(&mut self.stream).poll_read(cx, buf)
     }
 }
@@ -180,6 +185,7 @@ struct Connection {
     client: DuplexStream,
     task: JoinHandle<io::Result<()>>,
     writes: Arc<AtomicUsize>,
+    panic_read: Arc<AtomicBool>,
     stats: Arc<ConnectionStats>,
 }
 
@@ -191,6 +197,7 @@ impl Connection {
             .unwrap()
             .unwrap()
             .unwrap();
+        assert_eq!(self.stats.reader_tasks.load(Relaxed), 0);
     }
 }
 
@@ -414,6 +421,15 @@ async fn full_pipeline_rejects_reuse_of_deferred_id() {
 
 #[tokio::test]
 async fn full_pipeline_goodbye_discards_queue_without_cancelling_running_call() {
+    check_full_pipeline_goodbye().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inline_full_pipeline_goodbye_discards_queue_without_cancelling_running_call() {
+    check_full_pipeline_goodbye().await;
+}
+
+async fn check_full_pipeline_goodbye() {
     let fixture = Fixture::new(0);
     let hook = Arc::new(CallHook::new(true));
     let mut connection = fixture
@@ -433,16 +449,69 @@ async fn full_pipeline_goodbye_discards_queue_without_cancelling_running_call() 
     until(|| connection.stats.in_flight.load(Relaxed) == 2 && hook.calls.load(Relaxed) == 1)
         .await;
 
-    let before = bytes.len();
     bytes.clear();
     encode_message(&mut bytes, FrameKind::Goodbye, Flags(0), 4, &());
     send(&mut connection.client, &bytes).await;
-    until(|| connection.stats.read_bytes.load(Relaxed) == before + bytes.len()).await;
+    connection.client.shutdown().await.unwrap();
+    until(|| connection.stats.reader_tasks.load(Relaxed) == 0).await;
     hook.release();
 
     eof(&mut connection.client).await;
     assert!(!hook.cancelled.load(Relaxed));
     assert_eq!(hook.calls.load(Relaxed), 1);
+    connection.finish().await;
+}
+
+#[tokio::test]
+async fn aborting_connection_stops_reader_with_peer_still_open() {
+    let fixture = Fixture::new(0);
+    let connection = fixture.ready(4096, WireLimits::default(), None).await;
+    until(|| connection.stats.reader_tasks.load(Relaxed) == 1).await;
+
+    connection.task.abort();
+    assert!(connection.task.await.unwrap_err().is_cancelled());
+    until(|| connection.stats.reader_tasks.load(Relaxed) == 0).await;
+}
+
+#[tokio::test]
+async fn reader_panic_ends_connection_and_cancels_running_request() {
+    let fixture = Fixture::new(0);
+    let hook = Arc::new(CallHook::new(true));
+    let mut connection = fixture
+        .ready(4096, WireLimits::default(), Some(hook.clone()))
+        .await;
+    let mut bytes = Vec::new();
+    ping(&mut bytes, 2);
+    send(&mut connection.client, &bytes).await;
+    until(|| hook.calls.load(Relaxed) == 1).await;
+
+    connection.panic_read.store(true, Relaxed);
+    send(&mut connection.client, &[0]).await;
+    let error = timeout(TEST_TIMEOUT, connection.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert_eq!(error.to_string(), "wire reader task ended");
+    assert!(hook.cancelled.load(Relaxed));
+    assert_eq!(connection.stats.reader_tasks.load(Relaxed), 0);
+}
+
+#[tokio::test]
+async fn cancel_of_completed_request_does_not_cancel_reused_id() {
+    let fixture = Fixture::new(0);
+    let mut connection = fixture.ready(4096, WireLimits::default(), None).await;
+    let mut bytes = Vec::new();
+    ping(&mut bytes, 2);
+    send(&mut connection.client, &bytes).await;
+    assert_eq!(reply(&mut connection.client, 2).await.0.code, "ok");
+
+    bytes.clear();
+    cancel(&mut bytes, 3, 2);
+    ping(&mut bytes, 2);
+    send(&mut connection.client, &bytes).await;
+    assert_eq!(reply(&mut connection.client, 2).await.0.code, "ok");
     connection.finish().await;
 }
 
@@ -470,6 +539,15 @@ async fn idle_connection_ends_after_session_is_closed() {
 
 #[tokio::test]
 async fn batch_entries_count_against_in_flight() {
+    check_stop_on_error_batch_in_flight().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inline_batch_entries_count_against_in_flight() {
+    check_stop_on_error_batch_in_flight().await;
+}
+
+async fn check_stop_on_error_batch_in_flight() {
     let fixture = Fixture::new(0);
     let hook = Arc::new(CallHook::new(true));
     let mut connection = fixture
@@ -861,6 +939,15 @@ async fn buffers_shrink_after_large_reply() {
 
 #[tokio::test]
 async fn oversized_reply_is_split_into_more_frames() {
+    check_oversized_reply_split().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inline_oversized_reply_is_split_into_more_frames() {
+    check_oversized_reply_split().await;
+}
+
+async fn check_oversized_reply_split() {
     let fixture = Fixture::new(40);
     let mut connection = fixture.ready(64 * 1024, WireLimits::default(), None).await;
     let mut bytes = Vec::new();
@@ -877,6 +964,17 @@ async fn oversized_reply_is_split_into_more_frames() {
 #[cfg(feature = "engine-rocksdb")]
 #[tokio::test]
 async fn spilled_reply_is_reassembled_before_next_reply() {
+    check_spilled_reply_reassembly().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inline_spilled_reply_is_reassembled_before_next_reply() {
+    check_spilled_reply_reassembly().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+async fn check_spilled_reply_reassembly() {
     let fixture = Fixture::with_engine(140, Engine::V2);
     let mut connection = fixture.ready(64 * 1024, WireLimits::default(), None).await;
     let mut bytes = Vec::new();

@@ -492,6 +492,15 @@ impl ApiRuntime {
         self.registry.entry_alive(&session.entry)
     }
 
+    pub(crate) fn wire_runs_inline() -> bool {
+        matches!(
+            tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+        )
+    }
+
+    /// The connection flushes earlier replies before inline execution and
+    /// keeps a separate socket reader available for cancellation.
     pub(crate) async fn execute_wire(
         &self,
         session: &mut WireSession,
@@ -510,6 +519,9 @@ impl ApiRuntime {
         let lease =
             self.registry
                 .lease_entry(&session.entry, &session.identity, call.cancel.clone())?;
+        if Self::wire_runs_inline() {
+            return self.execute_wire_inline(lease, call, ownership).await;
+        }
         self.execute_invocation(
             lease,
             call.request,
@@ -521,6 +533,103 @@ impl ApiRuntime {
             ownership,
         )
         .await
+    }
+
+    async fn execute_wire_inline(
+        &self,
+        mut lease: SessionLease,
+        call: WireCall,
+        ownership: Arc<CallOwnership>,
+    ) -> Result<Completion, ApiError> {
+        let WireCall {
+            request,
+            operation_id,
+            received,
+            cancel: context,
+            ..
+        } = call;
+        // Admit in the same order as run_job. The reader can cancel the
+        // request while the connection waits for permits or runs the job.
+        context.check().map_err(|_| ApiError::DeadlineExceeded)?;
+        #[cfg(test)]
+        let hook = self.hook.lock().unwrap().take();
+        // Like run_job, the agent-slot wait ends only by admission, refusal
+        // or the caller going away (here, dropping this future).
+        let agent_slot = if lease.session().agent {
+            match self.service.agent_admission.admit().await {
+                Ok(slot) => Some(slot),
+                Err(error) => return agent_refusal(lease, &error, Encoding::Protobuf, ownership),
+            }
+        } else {
+            None
+        };
+        let role_permit = if role_statement_exempt(lease.session(), &request) {
+            None
+        } else {
+            let role = lease.session().role.clone();
+            Some(
+                self.service
+                    .admission
+                    .statement(&role, Some(&context))
+                    .await
+                    .map_err(statement_refusal)?,
+            )
+        };
+        let blocking_permit = self
+            .service
+            .blocking
+            .admit(&context)
+            .await
+            .map_err(|_| ApiError::DeadlineExceeded)?;
+
+        #[cfg(test)]
+        let (before, after, finished) = tests::WorkerHook::split(hook);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::task::block_in_place(move || {
+                // Match run_job: the blocking permit covers the whole worker,
+                // and run_admitted_job releases the role permit and agent slot.
+                let _blocking_permit = blocking_permit;
+                let _agent_slot = agent_slot;
+                let _role_permit = role_permit;
+                #[cfg(test)]
+                if let Some(barrier) = before {
+                    barrier.wait();
+                }
+                #[cfg(feature = "test-hooks")]
+                let panic_at = self.panic_next_request.swap(0, Ordering::Relaxed);
+                #[cfg(feature = "test-hooks")]
+                if panic_at == PANIC_IN_WORKER {
+                    panic!("injected request worker panic");
+                }
+                run_admitted_job(
+                    lease,
+                    request,
+                    operation_id,
+                    context,
+                    received,
+                    Encoding::Protobuf,
+                    true,
+                    ownership,
+                    StatementPanic {
+                        #[cfg(feature = "test-hooks")]
+                        armed: panic_at == PANIC_IN_STATEMENT,
+                    },
+                    (_role_permit, _agent_slot),
+                    || {
+                        #[cfg(test)]
+                        if let Some(barrier) = after {
+                            barrier.wait();
+                        }
+                    },
+                )
+            })
+        }))
+        .unwrap_or(Err(ApiError::Internal));
+        #[cfg(test)]
+        if let Some(finished) = finished {
+            let _ = finished.send(());
+        }
+        result
     }
 
     pub(crate) fn close_wire(&self, session: WireSession) {

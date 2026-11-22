@@ -5,7 +5,12 @@ use crate::api::{
     codec::wire_seam::{WireCall, WireSession},
     error::ApiError,
 };
-use std::sync::Arc;
+use std::{
+    future::{Future, poll_fn},
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
+    task::Poll,
+};
 
 pub(crate) async fn run_call(
     runtime: &ApiRuntime,
@@ -14,6 +19,18 @@ pub(crate) async fn run_call(
     ownership: Arc<CallOwnership>,
 ) -> Result<Completion, ApiError> {
     runtime.execute_wire(session, call, ownership).await
+}
+
+pub(super) async fn catch_call_panic<F: Future>(call: F) -> Result<F::Output, ()> {
+    tokio::pin!(call);
+    poll_fn(
+        |cx| match catch_unwind(AssertUnwindSafe(|| call.as_mut().poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Err(_) => Poll::Ready(Err(())),
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -55,4 +72,15 @@ impl CallHook {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn catches_request_panic_after_yielding() {
+    let call = async {
+        tokio::task::yield_now().await;
+        panic!("injected admission panic");
+    };
+
+    assert_eq!(catch_call_panic(call).await, Err::<(), ()>(()));
 }

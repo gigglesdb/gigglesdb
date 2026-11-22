@@ -608,6 +608,28 @@ impl Client {
             .await
     }
 
+    /// Sends EXECUTE and its CANCEL in one write for cancellation race tests.
+    #[cfg(feature = "test-hooks")]
+    pub async fn send_execute_and_cancel(&mut self, request: ExecuteRequest) -> io::Result<u32> {
+        self.writer.check(&request)?;
+        let ids = self.reserve_ids(2)?;
+        let id = ids.start;
+        let mut bytes = Vec::new();
+        encode_message(&mut bytes, FrameKind::Execute, Flags(0), id, &request);
+        encode_message(
+            &mut bytes,
+            FrameKind::Cancel,
+            Flags(0),
+            id + 1,
+            &WireCancel {
+                target_request_id: id,
+            },
+        );
+        self.writer.write(&bytes).await?;
+        self.pending.push_back(PendingReply { id, batch: false });
+        Ok(id)
+    }
+
     pub async fn recv(&mut self) -> io::Result<(u32, Result<ExecuteReply, WireConnError>)> {
         let expected = self.pending.front();
         if expected.is_some_and(|pending| pending.batch) {

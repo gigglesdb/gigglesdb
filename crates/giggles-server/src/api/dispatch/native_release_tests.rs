@@ -6,7 +6,7 @@
 //! cfg(test) route (`agent::statement::test_route`) admits only `Insert`
 //! here, to reach core's own refusal of a task write.
 use super::*;
-use crate::{AgentBinding, agent::statement::test_route};
+use crate::{AgentBinding, Role, agent::statement::test_route};
 use giggles_core::{
     Admin, Engine, Limits,
     relational::Value,
@@ -358,4 +358,174 @@ fn non_task_native_unchanged() {
     let task = task_id(&service);
     assert!(service.admin.task_read_log(task).unwrap().is_empty());
     assert_eq!(service.admin.task_disclosure(task).unwrap().debits.len(), 0);
+}
+
+// GD-0091 Stack 6b-C: an agent request on the native wire, through
+// execute_wire. A multi-thread runtime runs it inline on the connection
+// task; a current-thread runtime sends it to the API pool (run_job).
+
+fn open_agent_wire(runtime: &ApiRuntime) -> WireSession {
+    let identity = runtime.authenticate(FINGERPRINT).unwrap();
+    runtime
+        .open_wire(&identity, &proto::OpenSessionRequest::default())
+        .unwrap()
+        .1
+        .unwrap()
+}
+
+fn launch_wire(
+    runtime: &Arc<ApiRuntime>,
+    mut session: WireSession,
+    request: &Json,
+    budget_ms: u32,
+) -> JoinHandle<(WireSession, Result<Completion, ApiError>)> {
+    let runtime = runtime.clone();
+    let request = invocation(request);
+    let ownership = runtime
+        .admit_call(runtime.service.admission.connect().unwrap())
+        .unwrap();
+    tokio::spawn(async move {
+        let received = Instant::now();
+        let call = WireCall {
+            request,
+            operation_id: None,
+            budget_ms: Some(budget_ms),
+            received,
+            cancel: runtime.wire_cancellation(received, Some(budget_ms)).unwrap(),
+        };
+        let result = runtime.execute_wire(&mut session, call, ownership).await;
+        (session, result)
+    })
+}
+
+fn agent_role() -> Role {
+    Role::Database {
+        name: "agent_exec".into(),
+    }
+}
+
+/// (available, concurrent, queued) of the agent role's statement pool.
+fn role_pool(service: &Service) -> (usize, usize, usize) {
+    let pools = service.admission.role_pool_counts();
+    assert_eq!(pools.len(), 1, "{pools:?}");
+    pools[0]
+}
+
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// The refusal reply (code, transaction state) of a request that waits for a
+/// full agent admission through the refusal delay with a 10 ms budget, and
+/// the code of the session's next request once a slot is free.
+fn saturated_agent_refusal(runtime: tokio::runtime::Runtime) -> (String, i32, String) {
+    runtime.block_on(async {
+        let service = fixture();
+        service
+            .set_agent_limits(crate::agent::AgentLimits {
+                max_concurrent_statements: 1,
+                ceiling_refusal_delay_ms: 100,
+                ..service.agent_limits()
+            })
+            .unwrap();
+        let api = ApiRuntime::new_agent(service.clone(), ApiLimits::default()).unwrap();
+        let session = open_agent_wire(&api);
+        let held = service.agent_admission.try_admit().unwrap();
+        let started = Instant::now();
+        let (session, refused) = launch_wire(&api, session, &sql(SQL), 10).await.unwrap();
+        // Both paths wait out the refusal delay, not the 10 ms budget.
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        let refused = refused.unwrap().reply;
+        drop(held);
+        let (_session, next) = launch_wire(&api, session, &sql(SQL), 5_000).await.unwrap();
+        let next = next.unwrap().reply;
+        assert_eq!(service.agent_requests_admitted(), 0);
+        api.shutdown().await;
+        (refused.code, refused.transaction_state, next.code)
+    })
+}
+
+#[test]
+fn inline_agent_refusal_matches_pool_after_budget_expires() {
+    let inline = saturated_agent_refusal(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
+    let pool = saturated_agent_refusal(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
+    assert_eq!(inline, pool);
+    assert_eq!(inline.0, "54T01", "{inline:?}");
+    assert_eq!(inline.2, "ok", "{inline:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inline_agent_request_holds_every_permit_through_after_execution() {
+    assert!(ApiRuntime::wire_runs_inline());
+    let service = fixture();
+    let api = ApiRuntime::new_agent(service.clone(), ApiLimits::default()).unwrap();
+    let session = open_agent_wire(&api);
+    let gate = super::tests::gate(&api, true);
+    let task = launch_wire(&api, session, &sql(SQL), 5_000);
+    super::tests::signal(gate.entered).await;
+    // The barrier holds the job after run_admitted_job's work.
+    assert_eq!(service.agent_requests_admitted(), 1);
+    let (available, concurrent, queued) = role_pool(&service);
+    assert_eq!((available, queued), (concurrent - 1, 0));
+    assert_eq!(service.blocking_permits_held(), 1);
+    gate.release.send(()).unwrap();
+    let (_session, result) = task.await.unwrap();
+    assert_eq!(result.unwrap().reply.code, "ok");
+    super::tests::signal(gate.finished).await;
+    assert_eq!(service.agent_requests_admitted(), 0);
+    let (available, concurrent, _) = role_pool(&service);
+    assert_eq!(available, concurrent);
+    assert_eq!(service.blocking_permits_held(), 0);
+    api.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inline_agent_request_takes_agent_slot_before_role_and_blocking() {
+    assert!(ApiRuntime::wire_runs_inline());
+    let service = fixture();
+    service
+        .set_role_statement_limits(crate::admission::RoleStatementLimits {
+            concurrent: 1,
+            queue: 1,
+            wait_ms: 5_000,
+        })
+        .unwrap();
+    let api = ApiRuntime::new_agent(service.clone(), ApiLimits::default()).unwrap();
+    let session = open_agent_wire(&api);
+    let role = service
+        .admission
+        .statement(&agent_role(), None)
+        .await
+        .unwrap();
+    let task = launch_wire(&api, session, &sql(SQL), 5_000);
+    until("the request to queue for the role permit", || {
+        role_pool(&service) == (0, 1, 1)
+    })
+    .await;
+    // Waiting for the role permit, it already owns the agent slot and has
+    // not taken a blocking permit.
+    assert_eq!(service.agent_requests_admitted(), 1);
+    assert_eq!(service.blocking_permits_held(), 0);
+    drop(role);
+    let (_session, result) = task.await.unwrap();
+    assert_eq!(result.unwrap().reply.code, "ok");
+    assert_eq!(service.agent_requests_admitted(), 0);
+    assert_eq!(role_pool(&service), (1, 1, 0));
+    assert_eq!(service.blocking_permits_held(), 0);
+    api.shutdown().await;
 }

@@ -428,10 +428,11 @@ async fn wire_batch_never_reading_client_is_capped() {
         .await
         .expect("send wide-read batch")
         .unwrap();
-    wait_for(
-        "the unread batch to fill admission and reach the pending reply cap",
-        || stats.peak_in_flight() == limit && stats.peak_pending_reply_bytes() >= 2 * MAX_RESPONSE,
-    )
+    wait_for("an outstanding write to back up the unread batch", || {
+        stats.peak_in_flight() == limit
+            && stats.pending_reply_bytes() > 0
+            && stats.queued_requests() > 0
+    })
     .await;
 
     timeout(TEST_TIMEOUT, async {
@@ -442,6 +443,7 @@ async fn wire_batch_never_reading_client_is_capped() {
     .await
     .expect("50 pings while the batch client is not reading");
     assert!(Arc::ptr_eq(&stats, &connection_stats(&f, &unread)));
+    assert!(stats.pending_reply_bytes() > 0 && stats.queued_requests() > 0);
     let peak = stats.peak_pending_reply_bytes();
     assert!(
         peak <= 2 * MAX_RESPONSE + MAX_FRAME + HEADER_LEN,
@@ -523,12 +525,11 @@ async fn wire_batch_more_split_then_small_entries_keep_order_and_skipped() {
         .await
         .expect("send the blocked pipeline and split-reply batch");
         wait_for(
-            "the first three batch entries to fill the admitted queue",
+            "the blocked request, fillers and batch to reach the server",
             || {
                 f.admin.waiting_lock_count() == 1
                     && f.service.blocking_permits_held() == 1
-                    && stats.queued_requests() == fillers.len() + 3
-                    && stats.peak_in_flight() == limit
+                    && stats.received_frames() == fillers.len() + 2
             },
         )
         .await;
@@ -540,6 +541,7 @@ async fn wire_batch_more_split_then_small_entries_keep_order_and_skipped() {
                 assert_eq!(received, id);
                 assert_eq!(result.unwrap().code, "ok");
             }
+            assert_eq!(stats.peak_in_flight(), limit);
             assert_split_rows(&mut client, ids[0], &expected).await;
             for (index, &id) in ids.iter().enumerate().skip(1) {
                 let (header, body) = client.recv_raw_frame().await.unwrap();
