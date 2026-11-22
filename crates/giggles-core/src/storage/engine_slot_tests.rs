@@ -535,13 +535,11 @@ fn s6_drain_names_held_cursor_wakes_on_last_drop_and_refuses_install() {
     let p = session.prepare("SELECT id FROM t").unwrap();
     let cursor = session.open_cursor(&p, &[]).unwrap();
     let generation = slot(&admin).stop_admission(1).unwrap();
-    assert_eq!(
+    assert!(matches!(
         admin.storage_status(),
-        StorageStatus::Recovering {
-            generation: 1,
-            holders: vec![(Holder::Cursor, 1)]
-        },
-    );
+        StorageStatus::Recovering { generation: 1, holders, .. }
+            if holders == vec![(Holder::Cursor, 1)]
+    ));
     assert_eq!(
         generation.drain(Duration::ZERO),
         Err(DrainError::TimedOut {
@@ -929,8 +927,7 @@ fn close_proof_waits_for_rocksdb_snapshot_and_can_be_retried() {
 fn native_fence_preserves_write_fence_status_and_inner_refusals() {
     let (_dir, admin) = fixture();
     let db = admin.test_v2();
-    db.fence_native_commit();
-    admin.inner.fenced.store(true, Ordering::Release);
+    db.fence_native_commit(&admin.inner.fenced);
     assert!(!db.kv.is_fenced());
     assert!(admin.write_fence_status().is_ok());
     assert_eq!(
@@ -1120,10 +1117,10 @@ fn authorization_versions_refuse_a_registry_closed_during_the_observation() {
 fn recovery_maintenance_starts_after_publication() {
     let (_dir, admin) = fixture();
     let slot = slot(&admin);
-    let candidate = close_and_reopen(slot, slot.stop_admission(1).unwrap());
+    let mut candidate = close_and_reopen(slot, slot.stop_admission(1).unwrap());
     assert!(!candidate.db.as_ref().unwrap().test_maintenance_running());
     slot.install_with(
-        candidate,
+        &mut candidate,
         |db| {
             // The final health check passed, but this generation is still private.
             assert!(!db.test_maintenance_running());
@@ -1264,9 +1261,15 @@ fn copy_with_failed_old_reservation_cannot_regress_coverage_after_reopen() {
     for _ in 0..40 {
         normalize(&mut s, &old_copy).unwrap();
     }
+    // Admit recovery first. Fence the held counter write and its settlement
+    // on the existing lease, without attempting a reopen after a slot stop.
+    let generation = slot(&admin).stop_admission(1).unwrap();
     db.sequencer.stop_submissions();
     db.sequencer.gate_counter_writes(false);
-    assert_eq!(s.settle_sequences(), Err(CoreError::Fenced));
+    assert_eq!(
+        sql_sequences::settle(&db, &s.sequence_unsettled),
+        Err(CoreError::Fenced)
+    );
     assert_eq!(
         db.kv.get(Keyspace::Seq, &key).unwrap().unwrap(),
         before_reservation
@@ -1278,7 +1281,8 @@ fn copy_with_failed_old_reservation_cannot_regress_coverage_after_reopen() {
     let old_xact = Arc::clone(&s.xact);
     drop(db);
 
-    swap(&admin);
+    let candidate = close_and_reopen(slot(&admin), generation);
+    slot(&admin).install(candidate).unwrap();
     let mut advance = admin.sql_session();
     advance
         .execute_at("SELECT setval('seq', 1000)", &[], None, &clock)
@@ -1714,5 +1718,7 @@ fn close_drained_joins_workers_when_terminal_stop_wins() {
     // This owner prevents implicit V2Db drop from hiding a missed shutdown.
     assert!(!observer.db.test_maintenance_running());
     drop(observer);
+    assert!(latch.wait(Duration::ZERO).is_err());
+    drop(admin);
     latch.wait(WAIT).unwrap();
 }

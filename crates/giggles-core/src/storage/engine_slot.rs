@@ -1,6 +1,15 @@
 //! Process-local leases for the published engine generation.
 
 use super::{CoreError, V2Db, engine::kv::FenceCause, native_once::OnceOwners};
+#[cfg(feature = "engine-rocksdb")]
+use super::{
+    Inner,
+    engine::kv::{FenceClass, FenceSite, FenceState},
+    fence_supervisor::{FenceRecovery, Wake},
+    v2::OpenFailure,
+};
+#[cfg(feature = "engine-rocksdb")]
+use std::sync::OnceLock;
 use std::{
     num::NonZeroU64,
     ops::Deref,
@@ -12,7 +21,7 @@ use std::{
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Holder {
+pub enum Holder {
     Admin,
     Sql,
     Transaction,
@@ -69,6 +78,8 @@ struct Registry {
     kinds: [AtomicUsize; Holder::ALL.len()],
     drain: Mutex<()>,
     changed: Condvar,
+    #[cfg(feature = "engine-rocksdb")]
+    recovery_wake: OnceLock<Weak<Wake>>,
 }
 impl Registry {
     fn check(&self) -> Result<(), CoreError> {
@@ -94,6 +105,8 @@ impl Registry {
             kinds: Default::default(),
             drain: Mutex::new(()),
             changed: Condvar::new(),
+            #[cfg(feature = "engine-rocksdb")]
+            recovery_wake: OnceLock::new(),
         }
     }
 
@@ -148,8 +161,13 @@ impl Registry {
         // Pair with the waiter's predicate check and release of the wait mutex.
         let _guard = self.drain.lock().unwrap_or_else(|p| p.into_inner());
         self.changed.notify_all();
+        #[cfg(feature = "engine-rocksdb")]
+        if let Some(wake) = self.recovery_wake.get().and_then(Weak::upgrade) {
+            wake.signal();
+        }
     }
 
+    #[cfg(feature = "engine-rocksdb")]
     fn close(&self) {
         self.active.0.fetch_or(CLOSED, Ordering::AcqRel);
     }
@@ -179,7 +197,7 @@ impl Generation {
         })
     }
 
-    #[allow(dead_code, reason = "Used by the recovery supervisor")]
+    #[cfg_attr(not(feature = "engine-rocksdb"), allow(dead_code))]
     pub(crate) fn drain(&self, timeout: Duration) -> Result<(), DrainError> {
         self.drain_with(timeout, || {})
     }
@@ -217,7 +235,6 @@ impl Generation {
     /// Consume the drained owner and join the engine workers. The latch
     /// remains usable across timeouts while a residual native snapshot closes.
     #[cfg(feature = "engine-rocksdb")]
-    #[allow(dead_code, reason = "Used by the recovery supervisor")]
     pub(crate) fn close_drained(self: Arc<Self>) -> Result<ClosingGeneration, CoreError> {
         let active = self.registry.active.0.load(Ordering::Acquire);
         if active & (CLOSED | COUNT) != CLOSED {
@@ -253,7 +270,10 @@ pub(crate) struct ClosingGeneration {
 
 #[cfg(feature = "engine-rocksdb")]
 impl ClosingGeneration {
-    #[allow(dead_code, reason = "Used by the recovery supervisor")]
+    pub(super) fn notify_recovery(&self, wake: &Arc<Wake>) {
+        self.latch.notify_recovery(wake);
+    }
+
     pub(crate) fn wait(
         &self,
         timeout: Duration,
@@ -269,6 +289,7 @@ impl ClosingGeneration {
 
 /// A proof is specific to a slot and generation.
 #[cfg(feature = "engine-rocksdb")]
+#[derive(Clone)]
 pub(crate) struct ClosedProof {
     registry: Arc<Registry>,
     domain: [u8; 16],
@@ -281,6 +302,13 @@ pub(crate) struct ClosedProof {
 pub(crate) struct RecoveryCandidate {
     registry: Arc<Registry>,
     db: Option<V2Db>,
+}
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+impl RecoveryCandidate {
+    pub(super) fn db(&self) -> &V2Db {
+        self.db.as_ref().expect("unpublished recovery candidate")
+    }
 }
 
 #[cfg(feature = "engine-rocksdb")]
@@ -297,6 +325,36 @@ struct RecoverySource {
     path: std::path::PathBuf,
     identity: super::directory_identity::DirectoryIdentity,
     token: Option<Vec<u8>>,
+}
+
+/// Owns only the verified source and close proof, so the native open does
+/// not keep an Admin or slot alive.
+#[cfg(feature = "engine-rocksdb")]
+pub(super) struct RecoveryOpenRequest {
+    source: Arc<RecoverySource>,
+    proof: ClosedProof,
+    gc_retention: Option<Duration>,
+}
+
+#[cfg(feature = "engine-rocksdb")]
+impl RecoveryOpenRequest {
+    pub(super) fn open(&self) -> Result<RecoveryCandidate, OpenFailure> {
+        let db = V2Db::open_recovery(
+            &self.source.path,
+            self.source.token.as_deref(),
+            super::v2::RecoveryOpen {
+                ack_hw: self.proof.ack_hw,
+                gc_retention: self.gc_retention,
+                defer_maintenance: true,
+                identity: &self.source.identity,
+                expected_domain: Some(self.proof.domain),
+            },
+        )?;
+        Ok(RecoveryCandidate {
+            registry: Arc::clone(&self.proof.registry),
+            db: Some(db),
+        })
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -351,17 +409,26 @@ impl std::fmt::Debug for EngineLease {
     }
 }
 impl EngineLease {
-    pub(super) fn fence_engine_error(&self, site: super::engine::kv::FenceSite, error: &CoreError) {
-        self.kv.causes.record(FenceCause::for_core(site, error));
+    pub(super) fn fence_engine_error(
+        &self,
+        site: super::engine::kv::FenceSite,
+        error: &CoreError,
+        flag: &AtomicBool,
+    ) {
+        self.kv.causes.record_fence(FenceCause::for_core(site, error), flag, false);
     }
 
-    pub(super) fn fence_native_commit(&self) {
+    pub(super) fn fence_native_commit(&self, flag: &AtomicBool) {
         use super::engine::kv::{FenceClass, FenceSite};
-        self.kv.causes.record_if_empty(FenceCause::new(
-            FenceSite::NativeOnceCommit,
-            FenceClass::NotRecoverable,
-            &"engine commit outcome unknown",
-        ));
+        self.kv.causes.record_fence(
+            FenceCause::new(
+                FenceSite::NativeOnceCommit,
+                FenceClass::NotRecoverable,
+                &"engine commit outcome unknown",
+            ),
+            flag,
+            true,
+        );
     }
 
     pub(super) fn once_owners(&self) -> &OnceOwners {
@@ -439,33 +506,50 @@ impl Drop for EngineLease {
     }
 }
 
+#[cfg_attr(not(feature = "engine-rocksdb"), allow(dead_code))]
 enum State {
     Serving(Arc<Generation>),
     Recovering {
         generation: u64,
         registry: Arc<Registry>,
+        #[cfg(feature = "engine-rocksdb")]
+        causes: Arc<FenceState>,
+        since: Instant,
+        attempt: u32,
     },
     GaveUp {
         generation: u64,
         cause: FenceCause,
         registry: Arc<Registry>,
+        since: Instant,
+        attempts: u32,
     },
-    Stopping(Arc<Registry>),
+    Stopping {
+        // Keep the stopped engine alive through the service drain.
+        _generation: Option<Arc<Generation>>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum StorageStatus {
+pub enum StorageStatus {
     Legacy,
     Serving {
         generation: u64,
+        fenced: bool,
+        cause: Option<FenceCause>,
         holders: Counts,
     },
     Recovering {
         generation: u64,
+        since: Instant,
+        attempt: u32,
+        cause: Option<FenceCause>,
         holders: Counts,
     },
     GaveUp {
         generation: u64,
+        since: Instant,
+        attempts: u32,
         cause: FenceCause,
         holders: Counts,
     },
@@ -491,7 +575,9 @@ pub(crate) struct EngineSlot {
     #[cfg_attr(not(feature = "engine-rocksdb"), allow(dead_code, reason = "Owns the initial registry for the slot lifetime"))]
     publications: Mutex<Vec<Arc<Registry>>>,
     #[cfg(feature = "engine-rocksdb")]
-    recovery_source: Option<Box<RecoverySource>>,
+    recovery_source: Option<Arc<RecoverySource>>,
+    #[cfg(feature = "engine-rocksdb")]
+    recovery_wake: OnceLock<Arc<Wake>>,
     settings: Mutex<Box<Settings>>,
     cluster: bool,
     pub(super) native_fenced: Arc<AtomicBool>,
@@ -509,6 +595,8 @@ impl EngineSlot {
             publications: Mutex::new(vec![registry]),
             #[cfg(feature = "engine-rocksdb")]
             recovery_source: None,
+            #[cfg(feature = "engine-rocksdb")]
+            recovery_wake: OnceLock::new(),
             settings: Mutex::default(),
             cluster,
             native_fenced: Arc::default(),
@@ -523,12 +611,64 @@ impl EngineSlot {
     ) -> Self {
         let identity = db.directory_identity.take();
         let mut slot = Self::new(db);
-        slot.recovery_source = identity.map(|identity| Box::new(RecoverySource {
+        slot.recovery_source = identity.map(|identity| Arc::new(RecoverySource {
             path: path.to_path_buf(),
             identity,
             token: token.map(<[u8]>::to_vec),
         }));
         slot
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    pub(super) fn set_fence_recovery(
+        &self,
+        owner: Weak<Inner>,
+        settings: FenceRecovery,
+    ) -> Result<(), CoreError> {
+        self.start_recovery(settings, |wake| super::fence_supervisor::spawn(owner, wake, settings))
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    pub(super) fn start_recovery(
+        &self,
+        settings: FenceRecovery,
+        spawn: impl FnOnce(Arc<Wake>) -> std::io::Result<()>,
+    ) -> Result<(), CoreError> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !settings.enabled && self.recovery_wake.get().is_none() {
+            return Ok(());
+        }
+        let State::Serving(generation) = &*state else {
+            return Err(CoreError::Fenced);
+        };
+        if generation.db.sequencer.stopped() {
+            return Err(CoreError::Fenced);
+        }
+        if self.recovery_wake.get().is_some() {
+            return Err(CoreError::Storage("fence recovery is already configured".into()));
+        }
+        settings.validate()?;
+        if self.recovery_source.is_none() || generation.db.task_kernel_unsupported()
+            || !cfg!(any(target_os = "linux", windows))
+        {
+            return Err(CoreError::Unsupported);
+        }
+        let wake = Arc::new(Wake::default());
+        spawn(Arc::clone(&wake)).map_err(|e| CoreError::Storage(e.to_string()))?;
+        self.watch_generation(generation, &wake);
+        assert!(self.recovery_wake.set(wake).is_ok());
+        Ok(())
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    fn watch_generation(&self, generation: &Generation, wake: &Arc<Wake>) {
+        assert!(generation.registry.recovery_wake.set(Arc::downgrade(wake)).is_ok());
+        generation.db.kv.causes.notify_recovery(generation.id, wake);
+    }
+
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(super) fn recovery_enabled(&self) -> bool {
+        self.recovery_wake.get().is_some()
     }
 
     pub(crate) fn is_cluster(&self) -> bool {
@@ -598,20 +738,15 @@ impl EngineSlot {
 
     pub(crate) fn stop_submissions(&self) {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let generation = match &*state {
-            State::Serving(generation) => {
-                generation.db.sequencer.stop_submissions();
-                return;
-            }
-            State::Recovering { registry, .. }
-            | State::GaveUp { registry, .. }
-            | State::Stopping(registry) => registry.generation.upgrade(),
-        };
-        if let Some(generation) = &generation {
+        #[cfg(feature = "engine-rocksdb")]
+        let enabled = self.recovery_wake.get().is_some();
+        #[cfg(not(feature = "engine-rocksdb"))]
+        let enabled = false;
+        if !enabled && let State::Serving(generation) = &*state {
             generation.db.sequencer.stop_submissions();
+            return;
         }
-        drop(state);
-        drop(generation);
+        self.stop_locked(state, || {});
     }
 
     pub(crate) fn set_gc_retention(&self, retention: Duration) -> Result<(), CoreError> {
@@ -669,7 +804,7 @@ impl EngineSlot {
             State::Recovering { registry, .. } | State::GaveUp { registry, .. } => {
                 registry.generation.upgrade()
             }
-            State::Stopping(registry) => registry.generation.upgrade(),
+            State::Stopping { .. } => self.registry().generation.upgrade(),
         };
         if let Some(generation) = &generation {
             generation.db.sequencer.set_sync_hook(hook.clone());
@@ -701,150 +836,218 @@ impl EngineSlot {
         }
     }
 
-    #[allow(dead_code, reason = "Used by the recovery supervisor")]
     pub(crate) fn status(&self) -> StorageStatus {
         match &*self.state.lock().unwrap_or_else(|p| p.into_inner()) {
             State::Serving(g) => StorageStatus::Serving {
                 generation: g.id,
+                fenced: g.db.is_fenced() || self.native_fenced.load(Ordering::Acquire),
+                cause: g.db.fence_cause(),
                 holders: g.registry.counts(),
             },
             State::Recovering {
                 generation,
                 registry,
+                since,
+                attempt,
+                #[cfg(feature = "engine-rocksdb")]
+                causes,
             } => StorageStatus::Recovering {
                 generation: *generation,
+                since: *since,
+                attempt: *attempt,
+                #[cfg(feature = "engine-rocksdb")]
+                cause: causes.cause(),
+                #[cfg(not(feature = "engine-rocksdb"))]
+                cause: None,
                 holders: registry.counts(),
             },
             State::GaveUp {
                 generation,
                 cause,
                 registry,
+                since,
+                attempts,
             } => StorageStatus::GaveUp {
                 generation: *generation,
+                since: *since,
+                attempts: *attempts,
                 cause: cause.clone(),
                 holders: registry.counts(),
             },
-            State::Stopping(_) => StorageStatus::Stopping,
+            State::Stopping { .. } => StorageStatus::Stopping,
         }
     }
 
-    #[allow(dead_code, reason = "Used by the recovery supervisor")]
+    #[cfg(all(test, feature = "engine-rocksdb"))]
     pub(crate) fn stop_admission(&self, expected: u64) -> Option<Arc<Generation>> {
+        self.admit_recovery(expected, false).map(|(generation, _)| generation)
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    pub(super) fn admit_recovery(
+        &self,
+        expected: u64,
+        require_recoverable: bool,
+    ) -> Option<(Arc<Generation>, Arc<FenceState>)> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let State::Serving(generation) = &*state else {
             return None;
         };
-        if generation.id != expected || generation.db.task_kernel_unsupported() {
+        if generation.id != expected || generation.db.sequencer.stopped()
+            || generation.db.task_kernel_unsupported()
+        {
             return None;
         }
-        generation.registry.close();
         let generation = Arc::clone(generation);
-        *state = State::Recovering {
-            generation: expected,
-            registry: Arc::clone(&generation.registry),
-        };
-        self.changed.notify_all();
-        Some(generation)
-    }
-
-    #[allow(dead_code, reason = "Used by the recovery supervisor")]
-    pub(crate) fn give_up(&self, expected: u64, cause: FenceCause) {
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if let State::Recovering {
-            generation,
-            registry,
-        } = &*state
-            && *generation == expected
-        {
-            *state = State::GaveUp {
+        let causes = Arc::clone(&generation.db.kv.causes);
+        causes.with_cause(|cause| {
+            if require_recoverable
+                && (!(generation.db.is_fenced() || self.native_fenced.load(Ordering::Acquire))
+                    || !cause.is_some_and(|cause| {
+                        cause.class == FenceClass::Recoverable && cause.generation == expected
+                    }))
+            {
+                return None;
+            }
+            generation.registry.close();
+            *state = State::Recovering {
                 generation: expected,
-                cause,
-                registry: Arc::clone(registry),
+                registry: Arc::clone(&generation.registry),
+                causes: Arc::clone(&causes),
+                since: Instant::now(),
+                attempt: 0,
             };
             self.changed.notify_all();
-        }
+            Some((generation, Arc::clone(&causes)))
+        })
     }
 
-    /// Seed GC during open and keep its worker parked until publication.
     #[cfg(feature = "engine-rocksdb")]
-    #[allow(dead_code, reason = "Used by the recovery supervisor")]
-    pub(crate) fn reopen_candidate(
+    pub(super) fn give_up(&self, expected: u64, mut cause: FenceCause) -> Option<(FenceCause, u32)> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let State::Recovering { generation, registry, causes, attempt, .. } = &*state else {
+            return None;
+        };
+        if *generation != expected { return None; }
+        let causes = Arc::clone(causes);
+        let registry = Arc::clone(registry);
+        let attempts = *attempt;
+        causes.with_cause(|latest| {
+            if let Some(latest) = latest.filter(|c| c.class != FenceClass::Recoverable) {
+                cause = latest.clone();
+            }
+            cause.generation = expected;
+            *state = State::GaveUp {
+                generation: expected,
+                cause: cause.clone(),
+                registry,
+                since: Instant::now(),
+                attempts,
+            };
+            self.changed.notify_all();
+            Some((cause, attempts))
+        })
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    pub(super) fn reopen_request(
         &self,
         proof: &ClosedProof,
-    ) -> Result<RecoveryCandidate, super::v2::OpenFailure> {
-        let source = self.recovery_source.as_deref().ok_or(CoreError::Unsupported)?;
-        {
-            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            if !matches!(&*state, State::Recovering { registry, .. } if Arc::ptr_eq(registry, &proof.registry)) {
-                return Err(CoreError::Fenced.into());
-            }
+        attempt: u32,
+    ) -> Result<RecoveryOpenRequest, OpenFailure> {
+        let source = self.recovery_source.as_ref().ok_or(CoreError::Unsupported)?;
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let State::Recovering { registry, causes, attempt: current, .. } = &mut *state else {
+            return Err(CoreError::Fenced.into());
+        };
+        if !Arc::ptr_eq(registry, &proof.registry) {
+            return Err(CoreError::Fenced.into());
         }
-        let gc_retention = self
-            .settings
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .gc_retention;
-        let db = V2Db::open_recovery(
-            &source.path,
-            source.token.as_deref(),
-            super::v2::RecoveryOpen {
-                ack_hw: proof.ack_hw,
+        causes.with_cause(|cause| {
+            if let Some(cause) = cause.filter(|c| c.class != FenceClass::Recoverable) {
+                return Err(OpenFailure { error: CoreError::Fenced, cause: cause.clone() });
+            }
+            *current = attempt;
+            let gc_retention = self.settings.lock().unwrap_or_else(|p| p.into_inner()).gc_retention;
+            Ok(RecoveryOpenRequest {
+                source: Arc::clone(source),
+                proof: proof.clone(),
                 gc_retention,
-                defer_maintenance: true,
-                source: Some((&source.identity, proof.domain)),
-            },
-        )?;
-        Ok(RecoveryCandidate { registry: Arc::clone(&proof.registry), db: Some(db) })
+            })
+        })
+    }
+
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn reopen_candidate(&self, proof: &ClosedProof) -> Result<RecoveryCandidate, OpenFailure> {
+        self.reopen_request(proof, 1)?.open()
+    }
+
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn install(&self, mut candidate: RecoveryCandidate) -> Result<(), CoreError> {
+        self.install_recovery(&mut candidate).map_err(|_| CoreError::Fenced)
     }
 
     #[cfg(feature = "engine-rocksdb")]
-    #[allow(dead_code, reason = "Used by the recovery supervisor")]
-    pub(crate) fn install(&self, candidate: RecoveryCandidate) -> Result<(), CoreError> {
+    pub(super) fn install_recovery(&self, candidate: &mut RecoveryCandidate) -> Result<(), FenceCause> {
         self.install_with(candidate, |_| {}, || {})
     }
 
     #[cfg(feature = "engine-rocksdb")]
     fn install_with(
         &self,
-        mut candidate: RecoveryCandidate,
+        candidate: &mut RecoveryCandidate,
         before_publish: impl FnOnce(&V2Db),
         after_publish: impl FnOnce(),
-    ) -> Result<(), CoreError> {
+    ) -> Result<(), FenceCause> {
+        let refused = |text: &str| FenceCause::new(FenceSite::Open, FenceClass::NotRecoverable, &text);
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if let State::Recovering {
-            generation,
-            registry,
-        } = &*state
-            && Arc::ptr_eq(registry, &candidate.registry)
-            && let Some(next) = generation.checked_add(1)
-        {
-            let db = candidate.db.as_ref().expect("unpublished recovery candidate");
-            let settings = self.settings.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(retention) = settings.gc_retention {
-                db.set_gc_retention(retention);
-            }
-            if let Some(config) = &settings.task_retention {
-                db.set_task_retention(*config);
-            }
-            if let Some(ms) = settings.task_wall_ms {
-                db.set_wall_clock(Arc::new(super::engine::commit::ManualClock::new(ms)));
-            }
-            #[cfg(any(test, feature = "test-commit-sync"))]
-            db.sequencer.set_sync_hook(settings.sync_hook.clone());
-            if !db.kv.is_fenced() && db.fence_cause().is_none() && db.sequencer.is_accepting() {
-                before_publish(db);
-                let db = candidate.db.take().expect("healthy recovery candidate");
-                let generation = Generation::new(next, db, Some(registry.prepared.slot));
-                self.native_fenced.store(false, Ordering::Release);
-                self.publish(&mut state, Arc::clone(&generation));
-                after_publish();
-                generation.db.start_recovery_maintenance();
-                return Ok(());
-            }
+        let State::Recovering { generation, registry, causes, .. } = &*state else {
+            return Err(refused("storage is no longer recovering"));
+        };
+        if !Arc::ptr_eq(registry, &candidate.registry) {
+            return Err(refused("recovery candidate belongs to another generation"));
         }
-        // Candidate Drop joins its workers outside the slot lock.
-        drop(state);
-        Err(CoreError::Fenced)
+        let next = generation.checked_add(1).ok_or_else(|| refused("storage generation exhausted"))?;
+        let slot_id = registry.prepared.slot;
+        let causes = Arc::clone(causes);
+        let db = candidate.db.as_ref().expect("unpublished recovery candidate");
+        let settings = self.settings.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(retention) = settings.gc_retention {
+            db.set_gc_retention(retention);
+        }
+        if let Some(config) = &settings.task_retention {
+            db.set_task_retention(*config);
+        }
+        if let Some(ms) = settings.task_wall_ms {
+            db.set_wall_clock(Arc::new(super::engine::commit::ManualClock::new(ms)));
+        }
+        #[cfg(any(test, feature = "test-commit-sync"))]
+        db.sequencer.set_sync_hook(settings.sync_hook.clone());
+        // Serialize publication with a terminal fence report from the old
+        // generation. The candidate's maintenance is still paused.
+        causes.with_cause(|old| {
+            if let Some(cause) = old.filter(|cause| cause.class != FenceClass::Recoverable) {
+                return Err(cause.clone());
+            }
+            let db = candidate.db.as_ref().expect("unpublished recovery candidate");
+            if let Some(cause) = db.fence_cause() {
+                return Err(cause);
+            }
+            if db.is_fenced() || !db.sequencer.is_accepting() {
+                return Err(refused("recovery candidate is fenced or not accepting commits"));
+            }
+            before_publish(db);
+            let db = candidate.db.take().expect("healthy recovery candidate");
+            let generation = Generation::new(next, db, Some(slot_id));
+            if let Some(wake) = self.recovery_wake.get() {
+                self.watch_generation(&generation, wake);
+            }
+            self.native_fenced.store(false, Ordering::Release);
+            self.publish(&mut state, Arc::clone(&generation));
+            after_publish();
+            generation.db.start_recovery_maintenance();
+            Ok(())
+        })
     }
 
     #[allow(dead_code, reason = "Used by the recovery supervisor")]
@@ -853,36 +1056,39 @@ impl EngineSlot {
     }
 
     fn stop_with(&self, after_publish: impl FnOnce()) {
-        let (old, recovering) = {
-            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            let mut recovering = None;
-            let registry = match &*state {
-                State::Serving(generation) => {
-                    generation.db.sequencer.stop_submissions();
-                    &generation.registry
-                }
-                State::Recovering { registry, .. } | State::GaveUp { registry, .. } => {
-                    recovering = registry.generation.upgrade();
-                    if let Some(generation) = &recovering {
-                        generation.db.sequencer.stop_submissions();
-                    }
-                    registry
-                }
-                State::Stopping(_) => return,
-            };
-            registry.stop();
-            let stopping = State::Stopping(Arc::clone(registry));
-            let old = std::mem::replace(&mut *state, stopping);
-            self.changed.notify_all();
-            (old, recovering)
+        self.stop_locked(self.state.lock().unwrap_or_else(|p| p.into_inner()), after_publish);
+    }
+
+    fn stop_locked(&self, mut state: std::sync::MutexGuard<'_, State>, after_publish: impl FnOnce()) {
+        let (registry, generation) = match &*state {
+            State::Serving(generation) => (&generation.registry, Some(Arc::clone(generation))),
+            State::Recovering { registry, .. } | State::GaveUp { registry, .. } => {
+                (registry, registry.generation.upgrade())
+            }
+            State::Stopping { .. } => return,
         };
+        if let Some(generation) = &generation {
+            generation.db.sequencer.stop_submissions();
+        }
+        registry.stop();
+        let old = std::mem::replace(&mut *state, State::Stopping { _generation: generation });
+        self.changed.notify_all();
+        #[cfg(feature = "engine-rocksdb")]
+        if let Some(wake) = self.recovery_wake.get() {
+            wake.stop();
+        }
+        drop(state);
         after_publish();
-        drop((old, recovering));
+        drop(old);
     }
 }
 
 impl Drop for EngineSlot {
     fn drop(&mut self) {
+        #[cfg(feature = "engine-rocksdb")]
+        if let Some(wake) = self.recovery_wake.get() {
+            wake.stop();
+        }
         // Release the identity handle before stopping or dropping a generation
         // can close RocksDB and signal its latch.
         #[cfg(feature = "engine-rocksdb")]

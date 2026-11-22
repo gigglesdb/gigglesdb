@@ -16,13 +16,22 @@ pub(super) fn error_text(error: &impl Display) -> String {
     text
 }
 
-pub(super) fn error(cause: String) {
+pub(in crate::storage) fn error(cause: String) {
+    log("ERROR", cause);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+pub(in crate::storage) fn info(message: String) {
+    log("INFO", message);
+}
+
+fn log(level: &'static str, message: String) {
     // The writer may wait on stderr; the sequencer and catalog caller never do.
     let _ = std::thread::Builder::new()
         .name("engine-diagnostic".into())
         .spawn(move || {
             use std::io::Write;
-            let _ = writeln!(std::io::stderr(), "level=ERROR {cause}");
+            let _ = writeln!(std::io::stderr(), "level={level} {message}");
         });
 }
 

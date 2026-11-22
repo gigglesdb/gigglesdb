@@ -13,9 +13,13 @@ mod once_session;
 #[cfg(feature = "engine-rocksdb")]
 mod directory_identity;
 mod engine_slot;
-pub(crate) use engine_slot::{EngineLease, Holder};
+pub(crate) use engine_slot::EngineLease;
+pub use engine_slot::{Holder, StorageStatus};
+mod fence_supervisor;
+pub use fence_supervisor::FenceRecovery;
+pub use engine::kv::{FenceCause, FenceClass, FenceSite, RocksStatus};
 pub(crate) use engine_slot::{GenerationTag, PreparedGeneration};
-use engine_slot::{EngineSlot, StorageStatus};
+use engine_slot::EngineSlot;
 /// Task preview `schema_fp` input (GD-0061 R3-701): the catalog encodings of
 /// `table` and each of `constraints`, in the order given.
 pub(crate) fn task_schema_bytes(
@@ -1267,6 +1271,21 @@ impl Admin {
         if let Backend::V2(slot) = &self.inner.backend { slot.set_sync_hook(hook); }
     }
 
+    /// Opt in to automatic fence recovery on a local V2 RocksDB directory.
+    /// Configure once before serving traffic. A running supervisor cannot be
+    /// reconfigured. Disabled settings on an unconfigured Admin are a no-op.
+    ///
+    /// After the last Admin is dropped, a recovery open already in progress
+    /// may hold the writer lock and, on Windows, the directory pin until the
+    /// open finishes.
+    pub fn set_fence_recovery(&self, settings: FenceRecovery) -> Result<(), CoreError> {
+        #[cfg(feature = "engine-rocksdb")]
+        if let Backend::V2(slot) = &self.inner.backend {
+            return slot.set_fence_recovery(Arc::downgrade(&self.inner), settings);
+        }
+        if settings.enabled { Err(CoreError::Unsupported) } else { Ok(()) }
+    }
+
     /// Test seam for expiry, receipt, preview and retention timestamps.
     /// None restores the system clock.
     #[doc(hidden)]
@@ -1279,8 +1298,8 @@ impl Admin {
         self.inner.lease(kind)
     }
 
-    #[allow(dead_code, reason = "Used by the recovery supervisor")]
-    pub(crate) fn storage_status(&self) -> StorageStatus {
+    /// Observe the local storage generation without acquiring an engine lease.
+    pub fn storage_status(&self) -> StorageStatus {
         match &self.inner.backend {
             Backend::Legacy(_) => StorageStatus::Legacy,
             Backend::V2(slot) => slot.status(),

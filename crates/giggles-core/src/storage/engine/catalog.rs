@@ -407,6 +407,9 @@ fn read_current_version(visible: Ts, version: &std::sync::atomic::AtomicU64) -> 
 /// held while waiting for a transaction lock.
 pub(crate) struct Catalog {
     cache: Mutex<CatalogCache>,
+    // Recovery observes this while holding the cause mutex. Catalog reload
+    // records its cause with the cache mutex already held.
+    poisoned: std::sync::atomic::AtomicBool,
     current: RwLock<Option<(Ts, Arc<CatalogSnapshot>)>>,
     current_version: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
@@ -445,6 +448,7 @@ impl Catalog {
         }
         Ok(Self {
             cache: Mutex::new(cache),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
             current: RwLock::new(None),
             current_version: Arc::new(std::sync::atomic::AtomicU64::new(visible.0)),
             #[cfg(test)]
@@ -470,6 +474,10 @@ impl Catalog {
             .map_err(|_| TxnError::Misuse)?
             .ensure_live()?;
         Ok(())
+    }
+
+    pub(in crate::storage) fn is_poisoned(&self) -> bool {
+        self.poisoned.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// A local committed generation, or None during publication or before warming.
@@ -1389,11 +1397,7 @@ impl Catalog {
                             None => FenceCause::for_core(FenceSite::CatalogReload, &error),
                         };
                         recorded.error_text = cause.clone();
-                        if follow_kv_fence {
-                            state.record_if_empty(recorded);
-                        } else {
-                            state.record(recorded);
-                        }
+                        state.record_fence(recorded, &self.poisoned, follow_kv_fence);
                     }
                     cache.poison_cause = Some(cause);
                     // Durability already succeeded. Never expose the previous

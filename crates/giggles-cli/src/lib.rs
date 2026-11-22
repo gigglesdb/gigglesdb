@@ -635,6 +635,7 @@ pub fn run(
     let admin = if options.create {
         Admin::create(&options.database, Limits::default())
     } else {
+        // The one-shot CLI leaves automatic fence recovery disabled.
         Admin::open(&options.database, Limits::default())
     }
     .map_err(sql)?;

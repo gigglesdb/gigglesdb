@@ -1,5 +1,6 @@
 //! Optional RocksDB implementation of the storage-engine KV seam.
 use super::kv::*;
+use crate::storage::directory_identity::PinnedDirectory;
 use rocksdb::{
     AsColumnFamilyRef, AsRawPtr, BlockBasedOptions, Cache, DB, DBCompressionType, DBRecoveryMode,
     IngestExternalFileOptions, IteratorMode, Options, SstFileWriter, WriteOptions,
@@ -17,8 +18,10 @@ use std::{
 
 pub(crate) const WRITER_LOCK_FILE: &str = "giggles.lock";
 
-/// Never unlink this file: stale contents are harmless, but replacing its inode
-/// would let a new opener lock a different file while the old writer is alive.
+pub(in crate::storage) const WRITER_LOCK_HELD: &str = "database already open by another writer";
+
+/// Never unlink the lock file: replacing its inode would let a new opener
+/// lock a different file while the old writer is alive.
 pub(crate) struct WriterLock {
     _file: File,
 }
@@ -42,7 +45,7 @@ impl WriterLock {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
                 return Err(KvError::Io(
-                    "database already open by another writer".into(),
+                    WRITER_LOCK_HELD.into(),
                 ));
             }
             Err(TryLockError::Error(error)) => return Err(io_error(error)),
@@ -92,6 +95,7 @@ struct PointPool {
 struct CloseState {
     closed: Mutex<bool>,
     wake: Condvar,
+    recovery: std::sync::OnceLock<std::sync::Weak<super::super::fence_supervisor::Wake>>,
 }
 
 #[derive(Clone, Default)]
@@ -102,6 +106,10 @@ pub(crate) struct StillHeld;
 
 #[allow(dead_code, reason = "Used by the later recovery supervisor")]
 impl CloseLatch {
+    pub(in crate::storage) fn notify_recovery(&self, wake: &Arc<super::super::fence_supervisor::Wake>) {
+        assert!(self.0.recovery.set(Arc::downgrade(wake)).is_ok());
+    }
+
     pub(crate) fn wait(&self, timeout: Duration) -> Result<(), StillHeld> {
         let closed = self.0.closed.lock().unwrap_or_else(|p| p.into_inner());
         let (closed, _) = self.0.wake.wait_timeout_while(closed, timeout, |closed| !*closed)
@@ -110,13 +118,16 @@ impl CloseLatch {
     }
 }
 
-/// Declared after the native DB and writer lock so neither can outlive the signal.
+/// Declared last so the DB, writer lock and directory pin are already closed.
 struct SignalClose(CloseLatch);
 impl Drop for SignalClose {
     fn drop(&mut self) {
         let CloseLatch(state) = &self.0;
         *state.closed.lock().unwrap_or_else(|p| p.into_inner()) = true;
         state.wake.notify_all();
+        if let Some(wake) = state.recovery.get().and_then(std::sync::Weak::upgrade) {
+            wake.signal();
+        }
     }
 }
 
@@ -145,6 +156,7 @@ struct LockedDb {
     // Field order matters: close RocksDB before releasing the explicit lock.
     db: DB,
     _writer_lock: WriterLock,
+    _directory_pin: Option<File>,
     close: SignalClose,
 }
 
@@ -176,16 +188,23 @@ impl Drop for RocksKv {
 
 impl RocksKv {
     pub(crate) fn open(path: &Path, cache_bytes: usize) -> Result<Self, KvError> {
-        Self::open_in_mode(path, cache_bytes, DBRecoveryMode::PointInTime)
-    }
-
-    pub(crate) fn open_recovery(path: &Path, cache_bytes: usize) -> Result<Self, KvError> {
-        Self::open_in_mode(path, cache_bytes, DBRecoveryMode::TolerateCorruptedTailRecords)
-    }
-
-    fn open_in_mode(path: &Path, cache_bytes: usize, mode: DBRecoveryMode) -> Result<Self, KvError> {
         std::fs::create_dir_all(path).map_err(|error| KvError::Io(error.to_string()))?;
-        Self::open_locked_in_mode(path, cache_bytes, WriterLock::acquire(path)?, mode)
+        Self::open_locked(path, cache_bytes, WriterLock::acquire(path)?)
+    }
+
+    pub(in crate::storage) fn open_recovery(
+        pin: PinnedDirectory,
+        cache_bytes: usize,
+    ) -> Result<Self, KvError> {
+        let (directory, path) = pin.into_parts();
+        let writer_lock = WriterLock::acquire(&path)?;
+        Self::open_locked_in_mode(
+            &path,
+            cache_bytes,
+            writer_lock,
+            DBRecoveryMode::TolerateCorruptedTailRecords,
+            Some(directory),
+        )
     }
 
     pub(crate) fn close_latch(&self) -> CloseLatch {
@@ -225,7 +244,7 @@ impl RocksKv {
         cache_bytes: usize,
         writer_lock: WriterLock,
     ) -> Result<Self, KvError> {
-        Self::open_locked_in_mode(path, cache_bytes, writer_lock, DBRecoveryMode::PointInTime)
+        Self::open_locked_in_mode(path, cache_bytes, writer_lock, DBRecoveryMode::PointInTime, None)
     }
 
     fn open_locked_in_mode(
@@ -233,6 +252,7 @@ impl RocksKv {
         cache_bytes: usize,
         writer_lock: WriterLock,
         mode: DBRecoveryMode,
+        directory_pin: Option<File>,
     ) -> Result<Self, KvError> {
         let cache = Cache::new_lru_cache(cache_bytes);
         let mut table = BlockBasedOptions::default();
@@ -282,6 +302,7 @@ impl RocksKv {
                 points: Mutex::new(PointPool::default()),
                 db,
                 _writer_lock: writer_lock,
+                _directory_pin: directory_pin,
                 close: SignalClose(CloseLatch::default()),
             }),
         })

@@ -1,6 +1,6 @@
 //! Minimal v2 lifecycle. Public legacy operations fail before admission or mutation.
 #[cfg(feature = "engine-rocksdb")]
-use super::{directory_identity::DirectoryIdentity, io};
+use super::{directory_identity::{DirectoryIdentity, RecoveryDirectoryError}, io};
 use super::{CoreError, engine};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -130,13 +130,13 @@ pub(crate) struct RecoveryOpen<'a> {
     pub(crate) ack_hw: engine::hlc::Ts,
     pub(crate) gc_retention: Option<std::time::Duration>,
     pub(super) defer_maintenance: bool,
-    /// Required by the slot. Lower-level recovery-mode tests can omit it.
-    pub(super) source: Option<(&'a DirectoryIdentity, [u8; 16])>,
+    pub(super) identity: &'a DirectoryIdentity,
+    /// The slot supplies its domain. Replay-only tests can omit this check.
+    pub(super) expected_domain: Option<[u8; 16]>,
 }
 
 #[cfg(feature = "engine-rocksdb")]
 #[derive(Debug)]
-#[allow(dead_code, reason = "Used by the later recovery supervisor")]
 pub(crate) struct OpenFailure {
     pub(crate) error: CoreError,
     pub(crate) cause: engine::kv::FenceCause,
@@ -144,6 +144,34 @@ pub(crate) struct OpenFailure {
 
 #[cfg(feature = "engine-rocksdb")]
 impl OpenFailure {
+    fn recovery_directory(error: RecoveryDirectoryError) -> Self {
+        use engine::kv::{FenceCause, FenceClass, FenceSite};
+        Self {
+            cause: FenceCause::new(
+                FenceSite::Open,
+                if matches!(error, RecoveryDirectoryError::Io(_)) {
+                    FenceClass::Recoverable
+                } else {
+                    FenceClass::Data
+                },
+                &error,
+            ),
+            error: match error {
+                RecoveryDirectoryError::Io(error) => io(error),
+                _ => CoreError::Fenced,
+            },
+        }
+    }
+
+    fn at_recovery_path(mut self, path: &Path) -> Self {
+        self.cause.error_text = engine::kv::FenceCause::new(
+            self.cause.site,
+            self.cause.class,
+            &format_args!("recovery directory {path:?}: {}", self.cause.error_text),
+        ).error_text;
+        self
+    }
+
     fn from_startup_error(error: CoreError, kv: &engine::kv::Kv) -> Self {
         use engine::kv::FenceClass;
         let mut failure = Self::from(error);
@@ -166,10 +194,62 @@ impl From<CoreError> for OpenFailure {
 }
 
 #[cfg(feature = "engine-rocksdb")]
+pub(super) trait WriterLockContention {
+    fn is_writer_lock_held(&self) -> bool;
+}
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+impl WriterLockContention for engine::kv::KvError {
+    fn is_writer_lock_held(&self) -> bool {
+        matches!(self, Self::Io(message) if message == engine::kv_rocksdb::WRITER_LOCK_HELD)
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+impl WriterLockContention for CoreError {
+    fn is_writer_lock_held(&self) -> bool {
+        matches!(self, Self::Storage(message) if message == engine::kv_rocksdb::WRITER_LOCK_HELD)
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+impl WriterLockContention for OpenFailure {
+    fn is_writer_lock_held(&self) -> bool {
+        self.error.is_writer_lock_held()
+    }
+}
+
+/// E483: a forked child can hold the previous writer's flock after the
+/// close latch fires. The caller owns the deadline and interruptible wait.
+#[cfg(feature = "engine-rocksdb")]
+pub(super) fn retry_writer_lock<T, E: WriterLockContention>(
+    mut open: impl FnMut() -> Result<T, E>,
+    mut retry: impl FnMut() -> bool,
+) -> Result<T, E> {
+    loop {
+        let result = open();
+        if !result.as_ref().is_err_and(WriterLockContention::is_writer_lock_held) || !retry() {
+            return result;
+        }
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+fn kv_open_cause(error: &engine::kv::KvError) -> engine::kv::FenceCause {
+    use engine::{kv::{FenceCause, FenceClass, FenceSite, KvError}, kv_rocksdb::WRITER_LOCK_HELD};
+    match error {
+        KvError::Io(message) => {
+            let site = if message == WRITER_LOCK_HELD { FenceSite::WriterLock } else { FenceSite::Open };
+            FenceCause::new(site, FenceClass::Recoverable, error)
+        }
+        _ => FenceCause::for_kv(FenceSite::Open, error),
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
 impl From<engine::kv::KvError> for OpenFailure {
     fn from(error: engine::kv::KvError) -> Self {
-        use engine::kv::{FenceCause, FenceSite};
-        let cause = FenceCause::for_kv(FenceSite::Open, &error);
+        let cause = kv_open_cause(&error);
         Self { error: error.into(), cause }
     }
 }
@@ -187,11 +267,11 @@ impl From<engine::txn::TxnError> for OpenFailure {
 #[cfg(feature = "engine-rocksdb")]
 impl From<engine::meta::FormatError> for OpenFailure {
     fn from(error: engine::meta::FormatError) -> Self {
-        use engine::{kv::{FenceCause, FenceSite}, meta::FormatError};
+        use engine::meta::FormatError;
         match error {
             FormatError::WrappedIo { message, source } => Self {
                 error: CoreError::Corrupt(message),
-                cause: FenceCause::for_kv(FenceSite::Open, &source),
+                cause: kv_open_cause(&source),
             },
             other => format_error(other).into(),
         }
@@ -219,7 +299,6 @@ impl V2Db {
     }
 
     #[cfg(feature = "engine-rocksdb")]
-    #[allow(dead_code, reason = "Used by the later recovery supervisor")]
     pub(crate) fn close_latch(&self) -> Option<engine::kv_rocksdb::CloseLatch> {
         self.kv.close_latch()
     }
@@ -228,6 +307,9 @@ impl V2Db {
         self.kv.causes.cause()
     }
 
+    pub(super) fn is_fenced(&self) -> bool {
+        self.kv.is_fenced() || self.catalog.is_poisoned() || self.sequencer.is_fenced()
+    }
 
     #[cfg(feature = "engine-rocksdb")]
     pub(crate) fn create(path: &Path) -> Result<Self, CoreError> {
@@ -285,7 +367,7 @@ impl V2Db {
             }
         }
         let meta = engine::meta::open_checks(kv.as_ref())?;
-        if let Some((_, domain)) = recovery.and_then(|open| open.source)
+        if let Some(domain) = recovery.and_then(|open| open.expected_domain)
             && meta.domain != domain
         {
             return Err(CoreError::Fenced.into());
@@ -320,10 +402,6 @@ impl V2Db {
         )?;
         let locks = Arc::new(engine::locks::LockManager::new(engine::locks::LockConfig {
             shards: engine::locks::DEFAULT_LOCK_SHARDS,
-            // V2Db::begin alone issues IDs for this manager. Transaction is
-            // not Clone, releases only in Drop, and makes all other calls
-            // synchronously through &Transaction or &mut Transaction.
-            per_shard_release: true,
             // One million rows plus old/new keys for secondary indexes.
             max_row_locks_per_txn: 8_000_000,
             ..Default::default()
@@ -780,13 +858,13 @@ impl V2Db {
     }
 
     #[cfg(feature = "engine-rocksdb")]
-    #[allow(dead_code, reason = "Used by the later recovery supervisor")]
     pub(crate) fn open_recovery(
         path: &Path,
         token: Option<&[u8]>,
         recovery: RecoveryOpen<'_>,
     ) -> Result<Self, OpenFailure> {
         Self::open_in_mode(path, token, Some(recovery))
+            .map_err(|failure| failure.at_recovery_path(path))
     }
 
     #[cfg(feature = "engine-rocksdb")]
@@ -796,32 +874,35 @@ impl V2Db {
         recovery: Option<RecoveryOpen<'_>>,
     ) -> Result<Self, OpenFailure> {
         use engine::kv_rocksdb::RocksKv;
-        if engine::meta::classify_dir(path)? != engine::meta::DirClass::V2 {
-            return Err(CoreError::Corrupt("not a v2 directory".into()).into());
-        }
+        let check_format = |directory: &Path| -> Result<(), OpenFailure> {
+            if engine::meta::classify_dir(directory)? != engine::meta::DirClass::V2 {
+                return Err(CoreError::Corrupt("not a v2 directory".into()).into());
+            }
+            Ok(())
+        };
         const CACHE_BYTES: usize = 64 * 1024 * 1024;
-        let expected = recovery.and_then(|open| open.source).map(|(identity, _)| identity);
-        if expected.is_some_and(|identity| !identity.matches(path)) {
-            return Err(CoreError::Fenced.into());
-        }
-        let identity = if recovery.is_none() {
-            DirectoryIdentity::read(path).ok()
+        let (rocks, identity) = if let Some(open) = recovery {
+            let pin = open
+                .identity
+                .pin(path)
+                .map_err(OpenFailure::recovery_directory)?;
+            pin.check_recovery_links()
+                .map_err(OpenFailure::recovery_directory)?;
+            check_format(pin.path())?;
+            #[cfg(test)]
+            if let Some(hook) = TEST_BEFORE_RECOVERY_OPEN.take() {
+                hook();
+            }
+            let rocks = RocksKv::open_recovery(pin, CACHE_BYTES)?;
+            // The native open used the pin even if the configured path moved.
+            // Refuse publication and application startup writes in that case.
+            open.identity.verify_path(path).map_err(OpenFailure::recovery_directory)?;
+            (rocks, None)
         } else {
-            None
+            check_format(path)?;
+            let identity = DirectoryIdentity::read(path).ok();
+            (RocksKv::open(path, CACHE_BYTES)?, identity)
         };
-        let rocks = if recovery.is_some() {
-            // A retarget between the identity check and the native open can
-            // receive RocksDB replay writes before the second check refuses.
-            // The step 4 recovery supervisor must resolve this race.
-            RocksKv::open_recovery(path, CACHE_BYTES)?
-        } else {
-            RocksKv::open(path, CACHE_BYTES)?
-        };
-        // Check again before application startup writes in case the path
-        // changed during the native open.
-        if expected.is_some_and(|identity| !identity.matches(path)) {
-            return Err(CoreError::Fenced.into());
-        }
         let kv = Arc::new(engine::kv::Kv::new_single_writer(Arc::new(rocks)));
         let mut db = Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false, token, recovery)?;
         db.directory_identity = identity.filter(|identity| identity.matches(path));
@@ -835,7 +916,8 @@ type OpenReclaim = fn(&V2Db) -> Result<(), CoreError>;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 thread_local! {
     static TEST_OPEN_RECLAIM: std::cell::Cell<Option<OpenReclaim>> = const { std::cell::Cell::new(None) };
-
+    static TEST_BEFORE_RECOVERY_OPEN: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
 
     /// Test hook: the recent-log budget for databases opened on this thread,
     /// so SERIALIZABLE validation takes its durable fallback (R3-610).

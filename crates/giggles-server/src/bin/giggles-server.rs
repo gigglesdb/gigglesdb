@@ -3,7 +3,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use giggles_core::{Admin, Limits};
+use giggles_core::{Admin, FenceRecovery, Limits};
 use giggles_server::{
     Binding, Running, Service,
     agent::{AgentConfig, serve_agent_pg_bound},
@@ -27,6 +27,8 @@ use tokio::{net::TcpListener, sync::watch};
 #[serde(deny_unknown_fields)]
 struct Config {
     database: String,
+    #[serde(default)]
+    fence_recovery: Option<FenceRecovery>,
     #[serde(default)]
     replication: Option<giggles_server::replication::config::ReplicationConfig>,
     #[serde(default)]
@@ -66,6 +68,18 @@ struct Config {
     #[serde(default)]
     agent: Option<AgentConfig>,
 }
+fn validate_fence_recovery(c: &Config) -> Result<(), &'static str> {
+    if c.fence_recovery.is_some_and(|settings| settings.enabled) {
+        if c.cluster.is_some() || c.replication.is_some() {
+            return Err("fence_recovery requires single-node storage and cannot be combined with cluster or replication");
+        }
+        if !cfg!(feature = "engine-rocksdb") {
+            return Err("fence_recovery requires the engine-rocksdb feature");
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -99,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let bytes = bounded_file(&path)?;
     let c: Config = serde_json::from_slice(&bytes)?;
+    validate_fence_recovery(&c)?;
     if c.native.is_some() {
         if c.wire.is_some() {
             return Err("native is a deprecated alias for wire; set only wire".into());
@@ -170,6 +185,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => Admin::open(&c.database, Limits::default())?,
         },
     };
+    if let Some(settings) = c.fence_recovery.filter(|settings| settings.enabled) {
+        admin.set_fence_recovery(settings)
+            .map_err(|error| format!("fence_recovery: {error}"))?;
+    }
     let bindings = match &c.bindings_file {
         Some(path) => serde_json::from_slice(&bounded_file(path)?)?,
         None => c.bindings.clone(),
@@ -1246,6 +1265,32 @@ mod tests {
             "role_api":{"http":"127.0.0.1:8080", "tls":"disabled"}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn fence_recovery_startup_validation() {
+        let mut c = role_api_test_config();
+        assert!(c.fence_recovery.is_none());
+        assert!(validate_fence_recovery(&c).is_ok());
+        c.fence_recovery = Some(FenceRecovery { enabled: true, ..FenceRecovery::default() });
+        assert_eq!(
+            validate_fence_recovery(&c),
+            if cfg!(feature = "engine-rocksdb") { Ok(()) }
+            else { Err("fence_recovery requires the engine-rocksdb feature") }
+        );
+        c.cluster = Some(serde_json::from_value(serde_json::json!({
+            "node_id": 1, "cluster": "0123456789abcdef0123456789abcdef",
+            "listen": "127.0.0.1:7101", "log_dir": "cluster-log"
+        })).unwrap());
+        assert!(validate_fence_recovery(&c).unwrap_err().contains("cluster or replication"));
+        c.cluster = None;
+        c.replication = Some(serde_json::from_value(serde_json::json!({
+            "node_id": 1, "cluster": "0123456789abcdef0123456789abcdef",
+            "listen": "127.0.0.1:7201", "log_dir": "replication-log", "peers": []
+        })).unwrap());
+        assert!(validate_fence_recovery(&c).unwrap_err().contains("cluster or replication"));
+        c.fence_recovery = Some(FenceRecovery::default());
+        assert!(validate_fence_recovery(&c).is_ok());
     }
 
     #[test]

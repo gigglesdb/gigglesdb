@@ -45,8 +45,7 @@ impl SqlSession {
         })?;
         if inner.fenced.load(Ordering::Acquire) { return Err(CoreError::Fenced.into()); }
         let (ledger, header) = v2::read_v2_view(db).inspect_err(|error| {
-            db.fence_engine_error(engine::kv::FenceSite::NativeOnceLedger, error);
-            inner.fenced.store(true, Ordering::Release);
+            db.fence_engine_error(engine::kv::FenceSite::NativeOnceLedger, error, &inner.fenced);
         })?;
         let view = v2::v2_view(db, ledger.as_ref(), header);
         check_key(&view, &owner.key)?;
@@ -103,8 +102,7 @@ impl SqlSession {
         db.catalog().commit_ddl_guarded(txn, guard).map_err(|error| match error {
             TxnError::Guard(GuardRejection::LeaseExpired) => NativeOnceError::ClockUncertain,
             TxnError::CommitAmbiguous => {
-                db.fence_native_commit();
-                inner.fenced.store(true, Ordering::Release);
+                db.fence_native_commit(&inner.fenced);
                 CoreError::Storage("engine commit outcome unknown".into()).into()
             }
             other => CoreError::from(other).into(),
@@ -124,8 +122,7 @@ impl SqlSession {
         if point == CrashPoint::AfterCommit { crash_now(); }
         inner.decision_point(DecisionPoint::Committed);
         if point == CrashPoint::ErrorAfterCommit {
-            db.fence_native_commit();
-                inner.fenced.store(true, Ordering::Release);
+            db.fence_native_commit(&inner.fenced);
             return Err(CoreError::Storage("injected lost commit response".into()).into());
         }
         if point == CrashPoint::BeforeAck { crash_now(); }

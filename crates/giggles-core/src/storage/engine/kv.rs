@@ -279,7 +279,7 @@ impl Iterator for KvIter<'_> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code, reason = "Some sites are specific to the RocksDB backend")]
-pub(crate) enum FenceSite {
+pub enum FenceSite {
     Write,
     WalWrite,
     FlushBarrier,
@@ -298,7 +298,7 @@ pub(crate) enum FenceSite {
 /// Status fields from RocksDB 11.8.1. The C API returns Status::ToString()
 /// rather than Status itself, so severity is absent when it was not exported.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RocksStatus {
+pub struct RocksStatus {
     pub code: u8,
     pub subcode: u8,
     pub severity: Option<u8>,
@@ -309,14 +309,14 @@ impl RocksStatus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FenceClass {
+pub enum FenceClass {
     Recoverable,
     Data,
     NotRecoverable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FenceCause {
+pub struct FenceCause {
     pub site: FenceSite,
     pub class: FenceClass,
     pub status: Option<RocksStatus>,
@@ -380,7 +380,14 @@ impl FenceCause {
 }
 
 #[derive(Default)]
-pub(crate) struct FenceState(Mutex<Option<FenceCause>>);
+pub(crate) struct FenceState(Mutex<RecordedFence>);
+
+#[derive(Default)]
+struct RecordedFence {
+    cause: Option<FenceCause>,
+    #[cfg(feature = "engine-rocksdb")]
+    notifier: Option<(u64, std::sync::Weak<super::super::fence_supervisor::Wake>)>,
+}
 
 thread_local! {
     static READ_ERROR: Cell<Option<ReadErrorCapture>> = const { Cell::new(None) };
@@ -393,35 +400,113 @@ struct ReadErrorCapture {
 
 impl FenceState {
     pub(crate) fn cause(&self) -> Option<FenceCause> {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).cause.clone()
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    pub(in crate::storage) fn with_cause<T>(&self, read: impl FnOnce(Option<&FenceCause>) -> T) -> T {
+        let recorded = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        read(recorded.cause.as_ref())
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    pub(in crate::storage) fn notify_recovery(
+        &self,
+        generation: u64,
+        wake: &Arc<super::super::fence_supervisor::Wake>,
+    ) {
+        let mut recorded = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        recorded.notifier = Some((generation, Arc::downgrade(wake)));
+        if let Some(cause) = &mut recorded.cause {
+            cause.generation = generation;
+            wake.fenced(generation);
+        }
     }
 
     pub(crate) fn record(&self, cause: FenceCause) {
-        self.record_cause(cause, false);
+        self.record_cause(cause, false, None);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_if_empty(&self, cause: FenceCause) {
-        self.record_cause(cause, true);
+        self.record_cause(cause, true, None);
     }
 
-    fn record_cause(&self, cause: FenceCause, only_if_empty: bool) {
-        let mut current = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(previous) = current.as_ref()
-            && (only_if_empty
+    pub(crate) fn record_fence(
+        &self,
+        cause: FenceCause,
+        flag: &AtomicBool,
+        only_if_empty: bool,
+    ) -> bool {
+        self.record_cause(cause, only_if_empty, Some(flag))
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    pub(super) fn signal_recovery(&self) {
+        let recorded = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((generation, wake)) = &recorded.notifier
+            && recorded.cause.is_some()
+            && let Some(wake) = wake.upgrade()
+        {
+            wake.fenced(*generation);
+        }
+    }
+
+    fn record_cause(
+        &self,
+        cause: FenceCause,
+        only_if_empty: bool,
+        fence: Option<&AtomicBool>,
+    ) -> bool {
+        let mut recorded = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(feature = "engine-rocksdb")]
+        let mut cause = cause;
+        #[cfg(feature = "engine-rocksdb")]
+        let notifier = if let Some((generation, wake)) = &recorded.notifier {
+            if cause.generation != 0 && cause.generation != *generation {
+                return false;
+            }
+            cause.generation = *generation;
+            wake.upgrade()
+        } else {
+            None
+        };
+        // Admission reads both under this mutex. A new fence must wake the
+        // supervisor even if an earlier read error retains cause precedence.
+        let newly_fenced = fence.is_some_and(|flag| !flag.swap(true, Ordering::AcqRel));
+        let keep_previous = recorded.cause.as_ref().is_some_and(|previous| {
+            only_if_empty
                 || cause.generation < previous.generation
                 || (cause.generation == previous.generation
                     && (previous.class != FenceClass::Recoverable
-                        || cause.class == FenceClass::Recoverable)))
-        {
-            return;
+                        || cause.class == FenceClass::Recoverable))
+        });
+        if keep_previous && !newly_fenced {
+            return false;
         }
-        let text = format!(
-            "engine fence cause site={:?} class={:?} status={:?} generation={}: {}",
-            cause.site, cause.class, cause.status, cause.generation, cause.error_text
-        );
-        *current = Some(cause);
-        drop(current);
-        super::diagnostics::error(text);
+        #[cfg(feature = "engine-rocksdb")]
+        let generation = cause.generation;
+        let text = (!keep_previous).then(|| {
+            #[cfg(feature = "engine-rocksdb")]
+            let message = if notifier.is_some() { "storage fence cause" } else { "engine fence cause" };
+            #[cfg(not(feature = "engine-rocksdb"))]
+            let message = "engine fence cause";
+            let text = format!(
+                "{message} site={:?} class={:?} status={:?} generation={}: {}",
+                cause.site, cause.class, cause.status, cause.generation, cause.error_text
+            );
+            recorded.cause = Some(cause);
+            text
+        });
+        drop(recorded);
+        #[cfg(feature = "engine-rocksdb")]
+        if let Some(wake) = notifier {
+            wake.fenced(generation);
+        }
+        if let Some(text) = text {
+            super::diagnostics::error(text);
+        }
+        newly_fenced
     }
 
     /// Catalog reload runs on the caller thread. Carry the backend error across
@@ -594,6 +679,8 @@ impl Kv {
     /// Fences the handle: every later call fails without reaching the backend.
     pub(crate) fn fence(&self) {
         if !self.fenced.swap(true, Ordering::AcqRel) {
+            #[cfg(feature = "engine-rocksdb")]
+            self.causes.signal_recovery();
             super::diagnostics::error("KV fenced".into());
         }
     }
@@ -638,20 +725,48 @@ impl Kv {
         let result = self.backend.write(batch, durability);
         self.fence_on_error(FenceSite::Write, result)
     }
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(super) fn test_sync_wal_error(
+        &self,
+        batch: WriteBatch,
+        after_apply: bool,
+    ) -> Result<(), KvError> {
+        self.check()?;
+        if after_apply {
+            self.write(batch, Durability::Sync)?;
+        }
+        // Inject the backend result before it is classified and reported.
+        // AfterApply makes the native batch durable before reporting failure.
+        self.fence_on_error(FenceSite::Write, Err(KvError::RocksIo {
+            message: "injected commit WAL error".into(),
+            status: RocksStatus { code: RocksStatus::IO_ERROR, subcode: 0, severity: None },
+            site: FenceSite::WalWrite,
+        }))
+    }
+
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(in crate::storage) fn test_report_write_error(&self, error: KvError) {
+        let _ = self.fence_on_error(FenceSite::Write, Err(error));
+    }
+
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(in crate::storage) fn test_report_read_error(&self, error: &KvError) {
+        self.causes.read_error(error);
+    }
+
     pub(crate) fn flush_barrier(&self) -> Result<(), KvError> {
         self.check()?;
         let result = self.backend.flush_barrier();
         self.fence_on_error(FenceSite::FlushBarrier, result)
     }
     fn fence_on_error(&self, site: FenceSite, result: Result<(), KvError>) -> Result<(), KvError> {
-        if let Err(error) = &result {
-            self.causes.record(FenceCause::for_kv(site, error));
-            if !self.fenced.swap(true, Ordering::AcqRel) {
-                super::diagnostics::error(format!(
-                    "KV fenced after backend write/flush failure: {}",
-                    super::diagnostics::error_text(error),
-                ));
-            }
+        if let Err(error) = &result
+            && self.causes.record_fence(FenceCause::for_kv(site, error), &self.fenced, false)
+        {
+            super::diagnostics::error(format!(
+                "KV fenced after backend write/flush failure: {}",
+                super::diagnostics::error_text(error),
+            ));
         }
         result
     }

@@ -310,6 +310,7 @@ thread_local! {
 type HeldCounterReplies = Option<Vec<mpsc::Sender<Result<(), TxnError>>>>;
 struct Shared {
     stopped: AtomicBool,
+    fenced: AtomicBool,
     #[cfg(any(test, feature = "test-commit-sync"))]
     sync_hook: Mutex<Option<Arc<crate::CommitSyncHook>>>,
     #[cfg(test)]
@@ -472,8 +473,12 @@ impl Sequencer {
     }
     #[cfg(feature = "engine-rocksdb")]
     pub(crate) fn is_accepting(&self) -> bool {
-        !self.stopped() && self.worker.lock().unwrap_or_else(|p| p.into_inner())
+        !self.stopped() && !self.is_fenced() && self.worker.lock().unwrap_or_else(|p| p.into_inner())
             .as_ref().is_some_and(|worker| !worker.is_finished())
+    }
+
+    pub(in crate::storage) fn is_fenced(&self) -> bool {
+        self.shared.fenced.load(Ordering::Acquire)
     }
 
     pub(crate) fn shutdown(&self) {
@@ -491,7 +496,7 @@ impl Sequencer {
         }
     }
 
-    fn stopped(&self) -> bool {
+    pub(in crate::storage) fn stopped(&self) -> bool {
         self.shared.stopped.load(Ordering::Acquire)
     }
     #[cfg(any(test, feature = "test-commit-sync"))]
@@ -571,6 +576,7 @@ impl Sequencer {
         let seed = read_last_commit_ts(&kv)?;
         let shared = Arc::new(Shared {
             stopped: AtomicBool::new(false),
+            fenced: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-commit-sync"))]
             sync_hook: Mutex::new(None),
             #[cfg(test)]
@@ -893,16 +899,20 @@ fn run(
                 let result = if fenced || kv.is_fenced() || shared.stopped.load(Ordering::Acquire) {
                     Err(TxnError::Fenced)
                 } else {
-                    process_fence(
+                    let result = process_fence(
                         &kv,
                         action,
                         &mut fence,
                         &mut features,
                         &mut hlc,
                         clock.as_ref(),
-                    )
+                    );
+                    if matches!(result, Err(TxnError::CommitAmbiguous | TxnError::Fenced)) {
+                        fenced = true;
+                        publish_sequencer_fence(&shared, &kv);
+                    }
+                    result
                 };
-                fenced |= matches!(result, Err(TxnError::CommitAmbiguous | TxnError::Fenced));
                 let _ = reply.send(result);
                 continue;
             }
@@ -918,7 +928,6 @@ fn run(
             if shutdown {
                 break;
             }
-            fenced = true;
             continue;
         }
         fenced = process_group(
@@ -934,6 +943,9 @@ fn run(
             &served,
             &fence,
         );
+        if fenced && !shared.stopped.load(Ordering::Acquire) {
+            publish_sequencer_fence(&shared, &kv);
+        }
     }
     for message in receiver.try_iter() {
         match message {
@@ -949,6 +961,12 @@ fn run(
             Message::Shutdown => {}
         }
     }
+}
+
+fn publish_sequencer_fence(shared: &Shared, _kv: &Kv) {
+    shared.fenced.store(true, Ordering::Release);
+    #[cfg(feature = "engine-rocksdb")]
+    _kv.causes.signal_recovery();
 }
 fn process_fence(
     kv: &Kv,
@@ -1398,9 +1416,17 @@ fn process_group(
     #[cfg(any(test, feature = "test-commit-sync"))]
     // Serializable read-only commits also queue behind this sequencer.
     // Let the test seam stall those empty batches without adding a real write.
-    let sync_result = if sync_hook.is_some_and(|hook| hook.before_sync()) {
-        Err(super::kv::KvError::Io("injected commit Sync error".into()))
-    } else if !batch.is_empty() { kv.write(batch, Durability::Sync) } else { Ok(()) };
+    let sync_result = match sync_hook.map(|hook| hook.before_sync()) {
+        Some(crate::commit_sync_hook::SyncOutcome::Fail) => {
+            Err(super::kv::KvError::Io("injected commit Sync error".into()))
+        }
+        #[cfg(all(test, feature = "engine-rocksdb"))]
+        Some(crate::commit_sync_hook::SyncOutcome::WalError { after_apply }) if !batch.is_empty() => {
+            kv.test_sync_wal_error(batch, after_apply)
+        }
+        _ if !batch.is_empty() => kv.write(batch, Durability::Sync),
+        _ => Ok(()),
+    };
     #[cfg(not(any(test, feature = "test-commit-sync")))]
     let sync_result = if !batch.is_empty() { kv.write(batch, Durability::Sync) } else { Ok(()) };
     if let Err(error) = sync_result

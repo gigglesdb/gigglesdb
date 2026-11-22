@@ -57,9 +57,14 @@ enum WorkerState {
     Stopped,
 }
 
+#[cfg(all(test, feature = "engine-rocksdb"))]
+type TickHook = Box<dyn FnOnce() + Send>;
+
 struct Control {
     state: Mutex<WorkerState>,
     wake: Condvar,
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    before_tick: Mutex<Option<TickHook>>,
 }
 
 /// The retention sweeper's database handle and settings. The handle is weak
@@ -91,6 +96,8 @@ impl Maintenance {
             control: Arc::new(Control {
                 state: Mutex::new(WorkerState::Paused),
                 wake: Condvar::new(),
+                #[cfg(all(test, feature = "engine-rocksdb"))]
+                before_tick: Mutex::new(None),
             }),
             thread: Mutex::new(None),
             replicated,
@@ -181,6 +188,13 @@ fn run(gc: &Gc, control: &Control, budget: &AtomicUsize, errors: &AtomicU64, ret
             return;
         }
         drop(next);
+        #[cfg(all(test, feature = "engine-rocksdb"))]
+        {
+            let hook = control.before_tick.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let budget = budget.load(Ordering::Relaxed);
         let mut stats = MaintenanceStats::default();
         let result = step(gc, Keyspace::Kernel, budget, &mut stats)
@@ -220,6 +234,11 @@ fn step(
 }
 
 impl V2Db {
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(in crate::storage) fn test_before_maintenance_tick(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.maintenance.control.before_tick.lock().unwrap() = Some(Box::new(hook));
+    }
+
     /// One deterministic round: Kernel, then Catalog, Rows and Index, each
     /// stepped once from its cursor, independent of the thread's rotation.
     /// A replicated database runs no GC.

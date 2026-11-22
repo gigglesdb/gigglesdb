@@ -75,8 +75,8 @@ mod range_local;
 pub(crate) use range_local::{
     RangeLocalKey, check_range_value, parse_range_local_key, range_local_key, range_local_prefix,
 };
-const MARKER: &str = "GIGGLES_FORMAT";
-const TMP: &str = "GIGGLES_FORMAT.tmp";
+pub(in crate::storage) const MARKER: &str = "GIGGLES_FORMAT";
+pub(in crate::storage) const TMP: &str = "GIGGLES_FORMAT.tmp";
 const V2: &[u8] = b"giggles-v2\n";
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DirClass {

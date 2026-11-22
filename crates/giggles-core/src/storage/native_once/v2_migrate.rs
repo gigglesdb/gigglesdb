@@ -331,8 +331,7 @@ impl Admin {
         }
         db.catalog().commit_ddl(txn).map_err(|error| match error {
             TxnError::CommitAmbiguous => {
-                db.fence_native_commit();
-                inner.fenced.store(true, Ordering::Release);
+                db.fence_native_commit(&inner.fenced);
                 CoreError::Storage("engine commit outcome unknown".into())
             }
             other => CoreError::from(other),

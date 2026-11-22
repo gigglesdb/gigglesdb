@@ -21,47 +21,18 @@ use std::{
 
 const WAIT: Duration = Duration::from_secs(5);
 const ORPHAN: [u8; 8] = 99u64.to_be_bytes();
-const WRITER_LOCK_HELD: &str = "database already open by another writer";
 
-pub(in crate::storage) trait WriterLockContention {
-    fn is_writer_lock_held(&self) -> bool;
-}
-
-impl WriterLockContention for KvError {
-    fn is_writer_lock_held(&self) -> bool {
-        matches!(self, Self::Io(message) if message == WRITER_LOCK_HELD)
-    }
-}
-
-impl WriterLockContention for CoreError {
-    fn is_writer_lock_held(&self) -> bool {
-        matches!(self, Self::Storage(message) if message == WRITER_LOCK_HELD)
-    }
-}
-
-impl WriterLockContention for OpenFailure {
-    fn is_writer_lock_held(&self) -> bool {
-        self.error.is_writer_lock_held()
-    }
-}
-
-// See writer_lock_is_inherited_until_child_exec and fence recovery design note
-// section 2.2 ("writer lock still held: retry with backoff").
 pub(in crate::storage) fn retry_writer_lock<T, E: WriterLockContention>(
-    mut open: impl FnMut() -> Result<T, E>,
+    open: impl FnMut() -> Result<T, E>,
 ) -> Result<T, E> {
     let start = Instant::now();
-    loop {
-        let result = open();
-        if !result
-            .as_ref()
-            .is_err_and(WriterLockContention::is_writer_lock_held)
-            || start.elapsed() >= Duration::from_secs(10)
-        {
-            return result;
+    super::retry_writer_lock(open, || {
+        if start.elapsed() >= Duration::from_secs(10) {
+            return false;
         }
         thread::sleep(Duration::from_millis(30));
-    }
+        true
+    })
 }
 
 struct TestDir(PathBuf);
@@ -99,12 +70,25 @@ fn wal(path: &Path) -> PathBuf {
         .unwrap()
 }
 
-fn wal_len(path: &Path) -> u64 {
+pub(in crate::storage) fn wal_len(path: &Path) -> u64 {
     fs::metadata(wal(path)).unwrap().len()
 }
 
 fn reopen(path: &Path, ack_hw: Ts) -> Result<V2Db, OpenFailure> {
-    retry_writer_lock(|| V2Db::open_recovery(path, None, RecoveryOpen { ack_hw, gc_retention: None, defer_maintenance: false, source: None }))
+    let identity = DirectoryIdentity::read(path).unwrap();
+    retry_writer_lock(|| {
+        V2Db::open_recovery(
+            path,
+            None,
+            RecoveryOpen {
+                ack_hw,
+                gc_retention: None,
+                defer_maintenance: false,
+                identity: &identity,
+                expected_domain: None,
+            },
+        )
+    })
 }
 
 fn close(db: V2Db) -> Ts {
@@ -116,6 +100,149 @@ fn close(db: V2Db) -> Ts {
     drop(db);
     latch.wait(WAIT).unwrap();
     report.ack_hw
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn recovery_file_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, (u64, [u8; 32])> {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+
+    fn collect(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, (u64, [u8; 32])>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                collect(root, &path, files);
+            } else {
+                let bytes = fs::read(&path).unwrap();
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_owned(),
+                    (bytes.len() as u64, Sha256::digest(&bytes).into()),
+                );
+            }
+        }
+    }
+
+    let mut files = BTreeMap::new();
+    collect(root, root, &mut files);
+    files
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn has_sst(dir: &Path) -> bool {
+    // Names only: an open database's LOCK file cannot be read on Windows.
+    fs::read_dir(dir)
+        .unwrap()
+        .any(|entry| entry.unwrap().path().extension().is_some_and(|ext| ext == "sst"))
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn reopen_identified(
+    path: &Path,
+    ack_hw: Ts,
+    identity: &DirectoryIdentity,
+    domain: [u8; 16],
+) -> Result<V2Db, OpenFailure> {
+    V2Db::open_recovery(
+        path,
+        None,
+        RecoveryOpen {
+            ack_hw,
+            gc_retention: None,
+            defer_maintenance: true,
+            identity,
+            expected_domain: Some(domain),
+        },
+    )
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn recovery_open_never_writes_to_a_swapped_directory() {
+    let original = TestDir::new();
+    let moved = TestDir::new();
+    let replacement = TestDir::new();
+    let db = create_wal_only(&original.0);
+    let domain = db.meta.domain;
+    let identity = DirectoryIdentity::read(&original.0).unwrap();
+    let ts = submit(&db, 1..=1).unwrap();
+    close(db);
+    // Recovery replays the WAL into a new SST; none exists yet.
+    assert!(!has_sst(&original.0));
+    let db = create_wal_only(&replacement.0);
+    submit(&db, 2..=2).unwrap();
+    close(db);
+    let before = recovery_file_snapshot(&replacement.0);
+
+    let (p, p_moved, r) = (original.0.clone(), moved.0.clone(), replacement.0.clone());
+    // The hook records the first rename's outcome: Ok, or the OS error code.
+    let outcome = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = std::rc::Rc::clone(&outcome);
+    TEST_BEFORE_RECOVERY_OPEN.set(Some(Box::new(move || match fs::rename(&p, &p_moved) {
+        Ok(()) => {
+            fs::rename(&r, &p).unwrap();
+            seen.set(Some(Ok(())));
+        }
+        Err(error) => seen.set(Some(Err(error.raw_os_error()))),
+    })));
+    let opened = reopen_identified(&original.0, ts, &identity, domain);
+    let outcome = outcome.take().expect("the hook ran between the pin and the native open");
+    let swapped = outcome.is_ok();
+    assert_eq!(swapped, moved.0.exists());
+    let replacement_path = if swapped { &original.0 } else { &replacement.0 };
+    assert!(
+        recovery_file_snapshot(replacement_path) == before,
+        "recovery wrote to the unverified replacement directory"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        assert!(swapped);
+        assert!(matches!(opened, Err(error) if error.error == CoreError::Fenced));
+        assert!(has_sst(&moved.0));
+    }
+    #[cfg(windows)]
+    {
+        // The pin omits FILE_SHARE_DELETE: ERROR_SHARING_VIOLATION.
+        assert_eq!(outcome, Err(Some(32)));
+        let db = opened.unwrap();
+        assert!(has_sst(&original.0));
+        assert_eq!(db.meta.domain, domain);
+        assert_acknowledged(db.kv.as_ref(), &[ts]);
+        let snapshot = db.kv.snapshot().unwrap();
+        let latch = db.close_latch().unwrap();
+        db.shutdown();
+        drop(db);
+        assert_eq!(latch.wait(Duration::ZERO), Err(engine::kv_rocksdb::StillHeld));
+        assert!(fs::rename(&original.0, &moved.0).is_err());
+        drop(snapshot);
+        latch.wait(WAIT).unwrap();
+        fs::rename(&original.0, &moved.0).unwrap();
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn recovery_open_refuses_a_mismatched_pin_without_writes() {
+    use engine::kv::FenceClass;
+
+    let original = TestDir::new();
+    let replacement = TestDir::new();
+    let db = V2Db::create(&original.0).unwrap();
+    let domain = db.meta.domain;
+    let identity = DirectoryIdentity::read(&original.0).unwrap();
+    let ack_hw = close(db);
+    let db = create_wal_only(&replacement.0);
+    submit(&db, 2..=2).unwrap();
+    close(db);
+    let before = recovery_file_snapshot(&replacement.0);
+
+    let Err(failure) = reopen_identified(&replacement.0, ack_hw, &identity, domain) else {
+        panic!("recovery opened a directory with a mismatched identity");
+    };
+    assert_eq!(failure.error, CoreError::Fenced);
+    assert_eq!(failure.cause.class, FenceClass::Data);
+    assert!(failure.cause.error_text.contains(&format!("{:?}", replacement.0)));
+    assert_eq!(recovery_file_snapshot(&replacement.0), before);
 }
 
 fn submit(db: &V2Db, xids: std::ops::RangeInclusive<u64>) -> Result<Ts, TxnError> {
@@ -361,6 +488,32 @@ fn missing_acknowledged_group_refuses_before_counter_cleanup() {
     assert_orphan(&raw);
 }
 
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn recovery_allows_immutable_sst_hard_links() {
+    let dir = TestDir::new();
+    let db = create_wal_only(&dir.0);
+    let ts = submit(&db, 1..=1).unwrap();
+    close(db);
+
+    let db = reopen(&dir.0, ts).unwrap();
+    close(db);
+    let sst = fs::read_dir(&dir.0).unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|file| file.extension().is_some_and(|ext| ext == "sst"))
+        .unwrap();
+    let checkpoint = TestDir::new();
+    fs::create_dir(&checkpoint.0).unwrap();
+    let copy = checkpoint.0.join(sst.file_name().unwrap());
+    fs::hard_link(&sst, &copy).unwrap();
+    let before = fs::read(&copy).unwrap();
+
+    let db = reopen(&dir.0, ts).unwrap();
+    assert_acknowledged(db.kv.as_ref(), &[ts]);
+    assert_eq!(fs::read(copy).unwrap(), before);
+    close(db);
+}
+
 #[test]
 fn recovery_flushes_replayed_wal_to_synced_ssts() {
     let dir = TestDir::new();
@@ -531,7 +684,11 @@ fn partial_gc_batches_preserve_visible_rows_and_later_gc_converges() {
         assert_eq!(visible_rows(kv.as_ref()), expected);
         drop((kv, gc, backend));
 
-        let recovered = retry_writer_lock(|| RocksKv::open_recovery(&dir.0, 8 << 20)).unwrap();
+        let identity = DirectoryIdentity::read(&dir.0).unwrap();
+        let recovered = retry_writer_lock(|| {
+            RocksKv::open_recovery(identity.pin(&dir.0).unwrap(), 8 << 20)
+        })
+        .unwrap();
         let (kv, gc) = open_gc(Arc::new(recovered));
         assert_eq!(gc.watermark(), visible);
         assert_eq!(
@@ -672,8 +829,21 @@ fn recovery_open_preserves_the_write_fence_holder() {
         .unwrap();
     let ack_hw = close(db);
 
-    let db = retry_writer_lock(|| V2Db::open_recovery(&dir.0, Some(token), RecoveryOpen { ack_hw, gc_retention: None, defer_maintenance: false, source: None }))
-        .unwrap();
+    let identity = DirectoryIdentity::read(&dir.0).unwrap();
+    let db = retry_writer_lock(|| {
+        V2Db::open_recovery(
+            &dir.0,
+            Some(token),
+            RecoveryOpen {
+                ack_hw,
+                gc_retention: None,
+                defer_maintenance: false,
+                identity: &identity,
+                expected_domain: None,
+            },
+        )
+    })
+    .unwrap();
     db.sequencer.release_write_fence(token, epoch).unwrap();
 }
 
@@ -808,11 +978,11 @@ fn assert_child_passed(mut command: Command) {
 }
 
 #[cfg(target_os = "linux")]
-struct MaxFileSize(libc::rlimit);
+pub(in crate::storage) struct MaxFileSize(libc::rlimit);
 #[cfg(target_os = "linux")]
 impl MaxFileSize {
     #[allow(clippy::unnecessary_cast, reason = "rlim_t can be narrower on Linux")]
-    fn new(bytes: u64) -> Self {
+    pub(in crate::storage) fn new(bytes: u64) -> Self {
         // SAFETY: these calls use live libc rlimit structs. The child has no
         // concurrent limit changes, and restores its original soft limit.
         unsafe {
