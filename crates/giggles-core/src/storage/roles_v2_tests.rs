@@ -93,7 +93,7 @@ fn role_cache_snapshot_and_private_write_bypass() {
         )
         .unwrap();
     let old_image = engine::image_txn(db.catalog(), &mut old).unwrap();
-    assert!(old_image.get("reader").unwrap().unwrap().login);
+    assert!(old_image.with_role("reader", |role| role.unwrap().login).unwrap());
     assert!(!roles.get("reader").unwrap().unwrap().login);
     let mut own = db.begin(Isolation::ReadCommitted);
     let raw = key(b"role/", "reader");
@@ -107,7 +107,7 @@ fn role_cache_snapshot_and_private_write_bypass() {
     .unwrap();
     let private = engine::image_txn(db.catalog(), &mut own).unwrap();
     assert_eq!(private.table.0, engine::load_txn(&mut own).unwrap().0);
-    assert!(private.get("reader").unwrap().unwrap().login);
+    assert!(private.with_role("reader", |role| role.unwrap().login).unwrap());
     assert!(!Arc::ptr_eq(&private, &roles.image().unwrap().image));
     let again = engine::image_txn(db.catalog(), &mut own).unwrap();
     assert!(!Arc::ptr_eq(&private, &again));
@@ -142,7 +142,7 @@ fn role_cache_old_snapshot_fallback_bypass() {
     assert!(reopened.binding_snapshot(&old).unwrap().1.is_none());
     let image = engine::image_txn(&reopened, &mut old).unwrap();
     assert_eq!(image.table.0, engine::load_txn(&mut old).unwrap().0);
-    assert!(image.get("reader").unwrap().unwrap().login);
+    assert!(image.with_role("reader", |role| role.unwrap().login).unwrap());
     assert!(!Arc::ptr_eq(
         &image,
         &engine::image_txn(&reopened, &mut old).unwrap()
@@ -920,9 +920,12 @@ fn role_cache_decoded_misses_keep_raw_errors() {
     }).unwrap());
     table.0.insert(key(b"role/", "broken"), b"not json".to_vec());
     let image = RoleImage::new(table);
-    assert!(image.get("good").unwrap().is_some());
+    assert!(image.with_role("good", |role| role.is_some()).unwrap());
     assert_eq!(image.decoded.get().unwrap().len(), 1);
-    assert!(image.get("absent").unwrap().is_none());
+    assert!(image.with_role("absent", |role| role.is_none()).unwrap());
     let expected = decode::<CatalogRole>(b"not json").unwrap_err().to_string();
-    assert_eq!(image.get("broken").unwrap_err().to_string(), expected);
+    assert_eq!(
+        image.with_role("broken", |_| ()).unwrap_err().to_string(),
+        expected
+    );
 }

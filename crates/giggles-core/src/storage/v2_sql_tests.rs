@@ -88,6 +88,54 @@ fn occupancy_uses_the_statement_catalog_image_including_private_unique_ddl() {
 }
 
 #[test]
+fn native_coercion_uses_transaction_private_type_metadata() {
+    use relational::Value;
+
+    let f = Fixture::new();
+    let mut session = f.admin().sql_session();
+    for sql in [
+        "BEGIN",
+        "CREATE TYPE mood AS ENUM ('ok')",
+        "CREATE TABLE inputs (id bigint PRIMARY KEY, m mood, c char(3), u uuid)",
+    ] {
+        session.execute(sql, &[], None).unwrap();
+    }
+
+    let table = session.native_table_engine("inputs").unwrap();
+    let outside = f.admin().sql_session();
+    assert!(matches!(
+        outside.native_table_engine("inputs"),
+        Err(CoreError::Sql(SqlError::UnknownTable))
+    ));
+
+    // Reference the previous owned metadata path in the same transaction.
+    let owned = f.db().metadata_state(session.v2_transaction.as_ref()).unwrap();
+    let text = |s: &str| Value::Text(s.into());
+    for (column, input, expected) in [
+        (1, "ok", Ok(text("ok"))),
+        (1, "other", Err(SqlError::InvalidTextRepresentation)),
+        (2, "x", Ok(text("x  "))),
+        (2, "long", Err(SqlError::StringDataRightTruncation)),
+        (
+            3,
+            "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11",
+            Ok(text("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")),
+        ),
+        (3, "bad uuid", Err(SqlError::InvalidTextRepresentation)),
+    ] {
+        let column = &table.columns[column];
+        let reference = relational::coerce_to_column(&owned.sql, column, text(input));
+        assert_eq!(reference, expected, "{input}");
+        assert_eq!(
+            session.coerce_column_engine(column, text(input)),
+            reference.map_err(CoreError::Sql),
+            "{input}",
+        );
+    }
+    session.execute("ROLLBACK", &[], None).unwrap();
+}
+
+#[test]
 fn with_dml_locks_hold_plain_dml_sentinel_until_commit_or_rollback() {
     use crate::relational::Value;
     use std::sync::mpsc;

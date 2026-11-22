@@ -719,17 +719,35 @@ impl Service {
         } else {
             (role.clone(), epoch)
         };
-        let current_epoch = if let Role::Database { name } = &current_role {
-            let current = self.admin.roles().get(name)
+        let (current_epoch, database) = if let Role::Database { name } = &current_role {
+            let image = self
+                .admin
+                .roles()
+                .image_for_role(name)
+                .map_err(|_| CoreError::Policy(Error::Authentication))?;
+            let generation = image
+                .with_role(name, |current| {
+                    current
+                        .filter(|role| role.login && !role.task_only)
+                        .map(|role| role.generation)
+                })
                 .map_err(|_| CoreError::Policy(Error::Authentication))?
-                .filter(|role| role.login && !role.task_only)
                 .ok_or(CoreError::Policy(Error::Authentication))?;
-            if fingerprint_bound { current_epoch } else { current.generation }
-        } else { current_epoch };
+            let epoch = if fingerprint_bound { current_epoch } else { generation };
+            (epoch, Some((name, image)))
+        } else {
+            (current_epoch, None)
+        };
         if fingerprint_bound && (&current_role != role || current_epoch != epoch) {
             return Err(CoreError::Policy(Error::Authentication));
         }
-        self.check_role_binding(&current_role, current_epoch, role_fence, fingerprint, fingerprint_bound)
+        if let Some((name, image)) = database {
+            self.check_role_binding_in(&image, name, current_epoch, role_fence)?;
+            if !fingerprint_bound {
+                return Ok(());
+            }
+        }
+        self.check_fingerprint_binding(&current_role, current_epoch, fingerprint)
     }
     /// Revalidate ordinary role authority without constructing SQL session state.
     pub(crate) fn check_role_binding(
@@ -741,24 +759,44 @@ impl Service {
         fingerprint_bound: bool,
     ) -> Result<(), CoreError> {
         if let Role::Database { name } = role {
-            self
-                .admin
-                .roles()
-                .get(name)
-                .map_err(role_lookup_error)?
-                .filter(|role| {
-                    role.login
-                        && !role.task_only
-                        && role_fence.is_none_or(|(oid, _)| role.oid == oid)
-                        && self.role_generation_matches(role, role_fence.map_or(epoch, |(_, generation)| generation))
-                })
-                .map(|_| ())
-                .ok_or(CoreError::Policy(Error::Authentication))?;
+            let image = self.admin.roles().image_for_role(name).map_err(role_lookup_error)?;
+            self.check_role_binding_in(&image, name, epoch, role_fence)?;
             // Trusted pgwire sessions have no fingerprint binding to fence.
             if !fingerprint_bound {
                 return Ok(());
             }
         }
+        self.check_fingerprint_binding(role, epoch, fingerprint)
+    }
+    fn check_role_binding_in(
+        &self,
+        image: &roles::RoleCatalogImage,
+        name: &str,
+        epoch: u64,
+        role_fence: Option<(u32, u64)>,
+    ) -> Result<(), CoreError> {
+        image
+            .with_role(name, |current| {
+                current
+                    .filter(|role| {
+                        role.login
+                            && !role.task_only
+                            && role_fence.is_none_or(|(oid, _)| role.oid == oid)
+                            && self.role_generation_matches(
+                                role, role_fence.map_or(epoch, |(_, generation)| generation),
+                            )
+                    })
+                    .map(|_| ())
+            })
+            .map_err(role_lookup_error)?
+            .ok_or(CoreError::Policy(Error::Authentication))
+    }
+    fn check_fingerprint_binding(
+        &self,
+        role: &Role,
+        epoch: u64,
+        fingerprint: &str,
+    ) -> Result<(), CoreError> {
         let credentials = self
             .bindings
             .lock()
@@ -2565,10 +2603,14 @@ impl Session {
         self.service
             .admin
             .roles()
-            .get(name)
+            .image_for_role(name)
             .map_err(role_lookup_error)?
-            .filter(|role| self.authority_role_live(role))
-            .map(|role| role.superuser)
+            .with_role(name, |current| {
+                current
+                    .filter(|role| self.authority_role_live(role))
+                    .map(|role| role.superuser)
+            })
+            .map_err(role_lookup_error)?
             .ok_or(CoreError::Policy(Error::Authentication))
     }
     fn table_requirements_allowed(
@@ -5170,6 +5212,35 @@ mod lifecycle_tests {
         assert!(service.session(fp).is_err());
         assert!(service.check_native_identity(&app, entry.1, None, fp, true).is_err());
         assert_eq!(owner.check(&service), Err(crate::api::error::ApiError::Unauthenticated));
+    }
+    #[test]
+    fn native_identity_rechecks_committed_role_changes() {
+        let (service, bindings) = database_binding_fixture();
+        let roles = service.admin.roles();
+        let role = &bindings[0].role;
+        let original = roles.get("bound").unwrap().unwrap();
+        let check = |fence| service.check_native_identity(role, 0, fence, "", false);
+        let original_fence = Some((original.oid, original.generation));
+        let denied = Err(CoreError::Policy(Error::Authentication));
+
+        assert_eq!(check(original_fence), Ok(()));
+        assert_eq!(check(None), Ok(()));
+        roles.alter("bound", roles::RoleChanges {
+            login: Some(false), ..Default::default()
+        }).unwrap();
+        assert_eq!(check(None), denied);
+        assert_eq!(check(original_fence), denied);
+
+        roles.alter("bound", roles::RoleChanges {
+            login: Some(true), ..Default::default()
+        }).unwrap();
+        assert_eq!(check(None), Ok(()));
+        assert_eq!(check(original_fence), denied);
+        let restored = roles.get("bound").unwrap().unwrap();
+        assert_eq!(check(Some((restored.oid, restored.generation))), Ok(()));
+
+        roles.drop("bound").unwrap();
+        assert_eq!(check(None), denied);
     }
     #[test]
     fn database_fingerprint_binding_requires_existing_login_role() {

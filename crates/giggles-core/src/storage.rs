@@ -3837,8 +3837,8 @@ impl SqlSession {
     ) -> Result<relational::Value, CoreError> {
         if self.is_v2_engine() {
             let db = self.v2_lease(Holder::Sql)?;
-            let state = db.metadata_state(self.v2_transaction.as_ref())?;
-            return relational::coerce_to_column(&state.sql, column, value).map_err(CoreError::Sql);
+            let (_, image) = db.native_metadata_image(self.v2_transaction.as_ref())?;
+            return relational::coerce_to_column(&image, column, value).map_err(CoreError::Sql);
         }
         let state = self
             .staged

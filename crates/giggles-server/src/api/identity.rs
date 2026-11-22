@@ -177,13 +177,16 @@ impl ConnectionIdentity {
             let valid_role = service
                 .admin
                 .roles()
-                .get(name)
-                .ok()
-                .flatten()
-                .is_some_and(|role| {
-                    crate::agent::bindings::executor_role(&role)
-                        && self.role_fence == Some((role.oid, role.generation))
-                });
+                .image_for_role(name)
+                .and_then(|image| {
+                    image.with_role(name, |current| {
+                        current.is_some_and(|role| {
+                            crate::agent::bindings::executor_role(role)
+                                && self.role_fence == Some((role.oid, role.generation))
+                        })
+                    })
+                })
+                .unwrap_or(false);
             return if valid_role && service.admin.tasks().credential_live(task, self.epoch, now) {
                 Ok(())
             } else {

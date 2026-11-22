@@ -45,6 +45,14 @@ impl RoleImage {
     }
 
     fn get(&self, name: &str) -> Result<Option<CatalogRole>, RoleError> {
+        self.with_role(name, |role| role.cloned())
+    }
+
+    fn with_role<T>(
+        &self,
+        name: &str,
+        inspect: impl FnOnce(Option<&CatalogRole>) -> T,
+    ) -> Result<T, RoleError> {
         let decoded = self.decoded.get_or_init(|| {
             self.table
                 .0
@@ -57,10 +65,10 @@ impl RoleImage {
                 .collect()
         });
         if let Some(role) = decoded.get(name) {
-            return Ok(Some(role.clone()));
+            return Ok(inspect(Some(role)));
         }
         // Keep absent and corrupt records on the original lookup/error path.
-        role_record(&self.table, name)
+        Ok(inspect(role_record(&self.table, name)?.as_ref()))
     }
 }
 
@@ -82,9 +90,18 @@ impl RoleCatalogImage {
     }
 
     pub fn get(&self, name: &str) -> Result<Option<CatalogRole>, RoleError> {
+        self.with_role(name, |role| role.cloned())
+    }
+
+    /// Inspect a role in this image without cloning a decoded record.
+    pub fn with_role<T>(
+        &self,
+        name: &str,
+        inspect: impl FnOnce(Option<&CatalogRole>) -> T,
+    ) -> Result<T, RoleError> {
         self.check_fenced()?;
         validate_name(name)?;
-        self.image.get(name)
+        self.image.with_role(name, inspect)
     }
 
     pub fn table_owner(&self, table: &str) -> Result<Option<String>, RoleError> {
@@ -585,9 +602,14 @@ impl RoleCatalog {
     }
 
     pub fn get(&self, name: &str) -> Result<Option<CatalogRole>, RoleError> {
+        self.image_for_role(name)?.get(name)
+    }
+
+    /// Acquire an image for a named lookup, validating the name before loading it.
+    pub fn image_for_role(&self, name: &str) -> Result<RoleCatalogImage, RoleError> {
         self.check_fenced()?;
         validate_name(name)?;
-        self.image()?.get(name)
+        self.image()
     }
 
     pub(crate) fn get_leased(&self, db: &super::EngineLease, name: &str) -> Result<Option<CatalogRole>, RoleError> {
@@ -1474,6 +1496,44 @@ mod tests {
             name: name.into(),
             ..NewRole::default()
         }
+    }
+
+    #[test]
+    fn borrowed_role_lookup_matches_owned_lookup() {
+        database(|admin, _| {
+            let catalog = admin.roles();
+            let created = catalog.create(new_role("borrowed")).unwrap();
+            let image = catalog.image_for_role("borrowed").unwrap();
+            assert_eq!(image.get("borrowed").unwrap(), Some(created));
+            let same_record = image
+                .with_role("borrowed", |first| {
+                    image.with_role("borrowed", |second| {
+                        std::ptr::eq(first.unwrap(), second.unwrap())
+                    })
+                })
+                .unwrap()
+                .unwrap();
+            assert!(same_record);
+            for name in ["borrowed", "missing", "pg_database_owner"] {
+                assert_eq!(
+                    image.with_role(name, |role| role.cloned()).unwrap(),
+                    image.get(name).unwrap(),
+                    "{name:?}",
+                );
+            }
+            assert!(image.with_role("missing", |role| role.is_none()).unwrap());
+            assert!(matches!(image.get(""), Err(RoleError::Invalid)));
+            assert!(matches!(image.with_role("", |_| ()), Err(RoleError::Invalid)));
+
+            admin.inner.fenced.store(true, Ordering::Release);
+            for name in ["borrowed", ""] {
+                assert!(matches!(image.get(name), Err(RoleError::Core(CoreError::Fenced))));
+                assert!(matches!(
+                    image.with_role(name, |_| ()),
+                    Err(RoleError::Core(CoreError::Fenced))
+                ));
+            }
+        });
     }
 
     #[test]
