@@ -1130,6 +1130,7 @@ fn colty(c: &ColumnDef) -> Ty {
         | DataType::IntArray
         | DataType::BigIntArray
         | DataType::TextArray
+        | DataType::UuidArray
         | DataType::Text
         | DataType::Varchar => Ty::Text,
         DataType::Bpchar => Ty::Bpchar,

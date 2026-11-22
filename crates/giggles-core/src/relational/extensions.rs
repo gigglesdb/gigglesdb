@@ -96,9 +96,6 @@ pub const BUILTINS: &[BuiltinExtension] = &[
     },
 ];
 pub(crate) fn validate(ext: &CatalogExt) -> R<()> {
-    if ext.extensions.len() > 64 {
-        return Err(SqlError::Limit);
-    }
     let mut oids = BTreeSet::new();
     for (name, installed) in &ext.extensions {
         let builtin = BUILTINS

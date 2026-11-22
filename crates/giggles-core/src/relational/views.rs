@@ -79,7 +79,7 @@ fn oid(ty: &DataType) -> u32 {
         DataType::Timestamp => 1114, DataType::TimestampTz => 1184, DataType::Interval => 1186,
         DataType::Varchar => 1043, DataType::Bpchar => 1042, DataType::Uuid => 2950,
         DataType::Jsonb => 3802, DataType::IntArray => 1007, DataType::BigIntArray => 1016,
-        DataType::TextArray => 1009,
+        DataType::TextArray => 1009, DataType::UuidArray => 2951,
         DataType::RegType => 2206,
     }
 }

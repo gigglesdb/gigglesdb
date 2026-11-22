@@ -231,6 +231,7 @@ impl Kind {
             | DataType::IntArray
             | DataType::BigIntArray
             | DataType::TextArray
+            | DataType::UuidArray
             | DataType::Text
             | DataType::Varchar
             | DataType::Bpchar => Self::Text,

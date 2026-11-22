@@ -3,10 +3,8 @@ use super::*;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use std::fmt;
 pub(crate) const UNSUPPORTED_CATALOG_EXT: &str = "unsupported relational catalog extension";
-pub(crate) const MAX_EXT_COLUMNS: usize = MAX_TABLES * MAX_COLUMNS;
-pub(crate) const MAX_EXT_CONSTRAINTS: usize = MAX_EXT_COLUMNS;
-pub(crate) const MAX_EXT_SEQUENCES: usize = MAX_EXT_COLUMNS;
 const MAX_EXPR: usize = 65536;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatalogExt {
     pub(crate) ext_version: u32,
@@ -74,6 +72,7 @@ pub(crate) enum LogicalKind {
     IntArray,
     BigIntArray,
     TextArray,
+    UuidArray,
 }
 // Frozen version-three column tuple; version six appends type_id.
 #[derive(Serialize, Deserialize)]
@@ -337,7 +336,6 @@ pub(crate) fn validate_unique_indexes<'a>(
     Ok(())
 }
 fn validate_births(ext: &CatalogExt, tables: &BTreeMap<u64, &TableDef>, next_id: u64, used: &mut BTreeSet<u64>) -> R<()> {
-    if ext.primary_index_birth.len() > MAX_TABLES { return Err(SqlError::Type); }
     for (table, birth) in &ext.primary_index_birth {
         let table = tables.get(table).ok_or(SqlError::Type)?;
         if table.hidden_rowid().is_some() || table.primary_key.is_empty()
@@ -395,6 +393,10 @@ impl CatalogExt {
     }
     pub(crate) fn has_key_dependency_identity(&self) -> bool {
         !self.primary_index_birth.is_empty() || self.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::ForeignKey { target, .. } if target != ReferencedKey::Unknown))
+    }
+    pub(crate) fn has_uuid_arrays(&self) -> bool {
+        self.logical_kinds.values().any(|kind| *kind == LogicalKind::UuidArray)
+            || self.types.values().any(TypeDef::has_uuid_arrays)
     }
     pub(crate) fn wire_version(&self) -> u32 {
         if !self.extensions.is_empty() {
@@ -516,7 +518,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
         fn legacy_column_map<'de, D: serde::Deserializer<'de>>(
             d: D,
         ) -> Result<BTreeMap<u64, LegacyColumnExt>, D::Error> {
-            bounded_map::<D, LegacyColumnExt, MAX_EXT_COLUMNS>(d)
+            catalog_map::<D, LegacyColumnExt>(d)
         }
         #[derive(Deserialize)]
         struct Sequences(#[serde(deserialize_with = "sequence_map")] BTreeMap<u64, SequenceDef>);
@@ -529,7 +531,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
         fn legacy_constraints<'de, D: serde::Deserializer<'de>>(
             d: D,
         ) -> Result<Vec<ConstraintV1>, D::Error> {
-            bounded_vec::<D, ConstraintV1, MAX_EXT_CONSTRAINTS>(d)
+            catalog_vec::<D, ConstraintV1>(d)
         }
         #[derive(Deserialize)]
         struct LegacyMap(
@@ -538,17 +540,17 @@ impl<'de> Deserialize<'de> for CatalogExt {
         fn legacy_map<'de, D: serde::Deserializer<'de>>(
             d: D,
         ) -> Result<BTreeMap<u64, LegacyConstraints>, D::Error> {
-            bounded_map::<D, LegacyConstraints, MAX_TABLES>(d)
+            catalog_map::<D, LegacyConstraints>(d)
         }
         #[derive(Deserialize)]
         struct FrozenConstraints(#[serde(deserialize_with = "frozen_constraints")] Vec<ConstraintV2To7>);
         fn frozen_constraints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<ConstraintV2To7>, D::Error> {
-            bounded_vec::<D, ConstraintV2To7, MAX_EXT_CONSTRAINTS>(d)
+            catalog_vec::<D, ConstraintV2To7>(d)
         }
         #[derive(Deserialize)]
         struct FrozenMap(#[serde(deserialize_with = "frozen_map")] BTreeMap<u64, FrozenConstraints>);
         fn frozen_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, FrozenConstraints>, D::Error> {
-            bounded_map::<D, FrozenConstraints, MAX_TABLES>(d)
+            catalog_map::<D, FrozenConstraints>(d)
         }
         #[derive(Deserialize)]
         struct LogicalKinds(
@@ -557,7 +559,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
         fn logical_kind_map<'de, D: serde::Deserializer<'de>>(
             d: D,
         ) -> Result<BTreeMap<u64, LogicalKind>, D::Error> {
-            bounded_map::<D, LogicalKind, MAX_EXT_COLUMNS>(d)
+            catalog_map::<D, LogicalKind>(d)
         }
         #[derive(Deserialize)]
         struct Schemas(#[serde(deserialize_with = "schema_map")] BTreeMap<String, schemas::Schema>);
@@ -568,17 +570,14 @@ impl<'de> Deserialize<'de> for CatalogExt {
             impl<'de> Visitor<'de> for SV {
                 type Value = BTreeMap<String, schemas::Schema>;
                 fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                    f.write_str("bounded schemas")
+                    f.write_str("schema map")
                 }
                 fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
-                    if a.size_hint().is_some_and(|n| n > MAX_TABLES) {
-                        return Err(de::Error::custom("too many schemas"));
-                    }
                     let mut out = BTreeMap::new();
                     #[derive(Deserialize)]
                     struct Name(#[serde(deserialize_with = "name")] String);
                     while let Some(key) = a.next_key::<Name>()? {
-                        if out.len() >= MAX_TABLES || out.insert(key.0, a.next_value()?).is_some() {
+                        if out.insert(key.0, a.next_value()?).is_some() {
                             return Err(de::Error::custom("invalid schemas"));
                         }
                     }
@@ -596,7 +595,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
         ) -> Result<BTreeMap<u64, String>, D::Error> {
             #[derive(Deserialize)]
             struct Name(#[serde(deserialize_with = "name")] String);
-            Ok(bounded_map::<D, Name, MAX_TABLES>(d)?
+            Ok(catalog_map::<D, Name>(d)?
                 .into_iter()
                 .map(|(id, name)| (id, name.0))
                 .collect())
@@ -606,17 +605,17 @@ impl<'de> Deserialize<'de> for CatalogExt {
         #[derive(Deserialize)]
         struct Births(#[serde(deserialize_with = "birth_map")] BTreeMap<u64, u64>);
         fn birth_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, u64>, D::Error> {
-            bounded_map::<D, u64, MAX_TABLES>(d)
+            catalog_map::<D, u64>(d)
         }
         #[derive(Deserialize)]
         struct ColumnCollations(#[serde(deserialize_with = "bindings_map")] BTreeMap<u64, super::column_collations::Binding>);
         fn bindings_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, super::column_collations::Binding>, D::Error> {
-            bounded_map::<D, super::column_collations::Binding, MAX_EXT_COLUMNS>(d)
+            catalog_map::<D, super::column_collations::Binding>(d)
         }
         #[derive(Deserialize)]
         struct Collations(#[serde(deserialize_with = "collation_map")] BTreeMap<u64, super::collations::Collation>);
         fn collation_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, super::collations::Collation>, D::Error> {
-            bounded_map::<D, super::collations::Collation, MAX_TABLES>(d)
+            catalog_map::<D, super::collations::Collation>(d)
         }
         struct V;
         impl<'de> Visitor<'de> for V {
@@ -643,7 +642,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     fn v3_map<'de, D: serde::Deserializer<'de>>(
                         d: D,
                     ) -> Result<BTreeMap<u64, ColumnV3>, D::Error> {
-                        bounded_map::<D, ColumnV3, MAX_EXT_COLUMNS>(d)
+                        catalog_map::<D, ColumnV3>(d)
                     }
                     next!(V3)
                         .0
@@ -773,6 +772,15 @@ pub enum TypeDef {
         fields: Vec<TypeField>,
     },
 }
+impl TypeDef {
+    pub(crate) fn has_uuid_arrays(&self) -> bool {
+        match self {
+            Self::Enum { .. } => false,
+            Self::Domain { base, .. } => *base == DataType::UuidArray,
+            Self::Composite { fields, .. } => fields.iter().any(|(_, ty, _)| *ty == DataType::UuidArray),
+        }
+    }
+}
 fn type_labels<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     #[derive(Deserialize)]
     struct Label(#[serde(deserialize_with = "name")] String);
@@ -809,6 +817,7 @@ mod type_def_scalar {
         DataType::IntArray,
         DataType::BigIntArray,
         DataType::TextArray,
+        DataType::UuidArray,
     ];
     pub(super) fn serialize<S: serde::Serializer>(ty: &DataType, s: S) -> Result<S::Ok, S::Error> {
         let tag = TYPES.iter().position(|t| t == ty).ok_or_else(|| {
@@ -929,26 +938,44 @@ where
     }
     d.deserialize_seq(V::<T, N>(std::marker::PhantomData))
 }
-fn bounded_map<'de, D, T, const N: usize>(d: D) -> Result<BTreeMap<u64, T>, D::Error>
+// Ignore collection size hints: a malformed length cannot reserve memory or
+// cause a loop without consuming encoded bytes. The storage codec caps the
+// input byte length, and each catalog entry consumes bytes before insertion.
+fn catalog_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    struct V<T, const N: usize>(std::marker::PhantomData<T>);
-    impl<'de, T: Deserialize<'de>, const N: usize> Visitor<'de> for V<T, N> {
+    struct V<T>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+        type Value = Vec<T>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("catalog sequence")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+            let mut values = Vec::new();
+            while let Some(value) = a.next_element()? {
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+    d.deserialize_seq(V::<T>(std::marker::PhantomData))
+}
+fn catalog_map<'de, D, T>(d: D) -> Result<BTreeMap<u64, T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct V<T>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
         type Value = BTreeMap<u64, T>;
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("bounded map")
+            f.write_str("catalog map")
         }
         fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
-            if a.size_hint().is_some_and(|n| n > N) {
-                return Err(de::Error::custom("catalog map limit"));
-            }
             let mut v = BTreeMap::new();
             while let Some(k) = a.next_key()? {
-                if v.len() == N {
-                    return Err(de::Error::custom("catalog map limit"));
-                }
                 if v.insert(k, a.next_value()?).is_some() {
                     return Err(de::Error::custom("duplicate catalog key"));
                 }
@@ -956,7 +983,7 @@ where
             Ok(v)
         }
     }
-    d.deserialize_map(V::<T, N>(std::marker::PhantomData))
+    d.deserialize_map(V::<T>(std::marker::PhantomData))
 }
 fn string<'de, D: serde::Deserializer<'de>, const N: usize>(d: D) -> Result<String, D::Error> {
     String::from_utf8(bounded_vec::<D, u8, N>(d)?).map_err(de::Error::custom)
@@ -995,17 +1022,17 @@ fn ids<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u64>, D::Error> {
 fn column_map<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<BTreeMap<u64, ColumnExt>, D::Error> {
-    bounded_map::<D, ColumnExt, MAX_EXT_COLUMNS>(d)
+    catalog_map::<D, ColumnExt>(d)
 }
 #[derive(Deserialize)]
 struct Constraints(#[serde(deserialize_with = "constraints")] Vec<Constraint>);
 fn constraints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Constraint>, D::Error> {
-    bounded_vec::<D, Constraint, MAX_EXT_CONSTRAINTS>(d)
+    catalog_vec::<D, Constraint>(d)
 }
 fn constraint_map<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<BTreeMap<u64, Vec<Constraint>>, D::Error> {
-    Ok(bounded_map::<D, Constraints, MAX_TABLES>(d)?
+    Ok(catalog_map::<D, Constraints>(d)?
         .into_iter()
         .map(|(k, v)| (k, v.0))
         .collect())
@@ -1013,10 +1040,10 @@ fn constraint_map<'de, D: serde::Deserializer<'de>>(
 fn sequence_map<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<BTreeMap<u64, SequenceDef>, D::Error> {
-    bounded_map::<D, SequenceDef, MAX_EXT_SEQUENCES>(d)
+    catalog_map::<D, SequenceDef>(d)
 }
 fn type_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, TypeDef>, D::Error> {
-    bounded_map::<D, TypeDef, MAX_EXT_COLUMNS>(d)
+    catalog_map::<D, TypeDef>(d)
 }
 pub(crate) fn validate_typmod(ty: &DataType, t: i32) -> R<()> {
     let valid = match ty {
@@ -1209,14 +1236,6 @@ impl Relational {
         if self.format != 1 {
             return Err(SqlError::Type);
         }
-        if ext.logical_kinds.len() > MAX_EXT_COLUMNS
-            || ext.columns.len() > MAX_EXT_COLUMNS
-            || ext.constraints.len() > MAX_TABLES
-            || ext.sequences.len() > MAX_EXT_SEQUENCES
-            || ext.types.len() > MAX_EXT_COLUMNS
-        {
-            return Err(SqlError::Type);
-        }
         if let Some(excluded) = excluded_table
             && ext.constraints.values().flatten().any(|constraint| {
                 matches!(&constraint.kind, ConstraintKind::ForeignKey { ref_table, .. } if *ref_table == excluded)
@@ -1244,7 +1263,6 @@ impl Relational {
         super::extensions::validate(ext)?;
         super::column_collations::validate_bindings(self, ext, excluded_table)?;
         let mut collation_names = BTreeSet::new();
-        if ext.collations.len() > MAX_TABLES { return Err(SqlError::Limit); }
         for (id, c) in &ext.collations {
             super::collations::validate(c)?;
             if *id == 0 || *id >= next_id || !used.insert(*id)
@@ -1286,6 +1304,7 @@ impl Relational {
                 | DataType::IntArray
                 | DataType::BigIntArray
                 | DataType::TextArray
+                | DataType::UuidArray
                 | DataType::Boolean
                 | DataType::SmallInt
                 | DataType::Integer
@@ -1308,6 +1327,7 @@ impl Relational {
                 DataType::IntArray => Some(LogicalKind::IntArray),
                 DataType::BigIntArray => Some(LogicalKind::BigIntArray),
                 DataType::TextArray => Some(LogicalKind::TextArray),
+                DataType::UuidArray => Some(LogicalKind::UuidArray),
                 _ => None,
             };
             if ext.logical_kinds.get(id).copied() != logical {
@@ -1343,14 +1363,11 @@ impl Relational {
                 return Err(SqlError::Type);
             }
         }
-        let mut total = 0usize;
         for (table, cs) in &ext.constraints {
             let local = tables.get(table).ok_or(SqlError::Type)?;
             let mut names = BTreeSet::new();
             for c in cs {
-                total += 1;
-                if total > MAX_EXT_CONSTRAINTS
-                    || c.id == 0
+                if c.id == 0
                     || c.id >= next_id
                     || !used.insert(c.id)
                     || c.name.len() > 63
@@ -1663,17 +1680,14 @@ pub(crate) fn extension_map<'de, D: serde::Deserializer<'de>>(
     impl<'de> Visitor<'de> for SV {
         type Value = BTreeMap<String, super::extensions::InstalledExtension>;
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("bounded extensions")
+            f.write_str("extension map")
         }
         fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
-            if a.size_hint().is_some_and(|n| n > 64) {
-                return Err(de::Error::custom("too many extensions"));
-            }
             let mut out = BTreeMap::new();
             #[derive(Deserialize)]
             struct Name(#[serde(deserialize_with = "name")] String);
             while let Some(key) = a.next_key::<Name>()? {
-                if out.len() >= 64 || out.insert(key.0, a.next_value()?).is_some() {
+                if out.insert(key.0, a.next_value()?).is_some() {
                     return Err(de::Error::custom("invalid extensions"));
                 }
             }

@@ -4,6 +4,7 @@ mod flat_union;
 mod admission;
 mod numeric_literals;
 mod join_selection;
+mod introspection;
 mod regtype;
 mod viewdef;
 pub(crate) mod explain;
@@ -19,7 +20,7 @@ use sqlparser::{
     parser::Parser,
     tokenizer::{Token, Tokenizer},
 };
-use std::{collections::BTreeMap, ops::ControlFlow};
+use std::{collections::{BTreeMap, BTreeSet}, ops::ControlFlow};
 
 fn description(rows: &[Vec<Value>], name: &str, args: &[Value]) -> Value {
     use Value::{Int as I, Text as S, Null as N};
@@ -38,6 +39,7 @@ fn description(rows: &[Vec<Value>], name: &str, args: &[Value]) -> Value {
 pub struct Plan {
     contains_subquery: bool,
     query: Query,
+    catalog_relations: BTreeSet<String>,
     user_relations: BTreeMap<String, Vec<Field>>,
     parameters: usize,
     parameter_types: Vec<PgType>,
@@ -864,7 +866,8 @@ fn finish_plan(
         return Err(Error::Unsupported);
     }
     let mut types = vec![None; parameters];
-    collect_parameters(&query, &mut types)?;
+    let mut catalog_relations = BTreeSet::new();
+    collect_inputs(&query, &mut types, &mut catalog_relations)?;
     let parameter_types = types
         .into_iter()
         .map(|t| t.unwrap_or(PgType::Text))
@@ -872,6 +875,7 @@ fn finish_plan(
     join_selection::place(&mut query, &parameter_types);
     Ok(Some(Plan {
         contains_subquery: false,
+        catalog_relations,
         user_relations: BTreeMap::new(),
         projection_parameters,
         query,
@@ -906,14 +910,14 @@ pub fn execute_with_startup(
         .map(|(v, t)| cast(v.clone(), *t))
         .collect::<R<Vec<_>>>()?;
     validate_values(&parameters)?;
-    let mut catalogs = catalog::build(snapshot)?;
+    let mut catalogs = catalog::build(snapshot, &plan.catalog_relations)?;
     let mut input_bytes = 0;
     for (name, fields) in &plan.user_relations {
         let relation = snapshot
             .user_relations
             .get(name)
             .ok_or(Error::InvalidSnapshot)?;
-        if relation.fields != *fields || catalogs.contains_key(name) {
+        if relation.fields != *fields || catalog::schema(name).is_some() {
             return Err(Error::InvalidSnapshot);
         }
         for (i, row) in relation.rows.iter().enumerate() {
@@ -938,6 +942,7 @@ pub fn execute_with_startup(
         parameters: &parameters,
         work: 0,
         recursive_rows: BTreeMap::new(),
+        introspection: introspection::Lookups::default(),
     };
     let rows = rt.query(&plan.query, &[])?;
     Ok(ResultSet {
@@ -3628,8 +3633,11 @@ fn no_set_or_window(e: &E) -> R<()> {
     }
     Ok(())
 }
-fn collect_parameters(q: &Query, types: &mut [Option<PgType>]) -> R<()> {
-    fn expr(e: &E, types: &mut [Option<PgType>], hint: Option<PgType>) -> R<()> {
+fn collect_inputs(q: &Query, types: &mut [Option<PgType>], catalogs: &mut BTreeSet<String>) -> R<()> {
+    fn expr(e: &E, types: &mut [Option<PgType>], catalogs: &mut BTreeSet<String>, hint: Option<PgType>) -> R<()> {
+        if let K::Call(name, args) = &e.kind {
+            catalogs.extend(introspection::dependencies(name, args.len()).iter().map(|n| (*n).to_owned()));
+        }
         if let K::Param(i) = e.kind {
             let t = hint.unwrap_or(e.ty);
             let old = types[i];
@@ -3643,12 +3651,13 @@ fn collect_parameters(q: &Query, types: &mut [Option<PgType>]) -> R<()> {
             });
         }
         if let K::Subquery(q) | K::Exists(q, _) | K::ArrayQuery(q) | K::InQuery(_, q, _) = &e.kind {
-            collect_parameters(q, types)?;
+            collect_inputs(q, types, catalogs)?;
         }
         for c in children(e) {
             expr(
                 c,
                 types,
+                catalogs,
                 if let K::Cast(_, t) = e.kind {
                     Some(t)
                 } else {
@@ -3658,51 +3667,54 @@ fn collect_parameters(q: &Query, types: &mut [Option<PgType>]) -> R<()> {
         }
         Ok(())
     }
-    fn source(s: &Source, types: &mut [Option<PgType>]) -> R<()> {
+    fn source(s: &Source, types: &mut [Option<PgType>], catalogs: &mut BTreeSet<String>) -> R<()> {
         match s {
-            Source::Filtered(input, filter) => {
-                source(input, types)?;
-                expr(filter, types, None)?;
+            Source::Catalog(name) if catalog::schema(name).is_some() => {
+                catalogs.insert(name.clone());
             }
-            Source::Derived(q) | Source::Cte(q) => collect_parameters(q, types)?,
+            Source::Filtered(input, filter) => {
+                source(input, types, catalogs)?;
+                expr(filter, types, catalogs, None)?;
+            }
+            Source::Derived(q) | Source::Cte(q) => collect_inputs(q, types, catalogs)?,
             Source::FlatUnion(arms) => {
                 for arm in arms {
-                    collect_parameters(arm, types)?;
+                    collect_inputs(arm, types, catalogs)?;
                 }
             }
             Source::RoleRecursion(_, l, r, _) | Source::Union(l, r, _) => {
-                collect_parameters(l, types)?;
-                collect_parameters(r, types)?;
+                collect_inputs(l, types, catalogs)?;
+                collect_inputs(r, types, catalogs)?;
             }
             Source::Join(l, r, on, _, _, _) => {
-                source(l, types)?;
-                source(r, types)?;
-                expr(on, types, None)?
+                source(l, types, catalogs)?;
+                source(r, types, catalogs)?;
+                expr(on, types, catalogs, None)?
             }
             Source::Series(a, b) => {
-                expr(a, types, None)?;
-                expr(b, types, None)?
+                expr(a, types, catalogs, None)?;
+                expr(b, types, catalogs, None)?
             }
-            Source::Unnest(e, _) | Source::Options(e) | Source::Scalar(e) => expr(e, types, None)?,
+            Source::Unnest(e, _) | Source::Options(e) | Source::Scalar(e) => expr(e, types, catalogs, None)?,
             Source::ZipUnnest(es, _) => {
                 for e in es {
-                    expr(e, types, None)?;
+                    expr(e, types, catalogs, None)?;
                 }
             }
             _ => {}
         }
         Ok(())
     }
-    source(&q.source, types)?;
-    expr(&q.filter, types, None)?;
+    source(&q.source, types, catalogs)?;
+    expr(&q.filter, types, catalogs, None)?;
     for e in &q.projection {
-        expr(e, types, None)?
+        expr(e, types, catalogs, None)?
     }
     for o in &q.order {
-        expr(&o.e, types, None)?
+        expr(&o.e, types, catalogs, None)?
     }
     for e in &q.group {
-        expr(e, types, None)?;
+        expr(e, types, catalogs, None)?;
     }
     Ok(())
 }
@@ -3714,11 +3726,13 @@ struct Runtime<'a> {
     parameters: &'a [Value],
     work: usize,
     recursive_rows: BTreeMap<String, Vec<Vec<Value>>>,
+    introspection: introspection::Lookups<'a>,
 }
 pub(crate) fn evaluate_privilege(name: &str, values: &[Value], effective_role: &str, snapshot: &CatalogSnapshot) -> R<Option<bool>> {
     validate_values(values)?;
-    let catalogs = catalog::build(snapshot)?;
-    let mut rt = Runtime { snapshot, startup:None, catalogs:&catalogs, parameters:&[],work:0,recursive_rows:BTreeMap::new() };
+    let requested = introspection::dependencies(name, values.len()).iter().map(|n| (*n).to_owned()).collect();
+    let catalogs = catalog::build(snapshot, &requested)?;
+    let mut rt = Runtime { snapshot, startup:None, catalogs:&catalogs, parameters:&[],work:0,recursive_rows:BTreeMap::new(), introspection: introspection::Lookups::default() };
     match privilege_inquiry::evaluate(&mut rt,name,values,effective_role)? {
         Value::Null=>Ok(None),Value::Bool(b)=>Ok(Some(b)),_=>Err(Error::Type),
     }
@@ -3731,6 +3745,15 @@ fn admit(rows: &[Vec<Value>], row: &[Value], bytes: &mut usize) -> R<()> {
     } else {
         Ok(())
     }
+}
+fn admit_catalog_intermediate(rows: &[Vec<Value>], row: &[Value], bytes: &mut usize) -> R<()> {
+    const MAX_CATALOG_INTERMEDIATE_ROWS: usize = 65_536;
+    const MAX_CATALOG_INTERMEDIATE_BYTES: usize = 64 * 1024 * 1024;
+    *bytes = bytes.checked_add(catalog::row_bytes(row)).ok_or(Error::Limit)?;
+    if rows.len() >= MAX_CATALOG_INTERMEDIATE_ROWS || *bytes > MAX_CATALOG_INTERMEDIATE_BYTES {
+        return Err(Error::Limit);
+    }
+    Ok(())
 }
 fn boolean(v: Value) -> R<Option<bool>> {
     match v {
@@ -3807,15 +3830,18 @@ impl Runtime<'_> {
             Source::Catalog(n) => {
                 let r = self.catalogs.get(n).ok_or(Error::Unsupported)?;
                 self.charge(r.rows.len())?;
-                let mut rows = r.rows.clone();
-                if let Some(oid) = catalog::tableoid(n)
-                    .or_else(|| self.snapshot.user_relations.contains_key(n).then_some(0))
-                {
-                    for row in &mut rows {
-                        row.push(Value::Int(i64::from(oid)));
+                let oid = catalog::tableoid(n)
+                    .or_else(|| self.snapshot.user_relations.contains_key(n).then_some(0));
+                Ok(r.rows.iter().map(|row| {
+                    if let Some(oid) = oid {
+                        let mut copy = Vec::with_capacity(row.len() + 1);
+                        copy.extend_from_slice(row);
+                        copy.push(Value::Int(i64::from(oid)));
+                        copy
+                    } else {
+                        row.clone()
                     }
-                }
-                Ok(rows)
+                }).collect())
             }
             Source::Derived(q) => self.query(q, outer),
             Source::Cte(q) => self.query(
@@ -3886,7 +3912,7 @@ impl Runtime<'_> {
                 let mut bytes = 0;
                 for row in rows {
                     if boolean(self.eval(filter, &row, None, 0, &[], None)?)? == Some(true) {
-                        admit(&out, &row, &mut bytes)?;
+                        admit_catalog_intermediate(&out, &row, &mut bytes)?;
                         out.push(row);
                     }
                 }
@@ -3991,6 +4017,7 @@ impl Runtime<'_> {
                         }
                     }
                 }
+                let admit_join = if indexed.is_some() { admit_catalog_intermediate } else { admit };
                 let mut out = vec![];
                 let mut bytes = 0;
                 for l in &ls {
@@ -4026,7 +4053,8 @@ impl Runtime<'_> {
                         if size > MAX_BYTES {
                             return Err(Error::Limit);
                         }
-                        let mut row = l.clone();
+                        let mut row = Vec::with_capacity(l.len() + rwidth + outer.len());
+                        row.extend_from_slice(l);
                         row.extend(r.iter().cloned());
                         let width = row.len();
                         row.extend_from_slice(outer);
@@ -4034,14 +4062,15 @@ impl Runtime<'_> {
                         row.truncate(width);
                         if keep {
                             matched = true;
-                            admit(&out, &row, &mut bytes)?;
+                            admit_join(&out, &row, &mut bytes)?;
                             out.push(row)
                         }
                     }
                     if *left && !matched {
-                        let mut row = l.clone();
+                        let mut row = Vec::with_capacity(l.len() + rwidth + outer.len());
+                        row.extend_from_slice(l);
                         row.extend(std::iter::repeat_n(Value::Null, *rwidth));
-                        admit(&out, &row, &mut bytes)?;
+                        admit_join(&out, &row, &mut bytes)?;
                         out.push(row)
                     }
                 }
@@ -4071,7 +4100,7 @@ impl Runtime<'_> {
             }
             row.extend_from_slice(outer);
             if boolean(self.eval(filter, &row, None, 0, &[], None)?)? == Some(true) {
-                admit(&filtered, &row, &mut bytes)?;
+                admit_catalog_intermediate(&filtered, &row, &mut bytes)?;
                 filtered.push(row)
             }
         }
@@ -5268,134 +5297,8 @@ impl Runtime<'_> {
             "pg_get_statisticsobjdef_columns" => N,
             "_row" => Value::Record(v),
             "pg_indexam_has_property" => N,
-            "pg_get_constraintdef" => {
-                let oid = integer(v[0].clone())?;
-                if let Some(def) = catalog::definition(self.snapshot, oid, v.get(1) == Some(&B(true))) { return Ok(S(def)); }
-                self.catalogs["pg_constraint"]
-                    .rows
-                    .iter()
-                    .find(|r| {
-                        r[0] == I(oid) && matches!(&r[3], S(kind) if kind == "p" || kind == "n")
-                    })
-                    .and_then(|constraint| match &constraint[20] {
-                        Value::Array(keys) => keys
-                            .iter()
-                            .map(|key| {
-                                self.catalogs["pg_attribute"]
-                                    .rows
-                                    .iter()
-                                    .find(|r| r[0] == constraint[8] && r[4] == *key)
-                                    .and_then(|r| match &r[1] {
-                                        S(name) => Some(catalog::quote_identifier(name)),
-                                        _ => None,
-                                    })
-                            })
-                            .collect::<Option<Vec<_>>>()
-                            .map(|keys| (constraint[3] == S("n".into()), keys)),
-                        _ => None,
-                    })
-                    .map(|(not_null, keys)| {
-                        if not_null {
-                            S(format!("NOT NULL {}", keys.join(", ")))
-                        } else {
-                            S(format!("PRIMARY KEY ({})", keys.join(", ")))
-                        }
-                    })
-                    .unwrap_or(N)
-            }
-            "pg_get_indexdef" => {
-                let oid = integer(v[0].clone())?;
-                let column = if v.len() == 1 {
-                    0
-                } else {
-                    integer(v[1].clone())?
-                };
-                if column == 0 {
-                    let relation = self.catalogs["pg_index"]
-                        .rows
-                        .iter()
-                        .find(|r| r[0] == I(oid))
-                        .map(|r| r[1].clone());
-                    let visible = if v.len() == 3 && v[2] == B(true) {
-                        self.call(
-                            "pg_table_is_visible",
-                            vec![relation.unwrap_or(N)],
-                            remaining,
-                        )? == B(true)
-                    } else {
-                        false
-                    };
-                    let identity = self.catalogs["pg_class"]
-                        .rows
-                        .iter()
-                        .find(|r| r[0] == I(oid) && r[17] == S("i".into()))
-                        .and_then(|r| {
-                            self.catalogs["pg_namespace"]
-                                .rows
-                                .iter()
-                                .find(|ns| ns[0] == r[2])
-                                .map(|ns| (&r[1], &ns[1]))
-                        });
-                    self.catalogs["pg_indexes"]
-                        .rows
-                        .iter()
-                        .find(|r| Some((&r[2], &r[0])) == identity)
-                        .map(|r| match &r[4] {
-                            S(definition) if visible => {
-                                let index_name = match &r[2] {
-                                    S(name) => catalog::quote_identifier(name),
-                                    _ => return N,
-                                };
-                                let prefix = if definition.starts_with("CREATE UNIQUE INDEX ") {
-                                    "CREATE UNIQUE INDEX "
-                                } else {
-                                    "CREATE INDEX "
-                                };
-                                // Remove qualification only at the table position; an
-                                // index identifier may itself contain " ON public.".
-                                let offset = prefix.len() + index_name.len() + " ON ".len();
-                                S(format!(
-                                    "{}{}",
-                                    &definition[..offset],
-                                    &definition[offset
-                                        + text(r[0].clone())
-                                            .map(|schema| catalog::quote_identifier(&schema).len()
-                                                + 1)
-                                            .unwrap_or(0)..]
-                                ))
-                            }
-                            value => value.clone(),
-                        })
-                        .unwrap_or(N)
-                } else {
-                    self.catalogs["pg_attribute"]
-                        .rows
-                        .iter()
-                        .find(|r| {
-                            r[0] == I(oid)
-                                && r[4] == I(column)
-                                && self.catalogs["pg_index"]
-                                    .rows
-                                    .iter()
-                                    .any(|i| i[0] == I(oid))
-                        })
-                        .map(|r| match &r[1] {
-                            S(name) => S(catalog::quote_identifier(name)),
-                            _ => N,
-                        })
-                        .unwrap_or_else(|| {
-                            if self.catalogs["pg_index"]
-                                .rows
-                                .iter()
-                                .any(|i| i[0] == I(oid))
-                            {
-                                S(String::new())
-                            } else {
-                                N
-                            }
-                        })
-                }
-            }
+            "pg_get_constraintdef" => self.constraint_definition(&v)?,
+            "pg_get_indexdef" => self.index_definition(&v)?,
             "pg_get_viewdef" => {
                 let oid = match &v[0] { S(name) => i64::from(regclass_oid(name, self.snapshot).map_err(|_| Error::UnknownRelation(name.clone()))?), value => integer(value.clone())? };
                 let stored = self.snapshot.views.iter().find(|(id, _)| catalog::table_oid(**id).ok().map(i64::from) == Some(oid));
@@ -5467,31 +5370,7 @@ impl Runtime<'_> {
             "pg_has_role" | "has_table_privilege" | "has_column_privilege"
             | "has_any_column_privilege" | "has_sequence_privilege"
             | "has_schema_privilege" | "has_database_privilege" | "has_type_privilege" => self.privilege_function(n, &v)?,
-            "pg_table_is_visible" => {
-                let relations = &self.catalogs["pg_class"].rows;
-                self.charge(relations.len())?;
-                let Some(relation) = relations.iter().find(|r| r[0] == v[0]) else {
-                    return Ok(N);
-                };
-                let mut path = self.snapshot.search_path.clone();
-                if !path.iter().any(|n| n == "pg_catalog") {
-                    path.insert(0, "pg_catalog".into());
-                }
-                let namespaces = &self.catalogs["pg_namespace"].rows;
-                self.charge(
-                    path.len()
-                        .saturating_mul(namespaces.len() + relations.len()),
-                )?;
-                B(path
-                    .iter()
-                    .filter_map(|name| namespaces.iter().find(|n| n[1] == S(name.clone())))
-                    .find_map(|namespace| {
-                        relations
-                            .iter()
-                            .find(|r| r[1] == relation[1] && r[2] == namespace[0])
-                    })
-                    .is_some_and(|first| first[0] == v[0]))
-            }
+            "pg_table_is_visible" => self.table_is_visible(&v[0])?,
             "pg_type_is_visible" => B(self.catalogs["pg_type"]
                 .rows
                 .iter()

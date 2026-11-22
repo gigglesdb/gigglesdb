@@ -700,6 +700,7 @@ fn column(v: ColumnDef) -> p::NativeColumn {
             | DataType::IntArray
             | DataType::BigIntArray
             | DataType::TextArray
+            | DataType::UuidArray
             | DataType::Text
             | DataType::Varchar
             | DataType::Bpchar => 5,
@@ -918,6 +919,7 @@ fn catalog_type(v: &str) -> R<DataType> {
         "IntArray" => DataType::IntArray,
         "BigIntArray" => DataType::BigIntArray,
         "TextArray" => DataType::TextArray,
+        "UuidArray" => DataType::UuidArray,
         _ => return Err(ApiError::InvalidArgument),
     })
 }
@@ -945,6 +947,7 @@ fn catalog_type_name(v: &DataType) -> &'static str {
         DataType::IntArray => "IntArray",
         DataType::BigIntArray => "BigIntArray",
         DataType::TextArray => "TextArray",
+        DataType::UuidArray => "UuidArray",
         DataType::RegType => "RegType",
     }
 }

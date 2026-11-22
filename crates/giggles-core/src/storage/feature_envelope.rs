@@ -5,7 +5,10 @@ pub(crate) const KEY_DEPENDENCY_IDENTITY: u64 = 1 << 17;
 // Legacy format 53 has no WRITE_FENCE; retain its independent bit assignments.
 pub(crate) const COLUMN_COLLATIONS: u64 = 1 << 23;
 pub(crate) const USER_COLLATIONS: u64 = 1 << 22;
-pub(super) const NEW_BITS: u64 = 0x3c0 | KEY_DEPENDENCY_IDENTITY | USER_COLLATIONS | COLUMN_COLLATIONS;
+pub(crate) const UUID_ARRAY_COLUMNS: u64 = crate::storage::engine::meta::UUID_ARRAY_COLUMNS;
+const WIDE_CATALOG: u64 = super::engine::meta::WIDE_CATALOG;
+pub(super) const NEW_BITS: u64 =
+    0x3c0 | KEY_DEPENDENCY_IDENTITY | USER_COLLATIONS | COLUMN_COLLATIONS | UUID_ARRAY_COLUMNS | WIDE_CATALOG;
 pub(super) const ROLE_BOOTSTRAP: u64 = 1 << 9;
 
 /// E1 B0b: true when CatalogExt is nonempty.
@@ -30,6 +33,25 @@ fn role_bootstrap_present(_: &State) -> bool {
     false
 }
 
+pub(super) fn wide_catalog_present(s: &State) -> bool {
+    let ext = s.sql.catalog_ext();
+    s.wide_catalog || crate::relational::catalog_scale::Counts {
+        tables: s.sql.tables.len(),
+        schemas: ext.schemas.len(),
+        sequences: ext.sequences.len(),
+        types: ext.types.len(),
+        collations: ext.collations.len(),
+        column_collations: ext.column_collations.len(),
+        constraint_tables: ext.constraints.len(),
+        constraints: ext.constraints.values().map(Vec::len).sum(),
+    }
+    .needs_feature(s.sql.secondary_descriptors_engine().iter())
+}
+
+pub(super) fn uuid_array_columns_present(s: &State) -> bool {
+    s.uuid_array_columns || s.sql.catalog_ext().has_uuid_arrays()
+}
+
 pub(super) fn feature_bits_present(s: &State) -> Result<u64, CoreError> {
     let typed = s.sql.contains_typed()
         || s.native_outcomes
@@ -44,8 +66,10 @@ pub(super) fn feature_bits_present(s: &State) -> Result<u64, CoreError> {
         | (u64::from(extended_types_present(s)) << 7)
         | (u64::from(sequence_counters_present(s)) << 8)
         | (u64::from(role_bootstrap_present(s)) << 9)
+        | if wide_catalog_present(s) { WIDE_CATALOG } else { 0 }
         | if !s.sql.catalog_ext().column_collations.is_empty() { COLUMN_COLLATIONS } else { 0 }
         | if !s.sql.catalog_ext().collations.is_empty() { USER_COLLATIONS } else { 0 }
+        | if uuid_array_columns_present(s) { UUID_ARRAY_COLUMNS } else { 0 }
         | if s.sql.catalog_ext().has_key_dependency_identity() { KEY_DEPENDENCY_IDENTITY } else { 0 })
 }
 
@@ -75,7 +99,7 @@ pub(super) fn decode_bits(
         .and_then(|v| v.as_slice().try_into().ok())
         .ok_or_else(|| CoreError::Corrupt("missing or malformed feature record".into()))?;
     let bits = u64::from_be_bytes(bytes);
-    if bits & !(1023 | KEY_DEPENDENCY_IDENTITY | USER_COLLATIONS | COLUMN_COLLATIONS) != 0 {
+    if bits & !(63 | NEW_BITS) != 0 {
         return Err(CoreError::Unsupported);
     }
     if import && bits & ROLE_BOOTSTRAP != 0 {

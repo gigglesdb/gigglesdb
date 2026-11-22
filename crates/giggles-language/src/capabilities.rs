@@ -151,7 +151,9 @@ pub struct CapabilityLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inspection_metadata_bytes: Option<usize>,
     pub columns_per_table: usize,
-    pub catalog_tables: usize,
+    /// `null`: no fixed catalog table ceiling (removed in GD-0092 AM-3); byte
+    /// and work budgets still apply.
+    pub catalog_tables: Option<usize>,
     pub concurrent_explicit_sessions: usize,
     /// Text that begins with `insert` uses SQL's statement byte budget and
     /// flat-tuple token budget instead of text_bytes and text_tokens.
@@ -1809,7 +1811,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
             inspection_metadata_bytes: version.supports_inspection()
                 .then_some(giggles_core::operations::MAX_INSPECTION_METADATA_BYTES),
             columns_per_table: relational::MAX_COLUMNS,
-            catalog_tables: relational::MAX_TABLES,
+            catalog_tables: None,
             concurrent_explicit_sessions: relational::LEGACY_MAX_TRANSACTIONS,
             insert_text_bytes: crate::MAX_INSERT_INPUT.max(MAX_INPUT),
             insert_text_tokens: crate::MAX_INSERT_TOKENS,

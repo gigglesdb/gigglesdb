@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 
 const MAX_SELECT_BYTES: usize = 1 << 20;
 const MAX_DEPENDENCIES: usize = 100_000;
-// Frozen one-byte tags 0..=21, independent of DataType's serde representation.
-const STORAGE_TYPES: [DataType; 22] = [
+// One-byte tags independent of DataType's serde representation. Tags 0..=21 are frozen.
+const STORAGE_TYPES: [DataType; 23] = [
     DataType::Boolean,
     DataType::SmallInt,
     DataType::Integer,
@@ -32,6 +32,7 @@ const STORAGE_TYPES: [DataType; 22] = [
     DataType::IntArray,
     DataType::BigIntArray,
     DataType::TextArray,
+    DataType::UuidArray,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]

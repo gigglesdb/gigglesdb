@@ -35,14 +35,14 @@ fn pending_descriptors_then_exact_complete_finalize_and_compatible_wrapper() {
     let tuples = snap.tuples();
     let rows = snap.rows(&tuples);
     assert_eq!(
-        si::codec::decode_validated(&payload, &rows, &CatalogView(&restored), || false).unwrap(),
-        p.validate_complete(&rows, &CatalogView(&restored), || false)
+        si::codec::decode_validated(&payload, &rows, &CatalogView::new(&restored), || false).unwrap(),
+        p.validate_complete(&rows, &CatalogView::new(&restored), || false)
             .unwrap()
     );
     // A SELECT-sized prefix is never supplied by the real adapter. Exact
     // validation catches an omitted row relative to the persisted payload.
     assert_eq!(
-        pending(&payload).validate_complete(&[], &CatalogView(&restored), || false),
+        pending(&payload).validate_complete(&[], &CatalogView::new(&restored), || false),
         Err(si::Error::Corrupt)
     );
     restored
@@ -176,7 +176,7 @@ fn cancellation_at_every_pending_finalize_restore_and_encoding_fence() {
     let tuples = snap.tuples();
     let rows = snap.rows(&tuples);
     calls = 0;
-    p.validate_complete(&rows, &CatalogView(&target), || {
+    p.validate_complete(&rows, &CatalogView::new(&target), || {
         calls += 1;
         false
     })
@@ -184,7 +184,7 @@ fn cancellation_at_every_pending_finalize_restore_and_encoding_fence() {
     for stop in 1..=calls {
         let mut n = 0;
         assert_eq!(
-            pending(&payload).validate_complete(&rows, &CatalogView(&target), || {
+            pending(&payload).validate_complete(&rows, &CatalogView::new(&target), || {
                 n += 1;
                 n == stop
             }),

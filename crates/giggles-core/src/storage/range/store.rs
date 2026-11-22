@@ -250,7 +250,20 @@ impl RangeStore {
                 self.kv.write(batch, Durability::NoSync)?;
                 Ok(RangeApplyOutcome::Applied)
             }
-            Some(BatchCheck { features: bits, .. }) => {
+            Some(BatchCheck { features: mut bits, .. }) => {
+                // The sequencer's next feature write can have been built before
+                // a racing prepared finalize made this range's catalog wide.
+                if range == SYSTEM_RANGE && bits & meta::WIDE_CATALOG == 0 {
+                    let key = range_local_key(range, &RangeLocalKey::Features);
+                    if let Some(prior) = self.kv.get(Keyspace::Meta, &key)?
+                        && u64::from_be_bytes(prior.as_slice().try_into()
+                            .map_err(|_| CoreError::Corrupt("invalid prior range features".into()))?)
+                            & meta::WIDE_CATALOG != 0
+                    {
+                        bits |= meta::WIDE_CATALOG;
+                        batch.put(Keyspace::Meta, key, bits.to_be_bytes().to_vec());
+                    }
+                }
                 let _features = self
                     .features
                     .lock()

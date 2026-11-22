@@ -519,7 +519,7 @@ keys, nulls and multiple request/action alternatives are rejected.
 The exact, case-sensitive `dataType` names are `Boolean`, `SmallInt`, `Integer`,
 `BigInt`, `Text`, `Bytes`, `Numeric`, `Real`, `DoublePrecision`, `Date`, `Time`,
 `TimeTz`, `Timestamp`, `TimestampTz`, `Interval`, `Varchar`, `Bpchar`, `Uuid`,
-`Jsonb`, `IntArray`, `BigIntArray` and `TextArray`; SQL type spellings and
+`Jsonb`, `IntArray`, `BigIntArray`, `TextArray` and `UuidArray`; SQL type spellings and
 parameterized type declarations are not accepted here.
 
 Create-table columns additionally accept `default` with exactly one of

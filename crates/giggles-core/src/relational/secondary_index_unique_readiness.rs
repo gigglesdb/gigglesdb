@@ -153,8 +153,6 @@ fn key_bound(v: &Value) -> R<usize> {
 fn admit<F: FnMut() -> bool>(state: &Relational, d: &Descriptor, meter: &mut Meter<F>) -> R<()> {
     cap(d.name.len(), si::MAX_NAME)?;
     cap(d.columns.len(), MAX_COLUMNS)?;
-    cap(state.tables.len(), MAX_TABLES)?;
-    cap(state.rows.len(), MAX_TABLES)?;
     meter.bytes(add(d.name.len(), mul(d.columns.len(), 8)?)?)?;
     meter.work(add(1, d.columns.len())?)?;
     meter.checkpoint()?;

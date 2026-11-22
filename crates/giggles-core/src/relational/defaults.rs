@@ -716,6 +716,7 @@ pub(super) fn install_create(
             DataType::IntArray => Some(catalog_ext::LogicalKind::IntArray),
             DataType::BigIntArray => Some(catalog_ext::LogicalKind::BigIntArray),
             DataType::TextArray => Some(catalog_ext::LogicalKind::TextArray),
+            DataType::UuidArray => Some(catalog_ext::LogicalKind::UuidArray),
             _ => None,
         };
         if let Some(kind) = logical {
@@ -928,6 +929,7 @@ pub(super) fn type_name(ty: &DataType) -> &'static str {
         DataType::IntArray => "integer[]",
         DataType::BigIntArray => "bigint[]",
         DataType::TextArray => "text[]",
+        DataType::UuidArray => "uuid[]",
 
         DataType::Bytes => "bytea",
         DataType::Date => "date",

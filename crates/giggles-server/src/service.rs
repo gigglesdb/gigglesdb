@@ -2149,9 +2149,6 @@ impl Session {
         epoch: u64,
         visible: Vec<relational::TableDef>,
     ) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
-        if visible.len() > relational::MAX_TABLES {
-            return Err(CoreError::Sql(relational::SqlError::Limit));
-        }
         let schemas = self.sql.schema_metadata()?;
         let views = self.sql.catalog_metadata()?.presentation.views;
         for table in &visible {

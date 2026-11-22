@@ -67,10 +67,10 @@ pub(super) fn parse(p: &mut Parser, site: Site) -> R<Parsed> {
         _ => return Err(SqlError::Unsupported),
     };
     // Keep unsupported array families rejected before CREATE precision policy.
-    // The lexer now admits brackets for the supported integer/text arrays.
+    // The lexer now admits brackets for the supported integer, text and UUID arrays.
     if !matches!(
         data_type,
-        DataType::Integer | DataType::BigInt | DataType::Text
+        DataType::Integer | DataType::BigInt | DataType::Text | DataType::Uuid
     ) {
         let mut nesting = 0usize;
         for token in &p.tokens[p.at..] {
@@ -233,6 +233,7 @@ pub(super) fn parse(p: &mut Parser, site: Site) -> R<Parsed> {
             DataType::Integer => DataType::IntArray,
             DataType::BigInt => DataType::BigIntArray,
             DataType::Text => DataType::TextArray,
+            DataType::Uuid => DataType::UuidArray,
             _ => return Err(SqlError::Unsupported),
         };
     }

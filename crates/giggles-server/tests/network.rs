@@ -215,6 +215,9 @@ impl Fixture {
         .await
     }
     async fn with_app_table(table: &str, setup: &[&str]) -> Self {
+        Self::with_app_table_engine(table, setup, giggles_core::Engine::Legacy).await
+    }
+    async fn with_app_table_engine(table: &str, setup: &[&str], engine: giggles_core::Engine) -> Self {
         let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
             "network-fixture-{}-{}-{}",
             std::process::id(),
@@ -251,7 +254,7 @@ impl Fixture {
             .unwrap();
         }
         std::fs::write(path.join("FIXTURES-ONLY.txt"),"Generated local TEST certificates and private keys. Not deployment credentials. Retained intentionally.\n").unwrap();
-        let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+        let admin = Admin::create_engine(path.join("db.redb"), Limits::default(), engine).unwrap();
         let mut sql = admin.sql_session();
         for ddl in setup {
             sql.execute(ddl, &[], None).unwrap();
@@ -2466,6 +2469,7 @@ include!("immutable_planning_network.inc");
 include!("filter_planning_network.inc");
 include!("aggregate_scalar_network.inc");
 include!("array_ordering_network.inc");
+include!("uuid_array_network.inc");
 include!("count_parameter_network.inc");
 include!("character_network.inc");
 include!("pgparity_scalars_w06_network.inc");
@@ -2759,3 +2763,5 @@ fn task_prototype_probes() -> Vec<proto::ExecuteRequest> {
     );
     probes
 }
+
+include!("catalog_scale_network.inc");

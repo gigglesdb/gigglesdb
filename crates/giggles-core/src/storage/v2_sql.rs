@@ -707,23 +707,23 @@ impl SqlSession {
                             });
                         let mut connected = target_id.into_iter().chain(write_ids.iter().copied()).collect::<BTreeSet<_>>();
                         if writing && component_locks {
-                            loop {
-                                let count = connected.len();
-                                for (&child, constraints) in &parts.ext.constraints {
-                                    for c in constraints {
-                                        if let relational::catalog_ext::ConstraintKind::ForeignKey {
-                                            ref_table,
-                                            ..
-                                        } = &c.kind
-                                            && (connected.contains(&child)
-                                                || connected.contains(ref_table))
-                                        {
-                                            connected.extend([child, *ref_table]);
-                                        }
+                            let mut neighbors = BTreeMap::<_, Vec<_>>::new();
+                            for (&child, constraints) in &parts.ext.constraints {
+                                for constraint in constraints {
+                                    if let relational::catalog_ext::ConstraintKind::ForeignKey {
+                                        ref_table, ..
+                                    } = &constraint.kind {
+                                        neighbors.entry(child).or_default().push(*ref_table);
+                                        neighbors.entry(*ref_table).or_default().push(child);
                                     }
                                 }
-                                if connected.len() == count {
-                                    break;
+                            }
+                            let mut pending: Vec<_> = connected.iter().copied().collect();
+                            while let Some(table) = pending.pop() {
+                                for &neighbor in neighbors.get(&table).into_iter().flatten() {
+                                    if connected.insert(neighbor) {
+                                        pending.push(neighbor);
+                                    }
                                 }
                             }
                         }
@@ -1259,11 +1259,16 @@ impl SqlSession {
                         bound.apply_view(&image, &mut new, ids.start).map_err(CoreError::Sql)?;
                         txn.reclaim_after_commit |=
                             old.tables
-                                .values()
-                                .any(|table| !new.tables.values().any(|next| next.id == table.id))
-                                || old.indexes.iter().any(|index| {
-                                    !new.indexes.iter().any(|next| next.id == index.id)
-                                });
+                                .iter()
+                                .any(|(name, table)| {
+                                    new.tables.get(name).is_none_or(|next| next.id != table.id)
+                                        && !new.tables.values().any(|next| next.id == table.id)
+                                })
+                                || {
+                                    let new_indexes = new.indexes.iter().map(|index| index.id)
+                                        .collect::<BTreeSet<_>>();
+                                    old.indexes.iter().any(|index| !new_indexes.contains(&index.id))
+                                };
                         db.catalog().apply_diff(txn, old, &new, &ids, None, &|| {
                             crate::cancellation::check().is_err()
                         })?;

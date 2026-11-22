@@ -2068,3 +2068,121 @@ fn statement_token_budget() {
     eprintln!("20000 VALUES: {:?}", start.elapsed());
     assert_eq!(r.rows[0].values, vec![Int(20000)]);
 }
+
+
+#[test]
+fn uuid_array_feature_bit_tracks_persisted_types() {
+    let mut f = Fixture::new();
+    let bit = engine::meta::UUID_ARRAY_COLUMNS;
+    let features = |f: &Fixture| engine::meta::validate_meta(f.db().kv.as_ref()).unwrap().features;
+
+    f.execute("CREATE TABLE t (id bigint PRIMARY KEY, v text[])");
+    f.execute("INSERT INTO t VALUES (1,'{old}')");
+    let bytes = f.catalog_bytes();
+    let old_bits = features(&f);
+    assert_eq!(old_bits & bit, 0);
+    f.execute("SELECT ARRAY[]::uuid[]");
+    f.reopen();
+    assert_eq!(f.catalog_bytes(), bytes);
+    assert_eq!(features(&f), old_bits);
+
+    f.execute("CREATE TABLE copy AS SELECT id, ARRAY[]::uuid[] AS ids FROM t");
+    assert_ne!(features(&f) & bit, 0);
+    assert!(engine::content_check::check(f.db().kv.as_ref(), features(&f) & !bit).is_err());
+    f.execute("CREATE VIEW copied_ids AS SELECT ids FROM copy");
+    f.reopen();
+    assert_eq!(
+        values(&mut f.admin().sql_session(), "SELECT ids FROM copied_ids"),
+        vec![vec![relational::Value::Text("{}".into())]],
+    );
+    f.execute("DROP VIEW copied_ids");
+    f.execute("DROP TABLE copy");
+    f.reopen();
+    assert_ne!(features(&f) & bit, 0);
+}
+
+#[test]
+fn catalog_scale_feature_is_committed_with_the_first_wide_catalog() {
+    let f = Fixture::new();
+    let db = f.db();
+    let wide = || {
+        let bits = engine::meta::validate_meta(db.kv.snapshot().unwrap().as_ref()).unwrap().features;
+        bits & engine::meta::WIDE_CATALOG != 0
+    };
+    f.execute("CREATE TABLE wide_catalog_table(id integer PRIMARY KEY, k integer)");
+    for i in 1..=8 {
+        f.execute(&format!("CREATE INDEX wc_{i} ON wide_catalog_table(k)"));
+    }
+    assert!(!wide());
+
+    let mut session = f.admin().sql_session();
+    for sql in [
+        "BEGIN",
+        "CREATE INDEX wc_9 ON wide_catalog_table(k)",
+        "ROLLBACK",
+    ] {
+        session.execute(sql, &[], None).unwrap();
+    }
+    assert!(!wide());
+
+    f.execute("CREATE INDEX wc_9 ON wide_catalog_table(k)");
+    assert!(wide());
+    f.execute("DROP INDEX wc_9");
+    assert!(wide());
+}
+
+#[test]
+fn uuid_array_feature_uses_final_committed_overlay() {
+    let f = Fixture::new();
+    let mut session = f.admin().sql_session();
+    let features = || engine::meta::validate_meta(f.db().kv.as_ref()).unwrap().features;
+    let bit = engine::meta::UUID_ARRAY_COLUMNS;
+    for transaction in [
+        &["BEGIN", "CREATE TABLE dropped (id int PRIMARY KEY, a uuid[])", "DROP TABLE dropped", "COMMIT"][..],
+        &["BEGIN", "SAVEPOINT before_array", "CREATE TABLE restored (id int PRIMARY KEY, a uuid[])",
+            "ROLLBACK TO SAVEPOINT before_array", "CREATE TABLE kept (id int PRIMARY KEY)", "COMMIT"],
+    ] {
+        for sql in transaction {
+            session.execute(sql, &[], None).unwrap();
+        }
+        assert_eq!(features() & bit, 0);
+    }
+    f.execute("INSERT INTO kept VALUES (1)");
+    f.execute("ALTER TABLE kept ADD COLUMN a uuid[]");
+    assert_ne!(features() & bit, 0);
+}
+
+#[test]
+fn uuid_array_and_catalog_scale_bits_open_without_catalog_witnesses() {
+    let mut f = Fixture::new();
+    let features = |f: &Fixture| engine::meta::validate_meta(f.db().kv.as_ref()).unwrap().features;
+    f.execute("CREATE TABLE ordinary (id int PRIMARY KEY)");
+    let bits = engine::meta::UUID_ARRAY_COLUMNS | engine::meta::WIDE_CATALOG;
+    let old = features(&f);
+    assert_eq!(old & bits, 0);
+    let mut batch = WriteBatch::default();
+    engine::meta::put_features(&mut batch, old | bits).unwrap();
+    f.db().kv.write(batch, Durability::Sync).unwrap();
+    f.reopen();
+    f.execute("INSERT INTO ordinary VALUES (1)");
+    assert_eq!(
+        values(&mut f.admin().sql_session(), "SELECT id FROM ordinary"),
+        vec![vec![relational::Value::Int(1)]],
+    );
+    assert_eq!(features(&f), old | bits);
+}
+
+#[test]
+fn catalog_scale_main_shaped_sequences_preserve_feature_word() {
+    let mut f = Fixture::new();
+    let features = |f: &Fixture| engine::meta::validate_meta(f.db().kv.as_ref()).unwrap().features;
+    f.execute("CREATE TABLE ordinary (id int PRIMARY KEY)");
+    for i in 0..129 {
+        f.execute(&format!("CREATE SEQUENCE s{i}"));
+    }
+    let old = features(&f);
+    assert_eq!(old & engine::meta::WIDE_CATALOG, 0);
+    f.reopen();
+    f.execute("INSERT INTO ordinary VALUES (1)");
+    assert_eq!(features(&f), old);
+}

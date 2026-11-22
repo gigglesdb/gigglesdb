@@ -55,6 +55,7 @@ fn name(op: BinaryOp) -> &'static str {
         BinaryOp::JsonPathText => "\u{1}operator:#>>",
         BinaryOp::Contains => "\u{1}operator:@>",
         BinaryOp::ContainedBy => "\u{1}operator:<@",
+        BinaryOp::Overlap => "\u{1}operator:&&",
         BinaryOp::Regex => "\u{1}operator:~",
         BinaryOp::NotRegex => "\u{1}operator:!~",
         BinaryOp::RegexInsensitive => "\u{1}operator:~*",
@@ -86,6 +87,7 @@ pub(super) fn token_operator(token: Option<&Token>) -> Option<(BinaryOp, u8)> {
             "#>>" => (BinaryOp::JsonPathText, 1),
             "@>" => (BinaryOp::Contains, 1),
             "<@" => (BinaryOp::ContainedBy, 1),
+            "&&" => (BinaryOp::Overlap, 1),
             "~" => (BinaryOp::Regex, 1),
             "!~" => (BinaryOp::NotRegex, 1),
             "~*" => (BinaryOp::RegexInsensitive, 1),
@@ -295,8 +297,20 @@ fn signature(
             Err(undefined_operator(op, [a.as_ref(), b.as_ref()]))
         };
     }
-    if matches!(op, Contains | ContainedBy) {
-        return Err(SqlError::Unsupported);
+    if matches!(op, Contains | ContainedBy | Overlap) {
+        let types = [a.as_ref(), b.as_ref()];
+        if types.contains(&Some(&UuidArray)) {
+            return if types.into_iter().flatten().all(|ty| *ty == UuidArray) {
+                Ok((UuidArray, UuidArray, Boolean))
+            } else {
+                Err(undefined_operator(op, types))
+            };
+        }
+        return if op == Overlap {
+            Err(undefined_operator(op, types))
+        } else {
+            Err(SqlError::Unsupported)
+        };
     }
     if matches!(op, Like | NotLike | Ilike | NotIlike | StartsWith | Regex | NotRegex
         | RegexInsensitive | NotRegexInsensitive) {
@@ -373,7 +387,7 @@ fn undefined_operator(op: BinaryOp, types: [Option<&DataType>; 2]) -> SqlError {
     operator_error(spelling, Some(types[0]), types[1])
 }
 
-fn operator_error(spelling: &str, left: Option<Option<&DataType>>, right: Option<&DataType>) -> SqlError {
+pub(super) fn operator_error(spelling: &str, left: Option<Option<&DataType>>, right: Option<&DataType>) -> SqlError {
     let label = |ty: Option<&DataType>| ty.map_or("unknown", typeof_expr::name);
     let right = label(right);
     let signature = left.map_or_else(
@@ -567,6 +581,11 @@ pub(super) fn eval(
     if op == "~" && let Value::Int(n) = values[0] {
         reserve(budget, 8)?;
         return Ok(Value::Int(!n));
+    }
+    if matches!(op, "@>" | "<@" | "&&") {
+        let value = uuid_array_operators::eval(op, values)?;
+        charge(budget, &value)?;
+        return Ok(value);
     }
     if matches!(op, "#>" | "#>>") {
         let value = logical_types::eval(op, &args[0].ty, values)?;

@@ -172,7 +172,7 @@ pub(super) fn check_row_order(op: &str, args: &[BoundScalar]) -> R<()> {
             let (left, right, _) = row_operands(arg)?;
             if [left, right].iter().any(|arg| matches!(
                 arg.ty,
-                DataType::IntArray | DataType::BigIntArray | DataType::TextArray
+                DataType::IntArray | DataType::BigIntArray | DataType::TextArray | DataType::UuidArray
                     | DataType::Jsonb | DataType::RegType
             )) {
                 return Err(SqlError::Unsupported);

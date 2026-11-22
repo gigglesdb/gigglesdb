@@ -38,7 +38,6 @@ use std::{
     time::Instant,
 };
 
-pub(crate) const MAX_TABLES: usize = 100_000;
 
 // Tests exercise reclamation without requiring 1024 follow-up statements.
 const CURRENT_PRUNE_INTERVAL: u32 = if cfg!(test) { 1 } else { 1024 };
@@ -116,6 +115,32 @@ pub(crate) struct CatalogParts {
     pub(crate) ext: CatalogExt,
 }
 impl CatalogView {
+    fn has_uuid_arrays(&self) -> bool {
+        self.by_id.values().any(|entry| {
+            entry.def.columns.iter().any(|c| c.data_type == relational::DataType::UuidArray)
+        }) || self.sql_views.values().any(|view| {
+            view.columns.iter().any(|c| c.storage_type == relational::DataType::UuidArray)
+        }) || self.types.values().any(TypeDef::has_uuid_arrays)
+    }
+
+    fn needs_wide_catalog(&self) -> bool {
+        relational::catalog_scale::Counts {
+            tables: self.by_id.len(),
+            schemas: self.schemas.len(),
+            sequences: self.sequences.len(),
+            types: self.types.len(),
+            collations: self.collations.len(),
+            // Main's V2 image checked column bindings after removing index
+            // bindings. Legacy's serialized map cap includes both.
+            column_collations: self.column_collations.values()
+                .filter(|binding| !matches!(binding, relational::column_collations::Binding::Index(_)))
+                .count(),
+            constraint_tables: self.constraints.len(),
+            constraints: self.constraints.values().map(BTreeMap::len).sum(),
+        }
+        .needs_feature(self.indexes.values())
+    }
+
     pub(crate) fn parts(&self) -> CatalogParts {
         let mut parts = CatalogParts {
             sql_views: self.sql_views.clone(),
@@ -143,6 +168,7 @@ impl CatalogView {
                     relational::DataType::IntArray => LogicalKind::IntArray,
                     relational::DataType::BigIntArray => LogicalKind::BigIntArray,
                     relational::DataType::TextArray => LogicalKind::TextArray,
+                    relational::DataType::UuidArray => LogicalKind::UuidArray,
                     _ => continue,
                 };
                 parts.ext.logical_kinds.insert(column.id, kind);
@@ -915,7 +941,12 @@ impl Catalog {
             cancel,
         )?;
         for (key, value) in &new_records {
-            txn.require_features(super::content_check::required_bits_for_catalog_value(key, value).map_err(|e| corrupt(&e.to_string()))?);
+            if old_records.get(key) != Some(value) || txn.catalog_own(key).is_some() {
+                let bits = super::content_check::required_bits_for_catalog_value(key, value)
+                    .map_err(|e| corrupt(&e.to_string()))?;
+                // UUID arrays are admitted from the final catalog overlay.
+                txn.require_features(bits & !super::meta::UUID_ARRAY_COLUMNS);
+            }
         }
         self.lock_and_write(txn, &old_records, &new_records, deadline, cancel)?;
         if !new.indexes.is_empty() {
@@ -1375,7 +1406,13 @@ impl Catalog {
             }
         }
         // Reject limit/corruption before committing anything durably.
-        overlay_view(latest, txn.catalog_writes()).map_err(commit_error)?;
+        let final_view = overlay_view(latest, txn.catalog_writes()).map_err(commit_error)?;
+        if final_view.needs_wide_catalog() {
+            txn.require_features(super::meta::WIDE_CATALOG);
+        }
+        if final_view.has_uuid_arrays() {
+            txn.require_features(super::meta::UUID_ARRAY_COLUMNS);
+        }
         // A gateway's catalog commit also replaces the generation record, so other gateways
         // see that their cached catalog is stale (GD-0075 P7-1).
         let token = match self.services {
@@ -1577,6 +1614,36 @@ fn load_view_until(
     }
     finish_view(view, names).map_err(loaded_catalog_error)
 }
+/// A range leader has the final physical batch for both one-range commit
+/// and prepared finalize. All SQL catalog records live in the system range.
+#[cfg(feature = "engine-rocksdb")]
+pub(crate) fn range_batch_needs_wide_catalog(
+    kv: &dyn KvRead,
+    batch: &super::kv::WriteBatch,
+) -> Result<bool, CoreError> {
+    use super::kv::Op;
+    let mut writes = BTreeMap::new();
+    let mut grows_catalog = false;
+    for op in batch.ops() {
+        let Op::Put { ks: Keyspace::Catalog, key, value } = op else { continue };
+        let (user, _) = super::codec::split_versioned(key)?;
+        if user >= CLUSTER_RECORDS {
+            continue;
+        }
+        let kind = catalog_codec::classify_catalog_key(user)?;
+        let value = mvcc::decode(value)?;
+        grows_catalog |= value.is_some() && matches!(kind,
+            CatalogKind::Table | CatalogKind::Schema | CatalogKind::Sequence
+                | CatalogKind::TypeDefinition | CatalogKind::Collation | CatalogKind::ColumnCollation
+                | CatalogKind::Constraint | CatalogKind::Index | CatalogKind::SqlView);
+        writes.insert(user.to_vec(), value.map(<[u8]>::to_vec));
+    }
+    if !grows_catalog {
+        return Ok(false);
+    }
+    let previous = load_view_until(kv, Ts(u64::MAX), Bound::Excluded(CLUSTER_RECORDS))?;
+    Ok(overlay_view(&previous, writes.iter())?.needs_wide_catalog())
+}
 fn loaded_catalog_error(e: CoreError) -> CoreError {
     match e {
         CoreError::Limit => e,
@@ -1589,8 +1656,7 @@ fn overlay_view<'a>(
 ) -> Result<CatalogView, CoreError> {
     let mut view = base.clone();
     let mut names = base.names.clone();
-    // Remove first, so a full catalog can drop and create within one DDL txn
-    // without exceeding the bound transiently due to key ordering.
+    // Apply deletions before inserts so a transaction may reuse a dropped name.
     let records: Vec<_> = records.collect();
     for (key, value) in records.iter().filter(|(_, value)| value.is_none()) {
         apply_record(&mut view, &mut names, key, value.as_deref())?;
@@ -1662,9 +1728,6 @@ fn apply_record(
                     return Err(corrupt("catalog table key/id mismatch"));
                 }
                 view.by_id.insert(id, Arc::new(entry));
-                if view.by_id.len() > MAX_TABLES {
-                    return Err(CoreError::Limit);
-                }
             } else {
                 view.by_id.remove(&id);
             }
@@ -1738,9 +1801,6 @@ fn apply_record(
             if let Some(value) = value {
                 view.schemas
                     .insert(name.into(), catalog_codec::decode_schema(value)?);
-                if view.schemas.len() > MAX_TABLES {
-                    return Err(CoreError::Limit);
-                }
             } else {
                 view.schemas.remove(name);
             }
@@ -1992,7 +2052,7 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
         records.insert(catalog_codec::sql_views::view_key(*id), catalog_codec::sql_views::encode_view(view)?);
     }
     let mut columns = BTreeSet::new();
-    let mut table_ids = BTreeSet::new();
+    let mut table_ids = BTreeMap::new();
     for (name, def) in &parts.tables {
         let schema = parts
             .ext
@@ -2003,7 +2063,7 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
             return Err(corrupt("catalog table name mismatch"));
         }
         if !names.insert(name.clone()) { return Err(CoreError::Sql(SqlError::Duplicate)); }
-        table_ids.insert(def.id);
+        table_ids.insert(def.id, def);
         let ext = def
             .columns
             .iter()
@@ -2025,17 +2085,13 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
         records.insert(table_key(def.id), value);
         records.insert(name_key(name), def.id.to_be_bytes().to_vec());
     }
-    if parts.heap.iter().any(|id| !table_ids.contains(id))
+    if parts.heap.iter().any(|id| !table_ids.contains_key(id))
         || parts.ext.columns.keys().any(|id| !columns.contains(id))
     {
         return Err(corrupt("catalog extension owner absent"));
     }
     for (table, cs) in &parts.ext.constraints {
-        let def = parts
-            .tables
-            .values()
-            .find(|d| d.id == *table)
-            .ok_or_else(|| corrupt("constraint table absent"))?;
+        let def = table_ids.get(table).ok_or_else(|| corrupt("constraint table absent"))?;
         for c in cs {
             let value = catalog_codec::encode_constraint(c, &def.name)?;
             catalog_codec::decode_constraint(&value, def)?;
@@ -2043,11 +2099,7 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
         }
     }
     for descriptor in &parts.indexes {
-        let table = parts
-            .tables
-            .values()
-            .find(|table| table.id == descriptor.table)
-            .ok_or_else(|| corrupt("index table absent"))?;
+        let table = table_ids.get(&descriptor.table).ok_or_else(|| corrupt("index table absent"))?;
         super::indexes::validate_descriptor(descriptor, table)?;
         if !names.insert(descriptor.name.clone()) {
             return Err(CoreError::Sql(SqlError::Duplicate));

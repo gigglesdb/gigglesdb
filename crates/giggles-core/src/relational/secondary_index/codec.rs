@@ -58,17 +58,17 @@ impl<'a> Reader<'a> {
 // comparisons and payload equality. Complete-base validation separately admits
 // MAX_WORK, making the whole operation at most 2*MAX_WORK. Allocator internals
 // and bounded/non-reentrant caller callbacks are outside this model.
-fn admit(bytes: usize, byte_limit: usize, work_limit: usize) -> Result<()> {
+fn admit(bytes: usize, count: usize, byte_limit: usize, work_limit: usize) -> Result<()> {
     cap(bytes, byte_limit.min(MAX_PAYLOAD_BYTES))?;
     cap(
-        add(mul(bytes, 64)?, mul(MAX_INDEXES, MAX_INDEXES * MAX_NAME)?)?,
+        add(mul(bytes, 64)?, mul(mul(count, tree_comparisons(count))?, 2 * MAX_NAME)?)?,
         work_limit.min(MAX_WORK),
     )
 }
 
-// First pass uses only fixed stack arrays and borrowed slices; second pass may
-// allocate, only after the ENTIRE first pass succeeds. Fixed counts also bound
-// scalar loops on truncated/malicious input. Tick precedes byte comparisons.
+// The first pass retains only descriptor IDs and borrowed names. It bounds
+// their allocation by the bytes present before reading any descriptors.
+// The complete owned payload is built only after this pass succeeds.
 fn parse(bytes: &[u8], owned: bool, cancel: &mut impl FnMut() -> bool) -> Result<Sidecar> {
     tick(cancel)?;
     let mut r = Reader { bytes, pos: 0 };
@@ -80,32 +80,25 @@ fn parse(bytes: &[u8], owned: bool, cancel: &mut impl FnMut() -> bool) -> Result
         return Err(Error::Corrupt);
     }
     let mut any_unique = false;
-    let count = r.count(MAX_INDEXES)?;
-    let mut ids = [0u64; MAX_INDEXES];
-    let mut tables = [0u64; MAX_INDEXES];
-    let mut names: [&[u8]; MAX_INDEXES] = [&[]; MAX_INDEXES];
+    // Each descriptor needs at least 37 bytes, plus a 12-byte map header.
+    let count = r.count((bytes.len() - r.pos) / 49)?;
+    admit(bytes.len(), count, MAX_PAYLOAD_BYTES, MAX_WORK)?;
+    let mut ids = Vec::new();
+    let mut names = BTreeSet::new();
     let mut sidecar = Sidecar::default();
-    for i in 0..count {
+    for _ in 0..count {
         tick(cancel)?;
         let id = r.u64()?;
         let table = r.u64()?;
         let name = r.frame(MAX_NAME)?;
-        if id == 0 || table == 0 || (i > 0 && id <= ids[i - 1]) || name.is_empty() {
+        if id == 0 || table == 0 || ids.last().is_some_and(|prior| id <= *prior) || name.is_empty() {
             return Err(Error::Descriptor);
         }
         let name_str = std::str::from_utf8(name).map_err(|_| Error::Descriptor)?;
-        for prior in &names[..i] {
-            tick(cancel)?;
-            if *prior == name {
-                return Err(Error::Descriptor);
-            }
+        if !names.insert(name) {
+            return Err(Error::Descriptor);
         }
-        if tables[..i].iter().filter(|t| **t == table).count() >= MAX_INDEXES_PER_TABLE {
-            return Err(Error::Limit);
-        }
-        ids[i] = id;
-        tables[i] = table;
-        names[i] = name;
+        ids.push(id);
         let arity = r.count(MAX_ARITY)?;
         if arity == 0 {
             return Err(Error::Descriptor);
@@ -148,14 +141,14 @@ fn parse(bytes: &[u8], owned: bool, cancel: &mut impl FnMut() -> bool) -> Result
     if revision == UNIQUE_REVISION && !any_unique {
         return Err(Error::Corrupt);
     }
-    if r.count(MAX_INDEXES)? != count {
+    if r.count(count)? != count {
         return Err(Error::Corrupt);
     }
     let mut candidates = 0;
     let mut total = 0;
-    for id in &ids[..count] {
+    for id in ids {
         tick(cancel)?;
-        if r.u64()? != *id {
+        if r.u64()? != id {
             return Err(Error::Corrupt);
         }
         let n = r.count(MAX_CANDIDATES)?;
@@ -187,7 +180,7 @@ fn parse(bytes: &[u8], owned: bool, cancel: &mut impl FnMut() -> bool) -> Result
             }
         }
         if owned {
-            sidecar.entries.insert(*id, map);
+            sidecar.entries.insert(id, map);
         }
     }
     if r.pos != bytes.len() {
@@ -240,7 +233,7 @@ pub(crate) fn decode_pending(
     bytes: &[u8],
     mut cancel: impl FnMut() -> bool,
 ) -> Result<PendingDecode> {
-    admit(bytes.len(), MAX_PAYLOAD_BYTES, MAX_WORK)?;
+    cap(bytes.len(), MAX_PAYLOAD_BYTES)?;
     parse(bytes, false, &mut cancel)?;
     tick(&mut cancel)?;
     let candidate = parse(bytes, true, &mut cancel)?;
@@ -309,12 +302,13 @@ fn encode_with_limits(
     work_limit: usize,
 ) -> Result<Vec<u8>> {
     let size = encoded_len(sidecar, cancel)?;
-    admit(size, byte_limit, work_limit)?;
+    admit(size, sidecar.descriptors.len(), byte_limit, work_limit)?;
     tick(cancel)?;
     // Reject malformed model state before copying; serde remains a test model,
     // never an alternate untrusted codec API.
     let mut prior_id = 0;
-    for (i, d) in sidecar.descriptors.iter().enumerate() {
+    let mut names = BTreeSet::new();
+    for d in &sidecar.descriptors {
         tick(cancel)?;
         if d.id <= prior_id
             || d.table == 0
@@ -326,20 +320,9 @@ fn encode_with_limits(
             return Err(Error::Descriptor);
         }
         prior_id = d.id;
-        for previous in &sidecar.descriptors[..i] {
-            tick(cancel)?;
-            if previous.name == d.name {
-                return Err(Error::Descriptor);
-            }
+        if !names.insert(&d.name) {
+            return Err(Error::Descriptor);
         }
-        cap(
-            sidecar
-                .descriptors
-                .iter()
-                .filter(|x| x.table == d.table)
-                .count(),
-            MAX_INDEXES_PER_TABLE,
-        )?;
         for (j, col) in d.columns.iter().enumerate() {
             tick(cancel)?;
             if *col == 0 || d.columns[..j].contains(col) {

@@ -1035,7 +1035,11 @@ fn finish_row(
         let mut size = 0usize;
         for (index, (value, column)) in row.iter().zip(&table.columns).enumerate() {
             if index != hidden {
-                check(value, column)?;
+                check(value, column).inspect_err(|error| {
+                    if *error == SqlError::Null && column.data_type == DataType::UuidArray {
+                        logical_types::uuid_array_not_null(table, column, &row);
+                    }
+                })?;
             }
             size = size
                 .checked_add(value_bytes(value))

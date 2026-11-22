@@ -173,10 +173,11 @@ fn every_captured_driver_statement_executes_at_128_tables() {
 }
 
 #[test]
-fn snapshot_table_gate_rejects_129_tables() {
+fn snapshot_projects_129_tables_within_budget() {
+    let sql = "SELECT count(*) FROM pg_class WHERE relnamespace=2200 AND relkind='r'";
     assert_eq!(
-        run("SELECT oid FROM pg_class", &fixture_snapshot(129), &[]),
-        Err(Error::Limit)
+        run(sql, &fixture_snapshot(129), &[]).unwrap().rows,
+        vec![vec![Value::Int(129)]]
     );
 }
 

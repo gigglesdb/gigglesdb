@@ -276,6 +276,9 @@ fn recovery(
 #[derive(Clone, Serialize, serde::Deserialize)]
 pub(crate) struct State {
     #[serde(skip)]
+    wide_catalog: bool,
+    uuid_array_columns: bool,
+    #[serde(skip)]
     pub(crate) seq: BTreeMap<u64, sequences::SeqCounter>,
     // Legacy SQL stages these with its catalog, including across savepoints.
     #[serde(skip)]
@@ -394,6 +397,8 @@ struct Metadata {
 }
 pub(crate) fn empty(domain: u128) -> State {
     State {
+        wide_catalog: false,
+        uuid_array_columns: false,
         seq: BTreeMap::new(),
         sequence_owner_updates: BTreeMap::new(),
         accounting: BTreeMap::new(),
@@ -547,6 +552,8 @@ fn from_records_mode(
     let (base_version, _) = format_policy::heap_base(legacy).ok_or(CoreError::Unsupported)?;
     secondary_index::gate(&records, indexed)?;
     let mut s = empty(m.domain);
+    s.wide_catalog = bits.is_some_and(|bits| bits & engine::meta::WIDE_CATALOG != 0);
+    s.uuid_array_columns = bits.is_some_and(|bits| bits & feature_envelope::UUID_ARRAY_COLUMNS != 0);
     if records.contains_key(&vec![9]) {
         return Err(CoreError::Corrupt(
             "application format/namespace mismatch".into(),
@@ -646,12 +653,12 @@ fn from_records_mode(
     }
     s.sql.validate_unique_indexes().map_err(|e| CoreError::Corrupt(format!("relational invariant: {e:?}")))?;
     if let Some(bits) = bits
-        && feature_envelope::feature_bits_present(&s)? != bits
+        && (feature_envelope::feature_bits_present(&s)? ^ bits) & !engine::meta::WIDE_CATALOG != 0
     {
         return Err(CoreError::Corrupt("feature content mismatch".into()));
     }
     if bits.is_none()
-        && feature_envelope::feature_bits_present(&s)? & feature_envelope::NEW_BITS != 0
+        && feature_envelope::feature_bits_present(&s)? & (feature_envelope::NEW_BITS & !engine::meta::WIDE_CATALOG) != 0
     {
         return Err(CoreError::Corrupt("feature content mismatch".into()));
     }
@@ -1170,6 +1177,8 @@ impl Inner {
                 crate::cancellation::check()?;
             }
             tx.commit().map_err(|error| self.legacy_io(site, error))?;
+            s.wide_catalog = feature_envelope::wide_catalog_present(s);
+            s.uuid_array_columns = feature_envelope::uuid_array_columns_present(s);
             s.sequence_owner_updates.clear();
             self.accept_sequences(s)?;
             if decision {

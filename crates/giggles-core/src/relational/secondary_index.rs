@@ -26,10 +26,8 @@
 #[path = "secondary_index/codec.rs"]
 pub(crate) mod codec;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) const MAX_INDEXES_PER_TABLE: usize = 8;
-pub(crate) const MAX_INDEXES: usize = 128;
 pub(crate) const MAX_NAME: usize = 128;
 pub(crate) const MAX_ARITY: usize = 64;
 pub(crate) const MAX_COMPONENT: usize = 131_264;
@@ -41,7 +39,7 @@ pub(crate) const MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Conservative worst-case work units, not elapsed time. Preflight counts one
 /// unit per scalar check plus worst-case byte comparisons/copies. 64 comparison
 /// passes per entry byte covers BTree construction/equality and lookup traversal;
-/// quadratic descriptor/row identity scans charge full compared byte bounds.
+/// descriptor lookups and quadratic row identity scans charge comparison work.
 /// Each CRUD call admits TWO such budgets including cross-snapshot work;
 /// validation admits one. The 64 byte passes include stored-state preflight,
 /// staging, exact equality, and BTree comparisons; scalar work includes the
@@ -141,6 +139,11 @@ fn cap(n: usize, maximum: usize) -> Result<()> {
         Ok(())
     }
 }
+// Comparison allowance for the ordered lookup sets. A B-tree node
+// compares at most eleven keys, and each non-root node branches at least six ways.
+fn tree_comparisons(entries: usize) -> usize {
+    12 * (entries.max(1).ilog2() as usize + 1)
+}
 fn tick(cancel: &mut impl FnMut() -> bool) -> Result<()> {
     if cancel() {
         Err(Error::Cancelled)
@@ -164,14 +167,13 @@ fn entry_size(tuple: usize, pk: usize) -> Result<usize> {
     Ok(size)
 }
 /// No owned byte/descriptor copies occur during preflight. Resolver must be pure,
-/// bounded O(1) per call and reference the same immutable catalog snapshot.
+/// bounded per call and reference the same immutable catalog snapshot.
 fn preflight(
     ds: &[Descriptor],
     rows: &[BaseRow<'_>],
     catalog: &impl Catalog,
     cancel: &mut impl FnMut() -> bool,
 ) -> Result<Counts> {
-    cap(ds.len(), MAX_INDEXES)?;
     cap(rows.len(), MAX_ROWS)?;
     // R1: admit every borrowed descriptor/row/tuple shape before comparisons.
     for d in ds {
@@ -181,9 +183,14 @@ fn preflight(
     for row in rows {
         witness_shape(row)?;
     }
-    let mut work = mul(mul(ds.len(), ds.len())?, MAX_NAME + MAX_ARITY)?;
+    let comparisons = tree_comparisons(ds.len());
+    let mut work = mul(mul(ds.len(), comparisons)?, MAX_NAME + 2)?;
+    cap(work, MAX_WORK)?;
+    let mut indexes = BTreeMap::new();
+    let mut names = BTreeSet::new();
+    let mut table_counts = BTreeMap::new();
     // Charge actual possible compared PK bytes for every row identity pair.
-    for (i, d) in ds.iter().enumerate() {
+    for d in ds {
         tick(cancel)?;
         cap(d.name.len(), MAX_NAME)?;
         cap(d.columns.len(), MAX_ARITY)?;
@@ -196,15 +203,10 @@ fn preflight(
         {
             return Err(Error::Descriptor);
         }
-        for prior in &ds[..i] {
-            if prior.id == d.id || prior.name == d.name {
-                return Err(Error::Descriptor);
-            }
+        if indexes.insert(d.id, d.table).is_some() || !names.insert(&d.name) {
+            return Err(Error::Descriptor);
         }
-        cap(
-            ds.iter().filter(|x| x.table == d.table).count(),
-            MAX_INDEXES_PER_TABLE,
-        )?;
+        *table_counts.entry(d.table).or_insert(0) += 1;
         for (j, col) in d.columns.iter().enumerate() {
             if *col == 0
                 || d.columns[..j].contains(col)
@@ -223,7 +225,6 @@ fn preflight(
         if row.table == 0 || !catalog.table_exists(row.table) {
             return Err(Error::Rows);
         }
-        cap(row.tuples.len(), MAX_INDEXES_PER_TABLE)?;
         for prior in &rows[..i] {
             work = add(work, add(1, row.pk.len().min(prior.pk.len()))?)?;
             cap(work, MAX_WORK)?;
@@ -231,17 +232,17 @@ fn preflight(
                 return Err(Error::Rows);
             }
         }
-        let count = ds.iter().filter(|d| d.table == row.table).count();
+        let count = table_counts.get(&row.table).copied().unwrap_or(0);
+        work = add(work, comparisons)?;
+        work = add(work, mul(count, 2 * comparisons)?)?;
+        cap(work, MAX_WORK)?;
         if row.tuples.len() != count {
             return Err(Error::Rows);
         }
-        for (j, tuple) in row.tuples.iter().enumerate() {
+        let mut seen = BTreeSet::new();
+        for tuple in row.tuples {
             tick(cancel)?;
-            if row.tuples[..j].iter().any(|x| x.index == tuple.index)
-                || !ds
-                    .iter()
-                    .any(|d| d.id == tuple.index && d.table == row.table)
-            {
+            if !seen.insert(tuple.index) || indexes.get(&tuple.index) != Some(&row.table) {
                 return Err(Error::Rows);
             }
             component(tuple.bytes)?;
@@ -252,7 +253,6 @@ fn preflight(
         }
     }
     work = add(work, mul(bytes, 64)?)?;
-    work = add(work, mul(rows.len(), MAX_INDEXES * MAX_INDEXES_PER_TABLE)?)?;
     cap(work, MAX_WORK)?;
     Ok(Counts {
         rows: rows.len(),
@@ -266,7 +266,7 @@ fn preflight(
 // an earlier mismatch/cancellation. Descriptor mapping is checked by preflight.
 fn witness_shape(row: &BaseRow<'_>) -> Result<()> {
     cap(row.pk.len(), MAX_COMPONENT)?;
-    cap(row.tuples.len(), MAX_INDEXES_PER_TABLE)?;
+    cap(row.tuples.len(), MAX_CANDIDATES)?;
     for tuple in row.tuples {
         cap(tuple.bytes.len(), MAX_COMPONENT)?;
     }
@@ -311,14 +311,14 @@ fn contains_row(
     Ok(false)
 }
 fn witness_work(row: &BaseRow<'_>, searches: usize) -> Result<usize> {
-    // All membership/identity searches plus Update PK equality. Each exact
-    // search may scan 8x8 tuple pairs; charge 32 passes over both witnesses'
-    // byte sums (each tuple appears in at most 8 comparisons per search).
+    // Charge the membership/identity searches and the UPDATE PK comparison.
+    // Each exact search compares each tuple with up to this row's tuple count.
     let mut bytes = add(1, row.pk.len())?;
     for tuple in row.tuples {
         bytes = add(bytes, add(1, tuple.bytes.len())?)?;
     }
-    mul(mul(bytes, 32)?, add(searches, 1)?)
+    let passes = mul(row.tuples.len(), 4)?.max(32);
+    mul(mul(bytes, passes)?, add(searches, 1)?)
 }
 impl Sidecar {
     pub(crate) fn drop_table(&mut self, table: u64) {
@@ -392,8 +392,6 @@ impl Sidecar {
     /// oversized/extra entries, wrong payloads, missing/dangling/wrong-index keys
     /// all reject. External decoder must separately bound allocation/input bytes.
     fn stored_preflight(&self) -> Result<()> {
-        cap(self.descriptors.len(), MAX_INDEXES)?;
-        cap(self.entries.len(), MAX_INDEXES)?;
         let mut count = 0;
         let mut bytes = 0;
         for map in self.entries.values() {
@@ -476,7 +474,7 @@ impl Sidecar {
         let prior = preflight(&self.descriptors, before, catalog, &mut cancel)?;
         let counts = preflight(&self.descriptors, after, catalog, &mut cancel)?;
         // Cross-snapshot identity searches occur twice, plus membership tests.
-        // Full tuple equality is charged at 16 passes per staged input byte.
+        // Full tuple equality can scan every tuple pair for a matching row.
         let mut cross_work = add(admitted_work, add(prior.work, counts.work)?)?;
         cap(cross_work, work_limit)?;
         for a in before {
@@ -486,7 +484,12 @@ impl Sidecar {
                 cap(cross_work, work_limit)?;
             }
         }
-        cross_work = add(cross_work, mul(add(prior.bytes, counts.bytes)?, 16)?)?;
+        let max_tuples = before.iter().chain(after).map(|row| row.tuples.len()).max().unwrap_or(0);
+        let comparison_passes = mul(max_tuples, 2)?.max(16);
+        cross_work = add(
+            cross_work,
+            mul(add(prior.bytes, counts.bytes)?, comparison_passes)?,
+        )?;
         cap(cross_work, work_limit)?;
         tick(&mut cancel)?;
         if let (Some(old), Some(new)) = (old, new)
@@ -634,7 +637,7 @@ mod tests {
             index: 1,
             bytes: b"x",
             has_null: false,
-        }; MAX_INDEXES_PER_TABLE + 1];
+        }; MAX_CANDIDATES + 1];
         let large_tuple = [Tuple {
             index: 1,
             bytes: &huge,
@@ -733,7 +736,7 @@ mod tests {
                 Change::Update { old: row, new: row },
                 &Cat,
                 || false,
-                3000
+                400
             ),
             Err(Error::Limit)
         );
@@ -840,24 +843,12 @@ mod tests {
             Sidecar::default().build(&[a], &[], &Cat, || false),
             Err(Error::Limit)
         );
-        let ds: Vec<_> = (1..=128).map(|i| d(i, (i - 1) / 8 + 1)).collect();
-        build(&ds, &[]);
-        let mut over = ds.clone();
-        over.push(d(129, 17));
-        assert_eq!(
-            Sidecar::default().build(&over, &[], &Cat, || false),
-            Err(Error::Limit)
-        );
-        build(&(1..=8).map(|i| d(i, 1)).collect::<Vec<_>>(), &[]);
-        assert_eq!(
-            Sidecar::default().build(
-                &(1..=9).map(|i| d(i, 1)).collect::<Vec<_>>(),
-                &[],
-                &Cat,
-                || false
-            ),
-            Err(Error::Limit)
-        );
+        let wide_catalog: Vec<_> = (1..=129).map(|i| d(i, (i - 1) / 8 + 1)).collect();
+        let wide_table: Vec<_> = (1..=20).map(|i| d(i, 1)).collect();
+        for descriptors in [wide_catalog, wide_table] {
+            let sidecar = build(&descriptors, &[]);
+            assert_eq!(sidecar.descriptors(), descriptors);
+        }
     }
     #[test]
     fn component_combined_entry_arithmetic_bounds() {

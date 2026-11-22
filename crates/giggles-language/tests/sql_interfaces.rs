@@ -227,7 +227,6 @@ fn sql_interface_inventory_matches_public_core_limits() {
         ("sql_value_bytes", relational::MAX_ROW_BYTES),
         ("sql_columns", relational::MAX_COLUMNS),
         ("sql_params", relational::MAX_PARAMS),
-        ("sql_tables", relational::MAX_TABLES),
         ("sql_result_bytes", relational::MAX_RESULT_BYTES),
         ("sql_transactions", relational::LEGACY_MAX_TRANSACTIONS),
         ("local_input_bytes", giggles_core::local::MAX_INPUT),

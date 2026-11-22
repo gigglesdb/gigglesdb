@@ -1,6 +1,6 @@
 //! Bounded trusted catalog inspection, separate from data and catalog mutations.
 use super::{ENGINE_CONTRACT_VERSION, Engine, Error, Result, core, identifier, validate_size};
-use crate::{CoreError, relational::{MAX_COLUMNS, MAX_TABLES, SqlError, TableDef}};
+use crate::{CoreError, relational::{MAX_COLUMNS, SqlError, TableDef}};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -108,9 +108,6 @@ fn admit(
     tables: &BTreeMap<String, TableDef>,
     budget: &mut MetadataBudget,
 ) -> Result<()> {
-    if tables.len() > MAX_TABLES {
-        return Err(Error::Limit);
-    }
     // contract version + domain + epoch + complete + result discriminator.
     budget.charge(4 + 16 + 8 + 1 + 1)?;
     match request {
@@ -306,7 +303,7 @@ mod tests {
             ),
             Err(Error::Limit)
         );
-        let tables: BTreeMap<_, _> = (0..=MAX_TABLES)
+        let tables: BTreeMap<_, _> = (0..129)
             .map(|i| (format!("t{i}"), self::table()))
             .collect();
         assert_eq!(
@@ -315,7 +312,7 @@ mod tests {
                 &tables,
                 &mut MetadataBudget(MAX_INSPECTION_METADATA_BYTES)
             ),
-            Err(Error::Limit)
+            Ok(())
         );
     }
 

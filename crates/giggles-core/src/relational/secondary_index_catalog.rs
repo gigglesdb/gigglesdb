@@ -89,10 +89,7 @@ impl Relational {
         ident(name)?;
         let key = relation_key(self.table_schema(table.id), name);
         let name = key.as_str();
-        if columns.is_empty()
-            || columns.len() > si::MAX_ARITY
-            || self.secondary.descriptors().len() >= si::MAX_INDEXES
-        {
+        if columns.is_empty() || columns.len() > si::MAX_ARITY {
             return Err(SqlError::Limit);
         }
         super::unique(columns.iter())?;
@@ -101,16 +98,6 @@ impl Relational {
         }
         if self.relation_name_taken(name) {
             return Err(SqlError::DuplicateTable);
-        }
-        if self
-            .secondary
-            .descriptors()
-            .iter()
-            .filter(|d| d.table == table.id)
-            .count()
-            >= si::MAX_INDEXES_PER_TABLE
-        {
-            return Err(SqlError::Limit);
         }
         for id in columns
             .iter()

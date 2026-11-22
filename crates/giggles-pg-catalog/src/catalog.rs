@@ -1,9 +1,12 @@
 mod information_schema;
 mod pg_tables;
 mod constraints;
-pub(crate) use constraints::definition;
+mod materialize;
+use materialize::{Budget, Lookup, oid as row_oid};
+pub(crate) use constraints::Definitions;
+pub(crate) use materialize::{MAX_CATALOG_BYTES, row_bytes};
 use crate::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub(crate) struct Relation {
     pub fields: Vec<Field>,
     pub rows: Vec<Vec<Value>>,
@@ -59,7 +62,7 @@ pub(crate) fn acl_role_name(name: &str) -> String {
         format!("\"{}\"", name.replace('"', "\"\""))
     }
 }
-fn acl_value(snapshot: &CatalogSnapshot, entries: Option<&Vec<AclEntry>>) -> Value {
+fn acl_value(lookup: &Lookup<'_>, entries: Option<&Vec<AclEntry>>) -> Value {
     entries.map_or(N, |entries| {
         Value::Array(
             entries
@@ -68,10 +71,10 @@ fn acl_value(snapshot: &CatalogSnapshot, entries: Option<&Vec<AclEntry>>) -> Val
                     let grantee = if entry.grantee == 0 {
                         String::new()
                     } else {
-                        acl_role_name(role_name(snapshot, i64::from(entry.grantee)).unwrap())
+                        acl_role_name(lookup.roles.get(&i64::from(entry.grantee)).copied().unwrap())
                     };
                     let grantor =
-                        acl_role_name(role_name(snapshot, i64::from(entry.grantor)).unwrap());
+                        acl_role_name(lookup.roles.get(&i64::from(entry.grantor)).copied().unwrap());
                     let mut privileges = String::new();
                     for privilege in &entry.privileges {
                         privileges.push(privilege.code());
@@ -1111,6 +1114,7 @@ pub(crate) fn scalar(t: ScalarType) -> (u32, &'static str, i64, u32) {
         ScalarType::IntArray => (1007, "_int4", -1, 0),
         ScalarType::BigIntArray => (1016, "_int8", -1, 0),
         ScalarType::TextArray => (1009, "_text", -1, 0),
+        ScalarType::UuidArray => (2951, "_uuid", -1, 0),
         ScalarType::Bytes => (17, "bytea", -1, 1001),
         ScalarType::Numeric => (1700, "numeric", -1, 1231),
         ScalarType::Real => (700, "float4", 4, 1021),
@@ -1123,27 +1127,63 @@ pub(crate) fn scalar(t: ScalarType) -> (u32, &'static str, i64, u32) {
         ScalarType::Interval => (1186, "interval", 16, 1187),
     }
 }
-pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>> {
-    if snapshot.sequences.len() > 128 || snapshot.schema_privileges.len() > MAX_ROWS
-        || snapshot.schema_privileges.keys().any(|(_,name)| name.len() > 63) {return Err(Error::Limit); }
+type Relations = BTreeMap<String, Relation>;
+
+fn rows<'a>(all: &'a Relations, name: &str) -> &'a [Vec<Value>] {
+    all.get(name).map_or(&[], |r| &r.rows)
+}
+
+fn rows_mut<'a>(all: &'a mut Relations, name: &str) -> &'a mut [Vec<Value>] {
+    all.get_mut(name).map_or(&mut [], |r| &mut r.rows)
+}
+
+pub(crate) fn build(
+    snapshot: &CatalogSnapshot,
+    requested: &BTreeSet<String>,
+) -> R<Relations> {
+    build_with_budget(snapshot, requested, &mut Budget::default())
+}
+
+fn build_with_budget(
+    snapshot: &CatalogSnapshot,
+    requested: &BTreeSet<String>,
+    budget: &mut Budget,
+) -> R<Relations> {
+    let mut demand = requested.clone();
+    for (name, dependencies) in [
+        ("pg_operator", &["pg_constraint"][..]),
+        ("pg_depend", &["pg_constraint"]),
+        ("columns", &["pg_attribute", "pg_attrdef", "pg_type", "pg_collation", "pg_class"]),
+        ("schemata", &["pg_namespace"]),
+        ("tables", &["pg_class"]),
+        ("pg_tables", &["pg_class"]),
+    ] {
+        if demand.contains(name) {
+            demand.extend(dependencies.iter().map(|name| (*name).to_owned()));
+        }
+    }
+    let needs = |name: &str| demand.contains(name);
+    if snapshot.schema_privileges.len() > MAX_ROWS
+        || snapshot.schema_privileges.keys().any(|(_,name)| name.len() > 63)
+        || snapshot.roles.len() > MAX_ROWS - PREDEFINED_ROLES.len()
+    {
+        return Err(Error::Limit);
+    }
+    let lookup = Lookup::new(snapshot, budget)?;
+    let supplied_roles: BTreeSet<_> = snapshot.roles.iter().map(|role| role.oid).collect();
     let mut sequence_oids = BTreeSet::new();
     for sequence in &snapshot.sequences {
+        budget.visit(1)?;
         if sequence.name.len() > 128 || sequence.name.is_empty() || sequence.oid < 65536
             || !sequence_oids.insert(sequence.oid)
-            || snapshot.tables.iter().any(|t| table_oid(t.id).ok() == Some(sequence.oid))
-            || !snapshot.roles.iter().any(|r| r.oid == sequence.owner) {
+            || lookup.relations.contains_key(&i64::from(sequence.oid))
+            || !supplied_roles.contains(&sequence.owner) {
             return Err(Error::InvalidSnapshot);
         }
         if sequence.acl.as_ref().is_some_and(|entries| entries.iter().map(|e| 1+e.privileges.len()).sum::<usize>() > MAX_ROWS) { return Err(Error::Limit); }
     }
-    if snapshot.primary_names.iter().any(|(id, name)| name.is_empty() || name.len() > 63 || !snapshot.tables.iter().any(|t| t.id == *id)) {
+    if snapshot.primary_names.iter().any(|(id, name)| name.is_empty() || name.len() > 63 || !lookup.tables.contains_key(id)) {
         return Err(Error::InvalidSnapshot);
-    }
-    if snapshot.tables.len() > 128 || snapshot.roles.len() > MAX_ROWS - PREDEFINED_ROLES.len() {
-        return Err(Error::Limit);
-    }
-    if snapshot.schemas.len() > 128 || snapshot.table_schemas.len() > 128 {
-        return Err(Error::Limit);
     }
     let mut schema_oids = BTreeSet::new();
     for (name, (oid, owner)) in &snapshot.schemas {
@@ -1152,21 +1192,21 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             || name == "public"
             || *oid < 65536
             || !schema_oids.insert(*oid)
-            || !snapshot.roles.iter().any(|r| r.oid == *owner)
+            || !supplied_roles.contains(owner)
         {
             return Err(Error::InvalidSnapshot);
         }
     }
     if snapshot.table_schemas.iter().any(|(id, name)| {
-        !snapshot.tables.iter().any(|t| t.id == *id) || !snapshot.schemas.contains_key(name)
+        !lookup.tables.contains_key(id) || !snapshot.schemas.contains_key(name)
     }) {
         return Err(Error::InvalidSnapshot);
     }
     if snapshot.views.iter().any(|(id, sql)| sql.len() > 65536 || sql.is_empty()
-        || !snapshot.tables.iter().any(|t| t.id == *id && t.primary_key.is_empty()
+        || !lookup.tables.get(id).is_some_and(|t| t.primary_key.is_empty()
             && t.columns.iter().all(|c| !c.not_null))
-        || snapshot.indexes.iter().any(|i| i.table == *id)
-        || snapshot.constraints.iter().any(|c| c.table == *id)) { return Err(Error::InvalidSnapshot); }
+        || lookup.indexes_by_table.contains_key(id)
+        || lookup.constrained_tables.contains(id)) { return Err(Error::InvalidSnapshot); }
     let mut names = BTreeSet::new();
     let mut ids = BTreeSet::new();
     let mut input_bytes = 0usize;
@@ -1192,9 +1232,6 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     }
     let mut type_oids = BTreeSet::new();
     let mut type_names = BTreeSet::new();
-    if snapshot.user_types.len() > 16384 {
-        return Err(Error::Limit);
-    }
     for ty in &snapshot.user_types {
         if ty.oid < 65536
             || (ty.oid - 65536) % 4 != 0
@@ -1203,6 +1240,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             || ty.name.is_empty()
             || ty.name.len() > 63
             || !matches!(ty.kind, 'e' | 'd' | 'c')
+            || ty.schema != "public" && !snapshot.schemas.contains_key(&ty.schema)
             || ty.labels.len() > 64
         {
             return Err(Error::InvalidSnapshot);
@@ -1212,15 +1250,10 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             if label.len() > 63 || !labels.insert(label) {
                 return Err(Error::InvalidSnapshot);
             }
-            input_bytes += label.len();
         }
         let last_oid = u64::from(ty.oid) + ty.labels.len() as u64 * 4;
         if last_oid > u32::MAX as u64 {
             return Err(Error::InvalidSnapshot);
-        }
-        input_bytes += ty.name.len();
-        if input_bytes > 65536 {
-            return Err(Error::Limit);
         }
     }
     for t in &snapshot.tables {
@@ -1242,16 +1275,11 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             if c.name.is_empty() || !cn.insert(&c.name) || !ci.insert(c.id) {
                 return Err(Error::InvalidSnapshot);
             }
-            input_bytes += c.name.len();
         }
         for &k in &t.primary_key {
             if k >= t.columns.len() || !pk.insert(k) {
                 return Err(Error::InvalidSnapshot);
             }
-        }
-        input_bytes += t.name.len();
-        if input_bytes > 65536 {
-            return Err(Error::Limit);
         }
     }
     // Table and descriptor IDs share the core allocator. The same four-slot
@@ -1264,7 +1292,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     let mut descriptor_ids = ids.clone();
     let mut descriptor_names = BTreeSet::new();
     for i in &visible_indexes {
-        let t = snapshot.tables.iter().find(|t| t.id == i.table).unwrap();
+        let t = lookup.tables[&i.table];
         if !descriptor_ids.insert(i.id)
             || !descriptor_names.insert((snapshot.table_schema(i.table).0, &i.name))
             || i.name.is_empty()
@@ -1273,16 +1301,12 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             || i.columns.iter().collect::<BTreeSet<_>>().len() != i.columns.len()
             || i.columns
                 .iter()
-                .any(|id| !t.columns.iter().any(|c| c.id == *id))
+                .any(|id| lookup.column(t, *id).is_none())
         {
             return Err(Error::InvalidSnapshot);
         }
         if schema_oids.contains(&table_oid(i.id)?) {
             return Err(Error::InvalidSnapshot);
-        }
-        input_bytes += i.name.len();
-        if input_bytes > 65536 {
-            return Err(Error::Limit);
         }
     }
     if snapshot
@@ -1305,10 +1329,10 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 .map(|((t, c), a)| (*t, Some(*c), a)),
         )
     {
-        let Some(t) = snapshot.tables.iter().find(|t| t.id == table) else {
+        let Some(t) = lookup.tables.get(&table).copied() else {
             return Err(Error::InvalidSnapshot);
         };
-        if column.is_some_and(|id| !t.columns.iter().any(|c| c.id == id)) {
+        if column.is_some_and(|id| lookup.column(t, id).is_none()) {
             return Err(Error::InvalidSnapshot);
         }
         for entry in entries {
@@ -1316,8 +1340,8 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             if acl_size > MAX_ROWS {
                 return Err(Error::Limit);
             }
-            if (entry.grantee != 0 && role_name(snapshot, i64::from(entry.grantee)).is_none())
-                || role_name(snapshot, i64::from(entry.grantor)).is_none()
+            if (entry.grantee != 0 && lookup.roles.get(&i64::from(entry.grantee)).copied().is_none())
+                || lookup.roles.get(&i64::from(entry.grantor)).copied().is_none()
                 || entry.privileges.iter().collect::<BTreeSet<_>>().len() != entry.privileges.len()
                 || (column.is_some()
                     && entry.privileges.iter().any(|p| {
@@ -1334,8 +1358,8 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             }
             // Bound encoded ACL allocation before constructing the catalog rows;
             // repeated long role names must not multiply the input-name budget.
-            let grantee = role_name(snapshot, i64::from(entry.grantee)).map_or(0, str::len);
-            let grantor = role_name(snapshot, i64::from(entry.grantor)).unwrap().len();
+            let grantee = lookup.roles.get(&i64::from(entry.grantee)).copied().map_or(0, str::len);
+            let grantor = lookup.roles.get(&i64::from(entry.grantor)).copied().unwrap().len();
             acl_bytes =
                 acl_bytes.saturating_add(2 * (grantee + grantor) + 2 * entry.privileges.len() + 64);
             if acl_bytes > MAX_BYTES {
@@ -1343,83 +1367,88 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             }
         }
     }
-    let mut occupied = snapshot
-        .tables
-        .iter()
-        .map(|t| (snapshot.table_schema(t.id).0, t.name.clone()))
-        .collect::<BTreeSet<_>>();
-    occupied.extend(
-        visible_indexes
-            .iter()
-            .map(|i| (snapshot.table_schema(i.table).0, i.name.clone())),
-    );
+    // Every visible name is materialized at least once; bound the aggregate
+    // before allocating derived names and index definitions.
+    let names = std::iter::once(snapshot.database.as_str())
+        .chain(snapshot.tables.iter().flat_map(|table| {
+            std::iter::once(table.name.as_str()).chain(table.columns.iter().map(|c| c.name.as_str()))
+        }))
+        .chain(visible_indexes.iter().map(|i| i.name.as_str()));
+    names.map(str::len).try_fold(0usize, |sum, len| {
+        sum.checked_add(len)
+            .filter(|&total| len <= MAX_SQL && total <= MAX_BYTES / 2)
+            .ok_or(Error::Limit)
+    })?;
     let mut key_names = BTreeMap::new();
-    let mut sorted = snapshot.tables.iter().collect::<Vec<_>>();
-    sorted.sort_by_key(|t| t.id);
-    for t in sorted {
-        if t.primary_key.is_empty() {
-            continue;
-        }
-        let mut name = format!("{}_pkey", t.name);
-        let mut suffix = 0usize;
-        while occupied.contains(&(snapshot.table_schema(t.id).0, name.clone())) {
-            name = format!("{}_pkey_{}_{}", t.name, t.id, suffix);
-            suffix += 1;
-        }
-        occupied.insert((snapshot.table_schema(t.id).0, name.clone()));
-        key_names.insert(t.id, snapshot.primary_names.get(&t.id).cloned().unwrap_or(name));
-    }
-    let mut all: BTreeMap<String, Relation> = known_names()
-        .iter()
-        .map(|n| {
-            (
-                (*n).into(),
-                Relation {
-                    fields: storage_schema(n).unwrap(),
-                    rows: vec![],
-                },
-            )
-        })
-        .collect();
-    // These absent features are queryable, but do not expand the established
-    // finite reflected pg_class/pg_type inventory.
-    for name in [
-        "pg_statistic_ext",
-        "pg_publication",
-        "pg_publication_namespace",
-        "pg_publication_rel",
-    ] {
-        all.insert(
-            name.into(),
-            Relation {
-                fields: schema(name).unwrap(),
-                rows: vec![],
-            },
+    if ["pg_class", "pg_indexes", "pg_constraint", "table_constraints", "key_column_usage"]
+        .into_iter().any(needs)
+    {
+        let mut occupied = snapshot
+            .tables
+            .iter()
+            .map(|t| (snapshot.table_schema(t.id).0, t.name.clone()))
+            .collect::<BTreeSet<_>>();
+        occupied.extend(
+            visible_indexes
+                .iter()
+                .map(|i| (snapshot.table_schema(i.table).0, i.name.clone())),
         );
-    }
-    let mut add = |name: &str, row: Vec<Value>| {
-        all.get_mut(name).unwrap().rows.push(row);
-    };
-    for ext in &snapshot.extensions {
-        if let Some((oid, owner, namespace, version)) = &ext.installed {
-            add("pg_extension", vec![I(i64::from(*oid)), s(&ext.name), I(i64::from(*owner)), I(i64::from(*namespace)), B(ext.relocatable), s(version), N, N, N]);
+        let mut sorted = snapshot.tables.iter().collect::<Vec<_>>();
+        sorted.sort_by_key(|t| t.id);
+        for t in sorted {
+            if t.primary_key.is_empty() {
+                continue;
+            }
+            let mut name = format!("{}_pkey", t.name);
+            let mut suffix = 0usize;
+            while occupied.contains(&(snapshot.table_schema(t.id).0, name.clone())) {
+                name = format!("{}_pkey_{}_{}", t.name, t.id, suffix);
+                suffix += 1;
+                budget.visit(1)?;
+            }
+            occupied.insert((snapshot.table_schema(t.id).0, name.clone()));
+            key_names.insert(t.id, snapshot.primary_names.get(&t.id).cloned().unwrap_or(name));
         }
-        add("pg_available_extensions", vec![s(&ext.name), s(&ext.default_version), ext.installed.as_ref().map_or(N, |i| s(&i.3)), s(&ext.comment)]);
+    }
+    let mut all: Relations = demand.iter().map(|name| {
+        Ok((name.clone(), Relation {
+            fields: storage_schema(name).ok_or(Error::Unsupported)?,
+            rows: Vec::new(),
+        }))
+    }).collect::<R<_>>()?;
+    macro_rules! add {
+        ($name:expr, $row:expr $(,)?) => {
+            if let Some(relation) = all.get_mut($name) {
+                budget.add(&mut relation.rows, $row)?;
+            }
+        };
+    }
+    for ext in &snapshot.extensions {
+        budget.visit(1 + ext.versions.len())?;
+        if let Some((oid, owner, namespace, version)) = &ext.installed {
+            add!("pg_extension", vec![I(i64::from(*oid)), s(&ext.name), I(i64::from(*owner)), I(i64::from(*namespace)), B(ext.relocatable), s(version), N, N, N]);
+        }
+        add!("pg_available_extensions", vec![s(&ext.name), s(&ext.default_version), ext.installed.as_ref().map_or(N, |i| s(&i.3)), s(&ext.comment)]);
         for version in &ext.versions {
-            add("pg_available_extension_versions", vec![s(&ext.name), s(version), B(ext.installed.as_ref().is_some_and(|i| &i.3 == version)),
+            add!("pg_available_extension_versions", vec![s(&ext.name), s(version), B(ext.installed.as_ref().is_some_and(|i| &i.3 == version)),
                 B(ext.superuser), B(ext.trusted), B(ext.relocatable), ext.schema.as_ref().map_or(N, |v| s(v)), N, s(&ext.comment)]);
         }
     }
-    add("pg_description", vec![I(2200), I(2615), I(0), s("standard public schema"), N]);
-    for table in &snapshot.tables {
-        for (&(id, column), description) in &snapshot.comments {
-            if id != table.id { continue; }
-            let subid = if column == 0 { 0 } else {
-                let Some(offset) = table.columns.iter().position(|c| c.id == column) else { continue; };
-                offset + 1
-            };
-            add("pg_description", vec![I(i64::from(table_oid(id)?)), I(1259),
-                I(subid as i64), s(description), N]);
+    add!("pg_description", vec![I(2200), I(2615), I(0), s("standard public schema"), N]);
+    if needs("pg_description") {
+        for table in &snapshot.tables {
+            for (&(id, column), description) in snapshot.comments.range((table.id, 0)..=(table.id, u64::MAX)) {
+                budget.visit(1)?;
+                let subid = if column == 0 { 0 } else {
+                    let Some(offset) = lookup.columns.get(&(id, column)) else { continue; };
+                    offset + 1
+                };
+                if description.len() > MAX_BYTES / 2 {
+                    return Err(Error::Limit);
+                }
+                add!("pg_description", vec![I(i64::from(table_oid(id)?)), I(1259),
+                    I(subid as i64), s(description), N]);
+            }
         }
     }
     // PG18.6 casts from the integer/text GUI edit-type inventories. Both ends
@@ -1437,32 +1466,34 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         (10137,25,18,944,"a","f"), (10140,25,19,407,"i","f"),
         (10144,23,17,6368,"e","f"), (10150,23,18,78,"e","f"),
     ] {
-        add("pg_cast", vec![I(oid),I(source),I(target),I(function),s(context),s(method),N]);
+        add!("pg_cast", vec![I(oid),I(source),I(target),I(function),s(context),s(method),N]);
     }
-    for line in include_str!("../../giggles-icu/src/pg_collation.txt").lines() {
-        let fields: Vec<_> = line.split('|').collect();
-        let mut row = Vec::new();
-        for (i, field) in fields.iter().enumerate() {
-            row.push(match i {
-                0 | 6 => I(field.parse().expect("embedded collation integer")),
-                2 => I(11), 3 => I(10), 5 => B(*field == "t"),
-                _ if field.is_empty() => N,
-                _ => s(field),
-            });
+    if needs("pg_collation") {
+        for line in include_str!("../../giggles-icu/src/pg_collation.txt").lines() {
+            let fields: Vec<_> = line.split('|').collect();
+            let mut row = Vec::new();
+            for (i, field) in fields.iter().enumerate() {
+                row.push(match i {
+                    0 | 6 => I(field.parse().expect("embedded collation integer")),
+                    2 => I(11), 3 => I(10), 5 => B(*field == "t"),
+                    _ if field.is_empty() => N,
+                    _ => s(field),
+                });
+            }
+            row.push(N);
+            add!("pg_collation", row);
         }
-        row.push(N);
-        add("pg_collation", row);
     }
     for row in &snapshot.collations {
         if row.len() != 13 { return Err(Error::InvalidSnapshot); }
-        add("pg_collation", row.clone());
+        add!("pg_collation", row.clone());
         if row[12] != N {
-            add("pg_description", vec![row[0].clone(), I(3456), I(0), row[12].clone(), N]);
+            add!("pg_description", vec![row[0].clone(), I(3456), I(0), row[12].clone(), N]);
         }
     }
     // Only this freshly authorized connection is visible. TLS details beyond
     // the handshake status are not retained by the hosting session.
-    add(
+    add!(
         "pg_stat_ssl",
         vec![
             I(i64::from(snapshot.backend_pid)),
@@ -1475,7 +1506,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             N,
         ],
     );
-    add(
+    add!(
         "pg_stat_gssapi",
         vec![
             I(i64::from(snapshot.backend_pid)),
@@ -1490,9 +1521,9 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         (2200, "public", 6171),
         (13293, "information_schema", 10),
     ] {
-        add("pg_namespace", vec![I(id), s(name), I(owner), N, N]);
+        add!("pg_namespace", vec![I(id), s(name), I(owner), N, N]);
     }
-    add(
+    add!(
         "pg_database",
         vec![
             I(16384),
@@ -1504,10 +1535,10 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         ],
     );
     for (oid, name) in [(1663, "pg_default"), (1664, "pg_global")] {
-        add("pg_tablespace", vec![I(oid), s(name), I(10), N, N, N]);
+        add!("pg_tablespace", vec![I(oid), s(name), I(10), N, N, N]);
     }
     if snapshot.database == "postgres" {
-        add(
+        add!(
             "pg_shdescription",
             vec![
                 I(16384),
@@ -1517,8 +1548,8 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             ],
         );
     }
-    add("pg_am", vec![I(2), s("heap"), I(3), s("t"), N]);
-    add("pg_am", vec![I(403), s("btree"), I(330), s("i"), N]);
+    add!("pg_am", vec![I(2), s("heap"), I(3), s("t"), N]);
+    add!("pg_am", vec![I(403), s("btree"), I(330), s("i"), N]);
     // Snapshot flags and predefined identities are presentation metadata, not
     // authentication, privileges, memberships, or enforced role policies.
     let predefined = PREDEFINED_ROLES
@@ -1538,11 +1569,12 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         })
         .collect::<Vec<_>>();
     for row in &snapshot.role_memberships {
+        budget.visit(1)?;
         if row.len() != 7 { return Err(Error::InvalidSnapshot); }
-        add("pg_auth_members", row.clone());
+        add!("pg_auth_members", row.clone());
     }
     for role in snapshot.roles.iter().chain(&predefined) {
-        add(
+        add!(
             "pg_roles",
             vec![
                 s(&role.name),
@@ -1562,7 +1594,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         );
         // This finite catalog has no privilege model. Expose structural authid
         // metadata to callers, but never accept, store, or expose password hashes.
-        add(
+        add!(
             "pg_authid",
             vec![
                 I(i64::from(role.oid)),
@@ -1591,42 +1623,52 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 N,
                 N,
             ];
-            add("pg_user", row.clone());
+            add!("pg_user", row.clone());
             row[6] = N;
-            add("pg_shadow", row);
+            add!("pg_shadow", row);
         }
     }
-    let now = snapshot.timezone_now.unwrap_or_else(|| {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |v| v.as_secs() as i64)
-    });
-    for name in giggles_pg_types::temporal::TIMEZONE_NAMES.lines() {
-        let (abbrev, seconds, dst) = giggles_pg_types::temporal::timezone_info(name, now)
-            .map_err(|_| Error::InvalidSnapshot)?;
-        let sign = if seconds < 0 { "-" } else { "" };
-        let seconds = seconds.unsigned_abs();
-        let interval = format!("{sign}{:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
-        add("pg_timezone_names", vec![s(name), s(&abbrev), s(&interval), B(dst)]);
-    }
-    for (abbrev, seconds, dst) in crate::timezone_abbrevs::rows(snapshot.timezone, now)? {
-        let sign = if seconds < 0 { "-" } else { "" };
-        let seconds = seconds.unsigned_abs();
-        let interval = format!("{sign}{:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
-        add("pg_timezone_abbrevs", vec![s(&abbrev), s(&interval), B(dst)]);
+    if needs("pg_timezone_names") || needs("pg_timezone_abbrevs") {
+        let now = snapshot.timezone_now.unwrap_or_else(|| {
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |v| v.as_secs() as i64)
+        });
+        if needs("pg_timezone_names") {
+            for name in giggles_pg_types::temporal::TIMEZONE_NAMES.lines() {
+                let (abbrev, seconds, dst) = giggles_pg_types::temporal::timezone_info(name, now)
+                    .map_err(|_| Error::InvalidSnapshot)?;
+                let sign = if seconds < 0 { "-" } else { "" };
+                let seconds = seconds.unsigned_abs();
+                let interval = format!("{sign}{:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
+                add!("pg_timezone_names", vec![s(name), s(&abbrev), s(&interval), B(dst)]);
+            }
+        }
+        if needs("pg_timezone_abbrevs") {
+            for (abbrev, seconds, dst) in crate::timezone_abbrevs::rows(snapshot.timezone, now)? {
+                let sign = if seconds < 0 { "-" } else { "" };
+                let seconds = seconds.unsigned_abs();
+                let interval = format!("{sign}{:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
+                add!("pg_timezone_abbrevs", vec![s(&abbrev), s(&interval), B(dst)]);
+            }
+        }
     }
     for (txn, table, pid, mode, fastpath) in &snapshot.table_locks {
-        add("pg_locks", vec![s("relation"), I(16384), I(i64::from(table_oid(*table)?)),
+        budget.visit(1)?;
+        let oid = table_oid(*table)?;
+        add!("pg_locks", vec![s("relation"), I(16384), I(i64::from(oid)),
             N, N, N, N, N, N, N, s(&format!("{pid}/{txn}")), I(i64::from(*pid)),
             s(mode), B(true), B(*fastpath), N]);
     }
     // Catalog relations are genuine virtual tables, with their actual columns below.
-    for &name in known_names() {
+    for &name in known_names().iter().filter(|_| {
+        ["pg_class", "pg_type", "pg_attribute"].into_iter().any(needs)
+    }) {
         let oid = relation_oid(name).unwrap() as i64;
         let fs = schema(name).unwrap();
         let info = information_schema::identity(name);
         let namespace = if info.is_some() { 13293 } else { 11 };
         let rowtype = info.map_or(if name == "pg_views" { 12030 } else { 32768 + oid }, |(_, ty)| i64::from(ty));
-        add(
+        add!(
             "pg_class",
             vec![
                 I(oid),
@@ -1647,7 +1689,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 N,
             ],
         );
-        add(
+        add!(
             "pg_type",
             composite_row(rowtype as u32, name, namespace, oid, 10),
         );
@@ -1657,7 +1699,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             .chain(fs.iter().filter(|f| f.name == "xmin"))
             .enumerate()
         {
-            add(
+            add!(
                 "pg_attribute",
                 vec![
                     I(oid),
@@ -1704,8 +1746,8 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         // Built-ins must be visible before application DDL: drivers cache
         // type mappings when opening a connection to an empty database.
         let (oid, name, len, array) = scalar(ty);
-        add("pg_type", type_row(oid, name, len, 0, array, false));
-        add(
+        add!("pg_type", type_row(oid, name, len, 0, array, false));
+        add!(
             "pg_type",
             type_row(array, &format!("_{name}"), -1, oid, 0, true),
         );
@@ -1720,16 +1762,16 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         (28, "xid", 4, 1011),
         (1033, "aclitem", 16, 1034),
     ] {
-        add("pg_type", type_row(oid, name, len, 0, arr, false));
-        add(
+        add!("pg_type", type_row(oid, name, len, 0, arr, false));
+        add!(
             "pg_type",
             type_row(arr, &format!("_{name}"), -1, oid, 0, true),
         );
     }
-    add("pg_type", type_row(22, "int2vector", -1, 21, 1006, false));
-    add("pg_type", type_row(1006, "_int2vector", -1, 22, 0, true));
-    add("pg_type", type_row(30, "oidvector", -1, 26, 1013, false));
-    add("pg_type", type_row(1013, "_oidvector", -1, 30, 0, true));
+    add!("pg_type", type_row(22, "int2vector", -1, 21, 1006, false));
+    add!("pg_type", type_row(1006, "_int2vector", -1, 22, 0, true));
+    add!("pg_type", type_row(30, "oidvector", -1, 26, 1013, false));
+    add!("pg_type", type_row(1013, "_oidvector", -1, 30, 0, true));
     // PostgreSQL 18 nominal metadata only, not a callable routine registry.
     // pg_type.dat + pg_type.h: both are base types; node trees are category Z,
     // not pseudo-types. Only regproc has an associated array type.
@@ -1738,7 +1780,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         (1008, "_regproc", -1, "A", 24, 0, 750),
         (194, "pg_node_tree", -1, "Z", 0, 0, 195),
     ] {
-        add(
+        add!(
             "pg_type",
             vec![
                 I(oid),
@@ -1777,34 +1819,43 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     ] {
         let mut row = type_row(oid, name, len, 0, array, false);
         row[5] = s("N"); row[12] = I(input); row[21] = I(receive);
-        add("pg_type", row);
-        add("pg_type", type_row(array, &format!("_{name}"), -1, oid, 0, true));
+        add!("pg_type", row);
+        add!("pg_type", type_row(array, &format!("_{name}"), -1, oid, 0, true));
     }
-    let mut cardinal = type_row(13307, "cardinal_number", 4, 0, 13306, false);
-    cardinal[2] = I(13293); cardinal[4] = s("d"); cardinal[5] = s("N"); cardinal[7] = I(23);
-    cardinal[12] = I(2597); cardinal[21] = I(2598); add("pg_type", cardinal);
-    let mut array = type_row(13306, "_cardinal_number", -1, 13307, 0, true);
-    array[2] = I(13293); add("pg_type", array);
-    // Nominal descriptors needed by NULL-only catalog fields, not new SQL types.
-    for (oid, name, len, kind, category, elem, array, input, receive) in [
-        (2277, "anyarray", -1, "p", "P", 0, 0, 2296, 2502),
-        (3220, "pg_lsn", 8, "b", "U", 0, 3221, 3229, 3238),
-        (3221, "_pg_lsn", -1, "b", "A", 3220, 0, 750, 2400),
-    ] {
-        let mut row = type_row(oid, name, len, elem, array, elem != 0);
-        row[4] = s(kind);
-        row[5] = s(category);
-        row[12] = I(input);
-        row[21] = I(receive);
-        add("pg_type", row);
+    if needs("pg_type") {
+        let mut cardinal = type_row(13307, "cardinal_number", 4, 0, 13306, false);
+        cardinal[2] = I(13293); cardinal[4] = s("d"); cardinal[5] = s("N"); cardinal[7] = I(23);
+        cardinal[12] = I(2597); cardinal[21] = I(2598); add!("pg_type", cardinal);
+        let mut array = type_row(13306, "_cardinal_number", -1, 13307, 0, true);
+        array[2] = I(13293); add!("pg_type", array);
+        // Nominal descriptors needed by NULL-only catalog fields, not new SQL types.
+        for (oid, name, len, kind, category, elem, array, input, receive) in [
+            (2277, "anyarray", -1, "p", "P", 0, 0, 2296, 2502),
+            (3220, "pg_lsn", 8, "b", "U", 0, 3221, 3229, 3238),
+            (3221, "_pg_lsn", -1, "b", "A", 3220, 0, 750, 2400),
+        ] {
+            let mut row = type_row(oid, name, len, elem, array, elem != 0);
+            row[4] = s(kind);
+            row[5] = s(category);
+            row[12] = I(input);
+            row[21] = I(receive);
+            add!("pg_type", row);
+        }
     }
     for (name, (oid, owner)) in &snapshot.schemas {
-        add(
+        add!(
             "pg_namespace",
             vec![I(i64::from(*oid)), s(name), I(i64::from(*owner)), N, N],
         );
     }
-    let mut ordered_tables = snapshot.tables.iter().collect::<Vec<_>>();
+    let mut ordered_tables = if [
+        "pg_class", "pg_type", "pg_views", "pg_attribute", "pg_indexes",
+        "pg_index", "pg_constraint", "pg_depend",
+    ].into_iter().any(needs) {
+        snapshot.tables.iter().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     ordered_tables.sort_by_key(|t| t.id);
     for t in ordered_tables {
         let (schema, namespace) = snapshot.table_schema(t.id);
@@ -1813,7 +1864,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         let view = snapshot.views.get(&t.id);
         let has_pk = !t.primary_key.is_empty();
         let owner = i64::from(*snapshot.table_owners.get(&t.id).unwrap_or(&10));
-        add(
+        add!(
             "pg_class",
             vec![
                 I(oid),
@@ -1822,24 +1873,24 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 s(if view.is_some() { "v" } else { "r" }),
                 I(owner),
                 I(t.columns.len() as i64),
-                B(has_pk || visible_indexes.iter().any(|i| i.table == t.id)),
+                B(has_pk || lookup.indexes_by_table.contains_key(&t.id)),
                 s("p"),
                 B(false),
                 I(oid + 3),
                 I(if view.is_some() { 0 } else { 2 }),
                 I(0),
                 N,
-                acl_value(snapshot, snapshot.table_acls.get(&t.id)),
+                acl_value(&lookup, snapshot.table_acls.get(&t.id)),
                 N,
                 N,
             ],
         );
-        add(
+        add!(
             "pg_type",
             composite_row((oid + 3) as u32, &t.name, namespace, oid, owner),
         );
         if let Some(definition) = view {
-            add("pg_views", vec![s(schema), s(&t.name), s(role_name(snapshot, owner).unwrap()), s(definition)]);
+            add!("pg_views", vec![s(schema), s(&t.name), s(lookup.roles[&owner]), s(definition)]);
         }
         // Heap system attributes exist in pg_attribute but are excluded by
         // clients that explicitly request attnum > 0.
@@ -1851,7 +1902,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             (-2, "xmin", 28, 4),
             (-1, "ctid", 27, 6),
         ].into_iter().filter(|_| view.is_none()) {
-            add(
+            add!(
                 "pg_attribute",
                 vec![
                     I(oid),
@@ -1875,7 +1926,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         }
         for (i, c) in t.columns.iter().enumerate() {
             let (ty, _, len, _) = scalar(c.data_type);
-            add(
+            add!(
                 "pg_attribute",
                 vec![
                     I(oid),
@@ -1888,12 +1939,12 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     )),
                     I(len),
                     B(false),
+                    s(&snapshot.column_identities.get(&c.id).map_or(String::new(), char::to_string)),
                     s(""),
-                    s(""),
-                    B(false),
+                    B(snapshot.column_defaults.contains_key(&c.id) && !snapshot.column_identities.contains_key(&c.id)),
                     I(0),
                     N,
-                    I(0),
+                    I(i64::from(view.is_none() && c.data_type == ScalarType::UuidArray)),
                     B(true),
                     N,
                 ],
@@ -1901,22 +1952,22 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         }
         if has_pk {
             let key = Value::Array(t.primary_key.iter().map(|k| I(*k as i64 + 1)).collect());
-            let n = &key_names[&t.id];
-            add(
+            let name = || key_names[&t.id].as_str();
+            add!(
                 "pg_indexes",
                 vec![
                     s(schema),
                     s(&t.name),
-                    s(n),
+                    s(name()),
                     N,
-                    s(&index_definition(snapshot,None,schema, t, n, &t.primary_key, true)),
+                    s(&index_definition(snapshot, &lookup, None,schema, t, name(), &t.primary_key)),
                 ],
             );
-            add(
+            add!(
                 "pg_class",
                 vec![
                     I(oid + 1),
-                    s(n),
+                    s(name()),
                     I(namespace),
                     s("i"),
                     I(owner),
@@ -1933,7 +1984,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     N,
                 ],
             );
-            add(
+            add!(
                 "pg_index",
                 vec![
                     I(oid + 1),
@@ -1962,7 +2013,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             for (i, k) in t.primary_key.iter().enumerate() {
                 let c = &t.columns[*k];
                 let (ty, _, len, _) = scalar(c.data_type);
-                add(
+                add!(
                     "pg_attribute",
                     vec![
                         I(oid + 1),
@@ -1984,11 +2035,11 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     ],
                 );
             }
-            add(
+            add!(
                 "pg_constraint",
                 vec![
                     I(oid + 2),
-                    s(n),
+                    s(name()),
                     I(namespace),
                     s("p"),
                     I(oid),
@@ -2010,26 +2061,21 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 ],
             );
             // A primary-key index is internally owned by its constraint (PG18).
-            add(
+            add!(
                 "pg_depend",
                 vec![I(1259), I(oid + 1), I(0), I(2606), I(oid + 2), I(0), s("i")],
             );
         }
-        let mut indexes = visible_indexes
-            .iter()
-            .filter(|i| i.table == t.id)
-            .collect::<Vec<_>>();
-        indexes.sort_by_key(|i| i.id);
-        for index in indexes {
+        for &index in lookup.indexes_by_table.get(&t.id).into_iter().flatten() {
             let index_oid = table_oid(index.id)? as i64;
             let n = &index.name;
             let keys = index
                 .columns
                 .iter()
-                .map(|id| t.columns.iter().position(|c| c.id == *id).unwrap())
+                .map(|id| lookup.columns[&(t.id, *id)])
                 .collect::<Vec<_>>();
             let key = Value::Array(keys.iter().map(|k| I(*k as i64 + 1)).collect());
-            add(
+            add!(
                 "pg_class",
                 vec![
                     I(index_oid),
@@ -2050,7 +2096,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     N,
                 ],
             );
-            add(
+            add!(
                 "pg_index",
                 vec![
                     I(index_oid),
@@ -2079,7 +2125,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             for (i, k) in keys.iter().enumerate() {
                 let c = &t.columns[*k];
                 let (ty, _, len, _) = scalar(c.data_type);
-                add(
+                add!(
                     "pg_attribute",
                     vec![
                         I(index_oid),
@@ -2101,92 +2147,100 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     ],
                 );
             }
-            add(
+            add!(
                 "pg_indexes",
                 vec![
                     s(schema),
                     s(&t.name),
                     s(n),
                     N,
-                    s(&index_definition(snapshot,Some(index.id),schema, t, n, &keys, index.unique)),
+                    s(&index_definition(snapshot, &lookup, Some(index),schema, t, n, &keys)),
                 ],
             );
         }
     }
-    for row in &mut all.get_mut("pg_index").unwrap().rows {
-        let Some(t)=snapshot.tables.iter().find(|t|table_oid(t.id).ok().map(|o|I(i64::from(o)))==Some(row[1].clone())) else {continue};
-        let index=snapshot.indexes.iter().find(|i|table_oid(i.id).ok().map(|o|I(i64::from(o)))==Some(row[0].clone()));
-        let keys=index.map(|i|i.columns.clone()).unwrap_or_else(||t.primary_key.iter().map(|i|t.columns[*i].id).collect());
-        let overrides=index.and_then(|i|snapshot.collation_oids.get(&i.id));
-        row[11]=Value::Array(keys.iter().enumerate().map(|(n,id)| {
-            let c=t.columns.iter().find(|c|c.id==*id).unwrap();
-            I(i64::from(overrides.and_then(|v|v.get(n)).copied().filter(|oid|*oid!=0).unwrap_or_else(||column_collation(snapshot,c))))
-        }).collect());
+    for row in rows_mut(&mut all, "pg_index") {
+        let Some(&table) = lookup.relations.get(&row_oid(&row[1])) else { continue };
+        let index = lookup.index_relations.get(&row_oid(&row[0]));
+        let keys = index.map(|i| i.columns.clone())
+            .unwrap_or_else(|| table.primary_key.iter().map(|i| table.columns[*i].id).collect());
+        let overrides = index.and_then(|i| snapshot.collation_oids.get(&i.id));
+        budget.rewrite(row, |row| {
+            row[11] = Value::Array(keys.iter().enumerate().map(|(offset, id)| {
+                let column = lookup.column(table, *id).unwrap();
+                let collation = overrides.and_then(|v| v.get(offset)).copied()
+                    .filter(|oid| *oid != 0)
+                    .unwrap_or_else(|| column_collation(snapshot, &lookup, column));
+                I(i64::from(collation))
+            }).collect());
+        })?;
     }
-    all.get_mut("pg_index")
-        .unwrap()
-        .rows
-        .sort_by_key(|r| match (&r[1], &r[0]) {
+    rows_mut(&mut all, "pg_index").sort_by_key(|r| match (&r[1], &r[0]) {
             (I(t), I(i)) => (*t, *i),
             _ => unreachable!(),
         });
     // Append descriptor extensions here so established field positions remain stable.
-    for row in &mut all.get_mut("pg_class").unwrap().rows {
-        if row[2] == I(2200) && row[3] != s("v") {
-            row[10] = I(if row[3] == s("i") { 403 } else { 2 });
-        }
-        row.extend([
-            I(0),
-            B(false),
-            B(false),
-            B(false),
-            B(false),
-            I(0),
-            s(if row[3] == s("i") || row[3] == s("v") { "n" } else { "d" }),
-            I(0),
-            I(0),
-            Value::Float4(giggles_pg_types::Float4::parse("-1").unwrap()),
-            I(0),
-            // FrozenTransactionId (2) and FirstMultiXactId (1): virtual
-            // relations have no heap transaction horizon to preserve in dumps.
-            I(if row[3] == s("r") { 2 } else { 0 }),
-            B(true),
-            I(if row[3] == s("r") { 1 } else { 0 }),
-            I(0),
-        ]);
+    for row in rows_mut(&mut all, "pg_class") {
+        budget.rewrite(row, |row| {
+            if row[2] == I(2200) && row[3] != s("v") {
+                row[10] = I(if row[3] == s("i") { 403 } else { 2 });
+            }
+            row.extend([
+                I(0),
+                B(false),
+                B(false),
+                B(false),
+                B(false),
+                I(0),
+                s(if row[3] == s("i") || row[3] == s("v") { "n" } else { "d" }),
+                I(0),
+                I(0),
+                Value::Float4(giggles_pg_types::Float4::parse("-1").unwrap()),
+                I(0),
+                // FrozenTransactionId (2) and FirstMultiXactId (1): virtual
+                // relations have no heap transaction horizon to preserve in dumps.
+                I(if row[3] == s("r") { 2 } else { 0 }),
+                B(true),
+                I(if row[3] == s("r") { 1 } else { 0 }),
+                I(0),
+            ]);
+        })?;
     }
     for ty in &snapshot.user_types {
-        let len = match (ty.kind, ty.base) {
-            ('e', _) | ('d', 23 | 700 | 1082) => 4,
-            ('d', 20 | 701 | 1083 | 1114 | 1184) => 8,
-            ('d', 21) => 2,
-            ('d', 16) => 1,
-            _ => -1,
-        };
-        let mut row = type_row(ty.oid, &ty.name, len, 0, 0, false);
-        row[2] = I(if ty.schema == "public" {
-            2200
-        } else {
-            snapshot
-                .schemas
-                .get(&ty.schema)
-                .ok_or(Error::InvalidSnapshot)?
-                .0 as i64
-        });
-        row[4] = s(&ty.kind.to_string());
-        row[5] = s(match ty.kind {
-            'e' => "E",
-            'c' => "C",
-            _ => "N",
-        });
-        row[6] = B(ty.not_null);
-        row[7] = I(ty.base as i64);
-        row[8] = I(ty.typmod as i64);
-        all.get_mut("pg_type").unwrap().rows.push(row);
+        if needs("pg_type") {
+            let len = match (ty.kind, ty.base) {
+                ('e', _) | ('d', 23 | 700 | 1082) => 4,
+                ('d', 20 | 701 | 1083 | 1114 | 1184) => 8,
+                ('d', 21) => 2,
+                ('d', 16) => 1,
+                _ => -1,
+            };
+            let mut row = type_row(ty.oid, &ty.name, len, 0, 0, false);
+            row[2] = I(if ty.schema == "public" {
+                2200
+            } else {
+                snapshot
+                    .schemas
+                    .get(&ty.schema)
+                    .ok_or(Error::InvalidSnapshot)?
+                    .0 as i64
+            });
+            row[4] = s(&ty.kind.to_string());
+            row[5] = s(match ty.kind {
+                'e' => "E",
+                'c' => "C",
+                _ => "N",
+            });
+            row[6] = B(ty.not_null);
+            row[7] = I(ty.base as i64);
+            row[8] = I(ty.typmod as i64);
+            add!("pg_type", row);
+        }
+        if !needs("pg_enum") { continue; }
         for (i, label) in ty.labels.iter().enumerate() {
             // Label OIDs are stable within this immutable enumeration.
             let oid = i64::from(ty.oid) + 4 * (i as i64 + 1);
-            all.get_mut("pg_enum").unwrap().rows.push(vec![
+            add!("pg_enum", vec![
                 I(oid),
                 I(ty.oid as i64),
                 Value::Float4(giggles_pg_types::Float4::from_bits(
@@ -2196,197 +2250,206 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             ]);
         }
     }
-    for row in &mut all.get_mut("pg_type").unwrap().rows {
+    for row in rows_mut(&mut all, "pg_type") {
         let oid = match row[0] {
             I(v) => v,
             _ => 0,
         };
-        row.push(I(type_collation(snapshot,oid)));
-        row.push(s(type_layout(oid).0));
+        budget.rewrite(row, |row| {
+            row.push(I(type_collation(&lookup, oid)));
+            row.push(s(type_layout(oid).0));
+        })?;
     }
-    for row in &mut all.get_mut("pg_attribute").unwrap().rows {
-        row[11] = I(match row[2] {I(oid)=>type_collation(snapshot,oid),_=>0});
-    }
-    for row in &mut all.get_mut("pg_attribute").unwrap().rows {
-        if let Some(t)=snapshot.tables.iter().find(|t|table_oid(t.id).ok().map(|o|I(i64::from(o)))==Some(row[0].clone()))
-            && let I(n)=row[3] && n>0 && let Some(c)=t.columns.get((n-1) as usize)
-            && let Some(o)=snapshot.collation_oids.get(&c.id).and_then(|v|v.first()) {
-            row[11]=I(i64::from(*o));
-        }
-        if let I(n)=row[3] && n>0 {
-            let offset=(n-1) as usize;
-            if let Some(index)=snapshot.indexes.iter().find(|i|table_oid(i.id).ok().map(|o|I(i64::from(o)))==Some(row[0].clone())) {
-                let column=index.columns.get(offset).and_then(|id|snapshot.tables.iter().find(|t|t.id==index.table)?.columns.iter().find(|c|c.id==*id));
-                if let Some(column)=column {
-                    let oid=snapshot.collation_oids.get(&index.id).and_then(|v|v.get(offset)).copied().filter(|oid|*oid!=0).unwrap_or_else(||column_collation(snapshot,column));
-                    row[11]=I(i64::from(oid));
+    for row in rows_mut(&mut all, "pg_attribute") {
+        budget.rewrite(row, |row| {
+            let rel = row_oid(&row[0]);
+            let oid = row_oid(&row[2]);
+            let mut collation = type_collation(&lookup, oid);
+            let mut column_acl = None;
+            if let I(n) = row[3] && n > 0 {
+                let offset = (n - 1) as usize;
+                if let Some(table) = lookup.relations.get(&rel)
+                    && let Some(column) = table.columns.get(offset)
+                {
+                    if let Some(oid) = snapshot.collation_oids.get(&column.id).and_then(|v| v.first()) {
+                        collation = i64::from(*oid);
+                    }
+                    column_acl = snapshot.column_acls.get(&(table.id, column.id));
                 }
-            } else if let Some(table)=snapshot.tables.iter().find(|t|table_oid(t.id).ok().map(|o|I(i64::from(o)+1))==Some(row[0].clone()))
-                && let Some(column)=table.primary_key.get(offset).and_then(|i|table.columns.get(*i)) {
-                row[11]=I(i64::from(column_collation(snapshot,column)));
+                if let Some(index) = lookup.index_relations.get(&rel) {
+                    let column = index.columns.get(offset).and_then(|id| lookup.column(lookup.tables.get(&index.table)?, *id));
+                    if let Some(column) = column {
+                        let oid = snapshot.collation_oids.get(&index.id).and_then(|v| v.get(offset)).copied()
+                            .filter(|oid| *oid != 0).unwrap_or_else(|| column_collation(snapshot, &lookup, column));
+                        collation = i64::from(oid);
+                    }
+                } else if let Some(table) = lookup.primary_indexes.get(&rel)
+                    && let Some(column) = table.primary_key.get(offset).and_then(|i| table.columns.get(*i))
+                {
+                    collation = i64::from(column_collation(snapshot, &lookup, column));
+                }
             }
-        }
-        let oid = match row[2] {
-            I(oid) => oid,
-            _ => 0,
-        };
-        let (storage, align) = type_layout(oid);
-        // Builders above supply the structural fields in their original order.
-        // Project once into PG18's physical order, including supplied column ACLs.
-        let column_acl = snapshot.tables.iter().find(|t| table_oid(t.id).ok().map(|oid| I(i64::from(oid))) == Some(row[0].clone()))
-            .and_then(|t| match row[3] { I(n) if n > 0 => t.columns.get((n - 1) as usize).map(|c| (t.id, c.id)), _ => None })
-            .and_then(|key| snapshot.column_acls.get(&key));
-        let column_acl = acl_value(snapshot, column_acl);
-        let old = std::mem::take(row);
-        *row = vec![
-            old[0].clone(),
-            old[1].clone(),
-            old[2].clone(),
-            old[6].clone(),
-            old[3].clone(),
-            old[5].clone(),
-            old[13].clone(),
-            B(matches!(
-                oid,
-                16 | 18
-                    | 20
-                    | 21
-                    | 23
-                    | 24
-                    | 26
-                    | 28
-                    | 29
-                    | 700
-                    | 701
-                    | 1082
-                    | 1083
-                    | 1114
-                    | 1184
-                    | 3220
-            )),
-            s(align),
-            s(storage),
-            s(""),
-            old[4].clone(),
-            old[10].clone(),
-            B(false),
-            old[8].clone(),
-            old[9].clone(),
-            old[7].clone(),
-            old[14].clone(),
-            I(0),
-            old[11].clone(),
-            N,
-            column_acl,
-            N,
-            old[15].clone(),
-            N,
-            old[12].clone(),
-        ];
+            let (storage, align) = type_layout(oid);
+            // Project the structural row into PG18's physical order.
+            let column_acl = acl_value(&lookup, column_acl);
+            let old = std::mem::take(row);
+            *row = vec![
+                old[0].clone(),
+                old[1].clone(),
+                old[2].clone(),
+                old[6].clone(),
+                old[3].clone(),
+                old[5].clone(),
+                old[13].clone(),
+                B(matches!(
+                    oid,
+                    16 | 18
+                        | 20
+                        | 21
+                        | 23
+                        | 24
+                        | 26
+                        | 28
+                        | 29
+                        | 700
+                        | 701
+                        | 1082
+                        | 1083
+                        | 1114
+                        | 1184
+                        | 3220
+                )),
+                s(align),
+                s(storage),
+                s(""),
+                old[4].clone(),
+                old[10].clone(),
+                B(false),
+                old[8].clone(),
+                old[9].clone(),
+                old[7].clone(),
+                old[14].clone(),
+                I(0),
+                I(collation),
+                N,
+                column_acl,
+                N,
+                old[15].clone(),
+                N,
+                old[12].clone(),
+            ];
+        })?;
     }
     // PG18 discovers NOT NULL via pg_constraint rather than attnotnull.
     // These are snapshot-only identities; no persisted format is changed.
-    let mut used_oids = all
-        .values()
-        .flat_map(|relation| {
-            let oid = relation.fields.iter().position(|field| field.name == "oid");
-            relation.rows.iter().filter_map(move |row| {
-                oid.and_then(|i| match row[i] {
-                    I(oid) => Some(oid),
-                    _ => None,
-                })
-            })
-        })
-        .collect::<BTreeSet<_>>();
+    let mut used_oids = if needs("pg_constraint") || needs("pg_attrdef") || !snapshot.constraints.is_empty() {
+        materialize::occupied_oids(snapshot, &lookup, budget)?
+    } else {
+        BTreeSet::new()
+    };
     let mut next_oid = i64::from(u32::MAX);
     for c in &snapshot.constraints {
         if !used_oids.insert(i64::from(table_oid(c.id)?)) { return Err(Error::InvalidSnapshot); }
     }
-    let mut tables = snapshot.tables.iter().collect::<Vec<_>>();
-    tables.sort_by_key(|table| table.id);
-    for table in tables {
-        for (i, column) in table.columns.iter().enumerate() {
-            if !column.not_null && !table.primary_key.contains(&i) {
-                continue;
-            }
-            while !used_oids.insert(next_oid) {
+    if needs("pg_constraint") || needs("pg_attrdef") {
+        let mut tables = snapshot.tables.iter().collect::<Vec<_>>();
+        tables.sort_by_key(|table| table.id);
+        for table in tables {
+            for (i, column) in table.columns.iter().enumerate() {
+                if !column.not_null && !table.primary_key.contains(&i) {
+                    continue;
+                }
+                while !used_oids.insert(next_oid) {
+                    budget.visit(1)?;
+                    next_oid -= 1;
+                }
+                budget.visit(1)?;
+                add!("pg_constraint", vec![
+                    I(next_oid),
+                    s(&format!("{}_{}_not_null", table.name, column.name)),
+                    I(i64::from(snapshot.table_schema(table.id).1)),
+                    s("n"),
+                    I(i64::from(table_oid(table.id)?)),
+                    I(0),
+                    Value::Array(vec![I(i as i64 + 1)]),
+                    I(0),
+                    N,
+                    B(false),
+                    B(false),
+                    B(true),
+                    N,
+                    I(0),
+                    s(" "),
+                    s(" "),
+                    s(" "),
+                    B(false),
+                    N,
+                    N,
+                ]);
                 next_oid -= 1;
             }
-            all.get_mut("pg_constraint").unwrap().rows.push(vec![
-                I(next_oid),
-                s(&format!("{}_{}_not_null", table.name, column.name)),
-                I(i64::from(snapshot.table_schema(table.id).1)),
-                s("n"),
-                I(i64::from(table_oid(table.id)?)),
-                I(0),
-                Value::Array(vec![I(i as i64 + 1)]),
-                I(0),
-                N,
-                B(false),
-                B(false),
-                B(true),
-                N,
-                I(0),
-                s(" "),
-                s(" "),
-                s(" "),
-                B(false),
-                N,
-                N,
-            ]);
-            next_oid -= 1;
         }
     }
-    constraints::populate(snapshot, &mut all, &mut used_oids, &mut next_oid)?;
-    let foreign = snapshot.constraints.iter().filter(|c| c.kind == 'f')
-        .map(|c| Ok((I(i64::from(table_oid(c.id)?)), c))).collect::<R<BTreeMap<_, _>>>()?;
-    for row in &mut all.get_mut("pg_constraint").unwrap().rows {
-        row.extend([I(0), B(false), B(true), B(true), I(0), N, N, N, N]);
-        if let Some(c) = foreign.get(&row[0]) {
-            let operators = c.foreign_columns.iter().map(|id| {
-                let ty = snapshot.tables.iter().find(|t| t.id == c.foreign_table).unwrap().columns.iter().find(|col| col.id == *id).unwrap().data_type;
-                I(match ty {
-                    ScalarType::Boolean => 91, ScalarType::SmallInt => 94, ScalarType::Integer => 96,
-                    ScalarType::BigInt => 410, ScalarType::Text | ScalarType::Varchar => 98,
-                    ScalarType::Bpchar => 1054, ScalarType::Uuid => 2972, ScalarType::Jsonb => 3240,
-                    ScalarType::Bytes => 1955, ScalarType::Numeric => 1752, ScalarType::Real => 620,
-                    ScalarType::DoublePrecision => 670, ScalarType::Date => 1093, ScalarType::Time => 1108,
-                    ScalarType::TimeTz => 1550, ScalarType::Timestamp => 2060, ScalarType::TimestampTz => 1320,
-                    ScalarType::Interval => 1330, ScalarType::IntArray | ScalarType::BigIntArray | ScalarType::TextArray => 1070,
-                })
-            }).collect::<Vec<_>>();
-            for slot in &mut row[25..28] { *slot = Value::Array(operators.clone()); }
+    constraints::populate(snapshot, &lookup, budget, &mut all, &mut used_oids, &mut next_oid)?;
+    let foreign = if needs("pg_constraint") {
+        snapshot.constraints.iter().filter(|c| c.kind == 'f')
+            .map(|c| Ok((I(i64::from(table_oid(c.id)?)), c))).collect::<R<BTreeMap<_, _>>>()?
+    } else {
+        BTreeMap::new()
+    };
+    for row in rows_mut(&mut all, "pg_constraint") {
+        budget.rewrite(row, |row| {
+            row.extend([I(0), B(false), B(true), B(true), I(0), N, N, N, N]);
+            if let Some(c) = foreign.get(&row[0]) {
+                let operators = c.foreign_columns.iter().map(|id| {
+                    let ty = lookup.column(lookup.tables[&c.foreign_table], *id).unwrap().data_type;
+                    I(match ty {
+                        ScalarType::Boolean => 91, ScalarType::SmallInt => 94, ScalarType::Integer => 96,
+                        ScalarType::BigInt => 410, ScalarType::Text | ScalarType::Varchar => 98,
+                        ScalarType::Bpchar => 1054, ScalarType::Uuid => 2972, ScalarType::Jsonb => 3240,
+                        ScalarType::Bytes => 1955, ScalarType::Numeric => 1752, ScalarType::Real => 620,
+                        ScalarType::DoublePrecision => 670, ScalarType::Date => 1093, ScalarType::Time => 1108,
+                        ScalarType::TimeTz => 1550, ScalarType::Timestamp => 2060, ScalarType::TimestampTz => 1320,
+                        ScalarType::Interval => 1330, ScalarType::IntArray | ScalarType::BigIntArray | ScalarType::TextArray | ScalarType::UuidArray => 1070,
+                    })
+                }).collect::<Vec<_>>();
+                for slot in &mut row[25..28] { *slot = Value::Array(operators.clone()); }
+            }
+        })?;
+    }
+    if needs("pg_operator") {
+        let referenced_operators = rows(&all, "pg_constraint").iter().flat_map(|row| {
+            match &row[25] {
+                Value::Array(operators) => operators.as_slice(),
+                _ => &[],
+            }
+        }).filter_map(|value| match value {
+            I(oid) => Some(*oid),
+            _ => None,
+        }).collect::<BTreeSet<_>>();
+        // PG18 equality operators already referenced by pg_constraint.conpfeqop.
+        // Emit only referenced operators, once each in OID order.
+        // Source: PostgreSQL REL_18_STABLE pg_operator.dat and pg_proc.dat.
+        let mut equality_operators = [
+            (91, 16, 85, 60), (94, 21, 519, 63), (96, 23, 518, 65),
+            (410, 20, 411, 467), (98, 25, 531, 67), (1054, 1042, 1057, 1048),
+            (2972, 2950, 2973, 2956), (3240, 3802, 3241, 4043), (1955, 17, 1956, 1948),
+            (1752, 1700, 1753, 1718), (620, 700, 621, 287), (670, 701, 671, 293),
+            (1093, 1082, 1094, 1086), (1108, 1083, 1109, 1145), (1550, 1266, 1551, 1352),
+            (2060, 1114, 2061, 2052), (1320, 1184, 1321, 1152), (1330, 1186, 1331, 1162),
+            (1070, 2277, 1071, 744),
+        ];
+        equality_operators.sort_unstable_by_key(|operator| operator.0);
+        for (oid, ty, negate, code) in equality_operators {
+            if !referenced_operators.contains(&oid) { continue; }
+            add!("pg_operator", vec![I(oid), s("="), I(11), I(10), s("b"), B(true), B(true),
+                I(ty), I(ty), I(16), I(oid), I(negate), N, I(code), I(101), I(105)]);
         }
     }
-    let referenced_operators = all["pg_constraint"].rows.iter().flat_map(|row| {
-        match &row[25] {
-            Value::Array(operators) => operators.as_slice(),
-            _ => &[],
-        }
-    }).filter_map(|value| match value {
-        I(oid) => Some(*oid),
-        _ => None,
-    }).collect::<BTreeSet<_>>();
-    // PG18 equality operators already referenced by pg_constraint.conpfeqop.
-    // Emit only referenced operators, once each in OID order.
-    // Source: PostgreSQL REL_18_STABLE pg_operator.dat and pg_proc.dat.
-    let mut equality_operators = [
-        (91, 16, 85, 60), (94, 21, 519, 63), (96, 23, 518, 65),
-        (410, 20, 411, 467), (98, 25, 531, 67), (1054, 1042, 1057, 1048),
-        (2972, 2950, 2973, 2956), (3240, 3802, 3241, 4043), (1955, 17, 1956, 1948),
-        (1752, 1700, 1753, 1718), (620, 700, 621, 287), (670, 701, 671, 293),
-        (1093, 1082, 1094, 1086), (1108, 1083, 1109, 1145), (1550, 1266, 1551, 1352),
-        (2060, 1114, 2061, 2052), (1320, 1184, 1321, 1152), (1330, 1186, 1331, 1162),
-        (1070, 2277, 1071, 744),
-    ];
-    equality_operators.sort_unstable_by_key(|operator| operator.0);
-    for (oid, ty, negate, code) in equality_operators {
-        if !referenced_operators.contains(&oid) { continue; }
-        all.get_mut("pg_operator").unwrap().rows.push(vec![I(oid), s("="), I(11), I(10), s("b"), B(true), B(true),
-            I(ty), I(ty), I(16), I(oid), I(negate), N, I(code), I(101), I(105)]);
-    }
-    for row in &mut all.get_mut("pg_database").unwrap().rows {
-        row.extend([I(6), s("c"), s("C.UTF-8"), s("C.UTF-8"), N, N, I(1663)]);
+    for row in rows_mut(&mut all, "pg_database") {
+        budget.rewrite(row, |row| {
+            row.extend([I(6), s("c"), s("C.UTF-8"), s("C.UTF-8"), N, N, I(1663)]);
+        })?;
     }
     // No per-object MVCC tuple exists. Reporting the current durable generation
     // for every xmin makes DataGrip conservatively refresh every catalog object.
@@ -2398,36 +2461,35 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         {
             for row in &mut relation.rows {
                 // Newly synthesized system slots follow all physical fields.
-                if xmin == row.len() {
-                    row.push(N);
-                }
-                row[xmin] = I(i64::from(snapshot.generation as u32));
+                budget.rewrite(row, |row| {
+                    if xmin == row.len() {
+                        row.push(N);
+                    }
+                    row[xmin] = I(i64::from(snapshot.generation as u32));
+                })?;
             }
         }
     }
-    information_schema::populate(snapshot, &key_names, &mut all)?;
+    information_schema::populate(snapshot, &lookup, &key_names, budget, &mut all)?;
     // pg_tables reads pg_class in its private builder layout, so it runs
     // before pg_class/pg_index are presented in PG18 column order.
-    pg_tables::populate(snapshot, &mut all);
+    if needs("pg_tables") {
+        pg_tables::populate(&lookup, budget, &mut all)?;
+    }
     for name in ["pg_class", "pg_index", "pg_constraint"] {
-        let relation = all.get_mut(name).unwrap();
+        let Some(relation) = all.get_mut(name) else { continue };
         let fields = schema(name).unwrap();
+        let positions: Vec<_> = fields.iter().map(|f| {
+            relation.fields.iter().position(|old| old.name == f.name)
+        }).collect();
         for row in &mut relation.rows {
-            *row = fields.iter().map(|f| {
-                relation.fields.iter().position(|old| old.name == f.name)
-                    .map_or_else(|| if f.data_type == PgType::Bool { B(false) } else { I(0) }, |i| row[i].clone())
-            }).collect();
+            budget.rewrite(row, |row| {
+                *row = fields.iter().zip(&positions).map(|(field, position)| {
+                    position.map_or_else(|| if field.data_type == PgType::Bool { B(false) } else { I(0) }, |i| row[i].clone())
+                }).collect();
+            })?;
         }
         relation.fields = fields;
-    }
-    let total: usize = all
-        .values()
-        .flat_map(|r| &r.rows)
-        .flat_map(|r| r.iter())
-        .map(Value::bytes)
-        .sum();
-    if total > MAX_BYTES {
-        return Err(Error::Limit);
     }
     for relation in all.values() {
         if relation
@@ -2438,6 +2500,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             return Err(Error::InvalidSnapshot);
         }
     }
+    all.retain(|name, _| requested.contains(name));
     Ok(all)
 }
 // PostgreSQL physical type layout is catalog presentation only; it does
@@ -2613,26 +2676,27 @@ pub(crate) fn quote_identifier(name: &str) -> String {
         format!("\"{}\"", name.replace('"', "\"\""))
     }
 }
-fn type_collation(snapshot:&CatalogSnapshot,oid:i64)->i64 {
+fn type_collation(lookup: &Lookup<'_>, oid:i64)->i64 {
     match oid {19|1003=>950,25|1009|1042|1043|1014|1015=>100,_=>{
-        if snapshot.user_types.iter().any(|t|i64::from(t.oid)==oid && t.kind=='d' && matches!(t.base,25|1042|1043)) {100} else {0}
+        if lookup.user_types.get(&oid).is_some_and(|t|t.kind=='d' && matches!(t.base,25|1042|1043)) {100} else {0}
     }}
 }
-fn column_collation(snapshot:&CatalogSnapshot,column:&ColumnDef)->u32 {
+fn column_collation(snapshot:&CatalogSnapshot, lookup: &Lookup<'_>, column:&ColumnDef)->u32 {
     snapshot.collation_oids.get(&column.id).and_then(|v|v.first()).copied().unwrap_or_else(|| {
         let oid=snapshot.column_type_oids.get(&column.id).copied().unwrap_or(scalar(column.data_type).0);
-        type_collation(snapshot,i64::from(oid)) as u32
+        type_collation(lookup,i64::from(oid)) as u32
     })
 }
 fn index_definition(
     snapshot:&CatalogSnapshot,
-    index:Option<u64>,
+    lookup: &Lookup<'_>,
+    index: Option<&IndexDef>,
     schema: &str,
     t: &TableDef,
     name: &str,
     keys: &[usize],
-    unique: bool,
 ) -> String {
+    let unique = index.is_none_or(|index| index.unique);
     format!(
         "CREATE {}INDEX {} ON {}.{} USING btree ({})",
         if unique { "UNIQUE " } else { "" },
@@ -2642,17 +2706,22 @@ fn index_definition(
         keys.iter()
             .enumerate().map(|(offset,k)| {
                 let c=&t.columns[*k];let mut name=quote_identifier(&c.name);
-                let col=column_collation(snapshot,c);
-                if let Some(oid)=index.and_then(|id|snapshot.collation_oids.get(&id)).and_then(|v|v.get(offset)).copied().filter(|oid|*oid!=col && *oid!=0) {
-                    let builtin=include_str!("../../giggles-icu/src/pg_collation.txt").lines().find_map(|l|{let mut f=l.split('|');(f.next()?.parse::<u32>().ok()?==oid).then(||format!("pg_catalog.{}",quote_identifier(f.next().unwrap()))) });
-                    let user=snapshot.collations.iter().find(|r|r[0]==I(i64::from(oid))).and_then(|r| {
-                        let (Value::Text(n),I(namespace))=(&r[1],&r[2]) else {return None};
-                        let schema=if *namespace==2200 {"public"} else {
-                            snapshot.schemas.iter().find(|(_, (oid,_))|i64::from(*oid)==*namespace)?.0.as_str()
-                        };
-                        Some(format!("{}.{}",quote_identifier(schema),quote_identifier(n)))
-                    });
-                    if let Some(collation)=builtin.or(user) {name.push_str(&format!(" COLLATE {collation}"));}
+                let col=column_collation(snapshot,lookup,c);
+                if let Some(oid)=index.and_then(|index|snapshot.collation_oids.get(&index.id)).and_then(|v|v.get(offset)).copied().filter(|oid|*oid!=col && *oid!=0) {
+                    let collation = lookup.collations.get(&oid)
+                        .map(|name| format!("pg_catalog.{}", quote_identifier(name)))
+                        .or_else(|| {
+                            let row = lookup.user_collations.get(&i64::from(oid))?;
+                            let (Value::Text(name), I(namespace)) = (&row[1], &row[2]) else { return None };
+                            let schema = if *namespace == 2200 { "public" } else {
+                                // User collation definitions refer to supplied schemas.
+                                let name = lookup.namespaces.get(namespace)?;
+                                snapshot.schemas.get(*name)?;
+                                name
+                            };
+                            Some(format!("{}.{}", quote_identifier(schema), quote_identifier(name)))
+                        });
+                    if let Some(collation) = collation { name.push_str(&format!(" COLLATE {collation}")); }
                 }
                 name
             })
@@ -2878,7 +2947,9 @@ mod schema_tests {
             }],
             ..Default::default()
         };
-        let catalogs = build(&snapshot).unwrap();
+        let requested = ["pg_namespace", "pg_class", "pg_constraint", "tables", "columns"]
+            .into_iter().map(str::to_owned).collect();
+        let catalogs = build(&snapshot, &requested).unwrap();
         assert!(
             catalogs["pg_namespace"]
                 .rows
@@ -2942,7 +3013,8 @@ mod system_xmin_tests {
             generation: 12345,
             ..Default::default()
         };
-        let relations = build(&snapshot).unwrap();
+        let requested = known_names().iter().map(|&name| name.to_owned()).collect();
+        let relations = build(&snapshot, &requested).unwrap();
         for name in known_names() {
             let sql = format!("select xmin from pg_catalog.{name}");
             if tableoid(name).is_some() {
@@ -3000,3 +3072,6 @@ mod system_xmin_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod materialization_tests;

@@ -13,9 +13,11 @@ fn normal(r: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<State, CoreError> {
 }
 #[test]
 fn feature_record_precedes_payload_and_is_canonical() {
-    let mut r = forged(1 << 10);
-    r.insert(vec![5], vec![255]);
-    assert!(matches!(normal(r), Err(CoreError::Unsupported)));
+    for bit in [10, 29, 30] {
+        let mut r = forged(1 << bit);
+        r.insert(vec![5], vec![255]);
+        assert!(matches!(normal(r), Err(CoreError::Unsupported)));
+    }
     for bits in [0, 1, 63, 64, 128, 256, 320, 512] {
         assert!(
             matches!(normal(forged(bits)), Err(CoreError::Corrupt(_))),
@@ -573,4 +575,76 @@ fn legacy_collation_feature_positions() {
     assert_eq!(USER_COLLATIONS, 1 << 22);
     assert_eq!(COLUMN_COLLATIONS, 1 << 23);
     assert!(matches!(normal(forged((1 << 24) | 64)), Err(CoreError::Unsupported)));
+}
+
+
+#[test]
+fn uuid_array_legacy_feature_envelope_preserves_old_bytes() {
+    use crate::relational::Prepared;
+
+    let mut state = empty(17);
+    let exec = |state: &mut State, sql: &str| {
+        let prepared = Prepared::parse(sql, 17, state.sql.epoch).unwrap();
+        state.sql.execute(&prepared, &[], None).unwrap();
+    };
+    exec(&mut state, "CREATE TABLE t (id bigint PRIMARY KEY, v text[])");
+    exec(&mut state, "INSERT INTO t VALUES (1, '{old}')");
+    let old = records(&state).unwrap();
+    assert_eq!(state.sql.catalog_ext().wire_version(), 4);
+    assert_eq!(feature_bits_present(&state).unwrap() & UUID_ARRAY_COLUMNS, 0);
+    let mut reopened = normal(old.clone()).unwrap();
+    exec(&mut reopened, "SELECT ARRAY[]::uuid[]");
+    assert_eq!(records(&reopened).unwrap(), old);
+
+    exec(&mut reopened, "ALTER TABLE t ADD COLUMN ids uuid[]");
+    let new = records(&reopened).unwrap();
+    let bits = feature_bits_present(&reopened).unwrap();
+    assert_eq!(new[&vec![10]], bits.to_be_bytes());
+    assert_ne!(bits & UUID_ARRAY_COLUMNS, 0);
+    assert_eq!(reopened.sql.catalog_ext().wire_version(), 4);
+    assert_eq!(records(&normal(new.clone()).unwrap()).unwrap(), new);
+
+    let mut missing_bit = new.clone();
+    missing_bit.insert(vec![10], (bits & !UUID_ARRAY_COLUMNS).to_be_bytes().to_vec());
+    assert!(matches!(normal(missing_bit), Err(CoreError::Corrupt(_))));
+
+    let mut reopened = normal(new).unwrap();
+    exec(&mut reopened, "ALTER TABLE t DROP COLUMN ids");
+    let shrunk = records(&reopened).unwrap();
+    assert_ne!(feature_bits_present(&reopened).unwrap() & UUID_ARRAY_COLUMNS, 0);
+    assert_eq!(records(&normal(shrunk.clone()).unwrap()).unwrap(), shrunk);
+}
+
+#[test]
+fn catalog_scale_main_shaped_sequences_preserve_feature_word() {
+    use crate::relational::Prepared;
+    let mut state = empty(17);
+    let exec = |state: &mut State, sql: &str| {
+        let prepared = Prepared::parse(sql, 17, state.sql.epoch).unwrap();
+        state.sql.execute(&prepared, &[], None).unwrap();
+    };
+    exec(&mut state, "CREATE TABLE t (id bigint PRIMARY KEY)");
+    for i in 0..129 {
+        exec(&mut state, &format!("CREATE SEQUENCE s{i}"));
+    }
+    let old = records(&state).unwrap();
+    assert_eq!(state.sql.catalog_ext().sequences.len(), 129);
+    assert!(!wide_catalog_present(&state));
+    let mut reopened = normal(old.clone()).unwrap();
+    assert_eq!(records(&reopened).unwrap(), old);
+    exec(&mut reopened, "INSERT INTO t VALUES (1)");
+    assert_eq!(records(&reopened).unwrap()[&vec![10]], old[&vec![10]]);
+}
+
+#[test]
+fn monotone_catalog_bits_open_without_content() {
+    let bits = UUID_ARRAY_COLUMNS | crate::storage::engine::meta::WIDE_CATALOG;
+    let map = forged(bits);
+    let mut state = normal(map.clone()).unwrap();
+    assert_eq!(records(&state).unwrap(), map);
+    for sql in ["CREATE TABLE t (id bigint PRIMARY KEY)", "INSERT INTO t VALUES (1)"] {
+        let prepared = crate::relational::Prepared::parse(sql, 17, state.sql.epoch).unwrap();
+        state.sql.execute(&prepared, &[], None).unwrap();
+    }
+    assert_eq!(feature_bits_present(&state).unwrap() & bits, bits);
 }

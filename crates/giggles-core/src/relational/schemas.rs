@@ -97,9 +97,6 @@ impl Relational {
         next_id: u64,
         excluded: Option<u64>,
     ) -> R<()> {
-        if ext.schemas.len() > MAX_TABLES || ext.table_schemas.len() > MAX_TABLES {
-            return Err(SqlError::Limit);
-        }
         let mut ids = BTreeSet::new();
         for (name, schema) in &ext.schemas {
             ident(name)?;
@@ -170,9 +167,6 @@ impl Relational {
                 } else {
                     Err(SqlError::DuplicateObject)
                 };
-            }
-            if self.ext.schemas.len() >= MAX_TABLES {
-                return Err(SqlError::Limit);
             }
             let id = allocate(&mut self.next_id)?;
             std::sync::Arc::make_mut(&mut self.ext).schemas.insert(

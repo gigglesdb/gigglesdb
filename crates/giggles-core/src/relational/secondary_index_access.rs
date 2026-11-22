@@ -218,9 +218,12 @@ impl Relational {
             add(
                 request_bytes.checked_mul(64).ok_or(SqlError::Limit)?,
                 MAX_COLUMNS * MAX_COLUMNS * 64
-                    + si::MAX_INDEXES * si::MAX_ARITY * 64
                     + si::MAX_CANDIDATES * 64,
             )?,
+        )?;
+        charge(
+            &mut work,
+            self.secondary.descriptors().len().checked_mul(si::MAX_ARITY * 64).ok_or(SqlError::Limit)?,
         )?;
         let (sidecar, base) = self.secondary_access_engine(table, epoch, &mut cancel)?;
         // Deterministic selection among only descriptors with the exact supported

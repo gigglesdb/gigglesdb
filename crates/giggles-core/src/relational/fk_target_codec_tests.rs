@@ -37,17 +37,17 @@ fn extension_v8_mixed_targets_and_old_adapter_bytes() {
     assert!(matches!(old.kind, ConstraintKind::ForeignKey { target: ReferencedKey::Unknown, .. }));
 }
 #[test]
-fn extension_v8_rejects_version_tag_empty_and_excessive_births() {
+fn extension_v8_rejects_version_tag_empty_and_truncated_births() {
     let (_, mut ext, _) = fixture();
     ext.constraints.clear();
     let bytes = codec().serialize(&ext).unwrap();
     let mut unknown = bytes.clone(); unknown[..4].copy_from_slice(&12u32.to_be_bytes());
     assert!(codec().deserialize::<CatalogExt>(&unknown).unwrap_err().to_string().contains(UNSUPPORTED_CATALOG_EXT));
-    // Seven empty maps followed by a bounded birth map.
+    // Seven empty maps followed by a birth map.
     let mut empty = codec().serialize(&(8u32, [0u64; 8])).unwrap();
     assert!(codec().deserialize::<CatalogExt>(&empty).unwrap_err().to_string().contains("noncanonical"));
-    empty[60..68].copy_from_slice(&((MAX_TABLES + 1) as u64).to_be_bytes());
-    assert!(codec().deserialize::<CatalogExt>(&empty).unwrap_err().to_string().contains("catalog map limit"));
+    empty[60..68].copy_from_slice(&u64::MAX.to_be_bytes());
+    assert!(codec().deserialize::<CatalogExt>(&empty).is_err());
     ext.primary_index_birth.clear(); ext.constraints.insert(4, vec![fk(ReferencedKey::PrimaryKey)]);
     let mut bad = codec().serialize(&ext).unwrap();
     let at = bad.len() - 52; // target precedes six remaining map lengths.

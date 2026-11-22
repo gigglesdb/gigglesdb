@@ -6,7 +6,7 @@ use super::{
     meta::FormatError,
     mvcc,
 };
-use crate::task::records;
+use crate::{relational::DataType, task::records};
 use std::{collections::BTreeMap, ops::Bound};
 
 fn corrupt(error: impl std::fmt::Display) -> FormatError {
@@ -83,6 +83,9 @@ pub(crate) fn required_bits_for_catalog_value(
             if catalog_codec::requires_text_backed_types(&entry.def) {
                 required |= super::meta::TEXT_BACKED_COLUMN_TYPES;
             }
+            if entry.def.columns.iter().any(|column| column.data_type == DataType::UuidArray) {
+                required |= super::meta::UUID_ARRAY_COLUMNS;
+            }
             if ext.values().any(|column| column.type_id.is_some()) || entry.def.name.contains('\0')
             {
                 required |= super::meta::SCHEMAS_AND_USER_TYPES;
@@ -124,8 +127,9 @@ pub(crate) fn required_bits_for_catalog_value(
             Ok(super::meta::SECONDARY_INDEXES)
         }
         CatalogKind::SqlView => {
-            catalog_codec::sql_views::decode_view(value).map_err(corrupt)?;
-            Ok(super::meta::SQL_VIEWS)
+            let view = catalog_codec::sql_views::decode_view(value).map_err(corrupt)?;
+            let uuid_arrays = view.columns.iter().any(|column| column.storage_type == DataType::UuidArray);
+            Ok(super::meta::SQL_VIEWS | uuid_array_bit(uuid_arrays))
         }
         CatalogKind::RelationComment => {
             catalog_codec::decode_comment(value).map_err(corrupt)?;
@@ -148,9 +152,8 @@ pub(crate) fn required_bits_for_catalog_value(
         } else {
             0
         }),
-        CatalogKind::Schema | CatalogKind::TypeDefinition => {
-            Ok(super::meta::SCHEMAS_AND_USER_TYPES)
-        }
+        CatalogKind::Schema => Ok(super::meta::SCHEMAS_AND_USER_TYPES),
+        CatalogKind::TypeDefinition => Ok(super::meta::SCHEMAS_AND_USER_TYPES | type_uuid_array_bit(value)?),
         CatalogKind::Role
         | CatalogKind::RoleMembership
         | CatalogKind::TableOwner
@@ -167,6 +170,15 @@ pub(crate) fn required_bits_for_catalog_value(
                 })
         }
     }
+}
+
+fn uuid_array_bit(present: bool) -> u64 {
+    if present { super::meta::UUID_ARRAY_COLUMNS } else { 0 }
+}
+
+fn type_uuid_array_bit(value: &[u8]) -> Result<u64, FormatError> {
+    let ty = catalog_codec::decode_type(value).map_err(corrupt)?;
+    Ok(uuid_array_bit(ty.has_uuid_arrays()))
 }
 
 /// True for Kernel user keys in the protected task namespaces `0x20..=0x2B`.

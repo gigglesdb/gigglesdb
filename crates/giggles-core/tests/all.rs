@@ -568,6 +568,8 @@ mod sql_volatile_uuid;
 mod sql_array_ordering;
 #[path = "sql_array_validation.rs"]
 mod sql_array_validation;
+#[path = "sql_uuid_array.rs"]
+mod sql_uuid_array;
 
 #[path = "sql_numeric_domain.rs"]
 mod sql_numeric_domain;
@@ -587,3 +589,6 @@ mod catalog_read_fast_paths;
 
 #[path = "pgparity_scalars_w06.rs"]
 mod pgparity_scalars_w06;
+
+#[path = "sql_catalog_scale.rs"]
+mod sql_catalog_scale;

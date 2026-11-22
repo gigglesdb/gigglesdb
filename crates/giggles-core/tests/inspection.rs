@@ -7,7 +7,7 @@ use giggles_core::{
         InspectionOutcome, InspectionRequest, InspectionResult, MAX_INSPECTION_METADATA_BYTES,
         Request, TableSummary,
     },
-    relational::{DataType, MAX_COLUMNS, MAX_ROWS, MAX_TABLES, Value},
+    relational::{DataType, MAX_COLUMNS, MAX_ROWS, Value},
 };
 use std::path::PathBuf;
 
@@ -207,7 +207,7 @@ fn inspection_metadata_bounds_and_name_admission_are_explicit() {
         .collect();
     let mut sql = admin.sql_session();
     sql.execute("BEGIN", &[], None).unwrap();
-    for index in 0..MAX_TABLES - 1 {
+    for index in 0..129 {
         sql.execute(
             &format!("CREATE TABLE t{index:03} (id BIGINT PRIMARY KEY)"),
             &[],
@@ -232,7 +232,7 @@ fn inspection_metadata_bounds_and_name_admission_are_explicit() {
     sql.execute("COMMIT", &[], None).unwrap();
     let before = digest(&admin);
     let table_list = trap(|| engine.inspect(&InspectionRequest::Tables)).unwrap();
-    assert_eq!(summaries(table_list).len(), MAX_TABLES);
+    assert_eq!(summaries(table_list).len(), 130);
     let wide = trap(|| engine.inspect(&describe(&wide_name))).unwrap();
     let InspectionResult::Table(table) = wide.result else {
         panic!("descriptor expected")

@@ -44,7 +44,7 @@ fn previous_build(
     let tuples = snap.tuples();
     let mut staged = Sidecar::default();
     staged
-        .build(ds, &snap.rows(&tuples), &CatalogView(state), &mut cancel)
+        .build(ds, &snap.rows(&tuples), &CatalogView::new(state), &mut cancel)
         .map_err(error)?;
     Ok(staged)
 }
@@ -581,20 +581,15 @@ fn combined_arity_128_and_zero_escaped_boundary() {
     );
 }
 #[test]
-fn descriptor_limits_and_epoch_fences_are_atomic() {
+fn many_descriptors_still_enforce_epoch_fences() {
     let mut s = base();
     let t = s.tables["items"].clone();
     let stale = Prepared::parse("INSERT INTO items VALUES(1,NULL,NULL)", 1, s.epoch).unwrap();
-    for n in 0..si::MAX_INDEXES_PER_TABLE {
+    for n in 0..20 {
         s.secondary_configure_test(t.id, &format!("idx{n}"), &[t.columns[1].id], || false)
             .unwrap();
     }
-    let before = s.clone();
-    assert_eq!(
-        s.secondary_configure_test(t.id, "extra", &[t.columns[1].id], || false),
-        Err(SqlError::Limit)
-    );
-    assert_eq!(s, before);
+    assert_eq!(s.secondary.descriptors().len(), 20);
     assert_eq!(s.execute(&stale, &[], None), Err(SqlError::StaleSchema));
     assert!(matches!(
         s.secondary_access_engine(&t, s.epoch - 1, || false),

@@ -2,6 +2,7 @@
 use super::*;
 mod arithmetic;
 mod array_constructor;
+pub(super) mod uuid_array_operators;
 mod array_order;
 pub(super) mod collation;
 mod concat;
@@ -148,6 +149,7 @@ pub(super) enum BinaryOp {
     JsonPathText,
     Contains,
     ContainedBy,
+    Overlap,
     Regex,
     NotRegex,
     RegexInsensitive,
@@ -1390,6 +1392,9 @@ impl Scalar {
             });
         }
         let a = a.bind(resolve, tables, parameters)?;
+        if a.ty.is_array() && ty.is_array() {
+            uuid_array_operators::check_cast(&a.ty, ty)?;
+        }
         if a.ty != *ty && a.ty.is_temporal() && ty.is_temporal() {
             if !assignment::compatible(&a.ty, ty) {
                 return Err(SqlError::CannotCoerce);
@@ -1474,6 +1479,7 @@ impl Scalar {
     ) -> R<BoundScalar> {
         match name {
             array_constructor::NAME => array_constructor::bind(args, None, resolve, tables, parameters),
+            name if uuid_array_operators::is_quantified(name) => uuid_array_operators::bind_quantified(name, args, resolve, tables, parameters),
             "\0plan_cardinality" if args.len() == 1 => {
                 Self::bind_plan_cardinality(name, args, resolve, tables, parameters)
             }
@@ -1906,7 +1912,11 @@ impl Scalar {
             }
         }
         let null = |a: &BoundScalar| matches!(a.node, Node::Literal(Value::Null));
-        let ty = if matches!(
+        let ty = if name == "cardinality"
+            && matches!(args.as_slice(), [arg] if arg.ty == DataType::UuidArray)
+        {
+            DataType::Integer
+        } else if matches!(
             name,
             "\0array_subscript" | "array_length" | "\0json_get" | "\0json_text"
         ) {
@@ -1918,12 +1928,8 @@ impl Scalar {
                     if !integer(&args[1].ty) {
                         return Err(SqlError::UndefinedFunction);
                     }
-                    let element = match args[0].ty {
-                        DataType::IntArray => DataType::Integer,
-                        DataType::BigIntArray => DataType::BigInt,
-                        DataType::TextArray => DataType::Text,
-                        _ => return Err(SqlError::UndefinedFunction),
-                    };
+                    let element = array_constructor::element_type(&args[0].ty)
+                        .ok_or(SqlError::UndefinedFunction)?;
                     if name == "array_length" {
                         DataType::Integer
                     } else {
@@ -2431,6 +2437,7 @@ impl BoundScalar {
                         DataType::IntArray => "int4",
                         DataType::BigIntArray => "int8",
                         DataType::TextArray => "text",
+                        DataType::UuidArray => "uuid",
 
                         DataType::Boolean => "bool",
                         DataType::Bytes => "bytea",
@@ -2685,7 +2692,7 @@ impl BoundScalar {
                 }
                 if matches!(
                     n.as_str(),
-                    "\0array_subscript" | "array_length" | "\0json_get" | "\0json_text"
+                    "\0array_subscript" | "array_length" | "cardinality" | "\0json_get" | "\0json_text"
                 ) {
                     let values = args
                         .iter()
@@ -2715,7 +2722,10 @@ impl BoundScalar {
                 if matches!(n.as_str(), "nullif" | "width_bucket") || conditional::count_nulls(n) {
                     return conditional::eval(n, args, values, budget);
                 }
-                if n == array_constructor::NAME { return array_constructor::eval(&values,budget); }
+                if n == array_constructor::NAME { return array_constructor::eval(args, &values, budget); }
+                if uuid_array_operators::is_quantified(n) {
+                    return uuid_array_operators::eval_quantified(n, &values);
+                }
                 if n != "concat"
                     && n != "format"
                     && n != "concat_ws"
@@ -2977,6 +2987,7 @@ fn cast_type(p: &mut Parser) -> R<(DataType, Option<i32>)> {
             DataType::Integer => DataType::IntArray,
             DataType::BigInt => DataType::BigIntArray,
             DataType::Text => DataType::TextArray,
+            DataType::Uuid => DataType::UuidArray,
             _ => return Err(SqlError::Unsupported),
         };
     }
@@ -3340,6 +3351,9 @@ impl Scalar {
                 arithmetic::bind_unknown_operator(n, args, resolve, tables, parameters)?;
             }
             Self::Call(n, args) if n == array_constructor::NAME => array_constructor::infer(args, expected, parameters, resolve, tables)?,
+            Self::Call(n, args) if uuid_array_operators::is_quantified(n) => {
+                uuid_array_operators::infer_quantified(n, args, parameters, resolve, tables)?;
+            }
             Self::Call(n, args) if n == "\0plan_cardinality" && args.len() == 1 => {
                 args[0].infer(expected, parameters, resolve, tables)?;
             }

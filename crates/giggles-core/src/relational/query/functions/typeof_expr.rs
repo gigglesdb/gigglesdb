@@ -28,6 +28,7 @@ pub(super) fn name(ty: &DataType) -> &'static str {
         DataType::IntArray => "integer[]",
         DataType::BigIntArray => "bigint[]",
         DataType::TextArray => "text[]",
+        DataType::UuidArray => "uuid[]",
     }
 }
 

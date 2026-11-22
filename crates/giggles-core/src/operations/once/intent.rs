@@ -59,10 +59,7 @@ pub(super) fn accepted_identity(
     tables: &[TableDef],
     outputs: AcceptedOutput<'_>,
 ) -> OnceResult<[u8; 32]> {
-    if tables.len() > crate::relational::MAX_TABLES {
-        return Err(Error::Limit.into());
-    }
-    // The collection has already passed a constant bound before allocation.
+    // Each borrowed table is already present in the accepted catalog.
     let mut tables = tables.iter().collect::<Vec<_>>();
     tables.sort_unstable_by_key(|table| table.id);
     if tables.windows(2).any(|pair| pair[0].id == pair[1].id) {
@@ -192,6 +189,7 @@ impl Writer {
             | DataType::IntArray
             | DataType::BigIntArray
             | DataType::TextArray
+            | DataType::UuidArray
             | DataType::Text
             | DataType::Varchar
             | DataType::Bpchar => 4,
@@ -1152,6 +1150,12 @@ mod tests {
     }
 
     #[test]
+    fn accepted_identity_accepts_a_catalog_above_the_old_count() {
+        let tables = (1..=129).map(|id| table(id, &format!("t{id}"))).collect::<Vec<_>>();
+        assert!(accepted_identity(&[0; 32], &tables, AcceptedOutput::Operation(&[])).is_ok());
+    }
+
+    #[test]
     fn accepted_identity_binds_stable_objects_and_output_types() {
         let submitted = hash(insert(literal(7)));
         let a = table(1, "items");
@@ -1237,7 +1241,7 @@ mod tests {
                 not_null: true,
             })
             .collect::<Vec<_>>();
-        let tables = (0..crate::relational::MAX_TABLES)
+        let tables = (0..128)
             .map(|index| TableDef {
                 id: index as u64 + 1,
                 name: format!("t{index}"),

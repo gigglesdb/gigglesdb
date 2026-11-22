@@ -100,6 +100,7 @@ fn type_name(t: &DataType) -> &'static str {
         DataType::IntArray => "integer[]",
         DataType::BigIntArray => "bigint[]",
         DataType::TextArray => "text[]",
+        DataType::UuidArray => "uuid[]",
         DataType::RegType => "regtype",
     }
 }

@@ -286,12 +286,14 @@ fn profile_0_21_capabilities_unchanged() {
     // shared manifest text (+930 bytes in both profiles), and refrozen at the
     // GD-0082 bench stack on main 66ef93ce, whose v2 transaction cap added
     // engine_rows.*.concurrent_explicit_sessions (+68 bytes in both profiles).
+    // Refrozen at GD-0092 AM-3, whose removal of the per-database table cap
+    // made limits.catalog_tables null instead of 128 (+1 byte in both profiles).
     // The manifest text differs slightly without the v2 engine.
     if cfg!(feature = "engine-rocksdb") {
-        assert_eq!(fingerprint(LanguageVersion::Embedded020), (193_965, 0xc438_c348_6eb8_1174));
-        assert_eq!(fingerprint(PREVIOUS), (201_607, 0x0d9e_9262_1dcc_cdb8));
+        assert_eq!(fingerprint(LanguageVersion::Embedded020), (193_966, 0xe724_9eb8_111d_e3d0));
+        assert_eq!(fingerprint(PREVIOUS), (201_608, 0xef85_bf52_bccc_454e));
     } else {
-        assert_eq!(fingerprint(LanguageVersion::Embedded020), (193_962, 0xb32c_a131_11f0_74c3));
-        assert_eq!(fingerprint(PREVIOUS), (201_604, 0xd968_e55d_33aa_3481));
+        assert_eq!(fingerprint(LanguageVersion::Embedded020), (193_963, 0x201a_a814_5070_83f7));
+        assert_eq!(fingerprint(PREVIOUS), (201_605, 0xc1af_699b_6049_a65b));
     }
 }

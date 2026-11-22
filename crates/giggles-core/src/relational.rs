@@ -41,6 +41,7 @@ pub use clock::StatementClock;
 #[allow(dead_code)]
 pub(crate) mod catalog_ext;
 mod catalog_presentation;
+pub(crate) mod catalog_scale;
 pub use schema_binding::AuthorizationPlanKey;
 use schema_binding::AuthorizationBinding;
 pub use catalog_presentation::{CatalogConstraint, CatalogPresentation, CatalogView, ForeignKeyTarget};
@@ -139,7 +140,6 @@ pub(crate) fn max_projected_row_bytes(value_bytes: usize) -> usize {
 }
 pub const MAX_COLUMNS: usize = 64;
 pub const MAX_PARAMS: usize = 65_535;
-pub const MAX_TABLES: usize = 128;
 pub const MAX_RESULT_BYTES: usize = 1024 * 1024;
 /// Concurrent explicit SQL/native transactions per v2 database. A v2
 /// transaction holds an engine snapshot and its own write set (bounded by the
@@ -394,6 +394,7 @@ pub enum DataType {
     TextArray,
     /// Expression-only regtype; never admitted by the column type grammar.
     RegType,
+    UuidArray,
 }
 impl Serialize for DataType {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -410,7 +411,8 @@ impl Serialize for DataType {
             | Self::Jsonb
             | Self::IntArray
             | Self::BigIntArray
-            | Self::TextArray => (4, "Text"),
+            | Self::TextArray
+            | Self::UuidArray => (4, "Text"),
             Self::Bytes => (5, "Bytes"),
             Self::Numeric => (6, "Numeric"),
             Self::Real => (7, "Real"),
@@ -668,7 +670,8 @@ pub(crate) fn check(v: &Value, c: &ColumnDef) -> R<()> {
             | DataType::Jsonb
             | DataType::IntArray
             | DataType::BigIntArray
-            | DataType::TextArray,
+            | DataType::TextArray
+            | DataType::UuidArray,
             Value::Text(_),
         )
         | (DataType::Bytes, Value::Bytes(_)) => true,
@@ -769,7 +772,11 @@ pub(crate) fn row_check(t: &TableDef, values: &[Value]) -> R<()> {
     }
     let mut size = 0usize;
     for (v, c) in values.iter().zip(&t.columns) {
-        check(v, c)?;
+        check(v, c).inspect_err(|error| {
+            if *error == SqlError::Null && c.data_type == DataType::UuidArray {
+                logical_types::uuid_array_not_null(t, c, values);
+            }
+        })?;
         size = size.checked_add(value_bytes(v)).ok_or(SqlError::Limit)?;
     }
     if size > max_value_bytes() {
@@ -2197,9 +2204,6 @@ impl Prepared {
         }
         if state.tables.contains_key(&name) {
             return Err(SqlError::Duplicate);
-        }
-        if state.tables.len() >= MAX_TABLES {
-            return Err(SqlError::Limit);
         }
         let (schema, table) = split_key(&name);
         let reference = schemas::Reference {
@@ -3914,7 +3918,7 @@ impl Relational {
             return Err(SqlError::Unsupported);
         }
         self.validate_ext()?;
-        if self.tables.len() > MAX_TABLES || self.rows.len() != self.tables.len() {
+        if self.rows.len() != self.tables.len() {
             return Err(SqlError::Type);
         }
         let mut ids = BTreeSet::new();
@@ -4518,10 +4522,7 @@ impl Relational {
                     }
                     return Err(SqlError::DuplicateTable);
                 }
-                if self.tables.len() >= MAX_TABLES
-                    || columns.is_empty()
-                    || columns.len() > MAX_COLUMNS
-                {
+                if columns.is_empty() || columns.len() > MAX_COLUMNS {
                     return Err(SqlError::Limit);
                 }
                 let mut column_names = BTreeSet::new();

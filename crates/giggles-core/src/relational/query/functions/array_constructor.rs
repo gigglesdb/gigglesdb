@@ -25,6 +25,7 @@ pub(super) fn element_type(array: &DataType) -> Option<DataType> {
         DataType::IntArray => DataType::Integer,
         DataType::BigIntArray => DataType::BigInt,
         DataType::TextArray => DataType::Text,
+        DataType::UuidArray => DataType::Uuid,
         _ => return None,
     })
 }
@@ -78,17 +79,28 @@ pub(super) fn bind(
         DataType::Integer => DataType::IntArray,
         DataType::BigInt => DataType::BigIntArray,
         DataType::Text => DataType::TextArray,
+        DataType::Uuid => DataType::UuidArray,
         _ => return Err(SqlError::Unsupported),
     };
     let args = args
         .iter()
         .map(|a| {
             if target.is_some()
-                && arithmetic::known(a, resolve, tables, parameters)?
-                    .as_ref().and_then(element_type).is_some()
+                && let Some(source) = arithmetic::known(a, resolve, tables, parameters)?
             {
                 // The flat array codec cannot store a nested constructor.
-                return Err(SqlError::Unsupported);
+                if source.is_array() {
+                    return if element == DataType::Uuid {
+                        a.bind(resolve, tables, parameters)
+                    } else {
+                        Err(SqlError::Unsupported)
+                    };
+                }
+                if element == DataType::Uuid
+                    && !matches!(source, DataType::Uuid | DataType::Text | DataType::Varchar | DataType::Bpchar)
+                {
+                    return Err(uuid_array_operators::cannot_cast(&source, &element));
+                }
             }
             Scalar::Cast(Box::new(a.clone()), element.clone()).bind(resolve, tables, parameters)
         })
@@ -98,21 +110,28 @@ pub(super) fn bind(
         node: Node::Call(NAME.into(), args),
     })
 }
-pub(super) fn eval(values: &[Value], budget: &mut usize) -> R<Value> {
+pub(super) fn eval(args: &[BoundScalar], values: &[Value], budget: &mut usize) -> R<Value> {
     let mut parts = Vec::with_capacity(values.len());
-    for value in values {
+    let mut nested = false;
+    for (arg, value) in args.iter().zip(values) {
+        let array = arg.ty.is_array();
+        nested |= array;
         parts.push(if *value == Value::Null {
             "NULL".into()
         } else {
             let Value::Text(text) = cast_value(value.clone(), &DataType::Text, budget)? else {
                 return Err(SqlError::Type);
             };
-            let text = crate::relational::logical_types::array_quote(&text);
+            let text = if array { text } else { logical_types::array_quote(&text) };
             reserve(budget, text.len())?;
             text
         });
     }
-    let value = Value::Text(format!("{{{}}}", parts.join(",")));
+    let literal = format!("{{{}}}", parts.join(","));
+    if nested {
+        return Err(logical_types::malformed_array_literal(&literal));
+    }
+    let value = Value::Text(literal);
     charge(budget, &value)?;
     Ok(value)
 }

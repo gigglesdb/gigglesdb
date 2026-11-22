@@ -3,6 +3,7 @@ use super::*;
 fn element(ty: &DataType) -> Option<DataType> {
     Some(match ty {
         DataType::TextArray => DataType::Text,
+        DataType::UuidArray => DataType::Uuid,
         DataType::IntArray => DataType::Integer,
         DataType::BigIntArray => DataType::BigInt,
         _ => return None,

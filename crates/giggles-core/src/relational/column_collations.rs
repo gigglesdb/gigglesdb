@@ -121,9 +121,6 @@ pub(crate) fn validate_bindings(
     ext: &CatalogExt,
     excluded: Option<u64>,
 ) -> R<()> {
-    if ext.column_collations.len() > catalog_ext::MAX_EXT_COLUMNS {
-        return Err(SqlError::Limit);
-    }
     for table in state.tables.values().filter(|t|Some(t.id)!=excluded) {
         if table.logical_columns().next().is_none() && !matches!(ext.column_collations.get(&table.id),Some(Binding::EmptyTable)) {return Err(SqlError::Type);}
     }

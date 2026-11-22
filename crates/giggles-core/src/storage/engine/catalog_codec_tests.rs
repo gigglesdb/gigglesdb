@@ -89,6 +89,14 @@ fn frozen_table_goldens() {
     assert_corrupt(decode_table(&bad));
 }
 #[test]
+fn uuid_array_reserved_tag_is_corrupt() {
+    let mut bytes = hex(TABLE);
+    let tag = bytes.windows(5).position(|chunk| chunk == [b'c', 0, 0, 0, 2]).unwrap() + 1;
+    bytes[tag..tag + 4].copy_from_slice(&23u32.to_be_bytes());
+    assert_corrupt(decode_table(&bytes));
+}
+
+#[test]
 fn frozen_constraints() {
     let cases = [
         (
@@ -572,6 +580,7 @@ fn appended_column_type_tags_and_existing_typmod_round_trip() {
         (DataType::IntArray, 19, None, None),
         (DataType::BigIntArray, 20, None, None),
         (DataType::TextArray, 21, None, None),
+        (DataType::UuidArray, 24, None, None),
     ] {
         assert_eq!(
             super::super::super::encode(&DataTypeDto::try_from(data_type.clone()).unwrap())

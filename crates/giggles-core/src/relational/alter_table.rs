@@ -482,6 +482,7 @@ pub(super) fn execute(
                     DataType::IntArray => Some(catalog_ext::LogicalKind::IntArray),
                     DataType::BigIntArray => Some(catalog_ext::LogicalKind::BigIntArray),
                     DataType::TextArray => Some(catalog_ext::LogicalKind::TextArray),
+                    DataType::UuidArray => Some(catalog_ext::LogicalKind::UuidArray),
                     _ => None,
                 };
                 if let Some(kind) = logical {

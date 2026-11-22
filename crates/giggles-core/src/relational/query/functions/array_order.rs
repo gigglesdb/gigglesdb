@@ -12,6 +12,8 @@ pub(super) fn compare(ty: &DataType, collation: Option<&str>, a: &Value, b: &Val
             };
             Ok(integer(a)?.cmp(&integer(b)?))
         }
+        // Canonical UUID hex has fixed separators and sorts in byte order.
+        DataType::UuidArray => Ok(a.cmp(b)),
         DataType::TextArray => Ok(super::collation::compare_text(collation, a, b)),
         _ => unreachable!("array comparison requires an array type"),
     })?;

@@ -98,6 +98,7 @@ pub(super) fn element(ty: &DataType) -> R<DataType> {
         DataType::IntArray => Ok(DataType::Integer),
         DataType::BigIntArray => Ok(DataType::BigInt),
         DataType::TextArray => Ok(DataType::Text),
+        DataType::UuidArray => Ok(DataType::Uuid),
         _ => Err(SqlError::Type),
     }
 }

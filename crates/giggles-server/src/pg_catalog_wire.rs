@@ -526,6 +526,7 @@ fn snapshot_owned(
                             C::IntArray => P::IntArray,
                             C::BigIntArray => P::BigIntArray,
                             C::TextArray => P::TextArray,
+                            C::UuidArray => P::UuidArray,
 
                             C::Bytes => P::Bytes,
                             C::Numeric => P::Numeric,

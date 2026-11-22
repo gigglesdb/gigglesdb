@@ -121,66 +121,73 @@ pub(super) fn schema(name: &str) -> Option<Vec<Field>> {
 
 pub(super) fn populate(
     snapshot: &CatalogSnapshot,
+    lookup: &Lookup<'_>,
     key_names: &BTreeMap<u64, String>,
+    budget: &mut Budget,
     all: &mut BTreeMap<String, Relation>,
 ) -> R<()> {
     // The finite catalog presents bootstrap-superuser visibility; there is no
     // privilege filtering until an authorization model exists.
-    let mut generated: BTreeMap<&str, Vec<Vec<Value>>> = [
-        ("schemata", vec![]),
-        ("tables", vec![]),
-        ("columns", vec![]),
-        ("table_constraints", vec![]),
-        ("key_column_usage", vec![]),
-    ]
-    .into_iter()
-    .collect();
+    let mut generated = BTreeMap::<&str, Vec<Vec<Value>>>::new();
+    macro_rules! add {
+        ($name:literal, $row:expr) => {
+            if all.contains_key($name) {
+                budget.add(generated.entry($name).or_default(), $row)?;
+            }
+        };
+    }
+    let user = snapshot.roles.iter().find(|role| role.name == snapshot.user);
     for (&id, definition) in &snapshot.views {
-        let table = snapshot.tables.iter().find(|t| t.id == id).ok_or(Error::InvalidSnapshot)?;
+        let table = lookup.tables[&id];
         let owner = snapshot.table_owners.get(&id).copied().unwrap_or(10);
-        let can_define = snapshot.roles.iter().any(|r| r.name == snapshot.user && (r.oid == owner || r.superuser));
-        all.get_mut("views").unwrap().rows.push(vec![s(&snapshot.database), s(snapshot.table_schema(id).0),
+        let can_define = user.is_some_and(|role| role.oid == owner || role.superuser);
+        add!("views", vec![s(&snapshot.database), s(snapshot.table_schema(id).0),
             s(&table.name), if can_define { s(definition) } else { N }, s("NONE"),
             s("NO"), s("NO"), s("NO"), s("NO"), s("NO")]);
     }
-    for row in &all["pg_namespace"].rows {
+    for row in rows(all, "pg_namespace").iter().filter(|_| all.contains_key("schemata")) {
         let I(owner) = row[2] else {
             return Err(Error::InvalidSnapshot);
         };
-        generated.get_mut("schemata").unwrap().push(vec![
+        add!("schemata", vec![
             s(&snapshot.database),
             row[1].clone(),
-            s(role_name(snapshot, owner).unwrap()),
+            s(lookup.roles[&owner]),
             N,
             N,
             N,
             N,
         ]);
     }
-    let defaults = all["pg_attrdef"].rows.iter().map(|row| {
+    let mut attributes = HashMap::<i64, Vec<&[Value]>>::new();
+    if all.contains_key("columns") {
+        for row in rows(all, "pg_attribute") {
+            budget.visit(1)?;
+            if row_oid(&row[4]) > 0 {
+                attributes.entry(row_oid(&row[0])).or_default().push(row);
+            }
+        }
+    }
+    let column_source = |name| {
+        if all.contains_key("columns") { rows(all, name) } else { &[] }
+    };
+    budget.visit(column_source("pg_type").len() + column_source("pg_collation").len()
+        + column_source("pg_attrdef").len())?;
+    let types = materialize::by_oid(column_source("pg_type"));
+    let collations = materialize::by_oid(column_source("pg_collation"));
+    let defaults = column_source("pg_attrdef").iter().map(|row| {
         let (I(relation), I(position)) = (&row[1], &row[2]) else {
             return Err(Error::InvalidSnapshot);
         };
         Ok(((*relation, *position), &row[3]))
     }).collect::<R<BTreeMap<_, _>>>()?;
-    for relation in &all["pg_class"].rows {
+    for relation in rows(all, "pg_class").iter().filter(|_| all.contains_key("tables") || all.contains_key("columns")) {
         if !matches!(&relation[3], Value::Text(kind) if kind == "r" || kind == "v") {
             continue;
         }
-        let namespace = all["pg_namespace"]
-            .rows
-            .iter()
-            .find(|n| n[0] == relation[2])
-            .and_then(|n| {
-                if let Value::Text(name) = &n[1] {
-                    Some(name.as_str())
-                } else {
-                    None
-                }
-            })
-            .ok_or(Error::InvalidSnapshot)?;
+        let namespace = lookup.namespaces.get(&row_oid(&relation[2])).copied().ok_or(Error::InvalidSnapshot)?;
         let view = relation[3] == s("v");
-        generated.get_mut("tables").unwrap().push(vec![
+        add!("tables", vec![
             s(&snapshot.database),
             s(namespace),
             relation[1].clone(),
@@ -194,16 +201,10 @@ pub(super) fn populate(
             s("NO"),
             N,
         ]);
-        for attribute in &all["pg_attribute"].rows {
-            if attribute[0] != relation[0] {
-                continue;
-            }
+        for &attribute in attributes.get(&row_oid(&relation[0])).into_iter().flatten() {
             let (I(relation_id), I(oid), I(position)) = (&relation[0], &attribute[2], &attribute[4]) else {
                 return Err(Error::InvalidSnapshot);
             };
-            if *position <= 0 {
-                continue;
-            }
             let mut column = column_row(
                 snapshot,
                 namespace,
@@ -214,68 +215,76 @@ pub(super) fn populate(
                 &attribute[5],
                 attribute[11] == B(true),
                 !view,
-                all,
+                types.get(oid).copied(),
             );
             if let Some(default) = defaults.get(&(*relation_id, *position)) {
                 column[5] = (*default).clone();
             }
-            if attribute[19] != I(0) && attribute[19] != I(100)
-                && let Some(coll)=all["pg_collation"].rows.iter().find(|c|c[0]==attribute[19]) {
-                    column[19]=s(&snapshot.database);
-                    column[20]=all["pg_namespace"].rows.iter().find(|n|n[0]==coll[2]).map_or(N,|n|n[1].clone());
-                    column[21]=coll[1].clone();
+            let collation = row_oid(&attribute[19]);
+            if collation != 0 && collation != 100
+                && let Some(collation) = collations.get(&collation)
+            {
+                column[19] = s(&snapshot.database);
+                column[20] = match collation[2] {
+                    I(oid) => lookup.namespaces.get(&oid).map_or(N, |name| s(name)),
+                    _ => N,
+                };
+                column[21] = collation[1].clone();
             }
-            generated.get_mut("columns").unwrap().push(column);
+            add!("columns", column);
         }
     }
-    for table in &snapshot.tables {
-        let (schema, _) = snapshot.table_schema(table.id);
-        let mut constraint = |name: &str, kind: &str| {
-            generated.get_mut("table_constraints").unwrap().push(vec![
-                s(&snapshot.database),
-                s(schema),
-                s(name),
-                s(&snapshot.database),
-                s(schema),
-                s(&table.name),
-                s(kind),
-                s("NO"),
-                s("NO"),
-                s("YES"),
-                N,
-            ]);
-        };
-        for (index, column) in table.columns.iter().enumerate() {
-            if column.not_null || table.primary_key.contains(&index) {
-                constraint(&format!("{}_{}_not_null", table.name, column.name), "CHECK");
-            }
-        }
-        if !table.primary_key.is_empty() {
-            constraint(&key_names[&table.id], "PRIMARY KEY");
-            for (position, index) in table.primary_key.iter().enumerate() {
-                generated.get_mut("key_column_usage").unwrap().push(vec![
+    if all.contains_key("table_constraints") || all.contains_key("key_column_usage") {
+        for table in &snapshot.tables {
+            let (schema, _) = snapshot.table_schema(table.id);
+            let mut constraint = |name: &str, kind: &str| -> R<()> {
+                add!("table_constraints", vec![
                     s(&snapshot.database),
                     s(schema),
-                    s(&key_names[&table.id]),
+                    s(name),
                     s(&snapshot.database),
                     s(schema),
                     s(&table.name),
-                    s(&table.columns[*index].name),
-                    I(position as i64 + 1),
+                    s(kind),
+                    s("NO"),
+                    s("NO"),
+                    s("YES"),
                     N,
                 ]);
+                Ok(())
+            };
+            for (index, column) in table.columns.iter().enumerate() {
+                if column.not_null || table.primary_key.contains(&index) {
+                    constraint(&format!("{}_{}_not_null", table.name, column.name), "CHECK")?;
+                }
+            }
+            if !table.primary_key.is_empty() {
+                constraint(&key_names[&table.id], "PRIMARY KEY")?;
+                for (position, index) in table.primary_key.iter().enumerate() {
+                    add!("key_column_usage", vec![
+                        s(&snapshot.database),
+                        s(schema),
+                        s(&key_names[&table.id]),
+                        s(&snapshot.database),
+                        s(schema),
+                        s(&table.name),
+                        s(&table.columns[*index].name),
+                        I(position as i64 + 1),
+                        N,
+                    ]);
+                }
             }
         }
-    }
-    for c in snapshot.constraints.iter().filter(|c| c.kind == 'u') {
-        let table = snapshot.tables.iter().find(|t| t.id == c.table).ok_or(Error::InvalidSnapshot)?;
-        let schema = snapshot.table_schema(c.table).0;
-        generated.get_mut("table_constraints").unwrap().push(vec![s(&snapshot.database), s(schema), s(&c.name),
-            s(&snapshot.database), s(schema), s(&table.name), s("UNIQUE"), s("NO"), s("NO"), s("YES"), s("YES")]);
-        for (position, id) in c.columns.iter().enumerate() {
-            let col = table.columns.iter().find(|col| col.id == *id).ok_or(Error::InvalidSnapshot)?;
-            generated.get_mut("key_column_usage").unwrap().push(vec![s(&snapshot.database), s(schema), s(&c.name),
-                s(&snapshot.database), s(schema), s(&table.name), s(&col.name), I(position as i64 + 1), N]);
+        for c in snapshot.constraints.iter().filter(|c| c.kind == 'u') {
+            let table = lookup.tables[&c.table];
+            let schema = snapshot.table_schema(c.table).0;
+            add!("table_constraints", vec![s(&snapshot.database), s(schema), s(&c.name),
+                s(&snapshot.database), s(schema), s(&table.name), s("UNIQUE"), s("NO"), s("NO"), s("YES"), s("YES")]);
+            for (position, id) in c.columns.iter().enumerate() {
+                let col = lookup.column(table, *id).ok_or(Error::InvalidSnapshot)?;
+                add!("key_column_usage", vec![s(&snapshot.database), s(schema), s(&c.name),
+                    s(&snapshot.database), s(schema), s(&table.name), s(&col.name), I(position as i64 + 1), N]);
+            }
         }
     }
     for (name, rows) in generated {
@@ -295,7 +304,7 @@ fn column_row(
     typmod: &Value,
     not_null: bool,
     updatable: bool,
-    all: &BTreeMap<String, Relation>,
+    type_row: Option<&[Value]>,
 ) -> Vec<Value> {
     let mut row = vec![N; 44];
     row[0] = s(&snapshot.database);
@@ -304,10 +313,6 @@ fn column_row(
     row[3] = column.clone();
     row[4] = I(position);
     row[6] = s(if not_null { "NO" } else { "YES" });
-    let type_row = all["pg_type"]
-        .rows
-        .iter()
-        .find(|r| r[0] == I(i64::from(oid)));
     let udt = type_row
         .map(|r| r[1].clone())
         .unwrap_or_else(|| s("record"));

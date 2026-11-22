@@ -158,6 +158,8 @@ pub(crate) fn schema(tables: &[Table], bounds: Bounds) -> Result<()> {
                     | DataType::IntArray
                     | DataType::BigIntArray
                     | DataType::TextArray
+                    | DataType::UuidArray
+                    | DataType::RegType
             ) {
                 return Err(invalid(
                     "logical type is unsupported by the archive profile",
@@ -518,6 +520,8 @@ pub(crate) fn create_sql(t: &Table) -> String {
                     DataType::IntArray => "INTEGER[]",
                     DataType::BigIntArray => "BIGINT[]",
                     DataType::TextArray => "TEXT[]",
+                    DataType::UuidArray => "UUID[]",
+                    DataType::RegType => "REGTYPE",
                 },
                 if c.not_null { " NOT NULL" } else { "" }
             )
@@ -563,6 +567,7 @@ mod tests {
                 "{-9223372036854775808,9223372036854775807}",
             ),
             (DataType::TextArray, "TEXT[]", r#"{"a,b","NULL",NULL,""}"#),
+            (DataType::UuidArray, "UUID[]", "{NULL,12345678-1234-5678-1234-567812345678}"),
         ] {
             let table = Table {
                 name: "restored".into(),

@@ -153,9 +153,20 @@ fn real_legacy_directory_has_no_rocks_files() {
 fn feature_positions_and_validation() {
     assert_eq!(
         FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit),
-        0x1FFFF | KEY_DEPENDENCY_IDENTITY | RANGES | WIDE_ONCE_RECEIPTS | TASK_CATALOG | PROTECTED_RECORDS | WRITE_FENCE | USER_COLLATIONS | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS | ROLE_MEMBERSHIP | WIDE_ROWS
+        0x1FFFF | KEY_DEPENDENCY_IDENTITY | RANGES | WIDE_ONCE_RECEIPTS | TASK_CATALOG | PROTECTED_RECORDS | WRITE_FENCE | USER_COLLATIONS | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS | ROLE_MEMBERSHIP | WIDE_ROWS | UUID_ARRAY_COLUMNS | WIDE_CATALOG
     );
-    assert_eq!(FEATURE_TABLE.len(), 28);
+    assert_eq!(FEATURE_TABLE.len(), 30);
+    assert_eq!(FEATURE_TABLE[28], (UUID_ARRAY_COLUMNS, "uuid_array_columns"));
+    assert_eq!(UUID_ARRAY_COLUMNS, 1 << 32);
+    assert!(check_features(UUID_ARRAY_COLUMNS).is_ok());
+    assert!(matches!(
+        check_features_allowed(UUID_ARRAY_COLUMNS, (1 << 29) - 1),
+        Err(FormatError::Unsupported(_)),
+    ));
+    assert_eq!(FEATURE_TABLE[29], (WIDE_CATALOG, "wide_catalog"));
+    assert_eq!(WIDE_CATALOG, 1 << 31);
+    assert!(check_features_allowed(WIDE_CATALOG, u64::from(u32::MAX >> 1)).is_err());
+    check_features(WIDE_CATALOG).unwrap();
     assert_eq!(ROLE_MEMBERSHIP, 1 << 27);
     assert_eq!(FEATURE_TABLE[26], (ROLE_MEMBERSHIP, "role_membership"));
     assert_eq!(FEATURE_TABLE[27], (WIDE_ROWS, "wide_rows"));
@@ -197,8 +208,10 @@ fn feature_positions_and_validation() {
             .fold(0, |bits, (bit, _)| bits | bit),
         super::super::super::feature_envelope::NEW_BITS
             & !(KEY_DEPENDENCY_IDENTITY
+                | UUID_ARRAY_COLUMNS
                 | super::super::super::feature_envelope::USER_COLLATIONS
-                | super::super::super::feature_envelope::COLUMN_COLLATIONS)
+                | super::super::super::feature_envelope::COLUMN_COLLATIONS
+                | WIDE_CATALOG)
     );
     let kv = base();
     assert_eq!(validate_meta(&kv).unwrap().features, 0);
@@ -209,7 +222,7 @@ fn feature_positions_and_validation() {
     put(&kv, b"features", &PROTECTED_RECORDS.to_be_bytes());
     assert_eq!(validate_meta(&kv).unwrap().features, PROTECTED_RECORDS);
     assert!(check_features(PROTECTED_RECORDS).is_ok());
-    for i in (26..64).filter(|i| *i != 27 && *i != 28) {
+    for i in (26..64).filter(|i| !matches!(*i, 27 | 28 | 31 | 32)) {
         put(&kv, b"features", &(1u64 << i).to_be_bytes());
         assert!(matches!(
             validate_meta(&kv),

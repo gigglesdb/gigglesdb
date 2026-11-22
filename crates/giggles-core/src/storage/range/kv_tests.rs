@@ -123,3 +123,98 @@ fn sequencer_meta_keys_are_range_local() {
     let other = RangeKv::new(store.kv().clone(), descriptors()[1].clone(), _sink.clone());
     assert_eq!(other.get(Keyspace::Meta, b"last_commit_ts").unwrap(), None);
 }
+
+#[test]
+fn system_range_marks_only_the_committed_wide_catalog() {
+    use crate::relational::{ColumnDef, DataType, TableDef, secondary_index::Descriptor};
+    use crate::storage::engine::{catalog, codec, hlc::Ts, indexes, mvcc};
+    let dir = Dir::new("range-wide-catalog");
+    let (store, _sink, kv) = range_kv(&dir, 0);
+    let feature_word = |read: &dyn KvRead| {
+        let bytes = read.get(Keyspace::Meta, b"features").unwrap().unwrap();
+        u64::from_be_bytes(bytes.try_into().unwrap())
+    };
+    let mut initial = WriteBatch::default();
+    let table = catalog::TableEntry {
+        def: TableDef {
+            id: 1,
+            name: "wide".into(),
+            columns: vec![ColumnDef {
+                id: 2,
+                name: "id".into(),
+                data_type: DataType::Integer,
+                not_null: true,
+            }],
+            primary_key: vec![0],
+        },
+        heap: false,
+        columns_ext: Default::default(),
+        primary_index_birth: None,
+    };
+    let put = |batch: &mut WriteBatch, key: Vec<u8>, value: Vec<u8>, ts| {
+        batch.put(
+            Keyspace::Catalog,
+            codec::user_key_seek_at(&key, Ts(ts)),
+            mvcc::encode_live(&value),
+        );
+    };
+    let add_index = |batch: &mut WriteBatch, id, ts| {
+        let desc = Descriptor {
+            id,
+            table: 1,
+            name: format!("wc_{id}"),
+            columns: vec![2],
+            key_encoding: 1,
+            unique: false,
+        };
+        put(
+            batch,
+            indexes::descriptor_key(id),
+            indexes::encode_descriptor(&desc).unwrap(),
+            ts,
+        );
+        put(
+            batch,
+            catalog::name_key(&desc.name),
+            id.to_be_bytes().to_vec(),
+            ts,
+        );
+    };
+    put(
+        &mut initial,
+        catalog::table_key(1),
+        catalog::encode_entry(&table).unwrap(),
+        1,
+    );
+    put(
+        &mut initial,
+        catalog::name_key(&table.def.name),
+        1u64.to_be_bytes().to_vec(),
+        1,
+    );
+    for id in 3..=10 {
+        add_index(&mut initial, id, 1);
+    }
+    meta::put_features(&mut initial, meta::SECONDARY_INDEXES).unwrap();
+    kv.write(initial, Durability::Sync).unwrap();
+    assert_eq!(feature_word(&kv), meta::SECONDARY_INDEXES);
+
+    let mut finalization = WriteBatch::default();
+    add_index(&mut finalization, 11, 2);
+    kv.write(finalization, Durability::Sync).unwrap();
+    let wide = meta::SECONDARY_INDEXES | meta::WIDE_CATALOG;
+    assert_eq!(feature_word(&kv), wide);
+    assert_ne!(feature_word(store.kv().as_ref()) & meta::WIDE_CATALOG, 0);
+
+    let mut stale_features = WriteBatch::default();
+    let key = range_local_key(SYSTEM_RANGE, &RangeLocalKey::Features);
+    stale_features.put(
+        Keyspace::Meta,
+        key,
+        meta::SECONDARY_INDEXES.to_be_bytes().to_vec(),
+    );
+    store
+        .apply(SYSTEM_RANGE, &stale_features.encode(), pos(3, 1))
+        .unwrap();
+    assert_eq!(feature_word(&kv), wide);
+}

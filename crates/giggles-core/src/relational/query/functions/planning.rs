@@ -37,7 +37,7 @@ fn signature(name: &str, args: &[DataType], result: &DataType) -> Option<(bool, 
     }
     if matches!(
         name,
-        "\0array_subscript" | "array_length" | "\0json_get" | "\0json_text"
+        "\0array_subscript" | "array_length" | "cardinality" | "\0json_get" | "\0json_text"
     ) {
         return Some((true, true));
     }
@@ -51,6 +51,7 @@ fn signature(name: &str, args: &[DataType], result: &DataType) -> Option<(bool, 
         .then_some((false, false));
     }
     match (name, args, result) {
+        (array_constructor::NAME, _, UuidArray) => Some((true, false)),
         ("nullif", [first, _], result) if first == result => Some((true, false)),
         (name, args, Integer) if conditional::count_nulls(name) && !args.is_empty() => Some((true, false)),
         ("width_bucket", &[DoublePrecision, DoublePrecision, DoublePrecision, Integer], Integer)
@@ -383,7 +384,11 @@ fn immutable_cast(from: &DataType, to: &DataType) -> bool {
         || *from == DataType::Bytes && integer(to)
         || matches!(
             (from, to),
-            (DataType::Boolean, DataType::Integer) | (DataType::Integer, DataType::Boolean)
+            (DataType::Boolean, DataType::Integer)
+                | (DataType::Integer, DataType::Boolean)
+                | (DataType::Text | DataType::Varchar | DataType::Bpchar, DataType::Uuid)
+                | (DataType::Text | DataType::Varchar | DataType::Bpchar | DataType::TextArray, DataType::UuidArray)
+                | (DataType::UuidArray, DataType::Text | DataType::Varchar | DataType::Bpchar | DataType::TextArray)
         )
 }
 

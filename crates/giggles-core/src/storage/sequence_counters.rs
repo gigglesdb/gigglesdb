@@ -16,9 +16,6 @@ fn key(id: u64, incarnation: u128) -> Vec<u8> {
     key
 }
 pub(super) fn validate(s: &State) -> Result<(), CoreError> {
-    if s.seq.len() > relational::catalog_ext::MAX_EXT_SEQUENCES {
-        return Err(corrupt());
-    }
     for (&id, c) in &s.seq {
         let def = s.sql.catalog_ext().sequences.get(&id).ok_or_else(corrupt)?;
         if c.incarnation != def.incarnation

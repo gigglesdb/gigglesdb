@@ -995,7 +995,18 @@ impl Filter {
             ) {
                 return Err(SqlError::Syntax);
             }
-            Self::Compare(a, op, parse_scalar(p, depth + 1)?)
+            let quantified = functions::uuid_array_operators::name(&op, true)
+                .filter(|_| p.word("all"))
+                .or_else(|| functions::uuid_array_operators::name(&op, false)
+                    .filter(|_| p.word("any") || p.word("some")));
+            if let Some(name) = quantified {
+                p.punct('(')?;
+                let array = parse_scalar(p, depth + 1)?;
+                p.punct(')')?;
+                Self::Scalar(Scalar::Call(name.into(), vec![a, array]))
+            } else {
+                Self::Compare(a, op, parse_scalar(p, depth + 1)?)
+            }
         } else {
             match a {
                 Scalar::Predicate(f) => *f,
@@ -6476,6 +6487,7 @@ fn update_filtered_aggregates(
                     | DataType::IntArray
                     | DataType::BigIntArray
                     | DataType::TextArray
+                    | DataType::UuidArray
                     | DataType::Varchar
                     | DataType::Bpchar
                     | DataType::Bytes

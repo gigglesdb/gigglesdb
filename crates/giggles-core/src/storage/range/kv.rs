@@ -19,9 +19,9 @@ use crate::storage::engine::{
     kv::{
         Direction, Durability, Keyspace, KvBackend, KvError, KvIter, KvPair, KvRead, Op, WriteBatch,
     },
-    meta::{RangeLocalKey, range_local_key},
+    meta::{self, RangeLocalKey, range_local_key},
 };
-use crate::storage::range_api::{RangeDescriptor, RangeId};
+use crate::storage::range_api::{RangeDescriptor, RangeId, SYSTEM_RANGE};
 use crate::storage::replicated::{BatchSink, ReplicateError};
 
 /// Node-wide Meta keys the sequencer reads and writes, and their range-local homes.
@@ -162,7 +162,32 @@ impl KvRead for RangeKv {
 }
 
 impl KvBackend for RangeKv {
-    fn write(&self, batch: WriteBatch, _durability: Durability) -> Result<(), KvError> {
+    fn write(&self, mut batch: WriteBatch, _durability: Durability) -> Result<(), KvError> {
+        if self.descriptor.id == SYSTEM_RANGE && batch.ops().iter().any(|op| {
+            matches!(op, Op::Put { ks: Keyspace::Catalog, .. })
+                || matches!(op, Op::Put { ks: Keyspace::Meta, key, .. } if key == b"features")
+        }) {
+            let proposed = batch.ops().iter().find_map(|op| match op {
+                Op::Put { ks: Keyspace::Meta, key, value } if key == b"features" =>
+                    <[u8; 8]>::try_from(value.as_slice()).ok().map(u64::from_be_bytes),
+                _ => None,
+            });
+            let features = self.get(Keyspace::Meta, b"features")?
+                .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+                .map_or(0, u64::from_be_bytes);
+            // The sequencer can have cached the feature word before a 2PC
+            // finalize published the bit. Retain it in subsequent proposals.
+            let add_bit = if features & meta::WIDE_CATALOG != 0 {
+                proposed.is_some_and(|bits| bits & meta::WIDE_CATALOG == 0)
+            } else {
+                crate::storage::engine::catalog::range_batch_needs_wide_catalog(self, &batch)
+                    .map_err(|e| KvError::Corrupt(e.to_string()))?
+            };
+            if add_bit {
+                meta::put_features(&mut batch, proposed.unwrap_or(features) | meta::WIDE_CATALOG)
+                    .map_err(|e| KvError::Corrupt(e.to_string()))?;
+            }
+        }
         let batch = self.map_batch(batch);
         check_batch(&self.descriptor, &batch).map_err(|reason| {
             KvError::Corrupt(format!("write refused before proposal: {reason}"))

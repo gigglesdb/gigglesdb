@@ -66,6 +66,15 @@ enum DataTypeDto {
     TextArray,
     // Appended tag 22 requires meta feature bit 12.
     UserType(u64),
+    // reserved for UserTypeArray (AM-2)
+    #[allow(dead_code)]
+    #[serde(skip_serializing, deserialize_with = "reject_reserved_data_type")]
+    ReservedUserTypeArray,
+    // Appended tag 24 requires meta feature bit 30.
+    UuidArray,
+}
+fn reject_reserved_data_type<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+    Err(serde::de::Error::custom("reserved catalog data type tag 23"))
 }
 impl TryFrom<DataType> for DataTypeDto {
     type Error = CoreError;
@@ -94,6 +103,7 @@ impl TryFrom<DataType> for DataTypeDto {
             DataType::IntArray => Self::IntArray,
             DataType::BigIntArray => Self::BigIntArray,
             DataType::TextArray => Self::TextArray,
+            DataType::UuidArray => Self::UuidArray,
         })
     }
 }
@@ -122,6 +132,8 @@ impl From<DataTypeDto> for DataType {
             DataTypeDto::IntArray => Self::IntArray,
             DataTypeDto::BigIntArray => Self::BigIntArray,
             DataTypeDto::TextArray => Self::TextArray,
+            DataTypeDto::UuidArray => Self::UuidArray,
+            DataTypeDto::ReservedUserTypeArray => unreachable!("reserved catalog tag cannot deserialize"),
             // Resolved against the type catalog before a view is published.
             DataTypeDto::UserType(_) => Self::Text,
         }
@@ -610,8 +622,7 @@ pub(crate) fn decode_table(
         Some(3) => { let (dto, birth) = decode_version(3, value)?; (dto, Some(birth)) }
         _ => return Err(corrupt("unsupported table version")),
     };
-    if dto.columns_ext.len() > crate::relational::catalog_ext::MAX_EXT_COLUMNS
-        || dto
+    if dto
             .columns_ext
             .values()
             .any(|v| v.default.as_ref().is_some_and(|s| s.len() > 65536))
@@ -1037,6 +1048,7 @@ pub(crate) fn requires_text_backed_types(def: &TableDef) -> bool {
                 | DataType::IntArray
                 | DataType::BigIntArray
                 | DataType::TextArray
+                | DataType::UuidArray
         )
     })
 }
@@ -1052,6 +1064,6 @@ pub(crate) fn decode_extensions(v: &[u8]) -> Result<BTreeMap<String, crate::rela
     #[derive(Deserialize)]
     struct Map(#[serde(deserialize_with = "crate::relational::catalog_ext::extension_map")] BTreeMap<String, crate::relational::InstalledExtension>);
     let Map(map) = decode_version(1, v)?;
-    if map.is_empty() || map.len() > 64 || map.keys().any(|n| n.len() > 63) { return Err(corrupt("invalid extension map")); }
+    if map.is_empty() || map.keys().any(|n| n.len() > 63) { return Err(corrupt("invalid extension map")); }
     Ok(map)
 }

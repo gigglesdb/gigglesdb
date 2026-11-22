@@ -684,9 +684,9 @@ fn seven_client_outcomes_match_pg18_metadata_and_preserve_ordinary_ddl_fallback(
 }
 
 #[test]
-fn seven_client_outcomes_remain_bounded_at_128_tables() {
+fn seven_client_outcomes_work_with_301_tables() {
     let mut snapshot = snapshot();
-    for id in 3..=128 {
+    for id in 3..=301 {
         snapshot.tables.push(TableDef {
             id,
             name: format!("scale_{id}"),
@@ -707,7 +707,7 @@ fn seven_client_outcomes_remain_bounded_at_128_tables() {
             primary_key: vec![0],
         });
     }
-    assert_eq!(snapshot.tables.len(), 128);
+    assert_eq!(snapshot.tables.len(), 301);
     assert_client_outcomes(&snapshot);
 }
 

@@ -1756,7 +1756,7 @@
       "NativeSetval": {"type": "object", "additionalProperties": false, "properties": {"name": {"type": "string", "minLength": 1}, "value": {"$ref": "#/components/schemas/Int64"}, "isCalled": {"type": "boolean", "default": true}}, "required": ["name", "value"]},
       "NativeCatalogDataType": {
         "type": "string",
-        "enum": ["Boolean", "SmallInt", "Integer", "BigInt", "Text", "Bytes", "Numeric", "Real", "DoublePrecision", "Date", "Time", "TimeTz", "Timestamp", "TimestampTz", "Interval", "Varchar", "Bpchar", "Uuid", "Jsonb", "IntArray", "BigIntArray", "TextArray"]
+        "enum": ["Boolean", "SmallInt", "Integer", "BigInt", "Text", "Bytes", "Numeric", "Real", "DoublePrecision", "Date", "Time", "TimeTz", "Timestamp", "TimestampTz", "Interval", "Varchar", "Bpchar", "Uuid", "Jsonb", "IntArray", "BigIntArray", "TextArray", "UuidArray"]
       },
       "NativeCatalogColumn": {
         "type": "object", "additionalProperties": false, "required": ["name", "dataType"],

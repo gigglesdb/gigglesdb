@@ -46,18 +46,18 @@ fn kind(t: &DataType) -> Option<Kind> {
         _ => return None,
     })
 }
-struct CatalogView<'a>(&'a Relational);
+struct CatalogView<'a>(BTreeMap<u64, &'a TableDef>);
+impl<'a> CatalogView<'a> {
+    fn new(state: &'a Relational) -> Self {
+        Self(state.tables.values().map(|table| (table.id, table)).collect())
+    }
+}
 impl Catalog for CatalogView<'_> {
-    // Catalog and column counts are admitted before use, so resolver cost is
-    // bounded by the engine's fixed 128 tables x 64 columns, independent of rows.
     fn table_exists(&self, table: u64) -> bool {
-        self.0.tables.values().any(|t| t.id == table)
+        self.0.contains_key(&table)
     }
     fn column_kind(&self, table: u64, column: u64) -> Option<Kind> {
-        self.0
-            .tables
-            .values()
-            .find(|t| t.id == table)?
+        self.0.get(&table)?
             .columns
             .iter()
             .find(|c| c.id == column)
@@ -191,36 +191,30 @@ fn shape(w: Witness<'_>) -> R<()> {
     Ok(())
 }
 fn descriptors(state: &Relational, ds: &[Descriptor], cancel: &mut impl FnMut() -> bool) -> R<()> {
-    cap(state.tables.len(), MAX_TABLES)?;
-    cap(ds.len(), si::MAX_INDEXES)?;
     // Before any name equality, admit ALL descriptor shapes.
     for d in ds {
         cap(d.name.len(), si::MAX_NAME)?;
         cap(d.columns.len(), si::MAX_ARITY)?;
     }
+    let mut object_ids = BTreeSet::new();
+    let catalog = CatalogView::new(state);
     for t in state.tables.values() {
         cap(t.columns.len(), MAX_COLUMNS)?;
         cap(t.primary_key.len(), MAX_COLUMNS)?;
+        object_ids.insert(t.id);
+        object_ids.extend(t.columns.iter().map(|c| c.id));
     }
-    for (i, d) in ds.iter().enumerate() {
+    let mut names = BTreeSet::new();
+    for d in ds {
         tick(cancel)?;
         if d.id == 0 || d.name.is_empty() || d.columns.is_empty() || d.key_encoding != 1 {
             return Err(SqlError::Type);
         }
         // Index IDs share the stable catalog allocator with tables/columns.
-        if state
-            .tables
-            .values()
-            .any(|t| t.id == d.id || t.columns.iter().any(|c| c.id == d.id))
-            || ds[..i].iter().any(|p| p.id == d.id || p.name == d.name)
-        {
+        if !object_ids.insert(d.id) || !names.insert(&d.name) {
             return Err(SqlError::Duplicate);
         }
-        cap(
-            ds.iter().filter(|p| p.table == d.table).count(),
-            si::MAX_INDEXES_PER_TABLE,
-        )?;
-        let t = table(state, d.table)?;
+        let t = catalog.0.get(&d.table).copied().ok_or(SqlError::UnknownTable)?;
         schema_binding::validate_key(&d.name)?;
         if split_key(&d.name).0 != state.table_schema(t.id) {
             return Err(SqlError::Type);
@@ -377,7 +371,7 @@ fn admit(
     cap(
         add(
             add(work, witness_work)?,
-            mul(rows, si::MAX_INDEXES * si::MAX_ARITY)?,
+            add(mul(rows, ds.len())?, mul(candidates, si::MAX_ARITY)?)?,
         )?,
         si::MAX_WORK,
     )?;
@@ -899,7 +893,7 @@ impl Relational {
         let tuples = snap.tuples();
         let mut secondary = Sidecar::default();
         secondary
-            .build(ds, &snap.rows(&tuples), &CatalogView(self), &mut *cancel)
+            .build(ds, &snap.rows(&tuples), &CatalogView::new(self), &mut *cancel)
             .map_err(|failure| {
                 let failure = error(failure);
                 if failure == SqlError::Duplicate {
@@ -985,7 +979,7 @@ impl Relational {
         let snap = snapshot(self, ds, NONE, &mut cancel)?;
         let tuples = snap.tuples();
         let staged = pending
-            .validate_complete(&snap.rows(&tuples), &CatalogView(self), &mut cancel)
+            .validate_complete(&snap.rows(&tuples), &CatalogView::new(self), &mut cancel)
             .map_err(error)?;
         super::catalog_ext::validate_unique_indexes(
             self.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))),
@@ -1069,7 +1063,7 @@ impl Relational {
         let snap = snapshot(self, ds, NONE, &mut cancel)?;
         let tuples = snap.tuples();
         self.secondary
-            .validate(&snap.rows(&tuples), &CatalogView(self), &mut cancel)
+            .validate(&snap.rows(&tuples), &CatalogView::new(self), &mut cancel)
             .map_err(error)?;
         Ok(())
     }
@@ -1101,7 +1095,7 @@ impl Relational {
         let tuples = snap.tuples();
         let mut staged = Sidecar::default();
         staged
-            .build(ds, &snap.rows(&tuples), &CatalogView(self), &mut cancel)
+            .build(ds, &snap.rows(&tuples), &CatalogView::new(self), &mut cancel)
             .map_err(error)?;
         Ok(staged)
     }
@@ -1184,7 +1178,6 @@ impl Relational {
     ) -> R<u64> {
         cap(name.len(), si::MAX_NAME)?;
         cap(columns.len(), si::MAX_ARITY)?;
-        cap(self.secondary.descriptors().len() + 1, si::MAX_INDEXES)?;
         tick(&mut cancel)?;
         let mut next = self.next_id;
         let id = allocate(&mut next)?;
@@ -1202,7 +1195,7 @@ impl Relational {
         let tuples = snap.tuples();
         let mut staged = Sidecar::default();
         staged
-            .build(&ds, &snap.rows(&tuples), &CatalogView(self), &mut cancel)
+            .build(&ds, &snap.rows(&tuples), &CatalogView::new(self), &mut cancel)
             .map_err(error)?;
         tick(&mut cancel)?;
         self.secondary = staged;
@@ -1321,6 +1314,7 @@ impl<'de> Deserialize<'de> for Relational {
                                     catalog_ext::LogicalKind::IntArray => DataType::IntArray,
                                     catalog_ext::LogicalKind::BigIntArray => DataType::BigIntArray,
                                     catalog_ext::LogicalKind::TextArray => DataType::TextArray,
+                                    catalog_ext::LogicalKind::UuidArray => DataType::UuidArray,
                                 };
                             }
                         }

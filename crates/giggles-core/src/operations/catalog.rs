@@ -387,7 +387,6 @@ fn bind_catalog(
     request: &CatalogRequest,
 ) -> Result<BoundCatalogOperation> {
     let (database_domain, catalog_epoch) = session.snapshot_identity_engine().map_err(core)?;
-    let (_, tables) = session.catalog_engine().map_err(core)?;
     if matches!(request, CatalogRequest::DropTable { .. } | CatalogRequest::DropIndex { .. } | CatalogRequest::AlterTable { .. } | CatalogRequest::AddConstraint { .. } | CatalogRequest::DropConstraint { .. } | CatalogRequest::CreateView { .. } | CatalogRequest::DropView { .. }) {
         return Ok(BoundCatalogOperation {
             description: BoundCatalogDescription {
@@ -445,9 +444,6 @@ fn bind_catalog(
         Ok(_) => return Err(Error::Sql { sqlstate: "42P07".into() }),
         Err(CoreError::Sql(SqlError::UnknownTable)) => {},
         Err(error) => return Err(core(error)),
-    }
-    if tables.len() >= crate::relational::MAX_TABLES {
-        return Err(core(CoreError::Sql(SqlError::Limit)));
     }
     Ok(BoundCatalogOperation {
         description: BoundCatalogDescription {

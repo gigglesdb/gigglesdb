@@ -670,6 +670,10 @@ fn prepare(
                 functions::collation::scalar(typed(Value::Null, &ty), metadata.as_ref())?,
             );
             cmp.infer(parameters, &resolve, &[&table])?;
+            if matches!(a.right, Right::Array(_)) && !lhs.aggregate_unknown(parameters) {
+                let lhs_type = lhs.bind(&resolve, &[&table], parameters)?.ty;
+                functions::uuid_array_operators::check_element(op, Some(&lhs_type), &ty)?;
+            }
             cmp.bind(parameters, &resolve, &[&table])?;
         }
         let ty = if a.comparison.is_some() || a.exists {

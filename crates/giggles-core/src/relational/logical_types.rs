@@ -5,7 +5,7 @@ impl DataType {
     }
 
     pub(crate) fn is_array(&self) -> bool {
-        matches!(self, Self::IntArray | Self::BigIntArray | Self::TextArray)
+        matches!(self, Self::IntArray | Self::BigIntArray | Self::TextArray | Self::UuidArray)
     }
 }
 pub fn coerce(value: Value, ty: &DataType) -> R<Value> {
@@ -18,39 +18,11 @@ pub fn coerce(value: Value, ty: &DataType) -> R<Value> {
     };
     let bad = || SqlError::InvalidTextRepresentation;
     Ok(Value::Text(match ty {
-        DataType::Uuid => {
-            let s = s
-                .strip_prefix('{')
-                .and_then(|s| s.strip_suffix('}'))
-                .unwrap_or(&s);
-            let mut digits = String::new();
-            for c in s.chars() {
-                if c == '-' {
-                    if digits.is_empty() || !digits.len().is_multiple_of(4) {
-                        return Err(bad());
-                    }
-                } else if c.is_ascii_hexdigit() {
-                    digits.push(c.to_ascii_lowercase());
-                } else {
-                    return Err(bad());
-                }
-            }
-            if digits.len() != 32 || s.ends_with('-') || s.contains("--") {
-                return Err(bad());
-            }
-            format!(
-                "{}-{}-{}-{}-{}",
-                &digits[..8],
-                &digits[8..12],
-                &digits[12..16],
-                &digits[16..20],
-                &digits[20..]
-            )
-        }
+        DataType::Uuid => uuid_input(&s)?,
         DataType::Jsonb => {
             json_output(&serde_json::from_str::<serde_json::Value>(&s).map_err(|_| bad())?)?
         }
-        DataType::IntArray | DataType::BigIntArray | DataType::TextArray => {
+        DataType::IntArray | DataType::BigIntArray | DataType::TextArray | DataType::UuidArray => {
             let vals = array_values(&s)?;
             let vals = vals
                 .into_iter()
@@ -62,6 +34,7 @@ pub fn coerce(value: Value, ty: &DataType) -> R<Value> {
                         DataType::BigIntArray => giggles_pg_types::integer::parse_i64(&s)
                             .map(|n| n.to_string())
                             .map_err(integer_input_error),
+                        DataType::UuidArray => uuid_input(&s),
                         _ => Ok(array_quote(&s)),
                     })
                     .transpose()
@@ -73,6 +46,66 @@ pub fn coerce(value: Value, ty: &DataType) -> R<Value> {
         _ => return Err(SqlError::Type),
     }))
 }
+fn canonical_uuid(s: &str) -> R<String> {
+    let s = s
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or(s);
+    let mut digits = String::with_capacity(32);
+    for c in s.chars() {
+        if c == '-' {
+            if digits.is_empty() || !digits.len().is_multiple_of(4) {
+                return Err(SqlError::InvalidTextRepresentation);
+            }
+        } else if c.is_ascii_hexdigit() {
+            digits.push(c.to_ascii_lowercase());
+        } else {
+            return Err(SqlError::InvalidTextRepresentation);
+        }
+    }
+    if digits.len() != 32 || s.ends_with('-') || s.contains("--") {
+        return Err(SqlError::InvalidTextRepresentation);
+    }
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &digits[..8],
+        &digits[8..12],
+        &digits[12..16],
+        &digits[16..20],
+        &digits[20..]
+    ))
+}
+
+fn uuid_input(input: &str) -> R<String> {
+    canonical_uuid(input).inspect_err(|_| {
+        user_types::view_replace_error(format!("invalid input syntax for type uuid: \"{input}\""));
+    })
+}
+
+pub(super) fn uuid_array_not_null(table: &TableDef, column: &ColumnDef, values: &[Value]) {
+    use std::borrow::Cow;
+    let table_name = split_key(&table.name).1;
+    user_types::view_replace_error(format!(
+        "null value in column \"{}\" of relation \"{table_name}\" violates not-null constraint",
+        column.name,
+    ));
+    let fields = table.logical_offsets().into_iter().map(|offset| {
+        let text = match &values[offset] {
+            Value::Null => Cow::Borrowed("null"),
+            Value::Text(text) => Cow::Borrowed(text.as_str()),
+            Value::Bool(true) => Cow::Borrowed("t"),
+            Value::Bool(false) => Cow::Borrowed("f"),
+            value => Cow::Owned(query::output_text(value).ok().flatten().unwrap_or_default()),
+        };
+        if text.len() > 64 {
+            format!("{}...", &text[..text.floor_char_boundary(64)])
+        } else {
+            text.into_owned()
+        }
+    }).collect::<Vec<_>>();
+    user_types::sql_error_detail(format!("Failing row contains ({}).", fields.join(", ")));
+}
+
 pub fn json_output(v: &serde_json::Value) -> R<String> {
     use serde_json::Value as J;
     Ok(match v {
@@ -119,11 +152,13 @@ pub fn array_quote(s: &str) -> String {
         s.into()
     }
 }
+pub(super) fn malformed_array_literal(s: &str) -> SqlError {
+    user_types::view_replace_error(format!("malformed array literal: \"{s}\""));
+    SqlError::InvalidTextRepresentation
+}
+
 pub fn array_values(s: &str) -> R<Vec<Option<String>>> {
-    let bad = || {
-        user_types::view_replace_error(format!("malformed array literal: \"{s}\""));
-        SqlError::InvalidTextRepresentation
-    };
+    let bad = || malformed_array_literal(s);
     let inner = s
         .trim()
         .strip_prefix('{')
@@ -196,6 +231,9 @@ pub fn eval(name: &str, ty: &DataType, values: &[Value]) -> R<Value> {
     let Value::Text(s) = &values[0] else {
         return Err(SqlError::Type);
     };
+    if name == "cardinality" {
+        return Ok(Value::Int(array_values(s)?.len() as i64));
+    }
     if name == "array_length" || name == "\0array_subscript" {
         let Value::Int(index) = values[1] else {
             return Err(SqlError::Type);
@@ -216,7 +254,7 @@ pub fn eval(name: &str, ty: &DataType, values: &[Value]) -> R<Value> {
             return Ok(Value::Null);
         };
         return Ok(match ty {
-            DataType::TextArray => Value::Text(v.clone()),
+            DataType::TextArray | DataType::UuidArray => Value::Text(v.clone()),
             _ => Value::Int(v.parse().map_err(|_| SqlError::InvalidTextRepresentation)?),
         });
     }

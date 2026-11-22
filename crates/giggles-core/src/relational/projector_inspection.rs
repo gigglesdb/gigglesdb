@@ -18,7 +18,7 @@ impl Relational {
         if self.format != 1 || !self.catalog_ext().is_empty() {
             return Err(SqlError::Unsupported);
         }
-        if self.tables.len() > MAX_TABLES || self.rows.len() != self.tables.len() {
+        if self.rows.len() != self.tables.len() {
             return Err(SqlError::Type);
         }
         let mut found = None;

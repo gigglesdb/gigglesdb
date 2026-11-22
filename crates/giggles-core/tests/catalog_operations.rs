@@ -10,7 +10,7 @@ use giggles_core::{
         Bindings, CatalogRequest, ColumnSpec, Engine, Error, Request, Transaction, TransactionStep,
         ValueExpr,
     },
-    relational::{DataType, MAX_COLUMNS, MAX_TABLES, SqlError, Value as V},
+    relational::{DataType, MAX_COLUMNS, SqlError, Value as V},
 };
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
@@ -517,20 +517,14 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
         .map(|c| c.id)
         .collect::<BTreeSet<_>>();
     assert_eq!(ids, (7..71).collect::<BTreeSet<_>>());
-    for i in 3..MAX_TABLES {
+    for i in 3..128 {
         engine
             .execute_catalog(&create(&format!("table{i}")))
             .unwrap();
     }
-    assert_eq!(admin.catalog().unwrap().1.len(), MAX_TABLES);
-    reject_definition(
-        &admin,
-        &engine,
-        &create("one_too_many"),
-        Error::Sql {
-            sqlstate: "54000".into(),
-        },
-    );
+    assert_eq!(admin.catalog().unwrap().1.len(), 128);
+    engine.execute_catalog(&create("past_old_cap")).unwrap();
+    assert_eq!(admin.catalog().unwrap().1.len(), 129);
     admin
         .sql_session()
         .execute("INSERT INTO base VALUES(1)", &[], None)

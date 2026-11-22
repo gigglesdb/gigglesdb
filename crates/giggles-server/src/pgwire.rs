@@ -532,6 +532,7 @@ pub fn oid(t: &DataType) -> u32 {
         DataType::IntArray => 1007,
         DataType::BigIntArray => 1016,
         DataType::TextArray => 1009,
+        DataType::UuidArray => 2951,
         DataType::RegType => 2206,
 
         DataType::Bytes => 17,
@@ -550,7 +551,8 @@ fn size(t: &DataType) -> i16 {
     match t {
         DataType::RegType => 4,
         DataType::Uuid => 16,
-        DataType::Jsonb | DataType::IntArray | DataType::BigIntArray | DataType::TextArray => -1,
+        DataType::Jsonb | DataType::IntArray | DataType::BigIntArray | DataType::TextArray
+        | DataType::UuidArray => -1,
         DataType::Boolean => 1,
         DataType::Date => 4,
         DataType::Time => 8,
@@ -735,7 +737,8 @@ fn decode_with_order(
             | DataType::Jsonb
             | DataType::IntArray
             | DataType::BigIntArray
-            | DataType::TextArray => {
+            | DataType::TextArray
+            | DataType::UuidArray => {
                 giggles_core::relational::logical_types::coerce(Value::Text(s.into()), ty)
                     .map_err(|_| "22P02")
             }
@@ -1133,6 +1136,7 @@ fn core_declared_type(oid: u32) -> Option<DataType> {
         1007 => Some(DataType::IntArray),
         1016 => Some(DataType::BigIntArray),
         1009 => Some(DataType::TextArray),
+        2951 => Some(DataType::UuidArray),
 
         1700 => Some(DataType::Numeric),
         700 => Some(DataType::Real),
@@ -4139,6 +4143,7 @@ fn logical_binary_output(ty: &DataType, s: &str) -> R<Vec<u8>> {
     let elem = match ty {
         DataType::IntArray => 23u32,
         DataType::BigIntArray => 20,
+        DataType::UuidArray => 2950,
         _ => 25,
     };
     let mut b = Vec::new();
@@ -4162,6 +4167,7 @@ fn logical_binary_output(ty: &DataType, s: &str) -> R<Vec<u8>> {
                     .map_err(|_| "22P02")?
                     .to_be_bytes()
                     .to_vec(),
+                DataType::UuidArray => logical_binary_output(&DataType::Uuid, &s)?,
                 _ => s.into_bytes(),
             };
             b.extend_from_slice(&(v.len() as i32).to_be_bytes());
@@ -4199,6 +4205,7 @@ fn logical_binary_input(ty: &DataType, b: &[u8]) -> R<Value> {
     let expected = match ty {
         DataType::IntArray => 23,
         DataType::BigIntArray => 20,
+        DataType::UuidArray => 2950,
         _ => 25,
     };
     if !(0..=1).contains(&ndim) || !(0..=1).contains(&hasnull) || elem != expected {
@@ -4232,6 +4239,7 @@ fn logical_binary_input(ty: &DataType, b: &[u8]) -> R<Value> {
             DataType::BigIntArray if len == 8 => {
                 i64::from_be_bytes(v.try_into().unwrap()).to_string()
             }
+            DataType::UuidArray if len == 16 => hex::encode(v),
             DataType::TextArray => array_quote(std::str::from_utf8(v).map_err(|_| "22021")?),
             _ => return Err("22P03"),
         });
@@ -4280,6 +4288,7 @@ mod logical_wire_tests {
             (DataType::IntArray, "{1,NULL,-3}"),
             (DataType::BigIntArray, "{9223372036854775807}"),
             (DataType::TextArray, "{\"a,b\",NULL,\"NULL\"}"),
+            (DataType::UuidArray, "{NULL,12345678-1234-5678-1234-567812345678}"),
         ] {
             let binary = logical_binary_output(&ty, text).unwrap();
             assert_eq!(

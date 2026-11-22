@@ -97,10 +97,7 @@ impl Relational {
             cap(eq_bytes, crate::relational::max_value_bytes())?;
         }
         bytes = add(bytes, eq_bytes)?;
-        cap(self.tables.len(), MAX_TABLES)?;
-        cap(self.rows.len(), MAX_TABLES)?;
         let ds = self.secondary.descriptors();
-        cap(ds.len(), si::MAX_INDEXES)?;
         for (name, t) in self.tables.iter() {
             cap(name.len(), 127)?;
             bytes = add(bytes, table_shape(t)?)?;

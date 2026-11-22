@@ -14,10 +14,10 @@ fn captured_properties_have_budget_headroom_at_fifty_tables() {
         }] });
     }
     snapshot.indexes.push(IndexDef { id: 100, table: 1, name: "amount_idx".into(), columns: vec![1], unique: false });
-    let catalogs = catalog::build(&snapshot).unwrap();
     for (sql, expected_columns) in [(PROPERTIES_0, 56), (PROPERTIES_5, 42), (SQL_25, 33)] {
         let plan = plan_gateway(sql).unwrap().unwrap();
-        let mut rt = Runtime { snapshot: &snapshot, startup: None, catalogs: &catalogs, parameters: &[], work: 0, recursive_rows: BTreeMap::new() };
+        let catalogs = catalog::build(&snapshot, &plan.catalog_relations).unwrap();
+        let mut rt = Runtime { snapshot: &snapshot, startup: None, catalogs: &catalogs, parameters: &[], work: 0, recursive_rows: BTreeMap::new(), introspection: introspection::Lookups::default() };
         let rows = rt.query(&plan.query, &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(plan.query.fields.len(), expected_columns);

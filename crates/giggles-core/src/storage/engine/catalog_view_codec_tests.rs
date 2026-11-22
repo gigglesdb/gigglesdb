@@ -65,7 +65,7 @@ fn malformed_wire_and_every_truncation_fail_closed() {
         (9, 255),
         (13, 255),
         (14, 255),
-        (31, 22),
+        (31, 23),
         (40, 255),
         (59, 255),
         (71, 255),

@@ -52,6 +52,7 @@ pub enum ScalarType {
     IntArray,
     BigIntArray,
     TextArray,
+    UuidArray,
 
     Boolean,
     SmallInt,
