@@ -3200,10 +3200,14 @@ impl Prepared {
             return insert.implicit_sequences(state);
         }
         if let Statement::Plan(plan) = &self.statement { return plan.implicit_sequences(state); }
-        let mut dependencies = vec![];
+        let mut dependencies: Vec<Option<String>> = vec![];
         let mut add = |column: &ColumnDef| -> R<()> {
             if let Some(sql) = defaults::default_sql(state, column) {
-                dependencies.extend(defaults::dependencies(&sql)?.iter().cloned().map(Some));
+                for name in defaults::dependencies(&sql)?.iter() {
+                    if !dependencies.iter().any(|entry| entry.as_ref() == Some(name)) {
+                        dependencies.push(Some(name.clone()));
+                    }
+                }
             }
             Ok(())
         };

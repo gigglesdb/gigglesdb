@@ -62,6 +62,94 @@ fn parsed(text: &str) -> Prepared {
 }
 
 #[test]
+fn implicit_sequences_keep_distinct_names_in_first_use_order() {
+    let mut state = Relational::default();
+    for sql in [
+        "CREATE SEQUENCE distinct_seq",
+        "CREATE SEQUENCE shared_seq",
+        "CREATE SEQUENCE conflict_seq",
+        "CREATE TABLE items (
+            id BIGINT PRIMARY KEY,
+            distinct_value BIGINT DEFAULT nextval('distinct_seq'),
+            shared_left BIGINT DEFAULT nextval('shared_seq'),
+            shared_right BIGINT DEFAULT nextval('shared_seq'),
+            conflict_value BIGINT DEFAULT nextval('conflict_seq')
+        )",
+    ] {
+        let statement = Prepared::parse(sql, 1, state.epoch).unwrap();
+        state.execute(&statement, &[], None).unwrap();
+    }
+
+    let multi = parsed(
+        "INSERT INTO items VALUES
+         (1, 10, DEFAULT, DEFAULT, 20),
+         (2, DEFAULT, 30, DEFAULT, 40),
+         (3, DEFAULT, DEFAULT, 50, 60)
+         ON CONFLICT (id) DO UPDATE SET conflict_value = DEFAULT, shared_left = DEFAULT",
+    );
+    assert_eq!(
+        multi.implicit_sequences(&state).unwrap(),
+        [
+            Some("shared_seq".into()),
+            Some("distinct_seq".into()),
+            Some("conflict_seq".into()),
+        ],
+    );
+
+    let single = Prepared::parse(
+        "INSERT INTO items (id, distinct_value, conflict_value) VALUES (1, 10, 20)",
+        1,
+        state.epoch,
+    )
+    .unwrap();
+    assert!(matches!(single.statement, Statement::Insert { .. }));
+    assert_eq!(
+        single.implicit_sequences(&state).unwrap(),
+        [Some("shared_seq".into())],
+    );
+}
+
+#[test]
+fn implicit_sequences_reports_the_first_default_error_in_iteration_order() {
+    let mut state = Relational::default();
+    let create = Prepared::parse(
+        "CREATE TABLE items (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)",
+        1,
+        state.epoch,
+    )
+    .unwrap();
+    state.execute(&create, &[], None).unwrap();
+    let a = state.tables["items"].columns[1].id;
+    let b = state.tables["items"].columns[2].id;
+    state.set_column_default(a, Some("1 2".into())).unwrap();
+    state
+        .set_column_default(b, Some("'unterminated".into()))
+        .unwrap();
+
+    for (sql, expected) in [
+        (
+            "INSERT INTO items VALUES (1, 10, DEFAULT), (2, DEFAULT, 20)",
+            Err(SqlError::Syntax),
+        ),
+        (
+            "INSERT INTO items VALUES (1, DEFAULT, DEFAULT), (2, 10, 20)",
+            Err(SqlError::Unsupported),
+        ),
+        (
+            "INSERT INTO items VALUES (1, 10, 20), (2, 30, 40)
+             ON CONFLICT (id) DO UPDATE SET b = DEFAULT, a = DEFAULT",
+            Err(SqlError::Syntax),
+        ),
+        (
+            "INSERT INTO items VALUES (1, 10, 20), (2, 30, 40)",
+            Ok(vec![]),
+        ),
+    ] {
+        assert_eq!(parsed(sql).implicit_sequences(&state), expected, "{sql}");
+    }
+}
+
+#[test]
 fn sql_insert_claim_rule_preserves_single_row_paths() {
     for text in [
         "INSERT INTO items VALUES (1,'a','x',10)",

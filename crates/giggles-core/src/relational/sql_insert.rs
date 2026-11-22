@@ -715,6 +715,25 @@ impl Insert {
             .ok_or(SqlError::UnknownTable)?;
         let indexes = source_indexes(self, state, table)?;
         let mut dependencies = vec![];
+        // Each column's stored default text is built once per call. The syntax
+        // lookup still runs on every use, as before: its thread-local cache and
+        // the active statement budget decide hits, evictions and limit errors,
+        // so the sequence of lookups (and so every error) matches the per-row walk.
+        // Only distinct names are returned; consumers judge each name the same way.
+        let column_sql = vec![std::cell::OnceCell::<Option<String>>::new(); table.columns.len()];
+        let mut seen = BTreeSet::<String>::new();
+        let mut add = |index: usize| -> R<()> {
+            let sql = column_sql[index].get_or_init(|| defaults::default_sql(state, &table.columns[index]));
+            if let Some(sql) = sql {
+                for name in defaults::dependencies(sql)?.iter() {
+                    if !seen.contains(name.as_str()) {
+                        seen.insert(name.clone());
+                        dependencies.push(Some(name.clone()));
+                    }
+                }
+            }
+            Ok(())
+        };
         let source_defaults = self.source.as_ref().map(|_| vec![false; indexes.len()]);
         for row_defaults in self.defaults.iter().chain(source_defaults.iter()) {
             for (index, column) in table.columns.iter().enumerate() {
@@ -724,8 +743,8 @@ impl Insert {
                 let supplied = indexes.iter().position(|i| *i == index);
                 let generates = supplied.is_none_or(|slot| row_defaults[slot])
                     || self.overriding == Some(false) && state.column_identity(column.id).is_some();
-                if generates && let Some(sql) = defaults::default_sql(state, column) {
-                    dependencies.extend(defaults::dependencies(&sql)?.iter().cloned().map(Some));
+                if generates {
+                    add(index)?;
                 }
             }
         }
@@ -736,10 +755,7 @@ impl Insert {
         {
             for (name, value) in &update.sets {
                 if matches!(value, Operand::Default) {
-                    let column = &table.columns[col(table, name)?];
-                    if let Some(sql) = defaults::default_sql(state, column) {
-                        dependencies.extend(defaults::dependencies(&sql)?.iter().cloned().map(Some));
-                    }
+                    add(col(table, name)?)?;
                 }
             }
         }
