@@ -672,7 +672,10 @@ impl ActionWork {
                                 row.values[position] = match action {
                                     catalog_ext::Action::Cascade => new_values.as_ref().unwrap()[i].clone(),
                                     catalog_ext::Action::SetNull => Value::Null,
-                                    catalog_ext::Action::SetDefault => defaults::evaluate(state, &child.columns[position], clock).map_err(CoreError::Sql)?,
+                                    // Runs as the referencing table's owner (GD-0084 Q24).
+                                    catalog_ext::Action::SetDefault => defaults::evaluate(state, &child.columns[position],
+                                        clock.map(|clock| clock.with_sequence_origin(
+                                            clock::SequenceOrigin::ReferentialAction(*child_id))).as_ref()).map_err(CoreError::Sql)?,
                                     _ => unreachable!(),
                                 };
                             }

@@ -546,12 +546,12 @@ fn cached_callback_observes_drop_and_restart() {
             vec!["public".into()],
         );
         assert_eq!(
-            cb("nextval", "freshness", None, false).unwrap(),
+            cb("nextval", "freshness", None, false, relational::clock::SequenceOrigin::Call).unwrap(),
             Value::Int(1)
         );
         run(&mut s2, ddl);
         assert_eq!(
-            cb("nextval", "freshness", None, false),
+            cb("nextval", "freshness", None, false, relational::clock::SequenceOrigin::Call),
             Err(CoreError::Sql(SqlError::UnknownTable))
         );
         if ddl.starts_with("ALTER") {
@@ -1205,9 +1205,10 @@ fn callback(
     values: sequences::SessionValues, search_path: Vec<String>,
 ) -> relational::clock::SequenceCallback {
     let unsettled = Unsettled::default();
-    let callback = super::callback(db.child(Holder::Sequence).unwrap(), image, baseline, pending, values, unsettled.clone(), search_path);
-    Arc::new(move |operation, name, value, called| {
-        let result = callback(operation, name, value, called);
+    let callback = super::callback(db.child(Holder::Sequence).unwrap(), image, baseline, pending, values, unsettled.clone(), search_path,
+        super::Guard::unrestricted());
+    Arc::new(move |operation, name, value, called, origin| {
+        let result = callback(operation, name, value, called, origin);
         settle(&db, &unsettled)?;
         result
     })

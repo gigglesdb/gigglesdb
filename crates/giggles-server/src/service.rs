@@ -863,6 +863,7 @@ impl Service {
             api_path: ApiPathState::default(),
         };
         session.set_search_path("\"$user\", \"public\"");
+        session.sync_sequence_authority();
         Ok(session)
     }
     pub fn session(self: &Arc<Self>, fingerprint: &str) -> Result<Session, CoreError> {
@@ -927,6 +928,7 @@ impl Service {
             api_path: ApiPathState::default(),
         };
         session.set_search_path("\"$user\", \"public\"");
+        session.sync_sequence_authority();
         Ok(session)
     }
 }
@@ -1090,6 +1092,7 @@ impl Service {
             api_path: ApiPathState::default(),
         };
         session.set_search_path("\"$user\", \"public\"");
+        session.sync_sequence_authority();
         Ok(session)
     }
     /// Resolve credential authority without constructing a SQL session.
@@ -1204,6 +1207,7 @@ impl Service {
             api_path: ApiPathState::default(),
         };
         session.set_search_path("\"$user\", \"public\"");
+        session.sync_sequence_authority();
         Ok(session)
     }
 }
@@ -1694,12 +1698,36 @@ impl Session {
         )
     }
 
+    /// V2 checks every nextval/currval/setval at execution against the effective
+    /// role (GD-0084 Q24). It is taken from the session identity on each authorized
+    /// request, independently of the statement authorization memo, so SET ROLE,
+    /// RESET ROLE and SET SESSION AUTHORIZATION apply from the next request.
+    /// Roles, memberships and owners are read live at each call, not here.
+    pub(crate) fn sync_sequence_authority(&mut self) {
+        use giggles_core::SequenceAuthority as A;
+        let current = self.sql.sequence_authority();
+        let unchanged = match (self.authority_role(), current) {
+            (Role::Database { name }, A::Role(held)) => name == held,
+            (Role::Application { tables, .. }, A::Tables(held)) => tables == held,
+            (Role::Database { .. } | Role::Application { .. }, _) => false,
+            (_, current) => *current == A::Denied,
+        };
+        if !unchanged {
+            let next = match self.authority_role() {
+                Role::Database { name } => A::Role(name.clone()),
+                Role::Application { tables, .. } => A::Tables(tables.clone()),
+                _ => A::Denied,
+            };
+            self.sql.set_sequence_authority(next);
+        }
+    }
     pub(crate) fn authority_scope<T>(
         &mut self,
         work: impl FnOnce(&mut Self) -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
         if self.scoped {
             self.check_binding()?;
+            self.sync_sequence_authority();
             return work(self);
         }
         let service = self.service.clone();
@@ -1714,6 +1742,7 @@ impl Session {
             }
         };
         self.check_binding()?;
+        self.sync_sequence_authority();
         self.scoped = true;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(self)));
         self.scoped = false;
@@ -2395,8 +2424,10 @@ impl Session {
                 if superuser {
                     return true;
                 }
-                // Dynamic names are checked against the same table scope by the
-                // execution callback before any counter state is read or changed.
+                // Dynamic names are judged at execution, before any counter state
+                // is read or changed: on V2 by the sequence callback's owner check
+                // on the resolved sequence (GD-0084 Q24), on Legacy and COPY by this
+                // statement's table scope.
                 let Some(name) = dependency else {
                     return true;
                 };

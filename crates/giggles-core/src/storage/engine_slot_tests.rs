@@ -327,7 +327,7 @@ fn s2_live_stale_objects_cannot_use_replacement_engine() {
         Err(CoreError::Fenced)
     ));
     assert_eq!(
-        sequence("nextval", "seq", None, false),
+        sequence("nextval", "seq", None, false, crate::relational::clock::SequenceOrigin::Call),
         Err(CoreError::Fenced)
     );
     assert_eq!(readlog.finish(), Err(CoreError::Fenced));
@@ -799,7 +799,7 @@ fn session_sequence_and_xid_state_are_rebound_after_reopen() {
     assert!(next > last);
     assert!(next_xid > xid);
     assert_eq!(
-        exposed("nextval", "seq", None, false),
+        exposed("nextval", "seq", None, false, crate::relational::clock::SequenceOrigin::Call),
         Err(CoreError::Fenced)
     );
 }
@@ -815,7 +815,7 @@ fn leave_unsettled(
     lease.sequencer.gate_counter_acks(true);
     let result = (|| {
         for _ in 0..32 {
-            let Int(value) = callback("nextval", "seq", None, false).unwrap() else {
+            let Int(value) = callback("nextval", "seq", None, false, crate::relational::clock::SequenceOrigin::Call).unwrap() else {
                 panic!("sequence value");
             };
             if !s.sequence_unsettled.lock().unwrap().is_empty() {

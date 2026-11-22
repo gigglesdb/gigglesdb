@@ -291,7 +291,8 @@ enum BoundFilter {
     Like {
         value: BoundScalar,
         pattern: BoundScalar,
-        escape: Option<BoundScalar>,
+        // Boxed: keeps BoundFilter within clippy's variant-size bound.
+        escape: Option<Box<BoundScalar>>,
         insensitive: bool,
         negated: bool,
     },
@@ -1346,7 +1347,7 @@ impl Filter {
                 BoundFilter::Like {
                     value: text(value)?,
                     pattern: text(pattern)?,
-                    escape: escape.as_ref().map(text).transpose()?,
+                    escape: escape.as_ref().map(text).transpose()?.map(Box::new),
                     insensitive: *insensitive,
                     negated: *negated,
                 }

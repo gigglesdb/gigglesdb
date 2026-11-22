@@ -862,7 +862,10 @@ pub(super) fn enforce_with_rows<'a>(
                                 }
                                 catalog_ext::Action::SetNull => Value::Null,
                                 catalog_ext::Action::SetDefault => {
-                                    defaults::evaluate(state, &child.columns[*position], clock)?
+                                    // Runs as the referencing table's owner (GD-0084 Q24).
+                                    let action = clock.map(|clock| clock.with_sequence_origin(
+                                        clock::SequenceOrigin::ReferentialAction(child_id)));
+                                    defaults::evaluate(state, &child.columns[*position], action.as_ref())?
                                 }
                                 _ => unreachable!(),
                             };

@@ -333,6 +333,7 @@ mod cluster_replace;
 #[path = "write_fence_holder_network.rs"]
 mod write_fence_holder_network;
 #[path = "role_cache_network.rs"] mod role_cache_network;
+#[path = "sequence_execution_authority_network.rs"] mod sequence_execution_authority_network;
 #[path = "user_collation_network.rs"]
 mod user_collation_network;
 

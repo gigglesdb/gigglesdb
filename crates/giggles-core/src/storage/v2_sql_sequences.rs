@@ -48,6 +48,285 @@ pub(in crate::storage) fn settle(db: &EngineLease, list: &Unsettled) -> Result<(
     Ok(())
 }
 
+/// A sequence privilege as PostgreSQL names it. GigglesDB has no sequence ACLs
+/// yet; `Guard::held` is where GRANT ... ON SEQUENCE would plug in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SequencePrivilege {
+    Usage,
+    Select,
+    Update,
+}
+const OWNER_ANALOGUE: &[SequencePrivilege] =
+    &[SequencePrivilege::Usage, SequencePrivilege::Select, SequencePrivilege::Update];
+/// Any one of these suffices (PostgreSQL 18 sequence.c): nextval needs USAGE or
+/// UPDATE, setval UPDATE, currval (and lastval, unsupported) USAGE or SELECT.
+fn required(operation: &str) -> &'static [SequencePrivilege] {
+    use SequencePrivilege::*;
+    match operation {
+        "nextval" => &[Usage, Update],
+        "setval" => &[Update],
+        _ => &[Usage, Select],
+    }
+}
+fn role_error(error: roles::RoleError) -> CoreError {
+    match error {
+        roles::RoleError::Core(error) => error,
+        _ => CoreError::Policy(Error::Authentication),
+    }
+}
+type DecisionKey = (u64, u128, relational::clock::SequenceOrigin, &'static [SequencePrivilege]);
+struct Decision {
+    roles: roles::RoleCatalogImage,
+    latest: Option<Arc<relational::Relational>>,
+    key: DecisionKey,
+}
+
+/// Execution-time sequence authority for one statement (GD-0084 Q24).
+///
+/// The statement authorizer can only judge names it sees. A dynamic name
+/// (`nextval($1)`, a text expression), a sequence replaced or re-owned after
+/// authorization, or a referential action's default all reach this callback
+/// unjudged, so every call is checked here on the sequence it resolved to, before
+/// any session value, counter or cluster sequence RPC is touched.
+#[derive(Clone)]
+pub(in crate::storage) struct Guard {
+    authority: SequenceAuthority,
+    roles: Option<roles::RoleCatalog>,
+    /// Owner records this transaction wrote itself (role keyspace, prefix 10).
+    private_owners: Arc<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+    /// Sequences whose definition this transaction created or changed itself.
+    private_sequences: Arc<std::collections::BTreeSet<u64>>,
+    /// Tables whose definition this transaction changed itself (for example a
+    /// rename, which also moves the owner record to the new name).
+    private_tables: Arc<std::collections::BTreeSet<u64>>,
+    /// The last allowed decision, valid while both images are the same objects.
+    cache: Arc<Mutex<Option<Decision>>>,
+}
+impl Guard {
+    pub(in crate::storage) fn new(
+        authority: &SequenceAuthority,
+        roles: roles::RoleCatalog,
+        txn: Option<&engine::txn::Transaction>,
+        image: &relational::Relational,
+    ) -> Self {
+        let mut private_owners = BTreeMap::new();
+        let mut private_sequences = std::collections::BTreeSet::new();
+        let mut private_tables = std::collections::BTreeSet::new();
+        if !matches!(authority, SequenceAuthority::Unrestricted)
+            && let Some(txn) = txn
+            && txn.catalog_writes().next().is_some()
+        {
+            private_owners = txn
+                .catalog_writes()
+                .filter(|(key, _)| key.first() == Some(&10))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            private_sequences = image
+                .catalog_ext()
+                .sequences
+                .keys()
+                .copied()
+                .filter(|id| txn.catalog_own(&engine::catalog_codec::sequence_key(*id)).is_some())
+                .collect();
+            private_tables = image
+                .tables
+                .values()
+                .map(|table| table.id)
+                .filter(|id| txn.catalog_own(&engine::catalog::table_key(*id)).is_some())
+                .collect();
+        }
+        Self {
+            authority: authority.clone(),
+            roles: Some(roles),
+            private_owners: Arc::new(private_owners),
+            private_sequences: Arc::new(private_sequences),
+            private_tables: Arc::new(private_tables),
+            cache: Arc::default(),
+        }
+    }
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(in crate::storage) fn unrestricted() -> Self {
+        Self {
+            authority: SequenceAuthority::Unrestricted,
+            roles: None,
+            private_owners: Arc::default(),
+            private_sequences: Arc::default(),
+            private_tables: Arc::default(),
+            cache: Arc::default(),
+        }
+    }
+    /// The authority key (owner record name) of table `id`, found by stable id. A
+    /// table this transaction changed itself (renamed, say) is named as this
+    /// transaction sees it, matching the owner record its DDL moved; any other
+    /// table is named as the latest committed catalog has it, falling back to the
+    /// statement image when a gateway's latest image trails its routed read.
+    fn table_key(
+        &self,
+        id: u64,
+        image: &relational::Relational,
+        latest: Option<&relational::Relational>,
+    ) -> Option<String> {
+        let named = |source: &relational::Relational| {
+            source.tables.values().find(|t| t.id == id).map(|t| source.table_key(t))
+        };
+        match latest {
+            Some(latest) if !self.private_tables.contains(&id) => named(latest).or_else(|| named(image)),
+            _ => named(image),
+        }
+    }
+    /// The owner record that answers for `def`: its owning table's (resolved by id
+    /// as in `table_key`), or its own for a standalone sequence.
+    fn authority_key(
+        &self,
+        def: &relational::catalog_ext::SequenceDef,
+        image: &relational::Relational,
+        latest: Option<&relational::Relational>,
+    ) -> Option<String> {
+        match def.owned_by {
+            None => Some(def.name.clone()),
+            Some((table, _)) => self.table_key(table, image, latest),
+        }
+    }
+    /// The owner of `key`, this transaction's own record first (the same codec
+    /// as `roles_engine::own_owner`).
+    fn owner(&self, roles: &roles::RoleCatalogImage, key: &str) -> Result<Option<String>, CoreError> {
+        if let Some(value) = self.private_owners.get(&roles::engine::owner_key(key)?) {
+            return roles::engine::decode_owner(value);
+        }
+        roles.table_owner(key).map_err(role_error)
+    }
+    /// The privileges `principal` holds on the sequence whose owner record is `key`.
+    fn held(
+        &self,
+        principal: &SequenceAuthority,
+        roles: &roles::RoleCatalogImage,
+        key: &str,
+        standalone: bool,
+    ) -> Result<&'static [SequencePrivilege], CoreError> {
+        let owner_analogue = match principal {
+            SequenceAuthority::Unrestricted => true,
+            SequenceAuthority::Denied => false,
+            SequenceAuthority::Tables(tables) => !standalone && tables.contains(key),
+            SequenceAuthority::Role(name) => {
+                if roles.get(name).map_err(role_error)?.is_some_and(|role| role.superuser) {
+                    true
+                } else {
+                    match self.owner(roles, key)? {
+                        Some(owner) => roles.privileges_of(name).map_err(role_error)?.contains(&owner),
+                        None => false,
+                    }
+                }
+            }
+        };
+        Ok(if owner_analogue { OWNER_ANALOGUE } else { &[] })
+    }
+    /// Allow `operation` on sequence `id` (statement image definition `def`) or
+    /// refuse it with 42501. `committed` says whether the latest committed catalog
+    /// holds this same incarnation.
+    #[allow(clippy::too_many_arguments)]
+    fn check(
+        &self,
+        db: &EngineLease,
+        image: &relational::Relational,
+        operation: &str,
+        origin: relational::clock::SequenceOrigin,
+        id: u64,
+        def: &relational::catalog_ext::SequenceDef,
+        committed: bool,
+    ) -> Result<(), CoreError> {
+        use relational::clock::SequenceOrigin;
+        // Column defaults are checked like calls: the statement authorizer judges
+        // the stored name through the session search_path and the statement
+        // snapshot, misses calls nested in extension functions, and cannot see a
+        // later OWNED BY move, while execution draws the resolved sequence.
+        if matches!(self.authority, SequenceAuthority::Unrestricted) {
+            return Ok(());
+        }
+        // Only the unrestricted test guard has no catalog; never allow a
+        // restricted principal without one.
+        let Some(catalog) = &self.roles else { return Err(CoreError::Policy(Error::Scope)) };
+        // Roles and the latest catalog are read through the statement's own lease,
+        // never a fresh admission (which could reach another generation).
+        let roles = catalog.image_leased(Some(db)).map_err(role_error)?;
+        // The definition whose ownership link answers. A sequence this transaction
+        // created or altered is judged on its own private definition. Any other is
+        // judged on the latest committed definition of this same incarnation, so a
+        // REPEATABLE READ snapshot cannot keep a link (OWNED BY) another session has
+        // since moved; the snapshot only names the object.
+        let latest = if committed && !self.private_sequences.contains(&id) {
+            Some(db.native_metadata_image(None)?.1)
+        } else {
+            None
+        };
+        let required = required(operation);
+        let key: DecisionKey = (id, def.incarnation, origin, required);
+        {
+            let cache = self.cache.lock().map_err(|_| CoreError::Fenced)?;
+            if let Some(decision) = cache.as_ref()
+                && decision.key == key
+                && decision.roles.same_image(&roles)
+                && match (&decision.latest, &latest) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    _ => false,
+                }
+            {
+                return Ok(());
+            }
+        }
+        let (current, owner_key) = match &latest {
+            Some(latest) => {
+                // A replacement (another incarnation) is never judged under this name.
+                let current = latest
+                    .catalog_ext()
+                    .sequences
+                    .get(&id)
+                    .filter(|current| current.incarnation == def.incarnation)
+                    .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
+                // The ownership link (owning table id) is the latest committed one, so
+                // an OWNED BY transfer committed elsewhere applies even under
+                // REPEATABLE READ; only the table's name follows this transaction's
+                // own DDL (see `table_key`).
+                (current, self.authority_key(current, image, Some(latest)))
+            }
+            None => (def, self.authority_key(def, image, None)),
+        };
+        let standalone = current.owned_by.is_none();
+        // Referential actions run as the referencing table's owner (PostgreSQL
+        // ri_triggers.c), found by stable id like the owning table above.
+        // A referencing table with no owner record (created by an application
+        // identity or an embedded session) is judged on the session's own principal,
+        // exactly as a direct call by the caller would be: a caller with direct
+        // authority on the sequence passes, and a caller without it is refused with
+        // 42501. That refusal is a behaviour change from main, where such FK actions
+        // always succeeded; it never grants more than a direct call.
+        let principal = match origin {
+            SequenceOrigin::ReferentialAction(child) => self
+                .table_key(child, image, latest.as_deref())
+                .map(|key| self.owner(&roles, &key))
+                .transpose()?
+                .flatten()
+                .map(SequenceAuthority::Role),
+            _ => None,
+        };
+        let principal = principal.as_ref().unwrap_or(&self.authority);
+        let allowed = match &owner_key {
+            Some(owner_key) => {
+                let held = self.held(principal, &roles, owner_key, standalone)?;
+                required.iter().any(|privilege| held.contains(privilege))
+            }
+            // An owning table missing from every image: refuse.
+            None => false,
+        };
+        if !allowed {
+            return Err(CoreError::Policy(Error::Scope));
+        }
+        *self.cache.lock().map_err(|_| CoreError::Fenced)? = Some(Decision { roles, latest, key });
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn callback(
     db: impl Into<CallbackLease>,
     image: Arc<relational::Relational>,
@@ -56,9 +335,10 @@ pub(super) fn callback(
     values: sequences::SessionValues,
     unsettled: Unsettled,
     search_path: Vec<String>,
+    guard: Guard,
 ) -> relational::clock::SequenceCallback {
     let db = db.into();
-    Arc::new(move |operation, name, value, called| {
+    Arc::new(move |operation, name, value, called, origin| {
         let db = db.lease(Holder::Sequence)?;
         crate::cancellation::check()?;
         let name = sequences::sequence_name(name).map_err(CoreError::Sql)?;
@@ -87,6 +367,9 @@ pub(super) fn callback(
         if !committed && baseline.get(&id) == Some(&def.incarnation) {
             return Err(CoreError::Sql(SqlError::UnknownTable));
         }
+        // Authority on this resolved id and incarnation, before session values,
+        // counters or the cluster sequence RPC; every use below names the same pair.
+        guard.check(&db, &image, operation, origin, id, def, committed)?;
         if operation == "currval" {
             let values = values.lock().map_err(|_| CoreError::Fenced)?;
             return sequences::currval(&values, id, def.incarnation)

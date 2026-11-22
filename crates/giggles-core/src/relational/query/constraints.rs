@@ -278,7 +278,7 @@ pub(super) fn immutable(filter: &BoundFilter) -> bool {
             value.constraint_immutable()
                 && pattern.constraint_immutable()
                 && escape
-                    .as_ref()
+                    .as_deref()
                     .is_none_or(BoundScalar::constraint_immutable)
         }
         BoundFilter::Not(a) | BoundFilter::Is(a, _, _) => immutable(a),

@@ -299,8 +299,11 @@ impl SqlSession {
         db: &EngineLease,
         image: Arc<relational::Relational>,
     ) -> Result<relational::clock::SequenceCallback, CoreError> {
+        let guard = sql_sequences::Guard::new(&self.sequence_authority, self.admin.roles(),
+            self.v2_transaction.as_ref(), &image);
         Ok(sql_sequences::callback(CallbackLease::new(db, self.v2_transaction.as_ref()), image, self.sequence_baseline.clone(),
-            self.pending_sequences.clone(), self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone()))
+            self.pending_sequences.clone(), self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone(),
+            guard))
     }
 
     // Typed scans deliberately retain the active statement snapshot. In
@@ -388,12 +391,14 @@ impl SqlSession {
             let mut state = db.metadata_state(self.v2_transaction.as_ref())?;
             state.sql.epoch = 0;
             let image = Arc::new(state.sql.clone());
+            let guard = sql_sequences::Guard::new(&self.sequence_authority, self.admin.roles(),
+                self.v2_transaction.as_ref(), &image);
             let callback = sql_sequences::callback(CallbackLease::new(db, self.v2_transaction.as_ref()), image.clone(),
                 self.sequence_baseline.clone(), self.pending_sequences.clone(),
-                self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone());
+                self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone(), guard);
             let allowed = self.sequence_tables.clone();
             let path = self.search_path.clone();
-            let callback = Arc::new(move |operation: &str, text: &str, value, called| {
+            let callback = Arc::new(move |operation: &str, text: &str, value, called, origin| {
                 if let Some(allowed) = &allowed {
                     if allowed.is_empty() { return Err(CoreError::Policy(Error::Scope)); }
                     let name = sequences::sequence_name(text).map_err(CoreError::Sql)?;
@@ -405,7 +410,7 @@ impl SqlSession {
                         return Err(CoreError::Policy(Error::Scope));
                     }
                 }
-                callback(operation, text, value, called)
+                callback(operation, text, value, called, origin)
             });
             let context = relational::clock::ExecutionClock::new(clock)
                 .with_extra_float_digits(self.extra_float_digits)
@@ -1005,6 +1010,8 @@ impl SqlSession {
                                 self.sequence_values.clone(),
                                 self.sequence_unsettled.clone(),
                                 self.search_path.clone(),
+                                sql_sequences::Guard::new(&self.sequence_authority, self.admin.roles(),
+                                    Some(&*txn), &catalog_image),
                             ))
                             .with_xact(sql_xact::callback(
                                 CallbackLease::new(db, Some(txn)),

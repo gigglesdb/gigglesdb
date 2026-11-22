@@ -104,6 +104,11 @@ impl RoleCatalogImage {
         self.image.with_role(name, inspect)
     }
 
+    /// Whether both handles share one immutable role image.
+    pub(crate) fn same_image(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.image, &other.image)
+    }
+
     pub fn table_owner(&self, table: &str) -> Result<Option<String>, RoleError> {
         self.check_fenced()?;
         self.catalog.validate_relation_name(table)?;

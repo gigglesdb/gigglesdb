@@ -482,21 +482,27 @@ pub(crate) fn assign_created(
     })
 }
 
+/// The catalog key of `table`'s owner record.
+pub(crate) fn owner_key(table: &str) -> Result<Vec<u8>, CoreError> {
+    encode_key(&super::key(b"owner/", table))
+}
+
+/// Decode an owner record value as staged in a transaction (`None`: removed).
+pub(crate) fn decode_owner(value: &Option<Vec<u8>>) -> Result<Option<String>, CoreError> {
+    value
+        .as_ref()
+        .map(|v| {
+            String::from_utf8(v[1..].to_vec())
+                .map_err(|e| CoreError::Corrupt(e.to_string()))
+        })
+        .transpose()
+}
+
 pub(crate) fn own_owner(
     txn: &Transaction,
     table: &str,
 ) -> Result<Option<Option<String>>, CoreError> {
-    txn.catalog_own(&encode_key(&super::key(b"owner/", table))?)
-        .map(|value| {
-            value
-                .as_ref()
-                .map(|v| {
-                    String::from_utf8(v[1..].to_vec())
-                        .map_err(|e| CoreError::Corrupt(e.to_string()))
-                })
-                .transpose()
-        })
-        .transpose()
+    txn.catalog_own(&owner_key(table)?).map(decode_owner).transpose()
 }
 
 pub(crate) fn own_grants(

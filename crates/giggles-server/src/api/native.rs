@@ -420,6 +420,9 @@ pub(crate) fn run(
 ) -> Result<NativeResult, CoreError> {
     let result = (|| {
         session.check_binding()?;
+        // Application requests may reach core without authority_scope; the V2
+        // sequence check must see this identity, never the unrestricted default.
+        session.sync_sequence_authority();
         // GD-0061 R3-208/R3-209: a task session admits the class before any
         // resolution, authorization or execution (no catalog or table lookup),
         // as on the agent pgwire path. A refusal here never reaches core, so

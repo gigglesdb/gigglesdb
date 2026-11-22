@@ -2264,6 +2264,7 @@ pub struct SqlSession {
     xact: XactSlot,
     sequence_baseline: BTreeMap<u64, u128>,
     sequence_tables: Option<std::collections::BTreeSet<String>>,
+    sequence_authority: SequenceAuthority,
     deferral: relational::DeferralState,
     isolation: SqlIsolation,
     /// The task this session is bound to (GD-0061 R3-202); set once by `bind_task`.
@@ -2324,6 +2325,7 @@ impl Admin {
             xact: Default::default(),
             sequence_baseline: BTreeMap::new(),
             sequence_tables: None,
+            sequence_authority: SequenceAuthority::Unrestricted,
             deferral: Default::default(),
             isolation: SqlIsolation::ReadCommitted,
             task: None,
@@ -2469,6 +2471,26 @@ impl PrivilegeMetadata {
         }
         committed().map_err(|_| CoreError::Fenced)
     }
+}
+/// Who answers, at V2 execution, for a sequence function call (GD-0084 Q24).
+///
+/// GigglesDB has no sequence ACLs: the owner-analogue of a sequence (a
+/// superuser, or a member through inheritance of the owner of its owning table,
+/// or of the standalone sequence itself) holds USAGE, SELECT and UPDATE
+/// together, and table grants confer nothing. Roles, memberships and owners are
+/// read from the latest committed role catalog at each call.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SequenceAuthority {
+    /// No execution check: embedded and internal sessions.
+    #[default]
+    Unrestricted,
+    /// An ordinary database role (the session's effective role).
+    Role(String),
+    /// An application identity: owning tables by authority key; standalone
+    /// sequences are never in scope.
+    Tables(std::collections::BTreeSet<String>),
+    /// No sequence authority at all.
+    Denied,
 }
 /// One statement's privilege evaluator, installed only after authorization.
 pub type PrivilegeCallback = Arc<dyn Fn(&str, &[relational::Value], &PrivilegeMetadata)
@@ -2863,6 +2885,15 @@ impl SqlSession {
     }
     pub fn sequence_tables(&self) -> &Option<std::collections::BTreeSet<String>> {
         &self.sequence_tables
+    }
+    /// The principal V2 execution checks nextval/currval/setval against
+    /// (GD-0084 Q24). The server sets it from the effective role before each
+    /// authorized request; a session nobody configures stays unrestricted.
+    pub fn set_sequence_authority(&mut self, authority: SequenceAuthority) {
+        self.sequence_authority = authority;
+    }
+    pub fn sequence_authority(&self) -> &SequenceAuthority {
+        &self.sequence_authority
     }
     pub fn normalize_sequence_reference(&self, text: &str) -> Result<String, CoreError> {
         let name = sequences::sequence_name(text).map_err(CoreError::Sql)?;
@@ -3895,7 +3926,7 @@ impl SqlSession {
             let key = if key.contains('\0') { key } else { format!("public\0{key}") };
             quoted(&key)
         } else { quoted(name) };
-        let result = callback(operation, &qualified, value, called);
+        let result = callback(operation, &qualified, value, called, relational::clock::SequenceOrigin::Call);
         // Like a callback error here, a settle error does not abort the transaction.
         self.settle_sequences()?;
         match result? {

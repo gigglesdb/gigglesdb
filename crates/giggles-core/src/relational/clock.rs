@@ -55,7 +55,24 @@ impl std::fmt::Debug for StatementClock {
 /// contains this context. The error slot bridges the SQL-only scalar evaluator
 /// without translating the caller's CoreError.
 pub(crate) type SequenceCallback =
-    Arc<dyn Fn(&str, &str, Option<i64>, bool) -> Result<Value, CoreError> + Send + Sync>;
+    Arc<dyn Fn(&str, &str, Option<i64>, bool, SequenceOrigin) -> Result<Value, CoreError> + Send + Sync>;
+/// Why a sequence function runs, which decides whose authority answers for it
+/// at execution (GD-0084 Q24).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum SequenceOrigin {
+    /// nextval/currval/setval written in the statement, or a native sequence call:
+    /// the session's effective role answers, on the sequence the call resolves to.
+    Call,
+    /// A column default the statement itself fills (INSERT, SET DEFAULT, MERGE,
+    /// COPY, ALTER TABLE ADD COLUMN). Checked like `Call`, for the session's
+    /// effective role, in addition to the statement authorizer's implicit
+    /// dependencies.
+    ColumnDefault,
+    /// A default written by a referential action (ON DELETE/UPDATE SET DEFAULT) of
+    /// the referencing table with this id. As in PostgreSQL, the action runs as
+    /// that table's owner, not as the role whose statement fired it.
+    ReferentialAction(u64),
+}
 pub(crate) type XactCallback =
     Arc<dyn Fn(&str, Option<i64>) -> Result<Value, CoreError> + Send + Sync>;
 struct PrivilegeExecution {
@@ -68,6 +85,7 @@ pub(crate) struct ExecutionClock {
     clock: StatementClock,
     error: Arc<Mutex<Option<CoreError>>>,
     sequence: Option<SequenceCallback>,
+    sequence_origin: SequenceOrigin,
     xact: Option<XactCallback>,
     privilege: Option<Arc<PrivilegeExecution>>,
     extra_float_digits: i32,
@@ -79,6 +97,7 @@ impl ExecutionClock {
         Self {
             clock: clock.clone(),
             sequence: None,
+            sequence_origin: SequenceOrigin::Call,
             xact: None,
             privilege: None,
             extra_float_digits: 1,
@@ -120,6 +139,20 @@ impl ExecutionClock {
         context.sequence = Some(callback);
         context
     }
+    /// The same execution, with sequence functions attributed to `origin`.
+    pub(crate) fn with_sequence_origin(&self, origin: SequenceOrigin) -> Self {
+        let mut context = self.clone();
+        context.sequence_origin = origin;
+        context
+    }
+    /// A column default evaluation. A default evaluated inside a referential
+    /// action keeps the action's origin.
+    pub(crate) fn for_column_default(&self) -> Self {
+        match self.sequence_origin {
+            SequenceOrigin::Call => self.with_sequence_origin(SequenceOrigin::ColumnDefault),
+            _ => self.clone(),
+        }
+    }
     pub(crate) fn sequence(
         &self,
         name: &str,
@@ -128,7 +161,7 @@ impl ExecutionClock {
         called: bool,
     ) -> Result<Value, SqlError> {
         self.observe(OBS_SEQUENCE);
-        match (self.sequence.as_ref().ok_or(SqlError::Unsupported)?)(name, sequence, value, called)
+        match (self.sequence.as_ref().ok_or(SqlError::Unsupported)?)(name, sequence, value, called, self.sequence_origin)
         {
             Ok(value) => Ok(value),
             Err(error) => {
@@ -331,7 +364,7 @@ mod tests {
     #[test]
     fn sequence_sets_sequence() {
         let base = ExecutionClock::new(&clock(None));
-        let context = base.with_sequences(Arc::new(|_, _, _, _| Ok(Value::Int(7))));
+        let context = base.with_sequences(Arc::new(|_, _, _, _, _| Ok(Value::Int(7))));
         assert_eq!(
             context.sequence("nextval", "s", None, false).unwrap(),
             Value::Int(7)

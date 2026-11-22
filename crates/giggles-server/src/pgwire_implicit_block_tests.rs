@@ -219,7 +219,9 @@ fn metadata_cycle_counts() {
     simple(&mut state, &mut session, "SELECT v FROM t WHERE id = 1").unwrap();
     assert_eq!(giggles_core::metadata_read_counts::take(), [0, 0, 9, 0, 0]);
     extended(&mut state, &mut session, "INSERT INTO serial_t (v) VALUES (8)").unwrap();
-    assert_eq!(giggles_core::metadata_read_counts::take(), [17, 0, 8, 0, 0]);
+    // The serial default's execution-time sequence privilege check (GD-0084 Q24)
+    // reads the latest committed catalog once per statement.
+    assert_eq!(giggles_core::metadata_read_counts::take(), [17, 0, 9, 0, 0]);
 }
 #[test]
 fn metadata_ddl_between_bind_and_execute() {

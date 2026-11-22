@@ -11,7 +11,7 @@ fn run(state: &mut Relational, sql: &str) {
 
 fn serial_clock() -> clock::ExecutionClock {
     clock::ExecutionClock::new(&clock::ExecutionClock::pinned(0, None))
-        .with_sequences(Arc::new(|function, sequence, _, _| {
+        .with_sequences(Arc::new(|function, sequence, _, _, _| {
             assert_eq!((function, sequence), ("nextval", "\"public\".t_id_seq"));
             Ok(Value::Int(1))
         }))

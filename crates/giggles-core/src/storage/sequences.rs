@@ -289,7 +289,8 @@ impl Inner {
         search_path: Vec<String>,
     ) -> relational::clock::SequenceCallback {
         let inner = self.clone();
-        Arc::new(move |operation, text, value, called| {
+        // Legacy keeps its statement scope; the origin only steers V2 (GD-0084 Q24).
+        Arc::new(move |operation, text, value, called, _origin| {
             if allowed_tables
                 .as_ref()
                 .is_some_and(|tables| tables.is_empty())

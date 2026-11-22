@@ -1358,7 +1358,8 @@ pub(super) fn evaluate_sql(
         DataType::Varchar | DataType::Bpchar => &DataType::Text,
         other => other,
     };
-    query::InsertExpressions::default_value(&qualified, evaluation_target, clock, true)?
+    let clock = clock.map(clock::ExecutionClock::for_column_default);
+    query::InsertExpressions::default_value(&qualified, evaluation_target, clock.as_ref(), true)?
         .ok_or(SqlError::Type)
 }
 fn qualify_default(sql: &str) -> R<Rc<str>> {
