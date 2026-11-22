@@ -5,12 +5,23 @@ sys.dont_write_bytecode = True
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 import fnmatch
 import json
 import math
 import secrets
 from compat_lib import areas, checks, cluster, corpus, delta, docker, gigglesdb, oracle, pins, probes, psql_client, report, scratch, util, watch
+
+def positive_jobs(value):
+    try:
+        jobs = int(value)
+    except ValueError:
+        jobs = 0
+    if jobs < 1:
+        raise argparse.ArgumentTypeError('--jobs must be an integer >= 1')
+    return jobs
+
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
@@ -38,6 +49,7 @@ def parser():
     run.add_argument('--checks', default='*')
     run.add_argument('--owners', default=','.join(sorted(checks.OWNERS)))
     run.add_argument('--corpus', default='*', help='fnmatch globs over id, area, area/id or area/file, separated by commas; !glob excludes')
+    run.add_argument('--jobs', type=positive_jobs, default=1, help='parallel corpus workers (default 1)')
     run.add_argument('--no-corpus', action='store_true')
     run.add_argument('--no-checks', action='store_true')
     run.add_argument('--client-timeout', type=float, default=60)
@@ -104,7 +116,7 @@ def run_check(engine, client, client_pin, check, available, unavailable_reason, 
     data['checks'].append(item)
 
 def run_corpus_case(engine, client, client_pin, case, available, reason, data, run,
-                    network, pg_host, port, password):
+                    network, pg_host, port, password, *, cleanup_per_side=False):
     directory = run/'corpus'/case['area']/case['id']
     directory.mkdir(parents=True, exist_ok=False)
     script = corpus.generate_script(case)
@@ -118,33 +130,53 @@ def run_corpus_case(engine, client, client_pin, case, available, reason, data, r
         if case['expect'] != 'untested':
             item['reason'] = reason if not available else 'client has no session runner'
     else:
-        outputs = {}
-        for side, host, dest_port in [('pg',pg_host,5432), ('giggles','host.docker.internal',port)]:
-            name = engine.prefix+'c-'+str(len(engine.containers))
-            result = runner(engine,client_pin,network,name,host,dest_port,script,120,client_env={'PGAPPNAME':'r0:corpus:'+case['area']+'/'+case['id']})
-            outputs[side] = result
+        sides = [('pg',pg_host,5432), ('giggles','host.docker.internal',port)]
+        outputs, cleanup = {}, {}
+
+        def execute(side, host, dest_port, sql, phase):
+            name = (engine.prefix+'corpus-'+case['id']+'-'+side+'-'+phase if cleanup_per_side
+                    else engine.prefix+'c-'+str(len(engine.containers)))
+            return runner(engine,client_pin,network,name,host,dest_port,sql,120,
+                          client_env={'PGAPPNAME':f"r0:{phase}:{case['area']}/{case['id']}"})
+
+        def save_output(side, output, suffix=''):
             for stream in ('stdout','stderr'):
-                (directory/f'{side}.{stream}.txt').write_text(util.redact(result[stream],[password]),encoding='utf-8')
-        cleanup = {}
-        try:
-            cleanup_script = corpus.generate_cleanup_script(case)
-            if cleanup_script is not None:
-                (directory/'cleanup.sql').write_text(cleanup_script, encoding='utf-8')
-        except Exception as exc:
-            cleanup_script = None
-            cleanup = {side: {'error': str(exc)} for side in ('pg', 'giggles')}
-        if cleanup_script is not None:
-            for side, host, dest_port in [('pg',pg_host,5432), ('giggles','host.docker.internal',port)]:
-                try:
-                    name = engine.prefix+'c-'+str(len(engine.containers))
-                    result = runner(engine,client_pin,network,name,host,dest_port,cleanup_script,120,
-                                    client_env={'PGAPPNAME':'r0:cleanup:'+case['area']+'/'+case['id']})
-                    cleanup[side] = dict(exit=result['exit'] if result['exit'] is not None else -1,
-                                         timed_out=bool(result['timed_out']))
-                    for stream in ('stdout','stderr'):
-                        (directory/f'{side}.cleanup.{stream}.txt').write_text(util.redact(result[stream],[password]),encoding='utf-8')
-                except Exception as exc:
-                    cleanup[side] = {'error': str(exc)}
+                (directory/f'{side}{suffix}.{stream}.txt').write_text(
+                    util.redact(output[stream],[password]),encoding='utf-8')
+
+        def prepare_cleanup():
+            try:
+                sql = corpus.generate_cleanup_script(case)
+                if sql is not None:
+                    (directory/'cleanup.sql').write_text(sql, encoding='utf-8')
+                return sql
+            except Exception as exc:
+                cleanup.update({side: {'error': str(exc)} for side, _, _ in sides})
+                return None
+
+        def clean(side, host, dest_port, sql):
+            if sql is None:
+                return
+            try:
+                result = execute(side, host, dest_port, sql, 'cleanup')
+                cleanup[side] = dict(exit=result['exit'] if result['exit'] is not None else -1,
+                                     timed_out=bool(result['timed_out']))
+                save_output(side, result, '.cleanup')
+            except Exception as exc:
+                cleanup[side] = {'error': str(exc)}
+
+        cleanup_script = prepare_cleanup() if cleanup_per_side else None
+        for side, host, dest_port in sides:
+            outputs[side] = execute(side, host, dest_port, script, 'corpus')
+            if cleanup_per_side:
+                clean(side, host, dest_port, cleanup_script)
+            save_output(side, outputs[side])
+        if not cleanup_per_side:
+            # Preserve the invocation order for standalone callers of this helper.
+            cleanup_script = prepare_cleanup()
+            for side, host, dest_port in sides:
+                clean(side, host, dest_port, cleanup_script)
+
         transcripts = {}
         for side, output in outputs.items():
             transcript = corpus.parse_transcript(output['stdout'], case['statements'], side, output['stderr'])
@@ -165,6 +197,51 @@ def run_corpus_case(engine, client, client_pin, case, available, reason, data, r
     summary_keys = ('area','id','title','owner','expect','reason','outcome','compare','source',
                     'first_divergence','warnings','stale_expectation','row_counts','artifact_dir','harness_errors','cleanup','sqlstate_pin_failures')
     data['differential']['cases'].append({key:item.get(key) for key in summary_keys})
+
+
+def run_corpus(engine, client, client_pin, cases, available, data, run,
+               network, pg_host, port, password, jobs):
+    parallel, serial, reasons = [], [], {}
+    for case in cases:
+        alone, reason = corpus.needs_serial(case)
+        if alone or jobs == 1:
+            serial.append(case)
+            reasons[case['id']] = reason or '--jobs 1'
+        else:
+            parallel.append(case)
+    data['differential']['schedule'] = dict(jobs=jobs, parallel=[case['id'] for case in parallel],
+                                            serial=[case['id'] for case in serial], reasons=reasons)
+
+    def execute(case):
+        # Workers own their report data. Only the calling thread publishes results.
+        local = dict(networking={}, differential=dict(cases=[]))
+        run_corpus_case(engine, client, client_pin, case, available, 'client unavailable',
+                        local, run, network, pg_host, port, password, cleanup_per_side=True)
+        return local
+
+    completed = {}
+    try:
+        if parallel:
+            pool = ThreadPoolExecutor(max_workers=jobs)
+            try:
+                futures = {pool.submit(execute, case): case['id'] for case in parallel}
+                for future in as_completed(futures):
+                    completed[futures[future]] = future.result()
+            except BaseException:
+                # Stop active execs before waiting for workers on interruption.
+                engine.close_corpus_client()
+                raise
+            finally:
+                pool.shutdown(cancel_futures=True)
+        for case in serial:
+            completed[case['id']] = execute(case)
+    finally:
+        for case in cases:
+            if case['id'] in completed:
+                local = completed[case['id']]
+                data['differential']['cases'].extend(local['differential']['cases'])
+                data['networking'].update(local['networking'])
+
 
 
 def run_probe_client(engine, client, registration, args, data, run, network, pg_host, port, password):
@@ -332,14 +409,23 @@ def _run(args, capture):
                 run_check(engine, client, client_pin, check, available, unavailable_reason, args, data, run, network, pg_host, port, password)
         if cases:
             client = next((name for name in selected if psql_client.REGISTRY[name].get('run_session')), selected[0])
-            for case in cases:
-                run_corpus_case(engine, client, pinned['clients'].get(client), case, data['clients'][client]['available'], 'client unavailable', data, run, network, pg_host, port, password)
+            run_corpus(engine, client, pinned['clients'].get(client), cases,
+                       data['clients'][client]['available'], data, run, network, pg_host, port,
+                       password, args.jobs)
+        else:
+            data['differential']['schedule'] = dict(jobs=args.jobs, parallel=[], serial=[], reasons={})
     except (Exception, KeyboardInterrupt) as exc:
         infra = True
         if isinstance(exc, gigglesdb.BuildError):
             data['build'].update(exc.metadata)
         data['error'] = util.redact(str(exc) or type(exc).__name__, [password])
     finally:
+        # The exec client is transient even when --keep retains the oracle.
+        try:
+            engine.close_corpus_client()
+        except Exception as exc:
+            infra = True
+            data['cleanup_error'] = util.redact(str(exc), [password])
         if server:
             try:
                 server.stop()

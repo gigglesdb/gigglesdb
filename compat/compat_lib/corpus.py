@@ -186,6 +186,107 @@ def _cleanup_tokens(sql):
     return tokens
 
 
+_SERIAL_AREAS = frozenset({'pg_limits', 'pg_roles', 'pg_txn', 'known_gaps', 'session',
+                           'transactions', 'datagrip'})
+_GLOBAL_SQL = re.compile(
+    r'\b(?:ROLE|USER|GRANT|REVOKE|OWNER|AUTHORIZATION|ALTER\s+(?:SYSTEM|DATABASE)|'
+    r'(?:CREATE|DROP)\s+DATABASE|SCHEMA|search_path|EXTENSION|TABLESPACE|PUBLICATION|'
+    r'SUBSCRIPTION|pg_(?:try_)?advisory\w*|LISTEN|NOTIFY|UNLISTEN|SET\s+SESSION|'
+    r'RESET\s+ALL|DISCARD|LOCK|(?:PREPARE|COMMIT|ROLLBACK)\s+(?:TRANSACTION|PREPARED)|'
+    r'nextval|currval|setval|lastval|pg_sequence\w*|pg_catalog|information_schema|'
+    r'pg_(?:class|namespace|attribute|type|proc|tables|views|indexes|stat|locks|settings|'
+    r'roles|authid|database|constraint|depend|index|trigger|description|rewrite|inherits)\w*|'
+    r'current_setting|set_config|pg_backend_pid|(?:pg_)?(?:txid|xid8?)\w*|pg_\w*xact\w*|'
+    r'xmin|xmax|tableoid|(?:current|session)_(?:user|role|schema)|(?:to_)?reg(?:class|type|'
+    r'namespace|proc|procedure|role|collation|oper|operator)|pg_get_\w*|pg_\w*is_visible|'
+    r'has_\w*privilege|pg_(?:cancel_backend|terminate_backend|reload_conf|rotate_logfile)|'
+    r'VACUUM|ANALYZE|CHECKPOINT|CLUSTER|REINDEX)\b', re.I)
+_IDENTIFIER = r'(?:"(?:[^"]|"")*"|[A-Za-z_\u0080-\uffff][\w$]*)'
+_OBJECT = rf'(?:{_IDENTIFIER}\s*\.\s*)*({_IDENTIFIER})(?=\s|$)'
+_LOCAL_CREATE = re.compile(
+    rf'^CREATE\s+(?:(?:OR\s+REPLACE|TEMP|TEMPORARY|UNLOGGED|UNIQUE)\s+)*'
+    rf'(TABLE|INDEX|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?{_OBJECT}', re.I)
+_LOCAL_DROP = re.compile(
+    rf'^DROP\s+(?:TABLE|INDEX|VIEW)\s+(?:IF\s+EXISTS\s+)?{_OBJECT}(?:\s+RESTRICT)?\s*;$',
+    re.I)
+_WRITE_TARGET = re.compile(
+    rf'^(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|MERGE\s+INTO)\s+(?:ONLY\s+)?{_OBJECT}', re.I)
+_READ_TARGET = re.compile(rf'\b(FROM|JOIN|REFERENCES|PARTITION\s+OF)\s+(?:ONLY\s+)?{_OBJECT}', re.I)
+_NAMED_INDEX_CONSTRAINT = re.compile(rf'\bCONSTRAINT\s+{_OBJECT}\s+(?:PRIMARY\s+KEY|UNIQUE|EXCLUDE)\b', re.I)
+_LOCAL_STATEMENTS = frozenset({'SELECT', 'VALUES', 'WITH', 'INSERT', 'UPDATE', 'DELETE', 'MERGE',
+                               'TABLE', 'COPY', 'SET', 'RESET', 'SHOW', 'BEGIN', 'COMMIT',
+                               'END', 'ROLLBACK', 'SAVEPOINT', 'RELEASE'})
+
+
+def needs_serial(case):
+    """Return whether this case must run alone and the first reason."""
+    if case['area'] in _SERIAL_AREAS:
+        return True, 'area ' + case['area']
+
+    case_id = case['id'].casefold()
+    for statement in case['statements']:
+        tokens = _cleanup_tokens(statement['sql'])
+        code = ' '.join(tokens)
+        command = tokens[0].upper() if tokens else ''
+        keyword = _GLOBAL_SQL.search(code) or _GLOBAL_SQL.search(statement['sql'])
+        if keyword:
+            return True, 'SQL mentions ' + keyword[0]
+        for target in _READ_TARGET.finditer(code):
+            if command == 'COPY' and target[2].upper() == 'STDIN':
+                continue
+            if target[1].upper() in ('FROM', 'JOIN') and code[target.end():].lstrip().startswith('('):
+                continue  # A table-valued function; global functions are checked above.
+            if case_id not in target[2].casefold():
+                return True, 'relation ' + target[2] + ' is outside the case'
+        if command == 'TABLE' and case_id not in code[6:].casefold():
+            return True, 'TABLE target is outside the case'
+        if re.search(r'\bWITH\b.*\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|MERGE\s+INTO)\b', code, re.I):
+            if command in ('WITH', 'SELECT', 'CREATE', 'COPY'):
+                return True, 'WITH may write outside the case'
+        if command in ('CREATE', 'DROP'):
+            if command == 'CREATE':
+                create = _LOCAL_CREATE.match(code)
+                if create and case_id in create[2].casefold():
+                    if create[1].upper() == 'INDEX':
+                        target = re.match(rf'\s+ON\s+(?:ONLY\s+)?{_OBJECT}', code[create.end():], re.I)
+                        if not target or case_id not in target[1].casefold():
+                            return True, 'index target is outside the case'
+                    for constraint in _NAMED_INDEX_CONSTRAINT.finditer(code):
+                        if case_id not in constraint[1].casefold():
+                            return True, 'index constraint name is outside the case'
+                    continue
+            else:
+                drop = _LOCAL_DROP.match(code)
+                if drop and case_id in drop[1].casefold():
+                    continue
+            return True, command + ' may affect objects outside the case'
+        if command == 'COPY':
+            depth = 0
+            for token, next_token in zip(tokens, tokens[1:]):
+                if token == '(':
+                    depth += 1
+                elif token == ')':
+                    depth -= 1
+                elif depth == 0 and token.upper() in ('FROM', 'TO'):
+                    if (token.upper(), next_token.upper()) not in (('FROM', 'STDIN'), ('TO', 'STDOUT')):
+                        return True, 'COPY uses a server file or program'
+                    break
+            else:
+                return True, 'unclassified COPY destination'
+            target = re.match(rf'^COPY\s+{_OBJECT}', code, re.I)
+            if target and case_id not in target[1].casefold():
+                return True, 'COPY target is outside the case'
+        if command in ('INSERT', 'UPDATE', 'DELETE', 'MERGE'):
+            target = _WRITE_TARGET.match(code)
+            if not target or case_id not in target[1].casefold():
+                return True, 'write target is outside the case'
+        if command in ('SELECT', 'WITH') and re.search(r'\bINTO\b', code, re.I):
+            return True, 'SELECT INTO may create objects'
+        if command not in _LOCAL_STATEMENTS:
+            return True, 'unclassified SQL command ' + command
+    return False, None
+
+
 def cleanup_tables(case):
     """Return only corpus-owned table names, newest creation/rename first."""
     def identifier(token):

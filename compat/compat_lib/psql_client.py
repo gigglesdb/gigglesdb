@@ -1,6 +1,7 @@
 from .pins import reference
 from .checks import validate_env
 from . import pgdump
+from .docker import Docker
 
 def _execute(docker, pin, network, name, host, port, sql, timeout, options, client_env=None):
     environment = [arg for key,value in validate_env(client_env or {}).items() for arg in ('-e',key+'='+value)]
@@ -21,8 +22,26 @@ def run(docker, pin, network, name, host, port, sql, timeout, client_env=None):
 
 def run_session(docker, pin, network, name, host, port, sql, timeout=120, client_env=None):
     """Keep one psql session for a marked corpus script, including command tags."""
-    return _execute(docker, pin, network, name, host, port, sql, timeout,
-                    ('-v', 'ON_ERROR_STOP=0'), client_env)
+    options = ('-v', 'ON_ERROR_STOP=0')
+    if not isinstance(docker, Docker):
+        return _execute(docker, pin, network, name, host, port, sql, timeout, options, client_env)
+
+    environment = [arg for key, value in validate_env(client_env or {}).items()
+                   for arg in ('-e', key + '=' + value)]
+    image = reference(pin)
+    container = docker.corpus_client(image, network)
+    result = docker.call('exec','-i',*environment,container,'timeout','-s','KILL',str(timeout),
+                         'psql','-X',*options,'-h',host,'-p',str(port),'-U','postgres',
+                         '-d','postgres','-f','-',input=sql,timeout=timeout+15)
+    # A killed Docker CLI can leave the exec running in the container.
+    error = result['stderr'].lower()
+    if result['timed_out'] or (result['exit'] != 0 and any(
+            phrase in error for phrase in ('no such container', 'is not running', 'is restarting',
+                                           'is marked for removal'))):
+        docker.corpus_client(image, network, replace=container)
+    if result['exit'] in (124, 137):
+        result['timed_out'] = True
+    return result
 
 
 def version(docker, pin, name, timeout):

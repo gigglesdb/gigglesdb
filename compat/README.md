@@ -141,14 +141,28 @@ client startup parameter behavior separately from the remaining checks.
 ## Differential SQL corpus
 
 After client checks, the runner executes `compat/corpus/<area>/<case>.sql` in
-one psql session per case per server, sequentially against the same databases.
-The pinned PostgreSQL image and network are reused. Each server session has a
-120-second deadline. `--corpus '*'` selects case IDs, areas, or area/case paths
-by glob; several globs may be given separated by commas (`--corpus
+one psql session per case per server against the same databases. The harness
+starts one client container from the pinned PostgreSQL image on the run's
+Docker network, invokes each psql session with `docker exec`, and removes the
+client when the run ends. Each server session has a 120-second deadline.
+`--jobs N` defaults to 1 and preserves corpus order. At higher values, the harness
+runs independent cases in parallel and then runs cases with shared state or
+uncertain isolation serially. The serial classification covers sensitive
+areas, roles and session settings, catalog reads, shared objects, and server
+files and programs. The report preserves corpus order and records the split
+and reasons in `differential.schedule`.
+
+`--corpus '*'` selects case IDs, areas, or area/case paths by glob; several
+globs may be given separated by commas (`--corpus
 'case_a,case_b,pg_types/interval_*'`), and a glob starting with `!` excludes
 (`--corpus '!pg_types,!pg_ddl'` runs every other area). IDs are checked
-globally for duplicates before filtering. `--no-corpus` skips this stage; `--no-checks` runs the corpus
-without client checks.
+globally for duplicates before filtering. `--no-corpus` skips this stage;
+`--no-checks` runs the corpus without client checks.
+
+Timing on the GD-0092 development machine (991 cases, debug server, the same
+binary): one `docker run --rm` client per psql invocation took 2 h 23 min;
+the exec client takes 11.6 min with `--jobs 1` and 9.5 min with `--jobs 4`
+(497 cases parallel, 494 serial), all three with identical per-case outcomes.
 
 Cases require `-- case: safe_unique_id`, `-- title: ...`, and `-- owner: A`
 headers. Optional `-- expect: compatible` is the default; `-- expect: intentional
@@ -165,7 +179,7 @@ and semicolons inside single quotes, double quotes, or dollar quotes are handled
 trailing line comments are recognized.
 psql metacommands in corpus source are forbidden.
 
-Corpus `r0c_*` tables are dropped on both sides after each case. Cleanup output and status are recorded as artifacts and metadata, but are not compared.
+Corpus `r0c_*` tables are dropped on each side after its case session. Cleanup output and status are recorded as artifacts and metadata, but are not compared.
 
 Give corpus setup tables a primary key so setup succeeds before the intended
 feature is exercised. Preserve feature-specific key definitions: the
@@ -212,14 +226,23 @@ A lead or worker checks only its own cases against a lane build:
 
 ```bash
 cd <lane worktree>    # run the harness from the lane, not the shared checkout
-python -I -B compat/harness.py run --server-bin <lane target>/debug/giggles-server.exe   --no-checks --keep-scratch --corpus 'case_a,case_b,case_c'   --out-root J:/gigglesdb-work/pgparity/gap2/runs/<lane>   --cargo-target <lane target>
+python -I -B compat/harness.py run --server-bin <lane target>/debug/giggles-server.exe \
+  --no-checks --keep-scratch --corpus 'case_a,case_b,case_c' --jobs 4 \
+  --out-root J:/gigglesdb-work/pgparity/gap2/runs/<lane> \
+  --cargo-target <lane target>
 ```
+
+Use `--jobs N` to run independent cases from the selection concurrently. The
+default is 1. Both modes reuse one pinned Docker client through `docker exec`.
+With multiple workers, the harness runs shared-state cases and cases with
+uncertain isolation after the parallel batch, following the same classification
+as a full run.
 
 - `--corpus` takes one glob or several separated by commas. Each glob is
   matched against the case id, the area, `area/id`, `area/file.sql` and the
   file path, so ids, whole areas (`pg_types`) and prefixes (`pg_ddl/view_*`)
-  can be mixed; `!glob` excludes. Check the "Differential" table at the end of the output: it
-  lists only the selected cases.
+  can be mixed; `!glob` excludes. Check the "Differential" table at the end
+  of the output: it lists only the selected cases.
 - `--no-checks` skips client, ORM and GUI tool checks; the Docker oracle still
   starts once per run.
 - `--cargo-target` only names where the run lock `.gd-r0-run.lock` lives. Pass
@@ -232,9 +255,9 @@ python -I -B compat/harness.py run --server-bin <lane target>/debug/giggles-serv
   `--keep-scratch` the server's `bin` (a copy of the binary, about 96 MB),
   `data`, `tmp`, `target` and `cwd` directories stay for debugging. Delete the
   run folder when the stack lands.
-- Time: 3 cases took 25 seconds end to end (oracle start, server start, both
-  sides, cleanup) with a built binary and the oracle image present. A whole
-  area takes about 6 seconds per case.
+- Time: about 20 seconds of fixed cost (oracle and server start), then about
+  0.7 s per case serially. Measured: 3 cases in 23 seconds; the whole
+  `pg_types` area (205 cases) in 83 seconds with `--jobs 4`.
 
 ## Nightly main measurement
 
@@ -242,33 +265,30 @@ python -I -B compat/harness.py run --server-bin <lane target>/debug/giggles-serv
 bash K:/Projects/gigglesdb/scripts/pgparity-nightly.sh
 ```
 
-Where one task may run at most two hours (agent background tasks), run the two
-halves as two tasks, one after the other:
-
-```bash
-bash K:/Projects/gigglesdb/scripts/pgparity-nightly.sh --half a   # pg_types, pg_functions, pg_queries, pg_silent
-bash K:/Projects/gigglesdb/scripts/pgparity-nightly.sh --half b   # every other area
-```
+The whole corpus takes about 10 minutes with the default `--jobs 4`.
+`--half a` (pg_types, pg_functions, pg_queries, pg_silent) and `--half b`
+(every other area) still split it into two invocations when needed.
 
 The script resolves `main` once, builds a debug `giggles-server` through the
 build-slot wrapper in the stable worktree `J:/gigglesdb-work/wt/pgp-nightly`
 and target `J:/gigglesdb-work/pgparity/gap2/nightly-target` (sccache hits need
-both to stay the same), runs the corpus with `--no-checks --keep-scratch` in two
-halves split by area (`--half a|b|all`, default all) and writes
+both to stay the same), runs the corpus with `--no-checks --keep-scratch`
+(`--half full|a|b|all`, default full: one run of the whole corpus), passes
+`--jobs N` (default 4), and writes
 `J:/gigglesdb-work/pgparity/gap2/nightly/<UTC date>-<sha12>/`: `build.log`,
 `timings`, `harness-<half>.log`, `part-<half>/r0-*/report.json` with the
-per-case transcripts, `report.json` (the halves merged with `harness.py
-merge`), `areas.md` (per-area outcome counts and the COMPATIBLE change),
+per-case transcripts, `report.json` (the whole run, or the halves merged with
+`harness.py merge`), `areas.md` (per-area outcome counts and the COMPATIBLE change),
 `delta.md` (`harness.py delta` against the previous run) and `SUMMARY.md`.
 A half that already has a report for this commit is skipped, and whichever
 invocation completes the pair merges and reports.
 `nightly/LATEST` names the newest report; the next run compares against it, or
 against `--previous <report.json>`. A commit that already has a run is a no-op
 unless `--force`; `--with-checks` adds the client, ORM and GUI tool checks
-to half a;
+to the full run or half a;
 `--keep-scratch-runs <n>` (default 2) keeps server scratch only for the newest
 runs, while reports, transcripts and logs stay. Exit 0 done, 3 done with
-regressions, 2 failure. A full corpus run takes about 110 minutes.
+regressions, 2 failure.
 
 `watch` is not used for this: it builds without the build-slot wrapper, always
 runs every client check, deletes scratch and writes no per-area table.

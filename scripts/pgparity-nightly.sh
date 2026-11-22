@@ -3,31 +3,33 @@
 #
 # Builds giggles-server (debug, default features) for the current main commit
 # in a stable worktree and target directory, runs the differential corpus
-# against the pinned PostgreSQL oracle with --keep-scratch in two halves split
-# by area, merges the halves, then writes a per-area count table and a delta
-# against the previous nightly run.
+# against the pinned PostgreSQL oracle with --keep-scratch (one run, or two
+# halves split by area and merged), then writes a per-area count table and a
+# delta against the previous nightly run.
 #
 # Usage (the one command to schedule):
 #   bash K:/Projects/gigglesdb/scripts/pgparity-nightly.sh
-# A whole run takes about 110 minutes. Where one task may run at most 2 hours
-# (harness background tasks), run the halves as two tasks, one after the other:
-#   bash K:/Projects/gigglesdb/scripts/pgparity-nightly.sh --half a
-#   bash K:/Projects/gigglesdb/scripts/pgparity-nightly.sh --half b
-# The half that completes the pair merges and reports. Never start either with
-# a trailing & in a foreground shell.
+# The whole corpus (991 cases) takes about 10 minutes with --jobs 4 (12 with
+# --jobs 1); the build adds under a minute when sccache is warm. Never start it
+# with a trailing & in a foreground shell.
 # Options:
-#   --half a|b|all            a: pg_types,pg_functions,pg_queries,pg_silent;
-#                             b: every other area; all (default): a then b
+#   --half full|a|b|all       full (default): one run of the whole corpus;
+#                             a: pg_types,pg_functions,pg_queries,pg_silent;
+#                             b: every other area; all: a then b. The half that
+#                             completes the a/b pair merges and reports.
+#   --jobs N                  parallel corpus workers (default 4)
 #   --previous <report.json>  compare against this report instead of LATEST
-#   --with-checks             also run the client, ORM and GUI tool checks (half a)
+#   --with-checks             also run the client, ORM and GUI tool checks
+#                             (with full or half a)
 #   --force                   measure again even if this commit already has a run
 #   --keep-scratch-runs <n>   keep server scratch of the newest n runs (default 2)
 #   --out-base / --worktree / --target   override the stable locations below
 #
 # Output: <out-base>/<UTC date>-<sha12>/
-#   build.log, harness-<half>.log, part-<half>/r0-*/report.json (+ corpus/<area>/
-#   <id>/ transcripts and kept scratch), report.json (merged), areas.md,
-#   delta.md, SUMMARY.md. <out-base>/LATEST holds the newest merged report.
+#   build.log, harness-<part>.log, part-<part>/r0-*/report.json (+ corpus/<area>/
+#   <id>/ transcripts and kept scratch), report.json (the whole run, or the
+#   halves merged), areas.md, delta.md, SUMMARY.md. <out-base>/LATEST holds the
+#   newest report.json.
 # Exit: 0 done (or half done, or already measured), 3 done with regressions,
 #   2 failure.
 set -euo pipefail
@@ -40,10 +42,16 @@ target=J:/gigglesdb-work/pgparity/gap2/nightly-target
 buildslot=J:/gigglesdb-work/r2/buildslot2.sh
 half_a='pg_types,pg_functions,pg_queries,pg_silent'
 half_b='!pg_types,!pg_functions,!pg_queries,!pg_silent'
-half=all previous='' checks=0 force=0 keep_runs=2
+half=full jobs=4 previous='' checks=0 force=0 keep_runs=2
 while [ $# -gt 0 ]; do
   case "$1" in
     --half) half=$2; shift 2 ;;
+    --jobs)
+      jobs=${2:-}
+      if ! [[ $jobs =~ ^[0-9]+$ && $jobs =~ [1-9] ]]; then
+        echo "nightly: --jobs must be an integer >= 1" >&2; exit 2
+      fi
+      shift 2 ;;
     --previous) previous=$2; shift 2 ;;
     --with-checks) checks=1; shift ;;
     --force) force=1; shift ;;
@@ -54,8 +62,8 @@ while [ $# -gt 0 ]; do
     *) sed -n '2,32p' "$0" >&2; exit 2 ;;
   esac
 done
-case "$half" in a) halves=(a) ;; b) halves=(b) ;; all) halves=(a b) ;;
-  *) echo "nightly: --half must be a, b or all" >&2; exit 2 ;; esac
+case "$half" in full) halves=(full) ;; a) halves=(a) ;; b) halves=(b) ;; all) halves=(a b) ;;
+  *) echo "nightly: --half must be full, a, b or all" >&2; exit 2 ;; esac
 mkdir -p "$out_base"
 
 # One nightly at a time; reclaim a lock whose owner process is gone.
@@ -115,8 +123,8 @@ part_report() { ls -d "$run_dir/part-$1"/r0-*/report.json 2>/dev/null | head -1 
 for h in "${halves[@]}"; do
   if [ -n "$(part_report "$h")" ]; then echo "nightly: half $h already done"; continue; fi
   rm -rf "$run_dir/part-$h"
-  if [ "$h" = a ]; then corpus=$half_a; else corpus=$half_b; fi
-  harness_args=(run --server-bin "$server" --commit "$sha" --keep-scratch --corpus "$corpus"
+  case "$h" in full) corpus='*' ;; a) corpus=$half_a ;; *) corpus=$half_b ;; esac
+  harness_args=(run --server-bin "$server" --commit "$sha" --keep-scratch --corpus "$corpus" --jobs "$jobs"
     --out-root "$run_dir/part-$h" --cargo-target "$target")
   if [ $checks -eq 0 ] || [ "$h" = b ]; then harness_args+=(--no-checks); fi
   run_start=$SECONDS
@@ -137,15 +145,19 @@ for h in "${halves[@]}"; do
   fi
 done
 
-report_a=$(part_report a); report_b=$(part_report b)
-if [ -z "$report_a" ] || [ -z "$report_b" ]; then
+report_full=$(part_report full); report_a=$(part_report a); report_b=$(part_report b)
+if [ -n "$report_full" ]; then
+  parts=("$report_full")
+elif [ -n "$report_a" ] && [ -n "$report_b" ]; then
+  parts=("$report_a" "$report_b")
+else
   if [ -z "$report_a" ]; then other=a; else other=b; fi
   echo "nightly: half done; run --half $other to finish $run_dir"
   rm -rf "$run_dir/tmp"; exit 0
 fi
 
 report=$run_dir/report.json
-python -I -B "$tools" merge "$report_a" "$report_b" --out "$report" > /dev/null
+python -I -B "$tools" merge "${parts[@]}" --out "$report" > /dev/null
 if [ -z "$previous" ] && [ -f "$out_base/LATEST" ]; then previous=$(cat "$out_base/LATEST"); fi
 area_args=(areas "$report" --out "$run_dir/areas.md")
 if [ -n "$previous" ]; then area_args+=(--previous "$previous"); fi
@@ -165,7 +177,7 @@ fi
   echo "- commit: $sha"
   echo "- started: $(cat "$run_dir/started"); finished: $(date -u +%FT%TZ)"
   echo "- timings: $(tr '\n' ';' < "$run_dir/timings")"
-  echo "- report: $report (merged from $report_a and $report_b)"
+  echo "- report: $report (from ${parts[*]})"
   echo "- previous: ${previous:-none}"
   if [ -n "$previous" ]; then
     if [ $delta_rc -eq 3 ]; then verdict=REGRESSIONS; else verdict='no regressions'; fi
