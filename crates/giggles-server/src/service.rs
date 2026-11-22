@@ -4647,6 +4647,10 @@ mod lifecycle_tests {
     }
     use std::time::{SystemTime, UNIX_EPOCH};
     fn fixture() -> (Arc<Service>, Vec<Binding>) {
+        fixture_with_engine(giggles_core::Engine::Legacy)
+    }
+
+    fn fixture_with_engine(engine: giggles_core::Engine) -> (Arc<Service>, Vec<Binding>) {
         let path = crate::test_support::fixture_root().join(format!(
             "binding-unit-{}-{}",
             std::process::id(),
@@ -4657,7 +4661,7 @@ mod lifecycle_tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         println!("retained_fixture={}", path.display());
-        let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+        let admin = Admin::create_engine(path.join("db.redb"), Limits::default(), engine).unwrap();
         admin
             .sql_session()
             .execute("CREATE TABLE app (id BIGINT PRIMARY KEY)", &[], None)
@@ -5118,7 +5122,11 @@ mod lifecycle_tests {
         assert!(session.transaction_us.is_none());
     }
     fn database_binding_fixture() -> (Arc<Service>, Vec<Binding>) {
-        let (service, mut bindings) = fixture();
+        database_binding_fixture_with_engine(giggles_core::Engine::Legacy)
+    }
+
+    fn database_binding_fixture_with_engine(engine: giggles_core::Engine) -> (Arc<Service>, Vec<Binding>) {
+        let (service, mut bindings) = fixture_with_engine(engine);
         service.admin.roles().create(roles::NewRole {
             name: "bound".into(), login: true, superuser: true,
             ..roles::NewRole::default()
@@ -5135,13 +5143,23 @@ mod lifecycle_tests {
         let service = credential_fixture();
         let session = service.role_session("incident_controller").unwrap();
         service.admin.roles().set_task_only("incident_controller", true).unwrap();
-        assert!(session.check_binding_reference().is_err());
-        assert!(service.check_native_identity(&session.role, session.epoch,
-            session.role_fence, &session.fingerprint, false).is_err());
+        let reference = session.check_binding_reference();
+        assert_eq!(reference, Err(CoreError::Policy(Error::Authentication)));
+        assert_eq!(
+            service.check_native_identity(
+                &session.role, session.epoch, session.role_fence, &session.fingerprint, false,
+            ),
+            reference,
+        );
     }
     #[test]
     fn native_identity_equivalence_matrix() {
-        let (service, bindings) = database_binding_fixture();
+        let engine = if cfg!(feature = "engine-rocksdb") {
+            giggles_core::Engine::V2
+        } else {
+            giggles_core::Engine::Legacy
+        };
+        let (service, bindings) = database_binding_fixture_with_engine(engine);
         let fp = &bindings[0].fingerprint;
         let role = bindings[0].role.clone();
         let catalog = service.admin.roles().get("bound").unwrap().unwrap();
@@ -5149,7 +5167,10 @@ mod lifecycle_tests {
         let fences = [None, Some((catalog.oid, catalog.generation)),
             Some((catalog.oid + 1, catalog.generation)), Some((catalog.oid, catalog.generation + 10))];
         let mut cases = 0;
-        for state in ["normal", "missing", "nologin", "generation", "alias"] {
+        let states = ["normal", "missing", "nologin", "generation", "alias"];
+        #[cfg(feature = "engine-rocksdb")]
+        let states = states.into_iter().chain(["task_only"]);
+        for state in states {
             // Restore the role for each row without depending on its allocated oid.
             let roles = service.admin.roles();
             if roles.get("bound").unwrap().is_none() {
@@ -5162,6 +5183,7 @@ mod lifecycle_tests {
                 "missing" => roles.drop("bound").unwrap(),
                 "nologin" => { roles.alter("bound", roles::RoleChanges { login: Some(false), ..Default::default() }).unwrap(); }
                 "generation" | "alias" => { roles.alter("bound", roles::RoleChanges { superuser: Some(false), ..Default::default() }).unwrap(); }
+                "task_only" => { roles.set_task_only("bound", true).unwrap(); }
                 _ => {}
             }
             service.update_password_generations(&mut service.password_generations.lock().unwrap(), |aliases| {
@@ -5187,8 +5209,8 @@ mod lifecycle_tests {
                 drop(map);
                 for fence in &all_fences {
                     for bound in [false, true] {
-                        let old = service.native_identity_reference(&role, entry.1, *fence, fp, bound).is_ok();
-                        let new = service.check_native_identity(&role, entry.1, *fence, fp, bound).is_ok();
+                        let old = service.native_identity_reference(&role, entry.1, *fence, fp, bound);
+                        let new = service.check_native_identity(&role, entry.1, *fence, fp, bound);
                         assert_eq!(new, old, "{state} {fence:?} bound={bound}");
                         cases += 1;
                     }
@@ -5198,10 +5220,10 @@ mod lifecycle_tests {
         // Non-database roles must ignore role fences and still check bindings.
         let app = Role::Application { domain: "test".into(), tables: BTreeSet::new() };
         service.bindings.lock().unwrap().entries.insert(fp.clone(), (app.clone(), entry.1));
-        let mut session = service.session(fp).unwrap();
-        session.role_fence = fences[2];
-        assert_eq!(service.check_native_identity(&app, entry.1, fences[2], fp, true).is_ok(),
-            session.check_binding_reference().is_ok());
+        assert_eq!(
+            service.check_native_identity(&app, entry.1, fences[2], fp, true),
+            service.native_identity_reference(&app, entry.1, fences[2], fp, true),
+        );
         assert!(service.check_native_identity(&app, entry.1 + 1, None, fp, true).is_err());
         assert!(cases >= 250);
         let owner = crate::api::ConnectionIdentity::verified(&service, fp).unwrap();
@@ -5209,9 +5231,36 @@ mod lifecycle_tests {
             let _guard = service.bindings.lock().unwrap();
             panic!("poison bindings for fail-closed equivalence");
         }));
-        assert!(service.session(fp).is_err());
-        assert!(service.check_native_identity(&app, entry.1, None, fp, true).is_err());
+        let reference = service.native_identity_reference(&app, entry.1, None, fp, true);
+        assert_eq!(reference, Err(CoreError::Fenced));
+        assert_eq!(service.check_native_identity(&app, entry.1, None, fp, true), reference);
         assert_eq!(owner.check(&service), Err(crate::api::error::ApiError::Unauthenticated));
+
+        let (service, bindings) = database_binding_fixture();
+        let fp = &bindings[0].fingerprint;
+        let session = service.session(fp).unwrap();
+        service.admin.set_crash_point(giggles_core::CrashPoint::ErrorBeforeCommit).unwrap();
+        assert_eq!(
+            service.admin.sql_session().execute("CREATE TABLE fence_probe (id int)", &[], None),
+            Err(CoreError::Storage("injected before commit".into())),
+        );
+        assert!(matches!(
+            service.admin.roles().get("bound"),
+            Err(roles::RoleError::Core(CoreError::Fenced)),
+        ));
+        for bound in [false, true] {
+            let reference = service.native_identity_reference(
+                &session.role, session.epoch, session.role_fence, fp, bound,
+            );
+            assert_eq!(reference, Err(CoreError::Policy(Error::Authentication)));
+            assert_eq!(
+                service.check_native_identity(
+                    &session.role, session.epoch, session.role_fence, fp, bound,
+                ),
+                reference,
+                "fenced catalog, bound={bound}",
+            );
+        }
     }
     #[test]
     fn native_identity_rechecks_committed_role_changes() {
@@ -5241,6 +5290,63 @@ mod lifecycle_tests {
 
         roles.drop("bound").unwrap();
         assert_eq!(check(None), denied);
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn native_identity_rechecks_committed_role_changes_v2() {
+        let (service, bindings) = database_binding_fixture_with_engine(giggles_core::Engine::V2);
+        let fp = &bindings[0].fingerprint;
+        let session = service.session(fp).unwrap();
+        let role = &session.role;
+        let roles = service.admin.roles();
+        let denied = Err(CoreError::Policy(Error::Authentication));
+        let check_bound = |epoch, fence| service.check_native_identity(role, epoch, fence, fp, true);
+        let check_unbound = || service.check_native_identity(role, 0, None, "", false);
+        let fence_of = |role: roles::CatalogRole| Some((role.oid, role.generation));
+
+        // Warm the image through the same check used after each commit.
+        assert_eq!(check_bound(session.epoch, session.role_fence), Ok(()));
+        assert_eq!(check_unbound(), Ok(()));
+        roles.alter("bound", roles::RoleChanges {
+            login: Some(false), ..Default::default()
+        }).unwrap();
+        assert_eq!(check_bound(session.epoch, session.role_fence), denied);
+        assert_eq!(check_unbound(), denied);
+
+        let restored = roles.alter("bound", roles::RoleChanges {
+            login: Some(true), ..Default::default()
+        }).unwrap();
+        assert_eq!(check_unbound(), Ok(()));
+        let restored_fence = fence_of(restored);
+        assert_eq!(check_bound(session.epoch, restored_fence), Ok(()));
+        assert_eq!(check_bound(session.epoch, session.role_fence), denied);
+
+        let changed = roles.alter("bound", roles::RoleChanges {
+            superuser: Some(false), ..Default::default()
+        }).unwrap();
+        assert_eq!(check_bound(session.epoch, restored_fence), denied);
+        let current_fence = fence_of(changed);
+        assert_eq!(check_bound(session.epoch, current_fence), Ok(()));
+
+        service.reload_bindings(vec![]).unwrap();
+        assert_eq!(check_bound(session.epoch, current_fence), denied);
+        let new_epoch = service.reload_bindings(bindings.clone()).unwrap();
+        assert_ne!(new_epoch, session.epoch);
+        assert_eq!(check_bound(session.epoch, current_fence), denied);
+        assert_eq!(check_bound(new_epoch, current_fence), Ok(()));
+
+        let task_only = roles.set_task_only("bound", true).unwrap();
+        assert_eq!(check_bound(new_epoch, current_fence), denied);
+        // Use the new generation so only the task-only attribute explains denial.
+        assert_eq!(check_bound(new_epoch, fence_of(task_only)), denied);
+        assert_eq!(check_unbound(), denied);
+        let ordinary = roles.set_task_only("bound", false).unwrap();
+        let ordinary_fence = fence_of(ordinary);
+        assert_eq!(check_bound(new_epoch, ordinary_fence), Ok(()));
+        roles.drop("bound").unwrap();
+        assert_eq!(check_bound(new_epoch, ordinary_fence), denied);
+        assert_eq!(check_unbound(), denied);
     }
     #[test]
     fn database_fingerprint_binding_requires_existing_login_role() {

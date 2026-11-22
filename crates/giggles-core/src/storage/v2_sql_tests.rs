@@ -89,6 +89,7 @@ fn occupancy_uses_the_statement_catalog_image_including_private_unique_ddl() {
 
 #[test]
 fn native_coercion_uses_transaction_private_type_metadata() {
+    use giggles_pg_types::{Numeric, temporal::{ParserSettings, Timestamp}};
     use relational::Value;
 
     let f = Fixture::new();
@@ -96,7 +97,7 @@ fn native_coercion_uses_transaction_private_type_metadata() {
     for sql in [
         "BEGIN",
         "CREATE TYPE mood AS ENUM ('ok')",
-        "CREATE TABLE inputs (id bigint PRIMARY KEY, m mood, c char(3), u uuid)",
+        "CREATE TABLE inputs (id bigint PRIMARY KEY, m mood, c char(3), u uuid, n numeric(4,2), t timestamp(3))",
     ] {
         session.execute(sql, &[], None).unwrap();
     }
@@ -108,31 +109,126 @@ fn native_coercion_uses_transaction_private_type_metadata() {
         Err(CoreError::Sql(SqlError::UnknownTable))
     ));
 
-    // Reference the previous owned metadata path in the same transaction.
-    let owned = f.db().metadata_state(session.v2_transaction.as_ref()).unwrap();
     let text = |s: &str| Value::Text(s.into());
+    let numeric = |s: &str| Value::Numeric(Numeric::parse(s).unwrap());
+    let timestamp = |s: &str| Value::Timestamp(Timestamp::parse(s, &ParserSettings::default()).unwrap());
     for (column, input, expected) in [
-        (1, "ok", Ok(text("ok"))),
-        (1, "other", Err(SqlError::InvalidTextRepresentation)),
-        (2, "x", Ok(text("x  "))),
-        (2, "long", Err(SqlError::StringDataRightTruncation)),
+        (1, text("ok"), Ok(text("ok"))),
+        (1, text("other"), Err(SqlError::InvalidTextRepresentation)),
+        (2, text("x"), Ok(text("x  "))),
+        (2, text("long"), Err(SqlError::StringDataRightTruncation)),
         (
             3,
-            "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11",
+            text("A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11"),
             Ok(text("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")),
         ),
-        (3, "bad uuid", Err(SqlError::InvalidTextRepresentation)),
+        (3, text("bad uuid"), Err(SqlError::InvalidTextRepresentation)),
+        (4, numeric("12.345"), Ok(numeric("12.35"))),
+        (4, numeric("99.995"), Err(SqlError::Overflow)),
+        (
+            5,
+            timestamp("2024-02-29 12:34:56.7896"),
+            Ok(timestamp("2024-02-29 12:34:56.790")),
+        ),
     ] {
         let column = &table.columns[column];
-        let reference = relational::coerce_to_column(&owned.sql, column, text(input));
-        assert_eq!(reference, expected, "{input}");
-        assert_eq!(
-            session.coerce_column_engine(column, text(input)),
-            reference.map_err(CoreError::Sql),
-            "{input}",
-        );
+        assert_native_coercion(&f, &session, column, input, expected.map_err(CoreError::Sql));
     }
     session.execute("ROLLBACK", &[], None).unwrap();
+}
+
+fn assert_native_coercion(
+    f: &Fixture,
+    session: &SqlSession,
+    column: &relational::ColumnDef,
+    input: relational::Value,
+    expected: Result<relational::Value, CoreError>,
+) {
+    let actual = session.coerce_column_engine(column, input.clone());
+    let reference = f.db().metadata_state(session.v2_transaction.as_ref()).and_then(|owned| {
+        relational::coerce_to_column(&owned.sql, column, input.clone()).map_err(CoreError::Sql)
+    });
+    assert_eq!(actual, reference, "column={} input={input:?}", column.name);
+    assert_eq!(reference, expected, "column={} input={input:?}", column.name);
+}
+
+#[test]
+fn native_coercion_respects_isolation_after_committed_typmod_change() {
+    use giggles_pg_types::character::{CharKind, CharTypmod};
+    use relational::Value;
+
+    let f = Fixture::new();
+    f.execute("CREATE TABLE inputs (id bigint PRIMARY KEY, v varchar(3))");
+    let mut rr = f.admin().sql_session();
+    rr.set_isolation(crate::SqlIsolation::RepeatableRead);
+    rr.begin_native().unwrap();
+    let mut rc = f.admin().sql_session();
+    rc.begin_native().unwrap();
+    // BEGIN and metadata inspection alone do not pin the RR snapshot.
+    for reader in [&mut rr, &mut rc] {
+        reader.execute("SELECT 1", &[], None).unwrap();
+        assert!(reader.v2_transaction.as_ref().unwrap().current_snapshot_ts().is_some());
+    }
+    let table = rr.native_table_engine("inputs").unwrap();
+    let column = &table.columns[1];
+    let value = Value::Text("four".into());
+    let too_long = Err(CoreError::Sql(SqlError::StringDataRightTruncation));
+    for session in [&rr, &rc] {
+        assert_native_coercion(&f, session, column, value.clone(), too_long.clone());
+    }
+
+    // Change only the typmod through the catalog DDL transaction so both
+    // sessions can coerce against the same column ID across the commit.
+    let db = f.db();
+    let mut writer = db.begin(Isolation::ReadCommitted);
+    let before = db.catalog().parts(&mut writer).unwrap();
+    let mut after = before.clone();
+    after.ext.columns.get_mut(&column.id).unwrap().typmod =
+        Some(CharTypmod::new(CharKind::Varchar, 5).unwrap().to_typmod());
+    db.catalog()
+        .apply_diff(&mut writer, &before, &after, &(0..0), None, &|| false)
+        .unwrap();
+    db.catalog().commit_ddl(writer).unwrap();
+
+    rr.begin_native_step().unwrap();
+    assert_native_coercion(&f, &rr, column, value.clone(), too_long.clone());
+    assert_native_coercion(&f, &rc, column, value.clone(), too_long);
+    rc.begin_native_step().unwrap();
+    assert_native_coercion(&f, &rc, column, value.clone(), Ok(value));
+    rc.rollback_native().unwrap();
+    rr.rollback_native().unwrap();
+}
+
+#[test]
+fn native_coercion_preserves_kernel_metadata_provenance_error() {
+    use crate::storage::{Metadata, encode};
+    use relational::Value;
+
+    let f = Fixture::new();
+    f.execute("CREATE TABLE inputs (id bigint PRIMARY KEY)");
+    let session = f.admin().sql_session();
+    let table = session.native_table_engine("inputs").unwrap();
+    let column = &table.columns[0];
+    let value = Value::Int(1);
+    assert_native_coercion(&f, &session, column, value.clone(), Ok(value.clone()));
+
+    let db = f.db();
+    let metadata = Metadata {
+        format: 4,
+        domain: u128::from_be_bytes(db.meta.domain) ^ 1,
+        schema: 0,
+        last_time: 0,
+        next_approval: 0,
+        origin: Some(77),
+    };
+    let mut writer = db.begin(Isolation::ReadCommitted);
+    writer.put(Keyspace::Kernel, vec![0], encode(&metadata).unwrap()).unwrap();
+    writer.commit().unwrap();
+
+    assert_native_coercion(
+        &f, &session, column, value,
+        Err(CoreError::Corrupt("kernel metadata domain mismatch".into())),
+    );
 }
 
 #[test]

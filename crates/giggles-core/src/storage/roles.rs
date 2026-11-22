@@ -1537,6 +1537,30 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_role_lookup_preserves_corrupt_record_error() {
+        database(|admin, _| {
+            let catalog = admin.roles();
+            catalog.create(new_role("intact")).unwrap();
+            let tx = admin.inner.db(super::super::ROLES).unwrap().begin_write().unwrap();
+            {
+                let mut table = tx.open_table(ROLES).unwrap();
+                table.insert(b"role/corrupt".as_slice(), b"{".as_slice()).unwrap();
+            }
+            tx.commit().unwrap();
+
+            let image = catalog.image().unwrap();
+            assert!(image.get("intact").unwrap().is_some());
+            let owned = image.get("corrupt").unwrap_err();
+            let borrowed = image.with_role("corrupt", |_| panic!("record is corrupt")).unwrap_err();
+            let (RoleError::Core(owned), RoleError::Core(borrowed)) = (owned, borrowed) else {
+                panic!("expected both lookups to return a core error");
+            };
+            assert!(matches!(owned, CoreError::Corrupt(_)));
+            assert_eq!(borrowed, owned);
+        });
+    }
+
+    #[test]
     fn membership_statement_rolls_back_all_pairs() {
         database(|admin, _| {
             let catalog = admin.roles();
