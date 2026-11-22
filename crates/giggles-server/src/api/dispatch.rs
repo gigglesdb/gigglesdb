@@ -11,6 +11,8 @@ pub(crate) use super::stream::{Receiver as SpillChunks, grpc as spill_chunks};
 use crate::{Response, Service, Session, agent::statement::OperationId};
 use giggles_core::{Cancellation, relational::spill::{self, SpilledRows}};
 use prost::Message;
+#[cfg(feature = "test-hooks")]
+use std::sync::atomic::AtomicU8;
 use std::{
     sync::{
         Arc,
@@ -81,6 +83,16 @@ impl ResponseLease {
     }
 }
 
+#[cfg(feature = "test-hooks")]
+const PANIC_IN_STATEMENT: u8 = 1;
+#[cfg(feature = "test-hooks")]
+const PANIC_IN_WORKER: u8 = 2;
+
+pub(crate) struct StatementPanic {
+    #[cfg(feature = "test-hooks")]
+    armed: bool,
+}
+
 struct Job {
     lease: SessionLease,
     request: Invocation,
@@ -91,6 +103,8 @@ struct Job {
     stream: bool,
     ownership: Arc<CallOwnership>,
     reply: oneshot::Sender<Result<Completion, ApiError>>,
+    #[cfg(feature = "test-hooks")]
+    panic_next_request: Arc<AtomicU8>,
     #[cfg(test)]
     hook: Option<tests::WorkerHook>,
 }
@@ -119,6 +133,8 @@ pub struct ApiRuntime {
     supervisor: Mutex<Option<JoinHandle<()>>>,
     #[cfg(feature = "test-hooks")]
     pub(crate) wire_stats: crate::wire::listen::WireStats,
+    #[cfg(feature = "test-hooks")]
+    panic_next_request: Arc<AtomicU8>,
     #[cfg(test)]
     hook: std::sync::Mutex<Option<tests::WorkerHook>>,
 }
@@ -171,6 +187,8 @@ impl ApiRuntime {
         Ok(Arc::new(Self {
             #[cfg(feature = "test-hooks")]
             wire_stats: Default::default(),
+            #[cfg(feature = "test-hooks")]
+            panic_next_request: Default::default(),
             kind,
             role_listener,
             service,
@@ -597,6 +615,8 @@ impl ApiRuntime {
             reply,
             #[cfg(test)]
             hook: self.hook.lock().unwrap().take(),
+            #[cfg(feature = "test-hooks")]
+            panic_next_request: self.panic_next_request.clone(),
         };
         self.jobs.try_send(job).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => ApiError::ResourceExhausted,
@@ -614,6 +634,23 @@ impl ApiRuntime {
     #[cfg(feature = "test-hooks")]
     pub fn test_registry_entry_count(&self) -> usize {
         self.registry.entry_count()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn test_blocking_permits_in_use(&self) -> usize {
+        self.service.blocking.in_use()
+    }
+
+    /// Panic inside the next admitted request's statement execution.
+    #[cfg(feature = "test-hooks")]
+    pub fn test_panic_next_request(&self) {
+        self.panic_next_request.store(PANIC_IN_STATEMENT, Ordering::Relaxed);
+    }
+
+    /// Panic on entry to the next admitted request's blocking worker.
+    #[cfg(feature = "test-hooks")]
+    pub fn test_panic_next_request_worker(&self) {
+        self.panic_next_request.store(PANIC_IN_WORKER, Ordering::Relaxed);
     }
 
     #[cfg(feature = "test-hooks")]
@@ -699,13 +736,7 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
     };
     // GD-0075 R5-103: per-role statement admission before the blocking pool.
     let role = job.lease.session().role.clone();
-    let exempt = job.lease.session().is_aborted() || match &job.request {
-        Invocation::Commit | Invocation::Rollback | Invocation::Savepoint(_)
-        | Invocation::RollbackTo(_) | Invocation::Release(_) => true,
-        Invocation::Legacy(request) => crate::admission::request_exempt(request),
-        _ => false,
-    };
-    let role_permit = if exempt {
+    let role_permit = if role_statement_exempt(job.lease.session(), &job.request) {
         None
     } else { tokio::select! {
         biased;
@@ -713,11 +744,7 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
         admitted = service.admission.statement(&role, Some(&job.context)) => match admitted {
             Ok(permit) => Some(permit),
             Err(refusal) => {
-                let error = match refusal {
-                    crate::admission::StatementRefusal::Core(_) => ApiError::DeadlineExceeded,
-                    _ => ApiError::ResourceExhausted,
-                };
-                let _ = job.reply.send(Err(error));
+                let _ = job.reply.send(Err(statement_refusal(refusal)));
                 return;
             }
         }
@@ -734,7 +761,7 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
         return;
     }
     let Job {
-        mut lease,
+        lease,
         request,
         operation_id,
         context,
@@ -745,6 +772,8 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
         reply,
         #[cfg(test)]
         hook,
+        #[cfg(feature = "test-hooks")]
+        panic_next_request,
     } = job;
     #[cfg(test)]
     let (before, after, finished) = tests::WorkerHook::split(hook);
@@ -758,75 +787,36 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
             if let Some(barrier) = before {
                 barrier.wait();
             }
-            lease.session().connection = Some(ownership.socket.clone());
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                context.scope(|| {
-                    lease.session().authority_scope(|session| {
-                        // GD-0061 R3-310/313/314: a task session releases its rows before
-                        // encoding, so it never takes the streaming path. Agent sessions are
-                        // `Role::Database` with `agent` set (Service::agent_session), so the
-                        // role check alone does not cover them.
-                        let stream = stream
-                            && !session.agent
-                            && session.task().is_none();
-                        #[cfg(feature = "legacy-task")]
-                        let stream = stream && !matches!(session.role, crate::Role::Task { .. });
-                        let (result, spill) = spill::bounded(|| {
-                            if stream {
-                                spill::streaming(|| execute_reply(session, request, operation_id, received, encoding))
-                            } else {
-                                (execute_reply(session, request, operation_id, received, encoding), None)
-                            }
-                        });
-                        Ok(result.and_then(|(mut reply, json)| {
-                            if let Some(rows) = &spill {
-                                if let Some(proto::execute_reply::NativeResult::OperationOutcome(outcome)) = &mut reply.native_result {
-                                    outcome.matched = rows.len();
-                                }
-                                let state = proto::TransactionState::try_from(reply.transaction_state)
-                                    .map_err(|_| ApiError::Internal)?;
-                                let (reply, json) = prepare_encoded(Ok(reply), state, encoding)?;
-                                Ok((reply, json, spill))
-                            } else {
-                                Ok((reply, json, None))
-                            }
-                        }))
-                    })
-                })
-            }));
-            if matches!(&result, Ok(Ok(_))) {
-                lease.completed();
+            #[cfg(feature = "test-hooks")]
+            let panic_at = panic_next_request.swap(0, Ordering::Relaxed);
+            #[cfg(feature = "test-hooks")]
+            if panic_at == PANIC_IN_WORKER {
+                panic!("injected request worker panic");
             }
-            #[cfg(test)]
-            if let Some(barrier) = after {
-                barrier.wait();
-            }
-            match result {
-                Ok(Ok(Ok((reply, json, spill)))) => Ok(Completion {
-                    reply,
-                    json,
-                    spill,
-                    lease: ResponseLease {
-                        session: lease,
-                        _ownership: ownership,
-                    },
-                }),
-                Ok(Ok(Err(error))) => Err(error),
-                Ok(Err(error)) => {
-                    // Authority failed before the dispatcher ran. Never reconstruct
-                    // sensitive task fields or call the engine a second time.
-                    if matches!(error, giggles_core::CoreError::Cancelled) {
-                        Err(ApiError::DeadlineExceeded)
-                    } else {
-                        lease.invalidate();
-                        Err(ApiError::Unauthenticated)
+            // The permits go in as `held` so they drop before the lease on every
+            // path (role permit first, then the agent slot), as they did when this
+            // body ran inline in the closure.
+            run_admitted_job(
+                lease,
+                request,
+                operation_id,
+                context,
+                received,
+                encoding,
+                stream,
+                ownership,
+                StatementPanic {
+                    #[cfg(feature = "test-hooks")]
+                    armed: panic_at == PANIC_IN_STATEMENT,
+                },
+                (_role_permit, _agent_slot),
+                || {
+                    #[cfg(test)]
+                    if let Some(barrier) = after {
+                        barrier.wait();
                     }
-                }
-                Err(_) => {
-                    lease.invalidate();
-                    Err(ApiError::Internal)
-                }
-            }
+                },
+            )
         })
         .await;
     let _ = reply.send(result.unwrap_or(Err(ApiError::Internal)));
@@ -836,16 +826,140 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
     }
 }
 
+fn role_statement_exempt(session: &Session, request: &Invocation) -> bool {
+    session.is_aborted()
+        || match request {
+            Invocation::Commit
+            | Invocation::Rollback
+            | Invocation::Savepoint(_)
+            | Invocation::RollbackTo(_)
+            | Invocation::Release(_) => true,
+            Invocation::Legacy(request) => crate::admission::request_exempt(request),
+            _ => false,
+        }
+}
+
+fn statement_refusal(refusal: crate::admission::StatementRefusal) -> ApiError {
+    match refusal {
+        crate::admission::StatementRefusal::Core(_) => ApiError::DeadlineExceeded,
+        _ => ApiError::ResourceExhausted,
+    }
+}
+
+/// The body of one admitted job, run on a blocking worker. `held` keeps the
+/// caller's admission permits alive until the outcome is built and is dropped
+/// before the lease on error paths; `after_execution` runs once execution has
+/// finished and the lease is marked completed, before the outcome is built.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_admitted_job<H>(
+    mut lease: SessionLease,
+    request: codec::Invocation,
+    operation_id: Option<OperationId>,
+    context: Cancellation,
+    received: Instant,
+    encoding: Encoding,
+    stream: bool,
+    ownership: Arc<CallOwnership>,
+    StatementPanic {
+        #[cfg(feature = "test-hooks")]
+        armed: panic_in_statement,
+    }: StatementPanic,
+    held: H,
+    after_execution: impl FnOnce(),
+) -> Result<Completion, ApiError> {
+    lease.session().connection = Some(ownership.socket.clone());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        context.scope(|| {
+            lease.session().authority_scope(|session| {
+                // GD-0061 R3-310/313/314: a task session releases its rows before
+                // encoding, so it never takes the streaming path. Agent sessions are
+                // `Role::Database` with `agent` set (Service::agent_session), so the
+                // role check alone does not cover them.
+                let stream = stream
+                    && !session.agent
+                    && session.task().is_none();
+                #[cfg(feature = "legacy-task")]
+                let stream = stream && !matches!(session.role, crate::Role::Task { .. });
+                let (result, spill) = spill::bounded(|| {
+                    #[cfg(feature = "test-hooks")]
+                    if panic_in_statement {
+                        panic!("injected statement panic");
+                    }
+                    if stream {
+                        spill::streaming(|| execute_reply(session, request, operation_id, received, encoding))
+                    } else {
+                        (execute_reply(session, request, operation_id, received, encoding), None)
+                    }
+                });
+                Ok(result.and_then(|(mut reply, json)| {
+                    if let Some(rows) = &spill {
+                        if let Some(proto::execute_reply::NativeResult::OperationOutcome(outcome)) = &mut reply.native_result {
+                            outcome.matched = rows.len();
+                        }
+                        let state = proto::TransactionState::try_from(reply.transaction_state)
+                            .map_err(|_| ApiError::Internal)?;
+                        let (reply, json) = prepare_encoded(Ok(reply), state, encoding)?;
+                        Ok((reply, json, spill))
+                    } else {
+                        Ok((reply, json, None))
+                    }
+                }))
+            })
+        })
+    }));
+    if matches!(&result, Ok(Ok(_))) {
+        lease.completed();
+    }
+    after_execution();
+    let outcome = match result {
+        Ok(Ok(Ok((reply, json, spill)))) => Ok(Completion {
+            reply,
+            json,
+            spill,
+            lease: ResponseLease {
+                session: lease,
+                _ownership: ownership,
+            },
+        }),
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(error)) => {
+            // Authority failed before the dispatcher ran. Never reconstruct
+            // sensitive task fields or call the engine a second time.
+            if matches!(error, giggles_core::CoreError::Cancelled) {
+                Err(ApiError::DeadlineExceeded)
+            } else {
+                lease.invalidate();
+                Err(ApiError::Unauthenticated)
+            }
+        }
+        Err(_) => {
+            lease.invalidate();
+            Err(ApiError::Internal)
+        }
+    };
+    drop(held);
+    outcome
+}
+
 /// The reply to an agent call refused at agent admission: the statement never
 /// ran. As on the PostgreSQL listener, the refusal aborts an open transaction.
 fn refuse_agent_call(job: Job, error: &giggles_core::CoreError) {
     let Job {
-        mut lease,
+        lease,
         encoding,
         ownership,
         reply,
         ..
     } = job;
+    let _ = reply.send(agent_refusal(lease, error, encoding, ownership));
+}
+
+fn agent_refusal(
+    mut lease: SessionLease,
+    error: &giggles_core::CoreError,
+    encoding: Encoding,
+    ownership: Arc<CallOwnership>,
+) -> Result<Completion, ApiError> {
     let session = lease.session();
     session.abort();
     let state = if session.is_aborted() {
@@ -855,7 +969,7 @@ fn refuse_agent_call(job: Job, error: &giggles_core::CoreError) {
     } else {
         proto::TransactionState::Idle
     };
-    let result = prepare_encoded(codec::encode_error(error, state), state, encoding).map(|(reply, json)| {
+    prepare_encoded(codec::encode_error(error, state), state, encoding).map(|(reply, json)| {
         lease.completed();
         Completion {
             reply,
@@ -866,8 +980,7 @@ fn refuse_agent_call(job: Job, error: &giggles_core::CoreError) {
                 _ownership: ownership,
             },
         }
-    });
-    let _ = reply.send(result);
+    })
 }
 
 fn prepare_reply(

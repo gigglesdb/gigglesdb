@@ -81,7 +81,7 @@ async fn raw_wire(f: &ParityFixture) -> (tokio_rustls::client::TlsStream<TcpStre
     (stream, decoder)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_invalid_frames_end_the_connection() {
     let f = ParityFixture::start().await;
     let ping = proto::ExecuteRequest {
@@ -163,7 +163,7 @@ async fn batch_invalid_frames_end_the_connection() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipelined_prepare_run_close_see_each_other() {
     let f = ParityFixture::start().await;
     let (mut stream, mut decoder) = raw_wire(&f).await;
@@ -289,14 +289,14 @@ fn encode_handle_prepare(out: &mut Vec<u8>, id: u32) {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepare_checks_revoked_binding() {
     let mut out = Vec::new();
     encode_handle_prepare(&mut out, 3);
     expect_revoked_handle_request(out).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_handle_checks_revoked_binding() {
     let mut out = Vec::new();
     encode_message(
@@ -309,7 +309,7 @@ async fn close_handle_checks_revoked_binding() {
     expect_revoked_handle_request(out).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipelined_prepare_checks_revoked_binding_before_run() {
     let mut out = Vec::new();
     encode_handle_prepare(&mut out, 3);
@@ -382,7 +382,7 @@ fn batch_reply(outcome: BatchOutcome) -> proto::ExecuteReply {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_all_runs_every_entry() {
     let f = ParityFixture::start().await;
     let mut client = f.wire_client_for(&f.sql_app).await;
@@ -405,7 +405,7 @@ async fn batch_all_runs_every_entry() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_stop_on_error_skips_rest() {
     let f = ParityFixture::start().await;
     let mut client = f.wire_client_for(&f.sql_app).await;
@@ -439,7 +439,7 @@ async fn batch_stop_on_error_skips_rest() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_mixes_execute_and_run_entries() {
     let f = ParityFixture::start().await;
     let mut client = f.wire_client(false).await;
@@ -510,7 +510,7 @@ fn wire_error(error: &std::io::Error) -> &WireError {
     error.get_ref().unwrap().downcast_ref().unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn handle_controls_spend_shared_api_rate() {
     let f = ParityFixture::start().await;
     let service = Service::with_limits(
@@ -628,7 +628,7 @@ async fn compare(
     actual
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_equals_execute_for_each_form() {
     // Apply the same writes to independent databases and retain the same
     // prepared handles across catalog and authority changes.
@@ -768,7 +768,7 @@ async fn run_equals_execute_for_each_form() {
     direct.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parameter_admission_fails_at_run() {
     let f = ParityFixture::start().await;
     let mut client = f.wire_client(false).await;
@@ -789,7 +789,7 @@ async fn parameter_admission_fails_at_run() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_session_refuses_handle_like_text() {
     let f = ParityFixture::start().await;
     let mut client = f.wire_client(true).await;
@@ -827,7 +827,7 @@ async fn task_session_refuses_handle_like_text() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn handles_are_per_connection() {
     let f = ParityFixture::start().await;
     let mut first = f.wire_client(false).await;
@@ -848,7 +848,7 @@ async fn handles_are_per_connection() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_budget_and_operation_id_match_execute() {
     let f = ParityFixture::start().await;
     let mut client = f.wire_client(false).await;

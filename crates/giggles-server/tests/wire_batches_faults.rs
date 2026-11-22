@@ -166,7 +166,7 @@ async fn assert_native_shape(client: &mut Client, handle: u32, shape_id: u32, co
     assert!(native_columns(wire.reply.unwrap()).is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Session revocation is always fatal (conn.rs request_error), so the server's
 // tentative shape rollback cannot be observed here: the reply must never
 // complete, the error carries the request ID, and the connection then ends.
@@ -257,7 +257,7 @@ async fn wire_lease_failure_after_shape_head_ends_connection_without_completing_
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_run_redefines_shape_after_add_drop_and_rename() {
     let f = ParityFixture::start().await;
     f.sql(&format!("CREATE SCHEMA parity AUTHORIZATION {APP}"));
@@ -345,7 +345,7 @@ fn insert_shipment(id: usize) -> proto::ExecuteRequest {
     ))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_batch_disconnect_mid_batch_rolls_back() {
     let f = ParityFixture::start().await;
     let mut holder = f.wire_client_for(&f.sql_app).await;
@@ -410,7 +410,7 @@ async fn wire_batch_disconnect_mid_batch_rolls_back() {
 const WIDE_READ: &str = "SELECT id, status FROM shipments WHERE merchant_id=97 ORDER BY id";
 const WIDE_ROWS: i64 = 64;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_batch_never_reading_client_is_capped() {
     let f = ParityFixture::start().await;
     seed_wide_shipment_rows(&f, WIDE_ROWS);
@@ -482,7 +482,7 @@ async fn assert_split_rows(client: &mut Client, id: u32, expected: &[proto::SqlR
     assert_eq!(reply.sql.unwrap().rows, expected);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_batch_more_split_then_small_entries_keep_order_and_skipped() {
     let f = ParityFixture::start().await;
     seed_wide_shipment_rows(&f, WIDE_ROWS);
@@ -658,7 +658,7 @@ async fn assert_admission_refusal(
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_run_admission_refusals_match_execute_under_saturated_permits() {
     use agent_support::parity::APPROVER;
     use giggles_core::roles::TablePrivilege;
@@ -884,7 +884,7 @@ async fn spill_shape_head(
     shape
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_spill_read_failure_after_shape_head_rolls_back_shape() {
     use giggles_server::api::error::ApiError;
 

@@ -96,7 +96,7 @@ fn seed_wide_shipments(f: &ParityFixture, rows: i64) {
     session.execute("COMMIT", &[], None).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_disconnect_mid_pipeline_rolls_back() {
     let f = ParityFixture::start().await;
     for blocked in [false, true] {
@@ -167,7 +167,7 @@ async fn wire_disconnect_mid_pipeline_rolls_back() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_never_reading_client_is_capped() {
     let f = ParityFixture::start().await;
     seed_wide_shipments(&f, 64);
@@ -203,7 +203,7 @@ async fn wire_never_reading_client_is_capped() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_large_result_more_frames_then_small_reply() {
     let f = ParityFixture::start().await;
     seed_wide_shipments(&f, 192);
@@ -302,7 +302,7 @@ async fn wire_large_result_more_frames_then_small_reply() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_cancel_running_request() {
     let f = ParityFixture::start().await;
     let mut holder = f.wire_client_for(&f.sql_app).await;
@@ -353,7 +353,7 @@ async fn wire_cancel_running_request() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_binding_reload_ends_session() {
     let f = ParityFixture::start().await;
     let mut client = f.wire_client(false).await;
@@ -412,7 +412,7 @@ async fn read_fatal(client: &mut Client) -> WireConnError {
     WireConnError::decode(body.as_slice()).unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_cancel_with_full_pipeline() {
     let f = ParityFixture::start().await;
     let mut holder = f.wire_client_for(&f.sql_app).await;
@@ -492,7 +492,7 @@ async fn connect_with_certificate(
     .map(|(client, _)| client)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_idle_connection_ends_after_binding_revoked() {
     let f = ParityFixture::start().await;
     let binding = Binding {
@@ -568,12 +568,12 @@ async fn expect_request_revocation(request: proto::ExecuteRequest) {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_binding_reload_ends_session_without_sweep() {
     expect_request_revocation(ping()).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_revoked_connection_malformed_request_still_unauthenticated() {
     expect_request_revocation(proto::ExecuteRequest {
         budget_ms: Some(10_001),
@@ -582,7 +582,7 @@ async fn wire_revoked_connection_malformed_request_still_unauthenticated() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_listeners_reject_missing_bindings() {
     let f = ParityFixture::start().await;
     let unbound = agent_support::certificate(Some(&f.ca), false);
@@ -600,7 +600,7 @@ async fn wire_listeners_reject_missing_bindings() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_ping_and_sql_round_trip() {
     let f = ParityFixture::start().await;
     let mut client = f.wire_client_for(&f.sql_app).await;
@@ -625,7 +625,7 @@ async fn wire_ping_and_sql_round_trip() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_reuses_select_shape_and_client_restores_columns() {
     let f = ParityFixture::start().await;
     let mut client = f.wire_client_for(&f.sql_app).await;
@@ -655,7 +655,7 @@ async fn wire_reuses_select_shape_and_client_restores_columns() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_execute_equivalence_matrix() {
     // Each transport runs the same mutations and sequence calls on its own database.
     let wire = ParityFixture::start().await;
@@ -838,7 +838,7 @@ async fn wire_execute_equivalence_matrix() {
     grpc.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_pipelines_64_in_order() {
     let f = ParityFixture::start().await;
     let mut client = f.wire_client(false).await;
@@ -854,7 +854,7 @@ async fn wire_pipelines_64_in_order() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_session_counts_against_slots() {
     let f = ParityFixture::start_with_api_limits(ApiLimits { sessions: 2 }).await;
     let first = f.wire_client(false).await;
@@ -882,7 +882,7 @@ async fn wire_session_counts_against_slots() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_agent_forms_only_on_agent_listener() {
     let f = ParityFixture::start().await;
     let request = execute(json!({"taskPreview": {"text": {
@@ -942,7 +942,7 @@ async fn wire_agent_forms_only_on_agent_listener() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_bad_preface_inside_tls_closes() {
     let f = ParityFixture::start().await;
     let config = Arc::new(f.app.client(&f.ca));

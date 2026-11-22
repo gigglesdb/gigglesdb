@@ -141,7 +141,7 @@ fn assert_wire_error(error: &io::Error, expected: ApiError, context: &str) {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_role_auth_matrix() {
     let f = fixture().await;
     for (label, mode, tls) in [
@@ -230,7 +230,7 @@ async fn wire_role_auth_matrix() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_optional_port_sniffs_tls_and_plain() {
     let f = fixture().await;
     let wire = RoleWire::start(&f, settings(&f, TlsMode::Optional, false, 2)).await;
@@ -254,7 +254,7 @@ async fn wire_optional_port_sniffs_tls_and_plain() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_optional_port_rejects_garbage_and_other_protocols() {
     const CONNECTIONS: usize = 8;
     let f = fixture().await;
@@ -330,7 +330,7 @@ async fn expect_closed(client: &mut Client) {
     assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_role_idle_timeout_rolls_back_and_closes() {
     let f = fixture().await;
     let wire = RoleWire::start(
@@ -376,7 +376,7 @@ async fn wire_role_idle_timeout_rolls_back_and_closes() {
     f.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wire_role_nologin_while_connected_ends_session() {
     let f = fixture().await;
     let wire = RoleWire::start(&f, settings(&f, TlsMode::Disabled, false, 2)).await;

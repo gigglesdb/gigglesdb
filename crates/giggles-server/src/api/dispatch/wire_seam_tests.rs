@@ -319,7 +319,7 @@ async fn wire_identity_not_rechecked_without_binding_change() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn execute_wire_role_admission_matches() {
     let f = Fixture::new(2);
     let token = f.runtime.open(&f.owner).unwrap().session_id;
@@ -338,9 +338,20 @@ async fn execute_wire_role_admission_matches() {
         .await
         .unwrap();
 
-    let existing = f.execute(&token, ping()).await;
+    // If either path waits for blocking admission before checking the role,
+    // this short budget would expire instead of returning the role refusal.
+    let context = Cancellation::default();
+    let mut blocking = Vec::new();
+    for _ in 0..crate::blocking::MAX_BLOCKING {
+        blocking.push(service.blocking.admit(&context).await.unwrap());
+    }
+    let request = proto::ExecuteRequest {
+        budget_ms: Some(500),
+        ..ping()
+    };
+    let existing = f.execute(&token, request.clone()).await;
     assert_eq!(existing, Err(ApiError::ResourceExhausted));
-    assert_eq!(f.execute_wire(&mut wire, ping()).await, existing);
+    assert_eq!(f.execute_wire(&mut wire, request).await, existing);
 }
 
 #[tokio::test(flavor = "current_thread")]
