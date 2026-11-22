@@ -341,6 +341,7 @@ mod write_fence_holder_network;
 #[path = "role_cache_network.rs"] mod role_cache_network;
 #[path = "sequence_execution_authority_network.rs"] mod sequence_execution_authority_network;
 #[path = "sequence_owner_authority_network.rs"] mod sequence_owner_authority_network;
+#[path = "sequence_default_memo_network.rs"] mod sequence_default_memo_network;
 #[path = "user_collation_network.rs"]
 mod user_collation_network;
 

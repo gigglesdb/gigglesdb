@@ -14,10 +14,16 @@ engine and COPY already enforced the check.
   default. The check runs when the call runs, on the sequence that was actually found. It reads the latest committed
   roles and ownership, so a sequence dropped and recreated under the same name is judged on its new owner, and
   revokes, membership changes, owner changes and `ALTER SEQUENCE ... OWNED BY` transfers committed by another session
-  apply from the next statement. This holds inside READ COMMITTED and REPEATABLE READ transactions too. A refused
+  apply from the next statement. This holds inside READ COMMITTED and REPEATABLE READ transactions too.
+  In ordinary local V2 PostgreSQL sessions with no private catalog changes, column defaults are checked once per
+  statement, so a revoke committed while one statement draws several rows (a multi-row INSERT, or a COPY of an
+  `INSERT ... RETURNING` to the client) applies from the next statement, while explicit
+  sequence calls are checked on every call. A refused
   call leaves the sequence unchanged. The transaction's own uncommitted DDL (a rename of the owning table, a new
-  sequence) is judged as the transaction sees it. Over the native API, typed sequence calls return 42501; a native
-  INSERT whose default is refused reports the core error class (`NATIVE_ERROR_CLASS_CORE`) without a SQLSTATE.
+  sequence) is judged as the transaction sees it. Over the native API, typed sequence calls return 42501, and so
+  does a native INSERT whose column default draws a sequence the caller may not use: it returns the native SQL error
+  class with SQLSTATE 42501 over HTTP and gRPC (earlier builds reported the core error class,
+  `NATIVE_ERROR_CLASS_CORE`, with no SQLSTATE).
 - **Native Application identities and application sessions are now restricted when sequences are drawn.** Named native sequence calls were
   already refused outside an Application's tables, but defaults drawn by its native INSERTs were not checked. It is
   now limited to the sequences owned by the tables it was granted. Sequence calls and serial/identity defaults whose
@@ -30,6 +36,24 @@ engine and COPY already enforced the check.
     allowed it).
   - If the child table has no owner record (for example, it was created by an Application session), the action is
     checked against the role running the statement. A role that could not call the sequence directly now gets 42501.
+
+## Changing or dropping a sequence follows its current owner
+
+- **`ALTER SEQUENCE`, `DROP SEQUENCE` and relinking a sequence with `OWNED BY` are authorized against the sequence's
+  current owner.** For a sequence linked to a table (`OWNED BY t.c`, including serial and identity sequences), that
+  is the owner of the owning table, found by the table's stable id, so a table rename does not change it. For a
+  standalone sequence it is the sequence's own owner. This covers every `ALTER SEQUENCE` form and the native
+  DropSequence call. Earlier builds checked the sequence's own owner record even after the sequence was linked to
+  another role's table, so the role that created the sequence kept the right to alter, drop or relink it. That role
+  now gets 42501.
+- **`OWNED BY` records that owner.** Linking a sequence to a table makes the table's owner the sequence's owner, in the
+  same transaction as the DDL. `OWNED BY NONE` keeps the current owner, as in PostgreSQL 18.6, so unlinking no longer
+  hands the sequence back to the role that first created it.
+- GigglesDB still allows a superuser, or a member of both roles, to link a sequence to a table with a different owner;
+  PostgreSQL refuses that with 55000. After such a link the table's owner owns the sequence.
+- A sequence linked to another role's table before this release keeps its old owner record until it is next
+  relinked. Authorization ignores that record and uses the owning table's owner, but the owner shown in the catalog
+  and the `DROP ROLE` dependency check still read it.
 
 ## Who holds privileges on a sequence
 

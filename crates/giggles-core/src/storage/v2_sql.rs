@@ -305,7 +305,7 @@ impl SqlSession {
             self.v2_transaction.as_ref(), &image);
         Ok(sql_sequences::callback(CallbackLease::new(db, self.v2_transaction.as_ref()), image, self.sequence_baseline.clone(),
             self.pending_sequences.clone(), self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone(),
-            guard))
+            Arc::new(guard)))
     }
 
     // Typed scans deliberately retain the active statement snapshot. In
@@ -397,7 +397,7 @@ impl SqlSession {
                 self.v2_transaction.as_ref(), &image);
             let callback = sql_sequences::callback(CallbackLease::new(db, self.v2_transaction.as_ref()), image.clone(),
                 self.sequence_baseline.clone(), self.pending_sequences.clone(),
-                self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone(), guard);
+                self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone(), Arc::new(guard));
             let allowed = self.sequence_tables.clone();
             let path = self.search_path.clone();
             let callback = Arc::new(move |operation: &str, text: &str, value, called, origin| {
@@ -472,6 +472,26 @@ impl SqlSession {
             }
         }
         result
+    }
+
+    #[inline(never)]
+    fn statement_sequence_guard(
+        authority: &SequenceAuthority,
+        roles: roles::RoleCatalog,
+        db: &EngineLease,
+        txn: &Transaction,
+        image: &relational::Relational,
+        pin_images: bool,
+        execution: Option<&mut sql_sequences::DefaultExecution>,
+    ) -> Arc<sql_sequences::Guard> {
+        let mut guard = sql_sequences::Guard::new(authority, roles, Some(txn), image);
+        if pin_images && db.cluster_services().is_none() {
+            guard.pin_default_images(txn);
+        }
+        if let Some(execution) = execution {
+            return execution.bind(db, txn, guard);
+        }
+        Arc::new(guard)
     }
 
     fn execute_v2_inner(
@@ -1013,8 +1033,13 @@ impl SqlSession {
                         })?;
                         let mut image = catalog_image.catalog_image_for_statement(ids.start, versions.start);
                         p.check_extension_views(&image, old.sql_views.values().map(|v| (v.name.as_str(), v.select.as_str()))).map_err(CoreError::Sql)?;
-                        let context = clock.map(|clock| -> Result<_, CoreError> {
-                            Ok(clock.with_sequences(sql_sequences::callback(
+                        let context = clock.map(|clock| {
+                            let guard = Self::statement_sequence_guard(
+                                &self.sequence_authority, self.admin.roles(), db, txn, &catalog_image,
+                                self.authorization_bindings && self.copy_input.is_none(),
+                                self.sequence_default_execution.as_mut(),
+                            );
+                            clock.with_sequences(sql_sequences::callback(
                                 CallbackLease::new(db, Some(txn)),
                                 catalog_image.clone(),
                                 self.sequence_baseline.clone(),
@@ -1022,15 +1047,14 @@ impl SqlSession {
                                 self.sequence_values.clone(),
                                 self.sequence_unsettled.clone(),
                                 self.search_path.clone(),
-                                sql_sequences::Guard::new(&self.sequence_authority, self.admin.roles(),
-                                    Some(&*txn), &catalog_image),
+                                guard,
                             ))
                             .with_xact(sql_xact::callback(
                                 CallbackLease::new(db, Some(txn)),
                                 self.xact.clone(),
                                 Some(txn.id()),
-                            )))
-                        }).transpose()?;
+                            ))
+                        });
                         let context = context.map(|clock| match self.privilege_callback.as_ref().filter(|_| p.has_privilege_inquiry()) {
                             Some(callback) => clock.with_privileges(callback.clone(), privilege_provider(
                                 PrivilegeImage::Catalog(catalog_image.clone()), self.search_path.clone(), Some(txn), self.admin.roles(), Some(db))),

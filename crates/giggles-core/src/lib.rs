@@ -22,6 +22,7 @@ pub use storage::{
     Admin, CoreError, CrashPoint, DecisionPoint, Engine, IndexInfo, Limits, ReclaimStats,
     RecoveryPoint, SqlIsolation, UpgradePoint, UpgradeReport, WriteFenceStatus,
 };
+pub use storage::{SequenceDefaultContext, SequenceDefaultGrants};
 pub use storage::{CatalogMetadata, PrivilegeCallback, PrivilegeMetadata, SequenceAuthority, Cursor, PreparedCatalogState, SqlReplyCheck, SqlSession, SqlTableLockMode};
 mod sqlstate;
 pub use sqlstate::sqlstate;

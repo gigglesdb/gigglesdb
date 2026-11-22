@@ -72,14 +72,24 @@ fn extended_execute(
     out: &mut Vec<u8>,
 ) -> R<()> {
     let now = std::time::Instant::now();
-    let mut parse = Vec::new();
-    cstr("", &mut parse);
-    cstr(sql, &mut parse);
-    parse.extend(0u16.to_be_bytes());
-    state.handle(b'P', &parse, session, out, now)?;
+    metadata_parse_sql(state, session, "", sql, out, now)?;
+    bind_execute(state, session, "", out, now)
+}
+
+fn extended_bind_execute(
+    state: &mut State, session: &mut Session, name: &str, out: &mut Vec<u8>, now: std::time::Instant,
+) -> R<()> {
+    bind_execute(state, session, name, out, now)?;
+    state.handle(b'S', &[], session, out, now)?;
+    Ok(())
+}
+
+fn bind_execute(
+    state: &mut State, session: &mut Session, name: &str, out: &mut Vec<u8>, now: std::time::Instant,
+) -> R<()> {
     let mut bind = Vec::new();
     cstr("", &mut bind);
-    cstr("", &mut bind);
+    cstr(name, &mut bind);
     bind.extend([0, 0, 0, 0, 0, 0]);
     state.handle(b'B', &bind, session, out, now)?;
     let mut describe = vec![b'P'];
@@ -173,11 +183,18 @@ fn timezone_set_local_and_rollback_refresh_memo() {
 }
 
 fn metadata_parse(state: &mut State, session: &mut Session, name: &str) {
+    metadata_parse_sql(state, session, name, "SELECT v FROM t WHERE id = $1",
+        &mut Vec::new(), std::time::Instant::now()).unwrap();
+}
+fn metadata_parse_sql(
+    state: &mut State, session: &mut Session, name: &str, sql: &str,
+    out: &mut Vec<u8>, now: std::time::Instant,
+) -> R<()> {
     let mut body = Vec::new();
     cstr(name, &mut body);
-    cstr("SELECT v FROM t WHERE id = $1", &mut body);
+    cstr(sql, &mut body);
     body.extend(0u16.to_be_bytes());
-    state.handle(b'P', &body, session, &mut Vec::new(), std::time::Instant::now()).unwrap();
+    state.handle(b'P', &body, session, out, now).map(drop)
 }
 fn metadata_bind(state: &mut State, session: &mut Session, name: &str) {
     let mut body = Vec::new();
@@ -233,7 +250,118 @@ fn metadata_cycle_counts() {
     // The serial default's execution-time sequence privilege check (GD-0084 Q24)
     // reads the latest committed catalog once per statement.
     assert_eq!(giggles_core::metadata_read_counts::take(), [17, 0, 9, 0, 0]);
+
+    session.set_postgres_surface();
+    let now = std::time::Instant::now();
+    let name = "serial_insert";
+    let mut out = Vec::new();
+    metadata_parse_sql(&mut state, &mut session, name,
+        "INSERT INTO serial_t (v) VALUES (9), (10), (11)", &mut out, now).unwrap();
+    extended_bind_execute(&mut state, &mut session, name, &mut out, now).unwrap();
+    giggles_core::metadata_read_counts::take();
+    extended_bind_execute(&mut state, &mut session, name, &mut out, now).unwrap();
+    let warm = giggles_core::metadata_read_counts::take();
+    session.clear_sequence_default_grants();
+    extended_bind_execute(&mut state, &mut session, name, &mut out, now).unwrap();
+    let guard_reads = giggles_core::metadata_read_counts::take();
+    // Without grants the Guard reads one latest catalog image for all three
+    // rows. Replaying the grant skips that read on an otherwise identical cycle.
+    assert_eq!(warm[2] + 1, guard_reads[2], "without grants {guard_reads:?}, warm {warm:?}");
 }
+
+fn named_sequence_default() -> (Session, Session, State) {
+    let mut owner = fixture();
+    owner.set_postgres_surface();
+    let roles = owner.service.admin.roles();
+    for name in ["member", "other"] {
+        roles.create(NewRole { name: name.into(), login: true, ..Default::default() }).unwrap();
+    }
+    let mut owner_state = state();
+    for sql in [
+        "CREATE EXTENSION \"uuid-ossp\"",
+        "CREATE SEQUENCE memo_s",
+        "CREATE TABLE memo_t (id UUID PRIMARY KEY DEFAULT \
+         uuid_generate_v5('6ba7b810-9dad-11d1-80b4-00c04fd430c8', nextval('memo_s')::text))",
+        "GRANT INSERT, SELECT ON memo_t TO member",
+        "GRANT owner TO member",
+    ] {
+        simple(&mut owner_state, &mut owner, sql).unwrap();
+    }
+    let mut member = owner.service.role_session("member").unwrap();
+    member.set_postgres_surface();
+    (owner, member, state())
+}
+
+fn prepare_sequence_default(state: &mut State, member: &mut Session) {
+    metadata_parse_sql(state, member, "insert_default", "INSERT INTO memo_t DEFAULT VALUES RETURNING id",
+        &mut Vec::new(), std::time::Instant::now()).unwrap();
+}
+
+fn execute_sequence_default(state: &mut State, member: &mut Session) -> R<()> {
+    extended_bind_execute(state, member, "insert_default", &mut Vec::new(), std::time::Instant::now())
+}
+
+#[test]
+fn named_default_membership_revoke_reaches_the_execution_guard() {
+    use giggles_core::SequenceDefaultGrants;
+    let (mut owner, mut member, mut member_state) = named_sequence_default();
+    prepare_sequence_default(&mut member_state, &mut member);
+    let hits = SequenceDefaultGrants::replay_hits();
+    execute_sequence_default(&mut member_state, &mut member).unwrap();
+    assert!(member.has_sequence_default_grants(), "the first execution must record the grant");
+    simple(&mut state(), &mut owner, "REVOKE owner FROM member").unwrap();
+
+    // The direct table grants survive, and the static dependency walk does
+    // not see the sequence nested in the UUID default. Reaching this hook
+    // proves Bind, Describe and full statement authorization still passed.
+    let observed = std::rc::Rc::new(std::cell::Cell::new(None));
+    let capture = observed.clone();
+    Session::observe_sequence_default_execution(move |has_grant| capture.set(Some(has_grant)));
+    assert_eq!(execute_sequence_default(&mut member_state, &mut member), Err("42501"));
+    assert_eq!(observed.get(), Some(false), "execution reached without the invalidated grant");
+    assert_eq!(SequenceDefaultGrants::replay_hits(), hits);
+    assert_eq!(text_rows(&simple(&mut state(), &mut owner, "SELECT nextval('memo_s')").unwrap()), [["2"]]);
+}
+
+#[test]
+fn named_default_replays_on_second_execution_in_repeatable_read() {
+    use giggles_core::SequenceDefaultGrants;
+    let (_, mut member, mut state) = named_sequence_default();
+    simple(&mut state, &mut member, "BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
+    prepare_sequence_default(&mut state, &mut member);
+    let hits = SequenceDefaultGrants::replay_hits();
+    execute_sequence_default(&mut state, &mut member).unwrap();
+    assert_eq!(SequenceDefaultGrants::replay_hits(), hits);
+    execute_sequence_default(&mut state, &mut member).unwrap();
+    assert_eq!(SequenceDefaultGrants::replay_hits(), hits + 1);
+    simple(&mut state, &mut member, "ROLLBACK").unwrap();
+}
+
+#[test]
+fn named_default_rechecks_owner_changed_after_authorization() {
+    use giggles_core::SequenceDefaultGrants;
+    let (mut owner, mut member, mut member_state) = named_sequence_default();
+    // Keep the statement catalog version constant while the live owner
+    // record changes between S2 admission and the execution Guard's draw.
+    simple(&mut member_state, &mut member, "BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
+    prepare_sequence_default(&mut member_state, &mut member);
+    execute_sequence_default(&mut member_state, &mut member).unwrap();
+    let hits = SequenceDefaultGrants::replay_hits();
+    execute_sequence_default(&mut member_state, &mut member).unwrap();
+    assert_eq!(SequenceDefaultGrants::replay_hits(), hits + 1);
+
+    let roles = owner.service.admin.roles();
+    Session::observe_sequence_default_execution(move |has_grant| {
+        assert!(has_grant, "the owner must change after S2 handed off the old grant");
+        assert_eq!(roles.table_owner("memo_s").unwrap().as_deref(), Some("owner"));
+        roles.set_table_owner("memo_s", "other").unwrap();
+    });
+    assert_eq!(execute_sequence_default(&mut member_state, &mut member), Err("42501"));
+    assert_eq!(SequenceDefaultGrants::replay_hits(), hits + 1);
+    simple(&mut member_state, &mut member, "ROLLBACK").unwrap();
+    assert_eq!(text_rows(&simple(&mut state(), &mut owner, "SELECT nextval('memo_s')").unwrap()), [["3"]]);
+}
+
 #[test]
 fn metadata_ddl_between_bind_and_execute() {
     for name in ["", "named"] {

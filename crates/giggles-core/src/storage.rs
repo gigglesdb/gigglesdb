@@ -2324,6 +2324,7 @@ pub struct SqlSession {
     sequence_baseline: BTreeMap<u64, u128>,
     sequence_tables: Option<std::collections::BTreeSet<String>>,
     sequence_authority: SequenceAuthority,
+    sequence_default_execution: Option<v2_sql::sql_sequences::DefaultExecution>,
     deferral: relational::DeferralState,
     isolation: SqlIsolation,
     /// The task this session is bound to (GD-0061 R3-202); set once by `bind_task`.
@@ -2337,6 +2338,7 @@ pub struct SqlSession {
 mod complete_relation;
 pub(crate) use complete_relation::CompleteRelation;
 pub use complete_relation::native_input_rows;
+pub use v2_sql::sql_sequences::{SequenceDefaultContext, SequenceDefaultGrants};
 
 #[derive(PartialEq)]
 struct UnnamedPlanKey {
@@ -2388,6 +2390,7 @@ impl Admin {
             sequence_baseline: BTreeMap::new(),
             sequence_tables: None,
             sequence_authority: SequenceAuthority::Unrestricted,
+            sequence_default_execution: None,
             deferral: Default::default(),
             isolation: SqlIsolation::ReadCommitted,
             task: None,
@@ -2968,6 +2971,28 @@ impl SqlSession {
     pub fn set_sequence_tables(&mut self, tables: Option<std::collections::BTreeSet<String>>) {
         self.sequence_tables = tables;
     }
+    /// Carry execution-time grants for the duration of one authorized SQL statement.
+    /// Only grants from a successful execution can return to the authorization memo.
+    pub fn with_sequence_default_memo<T>(
+        &mut self,
+        context: SequenceDefaultContext,
+        grants: Option<Arc<SequenceDefaultGrants>>,
+        execute: impl FnOnce(&mut Self) -> Result<T, CoreError>,
+    ) -> (Result<T, CoreError>, Option<Arc<SequenceDefaultGrants>>) {
+        let previous = self.sequence_default_execution.replace(
+            v2_sql::sql_sequences::DefaultExecution::new(context, grants),
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(self)));
+        let execution = std::mem::replace(&mut self.sequence_default_execution, previous);
+        match result {
+            Ok(result) => {
+                let grants = if result.is_ok() { execution.and_then(|execution| execution.grants()) } else { None };
+                (result, grants)
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
     pub fn sequence_tables(&self) -> &Option<std::collections::BTreeSet<String>> {
         &self.sequence_tables
     }
@@ -3087,7 +3112,7 @@ impl SqlSession {
 
     /// The latest role catalog, the statement's catalog, and the schema context.
     /// A catalog publication or private metadata requires ordinary authorization.
-    pub fn authorization_catalog_key(&self, role_admin: &Admin) -> Option<(u64, u64, u64)> {
+    pub fn authorization_catalog_key(&self, role_admin: &Admin) -> Option<(u64, u64, u64, u64)> {
         if !Arc::ptr_eq(&self.admin.inner, &role_admin.inner)
             || self.admin.inner.fenced.load(Ordering::Acquire)
             || self.staged.is_some() || self.protected.is_some() || self.copy_input.is_some()
@@ -3095,7 +3120,7 @@ impl SqlSession {
             return None;
         }
         let Backend::V2(slot) = &self.admin.inner.backend else { return None; };
-        let (latest, statement) = slot.authorization_versions(|stamp, catalog| {
+        let (latest, statement, stamp) = slot.authorization_versions(|stamp, catalog| {
             self.statement_catalog_version_with(|lease| {
                 if lease.is_some_and(|db| db.stamp() != stamp) {
                     return None;
@@ -3103,7 +3128,7 @@ impl SqlSession {
                 Some(catalog.read())
             })
         })?;
-        Some((latest, statement, self.schema_context_revision?))
+        Some((latest, statement, self.schema_context_revision?, stamp))
     }
 
     /// Recheck metadata admission, provenance and snapshot guards. Stored

@@ -1206,7 +1206,7 @@ fn callback(
 ) -> relational::clock::SequenceCallback {
     let unsettled = Unsettled::default();
     let callback = super::callback(db.child(Holder::Sequence).unwrap(), image, baseline, pending, values, unsettled.clone(), search_path,
-        super::Guard::unrestricted());
+        Arc::new(super::Guard::unrestricted()));
     Arc::new(move |operation, name, value, called, origin| {
         let result = callback(operation, name, value, called, origin);
         settle(&db, &unsettled)?;
@@ -1617,6 +1617,175 @@ fn native_many_between_rows_crash_preserves_returned_ids() {
             let returned_high = if explicit { 80 } else { 40 };
             assert!(scalar(&mut s, "SELECT nextval('native_ids')") > returned_high);
             assert!(native_many(&mut s, 40).iter().all(|id| *id > returned_high));
+        }
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+mod default_memo_tests {
+    use super::*;
+    use crate::relational::clock::SequenceOrigin;
+
+    #[test]
+    fn replay_requires_the_default_origin_and_matching_catalog() {
+        let f = Fixture::new(Engine::V2);
+        let admin = f.admin.as_ref().unwrap();
+        admin.roles().create(roles::NewRole {
+            name: "root".into(), superuser: true, ..Default::default()
+        }).unwrap();
+        run(&mut f.session(), "CREATE TABLE t (id BIGSERIAL PRIMARY KEY)");
+        let root = || SequenceAuthority::Role("root".into());
+        let db = admin.test_v2();
+        let (_, image) = db.native_metadata_image(None).unwrap();
+        let (&id, def) = image.catalog_ext().sequences.iter().next().unwrap();
+        let child = image.tables.values().next().unwrap().id;
+        let context = SequenceDefaultContext {
+            stamp: db.stamp(),
+            latest_catalog: db.catalog().current_version().unwrap(),
+            statement_catalog: db.catalog().current_version().unwrap(),
+        };
+        let mut txn = db.begin(Isolation::ReadCommitted);
+        txn.begin_statement();
+
+        let bind = |context, previous, authority| {
+            let mut guard = Guard::new(&authority, admin.roles(), Some(&txn), &image);
+            guard.pin_default_images(&txn);
+            let mut execution = DefaultExecution::new(context, previous);
+            let guard = execution.bind(&db, &txn, guard);
+            (execution, guard)
+        };
+        let check = |guard: &Guard, origin| guard.check(&db, &image, "nextval", origin, id, def, true);
+        let hit_count = DEFAULT_GRANT_HITS.get();
+
+        let (cold, guard) = bind(context, None, root());
+        check(&guard, SequenceOrigin::ColumnDefault).unwrap();
+        let grants = cold.grants().expect("successful default was recorded");
+        assert_eq!(DEFAULT_GRANT_HITS.get(), hit_count);
+
+        let (warm, guard) = bind(context, Some(grants.clone()), root());
+        check(&guard, SequenceOrigin::ColumnDefault).unwrap();
+        assert_eq!(DEFAULT_GRANT_HITS.get(), hit_count + 1);
+        for origin in [SequenceOrigin::Call, SequenceOrigin::ReferentialAction(child)] {
+            check(&guard, origin).unwrap();
+        }
+        assert!(Arc::ptr_eq(&grants, &warm.grants().unwrap()));
+        assert_eq!(DEFAULT_GRANT_HITS.get(), hit_count + 1);
+
+        let (denied, guard) = bind(context, Some(grants.clone()), SequenceAuthority::Denied);
+        assert_eq!(check(&guard, SequenceOrigin::ColumnDefault), Err(CoreError::SequencePrivilege));
+        assert!(denied.grants().is_none());
+
+        // Publish after binding and before drawing. A grant from the old
+        // catalog must fall through even without another S2 lookup.
+        let (stale, guard) = bind(context, Some(grants), root());
+        admin.roles().create(roles::NewRole { name: "new_role".into(), ..Default::default() }).unwrap();
+        check(&guard, SequenceOrigin::ColumnDefault).unwrap();
+        assert!(stale.grants().is_none());
+        assert_eq!(DEFAULT_GRANT_HITS.get(), hit_count + 1);
+    }
+
+    #[test]
+    fn replay_requires_the_lease_stamp_at_binding_and_first_draw() {
+        let mut f = Fixture::new(Engine::V2);
+        let authority = SequenceAuthority::Role("root".into());
+        let (grants, closed) = {
+            let admin = f.admin.as_ref().unwrap();
+            admin.roles().create(roles::NewRole {
+                name: "root".into(), superuser: true, ..Default::default()
+            }).unwrap();
+            run(&mut f.session(), "CREATE TABLE t (id BIGSERIAL PRIMARY KEY)");
+            let db = admin.test_v2();
+            let (_, image) = db.native_metadata_image(None).unwrap();
+            let (&id, def) = image.catalog_ext().sequences.iter().next().unwrap();
+            let mut txn = db.begin(Isolation::ReadCommitted);
+            txn.begin_statement();
+            let version = db.catalog().current_version().unwrap();
+            let context = SequenceDefaultContext {
+                stamp: db.stamp(), latest_catalog: version, statement_catalog: version,
+            };
+            let mut cold = DefaultExecution::new(context, None);
+            let mut guard = Guard::new(&authority, admin.roles(), Some(&txn), &image);
+            guard.pin_default_images(&txn);
+            let guard = cold.bind(&db, &txn, guard);
+            guard.check(&db, &image, "nextval", SequenceOrigin::ColumnDefault, id, def, true).unwrap();
+            (cold.grants().unwrap(), db.close_latch().unwrap())
+        };
+        f.admin.take();
+        closed.wait(std::time::Duration::from_secs(10)).unwrap();
+        f.reopen();
+
+        // Reopening keeps the catalog, including the sequence incarnation.
+        // The old context and grant still agree, but the lease stamp changes.
+        let admin = f.admin.as_ref().unwrap();
+        let db = admin.test_v2();
+        let (_, image) = db.native_metadata_image(None).unwrap();
+        let (&id, def) = image.catalog_ext().sequences.iter().next().unwrap();
+        let mut txn = db.begin(Isolation::ReadCommitted);
+        txn.begin_statement();
+        let context = grants.context;
+        assert_ne!(db.stamp(), context.stamp);
+        assert_eq!(db.catalog().current_version(), Some(context.latest_catalog));
+        assert_eq!(db.catalog().snapshot_version(&txn).map(|v| v.0), Some(context.statement_catalog));
+        assert_eq!(grants.allowed, vec![(id, def.incarnation, required("nextval"))]);
+
+        let mut guard = Guard::new(&authority, admin.roles(), Some(&txn), &image);
+        guard.pin_default_images(&txn);
+        let mut wrong_lease = DefaultExecution::new(context, Some(grants.clone()));
+        let mut guard = wrong_lease.bind(&db, &txn, guard);
+        assert!(guard.memo.is_none(), "binding must reject the foreign lease");
+
+        // Install the old memo directly to isolate the first-draw check
+        // from the binding check that already rejected the lease above.
+        Arc::get_mut(&mut guard).unwrap().memo = Some(DefaultMemo {
+            context, previous: Some(grants), replay_valid: std::sync::OnceLock::new(),
+        });
+        let hits = DEFAULT_GRANT_HITS.get();
+        guard.check(&db, &image, "nextval", SequenceOrigin::ColumnDefault, id, def, true).unwrap();
+        assert_eq!(guard.memo.as_ref().unwrap().replay_valid.get(), Some(&false),
+            "replay must reject the foreign lease independently of binding");
+        assert_eq!(DEFAULT_GRANT_HITS.get(), hits);
+    }
+
+    #[test]
+    fn explicit_fk_and_private_overlay_draws_read_live_authority() {
+        let f = Fixture::new(Engine::V2);
+        let admin = f.admin.as_ref().unwrap();
+        let roles = admin.roles();
+        for name in ["owner", "member"] {
+            roles.create(roles::NewRole { name: name.into(), ..Default::default() }).unwrap();
+        }
+        let mut sql = f.session();
+        run(&mut sql, "CREATE SEQUENCE s");
+        run(&mut sql, "CREATE TABLE child (id BIGINT PRIMARY KEY)");
+        roles.set_table_owner("s", "owner").unwrap();
+        roles.set_table_owner("child", "member").unwrap();
+        let authority = SequenceAuthority::Role("member".into());
+        let db = admin.test_v2();
+        let (_, image) = db.native_metadata_image(None).unwrap();
+        let (&id, def) = image.catalog_ext().sequences.iter().next().unwrap();
+        let child = image.tables.values().next().unwrap().id;
+
+        for origin in [SequenceOrigin::Call, SequenceOrigin::ReferentialAction(child), SequenceOrigin::ColumnDefault] {
+            roles.grant_membership("owner", "member").unwrap();
+            run(&mut sql, "BEGIN");
+            if origin == SequenceOrigin::ColumnDefault {
+                // A schema overlay has no private owner, sequence or table
+                // in this Guard, but still rules out statement image reuse.
+                run(&mut sql, "CREATE SCHEMA private_memo");
+            } else {
+                run(&mut sql, "SELECT 1");
+            }
+            let txn = sql.v2_transaction.as_ref().unwrap();
+            let mut guard = Guard::new(&authority, roles.clone(), Some(txn), &image);
+            assert!(guard.private_owners.is_empty() && guard.private_sequences.is_empty()
+                && guard.private_tables.is_empty());
+            assert_eq!(txn.catalog_writes().next().is_some(), origin == SequenceOrigin::ColumnDefault);
+            guard.pin_default_images(txn);
+            guard.check(&db, &image, "nextval", origin, id, def, true).unwrap();
+            roles.revoke_membership("owner", "member").unwrap();
+            assert_eq!(guard.check(&db, &image, "nextval", origin, id, def, true),
+                Err(CoreError::SequencePrivilege), "{origin:?}");
+            run(&mut sql, "ROLLBACK");
         }
     }
 }

@@ -355,7 +355,7 @@ impl Prepared {
         }
     }
 
-    pub(crate) fn authorization_may_parse_defaults(&self) -> bool {
+    pub fn authorization_may_parse_defaults(&self) -> bool {
         matches!(&self.statement, Statement::Plan(_) | Statement::Insert { .. }
             | Statement::InsertMulti(_) | Statement::InsertExpressions(_)
             | Statement::UpdateExpressions { .. })

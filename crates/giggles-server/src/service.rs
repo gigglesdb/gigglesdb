@@ -1228,6 +1228,7 @@ pub(crate) struct ApiPathState {
 struct AuthorizationContext {
     latest_catalog: u64,
     statement_catalog: u64,
+    stamp: u64,
     schema_revision: u64,
     password_revision: u64,
 }
@@ -1241,6 +1242,7 @@ struct AuthorizationMemo {
     role_fence: Option<(u32, u64)>,
     plan: Option<relational::AuthorizationPlanKey>,
     sequence_tables: Option<BTreeSet<String>>,
+    sequence_defaults: Option<Arc<giggles_core::SequenceDefaultGrants>>,
 }
 
 pub struct Session {
@@ -1307,6 +1309,23 @@ impl Session {
         if !self.fingerprint_bound && !self.agent && matches!(self.role, Role::Database { .. }) {
             self.sql.enable_authorization_bindings();
         }
+    }
+
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn clear_sequence_default_grants(&mut self) {
+        if let Some(memo) = &mut self.authorization_memos[0] {
+            memo.sequence_defaults = None;
+        }
+    }
+
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn has_sequence_default_grants(&self) -> bool {
+        self.authorization_memos[0].as_ref().is_some_and(|memo| memo.sequence_defaults.is_some())
+    }
+
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn observe_sequence_default_execution(observe: impl FnOnce(bool) + 'static) {
+        BEFORE_SEQUENCE_DEFAULT_EXECUTION.with_borrow_mut(|hook| *hook = Some(Box::new(observe)));
     }
 
     fn authority_role_live(&self, role: &roles::CatalogRole) -> bool {
@@ -1703,7 +1722,8 @@ impl Session {
     /// role (GD-0084 Q24). It is taken from the session identity on each authorized
     /// request, independently of the statement authorization memo, so SET ROLE,
     /// RESET ROLE and SET SESSION AUTHORIZATION apply from the next request.
-    /// Roles, memberships and owners are read live at each call, not here.
+    /// The sequence guard checks roles, memberships and owners against the
+    /// statement's live authority, including any validated S2 default grants.
     pub(crate) fn sync_sequence_authority(&mut self) {
         use giggles_core::SequenceAuthority as A;
         let current = self.sql.sequence_authority();
@@ -2786,19 +2806,26 @@ impl Session {
         {
             return None;
         }
-        let (latest_catalog, statement_catalog, schema_revision) =
+        let (latest_catalog, statement_catalog, schema_revision, stamp) =
             self.sql.authorization_catalog_key(&self.service.admin)?;
         // Read after the catalog observation so a published password change
         // also makes the preceding invalidation visible to this reader.
         let password_revision = self.service.password_generation_revision.load(Ordering::Acquire);
         if password_revision & 1 != 0 { return None; }
-        Some(AuthorizationContext { latest_catalog, statement_catalog, schema_revision, password_revision })
+        Some(AuthorizationContext { latest_catalog, statement_catalog, stamp, schema_revision, password_revision })
     }
 
     fn authorize(&mut self, p: &Prepared) -> Result<(), CoreError> {
+        self.authorize_for_execution(p).map(drop)
+    }
+
+    fn authorize_for_execution(&mut self, p: &Prepared) -> Result<Option<AuthorizationContext>, CoreError> {
         self.admit_backstop(p.task_class())?;
         let control = p.implicit_authorization_block();
         let slot = control.map_or(0, |commit| 1 + usize::from(commit));
+        // A miss (including an ineligible plan or a preflight error) discards
+        // execution-time grants even when the old authorization entry survives.
+        let grants = self.authorization_memos[slot].as_mut().and_then(|memo| memo.sequence_defaults.take());
         let context = if p.has_authorization_binding() { self.authorization_context() } else { None };
         #[cfg(all(test, feature = "engine-rocksdb"))]
         if let Some(observe) = AUTHORIZATION_CONTEXT_OBSERVED.with_borrow_mut(Option::take) {
@@ -2817,9 +2844,10 @@ impl Session {
             && self.authorization_context() == Some(context)
         {
             self.sql.set_sequence_tables(memo.sequence_tables.clone());
+            self.authorization_memos[slot].as_mut().expect("authorization hit").sequence_defaults = grants;
             #[cfg(test)]
             { self.authorization_hits += 1; }
-            return Ok(());
+            return Ok(control.is_none().then_some(context));
         }
 
         #[cfg(test)]
@@ -2829,7 +2857,7 @@ impl Session {
             && self.authorization_context() == Some(context)
         {
             let plan = p.authorization_plan_key(context.statement_catalog);
-            if control.is_none() && plan.is_none() { return Ok(()); }
+            if control.is_none() && plan.is_none() { return Ok(None); }
             self.authorization_memos[slot] = Some(AuthorizationMemo {
                 context,
                 role: self.role.clone(),
@@ -2839,9 +2867,11 @@ impl Session {
                 role_fence: self.role_fence,
                 plan,
                 sequence_tables: self.sql.sequence_tables().clone(),
+                sequence_defaults: None,
             });
+            return Ok(control.is_none().then_some(context));
         }
-        Ok(())
+        Ok(None)
     }
 
     fn authorize_full(&mut self, p: &Prepared) -> Result<(), CoreError> {
@@ -3514,7 +3544,7 @@ impl Session {
             let bound = session.sql.bind_relation_context(p)?;
             let p = &bound;
             session.reconcile_sequence_owners()?;
-            session.authorize(p)?;
+            let authorization = session.authorize_for_execution(p)?;
             // Recovery must remain available even after the host clock latches.
             if session.sql.is_aborted() && p.command() == "ROLLBACK" {
                 if plain && session.sql.task().is_some() {
@@ -3549,19 +3579,63 @@ impl Session {
                     if plain && session.sql.task().is_some() {
                         return Err(task_session_refusal());
                     }
-                    let execute = |sql: &mut giggles_core::SqlSession| {
-                        sql.execute_prepared_at_checked_unreleased(p, params, None, &clock, check_reply)
-                    };
                     let result = if p.has_privilege_inquiry() {
                         let callback = crate::pg_catalog_wire::privilege_callback(session);
-                        session.sql.with_privilege_callback(callback, execute)
-                    } else { execute(&mut session.sql) };
+                        session.sql.with_privilege_callback(callback, |sql| {
+                            sql.execute_prepared_at_checked_unreleased(p, params, None, &clock, check_reply)
+                        })
+                    } else if let Some(context) = authorization.filter(|_| p.authorization_may_parse_defaults()) {
+                        session.execute_with_sequence_defaults(p, params, &clock, context, check_reply)
+                    } else {
+                        session.sql.execute_prepared_at_checked_unreleased(p, params, None, &clock, check_reply)
+                    };
                     if !session.sql.in_transaction() { session.transaction_us = None; }
                     else if clock.unavailable.is_none() { session.transaction_us = Some(transaction_us); }
                     result.map(|result| (result, true))
                 })
         })
     }
+    #[inline(never)]
+    fn execute_with_sequence_defaults(
+        &mut self,
+        p: &Prepared,
+        params: &[Value],
+        clock: &StatementClock,
+        context: AuthorizationContext,
+        check_reply: Option<&mut giggles_core::SqlReplyCheck<'_>>,
+    ) -> Result<Unreleased<SqlResult>, CoreError> {
+        let memo = self.authorization_memos[0].as_mut().expect("authorized statement");
+        let previous = memo.sequence_defaults.take();
+        #[cfg(all(test, feature = "engine-rocksdb"))]
+        if let Some(observe) = BEFORE_SEQUENCE_DEFAULT_EXECUTION.with_borrow_mut(Option::take) {
+            observe(previous.is_some());
+        }
+        let (result, grants) = self.sql.with_sequence_default_memo(
+            giggles_core::SequenceDefaultContext {
+                stamp: context.stamp,
+                latest_catalog: context.latest_catalog,
+                statement_catalog: context.statement_catalog,
+            },
+            previous,
+            |sql| sql.execute_prepared_at_checked_unreleased(p, params, None, clock, check_reply),
+        );
+        if grants.is_some()
+            && self.authorization_context() == Some(context)
+            && let Some(memo) = &mut self.authorization_memos[0]
+            && memo.context == context
+            && memo.role == self.role
+            && memo.effective_role.eq(&self.effective_role)
+            && memo.effective_session.eq(&self.effective_session)
+            && memo.epoch == self.epoch
+            && memo.role_fence == self.role_fence
+        {
+            // This execution holds the session exclusively and cannot replace
+            // its S2 entry. In particular, it ran the plan just authorized above.
+            memo.sequence_defaults = grants;
+        }
+        result
+    }
+
     fn execute_with_ddl_authority<T>(
         &mut self, command: &str, table: Option<&str>, ddl: bool, sequence_ddl: bool,
         sequences: Vec<String>, execute: impl FnOnce(&mut Self) -> Result<(T, bool), CoreError>,
@@ -3975,6 +4049,8 @@ type AuthorizationContextObserver = Box<dyn FnOnce(bool)>;
 thread_local! {
     static AUTHORIZATION_CONTEXT_OBSERVED: std::cell::RefCell<Option<AuthorizationContextObserver>> =
         const { std::cell::RefCell::new(None) };
+    static BEFORE_SEQUENCE_DEFAULT_EXECUTION: std::cell::RefCell<Option<AuthorizationContextObserver>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -4001,6 +4077,36 @@ mod lifecycle_tests {
         }
         assert_eq!(session.authorization_full_runs, 3);
         assert_eq!(session.authorization_hits, 10);
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn authorization_memo_replays_only_column_default_grants() {
+        let service = authorization_fixture(Engine::V2);
+        let mut session = service.role_session("owner").unwrap();
+        session.execute_sql("CREATE TABLE serial_t (id BIGSERIAL PRIMARY KEY)", &[]).unwrap();
+        session.execute_sql("CREATE TABLE explicit_t (id BIGINT PRIMARY KEY)", &[]).unwrap();
+        session.set_postgres_surface();
+
+        let insert = session.prepare("INSERT INTO serial_t DEFAULT VALUES RETURNING id").unwrap();
+        session.execute_prepared(&insert, &[]).unwrap();
+        let first = session.authorization_memos[0].as_ref().unwrap().sequence_defaults.clone().unwrap();
+        let hits = session.authorization_hits;
+        session.execute_prepared(&insert, &[]).unwrap();
+        let second = session.authorization_memos[0].as_ref().unwrap().sequence_defaults.as_ref().unwrap();
+        assert_eq!(session.authorization_hits, hits + 1);
+        assert!(Arc::ptr_eq(&first, second), "the second draw must use the recorded grant");
+
+        for (sql, params) in [
+            ("INSERT INTO explicit_t VALUES (nextval('serial_t_id_seq'))", vec![]),
+            ("INSERT INTO explicit_t VALUES (nextval($1))", vec![Value::Text("serial_t_id_seq".into())]),
+        ] {
+            let insert = session.prepare(sql).unwrap();
+            for _ in 0..2 {
+                session.execute_prepared(&insert, &params).unwrap();
+                assert!(session.authorization_memos[0].as_ref().unwrap().sequence_defaults.is_none());
+            }
+        }
     }
 
     #[test]
@@ -4313,9 +4419,11 @@ mod lifecycle_tests {
     }
 
     fn authorization_fixture(engine: Engine) -> Arc<Service> {
+        static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = crate::test_support::fixture_root().join(format!(
-            "authorization-memo-{}-{}",
+            "authorization-memo-{}-{}-{}",
             std::process::id(),
+            SERIAL.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

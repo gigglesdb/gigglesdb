@@ -706,7 +706,7 @@ impl EngineSlot {
     pub(super) fn authorization_versions(
         &self,
         statement_version: impl FnOnce(u64, &super::engine::catalog::CatalogVersion) -> Option<u64>,
-    ) -> Option<(u64, u64)> {
+    ) -> Option<(u64, u64, u64)> {
         if self.is_cluster() { return None; }
         let registry = self.registry();
         if registry.kv_fenced.load(Ordering::Acquire) { return None; }
@@ -718,7 +718,7 @@ impl EngineSlot {
         // closing it. This check revalidates the sampled generation even
         // while recovery is still between closing it and publishing the next.
         registry.check().ok()?;
-        Some((latest, statement))
+        Some((latest, statement, registry.prepared.stamp))
     }
 
     // The state mutex excludes cold observers while the Release store

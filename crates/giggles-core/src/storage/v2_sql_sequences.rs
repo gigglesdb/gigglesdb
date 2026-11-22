@@ -162,6 +162,93 @@ impl SqlSession {
     }
 }
 
+/// Catalog observations from the S2 authorization that admits this execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SequenceDefaultContext {
+    pub stamp: u64,
+    pub latest_catalog: u64,
+    pub statement_catalog: u64,
+}
+
+type DefaultGrant = (u64, u128, &'static [SequencePrivilege]);
+
+/// Opaque successes for resolved column defaults, scoped to one S2 entry.
+pub struct SequenceDefaultGrants {
+    context: SequenceDefaultContext,
+    authority: SequenceAuthority,
+    allowed: Vec<DefaultGrant>,
+}
+
+pub(in crate::storage) struct DefaultExecution {
+    context: SequenceDefaultContext,
+    previous: Option<Arc<SequenceDefaultGrants>>,
+    guard: Option<Arc<Guard>>,
+}
+
+impl DefaultExecution {
+    pub(in crate::storage) fn new(
+        context: SequenceDefaultContext, previous: Option<Arc<SequenceDefaultGrants>>,
+    ) -> Self {
+        Self { context, previous, guard: None }
+    }
+
+    pub(in crate::storage) fn bind(
+        &mut self, db: &EngineLease, txn: &Transaction, mut guard: Guard,
+    ) -> Arc<Guard> {
+        if guard.pin_default_images
+            && db.stamp() == self.context.stamp
+            && db.catalog().snapshot_version(txn).is_some_and(|version| version.0 == self.context.statement_catalog)
+        {
+            guard.memo = Some(DefaultMemo {
+                context: self.context,
+                previous: self.previous.take().filter(|grants| {
+                    grants.context == self.context && grants.authority == guard.authority
+                }),
+                replay_valid: std::sync::OnceLock::new(),
+            });
+        }
+        let guard = Arc::new(guard);
+        if guard.memo.is_some() {
+            self.guard = Some(guard.clone());
+        }
+        guard
+    }
+
+    pub(in crate::storage) fn grants(self) -> Option<Arc<SequenceDefaultGrants>> {
+        self.guard?.grants()
+    }
+}
+
+struct DefaultMemo {
+    context: SequenceDefaultContext,
+    previous: Option<Arc<SequenceDefaultGrants>>,
+    replay_valid: std::sync::OnceLock<bool>,
+}
+
+type Versioned<T> = (T, Option<u64>);
+
+#[derive(Default)]
+struct GuardState {
+    roles: Option<Versioned<roles::RoleCatalogImage>>,
+    latest: Option<Versioned<Arc<relational::Relational>>>,
+    last_pinned: Option<(DecisionKey, bool)>,
+    defaults: Vec<DefaultGrant>,
+    last_live: Option<Decision>,
+}
+
+#[cfg(any(test, feature = "test-metadata-counts"))]
+thread_local! {
+    static DEFAULT_GRANT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "test-metadata-counts")]
+impl SequenceDefaultGrants {
+    #[doc(hidden)]
+    pub fn replay_hits() -> usize {
+        DEFAULT_GRANT_HITS.get()
+    }
+}
+
 /// Execution-time sequence authority for one statement (GD-0084 Q24).
 ///
 /// The statement authorizer can only judge names it sees. A dynamic name
@@ -169,19 +256,19 @@ impl SqlSession {
 /// authorization, or a referential action's default all reach this callback
 /// unjudged, so every call is checked here on the sequence it resolved to, before
 /// any session value, counter or cluster sequence RPC is touched.
-#[derive(Clone)]
 pub(in crate::storage) struct Guard {
     authority: SequenceAuthority,
     roles: Option<roles::RoleCatalog>,
     /// Owner records this transaction wrote itself (role keyspace, prefix 10).
-    private_owners: Arc<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+    private_owners: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     /// Sequences whose definition this transaction created or changed itself.
-    private_sequences: Arc<std::collections::BTreeSet<u64>>,
+    private_sequences: std::collections::BTreeSet<u64>,
     /// Tables whose definition this transaction changed itself (for example a
     /// rename, which also moves the owner record to the new name).
-    private_tables: Arc<std::collections::BTreeSet<u64>>,
-    /// The last allowed decision, valid while both images are the same objects.
-    cache: Arc<Mutex<Option<Decision>>>,
+    private_tables: std::collections::BTreeSet<u64>,
+    pin_default_images: bool,
+    memo: Option<DefaultMemo>,
+    state: Mutex<GuardState>,
 }
 impl Guard {
     pub(in crate::storage) fn new(
@@ -219,10 +306,12 @@ impl Guard {
         Self {
             authority: authority.clone(),
             roles: Some(roles),
-            private_owners: Arc::new(private_owners),
-            private_sequences: Arc::new(private_sequences),
-            private_tables: Arc::new(private_tables),
-            cache: Arc::default(),
+            private_owners,
+            private_sequences,
+            private_tables,
+            pin_default_images: false,
+            memo: None,
+            state: Mutex::default(),
         }
     }
     #[cfg(all(test, feature = "engine-rocksdb"))]
@@ -230,12 +319,21 @@ impl Guard {
         Self {
             authority: SequenceAuthority::Unrestricted,
             roles: None,
-            private_owners: Arc::default(),
-            private_sequences: Arc::default(),
-            private_tables: Arc::default(),
-            cache: Arc::default(),
+            private_owners: BTreeMap::new(),
+            private_sequences: std::collections::BTreeSet::new(),
+            private_tables: std::collections::BTreeSet::new(),
+            pin_default_images: false,
+            memo: None,
+            state: Mutex::default(),
         }
     }
+    pub(in crate::storage) fn pin_default_images(&mut self, txn: &Transaction) {
+        self.pin_default_images = txn.catalog_writes().next().is_none()
+            && self.private_owners.is_empty()
+            && self.private_sequences.is_empty()
+            && self.private_tables.is_empty();
+    }
+
     /// The authority key (owner record name) of table `id`, found by stable id. A
     /// table this transaction changed itself (renamed, say) is named as this
     /// transaction sees it, matching the owner record its DDL moved; any other
@@ -317,27 +415,36 @@ impl Guard {
         if matches!(self.authority, SequenceAuthority::Unrestricted) {
             return Ok(());
         }
-        // Only the unrestricted test guard has no catalog; never allow a
-        // restricted principal without one.
-        let Some(catalog) = &self.roles else { return Err(CoreError::SequencePrivilege) };
-        // Roles and the latest catalog are read through the statement's own lease,
-        // never a fresh admission (which could reach another generation).
-        let roles = catalog.image_leased(Some(db)).map_err(role_error)?;
-        // The definition whose ownership link answers. A sequence this transaction
-        // created or altered is judged on its own private definition. Any other is
-        // judged on the latest committed definition of this same incarnation, so a
-        // REPEATABLE READ snapshot cannot keep a link (OWNED BY) another session has
-        // since moved; the snapshot only names the object.
-        let latest = if committed && !self.private_sequences.contains(&id) {
-            Some(db.native_metadata_image(None)?.1)
-        } else {
-            None
-        };
+        let pin_images = self.pin_default_images && origin == SequenceOrigin::ColumnDefault;
+        if pin_images {
+            self.roles.as_ref().ok_or(CoreError::SequencePrivilege)?
+                .check_fenced().map_err(role_error)?;
+        }
         let required = required(operation);
-        let key: DecisionKey = (id, def.incarnation, origin, required);
+        let key = (id, def.incarnation, origin, required);
+        let grant = (pin_images && committed).then_some((id, def.incarnation, required));
+        if let Some(grant) = &grant
+            && let Some(memo) = &self.memo
+            && let Some(previous) = &memo.previous
+            && previous.allowed.contains(grant)
+            && *memo.replay_valid.get_or_init(|| {
+                db.stamp() == memo.context.stamp
+                    && db.catalog().current_version() == Some(memo.context.latest_catalog)
+            })
         {
-            let cache = self.cache.lock().map_err(|_| CoreError::Fenced)?;
-            if let Some(decision) = cache.as_ref()
+            #[cfg(any(test, feature = "test-metadata-counts"))]
+            DEFAULT_GRANT_HITS.set(DEFAULT_GRANT_HITS.get() + 1);
+            return Ok(());
+        }
+
+        // Use the live definition only for a committed sequence the transaction
+        // has not altered. The statement image still names the resolved object.
+        let use_latest = committed && !self.private_sequences.contains(&id);
+        if !pin_images {
+            let roles = self.read_roles(db)?;
+            let latest = use_latest.then(|| db.native_metadata_image(None).map(|(_, image)| image)).transpose()?;
+            let state = self.state.lock().map_err(|_| CoreError::Fenced)?;
+            if let Some(decision) = &state.last_live
                 && decision.key == key
                 && decision.roles.same_image(&roles)
                 && match (&decision.latest, &latest) {
@@ -348,8 +455,89 @@ impl Guard {
             {
                 return Ok(());
             }
+            drop(state);
+            self.check_permission(image, key, def, &roles, latest.as_deref())?;
+            self.state.lock().map_err(|_| CoreError::Fenced)?.last_live =
+                Some(Decision { roles, latest, key });
+            return Ok(());
         }
-        let (current, owner_key) = match &latest {
+
+        let mut state = self.state.lock().map_err(|_| CoreError::Fenced)?;
+        if state.last_pinned == Some((key, use_latest))
+            || grant.as_ref().is_some_and(|grant| state.defaults.contains(grant))
+        {
+            return Ok(());
+        }
+        if state.roles.is_none() {
+            state.roles = Some(self.read_versioned(db, || self.read_roles(db))?);
+        }
+        if use_latest && state.latest.is_none() {
+            state.latest = Some(self.read_versioned(db, || db.native_metadata_image(None).map(|(_, image)| image))?);
+        }
+        let roles = &state.roles.as_ref().expect("statement role image").0;
+        let latest = state.latest.as_ref().filter(|_| use_latest).map(|(image, _)| &**image);
+        self.check_permission(image, key, def, roles, latest)?;
+        state.last_pinned = Some((key, use_latest));
+        if let Some(grant) = grant {
+            state.defaults.push(grant);
+        }
+        Ok(())
+    }
+
+    fn read_roles(&self, db: &EngineLease) -> Result<roles::RoleCatalogImage, CoreError> {
+        let catalog = self.roles.as_ref().ok_or(CoreError::SequencePrivilege)?;
+        catalog.image_leased(Some(db)).map_err(role_error)
+    }
+
+    fn read_versioned<T>(
+        &self, db: &EngineLease, read: impl FnOnce() -> Result<T, CoreError>,
+    ) -> Result<Versioned<T>, CoreError> {
+        // Both reads take fresh committed snapshots through this lease. Catalog
+        // publication invalidates the observer before making changes visible.
+        // Matching observations bracket the read at exactly the S2 version.
+        let version = self.memo.as_ref().map(|memo| memo.context.latest_catalog)
+            .filter(|version| db.catalog().current_version() == Some(*version));
+        let value = read()?;
+        Ok((value, version.filter(|version| db.catalog().current_version() == Some(*version))))
+    }
+
+    fn grants(&self) -> Option<Arc<SequenceDefaultGrants>> {
+        let memo = self.memo.as_ref()?;
+        let previous = memo.previous.as_ref().filter(|_| memo.replay_valid.get() == Some(&true));
+        let state = self.state.lock().ok()?;
+        let version = Some(memo.context.latest_catalog);
+        if state.defaults.is_empty()
+            || state.roles.as_ref().is_none_or(|(_, read)| *read != version)
+            || state.latest.as_ref().is_none_or(|(_, read)| *read != version)
+        {
+            return previous.cloned();
+        }
+        let mut allowed = state.defaults.clone();
+        if let Some(previous) = previous {
+            for grant in &previous.allowed {
+                if !allowed.contains(grant) {
+                    allowed.push(*grant);
+                }
+            }
+        }
+        Some(Arc::new(SequenceDefaultGrants {
+            context: memo.context,
+            authority: self.authority.clone(),
+            allowed,
+        }))
+    }
+
+    fn check_permission(
+        &self,
+        image: &relational::Relational,
+        key: DecisionKey,
+        def: &relational::catalog_ext::SequenceDef,
+        roles: &roles::RoleCatalogImage,
+        latest: Option<&relational::Relational>,
+    ) -> Result<(), CoreError> {
+        use relational::clock::SequenceOrigin;
+        let (id, _, origin, required) = key;
+        let (current, owner_key) = match latest {
             Some(latest) => {
                 // A replacement (another incarnation) is never judged under this name.
                 let current = latest
@@ -377,8 +565,8 @@ impl Guard {
         // always succeeded; it never grants more than a direct call.
         let principal = match origin {
             SequenceOrigin::ReferentialAction(child) => self
-                .table_key(child, image, latest.as_deref())
-                .map(|key| self.owner(&roles, &key))
+                .table_key(child, image, latest)
+                .map(|key| self.owner(roles, &key))
                 .transpose()?
                 .flatten()
                 .map(SequenceAuthority::Role),
@@ -387,7 +575,7 @@ impl Guard {
         let principal = principal.as_ref().unwrap_or(&self.authority);
         let allowed = match &owner_key {
             Some(owner_key) => {
-                let held = self.held(principal, &roles, owner_key, standalone)?;
+                let held = self.held(principal, roles, owner_key, standalone)?;
                 required.iter().any(|privilege| held.contains(privilege))
             }
             // An owning table missing from every image: refuse.
@@ -396,7 +584,6 @@ impl Guard {
         if !allowed {
             return Err(CoreError::SequencePrivilege);
         }
-        *self.cache.lock().map_err(|_| CoreError::Fenced)? = Some(Decision { roles, latest, key });
         Ok(())
     }
 }
@@ -410,7 +597,7 @@ pub(super) fn callback(
     values: sequences::SessionValues,
     unsettled: Unsettled,
     search_path: Vec<String>,
-    guard: Guard,
+    guard: Arc<Guard>,
 ) -> relational::clock::SequenceCallback {
     let db = db.into();
     Arc::new(move |operation, name, value, called, origin| {
