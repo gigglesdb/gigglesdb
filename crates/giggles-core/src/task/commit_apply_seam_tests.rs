@@ -80,7 +80,7 @@ fn apply_loading(
 ) -> Result<Receipt, TaskError> {
     let (rows, approved) = source;
     let mut resolved = 0;
-    let mut sources = |_: &Arc<V2Db>, ctx: &TaskContext, preview: PreviewId, _: &[u8; 32]| {
+    let mut sources = |_: &SessionLease, ctx: &TaskContext, preview: PreviewId, _: &[u8; 32]| {
         resolved += 1;
         assert_eq!(preview, PREVIEW);
         Ok(Box::new(FakeSource {

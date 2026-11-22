@@ -215,7 +215,7 @@ fn unsupported_values_row_count_set_and_isolation_fall_back() {
     assert_eq!(run(&mut s, &format!("INSERT INTO users(email) VALUES {rows} ON CONFLICT(email) DO NOTHING")).affected, 201);
     run(&mut s, "INSERT INTO users(email) VALUES('a') ON CONFLICT(email) DO UPDATE SET email=excluded.email");
     run(&mut s, "BEGIN");
-    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else { unreachable!() };
+    let db = f.admin.as_ref().unwrap().test_v2();
     s.v2_transaction = Some(db.begin(Isolation::RepeatableRead));
     run(&mut s, &upsert("b", "B", false));
     run(&mut s, "COMMIT");

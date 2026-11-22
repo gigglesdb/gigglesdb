@@ -1,7 +1,7 @@
 use super::*;
 
 fn comments(s: &mut SqlSession) -> BTreeMap<(u64, u64), String> {
-    let Backend::V2(db) = &s.admin.inner.backend else { unreachable!() };
+    let db = s.admin.test_v2();
     let mut implicit = db.begin(Isolation::ReadCommitted);
     db.catalog().parts(s.v2_transaction.as_mut().unwrap_or(&mut implicit)).unwrap().comments
 }

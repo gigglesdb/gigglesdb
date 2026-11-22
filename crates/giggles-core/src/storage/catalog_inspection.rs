@@ -1,5 +1,5 @@
 //! Borrowed committed catalog access for trusted engine inspection.
-use super::{Admin, CoreError};
+use super::{Admin, CoreError, Holder};
 use crate::relational::TableDef;
 use std::collections::BTreeMap;
 
@@ -14,7 +14,7 @@ impl Admin {
         &self,
         inspect: impl FnOnce(u128, u64, &BTreeMap<String, TableDef>) -> T,
     ) -> Result<T, CoreError> {
-        if let super::Backend::V2(db) = &self.inner.backend {
+        if let Some(db) = self.lease(Holder::Admin)? {
             let _ticket = self.inner.enter()?;
             return db.inspect_binding(None, inspect);
         }

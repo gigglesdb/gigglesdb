@@ -49,9 +49,9 @@ fn load(session: &mut crate::storage::SqlSession) {
     }
 }
 
-fn v2(admin: &Admin) -> &V2Db {
+fn v2(admin: &Admin) -> crate::storage::EngineLease {
     match &admin.inner.backend {
-        Backend::V2(db) => db,
+        Backend::V2(_) => admin.test_v2(),
         _ => panic!("expected a v2 backend"),
     }
 }

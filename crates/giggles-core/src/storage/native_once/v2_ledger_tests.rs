@@ -32,9 +32,8 @@ fn fixture() -> (Dir, Admin) {
         .execute("CREATE TABLE orders(id BIGINT PRIMARY KEY, note TEXT)", &[], None).unwrap();
     (dir, admin)
 }
-fn db(admin: &Admin) -> &crate::storage::v2::V2Db {
-    let Backend::V2(db) = &admin.inner.backend else { panic!("v2") };
-    db
+fn db(admin: &Admin) -> crate::storage::EngineLease {
+    admin.test_v2()
 }
 fn domain(admin: &Admin) -> u128 {
     u128::from_be_bytes(db(admin).meta.domain)
@@ -149,7 +148,7 @@ fn terminal_outcome_recorded() {
     let NativeOnceAdmission::Owner(owner) = admin.admit_native_once_engine(identity.clone(), [5; 32]).unwrap()
         else { panic!("owner") };
     let mut session = admin.sql_session();
-    let setup = session.begin_once_engine().unwrap();
+    let setup = session.begin_once_engine(None).unwrap();
     session.execute("INSERT INTO orders VALUES(7, 'discarded')", &[], None).unwrap();
     let (record, replayed) = session.publish_native_once_engine(Some(setup), owner, [6; 32], terminal.clone(), 60,
         NativePublishMode::Terminal, &mut || lease(100, 110)).unwrap();
@@ -255,7 +254,7 @@ fn task_and_once_identities_never_collide() {
     // A task operation outcome in the same `22` namespace.
     let task = TaskObjectId(5005);
     let op = crate::task::ledger::OperationId::new(b"A-5005".to_vec()).unwrap();
-    let task_key = crate::task::ledger::task_outcome_key(db(&admin), task, &op);
+    let task_key = crate::task::ledger::task_outcome_key(&db(&admin), task, &op);
     let task_record = OutcomeRecord {
         flags: 0,
         identity: crate::task::ledger::task_identity(task, &op),
@@ -274,7 +273,7 @@ fn task_and_once_identities_never_collide() {
     assert_eq!(once_record.identity[0], 1);
     assert_eq!(task_record.identity[0], crate::task::ledger::TASK_IDENTITY_TAG);
     assert!(matches!(engine.outcome(&request.identity), Ok(OnceStatus::Retained(_))));
-    assert_eq!(crate::task::ledger::lookup(db(&admin), &task_key).unwrap(), Some(task_record.clone()));
+    assert_eq!(crate::task::ledger::lookup(&db(&admin), &task_key).unwrap(), Some(task_record.clone()));
     // A native identity carrying a task tag is refused on the shared ledger.
     let forged = NativeOnceKey { database_domain: domain(&admin), identity: task_record.identity.clone() };
     assert!(matches!(admin.admit_native_once_engine(forged.clone(), [1; 32]), Err(NativeOnceError::RetentionUnavailable)));
@@ -282,7 +281,7 @@ fn task_and_once_identities_never_collide() {
     // Compaction blanks the once payload only; the task outcome is untouched
     // and is not counted as a once identity.
     assert_eq!(engine.compact_outcomes(&|| at(500, 510)), Ok(1));
-    assert_eq!(crate::task::ledger::lookup(db(&admin), &task_key).unwrap(), Some(task_record));
+    assert_eq!(crate::task::ledger::lookup(&db(&admin), &task_key).unwrap(), Some(task_record));
     assert_eq!(header(&admin).unwrap().once_identities, 1);
     assert_eq!(engine.outcome(&request.identity), Ok(OnceStatus::Expired { retry_until_seconds: 120 }));
 }

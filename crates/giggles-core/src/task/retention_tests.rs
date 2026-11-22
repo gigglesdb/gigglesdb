@@ -5,6 +5,7 @@
 //! four rows and writes a `24` header, four `25` rows, a `23` receipt, a
 //! `22` outcome, the `20` head and four `21` memberships.
 use super::*;
+use crate::storage::SessionLease;
 use crate::storage::engine::codec;
 use crate::storage::engine::commit::ManualClock;
 use crate::storage::roles::{NewRole, TablePrivilege};
@@ -62,8 +63,8 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn db(&self) -> Arc<V2Db> {
-        self.admin.sql_session().v2_db().unwrap()
+    fn db(&self) -> SessionLease {
+        self.admin.sql_session().v2_lease(crate::storage::Holder::TaskRun).unwrap()
     }
     fn commit(&self, id: &str) -> Receipt {
         let mut session = self.admin.sql_session();
@@ -244,7 +245,7 @@ fn change(db: &V2Db, task: TaskObjectId, seq: u64) -> (ChangeHeader, Vec<ChangeR
 fn read_log_deleted_after_90_days_with_debits() {
     let dir = directory();
     let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
-    let db = admin.sql_session().v2_db().unwrap();
+    let db = admin.sql_session().v2_lease(crate::storage::Holder::TaskRun).unwrap();
     let (a, b) = (TaskObjectId(5), TaskObjectId(6));
     let mut records = read_log(a, 1, NOW, 2);
     records.extend(read_log(a, 2, NOW + 2 * DAY, 1));

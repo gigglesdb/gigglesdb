@@ -6,7 +6,7 @@ impl Admin {
         &self, clock: &mut dyn FnMut() -> NativeResult<NativeClockLease>,
     ) -> NativeResult<usize> {
         let inner = &self.inner;
-        let Backend::V2(db) = &inner.backend else { unreachable!() };
+        let db = self.lease(Holder::NativeOnce)?.ok_or(CoreError::Unsupported)?;
         let _ticket = inner.enter()?;
         db.require_local()?;
         let mut txn = db.begin(Isolation::RepeatableRead);
@@ -46,7 +46,8 @@ impl Admin {
         db.catalog().commit_ddl_guarded(txn, guard).map_err(|error| match error {
             TxnError::Guard(GuardRejection::LeaseExpired) => NativeOnceError::ClockUncertain,
             TxnError::CommitAmbiguous => {
-                inner.fence_native_commit();
+                db.fence_native_commit();
+                inner.fenced.store(true, Ordering::Release);
                 CoreError::Storage("engine commit outcome unknown".into()).into()
             }
             other => CoreError::from(other).into(),

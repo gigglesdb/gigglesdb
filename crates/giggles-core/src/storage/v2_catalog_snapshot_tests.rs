@@ -20,9 +20,9 @@ impl Fixture {
     fn admin(&self) -> &Admin {
         self.admin.as_ref().unwrap()
     }
-    fn db(&self) -> &V2Db {
+    fn db(&self) -> crate::storage::EngineLease {
         match &self.admin().inner.backend {
-            super::super::Backend::V2(db) => db,
+            super::super::Backend::V2(_) => self.admin().test_v2(),
             _ => unreachable!(),
         }
     }
@@ -236,7 +236,7 @@ fn projection_view_source_bindings_survive_reopen() {
     let nested = wanted.sql_views.values().find(|v| v.name == "nested").unwrap();
     assert_eq!(nested.columns.iter().map(|c| c.source).collect::<Vec<_>>(), vec![Some((*id,repeated.columns[1].id)),Some((*id,repeated.columns[0].id))]);
     assert_eq!(sql.execute("ALTER TABLE t DROP COLUMN a", &[], None), Err(CoreError::Sql(crate::relational::SqlError::DependentObjects)));
-    drop(sql); f.admin.take();
+    drop(sql); drop(db); f.admin.take();
     f.admin = Some(Admin::open(&f.path, Limits::default()).unwrap());
     let db = f.db(); let mut tx = db.begin(engine::txn::Isolation::ReadCommitted);
     assert_eq!(db.catalog().parts(&mut tx).unwrap().sql_views, wanted.sql_views);
@@ -258,7 +258,7 @@ fn legacy_view_bytes_survive_unrelated_ddl_and_reopen() {
     for statement in ["CREATE TABLE unrelated(x int)", "COMMENT ON TABLE unrelated IS 'retained'"] {
         sql.execute(statement, &[], None).unwrap();
     }
-    drop(sql); f.admin.take();
+    drop(sql); drop(db); f.admin.take();
     f.admin = Some(Admin::open(&f.path, Limits::default()).unwrap());
     let db = f.db(); let mut tx = db.begin(engine::txn::Isolation::ReadCommitted);
     assert_eq!(tx.get(engine::kv::Keyspace::Catalog, &view_key(id)).unwrap(), Some(legacy));

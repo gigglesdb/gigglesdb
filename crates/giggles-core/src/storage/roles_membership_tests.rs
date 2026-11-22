@@ -36,7 +36,7 @@ fn raw(roles: &RoleCatalog) -> BTreeMap<Vec<u8>, Vec<u8>> {
     roles.read(|t| Ok(t.unwrap().0.clone())).unwrap()
 }
 fn bits(admin: &Admin) -> u64 {
-    let super::super::Backend::V2(db) = &admin.inner.backend else {
+    let Some(db) = admin.lease(super::super::Holder::Role).unwrap() else {
         // Legacy refuses extended records and has no feature-bit metadata.
         return 0;
     };

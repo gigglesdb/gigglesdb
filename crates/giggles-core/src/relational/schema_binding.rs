@@ -116,6 +116,7 @@ impl Prepared {
             domain: self.domain,
             epoch: self.epoch,
             transaction: self.transaction,
+            engine_generation: self.engine_generation,
             statement: (*unbound).clone(),
             native_delete: self.native_delete.clone(),
             native_insert_many: self.native_insert_many,

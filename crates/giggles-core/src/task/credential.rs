@@ -200,8 +200,7 @@ impl TaskCatalog {
         expires: Option<WallClockMs>,
         now: WallClockMs,
     ) -> Result<IssuedCredential, TaskDdlError> {
-        let (mut txn, _) = self.begin_write(None)?;
-        let db = self.db()?;
+        let (db, mut txn, _) = self.begin_write(None)?;
         let view = db.catalog().committed_view(&mut txn)?;
         let def = Self::current(&view, task)?;
         Self::may_administer(actor, &def)?;
@@ -239,7 +238,7 @@ impl TaskCatalog {
             encode_credential(&record)?,
         )?;
         txn.require_features(TASK_CATALOG);
-        db.catalog().commit_ddl(txn)?;
+        self.commit_catalog_write(&db, txn)?;
         Ok(IssuedCredential {
             id,
             task: def.name,
@@ -249,8 +248,7 @@ impl TaskCatalog {
     }
 
     pub fn revoke_credential(&self, actor: &CatalogRole, id: u64) -> Result<(), TaskDdlError> {
-        let (mut txn, _) = self.begin_write(None)?;
-        let db = self.db()?;
+        let (db, mut txn, _) = self.begin_write(None)?;
         let view = db.catalog().committed_view(&mut txn)?;
         let (task, _) = view
             .task_credentials
@@ -263,7 +261,7 @@ impl TaskCatalog {
         Self::may_administer(actor, def)?;
         txn.delete(Keyspace::Catalog, credential_key(*task, id))?;
         txn.require_features(TASK_CATALOG);
-        db.catalog().commit_ddl(txn)?;
+        self.commit_catalog_write(&db, txn)?;
         Ok(())
     }
 

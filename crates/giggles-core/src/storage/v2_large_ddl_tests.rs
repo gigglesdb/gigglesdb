@@ -461,7 +461,7 @@ fn reclaim_crash_worker() {
     let admin = Admin::open(path, Limits::default()).unwrap();
     // Keep pre-DROP snapshots until both prefixes are durable retirement candidates.
     let db = match &admin.inner.backend {
-        Backend::V2(db) => db,
+        Backend::V2(_) => admin.test_v2(),
         _ => unreachable!(),
     };
     let snapshot = db.sequencer.snapshot();

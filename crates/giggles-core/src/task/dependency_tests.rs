@@ -3,6 +3,7 @@
 //! through `apply_diff` and `check_table_ddl` directly.
 #![allow(non_snake_case)]
 use super::*;
+use crate::storage::V2Db;
 use crate::{
     storage::roles::{NewRole, TablePrivilege},
     Admin, Engine, Limits,
@@ -94,7 +95,7 @@ fn retyping_masked_column_is_2BP01_and_unreferenced_passes() {
     let (_dir, admin, issuer) = database();
     let tasks = admin.tasks();
     tasks.create(&issuer, task(), NOW).unwrap();
-    let db = Arc::clone(tasks.db().unwrap());
+    let db = tasks.db().unwrap();
 
     let mut txn = db.begin(Isolation::ReadCommitted);
     let (old, new) = retyped(&db, &mut txn, "customer_email");
@@ -123,7 +124,7 @@ fn retyping_masked_column_is_2BP01_and_unreferenced_passes() {
 fn task_committed_after_ddl_snapshot_is_40001() {
     let (_dir, admin, issuer) = database();
     let tasks = admin.tasks();
-    let db = Arc::clone(tasks.db().unwrap());
+    let db = tasks.db().unwrap();
     // A task on another table makes kind 19 non-empty, so the slow path runs.
     let mut txn = db.begin(Isolation::ReadCommitted);
     let _ = txn.snapshot_ts();

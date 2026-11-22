@@ -29,11 +29,8 @@ impl Fixture {
         self.admin.as_ref().unwrap()
     }
 
-    fn db(&self) -> &Arc<v2::V2Db> {
-        let Backend::V2(db) = &self.admin().inner.backend else {
-            unreachable!()
-        };
-        db
+    fn db(&self) -> crate::storage::EngineLease {
+        self.admin().test_v2()
     }
 
     fn snapshot(&self) -> V2Snapshot {
@@ -42,7 +39,6 @@ impl Fixture {
         V2Snapshot {
             index_reads: Default::default(),
             indexes: Vec::new(),
-            _db: db.clone(),
             kv: db.kv.clone(),
             ts: guard.ts(),
             _guard: guard,

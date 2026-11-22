@@ -344,7 +344,8 @@ fn lifecycle_and_public_refusals() {
     let path = directory();
     let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
     let domain = match &admin.inner.backend {
-        Backend::V2(db) => {
+        Backend::V2(_) => {
+            let db = admin.test_v2();
             assert_eq!(
                 engine::meta::validate_meta(db.kv.as_ref()).unwrap().engine,
                 "rocksdb"
@@ -356,7 +357,7 @@ fn lifecycle_and_public_refusals() {
     drop(admin);
     let admin = Admin::open(&path, Limits::default()).unwrap();
     match &admin.inner.backend {
-        Backend::V2(db) => assert_eq!(db.meta.domain, domain),
+        Backend::V2(_) => assert_eq!(admin.test_v2().meta.domain, domain),
         _ => panic!("legacy"),
     }
     fn denied<T>(result: Result<T, CoreError>, feature: &'static str) {

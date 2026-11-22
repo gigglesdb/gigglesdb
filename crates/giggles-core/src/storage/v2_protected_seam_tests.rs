@@ -19,8 +19,8 @@ impl Fixture {
     fn admin(&self) -> &Admin { self.admin.as_ref().unwrap() }
     fn sql(&self) -> SqlSession { self.admin().sql_session() }
     fn exec(&self, sql: &str) { run(&mut self.sql(), sql); }
-    fn db(&self) -> Arc<v2::V2Db> {
-        match &self.admin().inner.backend { Backend::V2(db) => db.clone(), _ => panic!("v2 only") }
+    fn db(&self) -> crate::storage::EngineLease {
+        match &self.admin().inner.backend { Backend::V2(_) => self.admin().test_v2(), _ => panic!("v2 only") }
     }
     fn run(&self) -> ProtectedRun {
         ProtectedRun { txn: self.db().begin(Isolation::Serializable), effects: Effects::default() }

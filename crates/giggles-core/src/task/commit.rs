@@ -75,6 +75,7 @@ use super::records::{
 use super::undo::{self, UndoMode, UndoStaged};
 use crate::relational::clock::ExecutionClock;
 use crate::relational::{Prepared, SqlError, Value};
+use crate::storage::SessionLease;
 use crate::storage::engine::txn::{Savepoint, TxnError};
 use crate::storage::roles::{table_privileges_txn, RoleError, TablePrivilege};
 use crate::storage::{Isolation, Keyspace, ProtectedRun, SqlSession, Transaction, V2Db};
@@ -213,7 +214,7 @@ pub(crate) trait ApplySource {
 /// Resolves the [`ApplySource`] of an Apply request, once per call, after
 /// the outcome lookup and the task checks (D-F steps 2 and 3).
 pub(crate) type Sources<'a> = dyn FnMut(
-        &Arc<V2Db>,
+        &SessionLease,
         &TaskContext,
         PreviewId,
         &[u8; 32],
@@ -223,7 +224,7 @@ pub(crate) type Sources<'a> = dyn FnMut(
 /// The attachment point for Phase 7 (R3-706): the stored preview and
 /// approval of `preview`.
 pub(crate) fn stored_apply_source(
-    db: &Arc<V2Db>,
+    db: &SessionLease,
     ctx: &TaskContext,
     preview: PreviewId,
     digest: &[u8; 32],
@@ -256,6 +257,16 @@ pub fn protected_commit(
     commit_with(session, actor, op, request, &mut catalog_def)
 }
 
+pub(super) fn protected_commit_leased(
+    session: &mut SqlSession,
+    db: SessionLease,
+    actor: Actor<'_>,
+    op: &OperationId,
+    request: ProtectedRequest,
+) -> Result<Receipt, TaskError> {
+    commit_checked(session, db, actor, op, request, &mut catalog_def, &mut stored_apply_source, None)
+}
+
 /// A caller's check of the statement's affected row count (the native
 /// intent's row bound: exactly one row, or at most `n`). It sees the real
 /// count of the attempt that would commit.
@@ -277,8 +288,10 @@ pub fn protected_commit_checked(
     intent: RowIntent,
     check: &RowCheck<'_>,
 ) -> Result<Receipt, TaskError> {
+    let db = session.v2_lease(crate::storage::Holder::TaskRun)?;
     commit_checked(
         session,
+        db,
         actor,
         op,
         request,
@@ -437,8 +450,8 @@ fn stored_outcome(
 }
 
 /// The database an outcome lookup reads: v2 only (D9), not replicated (D13).
-fn lookup_db(session: &SqlSession) -> Result<Arc<V2Db>, TaskError> {
-    let db = session.v2_db().ok_or_else(unsupported)?;
+fn lookup_db(session: &SqlSession) -> Result<SessionLease, TaskError> {
+    let db = session.v2_lease(crate::storage::Holder::TaskRun)?;
     if db.task_kernel_unsupported() {
         return Err(unsupported());
     }
@@ -527,7 +540,7 @@ enum Work<'c> {
 
 /// What every attempt of one call shares.
 struct Call<'c> {
-    db: Arc<V2Db>,
+    db: SessionLease,
     ctx: &'c TaskContext,
     op: &'c OperationId,
     work: Work<'c>,
@@ -583,12 +596,15 @@ pub(crate) fn commit_sourced(
     load_def: &mut LoadDef<'_>,
     sources: &mut Sources<'_>,
 ) -> Result<Receipt, TaskError> {
-    commit_checked(session, actor, op, request, load_def, sources, None)
+    let db = session.v2_lease(crate::storage::Holder::TaskRun)?;
+    commit_checked(session, db, actor, op, request, load_def, sources, None)
 }
 
 /// [`commit_sourced`] with an optional row-count check (an undo has none).
+#[allow(clippy::too_many_arguments)]
 fn commit_checked(
     session: &mut SqlSession,
+    db: SessionLease,
     actor: Actor<'_>,
     op: &OperationId,
     request: ProtectedRequest,
@@ -598,7 +614,6 @@ fn commit_checked(
 ) -> Result<Receipt, TaskError> {
     let check = bound.map(|(_, check)| check);
     // 0. v2 only (D9), not replicated (D13).
-    let db = session.v2_db().ok_or_else(unsupported)?;
     if db.task_kernel_unsupported() {
         return Err(unsupported());
     }
@@ -691,7 +706,7 @@ fn attempt(
     let (ctx, fp) = (*ctx, *fp);
     let task = ctx.task;
     // 4. The transaction; 5. the hold, before any snapshot (D1).
-    let mut txn = db.begin(Isolation::Serializable);
+    let mut txn = db.begin_leased(Isolation::Serializable, crate::storage::Holder::TaskRun)?;
     let deadline = Instant::now().checked_add(Duration::from_millis(limits.lock_wait_ms));
     authority::hold(&txn, task, deadline, &|| crate::cancellation::check().is_err())
         .map_err(hold_error)?;
@@ -1008,7 +1023,7 @@ fn deny(
 
 /// What every attempt of one undo call shares.
 struct UndoCall<'c> {
-    db: Arc<V2Db>,
+    db: SessionLease,
     role: &'c RoleName,
     task: TaskObjectId,
     preview: PreviewId,
@@ -1089,7 +1104,7 @@ fn attempt_undo(
 ) -> Result<Receipt, TaskError> {
     let UndoCall { db, role, task, preview, digest, mode, faults } = call;
     let task = *task;
-    let txn = db.begin(Isolation::Serializable);
+    let txn = db.begin_leased(Isolation::Serializable, crate::storage::Holder::TaskRun)?;
     let deadline = Instant::now().checked_add(Duration::from_millis(lock_wait));
     authority::hold(&txn, task, deadline, &|| crate::cancellation::check().is_err())
         .map_err(hold_error)?;
@@ -1171,21 +1186,6 @@ fn attempt_undo(
         .map_err(|e| engine(e.into()))?;
     faults.after_commit()?;
     Ok(Receipt::from_record(&record, Some(ChangeRecord { header, rows })))
-}
-
-impl crate::storage::Admin {
-    /// For tests: pins the database's wall clock (task expiry, receipt and
-    /// preview times, retention) at `ms` Unix milliseconds; `None` returns
-    /// to the system clock (v2 only).
-    #[doc(hidden)]
-    pub fn set_task_wall_clock(&self, ms: Option<u64>) -> Result<(), CoreError> {
-        let db = self.sql_session().v2_db().ok_or(CoreError::Unsupported)?;
-        match ms {
-            Some(ms) => db.set_wall_clock(Arc::new(crate::storage::engine::commit::ManualClock::new(ms))),
-            None => db.set_wall_clock(Arc::new(crate::storage::engine::commit::SystemClock)),
-        }
-        Ok(())
-    }
 }
 
 #[cfg(all(test, feature = "engine-rocksdb"))]

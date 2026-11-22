@@ -145,7 +145,7 @@ fn native_unique_waits_then_returns_duplicate() {
     let f = Fixture::new();
     f.execute("CREATE TABLE t(id bigint PRIMARY KEY,v bigint UNIQUE)");
     let db = match &f.admin().inner.backend {
-        Backend::V2(db) => db.clone(),
+        Backend::V2(_) => f.admin().test_v2(),
         _ => unreachable!(),
     };
     let parts = f.parts();
@@ -167,7 +167,7 @@ fn native_unique_waits_then_returns_duplicate() {
         .unwrap();
     let (started_tx, started_rx) = mpsc::channel();
     let (result_tx, result_rx) = mpsc::channel();
-    let other = db.clone();
+    let other = db.child(Holder::Admin).unwrap();
     let worker = thread::spawn(move || {
         let mut second = other.begin(Isolation::ReadCommitted);
         started_tx.send(()).unwrap();

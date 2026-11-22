@@ -24,9 +24,7 @@ const DDL: [&str; 6] = [
 
 /// Ids of d, d_a, o, o_a, o_b, r from the committed catalog.
 fn ids(admin: &Admin) -> [u64; 6] {
-    let Backend::V2(db) = &admin.inner.backend else {
-        panic!("expected a v2 backend")
-    };
+    let db = admin.test_v2();
     let mut txn = db.begin(Isolation::ReadCommitted);
     let parts = db.catalog().parts(&mut txn).unwrap();
     let table = |name: &str| parts.tables.values().find(|t| t.name == name).unwrap().id;

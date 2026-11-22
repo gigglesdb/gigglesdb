@@ -297,8 +297,7 @@ impl StatementLog {
 /// A running task statement. Its last handle going finalizes its record.
 pub(crate) struct StatementEntry {
     state: Arc<TaskSessionState>,
-    /// Weak: a lingering handle never keeps the database open.
-    db: Option<Weak<V2Db>>,
+    generation: Result<Option<crate::storage::GenerationTag>, CoreError>,
     /// The full text, put back on discard for the statement that replaces it.
     text: Option<Arc<str>>,
     pub(crate) log: Mutex<StatementLog>,
@@ -317,7 +316,7 @@ impl StatementEntry {
     /// text and becomes its current statement.
     pub(crate) fn start(
         state: &Arc<TaskSessionState>,
-        db: Option<Arc<V2Db>>,
+        generation: Result<Option<crate::storage::GenerationTag>, CoreError>,
         class: StatementClass,
         param_count: usize,
     ) -> Arc<Self> {
@@ -334,7 +333,7 @@ impl StatementEntry {
         };
         let entry = Arc::new(Self {
             state: state.clone(),
-            db: db.as_ref().map(Arc::downgrade),
+            generation,
             text,
             log: Mutex::new(StatementLog {
                 info,
@@ -380,20 +379,30 @@ impl StatementEntry {
         }
     }
 
-    /// Ends the statement: writes its final record (no-op once done).
-    pub(crate) fn finish(&self) {
-        match self.db.as_ref().and_then(Weak::upgrade) {
-            Some(db) => finalize(&db, &self.state, &self.log),
-            None => lock(&self.log).done = true,
-        }
+    pub(crate) fn engine(&self) -> Result<Option<crate::storage::EngineLease>, CoreError> {
+        // A dormant entry must not keep RocksDB open. Debit and finalization
+        // take counted, no-wait continuations on the issuing generation.
+        self.generation.as_ref().map_err(Clone::clone)?.as_ref()
+            .map(|tag| tag.lease(crate::storage::Holder::Readlog)).transpose()
     }
+
+    /// Ends the statement: writes its final record (no-op once done).
+    pub(crate) fn finish(&self) -> Result<(), CoreError> {
+        if let Some(db) = self.engine()? {
+            finalize(&db, &self.state, &self.log);
+        } else {
+            lock(&self.log).done = true;
+        }
+        Ok(())
+    }
+
 }
 
 impl Drop for StatementEntry {
     fn drop(&mut self) {
         // While unwinding, the record stays open, as after a crash.
         if !std::thread::panicking() {
-            self.finish();
+            let _ = self.finish();
         }
     }
 }
@@ -686,14 +695,14 @@ impl crate::storage::Admin {
     /// report.
     #[doc(hidden)]
     pub fn task_read_log(&self, task: TaskObjectId) -> Result<Vec<ReadRecord>, CoreError> {
-        let db = self.sql_session().v2_db().ok_or(CoreError::Unsupported)?;
+        let db = self.sql_session().v2_lease(crate::storage::Holder::Readlog)?;
         let mut txn = db.begin(Isolation::ReadCommitted);
         records(&mut txn, task, None, None)
     }
 
     /// The reconciliation of `task`'s disclosure records (v2 only).
     pub fn task_read_verify(&self, task: TaskObjectId) -> Result<Reconciliation, CoreError> {
-        let db = self.sql_session().v2_db().ok_or(CoreError::Unsupported)?;
+        let db = self.sql_session().v2_lease(crate::storage::Holder::Readlog)?;
         let mut txn = db.begin(Isolation::ReadCommitted);
         verify(&mut txn, task)
     }
@@ -809,10 +818,8 @@ pub fn show_reads(
     if limit > SHOW_LIMIT_MAX {
         return Err(CoreError::Sql(SqlError::InvalidParameterValue));
     }
-    let db = session.v2_db().ok_or(CoreError::Unsupported)?;
-    let def = session
-        .tasks()
-        .lookup(task)?
+    let db = session.v2_lease(crate::storage::Holder::Readlog)?;
+    let def = super::catalog::lookup_leased(Some(&db), task)?
         .ok_or(CoreError::Sql(SqlError::UndefinedObject))?;
     if !def.privileges_of(role).contains(TaskPrivileges::INSPECT) {
         return Err(CoreError::Policy(crate::Error::Scope));
@@ -866,9 +873,21 @@ impl SqlSession {
         class: StatementClass,
         param_count: usize,
     ) -> Option<Arc<StatementEntry>> {
-        self.task_state
-            .as_ref()
-            .map(|state| StatementEntry::start(state, self.v2_db(), class, param_count))
+        let state = self.task_state.as_ref()?;
+        let generation = self.statement_lease().map(|db| db.as_deref().map(crate::storage::EngineLease::tag));
+        Some(StatementEntry::start(state, generation, class, param_count))
+    }
+
+    pub(crate) fn start_task_statement_leased(
+        &self, class: StatementClass, param_count: usize, db: Option<&crate::storage::EngineLease>,
+    ) -> Option<Arc<StatementEntry>> {
+        let state = self.task_state.as_ref()?;
+        let generation = match db {
+            Some(db) => Ok(Some(db.tag())),
+            None if self.is_v2_engine() => Err(CoreError::Fenced),
+            None => Ok(None),
+        };
+        Some(StatementEntry::start(state, generation, class, param_count))
     }
 
     /// Logs a failure of a statement whose entry never started (its pending
@@ -887,7 +906,7 @@ impl SqlSession {
         }
         if let Some(entry) = self.start_task_statement(class, param_count) {
             entry.fail(error);
-            entry.finish();
+            let _ = entry.finish();
         }
     }
 

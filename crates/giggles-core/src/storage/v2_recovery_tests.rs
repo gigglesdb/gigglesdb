@@ -104,7 +104,7 @@ fn wal_len(path: &Path) -> u64 {
 }
 
 fn reopen(path: &Path, ack_hw: Ts) -> Result<V2Db, OpenFailure> {
-    retry_writer_lock(|| V2Db::open_recovery(path, None, RecoveryOpen { ack_hw }))
+    retry_writer_lock(|| V2Db::open_recovery(path, None, RecoveryOpen { ack_hw, gc_retention: None, defer_maintenance: false, source: None }))
 }
 
 fn close(db: V2Db) -> Ts {
@@ -672,7 +672,7 @@ fn recovery_open_preserves_the_write_fence_holder() {
         .unwrap();
     let ack_hw = close(db);
 
-    let db = retry_writer_lock(|| V2Db::open_recovery(&dir.0, Some(token), RecoveryOpen { ack_hw }))
+    let db = retry_writer_lock(|| V2Db::open_recovery(&dir.0, Some(token), RecoveryOpen { ack_hw, gc_retention: None, defer_maintenance: false, source: None }))
         .unwrap();
     db.sequencer.release_write_fence(token, epoch).unwrap();
 }

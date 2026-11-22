@@ -69,16 +69,26 @@ impl RoleImage {
 pub struct RoleCatalogImage {
     catalog: RoleCatalog,
     image: Arc<RoleImage>,
+    generation: Option<super::GenerationTag>,
 }
 impl RoleCatalogImage {
-    pub fn get(&self, name: &str) -> Result<Option<CatalogRole>, RoleError> {
+    /// Refuse use after the publishing generation closes or takes a native fence.
+    pub fn check_fenced(&self) -> Result<(), RoleError> {
         self.catalog.check_fenced()?;
+        if let Some(generation) = &self.generation {
+            generation.check()?;
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, name: &str) -> Result<Option<CatalogRole>, RoleError> {
+        self.check_fenced()?;
         validate_name(name)?;
         self.image.get(name)
     }
 
     pub fn table_owner(&self, table: &str) -> Result<Option<String>, RoleError> {
-        self.catalog.check_fenced()?;
+        self.check_fenced()?;
         self.catalog.validate_relation_name(table)?;
         raw_get(&self.image.table, &key(b"owner/", table))?
             .map(|value| {
@@ -86,6 +96,58 @@ impl RoleCatalogImage {
                     .map_err(|error| CoreError::Corrupt(error.to_string()).into())
             })
             .transpose()
+    }
+
+    pub fn list(&self) -> Result<Vec<CatalogRole>, RoleError> {
+        self.check_fenced()?;
+        list_roles(Some(&self.image.table))
+    }
+
+    pub fn edges(&self) -> Result<Vec<MembershipEdge>, RoleError> {
+        self.check_fenced()?;
+        membership_edges(&self.image.table)
+    }
+
+    pub fn privileges_of(&self, member: &str) -> Result<BTreeSet<String>, RoleError> {
+        validate_name(member)?;
+        Ok(reachable(&self.edges()?, member, |edge| edge.inherit))
+    }
+
+    pub fn builtin_capabilities_of(&self, member: &str) -> Result<BTreeSet<String>, RoleError> {
+        self.check_fenced()?;
+        validate_name(member)?;
+        builtin_capabilities(Some(&self.image.table), member)
+    }
+
+    pub fn can_set(&self, member: &str, role: &str) -> Result<bool, RoleError> {
+        validate_name(member)?;
+        validate_name(role)?;
+        Ok(reachable(&self.edges()?, member, |edge| edge.set).contains(role))
+    }
+
+    pub fn is_member(&self, member: &str, role: &str) -> Result<bool, RoleError> {
+        validate_name(member)?;
+        validate_name(role)?;
+        Ok(reachable(&self.edges()?, member, |_| true).contains(role))
+    }
+
+    pub fn table_acl(&self, table: &str) -> Result<BTreeMap<String, BTreeSet<TablePrivilege>>, RoleError> {
+        self.check_fenced()?;
+        self.catalog.validate_relation_name(table)?;
+        table_acl(Some(&self.image.table), table)
+    }
+
+    pub fn schema_privileges(&self, schema: &str, role: &str) -> Result<BTreeSet<SchemaPrivilege>, RoleError> {
+        self.check_fenced()?;
+        validate_name(schema)?;
+        validate_name(role)?;
+        read_grants(Some(&self.image.table), b"sgrant/", schema, role)
+    }
+
+    pub fn visible_tables(&self, role: &str) -> Result<BTreeSet<String>, RoleError> {
+        self.check_fenced()?;
+        validate_name(role)?;
+        visible_tables(Some(&self.image.table), role)
     }
 }
 struct Bytes<'a>(&'a [u8]);
@@ -256,11 +318,7 @@ pub(crate) use engine::lock_shared;
 
 impl Admin {
     pub fn tasks(&self) -> crate::task::catalog::TaskCatalog {
-        let db = match &self.inner.backend {
-            super::Backend::V2(db) => Some(Arc::clone(db)),
-            super::Backend::Legacy(_) => None,
-        };
-        crate::task::catalog::TaskCatalog::new(db, self.roles())
+        crate::task::catalog::TaskCatalog::new(self.clone(), None)
     }
 
     pub fn roles(&self) -> RoleCatalog {
@@ -273,6 +331,14 @@ impl Admin {
 impl super::SqlSession {
     /// The task catalog of this session's database (GD-0061).
     pub(crate) fn tasks(&self) -> crate::task::catalog::TaskCatalog {
+        if let Some(generation) = &self.task_generation {
+            return crate::task::catalog::TaskCatalog::new(self.admin.clone(), Some(generation.clone()));
+        }
+        if let Some(lease) = self.v2_transaction.as_ref().and_then(super::Transaction::engine_lifetime)
+            .and_then(|lifetime| lifetime.lease.as_ref())
+        {
+            return crate::task::catalog::TaskCatalog::new(self.admin.clone(), Some(lease.tag()));
+        }
         self.admin.tasks()
     }
 }
@@ -450,7 +516,7 @@ impl RoleCatalog {
         Ok(())
     }
 
-    fn check_fenced(&self) -> Result<(), RoleError> {
+    pub(crate) fn check_fenced(&self) -> Result<(), RoleError> {
         if self.inner.fenced.load(Ordering::Acquire) {
             return Err(CoreError::Fenced.into());
         }
@@ -461,8 +527,16 @@ impl RoleCatalog {
         &self,
         inspect: impl FnOnce(Option<&RoleTable>) -> Result<T, RoleError>,
     ) -> Result<T, RoleError> {
+        self.read_leased(None, inspect)
+    }
+
+    fn read_leased<T>(
+        &self, lease: Option<&super::EngineLease>,
+        inspect: impl FnOnce(Option<&RoleTable>) -> Result<T, RoleError>,
+    ) -> Result<T, RoleError> {
         self.check_fenced()?;
-        if let super::Backend::V2(db) = &self.inner.backend {
+        let owned = if lease.is_none() { self.inner.lease(super::Holder::Role)? } else { None };
+        if let Some(db) = lease.or(owned.as_ref()) {
             let image = engine::image(db)?;
             self.check_fenced()?;
             return inspect(Some(&image.table));
@@ -481,8 +555,8 @@ impl RoleCatalog {
         change: impl FnOnce(&mut RoleTable) -> Result<T, RoleError>,
     ) -> Result<T, RoleError> {
         self.check_fenced()?;
-        if let super::Backend::V2(db) = &self.inner.backend {
-            return engine::write(db, || self.check_fenced(), change);
+        if let Some(db) = self.inner.lease(super::Holder::Role)? {
+            return engine::write(&db, || self.check_fenced(), change);
         }
         let mut tx = self.inner.db(super::ROLES)?.begin_write().map_err(io)?;
         self.check_fenced()?;
@@ -516,41 +590,47 @@ impl RoleCatalog {
         self.image()?.get(name)
     }
 
+    pub(crate) fn get_leased(&self, db: &super::EngineLease, name: &str) -> Result<Option<CatalogRole>, RoleError> {
+        self.check_fenced()?;
+        validate_name(name)?;
+        db.check()?;
+        let image = engine::image(db)?;
+        self.check_fenced()?;
+        image.get(name)
+    }
+
     pub fn image(&self) -> Result<RoleCatalogImage, RoleError> {
         self.check_fenced()?;
-        let image = if let super::Backend::V2(db) = &self.inner.backend {
+        let lease = self.inner.lease(super::Holder::Role)?;
+        self.capture_image(lease.as_ref())
+    }
+
+    pub(super) fn image_leased(&self, db: Option<&super::EngineLease>) -> Result<RoleCatalogImage, RoleError> {
+        self.check_fenced()?;
+        if let Some(db) = db {
+            db.check()?;
+        }
+        self.capture_image(db)
+    }
+
+    fn capture_image(&self, db: Option<&super::EngineLease>) -> Result<RoleCatalogImage, RoleError> {
+        let (image, generation) = if let Some(db) = db {
             let image = engine::image(db)?;
             self.check_fenced()?;
-            image
+            (image, Some(db.tag()))
         } else {
-            self.read(|table| Ok(Arc::new(RoleImage::new(table.cloned().unwrap_or_default()))))?
+            (self.read(|table| Ok(Arc::new(RoleImage::new(table.cloned().unwrap_or_default()))))?, None)
         };
         Ok(RoleCatalogImage {
             catalog: self.clone(),
             image,
+            generation,
         })
     }
 
     pub fn list(&self) -> Result<Vec<CatalogRole>, RoleError> {
         self.check_fenced()?;
-        self.read(|table| {
-            let mut roles: Vec<CatalogRole> = PREDEFINED
-                .iter()
-                .filter_map(|(_, name)| predefined(name))
-                .collect();
-            if let Some(table) = table {
-                for entry in table.iter().map_err(io)? {
-                    let (key, value) = entry.map_err(io)?;
-                    if key.value().starts_with(b"role/") {
-                        let stored: CatalogRole = decode(value.value())?;
-                        roles.retain(|role| role.name != stored.name);
-                        roles.push(stored);
-                    }
-                }
-            }
-            roles.sort_by(|left, right| left.name.cmp(&right.name));
-            Ok(roles)
-        })
+        self.read(list_roles)
     }
 
     pub fn is_empty(&self) -> Result<bool, RoleError> {
@@ -768,13 +848,7 @@ impl RoleCatalog {
     /// Predefined capabilities in the inherited closure, excluding stored-name collisions.
     pub fn builtin_capabilities_of(&self, member: &str) -> Result<BTreeSet<String>, RoleError> {
         validate_name(member)?;
-        self.read(|table| {
-            let empty = RoleTable::default();
-            let table = table.unwrap_or(&empty);
-            let mut names = reachable(&membership_edges(table)?, member, |e| e.inherit);
-            names.retain(|name| predefined(name).is_some() && !table.0.contains_key(&key(b"role/", name)));
-            Ok(names)
-        })
+        self.read(|table| builtin_capabilities(table, member))
     }
 
     pub fn can_set(&self, member: &str, role: &str) -> Result<bool, RoleError> {
@@ -1010,9 +1084,13 @@ impl RoleCatalog {
     }
 
     pub fn table_owner(&self, table: &str) -> Result<Option<String>, RoleError> {
+        self.table_owner_leased(table, None)
+    }
+
+    pub(crate) fn table_owner_leased(&self, table: &str, db: Option<&super::EngineLease>) -> Result<Option<String>, RoleError> {
         self.check_fenced()?;
         self.validate_relation_name(table)?;
-        self.read(|roles| match roles {
+        self.read_leased(db, |roles| match roles {
             Some(roles) => raw_get(roles, &key(b"owner/", table))?
                 .map(|value| {
                     String::from_utf8(value)
@@ -1100,6 +1178,12 @@ impl RoleCatalog {
         object: &str,
         role: &str,
     ) -> Result<BTreeSet<P>, RoleError> {
+        self.read_grants_leased(prefix, object, role, None)
+    }
+
+    fn read_grants_leased<P: Ord + DeserializeOwned>(
+        &self, prefix: &[u8], object: &str, role: &str, db: Option<&super::EngineLease>,
+    ) -> Result<BTreeSet<P>, RoleError> {
         self.check_fenced()?;
         if prefix == b"tgrant/" {
             self.validate_relation_name(object)?;
@@ -1107,32 +1191,13 @@ impl RoleCatalog {
             validate_name(object)?;
         }
         validate_name(role)?;
-        self.read(|table| match table {
-            Some(table) => {
-                let mut held = privileges(raw_get(table, &grant_key(prefix, object, role))?)?;
-                held.extend(privileges::<P>(raw_get(table, &grant_key(prefix, object, ""))?)?);
-                Ok(held)
-            },
-            None => Ok(BTreeSet::new()),
-        })
+        self.read_leased(db, |table| read_grants(table, prefix, object, role))
     }
 
     /// Direct ACL entries; the empty grantee is PUBLIC, independent of role names.
     pub fn table_acl(&self, table: &str) -> Result<BTreeMap<String, BTreeSet<TablePrivilege>>, RoleError> {
         self.check_fenced()?; self.validate_relation_name(table)?;
-        self.read(|image| {
-            let mut result = BTreeMap::new();
-            if let Some(image) = image {
-                let prefix = grant_key(b"tgrant/", table, "");
-                for (key, value) in &image.0 {
-                    if let Some(role) = key.strip_prefix(prefix.as_slice()) {
-                        let role = std::str::from_utf8(role).map_err(io)?.to_owned();
-                        result.insert(role, privileges(Some(value.clone()))?);
-                    }
-                }
-            }
-            Ok(result)
-        })
+        self.read(|image| table_acl(image, table))
     }
     /// PUBLIC is represented by an empty ACL grantee, never by a role name.
     /// Extended writes require ROLE_MEMBERSHIP; legacy writers refuse them.
@@ -1169,7 +1234,13 @@ impl RoleCatalog {
         table: &str,
         role: &str,
     ) -> Result<BTreeSet<TablePrivilege>, RoleError> {
-        self.read_grants(b"tgrant/", table, role)
+        self.table_privileges_leased(table, role, None)
+    }
+
+    pub(crate) fn table_privileges_leased(
+        &self, table: &str, role: &str, db: Option<&super::EngineLease>,
+    ) -> Result<BTreeSet<TablePrivilege>, RoleError> {
+        self.read_grants_leased(b"tgrant/", table, role, db)
     }
 
     pub fn grant_schema(
@@ -1205,39 +1276,91 @@ impl RoleCatalog {
     pub fn visible_tables(&self, role: &str) -> Result<BTreeSet<String>, RoleError> {
         self.check_fenced()?;
         validate_name(role)?;
-        self.read(|table| {
-            let mut visible = BTreeSet::new();
-            if let Some(table) = table {
-                for entry in table.iter().map_err(io)? {
-                    let (key, value) = entry.map_err(io)?;
-                    let bytes = key.value();
-                    let name = if let Some(name) = bytes.strip_prefix(b"owner/") {
-                        (value.value() == role.as_bytes()).then_some(name)
-                    } else if let Some(grant) = bytes.strip_prefix(b"tgrant/") {
-                        match grant.iter().rposition(|byte| *byte == 0) {
-                            Some(separator)
-                                if (&grant[separator + 1..] == role.as_bytes() || grant[separator + 1..].is_empty())
-                                    && !decode::<Vec<TablePrivilege>>(value.value())?
-                                        .is_empty() =>
-                            {
-                                Some(&grant[..separator])
-                            }
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some(name) = name {
-                        visible.insert(
-                            String::from_utf8(name.to_vec())
-                                .map_err(|error| CoreError::Corrupt(error.to_string()))?,
-                        );
-                    }
-                }
-            }
-            Ok(visible)
-        })
+        self.read(|table| visible_tables(table, role))
     }
+}
+
+fn list_roles(table: Option<&RoleTable>) -> Result<Vec<CatalogRole>, RoleError> {
+    let mut roles: Vec<CatalogRole> = PREDEFINED
+        .iter()
+        .filter_map(|(_, name)| predefined(name))
+        .collect();
+    if let Some(table) = table {
+        for entry in table.iter().map_err(io)? {
+            let (key, value) = entry.map_err(io)?;
+            if key.value().starts_with(b"role/") {
+                let stored: CatalogRole = decode(value.value())?;
+                roles.retain(|role| role.name != stored.name);
+                roles.push(stored);
+            }
+        }
+    }
+    roles.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(roles)
+}
+
+fn builtin_capabilities(table: Option<&RoleTable>, member: &str) -> Result<BTreeSet<String>, RoleError> {
+    let empty = RoleTable::default();
+    let table = table.unwrap_or(&empty);
+    let mut names = reachable(&membership_edges(table)?, member, |e| e.inherit);
+    names.retain(|name| predefined(name).is_some() && !table.0.contains_key(&key(b"role/", name)));
+    Ok(names)
+}
+
+fn table_acl(image: Option<&RoleTable>, table: &str) -> Result<BTreeMap<String, BTreeSet<TablePrivilege>>, RoleError> {
+    let mut result = BTreeMap::new();
+    if let Some(image) = image {
+        let prefix = grant_key(b"tgrant/", table, "");
+        for (key, value) in &image.0 {
+            if let Some(role) = key.strip_prefix(prefix.as_slice()) {
+                let role = std::str::from_utf8(role).map_err(io)?.to_owned();
+                result.insert(role, privileges(Some(value.clone()))?);
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn visible_tables(table: Option<&RoleTable>, role: &str) -> Result<BTreeSet<String>, RoleError> {
+    let mut visible = BTreeSet::new();
+    if let Some(table) = table {
+        for entry in table.iter().map_err(io)? {
+            let (key, value) = entry.map_err(io)?;
+            let bytes = key.value();
+            let name = if let Some(name) = bytes.strip_prefix(b"owner/") {
+                (value.value() == role.as_bytes()).then_some(name)
+            } else if let Some(grant) = bytes.strip_prefix(b"tgrant/") {
+                match grant.iter().rposition(|byte| *byte == 0) {
+                    Some(separator)
+                        if (&grant[separator + 1..] == role.as_bytes() || grant[separator + 1..].is_empty())
+                            && !decode::<Vec<TablePrivilege>>(value.value())?
+                                .is_empty() =>
+                    {
+                        Some(&grant[..separator])
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(name) = name {
+                visible.insert(
+                    String::from_utf8(name.to_vec())
+                        .map_err(|error| CoreError::Corrupt(error.to_string()))?,
+                );
+            }
+        }
+    }
+    Ok(visible)
+}
+
+fn read_grants<P: Ord + DeserializeOwned>(
+    table: Option<&RoleTable>, prefix: &[u8], object: &str, role: &str,
+) -> Result<BTreeSet<P>, RoleError> {
+    let Some(table) = table else { return Ok(BTreeSet::new()); };
+    let mut held = privileges(raw_get(table, &grant_key(prefix, object, role))?)?;
+    held.extend(privileges::<P>(raw_get(table, &grant_key(prefix, object, ""))?)?);
+    Ok(held)
 }
 
 /// Remove authority for relation names in the schema publication transaction.

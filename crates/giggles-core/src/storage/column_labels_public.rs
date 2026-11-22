@@ -1,5 +1,5 @@
 //! Read access to untrusted-text column labels (GD-0061 R3-307).
-use super::{Admin, Backend, CoreError, engine};
+use super::{Admin, Backend, CoreError, Holder, engine};
 
 impl Admin {
     /// Columns that carry the `untrusted_text` security label, as
@@ -7,7 +7,7 @@ impl Admin {
     /// sorted. Table names are schema-qualified with `.` outside `public`.
     /// Legacy databases have no labels.
     pub fn untrusted_text_columns(&self) -> Result<Vec<(String, String)>, CoreError> {
-        let Backend::V2(db) = &self.inner.backend else {
+        let Some(db) = self.lease(Holder::Admin)? else {
             return Ok(Vec::new());
         };
         let _ticket = self.inner.enter()?;
@@ -34,12 +34,13 @@ impl super::SqlSession {
     /// Column labels of this session's catalog snapshot (its open transaction,
     /// else the committed catalog), keyed by (table id, column id). Legacy
     /// databases have none. GD-0061 R3-304.
-    pub(crate) fn task_column_labels(
-        &self,
+    pub(crate) fn task_column_labels_leased(
+        &self, db: Option<&super::EngineLease>,
     ) -> Result<std::collections::BTreeMap<(u64, u64), u8>, CoreError> {
         match &self.admin.inner.backend {
             Backend::Legacy(_) => Ok(std::collections::BTreeMap::new()),
-            Backend::V2(db) => {
+            Backend::V2(_) => {
+                let db = db.ok_or(CoreError::Fenced)?;
                 let _ticket = self.admin.inner.enter()?;
                 db.column_labels(self.v2_transaction.as_ref())
             }

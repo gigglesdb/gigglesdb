@@ -201,11 +201,11 @@ fn update_and_native_outcomes_count_only_scope_rows() {
     assert_eq!(crate::sqlstate(&refused), "0A000");
     crate::task::release::allow_task_writes_for_test(true);
     // SQL, outside the protected commit: the statement result is scoped too.
-    let (result, tag) = agent(&admin)
+    let (result, sql_tag) = agent(&admin)
         .execute_unreleased("UPDATE shipments SET attempt_count = attempt_count + 1", &[], None)
         .unwrap()
         .into_parts();
-    assert!(tag.is_some());
+    assert!(sql_tag.is_some());
     assert_eq!(result.affected, 2);
     let update = Request::Update {
         table: "shipments".into(),
@@ -273,6 +273,7 @@ fn update_and_native_outcomes_count_only_scope_rows() {
     assert_eq!(counts, [Value::Int(9), Value::Int(0), Value::Int(9), Value::Int(0)]);
     let outcome = admin.sql_session().execute_native(&update, &Bindings::new()).unwrap();
     assert_eq!(outcome.matched, 4);
+    drop((tag, sql_tag));
     drop(admin);
     std::fs::remove_dir_all(path).unwrap();
 }

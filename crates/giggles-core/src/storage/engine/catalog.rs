@@ -384,6 +384,23 @@ impl CatalogCache {
     }
 }
 
+/// The two publication atomics needed by SQL cache checks. This observer
+/// holds only metadata and can outlive the engine that published it.
+pub(crate) struct CatalogVersion {
+    visible: super::commit::VisibleClock,
+    version: Arc<std::sync::atomic::AtomicU64>,
+}
+impl CatalogVersion {
+    pub(crate) fn read(&self) -> Option<u64> {
+        read_current_version(self.visible.read(), &self.version)
+    }
+}
+
+fn read_current_version(visible: Ts, version: &std::sync::atomic::AtomicU64) -> Option<u64> {
+    let version = version.load(std::sync::atomic::Ordering::Acquire);
+    (version != 0 && version <= visible.0).then_some(version)
+}
+
 /// One catalog and allocator are shared by all transactions of an engine.
 /// Callers must use transactions from the same sequencer and lock manager.
 /// The cache mutex also orders DDL commit, rebuild and publication. It is never
@@ -391,7 +408,7 @@ impl CatalogCache {
 pub(crate) struct Catalog {
     cache: Mutex<CatalogCache>,
     current: RwLock<Option<(Ts, Arc<CatalogSnapshot>)>>,
-    current_version: std::sync::atomic::AtomicU64,
+    current_version: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     token_read_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -429,7 +446,7 @@ impl Catalog {
         Ok(Self {
             cache: Mutex::new(cache),
             current: RwLock::new(None),
-            current_version: std::sync::atomic::AtomicU64::new(visible.0),
+            current_version: Arc::new(std::sync::atomic::AtomicU64::new(visible.0)),
             #[cfg(test)]
             token_read_hook: Mutex::new(None),
             #[cfg(test)]
@@ -461,9 +478,12 @@ impl Catalog {
         let TxnServices::Local { seq, .. } = &self.services else { return None; };
         // Acquire visibility before reading the generation, as `current_at` does.
         // Observing a committed DDL then also observes its earlier invalidation.
-        let visible = seq.visible_ts();
-        let version = self.current_version.load(std::sync::atomic::Ordering::Acquire);
-        (version != 0 && version <= visible.0).then_some(version)
+        read_current_version(seq.visible_ts(), &self.current_version)
+    }
+
+    pub(crate) fn version_observer(&self) -> Option<CatalogVersion> {
+        let TxnServices::Local { seq, .. } = &self.services else { return None; };
+        Some(CatalogVersion { visible: seq.visible_clock(), version: Arc::clone(&self.current_version) })
     }
 
     /// Latest committed catalog observation, independent of transaction snapshots.
@@ -2135,14 +2155,12 @@ mod current_tests;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[test]
 fn unknown_binding_fence_fails_closed() {
-    use crate::storage::{Admin, Backend, Engine, Limits};
+    use crate::storage::{Admin, Engine, Limits};
     let root = crate::test_artifact_root().join("unknown-binding-fence");
     let admin = Admin::create_engine(&root, Limits::default(), Engine::V2).unwrap();
     let mut session = admin.sql_session();
     session.begin_native().unwrap();
-    let Backend::V2(db) = &admin.inner.backend else {
-        unreachable!()
-    };
+    let db = admin.test_v2();
     {
         let mut cache = db.catalog().cache.lock().unwrap();
         *db.catalog().current.write().unwrap() = None;
@@ -2158,6 +2176,7 @@ fn unknown_binding_fence_fails_closed() {
         Err(CoreError::Sql(relational::SqlError::StaleSchema))
     );
     drop(session);
+    drop(db);
     drop(admin);
     std::fs::remove_dir_all(root).unwrap();
 }

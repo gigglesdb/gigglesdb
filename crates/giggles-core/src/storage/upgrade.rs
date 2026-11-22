@@ -432,7 +432,7 @@ fn verify(
     };
     use std::ops::Bound::Unbounded;
     let admin = Admin::open(path, limits)?;
-    let Backend::V2(db) = &admin.inner.backend else {
+    let Some(db) = admin.lease(super::Holder::Admin)? else {
         return Err(io("upgrade verification engine"));
     };
     let mut expected = relational::Relational::catalog_image(

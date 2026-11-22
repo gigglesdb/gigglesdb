@@ -611,7 +611,7 @@ impl crate::storage::Admin {
     /// the exposure report.
     #[doc(hidden)]
     pub fn task_disclosure(&self, task: TaskObjectId) -> Result<Disclosure, CoreError> {
-        let db = self.sql_session().v2_db().ok_or(CoreError::Unsupported)?;
+        let db = self.sql_session().v2_lease(crate::storage::Holder::TaskRun)?;
         let mut txn = db.begin(Isolation::ReadCommitted);
         let mut out = match txn.get(Keyspace::Kernel, &disclosure_head_key(task))? {
             Some(value) => {
@@ -976,6 +976,17 @@ impl SqlSession {
         self.release_tag_for(entry, plan())
     }
 
+    pub(crate) fn release_tag_with_leased(
+        &self,
+        class: StatementClass,
+        param_count: usize,
+        db: Option<&crate::storage::EngineLease>,
+        plan: impl FnOnce() -> Result<OutputPlan, TaskError>,
+    ) -> Option<Arc<ReleaseTag>> {
+        let entry = self.start_task_statement_leased(class, param_count, db)?;
+        self.release_tag_for(entry, plan())
+    }
+
     /// The tag of a statement whose read-log entry already started.
     pub(crate) fn release_tag_for(
         &self,
@@ -1024,13 +1035,13 @@ impl SqlSession {
 
     /// Steps 1 to 4 of the protocol for one task page.
     fn release_steps<T: Page>(&self, tag: &ReleaseTag, value: &mut T) -> Result<Counts, CoreError> {
+        let db = tag.entry.engine()?.ok_or(CoreError::Unsupported)?;
         // 1. The statement deadline.
         crate::cancellation::check()?;
         // 2. Mask in memory; the cost is taken after masking.
         let plan = tag.plan.as_ref().map_err(|e| CoreError::Task(e.clone()))?;
         let counts = mask_page(value, plan)?;
         // 3 and 4. Validity, then the durable debit (or the reservation).
-        let db = self.v2_db().ok_or(CoreError::Unsupported)?;
         let crash = self.fault_points()?.0;
         let need = Need {
             rows_read: tag.state.take_rows_read(),
@@ -1046,7 +1057,7 @@ impl SqlSession {
         let Some(state) = &self.task_state else {
             return Ok(());
         };
-        let db = self.v2_db().ok_or(CoreError::Unsupported)?;
+        let db = self.v2_lease(crate::storage::Holder::TaskRun)?;
         let def = catalog_def(&db, state.ctx.task, DefAt::Latest)?;
         valid(def.as_deref(), &state.ctx, db.wall_now_ms())?;
         Ok(())
@@ -1063,7 +1074,7 @@ impl SqlSession {
             if let Err(error) = outcome {
                 entry.fail(error);
             }
-            entry.finish();
+            let _ = entry.finish();
         }
     }
 

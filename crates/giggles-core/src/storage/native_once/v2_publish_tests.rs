@@ -19,9 +19,8 @@ fn fixture() -> (Dir, Admin) {
     drop(sql);
     (dir, admin)
 }
-fn db(admin: &Admin) -> &crate::storage::v2::V2Db {
-    let Backend::V2(db) = &admin.inner.backend else { panic!("v2") };
-    db
+fn db(admin: &Admin) -> crate::storage::EngineLease {
+    admin.test_v2()
 }
 fn key(admin: &Admin) -> NativeOnceKey {
     NativeOnceKey { database_domain: u128::from_be_bytes(db(admin).meta.domain), identity: vec![10] }
@@ -36,7 +35,7 @@ fn payload() -> Vec<u8> {
 fn publish(admin: &Admin, expired: bool) -> NativeResult<(NativeOnceRecord, bool)> {
     let NativeOnceAdmission::Owner(owner) = admin.admit_native_once_engine(key(admin), [1; 32])? else { panic!("owner") };
     let mut session = admin.sql_session();
-    let setup = session.begin_once_engine().unwrap();
+    let setup = session.begin_once_engine(None).unwrap();
     session.execute("INSERT INTO items VALUES(1,10)", &[], None).unwrap();
     session.publish_native_once_engine(Some(setup), owner, [2; 32], payload(), 60, NativePublishMode::Success, &mut || {
         Ok(NativeClockLease { lower_unix_seconds: 100, upper_unix_seconds: 110,
@@ -103,7 +102,7 @@ fn unrelated_commit_rejects_stale_once_without_consuming_key() {
     let identity = key(&admin);
     let NativeOnceAdmission::Owner(owner) = admin.admit_native_once_engine(identity.clone(), [1; 32]).unwrap() else { panic!("owner") };
     let mut session = admin.sql_session();
-    let setup = session.begin_once_engine().unwrap();
+    let setup = session.begin_once_engine(None).unwrap();
     session.execute("INSERT INTO items VALUES(1,10)", &[], None).unwrap();
     admin.sql_session().execute("INSERT INTO other VALUES(2)", &[], None).unwrap();
     let result = session.publish_native_once_engine(Some(setup), owner, [2; 32], payload(), 60,
@@ -134,7 +133,7 @@ fn terminal_aborted_session_discards_sequences_features_and_prior_writes() {
     let NativeOnceAdmission::Owner(owner) = admin.admit_native_once_engine(key(&admin), [1; 32]).unwrap()
         else { panic!("owner") };
     let mut session = admin.sql_session();
-    let setup = session.begin_once_engine().unwrap();
+    let setup = session.begin_once_engine(None).unwrap();
     session.execute("INSERT INTO items VALUES(1,10)", &[], None).unwrap();
     let pending = session.pending_sequences.clone();
     pending.lock().unwrap().insert(u64::MAX, crate::storage::sequences::SeqCounter {
@@ -182,7 +181,7 @@ fn publication_xact_marker_tracks_success_terminal_and_rejection() {
         let NativeOnceAdmission::Owner(owner) = admin.admit_native_once_engine(identity.clone(), [1; 32]).unwrap()
             else { panic!("owner") };
         let mut session = admin.sql_session();
-        let setup = session.begin_once_engine().unwrap();
+        let setup = session.begin_once_engine(None).unwrap();
         let guard = db(&admin).xacts.assign().unwrap();
         let xid = guard.id();
         *session.xact.lock().unwrap() = Some(guard);
@@ -229,7 +228,7 @@ fn lost_reply_receipt_and_xact_status_agree_after_reopen() {
         let NativeOnceAdmission::Owner(owner) = admin.admit_native_once_engine(identity.clone(), [1; 32]).unwrap()
             else { panic!("owner") };
         let mut session = admin.sql_session();
-        let setup = session.begin_once_engine().unwrap();
+        let setup = session.begin_once_engine(None).unwrap();
         let guard = db(&admin).xacts.assign().unwrap();
         let xid = guard.id();
         *session.xact.lock().unwrap() = Some(guard);

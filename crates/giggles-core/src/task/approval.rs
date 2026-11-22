@@ -42,6 +42,7 @@ use super::records::{
 use super::release::Unreleased;
 use crate::CoreError;
 use crate::relational::{output_text, SqlError, SqlResult, SqlRow, TableDef, TimestampTz, Value};
+use crate::storage::SessionLease;
 use crate::storage::engine::codec;
 use crate::storage::roles::{role_txn, table_owner_txn, table_privileges_txn, TablePrivilege};
 use crate::storage::{Isolation, Keyspace, SqlSession, Transaction, V2Db};
@@ -524,17 +525,15 @@ fn may_select(txn: &mut Transaction, table: &str, role: &RoleName) -> Result<(),
 
 /// The v2 database and the task's latest definition. Neither statement runs
 /// inside a task session, on a cluster gateway or on a replicated store.
-fn open(session: &SqlSession, task: &TaskName) -> Result<(Arc<V2Db>, Arc<TaskDef>), TaskError> {
+fn open(session: &SqlSession, task: &TaskName) -> Result<(SessionLease, Arc<TaskDef>), TaskError> {
     if session.task().is_some() {
         return Err(TaskError::NotAllowedInTaskSession(StatementClass::Other));
     }
-    let db = session.v2_db().ok_or_else(unsupported)?;
+    let db = session.v2_lease(crate::storage::Holder::TaskRun)?;
     if db.task_kernel_unsupported() {
         return Err(unsupported());
     }
-    let def = session
-        .tasks()
-        .lookup(task.as_str())?
+    let def = super::catalog::lookup_leased(Some(&db), task.as_str())?
         .ok_or(CoreError::Sql(SqlError::UndefinedObject))?;
     Ok((db, def))
 }
@@ -582,8 +581,8 @@ fn may_revoke(
 /// ReadCommitted, the hold on the mutation head, then a statement snapshot
 /// taken after the wait (`authority::hold` refuses an RC transaction that
 /// already has a snapshot).
-fn hold(db: &Arc<V2Db>, def: &TaskDef) -> Result<Transaction, TaskError> {
-    let mut txn = db.begin(Isolation::ReadCommitted);
+fn hold(db: &SessionLease, def: &TaskDef) -> Result<Transaction, TaskError> {
+    let mut txn = db.begin_leased(Isolation::ReadCommitted, crate::storage::Holder::TaskRun)?;
     let deadline = Instant::now().checked_add(Duration::from_millis(def.limits.lock_wait_ms));
     txn.lock_kernel_key(&mutation_head_key(def.id), deadline, &|| {
         crate::cancellation::check().is_err()
@@ -624,7 +623,7 @@ fn load_approval(
 }
 
 fn put_and_commit(
-    db: &Arc<V2Db>,
+    db: &SessionLease,
     mut txn: Transaction,
     task: TaskObjectId,
     id: PreviewId,
@@ -657,7 +656,7 @@ impl crate::storage::Admin {
         task: TaskObjectId,
         id: PreviewId,
     ) -> Result<Option<StoredApproval>, CoreError> {
-        let db = self.sql_session().v2_db().ok_or(CoreError::Unsupported)?;
+        let db = self.sql_session().v2_lease(crate::storage::Holder::TaskRun)?;
         let mut txn = db.begin(Isolation::ReadCommitted);
         Ok(load_approval(&mut txn, task, id)?.map(|record| StoredApproval {
             state: record.state,
@@ -678,7 +677,7 @@ impl crate::storage::Admin {
         id: PreviewId,
         seq: u64,
     ) -> Result<(), CoreError> {
-        let db = self.sql_session().v2_db().ok_or(CoreError::Unsupported)?;
+        let db = self.sql_session().v2_lease(crate::storage::Holder::TaskRun)?;
         let mut txn = db.begin(Isolation::ReadCommitted);
         let mut record = load_approval(&mut txn, task, id)?
             .ok_or_else(|| CoreError::Corrupt("no approval to consume".into()))?;
@@ -693,7 +692,7 @@ impl crate::storage::Admin {
     /// header of preview `id` as kind 02 (task scope), keeping its digest.
     #[doc(hidden)]
     pub fn mark_task_preview_undo(&self, task: TaskObjectId, id: PreviewId) -> Result<(), CoreError> {
-        let db = self.sql_session().v2_db().ok_or(CoreError::Unsupported)?;
+        let db = self.sql_session().v2_lease(crate::storage::Holder::TaskRun)?;
         let mut txn = db.begin(Isolation::ReadCommitted);
         let mut header = load_header(&mut txn, task, id)?
             .ok_or_else(|| CoreError::Corrupt("no preview to mark".into()))?;

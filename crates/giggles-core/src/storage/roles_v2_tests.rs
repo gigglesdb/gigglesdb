@@ -11,13 +11,11 @@ fn version(db: &crate::storage::v2::V2Db) -> crate::storage::engine::hlc::Ts {
 fn role_cache_versions_and_reuse() {
     let dir = Directory::new();
     let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
-    let Backend::V2(db) = &admin.inner.backend else {
-        unreachable!()
-    };
+    let db = admin.test_v2();
     let roles = admin.roles();
-    let before = version(db);
+    let before = version(&db);
     roles.create(role("reader")).unwrap();
-    assert_ne!(before, version(db));
+    assert_ne!(before, version(&db));
     assert!(roles.get("reader").unwrap().is_some());
     let first = roles.image().unwrap();
     let before_read = crate::storage::engine::txn::engine_ops();
@@ -28,7 +26,7 @@ fn role_cache_versions_and_reuse() {
     first.get("reader").unwrap();
     assert_eq!(first.image.decoded.get().unwrap().len(), 1);
     for grant in [true, false, true, false] {
-        let before = version(db);
+        let before = version(&db);
         if grant {
             roles
                 .grant_table("items", "reader", &[TablePrivilege::Select])
@@ -38,7 +36,7 @@ fn role_cache_versions_and_reuse() {
                 .revoke_table("items", "reader", &[TablePrivilege::Select])
                 .unwrap();
         }
-        assert_ne!(before, version(db));
+        assert_ne!(before, version(&db));
         assert_eq!(
             roles
                 .table_privileges("items", "reader")
@@ -47,9 +45,9 @@ fn role_cache_versions_and_reuse() {
             grant
         );
     }
-    let before = version(db);
+    let before = version(&db);
     roles.set_table_owner("items", "reader").unwrap();
-    assert_ne!(before, version(db));
+    assert_ne!(before, version(&db));
     assert_eq!(
         roles.table_owner("items").unwrap().as_deref(),
         Some("reader")
@@ -58,7 +56,7 @@ fn role_cache_versions_and_reuse() {
         roles.image().unwrap().table_owner("items").unwrap(),
         roles.table_owner("items").unwrap()
     );
-    let before = version(db);
+    let before = version(&db);
     roles
         .alter(
             "reader",
@@ -68,7 +66,7 @@ fn role_cache_versions_and_reuse() {
             },
         )
         .unwrap();
-    assert_ne!(before, version(db));
+    assert_ne!(before, version(&db));
     assert!(!roles.get("reader").unwrap().unwrap().login);
     assert!(first.get("reader").unwrap().unwrap().login);
     assert!(matches!(first.get(""), Err(RoleError::Invalid)));
@@ -80,9 +78,7 @@ fn role_cache_snapshot_and_private_write_bypass() {
     use crate::storage::engine::{kv::Keyspace, txn::Isolation};
     let dir = Directory::new();
     let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
-    let Backend::V2(db) = &admin.inner.backend else {
-        unreachable!()
-    };
+    let db = admin.test_v2();
     let roles = admin.roles();
     roles.create(role("reader")).unwrap();
     let mut old = db.begin(Isolation::ReadCommitted);
@@ -122,9 +118,7 @@ fn role_cache_old_snapshot_fallback_bypass() {
     use crate::storage::engine::{catalog::Catalog, locks::LockManager, txn::Isolation};
     let dir = Directory::new();
     let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
-    let Backend::V2(db) = &admin.inner.backend else {
-        unreachable!()
-    };
+    let db = admin.test_v2();
     let roles = admin.roles();
     roles.create(role("reader")).unwrap();
     let mut old = db.begin(Isolation::ReadCommitted);
@@ -160,9 +154,7 @@ fn role_cache_failed_build_is_retryable() {
     use crate::storage::engine::txn::Isolation;
     let dir = Directory::new();
     let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
-    let Backend::V2(db) = &admin.inner.backend else {
-        unreachable!()
-    };
+    let db = admin.test_v2();
     let mut txn = db.begin(Isolation::ReadCommitted);
     let (snapshot, _) = db.catalog().binding_snapshot(&txn).unwrap();
     assert!(matches!(
@@ -181,9 +173,7 @@ fn role_image_session_owner_prefers_own_ddl() {
     use crate::storage::engine::{kv::Keyspace, txn::Isolation};
     let dir = Directory::new();
     let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
-    let Backend::V2(db) = &admin.inner.backend else {
-        unreachable!()
-    };
+    let db = admin.test_v2();
     let roles = admin.roles();
     roles.create(role("owner")).unwrap();
     roles.set_table_owner("items", "owner").unwrap();
@@ -462,9 +452,7 @@ fn legacy_v2_role_authorization_and_reopen_parity() {
     assert_eq!(results[0], results[1]);
 }
 fn features(admin: &Admin) -> u64 {
-    let Backend::V2(db) = &admin.inner.backend else {
-        panic!("expected v2")
-    };
+    let db = admin.test_v2();
     crate::storage::engine::meta::validate_meta(db.kv.as_ref())
         .unwrap()
         .features
@@ -579,9 +567,7 @@ fn v2_ddl_renames_and_drops_authority_atomically() {
     let dir = Directory::new();
     let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
     admin.roles().create(role("owner")).unwrap();
-    let Backend::V2(db) = &admin.inner.backend else {
-        unreachable!()
-    };
+    let db = admin.test_v2();
     // Stale authority for a name must be cleared when a new table gets that name.
     admin.roles().set_table_owner("items", "owner").unwrap();
     let mut tx = db.begin(Isolation::ReadCommitted);
@@ -681,6 +667,7 @@ fn v2_ddl_renames_and_drops_authority_atomically() {
             .unwrap()
             .is_empty()
     );
+    drop(db);
     drop(admin);
     let admin = Admin::open(&dir.0, Limits::default()).unwrap();
     assert!(admin.roles().visible_tables("owner").unwrap().is_empty());
@@ -722,7 +709,8 @@ fn qualified_authority_is_isolated_and_survives_reopen_on_both_engines() {
         roles
             .grant_table("alpha", "t", &[TablePrivilege::Insert])
             .unwrap();
-        if let Backend::V2(db) = &admin.inner.backend {
+        if admin.engine() == crate::Engine::V2 {
+        let db = admin.test_v2();
             use crate::storage::engine::{
                 kv::{Direction, Keyspace},
                 txn::Isolation,
@@ -830,9 +818,7 @@ fn qualified_authority_follows_ddl_identity_not_the_bare_table_name() {
             .grant_table(table, "reader", &[TablePrivilege::Select])
             .unwrap();
     }
-    let Backend::V2(db) = &admin.inner.backend else {
-        unreachable!()
-    };
+    let db = admin.test_v2();
     // Exercise the storage DDL reconciler with the main branch's qualified map
     // keys and bare TableDef names. This does not add v2 schema DDL support.
     let definition = |id| TableDef {
@@ -884,6 +870,7 @@ fn qualified_authority_follows_ddl_identity_not_the_bare_table_name() {
         );
     }
     drop(roles);
+    drop(db);
     drop(admin);
     let admin = Admin::open(&dir.0, Limits::default()).unwrap();
     assert_eq!(

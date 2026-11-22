@@ -15,9 +15,8 @@ impl Dir {
 impl Drop for Dir {
     fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); }
 }
-fn db(admin: &Admin) -> &v2::V2Db {
-    let Backend::V2(db) = &admin.inner.backend else { panic!("v2") };
-    db
+fn db(admin: &Admin) -> crate::storage::EngineLease {
+    admin.test_v2()
 }
 fn slots(admin: &Admin) -> usize { admin.inner.sql_transactions.load(Ordering::Acquire) }
 fn wait_for_lock(holder: &SqlSession) {
@@ -33,7 +32,7 @@ fn fresh_lock_wait_and_snapshot() {
     let admin = dir.open();
     admin.sql_session().execute("CREATE TABLE t (id BIGINT PRIMARY KEY)", &[], None).unwrap();
     let mut first = admin.sql_session();
-    let setup = first.begin_once_engine().unwrap();
+    let setup = first.begin_once_engine(None).unwrap();
     assert!(setup.before.is_none());
     assert_eq!(setup.image.0.view.domain, u128::from_be_bytes(db(&admin).meta.domain));
     first.v2_transaction.as_mut().unwrap().rollback_to(&setup.initial).unwrap();
@@ -42,7 +41,7 @@ fn fresh_lock_wait_and_snapshot() {
     let worker = thread::spawn(move || {
         let mut session = other.sql_session();
         let cancel = crate::cancellation::Cancellation::new(Some(std::time::Instant::now() + Duration::from_secs(10)));
-        let result = cancel.scope(|| session.begin_once_engine());
+        let result = cancel.scope(|| session.begin_once_engine(None));
         sent.send(result.map(|s| s.fence)).unwrap();
     });
     wait_for_lock(&first);
@@ -73,7 +72,7 @@ fn bootstrap_stage_and_preserved_origin() {
     let mut probe = db.begin(Isolation::RepeatableRead);
     assert!(Kernel::probe(&mut probe).unwrap().metadata);
     let mut session = admin.sql_session();
-    let setup = session.begin_once_engine().unwrap();
+    let setup = session.begin_once_engine(None).unwrap();
     assert!(setup.before.is_some());
     assert_eq!(setup.image.0.origin, Some(817));
 }
@@ -90,7 +89,7 @@ fn corrupt_ledger_releases_slot_and_lock() {
     let prior = slots(&admin);
     let mut session = admin.sql_session();
     for _ in 0..2 {
-        assert!(matches!(session.begin_once_engine(), Err(CoreError::Corrupt(_))));
+        assert!(matches!(session.begin_once_engine(None), Err(CoreError::Corrupt(_))));
         assert_eq!(slots(&admin), prior);
         assert!(session.v2_transaction.is_none());
     }
@@ -100,14 +99,14 @@ fn cancelled_wait_releases_slot() {
     let dir = Dir::new();
     let admin = dir.open();
     let mut first = admin.sql_session();
-    first.begin_once_engine().unwrap();
+    first.begin_once_engine(None).unwrap();
     let cancel = crate::cancellation::Cancellation::default();
     let child_cancel = cancel.clone();
     let other = admin.clone();
     let (sent, recv) = mpsc::channel();
     let worker = thread::spawn(move || {
         let mut session = other.sql_session();
-        let result = child_cancel.scope(|| session.begin_once_engine());
+        let result = child_cancel.scope(|| session.begin_once_engine(None));
         sent.send(matches!(result, Err(CoreError::Cancelled))).unwrap();
     });
     wait_for_lock(&first);
@@ -117,7 +116,7 @@ fn cancelled_wait_releases_slot() {
     worker.join().unwrap();
     assert_eq!(slots(&admin), 1);
     first.rollback();
-    admin.sql_session().begin_once_engine().unwrap();
+    admin.sql_session().begin_once_engine(None).unwrap();
     assert_eq!(slots(&admin), 0);
 }
 
@@ -127,11 +126,11 @@ fn refuses_active_and_aborted_sessions() {
     let admin = dir.open();
     let mut session = admin.sql_session();
     session.aborted = true;
-    assert!(matches!(session.begin_once_engine(), Err(CoreError::Sql(relational::SqlError::Transaction))));
+    assert!(matches!(session.begin_once_engine(None), Err(CoreError::Sql(relational::SqlError::Transaction))));
     assert_eq!(slots(&admin), 0);
     session.aborted = false;
-    session.begin_once_engine().unwrap();
-    assert!(matches!(session.begin_once_engine(), Err(CoreError::Sql(relational::SqlError::Transaction))));
+    session.begin_once_engine(None).unwrap();
+    assert!(matches!(session.begin_once_engine(None), Err(CoreError::Sql(relational::SqlError::Transaction))));
     assert_eq!(slots(&admin), 1);
     session.rollback();
     assert_eq!(slots(&admin), 0);
@@ -150,7 +149,7 @@ fn mismatched_domain_releases_slot_and_lock() {
     db.kv.write(batch, engine::kv::Durability::Sync).unwrap();
     let mut session = admin.sql_session();
     for _ in 0..2 {
-        assert!(matches!(session.begin_once_engine(), Err(CoreError::Corrupt(_))));
+        assert!(matches!(session.begin_once_engine(None), Err(CoreError::Corrupt(_))));
         assert_eq!(slots(&admin), 0);
     }
 }

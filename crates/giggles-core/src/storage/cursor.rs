@@ -14,6 +14,7 @@ pub struct Cursor {
     value_budget: usize,
     statement_tokens: usize,
     wide_values: bool,
+    engine: Option<CursorEngine>,
     /// The task statement's release tag (GD-0061 R3-301); `None` outside a task session.
     tag: Option<Arc<crate::task::release::ReleaseTag>>,
     /// The task's visible rows (GD-0061 R3-305); `None` outside a task session
@@ -28,6 +29,31 @@ pub struct Cursor {
     /// time (57014, R3-401) or past a row limit (54T01, R3-402).
     closed: Option<CoreError>,
 }
+impl Drop for Cursor {
+    fn drop(&mut self) {
+        let data = std::mem::replace(&mut self.data, Data::Buffered(VecDeque::new()));
+        drop(data);
+        drop(self.clock.take());
+        drop(self.tag.take());
+        drop(self.engine.take());
+    }
+}
+
+enum CursorEngine {
+    // Drop the lease before the slot owner. The snapshot and clock have
+    // already been dropped by the cursor.
+    Streaming { lease: EngineLease, _owner: Admin },
+    Materialized(GenerationTag),
+}
+impl CursorEngine {
+    fn check(&self) -> Result<(), CoreError> {
+        match self {
+            Self::Streaming { lease, .. } => lease.check(),
+            Self::Materialized(tag) => tag.check_materialized(),
+        }
+    }
+}
+
 enum Data {
     Scan {
         image: Arc<relational::Relational>,
@@ -81,6 +107,12 @@ impl Cursor {
         if let Some(error) = &self.closed {
             return Err(error.clone());
         }
+        if let Some(engine) = &self.engine
+            && let Err(error) = engine.check()
+        {
+            self.close(error.clone());
+            return Err(error);
+        }
         if self.guard.as_ref().is_some_and(|guard| guard.expired()) {
             self.close(CoreError::Cancelled);
             return Err(CoreError::Cancelled);
@@ -114,9 +146,11 @@ impl Cursor {
     fn close(&mut self, error: CoreError) {
         self.guard = None;
         self.data = Data::Buffered(VecDeque::new());
+        self.clock = None;
         if let Some(tag) = &self.tag {
             tag.fail(&error);
         }
+        self.engine = None;
         self.closed = Some(error);
     }
     fn fetch_page(&mut self, max_rows: usize, max_bytes: usize) -> Result<Vec<SqlRow>, CoreError> {
@@ -274,14 +308,17 @@ impl SqlSession {
             if p.transaction.is_some() && p.transaction != self.transaction_id {
                 return Err(CoreError::Sql(SqlError::StaleSchema));
             }
+            let lease = if self.is_v2_engine() { Some(self.v2_lease(Holder::Cursor)?) } else { None };
+            let db = lease.as_deref();
+            Self::check_prepared_generation(p, db)?;
             let mut p = p.clone();
             p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
             // A task cursor's tag carries the output plan; `SELECT *` runs
             // expanded to the task's columns (GD-0061 R3-308). A denied
             // statement is refused here, before any row is read.
-            let (tag, expanded) = self.statement_tag(&p)?;
+            let (tag, expanded) = self.statement_tag_leased(&p, db)?;
             started = tag.clone();
-            held = crate::task::limits::StatementGuard::enter(self)?;
+            held = crate::task::limits::StatementGuard::enter_leased(self, db)?;
             let _active = held
                 .as_ref()
                 .map(crate::task::limits::StatementGuard::activate);
@@ -300,7 +337,8 @@ impl SqlSession {
                     .with_extra_float_digits(self.extra_float_digits)
             });
             let (image, source, context, scope) = match &self.admin.inner.backend {
-                Backend::V2(db) => {
+                Backend::V2(_) => {
+                    let db = db.expect("V2 cursor is leased");
                     // Stream through the local store or the gateway's paged range reader.
                     // Correctness-sensitive statement shapes still use bounded buffering.
                     // The existing transaction API cannot fork its write overlay.
@@ -313,7 +351,7 @@ impl SqlSession {
                             || t.isolation() == engine::txn::Isolation::Serializable
                     }) {
                         discard(&tag);
-                        return self.buffer_cursor(&p, params, clock, buffer_limit);
+                        return self.buffer_cursor(&p, params, clock, buffer_limit, lease);
                     }
                     // V2 prepare normalizes the presentation epoch to zero, including
                     // gateway catalog-version epochs; match normal v2 execution.
@@ -338,7 +376,7 @@ impl SqlSession {
                                     &name,
                                     engine::locks::LockMode::AccessShare,
                                     crate::task::limits::lock_deadline(),
-                                    &|| crate::cancellation::check().is_err(),
+                                    &|| crate::cancellation::check().is_err() || db.check().is_err(),
                                 )
                                 .map_err(|e| match e {
                                     engine::catalog::CatalogError::Core(e) => e,
@@ -362,7 +400,7 @@ impl SqlSession {
                     // Sequence-bearing selects use the established execution path.
                     if !p.sequences().is_empty() {
                         discard(&tag);
-                        return self.buffer_cursor(&p, params, clock, buffer_limit);
+                        return self.buffer_cursor(&p, params, clock, buffer_limit, lease);
                     }
                     // A task statement that reads a table sees only the task's
                     // visible rows (GD-0061 R3-305), bound at this snapshot.
@@ -381,7 +419,6 @@ impl SqlSession {
                                 !catalog.parts.ext.column_collations.contains_key(&d.id)
                                     && d.columns.iter().all(|id|image.deterministic_column(*id) && image.byte_ordered(*id))
                             }).cloned().collect(),
-                            _db: db.clone(),
                             kv: db.cluster_services().map_or_else(
                                 || db.kv.clone() as Arc<dyn engine::kv::KvRead>,
                                 |services| services.reader(ts),
@@ -433,12 +470,17 @@ impl SqlSession {
             };
             let context = context.map(|clock| match self.privilege_callback.as_ref().filter(|_| p.has_privilege_inquiry()) {
                 Some(callback) => clock.with_privileges(callback.clone(), privilege_provider(
-                    PrivilegeImage::Catalog(image.clone()), self.search_path.clone(), self.v2_transaction.as_ref(),
-                    matches!(self.admin.inner.backend, Backend::V2(_)))),
+                    PrivilegeImage::Catalog(image.clone()), self.search_path.clone(), self.v2_transaction.as_ref(), self.admin.roles(), db)),
                 None => clock,
             });
             match Plan::new(&image, &p, params, context.clone()).map_err(CoreError::Sql)? {
                 Some(plan) => Ok(Cursor {
+                    engine: lease
+                        .map(|pin| Ok::<_, CoreError>(CursorEngine::Streaming {
+                            lease: pin.into_holder(Holder::Cursor)?,
+                            _owner: self.admin.clone(),
+                        }))
+                        .transpose()?,
                     data: Data::Scan {
                         image,
                         source,
@@ -455,7 +497,7 @@ impl SqlSession {
                 }),
                 None => {
                     discard(&tag);
-                    self.buffer_cursor(&p, params, clock, buffer_limit)
+                    self.buffer_cursor(&p, params, clock, buffer_limit, lease)
                 }
             }
         })();
@@ -473,25 +515,35 @@ impl SqlSession {
             cursor
         })
     }
-    fn buffer_cursor(
+    pub(super) fn buffer_cursor(
         &mut self,
         p: &relational::Prepared,
         params: &[Value],
         clock: Option<&relational::StatementClock>,
         limit: usize,
+        lease: Option<SessionLease>,
     ) -> Result<Cursor, CoreError> {
+        let db = lease.as_deref();
+        if let Some(db) = db { db.check()?; }
         // A task statement's spill is handed only to this tagged stream: the
         // cursor keeps the statement's tag, so every spilled page goes through
         // `release_page` (masking, validity, debit) like a buffered one, and
         // its rows were scoped when the statement read them (GD-0061).
+        // Embedded materialized cursors may fetch held rows after owner drop.
+        // Task release and readlog completion still need a live continuation
+        // for the debit and audit record, and are fenced once the owner drops.
         let (result, spilled) = relational::spill::streaming_tagged(|| {
             scan::with_cursor_limit(limit, || match clock {
-                Some(clock) => self.execute_prepared_at_unreleased(p, params, None, clock),
-                None => self.execute_prepared_unreleased(p, params, None),
+                Some(clock) => {
+                    self.guard_clock(clock)?;
+                    self.execute_prepared_at_leased(p, params, None, clock, db)
+                },
+                None => self.execute_bound_clocked_leased(p, params, None, None, db),
             })
         });
         let (result, tag) = result?.into_parts();
         Ok(Cursor {
+            engine: db.map(|db| CursorEngine::Materialized(db.tag())),
             data: match spilled {
                 Some(rows) => Data::Spilled(rows, None),
                 None => Data::Buffered(result.rows.into()),
@@ -511,8 +563,6 @@ struct V2Snapshot {
     #[cfg(test)]
     index_reads: std::cell::Cell<usize>,
     indexes: Vec<relational::secondary_index::Descriptor>,
-    // Keep the engine and its maintenance alive for local cursors as before.
-    _db: Arc<v2::V2Db>,
     kv: Arc<dyn engine::kv::KvRead>,
     _guard: engine::commit::SnapshotHandle,
     ts: engine::hlc::Ts,
@@ -702,11 +752,37 @@ mod point_tests;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn spilled_cursor_releases_the_directory_and_keeps_its_rows() {
+        let path = crate::test_artifact_root().join("detached-spilled-cursor");
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut session = admin.sql_session();
+        session.execute("CREATE TABLE t(id INT PRIMARY KEY, payload TEXT)", &[], None).unwrap();
+        let payload = Value::Text("x".repeat(512 * 1024));
+        for id in 1..=3 {
+            session.execute("INSERT INTO t VALUES ($1,$2)", &[Value::Int(id), payload.clone()], None).unwrap();
+        }
+        let p = session.prepare("SELECT payload FROM t ORDER BY id").unwrap();
+        let lease = session.v2_lease(Holder::Cursor).unwrap();
+        let mut cursor = session.buffer_cursor(&p, &[], None, DEFAULT_CURSOR_BUFFER_BYTES, Some(lease)).unwrap();
+        assert!(matches!(cursor.data, Data::Spilled(..)));
+        drop(session);
+        drop(admin);
+
+        let reopened = Admin::open(&path, Limits::default()).unwrap();
+        assert_eq!(cursor.fetch(1, 1024 * 1024).unwrap()[0].values, [payload]);
+        drop(reopened);
+        drop(cursor);
+        std::fs::remove_dir_all(path).unwrap();
+    }
     fn buffered_cursor(rows: Vec<SqlRow>) -> Cursor {
         Cursor {
             data: Data::Buffered(rows.into()), clock: None, statement_tokens: 0,
             value_budget: relational::DEFAULT_MAX_VALUE_BYTES,
             wide_values: true,
+            engine: None,
             tag: None, scope: None, meter: Default::default(), guard: None, closed: None,
         }
     }
@@ -756,6 +832,7 @@ mod tests {
             let mut cursor = Cursor {
                 data: Data::Buffered(VecDeque::from([SqlRow { values: vec![Value::Int(1)], version: 0 }])),
                 clock: None, statement_tokens: 0, value_budget: limit, wide_values: true,
+                engine: None,
                 tag: None, scope: None, meter: Default::default(), guard: None, closed: None,
             };
             assert!(matches!(cursor.fetch(1, 0), Err(CoreError::Sql(SqlError::Limit))));
@@ -773,7 +850,7 @@ mod tests {
             "CREATE INDEX users ON t (user_id, email)"] {
             s.execute(sql, &[], None).unwrap();
         }
-        let Backend::V2(db) = &admin.inner.backend else { unreachable!() };
+        let db = admin.test_v2();
         let mut txn = db.begin(engine::txn::Isolation::ReadCommitted);
         let entry = engine::catalog::TableEntry {
             primary_index_birth: None,
@@ -843,6 +920,7 @@ mod tests {
         writer.execute("COMMIT", &[], None).unwrap();
         assert_eq!(drain(cursor).0.len(), 4);
         assert_eq!(drain(s.open_cursor(&p, &[]).unwrap()).0.len(), 5);
+        drop(db);
         drop(writer); drop(s); drop(admin);
         std::fs::remove_dir_all(path).unwrap();
     }
@@ -860,9 +938,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let Backend::V2(db) = &admin.inner.backend else {
-            unreachable!()
-        };
+        let db = admin.test_v2();
         let mut txn = db.begin(engine::txn::Isolation::ReadCommitted);
         let entry = engine::catalog::TableEntry {
             primary_index_birth: None,
@@ -909,6 +985,7 @@ mod tests {
         assert!(370 * body.len() > 20 * 1024 * 1024);
         drop(c);
         drop(s);
+        drop(db);
         drop(admin);
         std::fs::remove_dir_all(path).unwrap();
     }

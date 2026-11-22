@@ -410,8 +410,7 @@ use crate::storage::{
         meta::TASK_CATALOG,
         txn::{Isolation, Transaction, TxnError},
     },
-    roles::{CatalogRole, RoleCatalog, RoleError, TablePrivilege},
-    v2::V2Db,
+    roles::{CatalogRole, RoleError, TablePrivilege},
 };
 use giggles_pg_types::temporal::{ParserSettings, TimestampTz};
 use std::sync::Arc;
@@ -478,20 +477,34 @@ impl From<RoleError> for TaskDdlError {
 /// is a standalone DDL transaction, like role DDL.
 #[derive(Clone)]
 pub struct TaskCatalog {
-    /// `None` on the legacy engine, where every method is 0A000 (D9).
-    db: Option<Arc<V2Db>>,
-    roles: RoleCatalog,
+    admin: crate::Admin,
+    generation: Option<crate::storage::GenerationTag>,
+}
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+thread_local! {
+    pub(crate) static TEST_BEFORE_TASK_DRAFT_ACL: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
 }
 
 impl TaskCatalog {
-    pub(crate) fn new(db: Option<Arc<V2Db>>, roles: RoleCatalog) -> Self {
-        Self { db, roles }
+    pub(crate) fn new(admin: crate::Admin, generation: Option<crate::storage::GenerationTag>) -> Self {
+        Self { admin, generation }
     }
 
-    pub(crate) fn db(&self) -> Result<&Arc<V2Db>, TaskDdlError> {
-        self.db
-            .as_ref()
-            .ok_or_else(|| ddl("0A000", "tasks require the v2 storage engine"))
+    pub(crate) fn db(&self) -> Result<crate::storage::EngineLease, TaskDdlError> {
+        if self.admin.engine() == crate::Engine::Legacy {
+            return Err(ddl("0A000", "tasks require the v2 storage engine"));
+        }
+        Ok(self.lease()?)
+    }
+
+    fn lease(&self) -> Result<crate::storage::EngineLease, CoreError> {
+        use crate::storage::Holder::TaskCatalog;
+        match &self.generation {
+            Some(tag) => tag.lease(TaskCatalog),
+            None => self.admin.lease(TaskCatalog)?.ok_or(CoreError::Unsupported),
+        }
     }
 
     /// The committed catalog view now.
@@ -505,8 +518,13 @@ impl TaskCatalog {
     /// (when given), the role lock shared, then the task catalog lock
     /// exclusive. The snapshot is refreshed after the last wait, as
     /// `roles_engine::write` does. Returns whether the table resolved.
-    pub(crate) fn begin_write(&self, table: Option<&str>) -> Result<(Transaction, bool), TaskDdlError> {
+    pub(crate) fn begin_write(&self, table: Option<&str>) -> Result<(crate::storage::EngineLease, Transaction, bool), TaskDdlError> {
         let db = self.db()?;
+        let (txn, resolved) = Self::begin_write_leased(&db, table)?;
+        Ok((db, txn, resolved))
+    }
+
+    fn begin_write_leased(db: &crate::storage::EngineLease, table: Option<&str>) -> Result<(Transaction, bool), TaskDdlError> {
         let mut txn = db.begin(Isolation::ReadCommitted);
         let resolved = table.is_some_and(|key| {
             db.catalog()
@@ -524,11 +542,18 @@ impl TaskCatalog {
         Ok((txn, resolved))
     }
 
-    fn write_record(&self, mut txn: Transaction, def: &TaskDef) -> Result<(), TaskDdlError> {
+    fn write_record(&self, db: &crate::storage::EngineLease, mut txn: Transaction, def: &TaskDef) -> Result<(), TaskDdlError> {
         let value = encode_task(def)?;
         txn.require_features(TASK_CATALOG);
         txn.put(Keyspace::Catalog, task_key(def.id.0), value)?;
-        self.db()?.catalog().commit_ddl(txn)?;
+        self.commit_catalog_write(db, txn)
+    }
+
+    pub(crate) fn commit_catalog_write(
+        &self, db: &crate::storage::EngineLease, txn: Transaction,
+    ) -> Result<(), TaskDdlError> {
+        db.check()?;
+        db.catalog().commit_ddl(txn)?;
         Ok(())
     }
 
@@ -540,8 +565,8 @@ impl TaskCatalog {
             .ok_or_else(|| ddl("42704", format!("task \"{name}\" does not exist")))
     }
 
-    fn role(&self, name: &str) -> Result<CatalogRole, TaskDdlError> {
-        match self.roles.get(name) {
+    fn role(&self, db: &crate::storage::EngineLease, name: &str) -> Result<CatalogRole, TaskDdlError> {
+        match self.admin.roles().get_leased(db, name) {
             Ok(Some(role)) => Ok(role),
             Ok(None) | Err(RoleError::Invalid) => {
                 Err(ddl("42704", format!("role \"{name}\" does not exist")))
@@ -566,15 +591,14 @@ impl TaskCatalog {
         new: NewTask,
         now: WallClockMs,
     ) -> Result<TaskDef, TaskDdlError> {
-        let db = Arc::clone(self.db()?);
         let schema = new.schema.as_deref().unwrap_or("public");
         let key = crate::relational::relation_key(schema, &new.table);
-        let (mut txn, resolved) = self.begin_write(Some(&key))?;
+        let (db, mut txn, resolved) = self.begin_write(Some(&key))?;
         let view = db.catalog().committed_view(&mut txn)?;
         let checked = Checked { view: &view, key: &key, resolved };
         let mut def = self.validate(issuer, &new, now, &checked, &db, &mut txn)?;
         def.id = TaskObjectId(db.sequences.next(0, 0)?);
-        self.write_record(txn, &def)?;
+        self.write_record(&db, txn, &def)?;
         Ok(def)
     }
 
@@ -587,13 +611,19 @@ impl TaskCatalog {
         new: &NewTask,
         now: WallClockMs,
     ) -> Result<TaskDef, TaskDdlError> {
-        let db = Arc::clone(self.db()?);
+        let db = self.db()?;
+        self.draft_leased(&db, issuer, new, now)
+    }
+
+    pub(crate) fn draft_leased(
+        &self, db: &crate::storage::EngineLease, issuer: &CatalogRole, new: &NewTask, now: WallClockMs,
+    ) -> Result<TaskDef, TaskDdlError> {
         let schema = new.schema.as_deref().unwrap_or("public");
         let key = crate::relational::relation_key(schema, &new.table);
-        let (mut txn, resolved) = self.begin_write(Some(&key))?;
+        let (mut txn, resolved) = Self::begin_write_leased(db, Some(&key))?;
         let view = db.catalog().committed_view(&mut txn)?;
         let checked = Checked { view: &view, key: &key, resolved };
-        let mut def = self.validate(issuer, new, now, &checked, &db, &mut txn)?;
+        let mut def = self.validate(issuer, new, now, &checked, db, &mut txn)?;
         // Dropping the transaction uncommitted releases its locks.
         drop(txn);
         def.def_version = 0;
@@ -606,7 +636,7 @@ impl TaskCatalog {
         new: &NewTask,
         now: WallClockMs,
         at: &Checked<'_>,
-        db: &V2Db,
+        db: &crate::storage::EngineLease,
         txn: &mut Transaction,
     ) -> Result<TaskDef, TaskDdlError> {
         let view = at.view;
@@ -634,8 +664,8 @@ impl TaskCatalog {
         };
         let table = &entry.def;
         // Row 5: roles exist.
-        let executor = self.role(&new.executor)?;
-        let approver = new.approver.as_deref().map(|a| self.role(a)).transpose()?;
+        let executor = self.role(db, &new.executor)?;
+        let approver = new.approver.as_deref().map(|a| self.role(db, a)).transpose()?;
         // Row 6: who may play which part.
         if issuer.name == executor.name {
             return Err(ddl("22023", "task issuer cannot be its executor"));
@@ -663,9 +693,14 @@ impl TaskCatalog {
             ));
         }
         // Row 8: the issuer holds what it delegates.
-        let owner = self.roles.table_owner(at.key)?;
+        #[cfg(all(test, feature = "engine-rocksdb"))]
+        if let Some(hook) = TEST_BEFORE_TASK_DRAFT_ACL.take() {
+            hook();
+        }
+        let roles = self.admin.roles();
+        let owner = roles.table_owner_leased(at.key, Some(db))?;
         if !issuer.superuser && owner.as_deref() != Some(issuer.name.as_str()) {
-            let held = self.roles.table_privileges(at.key, &issuer.name)?;
+            let held = roles.table_privileges_leased(at.key, &issuer.name, Some(db))?;
             let write = new.allowed_write.is_some();
             if !held.contains(&TablePrivilege::Select)
                 || (write && !held.contains(&TablePrivilege::Update))
@@ -804,8 +839,8 @@ impl TaskCatalog {
     /// REVOKE TASK: issuer or superuser. Bumps def_version once; revoking a
     /// revoked task succeeds without a write.
     pub fn revoke(&self, actor: &CatalogRole, name: &str) -> Result<TaskDef, TaskDdlError> {
-        let (mut txn, _) = self.begin_write(None)?;
-        let view = self.db()?.catalog().committed_view(&mut txn)?;
+        let (db, mut txn, _) = self.begin_write(None)?;
+        let view = db.catalog().committed_view(&mut txn)?;
         let mut def = Self::current(&view, name)?;
         Self::may_administer(actor, &def)?;
         if def.revoked {
@@ -816,7 +851,7 @@ impl TaskCatalog {
             .def_version
             .checked_add(1)
             .ok_or_else(|| ddl("54000", "task def_version exhausted"))?;
-        self.write_record(txn, &def)?;
+        self.write_record(&db, txn, &def)?;
         Ok(def)
     }
 
@@ -834,11 +869,11 @@ impl TaskCatalog {
         if bits.contains(TaskPrivileges::APPROVE) {
             return Err(ddl("0A000", "APPROVE on a task is not grantable"));
         }
-        let (mut txn, _) = self.begin_write(None)?;
-        let view = self.db()?.catalog().committed_view(&mut txn)?;
+        let (db, mut txn, _) = self.begin_write(None)?;
+        let view = db.catalog().committed_view(&mut txn)?;
         let mut def = Self::current(&view, name)?;
         Self::may_administer(actor, &def)?;
-        let target = self.role(role)?;
+        let target = self.role(&db, role)?;
         if target.name == def.executor || target.task_only {
             return Err(ddl(
                 "22023",
@@ -859,7 +894,7 @@ impl TaskCatalog {
         } else {
             def.grants.insert(role.to_owned(), next);
         }
-        self.write_record(txn, &def)
+        self.write_record(&db, txn, &def)
     }
 
     pub fn get(&self, name: &str) -> Result<Option<Arc<TaskDef>>, TaskDdlError> {
@@ -883,15 +918,14 @@ impl TaskCatalog {
     /// Deletes a task record. Phase 6 retention only; its name becomes reusable.
     #[cfg_attr(not(all(test, feature = "engine-rocksdb")), allow(dead_code))] // The retention sweeper (Phase 6) is the first caller.
     pub(crate) fn purge(&self, id: TaskObjectId) -> Result<(), TaskDdlError> {
-        let (mut txn, _) = self.begin_write(None)?;
-        let view = self.db()?.catalog().committed_view(&mut txn)?;
+        let (db, mut txn, _) = self.begin_write(None)?;
+        let view = db.catalog().committed_view(&mut txn)?;
         if !view.tasks.contains_key(&id.0) {
             return Err(ddl("42704", "task does not exist"));
         }
         txn.require_features(TASK_CATALOG);
         txn.delete(Keyspace::Catalog, task_key(id.0))?;
-        self.db()?.catalog().commit_ddl(txn)?;
-        Ok(())
+        self.commit_catalog_write(&db, txn)
     }
 }
 
@@ -1234,13 +1268,19 @@ impl TaskCatalog {
     /// The current definition named `name`, revoked or not; `None` when it
     /// does not exist or on the legacy engine (tasks are v2 only).
     pub(crate) fn lookup(&self, name: &str) -> Result<Option<Arc<TaskDef>>, CoreError> {
-        let Some(db) = &self.db else {
+        if self.admin.engine() == crate::Engine::Legacy {
             return Ok(None);
-        };
-        let mut txn = db.begin(Isolation::ReadCommitted);
-        let view = db.catalog().committed_view(&mut txn)?;
-        Ok(view.task_names.get(name).and_then(|id| view.tasks.get(id)).cloned())
+        }
+        let db = self.lease()?;
+        lookup_leased(Some(&db), name)
     }
+}
+
+pub(crate) fn lookup_leased(db: Option<&crate::storage::EngineLease>, name: &str) -> Result<Option<Arc<TaskDef>>, CoreError> {
+    let Some(db) = db else { return Ok(None); };
+    let mut txn = db.begin(Isolation::ReadCommitted);
+    let view = db.catalog().committed_view(&mut txn)?;
+    Ok(view.task_names.get(name).and_then(|id| view.tasks.get(id)).cloned())
 }
 
 #[cfg(all(test, feature = "engine-rocksdb"))]

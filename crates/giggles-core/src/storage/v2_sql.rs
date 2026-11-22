@@ -77,12 +77,17 @@ impl SqlSession {
             return self.execute(if commit { "COMMIT" } else { "BEGIN" }, &[], None).map(drop);
         }
         // Shares execute_v2's copy/abort/ticket/cancellation/error cleanup guards.
-        self.native_implicit_control(!commit)
+        self.native_implicit_control(!commit, Holder::Transaction)
     }
 
     pub(crate) fn begin_v2_transaction(
-        &mut self, db: &Arc<v2::V2Db>,
+        &mut self, db: &EngineLease,
     ) -> Result<(), CoreError> {
+        let lease = db.child(Holder::Transaction)?;
+        self.begin_v2_transaction_owned(lease)
+    }
+
+    pub(super) fn begin_v2_transaction_owned(&mut self, db: EngineLease) -> Result<(), CoreError> {
         let inner = self.admin.inner.clone();
         if self.v2_transaction.is_some() {
             return Err(CoreError::Sql(SqlError::Transaction));
@@ -111,13 +116,14 @@ impl SqlSession {
                 }
             })
             .map_err(|_| CoreError::Busy)?;
+        txn.attach_lease(db);
         self.v2_transaction = Some(txn);
         self.transaction_id = Some(u128::from_be_bytes(token));
         Ok(())
     }
 
     pub(super) fn commit_v2_transaction(
-        &mut self, db: &Arc<v2::V2Db>, ticket: &mut Ticket<'_>,
+        &mut self, db: &EngineLease, ticket: &mut Ticket<'_>,
     ) -> Result<(), CoreError> {
         let inner = self.admin.inner.clone();
         let txn = self.v2_transaction.take().ok_or(CoreError::Sql(SqlError::Transaction))?;
@@ -127,7 +133,7 @@ impl SqlSession {
 
     // Preserve explicit transaction cleanup before acknowledgement (including a
     // lost response), while sharing publication with statement autocommit.
-    fn publish_v2_sql(&mut self, db: &Arc<v2::V2Db>, inner: &Inner, txn: Transaction, explicit: bool, ticket: &mut Ticket<'_>) -> Result<(), CoreError> {
+    fn publish_v2_sql(&mut self, db: &EngineLease, inner: &Inner, txn: Transaction, explicit: bool, ticket: &mut Ticket<'_>) -> Result<(), CoreError> {
         // Statement autocommit historically samples the crash point before attaching.
         let point = if explicit { None } else { Some(*inner.crash.lock().map_err(|_| CoreError::Fenced)?) };
         let mut txn = txn;
@@ -201,7 +207,7 @@ impl SqlSession {
 
     #[cfg(feature = "engine-rocksdb")]
     pub(super) fn visit_native_range_v2<E>(
-        &mut self, db: &Arc<v2::V2Db>, table: &TableDef,
+        &mut self, db: &EngineLease, table: &TableDef,
         lo: Bound<Vec<u8>>, hi: Bound<Vec<u8>>,
         visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
     ) -> Result<(), E> {
@@ -230,9 +236,10 @@ impl SqlSession {
     pub(crate) fn native_index_access(&mut self, table: &TableDef,
         predicates: &[(String, String, relational::Value)]) -> Result<crate::operations::NativeAccess, CoreError> {
         let result = (|| {
-            let super::Backend::V2(db) = &self.admin.inner.backend else {
+            if !self.is_v2_engine() {
                 return Ok(crate::operations::NativeAccess::Full);
-            };
+            }
+            let db = self.v2_lease(Holder::Sql)?;
             let txn = self.v2_transaction.as_mut().ok_or(CoreError::Sql(SqlError::Transaction))?;
             let catalog = db.catalog().snapshot(txn)?;
             Ok(SqlRows::index_range(&catalog.parts, table, predicates)
@@ -244,7 +251,7 @@ impl SqlSession {
 
     #[cfg(feature = "engine-rocksdb")]
     pub(super) fn visit_native_index_v2<E>(
-        &mut self, db: &Arc<v2::V2Db>, table: &TableDef,
+        &mut self, db: &EngineLease, table: &TableDef,
         range: (&relational::secondary_index::Descriptor, Bound<Vec<u8>>, Bound<Vec<u8>>),
         visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
     ) -> Result<(), E> {
@@ -272,7 +279,7 @@ impl SqlSession {
 
     #[cfg(feature = "engine-rocksdb")]
     pub(super) fn visit_native_key_v2<E>(
-        &mut self, db: &Arc<v2::V2Db>, table: &TableDef, key: &[relational::Value],
+        &mut self, db: &EngineLease, table: &TableDef, key: &[relational::Value],
         visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
     ) -> Result<(), E> {
         sql_sequences::settle(db, &self.sequence_unsettled).map_err(map)?;
@@ -289,18 +296,18 @@ impl SqlSession {
 
     pub(super) fn insert_sequence_callback(
         &self,
-        db: &Arc<v2::V2Db>,
+        db: &EngineLease,
         image: Arc<relational::Relational>,
-    ) -> relational::clock::SequenceCallback {
-        sql_sequences::callback(db.clone(), image, self.sequence_baseline.clone(),
-            self.pending_sequences.clone(), self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone())
+    ) -> Result<relational::clock::SequenceCallback, CoreError> {
+        Ok(sql_sequences::callback(CallbackLease::new(db, self.v2_transaction.as_ref()), image, self.sequence_baseline.clone(),
+            self.pending_sequences.clone(), self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone()))
     }
 
     // Typed scans deliberately retain the active statement snapshot. In
     // particular, the completeness forward/max probes must never refresh it.
     #[cfg(feature = "engine-rocksdb")]
     pub(super) fn scan_v2_engine(
-        &mut self, db: &Arc<v2::V2Db>, scan: relational::Scan,
+        &mut self, db: &EngineLease, scan: relational::Scan,
     ) -> Result<relational::SqlResult, CoreError> {
         let _ticket = self.admin.inner.enter_sql()?;
         crate::cancellation::check()?;
@@ -323,23 +330,24 @@ impl SqlSession {
     pub(super) fn prepare_v2(
         &mut self,
         sql: &str,
-        domain: u128,
+        db: &EngineLease,
     ) -> Result<relational::Prepared, CoreError> {
         relational::assert_sql_frontend_allowed();
-        let result = relational::Prepared::parse(sql, domain, 0)
+        let result = relational::Prepared::parse(sql, u128::from_be_bytes(db.meta.domain), 0)
             .map_err(CoreError::Sql)
             .and_then(|mut p| {
                 if self.aborted && !p.allows_aborted_transaction() {
                     return Err(CoreError::Sql(relational::SqlError::Aborted));
                 }
                 p.transaction = self.transaction_id;
+                p.engine_generation = Some(db.prepared_generation());
                 p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
                 if self.authorization_bindings && self.task.is_none() {
                     p.enable_sql_authorization_binding();
                 }
                 // Match legacy preparation: authority sees bound dependency names,
                 // while semantic errors remain deferred until after authorization.
-                if let Ok(bound) = self.bind_relation_context(&p) {
+                if let Ok(bound) = self.bind_relation_context_leased(&p, Some(db)) {
                     p = bound;
                 }
                 Ok(p)
@@ -352,11 +360,17 @@ impl SqlSession {
 
     pub(super) fn normalize_copy_v2(
         &mut self,
-        db: &Arc<v2::V2Db>,
+        db: &EngineLease,
         prepared: &relational::Prepared,
         input: relational::CopyInput,
         clock: &relational::StatementClock,
     ) -> Result<(relational::Prepared, Vec<Vec<relational::Value>>, u64), CoreError> {
+        if let Err(error) = Self::check_prepared_generation(prepared, Some(db)) {
+            // The stale plan cannot settle sequence obligations on this engine.
+            self.abort_transaction(false);
+            return Err(error);
+        }
+        self.bind_sequence_generation(db);
         let result = (|| {
             let inner = self.admin.inner.clone();
             let _ticket = inner.enter_sql()?;
@@ -374,7 +388,7 @@ impl SqlSession {
             let mut state = db.metadata_state(self.v2_transaction.as_ref())?;
             state.sql.epoch = 0;
             let image = Arc::new(state.sql.clone());
-            let callback = sql_sequences::callback(db.clone(), image.clone(),
+            let callback = sql_sequences::callback(CallbackLease::new(db, self.v2_transaction.as_ref()), image.clone(),
                 self.sequence_baseline.clone(), self.pending_sequences.clone(),
                 self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone());
             let allowed = self.sequence_tables.clone();
@@ -397,7 +411,7 @@ impl SqlSession {
                 .with_extra_float_digits(self.extra_float_digits)
                 .with_sequences(callback)
                 .with_xact(sql_xact::callback(
-                    db.clone(),
+                    CallbackLease::new(db, self.v2_transaction.as_ref()),
                     self.xact.clone(),
                     self.v2_transaction.as_ref().map(|txn| txn.id()),
                 ));
@@ -422,12 +436,13 @@ impl SqlSession {
 
     pub(super) fn execute_v2(
         &mut self,
-        db: &Arc<v2::V2Db>,
+        db: &EngineLease,
         p: &relational::Prepared,
         params: &[relational::Value],
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<relational::SqlResult, CoreError> {
+        Self::check_prepared_generation(p, Some(db))?;
         let result = self.execute_v2_inner(db, p, params, expected_version, clock);
         // Result columns also identify spilled/streamed rows absent from rows.
         if result.as_ref().is_err() || result.as_ref().is_ok_and(|result| !result.columns.is_empty() || !result.rows.is_empty())
@@ -445,7 +460,7 @@ impl SqlSession {
 
     fn execute_v2_inner(
         &mut self,
-        db: &Arc<v2::V2Db>,
+        db: &EngineLease,
         p: &relational::Prepared,
         params: &[relational::Value],
         expected_version: Option<u64>,
@@ -475,6 +490,7 @@ impl SqlSession {
                 return Err(error);
             }
         };
+        let cancelled = || crate::cancellation::check().is_err() || db.check().is_err();
         let result = (|| {
             crate::cancellation::check()?;
             if p.domain != u128::from_be_bytes(db.meta.domain)
@@ -579,7 +595,7 @@ impl SqlSession {
                             // Table(0) RowExclusive while waiting; the deadlock detector then
                             // breaks any cycle).
                             if ddl {
-                                txn.ddl_begin(&|| crate::cancellation::check().is_err())?;
+                                txn.ddl_begin(&cancelled)?;
                             }
                             txn.acquire_lock(
                                 engine::locks::LockKey::Table(0),
@@ -589,7 +605,7 @@ impl SqlSession {
                                     LockMode::RowExclusive
                                 },
                                 crate::task::limits::lock_deadline(),
-                                &|| crate::cancellation::check().is_err(),
+                                &cancelled,
                             ).map_err(crate::task::limits::lock_error)?;
                             // Refresh AFTER waiting: DDL may have introduced an FK.
                             if !self.copy_input.as_ref().is_some_and(|input| input.started) {
@@ -721,7 +737,7 @@ impl SqlSession {
                             .collect();
                         for (id, mode) in locks {
                             if !table_names.contains_key(&id) {
-                                txn.acquire_lock(engine::locks::LockKey::Table(id), mode, crate::task::limits::lock_deadline(), &|| crate::cancellation::check().is_err()).map_err(crate::task::limits::lock_error)?;
+                                txn.acquire_lock(engine::locks::LockKey::Table(id), mode, crate::task::limits::lock_deadline(), &cancelled).map_err(crate::task::limits::lock_error)?;
                                 continue;
                             }
                             db.catalog()
@@ -738,7 +754,7 @@ impl SqlSession {
                             for id in write_ids.iter().filter(|id| Some(**id) != target_id) {
                                 txn.lock_sql_sentinel(*id, if txn.isolation() == Isolation::ReadCommitted && bound.row_lock_command().is_none() {
                                     LockMode::Exclusive
-                                } else { LockMode::Shared }, &|| crate::cancellation::check().is_err())?;
+                                } else { LockMode::Shared }, &cancelled)?;
                             }
                         }
                         if writing
@@ -814,7 +830,7 @@ impl SqlSession {
                                 || protected || bound.row_lock_command().is_some());
                             txn.lock_sql_sentinel(table.id,
                                 if shared { LockMode::Shared } else { LockMode::Exclusive },
-                                &|| crate::cancellation::check().is_err())?;
+                                &cancelled)?;
                             // Cluster FK hydration must follow the parent's Exclusive lock,
                             // including when the transaction keeps a fixed snapshot.
                             if fixed_snapshot
@@ -828,7 +844,7 @@ impl SqlSession {
                                 }).collect::<Result<BTreeSet<_>, CoreError>>()?;
                                 for key in physical {
                                     txn.lock_for_write(Keyspace::Rows, &key, crate::task::limits::lock_deadline(),
-                                        &|| crate::cancellation::check().is_err()).map_err(crate::task::limits::lock_error)?;
+                                        &cancelled).map_err(crate::task::limits::lock_error)?;
                                 }
                             }
                             let key_prelock = matches!(txn.services(), engine::txn::TxnServices::Local { .. })
@@ -847,11 +863,11 @@ impl SqlSession {
                                 for key in physical {
                                     if key_prelock {
                                         txn.lock_row_write_group(table.id, &key[8..],
-                                            crate::task::limits::lock_deadline(), &|| crate::cancellation::check().is_err())
+                                            crate::task::limits::lock_deadline(), &cancelled)
                                             .map_err(crate::task::limits::lock_error)?;
                                     }
                                     let target = txn.lock_for_write(Keyspace::Rows, &key, crate::task::limits::lock_deadline(),
-                                        &|| crate::cancellation::check().is_err()).map_err(crate::task::limits::lock_error)?;
+                                        &cancelled).map_err(crate::task::limits::lock_error)?;
                                     if let Some(bytes) = target.current {
                                         // Locked targets cannot grow before the final
                                         // snapshot. Reuse the publisher's exact budget.
@@ -875,7 +891,7 @@ impl SqlSession {
                                     // The point publisher would scan pages. Upgrade
                                     // before taking its snapshot; never refresh mid-scan.
                                     txn.lock_sql_sentinel(table.id, LockMode::Exclusive,
-                                        &|| crate::cancellation::check().is_err())?;
+                                        &cancelled)?;
                                 }
                             }
                             if let Some((mut physical, witnesses)) = upsert {
@@ -892,12 +908,12 @@ impl SqlSession {
                                 }
                                 for key in &physical {
                                     txn.lock_for_write(Keyspace::Rows, key, crate::task::limits::lock_deadline(),
-                                        &|| crate::cancellation::check().is_err()).map_err(crate::task::limits::lock_error)?;
+                                        &cancelled).map_err(crate::task::limits::lock_error)?;
                                 }
                                 let mut upgrade = false;
                                 for key in witnesses {
                                     let target = txn.lock_for_write(Keyspace::Index, &key, crate::task::limits::lock_deadline(),
-                                        &|| crate::cancellation::check().is_err()).map_err(crate::task::limits::lock_error)?;
+                                        &cancelled).map_err(crate::task::limits::lock_error)?;
                                     if let Some(owner) = target.current {
                                         let mut row = table.id.to_be_bytes().to_vec();
                                         row.extend(owner);
@@ -908,14 +924,14 @@ impl SqlSession {
                                     #[cfg(test)]
                                     UPSERT_UPGRADE.set(UPSERT_UPGRADE.get() + 1);
                                     txn.lock_sql_sentinel(table.id, LockMode::Exclusive,
-                                        &|| crate::cancellation::check().is_err())?;
+                                        &cancelled)?;
                                 }
                             }
                         }
                         // Phase 11: other gateways drain their writers and the readers of
                         // `exclusive` (as locals did above) before the snapshot is chosen.
                         if ddl {
-                            txn.ddl_close(&exclusive, &|| crate::cancellation::check().is_err())?;
+                            txn.ddl_close(&exclusive, &cancelled)?;
                         }
                         // Choose ONE snapshot after every potentially blocking lock.
                         // No refresh occurs while staging any of the statement's rows.
@@ -980,9 +996,9 @@ impl SqlSession {
                         })?;
                         let mut image = catalog_image.catalog_image_for_statement(ids.start, versions.start);
                         p.check_extension_views(&image, old.sql_views.values().map(|v| (v.name.as_str(), v.select.as_str()))).map_err(CoreError::Sql)?;
-                        let context = clock.map(|clock| {
-                            clock.with_sequences(sql_sequences::callback(
-                                db.clone(),
+                        let context = clock.map(|clock| -> Result<_, CoreError> {
+                            Ok(clock.with_sequences(sql_sequences::callback(
+                                CallbackLease::new(db, Some(txn)),
                                 catalog_image.clone(),
                                 self.sequence_baseline.clone(),
                                 self.pending_sequences.clone(),
@@ -991,14 +1007,14 @@ impl SqlSession {
                                 self.search_path.clone(),
                             ))
                             .with_xact(sql_xact::callback(
-                                db.clone(),
+                                CallbackLease::new(db, Some(txn)),
                                 self.xact.clone(),
                                 Some(txn.id()),
-                            ))
-                        });
+                            )))
+                        }).transpose()?;
                         let context = context.map(|clock| match self.privilege_callback.as_ref().filter(|_| p.has_privilege_inquiry()) {
                             Some(callback) => clock.with_privileges(callback.clone(), privilege_provider(
-                                PrivilegeImage::Catalog(catalog_image.clone()), self.search_path.clone(), Some(txn), true)),
+                                PrivilegeImage::Catalog(catalog_image.clone()), self.search_path.clone(), Some(txn), self.admin.roles(), Some(db))),
                             None => clock,
                         });
                         if let Some(input) = self.copy_input.as_mut() {
@@ -2873,7 +2889,7 @@ impl SqlSession {
     #[cfg_attr(not(all(test, feature = "engine-rocksdb")), allow(dead_code))]
     pub(crate) fn execute_protected_v2(
         &mut self,
-        db: &Arc<v2::V2Db>,
+        db: &EngineLease,
         run: ProtectedRun,
         p: &relational::Prepared,
         params: &[relational::Value],
@@ -2886,13 +2902,17 @@ impl SqlSession {
     /// point write (the undo restores, GD-0061 D8, R3-802).
     pub(crate) fn execute_protected_v2_expecting(
         &mut self,
-        db: &Arc<v2::V2Db>,
+        db: &EngineLease,
         run: ProtectedRun,
         p: &relational::Prepared,
         params: &[relational::Value],
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> (ProtectedRun, Result<relational::SqlResult, CoreError>) {
+        if let Err(error) = db.check() {
+            return (run, Err(error));
+        }
+        self.bind_sequence_generation(db);
         if self.v2_transaction.is_some()
             || self.staged.is_some()
             || self.copy_input.is_some()

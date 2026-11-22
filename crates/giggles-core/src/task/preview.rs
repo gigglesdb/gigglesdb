@@ -48,9 +48,10 @@ use crate::relational::clock::{
     ExecutionClock, StatementClock, OBS_INSTANT, OBS_SEQUENCE, OBS_WALL, OBS_XACT, OBS_ZONE,
 };
 use crate::relational::{Prepared, SqlRow, TableDef, Value, catalog_ext::Constraint};
+use crate::storage::SessionLease;
 use crate::storage::engine::kv::Direction;
 use crate::storage::roles::{role_txn, table_privileges_txn, RoleError, TablePrivilege};
-use crate::storage::{Isolation, Keyspace, ProtectedRun, SqlSession, Transaction, V2Db};
+use crate::storage::{Isolation, Keyspace, ProtectedRun, SqlSession, Transaction};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::ops::Bound;
@@ -282,7 +283,7 @@ pub fn preview(
         if let Err(error) = &result {
             entry.fail_with(error.sqlstate());
         }
-        entry.finish();
+        let _ = entry.finish();
     }
     result
 }
@@ -296,7 +297,7 @@ fn run(
     clock: &StatementClock,
 ) -> Result<PreviewSummary, TaskError> {
     // v2 only, never on a cluster gateway or a replicated store.
-    let db = session.v2_db().ok_or_else(unsupported)?;
+    let db = session.v2_lease(crate::storage::Holder::TaskRun)?;
     if db.task_kernel_unsupported() {
         return Err(unsupported());
     }
@@ -323,7 +324,7 @@ enum Policy {
 /// always rolled back.
 fn dry_run(
     session: &mut SqlSession,
-    db: &Arc<V2Db>,
+    db: &SessionLease,
     ctx: &TaskContext,
     text: &str,
     params: &[Value],
@@ -337,7 +338,7 @@ fn dry_run(
     standing(latest.as_deref(), ctx, db.wall_now_ms())?;
     let latest = latest.ok_or(TaskError::Revoked)?;
     // 2. One UPDATE, under the column rules (design-3 section 2).
-    let prepared = session.prepare(text)?;
+    let prepared = session.prepare_leased(text, Some(db))?;
     let class = prepared.task_class();
     if class != StatementClass::Update {
         return Err(TaskError::NotAllowedInTaskSession(class));
@@ -359,7 +360,7 @@ fn dry_run(
     // 3. The statement through the protected seam, bound to the task so it
     // matches only the visible rows, with every instant pinned at the
     // transaction instant (what apply re-runs with) and no wall clock.
-    let mut txn = db.begin(Isolation::Serializable);
+    let mut txn = db.begin_leased(Isolation::Serializable, crate::storage::Holder::TaskRun)?;
     let mark = txn.savepoint();
     let mut pinned = ExecutionClock::pinned(clock.transaction_us, clock.zone);
     pinned.unavailable = clock.unavailable.clone();
@@ -463,7 +464,7 @@ fn dry_run(
 
 /// T2: the store, under the authority hold.
 fn store(
-    db: &Arc<V2Db>,
+    db: &SessionLease,
     ctx: &TaskContext,
     surface: Surface,
     text: &str,
@@ -530,7 +531,7 @@ pub(super) struct StoredHeader {
 /// given and the head, in one commit. `expires_ms` is `now + preview_ttl`,
 /// capped at the task's expiry when `cap_at_task_expiry`.
 pub(super) fn store_preview(
-    db: &Arc<V2Db>,
+    db: &SessionLease,
     task: TaskObjectId,
     def: &TaskDef,
     recheck: &mut Recheck<'_>,
@@ -656,13 +657,13 @@ fn sweep(txn: &mut Transaction, task: TaskObjectId, now: u64) -> Result<u32, Cor
 /// is `decide::evaluate` in the commit. The source is resolved once per call;
 /// nothing is read until the first attempt holds the hold.
 pub(crate) fn apply_stage(
-    db: &Arc<V2Db>,
+    db: &SessionLease,
     ctx: &TaskContext,
     id: PreviewId,
     digest: [u8; 32],
 ) -> Result<Box<dyn ApplySource>, TaskError> {
     Ok(Box::new(StoredApply {
-        db: Arc::clone(db),
+        db: db.child(crate::storage::Holder::TaskRun)?,
         ctx: ctx.clone(),
         id,
         digest,
@@ -699,7 +700,7 @@ pub(crate) fn matches(effects: &Effects, rows: &[PreviewRow], width: usize) -> b
 
 /// The stored preview and approval behind one Apply call.
 struct StoredApply {
-    db: Arc<V2Db>,
+    db: crate::storage::EngineLease,
     ctx: TaskContext,
     id: PreviewId,
     /// The digest the executor sent.
@@ -724,6 +725,7 @@ impl StoredApply {
     /// has another digest, or its `def_version`, table or `schema_fp` is not
     /// the current one.
     fn checked(&self, txn: &mut Transaction) -> Result<Option<Checked>, CoreError> {
+        self.db.check()?;
         let task = self.ctx.task;
         let Some(value) = txn.get(Keyspace::Kernel, &preview_key(task, self.id.0))? else {
             return Ok(None);
@@ -782,6 +784,7 @@ impl ApplySource for StoredApply {
     /// stored text prepared under the current catalog and the stored
     /// parameters. The commit applies the task's column rules to it.
     fn statement(&self, session: &mut SqlSession) -> Result<(Prepared, Vec<Value>), TaskError> {
+        self.db.check()?;
         self.header.replace(None);
         self.used.replace(None);
         let mut read = self.db.begin(Isolation::ReadCommitted);
@@ -792,7 +795,7 @@ impl ApplySource for StoredApply {
         if header.surface != Surface::Sql as u8 && header.surface != Surface::Native as u8 {
             return Err(unsupported());
         }
-        let prepared = session.prepare(&header.text)?;
+        let prepared = session.prepare_leased(&header.text, Some(&self.db))?;
         if prepared.task_class() != StatementClass::Update {
             return Err(TaskError::ApprovalStale);
         }
@@ -944,7 +947,7 @@ impl crate::storage::Admin {
     /// latest committed state (v2 only). For tests.
     #[doc(hidden)]
     pub fn task_previews(&self, task: TaskObjectId) -> Result<PreviewStore, CoreError> {
-        let db = self.sql_session().v2_db().ok_or(CoreError::Unsupported)?;
+        let db = self.sql_session().v2_lease(crate::storage::Holder::TaskRun)?;
         let mut txn = db.begin(Isolation::ReadCommitted);
         let head = authority::load_head(&mut txn, task)?;
         let mut previews = Vec::new();
@@ -1021,7 +1024,7 @@ impl crate::storage::Admin {
         clock: &StatementClock,
     ) -> Result<PreviewSummary, TaskError> {
         let mut session = self.sql_session();
-        let db = session.v2_db().ok_or_else(unsupported)?;
+        let db = session.v2_lease(crate::storage::Holder::TaskRun)?;
         let dry = dry_run(&mut session, &db, ctx, text, &[], clock, Policy::Skip)?;
         store(&db, ctx, Surface::Sql, text, &[], dry)
     }
@@ -1036,7 +1039,7 @@ impl crate::storage::Admin {
         id: PreviewId,
         def_version: u64,
     ) -> Result<(), CoreError> {
-        let db = self.sql_session().v2_db().ok_or(CoreError::Unsupported)?;
+        let db = self.sql_session().v2_lease(crate::storage::Holder::TaskRun)?;
         let mut txn = db.begin(Isolation::ReadCommitted);
         let value = txn
             .get(Keyspace::Kernel, &preview_key(task, id.0))?

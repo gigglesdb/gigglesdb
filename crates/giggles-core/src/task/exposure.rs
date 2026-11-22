@@ -63,11 +63,13 @@ pub fn show_exposure(
     extra: &[(String, String)],
 ) -> Result<SqlResult, CoreError> {
     refuse_in_task(session)?;
-    let def = session
-        .tasks()
-        .lookup(task)?
+    let db = session.statement_lease()?;
+    let def = super::catalog::lookup_leased(db.as_deref(), task)?
         .ok_or(CoreError::Sql(SqlError::UndefinedObject))?;
-    report(session, role, &def, extra)
+    if !def.privileges_of(role).contains(TaskPrivileges::INSPECT) {
+        return Err(CoreError::Policy(crate::Error::Scope));
+    }
+    build(db.as_deref().ok_or(CoreError::Unsupported)?, role, &def, extra, Kind::Saved)
 }
 
 /// The exposure report of `def` for `role`. `extra` holds the server's
@@ -83,7 +85,8 @@ pub fn report(
     if !def.privileges_of(role).contains(TaskPrivileges::INSPECT) {
         return Err(CoreError::Policy(crate::Error::Scope));
     }
-    build(session, role, def, extra, Kind::Saved)
+    let db = session.v2_lease(crate::storage::Holder::TaskRun)?;
+    build(&db, role, def, extra, Kind::Saved)
 }
 
 /// `SHOW TASK EXPOSURE FOR CREATE TASK ...` for `role`: validates `new` as
@@ -98,8 +101,10 @@ pub fn draft_exposure(
     extra: &[(String, String)],
 ) -> Result<SqlResult, TaskDdlError> {
     refuse_in_task(session)?;
-    let def = session.tasks().draft(role, new, now)?;
-    Ok(build(session, role, &def, extra, Kind::Draft)?)
+    let catalog = session.tasks();
+    let db = catalog.db()?;
+    let def = catalog.draft_leased(&db, role, new, now)?;
+    Ok(build(&db, role, &def, extra, Kind::Draft)?)
 }
 
 /// Whether the definition is stored; a draft has nothing charged or changed.
@@ -110,13 +115,12 @@ enum Kind {
 }
 
 fn build(
-    session: &SqlSession,
+    db: &crate::storage::EngineLease,
     role: &CatalogRole,
     def: &TaskDef,
     extra: &[(String, String)],
     kind: Kind,
 ) -> Result<SqlResult, CoreError> {
-    let db = session.v2_db().ok_or(CoreError::Unsupported)?;
     let mut txn = db.begin(Isolation::ReadCommitted);
     let image = db.catalog().snapshot(&mut txn)?.image().map_err(CoreError::Sql)?;
     let view = db.catalog().committed_view(&mut txn)?;

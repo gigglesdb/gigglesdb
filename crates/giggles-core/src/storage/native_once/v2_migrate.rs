@@ -307,7 +307,7 @@ impl Admin {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn migrate_native_once_v2(&self) -> Result<Migration, CoreError> {
         let inner = &self.inner;
-        let Backend::V2(db) = &inner.backend else { return Err(CoreError::Unsupported) };
+        let db = self.lease(Holder::NativeOnce)?.ok_or(CoreError::Unsupported)?;
         let _ticket = inner.enter()?;
         if db.task_kernel_unsupported() {
             return Err(CoreError::Unsupported);
@@ -331,7 +331,8 @@ impl Admin {
         }
         db.catalog().commit_ddl(txn).map_err(|error| match error {
             TxnError::CommitAmbiguous => {
-                inner.fence_native_commit();
+                db.fence_native_commit();
+                inner.fenced.store(true, Ordering::Release);
                 CoreError::Storage("engine commit outcome unknown".into())
             }
             other => CoreError::from(other),

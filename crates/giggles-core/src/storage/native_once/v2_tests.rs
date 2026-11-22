@@ -9,8 +9,8 @@ fn fixture() -> (std::path::PathBuf, Admin) {
     let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
     (path, admin)
 }
-fn db(admin: &Admin) -> &crate::storage::v2::V2Db {
-    let Backend::V2(db) = &admin.inner.backend else { panic!("v2") }; db
+fn db(admin: &Admin) -> crate::storage::EngineLease {
+    admin.test_v2()
 }
 fn key(admin: &Admin, n: usize) -> NativeOnceKey {
     NativeOnceKey { database_domain: u128::from_be_bytes(db(admin).meta.domain), identity: n.to_be_bytes().to_vec() }
@@ -111,8 +111,9 @@ fn orphan_ledger_fences() {
     let mut batch = WriteBatch::default();
     batch.put(Keyspace::Kernel, codec::user_key_seek_at(&[0], db(&admin).sequencer.visible_ts()), mvcc::encode_tombstone());
     db(&admin).kv.write(batch, Durability::Sync).unwrap();
-    assert_eq!(admin.lookup_native_once_engine(&key(&admin, 0)), Err(NativeOnceError::Core(CoreError::Corrupt("native ledger without kernel metadata".into()))));
-    assert!(matches!(admit(&admin, &key(&admin, 0)), Err(NativeOnceError::Core(CoreError::Fenced))));
+    let key = key(&admin, 0);
+    assert_eq!(admin.lookup_native_once_engine(&key), Err(NativeOnceError::Core(CoreError::Corrupt("native ledger without kernel metadata".into()))));
+    assert!(matches!(admit(&admin, &key), Err(NativeOnceError::Core(CoreError::Fenced))));
     cleanup(path, admin);
 }
 

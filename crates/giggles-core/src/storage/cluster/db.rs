@@ -8,7 +8,7 @@ use super::coordinator::deadlock::DeadlockConfig;
 use super::txn::{ClusterConfig, ClusterTxnServices};
 use crate::CoreError;
 use crate::range_api::{GatewayPeer, RangeClient};
-use crate::storage::{Admin, Backend, Limits, v2::V2Db};
+use crate::storage::{Admin, Backend, EngineSlot, Limits, v2::V2Db};
 
 #[cfg(test)]
 pub(crate) mod local;
@@ -45,10 +45,10 @@ pub(crate) fn attach(
         None => ClusterTxnServices::new(client, config),
     };
     services.join_cluster()?;
-    let db = Arc::new(V2Db::cluster(services.clone(), domain)?);
-    let weak = Arc::downgrade(&db);
+    let db = EngineSlot::new(V2Db::cluster(services.clone(), domain)?);
+    let generation = db.tag().expect("new gateway is serving");
     services.set_catalog_refresh(Box::new(move || {
-        if let Some(db) = weak.upgrade() {
+        if let Ok(db) = generation.lease(crate::storage::Holder::Admin) {
             let _ = db.catalog().refresh_latest();
         }
     }));

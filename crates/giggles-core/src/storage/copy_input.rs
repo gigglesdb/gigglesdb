@@ -29,6 +29,8 @@ impl SqlSession {
         let implicit = !self.in_transaction();
         if implicit {
             self.execute("BEGIN", &[], None)?;
+        } else {
+            self.v2_lease(Holder::Sql)?;
         }
         self.copy_input = Some(CopyInput {
             mark: self.v2_transaction.as_mut().expect("v2 transaction").savepoint(),
@@ -76,12 +78,18 @@ impl SqlSession {
         Ok(relational::SqlResult { affected: input.affected, ..Default::default() })
     }
 
-    pub(super) fn abort_copy_input(&mut self) {
+    pub(super) fn abort_copy_input(&mut self, settle_on_rollback: bool) {
         if let Some(input) = self.copy_input.take() {
             let txn = self.v2_transaction.as_mut().expect("v2 transaction");
             let restored = txn.rollback_to(&input.mark).and_then(|()| txn.release(input.mark));
             self.deferral = input.deferred;
-            if input.implicit || restored.is_err() { self.rollback(); }
+            if input.implicit || restored.is_err() {
+                if settle_on_rollback {
+                    self.rollback();
+                } else {
+                    self.rollback_without_settling();
+                }
+            }
         }
     }
 }

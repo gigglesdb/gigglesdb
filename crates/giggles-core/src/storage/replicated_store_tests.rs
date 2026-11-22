@@ -552,7 +552,7 @@ mod native_once {
 
 #[test]
 fn applied_versions_bypass_admin_lock_and_origin_caches() {
-    use crate::storage::{Backend, Metadata, encode};
+    use crate::storage::{Metadata, encode};
     use crate::storage::engine::{codec, hlc::Ts, mvcc, txn::{Isolation, SerializationReason, TxnError}};
 
     for isolation in [Isolation::ReadCommitted, Isolation::RepeatableRead, Isolation::Serializable] {
@@ -568,7 +568,7 @@ fn applied_versions_bypass_admin_lock_and_origin_caches() {
                 stores: [store.clone(), store.clone(), store.clone()], next: Mutex::new(1),
             });
             let admin = store.open_admin(sink, Limits::default(), v2::DEFAULT_WRITE_SET_BYTES).unwrap();
-            let Backend::V2(db) = &admin.inner.backend else { unreachable!() };
+            let db = admin.test_v2();
             assert!(!db.kv.is_single_writer());
             let mut seed = db.begin(Isolation::ReadCommitted);
             seed.lock_for_write(ks, &key, None, &|| false).unwrap();

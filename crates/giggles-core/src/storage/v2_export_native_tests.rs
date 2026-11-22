@@ -8,9 +8,7 @@ fn native_bit_receipt_and_compacted_identity_refuse_export_before_staging() {
             .join(format!("native-backup-{}-{case}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let admin = Admin::create_engine(root.join("db"), Limits::default(), Engine::V2).unwrap();
-        let Backend::V2(db) = &admin.inner.backend else {
-            panic!("v2")
-        };
+        let db = admin.test_v2();
         let mut batch = WriteBatch::default();
         if case != 3 {
             engine::meta::put_features(&mut batch, 2).unwrap();
@@ -79,6 +77,7 @@ fn native_bit_receipt_and_compacted_identity_refuse_export_before_staging() {
         assert_eq!(fs::read(&existing).unwrap(), b"unchanged");
         assert!(!root.join("absent").exists());
         assert_eq!(fs::read_dir(&root).unwrap().count(), before);
+        drop(db);
         drop(admin);
         fs::remove_dir_all(root).unwrap();
     }

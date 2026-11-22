@@ -260,7 +260,7 @@ impl Engine {
         let mut session = self.admin.sql_session();
         #[cfg(feature = "engine-rocksdb")]
         let setup = if session.is_v2_engine() {
-            Some(session.begin_once_engine().map_err(core)?)
+            Some(session.begin_once_engine(Some(&owner)).map_err(core)?)
         } else {
             session.begin_engine().map_err(core)?;
             None

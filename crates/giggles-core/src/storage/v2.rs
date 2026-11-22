@@ -1,6 +1,6 @@
 //! Minimal v2 lifecycle. Public legacy operations fail before admission or mutation.
 #[cfg(feature = "engine-rocksdb")]
-use super::io;
+use super::{directory_identity::DirectoryIdentity, io};
 use super::{CoreError, engine};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,6 +63,8 @@ pub(crate) struct V2Db {
     // First field: dropping it stops and joins the GC thread before the rest
     // of the database (and its KV handle) is released.
     maintenance: maintenance::Maintenance,
+    #[cfg(feature = "engine-rocksdb")]
+    pub(super) directory_identity: Option<DirectoryIdentity>,
     pub(crate) gc: Arc<engine::gc::Gc>,
     pub(crate) kv: Arc<engine::kv::Kv>,
     pub(crate) meta: engine::meta::MetaInfo,
@@ -124,8 +126,12 @@ pub(crate) struct CloseReport {
 
 #[cfg(feature = "engine-rocksdb")]
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RecoveryOpen {
+pub(crate) struct RecoveryOpen<'a> {
     pub(crate) ack_hw: engine::hlc::Ts,
+    pub(crate) gc_retention: Option<std::time::Duration>,
+    pub(super) defer_maintenance: bool,
+    /// Required by the slot. Lower-level recovery-mode tests can omit it.
+    pub(super) source: Option<(&'a DirectoryIdentity, [u8; 16])>,
 }
 
 #[cfg(feature = "engine-rocksdb")]
@@ -203,6 +209,16 @@ impl V2Db {
     }
 
     #[cfg(feature = "engine-rocksdb")]
+    pub(super) fn start_recovery_maintenance(&self) {
+        self.maintenance.resume();
+    }
+
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(super) fn test_maintenance_running(&self) -> bool {
+        self.maintenance.running()
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
     #[allow(dead_code, reason = "Used by the later recovery supervisor")]
     pub(crate) fn close_latch(&self) -> Option<engine::kv_rocksdb::CloseLatch> {
         self.kv.close_latch()
@@ -218,6 +234,7 @@ impl V2Db {
         let mut domain = [0u8; 16];
         getrandom::fill(&mut domain).map_err(io)?;
         fs::create_dir_all(path).map_err(io)?;
+        let identity = DirectoryIdentity::read(path).ok();
         let writer_lock = engine::kv_rocksdb::WriterLock::acquire(path)?;
         let backend = engine::meta::create(path, domain, |path| {
             Ok(Arc::new(engine::kv_rocksdb::RocksKv::open_locked(
@@ -227,7 +244,9 @@ impl V2Db {
             )?))
         })
         .map_err(format_error)?;
-        Self::from_kv(Arc::new(engine::kv::Kv::new_single_writer(backend)))
+        let mut db = Self::from_kv(Arc::new(engine::kv::Kv::new_single_writer(backend)))?;
+        db.directory_identity = identity.filter(|identity| identity.matches(path));
+        Ok(db)
     }
     #[cfg(feature = "engine-rocksdb")]
     fn from_kv(kv: Arc<engine::kv::Kv>) -> Result<Self, CoreError> {
@@ -254,7 +273,7 @@ impl V2Db {
         write_set_bytes: usize,
         replicated_allowed: bool,
         token: Option<&[u8]>,
-        recovery: Option<RecoveryOpen>,
+        recovery: Option<RecoveryOpen<'_>>,
     ) -> Result<Self, OpenFailure> {
         if let Some(recovery) = recovery {
             let on_disk = engine::commit::read_last_commit_ts(&kv)?;
@@ -266,6 +285,11 @@ impl V2Db {
             }
         }
         let meta = engine::meta::open_checks(kv.as_ref())?;
+        if let Some((_, domain)) = recovery.and_then(|open| open.source)
+            && meta.domain != domain
+        {
+            return Err(CoreError::Fenced.into());
+        }
         if meta.features & engine::meta::REPLICATED != 0 && !replicated_allowed {
             return Err(CoreError::Unsupported.into());
         }
@@ -311,12 +335,13 @@ impl V2Db {
             kv.clone(),
             sequencer.clone(),
             engine::gc::GcConfig {
-                retention: maintenance::RETENTION,
+                retention: recovery.and_then(|open| open.gc_retention).unwrap_or(maintenance::RETENTION),
             },
         )?);
         let replicated = meta.features & engine::meta::REPLICATED != 0;
         let mut db = Self {
             maintenance: maintenance::Maintenance::new(replicated),
+            directory_identity: None,
             gc,
             kv,
             meta,
@@ -358,7 +383,10 @@ impl V2Db {
                 return Err(CoreError::Fenced.into());
             }
             Ok(())
-        }).and_then(|()| db.maintenance.start(&db.gc).map_err(OpenFailure::from));
+        }).and_then(|()| {
+            let paused = recovery.is_some_and(|open| open.defer_maintenance);
+            db.maintenance.start(&db.gc, paused).map_err(OpenFailure::from)
+        });
         if let Err(failure) = health {
             if recovery.is_some() {
                 db.shutdown();
@@ -410,6 +438,7 @@ impl V2Db {
         )?;
         Ok(Self {
             maintenance,
+            directory_identity: None,
             gc,
             kv,
             meta: engine::meta::MetaInfo {
@@ -751,7 +780,7 @@ impl V2Db {
     pub(crate) fn open_recovery(
         path: &Path,
         token: Option<&[u8]>,
-        recovery: RecoveryOpen,
+        recovery: RecoveryOpen<'_>,
     ) -> Result<Self, OpenFailure> {
         Self::open_in_mode(path, token, Some(recovery))
     }
@@ -760,20 +789,39 @@ impl V2Db {
     fn open_in_mode(
         path: &Path,
         token: Option<&[u8]>,
-        recovery: Option<RecoveryOpen>,
+        recovery: Option<RecoveryOpen<'_>>,
     ) -> Result<Self, OpenFailure> {
         use engine::kv_rocksdb::RocksKv;
         if engine::meta::classify_dir(path)? != engine::meta::DirClass::V2 {
             return Err(CoreError::Corrupt("not a v2 directory".into()).into());
         }
         const CACHE_BYTES: usize = 64 * 1024 * 1024;
+        let expected = recovery.and_then(|open| open.source).map(|(identity, _)| identity);
+        if expected.is_some_and(|identity| !identity.matches(path)) {
+            return Err(CoreError::Fenced.into());
+        }
+        let identity = if recovery.is_none() {
+            DirectoryIdentity::read(path).ok()
+        } else {
+            None
+        };
         let rocks = if recovery.is_some() {
+            // A retarget between the identity check and the native open can
+            // receive RocksDB replay writes before the second check refuses.
+            // The step 4 recovery supervisor must resolve this race.
             RocksKv::open_recovery(path, CACHE_BYTES)?
         } else {
             RocksKv::open(path, CACHE_BYTES)?
         };
+        // Check again before application startup writes in case the path
+        // changed during the native open.
+        if expected.is_some_and(|identity| !identity.matches(path)) {
+            return Err(CoreError::Fenced.into());
+        }
         let kv = Arc::new(engine::kv::Kv::new_single_writer(Arc::new(rocks)));
-        Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false, token, recovery)
+        let mut db = Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false, token, recovery)?;
+        db.directory_identity = identity.filter(|identity| identity.matches(path));
+        Ok(db)
     }
 
 }

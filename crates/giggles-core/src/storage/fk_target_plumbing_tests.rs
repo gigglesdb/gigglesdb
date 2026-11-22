@@ -50,7 +50,8 @@ fn fixture(root: &Path, known: bool) -> (Admin, CatalogParts) {
 }
 fn parts(admin: &Admin) -> CatalogParts {
     match &admin.inner.backend {
-        Backend::V2(db) => {
+        Backend::V2(_) => {
+            let db = admin.test_v2();
             let mut tx = db.begin(Isolation::ReadCommitted);
             db.catalog().parts(&mut tx).unwrap()
         }
@@ -68,7 +69,8 @@ fn assert_ext(admin: &Admin, expected: &CatalogParts) {
     let required = catalog::parts_records(&actual).unwrap().into_iter().fold(0, |bits, (k, v)|
         bits | engine::content_check::required_bits_for_catalog_value(&k, &v).unwrap());
     assert_eq!(required & IDENTITY != 0, actual.ext.has_key_dependency_identity());
-    if let Backend::V2(db) = &admin.inner.backend {
+    if admin.engine() == crate::Engine::V2 {
+        let db = admin.test_v2();
         let bits = db.kv.get(Keyspace::Meta, b"features").unwrap().unwrap();
         let bits = u64::from_be_bytes(bits.try_into().unwrap());
         assert_eq!(bits & IDENTITY != 0, !expected.ext.primary_index_birth.is_empty());
@@ -106,7 +108,7 @@ fn catalog_diffs_rebuild_and_remove_identity_atomically() {
     let root = fresh();
     let (legacy, expected) = fixture(&root, true);
     let admin = Admin::create_engine(root.join("v2"), Limits::default(), Engine::V2).unwrap();
-    let Backend::V2(db) = &admin.inner.backend else { unreachable!() };
+    let db = admin.test_v2();
     let ids = db.catalog().reserve_ids(1000).unwrap();
     let mut tx = db.begin(Isolation::ReadCommitted);
     db.catalog().apply_diff(&mut tx, &CatalogParts::default(), &expected, &ids, None, &|| false).unwrap();
@@ -122,6 +124,7 @@ fn catalog_diffs_rebuild_and_remove_identity_atomically() {
     db.catalog().apply_diff(&mut tx, &expected, &changed, &ids, None, &|| false).unwrap();
     db.catalog().commit_ddl(tx).unwrap();
     assert_ext(&admin, &changed);
+    drop(db);
     drop(admin);
     let admin = Admin::open(root.join("v2"), Limits::default()).unwrap();
     assert_ext(&admin, &changed);
@@ -130,7 +133,8 @@ fn catalog_diffs_rebuild_and_remove_identity_atomically() {
         let remaining = parts(admin);
         assert!(remaining.ext.primary_index_birth.is_empty());
         assert!(!remaining.ext.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. })));
-        if let Backend::V2(db) = &admin.inner.backend {
+        if admin.engine() == crate::Engine::V2 {
+        let db = admin.test_v2();
             let bits = db.kv.get(Keyspace::Meta, b"features").unwrap().unwrap();
             assert_ne!(u64::from_be_bytes(bits.try_into().unwrap()) & IDENTITY, 0);
         }
@@ -167,7 +171,7 @@ fn engine_catalog_drop_removes_birth_record() {
     expected.tables.remove("c");
     expected.ext.constraints.remove(&parts(&legacy).tables["c"].id);
     let admin = Admin::create_engine(root.join("v2"), Limits::default(), Engine::V2).unwrap();
-    let Backend::V2(db) = &admin.inner.backend else { unreachable!() };
+    let db = admin.test_v2();
     let ids = db.catalog().reserve_ids(1000).unwrap();
     let mut tx = db.begin(Isolation::ReadCommitted);
     db.catalog().apply_diff(&mut tx, &CatalogParts::default(), &expected, &ids, None, &|| false).unwrap();
@@ -176,6 +180,7 @@ fn engine_catalog_drop_removes_birth_record() {
     db.catalog().drop_table(&mut tx, "p", None, &|| false).unwrap();
     db.catalog().commit_ddl(tx).unwrap();
     assert!(parts(&admin).ext.primary_index_birth.is_empty());
+    drop(db);
     drop(admin);
     drop(legacy);
     fs::remove_dir_all(root).unwrap();
@@ -186,7 +191,7 @@ fn unknown_binding_blocks_every_index_drop_atomically() {
     let root = fresh();
     let (legacy, expected) = fixture(&root, false);
     let v2 = Admin::create_engine(root.join("v2"), Limits::default(), Engine::V2).unwrap();
-    let Backend::V2(db) = &v2.inner.backend else { unreachable!() };
+    let db = v2.test_v2();
     let ids = db.catalog().reserve_ids(1000).unwrap();
     let mut tx = db.begin(Isolation::ReadCommitted);
     db.catalog().apply_diff(&mut tx, &CatalogParts::default(), &expected, &ids, None, &|| false).unwrap();
@@ -208,6 +213,7 @@ fn unknown_binding_blocks_every_index_drop_atomically() {
         s.execute("CREATE INDEX free ON unrelated(id)", &[], None).unwrap();
         s.execute("DROP INDEX free CASCADE", &[], None).unwrap();
     }
+    drop(db);
     drop(v2); drop(legacy);
     fs::remove_dir_all(root).unwrap();
 }
@@ -219,7 +225,7 @@ fn unknown_binding_blocks_constraint_drop_atomically() {
     legacy.sql_session().execute("ALTER TABLE p ADD CONSTRAINT u UNIQUE(id)", &[], None).unwrap();
     let expected = parts(&legacy);
     let v2 = Admin::create_engine(root.join("v2"), Limits::default(), Engine::V2).unwrap();
-    let Backend::V2(db) = &v2.inner.backend else { unreachable!() };
+    let db = v2.test_v2();
     let ids = db.catalog().reserve_ids(1000).unwrap();
     let mut tx = db.begin(Isolation::ReadCommitted);
     db.catalog().apply_diff(&mut tx, &CatalogParts::default(), &expected, &ids, None, &|| false).unwrap();
@@ -235,6 +241,7 @@ fn unknown_binding_blocks_constraint_drop_atomically() {
             assert_eq!(s.foreign_key_targets().unwrap(), targets);
         }
     }
+    drop(db);
     drop(v2); drop(legacy);
     fs::remove_dir_all(root).unwrap();
 }

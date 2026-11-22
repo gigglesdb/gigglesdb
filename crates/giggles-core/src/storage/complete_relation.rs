@@ -250,8 +250,8 @@ impl SqlSession {
             let snapshot = self.complete_snapshot(table)?;
             let mut rows: Vec<SqlRow> = Vec::new();
             #[cfg(feature = "engine-rocksdb")]
-            if let super::Backend::V2(db) = &self.admin.inner.backend {
-                let db = db.clone();
+            if self.is_v2_engine() {
+                let db = self.v2_lease(super::Holder::Sql)?;
                 for key in keys {
                     self.visit_native_key_v2(&db, table, &key, &mut |row: &SqlRow| {
                         NATIVE_INPUT_ROWS.with(|n| n.set((n.get().0 + 1, n.get().1 + 1)));
@@ -280,8 +280,8 @@ impl SqlSession {
         -> Result<Option<crate::task::rows::Scope>, CoreError> {
         let Some(ctx) = self.task.clone() else { return Ok(None) };
         #[cfg(feature = "engine-rocksdb")]
-        if let super::Backend::V2(db) = &self.admin.inner.backend {
-            let db = db.clone();
+        if self.is_v2_engine() {
+            let db = self.v2_lease(super::Holder::Sql)?;
             let txn = self.v2_transaction.as_mut().ok_or(CoreError::Sql(SqlError::Transaction))?;
             let scope = crate::task::rows::scope_at(&db, txn, &ctx)?;
             if scope.table() != table.id {
@@ -301,8 +301,8 @@ impl SqlSession {
         map: fn(CoreError) -> E,
     ) -> Result<(), E> {
         #[cfg(feature = "engine-rocksdb")]
-        if let super::Backend::V2(db) = &self.admin.inner.backend {
-            let db = db.clone();
+        if self.is_v2_engine() {
+            let db = self.v2_lease(super::Holder::Sql).map_err(map)?;
             let snapshot = self.complete_snapshot(table).map_err(map)?;
             let scope = self.native_task_scope(table).map_err(map)?;
             let meter = StatementMeter::default();
@@ -359,8 +359,8 @@ impl SqlSession {
         let meter = StatementMeter::default();
         let visit = &mut scoped(scope.as_ref(), &meter, visit, map);
         #[cfg(feature = "engine-rocksdb")]
-        let visited = if let super::Backend::V2(db) = &self.admin.inner.backend {
-            let db = db.clone();
+        let visited = if self.is_v2_engine() {
+            let db = self.v2_lease(super::Holder::Sql).map_err(map)?;
             if let Some(range) = scope.as_ref().and_then(|scope| scope.key_range()) {
                 let range = if index.is_some() { range.clone() } else {
                     crate::task::rows::intersect(range, &crate::relational::scan::KeyRange { lo, hi })
@@ -613,7 +613,7 @@ mod tests {
     fn ordered_native_read_spills_matching_input_and_releases_runs() {
         use crate::operations::{Bindings, Engine, Request, Sort, ValueExpr};
         use crate::relational::spill;
-        use crate::storage::{Backend, engine::catalog::TableEntry};
+        use crate::storage::engine::catalog::TableEntry;
 
         const COUNT: usize = 18_000;
         const LIMIT: usize = 10_001;
@@ -640,9 +640,7 @@ mod tests {
             heap: false,
             columns_ext: Default::default(),
         };
-        let Backend::V2(db) = &admin.inner.backend else {
-            panic!("v2")
-        };
+        let db = admin.test_v2();
         let note = "x".repeat(4096);
         let row_bytes = retained_bytes(&SqlRow {
             version: 1,
@@ -707,6 +705,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(&spill_dir).unwrap().count(), 0);
         drop(engine);
         drop(session);
+        drop(db);
         drop(admin);
         std::fs::remove_dir_all(path).unwrap();
     }

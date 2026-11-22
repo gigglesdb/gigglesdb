@@ -866,14 +866,13 @@ impl NativeRules {
         let Some(ctx) = session.task() else {
             return Ok(None);
         };
-        let def = session
-            .tasks()
-            .lookup(ctx.name.as_str())
+        let db = session.statement_lease()?;
+        let def = super::catalog::lookup_leased(db.as_deref(), ctx.name.as_str())
             .map_err(|e| TaskError::Core(Box::new(e)))?
             .filter(|def| def.id == ctx.task && !def.revoked)
             .ok_or(TaskError::Revoked)?;
         let labels = session
-            .task_column_labels()
+            .task_column_labels_leased(db.as_deref())
             .map_err(|e| TaskError::Core(Box::new(e)))?;
         Ok(Some(Self {
             def,

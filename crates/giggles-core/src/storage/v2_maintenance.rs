@@ -50,8 +50,15 @@ impl MaintenanceStats {
     }
 }
 
-struct Stop {
-    stopped: Mutex<bool>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerState {
+    Paused,
+    Running,
+    Stopped,
+}
+
+struct Control {
+    state: Mutex<WorkerState>,
     wake: Condvar,
 }
 
@@ -70,7 +77,7 @@ impl Retention {
 }
 
 pub(crate) struct Maintenance {
-    stop: Arc<Stop>,
+    control: Arc<Control>,
     thread: Mutex<Option<JoinHandle<()>>>,
     replicated: bool,
     budget: Arc<AtomicUsize>,
@@ -81,8 +88,8 @@ pub(crate) struct Maintenance {
 impl Maintenance {
     pub(crate) fn new(replicated: bool) -> Self {
         Self {
-            stop: Arc::new(Stop {
-                stopped: Mutex::new(false),
+            control: Arc::new(Control {
+                state: Mutex::new(WorkerState::Paused),
                 wake: Condvar::new(),
             }),
             thread: Mutex::new(None),
@@ -93,12 +100,13 @@ impl Maintenance {
         }
     }
 
-    /// Starts the GC thread after the inline startup work passes its health check.
-    pub(crate) fn start(&mut self, gc: &Arc<Gc>) -> Result<(), CoreError> {
+    /// Reserve the worker after the inline startup work passes its health check.
+    /// A recovery candidate parks it until the slot publishes the database.
+    pub(crate) fn start(&mut self, gc: &Arc<Gc>, paused: bool) -> Result<(), CoreError> {
         if !self.replicated {
-            let (gc, stop, budget, errors, retention) = (
+            let (gc, control, budget, errors, retention) = (
                 gc.clone(),
-                self.stop.clone(),
+                self.control.clone(),
                 self.budget.clone(),
                 self.errors.clone(),
                 self.retention.clone(),
@@ -106,16 +114,27 @@ impl Maintenance {
             *self.thread.get_mut().unwrap() = Some(
                 std::thread::Builder::new()
                     .name("giggles-v2-gc".into())
-                    .spawn(move || run(&gc, &stop, &budget, &errors, &retention))
+                    .spawn(move || run(&gc, &control, &budget, &errors, &retention))
                     .map_err(|error| CoreError::Storage(error.to_string()))?,
             );
+            if !paused {
+                self.resume();
+            }
         }
         Ok(())
     }
 
+    pub(crate) fn resume(&self) {
+        let mut state = self.control.state.lock().unwrap_or_else(|p| p.into_inner());
+        if *state == WorkerState::Paused {
+            *state = WorkerState::Running;
+            self.control.wake.notify_all();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn running(&self) -> bool {
-        self.thread.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+        *self.control.state.lock().unwrap_or_else(|p| p.into_inner()) == WorkerState::Running
     }
 
     #[cfg(test)]
@@ -124,8 +143,8 @@ impl Maintenance {
     }
 
     pub(crate) fn shutdown(&self) {
-        *self.stop.stopped.lock().unwrap_or_else(|p| p.into_inner()) = true;
-        self.stop.wake.notify_all();
+        *self.control.state.lock().unwrap_or_else(|p| p.into_inner()) = WorkerState::Stopped;
+        self.control.wake.notify_all();
         let mut thread = self.thread.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(thread) = thread.take() {
             // The retention sweep upgrades its weak handle; if it held the
@@ -145,19 +164,23 @@ impl Drop for Maintenance {
     }
 }
 
-fn run(gc: &Gc, stop: &Stop, budget: &AtomicUsize, errors: &AtomicU64, retention: &Retention) {
+fn run(gc: &Gc, control: &Control, budget: &AtomicUsize, errors: &AtomicU64, retention: &Retention) {
+    let state = control.state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut state = control
+        .wake
+        .wait_while(state, |state| *state == WorkerState::Paused)
+        .unwrap_or_else(|p| p.into_inner());
     let mut rotation = 0;
     let mut last_sweep = Instant::now();
     loop {
-        let stopped = stop.stopped.lock().unwrap_or_else(|p| p.into_inner());
-        let (stopped, _) = stop
+        let (next, _) = control
             .wake
-            .wait_timeout_while(stopped, TICK, |stopped| !*stopped)
+            .wait_timeout_while(state, TICK, |state| *state == WorkerState::Running)
             .unwrap_or_else(|p| p.into_inner());
-        if *stopped {
+        if *next == WorkerState::Stopped {
             return;
         }
-        drop(stopped);
+        drop(next);
         let budget = budget.load(Ordering::Relaxed);
         let mut stats = MaintenanceStats::default();
         let result = step(gc, Keyspace::Kernel, budget, &mut stats)
@@ -182,6 +205,7 @@ fn run(gc: &Gc, stop: &Stop, budget: &AtomicUsize, errors: &AtomicU64, retention
                 errors.fetch_add(1, Ordering::Relaxed);
             }
         }
+        state = control.state.lock().unwrap_or_else(|p| p.into_inner());
     }
 }
 
@@ -227,6 +251,11 @@ impl V2Db {
             .db
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(Arc::downgrade(self));
+    }
+
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn test_task_retention(&self) -> RetentionConfig {
+        *self.maintenance.retention.config.lock().unwrap()
     }
 
     /// Replaces the retention settings; the next background pass uses them.

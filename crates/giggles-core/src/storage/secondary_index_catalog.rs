@@ -7,8 +7,8 @@ impl SqlSession {
         table: &relational::TableDef,
         request: &relational::secondary_index_access::Request<'_>,
     ) -> Result<relational::SqlResult, CoreError> {
-        if let Backend::V2(db) = &self.admin.inner.backend {
-            let db = db.clone();
+        if self.is_v2_engine() {
+            let db = self.v2_lease(Holder::Sql)?;
             let before = self.snapshot_identity_engine()?;
             let inner = self.admin.inner.clone();
             let _ticket = inner.enter_sql()?;
@@ -72,7 +72,8 @@ impl SqlSession {
             return Err(CoreError::Unsupported);
         }
         let result = (|| {
-            if let Backend::V2(db) = &self.admin.inner.backend {
+            if self.is_v2_engine() {
+                let db = self.v2_lease(Holder::Sql)?;
                 if unique {
                     return Err(CoreError::Unsupported);
                 }

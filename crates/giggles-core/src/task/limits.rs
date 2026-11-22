@@ -122,13 +122,18 @@ impl StatementGuard {
     /// no lock), inside the protected commit, and for a statement nested in
     /// a guarded one on this thread.
     pub(crate) fn enter(session: &SqlSession) -> Result<Option<Self>, TaskError> {
+        let db = if session.task.is_some() { session.statement_lease()? } else { None };
+        Self::enter_leased(session, db.as_deref())
+    }
+
+    pub(crate) fn enter_leased(session: &SqlSession, db: Option<&crate::storage::EngineLease>) -> Result<Option<Self>, TaskError> {
         let Some(state) = session.task_state.as_ref() else {
             return Ok(None);
         };
         if session.in_protected_run() || ACTIVE.with(Cell::get) {
             return Ok(None);
         }
-        let limits = state.load_limits(|| task_limits(session))?;
+        let limits = state.load_limits(|| task_limits(session, db))?;
         let task = state.ctx().task;
         let load = session.task_load().clone();
         load.acquire(task, limits.concurrent_statements)?;
@@ -331,11 +336,11 @@ pub(crate) fn apply_to_txn(txn: &mut Transaction, limits: &LoadLimits) {
 
 /// The bound task's load limits. A definition that is gone or replaced gets
 /// the defaults here; the statement's own checks refuse it.
-fn task_limits(session: &SqlSession) -> Result<Option<LoadLimits>, TaskError> {
+fn task_limits(session: &SqlSession, db: Option<&crate::storage::EngineLease>) -> Result<Option<LoadLimits>, TaskError> {
     let Some(ctx) = session.task.as_ref() else {
         return Ok(None);
     };
-    let def = session.tasks().lookup(ctx.name.as_str())?;
+    let def = super::catalog::lookup_leased(db, ctx.name.as_str())?;
     Ok(def.filter(|def| def.id == ctx.task).map(|def| def.limits))
 }
 

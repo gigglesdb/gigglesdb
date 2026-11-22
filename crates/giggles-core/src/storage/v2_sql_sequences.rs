@@ -3,6 +3,7 @@ use super::*;
 
 /// Values exposed even by rolled-back transactions must never be reissued after a crash.
 pub(in crate::storage) struct Obligation {
+    generation: u64,
     slot: Arc<v2::SeqSlot>,
     id: u64,
     def: relational::catalog_ext::SequenceDef,
@@ -11,8 +12,12 @@ pub(in crate::storage) struct Obligation {
 }
 pub(in crate::storage) type Unsettled = Arc<Mutex<Vec<Obligation>>>;
 
-pub(in crate::storage) fn settle(db: &v2::V2Db, list: &Unsettled) -> Result<(), CoreError> {
+pub(in crate::storage) fn settle(db: &EngineLease, list: &Unsettled) -> Result<(), CoreError> {
     let mut list = list.lock().map_err(|_| CoreError::Fenced)?;
+    // Check the entire list before using any slot or resending any counter.
+    if list.iter().any(|item| item.generation != db.stamp()) {
+        return Err(CoreError::Fenced);
+    }
     for item in list.iter() {
         let mut guard = item.slot.counter.lock_cancellable()?;
         drain_ready(&mut guard);
@@ -44,7 +49,7 @@ pub(in crate::storage) fn settle(db: &v2::V2Db, list: &Unsettled) -> Result<(), 
 }
 
 pub(super) fn callback(
-    db: Arc<v2::V2Db>,
+    db: impl Into<CallbackLease>,
     image: Arc<relational::Relational>,
     baseline: BTreeMap<u64, u128>,
     pending: sequences::Pending,
@@ -52,7 +57,9 @@ pub(super) fn callback(
     unsettled: Unsettled,
     search_path: Vec<String>,
 ) -> relational::clock::SequenceCallback {
+    let db = db.into();
     Arc::new(move |operation, name, value, called| {
+        let db = db.lease(Holder::Sequence)?;
         crate::cancellation::check()?;
         let name = sequences::sequence_name(name).map_err(CoreError::Sql)?;
         let name = image.resolve_relation_key(&name, &search_path);
@@ -300,7 +307,7 @@ fn drain_ready(guard: &mut v2::SeqSlotState) {
 
 #[allow(clippy::too_many_arguments)]
 fn committed_value(
-    db: &v2::V2Db,
+    db: &EngineLease,
     slot: &Arc<v2::SeqSlot>,
     id: u64,
     def: &relational::catalog_ext::SequenceDef,
@@ -419,6 +426,7 @@ fn committed_value(
             && if def.increment > 0 { write.hw >= result } else { write.hw <= result }
     }) {
         unsettled.lock().map_err(|_| CoreError::Fenced)?.push(Obligation {
+            generation: db.stamp(),
             slot: slot.clone(), id, def: def.clone(), value: result,
             coverage_epoch: guard.coverage_epoch,
         });

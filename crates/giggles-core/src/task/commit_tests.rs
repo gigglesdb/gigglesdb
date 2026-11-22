@@ -4,6 +4,7 @@
 //! is reserved): visible rows `merchant_id = 42`, write `status` from
 //! 'failed' to 'queued', 25 distinct rows / 25 transitions, approval above 25.
 use super::*;
+use crate::storage::SessionLease;
 use crate::storage::engine::commit::ManualClock;
 use crate::storage::engine::kv::Direction;
 use crate::storage::roles::NewRole;
@@ -63,8 +64,8 @@ impl Fixture {
     pub(super) fn admin(&self) -> &Admin {
         self.admin.as_ref().unwrap()
     }
-    pub(super) fn db(&self) -> Arc<V2Db> {
-        self.admin().sql_session().v2_db().unwrap()
+    pub(super) fn db(&self) -> SessionLease {
+        self.admin().sql_session().v2_lease(crate::storage::Holder::TaskRun).unwrap()
     }
     pub(super) fn statuses(&self) -> Vec<String> {
         sql(self.admin(), "SELECT status FROM shipments ORDER BY id")
@@ -476,7 +477,7 @@ fn legacy_engine_refused_0a000() {
     sql(&admin, "CREATE TABLE shipments (id bigint primary key, status text)");
     sql(&admin, "INSERT INTO shipments VALUES (1, 'failed')");
     let mut session = admin.sql_session();
-    assert!(session.v2_db().is_none());
+    assert!(matches!(session.v2_lease(crate::storage::Holder::TaskRun), Err(CoreError::Unsupported)));
     let request = direct(&mut session, "UPDATE shipments SET status = 'queued'");
     let ctx = dummy_ctx();
     let error = protected_commit(&mut session, Actor::Executor(&ctx), &op("r"), request).unwrap_err();

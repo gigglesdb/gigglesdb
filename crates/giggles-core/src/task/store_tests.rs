@@ -399,8 +399,7 @@ fn purge_frees_the_name() {
 fn check_against_follows_the_table() {
     let f = fixture();
     let def = f.admin.tasks().create(&f.issuer, inc_436(), NOW).unwrap();
-    let TaskCatalog { db, .. } = f.admin.tasks();
-    let db = db.unwrap();
+    let db = f.admin.tasks().db().unwrap();
     let mut txn = db.begin(Isolation::ReadCommitted);
     let view = db.catalog().committed_view(&mut txn).unwrap();
     def.check_against(&view).unwrap();

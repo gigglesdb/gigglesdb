@@ -4,9 +4,9 @@ use crate::storage::engine::{kv::Keyspace, txn::Isolation};
 use crate::task::records::LedgerHeader;
 
 impl Inner {
-    pub(super) fn native_once_view<T>(&self, work: impl FnOnce(&LedgerView<'_>) -> NativeResult<T>) -> NativeResult<T> {
-        let Backend::V2(db) = &self.backend else {
-            return self.native_once_locked(|state| work(&LedgerView::borrow(state)));
+    pub(super) fn native_once_view<T>(&self, work: impl FnOnce(&LedgerView<'_>, Option<&EngineLease>) -> NativeResult<T>) -> NativeResult<T> {
+        let Some(db) = self.lease(Holder::NativeOnce)? else {
+            return self.native_once_locked(|state| work(&LedgerView::borrow(state), None));
         };
         let _ticket = self.enter()?;
         let _guard = self.gate.lock_notified(|| {
@@ -15,8 +15,11 @@ impl Inner {
         if self.fenced.load(Ordering::Acquire) {
             return Err(CoreError::Fenced.into());
         }
-        let (ledger, header) = read_v2_view(db).inspect_err(|error| self.fence_error(engine::kv::FenceSite::NativeOnceLedger, error))?;
-        work(&v2_view(db, ledger.as_ref(), header))
+        let (ledger, header) = read_v2_view(&db).inspect_err(|error| {
+            db.fence_engine_error(engine::kv::FenceSite::NativeOnceLedger, error);
+            self.fenced.store(true, Ordering::Release);
+        })?;
+        work(&v2_view(&db, ledger.as_ref(), header), Some(&db))
     }
 }
 

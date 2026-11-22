@@ -160,6 +160,9 @@ impl SqlSession {
         work: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
         if self.is_aborted() {
+            if self.is_v2_engine() {
+                self.v2_lease(crate::storage::Holder::Sql).map_err(core)?;
+            }
             return Err(core(CoreError::Sql(SqlError::Aborted)));
         }
         // GD-0061 R3-401: a task request's slots and time limit, released on
@@ -167,6 +170,7 @@ impl SqlSession {
         let guard = crate::task::limits::StatementGuard::enter(self).map_err(task_error)?;
         let _active = guard.as_ref().map(crate::task::limits::StatementGuard::activate);
         let owned = !self.in_transaction();
+        let previous_generation = self.native_generation.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             validate()?;
             if owned {
@@ -176,6 +180,7 @@ impl SqlSession {
                     self.begin_engine().map_err(core)?;
                 }
             }
+            self.pin_native_generation(owned).map_err(core)?;
             let result = work(self)?;
             // Active outer transactions have no publication fence in this call.
             crate::cancellation::check().map_err(core)?;
@@ -196,6 +201,8 @@ impl SqlSession {
             }
             Ok(result)
         }));
+        // Retain this operation's pin through rollback and result handling.
+        let _generation = std::mem::replace(&mut self.native_generation, previous_generation);
         match result {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(error)) => {

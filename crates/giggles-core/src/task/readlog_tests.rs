@@ -95,7 +95,7 @@ fn fixture() -> Fixture {
         )
         .unwrap();
     let clock = Arc::new(ManualClock::new(NOW));
-    sql.v2_db().unwrap().set_wall_clock(clock.clone());
+    sql.v2_lease(crate::storage::Holder::TaskRun).unwrap().set_wall_clock(clock.clone());
     let task = admin.tasks().get("inc-436").unwrap().unwrap().id;
     Fixture { admin, clock, task }
 }
@@ -118,7 +118,7 @@ impl Fixture {
     }
 
     fn clock_ms(&self) -> u64 {
-        self.admin.sql_session().v2_db().unwrap().wall_now_ms()
+        self.admin.sql_session().v2_lease(crate::storage::Holder::TaskRun).unwrap().wall_now_ms()
     }
 
     fn records(&self) -> Vec<ReadRecord> {
@@ -142,7 +142,7 @@ fn finalize_does_not_resurrect_swept_entry() {
     assert_eq!((open[0].read_seq, open[0].outcome), (1, OUTCOME_OPEN));
     // The statement runs past the read-log retention; the sweep deletes it.
     f.clock.set(NOW + 2 * DAY_MS);
-    let db = s.v2_db().unwrap();
+    let db = s.v2_lease(crate::storage::Holder::TaskRun).unwrap();
     let config = RetentionConfig {
         read_log_ms: DAY_MS,
         ..RetentionConfig::default()

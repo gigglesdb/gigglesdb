@@ -101,8 +101,12 @@ impl SqlSession {
         }
         // Task sessions run on a local v2 database only: a cluster gateway
         // (or a replicated store) is 0A000 before anything is bound.
-        if self.v2_db().is_some_and(|db| db.task_kernel_unsupported()) {
-            return Err(CoreError::Unsupported);
+        if self.is_v2_engine() {
+            let db = self.v2_lease(crate::storage::Holder::TaskRun)?;
+            if db.task_kernel_unsupported() {
+                return Err(CoreError::Unsupported);
+            }
+            self.task_generation = Some(db.tag());
         }
         self.task_state = Some(std::sync::Arc::new(
             super::release::TaskSessionState::new(ctx.clone()),

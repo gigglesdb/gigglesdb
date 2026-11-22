@@ -17,7 +17,7 @@
 //! with the undo counts and the outcome under identity `03 | task |
 //! preview`. Membership and the caps are never touched.
 use super::admit::StatementClass;
-use super::commit::{engine, protected_commit, role_error, unsupported, Actor, ProtectedRequest};
+use super::commit::{engine, role_error, unsupported, Actor, ProtectedRequest};
 use super::definition::{RoleName, TableId, TaskDef, TaskName, TaskPrivileges};
 use super::effects::Effects;
 use super::error::{DenyRule, TaskError};
@@ -33,6 +33,7 @@ use super::records::{
     NS_OUTCOME, ROW_BEFORE_BLANKED,
 };
 use crate::relational::{SqlError, TableDef, Value};
+use crate::storage::SessionLease;
 use crate::storage::engine::{codec, kv::Direction};
 use crate::storage::roles::{role_txn, table_owner_txn, table_privileges_txn, TablePrivilege};
 use crate::storage::{Isolation, Keyspace, ProtectedRun, SqlSession, Transaction, V2Db};
@@ -243,13 +244,11 @@ pub fn undo_preview(
     if session.task().is_some() {
         return Err(TaskError::NotAllowedInTaskSession(StatementClass::Other));
     }
-    let db = session.v2_db().ok_or_else(unsupported)?;
+    let db = session.v2_lease(crate::storage::Holder::TaskRun)?;
     if db.task_kernel_unsupported() {
         return Err(unsupported());
     }
-    let def = session
-        .tasks()
-        .lookup(task.as_str())?
+    let def = super::catalog::lookup_leased(Some(&db), task.as_str())?
         .ok_or(CoreError::Sql(SqlError::UndefinedObject))?;
     may_undo(&db, &def, &mut db.begin(Isolation::ReadCommitted), role)?;
     // The operation's committed seq, through the 22 ledger.
@@ -318,11 +317,11 @@ pub fn undo_preview(
 }
 
 /// APPROVE UNDO `id` OF TASK `task` DIGEST `digest` MODE `mode` as `role`
-/// (D8): the undo commit, through [`protected_commit`] with
+/// (D8): the undo commit, through [`protected_commit`](super::commit::protected_commit) with
 /// [`Actor::Undo`] (ruling R3; no `TaskContext` is synthesized).
 ///
 /// Not in a task session (0A000); the task must exist (42704). The rest is
-/// [`protected_commit`]'s undo path: the role's privileges (42501), the
+/// [`protected_commit`](super::commit::protected_commit)'s undo path: the role's privileges (42501), the
 /// replay of a committed undo of this preview (same request: the same
 /// receipt; another mode or digest: `OperationConflict`), the pre-check
 /// (a missing, applied, expired or changed preview is `ApprovalStale`;
@@ -341,17 +340,16 @@ pub fn undo_approve(
     if session.task().is_some() {
         return Err(TaskError::NotAllowedInTaskSession(StatementClass::Other));
     }
-    let db = session.v2_db().ok_or_else(unsupported)?;
+    let db = session.v2_lease(crate::storage::Holder::TaskRun)?;
     if db.task_kernel_unsupported() {
         return Err(unsupported());
     }
-    let def = session
-        .tasks()
-        .lookup(task.as_str())?
+    let def = super::catalog::lookup_leased(Some(&db), task.as_str())?
         .ok_or(CoreError::Sql(SqlError::UndefinedObject))?;
     let request = ProtectedRequest::Undo { preview: id, digest, mode };
-    protected_commit(
+    super::commit::protected_commit_leased(
         session,
+        db,
         Actor::Undo { role, task: def.id },
         &undo_operation_id(id),
         request,
@@ -431,7 +429,7 @@ pub(crate) struct UndoStaged {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn undo_stage(
     session: &mut SqlSession,
-    db: &Arc<V2Db>,
+    db: &SessionLease,
     def: &TaskDef,
     role: &RoleName,
     id: PreviewId,
@@ -611,11 +609,11 @@ fn read_row(
 /// `plan` in a Serializable transaction that is always rolled back.
 fn dry_run(
     session: &mut SqlSession,
-    db: &Arc<V2Db>,
+    db: &SessionLease,
     def: &TaskDef,
     scope_seq: Option<u64>,
 ) -> Result<UndoDryRun, TaskError> {
-    let mut txn = db.begin(Isolation::Serializable);
+    let mut txn = db.begin_leased(Isolation::Serializable, crate::storage::Holder::TaskRun)?;
     let mark = txn.savepoint();
     let (dry, run) = plan_in(session, db, def, scope_seq, txn)?;
     // Discard the restores; dropping the transaction releases the locks.
@@ -632,7 +630,7 @@ fn dry_run(
 /// successful restores still applied.
 fn plan_in(
     session: &mut SqlSession,
-    db: &Arc<V2Db>,
+    db: &SessionLease,
     def: &TaskDef,
     scope_seq: Option<u64>,
     mut txn: Transaction,
@@ -779,7 +777,7 @@ impl crate::storage::Admin {
     /// settings from `set_task_retention` (v2 only).
     #[doc(hidden)]
     pub fn task_retention_step(&self) -> Result<super::retention::RetentionStats, CoreError> {
-        let db = self.sql_session().v2_db().ok_or(CoreError::Unsupported)?;
+        let db = self.sql_session().v2_lease(crate::storage::Holder::TaskRun)?;
         db.retention_step()
     }
 }

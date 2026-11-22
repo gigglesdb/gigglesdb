@@ -171,7 +171,7 @@ pub(crate) struct WriteTarget {
 /// An opaque mark belonging to one transaction instance, even when TxnId is reused.
 #[derive(Clone, Debug)]
 pub(crate) struct Savepoint {
-    owner: Arc<()>,
+    owner: Arc<TxnLifetime>,
     sequence: u64,
     undo_len: usize,
     raw_len: usize,
@@ -180,6 +180,12 @@ pub(crate) struct Savepoint {
     features_or: u64,
     minimum_subversion: u32,
 }
+/// Savepoints and outside users may retain the transaction's generation pin.
+#[derive(Debug, Default)]
+pub(crate) struct TxnLifetime {
+    pub(crate) lease: Option<crate::storage::EngineLease>,
+}
+
 struct UndoWrite {
     key: (Keyspace, Vec<u8>),
     // None means absent from the overlay; Some(None) means a buffered tombstone.
@@ -435,7 +441,7 @@ struct LockedWrite {
 }
 
 pub(crate) struct Transaction {
-    services: TxnServices,
+    services: Option<TxnServices>,
     id: TxnId,
     /// Set before acquisition (even failures), or on callback commit paths
     /// that also promise cleanup of locks acquired externally by transaction id.
@@ -457,7 +463,7 @@ pub(crate) struct Transaction {
     /// The most `write_bytes` may reach (`set_write_limit`); `None` = only
     /// the engine's write-set limit.
     write_limit: Option<usize>,
-    savepoint_owner: Arc<()>,
+    savepoint_owner: Option<Arc<TxnLifetime>>,
     savepoint_sequence: u64,
     savepoints: Vec<(u64, usize, bool)>,
     lock_savepoints: usize,
@@ -493,7 +499,7 @@ impl Transaction {
         #[cfg(test)]
         count_engine_op();
         let mut txn = Self {
-            services,
+            services: Some(services),
             id,
             lock_cleanup_needed: AtomicBool::new(false),
             isolation,
@@ -509,7 +515,7 @@ impl Transaction {
             xact: None,
             write_bytes: 0,
             write_limit: None,
-            savepoint_owner: Arc::new(()),
+            savepoint_owner: Some(Arc::default()),
             savepoint_sequence: 0,
             savepoints: Vec::new(),
             lock_savepoints: 0,
@@ -537,8 +543,14 @@ impl Transaction {
     pub(crate) fn xact_id(&self) -> Option<u64> {
         self.xact.as_ref().map(super::xact::XactGuard::id)
     }
-    pub(crate) fn lifetime(&self) -> std::sync::Weak<()> {
-        Arc::downgrade(&self.savepoint_owner)
+    pub(crate) fn attach_lease(&mut self, lease: crate::storage::EngineLease) {
+        Arc::get_mut(self.savepoint_owner.as_mut().expect("transaction owner")).expect("new transaction").lease = Some(lease);
+    }
+    pub(crate) fn engine_lifetime(&self) -> Option<&Arc<TxnLifetime>> {
+        self.savepoint_owner.as_ref().filter(|owner| owner.lease.is_some())
+    }
+    pub(crate) fn lifetime(&self) -> std::sync::Weak<TxnLifetime> {
+        Arc::downgrade(self.savepoint_owner.as_ref().expect("transaction owner"))
     }
     /// Marks buffered writes; undo records, keys, and prior values count against
     /// the write-set limit while a savepoint remains live.
@@ -557,7 +569,7 @@ impl Transaction {
             .checked_add(1)
             .expect("transaction savepoint sequence exhausted");
         let mark = Savepoint {
-            owner: self.savepoint_owner.clone(),
+            owner: Arc::clone(self.savepoint_owner.as_ref().expect("transaction owner")),
             sequence: self.savepoint_sequence,
             undo_len: self.undo.len(),
             raw_len: self.raw.len(),
@@ -571,7 +583,7 @@ impl Transaction {
         mark
     }
     fn savepoint_index(&self, mark: &Savepoint) -> Result<usize, TxnError> {
-        if !Arc::ptr_eq(&self.savepoint_owner, &mark.owner) {
+        if !Arc::ptr_eq(self.savepoint_owner.as_ref().expect("transaction owner"), &mark.owner) {
             return Err(TxnError::Misuse);
         }
         self.savepoints
@@ -623,7 +635,7 @@ impl Transaction {
         }
         self.rollback_to(mark)?;
         let undo = self.lock_undo.split_off(mark.lock_undo_len);
-        if let TxnServices::Local { locks, .. } = &self.services {
+        if let TxnServices::Local { locks, .. } = self.services() {
             locks.restore_modes(self.id, &undo);
         }
         for (key, _) in undo {
@@ -641,7 +653,7 @@ impl Transaction {
 
     fn acquire_tracked(&mut self, requested: &[(LockKey, LockMode)], grouped: bool,
         deadline: Option<Instant>, cancel: &dyn Fn() -> bool) -> Result<(), TxnError> {
-        let TxnServices::Local { locks, .. } = &self.services else { return Ok(()); };
+        let TxnServices::Local { locks, .. } = self.services() else { return Ok(()); };
         let tracked: Vec<_> = if self.lock_savepoints == 0 { Vec::new() } else {
             requested.iter().filter(|(key, _)| match key {
                 LockKey::Row { pk, .. } => !pk.is_empty(),
@@ -716,7 +728,7 @@ impl Transaction {
         if let Some(ts) = self.catalog_check_ts {
             return Ok(ts);
         }
-        let ts = self.services.visible_ts()?;
+        let ts = self.services().visible_ts()?;
         self.catalog_check_ts = Some(ts);
         Ok(ts)
     }
@@ -724,7 +736,7 @@ impl Transaction {
         #[cfg(test)]
         count_engine_op();
         if self.snapshot.is_none() {
-            match self.services.take_snapshot(self.id) {
+            match self.services().take_snapshot(self.id) {
                 Ok(snapshot) => {
                     self.snapshot = Some(snapshot);
                     self.snapshot_error = None;
@@ -747,7 +759,7 @@ impl Transaction {
     }
     #[allow(dead_code)] // R5-43
     pub(crate) fn services(&self) -> &TxnServices {
-        &self.services
+        self.services.as_ref().expect("transaction services until drop")
     }
     /// Replaces a non-RC snapshot with a fresh one and forgets every read made
     /// under the old one (GD-0061 C2). Only legal before anything is buffered:
@@ -818,7 +830,7 @@ impl Transaction {
         self.id
     }
     pub(crate) fn held_table_locks(&self) -> Vec<(u64, &'static str, bool)> {
-        let locks = match &self.services {
+        let locks = match self.services() {
             TxnServices::Local { locks, .. } => locks.as_ref(),
             TxnServices::Cluster(cluster) => cluster.gateway_locks(),
         };
@@ -842,7 +854,7 @@ impl Transaction {
         self.writes.get(&(Keyspace::Catalog, key.to_vec()))
     }
     pub(crate) fn catalog_latest_committed(&self, key: &[u8]) -> Result<Option<Vec<u8>>, TxnError> {
-        let version = match &self.services {
+        let version = match self.services() {
             TxnServices::Local { seq, .. } => {
                 mvcc::latest_version(seq.kv(), Keyspace::Catalog, key)?
             }
@@ -865,7 +877,7 @@ impl Transaction {
     }
     pub(crate) fn kernel_latest_committed(&self, key: &[u8]) -> Result<Option<Vec<u8>>, TxnError> {
         // Protected records are local-only (GD-0061); a cluster gateway has no form yet.
-        let TxnServices::Local { seq, .. } = &self.services else {
+        let TxnServices::Local { seq, .. } = self.services() else {
             return Err(TxnError::Unsupported);
         };
         Ok(mvcc::latest_version(seq.kv(), Keyspace::Kernel, key)?.and_then(|(_, value)| value))
@@ -880,13 +892,13 @@ impl Transaction {
     }
     /// DDL across gateways (Phase 11); no-op on a single node. See `ClusterServices`.
     pub(crate) fn ddl_begin(&self, cancel: &dyn Fn() -> bool) -> Result<(), TxnError> {
-        match &self.services {
+        match self.services() {
             TxnServices::Cluster(cluster) => cluster.ddl_begin(self.id, cancel),
             TxnServices::Local { .. } => Ok(()),
         }
     }
     pub(crate) fn ddl_close(&self, tables: &[u64], cancel: &dyn Fn() -> bool) -> Result<(), TxnError> {
-        match &self.services {
+        match self.services() {
             TxnServices::Cluster(cluster) => cluster.ddl_close(self.id, tables, cancel),
             TxnServices::Local { .. } => Ok(()),
         }
@@ -904,7 +916,7 @@ impl Transaction {
             return Err(TxnError::Misuse);
         }
         self.lock_cleanup_needed.store(true, Ordering::Relaxed);
-        self.services.acquire(self.id, key, mode, deadline, cancel)
+        self.services().acquire(self.id, key, mode, deadline, cancel)
     }
     /// Swap read sets around an FK snapshot crosscheck. RowKey locks protect
     /// this witness; ordinary version validation would reject non-key updates.
@@ -916,7 +928,7 @@ impl Transaction {
         &mut self, table: u64, pk_bytes: &[u8], mode: LockMode,
         deadline: Option<Instant>, cancel: &dyn Fn() -> bool,
     ) -> Result<(), TxnError> {
-        if matches!(self.services, TxnServices::Cluster(_)) {
+        if matches!(self.services(), TxnServices::Cluster(_)) {
             return Ok(());
         }
         self.lock_cleanup_needed.store(true, Ordering::Relaxed);
@@ -931,7 +943,7 @@ impl Transaction {
     pub(crate) fn begin_latest(&mut self) -> Ts {
         let ts = self.snapshot_ts();
         debug_assert!(self.set_aside.is_none(), "nested latest-state reads");
-        match self.services.take_snapshot(self.id) {
+        match self.services().take_snapshot(self.id) {
             Ok(latest) => self.set_aside = self.snapshot.replace(latest),
             // A cluster oracle failure: no snapshot, so latest-state reads fail.
             Err(error) => {
@@ -948,7 +960,7 @@ impl Transaction {
     }
     /// Whether a committed version of `key` is newer than `ts`.
     pub(crate) fn changed_since(&self, ks: Keyspace, key: &[u8], ts: Ts) -> Result<bool, TxnError> {
-        let latest = match &self.services {
+        let latest = match self.services() {
             TxnServices::Local { seq, .. } => mvcc::latest_version(seq.kv(), ks, key)?,
             TxnServices::Cluster(cluster) => {
                 mvcc::latest_version(&*cluster.reader(cluster.now()?), ks, key)?
@@ -964,7 +976,7 @@ impl Transaction {
         if let Some(value) = self.writes.get(&(ks, key.to_vec())) {
             return Ok(value.clone());
         }
-        mvcc::read_at(snapshot_view(&self.services, &self.snapshot), ks, key, ts)
+        mvcc::read_at(snapshot_view(self.services(), &self.snapshot), ks, key, ts)
     }
     /// SQL destination sentinel; acquire without choosing or inspecting a snapshot.
     pub(crate) fn lock_sql_sentinel(
@@ -977,7 +989,7 @@ impl Transaction {
             return Err(TxnError::Misuse);
         }
         self.lock_cleanup_needed.store(true, Ordering::Relaxed);
-        match &self.services {
+        match self.services() {
             TxnServices::Local { locks, .. } => {
                 locks.acquire(self.id, LockKey::Row { table, pk: Vec::new() }, mode, None, cancel)?
             }
@@ -998,7 +1010,7 @@ impl Transaction {
             return Err(TxnError::Misuse);
         }
         // The authority hold is local-only (GD-0061); a cluster gateway has no form yet.
-        let TxnServices::Local { locks, .. } = &self.services else {
+        let TxnServices::Local { locks, .. } = self.services() else {
             return Err(TxnError::Unsupported);
         };
         self.lock_cleanup_needed.store(true, Ordering::Relaxed);
@@ -1016,14 +1028,14 @@ impl Transaction {
     }
     #[cfg(test)]
     pub(crate) fn local_seq(&self) -> &Arc<Sequencer> {
-        match &self.services {
+        match self.services() {
             TxnServices::Local { seq, .. } => seq,
             TxnServices::Cluster(_) => panic!("cluster transaction has no local sequencer"),
         }
     }
     #[cfg(test)]
     pub(crate) fn sql_waiting_count(&self) -> usize {
-        match &self.services {
+        match self.services() {
             TxnServices::Local { locks, .. } => locks.waiting_count(),
             TxnServices::Cluster(cluster) => cluster.gateway_locks().waiting_count(),
         }
@@ -1036,7 +1048,7 @@ impl Transaction {
         deadline: Option<Instant>,
         cancel: &dyn Fn() -> bool,
     ) -> Result<(), TxnError> {
-        match &self.services {
+        match self.services() {
             TxnServices::Local { .. } => Ok(()),
             TxnServices::Cluster(cluster) => {
                 self.lock_cleanup_needed.store(true, Ordering::Relaxed);
@@ -1050,7 +1062,7 @@ impl Transaction {
         &mut self, table: u64, pk: &[u8], deadline: Option<Instant>,
         cancel: &dyn Fn() -> bool,
     ) -> Result<(), TxnError> {
-        if matches!(self.services, TxnServices::Cluster(_)) { return Ok(()); }
+        if matches!(self.services(), TxnServices::Cluster(_)) { return Ok(()); }
         self.lock_cleanup_needed.store(true, Ordering::Relaxed);
         self.acquire_tracked(&[
             (LockKey::RowKey { table, pk: pk.to_vec() }, LockMode::Exclusive),
@@ -1068,7 +1080,7 @@ impl Transaction {
     ) -> Result<WriteTarget, TxnError> {
         use crate::relational::scan::RowLock;
         let ts = self.try_snapshot_ts()?;
-        let TxnServices::Local { seq, .. } = &self.services else { return Err(TxnError::Unsupported); };
+        let TxnServices::Local { seq, .. } = self.services() else { return Err(TxnError::Unsupported); };
         let seq = seq.clone();
         let mut physical = table.to_be_bytes().to_vec();
         physical.extend_from_slice(pk);
@@ -1090,7 +1102,7 @@ impl Transaction {
         }
         let current = if let Some(own) = own { own.clone() }
             else if self.isolation == Isolation::ReadCommitted { latest.and_then(|(_, v)| v) }
-            else { mvcc::read_at(snapshot_view(&self.services, &self.snapshot), Keyspace::Rows, &physical, ts)? };
+            else { mvcc::read_at(snapshot_view(self.services(), &self.snapshot), Keyspace::Rows, &physical, ts)? };
         Ok(WriteTarget { current, changed_since_snapshot: changed })
     }
 
@@ -1123,7 +1135,7 @@ impl Transaction {
         self.acquire_tracked(&[(lock, LockMode::Exclusive)], false, deadline, cancel)?;
         let write_key = (ks, key.to_vec());
         let own = self.writes.get(&write_key);
-        let cached = if matches!(&self.services, TxnServices::Local { seq, .. } if seq.kv().is_single_writer() && !seq.kv().is_fenced()) {
+        let cached = if matches!(self.services(), TxnServices::Local { seq, .. } if seq.kv().is_single_writer() && !seq.kv().is_fenced()) {
             self.locked.get(&write_key).filter(|cached| {
                 self.isolation != Isolation::ReadCommitted || own.is_some() || cached.current.is_some()
             })
@@ -1133,7 +1145,7 @@ impl Transaction {
         let (latest_ts, latest_value) = if let Some(cached) = cached {
             (cached.latest_ts, cached.current.clone().flatten())
         } else {
-            let latest = match &self.services {
+            let latest = match self.services() {
                 TxnServices::Local { seq, .. } => mvcc::latest_version(seq.kv(), ks, key)?,
                 TxnServices::Cluster(cluster) => cluster.lock_key(self.id, ks, key, deadline, cancel)?,
             };
@@ -1151,7 +1163,7 @@ impl Transaction {
         } else if self.isolation == Isolation::ReadCommitted {
             latest_value
         } else {
-            mvcc::read_at(snapshot_view(&self.services, &self.snapshot), ks, key, ts)?
+            mvcc::read_at(snapshot_view(self.services(), &self.snapshot), ks, key, ts)?
         };
         self.locked.insert(write_key, LockedWrite {
             latest_ts,
@@ -1230,7 +1242,7 @@ impl Transaction {
             .ok_or(TxnError::WriteSetLimit)?;
         if size
             .checked_add(undo_bytes)
-            .is_none_or(|n| n > self.services.write_set_bytes())
+            .is_none_or(|n| n > self.services().write_set_bytes())
         {
             return Err(TxnError::WriteSetLimit);
         }
@@ -1277,7 +1289,7 @@ impl Transaction {
             _ => false,
         };
         let base = mvcc::VersionedRange::new(
-            snapshot_view(&self.services, &self.snapshot),
+            snapshot_view(self.services.as_ref().expect("transaction services"), &self.snapshot),
             ks,
             start.as_ref().map(Vec::as_slice),
             end.as_ref().map(Vec::as_slice),
@@ -1346,7 +1358,7 @@ impl Transaction {
         Ok(())
     }
     pub(crate) fn local_durable_tail_eligible(&self) -> bool {
-        matches!(self.services, TxnServices::Local { .. })
+        matches!(self.services(), TxnServices::Local { .. })
             && self.catalog_writes().next().is_none()
             && !self.reclaim_after_commit
     }
@@ -1401,7 +1413,7 @@ impl Transaction {
             && self.minimum_subversion == 0
             && self.isolation != Isolation::Serializable
         {
-            let ts = match &self.services {
+            let ts = match self.services() {
                 TxnServices::Local { seq, .. } => seq.visible_ts(),
                 TxnServices::Cluster(cluster) => match self.current_snapshot_ts() {
                     Some(ts) => ts,
@@ -1412,7 +1424,7 @@ impl Transaction {
             return Ok(ts);
         }
         let snapshot = self.try_snapshot_ts()?;
-        if let TxnServices::Cluster(cluster) = &self.services {
+        if let TxnServices::Cluster(cluster) = self.services.as_ref().expect("transaction services") {
             // A fenced guard compares against one node's visible timestamp,
             // which a cluster does not have; guarded DDL arrives with Phase 11.
             if let Some(guard) = &guard {
@@ -1461,7 +1473,7 @@ impl Transaction {
                 ) as _
             }),
         };
-        let TxnServices::Local { seq, .. } = &self.services else {
+        let TxnServices::Local { seq, .. } = self.services() else {
             unreachable!("cluster commits returned above");
         };
         let ts = match guard {
@@ -1477,11 +1489,17 @@ impl Drop for Transaction {
     fn drop(&mut self) {
         // Cluster range/prepared holders can acquire by txn id outside this object.
         if self.lock_cleanup_needed.load(Ordering::Relaxed)
-            || matches!(&self.services, TxnServices::Cluster(_))
+            || matches!(self.services(), TxnServices::Cluster(_))
         {
-            self.services.release_all(self.id);
+            self.services().release_all(self.id);
         }
-        self.snapshot.take();
+        // Release the engine resources before the counted generation pin.
+        // Savepoints can independently retain their share of this pin.
+        drop(self.snapshot.take());
+        drop(self.set_aside.take());
+        drop(self.xact.take());
+        drop(self.services.take());
+        drop(self.savepoint_owner.take());
     }
 }
 type OwnEntry<'a> = (&'a (Keyspace, Vec<u8>), &'a Option<Vec<u8>>);

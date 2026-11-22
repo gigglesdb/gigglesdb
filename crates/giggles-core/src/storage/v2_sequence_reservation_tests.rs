@@ -273,9 +273,7 @@ fn committed_lookahead_writes_only_on_refill_setval_and_cycle_wrap() {
     let mut s = f.session();
     run(&mut s, "CREATE SEQUENCE cached");
     run(&mut s, "CREATE SEQUENCE tiny MINVALUE 1 MAXVALUE 2 CYCLE");
-    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
-        unreachable!()
-    };
+    let db = f.admin.as_ref().unwrap().test_v2();
     let mut txn = db.begin(Isolation::ReadCommitted);
     let parts = db.catalog().parts(&mut txn).unwrap();
     let key = |name: &str| {
@@ -296,7 +294,7 @@ fn committed_lookahead_writes_only_on_refill_setval_and_cycle_wrap() {
     }
     assert_eq!(db.kv.get(Keyspace::Seq, &cached).unwrap(), first);
     assert_eq!(scalar(&mut s, "SELECT nextval('cached')"), 9);
-    drain_sequence(db, "cached");
+    drain_sequence(&db, "cached");
     assert_ne!(db.kv.get(Keyspace::Seq, &cached).unwrap(), first);
     assert_eq!(scalar(&mut s, "SELECT setval('cached',500,false)"), 500);
     let set = db.kv.get(Keyspace::Seq, &cached).unwrap();
@@ -526,9 +524,7 @@ fn cached_callback_observes_drop_and_restart() {
     let f = Fixture::new(Engine::V2);
     let mut s1 = f.session();
     let mut s2 = f.session();
-    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
-        unreachable!()
-    };
+    let db = f.admin.as_ref().unwrap().test_v2();
     for ddl in [
         "DROP SEQUENCE freshness",
         "ALTER SEQUENCE freshness RESTART WITH 700",
@@ -542,7 +538,7 @@ fn cached_callback_observes_drop_and_restart() {
             .map(|(id, def)| (*id, def.incarnation))
             .collect();
         let cb = callback(
-            db.clone(),
+            db.child(Holder::Sequence).unwrap(),
             Arc::new(image),
             baseline,
             Default::default(),
@@ -576,9 +572,7 @@ fn durable_counter_bytes_follow_original_lookahead() {
     let f = Fixture::new(Engine::V2);
     let mut s = f.session();
     run(&mut s, "CREATE SEQUENCE durable_bytes");
-    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
-        unreachable!()
-    };
+    let db = f.admin.as_ref().unwrap().test_v2();
     let view = db.catalog().current_local_view().unwrap();
     let (&id, def) = view
         .sequences
@@ -589,7 +583,7 @@ fn durable_counter_bytes_follow_original_lookahead() {
     for n in 1..=70 {
         assert_eq!(scalar(&mut s, "SELECT nextval('durable_bytes')"), n);
         // Reservations are written on calls 1, 9, 17, ... with 32 steps ahead.
-        drain_sequence(db, "durable_bytes");
+        drain_sequence(&db, "durable_bytes");
         let refill = 1 + ((n - 1) / 8) * 8;
         let expected = sequences::SeqCounter {
             incarnation: def.incarnation,
@@ -615,9 +609,7 @@ fn blocked_sequence_does_not_block_another() {
         run(&mut s, &format!("CREATE SEQUENCE {name}"));
     }
     // A's first allocation must refill. Hold its slot while B refills independently.
-    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
-        unreachable!()
-    };
+    let db = f.admin.as_ref().unwrap().test_v2();
     let view = db.catalog().current_local_view().unwrap();
     let (&id, _) = view
         .sequences
@@ -679,9 +671,7 @@ fn pipelined_acks_release_slot_and_cover_returns() {
     let mut s = f.session();
     run(&mut s, "CREATE SEQUENCE pipeline");
     assert_eq!(scalar(&mut s, "SELECT nextval('pipeline')"), 1);
-    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
-        unreachable!()
-    };
+    let db = f.admin.as_ref().unwrap().test_v2();
     db.sequencer.gate_counter_acks(true);
     let (tx, rx) = mpsc::channel();
     let workers: Vec<_> = (0..8)
@@ -756,9 +746,7 @@ fn nextval_waiting_on_ack_survives_concurrent_restart() {
     let mut s = f.session();
     run(&mut s, "CREATE SEQUENCE restart_pipeline");
     let mut values = BTreeSet::from([scalar(&mut s, "SELECT nextval('restart_pipeline')")]);
-    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
-        unreachable!()
-    };
+    let db = f.admin.as_ref().unwrap().test_v2();
     db.sequencer.gate_counter_acks(true);
     // The first durable reservation covers 1..=33. Refills are sent but their
     // acks stay gated; value 34 must enter await_coverage.
@@ -834,9 +822,7 @@ fn nextval_waiting_on_rejected_refill_survives_concurrent_restart() {
     let mut s = f.session();
     run(&mut s, "CREATE SEQUENCE rejected_refill");
     assert_eq!(scalar(&mut s, "SELECT nextval('rejected_refill')"), 1);
-    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
-        unreachable!()
-    };
+    let db = f.admin.as_ref().unwrap().test_v2();
     db.sequencer.gate_counter_writes(true);
     for expected in 2..=33 {
         assert_eq!(scalar(&mut s, "SELECT nextval('rejected_refill')"), expected);
@@ -880,9 +866,7 @@ fn stale_image_nextval_does_not_clobber_restarted_slot() {
     let f = Fixture::new(Engine::V2);
     let mut s = f.session();
     run(&mut s, "CREATE SEQUENCE stale_slot");
-    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
-        unreachable!()
-    };
+    let db = f.admin.as_ref().unwrap().test_v2();
     let image = db.metadata_state(None).unwrap().sql;
     let (&id, def) = image.catalog_ext().sequences.iter()
         .find(|(_, def)| def.name == "stale_slot").unwrap();
@@ -896,7 +880,7 @@ fn stale_image_nextval_does_not_clobber_restarted_slot() {
     assert_eq!(slot.counter.lock().unwrap().counter.as_ref().unwrap().incarnation, incarnation);
     // Bypass the callback's freshness check to exercise the install guard itself.
     assert_eq!(
-        committed_value(db, &slot, id, def, "nextval", None, false),
+        committed_value(&db, &slot, id, def, "nextval", None, false),
         Err(CoreError::Sql(SqlError::UnknownTable))
     );
     assert_eq!(slot.counter.lock().unwrap().counter.as_ref().unwrap().incarnation, incarnation);
@@ -1015,9 +999,7 @@ fn cancelled_receiver_restores_oldest_ack() {
     let mut s = f.session();
     run(&mut s, "CREATE SEQUENCE cancelled_ack");
     assert_eq!(scalar(&mut s, "SELECT nextval('cancelled_ack')"), 1);
-    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
-        unreachable!()
-    };
+    let db = f.admin.as_ref().unwrap().test_v2();
     db.sequencer.gate_counter_acks(true);
     for expected in 2..=33 {
         assert_eq!(scalar(&mut s, "SELECT nextval('cancelled_ack')"), expected);
@@ -1148,7 +1130,7 @@ fn deferred_insert_avoids_coverage_wait_but_exposed_select_waits() {
     let mut s = f.session();
     run(&mut s, "CREATE TABLE fast(id bigserial PRIMARY KEY, payload integer)");
     scalar(&mut s, "SELECT nextval('fast_id_seq')");
-    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else { unreachable!() };
+    let db = f.admin.as_ref().unwrap().test_v2();
     db.sequencer.gate_counter_acks(true);
     let admin = f.admin.as_ref().unwrap().clone();
     let (tx, rx) = mpsc::channel();
@@ -1218,12 +1200,12 @@ fn deferred_coverage_survives_a_durable_backwards_install() {
 // the obligation-aware signatures; these callers always settle before returning.
 #[cfg(feature = "engine-rocksdb")]
 fn callback(
-    db: Arc<v2::V2Db>, image: Arc<relational::Relational>,
+    db: EngineLease, image: Arc<relational::Relational>,
     baseline: BTreeMap<u64, u128>, pending: sequences::Pending,
     values: sequences::SessionValues, search_path: Vec<String>,
 ) -> relational::clock::SequenceCallback {
     let unsettled = Unsettled::default();
-    let callback = super::callback(db.clone(), image, baseline, pending, values, unsettled.clone(), search_path);
+    let callback = super::callback(db.child(Holder::Sequence).unwrap(), image, baseline, pending, values, unsettled.clone(), search_path);
     Arc::new(move |operation, name, value, called| {
         let result = callback(operation, name, value, called);
         settle(&db, &unsettled)?;
@@ -1233,7 +1215,7 @@ fn callback(
 
 #[cfg(feature = "engine-rocksdb")]
 fn committed_value(
-    db: &v2::V2Db, slot: &Arc<v2::SeqSlot>, id: u64,
+    db: &EngineLease, slot: &Arc<v2::SeqSlot>, id: u64,
     def: &relational::catalog_ext::SequenceDef, operation: &str,
     value: Option<i64>, called: bool,
 ) -> Result<i64, CoreError> {
@@ -1261,7 +1243,7 @@ fn coverage_waiters_sleep_and_resume() {
     let mut s = f.session();
     run(&mut s, "CREATE SEQUENCE sleeping");
     assert_eq!(scalar(&mut s, "SELECT nextval('sleeping')"), 1);
-    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else { unreachable!() };
+    let db = f.admin.as_ref().unwrap().test_v2();
     db.sequencer.gate_counter_acks(true);
     // Release gated acks even if an assertion unwinds, so workers finish
     // before fixture teardown instead of hanging on a gated receiver.
@@ -1309,7 +1291,7 @@ fn coverage_nonreceiver_cancellation_and_deadline() {
     let mut s = f.session();
     run(&mut s, "CREATE SEQUENCE cancel_waiter");
     scalar(&mut s, "SELECT nextval('cancel_waiter')");
-    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else { unreachable!() };
+    let db = f.admin.as_ref().unwrap().test_v2();
     db.sequencer.gate_counter_acks(true);
     // Release gated acks even if an assertion unwinds, so workers finish
     // before fixture teardown instead of hanging on a gated receiver.
@@ -1358,7 +1340,7 @@ fn coverage_nonreceiver_survives_ddl_restart() {
     let mut s = f.session();
     run(&mut s, "CREATE SEQUENCE restart_waiters");
     scalar(&mut s, "SELECT nextval('restart_waiters')");
-    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else { unreachable!() };
+    let db = f.admin.as_ref().unwrap().test_v2();
     db.sequencer.gate_counter_acks(true);
     // Release gated acks even if an assertion unwinds, so workers finish
     // before fixture teardown instead of hanging on a gated receiver.
@@ -1427,7 +1409,8 @@ fn native_many(s: &mut SqlSession, count: usize) -> Vec<i64> {
     assert_eq!(out.rows.len(), count);
     assert!(out.rows.iter().all(|r| r.version > 0));
     assert!(s.sequence_unsettled.lock().unwrap().is_empty());
-    if let Backend::V2(db) = &s.admin.inner.backend {
+    if s.admin.engine() == crate::Engine::V2 {
+        let db = s.admin.test_v2();
         let view = db.catalog().current_local_view().unwrap();
         let id = *view.sequences.iter().find(|(_, def)| def.name == "native_ids").unwrap().0;
         let slot = db.sql_counters.lock().unwrap().get(&id).unwrap().clone();

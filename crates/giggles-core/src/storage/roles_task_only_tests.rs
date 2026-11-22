@@ -1,6 +1,5 @@
 //! Task-only role attribute (GD-0061 R3-103, design section 7).
 use super::{
-    Backend,
     engine::{content_check, meta::TASK_CATALOG},
     roles::{CatalogRole, NewRole, RoleChanges, RoleError},
 };
@@ -37,7 +36,7 @@ fn role(name: &str) -> NewRole {
 }
 
 fn features(admin: &Admin) -> u64 {
-    let Backend::V2(db) = &admin.inner.backend else { panic!("expected v2") };
+    let db = admin.test_v2();
     super::engine::meta::validate_meta(db.kv.as_ref()).unwrap().features
 }
 

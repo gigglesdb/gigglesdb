@@ -560,7 +560,7 @@ pub(crate) trait KvBackend: KvRead {
 /// their own read view; calls in flight when another thread fences may finish.
 pub(crate) struct Kv {
     backend: Arc<dyn KvBackend>,
-    fenced: AtomicBool,
+    fenced: Arc<AtomicBool>,
     single_writer: bool,
     pub(crate) causes: Arc<FenceState>,
 }
@@ -569,7 +569,7 @@ impl Kv {
     pub(crate) fn new(backend: Arc<dyn KvBackend>) -> Self {
         Self {
             backend,
-            fenced: AtomicBool::new(false),
+            fenced: Arc::new(AtomicBool::new(false)),
             single_writer: false,
             causes: Arc::default(),
         }
@@ -599,6 +599,10 @@ impl Kv {
     }
     pub(crate) fn is_fenced(&self) -> bool {
         self.fenced.load(Ordering::Acquire)
+    }
+    /// Shared view of the fence flag for lease-free observers (engine slot).
+    pub(crate) fn fence_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.fenced)
     }
     fn check(&self) -> Result<(), KvError> {
         if self.is_fenced() {

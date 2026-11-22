@@ -48,11 +48,11 @@ pub(crate) fn error(error: giggles_pg_catalog::Error) -> &'static str {
 struct SnapshotContext {
     metadata: giggles_core::CatalogMetadata,
     identity: SnapshotIdentity,
+    registry: giggles_core::roles::RoleCatalogImage,
     owners: std::collections::BTreeMap<String, String>,
 }
 struct SnapshotIdentity {
     task: bool,
-    registry: giggles_core::roles::RoleCatalog,
     zone: giggles_pg_types::temporal::SessionZone,
     backend_pid: i32,
     backend_ssl: bool,
@@ -62,7 +62,7 @@ struct SnapshotIdentity {
     database: String,
 }
 fn identity(session: &crate::Session) -> SnapshotIdentity {
-    SnapshotIdentity { task: session.task().is_some(), registry: session.service.admin.roles(),
+    SnapshotIdentity { task: session.task().is_some(),
         zone: session.zone().unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0)),
         backend_pid: session.backend_pid, backend_ssl: session.backend_ssl,
         locks: session.sql.held_table_locks().into_iter().map(|(a,b,c,d)| (a,b,c.into(),d)).collect(),
@@ -80,14 +80,24 @@ pub(crate) fn privilege_callback(session: &crate::Session) -> giggles_core::Priv
     Arc::new(move |name, args, metadata| {
         let mut state = state.lock().map_err(|_| giggles_core::CoreError::Fenced)?;
         if state.1.is_none() {
-            let identity = state.0.take().ok_or(giggles_core::CoreError::Fenced)?;
+            use giggles_core::{CoreError, roles::RoleError};
+            let identity = state.0.take().ok_or(CoreError::Fenced)?;
             let mut catalog = metadata.catalog()?;
-            let registry = &identity.registry;
+            let registry = metadata.role_image();
+            // A failed capture is a failed committed owner read when the
+            // statement needs one. Check owners before mapping role errors.
             let owners = owner_keys(&catalog).into_iter().map(|key| {
-                Ok(metadata.table_owner(registry, &key)?.map(|owner| (key,owner)))
-            }).collect::<std::result::Result<Vec<_>, giggles_core::CoreError>>()?
+                Ok(metadata.table_owner_in_image(registry.as_ref().ok(), &key)?.map(|owner| (key,owner)))
+            }).collect::<std::result::Result<Vec<_>, CoreError>>()?
                 .into_iter().flatten().collect::<std::collections::BTreeMap<_, _>>();
-            let visible = authorized_tables(&role, registry, owners.iter().map(|(key, owner)| (key.as_str(), owner.as_str())))?;
+            let registry = registry.map_err(|error| match (&role, error) {
+                (crate::Role::Application { .. }, RoleError::Core(CoreError::Fenced)) =>
+                    CoreError::PrivilegeInquiry("XX000"),
+                (crate::Role::Application { .. } | crate::Role::Database { .. }, error) =>
+                    crate::service::role_lookup_error(error),
+                _ => CoreError::Policy(giggles_core::Error::Scope),
+            })?;
+            let visible = authorized_tables_in_image(&role, &registry, owners.iter().map(|(key, owner)| (key.as_str(), owner.as_str())))?;
             catalog.tables.retain(|table| visible.as_ref().is_none_or(|visible| visible.contains(
                 &giggles_core::relational::relation_key(catalog.schemas.tables.get(&table.id)
                     .map_or("public", String::as_str), &table.name))));
@@ -97,8 +107,10 @@ pub(crate) fn privilege_callback(session: &crate::Session) -> giggles_core::Priv
             let types = catalog.types.clone();
             let epoch = catalog.presentation.epoch;
             let path = metadata.search_path().to_vec();
-            let mut snapshot = snapshot_owned(SnapshotContext { identity, owners, metadata: catalog },
-                epoch, tables, indexes, typmods, types).map_err(giggles_core::CoreError::PrivilegeInquiry)?;
+            let result = snapshot_owned(SnapshotContext { identity, owners, metadata: catalog, registry: registry.clone() },
+                epoch, tables, indexes, typmods, types);
+            registry.check_fenced().map_err(crate::service::role_lookup_error)?;
+            let mut snapshot = result.map_err(giggles_core::CoreError::PrivilegeInquiry)?;
             snapshot.search_path = path;
             state.1 = Some(snapshot);
         }
@@ -118,6 +130,19 @@ pub(crate) fn privilege_callback(session: &crate::Session) -> giggles_core::Priv
 }
 /// The ordinary catalog adapter and execution callback select the same tables.
 pub(crate) fn authorized_tables<'a>(role: &crate::Role, registry: &giggles_core::roles::RoleCatalog,
+    execution_owners: impl Iterator<Item = (&'a str, &'a str)>)
+    -> std::result::Result<Option<std::collections::BTreeSet<String>>, giggles_core::CoreError> {
+    match role {
+        crate::Role::Application { tables, .. } => Ok(Some(tables.clone())),
+        crate::Role::Database { .. } => {
+            let image = registry.image().map_err(crate::service::role_lookup_error)?;
+            authorized_tables_in_image(role, &image, execution_owners)
+        }
+        _ => Err(giggles_core::CoreError::Policy(giggles_core::Error::Scope)),
+    }
+}
+
+fn authorized_tables_in_image<'a>(role: &crate::Role, registry: &giggles_core::roles::RoleCatalogImage,
     execution_owners: impl Iterator<Item = (&'a str, &'a str)>)
     -> std::result::Result<Option<std::collections::BTreeSet<String>>, giggles_core::CoreError> {
     use crate::service::role_lookup_error;
@@ -156,7 +181,10 @@ pub(crate) fn snapshot(
     let metadata = session.sql.catalog_metadata().map_err(|e| crate::service::sqlstate(&e))?;
     let owners = owner_keys(&metadata).into_iter().filter_map(|key|
         session.sql.table_owner(&key).ok().flatten().map(|owner| (key,owner))).collect();
-    let snapshot = snapshot_owned(SnapshotContext { identity: identity(session), metadata, owners }, epoch, tables, indexes, column_typmods, types)?;
+    let snapshot = snapshot_owned(SnapshotContext {
+        identity: identity(session), metadata, owners,
+        registry: session.service.admin.roles().image().map_err(|_| "XX000")?,
+    }, epoch, tables, indexes, column_typmods, types)?;
     if session.task().is_none() { return Ok(snapshot); }
     let view = session.task_catalog_view().map_err(|e| crate::service::sqlstate(&e))?;
     Ok(task_filtered(snapshot, &view))
@@ -194,11 +222,11 @@ fn snapshot_owned(
             .map(|role| role.name.clone()).collect()
     } else { Default::default() };
     let retained_bootstrap_oid = if context.identity.task && retained_task_names.contains(&roles[0].name) {
-        context.identity.registry.get(&roles[0].name).ok().flatten().map(|role| role.oid)
+        context.registry.get(&roles[0].name).ok().flatten().map(|role| role.oid)
     } else { None };
     let owner_oid = |name: &str| {
         if context.identity.task {
-            context.identity.registry.get(name).ok().flatten().map(|role| {
+            context.registry.get(name).ok().flatten().map(|role| {
                 if role.name == roles[0].name && retained_task_names.contains(name) { 10 } else { role.oid }
             })
         } else {
@@ -219,10 +247,10 @@ fn snapshot_owned(
         );
         let owner = *table_owners.get(&table.id).unwrap_or(&10);
         let mut grants = vec![];
-        for (role, privileges) in context.identity.registry.clone().table_acl(&key).map_err(|_| "XX000")? {
+        for (role, privileges) in context.registry.table_acl(&key).map_err(|_| "XX000")? {
             let grantee = if role.is_empty() { 0 } else {
                 if context.identity.task {
-                    let Some(actual) = context.identity.registry.get(&role).map_err(|_| "XX000")? else { continue; };
+                    let Some(actual) = context.registry.get(&role).map_err(|_| "XX000")? else { continue; };
                     if !retained_task_names.contains(&actual.name) { continue; }
                 }
                 let Some(role) = roles.iter().find(|r| r.name == role) else { continue; };
@@ -376,7 +404,7 @@ fn snapshot_owned(
         if context.identity.task && !retained_task_names.contains(&role.name) { continue; }
         for name in schemas.keys().map(String::as_str).chain(["public"]) {
             use giggles_core::roles::SchemaPrivilege as P;
-            let granted = context.identity.registry.clone().schema_privileges(name,&role.name).map_err(|_| "XX000")?;
+            let granted = context.registry.schema_privileges(name,&role.name).map_err(|_| "XX000")?;
             if !granted.is_empty() {schema_privileges.insert((role.oid,name.to_owned()),[granted.contains(&P::Create),granted.contains(&P::Usage)]);}
         }
     }
@@ -422,7 +450,7 @@ fn snapshot_owned(
         table_acls,
         session_user: context.identity.session_user,
         role_memberships: {
-            let catalog = context.identity.registry.clone();
+            let catalog = &context.registry;
             let roles = catalog.list().map_err(|_| "XX000")?;
             let bootstrap = roles.iter().filter(|r| r.superuser).min_by_key(|r| r.oid).map(|r| r.name.as_str()).unwrap_or("postgres");
             let oid = |name: &str| roles.iter().find(|r| r.name == name).map(|r| Value::Int(i64::from(r.oid))).unwrap_or(Value::Null);
@@ -435,7 +463,7 @@ fn snapshot_owned(
             // task_filtered rebuilds this over retained edges only.
             std::collections::BTreeMap::new()
         } else {
-            let catalog = context.identity.registry.clone();
+            let catalog = &context.registry;
             let listed = catalog.list().map_err(|_| "XX000")?;
             let mut result = std::collections::BTreeMap::new();
             for member in &listed {
@@ -849,7 +877,7 @@ fn catalog_roles(
     std::collections::BTreeMap<u64, u32>,
 ) {
     let default = giggles_pg_catalog::CatalogSnapshot::default();
-    let registry = context.identity.registry.clone();
+    let registry = &context.registry;
     let Ok(listed) = registry.list() else {
         return (default.roles, default.table_owners);
     };
@@ -2069,7 +2097,7 @@ mod task_hidden_owners {
             let metadata = session.sql.catalog_metadata().unwrap();
             let owners = owner_keys(&metadata).into_iter().filter_map(|key|
                 session.sql.table_owner(&key).unwrap().map(|owner| (key, owner))).collect();
-            snapshot_owned(SnapshotContext { identity, metadata, owners }, epoch, tables, indexes, typmods, types).unwrap()
+            snapshot_owned(SnapshotContext { identity, metadata, owners, registry: admin.roles().image().unwrap() }, epoch, tables, indexes, typmods, types).unwrap()
         };
         let baseline = read(&mut session, true, "r");
         admin.roles().create(NewRole { name: "giggles".into(), ..Default::default() }).unwrap();

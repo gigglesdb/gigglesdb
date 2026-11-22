@@ -18,9 +18,8 @@ fn fixture() -> (Dir, Admin) {
     admin.sql_session().execute("CREATE TABLE items(id BIGINT PRIMARY KEY)", &[], None).unwrap();
     (dir, admin)
 }
-fn db(admin: &Admin) -> &crate::storage::v2::V2Db {
-    let Backend::V2(db) = &admin.inner.backend else { panic!("v2") };
-    db
+fn db(admin: &Admin) -> crate::storage::EngineLease {
+    admin.test_v2()
 }
 fn domain(admin: &Admin) -> u128 {
     u128::from_be_bytes(db(admin).meta.domain)
@@ -45,7 +44,7 @@ fn kernel_get(admin: &Admin, key: &[u8]) -> Option<Vec<u8>> {
     db(admin).begin(Isolation::RepeatableRead).get(Keyspace::Kernel, key).unwrap()
 }
 fn ledger(admin: &Admin) -> NativeOutcomes {
-    v2::read_v2_ledger(db(admin)).unwrap().expect("ledger")
+    v2::read_v2_ledger(&db(admin)).unwrap().expect("ledger")
 }
 fn features(admin: &Admin) -> u64 {
     db(admin).kv.get(Keyspace::Meta, b"features").unwrap()
@@ -76,7 +75,7 @@ fn assert_moved(admin: &Admin, before: &NativeOutcomes) {
         assert_eq!(record.payload.kind(), 1);
         assert_eq!(record.flags & OUTCOME_PAYLOAD_BLANKED != 0, entry.record.result.is_none());
         assert_eq!(native_record(&record).unwrap(), entry.record);
-        assert_eq!(lookup_v2(db(admin), key).unwrap().as_ref(), Some(&entry.record));
+        assert_eq!(lookup_v2(&db(admin), key).unwrap().as_ref(), Some(&entry.record));
     }
 }
 
@@ -89,14 +88,14 @@ fn all_entries_and_tombstones_move() {
     assert_eq!(before.entries.len(), 3);
     assert_eq!(before.entries.values().filter(|e| e.record.result.is_none()).count(), 2);
     let keys: Vec<NativeOnceKey> = before.entries.keys().cloned().collect();
-    let pre = keys.iter().map(|k| lookup_v2(db(&admin), k).unwrap()).collect::<Vec<_>>();
+    let pre = keys.iter().map(|k| lookup_v2(&db(&admin), k).unwrap()).collect::<Vec<_>>();
 
     let migration = admin.migrate_native_once_v2().unwrap();
     assert_eq!(migration, Migration::Migrated(LedgerHeader {
         once_upper_watermark_s: 125, once_identities: 3, migrated_v1: true }));
     assert_moved(&admin, &before);
     // Lookups give the same answers from the 22 records as from the blob.
-    let post = keys.iter().map(|k| lookup_v2(db(&admin), k).unwrap()).collect::<Vec<_>>();
+    let post = keys.iter().map(|k| lookup_v2(&db(&admin), k).unwrap()).collect::<Vec<_>>();
     assert_eq!(post, pre);
     assert!(post.iter().all(Option::is_some));
     // [07] is the empty v1 ledger, never a tombstone.
@@ -104,7 +103,7 @@ fn all_entries_and_tombstones_move() {
     assert!(ledger(&admin).is_empty());
     assert_ne!(features(&admin) & PROTECTED_RECORDS, 0);
     let absent = NativeOnceKey { database_domain: domain(&admin), identity: vec![1, 2, 3] };
-    assert_eq!(lookup_v2(db(&admin), &absent).unwrap(), None);
+    assert_eq!(lookup_v2(&db(&admin), &absent).unwrap(), None);
 }
 
 #[test]
@@ -133,7 +132,7 @@ fn watermark_and_count_preserved() {
     // Historical-domain entries keep their own domain in the key.
     let old = NativeOnceKey { database_domain: current ^ 1, identity: 0u32.to_be_bytes().to_vec() };
     assert!(kernel_get(&admin, &records::outcome_key(current.to_be_bytes(), &old.identity)).is_none());
-    assert!(lookup_v2(db(&admin), &old).unwrap().is_some());
+    assert!(lookup_v2(&db(&admin), &old).unwrap().is_some());
 }
 
 #[test]

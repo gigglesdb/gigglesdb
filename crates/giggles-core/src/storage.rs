@@ -10,6 +10,12 @@ mod write_fence_admin;
 pub use write_fence_admin::WriteFenceStatus;
 pub(crate) mod engine;
 mod once_session;
+#[cfg(feature = "engine-rocksdb")]
+mod directory_identity;
+mod engine_slot;
+pub(crate) use engine_slot::{EngineLease, Holder};
+pub(crate) use engine_slot::{GenerationTag, PreparedGeneration};
+use engine_slot::{EngineSlot, StorageStatus};
 /// Task preview `schema_fp` input (GD-0061 R3-701): the catalog encodings of
 /// `table` and each of `constraints`, in the order given.
 pub(crate) fn task_schema_bytes(
@@ -729,8 +735,7 @@ const ROCKSDB_NOT_COMPILED: &str = "engine-rocksdb not compiled in";
 pub(crate) const RETIRED_APPLICATION_LEDGER: &str = "GD-0052 application ledger (legacy format family \"application\", feature bit 3, record namespace 9) was removed; open this store with a GigglesDB build at or before commit 429cbd2c";
 enum Backend {
     Legacy(Database),
-    // F8 executes SQL through this handle; until then only tests read it.
-    V2(#[allow(dead_code)] Arc<v2::V2Db>),
+    V2(EngineSlot),
 }
 struct Inner {
     backend: Backend,
@@ -740,7 +745,7 @@ struct Inner {
     sql_operations: AtomicUsize,
     /// Statement slots of task sessions (GD-0061 R3-401).
     task_load: Arc<crate::task::limits::TaskLoad>,
-    fenced: AtomicBool,
+    fenced: Arc<AtomicBool>,
     legacy_fence: engine::kv::FenceState,
     limits: Limits,
     crash: Mutex<CrashPoint>,
@@ -750,7 +755,7 @@ struct Inner {
     protected_hook: Mutex<Option<crate::task::commit::ProtectedHook>>,
     decision_hook: Mutex<Option<DecisionHook>>,
     sequences: Mutex<sequences::Live>,
-    native_once_owners: crate::cancellation::WaitMutex<BTreeMap<native_once::NativeOnceKey, native_once::InFlight>>,
+    native_once_owners: native_once::OnceOwners,
 }
 enum GuardedPersistError {
     Core(CoreError),
@@ -775,28 +780,15 @@ impl Drop for Ticket<'_> {
     }
 }
 impl Inner {
-    fn fence_state(&self) -> &engine::kv::FenceState {
+    fn lease(&self, kind: Holder) -> Result<Option<EngineLease>, CoreError> {
         match &self.backend {
-            Backend::Legacy(_) => &self.legacy_fence,
-            Backend::V2(db) => &db.kv.causes,
+            Backend::Legacy(_) => Ok(None),
+            Backend::V2(slot) => slot.fresh(kind).map(Some),
         }
     }
 
     fn fence_error(&self, site: engine::kv::FenceSite, error: &CoreError) {
-        self.fence_state().record(engine::kv::FenceCause::for_core(site, error));
-        self.fenced.store(true, Ordering::Release);
-    }
-
-    fn fence_native_commit(&self) {
-        use engine::kv::{FenceCause, FenceClass, FenceSite};
-        let state = self.fence_state();
-        // The sequencer or catalog records the original error before returning
-        // an ambiguous outcome. Preserve its diagnosis.
-        state.record_if_empty(FenceCause::new(
-            FenceSite::NativeOnceCommit,
-            FenceClass::NotRecoverable,
-            &"engine commit outcome unknown",
-        ));
+        self.legacy_fence.record(engine::kv::FenceCause::for_core(site, error));
         self.fenced.store(true, Ordering::Release);
     }
 
@@ -824,7 +816,8 @@ impl Inner {
     ) -> Result<T, CoreError> {
         match &self.backend {
             Backend::Legacy(_) => self.inspect(|state| f(&MetadataState::borrow(state))),
-            Backend::V2(db) => {
+            Backend::V2(slot) => {
+                let db = slot.fresh(Holder::Admin)?;
                 let _ticket = self.enter()?;
                 db.inspect_metadata(None, f)
             }
@@ -1222,18 +1215,43 @@ impl Admin {
     #[allow(dead_code, reason = "Used by the later recovery supervisor")]
     pub(crate) fn fence_cause(&self) -> Option<engine::kv::FenceCause> {
         match &self.inner.backend {
-            Backend::Legacy(_) => self.inner.fence_state().cause(),
-            Backend::V2(db) => db.fence_cause(),
+            Backend::Legacy(_) => self.inner.legacy_fence.cause(),
+            Backend::V2(slot) => slot.fence_cause(),
         }
     }
 
     /// Stop local commit decisions during service shutdown. Idempotent.
     pub fn stop_submissions(&self) {
-        if let Backend::V2(db) = &self.inner.backend { db.sequencer.stop_submissions(); }
+        if let Backend::V2(slot) = &self.inner.backend { slot.stop_submissions(); }
     }
     #[cfg(any(test, feature = "test-commit-sync"))]
     pub fn set_commit_sync_hook(&self, hook: Option<Arc<crate::CommitSyncHook>>) {
-        if let Backend::V2(db) = &self.inner.backend { db.sequencer.set_sync_hook(hook); }
+        if let Backend::V2(slot) = &self.inner.backend { slot.set_sync_hook(hook); }
+    }
+
+    /// Test seam for expiry, receipt, preview and retention timestamps.
+    /// None restores the system clock.
+    #[doc(hidden)]
+    pub fn set_task_wall_clock(&self, ms: Option<u64>) -> Result<(), CoreError> {
+        let Backend::V2(slot) = &self.inner.backend else { return Err(CoreError::Unsupported); };
+        slot.set_task_wall_clock(ms)
+    }
+
+    pub(crate) fn lease(&self, kind: Holder) -> Result<Option<EngineLease>, CoreError> {
+        self.inner.lease(kind)
+    }
+
+    #[allow(dead_code, reason = "Used by the recovery supervisor")]
+    pub(crate) fn storage_status(&self) -> StorageStatus {
+        match &self.inner.backend {
+            Backend::Legacy(_) => StorageStatus::Legacy,
+            Backend::V2(slot) => slot.status(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_v2(&self) -> EngineLease {
+        self.lease(Holder::Admin).unwrap().expect("v2 engine")
     }
 
     /// SQL admission count for commit-Sync qualification.
@@ -1259,8 +1277,8 @@ impl Admin {
     /// ticks. Legacy storage and replicated databases run no GC.
     pub fn maintenance_step(&self) -> Result<MaintenanceStats, CoreError> {
         let _ticket = self.inner.enter_sql()?;
-        match &self.inner.backend {
-            Backend::V2(db) => db.maintenance_step(),
+        match self.lease(Holder::Admin)? {
+            Some(db) => db.maintenance_step(),
             _ => Ok(MaintenanceStats::default()),
         }
     }
@@ -1270,8 +1288,8 @@ impl Admin {
     /// watermark. No effect on legacy storage.
     pub fn set_gc_retention(&self, retention: std::time::Duration) -> Result<(), CoreError> {
         let _ticket = self.inner.enter_sql()?;
-        if let Backend::V2(db) = &self.inner.backend {
-            db.set_gc_retention(retention);
+        if let Backend::V2(slot) = &self.inner.backend {
+            slot.set_gc_retention(retention)?;
         }
         Ok(())
     }
@@ -1281,8 +1299,8 @@ impl Admin {
     /// size. The next background pass uses them. No effect on legacy storage.
     pub fn set_task_retention(&self, config: crate::task::RetentionConfig) -> Result<(), CoreError> {
         let _ticket = self.inner.enter_sql()?;
-        if let Backend::V2(db) = &self.inner.backend {
-            db.set_task_retention(config);
+        if let Backend::V2(slot) = &self.inner.backend {
+            slot.set_task_retention(config)?;
         }
         Ok(())
     }
@@ -1322,10 +1340,7 @@ impl Admin {
     }
     /// Trusted test inspection: number of requests actually queued on v2 locks.
     pub fn waiting_lock_count(&self) -> usize {
-        match &self.inner.backend {
-            Backend::V2(db) => db.waiting_lock_count(),
-            _ => 0,
-        }
+        self.lease(Holder::Admin).ok().flatten().map_or(0, |db| db.waiting_lock_count())
     }
 
     /// Trusted test seam for deterministic local race verification. Not a wire API.
@@ -1352,9 +1367,10 @@ impl Admin {
         if limits.admitted == 0 || limits.selected_keys == 0 {
             return Err(CoreError::Limit);
         }
-        if let Backend::V2(db) = &backend {
-            db.attach_retention();
-        }
+        let fenced = match &backend {
+            Backend::Legacy(_) => Arc::default(),
+            Backend::V2(slot) => Arc::clone(&slot.native_fenced),
+        };
         Ok(Self {
             data_directory: None,
             inner: Arc::new(Inner {
@@ -1364,7 +1380,7 @@ impl Admin {
                 sql_transactions: AtomicUsize::new(0),
                 sql_operations: AtomicUsize::new(0),
                 task_load: Arc::new(crate::task::limits::TaskLoad::new(limits.admitted)),
-                fenced: AtomicBool::new(false),
+                fenced,
                 legacy_fence: Default::default(),
                 limits,
                 crash: Mutex::new(CrashPoint::None),
@@ -1383,7 +1399,7 @@ impl Admin {
         write_set_bytes: usize,
     ) -> Result<Admin, CoreError> {
         Self::attach_backend(
-            Backend::V2(Arc::new(v2::V2Db::from_backend(backend, write_set_bytes)?)),
+            Backend::V2(EngineSlot::new(v2::V2Db::from_backend(backend, write_set_bytes)?)),
             limits,
         )
     }
@@ -1410,10 +1426,10 @@ impl Admin {
                     if limits.admitted == 0 || limits.selected_keys == 0 {
                         return Err(CoreError::Limit);
                     }
-                    Self::attach_backend(
-                        Backend::V2(Arc::new(v2::V2Db::create(path.as_ref())?)),
-                        limits,
-                    ).map(|admin| admin.with_data_directory(path.as_ref()))
+                    let db = v2::V2Db::create(path.as_ref())?;
+                    let slot = EngineSlot::for_directory(db, path.as_ref(), None);
+                    Self::attach_backend(Backend::V2(slot), limits)
+                        .map(|admin| admin.with_data_directory(path.as_ref()))
                 }
             }
         }
@@ -1501,13 +1517,15 @@ impl Admin {
         if v2::has_traces(path) {
             match engine::meta::classify_dir(path).map_err(v2::format_error)? {
                 engine::meta::DirClass::V2 => {
-                    return Self::attach_backend(
-                        Backend::V2(Arc::new(match token {
-                            Some(token) => v2::V2Db::open_with_holder(path, Some(token))?,
-                            None => v2::V2Db::open(path)?,
-                        })),
-                        limits,
-                    );
+                    let db = match token {
+                        Some(token) => v2::V2Db::open_with_holder(path, Some(token))?,
+                        None => v2::V2Db::open(path)?,
+                    };
+                    #[cfg(feature = "engine-rocksdb")]
+                    let slot = EngineSlot::for_directory(db, path, token);
+                    #[cfg(not(feature = "engine-rocksdb"))]
+                    let slot = EngineSlot::new(db);
+                    return Self::attach_backend(Backend::V2(slot), limits);
                 }
                 engine::meta::DirClass::Legacy => {}
                 engine::meta::DirClass::Empty => {
@@ -1576,7 +1594,7 @@ impl Admin {
     }
     pub fn authority_metadata(&self) -> Result<(u128, u64, u64, Option<u128>), CoreError> {
         // V2 has a durable SQL authority domain, but no native approval clock/ledger.
-        if let Backend::V2(db) = &self.inner.backend {
+        if let Some(db) = self.lease(Holder::Admin)? {
             let _ticket = self.inner.enter()?;
             return Ok((
                 u128::from_be_bytes(db.meta.domain),
@@ -1767,9 +1785,9 @@ impl Admin {
         point: RecoveryPoint,
     ) -> Result<[u8; 32], CoreError> {
         #[cfg(feature = "engine-rocksdb")]
-        if let Backend::V2(db) = &self.inner.backend {
+        if let Some(db) = self.lease(Holder::Export)? {
             let _ticket = self.inner.enter()?;
-            return v2_export::export(db, path.as_ref(), point);
+            return v2_export::export(&db, path.as_ref(), point);
         }
         self.inner.db(LOGICAL_EXPORT)?;
         let path = path.as_ref();
@@ -2214,6 +2232,8 @@ pub struct SqlSession {
     admin: Admin,
     staged: Option<State>,
     v2_transaction: Option<engine::txn::Transaction>,
+    /// A typed operation reuses its checked transaction during binding and execution.
+    pub(crate) native_generation: Option<Arc<engine::txn::TxnLifetime>>,
     /// A parked protected run (R3-606, C1); set only inside
     /// `execute_protected_v2`, never counted as an SQL transaction slot.
     protected: Option<ProtectedRun>,
@@ -2238,6 +2258,7 @@ pub struct SqlSession {
     ddl_owner: Option<String>,
     staged_revision: u64,
     sequence_values: sequences::SessionValues,
+    sequence_generation: Option<GenerationTag>,
     sequence_unsettled: v2_sql::sql_sequences::Unsettled,
     pending_sequences: sequences::Pending,
     xact: XactSlot,
@@ -2247,6 +2268,7 @@ pub struct SqlSession {
     isolation: SqlIsolation,
     /// The task this session is bound to (GD-0061 R3-202); set once by `bind_task`.
     pub(crate) task: Option<crate::task::context::TaskContext>,
+    pub(crate) task_generation: Option<GenerationTag>,
     /// The release state of a task session (GD-0061 R3-308): reservation,
     /// pending `rows_read` and the current statement. Set with `task` by
     /// `bind_task`; the protected commit's temporary binding leaves it alone.
@@ -2261,6 +2283,7 @@ struct UnnamedPlanKey {
     sql: String,
     declared_types: Vec<Option<relational::DataType>>,
     catalog_version: u64,
+    generation: u64,
     search_path: Vec<String>,
     schema_user: String,
 }
@@ -2272,6 +2295,8 @@ impl Admin {
             admin: self.clone(),
             staged: None,
             v2_transaction: None,
+            native_generation: None,
+            sequence_generation: None,
             protected: None,
             copy_input: None,
             savepoints: Vec::new(),
@@ -2302,6 +2327,7 @@ impl Admin {
             deferral: Default::default(),
             isolation: SqlIsolation::ReadCommitted,
             task: None,
+            task_generation: None,
             task_state: None,
         }
     }
@@ -2399,6 +2425,8 @@ pub struct PrivilegeMetadata {
     image: PrivilegeImage,
     path: Vec<String>,
     ownership: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    roles: roles::RoleCatalog,
+    roles_generation: Option<GenerationTag>,
     generation: u64,
 }
 impl PrivilegeMetadata {
@@ -2408,13 +2436,38 @@ impl PrivilegeMetadata {
         let image = self.image.get();
         catalog_metadata_from(&MetadataState::new(image, image.epoch, 0), &self.path, self.generation)
     }
+    /// Read committed role and ACL records under the execution's generation.
+    pub fn role_image(&self) -> Result<roles::RoleCatalogImage, roles::RoleError> {
+        match &self.roles_generation {
+            Some(tag) => self.roles.image_leased(Some(&tag.lease(Holder::Role)?)),
+            None => self.roles.image_leased(None),
+        }
+    }
+
     pub fn table_owner(&self, registry: &roles::RoleCatalog, name: &str) -> Result<Option<String>, CoreError> {
+        self.table_owner_with(name, || match &self.roles_generation {
+            Some(_) => self.role_image()?.table_owner(name),
+            None => registry.table_owner(name),
+        })
+    }
+
+    /// A failed committed image read follows the same fence path as a failed
+    /// committed owner lookup. Transaction-local owner writes can still be read.
+    pub fn table_owner_in_image<'a>(
+        &self, registry: impl Into<Option<&'a roles::RoleCatalogImage>>, name: &str,
+    ) -> Result<Option<String>, CoreError> {
+        self.table_owner_with(name, || registry.into().ok_or(CoreError::Fenced)?.table_owner(name))
+    }
+
+    fn table_owner_with(
+        &self, name: &str, committed: impl FnOnce() -> Result<Option<String>, roles::RoleError>,
+    ) -> Result<Option<String>, CoreError> {
         let key = roles::engine::encode_key(&[b"owner/".as_slice(), name.as_bytes()].concat())?;
         if let Some(value) = self.ownership.get(&key) {
             return value.as_ref().map(|v| String::from_utf8(v[1..].to_vec())
                 .map_err(|e| CoreError::Corrupt(e.to_string()))).transpose();
         }
-        registry.table_owner(name).map_err(|_| CoreError::Fenced)
+        committed().map_err(|_| CoreError::Fenced)
     }
 }
 /// One statement's privilege evaluator, installed only after authorization.
@@ -2436,14 +2489,19 @@ impl PrivilegeImage {
 #[cfg(test)]
 thread_local! { static PRIVILEGE_CAPTURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
 pub(crate) type PrivilegeProvider = Arc<dyn Fn() -> PrivilegeMetadata + Send + Sync>;
-fn privilege_provider(image: PrivilegeImage, path: Vec<String>, txn: Option<&engine::txn::Transaction>, v2: bool) -> PrivilegeProvider {
+fn privilege_provider(
+    image: PrivilegeImage, path: Vec<String>, txn: Option<&engine::txn::Transaction>,
+    roles: roles::RoleCatalog, db: Option<&EngineLease>,
+) -> PrivilegeProvider {
+    let roles_generation = db.map(EngineLease::tag);
     let writes = txn.map(|txn| txn.privilege_writes());
     Arc::new(move || {
         #[cfg(test)]
         PRIVILEGE_CAPTURES.set(PRIVILEGE_CAPTURES.get() + 1);
-        let generation = if v2 { catalog_xid_from_hlc(image.get().epoch) } else { image.get().generation };
+        let generation = if roles_generation.is_some() { catalog_xid_from_hlc(image.get().epoch) } else { image.get().generation };
         PrivilegeMetadata { image: match &image { PrivilegeImage::Legacy(s) => PrivilegeImage::Legacy(s.clone()),
             PrivilegeImage::Catalog(s) => PrivilegeImage::Catalog(s.clone()) }, path: path.clone(), generation,
+            roles: roles.clone(), roles_generation: roles_generation.clone(),
             ownership: writes.iter().flat_map(|writes| writes.iter())
                 .filter(|((space,key),_)| *space == engine::kv::Keyspace::Catalog && key.first() == Some(&10))
                 .map(|((_,key),value)| (key.clone(),value.clone())).collect() }
@@ -2514,14 +2572,23 @@ impl SqlSession {
         &self,
         f: impl FnOnce(&MetadataState<'_>) -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
+        let lease = self.statement_lease()?;
+        self.inspect_metadata_leased(lease.as_deref(), f)
+    }
+
+    fn inspect_metadata_leased<T>(
+        &self,
+        db: Option<&EngineLease>,
+        f: impl FnOnce(&MetadataState<'_>) -> Result<T, CoreError>,
+    ) -> Result<T, CoreError> {
         match &self.admin.inner.backend {
             Backend::Legacy(_) => match &self.staged {
                 Some(state) => f(&MetadataState::borrow(state)),
                 None => self.admin.inner.inspect(|state| f(&MetadataState::borrow(state))),
             },
-            Backend::V2(db) => {
+            Backend::V2(_) => {
                 let _ticket = self.admin.inner.enter()?;
-                db.inspect_metadata(self.v2_transaction.as_ref(), f)
+                db.ok_or(CoreError::Fenced)?.inspect_metadata(self.v2_transaction.as_ref(), f)
             }
         }
     }
@@ -2568,11 +2635,22 @@ impl SqlSession {
         &self,
         prepared: &relational::Prepared,
     ) -> Result<relational::Prepared, CoreError> {
+        let lease = self.statement_lease()?;
+        self.bind_relation_context_leased(prepared, lease.as_deref())
+    }
+
+    fn bind_relation_context_leased(
+        &self,
+        prepared: &relational::Prepared,
+        db: Option<&EngineLease>,
+    ) -> Result<relational::Prepared, CoreError> {
+        Self::check_prepared_generation(prepared, db)?;
         let mut prepared = prepared.clone();
+        if let Some(db) = db { prepared.engine_generation = Some(db.prepared_generation()); }
         prepared.set_schema_context(self.search_path.clone(), self.schema_user.clone());
         prepared.clear_authorization_binding_version();
         let version = if prepared.has_sql_authorization_binding() { self.statement_catalog_version() } else { None };
-        let bind = |s: &MetadataState<'_>| {
+        self.inspect_metadata_leased(db, |s| {
             let Ok(mut bound) = prepared.bind_schemas(&s.sql) else { return Ok(prepared.clone()); };
             // Outside a fixed snapshot the binder can observe a newer catalog
             // than the first version read. Monotonic versions bracket the
@@ -2583,11 +2661,7 @@ impl SqlSession {
                 bound.set_authorization_binding_version(version);
             }
             Ok(bound)
-        };
-        match &self.staged {
-            Some(s) => bind(&MetadataState::borrow(s)),
-            None => self.inspect_metadata(bind),
-        }
+        })
     }
     pub fn schema_in_search_path(&self, schema: &str) -> bool {
         self.search_path.iter().any(|s| s == schema)
@@ -2672,7 +2746,8 @@ impl SqlSession {
         {
             return Ok(owner);
         }
-        self.admin.roles().table_owner(table)
+        let db = self.statement_lease()?;
+        self.admin.roles().table_owner_leased(table, db.as_deref())
     }
 
     /// Read authority from a captured image, including this session's own DDL.
@@ -2700,7 +2775,8 @@ impl SqlSession {
         {
             return Ok(grants);
         }
-        self.admin.roles().table_privileges(table, role)
+        let db = self.statement_lease()?;
+        self.admin.roles().table_privileges_leased(table, role, db.as_deref())
     }
 
     /// The level of every SQL transaction this session begins from now on:
@@ -2805,7 +2881,7 @@ impl SqlSession {
     /// V2 catalog snapshot. Private/unsupported contexts always build fresh.
     pub fn sequence_owners_shared(&self) -> Result<Arc<SequenceOwners>, CoreError> {
         let cacheable = self.staged.is_none() && !self.aborted && self.task.is_none()
-            && matches!(&self.admin.inner.backend, Backend::V2(db) if db.cluster_services().is_none())
+            && matches!(&self.admin.inner.backend, Backend::V2(slot) if !slot.is_cluster())
             && self.v2_transaction.as_ref().is_none_or(|txn|
                 txn.catalog_writes().next().is_none() && txn.snapshot_error().is_none());
         let owners = |s: &MetadataState<'_>| {
@@ -2847,12 +2923,15 @@ impl SqlSession {
         p: &relational::Prepared,
     ) -> Result<relational::Description, CoreError> {
         relational::assert_sql_frontend_allowed();
-        self.describe_bound_engine(p)
+        let lease = self.statement_lease()?;
+        self.describe_bound_engine(p, lease.as_deref())
     }
     fn describe_bound_engine(
         &mut self,
         p: &relational::Prepared,
+        db: Option<&EngineLease>,
     ) -> Result<relational::Description, CoreError> {
+        Self::check_prepared_generation(p, db)?;
         let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         let result = (|| {
@@ -2875,7 +2954,7 @@ impl SqlSession {
             if let Some(s) = &self.staged {
                 describe(&MetadataState::borrow(s))
             } else {
-                self.inspect_metadata(describe)
+                self.inspect_metadata_leased(db, describe)
             }
         })();
         if result.is_err() {
@@ -2899,12 +2978,16 @@ impl SqlSession {
         {
             return None;
         }
-        let Backend::V2(db) = &self.admin.inner.backend else { return None; };
-        if db.cluster_services().is_some() || db.kv.is_fenced() { return None; }
-        let latest = db.catalog().current_version()?;
-        let statement = self.statement_catalog_version()?;
-        (db.catalog().current_version() == Some(latest))
-            .then_some((latest, statement, self.schema_context_revision?))
+        let Backend::V2(slot) = &self.admin.inner.backend else { return None; };
+        let (latest, statement) = slot.authorization_versions(|stamp, catalog| {
+            self.statement_catalog_version_with(|lease| {
+                if lease.is_some_and(|db| db.stamp() != stamp) {
+                    return None;
+                }
+                Some(catalog.read())
+            })
+        })?;
+        Some((latest, statement, self.schema_context_revision?))
     }
 
     /// Recheck metadata admission, provenance and snapshot guards. Stored
@@ -2981,9 +3064,13 @@ impl SqlSession {
         result
     }
     pub(crate) fn settle_sequences(&self) -> Result<(), CoreError> {
-        if let Backend::V2(db) = &self.admin.inner.backend {
-            v2_sql::sql_sequences::settle(db, &self.sequence_unsettled)?;
+        if self.sequence_unsettled.lock().map_err(|_| CoreError::Fenced)?.is_empty() {
+            return Ok(());
         }
+        // Settlement uses the generation that produced the obligations.
+        let generation = self.sequence_generation.as_ref().ok_or(CoreError::Fenced)?;
+        let db = generation.lease(Holder::Sequence)?;
+        v2_sql::sql_sequences::settle(&db, &self.sequence_unsettled)?;
         Ok(())
     }
 
@@ -2991,7 +3078,11 @@ impl SqlSession {
     pub fn abort(&mut self) {
         // Void cleanup retains obligations on failure; fallible exits retry settlement.
         let _ = self.settle_sequences();
-        self.abort_copy_input();
+        self.abort_transaction(true);
+    }
+
+    fn abort_transaction(&mut self, settle_on_copy_rollback: bool) {
+        self.abort_copy_input(settle_on_copy_rollback);
         if self.in_transaction() {
             self.aborted = true;
         }
@@ -3005,8 +3096,8 @@ impl SqlSession {
     /// own exits carry the release tag.
     pub(crate) fn scan_engine(&mut self, scan: relational::Scan) -> Result<relational::SqlResult, CoreError> {
         #[cfg(feature = "engine-rocksdb")]
-        if let Backend::V2(db) = &self.admin.inner.backend {
-            let db = db.clone();
+        if self.is_v2_engine() {
+            let db = self.v2_lease(Holder::Sql)?;
             let result = self.scan_v2_engine(&db, scan);
             if result.is_err() { self.abort(); }
             return result;
@@ -3051,24 +3142,26 @@ impl SqlSession {
     #[cfg(all(test, feature = "engine-rocksdb"))]
     pub(crate) fn v2_max_commit_group_size(&self) -> usize {
         match &self.admin.inner.backend {
-            Backend::V2(db) => db.sequencer.max_group_size(),
+            Backend::V2(_) => self.admin.test_v2().sequencer.max_group_size(),
             _ => panic!("v2 sequencer required"),
         }
     }
 
     pub(crate) fn begin_native_implicit(&mut self) -> Result<(), CoreError> {
-        self.native_implicit_control(true)
+        self.native_implicit_control(true, Holder::Sql)
     }
 
     pub(crate) fn commit_native_implicit(&mut self) -> Result<(), CoreError> {
-        self.native_implicit_control(false)
+        self.native_implicit_control(false, Holder::Sql)
     }
 
-    fn native_implicit_control(&mut self, begin: bool) -> Result<(), CoreError> {
+    fn native_implicit_control(&mut self, begin: bool, kind: Holder) -> Result<(), CoreError> {
         let inner = self.admin.inner.clone();
-        let Backend::V2(db) = &inner.backend else {
+        if !self.is_v2_engine() {
             return if begin { self.begin_engine() } else { self.commit_engine() };
-        };
+        }
+        let db = self.v2_lease(kind)?;
+        self.bind_sequence_generation(&db);
         // These are the Control checks from execute_v2. No external Prepared,
         // parameters, version or schema context can be stale on this path.
         if self.copy_input.as_ref().is_some_and(|input| !input.executing) {
@@ -3082,14 +3175,19 @@ impl SqlSession {
         };
         let result = crate::cancellation::check().and_then(|()| {
             if begin {
-                self.begin_v2_transaction(db)?;
+                if self.v2_transaction.is_some() { return Err(CoreError::Sql(relational::SqlError::Transaction)); }
+                self.begin_v2_transaction_owned(db.into_holder(kind)?)?;
+                let db = self.v2_transaction.as_ref().and_then(Transaction::engine_lifetime)
+                    .and_then(|lifetime| lifetime.lease.as_ref()).expect("newly leased transaction");
+                v2_sql::sql_sequences::settle(db, &self.sequence_unsettled)?;
                 self.staged_revision = 0;
                 Ok(())
             } else {
-                self.commit_v2_transaction(db, &mut ticket)
+                self.commit_v2_transaction(&db, &mut ticket)
+                    .and_then(|()| v2_sql::sql_sequences::settle(&db, &self.sequence_unsettled))
             }
         });
-        let result = result.and_then(|value| self.settle_sequences().map(|()| value));
+
         if result.is_err() { self.abort(); }
         if self.v2_transaction.is_none() {
             self.xact.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -3099,10 +3197,11 @@ impl SqlSession {
     }
 
     pub(crate) fn begin_engine(&mut self) -> Result<(), CoreError> {
-        if let Backend::V2(db) = &self.admin.inner.backend {
+        if self.is_v2_engine() {
+            let db = self.v2_lease(Holder::Sql)?;
             let prepared =
                 relational::Prepared::begin_engine(u128::from_be_bytes(db.meta.domain), 0);
-            return self.execute_bound_engine(&prepared, &[], None).map(|_| ());
+            return self.execute_bound_kernel(&prepared, &[], None, None, Some(&db)).map(|_| ());
         }
         self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
@@ -3112,10 +3211,11 @@ impl SqlSession {
         .map(|_| ())
     }
     pub(crate) fn commit_engine(&mut self) -> Result<(), CoreError> {
-        if let Backend::V2(db) = &self.admin.inner.backend {
+        if self.is_v2_engine() {
+            let db = self.v2_lease(Holder::Sql)?;
             let prepared =
                 relational::Prepared::commit_engine(u128::from_be_bytes(db.meta.domain), 0);
-            return self.execute_bound_engine(&prepared, &[], None).map(|_| ());
+            return self.execute_bound_kernel(&prepared, &[], None, None, Some(&db)).map(|_| ());
         }
         self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
@@ -3128,12 +3228,13 @@ impl SqlSession {
         matches!(self.admin.inner.backend, Backend::V2(_))
     }
     pub(crate) fn rollback_v2_engine(&mut self) -> Result<(), CoreError> {
-        let Backend::V2(db) = &self.admin.inner.backend else {
-            unreachable!()
+        let db = match self.v2_lease(Holder::Sql) {
+            Ok(db) => db,
+            Err(CoreError::Fenced) => { self.rollback(); return Ok(()); }
+            Err(error) => return Err(error),
         };
-        let prepared =
-            relational::Prepared::rollback_engine(u128::from_be_bytes(db.meta.domain), 0);
-        self.execute_bound_engine(&prepared, &[], None).map(|_| ())
+        let prepared = relational::Prepared::rollback_engine(u128::from_be_bytes(db.meta.domain), 0);
+        self.execute_bound_kernel(&prepared, &[], None, None, Some(&db)).map(|_| ())
     }
     pub(crate) fn named_control_engine(
         &mut self,
@@ -3141,7 +3242,8 @@ impl SqlSession {
         make: impl FnOnce(&str, u128, u64) -> Result<relational::Prepared, relational::SqlError>,
     ) -> Result<(), CoreError> {
         // Do not use execute_engine: its aborted-state guard blocks recovery.
-        let (domain, epoch) = if let Backend::V2(db) = &self.admin.inner.backend {
+        let lease = self.statement_lease()?;
+        let (domain, epoch) = if let Some(db) = lease.as_deref() {
             (u128::from_be_bytes(db.meta.domain), 0)
         } else {
             self.admin.inner.db(SQL_SESSIONS)?;
@@ -3152,13 +3254,14 @@ impl SqlSession {
         };
         let mut prepared = make(name, domain, epoch).map_err(CoreError::Sql)?;
         prepared.transaction = self.transaction_id;
-        self.execute_bound_engine(&prepared, &[], None).map(|_| ())
+        self.execute_bound_kernel(&prepared, &[], None, None, lease.as_deref()).map(|_| ())
     }
     /// Native block steps are separate RC statements; legacy keeps its block snapshot.
     pub(crate) fn begin_native_step(&mut self) -> Result<(), CoreError> {
         crate::cancellation::check()?;
         #[cfg(feature = "engine-rocksdb")]
         if self.is_v2_engine() {
+            let _lease = self.v2_lease(Holder::Sql)?;
             self.v2_transaction.as_mut()
                 .ok_or(CoreError::Sql(relational::SqlError::Transaction))?
                 .begin_statement();
@@ -3179,7 +3282,8 @@ impl SqlSession {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
             crate::cancellation::check()?;
-            if let Backend::V2(db) = &self.admin.inner.backend {
+            if self.is_v2_engine() {
+                let db = self.v2_lease(Holder::Sql)?;
                 let _ticket = self.admin.inner.enter()?;
                 return db.inspect_binding(self.v2_transaction.as_ref(), |_, fence, tables| {
                     inspect(fence, tables)
@@ -3221,9 +3325,10 @@ impl SqlSession {
     pub(crate) fn native_view_rows_engine(&mut self, view: &relational::TableDef)
         -> Result<Option<Vec<relational::SqlRow>>, CoreError> {
         let Some(key) = self.native_view_key(view)? else { return Ok(None) };
-        let p = self.prepare_typed_read(vec![key.clone()], |domain, epoch|
+        let lease = self.statement_lease()?;
+        let p = self.prepare_typed_read(lease.as_deref(), vec![key.clone()], |domain, epoch|
             relational::Prepared::from_relation_read(domain, epoch, key))?;
-        let rows = relational::spill::bounded(|| self.execute_bound_engine(&p, &[], None))?.rows;
+        let rows = relational::spill::bounded(|| self.execute_bound_kernel(&p, &[], None, None, lease.as_deref()))?.rows;
         if rows.len() > relational::MAX_ROWS { return Err(CoreError::Limit); }
         Ok(Some(rows))
     }
@@ -3244,9 +3349,10 @@ impl SqlSession {
                 return Err(map(CoreError::Sql(relational::SqlError::Unsupported)));
             }
             let Some(key) = self.native_view_key(view).map_err(map)? else { return Ok(None) };
-            let p = self.prepare_typed_read(vec![key.clone()], |domain, epoch|
+            let lease = self.statement_lease().map_err(map)?;
+            let p = self.prepare_typed_read(lease.as_deref(), vec![key.clone()], |domain, epoch|
                 relational::Prepared::from_relation_read(domain, epoch, key)).map_err(map)?;
-            let (result, spilled) = relational::spill::streaming(|| self.execute_bound_engine(&p, &[], None));
+            let (result, spilled) = relational::spill::streaming(|| self.execute_bound_kernel(&p, &[], None, None, lease.as_deref()));
             let result = result.map_err(map)?;
             complete_relation::retain_native_rows(keep, bound, map, |visit| {
                 if let Some(spilled) = spilled {
@@ -3273,7 +3379,7 @@ impl SqlSession {
             if current.as_ref() != Some(view) { return Ok(None); }
             Ok(s.sql.view_names.iter().find(|(_, (id, _))| *id == view.id).map(|(key, _)| {
                 let (schema, name) = relational::split_key(key);
-                format!("{schema} {name}")
+                format!("{schema}\0{name}")
             }))
         })
     }
@@ -3301,7 +3407,7 @@ impl SqlSession {
     /// Committed authority/catalog observation to take before Bind authorization.
     pub fn prepared_bind_observation(&self) -> Result<Option<u128>, CoreError> {
         match &self.admin.inner.backend {
-            Backend::V2(db) => db.catalog().committed_observation().map(Some),
+            Backend::V2(_) => self.v2_lease(Holder::Sql)?.catalog().committed_observation().map(Some),
             _ => Ok(None),
         }
     }
@@ -3311,8 +3417,8 @@ impl SqlSession {
     /// Errors do not abort here, so the caller can preserve error ordering.
     pub fn lock_prepared_relations(&mut self, p: &relational::Prepared, observation: Option<u128>) -> Result<bool, CoreError> {
         if !self.is_v2_engine() { return Ok(true); }
-        let Backend::V2(db) = &self.admin.inner.backend else { unreachable!() };
-        let db = db.clone();
+        let db = self.v2_lease(Holder::Sql)?;
+        Self::check_prepared_generation(p, Some(&db))?;
         let mut scoped = p.clone();
         scoped.set_schema_context(self.search_path.clone(), self.schema_user.clone());
         let txn = self.v2_transaction.as_mut()
@@ -3323,7 +3429,7 @@ impl SqlSession {
         self.admin.inner.decision_point(DecisionPoint::PreparedBindAuthorized);
         // Bind and expand from one image of the portal's statement snapshot.
         // Runtime view projections already contain nested physical dependencies.
-        let locks = self.inspect_metadata(|state| {
+        let locks = self.inspect_metadata_leased(Some(&db), |state| {
             let bound = scoped.bind_schemas(&state.sql).map_err(CoreError::Sql)?;
             let mut pending = bound.authorization_tables().map_err(CoreError::Sql)?;
             pending.extend(bound.write_tables().into_iter().map(|(name, _)| name));
@@ -3402,19 +3508,17 @@ impl SqlSession {
             if self.aborted {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
+            let db = self.v2_lease(Holder::Sql)?;
             let names = tables
                 .iter()
                 .map(|name| {
-                    let prepared = self.prepare(&format!("SELECT * FROM {name} LIMIT 0"))?;
+                    let prepared = self.prepare_leased(&format!("SELECT * FROM {name} LIMIT 0"), Some(&db))?;
                     prepared
                         .table()
                         .map(str::to_owned)
                         .ok_or(CoreError::Sql(relational::SqlError::UnknownTable))
                 })
                 .collect::<Result<Vec<_>, CoreError>>()?;
-            let Backend::V2(db) = &self.admin.inner.backend else {
-                unreachable!()
-            };
             let txn = self
                 .v2_transaction
                 .as_mut()
@@ -3440,7 +3544,7 @@ impl SqlSession {
             for name in names {
                 db.catalog()
                     .resolve(txn, &name, mode, deadline, &|| {
-                        crate::cancellation::check().is_err()
+                        crate::cancellation::check().is_err() || db.check().is_err()
                     })
                     .map_err(|error| match error {
                         engine::catalog::CatalogError::Core(error) => error,
@@ -3524,7 +3628,8 @@ impl SqlSession {
         defaults: Vec<Option<String>>,
         sequences: Vec<Option<relational::defaults::SequenceSpec>>,
     ) -> Result<(), CoreError> {
-        if let Backend::V2(db) = &self.admin.inner.backend {
+        if self.is_v2_engine() {
+            let db = self.v2_lease(Holder::Sql)?;
             let domain = u128::from_be_bytes(db.meta.domain);
             let result = (|| {
                 self.catalog_empty_engine()?;
@@ -3623,7 +3728,8 @@ impl SqlSession {
     /// Returns a view postimage on create and preimage on drop (no primary key).
     pub fn execute_typed_view(&mut self, name: String, read: Option<relational::ViewRead>, cascade: bool) -> Result<relational::TableDef, CoreError> {
         let result = (|| {
-            let (domain, epoch) = self.inspect_metadata(|s| Ok((s.view.domain, if self.is_v2_engine() { 0 } else { s.sql.epoch })))?;
+            let lease = self.statement_lease()?;
+            let db = lease.as_deref();
             let dropping = read.is_none();
             let search_path = self.search_path.clone();
             let definition = |s: &MetadataState<'_>| {
@@ -3632,12 +3738,16 @@ impl SqlSession {
                 Ok(s.sql.catalog_presentation().map_err(CoreError::Sql)?.views.into_iter()
                     .find(|(view, _)| Some(*view) == id).map(|(_, v)| v.table))
             };
-            let before = if dropping { self.inspect_metadata(definition)? } else { None };
+            let (domain, epoch, before) = self.inspect_metadata_leased(db, |s| {
+                let epoch = if db.is_some() { 0 } else { s.sql.epoch };
+                Ok((s.view.domain, epoch, if dropping { definition(s)? } else { None }))
+            })?;
             let mut p = relational::Prepared::from_view_read(domain, epoch, name.clone(), read, cascade).map_err(CoreError::Sql)?;
+            p.engine_generation = db.map(EngineLease::prepared_generation);
             p.transaction = self.transaction_id;
             p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
-            self.execute_bound_engine(&p, &[], None)?;
-            let table = if dropping { before } else { self.inspect_metadata(definition)? };
+            self.execute_bound_kernel(&p, &[], None, None, db)?;
+            let table = if dropping { before } else { self.inspect_metadata_leased(db, definition)? };
             table.ok_or(CoreError::Sql(relational::SqlError::UnknownTable))
         })();
         if result.is_err() { self.abort(); }
@@ -3649,7 +3759,8 @@ impl SqlSession {
             if self.aborted {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
-            if let Backend::V2(db) = &self.admin.inner.backend {
+            if self.is_v2_engine() {
+                let db = self.v2_lease(Holder::Sql)?;
                 let _ticket = self.admin.inner.enter()?;
                 let txn = self
                     .v2_transaction
@@ -3680,7 +3791,8 @@ impl SqlSession {
             if self.aborted {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
-            if let Backend::V2(db) = &self.admin.inner.backend {
+            if self.is_v2_engine() {
+                let db = self.v2_lease(Holder::Sql)?;
                 let _ticket = self.admin.inner.enter_sql()?;
                 crate::cancellation::check()?;
                 let txn = self.v2_transaction.as_mut()
@@ -3723,7 +3835,8 @@ impl SqlSession {
         column: &relational::ColumnDef,
         value: relational::Value,
     ) -> Result<relational::Value, CoreError> {
-        if let Backend::V2(db) = &self.admin.inner.backend {
+        if self.is_v2_engine() {
+            let db = self.v2_lease(Holder::Sql)?;
             let state = db.metadata_state(self.v2_transaction.as_ref())?;
             return relational::coerce_to_column(&state.sql, column, value).map_err(CoreError::Sql);
         }
@@ -3733,11 +3846,21 @@ impl SqlSession {
             .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
         relational::coerce_to_column(&state.sql, column, value).map_err(CoreError::Sql)
     }
+    fn native_sequence_lease(&mut self) -> Result<Option<SessionLease>, CoreError> {
+        let lease = self.statement_lease()?;
+        if let Some(db) = lease.as_deref() {
+            self.bind_sequence_generation(db);
+        }
+        Ok(lease)
+    }
+
     /// Share SQL sequence state and callbacks across native entry points.
-    fn native_sequence_callback(&self) -> Result<(Arc<relational::Relational>, relational::clock::SequenceCallback), CoreError> {
-        if let Backend::V2(db) = &self.admin.inner.backend {
+    fn native_sequence_callback(
+        &self, db: Option<&EngineLease>,
+    ) -> Result<(Arc<relational::Relational>, relational::clock::SequenceCallback), CoreError> {
+        if let Some(db) = db {
             let (_, image) = db.native_metadata_image(self.v2_transaction.as_ref())?;
-            let callback = self.insert_sequence_callback(db, image.clone());
+            let callback = self.insert_sequence_callback(db, image.clone())?;
             return Ok((image, callback));
         }
         let mut state = match &self.staged {
@@ -3758,9 +3881,10 @@ impl SqlSession {
         Ok((Arc::new(state.sql), callback))
     }
     pub(crate) fn sequence_call_engine(&mut self, operation: &str, name: &str, value: Option<i64>, called: bool) -> Result<i64, CoreError> {
+        let lease = self.native_sequence_lease()?;
         let _ticket = self.admin.inner.enter_sql()?;
         crate::cancellation::check()?;
-        let (state, callback) = self.native_sequence_callback()?;
+        let (state, callback) = self.native_sequence_callback(lease.as_deref())?;
         let quoted = |key: &str| key.split('\0')
             .map(|part| format!("\"{}\"", part.replace('"', "\"\""))).collect::<Vec<_>>().join(".");
         let qualified = if self.is_v2_engine() {
@@ -3816,12 +3940,13 @@ impl SqlSession {
         settle: bool,
     ) -> Result<Vec<relational::Value>, CoreError> {
         let result = (|| {
+            let lease = self.native_sequence_lease()?;
             let _ticket = self.admin.inner.enter_sql()?;
             crate::cancellation::check()?;
             if self.aborted {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
-            let (state, callback) = self.native_sequence_callback()?;
+            let (state, callback) = self.native_sequence_callback(lease.as_deref())?;
             let clock = relational::clock::ExecutionClock::new(&relational::StatementClock {
                 unavailable: Some(CoreError::Sql(relational::SqlError::Unsupported)),
                 transaction_us: 0, statement_us: 0, zone: None, wall: None,
@@ -3862,8 +3987,8 @@ impl SqlSession {
     fn execute_native_many(
         &mut self, build: impl FnOnce(u128, &relational::Relational) -> Result<relational::Prepared, relational::SqlError>,
     ) -> Result<relational::SqlResult, CoreError> {
-        if let Backend::V2(db) = &self.admin.inner.backend {
-            let db = db.clone();
+        if self.is_v2_engine() {
+            let db = self.v2_lease(Holder::Sql)?;
             let result = (|| {
                 if self.aborted { return Err(CoreError::Sql(relational::SqlError::Aborted)); }
                 let (domain, image) = db.native_metadata_image(self.v2_transaction.as_ref())?;
@@ -3874,7 +3999,7 @@ impl SqlSession {
                 });
                 prepared.epoch = 0;
                 prepared.transaction = self.transaction_id;
-                self.execute_bound_engine(&prepared, &[], None)
+                self.execute_bound_kernel(&prepared, &[], None, None, Some(&db))
             })();
             if result.is_err() { self.abort(); }
             return result;
@@ -3893,8 +4018,8 @@ impl SqlSession {
         values: Vec<relational::Value>,
         settle: bool,
     ) -> Result<relational::SqlResult, CoreError> {
-        if let Backend::V2(db) = &self.admin.inner.backend {
-            let db = db.clone();
+        if self.is_v2_engine() {
+            let db = self.v2_lease(Holder::Sql)?;
             let result = (|| {
                 if self.aborted {
                     return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -3909,7 +4034,7 @@ impl SqlSession {
                 });
                 prepared.epoch = 0;
                 prepared.transaction = self.transaction_id;
-                self.execute_bound_engine(&prepared, &[], None)
+                self.execute_bound_kernel(&prepared, &[], None, None, Some(&db))
             })();
             let result = result.and_then(|value| {
                 if settle { self.settle_sequences()?; }
@@ -3931,8 +4056,8 @@ impl SqlSession {
         sets: Vec<(usize, relational::Value)>,
         expected_version: u64,
     ) -> Result<relational::SqlResult, CoreError> {
-        if let Backend::V2(db) = &self.admin.inner.backend {
-            let db = db.clone();
+        if self.is_v2_engine() {
+            let db = self.v2_lease(Holder::Sql)?;
             let result = (|| {
                 if self.aborted {
                     return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -3942,7 +4067,7 @@ impl SqlSession {
                     table, key, sets, domain, &image).map_err(CoreError::Sql)?;
                 prepared.epoch = 0;
                 prepared.transaction = self.transaction_id;
-                self.execute_bound_engine(&prepared, &[], Some(expected_version))
+                self.execute_bound_kernel(&prepared, &[], Some(expected_version), None, Some(&db))
             })();
             if result.is_err() { self.abort(); }
             return result;
@@ -3959,8 +4084,8 @@ impl SqlSession {
         key: Vec<relational::Value>,
         expected_version: u64,
     ) -> Result<relational::SqlResult, CoreError> {
-        if let Backend::V2(db) = &self.admin.inner.backend {
-            let db = db.clone();
+        if self.is_v2_engine() {
+            let db = self.v2_lease(Holder::Sql)?;
             let result = (|| {
                 if self.aborted {
                     return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -3970,7 +4095,7 @@ impl SqlSession {
                     table, key, domain, &image).map_err(CoreError::Sql)?;
                 prepared.epoch = 0;
                 prepared.transaction = self.transaction_id;
-                self.execute_bound_engine(&prepared, &[], Some(expected_version))
+                self.execute_bound_kernel(&prepared, &[], Some(expected_version), None, Some(&db))
             })();
             if result.is_err() { self.abort(); }
             return result;
@@ -4004,37 +4129,50 @@ impl SqlSession {
     /// Start a protocol preparation boundary against the transaction's visible catalog.
     /// READ COMMITTED advances; repeatable snapshots and private DDL stay intact.
     pub fn begin_prepared_statement(&mut self) {
-        if let Some(txn) = &mut self.v2_transaction {
+        if let Some(txn) = &mut self.v2_transaction
+            && txn.engine_lifetime().is_none_or(|life| life.lease.as_ref().unwrap().check().is_ok())
+        {
             txn.begin_statement();
         }
     }
 
     /// Whether a prepared statement belongs to the current transaction lifetime.
     pub fn prepared_is_current(&self, p: &relational::Prepared) -> bool {
-        p.transaction.is_none() || p.transaction == self.transaction_id
+        (p.transaction.is_none() || p.transaction == self.transaction_id)
+            && p.engine_generation.is_none_or(|generation| {
+                matches!(&self.admin.inner.backend, Backend::V2(slot) if slot.serves_stamp(generation.stamp))
+            })
     }
 
     /// Catalog generation used by metadata planning at the current statement snapshot.
     /// Private DDL, failed snapshots and unsupported backends cannot be cached.
     pub fn statement_catalog_version(&self) -> Option<u64> {
+        let Backend::V2(slot) = &self.admin.inner.backend else { return None; };
+        if slot.is_cluster() { return None; }
+        self.statement_catalog_version_with(|lease| match lease {
+            Some(db) => {
+                db.check().ok()?;
+                Some(db.catalog().current_version())
+            }
+            None => Some(slot.catalog_version()),
+        })
+    }
+
+    // The outer option validates the observation. An unknown current version
+    // still permits the transaction's historical snapshot lookup.
+    fn statement_catalog_version_with(
+        &self,
+        current_version: impl FnOnce(Option<&EngineLease>) -> Option<Option<u64>>,
+    ) -> Option<u64> {
         if self.aborted || self.task.is_some() { return None; }
-        match &self.admin.inner.backend {
-            Backend::V2(db) if db.cluster_services().is_none() => match &self.v2_transaction {
-                Some(txn) => {
-                    if txn.catalog_writes().next().is_some() || txn.snapshot_error().is_some() {
-                        return None;
-                    }
-                    if let Some(ts) = txn.current_snapshot_ts() {
-                        // The common current-generation case needs only atomic reads.
-                        db.catalog().current_version().filter(|version| *version <= ts.0)
-                            .or_else(|| db.catalog().snapshot_version(txn).map(|version| version.0))
-                    } else {
-                        db.catalog().current_version()
-                    }
-                }
-                None => db.catalog().current_version(),
-            },
-            _ => None,
+        let Some(txn) = &self.v2_transaction else { return current_version(None)?; };
+        if txn.catalog_writes().next().is_some() || txn.snapshot_error().is_some() { return None; }
+        let db = txn.engine_lifetime()?.lease.as_ref()?;
+        let current = current_version(Some(db))?;
+        match txn.current_snapshot_ts() {
+            Some(ts) => current.filter(|version| *version <= ts.0)
+                .or_else(|| db.catalog().snapshot_version(txn).map(|version| version.0)),
+            None => current,
         }
     }
 
@@ -4045,20 +4183,27 @@ impl SqlSession {
             return PreparedCatalogState::PrivateDdl;
         }
         match &self.admin.inner.backend {
-            Backend::V2(db) if db.cluster_services().is_none() =>
+            Backend::V2(slot) if !slot.is_cluster() =>
                 PreparedCatalogState::Version(self.statement_catalog_version()),
             _ => PreparedCatalogState::UnknownBackend,
         }
     }
 
-    /// Lock-free local catalog generation. Transactions and cluster gateways
+    /// Committed local catalog version. Transactions and cluster gateways
     /// deliberately use the normal snapshot path instead.
     pub fn committed_catalog_version(&self) -> Option<u64> {
         if self.in_transaction() || self.aborted || self.task.is_some() { return None; }
         match &self.admin.inner.backend {
-            Backend::V2(db) if db.cluster_services().is_none() => db.catalog().current_version(),
+            Backend::V2(slot) if !slot.is_cluster() => slot.catalog_version(),
             _ => None,
         }
+    }
+
+    fn committed_catalog_key(&self, db: &EngineLease) -> Option<(u64, u64)> {
+        if self.in_transaction() || self.aborted || self.task.is_some() || db.cluster_services().is_some() {
+            return None;
+        }
+        Some((db.catalog().current_version()?, db.id()))
     }
 
     /// Reuse only SELECT preparation in an unnamed, ordinary SQL session.
@@ -4067,10 +4212,16 @@ impl SqlSession {
         &mut self, sql: &str, declared_types: &[Option<relational::DataType>],
     ) -> Result<relational::Prepared, CoreError> {
         relational::assert_sql_frontend_allowed();
-        let key = self.committed_catalog_version().filter(|_| {
+        let lease = match self.statement_lease() {
+            Ok(lease) => lease,
+            Err(CoreError::Fenced) => return self.prepare_fenced_rollback(sql),
+            Err(error) => return Err(error),
+        };
+        if let Some(db) = lease.as_deref() { self.bind_sequence_generation(db); }
+        let key = lease.as_deref().filter(|_| {
             sql.trim_start().get(..7).is_some_and(|head| head.eq_ignore_ascii_case("SELECT "))
-        }).map(|catalog_version| UnnamedPlanKey {
-            sql: sql.into(), declared_types: declared_types.into(), catalog_version,
+        }).and_then(|db| self.committed_catalog_key(db)).map(|(catalog_version, generation)| UnnamedPlanKey {
+            sql: sql.into(), declared_types: declared_types.into(), catalog_version, generation,
             search_path: self.search_path.clone(), schema_user: self.schema_user.clone(),
         });
         if let Some(key) = &key
@@ -4082,9 +4233,9 @@ impl SqlSession {
             self.unnamed_plans.push(entry);
             return Ok(p);
         }
-        let p = self.prepare(sql)?;
+        let p = self.prepare_leased(sql, lease.as_deref())?;
         if let Some(key) = key
-            && self.committed_catalog_version() == Some(key.catalog_version)
+            && lease.as_deref().and_then(|db| self.committed_catalog_key(db)) == Some((key.catalog_version, key.generation))
             && !p.is_ddl()
         {
             if self.unnamed_plans.len() == 64 { self.unnamed_plans.remove(0); }
@@ -4100,22 +4251,46 @@ impl SqlSession {
     /// error) that tells them apart (design-3 section 2, call site 1). A
     /// session without a task does no extra work.
     pub fn prepare(&mut self, sql: &str) -> Result<relational::Prepared, CoreError> {
-        let p = self.prepare_unruled(sql)?;
+        match self.statement_lease() {
+            Ok(lease) => self.prepare_leased(sql, lease.as_deref()),
+            Err(CoreError::Fenced) => self.prepare_fenced_rollback(sql),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn prepare_leased(&mut self, sql: &str, db: Option<&EngineLease>) -> Result<relational::Prepared, CoreError> {
+        let p = self.prepare_unruled(sql, db)?;
         if self.task.is_none() {
             return Ok(p);
         }
         // A refusal here is the statement's outcome in the read log
         // (R3-309), when the caller set its text first.
-        self.task_column_rules(&p).inspect_err(|error| {
+        self.task_column_rules_leased(&p, db).inspect_err(|error| {
             self.log_unstarted_task_failure(p.task_class(), p.parameter_count(), error);
             self.abort();
         })
     }
-    fn prepare_unruled(&mut self, sql: &str) -> Result<relational::Prepared, CoreError> {
-        let _value_budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
-        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
-        if let Backend::V2(db) = &self.admin.inner.backend {
-            return self.prepare_v2(sql, u128::from_be_bytes(db.meta.domain));
+    fn prepare_fenced_rollback(&self, sql: &str) -> Result<relational::Prepared, CoreError> {
+        // Full rollback remains local after a flip. Keep the former size and
+        // token budgets even though this parse needs no engine metadata.
+        let _value_budget = relational::ValueBudget::enter(self.value_budget(), true);
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, true);
+        let mut p = relational::Prepared::parse(sql, 0, 0)
+            .ok().filter(|p| p.control() == Some("rollback"))
+            .ok_or(CoreError::Fenced)?;
+        p.transaction = self.transaction_id;
+        p.engine_generation = self.sequence_generation.as_ref().map(GenerationTag::prepared_generation);
+        p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
+        Ok(p)
+    }
+
+    fn prepare_unruled(&mut self, sql: &str, db: Option<&EngineLease>) -> Result<relational::Prepared, CoreError> {
+        let _value_budget = relational::ValueBudget::enter(self.value_budget(), self.is_v2_engine());
+        let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, self.is_v2_engine());
+        if self.is_v2_engine() {
+            let db = db.ok_or(CoreError::Fenced)?;
+            self.bind_sequence_generation(db);
+            return self.prepare_v2(sql, db);
         }
         if sql.len() > relational::MAX_SQL {
             self.abort();
@@ -4161,6 +4336,8 @@ impl SqlSession {
         &mut self,
         sql: &str,
     ) -> Result<(relational::Copy, relational::Prepared), CoreError> {
+        let lease = self.statement_lease()?;
+        let db = lease.as_deref();
         let inner = self.admin.inner.clone();
         let _ticket = inner.enter_sql()?;
         relational::assert_sql_frontend_allowed();
@@ -4176,7 +4353,7 @@ impl SqlSession {
             };
             (copy.table, copy.target_is_view) = match &self.staged {
                 Some(s) => resolve(&MetadataState::borrow(s))?,
-                None => self.inspect_metadata(resolve)?,
+                None => self.inspect_metadata_leased(db, resolve)?,
             };
             let prepare = |s: &MetadataState<'_>| {
                 let image = self.copy_target_image(&copy, s);
@@ -4189,10 +4366,11 @@ impl SqlSession {
             };
             let mut prepared = match &self.staged {
                 Some(s) => prepare(&MetadataState::borrow(s))?,
-                None => self.inspect_metadata(prepare)?,
+                None => self.inspect_metadata_leased(db, prepare)?,
             };
             if matches!(self.admin.inner.backend, Backend::V2(_)) {
                 prepared.epoch = 0;
+                prepared.engine_generation = db.map(EngineLease::prepared_generation);
             }
             prepared.transaction = self.transaction_id;
             prepared.set_schema_context(self.search_path.clone(), self.schema_user.clone());
@@ -4265,8 +4443,8 @@ impl SqlSession {
         let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         relational::assert_sql_frontend_allowed();
-        if let Backend::V2(db) = &self.admin.inner.backend {
-            let db = db.clone();
+        if self.is_v2_engine() {
+            let db = self.v2_lease(Holder::Sql)?;
             return self.normalize_copy_v2(&db, prepared, input, clock);
         }
         self.admin.inner.db(SQL_SESSIONS)?;
@@ -4425,8 +4603,8 @@ impl SqlSession {
                 return Ok(crate::task::release::Unreleased::new(Default::default(), tag));
             }
         }
-        let p = self.prepare(sql)?;
-        self.execute_prepared_unreleased(&p, params, expected_version)
+        let (p, lease) = self.prepare_for_execution(sql)?;
+        self.execute_bound_clocked_leased(&p, params, expected_version, None, lease.as_deref())
     }
     /// Execute using caller-supplied transaction, statement and wall time.
     pub fn execute_at(
@@ -4450,14 +4628,22 @@ impl SqlSession {
         let result = (|| {
             relational::assert_sql_frontend_allowed();
             self.guard_clock(clock)?;
-            let p = self.prepare(sql)?;
-            self.execute_prepared_at_unreleased(&p, params, expected_version, clock)
+            let (p, lease) = self.prepare_for_execution(sql)?;
+            self.execute_prepared_at_leased(&p, params, expected_version, clock, lease.as_deref())
         })();
         if let Err(error) = &result {
             self.log_text_failure(sql, params.len(), error);
         }
         result
     }
+    fn prepare_for_execution(&mut self, sql: &str) -> Result<(relational::Prepared, Option<SessionLease>), CoreError> {
+        match self.statement_lease() {
+            Ok(lease) => Ok((self.prepare_leased(sql, lease.as_deref())?, lease)),
+            Err(CoreError::Fenced) => Ok((self.prepare_fenced_rollback(sql)?, None)),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn execute_prepared_at(
         &mut self,
         p: &relational::Prepared,
@@ -4477,9 +4663,21 @@ impl SqlSession {
     ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         relational::assert_sql_frontend_allowed();
         self.guard_clock(clock)?;
+        let lease = self.execution_lease(p)?;
+        self.execute_prepared_at_leased(p, params, expected_version, clock, lease.as_deref())
+    }
+
+    fn execute_prepared_at_leased(
+        &mut self,
+        p: &relational::Prepared,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+        clock: &relational::StatementClock,
+        db: Option<&EngineLease>,
+    ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         let context = relational::clock::ExecutionClock::new(clock)
             .with_extra_float_digits(self.extra_float_digits);
-        let result = self.execute_bound_clocked(p, params, expected_version, Some(&context));
+        let result = self.execute_bound_clocked_leased(p, params, expected_version, Some(&context), db);
         // A BEGIN under an unavailable clock stays unpinned, so the first available clocked statement
         // becomes the pin. That is acceptable: the server clock stays latched until restart.
         if result.is_ok() && p.control() == Some("begin") && clock.unavailable.is_none() {
@@ -4540,9 +4738,10 @@ impl SqlSession {
     pub fn describe_typed_read(&mut self, read: relational::SingleSourceRead) -> Result<relational::Description, CoreError> {
         let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
-        let p = self.prepare_typed_read(vec![read.table.replace('.', "\0")], |domain, epoch|
+        let lease = self.statement_lease()?;
+        let p = self.prepare_typed_read(lease.as_deref(), vec![read.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_single_source_read(domain, epoch, read))?;
-        self.describe_bound_engine(&p)
+        self.describe_bound_engine(&p, lease.as_deref())
     }
     /// Typed leaf reads use the same transaction/snapshot kernel as prepared SQL.
     pub fn execute_typed_read(&mut self, read: relational::SingleSourceRead, expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
@@ -4553,18 +4752,20 @@ impl SqlSession {
         -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
-        let p = self.prepare_typed_read(vec![read.table.replace('.', "\0")], |domain, epoch|
+        let lease = self.statement_lease()?;
+        let p = self.prepare_typed_read(lease.as_deref(), vec![read.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_single_source_read(domain, epoch, read))?;
         // Native reads materialise their whole result: keep the result budget.
-        relational::spill::bounded(|| self.execute_bound_clocked(&p, &[], expected_version, None))
+        relational::spill::bounded(|| self.execute_bound_clocked_leased(&p, &[], expected_version, None, lease.as_deref()))
     }
     /// Trusted Admin entry point; gateways must authorize both source tables first.
     pub fn describe_typed_join(&mut self, read: relational::TwoSourceRead) -> Result<relational::Description, CoreError> {
         let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
-        let p = self.prepare_typed_read(vec![read.left.table.replace('.', "\0"), read.right.table.replace('.', "\0")], |domain, epoch|
+        let lease = self.statement_lease()?;
+        let p = self.prepare_typed_read(lease.as_deref(), vec![read.left.table.replace('.', "\0"), read.right.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_two_source_read(domain, epoch, read))?;
-        self.describe_bound_engine(&p)
+        self.describe_bound_engine(&p, lease.as_deref())
     }
     pub fn execute_typed_join(&mut self, read: relational::TwoSourceRead, expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
         self.refuse_task_session()?;
@@ -4574,9 +4775,10 @@ impl SqlSession {
         -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
-        let p = self.prepare_typed_read(vec![read.left.table.replace('.', "\0"), read.right.table.replace('.', "\0")], |domain, epoch|
+        let lease = self.statement_lease()?;
+        let p = self.prepare_typed_read(lease.as_deref(), vec![read.left.table.replace('.', "\0"), read.right.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_two_source_read(domain, epoch, read))?;
-        relational::spill::bounded(|| self.execute_bound_clocked(&p, &[], expected_version, None))
+        relational::spill::bounded(|| self.execute_bound_clocked_leased(&p, &[], expected_version, None, lease.as_deref()))
     }
     /// Trusted Admin entry point; gateways authorize the target and every source first.
     pub fn execute_typed_insert_select(&mut self, insert: relational::TypedInsertSelect,
@@ -4586,17 +4788,19 @@ impl SqlSession {
         // Counts only, and refused by `admit()`: the guard, no twin (R3-301).
         self.refuse_task_session()?;
         let target = insert.table.replace('.', "\0");
-        let p = self.prepare_typed_read(vec![target], |domain, epoch|
+        let lease = self.statement_lease()?;
+        let p = self.prepare_typed_read(lease.as_deref(), vec![target], |domain, epoch|
             relational::Prepared::from_typed_insert_select(domain, epoch, insert))?;
-        self.execute_bound_engine(&p, &[], expected_version)
+        self.execute_bound_kernel(&p, &[], expected_version, None, lease.as_deref())
     }
-    fn prepare_typed_read(&mut self, tables: Vec<String>,
+    fn prepare_typed_read(&mut self, db: Option<&EngineLease>, tables: Vec<String>,
         prepare: impl FnOnce(u128, u64) -> Result<relational::Prepared, relational::SqlError>) -> Result<relational::Prepared, CoreError> {
         let make = |s: &MetadataState<'_>| {
             if self.aborted { return Err(CoreError::Sql(relational::SqlError::Aborted)); }
             let epoch = if matches!(self.admin.inner.backend, Backend::V2(_)) { 0 } else { s.sql.epoch };
             let mut p = prepare(s.view.domain, epoch).map_err(CoreError::Sql)?;
             p.transaction = self.transaction_id;
+            p.engine_generation = db.map(EngineLease::prepared_generation);
             p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
             // Views can introduce dependencies beyond the authorized sources.
             for table in tables.into_iter().chain(p.authorization_tables().map_err(CoreError::Sql)?) {
@@ -4607,7 +4811,7 @@ impl SqlSession {
         };
         let result = match &self.staged {
             Some(s) => make(&MetadataState::borrow(s)),
-            None => self.inspect_metadata(make),
+            None => self.inspect_metadata_leased(db, make),
         };
         if result.is_err() { self.abort(); }
         result
@@ -4624,7 +4828,8 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
-        self.execute_bound_kernel(p, params, expected_version, None)
+        let lease = self.execution_lease(p)?;
+        self.execute_bound_kernel(p, params, expected_version, None, lease.as_deref())
     }
     /// The statement kernel. Its result carries the task's release tag
     /// (GD-0061 R3-301); only `release` or `untasked` take the value out.
@@ -4635,7 +4840,20 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
-        let (tag, expanded) = self.statement_tag(p)?;
+        let lease = self.execution_lease(p)?;
+        self.execute_bound_clocked_leased(p, params, expected_version, clock, lease.as_deref())
+    }
+
+    fn execute_bound_clocked_leased(
+        &mut self,
+        p: &relational::Prepared,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+        clock: Option<&relational::clock::ExecutionClock>,
+        db: Option<&EngineLease>,
+    ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
+        Self::check_prepared_generation(p, db)?;
+        let (tag, expanded) = self.statement_tag_leased(p, db)?;
         // GD-0061 R3-308: in a task session a write runs only inside the
         // protected commit; any other write is refused before it runs (and
         // logged, R3-309).
@@ -4644,13 +4862,13 @@ impl SqlSession {
         // carry this tag; any other caller gets it materialised behind the tag.
         let result = self.refuse_task_write(p).and_then(|()| {
             // GD-0061 R3-401: the task statement's slots and time limit.
-            let guard = crate::task::limits::StatementGuard::enter(self)?;
+            let guard = crate::task::limits::StatementGuard::enter_leased(self, db)?;
             let _active = guard.as_ref().map(crate::task::limits::StatementGuard::activate);
             match tag {
                 Some(_) => relational::spill::task_statement(|| {
-                    self.execute_bound_kernel(p, params, expected_version, clock)
+                    self.execute_bound_kernel(p, params, expected_version, clock, db)
                 }),
-                None => self.execute_bound_kernel(p, params, expected_version, clock),
+                None => self.execute_bound_kernel(p, params, expected_version, clock, db),
             }
         });
         match result {
@@ -4692,17 +4910,18 @@ impl SqlSession {
     /// statements return no task rows and get an empty plan, so any row
     /// would fail closed.
     #[allow(clippy::type_complexity)]
-    pub(crate) fn statement_tag(
+    fn statement_tag_leased(
         &self,
         p: &relational::Prepared,
+        db: Option<&EngineLease>,
     ) -> Result<(Option<Arc<crate::task::release::ReleaseTag>>, Option<relational::Prepared>), CoreError> {
         let mut expanded = None;
         let class = if self.task.is_some() { p.task_class() } else { crate::task::StatementClass::Other };
-        let tag = self.release_tag_with(class, p.parameter_count(), || {
+        let tag = self.release_tag_with_leased(class, p.parameter_count(), db, || {
             if !p.is_read() {
                 return Ok(Default::default());
             }
-            let (statement, plan) = self.task_output_plan(p)?;
+            let (statement, plan) = self.task_output_plan(p, db)?;
             expanded = Some(statement);
             Ok(plan)
         });
@@ -4723,13 +4942,18 @@ impl SqlSession {
         &self,
         p: &relational::Prepared,
     ) -> Result<relational::Prepared, CoreError> {
+        let lease = if self.task.is_some() { self.statement_lease()? } else { None };
+        self.task_column_rules_leased(p, lease.as_deref())
+    }
+
+    fn task_column_rules_leased(&self, p: &relational::Prepared, db: Option<&EngineLease>) -> Result<relational::Prepared, CoreError> {
         use crate::task::StatementClass;
         if self.task.is_none()
             || !matches!(p.task_class(), StatementClass::Select | StatementClass::Update)
         {
             return Ok(p.clone());
         }
-        let (expanded, _) = self.task_output_plan(p).map_err(CoreError::Task)?;
+        let (expanded, _) = self.task_output_plan(p, db).map_err(CoreError::Task)?;
         Ok(expanded)
     }
     pub(crate) fn task_search_path(&self) -> &[String] {
@@ -4738,18 +4962,17 @@ impl SqlSession {
     fn task_output_plan(
         &self,
         p: &relational::Prepared,
+        db: Option<&EngineLease>,
     ) -> Result<(relational::Prepared, crate::task::columns::OutputPlan), crate::task::TaskError> {
         use crate::task::TaskError;
         let core = |e: CoreError| TaskError::Core(Box::new(e));
         let ctx = self.task.as_ref().ok_or(TaskError::Revoked)?;
-        let def = self
-            .tasks()
-            .lookup(ctx.name.as_str())
+        let def = crate::task::catalog::lookup_leased(db, ctx.name.as_str())
             .map_err(core)?
             .filter(|def| def.id == ctx.task && !def.revoked)
             .ok_or(TaskError::Revoked)?;
-        let labels = self.task_column_labels().map_err(core)?;
-        let plan = self.inspect_metadata(|s| {
+        let labels = self.task_column_labels_leased(db).map_err(core)?;
+        let plan = self.inspect_metadata_leased(db, |s| {
             Ok(crate::task::columns::apply_in_catalog_with_path(
                 &def,
                 ctx.bound_def_version,
@@ -4778,10 +5001,11 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
+        db: Option<&EngineLease>,
     ) -> Result<relational::SqlResult, CoreError> {
         // A spilled v2 RETURNING or SELECT result is materialised here unless the
         // caller streams it (`relational::spill::streaming`); errors and unwinds drop it.
-        relational::spill::statement(|| self.execute_bound_clocked_once(p, params, expected_version, clock))
+        relational::spill::statement(|| self.execute_bound_clocked_once(p, params, expected_version, clock, db))
     }
     fn execute_bound_clocked_once(
         &mut self,
@@ -4789,16 +5013,26 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
+        db: Option<&EngineLease>,
     ) -> Result<relational::SqlResult, CoreError> {
         let _value_budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         if p.schema_context_differs(&self.search_path, &self.schema_user) {
             let mut bound = p.clone();
             bound.set_schema_context(self.search_path.clone(), self.schema_user.clone());
-            return self.execute_bound_clocked_once(&bound, params, expected_version, clock);
+            return self.execute_bound_clocked_once(&bound, params, expected_version, clock, db);
         }
-        if let Backend::V2(db) = &self.admin.inner.backend {
-            let db = db.clone();
+        if self.is_v2_engine() {
+            let Some(db) = db else {
+                if p.control() != Some("rollback") { return Err(CoreError::Fenced); }
+                if !params.is_empty() || expected_version.is_some() {
+                    return Err(CoreError::Sql(relational::SqlError::Parameters));
+                }
+                self.rollback();
+                return Ok(relational::SqlResult::default());
+            };
+            Self::check_prepared_generation(p, Some(db))?;
+            self.bind_sequence_generation(db);
             // Complete native materializations expire after any staged write,
             // including writes issued through SQL on the same v2 transaction.
             let revision = if self.v2_transaction.is_some() && !p.is_read() && p.control().is_none() {
@@ -4808,7 +5042,7 @@ impl SqlSession {
                 };
                 Some(revision)
             } else { None };
-            let result = self.execute_v2(&db, p, params, expected_version, clock);
+            let result = self.execute_v2(db, p, params, expected_version, clock);
             if result.is_ok() {
                 if let Some(revision) = revision { self.staged_revision = revision; }
                 if p.control() == Some("begin") { self.staged_revision = 0; }
@@ -5054,7 +5288,7 @@ impl SqlSession {
                 self.sequence_values.clone(), self.sequence_tables.clone(), self.search_path.clone()));
             match self.privilege_callback.as_ref().filter(|_| p.has_privilege_inquiry()) {
                 Some(callback) => context.with_privileges(callback.clone(), privilege_provider(
-                    PrivilegeImage::Legacy(snapshot), self.search_path.clone(), None, false)),
+                    PrivilegeImage::Legacy(snapshot), self.search_path.clone(), None, self.admin.roles(), None)),
                 None => context,
             }
         });
@@ -5308,6 +5542,10 @@ impl SqlSession {
     }
     pub fn rollback(&mut self) {
         let _ = self.settle_sequences();
+        self.rollback_without_settling();
+    }
+
+    fn rollback_without_settling(&mut self) {
         self.xact.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.copy_input = None;
         // A parked protected run is not an SQL transaction slot.
@@ -6472,6 +6710,87 @@ mod tests {
 #[cfg(all(test, feature = "engine-rocksdb"))]
 mod fk_target_plumbing_tests;
 
+/// Reuse the transaction's existing savepoint lifetime allocation and
+/// registration. An explicit statement does one acquire load to validate it.
+pub(crate) enum SessionLease {
+    Fresh(EngineLease),
+    Transaction(Arc<engine::txn::TxnLifetime>),
+}
+
+impl SessionLease {
+    pub(crate) fn into_holder(self, kind: Holder) -> Result<EngineLease, CoreError> {
+        match self {
+            Self::Fresh(lease) => Ok(lease),
+            Self::Transaction(lifetime) => lifetime.lease.as_ref().expect("leased transaction").child(kind),
+        }
+    }
+}
+
+impl From<EngineLease> for SessionLease {
+    fn from(lease: EngineLease) -> Self {
+        Self::Fresh(lease)
+    }
+}
+
+impl std::ops::Deref for SessionLease {
+    type Target = EngineLease;
+    fn deref(&self) -> &EngineLease {
+        match self {
+            Self::Fresh(lease) => lease,
+            Self::Transaction(lifetime) => lifetime.lease.as_ref().expect("leased transaction"),
+        }
+    }
+}
+
+/// A callback uses the transaction pin when one exists. A callback in a
+/// statement without a transaction registers only if it is actually invoked.
+/// The tag makes a retained callback permanently local to its original engine.
+enum CallbackLease {
+    Pinned(SessionLease),
+    Tagged(GenerationTag),
+}
+
+impl CallbackLease {
+    fn new(db: &EngineLease, txn: Option<&Transaction>) -> Self {
+        match txn.and_then(Transaction::engine_lifetime) {
+            Some(lifetime) => Self::Pinned(SessionLease::Transaction(Arc::clone(lifetime))),
+            None => Self::Tagged(db.tag()),
+        }
+    }
+
+    fn lease(&self, kind: Holder) -> Result<CallbackEngine<'_>, CoreError> {
+        match self {
+            Self::Pinned(db) => {
+                db.check()?;
+                Ok(CallbackEngine::Borrowed(db))
+            }
+            Self::Tagged(tag) => Ok(CallbackEngine::Owned(tag.lease(kind)?)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<EngineLease> for CallbackLease {
+    fn from(db: EngineLease) -> Self {
+        Self::Pinned(db.into())
+    }
+}
+
+enum CallbackEngine<'a> {
+    Borrowed(&'a EngineLease),
+    Owned(EngineLease),
+}
+
+impl std::ops::Deref for CallbackEngine<'_> {
+    type Target = EngineLease;
+    fn deref(&self) -> &EngineLease {
+        match self {
+            Self::Borrowed(db) => db,
+            Self::Owned(db) => db,
+        }
+    }
+}
+
 /// A protected run: the caller-owned transaction plus the row effects its
 /// statements produced (design section 6, D-C).
 // Constructed by `protected_commit` (R3-610); until it lands only tests do.
@@ -6484,12 +6803,74 @@ pub(crate) struct ProtectedRun {
 pub(crate) use v2_sql::{cross_check_effects, task_restore_statement};
 
 impl SqlSession {
-    /// The session's v2 database; `None` on the legacy engine (GD-0061
-    /// R3-615: the protected commit is v2 only, D9).
-    pub(crate) fn v2_db(&self) -> Option<Arc<v2::V2Db>> {
-        match &self.admin.inner.backend {
-            Backend::V2(db) => Some(Arc::clone(db)),
-            Backend::Legacy(_) => None,
+    pub(crate) fn statement_lease(&self) -> Result<Option<SessionLease>, CoreError> {
+        if self.is_v2_engine() { self.v2_lease(Holder::Sql).map(Some) } else { Ok(None) }
+    }
+
+    fn execution_lease(&self, p: &relational::Prepared) -> Result<Option<SessionLease>, CoreError> {
+        match self.statement_lease() {
+            Err(CoreError::Fenced) if p.control() == Some("rollback") => Ok(None),
+            result => result,
+        }
+    }
+
+    fn check_prepared_generation(p: &relational::Prepared, db: Option<&EngineLease>) -> Result<(), CoreError> {
+        // Other domains follow the normal validation and statement error cleanup.
+        if let Some(db) = db
+            && p.engine_generation.is_some_and(|prepared| {
+                let current = db.prepared_generation();
+                prepared.slot == current.slot && prepared.stamp != current.stamp
+            })
+            && p.domain == u128::from_be_bytes(db.meta.domain)
+            && p.control().is_none()
+        {
+            return Err(CoreError::Fenced);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn v2_lease(&self, kind: Holder) -> Result<SessionLease, CoreError> {
+        if let Some(lifetime) = self.v2_transaction.as_ref()
+            .or_else(|| self.protected.as_ref().map(|run| &run.txn))
+            .and_then(Transaction::engine_lifetime)
+        {
+            if self.native_generation.as_ref().is_none_or(|active| !Arc::ptr_eq(active, lifetime)) {
+                lifetime.lease.as_ref().expect("leased transaction").check()?;
+            }
+            return Ok(SessionLease::Transaction(Arc::clone(lifetime)));
+        }
+        if let Some(generation) = &self.task_generation {
+            return Ok(SessionLease::Fresh(generation.lease(kind)?));
+        }
+        self.admin.lease(kind)?.map(SessionLease::Fresh).ok_or(CoreError::Unsupported)
+    }
+
+    pub(crate) fn pin_native_generation(&mut self, already_admitted: bool) -> Result<(), CoreError> {
+        let Some(lifetime) = self.v2_transaction.as_ref().and_then(Transaction::engine_lifetime) else {
+            return Ok(());
+        };
+        if self.native_generation.as_ref().is_some_and(|active| Arc::ptr_eq(active, lifetime)) {
+            return Ok(());
+        }
+        if !already_admitted {
+            lifetime.lease.as_ref().expect("leased transaction").check()?;
+        }
+        self.native_generation = Some(Arc::clone(lifetime));
+        Ok(())
+    }
+
+    fn bind_sequence_generation(&mut self, db: &EngineLease) {
+        if self.sequence_generation.as_ref().is_none_or(|tag| tag.stamp() != db.stamp()) {
+            // Old records can retain their own Arcs. Give the new generation
+            // separate session storage so a late callback cannot mutate it.
+            if self.sequence_generation.is_some() {
+                self.sequence_values = Default::default();
+                self.sequence_unsettled = Default::default();
+                self.pending_sequences = Default::default();
+                self.xact = Default::default();
+                self.unnamed_plans.clear();
+            }
+            self.sequence_generation = Some(db.tag());
         }
     }
 

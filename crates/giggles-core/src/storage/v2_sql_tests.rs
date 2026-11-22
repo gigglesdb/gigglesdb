@@ -218,9 +218,9 @@ impl Fixture {
     fn admin(&self) -> &Admin {
         self.admin.as_ref().unwrap()
     }
-    fn db(&self) -> &v2::V2Db {
+    fn db(&self) -> crate::storage::EngineLease {
         match &self.admin().inner.backend {
-            Backend::V2(db) => db,
+            Backend::V2(_) => self.admin().test_v2(),
             _ => unreachable!(),
         }
     }
@@ -1767,7 +1767,7 @@ fn fk_validation_at_fixed_snapshots_crosschecks_witnesses() {
         s.execute("INSERT INTO c VALUES(1,1)", &[], None).unwrap();
         let mut pending = s.deferral.clone();
         let mut txn = f.db().begin(isolation);
-        validate_pending(f.db(), &mut txn, &mut pending).unwrap();
+        validate_pending(&f.db(), &mut txn, &mut pending).unwrap();
         drop(txn);
         s.execute("COMMIT", &[], None).unwrap();
         // A parent deleted after the snapshot. PostgreSQL 18.6 fails the

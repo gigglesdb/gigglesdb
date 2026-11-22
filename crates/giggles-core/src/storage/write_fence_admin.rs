@@ -1,4 +1,4 @@
-use super::{Admin, Backend, CoreError, Limits};
+use super::{Admin, CoreError, Holder, Limits};
 use std::path::Path;
 
 /// Public fence metadata; holder credentials and their digest are never exposed.
@@ -20,7 +20,7 @@ impl Admin {
     }
     /// Install or advance the durable write fence. Labels are at most 256 UTF-8 bytes.
     pub fn install_write_fence(&self, token: &[u8], label: &str) -> Result<u64, CoreError> {
-        let Backend::V2(db) = &self.inner.backend else {
+        let Some(db) = self.lease(Holder::Admin)? else {
             return Err(CoreError::Unsupported);
         };
         if db.task_kernel_unsupported() {
@@ -32,7 +32,7 @@ impl Admin {
     }
     /// Release only the matching holder's current fence epoch.
     pub fn release_write_fence(&self, token: &[u8], epoch: u64) -> Result<(), CoreError> {
-        let Backend::V2(db) = &self.inner.backend else {
+        let Some(db) = self.lease(Holder::Admin)? else {
             return Err(CoreError::Unsupported);
         };
         db.sequencer
@@ -40,7 +40,7 @@ impl Admin {
             .map_err(Into::into)
     }
     pub fn write_fence_status(&self) -> Result<Option<WriteFenceStatus>, CoreError> {
-        let Backend::V2(db) = &self.inner.backend else {
+        let Some(db) = self.lease(Holder::Admin)? else {
             return Ok(None);
         };
         Ok(db

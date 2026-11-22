@@ -139,7 +139,7 @@ fn pinned_export_allows_commits_and_restores_snapshot_roles_and_features() {
                 .unwrap();
             done.send(()).unwrap();
         });
-        export_inner(db, &root.join("backup"), RecoveryPoint::None, |ts| {
+        export_inner(&db, &root.join("backup"), RecoveryPoint::None, |ts| {
             assert_eq!(ts, before);
             start.send(()).unwrap();
             // These commits must complete while the export still owns its pin.
@@ -199,17 +199,19 @@ fn pinned_export_allows_commits_and_restores_snapshot_roles_and_features() {
     );
     drop(copy_sql);
     drop(read);
+    drop(copy);
     drop(restored);
     drop(sql);
+    drop(db);
     drop(admin);
     fs::remove_dir_all(root).unwrap();
 }
 
-struct BackupDb<'a>(&'a v2::V2Db);
-impl<'a> BackupDb<'a> {
-    fn from_admin(admin: &'a Admin) -> Self {
+struct BackupDb(crate::storage::EngineLease);
+impl BackupDb {
+    fn from_admin(admin: &Admin) -> Self {
         match &admin.inner.backend {
-            Backend::V2(db) => Self(db),
+            Backend::V2(_) => Self(admin.test_v2()),
             _ => panic!("expected v2"),
         }
     }
@@ -318,8 +320,10 @@ fn streaming_export_exceeds_legacy_limit_and_detects_corruption() {
         fs::write(root.join("malformed"), damaged).unwrap();
         assert!(Admin::verify_export(root.join("malformed")).is_err());
     }
+    drop(copy);
     drop(restored);
     drop(sql);
+    drop(db);
     drop(admin);
     fs::remove_dir_all(root).unwrap();
 }
@@ -330,9 +334,7 @@ fn export_omits_write_fence_and_restore_has_no_record() {
     let root = directory();
     fs::create_dir(&root).unwrap();
     let source = Admin::create_engine(root.join("db"), Limits::default(), Engine::V2).unwrap();
-    let Backend::V2(db) = &source.inner.backend else {
-        panic!("expected v2")
-    };
+    let db = source.test_v2();
     let features = engine::meta::validate_meta(db.kv.as_ref())
         .unwrap()
         .features;
@@ -365,9 +367,7 @@ fn export_omits_write_fence_and_restore_has_no_record() {
         Limits::default(),
     )
     .unwrap();
-    let Backend::V2(copy) = &restored.inner.backend else {
-        panic!("expected v2")
-    };
+    let copy = restored.test_v2();
     assert!(
         copy.kv
             .get(Keyspace::Meta, b"write_fence")
@@ -380,6 +380,8 @@ fn export_omits_write_fence_and_restore_has_no_record() {
             .write_fence
             .is_none()
     );
+    drop(copy);
+    drop(db);
     drop(restored);
     drop(source);
     fs::remove_dir_all(root).unwrap();

@@ -116,6 +116,11 @@ impl Gc {
 
     /// Changes the retention window for later watermark computations. A
     /// longer window never rewinds the durable watermark.
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn test_retention_ms(&self) -> u64 {
+        self.retention_ms.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn set_retention(&self, retention: Duration) {
         self.retention_ms
             .store(duration_ms(retention), Ordering::Relaxed);

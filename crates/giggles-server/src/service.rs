@@ -4524,6 +4524,69 @@ mod lifecycle_tests {
         assert!(session.release_page(read).unwrap().into_inner().rows.is_empty());
     }
 
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn privilege_inquiry_preserves_native_fence_after_sql_admission() {
+        use giggles_core::{
+            CrashPoint,
+            operations::{self, Bindings, ValueExpr, once::{
+                ONCE_CONTRACT_VERSION, OnceBody, OnceError, OnceIdentity, OnceRequest, OnceTime,
+            }},
+        };
+        use std::time::{Duration, Instant};
+
+        let service = authorization_fixture(Engine::V2);
+        let mut session = service.role_session("owner").unwrap();
+        session.set_postgres_surface();
+        session.execute_sql("CREATE TABLE fence_writer (id BIGINT PRIMARY KEY)", &[]).unwrap();
+        let text = "SELECT has_table_privilege('t','SELECT') FROM t";
+        assert_eq!(session.execute_sql(text, &[]).unwrap().rows.len(), 1);
+        let plan = session.prepare(text).unwrap();
+        let callback = crate::pg_catalog_wire::privilege_callback(&session);
+
+        let admin = service.admin.clone();
+        let request = OnceRequest {
+            contract_version: ONCE_CONTRACT_VERSION,
+            identity: OnceIdentity {
+                database_domain: admin.authority_metadata().unwrap().0,
+                tenant: 0,
+                namespace: "privilege-inquiry".into(),
+                key: b"native-fence".to_vec(),
+            },
+            retention_seconds: 60,
+            body: OnceBody::Operation(operations::Request::Insert {
+                table: "fence_writer".into(),
+                values: vec![("id".into(), ValueExpr::Literal(relational::Value::Int(1)))],
+            }),
+        };
+        let callback: giggles_core::PrivilegeCallback = Arc::new(move |name, args, metadata| {
+            // This is the first inquiry, inside the admitted SQL execution.
+            admin.set_crash_point(CrashPoint::ErrorAfterCommit).unwrap();
+            let result = operations::Engine::new(admin.clone()).execute_once(
+                &request, &Bindings::new(), &|| Ok(OnceTime {
+                    lower_unix_seconds: 100,
+                    upper_unix_seconds: 101,
+                    valid_until: Instant::now() + Duration::from_secs(10),
+                }),
+            );
+            assert_eq!(result, Err(OnceError::Unknown));
+            callback(name, args, metadata)
+        });
+        let clock = StatementClock {
+            transaction_us: 100,
+            statement_us: 100,
+            unavailable: None,
+            zone: None,
+            wall: None,
+        };
+        let result = session.sql.with_privilege_callback(callback, |sql| {
+            sql.execute_prepared_at(&plan, &[], None, &clock)
+        });
+        let error = result.unwrap_err();
+        assert_eq!(sqlstate(&error), "08007");
+        assert_eq!(error, CoreError::Fenced);
+    }
+
     /// GD-0075 P11-5: a role recheck that fails transiently (a fenced gateway's 40001, an
     /// unavailable range's 08007) keeps its own SQLSTATE; other failures stay 28000.
     #[test]

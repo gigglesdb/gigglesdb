@@ -99,7 +99,7 @@ fn real_task(admin: &crate::storage::Admin) -> TaskContext {
         .unwrap();
     let sql = admin.sql_session();
     // Release checks expiry against the database clock: pin it to `now`.
-    sql.v2_db().unwrap().set_wall_clock(std::sync::Arc::new(
+    sql.v2_lease(crate::storage::Holder::TaskRun).unwrap().set_wall_clock(std::sync::Arc::new(
         crate::storage::engine::commit::ManualClock::new(now.0 as u64),
     ));
     crate::task::context::open_context(&sql, &context().name, &"agent_exec".to_string(), [7; 32], now, 0)
@@ -146,7 +146,7 @@ fn no_task_release_is_move() {
     // The counter does count: one transaction with one read.
     #[cfg(feature = "engine-rocksdb")]
     {
-        let db = sql.v2_db().unwrap();
+        let db = sql.v2_lease(crate::storage::Holder::TaskRun).unwrap();
         let mut txn = db.begin(crate::storage::Isolation::ReadCommitted);
         txn.get(crate::storage::Keyspace::Kernel, b"x").unwrap();
         assert!(crate::storage::engine::txn::engine_ops() >= ops + 2);

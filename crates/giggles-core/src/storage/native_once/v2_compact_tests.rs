@@ -11,8 +11,8 @@ fn fixture() -> (Dir, Admin) {
     admin.sql_session().execute("CREATE TABLE items(id BIGINT PRIMARY KEY)", &[], None).unwrap();
     (dir, admin)
 }
-fn db(admin: &Admin) -> &crate::storage::v2::V2Db {
-    let Backend::V2(db) = &admin.inner.backend else { panic!("v2") }; db
+fn db(admin: &Admin) -> crate::storage::EngineLease {
+    admin.test_v2()
 }
 fn at(lower: u64, upper: u64) -> Result<OnceTime, OnceClockUnavailable> {
     Ok(OnceTime { lower_unix_seconds: lower, upper_unix_seconds: upper,

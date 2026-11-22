@@ -697,6 +697,7 @@ impl Copy {
             domain,
             epoch: state.epoch,
             transaction: None,
+            engine_generation: None,
             params: 0,
             parameter_types: vec![],
             relations: vec![self.relation.clone()],

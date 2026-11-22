@@ -289,6 +289,8 @@ fn decode_entries<'de, D: serde::Deserializer<'de>>(
     d.deserialize_map(Entries)
 }
 
+pub(super) type OnceOwners = crate::cancellation::WaitMutex<BTreeMap<NativeOnceKey, InFlight>>;
+
 pub(super) struct InFlight {
     submitted: [u8; 32],
     token: Arc<()>,
@@ -298,6 +300,20 @@ pub(crate) struct NativeOnceOwner {
     key: NativeOnceKey,
     submitted: [u8; 32],
     token: Arc<()>,
+    lease: Option<EngineLease>,
+}
+#[cfg(feature = "engine-rocksdb")]
+impl NativeOnceOwner {
+    pub(crate) fn belongs_to(&self, admin: &Admin) -> bool {
+        Arc::ptr_eq(&self.inner, &admin.inner)
+    }
+
+    pub(crate) fn lease(&self) -> Result<Option<&EngineLease>, CoreError> {
+        if let Some(lease) = &self.lease {
+            lease.check()?;
+        }
+        Ok(self.lease.as_ref())
+    }
 }
 impl fmt::Debug for NativeOnceOwner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -309,7 +325,7 @@ impl Drop for NativeOnceOwner {
         // Cleanup must work after cancellation. No publication gate is acquired.
         let mut owners = self
             .inner
-            .native_once_owners
+            .once_owners(self.lease.as_ref())
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if owners
@@ -369,6 +385,13 @@ fn persistence(error: GuardedPersistError) -> NativeOnceError {
     }
 }
 impl Inner {
+    fn once_owners<'a>(&'a self, db: Option<&'a EngineLease>) -> &'a OnceOwners {
+        match db {
+            Some(db) => db.once_owners(),
+            None => &self.native_once_owners,
+        }
+    }
+
     fn native_once_locked<T>(
         &self,
         work: impl FnOnce(&mut State) -> NativeResult<T>,
@@ -394,12 +417,12 @@ impl Admin {
         key: NativeOnceKey,
         submitted_fingerprint: [u8; 32],
     ) -> NativeResult<NativeOnceAdmission> {
-        self.inner.native_once_view(|state| {
+        self.inner.native_once_view(|state, db| {
             check_key(state, &key)?;
             if let Some(record) = retained(state, &key)? {
                 return replay(&record, submitted_fingerprint).map(NativeOnceAdmission::Replay);
             }
-            let mut owners = self.inner.native_once_owners.lock_cancellable()?;
+            let mut owners = self.inner.once_owners(db).lock_cancellable()?;
             if let Some(owner) = owners.get(&key) {
                 return Err(if owner.submitted == submitted_fingerprint {
                     NativeOnceError::InProgress
@@ -413,6 +436,7 @@ impl Admin {
             if identities(state).saturating_add(owners.len()) >= MAX_NATIVE_RECORDS {
                 return Err(NativeOnceError::RetentionUnavailable);
             }
+            let lease = db.map(|db| db.child(Holder::NativeOnce)).transpose()?;
             let token = Arc::new(());
             owners.insert(
                 key.clone(),
@@ -426,6 +450,7 @@ impl Admin {
                 key,
                 submitted: submitted_fingerprint,
                 token,
+                lease,
             }))
         })
     }
@@ -434,7 +459,7 @@ impl Admin {
         &self,
         key: &NativeOnceKey,
     ) -> NativeResult<NativeOnceLookup> {
-        self.inner.native_once_view(|state| {
+        self.inner.native_once_view(|state, db| {
             check_key(state, key)?;
             if let Some(record) = retained(state, key)? {
                 return Ok(if record.result.is_some() {
@@ -446,7 +471,7 @@ impl Admin {
                 });
             }
             Ok(
-                if self.inner.native_once_owners.lock_cancellable()?.contains_key(key) {
+                if self.inner.once_owners(db).lock_cancellable()?.contains_key(key) {
                     NativeOnceLookup::InProgress
                 } else {
                     NativeOnceLookup::Absent

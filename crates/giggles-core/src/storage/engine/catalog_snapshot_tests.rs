@@ -59,7 +59,7 @@ fn gateway_token_reads_leave_the_catalog_cache_unlocked() {
         db::{attach, local::LocalCluster},
         txn::ClusterConfig,
     };
-    use crate::storage::{Backend, Limits};
+    use crate::storage::Limits;
     use std::{sync::mpsc, time::Duration};
 
     let cluster = LocalCluster::new(&[]);
@@ -71,9 +71,7 @@ fn gateway_token_reads_leave_the_catalog_cache_unlocked() {
         Limits::default(),
     )
     .unwrap();
-    let Backend::V2(db) = &gateway.admin.inner.backend else {
-        unreachable!()
-    };
+    let db = gateway.admin.test_v2();
     let catalog = db.catalog();
     for acquisition in 0..5 {
         let (entered, waiting) = mpsc::channel();

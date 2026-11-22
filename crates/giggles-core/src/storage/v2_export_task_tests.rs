@@ -12,9 +12,9 @@ fn directory() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("v2-export-task-{:032x}", u128::from_be_bytes(nonce)))
 }
 
-fn v2(admin: &Admin) -> &v2::V2Db {
+fn v2(admin: &Admin) -> crate::storage::EngineLease {
     match &admin.inner.backend {
-        Backend::V2(db) => db,
+        Backend::V2(_) => admin.test_v2(),
         _ => panic!("expected v2"),
     }
 }
@@ -59,7 +59,7 @@ fn export_refused_with_protected_bit_and_no_file_created() {
     let before = listing(&root);
     assert!(matches!(admin.export(root.join("backup")), Err(CoreError::Unsupported)));
     assert!(matches!(
-        export_inner(db, &root.join("backup"), RecoveryPoint::None, |_| {
+        export_inner(&db, &root.join("backup"), RecoveryPoint::None, |_| {
             panic!("refusal must precede the export snapshot")
         }),
         Err(CoreError::Unsupported)
@@ -67,6 +67,7 @@ fn export_refused_with_protected_bit_and_no_file_created() {
     // Neither the destination nor a staging file was created.
     assert!(!root.join("backup").exists());
     assert_eq!(listing(&root), before);
+    drop(db);
     drop(admin);
     // The refusal also holds after reopen.
     let admin = Admin::open(root.join("db"), Limits::default()).unwrap();
@@ -151,6 +152,7 @@ fn export_bytes_unchanged_without_bits() {
         2
     );
     drop(restored);
+    drop(db);
     drop(admin);
     fs::remove_dir_all(root).unwrap();
 }
@@ -205,7 +207,7 @@ fn assert_export_refused(root: &Path, admin: &Admin) {
     let before = listing(root);
     assert!(matches!(admin.export(root.join("backup")), Err(CoreError::Unsupported)));
     assert!(matches!(
-        export_inner(v2(admin), &root.join("backup"), RecoveryPoint::None, |_| {
+        export_inner(&v2(admin), &root.join("backup"), RecoveryPoint::None, |_| {
             panic!("refusal must precede the export snapshot")
         }),
         Err(CoreError::Unsupported)

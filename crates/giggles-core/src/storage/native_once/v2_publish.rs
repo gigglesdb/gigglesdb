@@ -10,6 +10,12 @@ impl SqlSession {
         clock: &mut dyn FnMut() -> NativeResult<NativeClockLease>,
     ) -> NativeResult<(NativeOnceRecord, bool)> {
         if !Arc::ptr_eq(&self.admin.inner, &owner.inner) { return Err(NativeOnceError::DomainMismatch); }
+        let db = owner.lease()?.ok_or(CoreError::Fenced)?;
+        setup.lease.check()?;
+        let session = self.v2_lease(Holder::NativeOnce)?;
+        if !setup.lease.same_generation(db) || !session.same_generation(db) {
+            return Err(CoreError::Fenced.into());
+        }
         if !(1..=MAX_NATIVE_RETENTION_SECONDS).contains(&retention_seconds) || result.len() > MAX_NATIVE_RESULT_BYTES {
             return Err(NativeOnceError::RetentionUnavailable);
         }
@@ -26,7 +32,7 @@ impl SqlSession {
             self.pending_sequences.lock().unwrap_or_else(|e| e.into_inner()).clear();
         }
         let inner = self.admin.inner.clone();
-        let Backend::V2(db) = &inner.backend else { unreachable!() };
+        let _ticket = inner.enter()?;
         // Match SQL COMMIT's sequence validation, serialization and publication.
         let mut live = db.sql_counters.lock_cancellable()?;
         let txn = self.v2_transaction.as_mut().expect("active transaction");
@@ -34,18 +40,20 @@ impl SqlSession {
             v2_sql::validate_pending(db, txn, &mut self.deferral)?;
             v2_sql::sql_sequences::stage_pending(db, txn, &self.pending_sequences)?;
         }
-        let _ticket = inner.enter()?;
         let _gate = inner.gate.lock_notified(|| {
             inner.decision_point(DecisionPoint::WaitingLock)
         })?;
         if inner.fenced.load(Ordering::Acquire) { return Err(CoreError::Fenced.into()); }
-        let (ledger, header) = v2::read_v2_view(db).inspect_err(|error| inner.fence_error(engine::kv::FenceSite::NativeOnceLedger, error))?;
+        let (ledger, header) = v2::read_v2_view(db).inspect_err(|error| {
+            db.fence_engine_error(engine::kv::FenceSite::NativeOnceLedger, error);
+            inner.fenced.store(true, Ordering::Release);
+        })?;
         let view = v2::v2_view(db, ledger.as_ref(), header);
         check_key(&view, &owner.key)?;
         if let Some(record) = retained(&view, &owner.key)? {
             return replay(&record, owner.submitted).map(|record| (record, true));
         }
-        if !inner.native_once_owners.lock_cancellable()?.get(&owner.key)
+        if !db.once_owners().lock_cancellable()?.get(&owner.key)
             .is_some_and(|entry| Arc::ptr_eq(&entry.token, &owner.token)) {
             return Err(CoreError::Fenced.into());
         }
@@ -78,6 +86,7 @@ impl SqlSession {
                 (lease, response)
             }
         };
+        db.check()?;
         let point = *inner.crash.lock().map_err(|_| CoreError::Fenced)?;
         if point == CrashPoint::BeforeCommit { crash_now(); }
         if point == CrashPoint::ErrorBeforeCommit { return Err(CoreError::Storage("injected before commit".into()).into()); }
@@ -94,7 +103,8 @@ impl SqlSession {
         db.catalog().commit_ddl_guarded(txn, guard).map_err(|error| match error {
             TxnError::Guard(GuardRejection::LeaseExpired) => NativeOnceError::ClockUncertain,
             TxnError::CommitAmbiguous => {
-                inner.fence_native_commit();
+                db.fence_native_commit();
+                inner.fenced.store(true, Ordering::Release);
                 CoreError::Storage("engine commit outcome unknown".into()).into()
             }
             other => CoreError::from(other).into(),
@@ -114,7 +124,8 @@ impl SqlSession {
         if point == CrashPoint::AfterCommit { crash_now(); }
         inner.decision_point(DecisionPoint::Committed);
         if point == CrashPoint::ErrorAfterCommit {
-            inner.fence_native_commit();
+            db.fence_native_commit();
+                inner.fenced.store(true, Ordering::Release);
             return Err(CoreError::Storage("injected lost commit response".into()).into());
         }
         if point == CrashPoint::BeforeAck { crash_now(); }

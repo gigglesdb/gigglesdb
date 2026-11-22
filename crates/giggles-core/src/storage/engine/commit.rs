@@ -324,9 +324,17 @@ struct Shared {
     sync_writes: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     highwater_puts: std::sync::atomic::AtomicUsize,
-    visible: AtomicU64,
+    visible: Arc<AtomicU64>,
     active: [Mutex<BTreeMap<Ts, usize>>; SNAPSHOT_SHARDS],
 }
+/// Read-only access to published time without retaining a sequencer or KV.
+pub(crate) struct VisibleClock(Arc<AtomicU64>);
+impl VisibleClock {
+    pub(crate) fn read(&self) -> Ts {
+        Ts(self.0.load(Ordering::Acquire))
+    }
+}
+
 pub(crate) struct SnapshotHandle {
     shared: Arc<Shared>,
     shard: usize,
@@ -454,6 +462,10 @@ pub(crate) struct Sequencer {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 impl Sequencer {
+    pub(crate) fn visible_clock(&self) -> VisibleClock {
+        VisibleClock(Arc::clone(&self.shared.visible))
+    }
+
     /// Fence future decisions without joining the worker or waiting for Sync.
     pub(crate) fn stop_submissions(&self) {
         self.shared.stopped.store(true, Ordering::Release);
@@ -485,6 +497,16 @@ impl Sequencer {
     #[cfg(any(test, feature = "test-commit-sync"))]
     pub(crate) fn set_sync_hook(&self, hook: Option<Arc<crate::CommitSyncHook>>) {
         *self.shared.sync_hook.lock().unwrap() = hook;
+    }
+
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn test_worker_joined(&self) -> bool {
+        self.worker.lock().unwrap().is_none()
+    }
+
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn test_has_sync_hook(&self) -> bool {
+        self.shared.sync_hook.lock().unwrap().is_some()
     }
 
     #[cfg(test)]
@@ -563,7 +585,7 @@ impl Sequencer {
             sync_writes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             highwater_puts: std::sync::atomic::AtomicUsize::new(0),
-            visible: AtomicU64::new(seed.0),
+            visible: Arc::new(AtomicU64::new(seed.0)),
             active: std::array::from_fn(|_| Mutex::new(BTreeMap::new())),
         });
         let served = Arc::new(ServedGate::new(Ts(0)));

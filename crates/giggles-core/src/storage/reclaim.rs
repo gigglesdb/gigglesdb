@@ -16,7 +16,7 @@ pub struct ReclaimStats {
 }
 #[derive(Default)]
 pub(super) struct Registry {
-    builds: Vec<(Range<u64>, Weak<()>)>,
+    builds: Vec<(Range<u64>, Weak<engine::txn::TxnLifetime>)>,
     next: [u64; 2],
 }
 impl Admin {
@@ -25,7 +25,7 @@ impl Admin {
     pub fn reclaim_storage(&self) -> Result<ReclaimStats, CoreError> {
         let _ticket = self.inner.enter_sql()?;
         match &self.inner.backend {
-            Backend::V2(db) => db.reclaim_storage(usize::MAX),
+            Backend::V2(slot) => slot.fresh(crate::storage::Holder::Admin)?.reclaim_storage(usize::MAX),
             _ => Ok(ReclaimStats::default()),
         }
     }

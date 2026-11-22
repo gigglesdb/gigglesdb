@@ -87,9 +87,7 @@ fn single_node_creation_preserves_initial_meta() {
         u128::from_be_bytes(nonce),
     ));
     let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
-    let crate::storage::Backend::V2(db) = &admin.inner.backend else {
-        unreachable!();
-    };
+    let db = admin.test_v2();
     let actual = db
         .kv
         .snapshot()
@@ -115,6 +113,7 @@ fn single_node_creation_preserves_initial_meta() {
     ];
     expected.sort();
     assert_eq!(actual, expected);
+    drop(db);
     drop(admin);
     std::fs::remove_dir_all(path).unwrap();
 }

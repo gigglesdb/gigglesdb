@@ -28,9 +28,9 @@ fn attach(backend: &Arc<MemKv>) -> Admin {
     Admin::attach_v2_backend(backend.clone(), Limits::default(), DEFAULT_WRITE_SET_BYTES).unwrap()
 }
 
-fn db(admin: &Admin) -> Arc<V2Db> {
+fn db(admin: &Admin) -> crate::storage::EngineLease {
     match &admin.inner.backend {
-        Backend::V2(db) => db.clone(),
+        Backend::V2(_) => admin.test_v2(),
         Backend::Legacy(_) => unreachable!("v2 backend expected"),
     }
 }

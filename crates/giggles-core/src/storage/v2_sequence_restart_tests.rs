@@ -334,9 +334,7 @@ fn old_orphan_counter_is_retired_on_open() {
         scalar(&mut s, "SELECT nextval('ids')");
         let stale;
         {
-            let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
-                unreachable!()
-            };
+            let db = f.admin.as_ref().unwrap().test_v2();
             let mut txn = db.begin(Isolation::ReadCommitted);
             let parts = db.catalog().parts(&mut txn).unwrap();
             let (&id, def) = parts.ext.sequences.iter().next().unwrap();
@@ -369,12 +367,13 @@ fn old_orphan_counter_is_retired_on_open() {
         std::fs::remove_file(backup).unwrap();
         drop(s);
         f.reopen();
-        let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else { unreachable!() };
+        let db = f.admin.as_ref().unwrap().test_v2();
         assert!(db.kv.get(Keyspace::Seq, &stale).unwrap().is_none());
         assert!(engine::meta::open_checks(db.kv.as_ref()).unwrap().stale_counters.is_empty());
         let mut s = f.session();
         assert_eq!(scalar(&mut s, "SELECT nextval('ids')"), if matching { 10 } else { 1 });
         drop(s);
+        drop(db);
         f.reopen();
     }
 }
@@ -387,7 +386,7 @@ fn invalid_live_or_missing_sequence_counter_stays_corrupt() {
         run(&mut s, "CREATE SEQUENCE ids");
         scalar(&mut s, "SELECT nextval('ids')");
         {
-            let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else { unreachable!() };
+            let db = f.admin.as_ref().unwrap().test_v2();
             let mut txn = db.begin(Isolation::ReadCommitted);
             let parts = db.catalog().parts(&mut txn).unwrap();
             let (&id, def) = parts.ext.sequences.iter().next().unwrap();

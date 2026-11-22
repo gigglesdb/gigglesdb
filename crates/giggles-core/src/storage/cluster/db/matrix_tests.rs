@@ -641,9 +641,7 @@ fn union_all_gateway_parity() {
                 .unwrap();
         }
     }
-    let Backend::V2(db) = &gateways[0].admin.inner.backend else {
-        unreachable!();
-    };
+    let db = gateways[0].admin.test_v2();
     let parts = db
         .catalog()
         .parts(&mut db.begin(crate::storage::engine::txn::Isolation::ReadCommitted))
