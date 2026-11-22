@@ -853,6 +853,13 @@ impl Catalog {
         Ok(())
     }
 
+    /// Stages an SQL catalog diff in `txn`.
+    ///
+    /// The caller must hold `Table(0)` AccessExclusive through commit for any
+    /// sequence record change. This keeps committed sequence incarnations
+    /// stable while an INSERT reuses its resolution of a column default.
+    /// Debug builds assert this here; sequence-record writes that bypass
+    /// `apply_diff` are not checked and must follow the same rule.
     pub(crate) fn apply_diff(
         &self,
         txn: &mut Transaction,
@@ -965,6 +972,19 @@ impl Catalog {
             .collect();
         if changes.is_empty() {
             return Ok(());
+        }
+        #[cfg(debug_assertions)]
+        if changes.keys().any(|key| {
+            matches!(catalog_codec::classify_catalog_key(key), Ok(CatalogKind::Sequence))
+        }) {
+            let locks = match txn.services() {
+                TxnServices::Local { locks, .. } => locks.as_ref(),
+                TxnServices::Cluster(cluster) => cluster.gateway_locks(),
+            };
+            debug_assert!(
+                locks.holds_mode(txn.id(), LockKey::Table(0), LockMode::AccessExclusive),
+                "sequence catalog changes require Table(0) AccessExclusive"
+            );
         }
         let mut tables = BTreeSet::new();
         for key in changes.keys() {

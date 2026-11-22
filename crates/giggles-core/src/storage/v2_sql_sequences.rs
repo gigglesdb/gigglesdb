@@ -243,6 +243,15 @@ thread_local! {
     static DEFAULT_GRANT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(all(test, feature = "engine-rocksdb"))]
+type ColumnDefaultDrawHook = Box<dyn FnOnce(i64)>;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+thread_local! {
+    static AFTER_COLUMN_DEFAULT_DRAW: std::cell::RefCell<Option<ColumnDefaultDrawHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(feature = "test-metadata-counts")]
 impl SequenceDefaultGrants {
     #[doc(hidden)]
@@ -734,6 +743,13 @@ pub(super) fn callback(
                     .lock()
                     .map_err(|_| CoreError::Fenced)?
                     .insert((id, def.incarnation), result);
+            }
+            #[cfg(all(test, feature = "engine-rocksdb"))]
+            if origin == SequenceOrigin::ColumnDefault
+                && operation == "nextval"
+                && let Some(hook) = AFTER_COLUMN_DEFAULT_DRAW.take()
+            {
+                hook(result);
             }
             return Ok(relational::Value::Int(result));
         }

@@ -45,6 +45,17 @@ fn setup() -> (Arc<MemKv>, Arc<Sequencer>, Arc<LockManager>, Catalog) {
 fn txn(seq: &Arc<Sequencer>, locks: &Arc<LockManager>, id: u64) -> Transaction {
     Transaction::begin(seq, locks, TxnId(id), Isolation::ReadCommitted)
 }
+fn sequence_ddl_txn(seq: &Arc<Sequencer>, locks: &Arc<LockManager>, id: u64) -> Transaction {
+    let txn = txn(seq, locks, id);
+    txn.acquire_lock(
+        LockKey::Table(0),
+        LockMode::AccessExclusive,
+        Some(Instant::now() + Duration::from_secs(5)),
+        &|| false,
+    )
+    .unwrap();
+    txn
+}
 fn empty() -> CatalogParts {
     CatalogParts {
         tables: BTreeMap::new(),
@@ -153,7 +164,7 @@ fn diff_roundtrips_owned_sequence_identity_and_check_after_crash() {
         },
     );
     wanted.heap.insert(ids.start + 5);
-    let mut tx = txn(&seq, &locks, 1);
+    let mut tx = sequence_ddl_txn(&seq, &locks, 1);
     catalog
         .apply_diff(&mut tx, &empty(), &wanted, &ids, None, &|| false)
         .unwrap();
@@ -237,9 +248,18 @@ fn diff_concurrent_same_name_serializes_and_rejects_stale_creator() {
             let (catalog, seq, locks, barrier) =
                 (catalog.clone(), seq.clone(), locks.clone(), barrier.clone());
             thread::spawn(move || {
+                // Both transactions begin before the barrier so the loser keeps a
+                // stale snapshot; Table(0) is taken only after it, as SQL DDL does.
                 let mut tx = txn(&seq, &locks, index as u64 + 1);
                 let wanted = serial_parts(&ids);
                 barrier.wait();
+                tx.acquire_lock(
+                    LockKey::Table(0),
+                    LockMode::AccessExclusive,
+                    Some(Instant::now() + Duration::from_secs(5)),
+                    &|| false,
+                )
+                .unwrap();
                 match catalog.apply_diff(
                     &mut tx,
                     &empty(),
@@ -279,7 +299,7 @@ fn diff_rejects_each_new_object_id_outside_reservation() {
     let (_, seq, locks, catalog) = setup();
     let ids = catalog.reserve_ids(5).unwrap();
     let before = serial_parts(&ids);
-    let mut tx = txn(&seq, &locks, 1);
+    let mut tx = sequence_ddl_txn(&seq, &locks, 1);
     catalog
         .apply_diff(&mut tx, &empty(), &before, &ids, None, &|| false)
         .unwrap();
@@ -356,7 +376,7 @@ fn diff_rename_preserves_explicit_primary_constraint_name() {
     let (mem, seq, locks, catalog) = setup();
     let ids = catalog.reserve_ids(5).unwrap();
     let before = serial_parts(&ids);
-    let mut tx = txn(&seq, &locks, 1);
+    let mut tx = sequence_ddl_txn(&seq, &locks, 1);
     catalog
         .apply_diff(&mut tx, &empty(), &before, &ids, None, &|| false)
         .unwrap();
@@ -401,7 +421,7 @@ fn diff_drop_owned_sequence_removes_counter_with_catalog_commit() {
     let ids = catalog.reserve_ids(5).unwrap();
     let before = serial_parts(&ids);
     let key = catalog_codec::counter_key(ids.start + 2, 17);
-    let mut tx = txn(&seq, &locks, 1);
+    let mut tx = sequence_ddl_txn(&seq, &locks, 1);
     catalog
         .apply_diff(&mut tx, &empty(), &before, &ids, None, &|| false)
         .unwrap();
@@ -421,7 +441,7 @@ fn diff_drop_owned_sequence_removes_counter_with_catalog_commit() {
     )
     .unwrap();
     assert!(seq.kv().get(Keyspace::Seq, &key).unwrap().is_some());
-    let mut tx = txn(&seq, &locks, 2);
+    let mut tx = sequence_ddl_txn(&seq, &locks, 2);
     catalog
         .apply_diff(&mut tx, &before, &empty(), &(0..0), None, &|| false)
         .unwrap();
@@ -463,7 +483,7 @@ fn diff_identical_parts_buffer_no_catalog_or_counter_writes() {
     let (_, seq, locks, catalog) = setup();
     let ids = catalog.reserve_ids(5).unwrap();
     let before = serial_parts(&ids);
-    let mut tx = txn(&seq, &locks, 1);
+    let mut tx = sequence_ddl_txn(&seq, &locks, 1);
     catalog
         .apply_diff(&mut tx, &empty(), &before, &ids, None, &|| false)
         .unwrap();

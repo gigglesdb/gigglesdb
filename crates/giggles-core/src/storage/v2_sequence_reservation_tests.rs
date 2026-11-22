@@ -1624,7 +1624,11 @@ fn native_many_between_rows_crash_preserves_returned_ids() {
 #[cfg(feature = "engine-rocksdb")]
 mod default_memo_tests {
     use super::*;
+    use crate::cancellation::Cancellation;
     use crate::relational::clock::SequenceOrigin;
+    use engine::locks::{LockKey, LockMode};
+    use engine::txn::TxnServices;
+    use std::{sync::mpsc, time::{Duration, Instant}};
 
     fn session_with_bindings(fixture: &Fixture) -> SqlSession {
         let mut session = fixture.session();
@@ -1655,6 +1659,149 @@ mod default_memo_tests {
             run(&mut sql, &insert);
             assert_eq!((first, resolutions_since(before)), ([1, 0, 0], [2, 0, 0]), "bindings={bindings}");
         }
+    }
+
+    fn assert_sequence_ddl_waits(ddl: &str, next_default: Value) {
+        let f = Fixture::new(Engine::V2);
+        let mut setup = f.session();
+        run(&mut setup, "CREATE SEQUENCE s START 100");
+        run(
+            &mut setup,
+            "CREATE TABLE t (slot INT PRIMARY KEY, id BIGINT DEFAULT nextval('s'))",
+        );
+        assert_eq!(scalar(&mut setup, "SELECT nextval('s')"), 100);
+
+        let mut insert = session_with_bindings(&f);
+        run(&mut insert, "BEGIN");
+        let txn = insert.v2_transaction.as_ref().unwrap();
+        let insert_id = txn.id();
+        let TxnServices::Local { locks, .. } = txn.services() else {
+            unreachable!("the fixture uses local transactions");
+        };
+        let locks = Arc::clone(locks);
+        let mut ddl_session = f.session();
+        run(&mut ddl_session, "BEGIN");
+        let ddl_id = ddl_session.v2_transaction.as_ref().unwrap().id();
+
+        let wait = Duration::from_secs(10);
+        let bounded_run = |session: &mut SqlSession, sql: &str| {
+            Cancellation::new(Some(Instant::now() + 2 * wait)).scope(|| run(session, sql))
+        };
+
+        thread::scope(|scope| {
+            let (drawn, first_draw) = mpsc::channel();
+            let (release, resume) = mpsc::channel();
+            let (insert_done, inserted) = mpsc::channel();
+            scope.spawn(move || {
+                AFTER_COLUMN_DEFAULT_DRAW.set(Some(Box::new(move |value| {
+                    if drawn.send(value).is_ok() {
+                        // A dropped sender also releases the writer on test failure.
+                        // Watchdog with slack beyond every controller deadline below.
+                        assert_ne!(resume.recv_timeout(wait * 3), Err(mpsc::RecvTimeoutError::Timeout));
+                    }
+                })));
+                let before = SEQUENCE_RESOLUTIONS.get();
+                let result = bounded_run(
+                    &mut insert,
+                    "INSERT INTO t (slot) VALUES (1), (2), (3) RETURNING slot, id",
+                );
+                let resolutions = resolutions_since(before);
+                bounded_run(&mut insert, "COMMIT");
+                let _ = insert_done.send((result, resolutions));
+            });
+            assert_eq!(first_draw.recv_timeout(wait).expect("first default draw"), 101);
+
+            let (ddl_done, ddl_result) = mpsc::channel();
+            scope.spawn(move || {
+                bounded_run(&mut ddl_session, ddl);
+                bounded_run(&mut ddl_session, "COMMIT");
+                let _ = ddl_done.send(());
+            });
+            let until = Instant::now() + wait;
+            while locks.blockers(ddl_id) != [insert_id] {
+                assert_eq!(
+                    ddl_result.recv_timeout(Duration::from_millis(10)),
+                    Err(mpsc::RecvTimeoutError::Timeout),
+                    "{ddl} finished before the INSERT was released"
+                );
+                assert!(Instant::now() < until, "{ddl} never queued behind the INSERT");
+            }
+            // CASCADE can also need the table lock. If DDL has already
+            // acquired the barrier, a later wait cannot prove it blocked here.
+            assert!(
+                !locks.held(ddl_id).contains(&(LockKey::Table(0), LockMode::AccessExclusive)),
+                "{ddl} passed the Table(0) barrier while the INSERT was parked"
+            );
+            assert_eq!(
+                ddl_result.recv_timeout(Duration::from_millis(20)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            );
+
+            release.send(()).unwrap();
+            let (result, resolutions) = inserted.recv_timeout(wait).expect("INSERT committed");
+            ddl_result.recv_timeout(wait).expect("DDL committed");
+            assert_eq!(resolutions, [1, 0, 0]);
+            let rows: Vec<_> = result.rows.into_iter().map(|row| row.values).collect();
+            assert_eq!(
+                rows,
+                [
+                    vec![Value::Int(1), Value::Int(101)],
+                    vec![Value::Int(2), Value::Int(102)],
+                    vec![Value::Int(3), Value::Int(103)],
+                ]
+            );
+        });
+
+        let result = run(&mut setup, "INSERT INTO t (slot) VALUES (4) RETURNING id");
+        assert_eq!(result.rows[0].values, [next_default]);
+    }
+
+    #[test]
+    fn sequence_restart_waits_for_multi_row_insert() {
+        assert_sequence_ddl_waits("ALTER SEQUENCE s RESTART", Value::Int(100));
+    }
+
+    #[test]
+    fn sequence_drop_waits_for_multi_row_insert() {
+        assert_sequence_ddl_waits("DROP SEQUENCE s CASCADE", Value::Null);
+    }
+
+    #[test]
+    fn column_default_resolution_reuses_lookup_after_savepoint_rollback() {
+        let f = Fixture::new(Engine::V2);
+        let mut sql = session_with_bindings(&f);
+        run(&mut sql, "CREATE TABLE t (slot INT PRIMARY KEY, id BIGSERIAL)");
+        run(&mut sql, "BEGIN");
+        run(&mut sql, "SAVEPOINT seq_ddl");
+        run(&mut sql, "CREATE SEQUENCE discarded");
+        run(&mut sql, "ROLLBACK TO SAVEPOINT seq_ddl");
+        let before = SEQUENCE_RESOLUTIONS.get();
+        let result = run(&mut sql, "INSERT INTO t (slot) VALUES (1), (2), (3) RETURNING id");
+        assert_eq!(resolutions_since(before), [1, 0, 0]);
+        let rows: Vec<_> = result.rows.into_iter().map(|row| row.values).collect();
+        assert_eq!(rows, [vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Int(3)]]);
+        run(&mut sql, "COMMIT");
+    }
+
+    #[test]
+    fn column_default_resolution_resolves_same_name_replacement() {
+        let f = Fixture::new(Engine::V2);
+        let mut sql = session_with_bindings(&f);
+        run(&mut sql, "CREATE SEQUENCE s");
+        run(&mut sql, "CREATE TABLE t (slot INT PRIMARY KEY, id BIGINT DEFAULT nextval('s'))");
+        let assert_draws = |sql: &mut SqlSession, slots, start| {
+            let before = SEQUENCE_RESOLUTIONS.get();
+            let result = run(sql, &format!("INSERT INTO t (slot) VALUES {slots} RETURNING id"));
+            assert_eq!(resolutions_since(before), [1, 0, 0]);
+            let rows: Vec<_> = result.rows.into_iter().map(|row| row.values).collect();
+            assert_eq!(rows, [vec![Value::Int(start)], vec![Value::Int(start + 1)]]);
+        };
+        assert_draws(&mut sql, "(1), (2)", 1);
+        run(&mut sql, "ALTER TABLE t ALTER COLUMN id DROP DEFAULT");
+        run(&mut sql, "DROP SEQUENCE s");
+        run(&mut sql, "CREATE SEQUENCE s START 100");
+        run(&mut sql, "ALTER TABLE t ALTER COLUMN id SET DEFAULT nextval('s')");
+        assert_draws(&mut sql, "(3), (4)", 100);
     }
 
     #[test]
