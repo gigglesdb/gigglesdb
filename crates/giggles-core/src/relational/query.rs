@@ -229,7 +229,6 @@ struct QueryPrefix {
 #[derive(Debug, Clone, Default)]
 struct QueryClauses {
     row_locks: Vec<row_locks::Clause>,
-    allow_duplicate_outputs: bool,
     mutation_keys: Option<std::sync::Arc<BTreeSet<Vec<u8>>>>,
     join_namespace: Option<plan::join::Namespace>,
     view_reads: Vec<String>,
@@ -1655,7 +1654,7 @@ impl BoundFilter {
                                 user_types::view_replace_error("could not determine which collation to use for string comparison".into());
                                 return Err(SqlError::IndeterminateCollation);
                             }
-                            if if let Some(n)=collation {functions::collation::compare(n,&lhs,element,&value.ty)==Ordering::Equal} else {functions::join_equal(
+                            if if let Some(n)=collation {functions::collation::compare(Some(n),&lhs,element,&value.ty)==Ordering::Equal} else {functions::join_equal(
                                 &lhs,
                                 &value.ty,
                                 element,
@@ -2303,6 +2302,16 @@ impl Query {
             _ => None,
         }
     }
+    fn clauses_mut(&mut self) -> &mut QueryClauses {
+        if !matches!(self.filter, Some(Filter::Clauses(_))) {
+            self.filter = Some(Filter::Clauses(Box::new(QueryClauses {
+                filter: self.filter.take(),
+                ..Default::default()
+            })));
+        }
+        let Some(Filter::Clauses(clauses)) = &mut self.filter else { unreachable!() };
+        clauses
+    }
     fn where_filter(&self) -> Option<&Filter> {
         match &self.filter {
             Some(Filter::Clauses(c)) => c.filter.as_ref(),
@@ -2639,8 +2648,7 @@ impl Query {
         let locks = row_locks::extract(p)?;
         let mut query = Self::parse_unlocked(p)?;
         if !locks.is_empty() {
-            query.allow_duplicate_outputs();
-            if let Some(Filter::Clauses(c)) = &mut query.filter { c.row_locks = locks; }
+            query.clauses_mut().row_locks = locks;
             row_locks::validate(&query)?;
         }
         Ok(query)
@@ -2878,7 +2886,6 @@ impl Query {
             } else {
                 Some(Filter::Clauses(Box::new(QueryClauses {
                     row_locks: vec![],
-                    allow_duplicate_outputs: false,
                     mutation_keys: None,
                     join_namespace: None,
                     view_reads: vec![],
@@ -3821,11 +3828,13 @@ impl Query {
                         .ok_or(SqlError::Syntax)?;
                     let item = bound.items.get(position).ok_or(SqlError::Syntax)?;
                     bound.order[index].0 = match item {
-                        BoundItem::Scalar(_) => projection
-                            .get(position)
-                            .and_then(|scalar| *scalar)
-                            .ok_or(SqlError::Unsupported)?
-                            .bind(&resolve, tables, &parameter_types)?,
+                        BoundItem::Scalar(_) => {
+                            // Star-expanded columns already carry their sort metadata.
+                            let Some(scalar) = projection.get(position).ok_or(SqlError::Unsupported)? else {
+                                continue;
+                            };
+                            scalar.bind(&resolve, tables, &parameter_types)?
+                        },
                         BoundItem::Column(column) => Scalar::Column(ColumnRef {
                             qualifier: None,
                             name: String::new(),
@@ -3974,26 +3983,24 @@ impl Query {
             if bound.outer_slots.is_empty() { bound.tables.truncate(self.sources.len()); }
             return Ok(bound);
         }
-        let distinct_order = self
-            .distinct()
-            .then(|| {
-                let projection = grouping::projection(self, &tables)?;
-                self.order
-                    .iter()
-                    .map(|(s, _, _)| {
-                        grouping::output_order(self, s, &projection, &resolve, &tables)
-                    })
-                    .collect::<R<Vec<_>>>()
-            })
-            .transpose()?;
-        let distinct_order_slots = if let Some(order) = &distinct_order {
-            let projection = grouping::projection(self, &tables)?;
-            order
+        let resolve_order = |projection: &[(Item, Option<String>)]| {
+            self.order
                 .iter()
-                .map(|s| grouping::output_slot(s, &projection, &resolve, &tables))
-                .collect::<R<Vec<_>>>()?
+                .map(|(s, _, _)| grouping::order_output(self, s, projection, &resolve, &tables))
+                .collect::<R<Vec<_>>>()
+        };
+        let distinct_order = if self.distinct() && !self.order.is_empty() {
+            let projection = grouping::projection(self, &tables)?;
+            let order = resolve_order(&projection)?;
+            let slots = order
+                .iter()
+                .map(|(s, slot)| {
+                    slot.map_or_else(|| grouping::output_slot(s, &projection, &resolve, &tables), Ok)
+                })
+                .collect::<R<Vec<_>>>()?;
+            Some((order, slots))
         } else {
-            vec![]
+            None
         };
         let mut items = vec![];
         let mut unresolved_count_parameters = Vec::new();
@@ -4029,7 +4036,7 @@ impl Query {
             f.infer_with_subqueries(&mut parameters, &resolve, &tables, &subqueries)?;
         }
         for (i, (e, _, _)) in self.order.iter().enumerate() {
-            let e = distinct_order.as_ref().map_or(e, |order| &order[i]);
+            let e = distinct_order.as_ref().map_or(e, |(order, _)| &order[i].0);
             e.infer(None, &mut parameters, &resolve, &tables)?;
         }
         let bind_expr = |e: &Expr, ty: &DataType, parameters: &mut [Option<DataType>]| -> R<bool> {
@@ -4095,8 +4102,14 @@ impl Query {
             if tables[c.source].columns[c.column].data_type == DataType::Bpchar {
                 return Err(SqlError::Unsupported);
             }
-            let id=tables[c.source].columns[c.column].id;
-            if !state.deterministic_column(id) || op != "=" && !state.byte_ordered(id) { continue; }
+            let column = &tables[c.source].columns[c.column];
+            let id = column.id;
+            // Array keys retain their byte encoding for equality lookups.
+            if !state.deterministic_column(id)
+                || op != "=" && (column.data_type.is_array() || !state.byte_ordered(id))
+            {
+                continue;
+            }
             if let Expr::Literal(value) = e
                 && !matches!(value, Value::Null | Value::Text(_))
             {
@@ -4164,14 +4177,7 @@ impl Query {
         }
         let mut joins = self.bind_joins(&tables, &mut parameters, &resolve, &subqueries)?;
         let mut columns = vec![];
-        let mut aliases = BTreeSet::new();
         for (item, alias) in &self.items {
-            if let Some(a) = alias
-                && !aliases.insert(a)
-                && self.clauses().is_none_or(|c| c.join_namespace.is_none() && !c.allow_duplicate_outputs)
-            {
-                return Err(SqlError::Duplicate);
-            }
             let mut push = |item: BoundItem, mut column: ColumnDef| {
                 if let Some(a) = alias {
                     column.name = a.clone();
@@ -4323,7 +4329,13 @@ impl Query {
                                 d.not_null = false;
                             }
                             let c=BoundColumn {source,column};
-                            let item=if functions::collation::has_column(d.id) { BoundItem::Scalar(functions::collation::bound_column(c,&d)?) } else {BoundItem::Column(c)};
+                            let item = if functions::collation::has_column(d.id)
+                                || self.distinct() && d.data_type.is_array()
+                            {
+                                BoundItem::Scalar(functions::collation::bound_column(c, &d)?)
+                            } else {
+                                BoundItem::Column(c)
+                            };
                             push(item, d);
                         }
                     }
@@ -4345,20 +4357,20 @@ impl Query {
             .map(|f| f.bind_with_subqueries(&parameters, &resolve, &tables, &subqueries))
             .transpose()?;
         views::bind_filters(self, state, &tables, &mut joins, &mut filter)?;
+        let (order_syntax, distinct_order_slots) = if let Some(order) = distinct_order {
+            order
+        } else if self.order.is_empty() {
+            (vec![], vec![])
+        } else {
+            (resolve_order(&grouping::projection(self, &tables)?)?, vec![])
+        };
+        let mut volatile_order = Vec::new();
         let order = self
             .order
             .iter()
+            .zip(&order_syntax)
             .enumerate()
-            .map(|(i, (e, d, n))| {
-                let ordinal;
-                let e = if let Some(order) = &distinct_order {
-                    &order[i]
-                } else if let Scalar::Literal(Value::Int(k)) = e {
-                    ordinal = self.order_ordinal(*k, &tables)?;
-                    &ordinal
-                } else {
-                    e
-                };
+            .map(|(index, ((_, d, n), (e, output)))| {
                 let bound = e
                     .bind(&resolve, &tables, &parameters)?
                     .enum_sort(state, &tables);
@@ -4366,10 +4378,16 @@ impl Query {
                     return Err(SqlError::Unsupported);
                 }
                 bound.require_collation()?;
-
+                if let Some(output) = output
+                    && !self.distinct()
+                    && e.has_volatile_call()
+                {
+                    volatile_order.push((*output, index));
+                }
                 Ok((bound, *d, *n))
             })
             .collect::<R<Vec<_>>>()?;
+        volatile_order.sort_unstable();
         let exists_keys = exists::probe_keys(self, &tables, &parameters, &resolve)?;
         let parameters = parameters
             .into_iter()
@@ -4390,6 +4408,7 @@ impl Query {
             grouping: None,
             exists_keys,
             distinct_order_slots,
+            volatile_order,
             outer_slots: outer_slots.into_inner(),
             subqueries,
             declared: vec![],
@@ -4429,6 +4448,8 @@ pub(super) struct BoundQuery<'a> {
     aggregate: bool,
     grouping: Option<grouping::Grouping>,
     distinct_order_slots: Vec<usize>,
+    // (Select-list slot, ORDER BY key), in select-list order.
+    volatile_order: Vec<(usize, usize)>,
     exists_keys: Vec<exists::ProbeKey>,
     outer_slots: Vec<outer::OuterSlot>,
     subqueries: Subplans<'a>,
@@ -4774,12 +4795,32 @@ impl BoundQuery<'_> {
         work: &mut usize,
         bytes: &mut usize,
     ) -> R<SqlRow> {
+        self.project_sorted_tuple(row, params, work, bytes, &mut [])
+    }
+    fn project_sorted_tuple(
+        &self,
+        row: &Tuple,
+        params: &[Value],
+        work: &mut usize,
+        bytes: &mut usize,
+        keys: &mut [Value],
+    ) -> R<SqlRow> {
+        let mut cached = self.volatile_order.iter().peekable();
         let values = self
             .items
             .iter()
-            .map(|item| match item {
+            .enumerate()
+            .map(|(slot, item)| match item {
                 BoundItem::Scalar(value) => {
-                    let value = value.eval(row, params, work)?;
+                    let value = if !keys.is_empty()
+                        && let Some(&&(output, key)) = cached.peek()
+                        && output == slot
+                    {
+                        while cached.next_if(|(output, _)| *output == slot).is_some() {}
+                        std::mem::replace(&mut keys[key], Value::Null)
+                    } else {
+                        value.eval(row, params, work)?
+                    };
                     charge_projected(bytes, &value)?;
                     Ok(value)
                 }
@@ -4804,6 +4845,27 @@ impl BoundQuery<'_> {
             values,
             version: row.version,
         })
+    }
+    fn sort_keys(&self, row: &Tuple, params: &[Value]) -> R<Vec<Value>> {
+        let mut work = 0;
+        if self.volatile_order.is_empty() {
+            return self.order.iter().map(|(e, _, _)| e.eval(row, params, &mut work)).collect();
+        }
+        // Evaluate the volatile select items in projection order, once per
+        // input row, and use their values for every reference in ORDER BY.
+        let mut keys = vec![None; self.order.len()];
+        let mut previous: Option<(usize, usize)> = None;
+        for &(slot, index) in &self.volatile_order {
+            let value = match previous {
+                Some((output, key)) if output == slot => keys[key].clone(),
+                _ => Some(self.order[index].0.eval(row, params, &mut work)?),
+            };
+            keys[index] = value;
+            previous = Some((slot, index));
+        }
+        keys.into_iter().zip(&self.order)
+            .map(|(key, (e, _, _))| key.map_or_else(|| e.eval(row, params, &mut work), Ok))
+            .collect()
     }
     pub(super) fn project_row(
         &self,
@@ -4972,10 +5034,12 @@ impl BoundQuery<'_> {
                     scalar
                 };
                 *reverse == desc
+                    && !value.ty.is_array()
                     && value.explicit_collation().ok().flatten().is_none_or(|n| matches!(n,"C"|"POSIX"|"C.utf8"|"default"|"ucs_basic"|"pg_c_utf8"|"pg_unicode_fast"))
                     && matches!(scalar, Scalar::Column(c)
                 if self.tables[0].primary_key.get(i).is_some_and(|index|
                     self.tables[0].columns[*index].name == c.name
+                    && value.collation_column().is_some_and(|c| c.source == 0 && c.column == *index)
                     && self.tables[0].columns[*index].data_type == value.ty))
             })
         {
@@ -5454,8 +5518,13 @@ impl BoundQuery<'_> {
                 {
                     return Ok(result);
                 }
-                for (e, _, _) in &self.order {
-                    e.eval(&row, params, &mut work)?;
+                // DISTINCT keys are all projected values, and there is at most one row.
+                if !self.query.distinct() {
+                    for (index, (e, _, _)) in self.order.iter().enumerate() {
+                        if !self.volatile_order.iter().any(|(_, key)| *key == index) {
+                            e.eval(&row, params, &mut work)?;
+                        }
+                    }
                 }
                 let mut output = 0;
                 let values = self
@@ -5759,17 +5828,12 @@ impl BoundQuery<'_> {
             // (OFFSET + LIMIT), spill like PostgreSQL's bounded-heap fallback.
             const TOP_N_ROWS: usize = 10_000;
             let external = source.streams_reductions() && (self.query.has_row_locks() || page.keep().is_none_or(|keep| keep > TOP_N_ROWS));
-            let rows: Box<dyn Iterator<Item = R<Tuple>> + '_> = if self.order.is_empty() {
-                Box::new(filtered)
+            let rows: Box<dyn Iterator<Item = R<(Tuple, Vec<Value>)>> + '_> = if self.order.is_empty() {
+                Box::new(filtered.map(|row| row.map(|row| (row, vec![]))))
             } else {
                 let keyed = filtered.map(|row| {
                     let row = row?;
-                    let mut key_work = 0;
-                    let keys = self
-                        .order
-                        .iter()
-                        .map(|(e, _, _)| e.eval(&row, params, &mut key_work))
-                        .collect::<R<Vec<_>>>()?;
+                    let keys = self.sort_keys(&row, params)?;
                     // Buffered table images visit primary keys in order. Preserve
                     // that stable tie order even when a secondary index supplied input.
                     let stable_key = (source.streams_reductions() && limit.is_none())
@@ -5827,12 +5891,15 @@ impl BoundQuery<'_> {
                     };
                 // v2 full sorts spill sorted runs past work_mem (PostgreSQL's
                 // external sort); top-N sorts keep only OFFSET + LIMIT rows.
+                let sorted_row = |(row, keys, _)| {
+                    (row, if self.volatile_order.is_empty() { vec![] } else { keys })
+                };
                 if external {
                     let sorted = spill::sort_external(keyed, size, compare, &mut retention)?;
-                    Box::new(sorted.map(|item| item.map(|(row, _, _)| row)))
+                    Box::new(sorted.map(move |item| item.map(sorted_row)))
                 } else {
                     let sorted = scan::sort_bounded(keyed, page.keep(), size, compare, &mut retention)?;
-                    Box::new(sorted.into_iter().map(|(row, _, _)| Ok(row)))
+                    Box::new(sorted.into_iter().map(move |item| Ok(sorted_row(item))))
                 }
             };
             // A v2 SqlSession statement's own output spills past SPILL_BYTES like
@@ -5840,25 +5907,27 @@ impl BoundQuery<'_> {
             // A captured v2 subquery result is spill-backed the same way.
             let mut output = Output::new(source.streams_reductions(), subquery, insert_source, capture)?;
             let locked = rows.filter_map(|row| {
-                let row = match row { Ok(row) => row, Err(e) => return Some(Err(e)) };
-                row_locks::lock(self, row, physical_source, params, state, execution).transpose()
+                let (row, keys) = match row { Ok(row) => row, Err(e) => return Some(Err(e)) };
+                row_locks::lock(self, row, physical_source, params, state, execution)
+                    .map(|row| row.map(|row| (row, keys))).transpose()
             });
             for row in page.apply(locked) {
-                let row = row?;
+                let (row, mut keys) = row?;
                 let mut scalar_work_bytes = 0usize;
                 if !matches!(output, Output::Capped(_)) {
-                    let row = self.project_tuple(&row, params, &mut scalar_work_bytes, &mut 0)?;
+                    let row = self.project_sorted_tuple(&row, params, &mut scalar_work_bytes, &mut 0, &mut keys)?;
                     output.push(row, &mut result)?;
                     continue;
                 }
                 if result.rows.len() >= scan::query_row_limit() {
                     return Err(SqlError::Limit);
                 }
-                result.rows.push(self.project_tuple(
+                result.rows.push(self.project_sorted_tuple(
                     &row,
                     params,
                     &mut scalar_work_bytes,
                     &mut result_bytes,
+                    &mut keys,
                 )?);
             }
             output.finish(&mut result, execution)?;

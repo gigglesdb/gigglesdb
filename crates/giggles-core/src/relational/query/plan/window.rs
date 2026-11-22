@@ -957,7 +957,7 @@ fn bind_call(
         }
         (ty, None)
     };
-    let collation = if matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar) {
+    let collation = if functions::collation::is_collatable(&ty) {
         // Value windows inherit their value arguments (including lag/lead's default).
         let values = if matches!(call.name.as_str(), "lag" | "lead") && call.args.len() == 3 {
             vec![call.args[0].clone(), call.args[2].clone()]

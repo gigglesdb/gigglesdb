@@ -15,6 +15,13 @@ pub(super) fn parse(p: &mut Parser, items: &mut Vec<(Item, Option<String>)>) -> 
         || child.items.len() > 1 && child.items.iter().any(|(i, _)| matches!(i, Item::Star)) {
         return Err(SqlError::Unsupported);
     }
+    // The FROM planner keeps each output slot when a derived name is repeated.
+    let mut names = BTreeSet::new();
+    if child.items.iter().any(|(item, alias)| {
+        matches!(item, Item::Scalar(Scalar::Column(c)) if !names.insert(alias.as_ref().unwrap_or(&c.name)))
+    }) {
+        return Err(SqlError::Unsupported);
+    }
     p.word("as");
     let alias = p.name()?;
     let mut expanded = Vec::new();
@@ -77,14 +84,12 @@ impl BoundQuery<'_> {
         let expanded_bound;
         let bound = if self.query.has_row_locks() {
             expanded = child.clone();
-            expanded.allow_duplicate_outputs();
-            if let Some(Filter::Clauses(c)) = &mut expanded.filter {
-                for mark in &self.query.clauses().ok_or(SqlError::Unsupported)?.row_locks {
-                    let mut mark = mark.clone();
-                    mark.names.clear();
-                    c.row_locks.push(mark);
-                }
-            } else { return Err(SqlError::Unsupported); }
+            let clauses = expanded.clauses_mut();
+            for mark in &self.query.clauses().ok_or(SqlError::Unsupported)?.row_locks {
+                let mut mark = mark.clone();
+                mark.names.clear();
+                clauses.row_locks.push(mark);
+            }
             expanded.items.push((Item::QualifiedStar { schema: None, relation: child.sources[0].alias.clone() }, None));
             expanded_bound = expanded.bind_projection_seeded(state,
                 bound.parameters.iter().cloned().map(Some).collect())?;

@@ -215,6 +215,8 @@ mod sql_pk_update;
 mod sql_position_functions;
 #[path = "sql_prepared_filter_coercion.rs"]
 mod sql_prepared_filter_coercion;
+#[path = "sql_order_select_items.rs"]
+mod sql_order_select_items;
 #[path = "sql_prepared_function_contract.rs"]
 mod sql_prepared_function_contract;
 #[path = "sql_qualified_routines.rs"]
@@ -560,6 +562,8 @@ mod sql_float_glibc;
 #[path = "sql_extensions.rs"]
 mod sql_extensions;
 
+#[path = "sql_array_ordering.rs"]
+mod sql_array_ordering;
 #[path = "sql_array_validation.rs"]
 mod sql_array_validation;
 

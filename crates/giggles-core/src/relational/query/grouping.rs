@@ -13,6 +13,7 @@ pub(super) struct Grouping {
     outputs: Vec<BoundScalar>,
     output_sources: Vec<Option<BoundColumn>>,
     order_slots: Vec<usize>,
+    order_outputs: Vec<Option<usize>>,
     having: Option<BoundFilter>,
     having_outer: Vec<(BoundColumn, BoundScalar)>,
     order: Vec<(BoundScalar, bool, bool)>,
@@ -354,6 +355,17 @@ pub(super) fn output_scalar(item: &Item) -> R<Scalar> {
         Item::Star | Item::QualifiedStar { .. } => Err(SqlError::GroupingError),
     }
 }
+fn output_name_matches(item: &Item, alias: &Option<String>, name: &str, implicit: bool) -> bool {
+    if let Some(alias) = alias {
+        return alias == name;
+    }
+    implicit
+        && match item {
+            Item::Scalar(s) => cast_output_name(s).as_deref() == Some(name),
+            Item::Aggregate(a, _) => a.name() == name,
+            _ => false,
+        }
+}
 fn resolve_output(
     s: &Scalar,
     items: &[(Item, Option<String>)],
@@ -361,33 +373,35 @@ fn resolve_output(
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     scope: usize,
     tables: &[&TableDef],
-) -> R<Scalar> {
+) -> R<(Scalar, Option<usize>)> {
     if let Scalar::Literal(Value::Int(n)) = s {
-        if *n < 1 || *n as usize > items.len() {
-            return Err(SqlError::UnknownColumn);
-        }
-        return output_scalar(&items[*n as usize - 1].0);
+        let index = usize::try_from(*n)
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .ok_or(SqlError::UnknownColumn)?;
+        let (item, _) = items.get(index).ok_or(SqlError::UnknownColumn)?;
+        return Ok((output_scalar(item)?, Some(index)));
     }
     if let Scalar::Column(c) = s
         && c.qualifier.is_none()
         && (!input_first || matches!(resolve(c, scope), Err(SqlError::UnknownColumn)))
     {
-        let mut matches = items
-            .iter()
-            .filter(|(_, alias)| alias.as_ref() == Some(&c.name));
-        if let Some((item, _)) = matches.next() {
+        let mut matches = items.iter().enumerate().filter(|(_, (item, alias))| {
+            output_name_matches(item, alias, &c.name, !input_first)
+        });
+        if let Some((index, (item, _))) = matches.next() {
             let selected = output_scalar(item)?;
-            for (other, _) in matches {
+            for (_, (other, _)) in matches {
                 if canonical(&selected, resolve, scope, tables)?
                     != canonical(&output_scalar(other)?, resolve, scope, tables)?
                 {
                     return Err(SqlError::Duplicate);
                 }
             }
-            return Ok(selected);
+            return Ok((selected, Some(index)));
         }
     }
-    Ok(s.clone())
+    Ok((s.clone(), None))
 }
 pub(super) fn projection(q: &Query, tables: &[&TableDef]) -> R<Vec<(Item, Option<String>)>> {
     let mut projection = vec![];
@@ -396,14 +410,21 @@ pub(super) fn projection(q: &Query, tables: &[&TableDef]) -> R<Vec<(Item, Option
             for index in q.star_sources(item)? {
                 let source = &q.sources[index];
                 let table = tables[index];
+                let mut names = BTreeSet::new();
+                let duplicate_names = table.logical_columns().any(|column| !names.insert(&column.name));
+                // Star names can repeat in a temporary relation. Resolve those slots by position.
                 for (n, column) in table.columns.iter().enumerate() {
                     if table.hidden_rowid() != Some(n) {
                         projection.push((
                             Item::Scalar(Scalar::Column(ColumnRef {
                                 qualifier: Some(source.alias.clone()),
-                                name: column.name.clone(),
+                                name: if duplicate_names {
+                                    format!("\0star_column_{n}")
+                                } else {
+                                    column.name.clone()
+                                },
                             })),
-                            None,
+                            duplicate_names.then(|| column.name.clone()),
                         ));
                     }
                 }
@@ -414,18 +435,45 @@ pub(super) fn projection(q: &Query, tables: &[&TableDef]) -> R<Vec<(Item, Option
     }
     Ok(projection)
 }
-pub(super) fn output_order(
+/// Resolve an ORDER BY position, output name, or matching volatile expression.
+pub(super) fn order_output(
     q: &Query,
     s: &Scalar,
     projection: &[(Item, Option<String>)],
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     tables: &[&TableDef],
-) -> R<Scalar> {
-    let s = resolve_output(s, projection, false, resolve, tables.len(), tables)?;
-    if q.distinct() {
-        output_slot(&s, projection, resolve, tables)?;
+) -> R<(Scalar, Option<usize>)> {
+    let output = resolve_output(s, projection, false, resolve, tables.len(), tables);
+    if matches!(output, Err(SqlError::Duplicate)) && let Scalar::Column(c) = s {
+        // Preserve the merged input name for joins whose duplicate output
+        // names come solely from unaliased input columns.
+        if q.clauses().is_some_and(|c| c.join_namespace.is_some())
+            && projection.iter()
+                .filter(|(item, alias)| output_name_matches(item, alias, &c.name, true))
+                .all(|(item, alias)| alias.is_none() && matches!(item, Item::Scalar(Scalar::Column(_))))
+            && resolve(c, tables.len()).is_ok()
+        {
+            return Ok((s.clone(), None));
+        }
+        user_types::view_replace_error(format!(r#"ORDER BY "{}" is ambiguous"#, c.name));
+        return Err(SqlError::AmbiguousColumn);
     }
-    Ok(s)
+
+    let (scalar, slot) = output?;
+    if slot.is_none() && scalar.has_volatile_call() {
+        // Match the same expression even when its columns are qualified differently.
+        let identity = |s| {
+            user_types::probe_preserving_error_message(|| canonical(s, resolve, tables.len(), tables))
+        };
+        if let Ok(key) = identity(&scalar) {
+            let slot = projection.iter().position(|(item, _)| {
+                matches!(item, Item::Scalar(s) if s.has_volatile_call()
+                    && identity(s).is_ok_and(|s| s == key))
+            });
+            return Ok((scalar, slot));
+        }
+    }
+    Ok((scalar, slot))
 }
 pub(super) fn output_slot(
     s: &Scalar,
@@ -463,7 +511,10 @@ pub(super) fn bind<'a>(
     let groups = q
         .group()
         .iter()
-        .map(|s| resolve_output(s, &projection, true, resolve, tables.len(), tables))
+        .map(|s| {
+            resolve_output(s, &projection, true, resolve, tables.len(), tables)
+                .map(|(scalar, _)| scalar)
+        })
         .collect::<R<Vec<_>>>()?;
     for s in &groups {
         aggregate_filter::validate_scalar(s, &parameters, resolve, tables)?;
@@ -564,13 +615,12 @@ pub(super) fn bind<'a>(
             Ok(())
         })?;
     }
+    let order = q.order.iter()
+        .map(|(s, _, _)| order_output(q, s, &projection, resolve, tables))
+        .collect::<R<Vec<_>>>()?;
     let order_slots = if q.distinct() {
-        q.order
-            .iter()
-            .map(|(s, _, _)| {
-                let s = output_order(q, s, &projection, resolve, tables)?;
-                output_slot(&s, &projection, resolve, tables)
-            })
+        order.iter()
+            .map(|(s, slot)| slot.map_or_else(|| output_slot(s, &projection, resolve, tables), Ok))
             .collect::<R<Vec<_>>>()?
     } else {
         vec![]
@@ -578,12 +628,13 @@ pub(super) fn bind<'a>(
     let order_syntax = q
         .order
         .iter()
-        .map(|(s, d, n)| {
-            Ok((
-                lower.scalar(&output_order(q, s, &projection, resolve, tables)?)?,
-                *d,
-                *n,
-            ))
+        .zip(&order)
+        .map(|((_, d, n), (s, slot))| {
+            let scalar = match slot {
+                Some(slot) => output_syntax[*slot].clone(),
+                None => lower.scalar(s)?,
+            };
+            Ok((scalar, *d, *n))
         })
         .collect::<R<Vec<_>>>()?;
     let mut unresolved_count = vec![];
@@ -757,40 +808,40 @@ pub(super) fn bind<'a>(
         .iter()
         .map(|c| functions::collation::bound_column(*c, &tables[c.source].columns[c.column]))
         .collect::<R<Vec<_>>>()?;
+    let metadata = keys
+        .iter()
+        .map(Some)
+        .chain(
+            aggregates
+                .iter()
+                .zip(&aggregate_columns)
+                .map(|(a, column)| match a {
+                    BoundItem::Aggregate(_, Some(value))
+                        if functions::collation::is_collatable(&column.data_type) =>
+                    {
+                        Some(value)
+                    }
+                    _ => None,
+                }),
+        )
+        .chain(dependent_metadata.iter().map(Some))
+        .collect::<Vec<_>>();
+    // Expose the post-group type and collation while binding consumers of
+    // synthetic slots. Bindings over the original sources use their own IDs.
+    let mut metadata_table = slot_table.clone();
+    for (i, column) in metadata_table.columns.iter_mut().enumerate() {
+        column.id = i as u64 + 1;
+    }
+    let metadata_tables = [&metadata_table];
+    let slot_collations = || {
+        functions::collation::ColumnScope::enter_refs(
+            &metadata_table.columns,
+            metadata.iter().copied(),
+        )
+    };
     let outputs = {
-        let metadata = keys
-            .iter()
-            .map(Some)
-            .chain(
-                aggregates
-                    .iter()
-                    .zip(&aggregate_columns)
-                    .map(|(a, column)| match a {
-                        BoundItem::Aggregate(_, Some(value))
-                            if matches!(
-                                column.data_type,
-                                DataType::Text | DataType::Varchar | DataType::Bpchar
-                            ) =>
-                        {
-                            Some(value)
-                        }
-                        _ => None,
-                    }),
-            )
-            .chain(dependent_metadata.iter().map(Some))
-            .collect::<Vec<_>>();
-        // These IDs belong only to this output-binding overlay. Other group
-        // binders keep the original slot catalog and original column IDs.
-        let mut metadata_table = slot_table.clone();
-        for (i, column) in metadata_table.columns.iter_mut().enumerate() {
-            column.id = i as u64 + 1;
-        }
-        let metadata_tables = [&metadata_table];
         {
-            let _collations = functions::collation::ColumnScope::enter_refs(
-                &metadata_table.columns,
-                metadata.iter().copied(),
-            )?;
+            let _collations = slot_collations()?;
             for s in &output_syntax {
                 s.infer(None, &mut parameters, &slot_resolve, &metadata_tables)?;
             }
@@ -801,8 +852,7 @@ pub(super) fn bind<'a>(
         for (s, _, _) in &order_syntax {
             s.infer(None, &mut parameters, &slot_resolve, &slot_tables)?;
         }
-        let _collations =
-            functions::collation::ColumnScope::enter_refs(&metadata_table.columns, metadata)?;
+        let _collations = slot_collations()?;
         output_syntax
             .iter()
             .map(|s| s.bind(&slot_resolve, &metadata_tables, &parameters))
@@ -863,34 +913,40 @@ pub(super) fn bind<'a>(
             column
         })
         .collect();
-    let having_outer = having_outer_syntax.iter().map(|(c, s)|
-        Ok((*c, s.bind(&slot_resolve, &slot_tables, &parameters)?))).collect::<R<Vec<_>>>()?;
-    // HAVING scalar operands use the final tuple slot, after original sources.
-    let having_source = if having_outer.is_empty() { 0 } else { q.sources.len() };
-    let having_tables = std::iter::repeat_n(&slot_table, having_source + 1).collect::<Vec<_>>();
-    let having_resolve = |c: &ColumnRef, scope| {
-        let mut column = slot_resolve(c, scope)?;
-        column.source = having_source;
-        Ok(column)
+    let (having_outer, having, order_keys) = {
+        let _collations = slot_collations()?;
+        let having_outer = having_outer_syntax.iter().map(|(c, s)|
+            Ok((*c, s.bind(&slot_resolve, &metadata_tables, &parameters)?))).collect::<R<Vec<_>>>()?;
+        // HAVING scalar operands use the final tuple slot, after original sources.
+        let having_source = if having_outer.is_empty() { 0 } else { q.sources.len() };
+        let having_tables = std::iter::repeat_n(&metadata_table, having_source + 1).collect::<Vec<_>>();
+        let having_resolve = |c: &ColumnRef, scope| {
+            let mut column = slot_resolve(c, scope)?;
+            column.source = having_source;
+            Ok(column)
+        };
+        let having = having_syntax
+            .as_ref()
+            .map(|f| f.bind_with_subqueries(&parameters, &having_resolve, &having_tables, &subqueries))
+            .transpose()?;
+        let order_keys = order_syntax.iter().map(|(s, d, n)| {
+            Ok((s.bind(&slot_resolve, &metadata_tables, &parameters)?, *d, *n))
+        }).collect::<R<Vec<_>>>()?;
+        (having_outer, having, order_keys)
     };
-    let having = having_syntax
-        .as_ref()
-        .map(|f| f.bind_with_subqueries(&parameters, &having_resolve, &having_tables, &subqueries))
-        .transpose()?;
-    let order = order_syntax
-        .iter()
+    let order_outputs = order.iter().map(|(_, slot)| *slot).collect();
+    let order = order_keys
+        .into_iter()
         .enumerate()
-        .map(|(i, (s, d, n))| {
-            let original = output_order(q, &q.order[i].0, &projection, resolve, tables)?
-                .bind(resolve, tables, &parameters);
-            let bound = s.bind(&slot_resolve, &slot_tables, &parameters)?;
+        .map(|(i, (bound, d, n))| {
+            let original = order[i].0.bind(resolve, tables, &parameters);
             let original = original.ok();
             let bound = if let Some(ty) = original.as_ref().and_then(|s| s.enum_type(tables)) {
                 bound.with_enum(&ty)
             } else { bound };
             let bound = if let Some(original) = &original { bound.inherit_collation(original)? } else { bound };
             bound.require_collation()?;
-            Ok((bound, *d, *n))
+            Ok((bound, d, n))
         })
         .collect::<R<Vec<_>>>()?;
     let filter = q
@@ -901,6 +957,9 @@ pub(super) fn bind<'a>(
     let predicates = q.predicates.iter().filter_map(|(c, op, e)| {
         let c = resolve(c, tables.len()).ok()?;
         let ty = &tables[c.source].columns[c.column].data_type;
+        if op != "=" && ty.is_array() {
+            return None;
+        }
         // Range selection is optional; the bound WHERE remains authoritative.
         let safe = match e {
             Expr::Literal(v) => check(v, &tables[c.source].columns[c.column]).is_ok()
@@ -930,6 +989,7 @@ pub(super) fn bind<'a>(
         exists_keys: vec![],
         declared: vec![],
         distinct_order_slots: vec![],
+        volatile_order: vec![],
         grouping: Some(Grouping {
             empty_set: grouping_mask.as_ref().is_some_and(|m| !m.iter().any(|b| *b)),
             keys,
@@ -941,6 +1001,7 @@ pub(super) fn bind<'a>(
             outputs,
             output_sources,
             order_slots,
+            order_outputs,
             having,
             having_outer,
             order,
@@ -948,22 +1009,48 @@ pub(super) fn bind<'a>(
     })
 }
 #[derive(Clone)]
-pub(super) struct Key(pub(super) Vec<Value>, Vec<Option<(String, DataType)>>);
+struct KeyOrder {
+    collation: Option<String>,
+    ty: DataType,
+}
+
+impl KeyOrder {
+    fn of(scalar: &BoundScalar) -> Option<Self> {
+        let collation = scalar.explicit_collation().expect("bound collation");
+        (collation.is_some() || scalar.ty.is_array()).then(|| Self {
+            collation: collation.map(str::to_owned),
+            ty: scalar.ty.clone(),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct Key(pub(super) Vec<Value>, Vec<Option<KeyOrder>>);
 impl Key {
     pub(super) fn plain(values: Vec<Value>) -> Self { Self(values, Vec::new()) }
     pub(super) fn collated(values: Vec<Value>, scalars: &[BoundScalar]) -> Self {
-        Self(values, scalars.iter().map(|s| s.explicit_collation().expect("bound collation").map(|n| (n.to_owned(), s.ty.clone()))).collect())
+        Self(values, scalars.iter().map(KeyOrder::of).collect())
     }
     pub(super) fn metadata(values: Vec<Value>, scalars: &[Option<BoundScalar>]) -> Self {
-        Self(values, scalars.iter().map(|s| s.as_ref().and_then(|s| s.explicit_collation().expect("bound collation").map(|n| (n.to_owned(), s.ty.clone())))).collect())
+        Self(values, scalars.iter().map(|s| s.as_ref().and_then(KeyOrder::of)).collect())
     }
     pub(super) fn output(values: Vec<Value>, items: &[BoundItem]) -> Self {
-        Self(values, items.iter().map(|s| match s { BoundItem::Scalar(s) => s.explicit_collation().expect("bound collation").map(|n| (n.to_owned(), s.ty.clone())), _ => None }).collect())
+        Self(values, items.iter().map(|s| match s {
+            BoundItem::Scalar(s) => KeyOrder::of(s),
+            _ => None,
+        }).collect())
     }
 }
-fn cmp_collated(a: &[Value], b: &[Value], collations: &[Option<(String, DataType)>]) -> Ordering {
-    if collations.is_empty() { return cmp_values(a,b); }
-    a.iter().zip(b).enumerate().map(|(i,(a,b))| collations.get(i).and_then(Option::as_ref).map_or_else(|| cmp(a,b), |(n,ty)| functions::collation::compare(n,a,b,ty))).find(|c| *c != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len()))
+fn cmp_collated(a: &[Value], b: &[Value], keys: &[Option<KeyOrder>]) -> Ordering {
+    if keys.is_empty() {
+        return cmp_values(a, b);
+    }
+    a.iter().zip(b).enumerate().map(|(i, (a, b))| {
+        keys.get(i).and_then(Option::as_ref).map_or_else(
+            || cmp(a, b),
+            |key| functions::collation::compare(key.collation.as_deref(), a, b, &key.ty),
+        )
+    }).find(|c| *c != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len()))
 }
 fn cmp_scalars(a: &[Value], b: &[Value], scalars: &[BoundScalar]) -> Ordering {
     a.iter().zip(b).enumerate().map(|(i,(a,b))| scalars.get(i).map_or_else(|| cmp(a,b), |s| s.compare_values(a,b))).find(|c| *c != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len()))
@@ -1343,11 +1430,12 @@ impl Grouping {
                 .iter()
                 .enumerate()
                 .map(|(i, (s, _, _))| {
-                    if query.query.distinct() {
-                        Ok(values[self.order_slots[i]].clone())
+                    let slot = if query.query.distinct() {
+                        Some(self.order_slots[i])
                     } else {
-                        s.eval(&row, params, &mut work)
-                    }
+                        self.order_outputs[i]
+                    };
+                    slot.map_or_else(|| s.eval(&row, params, &mut work), |slot| Ok(values[slot].clone()))
                 })
                 .collect::<R<Vec<_>>>()?;
             let item = (SqlRow { values, version: 0 }, keys);

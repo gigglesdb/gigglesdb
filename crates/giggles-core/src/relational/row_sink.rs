@@ -34,6 +34,7 @@ pub(crate) fn reduction_range(table: &TableDef, p: &Prepared, params: &[Value]) 
     let predicates = p.v2_index_predicates(params).into_iter().filter_map(|(column, op, value)| {
         let c = table.columns.iter().find(|c| c.name == column)?;
         if !table.primary_key.iter().any(|i| table.columns[*i].id == c.id)
+            || op != "=" && c.data_type.is_array()
             || check(&value, c).is_err()
             || query::comparison_requires_filter(&value, &c.data_type).ok()? { return None; }
         Some(Predicate { column, op, value: Expr::Literal(value) })

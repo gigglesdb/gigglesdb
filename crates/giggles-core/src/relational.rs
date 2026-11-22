@@ -4464,6 +4464,15 @@ impl Relational {
                 if let Some((query,no_data))=as_query {
                     let bound=query.bind(self,prepared.params,&prepared.parameter_types)?.with_clock(clock);
                     let description=bound.description(self);
+                    // PG reports an existing relation (42P07 / IF NOT EXISTS skip)
+                    // before duplicate output names (42701); both before any row runs.
+                    let mut names = BTreeSet::new();
+                    if !self.relation_name_taken(name)
+                        && self.type_by_name(split_key(name).1).is_none()
+                        && description.columns.iter().any(|c| !names.insert(&c.name))
+                    {
+                        return Err(SqlError::DuplicateColumn);
+                    }
                     collations=bound.output_collations()?.into_iter().map(|n|n.map(|n|n.split('\0').next().unwrap_or(&n).to_owned())).collect();
                     columns=description.columns; for c in &mut columns {c.id=0;c.not_null=false;}
                     typmods=description.typmods.into_iter().map(|n|(n>=0).then_some(n)).collect();

@@ -2,6 +2,7 @@
 use super::*;
 mod arithmetic;
 mod array_constructor;
+mod array_order;
 pub(super) mod collation;
 mod concat;
 pub(in crate::relational) mod assignment;
@@ -1398,11 +1399,7 @@ impl Scalar {
         }
         if !(number(&a.ty) && number(ty)
             || a.ty == *ty
-            || matches!(
-                (&a.ty, ty),
-                (DataType::IntArray, DataType::BigIntArray)
-                    | (DataType::BigIntArray, DataType::IntArray)
-            )
+            || a.ty.is_array() && ty.is_array()
             || integer(&a.ty) && (integer(ty) || *ty == DataType::Bytes)
             || a.ty == DataType::Bytes && integer(ty)
             || matches!(a.ty, DataType::Text | DataType::Varchar | DataType::Bpchar)

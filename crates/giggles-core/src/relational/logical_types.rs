@@ -1,10 +1,11 @@
 use super::*;
 impl DataType {
     pub fn is_extended_text(&self) -> bool {
-        matches!(
-            self,
-            Self::Uuid | Self::Jsonb | Self::IntArray | Self::BigIntArray | Self::TextArray
-        )
+        matches!(self, Self::Uuid | Self::Jsonb) || self.is_array()
+    }
+
+    pub(crate) fn is_array(&self) -> bool {
+        matches!(self, Self::IntArray | Self::BigIntArray | Self::TextArray)
     }
 }
 pub fn coerce(value: Value, ty: &DataType) -> R<Value> {
@@ -277,30 +278,37 @@ fn integer_input_error(error: giggles_pg_types::integer::IntegerError) -> SqlErr
 
 /// The existing array codec accepts flat, one-based arrays only. Compare decoded
 /// elements, with NULL elements last, then the length (the only varying shape).
-pub(super) fn compare_text_arrays(
+pub(super) fn compare_arrays(
     a: &Value,
     b: &Value,
-    mut element: impl FnMut(&str, &str) -> std::cmp::Ordering,
+    mut element: impl FnMut(&str, &str) -> R<std::cmp::Ordering>,
 ) -> R<std::cmp::Ordering> {
     use std::cmp::Ordering;
-    validate_text_array(a)?;
-    validate_text_array(b)?;
-    let (Value::Text(a), Value::Text(b)) = (a, b) else {
-        return Ok(match (a, b) {
-            (Value::Null, Value::Null) => Ordering::Equal,
-            (Value::Null, _) => Ordering::Less,
-            (_, Value::Null) => Ordering::Greater,
-            _ => return Err(SqlError::InternalError),
-        });
+    let (a, b) = match (a, b) {
+        (Value::Text(a), Value::Text(b)) => (array_values(a)?, array_values(b)?),
+        (Value::Null, Value::Null) => return Ok(Ordering::Equal),
+        (Value::Null, Value::Text(b)) => {
+            array_values(b)?;
+            return Ok(Ordering::Less);
+        }
+        (Value::Text(a), Value::Null) => {
+            array_values(a)?;
+            return Ok(Ordering::Greater);
+        }
+        _ => return Err(SqlError::InternalError),
     };
-    let a = array_values(a)?;
-    let b = array_values(b)?;
-    Ok(a.iter().zip(&b).map(|(a, b)| match (a, b) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Greater,
-        (Some(_), None) => Ordering::Less,
-        (Some(a), Some(b)) => element(a, b),
-    }).find(|o| *o != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len())))
+    for (a, b) in a.iter().zip(&b) {
+        let order = match (a, b) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(a), Some(b)) => element(a, b)?,
+        };
+        if order != Ordering::Equal {
+            return Ok(order);
+        }
+    }
+    Ok(a.len().cmp(&b.len()))
 }
 
 /// Validate before values enter infallible sort/map comparators.
@@ -317,15 +325,15 @@ mod tests {
     use super::*;
     #[test]
     fn malformed_array_comparison_is_an_error() {
-        let error = compare_text_arrays(&Value::Text("{a,b".into()),
-            &Value::Text("{a}".into()), str::cmp).unwrap_err();
+        let error = compare_arrays(&Value::Text("{a,b".into()),
+            &Value::Text("{a}".into()), |a, b| Ok(a.cmp(b))).unwrap_err();
         assert_eq!(crate::sqlstate(&crate::CoreError::Sql(error)), "22P02");
         assert_eq!(take_sql_error_message().as_deref(), Some("malformed array literal: \"{a,b\""));
     }
     #[test]
     fn invalid_array_operand_is_internal_error() {
         for other in [Value::Null, Value::Text("{}".into())] {
-            let error=compare_text_arrays(&Value::Int(1), &other, str::cmp).unwrap_err();
+            let error = compare_arrays(&Value::Int(1), &other, |a, b| Ok(a.cmp(b))).unwrap_err();
             assert_eq!(crate::sqlstate(&crate::CoreError::Sql(error)), "XX000");
         }
     }

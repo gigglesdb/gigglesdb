@@ -203,7 +203,7 @@ fn review_between_and_nullif_checks_use_postgres_catalog_text() {
 }
 
 #[test]
-fn review_restores_encoded_array_order_and_rejects_row_array_ordering() {
+fn review_array_order_is_element_wise_and_rejects_row_array_ordering() {
     let admin = Admin::create(fresh("pgparity-w06-array-order"), Limits::default()).unwrap();
     let mut session = admin.sql_session();
     let result = session.execute(
@@ -216,7 +216,8 @@ fn review_restores_encoded_array_order_and_rejects_row_array_ordering() {
     ).unwrap();
     assert_eq!(
         result.rows[0].values,
-        [true, true, false, false, true, true, true, false].map(Value::Bool),
+        // GD-0092 S0: element-wise array ordering (PostgreSQL 18.6: f|f|t|t|f|t|t|f).
+        [false, false, true, true, false, true, true, false].map(Value::Bool),
     );
 
     for expression in [
@@ -233,11 +234,16 @@ fn review_restores_encoded_array_order_and_rejects_row_array_ordering() {
 
     for sql in [
         "CREATE TABLE array_check (id int PRIMARY KEY, a int[], b int[], label text, CHECK (a < b))",
-        "INSERT INTO array_check VALUES (1, '{10}', '{2}', 'old'), (2, '{2}', '{3}', 'second')",
+        "INSERT INTO array_check VALUES (1, '{2}', '{10}', 'old'), (2, '{9,1}', '{10}', 'second')",
         "UPDATE array_check SET label = 'new' WHERE id = 1",
     ] {
         session.execute(sql, &[], None).unwrap();
     }
+    // PG 18.6: '{10}' < '{2}' is false element-wise, so the CHECK rejects it.
+    let error = session
+        .execute("INSERT INTO array_check VALUES (3, '{10}', '{2}', 'bad')", &[], None)
+        .unwrap_err();
+    assert_eq!(giggles_core::sqlstate(&error), "23514", "{error:?}");
     let result = session.execute("SELECT label FROM array_check ORDER BY a", &[], None).unwrap();
     assert_eq!(result.rows[0].values, [Value::Text("new".into())]);
     assert_eq!(result.rows[1].values, [Value::Text("second".into())]);

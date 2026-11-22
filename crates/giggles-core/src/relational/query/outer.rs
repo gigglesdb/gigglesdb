@@ -47,7 +47,19 @@ pub(super) fn resolve(
             let projection = views::projection(state, &syntax.name)?;
             let index = if let Some(p) = projection {
                 p.columns.iter().find(|(c, _)| c.name == column.name).map(|(_, n)| *n)
-            } else { table.logical_offsets().into_iter().find(|n| table.columns[*n].name == column.name) };
+            } else if column.qualifier.is_some()
+                && let Some(index) = column.name.strip_prefix("\0star_column_").and_then(|n| n.parse::<usize>().ok())
+            {
+                (index < table.columns.len() && table.hidden_rowid() != Some(index)).then_some(index)
+            } else {
+                let mut matches = table.logical_offsets().into_iter()
+                    .filter(|n| table.columns[*n].name == column.name);
+                let index = matches.next();
+                if matches.next().is_some() {
+                    return Err(SqlError::AmbiguousColumn);
+                }
+                index
+            };
             if let Some(index) = index {
                 if found.is_some() {
                     return Err(if outer.is_empty() {

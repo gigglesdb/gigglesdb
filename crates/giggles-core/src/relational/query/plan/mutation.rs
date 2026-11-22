@@ -82,7 +82,6 @@ pub(super) fn projection(
     t.extend_from_slice(tokens);
     let mut plan = parse::child_expression(&t, owner, depth, next)?;
     if let Body::Select(select) = &mut plan.body {
-        select.query.allow_duplicate_outputs();
         for (item, alias) in &mut select.query.items {
             if alias.is_none() && let Item::Scalar(Scalar::Column(c)) = item {
                 *alias = Some(c.name.clone());

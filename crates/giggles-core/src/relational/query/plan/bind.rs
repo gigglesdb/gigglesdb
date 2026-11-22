@@ -310,10 +310,7 @@ impl Plan {
                         .map(|(item, column)| match item {
                             BoundItem::Scalar(value) => Some(value),
                             BoundItem::Aggregate(_, Some(value))
-                                if matches!(
-                                    column.data_type,
-                                    DataType::Text | DataType::Varchar | DataType::Bpchar
-                                ) =>
+                                if functions::collation::is_collatable(&column.data_type) =>
                             {
                                 Some(value)
                             }

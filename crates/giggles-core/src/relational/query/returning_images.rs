@@ -1,16 +1,5 @@
 use super::*;
 impl Query {
-    pub(super) fn allow_duplicate_outputs(&mut self) {
-        if !matches!(self.filter, Some(Filter::Clauses(_))) {
-            self.filter = Some(Filter::Clauses(Box::new(QueryClauses {
-                filter: self.filter.take(),
-                ..Default::default()
-            })));
-        }
-        if let Some(Filter::Clauses(c)) = &mut self.filter {
-            c.allow_duplicate_outputs = true;
-        }
-    }
     pub(in crate::relational) fn mutation_input(table: &str, keys: BTreeSet<Vec<u8>>) -> Self {
         let mut query = Self::materialized_returning(table, &[]);
         query.filter = Some(Filter::Clauses(Box::new(QueryClauses {
@@ -39,7 +28,7 @@ impl Query {
         table: &str,
         columns: &[ColumnDef],
     ) -> Self {
-        let mut query = Self {
+        Self {
             explain: false,
             sources: vec![Source {
                 name: table.into(),
@@ -62,9 +51,7 @@ impl Query {
             filter: None,
             order: vec![],
             limit: None,
-        };
-        query.allow_duplicate_outputs();
-        query
+        }
     }
     pub(in crate::relational) fn rewrite_returning_images(
         &mut self,
@@ -141,7 +128,6 @@ impl Query {
                 }
             }
             query.items = items;
-            query.allow_duplicate_outputs();
         }
         Ok(query)
     }

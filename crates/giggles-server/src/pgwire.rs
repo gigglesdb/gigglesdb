@@ -214,7 +214,8 @@ impl Diagnostic {
                 || m.starts_with("function num_nonnulls(") || m.starts_with("invalid input syntax for type ") || m.starts_with("could not obtain lock on row ")
                 || m == "canceling statement due to lock timeout"
                 || m.starts_with("permission denied for table ") || m.starts_with("view ") || m.starts_with("sequence ") || m.starts_with("index ")
-                || m.starts_with("relation ") && m.contains(" clause not found in FROM clause")) {
+                || m.starts_with("relation ") && m.contains(" clause not found in FROM clause")
+                || m.starts_with("ORDER BY \"") && m.ends_with("\" is ambiguous")) {
             self.wire_message = message.clone();
         }
         self.sql_detail = giggles_core::relational::take_sql_error_detail();

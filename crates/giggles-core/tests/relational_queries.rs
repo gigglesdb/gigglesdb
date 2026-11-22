@@ -86,14 +86,13 @@ fn invalid_scope_duplicate_and_ambiguous_names() {
             "SELECT p.id FROM people p JOIN jobs j ON j.id=z.id",
             E::UnknownTable,
         ),
-        (
-            "SELECT p.id AS x,p.manager AS x FROM people p LIMIT 1",
-            E::Duplicate,
-        ),
         ("SELECT p.id FROM people p JOIN jobs j", E::Syntax),
     ] {
         err(&mut s, q, e);
     }
+    let result = run(&mut s, "SELECT p.id AS x,p.manager AS x FROM people p LIMIT 1");
+    assert_eq!(result.columns, ["x", "x"]);
+    assert_eq!(vals(result), vec![vec![V::Int(1), V::Null]]);
     for q in [
         "SELECT p.id FROM people p CROSS JOIN jobs j",
         "SELECT p.id FROM people p JOIN jobs j ON j.person=p.id",

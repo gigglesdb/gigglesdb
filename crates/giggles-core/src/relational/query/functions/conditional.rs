@@ -423,7 +423,7 @@ fn array_bucket(
                 || operand.cmp(value),
                 |name| {
                     collation::compare(
-                        name,
+                        Some(name),
                         &Value::Text(operand.clone()),
                         &Value::Text(value.clone()),
                         &DataType::Text,

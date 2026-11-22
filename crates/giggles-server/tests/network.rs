@@ -208,6 +208,13 @@ impl Fixture {
         .await
     }
     async fn with_task_resources(_task_limits: LegacyTaskResources) -> Self {
+        Self::with_app_table(
+            "app",
+            &["CREATE TABLE app (id BIGINT PRIMARY KEY, body TEXT, flag BOOLEAN, small SMALLINT, num INTEGER, data BYTEA)"],
+        )
+        .await
+    }
+    async fn with_app_table(table: &str, setup: &[&str]) -> Self {
         let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
             "network-fixture-{}-{}-{}",
             std::process::id(),
@@ -246,7 +253,9 @@ impl Fixture {
         std::fs::write(path.join("FIXTURES-ONLY.txt"),"Generated local TEST certificates and private keys. Not deployment credentials. Retained intentionally.\n").unwrap();
         let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
         let mut sql = admin.sql_session();
-        sql.execute("CREATE TABLE app (id BIGINT PRIMARY KEY, body TEXT, flag BOOLEAN, small SMALLINT, num INTEGER, data BYTEA)",&[],None).unwrap();
+        for ddl in setup {
+            sql.execute(ddl, &[], None).unwrap();
+        }
         sql.execute(
             "CREATE TABLE other (id BIGINT PRIMARY KEY, body TEXT)",
             &[],
@@ -260,7 +269,7 @@ impl Fixture {
                 fingerprint: tls::fingerprint(app.cert.der()),
                 role: Role::Application {
                     domain: domain.clone(),
-                    tables: BTreeSet::from(["app".into()]),
+                    tables: BTreeSet::from([table.into()]),
                 },
             },
             Binding {
@@ -2456,12 +2465,14 @@ include!("sqlstate_network.inc");
 include!("immutable_planning_network.inc");
 include!("filter_planning_network.inc");
 include!("aggregate_scalar_network.inc");
+include!("array_ordering_network.inc");
 include!("count_parameter_network.inc");
 include!("character_network.inc");
 include!("pgparity_scalars_w06_network.inc");
 include!("integer_formats_network.inc");
 include!("trim_syntax_network.inc");
 include!("substring_order_network.inc");
+include!("order_select_items_network.inc");
 include!("degree_math_network.inc");
 include!("md5_functions_network.inc");
 include!("overlay_functions_observe_network.inc");

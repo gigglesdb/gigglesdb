@@ -1016,28 +1016,7 @@ pub(super) fn prepare(query: &Query, shape: &Shape) -> R<Query> {
         }
     }
     query.items = items;
-    let table = table(shape);
-    let resolve = |c: &ColumnRef, _: usize| {
-        shape
-            .namespace
-            .resolve(c)
-            .map(|column| BoundColumn { source: 0, column })
-    };
-    query.order = query
-        .order
-        .iter()
-        .map(|(scalar, desc, first)| {
-            let scalar = grouping::output_order(&query, scalar, &query.items, &resolve, &[&table])
-                .map_err(|error| {
-                    if error == SqlError::Duplicate {
-                        SqlError::AmbiguousColumn
-                    } else {
-                        error
-                    }
-                })?;
-            Ok((scalar, *desc, *first))
-        })
-        .collect::<R<_>>()?;
+    // Keep ORDER BY positions and names until binding, after star expansion.
     query.predicates.clear();
     if !matches!(query.filter, Some(Filter::Clauses(_))) {
         query.filter = Some(Filter::Clauses(Box::new(QueryClauses {

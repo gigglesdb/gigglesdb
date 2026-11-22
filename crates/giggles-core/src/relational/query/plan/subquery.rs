@@ -771,9 +771,7 @@ pub(super) fn resolve(
     } else {
         bound.items.into_iter().zip(&d.columns).map(|(item, column)| match item {
             BoundItem::Scalar(value) => Some(value),
-            BoundItem::Aggregate(_, Some(value)) if matches!(
-                column.data_type, DataType::Text | DataType::Varchar | DataType::Bpchar
-            ) => Some(value),
+            BoundItem::Aggregate(_, Some(value)) if functions::collation::is_collatable(&column.data_type) => Some(value),
             _ => None,
         }).collect()
     };
