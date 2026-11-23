@@ -416,17 +416,22 @@ pub fn encode_reply(
             .transpose()
             .map_err(|_| ApiError::Internal)?,
         digest: response.digest,
-        sql: response.sql.map(|sql| proto::SqlResult {
-            columns: sql.columns,
-            rows: sql
-                .rows
-                .into_iter()
-                .map(|row| proto::SqlRow {
-                    values: row.values.into_iter().map(encode_value).collect(),
-                    version: row.version,
-                })
-                .collect(),
-            affected: sql.affected,
+        sql: response.sql.map(|sql| {
+            let column_types = response.sql_types.unwrap_or_default();
+            debug_assert!(column_types.is_empty() || column_types.len() == sql.columns.len());
+            proto::SqlResult {
+                column_types,
+                columns: sql.columns,
+                rows: sql
+                    .rows
+                    .into_iter()
+                    .map(|row| proto::SqlRow {
+                        values: row.values.into_iter().map(encode_value).collect(),
+                        version: row.version,
+                    })
+                    .collect(),
+                affected: sql.affected,
+            }
         }),
         transaction_state: transaction_state as i32,
         task_error: None,

@@ -110,6 +110,7 @@ mod tests {
                         version: 1,
                     }],
                     affected: 0,
+                    column_types: vec![23],
                 }),
                 transaction_state: TransactionState::Idle as i32,
                 ..Default::default()

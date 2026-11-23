@@ -146,6 +146,10 @@ pub enum Request {
     },
     Ping,
 }
+pub(crate) type ApiSqlReplyCheck<'a> = dyn FnMut(
+    Released<&SqlResult>, Option<&mut giggles_core::relational::spill::SpilledRows>, &[u32],
+) -> Result<(), CoreError> + 'a;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Response {
@@ -155,6 +159,8 @@ pub struct Response {
     pub count: Option<usize>,
     pub digest: Option<String>,
     pub sql: Option<SqlResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_types: Option<Vec<u32>>,
 }
 impl Response {
     pub fn code(code: &str) -> Self {
@@ -165,6 +171,7 @@ impl Response {
             count: None,
             digest: None,
             sql: None,
+            sql_types: None,
         }
     }
     pub fn error(e: &CoreError) -> Self {
@@ -186,8 +193,12 @@ impl Response {
     /// let response = giggles_server::Response::released_sql(SqlResult::default());
     /// ```
     pub fn released_sql(result: Released<SqlResult>) -> Self {
+        Self::released_sql_typed(result, Vec::new())
+    }
+    pub(crate) fn released_sql_typed(result: Released<SqlResult>, types: Vec<u32>) -> Self {
         Self {
             sql: Some(result.into_inner()),
+            sql_types: Some(types),
             ..Self::code("ok")
         }
     }
@@ -3386,11 +3397,11 @@ impl Session {
         &mut self,
         sql: &str,
         params: &[Value],
-        check_reply: Option<&mut giggles_core::SqlReplyCheck<'_>>,
-    ) -> Result<Unreleased<SqlResult>, CoreError> {
+        check_reply: Option<&mut ApiSqlReplyCheck<'_>>,
+    ) -> Result<(Unreleased<SqlResult>, Vec<u32>), CoreError> {
         if self.sql.task().is_none() {
             return self.authority_scope(|session| {
-                session.execute_sql_authorized(sql, params, false, check_reply)
+                session.execute_sql_authorized_typed(sql, params, false, check_reply)
             });
         }
         self.authority_scope(|session| {
@@ -3423,7 +3434,9 @@ impl Session {
                 return refused(session, p.task_class(), error);
             }
             session.sql.set_task_statement_text(sql);
-            session.run_prepared(&p, params, false, None)
+            let types = crate::pgwire::result_type_oids(&session.describe(&p)?);
+            let result = session.run_prepared(&p, params, false, None)?;
+            Ok((result, types))
         })
     }
     /// Validity only (revoked, expired, definition changed), for re-serving
@@ -3839,6 +3852,20 @@ impl Session {
         plain: bool,
         check_reply: Option<&mut giggles_core::SqlReplyCheck<'_>>,
     ) -> Result<Unreleased<SqlResult>, CoreError> {
+        let checking = check_reply.is_some();
+        let mut check_reply = check_reply;
+        let mut check = |result: Released<&SqlResult>, spill: Option<&mut relational::spill::SpilledRows>, _types: &[u32]| {
+            if let Some(check) = &mut check_reply { check(result, spill) } else { Ok(()) }
+        };
+        self.execute_sql_authorized_typed(sql, params, plain, checking.then_some(&mut check)).map(|(result, _)| result)
+    }
+    fn execute_sql_authorized_typed(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        plain: bool,
+        check_reply: Option<&mut ApiSqlReplyCheck<'_>>,
+    ) -> Result<(Unreleased<SqlResult>, Vec<u32>), CoreError> {
         // Core's aborted-state ROLLBACK escape must remain reachable.
         if self.sql.is_aborted()
             && sql
@@ -3854,12 +3881,18 @@ impl Session {
                 self.transaction_us = None;
                 self.reconcile_sequence_owners()?;
             }
-            return result;
+            return result.map(|result| (result, Vec::new()));
         }
         let p = self.prepare(sql)?;
-        let result = self.run_prepared(&p, params, plain, check_reply);
+        let types = crate::pgwire::result_type_oids(&self.describe(&p)?);
+        let checking = check_reply.is_some();
+        let mut check_reply = check_reply;
+        let mut check = |result: Released<&SqlResult>, spill: Option<&mut relational::spill::SpilledRows>| {
+            if let Some(check) = &mut check_reply { check(result, spill, &types) } else { Ok(()) }
+        };
+        let result = self.run_prepared(&p, params, plain, checking.then_some(&mut check));
         self.api_path.sql_committed = result.is_ok() && p.command() == "COMMIT";
-        result
+        result.map(|result| (result, types))
     }
     #[cfg(feature = "legacy-task")]
     fn executor(&self) -> Result<(Executor, (u64, u64)), CoreError> {
@@ -3899,7 +3932,7 @@ impl Session {
         &mut self,
         request: Request,
         received: std::time::Instant,
-        check_reply: Option<&mut giggles_core::SqlReplyCheck<'_>>,
+        check_reply: Option<&mut ApiSqlReplyCheck<'_>>,
     ) -> Response {
         self.authority_scope(|session| {
             Ok(session.handle_authorized(request, received, check_reply))
@@ -3910,7 +3943,7 @@ impl Session {
         &mut self,
         request: Request,
         received: std::time::Instant,
-        check_reply: Option<&mut giggles_core::SqlReplyCheck<'_>>,
+        check_reply: Option<&mut ApiSqlReplyCheck<'_>>,
     ) -> Response {
         if self.service.check_statement_gate().is_err() {
             return Response::code("57P01");
@@ -3955,7 +3988,7 @@ impl Session {
         request: Request,
         received: std::time::Instant,
         context: &Cancellation,
-        check_reply: Option<&mut giggles_core::SqlReplyCheck<'_>>,
+        check_reply: Option<&mut ApiSqlReplyCheck<'_>>,
     ) -> Response {
         if matches!(&self.role, Role::NoSql { .. }) {
             return Response::code(if matches!(request, Request::Ping) { "ok" } else { "42501" });
@@ -4045,8 +4078,8 @@ impl Session {
                 // GD-0061 R3-313: the result is released before the Response
                 // that both transports encode is built.
                 Request::Sql { sql, params } => {
-                    let result = self.execute_api_sql(&sql, &params, check_reply)?;
-                    Ok(Response::released_sql(self.release_page(result)?))
+                    let (result, types) = self.execute_api_sql(&sql, &params, check_reply)?;
+                    Ok(Response::released_sql_typed(self.release_page(result)?, types))
                 }
                 #[cfg(feature = "legacy-task")]
                 Request::Preview { request } => {
@@ -4115,6 +4148,27 @@ thread_local! {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn api_sql_types_for_empty_select() {
+        let (service, _) = fixture();
+        service.admin.roles().create(roles::NewRole {
+            name: "type_owner".into(), login: true, superuser: true,
+            ..roles::NewRole::default()
+        }).unwrap();
+        let mut session = service.role_session("type_owner").unwrap();
+        let execute = |session: &mut Session, sql: &str| session.handle(Request::Sql {
+            sql: sql.into(), params: vec![],
+        });
+        let ddl = execute(&mut session, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+        assert_eq!(ddl.code, "ok");
+        assert_eq!(ddl.sql_types, Some(vec![]));
+        let reply = execute(&mut session, "SELECT id FROM t WHERE false");
+        assert_eq!(reply.code, "ok");
+        assert!(reply.sql.as_ref().unwrap().rows.is_empty());
+        let reply = crate::api::codec::encode_reply(reply, crate::api::proto::TransactionState::Idle).unwrap();
+        assert_eq!(reply.sql.unwrap().column_types, vec![23]);
+    }
 
     #[cfg(feature = "engine-rocksdb")]
     #[test]

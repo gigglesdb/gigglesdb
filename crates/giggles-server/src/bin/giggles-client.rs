@@ -195,6 +195,7 @@ fn encode_task(request: giggles_core::Request) -> giggles_server::api::proto::Ta
 }
 
 fn legacy_response(reply: ExecuteReply) -> Result<Response, Box<dyn Error>> {
+    let sql_types = reply.sql.as_ref().map(|sql| sql.column_types.clone());
     let sql = if let Some(sql) = reply.sql {
         let rows = sql
             .rows
@@ -225,5 +226,6 @@ fn legacy_response(reply: ExecuteReply) -> Result<Response, Box<dyn Error>> {
         count: reply.count.map(usize::try_from).transpose()?,
         digest: reply.digest,
         sql,
+        sql_types,
     })
 }

@@ -258,6 +258,8 @@ message SqlResult {
   repeated string columns = 1;
   repeated SqlRow rows = 2;
   uint64 affected = 3;
+  // PostgreSQL type OID per column, parallel to `columns`, as the PostgreSQL listener's RowDescription reports it. Empty when `columns` is empty.
+  repeated uint32 column_types = 4;
 }
 message SqlRow {
   repeated Value values = 1;

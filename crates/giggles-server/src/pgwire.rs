@@ -585,6 +585,12 @@ pub fn oid(t: &DataType) -> u32 {
         DataType::Interval => 1186,
     }
 }
+pub(crate) fn result_type_oids(d: &Description) -> Vec<u32> {
+    d.columns.iter().enumerate().map(|(i, c)| {
+        d.type_oids.get(i).copied().filter(|id| *id != 0)
+            .unwrap_or_else(|| oid(&c.data_type))
+    }).collect()
+}
 fn size(t: &DataType) -> i16 {
     match t {
         DataType::RegType => 4,
@@ -637,18 +643,12 @@ pub fn row_description(d: &Description, formats: &[u16], out: &mut Vec<u8>) -> R
     }
     let mut b = vec![];
     b.extend((d.columns.len() as u16).to_be_bytes());
+    let type_oids = result_type_oids(d);
     for (i, c) in d.columns.iter().enumerate() {
         z(&c.name, &mut b);
         b.extend(0u32.to_be_bytes());
         b.extend(0i16.to_be_bytes());
-        b.extend(
-            d.type_oids
-                .get(i)
-                .copied()
-                .filter(|id| *id != 0)
-                .unwrap_or_else(|| oid(&c.data_type))
-                .to_be_bytes(),
-        );
+        b.extend(type_oids[i].to_be_bytes());
         b.extend(if d.type_oids.get(i) == Some(&2278) { 4i16 } else { size(&c.data_type) }.to_be_bytes());
         b.extend(d.typmods.get(i).copied().unwrap_or(-1).to_be_bytes());
         b.extend(format_at(formats, i).to_be_bytes());
@@ -4719,6 +4719,46 @@ mod prepared_validation_tests {
                 assert_eq!(s.constant_validations, n);
                 assert!(s.validated.is_none());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn result_type_oids_matches_row_description() {
+        for overrides in [vec![], vec![0, 2278, 20]] {
+            let d = Description {
+                columns: [DataType::Integer, DataType::Text, DataType::BigInt, DataType::Boolean]
+                    .into_iter().enumerate().map(|(i, data_type)| giggles_core::relational::ColumnDef {
+                        id: 0, name: format!("c{i}"), data_type, not_null: false,
+                    }).collect(),
+                type_oids: overrides,
+                typmods: vec![-1, 7],
+                parameters: vec![],
+            };
+            let types = result_type_oids(&d);
+            assert_eq!(types, if d.type_oids.is_empty() { vec![23, 25, 20, 16] } else { vec![23, 2278, 20, 16] });
+            // Independently assemble the original RowDescription layout, including
+            // void's special size, typmods, and per-column result formats.
+            let mut body = 4u16.to_be_bytes().to_vec();
+            for (i, c) in d.columns.iter().enumerate() {
+                z(&c.name, &mut body);
+                body.extend(0u32.to_be_bytes());
+                body.extend(0i16.to_be_bytes());
+                body.extend(d.type_oids.get(i).copied().filter(|id| *id != 0)
+                    .unwrap_or_else(|| oid(&c.data_type)).to_be_bytes());
+                body.extend(if d.type_oids.get(i) == Some(&2278) { 4i16 } else { size(&c.data_type) }.to_be_bytes());
+                body.extend(d.typmods.get(i).copied().unwrap_or(-1).to_be_bytes());
+                body.extend(format_at(&[0, 1], i).to_be_bytes());
+            }
+            let mut expected = vec![];
+            frame(b'T', &body, &mut expected).unwrap();
+            let mut actual = vec![];
+            row_description(&d, &[0, 1], &mut actual).unwrap();
+            assert_eq!(actual, expected);
         }
     }
 }

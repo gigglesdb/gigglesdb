@@ -1197,8 +1197,8 @@ fn execute_released(
         // A refusal is a native error reply, so it carries its task fields.
         Invocation::Legacy(request) => match native::admit_legacy(session, &request) {
             Ok(()) => {
-                let mut check = |result: Released<&SqlResult>, spill: Option<&mut SpilledRows>| {
-                    prepared_reply = Some(check_sql_stream_reply(result, spill, encoding)?);
+                let mut check = |result: Released<&SqlResult>, spill: Option<&mut SpilledRows>, types: &[u32]| {
+                    prepared_reply = Some(check_sql_stream_reply(result, spill, types, encoding)?);
                     Ok(())
                 };
                 Executed::Legacy(session.handle_with_reply_check(
@@ -1305,8 +1305,8 @@ fn execute_released(
                         index_id: None,
                     }))
                 }
-                native::NativeResult::Sql(sql) => {
-                    reply.sql = codec::encode_reply(Response::released_sql(sql), state)?.sql;
+                native::NativeResult::Sql(sql, types) => {
+                    reply.sql = codec::encode_reply(Response::released_sql_typed(sql, types), state)?.sql;
                     None
                 }
                 native::NativeResult::Operation(outcome) => {
@@ -1340,9 +1340,10 @@ fn execute_released(
 fn check_sql_stream_reply(
     result: Released<&SqlResult>,
     spill: Option<&mut SpilledRows>,
+    types: &[u32],
     encoding: Encoding,
 ) -> Result<(proto::ExecuteReply, Option<Vec<u8>>), CoreError> {
-    let response = Response::released_sql(result.map(SqlResult::clone));
+    let response = Response::released_sql_typed(result.map(SqlResult::clone), types.to_vec());
     let reply = codec::encode_reply(response, proto::TransactionState::Idle)
         .and_then(|reply| encode(reply, encoding))
         .map_err(stream::sql_reply_error)?;

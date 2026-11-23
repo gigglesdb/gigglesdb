@@ -181,6 +181,7 @@ impl GrpcRows {
                 proto::NativeOutcome::default(),
             ));
         } else {
+            // Columns and their type OIDs belong to the head, never continuations.
             reply.sql = Some(proto::SqlResult::default());
         }
         Self {
@@ -299,6 +300,23 @@ fn protobuf_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sql_continuations_do_not_repeat_type_metadata() {
+        let mut chunks = GrpcRows::new(false);
+        let row = SqlRow {
+            values: vec![giggles_core::relational::Value::Text("x".repeat(CHUNK))],
+            version: 0,
+        };
+        assert!(chunks.push(row.clone()).is_none());
+        let first = chunks.push(row).unwrap();
+        for chunk in [first, chunks.finish().unwrap()] {
+            let sql = chunk.sql.unwrap();
+            assert_eq!(sql.rows.len(), 1);
+            assert!(sql.columns.is_empty());
+            assert!(sql.column_types.is_empty());
+        }
+    }
+
     #[test]
     fn temp_file_status_keeps_sqlstate_and_resource_class() {
         for (disk_full, code, expected) in [

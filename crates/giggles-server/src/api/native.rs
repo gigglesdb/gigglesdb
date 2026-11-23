@@ -17,7 +17,7 @@ pub(crate) enum NativeResult {
     Control,
     Catalog(ops::CatalogOutcome, String),
     SequenceCatalog(u64, String),
-    Sql(Released<giggles_core::relational::SqlResult>),
+    Sql(Released<giggles_core::relational::SqlResult>, Vec<u32>),
     Operation(Released<ops::Outcome>),
     Page(ops::Page),
     Transaction(Released<ops::TransactionOutcome>),
@@ -410,7 +410,13 @@ fn protected(
             return Ok(NativeResult::Error(error));
         }
     }
-    Ok(NativeResult::Sql(Released::synthetic(result)))
+    let head = match &statement {
+        ProtectedStatement::Preview { .. } => crate::agent::statement::ProtectedHead::Preview,
+        ProtectedStatement::Outcome { op } => crate::agent::statement::ProtectedHead::Outcome { op: op.clone() },
+        _ => return Ok(NativeResult::Sql(Released::synthetic(result), Vec::new())),
+    };
+    let types = crate::pgwire::result_type_oids(&crate::agent::statement::description(&head, None));
+    Ok(NativeResult::Sql(Released::synthetic(result), types))
 }
 
 pub(crate) fn run(
@@ -474,8 +480,8 @@ pub(crate) fn run(
             }
             return Ok(match session.execute_task_ddl(statement) {
                 Ok(giggles_core::task::statements::TaskOutcome::Tag(_)) => NativeResult::Control,
-                Ok(giggles_core::task::statements::TaskOutcome::Rows(_, rows)) => {
-                    NativeResult::Sql(Released::synthetic(rows))
+                Ok(giggles_core::task::statements::TaskOutcome::Rows(description, rows)) => {
+                    NativeResult::Sql(Released::synthetic(rows), crate::pgwire::result_type_oids(&description))
                 }
                 Err(error) => NativeResult::Error(ops::Error::Sql {
                     sqlstate: error.sqlstate.into(),
@@ -567,7 +573,7 @@ pub(crate) fn run(
                     columns: vec!["search_path".into()],
                     rows: vec![giggles_core::relational::SqlRow { values: vec![giggles_core::relational::Value::Text(session.search_path.clone())], version: 0 }],
                     affected: 0,
-                })));
+                }), vec![crate::pgwire::oid(&giggles_core::relational::DataType::Text)]));
             }
             // GD-0061 R3-313: every result core returns is held until the
             // session releases it, here, before anything encodes it. Outside
@@ -620,7 +626,7 @@ pub(crate) fn run(
                     columns: vec![column.into()],
                     rows: vec![giggles_core::relational::SqlRow { values: vec![giggles_core::relational::Value::Int(value)], version: 0 }],
                     affected: 1,
-                })))
+                }), vec![crate::pgwire::oid(&giggles_core::relational::DataType::BigInt)]))
             }
             Invocation::Savepoint(name) => { session.sql.savepoint(&name)?; return Ok(NativeResult::Control); }
             Invocation::RollbackTo(name) => { session.sql.rollback_to(&name)?; return Ok(NativeResult::Control); }
@@ -664,6 +670,34 @@ mod tests {
     use super::*;
     use crate::{Binding, Service, clock::Clock};
     use giggles_core::{Admin, Limits, roles};
+
+    #[test]
+    fn synthetic_sequence_types_match_pgwire() {
+        let path = crate::test_support::fixture_root().join(format!("sequence-types-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+        admin.roles().create(roles::NewRole {
+            name: "type_owner".into(), login: true, superuser: true,
+            ..roles::NewRole::default()
+        }).unwrap();
+        let service = Service::new(admin, vec![], Clock::new(0, 3600).unwrap()).unwrap();
+        let mut session = service.role_session("type_owner").unwrap();
+        session.execute_sql("CREATE SEQUENCE type_seq", &[]).unwrap();
+        for (sql, call) in [
+            ("SELECT nextval('type_seq')", ops::SequenceCall::Nextval("type_seq".into())),
+            ("SELECT currval('type_seq')", ops::SequenceCall::Currval("type_seq".into())),
+            ("SELECT setval('type_seq', 42)", ops::SequenceCall::Setval { name: "type_seq".into(), value: 42, is_called: None }),
+        ] {
+            let prepared = session.prepare(sql).unwrap();
+            let description = session.describe(&prepared).unwrap();
+            let expected = crate::pgwire::result_type_oids(&description);
+            assert_eq!(expected, vec![20], "{sql}");
+            let outcome = run(&mut session, Invocation::Sequence(call), None).unwrap();
+            let NativeResult::Sql(result, types) = outcome else { panic!("sequence SQL result") };
+            let reply = super::super::codec::encode_reply(crate::Response::released_sql_typed(result, types), super::super::proto::TransactionState::Idle).unwrap();
+            assert_eq!(reply.sql.unwrap().column_types, expected, "{sql}");
+        }
+    }
 
     #[test]
     fn native_ast_collects_column_reads_and_conflict_updates() {
