@@ -187,9 +187,9 @@ for scenario in "${expanded[@]}"; do
   fi
   # The trusted CLI emits quoted POSIX exports. Keep exports and bearer private.
   eval "$("$binary" session env "${agent[@]}" --context "$scenario" --format sh 2>"$run/env-$scenario.log" | tr -d '\r')"
-  [[ $PGUSER == session:* && -n ${NUNYA_SPANNER_BEARER:-} ]]
+  [[ -z ${PGUSER:-} && $NUNYA_SPANNER_BEARER == nunya.session:*.* ]]
   export NUNYA_D2_BEARER="$NUNYA_SPANNER_BEARER"
-  scenario_session=${PGUSER#session:}
+  scenario_session=${NUNYA_SPANNER_BEARER#nunya.session:}; scenario_session=${scenario_session%%.*}
   unset PGUSER PGPASSWORD PGHOST PGPORT PGDATABASE NUNYA_SPANNER_BEARER
   export NUNYA_D2_REVOKE="$run/revoke-$scenario.sh"
   {

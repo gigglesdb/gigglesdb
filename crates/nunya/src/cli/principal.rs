@@ -7,7 +7,12 @@ use crate::{
     token::PrincipalId,
 };
 use clap::{Args, Subcommand};
-use std::{collections::BTreeSet, fmt};
+use std::{
+    collections::BTreeSet,
+    fmt, fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
 use zeroize::Zeroizing;
 
 /// Fixed administration failures, excluding all credential material.
@@ -115,6 +120,9 @@ pub enum PrincipalCommand {
         /// Credential input.
         #[command(flatten)]
         credential: CredentialOpts,
+        /// Store a generated secret in a new file.
+        #[arg(long, requires = "generate_secret")]
+        secret_out: Option<PathBuf>,
     },
     /// List principal summaries.
     List(ConnectionOpts),
@@ -203,11 +211,36 @@ pub async fn create(
     admin: bool,
     credential: &CredentialOpts,
 ) -> Result<Issued<PrincipalView>, AdminError> {
+    create_with_secret_out(client, name, kind, admin, credential, None).await
+}
+async fn create_with_secret_out(
+    client: &MgmtClient,
+    name: &str,
+    kind: PrincipalKind,
+    admin: bool,
+    credential: &CredentialOpts,
+    secret_out: Option<&Path>,
+) -> Result<Issued<PrincipalView>, AdminError> {
     let (verifier, secret) = material(credential)?;
-    let value = client
+    if let Some(path) = secret_out {
+        let secret = secret.as_ref().ok_or(AdminError::Invalid(
+            "--secret-out requires --generate-secret",
+        ))?;
+        write_secret_out(path, secret)?;
+    }
+    let result = client
         .create_principal(name, kind, admin, verifier.as_deref().map(|s| s.as_str()))
-        .await?;
-    Ok(Issued { value, secret })
+        .await;
+    if result.is_err()
+        && let Some(path) = secret_out
+    {
+        // If the response was lost, the principal may already exist.
+        eprintln!("Generated secret retained at {}", path.display());
+    }
+    Ok(Issued {
+        value: result?,
+        secret,
+    })
 }
 /// List public principal summaries.
 pub async fn list(client: &MgmtClient) -> Result<Vec<PrincipalView>, AdminError> {
@@ -293,6 +326,44 @@ fn print_secret(secret: Option<Zeroizing<String>>) {
         eprintln!("Save this secret now; it cannot be shown again.");
     }
 }
+fn write_secret_out(path: &Path, secret: &str) -> Result<(), AdminError> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // On Windows the secret file inherits the directory ACL.
+    let mut file = options.open(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            AdminError::Invalid("the --secret-out file already exists")
+        } else {
+            AdminError::Invalid("cannot create the file given by --secret-out")
+        }
+    })?;
+    if writeln!(file, "{secret}")
+        .and_then(|()| file.sync_all())
+        .is_err()
+    {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(AdminError::Invalid(
+            "cannot write the generated secret to --secret-out",
+        ));
+    }
+    Ok(())
+}
+fn report_created_with_secret_file(
+    id: &str,
+    path: &Path,
+    mut stdout: impl Write,
+    mut stderr: impl Write,
+) -> Result<(), AdminError> {
+    writeln!(stdout, "{id}")
+        .and_then(|()| writeln!(stderr, "Generated secret written to {}", path.display()))
+        .map_err(|_| AdminError::Invalid("cannot report the created principal"))
+}
 fn print_principal(p: &PrincipalView) {
     println!(
         "{}\t{}\t{:?}\t{:?}\t{:?}\t{}",
@@ -307,10 +378,28 @@ async fn dispatch(command: PrincipalCommand) -> Result<(), AdminError> {
             kind,
             admin,
             credential,
+            secret_out,
         } => {
-            let issued = create(&connection.client()?, &name, kind, admin, &credential).await?;
-            println!("{}", issued.value.id);
-            print_secret(issued.secret);
+            let issued = create_with_secret_out(
+                &connection.client()?,
+                &name,
+                kind,
+                admin,
+                &credential,
+                secret_out.as_deref(),
+            )
+            .await?;
+            if let Some(path) = secret_out {
+                report_created_with_secret_file(
+                    &issued.value.id,
+                    &path,
+                    io::stdout().lock(),
+                    io::stderr().lock(),
+                )?;
+            } else {
+                println!("{}", issued.value.id);
+                print_secret(issued.secret);
+            }
         }
         PrincipalCommand::List(connection) => {
             for p in list(&connection.client()?).await? {
@@ -425,6 +514,37 @@ pub fn run_connections(command: ConnectionsCommand) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn secret_out_requires_a_new_private_file_and_prints_only_the_id() {
+        let path = std::env::temp_dir().join(format!(
+            "nunya-principal-{}.secret",
+            crate::token::SessionId::random().to_hex()
+        ));
+        write_secret_out(&path, "private-generated-secret").unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        report_created_with_secret_file("principal-id", &path, &mut stdout, &mut stderr).unwrap();
+        assert_eq!(stdout, b"principal-id\n");
+        let notice = String::from_utf8(stderr).unwrap();
+        assert!(notice.contains(&path.display().to_string()));
+        assert!(!notice.contains("private-generated-secret"));
+        assert_eq!(
+            write_secret_out(&path, "replacement")
+                .unwrap_err()
+                .to_string(),
+            "the --secret-out file already exists"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"private-generated-secret\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_file(path).unwrap();
+    }
     #[test]
     fn generated_material_is_valid_and_diagnostics_redact_it() {
         let opts = CredentialOpts {

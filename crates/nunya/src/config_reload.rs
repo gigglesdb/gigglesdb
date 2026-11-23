@@ -24,6 +24,10 @@ const RESTART_ONLY: &[&str] = &[
     "policy_store",
     "policy_store_kubernetes",
     "listen",
+    "advertise_host",
+    "advertise_port",
+    "spanner_native.advertise",
+    "schema_snapshot_timeout_ms",
     "admin_listen",
     "root_key",
     "state_dir",
@@ -64,6 +68,10 @@ pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
         path: _,
         revision: _,
         listen: a_listen,
+        advertise_host: a_advertise_host,
+        advertise_port: a_advertise_port,
+        spanner_advertise: a_spanner_advertise,
+        schema_snapshot_timeout_ms: a_schema_snapshot_timeout_ms,
         admin_listen: a_admin_listen,
         postgres_policy: a_postgres_policy,
         spanner_policy: a_spanner_policy,
@@ -94,6 +102,10 @@ pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
         path: _,
         revision: _,
         listen: b_listen,
+        advertise_host: b_advertise_host,
+        advertise_port: b_advertise_port,
+        spanner_advertise: b_spanner_advertise,
+        schema_snapshot_timeout_ms: b_schema_snapshot_timeout_ms,
         admin_listen: b_admin_listen,
         postgres_policy: b_postgres_policy,
         spanner_policy: b_spanner_policy,
@@ -131,6 +143,26 @@ pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
     changed!(restart_only, "readlog", a_policy_settings.readlog != b_policy_settings.readlog);
     changed!(restart_only, "snapshot_max_age_ms", a_policy_settings.snapshot_max_age_ms != b_policy_settings.snapshot_max_age_ms);
     changed!(restart_only, "listen", a_listen != b_listen);
+    changed!(
+        restart_only,
+        "advertise_host",
+        a_advertise_host != b_advertise_host
+    );
+    changed!(
+        restart_only,
+        "advertise_port",
+        a_advertise_port != b_advertise_port
+    );
+    changed!(
+        restart_only,
+        "spanner_native.advertise",
+        a_spanner_advertise != b_spanner_advertise
+    );
+    changed!(
+        restart_only,
+        "schema_snapshot_timeout_ms",
+        a_schema_snapshot_timeout_ms != b_schema_snapshot_timeout_ms
+    );
     changed!(
         restart_only,
         "admin_listen",
@@ -277,6 +309,10 @@ pub(crate) fn copy_config(c: &Config) -> Config {
         path: c.path.clone(),
         revision: c.revision.clone(),
         listen: c.listen,
+        advertise_host: c.advertise_host.clone(),
+        advertise_port: c.advertise_port,
+        spanner_advertise: c.spanner_advertise.clone(),
+        schema_snapshot_timeout_ms: c.schema_snapshot_timeout_ms,
         admin_listen: c.admin_listen,
         postgres_policy: c.postgres_policy.clone(),
         spanner_policy: c.spanner_policy.clone(),
@@ -350,7 +386,12 @@ pub(crate) async fn refresh_tick<T: Clone>(rx: &mut tokio::sync::watch::Receiver
         }
     }
 }
-type SnapshotSource = dyn Fn(Config) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::schema::Snapshot, &'static str>> + Send>> + Send + Sync;
+type SnapshotSource = dyn Fn(
+        Config,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<crate::schema::Snapshot, String>> + Send>,
+    > + Send
+    + Sync;
 struct CatalogApplier {
     context: Arc<crate::pgwire::context::GatewayContext>,
     source: Arc<SnapshotSource>,
@@ -552,9 +593,9 @@ impl ConfigReloader {
             } else { Ok(None) }
         } else if prepared.as_ref().is_ok_and(|p| running.upstream.is_some()
             && p.diff.reloadable.iter().any(|s| ["schemas", "search_path"].contains(s))) {
-            Err("snapshot unavailable")
+            Err("snapshot unavailable".into())
         } else { Ok(None) };
-        let prepared = prepared.and_then(|p| candidate.map(|c| (p, c)).map_err(str::to_owned));
+        let prepared = prepared.and_then(|p| candidate.map(|c| (p, c)));
         let mut standing_pending = false;
         #[cfg(feature = "kubernetes")]
         let mut deferred = false;
@@ -1197,6 +1238,20 @@ key_file='key'
             ("search_path", "search_path", "['other']", true),
             ("snapshot_refresh_ms", "snapshot_refresh_ms", "30001", true),
             (
+                "schema_snapshot_timeout_ms",
+                "schema_snapshot_timeout_ms",
+                "60001",
+                false,
+            ),
+            ("advertise_host", "advertise_host", "'pg.example'", false),
+            ("advertise_port", "advertise_port", "6543", false),
+            (
+                "spanner_native.advertise",
+                "spanner_native.advertise",
+                "'spanner.example:6543'",
+                false,
+            ),
+            (
                 "spanner_native.snapshot_refresh_ms",
                 "spanner_native.snapshot_refresh_ms",
                 "30001",
@@ -1491,18 +1546,33 @@ key_file='key'
             let reload = ConfigReloader::new(cfg, Arc::downgrade(&hub));
             reload.attach_transports(transports.clone());
             let source_snapshot = (*original).clone();
-            reload.attach_catalog(pg.ctx.clone(), Arc::new(move |cfg| {
-                let mut snapshot = source_snapshot.clone();
-                Box::pin(async move {
-                    assert_eq!(cfg.schemas, ["public", "other"]);
-                    assert_eq!(cfg.search_path, ["other"]);
-                    if outcome == 0 { return Err("snapshot unavailable"); }
-                    if outcome == 1 { snapshot.relations.clear(); }
-                    snapshot.search_path = cfg.search_path;
-                    Ok(snapshot)
-                })
-            }));
-            let edited = edit(&edit(&edit(&f.text, "search_path", "['other']"), "snapshot_refresh_ms", "10"), "max_connections", "1");
+            reload.attach_catalog(
+                pg.ctx.clone(),
+                Arc::new(move |cfg| {
+                    let mut snapshot = source_snapshot.clone();
+                    Box::pin(async move {
+                        assert_eq!(cfg.schemas, ["public", "other"]);
+                        assert_eq!(cfg.search_path, ["other"]);
+                        if outcome == 0 {
+                            return Err("snapshot unavailable".into());
+                        }
+                        if outcome == 1 {
+                            snapshot.relations.clear();
+                        }
+                        snapshot.search_path = cfg.search_path;
+                        Ok(snapshot)
+                    })
+                }),
+            );
+            let edited = edit(
+                &edit(
+                    &edit(&f.text, "search_path", "['other']"),
+                    "snapshot_refresh_ms",
+                    "10",
+                ),
+                "max_connections",
+                "1",
+            );
             f.load(&edited);
             reload.reload().await;
             let current = pg.ctx.snapshot.read().unwrap().clone();

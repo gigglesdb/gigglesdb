@@ -1,6 +1,7 @@
 //! PostgreSQL gateway lifecycle and schema transport.
 use crate::{
     config::{Config, UpstreamDialect},
+    mgmt::client::ConnectInfo,
     pgwire::{
         context::{GatewayContext, Metrics},
         upstream::{UpstreamConfig, UpstreamTls},
@@ -293,34 +294,64 @@ pub(crate) fn now() -> u64 {
         .and_then(|d| u64::try_from(d.as_millis()).ok())
         .unwrap_or(u64::MAX)
 }
+#[derive(Debug)]
+pub(crate) enum SnapshotError {
+    Unavailable,
+    Timeout(u64),
+}
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("upstream schema snapshot unavailable"),
+            Self::Timeout(ms) => write!(
+                f,
+                "upstream schema snapshot did not finish within schema_snapshot_timeout_ms ({ms} ms)"
+            ),
+        }
+    }
+}
+
+async fn with_snapshot_timeout<T>(
+    cfg: &Config,
+    capture: impl Future<Output = Result<T, SnapshotError>>,
+) -> Result<T, SnapshotError> {
+    let ms = cfg.schema_snapshot_timeout_ms;
+    tokio::time::timeout(Duration::from_millis(ms), capture)
+        .await
+        .map_err(|_| SnapshotError::Timeout(ms))?
+}
+
 /// Load the configured catalog dialect on an exclusive client.
 pub(crate) async fn snapshot(
     client: &tokio_postgres::Client,
     cfg: &Config,
-) -> Result<Snapshot, String> {
-    let result = match cfg.dialect {
-        UpstreamDialect::Postgres => {
-            crate::schema::pg::load_pg_snapshot(
-                client,
-                &crate::schema::pg::PgSchemaOptions {
-                    schemas: cfg.schemas.clone(),
-                    search_path: cfg.search_path.clone(),
-                },
-                now(),
-            )
-            .await
-        }
-        UpstreamDialect::SpannerPg => {
-            crate::schema::spanner_pg::load_spanner_pg_snapshot(
-                client,
-                &cfg.schemas,
-                &cfg.search_path,
-                now(),
-            )
-            .await
-        }
-    };
-    result.map_err(|_| "upstream schema snapshot unavailable".into())
+) -> Result<Snapshot, SnapshotError> {
+    with_snapshot_timeout(cfg, async {
+        let result = match cfg.dialect {
+            UpstreamDialect::Postgres => {
+                crate::schema::pg::load_pg_snapshot(
+                    client,
+                    &crate::schema::pg::PgSchemaOptions {
+                        schemas: cfg.schemas.clone(),
+                        search_path: cfg.search_path.clone(),
+                    },
+                    now(),
+                )
+                .await
+            }
+            UpstreamDialect::SpannerPg => {
+                crate::schema::spanner_pg::load_spanner_pg_snapshot(
+                    client,
+                    &cfg.schemas,
+                    &cfg.search_path,
+                    now(),
+                )
+                .await
+            }
+        };
+        result.map_err(|_| SnapshotError::Unavailable)
+    })
+    .await
 }
 /// Parse policy bytes and resolve its audit path relative to the policy file.
 pub(crate) fn parse_policy_bytes(path: &Path, bytes: &[u8], service: &crate::policy::ServicePolicySettings) -> Result<crate::policy::PolicyDocument, Vec<PolicyError>> {
@@ -396,6 +427,7 @@ struct ManagementStatus {
     hub: Arc<crate::reload::Hub>,
     routes: Vec<crate::state::model::RouteId>,
     spanner_route: Option<crate::state::model::RouteId>,
+    connect: HashMap<crate::state::model::RouteId, ConnectInfo>,
 }
 impl crate::mgmt::routes::StatusSource for ManagementStatus {
     fn policy_revision(&self, route: &str) -> Option<String> {
@@ -414,6 +446,10 @@ impl crate::mgmt::routes::StatusSource for ManagementStatus {
     fn route_kind(&self, route: &str) -> Option<&'static str> {
         let id = self.routes.iter().find(|id| id.as_str() == route)?;
         Some(if self.spanner_route.as_ref() == Some(id) { "spanner-native" } else { "postgres" })
+    }
+    fn route_connect(&self, route: &str) -> Option<&ConnectInfo> {
+        let id = self.routes.iter().find(|id| id.as_str() == route)?;
+        self.connect.get(id)
     }
     fn route_ids(&self) -> Vec<String> { self.routes.iter().map(|r| r.as_str().into()).collect() }
 }
@@ -922,6 +958,34 @@ async fn run_inner(mut config: Config, #[cfg(feature = "kubernetes")] election_t
         reload_hub.run(reload_rx, Some(reload_config)).await
     }));
     let management = if config.management.is_some() || cfg!(unix) {
+        let mut connect = HashMap::new();
+        if let (Some(route), Some(upstream), Some((host, port))) = (
+            &postgres_route,
+            &config.upstream,
+            config.postgres_endpoint(),
+        ) {
+            connect.insert(
+                route.clone(),
+                ConnectInfo::Postgres {
+                    host,
+                    port,
+                    database: upstream.dbname.clone(),
+                },
+            );
+        }
+        if let (Some(route), Some(section), Some(endpoint)) = (
+            &spanner_route,
+            &config.spanner_native,
+            config.spanner_endpoint(),
+        ) {
+            connect.insert(
+                route.clone(),
+                ConnectInfo::SpannerNative {
+                    endpoint,
+                    database: section.database.clone(),
+                },
+            );
+        }
         let ctx = crate::mgmt::routes::MgmtContext { leadership,
             policy: Some(Arc::new(ManagementPolicy { rejections: Default::default(), hub: hub.clone(), store: runtime.store(), writes: std::sync::Mutex::new(()) })),
             authority: runtime.authority.clone(), admins,
@@ -931,6 +995,7 @@ async fn run_inner(mut config: Config, #[cfg(feature = "kubernetes")] election_t
                 hub: hub.clone(),
                 spanner_route: spanner_route.clone(),
                 routes: postgres_route.iter().chain(spanner_route.iter()).cloned().collect(),
+                connect,
             }),
             lifecycle: Arc::new(crate::mgmt::audit::ReadLogSink(hub.log.clone())),
         };
@@ -1090,12 +1155,9 @@ async fn run_postgres(
         .upstream_config()
         .ok_or("PostgreSQL route unavailable")?;
     let schema = connect_schema(&upstream).await?;
-    let first = tokio::time::timeout(
-        Duration::from_millis(upstream.connect_timeout_ms),
-        snapshot(&schema.client, &config),
-    )
-    .await
-    .map_err(|_| "upstream schema snapshot timed out")??;
+    let first = snapshot(&schema.client, &config)
+        .await
+        .map_err(|error| error.to_string())?;
 
     let tls = transports.postgres.clone();
     let root_hex = zeroize::Zeroizing::new(data_encoding::HEXLOWER.encode(&*config.root_key));
@@ -1130,12 +1192,20 @@ async fn run_postgres(
             .await
             .map_err(|_| "agent listener unavailable")?;
     hub.register(crate::reload::Route::Postgres(ctx.clone()))?;
-    config_reload.attach_catalog(ctx.clone(), Arc::new(|cfg| Box::pin(async move {
-        let upstream = cfg.upstream_config().ok_or("snapshot unavailable")?;
-        let schema = connect_schema(&upstream).await.map_err(|_| "snapshot unavailable")?;
-        tokio::time::timeout(Duration::from_millis(upstream.connect_timeout_ms), snapshot(&schema.client, &cfg))
-            .await.map_err(|_| "snapshot unavailable")?.map_err(|_| "snapshot unavailable")
-    })));
+    config_reload.attach_catalog(
+        ctx.clone(),
+        Arc::new(|cfg| {
+            Box::pin(async move {
+                let upstream = cfg.upstream_config().ok_or("snapshot unavailable")?;
+                let schema = connect_schema(&upstream)
+                    .await
+                    .map_err(|_| "snapshot unavailable")?;
+                snapshot(&schema.client, &cfg)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        }),
+    );
     let config = Arc::new(config);
     let refresh_config = config.clone();
     let mut settings_rx = transports.refresh.subscribe();
@@ -1157,20 +1227,15 @@ async fn run_postgres(
                     }
                 }
             }
-            let candidate = tokio::time::timeout(
-                Duration::from_millis(upstream.connect_timeout_ms),
-                snapshot(&schema.client, &capture_config),
-            )
-            .await;
-            match candidate {
-                Ok(Ok(new)) => {
+            match snapshot(&schema.client, &capture_config).await {
+                Ok(new) => {
                     if snapshot_tx.send((settings.generation, new)).await.is_err() {
                         break;
                     }
                 }
-                Ok(Err(_)) => eprintln!("serve: snapshot refresh failed"),
-                Err(_) => {
-                    eprintln!("serve: snapshot refresh timed out");
+                Err(SnapshotError::Unavailable) => eprintln!("serve: snapshot refresh failed"),
+                Err(error @ SnapshotError::Timeout(_)) => {
+                    eprintln!("serve: {error}");
                     // Dropping and reconnecting also cancels any unfinished catalog transaction.
                     match connect_schema(&upstream).await {
                         Ok(new) => schema = new,
@@ -1231,6 +1296,36 @@ async fn run_postgres(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    #[tokio::test]
+    async fn snapshot_deadline_is_independent_of_connect_timeout() {
+        use crate::config_reload::tests::{Fixture, edit};
+        let fixture = Fixture::new();
+        let text = edit(&fixture.text, "upstream.connect_timeout_ms", "5");
+        let config = fixture.load(&edit(&text, "schema_snapshot_timeout_ms", "500"));
+        let delay = Duration::from_millis(25);
+        assert!(
+            delay > Duration::from_millis(config.upstream.as_ref().unwrap().connect_timeout_ms)
+        );
+        assert_eq!(
+            with_snapshot_timeout(&config, async {
+                tokio::time::sleep(delay).await;
+                Ok("snapshot captured")
+            })
+            .await
+            .unwrap(),
+            "snapshot captured"
+        );
+        let config = fixture.load(&edit(&text, "schema_snapshot_timeout_ms", "10"));
+        let error =
+            with_snapshot_timeout(&config, std::future::pending::<Result<(), SnapshotError>>())
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "upstream schema snapshot did not finish within schema_snapshot_timeout_ms (10 ms)"
+        );
+    }
+
     #[test]
     fn management_status_tracks_live_revisions_and_refuses_poisoned_lock() {
         use crate::mgmt::routes::StatusSource;
@@ -1244,7 +1339,13 @@ mod tests {
         let hub = crate::reload::Hub::new(&[(route.clone(), path)], None, crate::policy::ServicePolicySettings::default()).unwrap();
         hub.set_config_revision("config").unwrap();
         let revisions = hub.route_log(&route).unwrap().1;
-        let status = ManagementStatus { config_reload: None, hub: hub.clone(), spanner_route: None, routes: vec![route] };
+        let status = ManagementStatus {
+            config_reload: None,
+            hub: hub.clone(),
+            spanner_route: None,
+            routes: vec![route],
+            connect: HashMap::new(),
+        };
         let first = status.policy_revision("postgres").unwrap();
         revisions.write().unwrap().policy = "reloaded".into();
         assert_ne!(first, "reloaded");
@@ -1281,7 +1382,13 @@ mod tests {
         let routes = vec![crate::state::model::RouteId::new("a").unwrap(), crate::state::model::RouteId::new("b").unwrap()];
         let hub = crate::reload::Hub::new(&[(routes[0].clone(), a), (routes[1].clone(), b)], None, crate::policy::ServicePolicySettings::default()).unwrap();
         hub.set_config_revision("config").unwrap();
-        let status = ManagementStatus { config_reload: None, hub: hub.clone(), spanner_route: None, routes: routes.clone() };
+        let status = ManagementStatus {
+            config_reload: None,
+            hub: hub.clone(),
+            spanner_route: None,
+            routes: routes.clone(),
+            connect: HashMap::new(),
+        };
         let first = status.policy_revision("a").unwrap();
         assert_eq!(status.policy_revision("b"), Some(first.clone()));
         hub.route_log(&routes[1]).unwrap().1.write().unwrap().policy = "other".into();

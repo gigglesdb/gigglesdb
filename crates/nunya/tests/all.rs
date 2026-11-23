@@ -33,6 +33,8 @@ mod noninterference;
 mod serve_pg;
 #[path = "access_sessions.rs"]
 mod access_sessions;
+#[path = "session_connect.rs"]
+mod session_connect;
 
 #[path = "spanner_native.rs"]
 mod spanner_native;

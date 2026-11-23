@@ -26,72 +26,81 @@ Deploy once, provision a principal, then connect through an access session. The 
 
 ### 1. Deploy once
 
-Build from this crate with `cargo build --release`. Put the binary on PATH. Copy `examples/nunya.toml` and `examples/policy.toml` into a private configuration directory, set the upstream host, port and database, and mark every sensitive column before exposing the gateway. Create a private local `state_dir` and preserve it across restarts. A local harness database is also available below.
+Build from this crate with `cargo build --release` and put `target/release` on PATH. On Windows, point `LIBCLANG_PATH` at the LLVM bin directory before building because `pg_query` uses bindgen.
 
-Add an authenticated management listener to the configuration (separate from the private admin listener):
+```powershell
+$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
+cargo build --release
+```
+
+Copy `examples/nunya.toml` and `examples/policy.toml` into a private configuration directory. Set the upstream host, port and database, and mark every sensitive column before exposing the gateway. The example points to the [local harness](#local-harness) on loopback port 16432. Create a private local `state_dir` and preserve it across restarts.
+
+From the private directory, set `umask 077` on Unix or use a private directory ACL on Windows. Save a private administrator password as one UTF-8 line without a byte-order mark in `operator.secret`. Generate its verifier with `nunya standing hash < operator.secret` in Bash or `Get-Content operator.secret | nunya standing hash` in PowerShell. Add the management listener and paste in the generated verifier before starting the service.
 
 ```toml
 [management]
 listen = "127.0.0.1:6481"
+
+[[management.admin]]
+name = "operator"
+verifier = "REPLACE_WITH_GENERATED_SCRAM_VERIFIER"
 ```
 
-From the private directory, create credential files and set `root_key_file = "root.key"` at the top level and `password_file = "upstream.password"` under `[upstream]`:
+Set `root_key_file = "root.key"` at the top level and `password_file = "upstream.password"` under `[upstream]`. From the private directory in Bash:
 
 ```sh
-umask 077
+mkdir -p state
 nunya key generate > root.key
 printf '%s\n' 'your-upstream-password' > upstream.password
 nunya policy check --config nunya.toml
 nunya serve --config nunya.toml
 ```
 
-Keep serve running. Use verified TLS for remote database traffic; management requires TLS off loopback. Instead of files, the service accepts `NUNYA_ROOT_KEY` (64 hex characters) and `NUNYA_UPSTREAM_PASSWORD`. Never commit secret files.
+Use `nunya-harness-only` for the isolated local harness. For Windows file creation commands, see the [site quickstart](site/docs/quickstart.html#deploy). Keep serve running. Use verified TLS for remote database traffic. Management requires TLS off loopback. The service also accepts `NUNYA_ROOT_KEY` (64 hex characters) and `NUNYA_UPSTREAM_PASSWORD` as alternatives to files. Keep all secret files private.
 
 ### 2. Provision an identity
 
-On Unix, use the administrator socket as the service user; substitute the absolute state directory:
+In a second trusted terminal in the private configuration directory, create the agent principal and grant read-only access.
 
 ```sh
-nunya principal create reporting-agent --kind agent --server unix:/absolute/private/state/nunya.sock
-nunya principal grant reporting-agent --route postgres=read-only --server unix:/absolute/private/state/nunya.sock
-nunya principal credential add reporting-agent --generate-secret --server unix:/absolute/private/state/nunya.sock
-```
-
-The credential command prints an ID and then the secret once. Save only the secret line in private `principal.secret`.
-
-Windows has no socket. Before starting serve, run `nunya standing hash`, provide an administrator password on stdin, and add its verifier to the configuration:
-
-```toml
-[[management.admin]]
-name = "operator"
-verifier = "REPLACE_WITH_GENERATED_SCRAM_VERIFIER"
-```
-
-Protect the verifier and save the original password as the first line of private `operator.secret`. Replace the Unix provisioning commands with:
-
-```sh
-nunya principal create reporting-agent --kind agent --server http://127.0.0.1:6481 --principal operator --principal-secret-file operator.secret
+nunya principal create reporting-agent --kind agent --generate-secret --secret-out principal.secret --server http://127.0.0.1:6481 --principal operator --principal-secret-file operator.secret
 nunya principal grant reporting-agent --route postgres=read-only --server http://127.0.0.1:6481 --principal operator --principal-secret-file operator.secret
-nunya principal credential add reporting-agent --generate-secret --server http://127.0.0.1:6481 --principal operator --principal-secret-file operator.secret
 ```
+
+The create command prints the principal ID and saves the generated agent secret to the new `principal.secret` file. On Unix, the [administrator socket](site/docs/configuration.html#management) can also provision identities.
 
 ### 3. Connect
 
-Use the agent's management credential to acquire an access session, then run psql with that session's PostgreSQL environment:
+For this example, select a fresh helper state directory with `export NUNYA_HOME="$PWD/session-home"` in Bash or `$env:NUNYA_HOME = Join-Path $PWD 'session-home'` in PowerShell. Acquire an access session into the default context using the agent's management credential.
 
 ```sh
-nunya session acquire --server http://127.0.0.1:6481 --principal reporting-agent --principal-secret-file principal.secret --route postgres --context reporting --ttl 1h
-nunya exec --server http://127.0.0.1:6481 --principal reporting-agent --principal-secret-file principal.secret --context reporting -- psql -d app -c "SELECT 1"
+nunya session acquire --server http://127.0.0.1:6481 --principal reporting-agent --principal-secret-file principal.secret --route postgres --ttl 1h
 ```
 
-Database ports accept only session credentials: PostgreSQL user `session:REPLACE_WITH_SESSION_ID` (the ID is 32 lowercase hex characters) and the session secret. Principal credentials work only on management. `nunya session env --server http://127.0.0.1:6481 --principal reporting-agent --principal-secret-file principal.secret --context reporting --format sh` prints credentials for other clients; choose `--format powershell` on Windows and treat the output as secret. Protect the helper's private `sessions.json` in the per-user state directory, or the directory selected by `NUNYA_HOME`. The default route is `postgres`, with PostgreSQL at `127.0.0.1:6432`.
+Load the session environment and connect with plain `psql`. In Bash:
+
+```sh
+eval "$(nunya session env)"
+psql
+```
+
+In PowerShell:
+
+```powershell
+nunya session env --format powershell | Invoke-Expression
+psql
+```
+
+The exports supply `PGDATABASE`, `PGHOST`, `PGPORT`, `PGUSER` and `PGPASSWORD`. The database user has the form `session:ID` and the password is the session secret. Keep the principal and upstream credentials in the trusted environment. Without a principal secret, `nunya session env` uses the locally unexpired stored session and notes that it skipped server revalidation. Protect the helper's `sessions.json` in the per-user state directory, or the directory selected by `NUNYA_HOME`.
+
+The default route is `postgres`. Connection details come from the advertised listener. For container port mappings or NAT, set `advertise_host` and `advertise_port` in [configuration](site/docs/configuration.html#gateway) or use `--pg-host` and `--pg-port` as per-session acquisition overrides.
 
 Reconnects and renewals preserve the persisted token scope, so equal values in the same domain keep equal tokens across connections. `nunya session show` displays public details; `nunya session renew` renews access, and `--rotate` rotates the credential while keeping the scope. Use `nunya session acquire --isolated` to create a separate scope in a new context, then `nunya exec --context <that context>` to use it. If a stored session has ended, the helper requires `--new-scope` before replacement; obtain fresh tokens for the new scope. Default lifetimes are 8 hours absolute and 1 hour idle. Shorten them with `[session] max_lifetime`, `idle_timeout`, or a shorter acquisition `--ttl`.
 
 Revoke while the service is still running, then stop it with Ctrl-C:
 
 ```sh
-nunya session revoke --server http://127.0.0.1:6481 --principal reporting-agent --principal-secret-file principal.secret --context reporting
+nunya session revoke --principal-secret-file principal.secret
 ```
 
 Revocation or expiry ends active work and closes PostgreSQL connections. NY011 reports that access ended; NY012 reports a forwarded write whose outcome was not observed. Reconcile an uncertain write before retrying; Nunya never replays it. See [operations](site/docs/operations.html) for revocation, private-network reachability and recovery, and the [reload settings table](site/docs/configuration.html#reload) before changing a running service. A state restore can bring back revoked sessions: revoke all sessions or disable affected principals before serving traffic after any restore.

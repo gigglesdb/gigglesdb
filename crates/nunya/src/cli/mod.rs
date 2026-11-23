@@ -13,7 +13,7 @@ use std::{
 };
 use zeroize::Zeroizing;
 #[derive(Parser)]
-#[command(name = "nunya", about = "Tokenizing database gateway")]
+#[command(name = "nunya", version, about = "Tokenizing database gateway")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -95,7 +95,7 @@ async fn validate(path: &Path) -> Result<(), Vec<String>> {
             .map_err(|e| vec![e])?;
         let snapshot = crate::serve::snapshot(&schema.client, &cfg)
             .await
-            .map_err(|e| vec![e])?;
+            .map_err(|e| vec![e.to_string()])?;
         crate::policy::validate::validate(policy, &snapshot).map_err(|errors| {
             errors
                 .into_iter()
@@ -255,6 +255,7 @@ mod tests {
     #[test]
     fn session_commands() {
         for verb in ["show", "renew", "revoke", "env"] {
+            assert!(Cli::try_parse_from(["nunya", "session", verb]).is_ok());
             assert!(
                 Cli::try_parse_from([
                     "nunya",
@@ -404,6 +405,8 @@ mod tests {
                 "agent",
                 "--admin",
                 "--generate-secret",
+                "--secret-out",
+                "new.secret",
             ],
             vec![
                 "create",
@@ -465,6 +468,14 @@ mod tests {
                 "alice",
                 "--kind",
                 "person",
+                "--secret-out",
+                "secret",
+            ],
+            vec![
+                "create",
+                "alice",
+                "--kind",
+                "person",
                 "--verifier",
                 &verifier,
                 "--generate-secret",
@@ -500,6 +511,22 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+    #[test]
+    fn version_and_help_are_successful_display_requests() {
+        for flag in ["--version", "-V"] {
+            let error = Cli::try_parse_from(["nunya", flag]).err().unwrap();
+            assert!(!error.use_stderr());
+            assert_eq!(
+                error.to_string(),
+                concat!("nunya ", env!("CARGO_PKG_VERSION"), "\n")
+            );
+        }
+        for flag in ["--help", "-h"] {
+            let error = Cli::try_parse_from(["nunya", flag]).err().unwrap();
+            assert!(!error.use_stderr());
+            assert!(error.to_string().contains("Usage: nunya"));
+        }
     }
     #[test]
     fn commands() {

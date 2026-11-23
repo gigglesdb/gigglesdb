@@ -1927,7 +1927,10 @@ async fn helper_acquire_resume_scope_replacement_and_isolation() -> TransportRes
     let mut opts = AcquireOpts {
         connection: ConnectionOpts {
             follow_leader: false,
-            server: format!("http://{}", server.tcp_addr.ok_or("missing TCP listener")?),
+            server: Some(format!(
+                "http://{}",
+                server.tcp_addr.ok_or("missing TCP listener")?
+            )),
             ca_file: None,
             principal: Some("alice".into()),
             principal_secret_file: None,
@@ -1939,8 +1942,8 @@ async fn helper_acquire_resume_scope_replacement_and_isolation() -> TransportRes
         label: None,
         new_scope: false,
         rotate: false,
-        pg_host: "127.0.0.1".into(),
-        pg_port: 6432,
+        pg_host: None,
+        pg_port: None,
         isolated: false,
     };
     let first = acquire_or_resume(&alice, &store, &opts).await?;
@@ -2107,7 +2110,10 @@ async fn principal_cli_lifecycle() -> TransportResult {
     let acquire = AcquireOpts {
         connection: ConnectionOpts {
             follow_leader: false,
-            server: format!("http://{}", server.tcp_addr.ok_or("missing TCP listener")?),
+            server: Some(format!(
+                "http://{}",
+                server.tcp_addr.ok_or("missing TCP listener")?
+            )),
             ca_file: None,
             principal: Some("cli-principal".into()),
             principal_secret_file: None,
@@ -2119,8 +2125,8 @@ async fn principal_cli_lifecycle() -> TransportResult {
         label: None,
         new_scope: false,
         rotate: false,
-        pg_host: "127.0.0.1".into(),
-        pg_port: 6432,
+        pg_host: None,
+        pg_port: None,
         isolated: false,
     };
     let session = acquire_or_resume(&client, &store, &acquire).await?;

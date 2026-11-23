@@ -223,6 +223,27 @@ pub struct SessionCredential {
     /// SHA-256 hex digest.
     pub secret_sha256: String,
 }
+/// Advertised, non-secret connection details for a session route.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ConnectInfo {
+    /// PostgreSQL wire protocol, including the PGAdapter route.
+    Postgres {
+        /// Gateway host.
+        host: String,
+        /// Gateway port.
+        port: u16,
+        /// Database name.
+        database: String,
+    },
+    /// Native Cloud Spanner protocol.
+    SpannerNative {
+        /// Gateway host and port.
+        endpoint: String,
+        /// Fully qualified database path.
+        database: String,
+    },
+}
 /// Public session projection.
 #[derive(Debug, Deserialize)]
 pub struct SessionView {
@@ -241,6 +262,9 @@ pub struct SessionView {
     /// Configured route protocol kind, absent on older servers.
     #[serde(default)]
     pub route_kind: Option<String>,
+    /// Advertised connection details, absent on older servers or unknown routes.
+    #[serde(default)]
+    pub connect: Option<ConnectInfo>,
     /// Effective access mode.
     pub mode: Mode,
     /// Lifecycle state.

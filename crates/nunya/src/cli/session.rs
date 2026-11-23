@@ -2,8 +2,8 @@
 use crate::{
     config::parse_duration,
     mgmt::client::{
-        AcquireParams, ClientError, Credentials, MgmtClient, SessionCredential, SessionSecret,
-        SessionView,
+        AcquireParams, ClientError, ConnectInfo, Credentials, MgmtClient, SessionCredential,
+        SessionSecret, SessionView,
     },
     state::model::{Mode, SessionState},
 };
@@ -15,10 +15,15 @@ use std::{
     fs::{self, OpenOptions},
     io::{BufRead, Write},
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 use zeroize::Zeroizing;
 
 const ENDED: &str = "the stored session has ended and its token scope was replaced; tokens from it will not match a new session. Run again with --new-scope to start a new scope.";
+const DEFAULT_PG_HOST: &str = "127.0.0.1";
+const DEFAULT_PG_PORT: u16 = 6432;
+const UNVALIDATED: &str = "note: session not revalidated with the server (principal secret missing: pass --principal-secret-file or set NUNYA_PRINCIPAL_SECRET)";
+
 /// Fixed, secret-free helper failures.
 #[derive(Debug, PartialEq, Eq)]
 pub enum HelperError {
@@ -34,8 +39,22 @@ pub enum HelperError {
     Missing,
     /// Context would be overwritten or used with another identity.
     Conflict,
-    /// Connection configuration invalid.
-    Configuration,
+    /// No management server was supplied.
+    ServerMissing,
+    /// Management destination was invalid.
+    ServerInvalid,
+    /// Bearer principal name was missing.
+    PrincipalMissing,
+    /// No bearer secret was supplied.
+    PrincipalSecretMissing,
+    /// Explicit secret file could not be read.
+    PrincipalSecretFileUnreadable,
+    /// Explicit secret file did not provide a secret.
+    PrincipalSecretFileEmpty,
+    /// The stored session cannot be used without revalidation.
+    ExpiredWithoutSecret,
+    /// The command runtime could not start.
+    Runtime,
     /// Management request refused or unavailable.
     Management(ClientError),
     /// Child could not be started.
@@ -52,7 +71,14 @@ impl fmt::Display for HelperError {
             Self::Version => "unsupported session helper version",
             Self::Missing => "session context not found",
             Self::Conflict => "session context already exists or belongs to another connection",
-            Self::Configuration => "invalid session helper configuration",
+            Self::ServerMissing => "server URL missing: pass --server or set NUNYA_SERVER",
+            Self::ServerInvalid => "invalid --server URL",
+            Self::PrincipalMissing => "principal name missing: pass --principal or set NUNYA_PRINCIPAL",
+            Self::PrincipalSecretMissing => "principal secret missing: pass --principal-secret-file PATH or set NUNYA_PRINCIPAL_SECRET",
+            Self::PrincipalSecretFileUnreadable => "cannot read the principal secret file given by --principal-secret-file",
+            Self::PrincipalSecretFileEmpty => "principal secret file is empty",
+            Self::ExpiredWithoutSecret => "stored session has expired locally and the principal secret is missing: pass --principal-secret-file PATH or set NUNYA_PRINCIPAL_SECRET",
+            Self::Runtime => "session helper runtime unavailable",
             Self::Management(error) => {
                 return write!(f, "session management request failed: {error}");
             }
@@ -107,14 +133,48 @@ pub struct Context {
     pub scope: String,
     /// Expiration timestamp.
     pub expires_ms: u64,
-    /// PostgreSQL host.
-    pub pg_host: String,
-    /// PostgreSQL port.
-    pub pg_port: u16,
+    /// PostgreSQL host persisted by older helpers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pg_host: Option<String>,
+    /// PostgreSQL port persisted by older helpers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pg_port: Option<u16>,
+    /// Explicit PostgreSQL host override.
+    #[serde(default)]
+    pub pg_host_override: Option<String>,
+    /// Explicit PostgreSQL port override.
+    #[serde(default)]
+    pub pg_port_override: Option<u16>,
+    /// Connection details most recently advertised by the server.
+    #[serde(default)]
+    pub connect: Option<ConnectInfo>,
     /// Scope isolation flag.
     pub isolated: bool,
     /// Optional label.
     pub label: Option<String>,
+}
+impl Context {
+    fn refresh(&mut self, view: &SessionView) {
+        self.expires_ms = view.expires_ms;
+        self.route_kind.clone_from(&view.route_kind);
+        self.connect.clone_from(&view.connect);
+    }
+
+    fn apply_pg_overrides(&mut self, opts: &AcquireOpts) {
+        if let Some(host) = &opts.pg_host {
+            self.pg_host_override = Some(host.clone());
+        }
+        if let Some(port) = opts.pg_port {
+            self.pg_port_override = Some(port);
+        }
+    }
+
+    fn ensure_unexpired(&self, now_ms: u128) -> Result<(), HelperError> {
+        if u128::from(self.expires_ms) <= now_ms {
+            return Err(HelperError::ExpiredWithoutSecret);
+        }
+        Ok(())
+    }
 }
 impl fmt::Debug for Context {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -298,7 +358,7 @@ impl HelperStore {
 pub struct ConnectionOpts {
     /// Management URL.
     #[arg(long, env = "NUNYA_SERVER")]
-    pub server: String,
+    pub server: Option<String>,
     /// Follow one leader redirect (HTTPS endpoints and the same trusted CA required).
     #[arg(long)]
     pub follow_leader: bool,
@@ -320,46 +380,79 @@ impl ConnectionOpts {
         self.context.as_deref().unwrap_or("default")
     }
     pub(super) fn client(&self) -> Result<MgmtClient, HelperError> {
-        let credentials = if self.server.starts_with("unix:") {
+        self.client_with_context(None)
+    }
+
+    fn client_with_context(&self, context: Option<&Context>) -> Result<MgmtClient, HelperError> {
+        let server = self
+            .server
+            .as_deref()
+            .or_else(|| context.map(|ctx| ctx.server.as_str()))
+            .ok_or(HelperError::ServerMissing)?;
+        let endpoint = server.parse().map_err(|_| HelperError::ServerInvalid)?;
+        let credentials = if server.starts_with("unix:") {
             Credentials::None
         } else {
-            let secret = if let Some(path) = &self.principal_secret_file {
-                let file = fs::File::open(path).map_err(|_| HelperError::Configuration)?;
-                let mut text = Zeroizing::new(String::new());
-                std::io::BufReader::new(file)
-                    .read_line(&mut text)
-                    .map_err(|_| HelperError::Configuration)?;
-                while text.ends_with(['\r', '\n']) {
-                    text.pop();
-                }
-                text
-            } else {
-                Zeroizing::new(
-                    std::env::var("NUNYA_PRINCIPAL_SECRET")
-                        .map_err(|_| HelperError::Configuration)?,
-                )
-            };
-            if secret.is_empty() {
-                return Err(HelperError::Configuration);
-            }
+            let secret = self.principal_secret()?;
+            let name = self
+                .principal
+                .as_ref()
+                .or_else(|| context.and_then(|ctx| ctx.principal.as_ref()))
+                .filter(|name| !name.is_empty())
+                .ok_or(HelperError::PrincipalMissing)?;
             Credentials::Bearer {
-                name: self.principal.clone().ok_or(HelperError::Configuration)?,
+                name: name.clone(),
                 secret,
             }
         };
-        MgmtClient::new(
-            self.server
-                .parse()
-                .map_err(|_| HelperError::Configuration)?,
-            self.ca_file.as_deref(),
-            credentials,
-        )
-        .map(|client| client.follow_leader_redirect(self.follow_leader))
-        .map_err(Into::into)
+        MgmtClient::new(endpoint, self.ca_file.as_deref(), credentials)
+            .map(|client| client.follow_leader_redirect(self.follow_leader))
+            .map_err(Into::into)
     }
+
+    fn principal_secret(&self) -> Result<Zeroizing<String>, HelperError> {
+        if let Some(path) = &self.principal_secret_file {
+            let file =
+                fs::File::open(path).map_err(|_| HelperError::PrincipalSecretFileUnreadable)?;
+            let mut text = Zeroizing::new(String::new());
+            std::io::BufReader::new(file)
+                .read_line(&mut text)
+                .map_err(|_| HelperError::PrincipalSecretFileUnreadable)?;
+            while text.ends_with(['\r', '\n']) {
+                text.pop();
+            }
+            if text.is_empty() {
+                return Err(HelperError::PrincipalSecretFileEmpty);
+            }
+            Ok(text)
+        } else {
+            std::env::var("NUNYA_PRINCIPAL_SECRET")
+                .ok()
+                .filter(|text| !text.is_empty())
+                .map(Zeroizing::new)
+                .ok_or(HelperError::PrincipalSecretMissing)
+        }
+    }
+
+    fn revalidation_client(&self, ctx: &Context) -> Result<Option<MgmtClient>, HelperError> {
+        match self.client_with_context(Some(ctx)) {
+            Ok(client) => Ok(Some(client)),
+            Err(HelperError::PrincipalSecretMissing) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     fn context(&self, store: &HelperStore) -> Result<Context, HelperError> {
         let ctx = store.get(self.name())?;
-        if ctx.server != self.server || ctx.principal != self.principal {
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| *server != ctx.server)
+            || self
+                .principal
+                .as_ref()
+                .is_some_and(|principal| Some(principal) != ctx.principal.as_ref())
+        {
             return Err(HelperError::Conflict);
         }
         Ok(ctx)
@@ -401,12 +494,12 @@ pub struct AcquireOpts {
     /// Rotate the credential of an existing session.
     #[arg(long, conflicts_with = "new_scope")]
     pub rotate: bool,
-    /// PostgreSQL host.
-    #[arg(long, env = "NUNYA_PG_HOST", default_value = "127.0.0.1")]
-    pub pg_host: String,
-    /// PostgreSQL port.
-    #[arg(long, env = "NUNYA_PG_PORT", default_value_t = 6432)]
-    pub pg_port: u16,
+    /// Override the advertised PostgreSQL host.
+    #[arg(long, env = "NUNYA_PG_HOST")]
+    pub pg_host: Option<String>,
+    /// Override the advertised PostgreSQL port.
+    #[arg(long, env = "NUNYA_PG_PORT")]
+    pub pg_port: Option<u16>,
     /// Internal isolation flag; exposed only by session acquire.
     #[arg(skip)]
     pub isolated: bool,
@@ -482,6 +575,7 @@ async fn resume(client: &MgmtClient, ctx: &mut Context) -> Result<SessionView, H
     if view.state != SessionState::Active || view.scope != ctx.scope {
         return Err(HelperError::ScopeReplaced);
     }
+    ctx.refresh(&view);
     // Renewal authoritatively checks expiration using the server's clock.
     let view = client
         .renew(&ctx.session_id, None, None)
@@ -493,8 +587,7 @@ async fn resume(client: &MgmtClient, ctx: &mut Context) -> Result<SessionView, H
                 HelperError::Management(e)
             }
         })?;
-    ctx.expires_ms = view.expires_ms;
-    ctx.route_kind = view.route_kind.clone();
+    ctx.refresh(&view);
     Ok(view)
 }
 /// Acquire a new session or authoritatively revalidate a stored session.
@@ -503,12 +596,18 @@ pub async fn acquire_or_resume(
     store: &HelperStore,
     opts: &AcquireOpts,
 ) -> Result<Context, HelperError> {
+    let server = opts
+        .connection
+        .server
+        .as_ref()
+        .ok_or(HelperError::ServerMissing)?;
     let name = opts.connection.name();
     if opts.rotate {
         if opts.new_scope || opts.isolated {
             return Err(HelperError::Conflict);
         }
         let mut ctx = opts.connection.context(store)?;
+        ctx.apply_pg_overrides(opts);
         rotate(client, store, &mut ctx, opts.mode).await?;
         return Ok(ctx);
     }
@@ -526,6 +625,7 @@ pub async fn acquire_or_resume(
         }
     } else if existing {
         let mut ctx = opts.connection.context(store)?;
+        ctx.apply_pg_overrides(opts);
         match resume(client, &mut ctx).await {
             Ok(_) => {
                 store.put(&ctx)?;
@@ -561,7 +661,7 @@ pub async fn acquire_or_resume(
         };
         let ctx = Context {
             name,
-            server: opts.connection.server.clone(),
+            server: server.clone(),
             principal: opts.connection.principal.clone(),
             route: view.route,
             route_kind: view.route_kind,
@@ -571,8 +671,11 @@ pub async fn acquire_or_resume(
             scram_iterations: Some(secret.scram_iterations),
             scope: view.scope,
             expires_ms: view.expires_ms,
-            pg_host: opts.pg_host.clone(),
-            pg_port: opts.pg_port,
+            pg_host: None,
+            pg_port: None,
+            pg_host_override: opts.pg_host.clone(),
+            pg_port_override: opts.pg_port,
+            connect: view.connect,
             isolated: view.isolated,
             label: view.label,
         };
@@ -609,6 +712,7 @@ pub async fn rotate(
     if current.state != SessionState::Active || current.scope != ctx.scope {
         return Err(HelperError::ScopeReplaced);
     }
+    ctx.refresh(&current);
     let secret = SessionSecret::generate_with(&salt, iterations)?;
     let view = client
         .renew(
@@ -622,8 +726,7 @@ pub async fn rotate(
         .await?;
     let mut updated = ctx.clone();
     updated.secret = secret.secret;
-    updated.expires_ms = view.expires_ms;
-    updated.route_kind = view.route_kind;
+    updated.refresh(&view);
     store.put(&updated)?;
     *ctx = updated;
     println!("The previous secret keeps working until the session expires.");
@@ -631,25 +734,67 @@ pub async fn rotate(
 }
 /// Connection environment values, including protected session credentials.
 pub fn pg_env(ctx: &Context) -> Vec<(String, Zeroizing<String>)> {
-    let mut env: Vec<_> = [
-        ("PGHOST", ctx.pg_host.clone()),
-        ("PGPORT", ctx.pg_port.to_string()),
-        ("PGUSER", format!("session:{}", ctx.session_id)),
-        ("PGPASSWORD", ctx.secret.to_string()),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.into(), Zeroizing::new(v)))
-    .collect();
-    if ctx
-        .route_kind
-        .as_deref()
-        .map_or(ctx.route == "spanner-native", |kind| kind == "spanner-native")
-    {
+    let native = match &ctx.connect {
+        Some(details) => matches!(details, ConnectInfo::SpannerNative { .. }),
+        None => ctx
+            .route_kind
+            .as_deref()
+            .map_or(ctx.route == "spanner-native", |kind| {
+                kind == "spanner-native"
+            }),
+    };
+    if native {
         let mut bearer = Zeroizing::new(String::from("nunya.session:"));
         bearer.push_str(&ctx.session_id);
         bearer.push('.');
         bearer.push_str(&ctx.secret);
-        env.push(("NUNYA_SPANNER_BEARER".into(), bearer));
+        let mut env = vec![("NUNYA_SPANNER_BEARER".into(), bearer)];
+        if let Some(ConnectInfo::SpannerNative { endpoint, database }) = &ctx.connect {
+            env.push((
+                "NUNYA_SPANNER_ENDPOINT".into(),
+                Zeroizing::new(endpoint.clone()),
+            ));
+            env.push((
+                "NUNYA_SPANNER_DATABASE".into(),
+                Zeroizing::new(database.clone()),
+            ));
+        }
+        return env;
+    }
+
+    let (host, port, database) = match &ctx.connect {
+        Some(ConnectInfo::Postgres {
+            host,
+            port,
+            database,
+        }) => (host.as_str(), *port, Some(database)),
+        _ => (DEFAULT_PG_HOST, DEFAULT_PG_PORT, None),
+    };
+    // A legacy value that differs from the old default came from a flag or env.
+    let host = ctx
+        .pg_host_override
+        .as_deref()
+        .or_else(|| {
+            ctx.pg_host
+                .as_deref()
+                .filter(|value| *value != DEFAULT_PG_HOST)
+        })
+        .unwrap_or(host);
+    let port = ctx
+        .pg_port_override
+        .or_else(|| ctx.pg_port.filter(|value| *value != DEFAULT_PG_PORT))
+        .unwrap_or(port);
+    let mut env = vec![
+        ("PGHOST".into(), Zeroizing::new(host.to_owned())),
+        ("PGPORT".into(), Zeroizing::new(port.to_string())),
+        (
+            "PGUSER".into(),
+            Zeroizing::new(format!("session:{}", ctx.session_id)),
+        ),
+        ("PGPASSWORD".into(), ctx.secret.clone()),
+    ];
+    if let Some(database) = database {
+        env.push(("PGDATABASE".into(), Zeroizing::new(database.clone())));
     }
     env
 }
@@ -659,14 +804,24 @@ fn quoted(value: &str, format: EnvFormat) -> Zeroizing<String> {
         EnvFormat::Powershell => format!("'{}'", value.replace('\'', "''")),
     })
 }
+fn print_session(ctx: &Context, view: Option<&SessionView>) {
+    println!("id: {}\nroute: {}", ctx.session_id, ctx.route);
+    if let Some(view) = view {
+        println!("mode: {:?}", view.mode);
+    }
+    println!(
+        "expires_ms: {}\ncontext: {}\nconnect: {}",
+        ctx.expires_ms,
+        ctx.name,
+        serde_json::json!(ctx.connect)
+    );
+}
+
 async fn summary(client: &MgmtClient, store: &HelperStore, ctx: &mut Context) -> Result<(), HelperError> {
     let view = client.session(&ctx.session_id).await?;
-    ctx.route_kind = view.route_kind.clone();
+    ctx.refresh(&view);
     store.put(ctx)?;
-    println!(
-        "id: {}\nroute: {}\nmode: {:?}\nexpires_ms: {}\ncontext: {}",
-        view.id, view.route, view.mode, view.expires_ms, ctx.name
-    );
+    print_session(ctx, Some(&view));
     Ok(())
 }
 /// Revoke a session and delete its stored context after success.
@@ -688,44 +843,56 @@ async fn dispatch(command: SessionCommand) -> Result<i32, HelperError> {
             summary(&client, &store, &mut ctx).await?;
         }
         SessionCommand::Show(connection) => {
-            let client = connection.client()?;
             let mut ctx = connection.context(&store)?;
-            let v = client.session(&ctx.session_id).await?;
-            ctx.route_kind = v.route_kind.clone();
-            store.put(&ctx)?;
-            println!(
-                "state: {:?}\nmode: {:?}\nexpires_ms: {}\nrevoke_reason: {:?}\nscope_continuity: {}",
-                v.state, v.mode, v.expires_ms, v.revoke_reason, v.scope_continuity
-            );
+            if let Some(client) = connection.revalidation_client(&ctx)? {
+                let view = client.session(&ctx.session_id).await?;
+                ctx.refresh(&view);
+                store.put(&ctx)?;
+                print_session(&ctx, Some(&view));
+                println!(
+                    "state: {:?}\nrevoke_reason: {:?}\nscope_continuity: {}",
+                    view.state, view.revoke_reason, view.scope_continuity
+                );
+            } else {
+                print_session(&ctx, None);
+                eprintln!("{UNVALIDATED}");
+            }
         }
         SessionCommand::Renew {
             connection,
             mode,
             rotate: rotating,
         } => {
-            let client = connection.client()?;
             let mut ctx = connection.context(&store)?;
+            let client = connection.client_with_context(Some(&ctx))?;
             if rotating {
                 rotate(&client, &store, &mut ctx, mode).await?;
             } else {
                 let view = client.renew(&ctx.session_id, mode, None).await?;
-                ctx.expires_ms = view.expires_ms;
-                ctx.route_kind = view.route_kind.clone();
+                ctx.refresh(&view);
                 store.put(&ctx)?;
             }
             summary(&client, &store, &mut ctx).await?;
         }
         SessionCommand::Revoke(connection) => {
-            let client = connection.client()?;
             let ctx = connection.context(&store)?;
+            let client = connection.client_with_context(Some(&ctx))?;
             revoke(&client, &store, &ctx).await?;
             println!("session revoked");
         }
         SessionCommand::Env { connection, format } => {
-            let client = connection.client()?;
             let mut ctx = connection.context(&store)?;
-            resume(&client, &mut ctx).await?;
-            store.put(&ctx)?;
+            if let Some(client) = connection.revalidation_client(&ctx)? {
+                resume(&client, &mut ctx).await?;
+                store.put(&ctx)?;
+            } else {
+                ctx.ensure_unexpired(
+                    UNIX_EPOCH
+                        .elapsed()
+                        .map_or(u128::MAX, |now| now.as_millis()),
+                )?;
+                eprintln!("{UNVALIDATED}");
+            }
             for (key, value) in pg_env(&ctx) {
                 let value = quoted(&value, format);
                 match format {
@@ -740,7 +907,7 @@ async fn dispatch(command: SessionCommand) -> Result<i32, HelperError> {
 fn runtime(result: impl std::future::Future<Output = Result<i32, HelperError>>) -> i32 {
     let result = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt.block_on(result),
-        Err(_) => Err(HelperError::Configuration),
+        Err(_) => Err(HelperError::Runtime),
     };
     match result {
         Ok(code) => code,
@@ -804,8 +971,11 @@ mod tests {
             scram_iterations: None,
             scope: "34".repeat(16),
             expires_ms: 12345,
-            pg_host: "localhost".into(),
-            pg_port: 6432,
+            pg_host: None,
+            pg_port: None,
+            pg_host_override: None,
+            pg_port_override: None,
+            connect: None,
             isolated: false,
             label: None,
         }
@@ -815,6 +985,11 @@ mod tests {
         let mut ctx = context();
         ctx.route = "native-renamed".into();
         ctx.route_kind = Some("spanner-native".into());
+        ctx.connect = Some(ConnectInfo::SpannerNative {
+            endpoint: "spanner.example:7443".into(),
+            database: "projects/p/instances/i/databases/d".into(),
+        });
+        ctx.pg_port_override = Some(4444);
         let env = pg_env(&ctx);
         let bearer = &env
             .iter()
@@ -831,7 +1006,16 @@ mod tests {
             ctx.session_id
         );
         assert!(secret == ctx.secret.as_str(), "session credential mismatch");
-        assert!(env.iter().any(|(key, _)| key == "PGPASSWORD"));
+        assert!(env.iter().all(|(key, _)| !key.starts_with("PG")));
+        let env = BTreeMap::from_iter(env);
+        assert_eq!(
+            env["NUNYA_SPANNER_ENDPOINT"].as_str(),
+            "spanner.example:7443"
+        );
+        assert_eq!(
+            env["NUNYA_SPANNER_DATABASE"].as_str(),
+            "projects/p/instances/i/databases/d"
+        );
         assert!(!format!("{ctx:?}").contains(ctx.secret.as_str()));
     }
     #[test]
@@ -857,15 +1041,148 @@ mod tests {
         });
         let legacy: SessionView = serde_json::from_value(value.clone()).unwrap();
         assert!(legacy.route_kind.is_none());
+        assert_eq!(legacy.connect, None);
         value["route_kind"] = "spanner-native".into();
+        value["connect"] = serde_json::json!({
+            "kind": "spanner-native",
+            "endpoint": "[::1]:7443",
+            "database": "projects/p/instances/i/databases/d",
+        });
         let current: SessionView = serde_json::from_value(value).unwrap();
-        assert_eq!(current.route_kind.as_deref(), Some("spanner-native"));
+        let mut ctx = context();
+        ctx.refresh(&current);
+        assert_eq!(ctx.route_kind.as_deref(), Some("spanner-native"));
+        assert_eq!(ctx.connect, current.connect);
+        assert_eq!(ctx.expires_ms, current.expires_ms);
     }
     #[test]
-    fn postgres_environment_has_no_spanner_bearer() {
-        let env = pg_env(&context());
+    fn postgres_environment_uses_advertised_values_and_explicit_overrides() {
+        let mut ctx = context();
+        let env = BTreeMap::from_iter(pg_env(&ctx));
         assert_eq!(env.len(), 4);
-        assert!(!env.iter().any(|(key, _)| key == "NUNYA_SPANNER_BEARER"));
+        assert_eq!(env["PGHOST"].as_str(), "127.0.0.1");
+        assert_eq!(env["PGPORT"].as_str(), "6432");
+        ctx.connect = Some(ConnectInfo::Postgres {
+            host: "pg.example".into(),
+            port: 7443,
+            database: "app".into(),
+        });
+        let env = BTreeMap::from_iter(pg_env(&ctx));
+        assert_eq!(env.len(), 5);
+        assert_eq!(env["PGHOST"].as_str(), "pg.example");
+        assert_eq!(env["PGPORT"].as_str(), "7443");
+        assert_eq!(env["PGDATABASE"].as_str(), "app");
+        assert_eq!(
+            env["PGUSER"].as_str(),
+            format!("session:{}", ctx.session_id)
+        );
+        assert!(env["PGPASSWORD"].as_str() == ctx.secret.as_str());
+
+        // Even an explicitly requested old default outranks the server.
+        ctx.pg_host_override = Some("127.0.0.1".into());
+        ctx.pg_port_override = Some(6432);
+        let env = BTreeMap::from_iter(pg_env(&ctx));
+        assert_eq!(env["PGHOST"].as_str(), "127.0.0.1");
+        assert_eq!(env["PGPORT"].as_str(), "6432");
+        assert_eq!(env["PGDATABASE"].as_str(), "app");
+    }
+    #[test]
+    fn legacy_context_retains_custom_pg_values_and_accepts_advertised_defaults() {
+        let mut old = serde_json::to_value(context()).unwrap();
+        let object = old.as_object_mut().unwrap();
+        for key in ["connect", "pg_host_override", "pg_port_override"] {
+            object.remove(key);
+        }
+        old["pg_host"] = "127.0.0.1".into();
+        old["pg_port"] = 7432.into();
+        let mut ctx: Context = serde_json::from_value(old).unwrap();
+        assert_eq!(ctx.connect, None);
+        let env = BTreeMap::from_iter(pg_env(&ctx));
+        assert_eq!(env["PGHOST"].as_str(), "127.0.0.1");
+        assert_eq!(env["PGPORT"].as_str(), "7432");
+        ctx.connect = Some(ConnectInfo::Postgres {
+            host: "pg.example".into(),
+            port: 7443,
+            database: "app".into(),
+        });
+        let env = BTreeMap::from_iter(pg_env(&ctx));
+        assert_eq!(env["PGHOST"].as_str(), "pg.example");
+        assert_eq!(env["PGPORT"].as_str(), "7432");
+    }
+    #[test]
+    fn stored_connection_fallback_allows_only_the_same_server_and_principal() {
+        let temp = Temp::new();
+        let store = HelperStore::at(&temp.0);
+        let mut ctx = context();
+        ctx.server = "http://127.0.0.1:9876".into();
+        ctx.principal = Some("reader".into());
+        store.put(&ctx).unwrap();
+        let secret_file = temp.0.join("principal.secret");
+        fs::write(&secret_file, "private-principal-secret\r\n").unwrap();
+        let mut opts = ConnectionOpts {
+            server: None,
+            principal: None,
+            ca_file: None,
+            principal_secret_file: Some(secret_file),
+            context: None,
+            follow_leader: false,
+        };
+        assert!(
+            opts.client_with_context(Some(&opts.context(&store).unwrap()))
+                .is_ok()
+        );
+        opts.server = Some("http://127.0.0.1:7890".into());
+        assert_eq!(opts.context(&store).unwrap_err(), HelperError::Conflict);
+        opts.server = None;
+        opts.principal = Some("other".into());
+        assert_eq!(opts.context(&store).unwrap_err(), HelperError::Conflict);
+        assert_eq!(ctx.ensure_unexpired(12344), Ok(()));
+        assert_eq!(
+            ctx.ensure_unexpired(12345),
+            Err(HelperError::ExpiredWithoutSecret)
+        );
+    }
+    #[test]
+    fn connection_errors_describe_what_is_missing_without_secrets() {
+        let temp = Temp::new();
+        fs::create_dir(&temp.0).unwrap();
+        let secret_file = temp.0.join("principal.secret");
+        let mut opts = ConnectionOpts {
+            server: None,
+            principal: None,
+            ca_file: None,
+            principal_secret_file: Some(secret_file.clone()),
+            context: None,
+            follow_leader: false,
+        };
+        let error = |opts: &ConnectionOpts| opts.client().err().unwrap().to_string();
+        assert_eq!(
+            error(&opts),
+            "server URL missing: pass --server or set NUNYA_SERVER"
+        );
+        opts.server = Some("private-invalid-server".into());
+        assert_eq!(error(&opts), "invalid --server URL");
+        opts.server = Some("http://127.0.0.1:9876".into());
+        assert_eq!(
+            error(&opts),
+            "cannot read the principal secret file given by --principal-secret-file"
+        );
+        fs::write(&secret_file, "\r\n").unwrap();
+        assert_eq!(error(&opts), "principal secret file is empty");
+        fs::write(&secret_file, "private-principal-secret\n").unwrap();
+        assert_eq!(
+            error(&opts),
+            "principal name missing: pass --principal or set NUNYA_PRINCIPAL"
+        );
+        assert_eq!(
+            HelperError::PrincipalSecretMissing.to_string(),
+            "principal secret missing: pass --principal-secret-file PATH or set NUNYA_PRINCIPAL_SECRET"
+        );
+        assert!(
+            HelperError::ExpiredWithoutSecret
+                .to_string()
+                .contains("principal secret is missing")
+        );
     }
     #[test]
     fn rotation_requires_locally_stored_parameters() -> Result<(), Box<dyn std::error::Error>> {

@@ -111,6 +111,13 @@ class Agent:
             self.proc.wait(timeout=30)
             self.proc = None
 
+    def session_user(self, context):
+        """Return session:ID; native sessions export only the bearer, not PG* variables."""
+        creds = self.credentials(context)
+        if "PGUSER" in creds:
+            return creds["PGUSER"]
+        return "session:" + creds["NUNYA_SPANNER_BEARER"].split(":", 1)[1].split(".", 1)[0]
+
     def credentials(self, context):
         """Read trusted POSIX helper exports without evaluating shell code."""
         output = self.cli("session", "env", "--context", context, "--format", "sh")
@@ -275,7 +282,7 @@ idle_timeout = '60s'
         sp = self.acquire("agent-sp", "spanner-native")
         idle = self.acquire("agent-idle", "postgres")
         initial = {c: self.show(c) for c in ("agent-pg", "agent-sp")}
-        ids = {c: self.credentials(c)["PGUSER"] for c in initial}
+        ids = {c: self.session_user(c) for c in initial}
         started = None
         token = None
         renewals = 0
@@ -339,7 +346,7 @@ idle_timeout = '60s'
                 started = last
             cycles += 1
             for c in initial:
-                assert self.credentials(c)["PGUSER"] == ids[c]
+                assert self.session_user(c) == ids[c]
             if last - started >= minutes * 60 and renewals >= 2 and cycles >= 5 and restarted:
                 break
             time.sleep(40)
@@ -347,7 +354,7 @@ idle_timeout = '60s'
                 self.stage = "restart"
                 self.stop()
                 self.start("after")
-                self.check("restart", all(self.credentials(c)["PGUSER"] == ids[c] for c in initial))
+                self.check("restart", all(self.session_user(c) == ids[c] for c in initial))
                 restarted = True
                 restart_pending = True
             if cycles == 1:
@@ -363,7 +370,7 @@ idle_timeout = '60s'
                 for c in initial:
                     current = self.show(c)
                     assert current["expires_ms"] == initial[c]["expires_ms"]
-                    assert self.credentials(c)["PGUSER"] == ids[c]
+                    assert self.session_user(c) == ids[c]
                 reload_pending = held, old_revision, new_revision
             elif reload_done and not removed:
                 self.remove_standing()
@@ -372,7 +379,7 @@ idle_timeout = '60s'
             for c in initial:
                 self.cli("session", "renew", "--context", c)
                 assert self.show(c)["expires_ms"] == initial[c]["expires_ms"]
-                assert self.credentials(c)["PGUSER"] == ids[c]
+                assert self.session_user(c) == ids[c]
             renewals += 1
             time.sleep(35)
             elapsed = time.monotonic() - started

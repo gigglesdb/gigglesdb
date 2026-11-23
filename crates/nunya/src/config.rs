@@ -217,6 +217,12 @@ pub struct Config {
     pub revision: String,
     /// Agent listener.
     pub listen: Option<SocketAddr>,
+    /// Optional advertised PostgreSQL host.
+    pub advertise_host: Option<String>,
+    /// Optional advertised PostgreSQL port.
+    pub advertise_port: Option<u16>,
+    /// Optional advertised native Spanner endpoint.
+    pub spanner_advertise: Option<String>,
     /// Administration listener.
     pub admin_listen: SocketAddr,
     /// Effective PostgreSQL route policy path, when configured.
@@ -231,6 +237,8 @@ pub struct Config {
     pub schemas: Vec<String>,
     /// Name resolution search path.
     pub search_path: Vec<String>,
+    /// Deadline for a PostgreSQL schema snapshot in milliseconds.
+    pub schema_snapshot_timeout_ms: u64,
     /// Refresh interval in milliseconds.
     pub snapshot_refresh_ms: u64,
     /// Optional policy polling interval in milliseconds.
@@ -268,6 +276,24 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, Vec<String>> {
         load(path)
     }
+    /// Advertised PostgreSQL host and port for the configured listener.
+    pub(crate) fn postgres_endpoint(&self) -> Option<(String, u16)> {
+        let listen = self.listen?;
+        let host = self
+            .advertise_host
+            .clone()
+            .unwrap_or_else(|| advertised_ip(listen).to_string());
+        Some((host, self.advertise_port.unwrap_or(listen.port())))
+    }
+
+    /// Advertised endpoint for a configured native Spanner listener.
+    pub(crate) fn spanner_endpoint(&self) -> Option<String> {
+        let section = self.spanner_native.as_ref()?;
+        self.spanner_advertise.clone().or_else(|| {
+            let listen = section.listen.parse::<SocketAddr>().ok()?;
+            Some(SocketAddr::new(advertised_ip(listen), listen.port()).to_string())
+        })
+    }
     /// Copy settings into the session upstream configuration.
     pub fn upstream_config(&self) -> Option<crate::pgwire::upstream::UpstreamConfig> {
         use crate::pgwire::upstream::{UpstreamConfig, UpstreamTls};
@@ -290,6 +316,14 @@ impl Config {
         })
     }
 }
+fn advertised_ip(listen: SocketAddr) -> std::net::IpAddr {
+    let ip = listen.ip();
+    if ip.is_unspecified() {
+        std::net::Ipv4Addr::LOCALHOST.into()
+    } else {
+        ip
+    }
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawStanding {
@@ -308,7 +342,8 @@ strict_section!(RawConfig,
     _readlog=>"readlog", _age=>"snapshot_max_age_ms",
     _watch=>"policy_watch_ms", _max=>"max_connections", _listen=>"listen", _admin=>"admin_listen", _policy=>"policy",
     _root=>"root_key_file", _state=>"state_dir", _schemas=>"schemas",
-    _search=>"search_path", _refresh=>"snapshot_refresh_ms",
+    _search=>"search_path", _refresh=>"snapshot_refresh_ms", _snapshot_timeout=>"schema_snapshot_timeout_ms",
+    _advertise_host=>"advertise_host", _advertise_port=>"advertise_port",
     _plaintext=>"allow_plaintext", _tls=>"tls", _upstream=>"upstream", _standing=>"standing", _spanner=>"spanner_native", _management=>"management", _session=>"session");
 strict_section!(RawUpstream,
     _dialect=>"dialect", _host=>"host", _port=>"port", _user=>"user", _password=>"password_file",
@@ -345,6 +380,34 @@ fn get<T: DeserializeOwned>(
             None
         }
     })
+}
+fn native_advertise(value: Value, e: &mut Vec<String>) -> Option<String> {
+    let Value::String(endpoint) = value else {
+        err(e, "spanner_native.advertise", "invalid value or type");
+        return None;
+    };
+    let valid = endpoint
+        .parse::<http::uri::Authority>()
+        .is_ok_and(|authority| {
+            let host = authority.host();
+            !host.is_empty()
+                && !endpoint.contains('@')
+                && authority.port_u16().is_some_and(|port| port != 0)
+                && if let Some(ip) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+                    ip.parse::<std::net::Ipv6Addr>().is_ok()
+                } else {
+                    host.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
+                }
+        });
+    if !valid {
+        err(
+            e,
+            "spanner_native.advertise",
+            "must be a host:port endpoint with a nonzero port",
+        );
+    }
+    valid.then_some(endpoint)
 }
 fn req<T: DeserializeOwned + Default>(
     m: &mut Map<String, Value>,
@@ -430,6 +493,8 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
             "policy_watch_ms",
             "max_connections",
             "listen",
+            "advertise_host",
+            "advertise_port",
             "admin_listen",
             "policy",
             "root_key_file",
@@ -437,6 +502,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
             "schemas",
             "search_path",
             "snapshot_refresh_ms",
+            "schema_snapshot_timeout_ms",
             "allow_plaintext",
             "tls",
             "upstream",
@@ -491,12 +557,27 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     if has_upstream && listen.is_none() {
         err(&mut e, "listen", "valid address required for upstream");
     }
+    let advertise_host: Option<String> = get(&mut m, "advertise_host", &mut e);
+    if advertise_host
+        .as_ref()
+        .is_some_and(|host| host.trim().is_empty())
+    {
+        err(&mut e, "advertise_host", "must be nonempty");
+    }
+    let advertise_port: Option<u16> = get(&mut m, "advertise_port", &mut e);
+    if advertise_port == Some(0) {
+        err(&mut e, "advertise_port", "must be from 1 to 65535");
+    }
     let has_spanner = m.contains_key("spanner_native");
+    let mut spanner_advertise = None;
     let mut spanner_file_owner = false;
     let mut spanner_policy = None;
     let mut spanner_route_id = None;
     let spanner_native = m.remove("spanner_native").and_then(|mut v| {
         if let Value::Table(t) = &mut v {
+            spanner_advertise = t
+                .remove("advertise")
+                .and_then(|v| native_advertise(v, &mut e));
             spanner_file_owner = file_owner(t, "spanner_native.policy_owner", &mut e);
             spanner_policy = route_policy(t, "spanner_native.policy", base, &mut e);
             spanner_route_id = Some(route_id(
@@ -552,6 +633,11 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     let schemas = get(&mut m, "schemas", &mut e).unwrap_or_else(|| vec!["public".into()]);
     let search_path: Vec<String> = get(&mut m, "search_path", &mut e).unwrap_or_else(|| vec!["public".into()]);
     let schemas = effective_schemas(schemas, &search_path);
+    let schema_snapshot_timeout_ms =
+        get(&mut m, "schema_snapshot_timeout_ms", &mut e).unwrap_or(60000);
+    if schema_snapshot_timeout_ms == 0 {
+        err(&mut e, "schema_snapshot_timeout_ms", "must be positive");
+    }
     let snapshot_refresh_ms = get(&mut m, "snapshot_refresh_ms", &mut e).unwrap_or(30000);
     if snapshot_refresh_ms == 0 {
         err(&mut e, "snapshot_refresh_ms", "must be positive");
@@ -799,6 +885,9 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         postgres_route_id: postgres_route_id.clone(),
         spanner_route_id: spanner_route_id.clone(),
         listen,
+        advertise_host,
+        advertise_port,
+        spanner_advertise,
         admin_listen,
         file_policy_routes: [(postgres_file_owner, &postgres_route_id), (spanner_file_owner, &spanner_route_id)].into_iter().filter_map(|(release, route)| if release { route.clone() } else { None }).collect(),
         postgres_policy,
@@ -807,6 +896,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         root_key,
         schemas,
         search_path,
+        schema_snapshot_timeout_ms,
         snapshot_refresh_ms,
         policy_watch_ms,
         allow_plaintext,
@@ -1040,6 +1130,96 @@ tls = "disable"
 "#;
     const NATIVE: &str = "\n[spanner_native]\nlisten='127.0.0.1:6433'\ndatabase='projects/p/instances/i/databases/d'\n";
     const KUBE: &str = "[policy_store_kubernetes]\nnamespace='default'\npod_name='nunya-abc'\nmanagement_url='http://10.0.0.1:6481'\n";
+    #[test]
+    fn advertised_connection_defaults_to_listen_address() {
+        let f = Fixture::new();
+        for (listen, host, endpoint) in [
+            ("127.0.0.5", "127.0.0.5", "127.0.0.5:6433"),
+            ("0.0.0.0", "127.0.0.1", "127.0.0.1:6433"),
+            ("[::]", "127.0.0.1", "127.0.0.1:6433"),
+            ("[::1]", "::1", "[::1]:6433"),
+        ] {
+            let pg = EXAMPLE.replace("127.0.0.1:6432", &format!("{listen}:7432"));
+            let native = NATIVE.replace("127.0.0.1:6433", &format!("{listen}:6433"));
+            let config = f.load(&format!("{pg}{native}")).unwrap();
+            assert_eq!(config.postgres_endpoint(), Some((host.into(), 7432)));
+            assert_eq!(config.spanner_endpoint().as_deref(), Some(endpoint));
+        }
+    }
+    #[test]
+    fn advertise_overrides_are_validated() {
+        let f = Fixture::new();
+        for endpoint in ["spanner.example:1", "[2001:db8::a]:65535"] {
+            let config = f.load(&format!(
+                "advertise_host='pg.example'\nadvertise_port=65535\n{EXAMPLE}{NATIVE}advertise='{endpoint}'"
+            )).unwrap();
+            assert_eq!(
+                config.postgres_endpoint(),
+                Some(("pg.example".into(), 65535))
+            );
+            assert_eq!(config.spanner_endpoint().as_deref(), Some(endpoint));
+        }
+        for (key, value) in [
+            ("advertise_host", "''"),
+            ("advertise_host", "'  '"),
+            ("advertise_host", "42"),
+            ("advertise_port", "0"),
+            ("advertise_port", "-1"),
+            ("advertise_port", "65536"),
+            ("advertise_port", "'6432'"),
+        ] {
+            let errors = f.load(&format!("{key}={value}\n{EXAMPLE}")).unwrap_err();
+            assert!(errors.iter().any(|e| e.starts_with(key)));
+        }
+        for value in [
+            "42",
+            "''",
+            "'spanner'",
+            "':6433'",
+            "'spanner:0'",
+            "'spanner:65536'",
+            "'https://spanner:6433'",
+            "'name@spanner:6433'",
+            "'::1:6433'",
+            "'[invalid]:6433'",
+        ] {
+            let errors = f
+                .load(&format!("{EXAMPLE}{NATIVE}advertise={value}"))
+                .unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.starts_with("spanner_native.advertise"))
+            );
+        }
+        assert!(
+            f.load(&format!(
+                "{EXAMPLE}{NATIVE}unknown_advertise='localhost:6433'"
+            ))
+            .is_err()
+        );
+    }
+    #[test]
+    fn schema_snapshot_timeout_is_positive_and_defaults_to_one_minute() {
+        let f = Fixture::new();
+        assert_eq!(f.load(EXAMPLE).unwrap().schema_snapshot_timeout_ms, 60000);
+        assert_eq!(
+            f.load(&format!("schema_snapshot_timeout_ms=1234\n{EXAMPLE}"))
+                .unwrap()
+                .schema_snapshot_timeout_ms,
+            1234
+        );
+        for value in ["0", "-1", "'100'", "1.5"] {
+            let errors = f
+                .load(&format!("schema_snapshot_timeout_ms={value}\n{EXAMPLE}"))
+                .unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.starts_with("schema_snapshot_timeout_ms"))
+            );
+        }
+    }
     #[test]
     fn policy_store_defaults_and_unknown_selection() {
         let f = Fixture::new();
