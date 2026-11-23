@@ -2143,6 +2143,7 @@ pub(crate) mod tests {
         bad_log.readlog = ReadLogSink::File {
             path: missing_parent.join("readlog"),
             max_bytes: 1024,
+            max_files: 10,
         };
         assert!(h.apply(0, Ok(document(bad_log)), Some(hash(b"bad-log"))).is_err());
         h.register(Route::Test(
@@ -2241,6 +2242,7 @@ pub(crate) mod tests {
         new.readlog = ReadLogSink::File {
             path: dir.join("audit.log"),
             max_bytes: 1024,
+            max_files: 10,
         };
         h.apply(0, Ok(document(new)), Some("R2".into())).unwrap();
         assert_eq!(ctx.policy_revision.read().unwrap().as_deref(), Some("R2"));
@@ -2540,7 +2542,7 @@ pub(crate) mod tests {
         std::fs::write(&files.a, "version=2\ndefault='tokenize'\n[[link]]\nfields=['public.customers.email','public.customers.other']\n").unwrap();
         let audit = files.dir.join("restart-audit.jsonl");
         let hub = Hub::new(&[(id("a"), files.a.clone())], None,
-            crate::policy::ServicePolicySettings { readlog: Some(ReadLogSink::File { path: audit.clone(), max_bytes: 1000000 }), ..Default::default() }).unwrap();
+            crate::policy::ServicePolicySettings { readlog: Some(ReadLogSink::File { path: audit.clone(), max_bytes: 1000000, max_files: 10 }), ..Default::default() }).unwrap();
         let store = binding_store(&files); hub.set_store(store.clone()).unwrap();
         let authority = Authority::load(store.clone(), SessionLimits::default()).unwrap();
         assert_eq!(authority.session(session.id).unwrap().state, SessionState::Active);

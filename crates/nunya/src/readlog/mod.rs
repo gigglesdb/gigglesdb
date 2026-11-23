@@ -1,7 +1,7 @@
 //! JSON-line read logging with bounded file rotation.
 use crate::{
     error::{NyCode, Refusal},
-    policy::ReadLogSink,
+    policy::{MAX_READLOG_FILES, ReadLogSink},
     token::{PrincipalId, SessionId, ScopeId},
     state::model::CredentialId,
 };
@@ -147,18 +147,45 @@ fn lifecycle_line(rec: &LifecycleRecord) -> Result<Vec<u8>, Refusal> {
 fn failure() -> Refusal {
     Refusal::new(NyCode::ReadLogUnavailable, "read log unavailable")
 }
+const TOKENS_PER_RECORD: usize = 10_000;
+
 fn line(rec: &ReadLogRecord) -> Result<Vec<u8>, Refusal> {
     let outcome = match rec.outcome {
         Outcome::Allowed => "allowed",
         Outcome::Refused(c) => c.sqlstate(),
     };
-    let mut bytes=serde_json::to_vec(&serde_json::json!({"ts":rec.ts_unix_ms,"kind":"statement","principal":rec.principal.to_hex(),"session":rec.session.to_hex(),"scope":rec.scope.to_hex(),"connection":rec.connection,"credential_id":rec.credential_id.map(|id| id.to_hex()),"route":rec.route,"policy_revision":rec.policy_revision,"config_revision":rec.config_revision,"fingerprint":rec.statement_fingerprint,"statement":rec.statement,"outcome":outcome,"rows":rec.rows,"tokens":rec.tokens_released})).map_err(|_|failure())?;
+    let session = rec.session.to_hex();
+    let total = rec.tokens_released.len();
+    let parts = total.div_ceil(TOKENS_PER_RECORD);
+    let (first, rest) = rec.tokens_released.split_at(total.min(TOKENS_PER_RECORD));
+    let mut record = serde_json::json!({
+        "ts": rec.ts_unix_ms, "kind": "statement", "principal": rec.principal.to_hex(),
+        "session": session, "scope": rec.scope.to_hex(), "connection": rec.connection,
+        "credential_id": rec.credential_id.map(|id| id.to_hex()), "route": rec.route,
+        "policy_revision": rec.policy_revision, "config_revision": rec.config_revision,
+        "fingerprint": rec.statement_fingerprint, "statement": rec.statement,
+        "outcome": outcome, "rows": rec.rows, "tokens": first,
+    });
+    if parts > 1 {
+        record["tokens_total"] = serde_json::json!(total);
+        record["token_parts"] = serde_json::json!(parts);
+    }
+    let mut bytes = serde_json::to_vec(&record).map_err(|_| failure())?;
     bytes.push(b'\n');
+    for (index, tokens) in rest.chunks(TOKENS_PER_RECORD).enumerate() {
+        let continuation = serde_json::json!({
+            "ts": rec.ts_unix_ms, "kind": "statement_tokens", "session": session,
+            "route": rec.route, "fingerprint": rec.statement_fingerprint,
+            "part": index + 2, "tokens": tokens,
+        });
+        serde_json::to_writer(&mut bytes, &continuation).map_err(|_| failure())?;
+        bytes.push(b'\n');
+    }
     Ok(bytes)
 }
 /// Durable-enough per-record logging contract; failures always use NY009.
 pub trait ReadLog: Send + Sync {
-    /// Write and flush one JSON record.
+    /// Write and flush a statement and any token continuation records together.
     fn write(&self, rec: &ReadLogRecord) -> Result<(), Refusal>;
     /// Write and flush one lifecycle record.
     fn write_lifecycle(&self, rec: &LifecycleRecord) -> Result<(), Refusal>;
@@ -185,15 +212,19 @@ struct FileState {
     file: Option<File>,
     size: u64,
 }
-/// Append-only JSON log with one rotated predecessor.
+/// Append-only JSON log with a bounded number of rotated predecessors.
 pub struct FileLog {
     path: PathBuf,
     max_bytes: u64,
+    max_files: usize,
     state: Mutex<FileState>,
 }
 impl FileLog {
     /// Open an existing log for append, or create it without creating parents.
-    pub fn open(path: &Path, max_bytes: u64) -> Result<Self, Refusal> {
+    pub fn open(path: &Path, max_bytes: u64, max_files: usize) -> Result<Self, Refusal> {
+        if !(1..=MAX_READLOG_FILES).contains(&max_files) {
+            return Err(failure());
+        }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -203,6 +234,7 @@ impl FileLog {
         Ok(Self {
             path: path.into(),
             max_bytes,
+            max_files,
             state: Mutex::new(FileState {
                 file: Some(file),
                 size,
@@ -219,25 +251,28 @@ impl ReadLog for FileLog {
     }
 }
 impl FileLog {
+    fn backup_path(&self, number: usize) -> PathBuf {
+        let mut name = self.path.as_os_str().to_os_string();
+        name.push(format!(".{number}"));
+        PathBuf::from(name)
+    }
+
     fn write_bytes(&self, bytes: &[u8]) -> Result<(), Refusal> {
         let len = u64::try_from(bytes.len()).map_err(|_| failure())?;
         let mut state = self.state.lock().map_err(|_| failure())?;
         if state.size != 0 && state.size.checked_add(len).ok_or_else(failure)? > self.max_bytes {
-            let file = state.file.as_mut().ok_or_else(failure)?;
-            file.flush()
-                .and_then(|_| file.sync_data())
-                .map_err(|_| failure())?;
-            // Close before rename for Windows; a failed rotation poisons this sink closed.
-            drop(state.file.take());
-            let mut name = self.path.as_os_str().to_os_string();
-            name.push(".1");
-            let backup = PathBuf::from(name);
-            match std::fs::remove_file(&backup) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(failure()),
+            // Close before renaming on Windows. Any failure leaves the sink closed.
+            let mut file = state.file.take().ok_or_else(failure)?;
+            file.flush().and_then(|_| file.sync_data()).map_err(|_| failure())?;
+            drop(file);
+            ignore_missing(std::fs::remove_file(self.backup_path(self.max_files)))?;
+            for number in (1..self.max_files).rev() {
+                ignore_missing(std::fs::rename(
+                    self.backup_path(number),
+                    self.backup_path(number + 1),
+                ))?;
             }
-            std::fs::rename(&self.path, &backup).map_err(|_| failure())?;
+            std::fs::rename(&self.path, self.backup_path(1)).map_err(|_| failure())?;
             state.file = Some(
                 OpenOptions::new()
                     .create_new(true)
@@ -256,11 +291,21 @@ impl FileLog {
         Ok(())
     }
 }
+fn ignore_missing(result: std::io::Result<()>) -> Result<(), Refusal> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(failure()),
+    }
+}
+
 /// Open the configured read-log destination.
 pub fn open_sink(sink: &ReadLogSink) -> Result<Box<dyn ReadLog>, Refusal> {
     match sink {
         ReadLogSink::Stdout => Ok(Box::new(StdoutLog)),
-        ReadLogSink::File { path, max_bytes } => Ok(Box::new(FileLog::open(path, *max_bytes)?)),
+        ReadLogSink::File { path, max_bytes, max_files } => {
+            Ok(Box::new(FileLog::open(path, *max_bytes, *max_files)?))
+        }
     }
 }
 /// Fingerprint preserving case and collapsing whitespace everywhere, including quotes.
@@ -556,14 +601,14 @@ mod tests {
     fn file_log_orders_both_record_kinds() {
         let dir = temp();
         let path = dir.join("audit");
-        let log = FileLog::open(&path, u64::MAX).unwrap();
+        let log = FileLog::open(&path, u64::MAX, 1).unwrap();
         let statement = record();
         let lifecycle = lifecycle(LifecycleActor::System);
         log.write(&statement).unwrap();
         log.write_lifecycle(&lifecycle).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), [line(&statement).unwrap(), lifecycle_line(&lifecycle).unwrap()].concat());
         drop(log);
-        let log = FileLog::open(&path, 1).unwrap();
+        let log = FileLog::open(&path, 1, 1).unwrap();
         log.write_lifecycle(&lifecycle).unwrap();
         assert_eq!(std::fs::read(dir.join("audit.1")).unwrap(), [line(&statement).unwrap(), lifecycle_line(&lifecycle).unwrap()].concat());
         assert_eq!(std::fs::read(&path).unwrap(), lifecycle_line(&lifecycle).unwrap());
@@ -606,6 +651,42 @@ mod tests {
             statement_fingerprint(&redact_tokenize_args("SELECT\n1"))
         );
     }
+    #[test]
+    fn large_token_records_keep_order() {
+        let mut rec = record();
+        rec.tokens_released = (0..25_001).map(|i| format!("token_{i}")).collect();
+        let bytes = line(&rec).unwrap();
+        let records: Vec<serde_json::Value> = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["kind"], "statement");
+        assert_eq!(records[0]["tokens_total"], 25_001);
+        assert_eq!(records[0]["token_parts"], 3);
+        for (index, count) in [10_000, 10_000, 5_001].into_iter().enumerate() {
+            assert_eq!(records[index]["tokens"].as_array().unwrap().len(), count);
+            if index > 0 {
+                assert_eq!(records[index]["kind"], "statement_tokens");
+                assert_eq!(records[index]["part"], index + 1);
+                for field in ["ts", "session", "route", "fingerprint"] {
+                    assert_eq!(records[index][field], records[0][field]);
+                }
+            }
+        }
+        let tokens = records.iter().flat_map(|record| record["tokens"].as_array().unwrap());
+        assert!(tokens.map(|token| token.as_str().unwrap()).eq(rec.tokens_released.iter().map(String::as_str)));
+
+        let dir = temp();
+        let path = dir.join("audit");
+        let log = FileLog::open(&path, 1, 1).unwrap();
+        log.write(&rec).unwrap();
+        log.write(&record()).unwrap();
+        assert_eq!(std::fs::read(dir.join("audit.1")).unwrap(), bytes);
+        drop(log);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     fn temp() -> PathBuf {
         let root = std::env::temp_dir();
         let path = root.join(format!(
@@ -625,13 +706,68 @@ mod tests {
         let path = dir.join("audit");
         let rec = record();
         let len = line(&rec).unwrap().len() as u64;
-        let log = FileLog::open(&path, len).unwrap();
+        let log = FileLog::open(&path, len, 1).unwrap();
         log.write(&rec).unwrap();
         assert!(!dir.join("audit.1").exists());
         log.write(&rec).unwrap();
         log.write(&rec).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
         assert_eq!(std::fs::metadata(dir.join("audit.1")).unwrap().len(), len);
+        assert!(!dir.join("audit.2").exists());
+        drop(log);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn rotation_retains_predecessors_in_order() {
+        let dir = temp();
+        let path = dir.join("audit");
+        let log = FileLog::open(&path, 1, 3).unwrap();
+        let mut rec = record();
+        let mut expected = vec![];
+        for timestamp in 1..=6 {
+            rec.ts_unix_ms = timestamp;
+            log.write(&rec).unwrap();
+            expected.push(line(&rec).unwrap());
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), expected[5]);
+        for number in 1..=3 {
+            assert_eq!(std::fs::read(log.backup_path(number)).unwrap(), expected[5 - number]);
+        }
+        assert!(!log.backup_path(4).exists());
+        drop(log);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn rotation_skips_missing_predecessors() {
+        let dir = temp();
+        let path = dir.join("audit");
+        let log = FileLog::open(&path, 1, 4).unwrap();
+        std::fs::write(log.backup_path(1), b"recent").unwrap();
+        std::fs::write(log.backup_path(3), b"older").unwrap();
+        std::fs::write(log.backup_path(4), b"oldest").unwrap();
+        let rec = record();
+        log.write(&rec).unwrap();
+        log.write(&rec).unwrap();
+        assert_eq!(std::fs::read(log.backup_path(1)).unwrap(), line(&rec).unwrap());
+        assert_eq!(std::fs::read(log.backup_path(2)).unwrap(), b"recent");
+        assert!(!log.backup_path(3).exists());
+        assert_eq!(std::fs::read(log.backup_path(4)).unwrap(), b"older");
+        drop(log);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn failed_rotation_poisons_sink() {
+        let dir = temp();
+        let path = dir.join("audit");
+        let log = FileLog::open(&path, 1, 1).unwrap();
+        let blocked = log.backup_path(1);
+        std::fs::create_dir(&blocked).unwrap();
+        let rec = record();
+        log.write(&rec).unwrap();
+        assert_eq!(log.write(&rec).unwrap_err().code, NyCode::ReadLogUnavailable);
+        std::fs::remove_dir(blocked).unwrap();
+        assert_eq!(log.write(&rec).unwrap_err().code, NyCode::ReadLogUnavailable);
+        assert_eq!(std::fs::read(&path).unwrap(), line(&rec).unwrap());
         drop(log);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -646,7 +782,7 @@ mod tests {
         second.ts_unix_ms += 1;
         let first_bytes = line(&first).unwrap();
         let second_bytes = line(&second).unwrap();
-        let log = FileLog::open(&path, 1).unwrap();
+        let log = FileLog::open(&path, 1, 1).unwrap();
         log.write(&first).unwrap();
         assert_eq!(std::fs::read(&backup).unwrap(), b"existing backup");
         assert_eq!(std::fs::read(&path).unwrap(), first_bytes);
@@ -682,7 +818,7 @@ mod tests {
     fn missing_parent() {
         let dir = temp();
         assert_eq!(
-            FileLog::open(&dir.join("missing/audit"), 100)
+            FileLog::open(&dir.join("missing/audit"), 100, 1)
                 .err()
                 .unwrap()
                 .code,

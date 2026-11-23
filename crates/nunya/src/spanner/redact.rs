@@ -1,5 +1,6 @@
 //! Fixed gRPC statuses that never copy upstream data.
-use crate::error::NyCode;
+use crate::error::{NyCode, Refusal};
+use std::sync::Arc;
 use tonic::{Code, Status};
 /// Replace an upstream code with a fixed message and empty details and metadata.
 pub fn redact_status(code: Code) -> Status {
@@ -42,7 +43,9 @@ pub fn nunya_status(code: NyCode) -> Status {
         | NyCode::TokenizeLimit
         | NyCode::ProtocolNotAllowed => Code::PermissionDenied,
     };
-    Status::new(grpc, format!("{}: {}", code.sqlstate(), code.message()))
+    let mut status = Status::new(grpc, format!("{}: {}", code.sqlstate(), code.message()));
+    status.set_source(Arc::new(Refusal::new(code, code.message())));
+    status
 }
 #[cfg(test)]
 mod tests {

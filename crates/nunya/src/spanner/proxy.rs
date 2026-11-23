@@ -16,7 +16,7 @@ use crate::{
     error::{NyCode, Refusal},
     ir::{InputRewrite, RewritePlan, StatementKind, ValueSource, check::check},
     policy::{DomainName, Policy, TokenizeSetting, Treatment, ReleaseSlot, tightens},
-    readlog::{LifecycleRecord, LifecycleKind, LifecycleActor, Outcome, ReadLog, ReadLogRecord, statement_fingerprint},
+    readlog::{LifecycleRecord, LifecycleKind, LifecycleActor, Outcome, ReadLog, ReadLogRecord, redact_tokenize_args, statement_fingerprint},
     schema::Snapshot,
     state::authority::{AdmitError, Operation, TokenizeError, TokenizeLimits},
     token::{SessionId, StandardCodec, TokenCodec, keys::RootKey},
@@ -27,6 +27,7 @@ use googleapis_tonic_google_spanner_v1::google::spanner::v1::{spanner_client::Sp
 use prost_types::{ListValue, Value};
 use std::{
     collections::HashMap,
+    error::Error as _,
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex, RwLock},
@@ -287,7 +288,6 @@ impl WriteAudit {
         Status::new(error.code(), error.message())
     }
     fn finish_error(&self, error: Status) -> Status {
-        use std::error::Error;
         let reason = error.source().and_then(|source| source.downcast_ref::<UnknownCause>()).copied();
         match reason {
             Some(reason) => self.finish(error, reason),
@@ -311,7 +311,10 @@ fn unknown_status(reason: UnknownCause) -> Status {
     error
 }
 fn upstream_not_ready() -> Status {
-    Status::unavailable(nunya_status(NyCode::ProtocolNotAllowed).message())
+    let code = NyCode::ProtocolNotAllowed;
+    let mut error = Status::unavailable(nunya_status(code).message());
+    error.set_source(Arc::new(refusal(code)));
+    error
 }
 async fn ready_for_write(channel: &Channel, write: bool) -> Result<(), Status> {
     if write {
@@ -322,7 +325,6 @@ async fn ready_for_write(channel: &Channel, write: bool) -> Result<(), Status> {
 // A wire-decoded Status has no io::Error source. A local TCP refusal proves
 // no send, but only before any response part has been received.
 fn connection_refused(error: &Status) -> bool {
-    use std::error::Error;
     let mut source = error.source();
     while let Some(error) = source {
         if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused) {
@@ -412,8 +414,8 @@ impl RevisionGuard {
                 connection: service.watchers.lock().ok().and_then(|w| w.get(&who.session).map(|w| w.connection)),
                 route: service.ctx.route.as_str().into(), policy_revision: revision.map(str::to_owned),
                 config_revision: None,
-                statement_fingerprint: statement_fingerprint(&crate::readlog::redact_tokenize_args(label)),
-                statement: "Spanner operation".into(), outcome: Outcome::Refused(NyCode::SchemaStale),
+                statement_fingerprint: statement_fingerprint(label),
+                statement: label.into(), outcome: Outcome::Refused(NyCode::SchemaStale),
                 rows: 0, tokens_released: vec![],
             },
             refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1012,7 +1014,6 @@ impl NunyaSpanner {
         tokens: Vec<String>,
         outcome: Outcome,
     ) -> Result<(), Status> {
-        // Fingerprint the original agent statement; log no literals, tokens, or upstream values.
         ctx.readlog
             .write(&ReadLogRecord {
                 ts_unix_ms: (ctx.clock)(),
@@ -1024,24 +1025,13 @@ impl NunyaSpanner {
                 route: ctx.route.as_str().into(),
                 policy_revision: revision.map(str::to_owned),
                 config_revision: None,
-                statement_fingerprint: statement_fingerprint(
-                    &crate::readlog::redact_tokenize_args(label),
-                ),
-                statement: "Spanner operation".into(),
+                statement_fingerprint: statement_fingerprint(label),
+                statement: label.into(),
                 outcome,
                 rows,
                 tokens_released: tokens,
             })
             .map_err(|_| nunya_status(NyCode::ReadLogUnavailable))
-    }
-    fn refuse_tokenize(&self, who: &Authenticated, revision: Option<&str>, code: NyCode) -> Status {
-        match Self::audit_outcome(
-            &self.ctx, &self.watchers, who, revision, "Spanner nunya_tokenize", 0, vec![],
-            Outcome::Refused(code),
-        ) {
-            Ok(()) => nunya_status(code),
-            Err(error) => error,
-        }
     }
     fn convert(
         &self,
@@ -1065,25 +1055,16 @@ impl NunyaSpanner {
         .map_err(status)?;
         values::to_proto(wire_ty, &result).map_err(status)
     }
-    #[allow(clippy::too_many_arguments)]
     fn sql(
         &self,
         who: &Authenticated,
-        revision: Option<&str>,
         sql: &str,
         params: &mut Option<prost_types::Struct>,
         policy: &Policy,
         snapshot: &Snapshot,
     ) -> Result<SqlPlan, Status> {
-        let refusal = |error: Refusal| {
-            if sql.to_ascii_lowercase().contains("nunya_tokenize") {
-                self.refuse_tokenize(who, revision, error.code)
-            } else {
-                status(error)
-            }
-        };
-        let (stmt, names) = lower_gsql(sql, snapshot, policy).map_err(refusal)?;
-        let mut plan = check(&stmt, policy, snapshot).map_err(refusal)?;
+        let (stmt, names) = lower_gsql(sql, snapshot, policy).map_err(status)?;
+        let mut plan = check(&stmt, policy, snapshot).map_err(status)?;
 
         if plan.tokenize.is_none()
             && let Some(params) = params.as_ref()
@@ -1130,6 +1111,33 @@ impl NunyaSpanner {
         }
 
         Ok((plan, names, stmt.kind))
+    }
+    fn prepare_sql(
+        &self,
+        req: &mut ExecuteSqlRequest,
+        who: &Authenticated,
+        policy: &Policy,
+        snapshot: &Snapshot,
+    ) -> Result<(RewritePlan, Vec<String>, bool), Status> {
+        let (plan, names, kind) = self.sql(who, &req.sql, &mut req.params, policy, snapshot)?;
+        req.sql = splice_sql(&req.sql, &plan.inputs)?;
+        let write = match kind {
+            StatementKind::Insert | StatementKind::Update | StatementKind::Delete => {
+                self.mark_selector_dml(&req.session, req.transaction.as_ref(), who.session)?;
+                self.admit_write(who)?;
+                true
+            }
+            StatementKind::JsonSelect { .. } | StatementKind::Select | StatementKind::Tokenize { .. } => false,
+            StatementKind::Begin
+            | StatementKind::Commit
+            | StatementKind::Rollback
+            | StatementKind::Savepoint
+            | StatementKind::ReleaseSavepoint
+            | StatementKind::RollbackToSavepoint
+            | StatementKind::SessionNoop { .. }
+            | StatementKind::Refused(_) => return Err(denied()),
+        };
+        Ok((plan, names, write))
     }
     fn rewrite(
         ctx: &SpannerContext,
@@ -1205,11 +1213,9 @@ impl NunyaSpanner {
         }
         Ok(tokens)
     }
-    #[allow(clippy::too_many_arguments)]
     fn local_tokenize(
         &self,
         who: &Authenticated,
-        revision: Option<&str>,
         policy: &Policy,
         snapshot: &Snapshot,
         plan: &RewritePlan,
@@ -1221,7 +1227,7 @@ impl NunyaSpanner {
         };
         self.local_tokenize_inner(who, policy, snapshot, (domain, arg), names, req)
             .map(Some)
-            .map_err(|code| self.refuse_tokenize(who, revision, code))
+            .map_err(nunya_status)
     }
     fn local_tokenize_inner(
         &self,
@@ -1361,6 +1367,24 @@ impl NunyaSpanner {
             }
         }
         Ok(result)
+    }
+    fn prepare_read(
+        &self,
+        req: &mut ReadRequest,
+        who: &Authenticated,
+        policy: &Policy,
+        snapshot: &Snapshot,
+    ) -> Result<RewritePlan, Status> {
+        let lowered = spanner_struct::lower_read(req, snapshot, policy).map_err(status)?;
+        let plan = check(&lowered.stmt, policy, snapshot).map_err(status)?;
+        check_key_tokens(req.key_set.as_ref(), policy, &plan, &lowered.positions, false)?;
+        let rewrites = self.structured(who, policy, &plan, &lowered.positions, |p| {
+            read_value(req, p)
+        })?;
+        for (index, value) in rewrites {
+            *read_value_mut(req, &lowered.positions[index]).ok_or_else(invalid)? = value;
+        }
+        Ok(plan)
     }
     fn prepare_mutation(
         &self,
@@ -1548,6 +1572,100 @@ fn owned(
     }
 }
 
+// Keep the policy revision used for admission with any refusal it produces.
+struct RequestAudit<'a> {
+    service: &'a NunyaSpanner,
+    who: &'a Authenticated,
+    revision: Option<String>,
+}
+
+impl<'a> RequestAudit<'a> {
+    fn new(service: &'a NunyaSpanner, who: &'a Authenticated) -> Self {
+        Self { service, who, revision: None }
+    }
+
+    fn configuration(&mut self) -> Result<(Arc<Policy>, Arc<Snapshot>), Status> {
+        let (policy, snapshot, revision) = self.service.configuration()?;
+        self.revision = revision;
+        Ok((policy, snapshot))
+    }
+
+    fn preflight<T>(
+        &mut self,
+        statement: &str,
+        prepare: impl FnOnce(&mut Self) -> Result<T, Status>,
+    ) -> Result<T, Status> {
+        let result = prepare(self);
+        self.result(statement, result)
+    }
+
+    fn result<T>(&self, statement: &str, result: Result<T, Status>) -> Result<T, Status> {
+        result.map_err(|error| {
+            // Upstream statuses are redacted and carry no local refusal source.
+            let Some(refusal) = error.source().and_then(|source| source.downcast_ref::<Refusal>()) else {
+                return error;
+            };
+            if matches!(
+                refusal.code,
+                NyCode::ReadLogUnavailable | NyCode::SessionEnded | NyCode::WriteOutcomeUnknown
+            ) {
+                return error;
+            }
+            match NunyaSpanner::audit_outcome(
+                &self.service.ctx, &self.service.watchers, self.who, self.revision.as_deref(),
+                statement, 0, vec![], Outcome::Refused(refusal.code),
+            ) {
+                Ok(()) => error,
+                Err(log_error) => log_error,
+            }
+        })
+    }
+}
+
+fn sql_statement(sql: &str) -> String {
+    if sql.as_bytes().windows(b"nunya_tokenize".len())
+        .any(|word| word.eq_ignore_ascii_case(b"nunya_tokenize"))
+    {
+        "Spanner nunya_tokenize".into()
+    } else {
+        redact_tokenize_args(sql)
+    }
+}
+
+fn read_statement(rpc: &str, table: &str, columns: &[String]) -> String {
+    format!("{rpc} table={table} columns={}", columns.join(","))
+}
+
+fn mutation_statement<'a>(rpc: &str, mutations: impl IntoIterator<Item = &'a Mutation>) -> String {
+    let mut statement = rpc.to_owned();
+    for (index, mutation) in mutations.into_iter().enumerate() {
+        statement.push_str(if index == 0 { " mutations=" } else { "; " });
+        let (kind, write) = match &mutation.operation {
+            Some(mutation::Operation::Insert(write)) => ("insert", write),
+            Some(mutation::Operation::Update(write)) => ("update", write),
+            Some(mutation::Operation::InsertOrUpdate(write)) => ("insert_or_update", write),
+            Some(mutation::Operation::Replace(write)) => ("replace", write),
+            Some(mutation::Operation::Delete(delete)) => {
+                statement.push_str("delete ");
+                statement.push_str(&delete.table);
+                statement.push_str("()");
+                continue;
+            }
+            None => {
+                statement.push_str("unknown");
+                continue;
+            }
+        };
+        statement.push_str(kind);
+        statement.push(' ');
+        statement.push_str(&write.table);
+        statement.push('(');
+        statement.push_str(&write.columns.join(","));
+        statement.push(')');
+    }
+    statement
+}
+
 #[tonic::async_trait]
 impl SpannerService for NunyaSpanner {
     type ExecuteStreamingSqlStream = ResultStream;
@@ -1560,17 +1678,19 @@ impl SpannerService for NunyaSpanner {
     ) -> Result<Response<Session>, Status> {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
-        self.database(&req.database)?;
-        if let Some(s) = &mut req.session {
-            s.creator_role.clear();
-            if !s.name.is_empty() {
-                self.session_database(&s.name)?;
+        let audit = RequestAudit::new(self, &who);
+        let label = "CreateSession";
+        audit.result(label, (|| {
+            self.database(&req.database)?;
+            if let Some(s) = &mut req.session {
+                s.creator_role.clear();
+                if !s.name.is_empty() {
+                    self.session_database(&s.name)?;
+                }
             }
-        }
-        let response = self
-            .client()
-            .await?
-            .create_session(req)
+            Ok(())
+        })())?;
+        let response = audit.result(label, self.client().await)?            .create_session(req)
             .await
             .map_err(remote)?
             .into_inner();
@@ -1586,17 +1706,19 @@ impl SpannerService for NunyaSpanner {
     ) -> Result<Response<BatchCreateSessionsResponse>, Status> {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
-        self.database(&req.database)?;
-        if let Some(s) = &mut req.session_template {
-            s.creator_role.clear();
-            if !s.name.is_empty() {
-                self.session_database(&s.name)?;
+        let audit = RequestAudit::new(self, &who);
+        let label = "BatchCreateSessions";
+        audit.result(label, (|| {
+            self.database(&req.database)?;
+            if let Some(s) = &mut req.session_template {
+                s.creator_role.clear();
+                if !s.name.is_empty() {
+                    self.session_database(&s.name)?;
+                }
             }
-        }
-        let response = self
-            .client()
-            .await?
-            .batch_create_sessions(req)
+            Ok(())
+        })())?;
+        let response = audit.result(label, self.client().await)?            .batch_create_sessions(req)
             .await
             .map_err(remote)?
             .into_inner();
@@ -1616,10 +1738,10 @@ impl SpannerService for NunyaSpanner {
     ) -> Result<Response<Session>, Status> {
         let who = self.authenticate(&req)?;
         let req = req.into_inner();
-        self.session(&req.name, &who)?;
-        let response = self
-            .client()
-            .await?
+        let audit = RequestAudit::new(self, &who);
+        let label = "GetSession";
+        audit.result(label, self.session(&req.name, &who))?;
+        let response = audit.result(label, self.client().await)?
             .get_session(req.clone())
             .await
             .map_err(remote)?
@@ -1635,10 +1757,10 @@ impl SpannerService for NunyaSpanner {
     ) -> Result<Response<ListSessionsResponse>, Status> {
         let who = self.authenticate(&req)?;
         let req = req.into_inner();
-        self.database(&req.database)?;
-        let mut response = self
-            .client()
-            .await?
+        let audit = RequestAudit::new(self, &who);
+        let label = "ListSessions";
+        audit.result(label, self.database(&req.database))?;
+        let mut response = audit.result(label, self.client().await)?
             .list_sessions(req)
             .await
             .map_err(remote)?
@@ -1654,9 +1776,10 @@ impl SpannerService for NunyaSpanner {
     ) -> Result<Response<()>, Status> {
         let who = self.authenticate(&req)?;
         let req = req.into_inner();
-        self.session(&req.name, &who)?;
-        self.client()
-            .await?
+        let audit = RequestAudit::new(self, &who);
+        let label = "DeleteSession";
+        audit.result(label, self.session(&req.name, &who))?;
+        audit.result(label, self.client().await)?
             .delete_session(req.clone())
             .await
             .map_err(remote)?;
@@ -1677,64 +1800,43 @@ impl SpannerService for NunyaSpanner {
     ) -> Result<Response<ResultSet>, Status> {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
-        self.session(&req.session, &who)?;
-        let mut signal = self.end_signal(&who)?;
-        sql_features(&req)?;
-        let epoch = self.ctx.fence.epoch();
-        let (policy, snapshot, revision) = self.configuration()?;
-        let label = req.sql.clone();
-        let (plan, names, kind) = self.sql(&who, revision.as_deref(), &req.sql, &mut req.params, &policy, &snapshot)?;
-        req.sql = splice_sql(&req.sql, &plan.inputs)?;
-        let write = matches!(
-            kind,
-            StatementKind::Insert | StatementKind::Update | StatementKind::Delete
-        );
-        match kind {
-            StatementKind::Insert | StatementKind::Update | StatementKind::Delete => {
-                self.mark_selector_dml(&req.session, req.transaction.as_ref(), who.session)?;
-                self.admit_write(&who)?
-            }
-            StatementKind::JsonSelect { .. } | StatementKind::Select | StatementKind::Tokenize { .. } => {}
-            StatementKind::Begin
-            | StatementKind::Commit
-            | StatementKind::Rollback
-            | StatementKind::Savepoint
-            | StatementKind::ReleaseSavepoint
-            | StatementKind::RollbackToSavepoint
-            | StatementKind::SessionNoop { .. }
-            | StatementKind::Refused(_) => return Err(denied()),
-        }
-        let label = if plan.tokenize.is_some() {
-            "Spanner nunya_tokenize".to_owned()
-        } else {
-            label
-        };
-        let mut revision_guard = RevisionGuard::new(self, &who, policy.clone(), epoch, revision.as_deref(), &label);
+        let label = sql_statement(&req.sql);
+        let mut audit = RequestAudit::new(self, &who);
+        let (mut signal, epoch, policy, snapshot, plan, names, write) = audit.preflight(&label, |audit| {
+            self.session(&req.session, &who)?;
+            let signal = self.end_signal(&who)?;
+            sql_features(&req)?;
+            let epoch = self.ctx.fence.epoch();
+            let (policy, snapshot) = audit.configuration()?;
+            let (plan, names, write) = self.prepare_sql(&mut req, &who, &policy, &snapshot)?;
+            Ok((signal, epoch, policy, snapshot, plan, names, write))
+        })?;
+        let revision = audit.revision.as_deref();
+        let mut revision_guard = RevisionGuard::new(self, &who, policy.clone(), epoch, revision, &label);
         if plan.tokenize.is_none() {
-            Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, 0, vec![])?;
+            Self::audit(&self.ctx, &self.watchers, &who, revision, &label, 0, vec![])?;
         }
-        if let Some(result) =
-            self.local_tokenize(&who, revision.as_deref(), &policy, &snapshot, &plan, &names, &req)?
-        {
-            Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, 1, local_tokens(&result)?)?;
+        let local = audit.result(&label, self.local_tokenize(&who, &policy, &snapshot, &plan, &names, &req))?;
+        if let Some(result) = local {
+            let tokens = audit.result(&label, local_tokens(&result))?;
+            Self::audit(&self.ctx, &self.watchers, &who, revision, &label, 1, tokens)?;
             self.check_response(&who, &signal, false)?;
             revision_guard.unary(false)?;
             return Ok(Response::new(result));
         }
-        let (mut client, marker) = self.write_client().await?;
-        ready_for_write(&self.channel, write).await?;
+        let (mut client, marker) = audit.result(&label, self.write_client().await)?;
+        audit.result(&label, ready_for_write(&self.channel, write).await)?;
         let outcome_audit = WriteAudit::new(self, &who);
         let result = async {
             let inline = inline_read_write(req.transaction.as_ref());
             let session = req.session.clone();
-            let mut result = cancellable_write(&mut signal, write, &marker, client.execute_sql(req))
-                .await?
-                .into_inner();
+            let upstream = cancellable_write(&mut signal, write, &marker, client.execute_sql(req)).await;
+            let mut result = audit.result(&label, upstream)?.into_inner();
             self.record_inline(&session, who.session, inline, write, result.metadata.as_ref())?;
             let tokens = self
                 .rows(&who, &policy, &plan, &mut result)
                 .map_err(|e| after_forward(e, write))?;
-            Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, result.rows.len() as u64, tokens)
+            Self::audit(&self.ctx, &self.watchers, &who, revision, &label, result.rows.len() as u64, tokens)
                 .map_err(|e| after_forward(e, write))?;
             self.check_response(&who, &signal, write)?;
             revision_guard.unary(write)?;
@@ -1748,46 +1850,26 @@ impl SpannerService for NunyaSpanner {
     ) -> Result<Response<Self::ExecuteStreamingSqlStream>, Status> {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
-        self.session(&req.session, &who)?;
-        let mut signal = self.end_signal(&who)?;
-        sql_features(&req)?;
-        let epoch = self.ctx.fence.epoch();
-        let (policy, snapshot, revision) = self.configuration()?;
-        let label = req.sql.clone();
-        let (plan, names, kind) = self.sql(&who, revision.as_deref(), &req.sql, &mut req.params, &policy, &snapshot)?;
-        req.sql = splice_sql(&req.sql, &plan.inputs)?;
-        let write = matches!(
-            kind,
-            StatementKind::Insert | StatementKind::Update | StatementKind::Delete
-        );
-        match kind {
-            StatementKind::Insert | StatementKind::Update | StatementKind::Delete => {
-                self.mark_selector_dml(&req.session, req.transaction.as_ref(), who.session)?;
-                self.admit_write(&who)?
-            }
-            StatementKind::JsonSelect { .. } | StatementKind::Select | StatementKind::Tokenize { .. } => {}
-            StatementKind::Begin
-            | StatementKind::Commit
-            | StatementKind::Rollback
-            | StatementKind::Savepoint
-            | StatementKind::ReleaseSavepoint
-            | StatementKind::RollbackToSavepoint
-            | StatementKind::SessionNoop { .. }
-            | StatementKind::Refused(_) => return Err(denied()),
-        }
-        let label = if plan.tokenize.is_some() {
-            "Spanner nunya_tokenize".to_owned()
-        } else {
-            label
-        };
-        let revision_guard = RevisionGuard::new(self, &who, policy.clone(), epoch, revision.as_deref(), &label);
+        let label = sql_statement(&req.sql);
+        let mut audit = RequestAudit::new(self, &who);
+        let (mut signal, epoch, policy, snapshot, plan, names, write) = audit.preflight(&label, |audit| {
+            self.session(&req.session, &who)?;
+            let signal = self.end_signal(&who)?;
+            sql_features(&req)?;
+            let epoch = self.ctx.fence.epoch();
+            let (policy, snapshot) = audit.configuration()?;
+            let (plan, names, write) = self.prepare_sql(&mut req, &who, &policy, &snapshot)?;
+            Ok((signal, epoch, policy, snapshot, plan, names, write))
+        })?;
+        let revision = audit.revision.as_deref();
+        let revision_guard = RevisionGuard::new(self, &who, policy.clone(), epoch, revision, &label);
         if plan.tokenize.is_none() {
-            Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, 0, vec![])?;
+            Self::audit(&self.ctx, &self.watchers, &who, revision, &label, 0, vec![])?;
         }
-        if let Some(result) =
-            self.local_tokenize(&who, revision.as_deref(), &policy, &snapshot, &plan, &names, &req)?
-        {
-            Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, 1, local_tokens(&result)?)?;
+        let local = audit.result(&label, self.local_tokenize(&who, &policy, &snapshot, &plan, &names, &req))?;
+        if let Some(result) = local {
+            let tokens = audit.result(&label, local_tokens(&result))?;
+            Self::audit(&self.ctx, &self.watchers, &who, revision, &label, 1, tokens)?;
             self.check_response(&who, &signal, false)?;
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let _ = tx.try_send(Ok(PartialResultSet {
@@ -1799,14 +1881,16 @@ impl SpannerService for NunyaSpanner {
             stream.revision_guard = Some(revision_guard);
             return Ok(Response::new(Box::pin(stream)));
         }
-        let (mut client, marker) = self.write_client().await?;
+        let (mut client, marker) = audit.result(&label, self.write_client().await)?;
         let inline = inline_read_write(req.transaction.as_ref());
         let session = req.session.clone();
-        ready_for_write(&self.channel, write).await?;
+        audit.result(&label, ready_for_write(&self.channel, write).await)?;
         let outcome_audit = WriteAudit::new(self, &who);
-        let upstream = cancellable_write(&mut signal, write, &marker, client.execute_streaming_sql(req))
-            .await.map_err(|error| outcome_audit.finish_error(error))?
+        let upstream = cancellable_write(&mut signal, write, &marker, client.execute_streaming_sql(req)).await;
+        let upstream = audit.result(&label, upstream)
+            .map_err(|error| outcome_audit.finish_error(error))?
             .into_inner();
+        let revision = audit.revision;
         Ok(Response::new(
             self.stream(who, policy, revision, plan, label, upstream, signal, write, inline.then_some(session), outcome_audit, revision_guard),
         ))
@@ -1817,54 +1901,55 @@ impl SpannerService for NunyaSpanner {
     ) -> Result<Response<ExecuteBatchDmlResponse>, Status> {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
-        self.session(&req.session, &who)?;
-        let mut signal = self.end_signal(&who)?;
-        let (policy, snapshot, revision) = self.configuration()?;
-        let mut plans = vec![];
-        let mut labels = vec![];
-        for statement in &mut req.statements {
-            labels.push(statement.sql.clone());
-            let (plan, _, kind) = self.sql(
-                &who,
-                revision.as_deref(),
-                &statement.sql,
-                &mut statement.params,
-                &policy,
-                &snapshot,
-            )?;
-            statement.sql = splice_sql(&statement.sql, &plan.inputs)?;
-            match kind {
-                StatementKind::Insert | StatementKind::Update | StatementKind::Delete => {}
-                StatementKind::Tokenize { .. } => {
-                    return Err(self.refuse_tokenize(&who, revision.as_deref(), NyCode::NotAnalysable));
+        let mut audit = RequestAudit::new(self, &who);
+        let labels: Vec<_> = req.statements.iter().map(|stmt| sql_statement(&stmt.sql)).collect();
+        let batch_label = labels.first().map_or("ExecuteBatchDml", String::as_str);
+        let (mut signal, policy, snapshot) = audit.preflight(batch_label, |audit| {
+            self.session(&req.session, &who)?;
+            let signal = self.end_signal(&who)?;
+            let (policy, snapshot) = audit.configuration()?;
+            Ok((signal, policy, snapshot))
+        })?;
+        let revision = audit.revision.as_deref();
+        let mut plans = Vec::with_capacity(labels.len());
+        for (statement, label) in req.statements.iter_mut().zip(&labels) {
+            let plan = audit.result(label, (|| {
+                let (plan, _, kind) = self.sql(
+                    &who, &statement.sql, &mut statement.params, &policy, &snapshot,
+                )?;
+                statement.sql = splice_sql(&statement.sql, &plan.inputs)?;
+                match kind {
+                    StatementKind::Insert | StatementKind::Update | StatementKind::Delete => Ok(plan),
+                    StatementKind::Tokenize { .. } => Err(invalid()),
+                    StatementKind::JsonSelect { .. }
+                    | StatementKind::Select
+                    | StatementKind::Begin
+                    | StatementKind::Commit
+                    | StatementKind::Rollback
+                    | StatementKind::Savepoint
+                    | StatementKind::ReleaseSavepoint
+                    | StatementKind::RollbackToSavepoint
+                    | StatementKind::SessionNoop { .. }
+                    | StatementKind::Refused(_) => Err(denied()),
                 }
-                StatementKind::JsonSelect { .. }
-                | StatementKind::Select
-                | StatementKind::Begin
-                | StatementKind::Commit
-                | StatementKind::Rollback
-                | StatementKind::Savepoint
-                | StatementKind::ReleaseSavepoint
-                | StatementKind::RollbackToSavepoint
-                | StatementKind::SessionNoop { .. }
-                | StatementKind::Refused(_) => return Err(denied()),
-            }
+            })())?;
             plans.push(plan);
         }
-        self.mark_selector_dml(&req.session, req.transaction.as_ref(), who.session)?;
-        self.admit_write(&who)?;
+        audit.result(batch_label, (|| {
+            self.mark_selector_dml(&req.session, req.transaction.as_ref(), who.session)?;
+            self.admit_write(&who)
+        })())?;
         for label in &labels {
-            Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), label, 0, vec![])?;
+            Self::audit(&self.ctx, &self.watchers, &who, revision, label, 0, vec![])?;
         }
-        let (mut client, marker) = self.write_client().await?;
-        ready_for_write(&self.channel, true).await?;
+        let (mut client, marker) = audit.result(batch_label, self.write_client().await)?;
+        audit.result(batch_label, ready_for_write(&self.channel, true).await)?;
         let outcome_audit = WriteAudit::new(self, &who);
         let result = async {
             let inline = inline_read_write(req.transaction.as_ref());
             let session = req.session.clone();
-            let mut result = cancellable_write(&mut signal, true, &marker, client.execute_batch_dml(req))
-                .await?
-                .into_inner();
+            let upstream = cancellable_write(&mut signal, true, &marker, client.execute_batch_dml(req)).await;
+            let mut result = audit.result(batch_label, upstream)?.into_inner();
             self.record_inline(&session, who.session, inline, true, result.result_sets.first().and_then(|set| set.metadata.as_ref()))?;
             if result.result_sets.len() > plans.len() {
                 return Err(unknown_status(UnknownCause::UpstreamLost));
@@ -1873,7 +1958,7 @@ impl SpannerService for NunyaSpanner {
                 let tokens = self
                     .rows(&who, &policy, &plans[i], set)
                     .map_err(|e| after_forward(e, true))?;
-                Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &labels[i], set.rows.len() as u64, tokens)
+                Self::audit(&self.ctx, &self.watchers, &who, revision, &labels[i], set.rows.len() as u64, tokens)
                     .map_err(|e| after_forward(e, true))?;
             }
             if let Some(s) = &mut result.status {
@@ -1894,36 +1979,28 @@ impl SpannerService for NunyaSpanner {
     async fn read(&self, req: Request<ReadRequest>) -> Result<Response<ResultSet>, Status> {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
-        self.session(&req.session, &who)?;
-        let mut signal = self.end_signal(&who)?;
-        read_features(&req)?;
-        let epoch = self.ctx.fence.epoch();
-        let (policy, snapshot, revision) = self.configuration()?;
-        let lowered = spanner_struct::lower_read(&req, &snapshot, &policy).map_err(status)?;
-        let plan = check(&lowered.stmt, &policy, &snapshot).map_err(status)?;
-        let mut revision_guard = RevisionGuard::new(self, &who, policy.clone(), epoch, revision.as_deref(), "Read");
-        check_key_tokens(
-            req.key_set.as_ref(),
-            &policy,
-            &plan,
-            &lowered.positions,
-            false,
-        )?;
-        let rewrites = self.structured(&who, &policy, &plan, &lowered.positions, |p| {
-            read_value(&req, p)
+        let label = read_statement("Read", &req.table, &req.columns);
+        let mut audit = RequestAudit::new(self, &who);
+        let (mut signal, epoch, policy, plan) = audit.preflight(&label, |audit| {
+            self.session(&req.session, &who)?;
+            let signal = self.end_signal(&who)?;
+            read_features(&req)?;
+            let epoch = self.ctx.fence.epoch();
+            let (policy, snapshot) = audit.configuration()?;
+            let plan = self.prepare_read(&mut req, &who, &policy, &snapshot)?;
+            Ok((signal, epoch, policy, plan))
         })?;
-        for (index, value) in rewrites {
-            *read_value_mut(&mut req, &lowered.positions[index]).ok_or_else(invalid)? = value;
-        }
-        Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), "Read", 0, vec![])?;
+        let revision = audit.revision.as_deref();
+        let mut revision_guard = RevisionGuard::new(self, &who, policy.clone(), epoch, revision, &label);
+        Self::audit(&self.ctx, &self.watchers, &who, revision, &label, 0, vec![])?;
         let inline = inline_read_write(req.transaction.as_ref());
         let session = req.session.clone();
-        let mut result = cancellable(&mut signal, false, self.client().await?.read(req))
+        let mut result = cancellable(&mut signal, false, audit.result(&label, self.client().await)?.read(req))
             .await?
             .into_inner();
         self.record_inline(&session, who.session, inline, false, result.metadata.as_ref())?;
         let tokens = self.rows(&who, &policy, &plan, &mut result)?;
-        Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), "Read", result.rows.len() as u64, tokens)?;
+        Self::audit(&self.ctx, &self.watchers, &who, revision, &label, result.rows.len() as u64, tokens)?;
         self.check_response(&who, &signal, false)?;
         revision_guard.unary(false)?;
         Ok(Response::new(result))
@@ -1934,40 +2011,33 @@ impl SpannerService for NunyaSpanner {
     ) -> Result<Response<Self::StreamingReadStream>, Status> {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
-        self.session(&req.session, &who)?;
-        let mut signal = self.end_signal(&who)?;
-        read_features(&req)?;
-        let epoch = self.ctx.fence.epoch();
-        let (policy, snapshot, revision) = self.configuration()?;
-        let lowered = spanner_struct::lower_read(&req, &snapshot, &policy).map_err(status)?;
-        let plan = check(&lowered.stmt, &policy, &snapshot).map_err(status)?;
-        let revision_guard = RevisionGuard::new(self, &who, policy.clone(), epoch, revision.as_deref(), "Read");
-        check_key_tokens(
-            req.key_set.as_ref(),
-            &policy,
-            &plan,
-            &lowered.positions,
-            false,
-        )?;
-        let rewrites = self.structured(&who, &policy, &plan, &lowered.positions, |p| {
-            read_value(&req, p)
+        let label = read_statement("Read", &req.table, &req.columns);
+        let mut audit = RequestAudit::new(self, &who);
+        let (mut signal, epoch, policy, plan) = audit.preflight(&label, |audit| {
+            self.session(&req.session, &who)?;
+            let signal = self.end_signal(&who)?;
+            read_features(&req)?;
+            let epoch = self.ctx.fence.epoch();
+            let (policy, snapshot) = audit.configuration()?;
+            let plan = self.prepare_read(&mut req, &who, &policy, &snapshot)?;
+            Ok((signal, epoch, policy, plan))
         })?;
-        for (index, value) in rewrites {
-            *read_value_mut(&mut req, &lowered.positions[index]).ok_or_else(invalid)? = value;
-        }
-        Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), "Read", 0, vec![])?;
+        let revision = audit.revision.as_deref();
+        let revision_guard = RevisionGuard::new(self, &who, policy.clone(), epoch, revision, &label);
+        Self::audit(&self.ctx, &self.watchers, &who, revision, &label, 0, vec![])?;
         let inline = inline_read_write(req.transaction.as_ref());
         let session = req.session.clone();
-        let upstream = cancellable(&mut signal, false, self.client().await?.streaming_read(req))
+        let upstream = cancellable(&mut signal, false, audit.result(&label, self.client().await)?.streaming_read(req))
             .await?
             .into_inner();
         let outcome_audit = WriteAudit::new(self, &who);
+        let revision = audit.revision;
         Ok(Response::new(self.stream(
             who,
             policy,
             revision,
             plan,
-            "Read".into(),
+            label,
             upstream,
             signal,
             false,
@@ -1982,19 +2052,30 @@ impl SpannerService for NunyaSpanner {
     ) -> Result<Response<Transaction>, Status> {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
-        self.session(&req.session, &who)?;
-        let mut signal = self.end_signal(&who)?;
-        if let Some(mutation) = &mut req.mutation_key {
-            self.admit_write(&who)?;
-            let (policy, snapshot, _) = self.configuration()?;
-            self.prepare_mutation(&who, &policy, &snapshot, mutation)?;
+        let label = match &req.mutation_key {
+            Some(mutation) => mutation_statement("Commit", std::iter::once(mutation)),
+            None => "BeginTransaction".into(),
+        };
+        let mut audit = RequestAudit::new(self, &who);
+        let mut signal = audit.preflight(&label, |audit| {
+            self.session(&req.session, &who)?;
+            let signal = self.end_signal(&who)?;
+            if let Some(mutation) = &mut req.mutation_key {
+                self.admit_write(&who)?;
+                let (policy, snapshot) = audit.configuration()?;
+                self.prepare_mutation(&who, &policy, &snapshot, mutation)?;
+            }
+            Ok(signal)
+        })?;
+        if req.mutation_key.is_some() {
+            Self::audit(&self.ctx, &self.watchers, &who, audit.revision.as_deref(), &label, 0, vec![])?;
         }
         let track = read_write(req.options.as_ref());
         let session = req.session.clone();
         let transaction = cancellable(
             &mut signal,
             false,
-            self.client().await?.begin_transaction(req),
+            audit.result(&label, self.client().await)?.begin_transaction(req),
         )
         .await?
         .into_inner();
@@ -2013,9 +2094,13 @@ impl SpannerService for NunyaSpanner {
     async fn rollback(&self, req: Request<RollbackRequest>) -> Result<Response<()>, Status> {
         let who = self.authenticate(&req)?;
         let req = req.into_inner();
-        self.session(&req.session, &who)?;
-        let mut signal = self.end_signal(&who)?;
-        let mut client = self.client().await?;
+        let audit = RequestAudit::new(self, &who);
+        let label = "Rollback";
+        let mut signal = audit.result(label, (|| {
+            self.session(&req.session, &who)?;
+            self.end_signal(&who)
+        })())?;
+        let mut client = audit.result(label, self.client().await)?;
         let key = (req.session.clone(), req.transaction_id.clone());
         let result = cancellable(&mut signal, false, client.rollback(req)).await;
         self.transactions
@@ -2031,51 +2116,57 @@ impl SpannerService for NunyaSpanner {
     ) -> Result<Response<CommitResponse>, Status> {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
-        self.session(&req.session, &who)?;
-        let mut signal = self
-            .end_signal(&who)
-            .inspect_err(|_| self.refused_commit_rollback(&req))?;
-        let (policy, snapshot, revision) = self.configuration()?;
-        let key = match &req.transaction {
-            Some(commit_request::Transaction::TransactionId(id)) => {
-                Some((req.session.clone(), id.clone()))
-            }
-            Some(commit_request::Transaction::SingleUseTransaction(_)) => None,
-            None => None,
-        };
-        let state = if let Some(key) = &key {
-            self.transactions.lock().map_err(|_| invalid())?.remove(key)
-        } else {
-            None
-        };
-        let clean = match &req.transaction {
-            Some(commit_request::Transaction::TransactionId(_)) => {
-                state.is_some_and(|t| t.state == TxnState::Clean)
-            }
-            Some(commit_request::Transaction::SingleUseTransaction(_)) => true,
-            None => false,
-        };
-        if !req.mutations.is_empty() || !clean {
-            self.admit_write(&who)
+        let label = mutation_statement("Commit", &req.mutations);
+        let mut audit = RequestAudit::new(self, &who);
+        let (mut signal, key, state) = audit.preflight(&label, |audit| {
+            self.session(&req.session, &who)?;
+            let signal = self
+                .end_signal(&who)
                 .inspect_err(|_| self.refused_commit_rollback(&req))?;
-        }
-        for mutation in &mut req.mutations {
-            self.prepare_mutation(&who, &policy, &snapshot, mutation)?;
-        }
+            let (policy, snapshot) = audit.configuration()?;
+            let key = match &req.transaction {
+                Some(commit_request::Transaction::TransactionId(id)) => {
+                    Some((req.session.clone(), id.clone()))
+                }
+                Some(commit_request::Transaction::SingleUseTransaction(_)) => None,
+                None => None,
+            };
+            let state = if let Some(key) = &key {
+                self.transactions.lock().map_err(|_| invalid())?.remove(key)
+            } else {
+                None
+            };
+            let clean = match &req.transaction {
+                Some(commit_request::Transaction::TransactionId(_)) => {
+                    state.is_some_and(|t| t.state == TxnState::Clean)
+                }
+                Some(commit_request::Transaction::SingleUseTransaction(_)) => true,
+                None => false,
+            };
+            if !req.mutations.is_empty() || !clean {
+                self.admit_write(&who)
+                    .inspect_err(|_| self.refused_commit_rollback(&req))?;
+            }
+            for mutation in &mut req.mutations {
+                self.prepare_mutation(&who, &policy, &snapshot, mutation)?;
+            }
+            Ok((signal, key, state))
+        })?;
         Self::audit(
             &self.ctx,
             &self.watchers,
             &who,
-            revision.as_deref(),
-            "Commit",
+            audit.revision.as_deref(),
+            &label,
             0,
             vec![],
         )?;
-        let (mut client, marker) = self.write_client().await?;
-        ready_for_write(&self.channel, true).await?;
+        let (mut client, marker) = audit.result(&label, self.write_client().await)?;
+        audit.result(&label, ready_for_write(&self.channel, true).await)?;
         let outcome_audit = WriteAudit::new(self, &who);
         let result = async {
-            let result = cancellable_write(&mut signal, true, &marker, client.commit(req)).await;
+            let upstream = cancellable_write(&mut signal, true, &marker, client.commit(req)).await;
+            let result = audit.result(&label, upstream);
             let retry = result.as_ref().is_ok_and(|response| {
                 matches!(
                     response.get_ref().multiplexed_session_retry,
@@ -2099,25 +2190,46 @@ impl SpannerService for NunyaSpanner {
         req: Request<PartitionQueryRequest>,
     ) -> Result<Response<PartitionResponse>, Status> {
         let who = self.authenticate(&req)?;
-        self.session(&req.get_ref().session, &who)?;
-        Err(denied())
+        let req = req.into_inner();
+        let label = if req.sql.is_empty() {
+            "PartitionQuery".into()
+        } else {
+            format!("PartitionQuery {}", sql_statement(&req.sql))
+        };
+        RequestAudit::new(self, &who).result(&label, (|| {
+            self.session(&req.session, &who)?;
+            Err(denied())
+        })())
     }
     async fn partition_read(
         &self,
         req: Request<PartitionReadRequest>,
     ) -> Result<Response<PartitionResponse>, Status> {
         let who = self.authenticate(&req)?;
-        self.session(&req.get_ref().session, &who)?;
-        Err(denied())
+        let req = req.into_inner();
+        let label = if req.table.is_empty() && req.columns.is_empty() {
+            "PartitionRead".into()
+        } else {
+            read_statement("PartitionRead", &req.table, &req.columns)
+        };
+        RequestAudit::new(self, &who).result(&label, (|| {
+            self.session(&req.session, &who)?;
+            Err(denied())
+        })())
     }
     async fn batch_write(
         &self,
         req: Request<BatchWriteRequest>,
     ) -> Result<Response<Self::BatchWriteStream>, Status> {
         let who = self.authenticate(&req)?;
-        self.session(&req.get_ref().session, &who)?;
-        self.admit_write(&who)?;
-        Err(denied())
+        let req = req.into_inner();
+        let mutations = req.mutation_groups.iter().flat_map(|group| &group.mutations);
+        let label = mutation_statement("BatchWrite", mutations);
+        RequestAudit::new(self, &who).result(&label, (|| {
+            self.session(&req.session, &who)?;
+            self.admit_write(&who)?;
+            Err(denied())
+        })())
     }
 }
 fn check_key_tokens(
@@ -2974,6 +3086,194 @@ mod tests {
             Ok(())
         }
     }
+    async fn audited_fixture() -> (Fixture, Arc<Mutex<Vec<ReadLogRecord>>>) {
+        let records = Arc::new(Mutex::new(vec![]));
+        let f = Fixture::with_log(Box::new(CaptureLog(
+            records.clone(),
+            Arc::new(Mutex::new(vec![])),
+        ))).await;
+        (f, records)
+    }
+
+    fn assert_refused_statement(records: &Mutex<Vec<ReadLogRecord>>, code: NyCode, statement: &str) {
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert!(matches!(record.outcome, Outcome::Refused(actual) if actual == code));
+        assert_eq!(record.rows, 0);
+        assert!(record.tokens_released.is_empty());
+        assert_eq!(record.statement, statement);
+        assert_eq!(record.statement_fingerprint, statement_fingerprint(statement));
+    }
+
+    #[tokio::test]
+    async fn ny001_audits_sql_refusal_without_parameter_values() {
+        let (f, records) = audited_fixture().await;
+        let mut policy = (**f.svc.ctx.policy.read().unwrap()).clone();
+        policy.columns.clear();
+        let snapshot = f.svc.ctx.snapshot.read().unwrap().clone();
+        *f.svc.ctx.policy.write().unwrap() =
+            Arc::new(crate::policy::effective::legacy_policy(policy, &snapshot));
+        let sql = "UPDATE customers SET email = @v";
+        let mut req = f.query(sql).await;
+        req.params = Some(prost_types::Struct {
+            fields: [("v".into(), text("tok_email_a"))].into(),
+        });
+        let error = f.svc.execute_sql(f.request(req, "alice")).await.unwrap_err();
+        assert_tokenize_error(error, NyCode::TokenOutsideDomain);
+        assert_refused_statement(&records, NyCode::TokenOutsideDomain, sql);
+        assert!(f.fake.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ny002_audits_streaming_sql_refusal_once() {
+        let (f, records) = audited_fixture().await;
+        let sql = "SELECT email FROM customers WHERE email LIKE '%example%'";
+        let req = f.query(sql).await;
+        let error = f.svc.execute_streaming_sql(f.request(req, "alice")).await.err().unwrap();
+        assert_tokenize_error(error, NyCode::BlindOperation);
+        assert_refused_statement(&records, NyCode::BlindOperation, sql);
+        assert!(f.fake.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ny004_audits_sql_analysis_refusal_once() {
+        let (f, records) = audited_fixture().await;
+        let sql = "SELECT missing FROM customers";
+        let req = f.query(sql).await;
+        let error = f.svc.execute_sql(f.request(req, "alice")).await.unwrap_err();
+        assert_tokenize_error(error, NyCode::NotAnalysable);
+        assert_refused_statement(&records, NyCode::NotAnalysable, sql);
+        assert!(f.fake.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ny005_audits_masked_expression_refusal_once() {
+        let (f, records) = audited_fixture().await;
+        revise_column(&f, "email", Treatment::Masked { placeholder: None });
+        let sql = "SELECT email FROM customers WHERE email = @v";
+        let mut req = f.query(sql).await;
+        req.params = Some(prost_types::Struct {
+            fields: [("v".into(), text("private@example.com"))].into(),
+        });
+        let error = f.svc.execute_sql(f.request(req, "alice")).await.unwrap_err();
+        assert_tokenize_error(error, NyCode::MaskedExpression);
+        assert_refused_statement(&records, NyCode::MaskedExpression, sql);
+        assert!(f.fake.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ny006_audits_sql_feature_refusal_once() {
+        let (f, records) = audited_fixture().await;
+        let sql = "SELECT email FROM customers";
+        let mut req = f.query(sql).await;
+        req.data_boost_enabled = true;
+        let error = f.svc.execute_sql(f.request(req, "alice")).await.unwrap_err();
+        assert_tokenize_error(error, NyCode::StatementNotAllowed);
+        assert_refused_statement(&records, NyCode::StatementNotAllowed, sql);
+        assert!(f.fake.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_statement_records_columns_without_keys() {
+        let (f, records) = audited_fixture().await;
+        let mut req = customer_read(&f).await;
+        req.key_set = Some(KeySet {
+            keys: vec![ListValue { values: vec![f.token()] }],
+            ..Default::default()
+        });
+        f.svc.read(f.request(req, "alice")).await.unwrap();
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        for record in records.iter() {
+            assert!(matches!(record.outcome, Outcome::Allowed));
+            assert_eq!(record.statement, "Read table=customers columns=email");
+            assert_eq!(record.statement_fingerprint, statement_fingerprint(&record.statement));
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_statement_records_columns_without_mutation_values() {
+        let (f, records) = audited_fixture().await;
+        let req = CommitRequest {
+            session: f.session().await,
+            mutations: vec![Mutation {
+                operation: Some(mutation::Operation::Insert(mutation::Write {
+                    table: "customers".into(),
+                    columns: vec!["email".into()],
+                    values: vec![ListValue { values: vec![f.token()] }],
+                })),
+            }],
+            ..Default::default()
+        };
+        f.svc.commit(f.request(req, "alice")).await.unwrap();
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert!(matches!(record.outcome, Outcome::Allowed));
+        assert_eq!(record.statement, "Commit mutations=insert customers(email)");
+        assert_eq!(record.statement_fingerprint, statement_fingerprint(&record.statement));
+    }
+
+    #[tokio::test]
+    async fn double_quoted_tokenize_plaintext_uses_fixed_label() {
+        let (f, records) = audited_fixture().await;
+        let sql = r#"SELECT `NuNyA_ToKeNiZe`('email', "private@example.com")"#;
+        let mut req = f.query(sql).await;
+        f.svc.execute_sql(f.request(req.clone(), "alice")).await.unwrap();
+        {
+            let mut records = records.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert!(matches!(records[0].outcome, Outcome::Allowed));
+            assert_eq!(records[0].statement, "Spanner nunya_tokenize");
+            assert_eq!(records[0].statement_fingerprint, statement_fingerprint("Spanner nunya_tokenize"));
+            records.clear();
+        }
+        req.data_boost_enabled = true;
+        let error = f.svc.execute_sql(f.request(req, "alice")).await.unwrap_err();
+        assert_tokenize_error(error, NyCode::StatementNotAllowed);
+        assert_refused_statement(&records, NyCode::StatementNotAllowed, "Spanner nunya_tokenize");
+        assert_no_tokenize_upstream(&f);
+    }
+
+    #[tokio::test]
+    async fn only_authenticated_refusals_are_audited() {
+        let (f, records) = audited_fixture().await;
+        let sql = "SELECT email FROM customers";
+        let query = f.query(sql).await;
+        let error = f.svc.execute_sql(session_request(query.clone(), f.alice, "wrong")).await.unwrap_err();
+        assert_tokenize_error(error, NyCode::TokenNotValid);
+        assert!(records.lock().unwrap().is_empty());
+
+        let error = f.svc.execute_sql(f.request(query, "bob")).await.unwrap_err();
+        assert_tokenize_error(error, NyCode::TokenNotValid);
+        assert_refused_statement(&records, NyCode::TokenNotValid, sql);
+    }
+
+    #[tokio::test]
+    async fn refusal_log_failure_returns_ny009() {
+        struct FailRefusal;
+        impl ReadLog for FailRefusal {
+            fn write(&self, record: &ReadLogRecord) -> Result<(), Refusal> {
+                assert!(matches!(record.outcome, Outcome::Refused(NyCode::StatementNotAllowed)));
+                Err(refusal(NyCode::ReadLogUnavailable))
+            }
+
+            fn write_lifecycle(&self, _: &LifecycleRecord) -> Result<(), Refusal> {
+                Ok(())
+            }
+        }
+        let f = Fixture::with_log(Box::new(FailRefusal)).await;
+        let req = PartitionQueryRequest {
+            session: f.session().await,
+            sql: "SELECT email FROM customers".into(),
+            ..Default::default()
+        };
+        let error = f.svc.partition_query(f.request(req, "alice")).await.unwrap_err();
+        assert_tokenize_error(error, NyCode::ReadLogUnavailable);
+        assert!(f.fake.seen.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn statement_snapshot_retains_revision_across_reload() {
         let records = Arc::new(Mutex::new(vec![]));
@@ -3023,11 +3323,11 @@ mod tests {
         let who = f.svc.authenticate(&f.request((), "alice")).unwrap();
         let (policy, snapshot, revision) = f.svc.configuration().unwrap();
         let (plan, names, _) = f.svc.sql(
-            &who, revision.as_deref(), &req.sql, &mut req.params, &policy, &snapshot,
+            &who, &req.sql, &mut req.params, &policy, &snapshot,
         ).unwrap();
         install("R2");
         let result = f.svc.local_tokenize(
-            &who, revision.as_deref(), &policy, &snapshot, &plan, &names, &req,
+            &who, &policy, &snapshot, &plan, &names, &req,
         ).unwrap().unwrap();
         NunyaSpanner::audit(
             &f.svc.ctx, &f.svc.watchers, &who, revision.as_deref(),
@@ -3036,8 +3336,10 @@ mod tests {
         assert_eq!(records.lock().unwrap()[0].policy_revision.as_deref(), Some("R1"));
         records.lock().unwrap().clear();
         req.resume_token = vec![1];
-        f.svc.local_tokenize(
-            &who, revision.as_deref(), &policy, &snapshot, &plan, &names, &req,
+        let audit = RequestAudit { service: &f.svc, who: &who, revision };
+        audit.result(
+            "Spanner nunya_tokenize",
+            f.svc.local_tokenize(&who, &policy, &snapshot, &plan, &names, &req),
         ).unwrap_err();
         {
             let records = records.lock().unwrap();
@@ -3646,7 +3948,7 @@ mod tests {
         let who = f.svc.authenticate(&f.request((), "alice")).unwrap();
         let (policy, snapshot, revision) = f.svc.configuration().unwrap();
         let (plan, _, _) = f.svc.sql(
-            &who, revision.as_deref(), &req.sql, &mut None, &policy, &snapshot,
+            &who, &req.sql, &mut None, &policy, &snapshot,
         ).unwrap();
         // Keep the watcher false to exercise the authoritative recheck itself.
         let (_signal_tx, signal) = tokio::sync::watch::channel(false);
@@ -3914,9 +4216,12 @@ mod tests {
                 },
             )),
         };
+        let audit = RequestAudit::new(&f.svc, &who);
         let tokenize = || {
-            f.svc
-                .local_tokenize(&who, None, &policy, &snapshot, &plan, &[], &ExecuteSqlRequest::default())
+            audit.result(
+                "Spanner nunya_tokenize",
+                f.svc.local_tokenize(&who, &policy, &snapshot, &plan, &[], &ExecuteSqlRequest::default()),
+            )
         };
         for _ in 0..10 {
             assert!(tokenize().unwrap().is_some());

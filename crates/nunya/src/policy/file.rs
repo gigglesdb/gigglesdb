@@ -1,8 +1,8 @@
 //! Strict policy file parsing with data-free diagnostics.
 use super::{
     DomainName, DomainSettings, JsonLeafType, JsonPathRule, JsonPathTreatment, JsonTokenType,
-    LinkRule, Policy, PolicyDocument, PolicyVersion, ReadLogSink, RouteDefault,
-    ServicePolicySettings, TokenizeSetting, Treatment, TypeRange,
+    LinkRule, MAX_READLOG_FILES, Policy, PolicyDocument, PolicyVersion, ReadLogSink, RouteDefault,
+    ServicePolicySettings, TokenizeSetting, Treatment, TypeRange, default_readlog_max_files,
 };
 use crate::schema::ColumnRef;
 use serde::{Deserialize, de::DeserializeOwned};
@@ -50,6 +50,7 @@ struct RawLog {
     sink: Option<Value>,
     path: Option<Value>,
     max_bytes: Option<Value>,
+    max_files: Option<Value>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -137,8 +138,9 @@ fn domain_name_valid(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 pub(crate) fn parse_log(value: Value, errors: &mut Vec<PolicyError>) -> ReadLogSink {
-    let Some(raw): Option<RawLog> = table(value, &["sink", "path", "max_bytes"], "readlog", errors)
-    else {
+    let Some(raw): Option<RawLog> = table(
+        value, &["sink", "path", "max_bytes", "max_files"], "readlog", errors,
+    ) else {
         return ReadLogSink::Stdout;
     };
     let sink = required_string(raw.sink, "readlog", "sink must be stdout or file", errors);
@@ -153,12 +155,28 @@ pub(crate) fn parse_log(value: Value, errors: &mut Vec<PolicyError>) -> ReadLogS
     if max_bytes == 0 {
         error(errors, "readlog", "max_bytes must be positive");
     }
+    let has_max_files = raw.max_files.is_some();
+    let max_files = field(
+        raw.max_files,
+        "readlog",
+        "max_files must be an integer from 1 to 1000",
+        errors,
+    ).unwrap_or_else(default_readlog_max_files);
+    if !(1..=MAX_READLOG_FILES).contains(&max_files) {
+        error(errors, "readlog", "max_files must be an integer from 1 to 1000");
+    }
     match sink.as_deref() {
-        Some("stdout") => ReadLogSink::Stdout,
+        Some("stdout") => {
+            if has_max_files {
+                error(errors, "readlog", "max_files is only valid with a file sink");
+            }
+            ReadLogSink::Stdout
+        }
         Some("file") => match path {
             Some(path) if !path.is_empty() => ReadLogSink::File {
                 path: PathBuf::from(path),
                 max_bytes,
+                max_files,
             },
             _ => {
                 error(errors, "readlog", "file sink requires path");
@@ -853,7 +871,7 @@ pub(crate) fn readlog_key(sink: &crate::policy::ReadLogSink) -> crate::policy::R
     use crate::policy::ReadLogSink;
     match sink {
         ReadLogSink::Stdout => ReadLogSink::Stdout,
-        ReadLogSink::File { path, max_bytes } => {
+        ReadLogSink::File { path, max_bytes, max_files } => {
             let canonical = std::fs::canonicalize(path)
                 .or_else(|error| {
                     let parent = path
@@ -869,6 +887,7 @@ pub(crate) fn readlog_key(sink: &crate::policy::ReadLogSink) -> crate::policy::R
             ReadLogSink::File {
                 path: canonical,
                 max_bytes: *max_bytes,
+                max_files: *max_files,
             }
         }
     }
@@ -1105,7 +1124,8 @@ placeholder = "**"
             policy.readlog,
             ReadLogSink::File {
                 path: "/var/log/nunya/read.log".into(),
-                max_bytes: 104857600
+                max_bytes: 104857600,
+                max_files: 10
             }
         );
         assert_eq!(
@@ -1427,10 +1447,25 @@ placeholder = "**"
     }
 
     #[test]
+    fn legacy_readlog_max_files() {
+        let file = "[readlog]\nsink='file'\npath='audit.log'\n";
+        for (setting, expected) in [("", 10), ("max_files=1", 1), ("max_files=1000", 1000)] {
+            let policy = parse_policy(&format!("{file}{setting}")).unwrap();
+            assert!(matches!(policy.readlog, ReadLogSink::File { max_files, .. } if max_files == expected));
+        }
+        for setting in ["max_files=0", "max_files=-1", "max_files=1.5", "max_files='1'", "max_files=1001"] {
+            let errors = parse_policy(&format!("{file}{setting}")).unwrap_err();
+            assert!(errors.iter().any(|error| error.message.contains("readlog: max_files")), "{setting}");
+        }
+        let errors = parse_policy("[readlog]\nsink='stdout'\nmax_files=3").unwrap_err();
+        assert!(errors.iter().any(|error| error.message.contains("readlog: max_files")));
+    }
+
+    #[test]
     fn resolution_checks_both_sources() {
         let doc = || parse_policy_document("").unwrap();
         let stdout = ReadLogSink::Stdout;
-        let file = ReadLogSink::File { path: PathBuf::from("other.log"), max_bytes: 1 };
+        let file = ReadLogSink::File { path: PathBuf::from("other.log"), max_bytes: 1, max_files: 10 };
         for (declared, service, expected) in [
             (Some(stdout.clone()), None, stdout.clone()),
             (None, Some(stdout.clone()), stdout.clone()),
@@ -1450,9 +1485,14 @@ placeholder = "**"
         assert_eq!(resolve(d, &ServicePolicySettings { snapshot_max_age_ms: Some(43), ..Default::default() }).unwrap_err()[0].message, "snapshot_max_age_ms: policy file and service config disagree");
         let base = std::env::temp_dir();
         let mut d = doc();
-        d.file_readlog = Some(ReadLogSink::File { path: base.join(".").join("resolution.log"), max_bytes: 12 });
-        let service = ServicePolicySettings { readlog: Some(ReadLogSink::File { path: std::fs::canonicalize(base).unwrap().join("resolution.log"), max_bytes: 12 }), ..Default::default() };
-        assert!(resolve(d, &service).is_ok());
+        d.file_readlog = Some(ReadLogSink::File { path: base.join(".").join("resolution.log"), max_bytes: 12, max_files: 10 });
+        let service = ServicePolicySettings { readlog: Some(ReadLogSink::File { path: std::fs::canonicalize(base).unwrap().join("resolution.log"), max_bytes: 12, max_files: 10 }), ..Default::default() };
+        assert!(resolve(d.clone(), &service).is_ok());
+        let mut service = service;
+        if let Some(ReadLogSink::File { max_files, .. }) = &mut service.readlog {
+            *max_files = 3;
+        }
+        assert_eq!(resolve(d, &service).unwrap_err()[0].message, "readlog: policy file and service config disagree");
     }
     fn link_error(body: &str, expected: &str) {
         let errors = parse_policy_document(&format!("{V2}{body}")).unwrap_err();

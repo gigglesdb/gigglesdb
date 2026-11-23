@@ -38,6 +38,8 @@ mod access_sessions;
 mod spanner_native;
 #[path = "spanner_pg.rs"]
 mod spanner_pg;
+#[path = "readlog_rotation.rs"]
+mod readlog_rotation;
 
 #[path = "bindings_live.rs"] mod bindings_live;
 #[path = "json_filter.rs"]

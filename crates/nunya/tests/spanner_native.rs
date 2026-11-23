@@ -91,6 +91,7 @@ async fn session_worked_example() {
     policy.readlog = nunya::policy::ReadLogSink::File {
         path: dir.join("read.log"),
         max_bytes: 1_000_000,
+        max_files: 10,
     };
     let log = nunya::readlog::open_sink(&policy.readlog).unwrap();
     let listen = TcpListener::bind("127.0.0.1:0")

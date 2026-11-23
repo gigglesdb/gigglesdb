@@ -69,6 +69,12 @@ pub struct DomainSettings {
     /// Range.
     pub range: Option<TypeRange>,
 }
+pub(crate) const MAX_READLOG_FILES: usize = 1000;
+
+pub(crate) fn default_readlog_max_files() -> usize {
+    10
+}
+
 /// Read log sink.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReadLogSink {
@@ -80,6 +86,9 @@ pub enum ReadLogSink {
         path: PathBuf,
         /// Max bytes.
         max_bytes: u64,
+        /// Number of rotated predecessors to retain.
+        #[serde(default = "default_readlog_max_files")]
+        max_files: usize,
     },
 }
 /// Service-level defaults resolved with policy file settings.

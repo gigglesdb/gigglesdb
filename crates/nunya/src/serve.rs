@@ -1389,6 +1389,7 @@ mod tests {
         let sink = |path| ReadLogSink::File {
             path,
             max_bytes: 10,
+            max_files: 10,
         };
         let plain = sink(dir.as_path().join("read.log"));
         let dotted = sink(dir.as_path().join("./read.log"));
@@ -1402,6 +1403,7 @@ mod tests {
             readlog_key(&ReadLogSink::File {
                 path: dir.as_path().join("read.log"),
                 max_bytes: 11,
+                max_files: 10,
             })
         );
         assert_eq!(readlog_key(&ReadLogSink::Stdout), ReadLogSink::Stdout);
@@ -1481,6 +1483,7 @@ mod tests {
             readlog: Some(ReadLogSink::File {
                 path: std::fs::canonicalize(&base).unwrap().join("gd88-audit.log"),
                 max_bytes: 100 * 1024 * 1024,
+                max_files: 10,
             }),
             ..Default::default()
         };

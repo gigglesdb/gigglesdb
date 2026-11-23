@@ -244,6 +244,7 @@ mod tests {
         let absolute = crate::policy::ReadLogSink::File {
             path: dir.as_path().join("read.log"),
             max_bytes: 104857600,
+            max_files: 10,
         };
         assert_eq!(
             crate::serve::readlog_key(&checked.readlog),

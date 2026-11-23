@@ -1685,6 +1685,25 @@ tls = "disable"
     }
 
     #[test]
+    fn service_readlog_max_files() {
+        use crate::policy::ReadLogSink;
+
+        let f = Fixture::new();
+        let file = format!("{EXAMPLE}\n[readlog]\nsink='file'\npath='audit.log'\n");
+        for (setting, expected) in [("", 10), ("max_files=3", 3), ("max_files=1000", 1000)] {
+            let c = f.load(&format!("{file}{setting}")).unwrap();
+            assert!(matches!(c.policy_settings.readlog,
+                Some(ReadLogSink::File { max_files, .. }) if max_files == expected));
+        }
+        for setting in ["max_files=0", "max_files=-1", "max_files=1.5", "max_files='1'", "max_files=1001"] {
+            let errors = f.load(&format!("{file}{setting}")).unwrap_err();
+            assert!(errors.iter().any(|error| error.contains("readlog: max_files")), "{setting}");
+        }
+        let errors = f.load(&format!("{EXAMPLE}\n[readlog]\nsink='stdout'\nmax_files=3")).unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("readlog: max_files")));
+    }
+
+    #[test]
     fn service_policy_settings_parse_and_validate() {
         let f = Fixture::new();
         let c = f.load(EXAMPLE).unwrap();
@@ -1692,7 +1711,7 @@ tls = "disable"
         let text = format!("snapshot_max_age_ms=0\n{EXAMPLE}\n[readlog]\nsink='file'\npath='audit.log'\nmax_bytes=12\n");
         let c = f.load(&text).unwrap();
         assert_eq!(c.policy_settings.snapshot_max_age_ms, Some(0));
-        assert_eq!(c.policy_settings.readlog, Some(crate::policy::ReadLogSink::File { path: f.0.join("audit.log"), max_bytes: 12 }));
+        assert_eq!(c.policy_settings.readlog, Some(crate::policy::ReadLogSink::File { path: f.0.join("audit.log"), max_bytes: 12, max_files: 10 }));
         for setting in ["snapshot_max_age_ms=-1", "snapshot_max_age_ms=1.5", "snapshot_max_age_ms='1'"] {
             assert!(f.load(&format!("{setting}\n{EXAMPLE}")).is_err());
         }
