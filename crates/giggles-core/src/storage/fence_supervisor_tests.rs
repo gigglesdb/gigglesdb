@@ -900,26 +900,30 @@ fn close_latch_waits_for_unregistered_native_snapshot() {
     let snapshot = lease.kv.snapshot().unwrap();
     let latch = lease.close_latch().unwrap();
     drop(lease);
+    let recovery = FenceRecovery {
+        drain_timeout: Duration::from_secs(60),
+        close_timeout: Duration::ZERO,
+        ..settings()
+    };
+    let stall_log_interval = recovery.stall_log_interval;
     let (wait_tx, wait_rx) = mpsc::channel();
     let _worker = Worker::start(
         &admin,
-        FenceRecovery {
-            close_timeout: Duration::ZERO,
-            ..settings()
-        },
+        recovery,
         TestRuntime {
             wait: Some(Box::new(move |duration| {
-                wait_tx.send(duration).unwrap();
+                // Fencing can wake the supervisor before the helper's lease drops.
+                // Ignore the longer lease drain waits and observe the close latch.
+                if duration <= stall_log_interval {
+                    wait_tx.send(duration).unwrap();
+                }
                 false
             })),
             ..TestRuntime::default()
         },
     );
     fence(&admin, FenceClass::Recoverable);
-    assert_eq!(
-        wait_rx.recv_timeout(WAIT).unwrap(),
-        settings().stall_log_interval
-    );
+    assert_eq!(wait_rx.recv_timeout(WAIT).unwrap(), stall_log_interval);
     assert!(latch.wait(Duration::ZERO).is_err());
     assert_fenced(&admin);
     drop(snapshot);

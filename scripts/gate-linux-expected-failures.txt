@@ -6,9 +6,3 @@
 # client gets "Connection reset by peer" before the final message (Windows delivers it).
 # Probable Linux product bug; remove once the server drains or half-closes before closing.
 giggles-server deferred_routine_role_network::deferred_routines_nonsuperuser_four_protocols
-#
-# giggles-core: STOPGAP (GD-0084 perf-b, 2026-11-23). Fails consistently on Linux: its test hook forwards a
-# 10 s lease-drain wait (the fence() helper's temporary lease is still alive when the supervisor polls)
-# where it expects the 5 s close-latch stall wait. Test-timing defect, not a product bug (GD-0084 E728).
-# The test-only fix is 6d789d0ca; remove this entry when that fix lands after a Linux gate shows it passing.
-giggles-core storage::fence_supervisor::worker::tests::close_latch_waits_for_unregistered_native_snapshot
