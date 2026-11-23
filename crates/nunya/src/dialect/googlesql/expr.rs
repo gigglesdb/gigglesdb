@@ -5,7 +5,7 @@ pub(super) struct Expr {
     pub label: Label,
     /// Direct value used for equality and writes.
     pub value: ValueSource,
-    /// Unchanged column source when present.
+    /// A column supplying the result's domain and type for output rewriting.
     pub source: Option<ColumnRef>,
     /// Known database column type.
     pub ty: Option<ColumnType>,
@@ -144,6 +144,33 @@ impl State<'_> {
         {
             return Err(refuse());
         }
+        if matches!(name, "coalesce" | "ifnull") {
+            if args.iter().any(|e| e.label == Label::Masked) {
+                return Err(Refusal::new(NyCode::MaskedExpression, "masked COALESCE input"));
+            }
+            // INSERT ... SELECT discards projection uses when building writes.
+            let result_projection = *context == Context::Returning
+                || (*context == Context::SelectList && self.stmt.kind == StatementKind::Select);
+            if result_projection
+                && (name != "ifnull" || args.len() == 2)
+                && let Some(first) = args.first()
+                && matches!(first.label, Label::Blind(_))
+                && first.ty.is_some()
+                && args.iter().all(|e| {
+                    e.bare && e.source.is_some() && e.label == first.label && e.ty == first.ty
+                })
+            {
+                return Ok(Expr {
+                    label: first.label.clone(),
+                    value: ValueSource::Computed(first.label.clone()),
+                    source: first.source.clone(),
+                    ty: first.ty.clone(),
+                    inputs: args.into_iter().flat_map(|e| e.inputs).collect(),
+                    params: vec![],
+                    bare: false,
+                });
+            }
+        }
         for e in &args {
             self.record(e, kind.clone(), context)
         }
@@ -205,19 +232,27 @@ impl State<'_> {
                 Ok(e)
             }
             X::Value(
-                a::Value::Number(..)
-                | a::Value::SingleQuotedString(_)
+                a::Value::SingleQuotedString(_)
                 | a::Value::DoubleQuotedString(_)
                 | a::Value::TripleSingleQuotedString(_)
                 | a::Value::TripleDoubleQuotedString(_)
+                | a::Value::SingleQuotedRawStringLiteral(_)
+                | a::Value::DoubleQuotedRawStringLiteral(_)
+                | a::Value::TripleSingleQuotedRawStringLiteral(_)
+                | a::Value::TripleDoubleQuotedRawStringLiteral(_),
+            ) => {
+                // GoogleSQL literals are never decrypted: a token must be bound as a
+                // parameter, so any text literal in a token position is not a valid token.
+                let mut e = Expr::plain();
+                e.value = ValueSource::NonTokenText;
+                Ok(e)
+            }
+            X::Value(
+                a::Value::Number(..)
                 | a::Value::SingleQuotedByteStringLiteral(_)
                 | a::Value::DoubleQuotedByteStringLiteral(_)
                 | a::Value::TripleSingleQuotedByteStringLiteral(_)
                 | a::Value::TripleDoubleQuotedByteStringLiteral(_)
-                | a::Value::SingleQuotedRawStringLiteral(_)
-                | a::Value::DoubleQuotedRawStringLiteral(_)
-                | a::Value::TripleSingleQuotedRawStringLiteral(_)
-                | a::Value::TripleDoubleQuotedRawStringLiteral(_)
                 | a::Value::Boolean(_)
                 | a::Value::Null,
             ) => Ok(Expr::plain()),
@@ -448,8 +483,19 @@ impl State<'_> {
                     a::FunctionArguments::None
                         if matches!(name.as_str(), "current_date" | "current_timestamp") => {}
                     a::FunctionArguments::List(l) => {
-                        if !l.clauses.is_empty() {
-                            return Err(refuse());
+                        match l.clauses.as_slice() {
+                            [] => {}
+                            [a::FunctionArgumentClause::OrderBy(keys)]
+                                if matches!(name.as_str(), "array_agg" | "string_agg") =>
+                            {
+                                for key in keys {
+                                    if key.with_fill.is_some() {
+                                        return Err(refuse());
+                                    }
+                                    self.root(&key.expr, scope, Context::OrderBy, UseKind::Order)?;
+                                }
+                            }
+                            _ => return Err(refuse()),
                         }
                         distinct = l.duplicate_treatment == Some(a::DuplicateTreatment::Distinct);
                         if distinct && !agg {

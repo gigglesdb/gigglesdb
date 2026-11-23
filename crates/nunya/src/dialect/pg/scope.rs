@@ -7,7 +7,7 @@ pub(super) struct Output {
     pub name: String,
     /// The result information-flow label.
     pub label: Label,
-    /// The unchanged single-column pass-through source, when present.
+    /// The column supplying the output's policy and type, when present.
     pub source: Option<ColumnRef>,
     /// The known database column type.
     pub ty: Option<ColumnType>,

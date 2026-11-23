@@ -191,6 +191,15 @@ impl State<'_> {
                         {
                             l.label.clone()
                         }
+                        (Label::Masked, Label::Blind(_)) | (Label::Blind(_), Label::Masked) => {
+                            return Err(Refusal::new(NyCode::MaskedExpression, "mixed set output"));
+                        }
+                        (Label::Blind(a), Label::Blind(b)) if a != b => {
+                            return Err(Refusal::new(NyCode::TokenOutsideDomain, "mixed set output"));
+                        }
+                        (Label::Blind(_), Label::Plain) | (Label::Plain, Label::Blind(_)) => {
+                            return Err(Refusal::new(NyCode::TokenOutsideDomain, "mixed set output"));
+                        }
                         (Label::Blind(_), _) | (_, Label::Blind(_)) => Label::Tainted,
                         _ => Label::join(l.label.clone(), r.label.clone()),
                     };

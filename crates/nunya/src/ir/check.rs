@@ -29,6 +29,7 @@ fn source(value: &ValueSource, snapshot: &Snapshot) -> Result<(), Refusal> {
         }
         | ValueSource::Param(_)
         | ValueSource::Literal { .. }
+        | ValueSource::NonTokenText
         | ValueSource::Null
         | ValueSource::JsonLeaf(_)
         | ValueSource::Computed(_) => {}
@@ -60,7 +61,10 @@ fn blind(
                 return Err(refusal(NyCode::TokenOutsideDomain));
             }
         }
-        ValueSource::Column {
+        ValueSource::NonTokenText if ty.is_textual() => {
+            return Err(refusal(NyCode::TokenNotValid));
+        }
+        ValueSource::NonTokenText | ValueSource::Column {
             label: Label::Plain | Label::Masked | Label::Tainted,
             ..
         }
@@ -103,7 +107,11 @@ pub fn check(
             }
             match arg {
                 ValueSource::Param(_) | ValueSource::Literal { .. } => {}
-                ValueSource::JsonLeaf(_) | ValueSource::Column { .. } | ValueSource::Null | ValueSource::Computed(_) => {
+                ValueSource::JsonLeaf(_)
+                | ValueSource::Column { .. }
+                | ValueSource::NonTokenText
+                | ValueSource::Null
+                | ValueSource::Computed(_) => {
                     return Err(refusal(NyCode::NotAnalysable));
                 }
             }
@@ -219,6 +227,7 @@ pub fn check(
                 match &write.value {
                     ValueSource::Param(_)
                     | ValueSource::Literal { .. }
+                    | ValueSource::NonTokenText
                     | ValueSource::Null
                     | ValueSource::Column {
                         label: Label::Plain,
@@ -983,6 +992,15 @@ mod tests {
                 .push(usage(UseKind::Equality { other }, Context::Where));
             denied(&s, code);
         }
+    }
+    #[test]
+    fn non_token_text_literal_in_text_blind_equality_is_invalid() {
+        let mut s = stmt();
+        s.uses.push(usage(
+            UseKind::Equality { other: ValueSource::NonTokenText },
+            Context::Where,
+        ));
+        denied(&s, NyCode::TokenNotValid);
     }
     #[test]
     fn plain_tainted_and_masked_uses() {

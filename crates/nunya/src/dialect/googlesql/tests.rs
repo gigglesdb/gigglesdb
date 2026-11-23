@@ -93,7 +93,7 @@ fn literals_never_decrypt() {
     assert!(has(
         &s,
         UseKind::Equality {
-            other: ValueSource::Computed(Label::Plain)
+            other: ValueSource::NonTokenText
         }
     ));
     let (sn, p) = fixture();
@@ -136,10 +136,6 @@ fn functions_and_set() {
             name: "upper".into()
         }
     ));
-    assert_eq!(
-        lower("SELECT Email FROM Customers UNION ALL SELECT Body FROM Notes").outputs[0].label,
-        Label::Tainted
-    );
 }
 #[test]
 fn writes() {
@@ -264,7 +260,7 @@ fn ctes_views_and_parameter_refusal() {
     assert!(has(
         &s,
         UseKind::Equality {
-            other: ValueSource::Computed(Label::Plain)
+            other: ValueSource::NonTokenText
         }
     ));
     sn.relations.last_mut().unwrap().view_definition =
@@ -685,4 +681,189 @@ fn compiled_tokenize_policy_drives_output_rewrites_and_predicate_refusals() {
             NyCode::MaskedExpression
         );
     }
+}
+
+fn check_sql(sql: &str) -> Result<RewritePlan> {
+    let (snapshot, policy) = fixture();
+    let (stmt, _) = lower_gsql(sql, &snapshot, &policy)?;
+    crate::ir::check::check(&stmt, &policy, &snapshot)
+}
+
+#[test]
+fn same_domain_coalesce_and_ifnull_outputs_use_a_real_source() {
+    let (snapshot, policy) = fixture();
+    for name in ["COALESCE", "IFNULL"] {
+        let sql = format!(
+            "SELECT {name}(c.Email, o.ToAddress) FROM Customers c JOIN Outbox o ON c.Id = o.Id"
+        );
+        let stmt = lower(&sql);
+        let source = stmt.outputs[0].source.as_ref().unwrap();
+        assert_eq!(source.column, "Email");
+        assert_eq!(policy.domain_of(source), Some(&DomainName("email".into())));
+        assert_eq!(
+            check_sql(&sql).unwrap().outputs,
+            [OutputRewrite::Tokenize { domain: DomainName("email".into()), ty: ColumnType::Text }]
+        );
+        for (args, code) in [
+            ("Email, Phone", NyCode::BlindOperation),
+            ("Email, Id", NyCode::BlindOperation),
+            ("Email, 'x'", NyCode::BlindOperation),
+            ("Email, @p", NyCode::BlindOperation),
+            ("Email, Country", NyCode::MaskedExpression),
+            ("LOWER(Email), Email", NyCode::BlindOperation),
+        ] {
+            let sql = format!("SELECT {name}({args}) FROM Customers");
+            assert_eq!(check_sql(&sql).unwrap_err().code, code, "{sql}");
+        }
+        let sql = format!("SELECT LOWER({name}(Email, Email)) FROM Customers");
+        assert_eq!(check_sql(&sql).unwrap_err().code, NyCode::BlindOperation);
+        let sql = format!("SELECT Id FROM Customers WHERE {name}(Email, Email) = @p");
+        assert_eq!(check_sql(&sql).unwrap_err().code, NyCode::BlindOperation);
+        let sql = format!(
+            "INSERT INTO Outbox (Id, ToAddress, Template) SELECT Id, {name}(Email, Email), 't' FROM Customers"
+        );
+        assert_eq!(check_sql(&sql).unwrap_err().code, NyCode::BlindOperation);
+    }
+    let mut different_type = snapshot;
+    different_type.relations[1].columns[1].ty = ColumnType::Int8;
+    let (stmt, _) = lower_gsql(
+        "SELECT COALESCE(c.Email, o.ToAddress) FROM Customers c JOIN Outbox o ON c.Id = o.Id",
+        &different_type,
+        &policy,
+    ).unwrap();
+    assert_eq!(
+        crate::ir::check::check(&stmt, &policy, &different_type).unwrap_err().code,
+        NyCode::BlindOperation
+    );
+}
+
+#[test]
+fn coalesce_result_reused_downstream_or_written_is_still_refused() {
+    for sql in [
+        "SELECT COALESCE(Email, Email) AS e FROM Customers ORDER BY e",
+        "SELECT x FROM (SELECT COALESCE(c.Email, o.ToAddress) x FROM Customers c, Outbox o) d WHERE x LIKE 'a%'",
+        "WITH c AS (SELECT IFNULL(Email, Email) x FROM Customers) SELECT LOWER(x) FROM c",
+        "SELECT MIN(x) FROM (SELECT COALESCE(Email, Email) x FROM Customers) d",
+    ] {
+        assert_eq!(check_sql(sql).unwrap_err().code, NyCode::BlindOperation, "{sql}");
+    }
+    for sql in [
+        "INSERT INTO Outbox (Id, ToAddress, Template) SELECT Id, x, 't' FROM (SELECT Id, COALESCE(Email, Email) x FROM Customers) d",
+        "UPDATE Outbox SET Template = (SELECT COALESCE(Email, Email) FROM Customers LIMIT 1) WHERE TRUE",
+    ] {
+        assert!(check_sql(sql).is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn text_literals_in_token_positions_are_not_valid_tokens() {
+    for sql in [
+        "SELECT Id FROM Customers WHERE Email = 'olivia@example.com'",
+        "SELECT Id FROM Customers WHERE Email = 'tok_email_abc'",
+        "INSERT INTO Outbox (Id, ToAddress, Template) VALUES (1, 'olivia@example.com', 't')",
+    ] {
+        assert_eq!(check_sql(sql).unwrap_err().code, NyCode::TokenNotValid, "{sql}");
+    }
+    assert!(check_sql("SELECT Id FROM Customers WHERE Email = @p").is_ok());
+}
+
+#[test]
+fn then_return_lowers_dml_outputs_with_returning_policy() {
+    for (sql, kind) in [
+        ("INSERT INTO Outbox (Id, ToAddress, Template) VALUES (@id, @tok, 't') THEN RETURN Id, ToAddress", StatementKind::Insert),
+        (
+            "UPDATE Outbox SET Template = CASE WHEN Id = @id THEN 't' ELSE Template END WHERE Id = @id THEN RETURN Id, ToAddress",
+            StatementKind::Update,
+        ),
+        ("DELETE FROM Outbox WHERE Id = @id THEN /* return the deleted row */ RETURN Id, ToAddress", StatementKind::Delete),
+    ] {
+        let stmt = lower(sql);
+        assert_eq!(stmt.kind, kind, "{sql}");
+        assert!(stmt.uses.iter().any(|u| u.context == Context::Returning
+            && u.kind == UseKind::Output && u.column.column == "ToAddress"), "{sql}");
+        assert_eq!(
+            check_sql(sql).unwrap().outputs,
+            [
+                OutputRewrite::Pass,
+                OutputRewrite::Tokenize { domain: DomainName("email".into()), ty: ColumnType::Text },
+            ],
+            "{sql}"
+        );
+    }
+    let stmt = lower("INSERT INTO Outbox (Id, ToAddress, Template) VALUES (@id, @tok, 't') THEN RETURN *");
+    let (snapshot, policy) = fixture();
+    assert_eq!(
+        crate::ir::check::check(&stmt, &policy, &snapshot).unwrap().outputs,
+        check_sql("SELECT * FROM Outbox").unwrap().outputs
+    );
+    assert_eq!(
+        check_sql("DELETE FROM Customers WHERE Id = @id THEN RETURN Country").unwrap().outputs,
+        [OutputRewrite::Mask { placeholder: None }]
+    );
+    for (item, code) in [
+        ("LOWER(ToAddress)", NyCode::BlindOperation),
+        ("WITH ACTION Id", NyCode::NotAnalysable),
+    ] {
+        let sql = format!("DELETE FROM Outbox WHERE Id = @id THEN RETURN {item}");
+        assert_eq!(check_sql(&sql).unwrap_err().code, code, "{sql}");
+    }
+    assert_eq!(
+        check_sql("DELETE FROM Customers WHERE Id = @id THEN RETURN LOWER(Country)").unwrap_err().code,
+        NyCode::MaskedExpression
+    );
+    assert_eq!(
+        check_sql("DELETE FROM Outbox WHERE Id = @id RETURNING ToAddress").unwrap_err().code,
+        NyCode::NotAnalysable
+    );
+    assert!(check_sql("UPDATE Notes SET Body = 'THEN RETURN Email' WHERE Id = 1")
+        .unwrap().outputs.is_empty());
+}
+
+#[test]
+fn ordered_aggregates_require_plain_keys() {
+    for sql in [
+        "SELECT ARRAY_AGG(Id ORDER BY FailedPayments) FROM Customers",
+        "SELECT STRING_AGG(Body ORDER BY Id) FROM Notes",
+    ] {
+        assert_eq!(check_sql(sql).unwrap().outputs, [OutputRewrite::Pass], "{sql}");
+    }
+    for (expression, code) in [
+        ("ARRAY_AGG(Id ORDER BY Email)", NyCode::BlindOperation),
+        ("ARRAY_AGG(Id ORDER BY Country)", NyCode::MaskedExpression),
+        ("ARRAY_AGG(Email ORDER BY Id)", NyCode::BlindOperation),
+        ("ARRAY_AGG(Country ORDER BY Id)", NyCode::MaskedExpression),
+        ("STRING_AGG(Email ORDER BY Id)", NyCode::BlindOperation),
+        ("STRING_AGG('x' ORDER BY Country)", NyCode::MaskedExpression),
+        ("ARRAY_AGG(Id ORDER BY FailedPayments LIMIT 2)", NyCode::NotAnalysable),
+    ] {
+        let sql = format!("SELECT {expression} FROM Customers");
+        assert_eq!(check_sql(&sql).unwrap_err().code, code, "{sql}");
+    }
+}
+
+#[test]
+fn set_operations_preserve_domains_and_mask_refusals() {
+    for op in ["UNION ALL", "UNION DISTINCT", "INTERSECT DISTINCT", "EXCEPT DISTINCT"] {
+        for (right, code) in [
+            ("Phone FROM Customers", NyCode::TokenOutsideDomain),
+            ("Body FROM Notes", NyCode::TokenOutsideDomain),
+            ("Country FROM Customers", NyCode::MaskedExpression),
+        ] {
+            for (left, right) in [("Email FROM Customers", right), (right, "Email FROM Customers")] {
+                let sql = format!("SELECT {left} {op} SELECT {right}");
+                assert_eq!(check_sql(&sql).unwrap_err().code, code, "{sql}");
+            }
+        }
+        let same = format!("SELECT Email FROM Customers {op} SELECT ToAddress FROM Outbox");
+        assert_eq!(
+            check_sql(&same).unwrap().outputs,
+            [OutputRewrite::Tokenize { domain: DomainName("email".into()), ty: ColumnType::Text }]
+        );
+    }
+}
+
+#[test]
+fn case_with_blind_branch_is_still_an_operation_refusal() {
+    let sql = "SELECT CASE WHEN Id > 0 THEN Email ELSE 'x' END FROM Customers";
+    assert_eq!(check_sql(sql).unwrap_err().code, NyCode::BlindOperation);
 }

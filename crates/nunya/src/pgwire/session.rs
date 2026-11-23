@@ -3180,6 +3180,104 @@ pub(crate) mod tests {
         );
     }
     #[test]
+    fn aggregate_filter_rewrites_text_tokens_in_simple_and_extended_queries() {
+        let f = Fixture::new();
+        let mut simple = f.session();
+        let clear = SqlValue::Text("O'Brien".into());
+        let token = f.ctx.codec.encode(
+            &simple.keys,
+            &DomainName("secret".into()),
+            &ColumnType::Text,
+            None,
+            &clear,
+        ).unwrap();
+        let token = values::encode_text(&token).unwrap();
+        let sql = format!(
+            "SELECT count(*) FILTER (WHERE value = '{}') FROM items",
+            std::str::from_utf8(&token).unwrap()
+        );
+        let out = simple.frontend(Frontend::Query(sql));
+        assert!(matches!(out.upstream.as_slice(), [Frontend::Query(sql)]
+            if sql == "SELECT count(*) FILTER (WHERE value = 'O''Brien') FROM items"));
+
+        let mut extended = f.session();
+        let out = extended.frontend(Frontend::Parse {
+            name: "s".into(),
+            query: "SELECT count(*) FILTER (WHERE value = $1) FROM items".into(),
+            param_types: vec![25],
+        });
+        assert!(matches!(out.upstream.as_slice(), [Frontend::Parse { .. }]));
+        extended.backend(Backend::ParseComplete);
+        let out = extended.frontend(Frontend::Bind {
+            portal: "p".into(),
+            statement: "s".into(),
+            param_formats: vec![],
+            params: vec![Some(token)],
+            result_formats: vec![],
+        });
+        assert!(matches!(out.upstream.as_slice(), [Frontend::Bind { params, .. }]
+            if params[0].as_deref() == Some(b"O'Brien")));
+    }
+
+    #[test]
+    fn coalesce_output_is_tokenized_before_release() {
+        let f = Fixture::new();
+        let mut session = f.session();
+        let out = session.frontend(Frontend::Query("SELECT coalesce(value, value) FROM items".into()));
+        assert!(matches!(out.upstream.as_slice(), [Frontend::Query(_)]));
+        let out = session.backend(Backend::RowDescription(vec![field()]));
+        assert!(matches!(out.client.as_slice(), [Backend::RowDescription(_)]));
+        let clear = "private@example.com";
+        let out = session.backend(Backend::DataRow(vec![Some(clear.as_bytes().to_vec())]));
+        let [Backend::DataRow(row)] = out.client.as_slice() else {
+            panic!("expected tokenized row");
+        };
+        let token = row[0].as_ref().unwrap();
+        assert!(token.starts_with(b"tok_secret_"));
+        assert_ne!(token, clear.as_bytes());
+        let token = values::decode_text(&ColumnType::Text, token).unwrap();
+        assert_eq!(
+            f.ctx.codec.decode(&session.keys, &DomainName("secret".into()), &ColumnType::Text, None, &token).unwrap(),
+            SqlValue::Text(clear.into())
+        );
+    }
+
+    #[test]
+    fn plaintext_literal_and_bind_in_blind_equality_return_ny003() {
+        let f = Fixture::new();
+        let clear = "olivia.smith@example.com";
+        let mut simple = f.session();
+        let literal = simple.frontend(Frontend::Query(format!(
+            "SELECT value FROM items WHERE value = '{clear}'"
+        )));
+
+        let mut extended = f.session();
+        let out = extended.frontend(Frontend::Parse {
+            name: "s".into(),
+            query: "SELECT value FROM items WHERE value = $1".into(),
+            param_types: vec![25],
+        });
+        assert!(matches!(out.upstream.as_slice(), [Frontend::Parse { .. }]));
+        extended.backend(Backend::ParseComplete);
+        let bind = extended.frontend(Frontend::Bind {
+            portal: "p".into(),
+            statement: "s".into(),
+            param_formats: vec![],
+            params: vec![Some(clear.as_bytes().to_vec())],
+            result_formats: vec![],
+        });
+
+        for out in [literal, bind] {
+            assert_eq!(code(&out), "NY003");
+            assert!(out.upstream.is_empty());
+            let Backend::ErrorResponse(fields) = &out.client[0] else {
+                panic!("expected error response");
+            };
+            assert!(fields.iter().all(|(_, value)| !value.contains(clear)));
+        }
+    }
+
+    #[test]
     fn response_pump_tokenizes_and_checks_shapes() {
         let f = Fixture::new();
         let mut session = f.session();

@@ -38,6 +38,8 @@ pub enum ValueSource {
         /// Text.
         text: String,
     }, // literal as written; text is the unquoted value
+    /// A text literal on a route that never rewrites literals (GoogleSQL); tokens must be parameters.
+    NonTokenText,
     /// Resolved column and its information-flow label.
     Column {
         /// Column.
@@ -144,12 +146,12 @@ pub struct OutputColumn {
     pub name: String,
     /// Label.
     pub label: Label,
-    /// Present only for an unchanged single-column passthrough, including through relational layers.
+    /// Column supplying the output's policy and type. A blind output may use
+    /// a representative column when all possible source columns share its domain and type.
     pub source: Option<ColumnRef>,
     /// Known database column type, if resolved.
     pub ty: Option<ColumnType>,
 }
-// source is Some only when the output is exactly one column passed through unchanged (also through subqueries/CTEs/views/unions).
 
 /// Write target.
 #[derive(Debug, Clone, PartialEq)]

@@ -15,7 +15,7 @@ fn bad() -> Refusal {
 }
 pub(crate) fn token_parts(text: &str) -> Result<(&str, &str), Refusal> {
     text.strip_prefix("tok_")
-        .ok_or_else(|| Refusal::new(NyCode::BlindOperation, "plain text in blind position"))?
+        .ok_or_else(|| Refusal::new(NyCode::TokenNotValid, "plain text in blind position"))?
         .rsplit_once('_')
         .ok_or_else(bad)
 }
@@ -137,7 +137,7 @@ mod tests {
         for (k, d, v, code) in [
             (&other, "d", &token, NyCode::TokenNotValid),
             (&keys, "x", &token, NyCode::TokenOutsideDomain),
-            (&keys, "d", &plain, NyCode::BlindOperation),
+            (&keys, "d", &plain, NyCode::TokenNotValid),
         ] {
             assert_eq!(run(k, d, v, true).unwrap_err().code, code);
         }

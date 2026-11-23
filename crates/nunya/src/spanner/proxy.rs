@@ -1303,7 +1303,11 @@ impl NunyaSpanner {
             ValueSource::Literal { text, .. } => Value {
                 kind: Some(prost_types::value::Kind::StringValue(text.clone())),
             },
-            ValueSource::JsonLeaf(_) | ValueSource::Column { .. } | ValueSource::Null | ValueSource::Computed(_) => {
+            ValueSource::JsonLeaf(_)
+            | ValueSource::Column { .. }
+            | ValueSource::NonTokenText
+            | ValueSource::Null
+            | ValueSource::Computed(_) => {
                 return Err(NyCode::NotAnalysable);
             }
         };
@@ -2526,6 +2530,7 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         json_result: Mutex<Option<ResultSet>>,
+        batch_results: Mutex<Option<Vec<ResultSet>>>,
         result_token: Mutex<Option<MultiplexedSessionPrecommitToken>>,
         next_commit: Mutex<Option<CommitResponse>>,
         commit_status: Mutex<Option<Status>>,
@@ -2794,10 +2799,14 @@ mod tests {
             let req = req.into_inner();
             let transaction = self.inline_transaction(req.transaction.as_ref());
             self.batches.lock().unwrap().push(req);
+            let result_sets = self.batch_results.lock().unwrap().take().unwrap_or_else(|| {
+                transaction.map(|transaction| ResultSet {
+                    metadata: Some(ResultSetMetadata { transaction: Some(transaction), ..Default::default() }),
+                    ..Default::default()
+                }).into_iter().collect()
+            });
             Ok(Response::new(ExecuteBatchDmlResponse {
-                result_sets: transaction.map(|transaction| ResultSet {
-                    metadata: Some(ResultSetMetadata { transaction: Some(transaction), ..Default::default() }), ..Default::default()
-                }).into_iter().collect(),
+                result_sets,
                 precommit_token: self.result_token.lock().unwrap().clone(), ..Default::default()
             }))
         }
@@ -3058,6 +3067,110 @@ mod tests {
                 .unwrap()
         }
     }
+    #[tokio::test]
+    async fn plaintext_literal_and_param_in_blind_equality_return_ny003() {
+        let f = Fixture::new().await;
+        let clear = "olivia.smith@example.com";
+        let literal = f.query(&format!("SELECT email FROM customers WHERE email = '{clear}'")).await;
+        let mut parameter = f.query("SELECT email FROM customers WHERE email = @v").await;
+        parameter.params = Some(prost_types::Struct {
+            fields: [("v".into(), text(clear))].into(),
+        });
+        for request in [literal, parameter] {
+            let error = f.svc.execute_sql(f.request(request, "alice")).await.unwrap_err();
+            assert!(!error.message().contains(clear));
+            assert_tokenize_error(error, NyCode::TokenNotValid);
+        }
+        assert!(f.fake.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn then_return_rewrites_dml_rows_on_all_sql_rpcs() {
+        let f = Fixture::new().await;
+        let mut snapshot = (**f.svc.ctx.snapshot.read().unwrap()).clone();
+        snapshot.relations[0].columns.push(Column {
+            name: "status".into(),
+            ty: ColumnType::Text,
+            nullable: false,
+            generated: None,
+            default: None,
+        });
+        *f.svc.ctx.snapshot.write().unwrap() = Arc::new(snapshot);
+        let mut policy = (**f.svc.ctx.policy.read().unwrap()).clone();
+        policy.columns.insert(ColumnRef {
+            schema: "".into(),
+            table: "customers".into(),
+            column: "status".into(),
+        }, Treatment::Show);
+        *f.svc.ctx.policy.write().unwrap() = Arc::new(policy);
+
+        let clear = "private@example.com";
+        let values = vec![text(clear), text("queued")];
+        let metadata = ResultSetMetadata {
+            row_type: Some(StructType {
+                fields: ["email", "status"].into_iter().map(|name| struct_type::Field {
+                    name: name.into(),
+                    r#type: Some(Type { code: TypeCode::String as i32, ..Default::default() }),
+                }).collect(),
+            }),
+            ..Default::default()
+        };
+        let result = ResultSet {
+            metadata: Some(metadata.clone()),
+            rows: vec![ListValue { values: values.clone() }],
+            ..Default::default()
+        };
+        let mut req = f.query(
+            "INSERT INTO customers (email, status) VALUES (@v, 'queued') THEN RETURN email, status",
+        ).await;
+        req.params = Some(prost_types::Struct {
+            fields: [("v".into(), f.token())].into(),
+        });
+        let expected = vec![f.token(), text("queued")];
+        assert_ne!(expected[0], values[0]);
+
+        *f.fake.json_result.lock().unwrap() = Some(result.clone());
+        let unary = f.svc.execute_sql(f.request(req.clone(), "alice")).await.unwrap().into_inner();
+        assert_eq!(unary.rows[0].values, expected);
+        {
+            let seen = f.fake.seen.lock().unwrap();
+            assert_eq!(seen[0].sql, req.sql);
+            assert_eq!(seen[0].params.as_ref().unwrap().fields["v"], text(clear));
+        }
+
+        *f.fake.parts.lock().unwrap() = Some(vec![
+            PartialResultSet {
+                metadata: Some(metadata),
+                values: vec![text("private@")],
+                chunked_value: true,
+                ..Default::default()
+            },
+            PartialResultSet {
+                values: vec![text("example.com"), text("queued")],
+                ..Default::default()
+            },
+        ]);
+        let stream = f.svc.execute_streaming_sql(f.request(req.clone(), "alice")).await.unwrap().into_inner();
+        let mut streamed = vec![];
+        futures::pin_mut!(stream);
+        while let Some(part) = stream.next().await {
+            streamed.extend(part.unwrap().values);
+        }
+        assert_eq!(streamed, expected);
+
+        *f.fake.batch_results.lock().unwrap() = Some(vec![result]);
+        let batch = f.svc.execute_batch_dml(f.request(ExecuteBatchDmlRequest {
+            session: req.session,
+            statements: vec![execute_batch_dml_request::Statement {
+                sql: req.sql,
+                params: req.params,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }, "alice")).await.unwrap().into_inner();
+        assert_eq!(batch.result_sets[0].rows[0].values, expected);
+    }
+
     #[tokio::test]
     async fn retired_param_refused_before_upstream() {
         let f = Fixture::new().await;
@@ -5554,7 +5667,7 @@ mod tests {
         // A valid token lets SQL lowering reach admission for the blind column.
         let dml = ExecuteSqlRequest {
             session: session.clone(),
-            sql: "UPDATE customers SET email = @v".into(),
+            sql: "UPDATE customers SET email = @v THEN RETURN email".into(),
             params: Some(prost_types::Struct {
                 fields: [("v".into(), f.token())].into(),
             }),

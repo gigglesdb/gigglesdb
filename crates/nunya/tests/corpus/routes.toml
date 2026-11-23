@@ -40,8 +40,8 @@ note = "same domain except"
 
 [[case]]
 sql = "SELECT email FROM customers UNION SELECT body FROM notes"
-expect = "NY002"
-note = "mixed union taint"
+expect = "NY001"
+note = "blind union branch mixed with plain"
 
 [[case]]
 sql = "SELECT (SELECT email FROM customers WHERE id=1)"
@@ -125,8 +125,9 @@ note = "rollup"
 
 [[case]]
 sql = "SELECT count(email) FILTER(WHERE id>1) FROM customers"
-expect = "NY004"
+expect = "allow"
 note = "aggregate filter"
+plan = { inputs = [], outputs = ["pass"] }
 
 [[case]]
 sql = "SELECT count(email) OVER() FROM customers"

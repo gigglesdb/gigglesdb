@@ -35,7 +35,7 @@ pub(super) struct Expr {
     pub label: Label,
     /// The direct counterpart value source.
     pub value: ValueSource,
-    /// The unchanged single-column pass-through source, when present.
+    /// A column supplying the result's domain and type for output rewriting.
     pub source: Option<ColumnRef>,
     /// The known database column type.
     pub ty: Option<ColumnType>,
@@ -453,7 +453,6 @@ impl State<'_> {
             }
             NodeEnum::FuncCall(f) => {
                 if !f.agg_order.is_empty()
-                    || f.agg_filter.is_some()
                     || f.over.is_some()
                     || f.agg_within_group
                     || f.func_variadic
@@ -472,6 +471,12 @@ impl State<'_> {
                     return Err(json_extract::refusal());
                 }
                 let aggregate = functions::aggregate(&name, self.snapshot).ok_or_else(refuse)?;
+                if let Some(filter) = &f.agg_filter {
+                    if !aggregate {
+                        return Err(refuse());
+                    }
+                    self.root(filter, scope, Context::Where, UseKind::Comparison)?;
+                }
                 if f.agg_star {
                     return if name == "count" && f.args.is_empty() && !f.agg_distinct {
                         Ok(Expr::plain(ValueSource::Computed(Label::Plain)))
@@ -483,8 +488,20 @@ impl State<'_> {
                     return Err(refuse());
                 }
                 let mut args = vec![];
-                for n in &f.args {
-                    args.push(self.expression(n, scope, context)?);
+                let extract_syntax = matches!(names.as_slice(), [schema, name]
+                    if schema == "pg_catalog" && name == "extract")
+                    && f.funcformat == p::CoercionForm::CoerceSqlSyntax as i32;
+                for (index, n) in f.args.iter().enumerate() {
+                    // EXTRACT's field keyword is a synthesized string constant. Its
+                    // location refers to the keyword, which has no literal to rewrite.
+                    if extract_syntax && index == 0
+                        && matches!(node(n)?, NodeEnum::AConst(c)
+                            if matches!(c.val, Some(p::a_const::Val::Sval(_))))
+                    {
+                        args.push(Expr::plain(ValueSource::Computed(Label::Plain)));
+                    } else {
+                        args.push(self.expression(n, scope, context)?);
+                    }
                 }
                 if name == "count" && args.iter().any(|e| e.label != Label::Plain && !e.bare) {
                     return Err(refuse());
@@ -710,9 +727,37 @@ impl State<'_> {
     ) -> Result<Expr> {
         let mut args = vec![];
         for n in ns {
-            let e = self.expression(n, scope, context)?;
+            args.push(self.expression(n, scope, context)?);
+        }
+        if name == "coalesce" {
+            if args.iter().any(|e| e.label == Label::Masked) {
+                return Err(Refusal::new(NyCode::MaskedExpression, "masked COALESCE input"));
+            }
+            // INSERT ... SELECT discards projection uses when building writes.
+            let result_projection = *context == Context::Returning
+                || (*context == Context::SelectList && self.statement.kind == StatementKind::Select);
+            if result_projection
+                && let Some(first) = args.first()
+                && matches!(first.label, Label::Blind(_))
+                && first.ty.is_some()
+                && args.iter().all(|e| {
+                    e.bare && e.source.is_some() && e.label == first.label && e.ty == first.ty
+                })
+            {
+                return Ok(Expr {
+                    label: first.label.clone(),
+                    value: ValueSource::Computed(first.label.clone()),
+                    source: first.source.clone(),
+                    ty: first.ty.clone(),
+                    inputs: args.into_iter().flat_map(|e| e.inputs).collect(),
+                    params: vec![],
+                    bare: false,
+                });
+            }
+        }
+        for e in &args {
             self.record(
-                &e,
+                e,
                 if order {
                     UseKind::Order
                 } else {
@@ -720,7 +765,6 @@ impl State<'_> {
                 },
                 context,
             );
-            args.push(e);
         }
         Ok(combine(args, false))
     }

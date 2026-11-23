@@ -512,6 +512,18 @@ mod tests {
         crate::ir::check::check(&stmt, &policy, &snapshot)
     }
     #[test]
+    fn then_return_of_json_filtered_column_is_refused() {
+        for mode in [JsonMode::Show, JsonMode::Tokenize] {
+            for sql in [
+                "DELETE FROM docs WHERE TRUE THEN RETURN doc",
+                "DELETE FROM docs WHERE TRUE THEN RETURN *",
+                "UPDATE docs SET email = NULL WHERE TRUE THEN RETURN doc",
+            ] {
+                assert_eq!(plan(sql, mode).unwrap_err().code, NyCode::MaskedExpression, "{sql}");
+            }
+        }
+    }
+    #[test]
     fn normalizes_like_pg_and_refuses_unknown_paths() {
         let (_, policy) = fixture(JsonMode::Show);
         let filter = policy.json_filters.values().next().unwrap();

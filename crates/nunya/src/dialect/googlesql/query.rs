@@ -152,6 +152,15 @@ impl State<'_> {
                         {
                             l.ir.label.clone()
                         }
+                        (Label::Masked, Label::Blind(_)) | (Label::Blind(_), Label::Masked) => {
+                            return Err(Refusal::new(NyCode::MaskedExpression, "mixed set output"));
+                        }
+                        (Label::Blind(a), Label::Blind(b)) if a != b => {
+                            return Err(Refusal::new(NyCode::TokenOutsideDomain, "mixed set output"));
+                        }
+                        (Label::Blind(_), Label::Plain) | (Label::Plain, Label::Blind(_)) => {
+                            return Err(Refusal::new(NyCode::TokenOutsideDomain, "mixed set output"));
+                        }
                         (Label::Blind(_), _) | (_, Label::Blind(_)) => Label::Tainted,
                         _ => Label::join(l.ir.label.clone(), r.ir.label.clone()),
                     };
@@ -243,8 +252,43 @@ impl State<'_> {
                 order_references.push(reference);
             }
         }
+        let os = self.projection(
+            &s.projection,
+            &scope,
+            Context::SelectList,
+            grouped,
+            &order_references,
+        )?;
+        if let Some(e) = &s.selection {
+            self.root(e, &scope, Context::Where, UseKind::Comparison)?;
+        }
+        if let Some(e) = &s.having {
+            self.root(e, &scope, Context::Having, UseKind::Comparison)?;
+        }
+        for e in groups {
+            self.clause(e, &scope, &os, Context::GroupBy, UseKind::GroupBy)?;
+        }
+        if s.distinct.is_some() {
+            for o in &os {
+                self.record(
+                    &expr::Expr::column(o.clone()),
+                    UseKind::GroupBy,
+                    &Context::GroupBy,
+                )
+            }
+        }
+        Ok((scope, os))
+    }
+    fn projection(
+        &mut self,
+        items: &[a::SelectItem],
+        scope: &Scope,
+        context: Context,
+        grouped: bool,
+        order_references: &[ClauseReference<'_>],
+    ) -> Result<Vec<Output>> {
         let mut os = vec![];
-        for item in &s.projection {
+        for item in items {
             match item {
                 a::SelectItem::UnnamedExpr(e) | a::SelectItem::ExprWithAlias { expr: e, .. } => {
                     let name = match item {
@@ -256,7 +300,10 @@ impl State<'_> {
                         }
                         _ => "?column?".into(),
                     };
-                    let e = if let Some(extract) = self.json_extraction(e, &scope)? {
+                    let e = if let Some(extract) = self.json_extraction(e, scope)? {
+                        if context != Context::SelectList {
+                            return Err(refuse());
+                        }
                         if grouped || order_references.iter().any(|r| r.matches(os.len(), &name)) {
                             self.json_grouping(extract)?
                         } else {
@@ -266,7 +313,7 @@ impl State<'_> {
                             self.json_projection(extract, os.len())?
                         }
                     } else {
-                        self.root(e, &scope, Context::SelectList, UseKind::Output)?
+                        self.root(e, scope, context.clone(), UseKind::Output)?
                     };
                     os.push(e.output(name))
                 }
@@ -283,7 +330,7 @@ impl State<'_> {
                         _ => vec![],
                     };
                     let mut expanded = vec![];
-                    for b in &scope {
+                    for b in scope {
                         let yes = match qualifiers.as_slice() {
                             [] => b.visible,
                             [t] => b.qualified && b.table.to_lowercase() == *t,
@@ -312,32 +359,24 @@ impl State<'_> {
                         self.record(
                             &expr::Expr::column(o.clone()),
                             UseKind::Output,
-                            &Context::SelectList,
+                            &context,
                         );
                         os.push(o)
                     }
                 }
             }
         }
-        if let Some(e) = &s.selection {
-            self.root(e, &scope, Context::Where, UseKind::Comparison)?;
+        Ok(os)
+    }
+    fn returning(&mut self, items: Option<&[a::SelectItem]>, scope: &Scope) -> Result<()> {
+        if let Some(items) = items {
+            self.stmt.outputs = self
+                .projection(items, scope, Context::Returning, false, &[])?
+                .into_iter()
+                .map(|o| o.ir)
+                .collect();
         }
-        if let Some(e) = &s.having {
-            self.root(e, &scope, Context::Having, UseKind::Comparison)?;
-        }
-        for e in groups {
-            self.clause(e, &scope, &os, Context::GroupBy, UseKind::GroupBy)?;
-        }
-        if s.distinct.is_some() {
-            for o in &os {
-                self.record(
-                    &expr::Expr::column(o.clone()),
-                    UseKind::GroupBy,
-                    &Context::GroupBy,
-                )
-            }
-        }
-        Ok((scope, os))
+        Ok(())
     }
     fn factor(&mut self, t: &a::TableFactor) -> Result<Scope> {
         match t {
@@ -726,7 +765,6 @@ impl State<'_> {
                     || !i.after_columns.is_empty()
                     || i.table
                     || i.on.is_some()
-                    || i.returning.is_some()
                     || i.replace_into
                     || i.priority.is_some()
                     || i.insert_alias.is_some()
@@ -794,13 +832,14 @@ impl State<'_> {
                         })
                     }
                 }
+                self.returning(i.returning.as_deref(), &scope)?;
             }
             a::Statement::Update {
                 table,
                 assignments,
                 from: None,
                 selection,
-                returning: None,
+                returning,
                 or: None,
             } => {
                 self.stmt.kind = StatementKind::Update;
@@ -823,13 +862,13 @@ impl State<'_> {
                 if let Some(e) = selection {
                     self.root(e, &scope, Context::Where, UseKind::Comparison)?;
                 }
+                self.returning(returning.as_deref(), &scope)?;
             }
             a::Statement::Update { .. } => return Err(refuse()),
             a::Statement::Delete(d) => {
                 self.stmt.kind = StatementKind::Delete;
                 if !d.tables.is_empty()
                     || d.using.is_some()
-                    || d.returning.is_some()
                     || !d.order_by.is_empty()
                     || d.limit.is_some()
                 {
@@ -845,6 +884,7 @@ impl State<'_> {
                 if let Some(e) = &d.selection {
                     self.root(e, &scope, Context::Where, UseKind::Comparison)?;
                 }
+                self.returning(d.returning.as_deref(), &scope)?;
             }
             _ => self.stmt.kind = StatementKind::Refused(NyCode::StatementNotAllowed),
         }

@@ -12,7 +12,7 @@ use sqlparser::{
     dialect::BigQueryDialect,
     keywords::Keyword,
     parser::Parser,
-    tokenizer::{Token, Tokenizer},
+    tokenizer::{Token, Tokenizer, Word},
 };
 use std::collections::{BTreeMap, BTreeSet};
 mod expr;
@@ -57,14 +57,71 @@ struct State<'a> {
     view_depth: usize,
     sql_has_backslash: bool,
 }
+// sqlparser understands RETURNING. Adapt Spanner's clause for analysis only;
+// the proxy still forwards the original SQL and its original parameter names.
+fn parse_then_return(tokens: &[Token]) -> Option<Vec<a::Statement>> {
+    let Token::Word(first) = tokens.first()? else {
+        return None;
+    };
+    if !matches!(first.keyword, Keyword::INSERT | Keyword::UPDATE | Keyword::DELETE) {
+        return None;
+    }
+    let mut nesting = 0usize;
+    let mut clause = None;
+    for (index, pair) in tokens.windows(2).enumerate() {
+        match &pair[0] {
+            Token::LParen | Token::LBracket | Token::Word(Word { keyword: Keyword::CASE, .. }) => {
+                nesting += 1;
+            }
+            Token::RParen | Token::RBracket | Token::Word(Word { keyword: Keyword::END, .. }) => {
+                nesting = nesting.checked_sub(1)?;
+            }
+            _ => {}
+        }
+        if nesting == 0
+            && matches!(
+                pair,
+                [
+                    Token::Word(Word { keyword: Keyword::THEN, .. }),
+                    Token::Word(Word { keyword: Keyword::RETURN, .. }),
+                ]
+            )
+        {
+            if clause.is_some() {
+                return None;
+            }
+            clause = Some(index);
+        }
+    }
+    let index = clause?;
+    if matches!(tokens.get(index + 2), Some(Token::Word(w)) if w.keyword == Keyword::WITH) {
+        return None;
+    }
+    let mut normalized = tokens.to_vec();
+    normalized.splice(index..index + 2, [Token::make_keyword("RETURNING")]);
+    Parser::new(&BigQueryDialect {})
+        .with_tokens(normalized)
+        .parse_statements()
+        .ok()
+}
+
+fn has_returning(statement: &a::Statement) -> bool {
+    match statement {
+        a::Statement::Insert(i) => i.returning.is_some(),
+        a::Statement::Update { returning, .. } => returning.is_some(),
+        a::Statement::Delete(d) => d.returning.is_some(),
+        _ => false,
+    }
+}
+
 /// Lower exactly one GoogleSQL statement, returning parameter names in textual occurrence order.
 pub fn lower_gsql(
     sql: &str,
     snapshot: &Snapshot,
     policy: &Policy,
 ) -> Result<(ResolvedStatement, Vec<String>)> {
-    let parsed = match Parser::parse_sql(&BigQueryDialect {}, sql) {
-        Ok(parsed) => parsed,
+    let (parsed, then_return) = match Parser::parse_sql(&BigQueryDialect {}, sql) {
+        Ok(parsed) => (parsed, false),
         Err(_) => {
             let mut tokens = Tokenizer::new(&BigQueryDialect {}, sql)
                 .tokenize()
@@ -76,43 +133,47 @@ pub fn lower_gsql(
             if tokens.iter().any(|token| matches!(token, Token::SemiColon)) {
                 return Err(refuse());
             }
-            // Classifying unparsable Spanner DDL/DCL as refused never accepts input.
-            match tokens.first() {
-                Some(Token::Word(word))
-                    if matches!(
-                        word.keyword,
-                        Keyword::CREATE
-                            | Keyword::ALTER
-                            | Keyword::DROP
-                            | Keyword::GRANT
-                            | Keyword::REVOKE
-                            | Keyword::RENAME
-                            | Keyword::TRUNCATE
-                            | Keyword::ANALYZE
-                    ) =>
-                {
-                    return Ok((
-                        ResolvedStatement {
-                            canonical_sql: None,
-                            kind: StatementKind::Refused(NyCode::StatementNotAllowed),
-                            outputs: vec![],
-                            uses: vec![],
-                            writes: vec![],
-                            param_count: 0,
-                            plain_params: vec![],
-                            source_span: Span {
-                                start: 0,
-                                end: sql.len(),
+            if let Some(parsed) = parse_then_return(&tokens) {
+                (parsed, true)
+            } else {
+                // Classifying unparsable Spanner DDL/DCL as refused never accepts input.
+                match tokens.first() {
+                    Some(Token::Word(word))
+                        if matches!(
+                            word.keyword,
+                            Keyword::CREATE
+                                | Keyword::ALTER
+                                | Keyword::DROP
+                                | Keyword::GRANT
+                                | Keyword::REVOKE
+                                | Keyword::RENAME
+                                | Keyword::TRUNCATE
+                                | Keyword::ANALYZE
+                        ) =>
+                    {
+                        return Ok((
+                            ResolvedStatement {
+                                canonical_sql: None,
+                                kind: StatementKind::Refused(NyCode::StatementNotAllowed),
+                                outputs: vec![],
+                                uses: vec![],
+                                writes: vec![],
+                                param_count: 0,
+                                plain_params: vec![],
+                                source_span: Span {
+                                    start: 0,
+                                    end: sql.len(),
+                                },
                             },
-                        },
-                        vec![],
-                    ));
+                            vec![],
+                        ));
+                    }
+                    _ => return Err(refuse()),
                 }
-                _ => return Err(refuse()),
             }
         }
     };
-    if parsed.len() != 1 {
+    if parsed.len() != 1 || has_returning(&parsed[0]) != then_return {
         return Err(refuse());
     }
     let tokens = Tokenizer::new(&BigQueryDialect {}, sql)
@@ -214,7 +275,7 @@ impl State<'_> {
         kind: UseKind,
     ) -> Result<expr::Expr> {
         let e = self.expression(n, scope, &context)?;
-        if e.bare || matches!(kind, UseKind::Order | UseKind::GroupBy) {
+        if e.bare || e.source.is_some() || matches!(kind, UseKind::Order | UseKind::GroupBy) {
             self.record(&e, kind, &context)
         }
         self.plain.extend(&e.params);

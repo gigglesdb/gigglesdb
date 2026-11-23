@@ -216,7 +216,6 @@ fn refused_shapes() {
         "SELECT pg_read_file('x')",
         "SELECT * FROM pg_catalog.pg_stats",
         "SELECT email[1] FROM customers",
-        "SELECT count(email) FILTER (WHERE id = 1) FROM customers",
         "SELECT email::public.unknown_type FROM customers",
         "SELECT id FROM customers WHERE email = E'x'",
         "SELECT id FROM customers WHERE email = 'a'\n'b'",
@@ -413,10 +412,31 @@ fn case14_cte_passthrough_and_ordered_aliases() {
     }
 }
 #[test]
-fn case15_set_mixed_is_tainted() {
-    let s = lower("SELECT email FROM customers UNION SELECT body FROM notes");
-    assert_eq!(s.outputs[0].label, Label::Tainted);
-    assert!(s.outputs[0].source.is_none());
+fn case15_set_mixed_leaves_its_domain() {
+    let (snapshot, policy) = fixture();
+    for op in ["UNION", "UNION ALL", "INTERSECT", "EXCEPT"] {
+        for (right, code) in [
+            ("phone FROM customers", NyCode::TokenOutsideDomain),
+            ("body FROM notes", NyCode::TokenOutsideDomain),
+            ("country FROM customers", NyCode::MaskedExpression),
+        ] {
+            for (left, right) in [("email FROM customers", right), (right, "email FROM customers")] {
+                let sql = format!("SELECT {left} {op} SELECT {right}");
+                assert_eq!(
+                    PgLowering.lower(&sql, &snapshot, &policy, &[]).unwrap_err().code,
+                    code,
+                    "{sql}"
+                );
+            }
+        }
+        let s = lower(&format!(
+            "SELECT email FROM customers {op} SELECT to_address FROM outbox"
+        ));
+        assert!(matches!(
+            crate::ir::check::check(&s, &policy, &snapshot).unwrap().outputs.as_slice(),
+            [OutputRewrite::Tokenize { domain, ty: ColumnType::Text }] if domain.0 == "email"
+        ));
+    }
 }
 #[test]
 fn case16_catalogs_and_case17_functions_refuse() {
@@ -712,10 +732,6 @@ fn set_label_rules_and_outer_clauses() {
         assert_eq!(s.plain_params, vec![1, 2]);
         assert!(has(&s, UseKind::Order, Context::OrderBy));
     }
-    assert_eq!(
-        lower("SELECT phone FROM customers UNION SELECT email FROM customers").outputs[0].label,
-        Label::Tainted
-    );
     for sql in [
         "SELECT country FROM customers UNION SELECT body FROM notes",
         "SELECT body FROM notes UNION SELECT country FROM customers",
@@ -1878,4 +1894,187 @@ fn r2_pg_guarded_projection_preserves_default_and_explicit_names() {
     let statements = PgLowering.lower(sql, &snapshot, &policy, &[]).unwrap();
     let plan = crate::ir::check::check(&statements[0], &policy, &snapshot).unwrap();
     assert!(matches!(&plan.inputs[0], InputRewrite::ReplaceSpan { text, .. } if text.ends_with(" AS \"?column?\"")));
+}
+
+fn analyser_shapes_fixture() -> (Snapshot, Policy) {
+    let (snapshot, mut policy) = fixture();
+    let mut relations = snapshot.relations;
+    relations.push(Relation {
+        schema: "public".into(),
+        name: "tickets".into(),
+        kind: RelationKind::Table,
+        columns: [
+            ("status", ColumnType::Text),
+            ("plan", ColumnType::Text),
+            ("amount", ColumnType::Int4),
+            ("tax_id", ColumnType::Text),
+            ("created_at", ColumnType::Timestamp),
+            ("resolved_at", ColumnType::Timestamp),
+            ("date_of_birth", ColumnType::Date),
+            ("blind_at", ColumnType::Timestamp),
+        ]
+        .into_iter()
+        .map(|(name, ty)| Column {
+            name: name.into(),
+            ty,
+            nullable: true,
+            generated: None,
+            default: None,
+        })
+        .collect(),
+        view_definition: None,
+        primary_key: vec![],
+    });
+    for (column, treatment) in [
+        ("tax_id", Treatment::Masked { placeholder: None }),
+        ("date_of_birth", Treatment::Masked { placeholder: None }),
+        ("blind_at", Treatment::Blind { domain: DomainName("email".into()) }),
+    ] {
+        policy.columns.insert(
+            ColumnRef {
+                schema: "public".into(),
+                table: "tickets".into(),
+                column: column.into(),
+            },
+            treatment,
+        );
+    }
+    let snapshot = Snapshot::new(relations, vec![], vec!["public".into()], 0);
+    let policy = crate::policy::effective::legacy_policy(policy, &snapshot);
+    (snapshot, policy)
+}
+
+#[test]
+fn same_domain_coalesce_outputs_use_a_real_source() {
+    let (snapshot, policy) = analyser_shapes_fixture();
+    for sql in [
+        "SELECT coalesce(c.email, o.to_address) FROM customers c JOIN outbox o ON c.id = o.id",
+        "UPDATE outbox SET template = 'r' RETURNING coalesce(to_address, to_address)",
+    ] {
+        let s = PgLowering.lower(sql, &snapshot, &policy, &[]).unwrap().remove(0);
+        let source = s.outputs[0].source.as_ref().unwrap();
+        assert!(matches!(source.column.as_str(), "email" | "to_address"));
+        assert_eq!(policy.domain_of(source), Some(&DomainName("email".into())));
+        assert_eq!(
+            crate::ir::check::check(&s, &policy, &snapshot).unwrap().outputs,
+            [OutputRewrite::Tokenize { domain: DomainName("email".into()), ty: ColumnType::Text }]
+        );
+    }
+    for (sql, code) in [
+        ("SELECT coalesce(email, phone) FROM customers", NyCode::BlindOperation),
+        ("SELECT coalesce(email, id) FROM customers", NyCode::BlindOperation),
+        ("SELECT coalesce(email, 'x') FROM customers", NyCode::BlindOperation),
+        ("SELECT coalesce(email, $1) FROM customers", NyCode::BlindOperation),
+        ("SELECT coalesce(email, country) FROM customers", NyCode::MaskedExpression),
+        ("SELECT coalesce(lower(email), email) FROM customers", NyCode::BlindOperation),
+        ("SELECT coalesce(email, blind_at) FROM customers, tickets", NyCode::BlindOperation),
+        ("SELECT lower(coalesce(email, email)) FROM customers", NyCode::BlindOperation),
+        (
+            "INSERT INTO outbox (to_address, template) SELECT coalesce(email, email), 't' FROM customers",
+            NyCode::BlindOperation,
+        ),
+        ("SELECT id FROM customers WHERE coalesce(email, email) = $1", NyCode::BlindOperation),
+    ] {
+        let result = PgLowering.lower(sql, &snapshot, &policy, &[]).and_then(|stmts| {
+            crate::ir::check::check(&stmts[0], &policy, &snapshot)
+        });
+        assert_eq!(result.unwrap_err().code, code, "{sql}");
+    }
+}
+
+#[test]
+fn coalesce_result_reused_downstream_or_written_is_still_refused() {
+    let (snapshot, policy) = analyser_shapes_fixture();
+    let run = |sql: &str| {
+        PgLowering.lower(sql, &snapshot, &policy, &[]).and_then(|stmts| {
+            crate::ir::check::check(&stmts[0], &policy, &snapshot)
+        })
+    };
+    for sql in [
+        "SELECT coalesce(email, email) AS e FROM customers ORDER BY e",
+        "SELECT x FROM (SELECT coalesce(c.email, o.to_address) x FROM customers c, outbox o) d WHERE x LIKE 'a%'",
+        "WITH c AS (SELECT coalesce(email, email) x FROM customers) SELECT lower(x) FROM c",
+        "SELECT x FROM (SELECT coalesce(email, email) x FROM customers) d ORDER BY x",
+        "SELECT min(x) FROM (SELECT coalesce(email, email) x FROM customers) d",
+    ] {
+        assert_eq!(run(sql).unwrap_err().code, NyCode::BlindOperation, "{sql}");
+    }
+    for sql in [
+        "WITH c AS (SELECT coalesce(email, email) x FROM customers) INSERT INTO outbox (to_address, template) SELECT x, 't' FROM c",
+        "UPDATE outbox SET template = (SELECT coalesce(email, email) FROM customers LIMIT 1)",
+    ] {
+        assert!(run(sql).is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn aggregate_filter_uses_where_policy_and_rewrite_spans() {
+    let (snapshot, policy) = analyser_shapes_fixture();
+    let plan = |sql| {
+        let s = PgLowering.lower(sql, &snapshot, &policy, &[])?.remove(0);
+        crate::ir::check::check(&s, &policy, &snapshot)
+    };
+    for sql in [
+        "SELECT count(*) FILTER (WHERE status = 'open') FROM tickets",
+        "SELECT sum(amount) FILTER (WHERE plan = 'pro') FROM tickets",
+        "SELECT count(email) FILTER (WHERE id = 1) FROM customers",
+    ] {
+        assert_eq!(plan(sql).unwrap().outputs, [OutputRewrite::Pass]);
+    }
+    for (sql, code) in [
+        ("SELECT count(*) FILTER (WHERE email LIKE 'a%') FROM customers", NyCode::BlindOperation),
+        ("SELECT count(*) FILTER (WHERE tax_id = '1') FROM tickets", NyCode::MaskedExpression),
+        ("SELECT min(email) FILTER (WHERE true) FROM customers", NyCode::BlindOperation),
+        ("SELECT sum(email) FILTER (WHERE id = 1) FROM customers", NyCode::BlindOperation),
+        ("SELECT lower('x') FILTER (WHERE true)", NyCode::NotAnalysable),
+        ("SELECT $1, count(*) FILTER (WHERE email = $1) FROM customers", NyCode::BlindOperation),
+    ] {
+        assert_eq!(plan(sql).unwrap_err().code, code, "{sql}");
+    }
+    let domain = DomainName("email".into());
+    let sql = "SELECT count(*) FILTER (WHERE email = 'tok_email_a') FROM customers";
+    let result = plan(sql).unwrap();
+    assert!(matches!(result.inputs.as_slice(),
+        [InputRewrite::DecryptLiteral { span, domain: d, ty: ColumnType::Text }]
+            if &sql[span.start..span.end] == "'tok_email_a'" && d == &domain));
+    let sql = "SELECT count(*) FILTER (WHERE email = $1) FROM customers";
+    assert_eq!(
+        plan(sql).unwrap().inputs,
+        [InputRewrite::DecryptParam { index: 1, domain, ty: ColumnType::Text }]
+    );
+}
+
+#[test]
+fn extract_accepts_plain_values_and_rejects_protected_inputs() {
+    let (snapshot, policy) = analyser_shapes_fixture();
+    let plan = |sql| {
+        let s = PgLowering.lower(sql, &snapshot, &policy, &[])?.remove(0);
+        crate::ir::check::check(&s, &policy, &snapshot)
+    };
+    for sql in [
+        "SELECT extract(epoch FROM resolved_at - created_at) FROM tickets",
+        "SELECT extract(year FROM created_at) FROM tickets",
+        "SELECT pg_catalog.extract('year', created_at) FROM tickets",
+        "SELECT date_part('year', created_at) FROM tickets",
+    ] {
+        assert_eq!(plan(sql).unwrap().outputs, [OutputRewrite::Pass], "{sql}");
+    }
+    for (sql, code) in [
+        ("SELECT extract(year FROM date_of_birth) FROM tickets", NyCode::MaskedExpression),
+        ("SELECT extract(year FROM blind_at) FROM tickets", NyCode::BlindOperation),
+        ("SELECT extract(epoch FROM blind_at - created_at) FROM tickets", NyCode::BlindOperation),
+        ("SELECT date_part('year', blind_at) FROM tickets", NyCode::BlindOperation),
+    ] {
+        assert_eq!(plan(sql).unwrap_err().code, code, "{sql}");
+    }
+}
+
+#[test]
+fn case_with_blind_branch_is_still_an_operation_refusal() {
+    let (snapshot, policy) = fixture();
+    let s = lower("SELECT CASE WHEN id > 0 THEN email ELSE 'x' END FROM customers");
+    assert_eq!(
+        crate::ir::check::check(&s, &policy, &snapshot).unwrap_err().code,
+        NyCode::BlindOperation
+    );
 }
