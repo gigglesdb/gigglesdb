@@ -186,9 +186,18 @@ async fn wire_never_reading_client_is_capped() {
     .await;
     for _ in 0..50 {
         assert_eq!(pinger.execute(ping()).await.unwrap().code, "ok");
+        wait_for(
+            "the unread connection to remain backed up while pings succeed",
+            || stats.pending_reply_bytes() > 0 && stats.queued_requests() > 0,
+        )
+        .await;
     }
     assert!(Arc::ptr_eq(&stats, &connection_stats(&f, &unread)));
-    assert!(stats.pending_reply_bytes() > 0 && stats.queued_requests() > 0);
+    wait_for(
+        "the unread connection to remain backed up after the pings",
+        || stats.pending_reply_bytes() > 0 && stats.queued_requests() > 0,
+    )
+    .await;
     let peak = stats.peak_pending_reply_bytes();
     assert!(
         peak <= 2 * MAX_RESPONSE + MAX_FRAME + HEADER_LEN,
