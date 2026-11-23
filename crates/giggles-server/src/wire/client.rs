@@ -455,11 +455,10 @@ impl Client {
     /// Prepare SQL text for reuse. Check `protocol_minor() >= 1` first.
     pub async fn prepare_sql(&mut self, sql: &str) -> io::Result<Result<u32, WireConnError>> {
         self.require_idle()?;
-        let request = WirePrepare {
-            text: sql.into(),
-            sql: Some(true),
-            ..Default::default()
-        };
+        let text = sql.into();
+        // Keep the flag local so the release-seal scan stays valid.
+        let sql = Some(true);
+        let request = WirePrepare { text, sql, ..Default::default() };
         let id = self.send_request(FrameKind::Prepare, &request).await?;
         let reply = self.reader.prepared(id).await?;
         self.pending.pop_front();
