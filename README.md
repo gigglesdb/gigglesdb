@@ -39,7 +39,7 @@ The repository also contains two sibling tools:
 | --- | --- |
 | Try SQL locally with no server | [Embedded SQL](#embedded-sql-in-three-commands) |
 | Point psql, DataGrip or an app at it | [Connect a PostgreSQL client](#connect-a-postgresql-client) |
-| Serve agents and services over mTLS, HTTPS/JSON or gRPC | [mTLS service](#run-a-mtls-service-for-agents-and-apps) |
+| Serve agents and services over the native wire, HTTPS/JSON or gRPC | [mTLS service](#run-a-mtls-service-for-agents-and-apps) |
 | Survive the loss of a machine | [Replicated cluster](#run-a-replicated-cluster) |
 | Use GigglesDB from IntelliJ | [IntelliJ run guide](scripts/README.md) |
 
@@ -139,11 +139,19 @@ More: the [server guide](crates/giggles-server/README.md), the
 ## Run a mTLS service for agents and apps
 
 `giggles-server CONFIG.json` opens an existing database and serves it over
-mutually authenticated TLS: a framed JSON protocol, a bounded PostgreSQL wire
+mutually authenticated TLS: the native wire protocol, a bounded PostgreSQL wire
 interface and, optionally, HTTPS/JSON and typed gRPC listeners. These
 listeners expose native reads, guarded writes, claims and atomic blocks
 alongside parameterized SQL and scoped task operations. Client certificates
 map to database roles; there is no password fallback and no plaintext.
+
+The native wire protocol is the lowest-overhead way to call the native API.
+It carries Protocol Buffers over one long-lived connection per session and
+lets a client pipeline requests, reuse prepared operations and send batches.
+It uses much less server CPU per request than HTTP. A SQL-role variant
+(`role_api.wire`) can also accept SCRAM sign-in over plain TCP. See the
+[native wire release notes](docs/release-notes/native-wire.md) and the
+[protocol reference](docs/reference/native-wire-protocol.md).
 
 The [server guide](crates/giggles-server/README.md#configured-mtls-service)
 walks through generating a demo database and certificates, starting the
@@ -180,7 +188,7 @@ isolation levels across a cluster.
 | Crate | What it is |
 | --- | --- |
 | [giggles-core](crates/giggles-core/README.md) | Embedded storage engine and SQL: typed tables, composite keys, transactions, scans, joins, aggregates, `EXPLAIN` |
-| [giggles-server](crates/giggles-server/README.md) | Network server: PostgreSQL wire, framed JSON, HTTPS/JSON and gRPC |
+| [giggles-server](crates/giggles-server/README.md) | Network server: PostgreSQL wire, native wire, HTTPS/JSON and gRPC |
 | [giggles-cli](crates/giggles-cli/README.md) | Embedded SQL shell with JSON and table output |
 | [giggles-language](crates/giggles-language/README.md) | Native embedded query language frontend |
 | [giggles-replication](crates/giggles-replication/README.md) | Three-voter Raft replication |

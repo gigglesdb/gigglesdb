@@ -4,8 +4,13 @@ The optional interfaces expose `giggles_core::operations` as typed requests and
 atomic blocks. Clients send structured operations, expressions, or native language text; SQL
 is an additional interface. Both use the same database, persistent transaction,
 mTLS certificate bindings, task accounting and admission limits as the native
-and PostgreSQL listeners. HTTP supports HTTP/1.1 and HTTP/2 over TLS. gRPC requires
+wire and PostgreSQL listeners. HTTP supports HTTP/1.1 and HTTP/2 over TLS. gRPC requires
 HTTP/2 over TLS. This remains a single-host preview.
+
+The same requests also run over the native wire protocol, which costs much less
+server CPU per request and supports pipelining, prepared handles and batches.
+See the [native wire protocol reference](../../docs/reference/native-wire-protocol.md)
+and [choosing a transport](../../docs/release-notes/native-wire.md#choosing-a-transport).
 
 Design: [DD-0056](https://app.archdocs.io/design-docs/f82329f8-0d03-4077-b584-9b2579b941d9).
 The executable contract is [giggles.proto](proto/giggles/v1/giggles.proto), with
