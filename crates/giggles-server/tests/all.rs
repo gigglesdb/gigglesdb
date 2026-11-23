@@ -155,6 +155,8 @@ mod npgsql_get_schema_network;
 mod logical_columns;
 #[path = "mixed_catalog_app_query.rs"]
 mod mixed_catalog_app_query;
+#[path = "sql_column_types.rs"]
+mod sql_column_types;
 #[path = "sql_cursors_network.rs"]
 mod sql_cursors_network;
 #[path = "transaction_isolation_reporting.rs"]

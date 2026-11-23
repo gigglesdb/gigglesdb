@@ -1364,6 +1364,11 @@
               "type": "string"
             }
           },
+          "column_types": {
+            "type": "array",
+            "items": { "type": "integer", "format": "uint32", "minimum": 0, "maximum": 4294967295 },
+            "description": "PostgreSQL type OID per column, parallel to `columns`, as the PostgreSQL listener's RowDescription reports it. Empty when `columns` is empty."
+          },
           "rows": {
             "type": "array",
             "items": {

@@ -252,6 +252,14 @@ states are `TRANSACTION_STATE_IDLE`, `TRANSACTION_STATE_IN_TRANSACTION` and
 `57014` or `GD001` remain HTTP 200 / gRPC OK: always inspect `code`.
 Task responses never recover denied fields from the submitted request.
 
+SQL results in `sql` contain column names in `columns` and PostgreSQL type OIDs
+in `column_types`, parallel to those names and equal to the PostgreSQL listener's
+RowDescription OIDs. HTTP encodes `column_types` as an array of unsigned numbers;
+gRPC uses repeated uint32. These are type OIDs only, without typmods (for example,
+VARCHAR length or NUMERIC precision/scale). An empty query result still includes
+its column names and types. DDL and DML without RETURNING have no columns and no
+types. Older replies that omit `column_types` decode as an empty list.
+
 `operationOutcome` preserves column names, typed rows and their real versions,
 `matched`, `affected`, `changed`, `complete`, and optional `conflictResults`.
 `transactionOutcome` has per-step summaries and typed emitted values; summary

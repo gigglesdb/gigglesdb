@@ -557,11 +557,78 @@ impl Serialize for JsonRows<'_> {
         seq.end()
     }
 }
+/// Decode the SQL result object in an HTTP reply. Older replies may omit OIDs.
+pub fn decode_sql_result(bytes: &[u8]) -> Result<proto::SqlResult, ApiError> {
+    let mut object = Object::new(parse(bytes)?)?;
+    let columns = object
+        .optional("columns")
+        .map(array)
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .map(text)
+        .collect::<Result<Vec<_>, _>>()?;
+    let column_types = object
+        .optional("column_types")
+        .map(array)
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .map(uint32)
+        .collect::<Result<Vec<_>, _>>()?;
+    if !column_types.is_empty() && column_types.len() != columns.len() {
+        return Err(ApiError::InvalidArgument);
+    }
+    let rows = object
+        .optional("rows")
+        .map(array)
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| {
+            let mut row = Object::new(row)?;
+            let values = row
+                .optional("values")
+                .map(array)
+                .transpose()?
+                .unwrap_or_default()
+                .into_iter()
+                .map(decode_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            let version = row
+                .optional("version")
+                .map(uint)
+                .transpose()?
+                .unwrap_or_default();
+            row.finish()?;
+            Ok(proto::SqlRow { values, version })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let affected = object
+        .optional("affected")
+        .map(uint)
+        .transpose()?
+        .unwrap_or_default();
+    object.finish()?;
+    Ok(proto::SqlResult {
+        columns,
+        column_types,
+        rows,
+        affected,
+    })
+}
+
 struct JsonSql<'a>(&'a proto::SqlResult);
 impl Serialize for JsonSql<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(3))?;
+        if !self.0.column_types.is_empty() && self.0.column_types.len() != self.0.columns.len() {
+            return Err(S::Error::custom(
+                "column_types must be empty or parallel to columns",
+            ));
+        }
+        let mut map = serializer.serialize_map(Some(4))?;
         map.serialize_entry("columns", &self.0.columns)?;
+        map.serialize_entry("column_types", &self.0.column_types)?;
         map.serialize_entry("rows", &JsonRows(&self.0.rows))?;
         map.serialize_entry("affected", &Decimal(self.0.affected))?;
         map.end()
@@ -918,6 +985,49 @@ mod tests {
             value["transactionState"],
             "TRANSACTION_STATE_IN_TRANSACTION"
         );
+    }
+
+    #[test]
+    fn sql_column_types_round_trip_and_legacy_default() {
+        for types in [vec![], vec![23, 25]] {
+            let sql = proto::SqlResult {
+                columns: vec!["id".into(), "body".into()],
+                column_types: types,
+                rows: vec![proto::SqlRow {
+                    values: vec![
+                        proto::Value {
+                            value: Some(proto::value::Value::IntValue(1)),
+                        },
+                        proto::Value {
+                            value: Some(proto::value::Value::TextValue("text".into())),
+                        },
+                    ],
+                    version: 0,
+                }],
+                affected: 0,
+            };
+            let bytes = encode(&JsonSql(&sql), crate::MAX_RESPONSE).unwrap();
+            assert_eq!(decode_sql_result(&bytes).unwrap(), sql);
+        }
+        assert!(
+            decode_sql_result(br#"{"columns":["id"],"rows":[],"affected":"0"}"#)
+                .unwrap()
+                .column_types
+                .is_empty()
+        );
+        assert_eq!(
+            decode_sql_result(br#"{}"#).unwrap(),
+            proto::SqlResult::default()
+        );
+        for types in ["[23,25]", "[-1]", "[4294967296]", "[1.5]", "[\"23\"]"] {
+            let bytes = format!("{{\"columns\":[\"id\"],\"column_types\":{types}}}");
+            assert!(decode_sql_result(bytes.as_bytes()).is_err(), "{types}");
+        }
+        let invalid = proto::SqlResult {
+            column_types: vec![23],
+            ..Default::default()
+        };
+        assert!(encode(&JsonSql(&invalid), crate::MAX_RESPONSE).is_err());
     }
 
     #[test]
