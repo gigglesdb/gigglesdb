@@ -1413,10 +1413,12 @@ fn process_group(
     }
     #[cfg(any(test, feature = "test-commit-sync"))]
     let sync_hook = shared.sync_hook.lock().unwrap().clone();
+    #[cfg(test)]
+    let wrote_batch = !batch.is_empty();
     #[cfg(any(test, feature = "test-commit-sync"))]
     // Serializable read-only commits also queue behind this sequencer.
     // Let the test seam stall those empty batches without adding a real write.
-    let sync_result = match sync_hook.map(|hook| hook.before_sync()) {
+    let sync_result = match sync_hook.as_ref().map(|hook| hook.before_sync()) {
         Some(crate::commit_sync_hook::SyncOutcome::Fail) => {
             Err(super::kv::KvError::Io("injected commit Sync error".into()))
         }
@@ -1437,6 +1439,10 @@ fn process_group(
         }
         for reply in counters { let _ = reply.send(Err(error.clone())); }
         return true;
+    }
+    #[cfg(test)]
+    if wrote_batch && let Some(hook) = sync_hook {
+        hook.after_sync();
     }
     *features = pending_features;
     *subversion = pending_subversion;

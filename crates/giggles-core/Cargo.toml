@@ -36,6 +36,8 @@ unicode-normalization = "=0.1.26"
 
 [dev-dependencies]
 giggles-model = { path = "../giggles-model" }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "2", features = ["full", "visit"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2"

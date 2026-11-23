@@ -35,6 +35,48 @@ fn store(seq: &Arc<Sequencer>, locks: &Arc<LockManager>, id: u64, k: &[u8], v: &
     t.put(Keyspace::Rows, k.to_vec(), v.to_vec()).unwrap();
     t.commit().unwrap()
 }
+
+fn latest_metadata_waits_for_publication(
+    ks: Keyspace,
+    key: &[u8],
+    read: impl Fn(&Transaction, &[u8]) -> Result<Option<Vec<u8>>, TxnError>,
+) {
+    let (_, seq, locks) = setup(SequencerConfig::default());
+    let mut seed = txn(&seq, &locks, 1, Isolation::ReadCommitted);
+    seed.put(ks, key.to_vec(), b"old".to_vec()).unwrap();
+    let published = seed.commit_then(|_| Ok(())).unwrap();
+    let reader = txn(&seq, &locks, 2, Isolation::ReadCommitted);
+    let mut writer = txn(&seq, &locks, 3, Isolation::ReadCommitted);
+    writer.put(ks, key.to_vec(), b"new".to_vec()).unwrap();
+
+    let hook = crate::CommitSyncHook::before_publish();
+    seq.set_sync_hook(Some(hook.clone()));
+    let worker = thread::spawn(move || writer.commit_then(|_| Ok(())));
+    let entered = hook.wait_entered(Duration::from_secs(10));
+    let visible = seq.visible_ts();
+    let physical = mvcc::latest_version(seq.kv(), ks, key);
+    let while_paused = read(&reader, key);
+    hook.release(false);
+    let committed = worker.join().unwrap().unwrap();
+
+    assert!(entered, "writer never reached the publication hook");
+    assert_eq!(visible, published);
+    assert_eq!(physical.unwrap(), Some((committed, Some(b"new".to_vec()))));
+    assert_eq!(while_paused.unwrap(), Some(b"old".to_vec()));
+    assert_eq!(read(&reader, key).unwrap(), Some(b"new".to_vec()));
+}
+
+#[test]
+fn catalog_latest_committed_uses_the_published_version() {
+    let key = super::super::catalog_codec::name_key("test_table");
+    latest_metadata_waits_for_publication(Keyspace::Catalog, &key, Transaction::catalog_latest_committed);
+}
+
+#[test]
+fn kernel_latest_committed_uses_the_published_version() {
+    latest_metadata_waits_for_publication(Keyspace::Kernel, &[9], Transaction::kernel_latest_committed);
+}
+
 #[test]
 fn isolation_snapshots_and_own_overlay() {
     let (_, seq, locks) = setup(SequencerConfig::default());

@@ -60,6 +60,15 @@ pub(crate) fn latest_version(
     version_at(kv, ks, user_key, Ts(u64::MAX))
 }
 
+pub(crate) fn latest_committed_at_most(
+    kv: &dyn KvRead,
+    ks: Keyspace,
+    user_key: &[u8],
+    bound: Ts,
+) -> Result<Option<Version>, TxnError> {
+    version_at(kv, ks, user_key, bound)
+}
+
 fn version_at(
     kv: &dyn KvRead,
     ks: Keyspace,

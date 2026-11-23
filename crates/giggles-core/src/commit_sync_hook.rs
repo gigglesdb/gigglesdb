@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 pub struct CommitSyncHook {
     state: Mutex<State>,
     changed: Condvar,
+    #[cfg(test)]
+    pause_before_publish: bool,
 }
 #[derive(Default)]
 struct State {
@@ -24,6 +26,14 @@ pub(crate) enum SyncOutcome {
 impl CommitSyncHook {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+    /// Pause a successful nonempty Sync batch before publication.
+    #[cfg(test)]
+    pub(crate) fn before_publish() -> Arc<Self> {
+        Arc::new(Self {
+            pause_before_publish: true,
+            ..Self::default()
+        })
     }
     pub fn wait_entered(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
@@ -56,6 +66,21 @@ impl CommitSyncHook {
     }
 
     pub(crate) fn before_sync(&self) -> SyncOutcome {
+        #[cfg(test)]
+        if self.pause_before_publish {
+            return SyncOutcome::Proceed;
+        }
+        self.pause()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn after_sync(&self) {
+        if self.pause_before_publish {
+            self.pause();
+        }
+    }
+
+    fn pause(&self) -> SyncOutcome {
         let mut state = self.state.lock().unwrap();
         state.entered = true;
         self.changed.notify_all();

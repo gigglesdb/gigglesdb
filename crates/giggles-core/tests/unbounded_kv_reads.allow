@@ -1,0 +1,136 @@
+# Relative source path, containing function, call name, exact count, and justification.
+relational.rs execute_statement_inner get 3 | Logical row source reads use the caller's snapshot or transient statement image.
+relational/query.rs bind_with_subqueries get 3 | Logical row source reads use the caller's snapshot or transient statement image.
+relational/query.rs eval_with_subqueries get 3 | Logical row source reads use the caller's snapshot or transient statement image.
+relational/query.rs execute_context get 1 | Logical row source reads use the caller's snapshot or transient statement image.
+relational/query.rs fetch_cursor get 1 | Logical row source reads use the caller's snapshot or transient statement image.
+relational/query.rs infer_with_subqueries get 1 | Logical row source reads use the caller's snapshot or transient statement image.
+relational/query.rs join_rows get 1 | Logical row source reads use the caller's snapshot or transient statement image.
+relational/query/derived.rs materialize_derived get 1 | Logical row source reads use the caller's snapshot or transient statement image.
+relational/query/plan/correlation.rs get get 1 | Logical row source reads use the caller's snapshot or transient statement image.
+relational/query/plan/cte.rs get get 1 | Logical row source reads use the caller's snapshot or transient statement image.
+relational/query/plan/mutation.rs get get 1 | Logical row source reads use the caller's snapshot or transient statement image.
+relational/row_sink.rs execute_with_sink_actions get 1 | Logical row source reads use the caller's snapshot or transient statement image.
+relational/scan.rs contains get 1 | Logical row source reads use the caller's snapshot or transient statement image.
+relational/scan.rs get get 1 | Logical row source reads use the caller's snapshot or transient statement image.
+storage/cursor.rs index_scan get 1 | Cursor row-source lookup uses the cursor's pinned snapshot.
+storage/engine/catalog.rs range_batch_needs_wide_catalog load_view_until@MAX 1 | Only RangeKv batch construction uses this range-apply read. Range stores never pipeline.
+storage/engine/catalog.rs resolve_inner get 2 | Transaction::get reads the selected MVCC snapshot.
+storage/engine/commit.rs load_features get 1 | Reads the initial features before the sequencer starts.
+storage/engine/commit.rs load_subversion get 1 | Reads the initial format version before the sequencer starts.
+storage/engine/commit.rs open_with_holder get 1 | Recovers the fence before starting the sequencer.
+storage/engine/commit.rs read_last_commit_ts get 1 | Reads the recovery timestamp before starting the sequencer.
+storage/engine/commit.rs validate_counter latest_version 1 | Sequencer validation includes every applied predecessor and the current group overlay.
+storage/engine/commit.rs validate_highwater get 1 | Sequencer validation compares against prior applied and staged highwaters.
+storage/engine/content_check.rs check range 2 | Engine format validation reads a recovery or export image.
+storage/engine/content_check.rs check_protected_kernel range 2 | Engine format validation reads a recovery or export image.
+storage/engine/gc.rs open get 1 | Recovers GC's dedicated watermark, written by the GC state owner.
+storage/engine/gc.rs reclaim_table range 1 | A dropped, non-reused prefix is reclaimed only below the durable watermark.
+storage/engine/gc.rs step get 1 | GC's own progress cursor is serialized by its work mutex.
+storage/engine/gc.rs step range 2 | Physical maintenance only deletes versions at or below its visibility-bounded watermark.
+storage/engine/indexes.rs entries_for get 1 | Memory lookup of catalog-derived predicate metadata.
+storage/engine/indexes.rs visit_page get 1 | Transaction::get reads the selected MVCC snapshot.
+storage/engine/kernel.rs lock latest_version 1 | The reader and stamp writers take KERNEL AccessExclusive through acknowledgment.
+storage/engine/kernel.rs probe get 2 | Transaction::get reads the selected MVCC snapshot.
+storage/engine/kv.rs first_in first_in 2 | The Kv adapter implements or delegates a raw primitive for its caller to constrain.
+storage/engine/kv.rs first_in range 1 | The Kv adapter implements or delegates a raw primitive for its caller to constrain.
+storage/engine/kv.rs get get 3 | The Kv adapter implements or delegates a raw primitive for its caller to constrain.
+storage/engine/kv.rs range range 3 | The Kv adapter implements or delegates a raw primitive for its caller to constrain.
+storage/engine/kv.rs seek_ge range 1 | The Kv adapter implements or delegates a raw primitive for its caller to constrain.
+storage/engine/kv.rs seek_ge seek_ge 3 | The Kv adapter implements or delegates a raw primitive for its caller to constrain.
+storage/engine/meta.rs fixed get 1 | Engine format validation reads a recovery or export image.
+storage/engine/meta.rs live_role_bootstrap_entries range 1 | Engine format validation reads a recovery or export image.
+storage/engine/meta.rs optional get 1 | Engine format validation reads a recovery or export image.
+storage/engine/meta.rs validate_meta get 4 | Engine format validation reads a recovery or export image.
+storage/engine/meta.rs validate_meta range 1 | Engine format validation reads a recovery or export image.
+storage/engine/mvcc.rs new range 1 | VersionedRange filters both directions against its supplied timestamp.
+storage/engine/mvcc.rs version_at first_in 1 | The encoded seek starts at the caller's timestamp and stays inside one user key.
+storage/engine/native_content.rs check range 2 | Format validation scans a recovery or export image.
+storage/engine/native_content.rs load latest_version 1 | Sequencer validation reads applied predecessors. Format validation uses its supplied image.
+storage/engine/rows.rs get get 1 | Transaction::get reads the selected MVCC snapshot.
+storage/engine/seq.rs highwater get 1 | The per-allocator mutex and extension acknowledgment serialize the separate nine-byte key.
+storage/engine/ssi_validate.rs validate_kv latest_version 1 | Sequencer SSI point validation includes every applied predecessor.
+storage/engine/ssi_validate.rs validate_kv range 1 | Sequencer SSI interval validation includes every applied predecessor.
+storage/engine/txn.rs catalog_latest_committed latest_committed_at_most 2 | The local path uses sequencer visibility. The routed path uses the oracle timestamp supplied to the same reader.
+storage/engine/txn.rs changed_since latest_version 2 | The only caller treats an early positive as a retryable FK conflict.
+storage/engine/txn.rs kernel_latest_committed latest_committed_at_most 1 | The local Kernel read is bounded by sequencer visibility.
+storage/engine/txn.rs lock_for_write latest_version 1 | The local transaction enforces the same Exclusive Row or Unique lock for every staged version.
+storage/engine/txn.rs lock_sql_row latest_committed_at_most 1 | The KEY SHARE fallback uses the sequencer visibility captured after taking the row-key lock.
+storage/engine/txn.rs lock_sql_row latest_version 1 | KEY SHARE caps the RC value at visible. Other row modes conflict with Exclusive Row writers.
+storage/engine/xact.rs status get 1 | The live-XID mutex excludes commit-marker reads until transaction drop after acknowledgment.
+storage/native_once/v2.rs read_v2_ledger get 2 | Transaction::get reads the selected MVCC snapshot.
+storage/native_once/v2_migrate.rs ledger_header get 1 | Transaction::get reads the selected MVCC snapshot.
+storage/native_once/v2_migrate.rs shared_record get 1 | Transaction::get reads the selected MVCC snapshot.
+storage/native_once/v2_migrate.rs stage_outcome get 1 | Transaction::get reads the selected MVCC snapshot.
+storage/range/engine.rs check_role_bootstrap get 1 | Range startup checks the installed format before opening its sequencer.
+storage/range/engine.rs open get 1 | Range startup recovers the install state before opening its sequencer.
+storage/range/engine.rs reinstall_prepared range 1 | Range startup restores durable prepared records and their locks.
+storage/range/engine/home_log.rs fresh_incarnation get 1 | The home log reads its own Raft-applied transaction records.
+storage/range/engine/home_log.rs get get 1 | The home log reads its own Raft-applied transaction records.
+storage/range/engine/home_log.rs list range 1 | The home log reads its own Raft-applied transaction records.
+storage/range/engine/locking.rs lock_target latest_version 1 | Routed lock grants use the range's Raft-applied image and key locks.
+storage/range/engine/read.rs scan_page range 1 | Routed reads pass the reservation gate and filter versioned entries at request time.
+storage/range/engine/reclaim.rs first_id range 1 | Physical maintenance discovers a prefix. A routed catalog read at the GC floor authorizes deletion.
+storage/range/export.rs check_row_files range 1 | Reads an install image while validating it before ingest.
+storage/range/export.rs export range 1 | Range snapshot transport copies Raft-applied state.
+storage/range/export.rs needs_snapshot get 1 | Install recovery checks its own durable install record.
+storage/range/export.rs node_subversion get 1 | Range installation checks the node's stored format.
+storage/range/export.rs recover_installs range 1 | Startup recovers interrupted range snapshot installs.
+storage/range/kv.rs first_in first_in 2 | The RangeKv adapter delegates the storage primitive without setting visibility policy.
+storage/range/kv.rs get get 3 | The RangeKv adapter delegates the storage primitive without setting visibility policy.
+storage/range/kv.rs range range 2 | The RangeKv adapter delegates the storage primitive without setting visibility policy.
+storage/range/kv.rs seek_ge seek_ge 2 | The RangeKv adapter delegates the storage primitive without setting visibility policy.
+storage/range/kv.rs write get 1 | Raft batch construction reconciles the applied node feature mask.
+storage/range/oracle.rs lease get 1 | The system-range lease mutex serializes this Raft-applied allocator key.
+storage/range/oracle.rs read_u64 get 1 | Oracle startup reads the last Raft-applied timestamp reservation.
+storage/range/oracle/sequence.rs sequence_op get 2 | The system-range sequence mutex serializes counter operations through their durable acknowledgment.
+storage/range/oracle/sequence.rs sequence_op latest_version 1 | System-range RPCs resolve definitions against Raft-applied catalog state and validate the requested incarnation.
+storage/range/size.rs walk range 1 | Split policy counts physical bytes for maintenance without returning row values.
+storage/range/split.rs check_split_key seek_ge 1 | Range split maintenance verifies a physical split boundary.
+storage/range/split.rs child_route get 1 | Reads Raft-owned split routing metadata.
+storage/range/split.rs local_keys range 1 | Range split maintenance transfers its Raft-owned metadata records.
+storage/range/store.rs apply_entry get 1 | Raft apply checks metadata from the prior applied state.
+storage/range/store.rs create_range get 1 | Raft membership checks a range descriptor before creating it.
+storage/range/store.rs directory_regression range 1 | Raft apply compares the proposed directory version against prior applied versions.
+storage/range/store.rs next_entry get 1 | Raft replay loads its own buffered log entry.
+storage/range/store.rs ranges range 1 | Raft recovery enumerates durable range descriptors.
+storage/range/store.rs read_applied get 1 | Raft recovery reads the persisted apply index.
+storage/range/store.rs read_descriptor get 1 | Reads the range descriptor owned by Raft membership.
+storage/range/store.rs union_node_features get 1 | Raft apply merges features with the prior applied state.
+storage/reclaim.rs reclaim_storage latest_version 1 | Reclaim skips versions above the visible horizon and any registered builder's prefixes.
+storage/reclaim.rs reclaim_storage seek_ge 1 | Discovers prefixes. The catalog horizon and builder registry authorize deletion.
+storage/replicated.rs applied get 1 | Raft recovery reads the persisted apply index.
+storage/replicated.rs first_in first_in 1 | The replicated KV adapter delegates the raw primitive for its caller to constrain.
+storage/replicated.rs get get 1 | The replicated KV adapter delegates the raw primitive for its caller to constrain.
+storage/replicated.rs range range 1 | The replicated KV adapter delegates the raw primitive for its caller to constrain.
+storage/replicated.rs seek_ge seek_ge 1 | The replicated KV adapter delegates the raw primitive for its caller to constrain.
+storage/roles_engine.rs reconcile_tables range 1 | Local writers and DDL take ROLE_LOCK AccessExclusive. Routed role DDL also takes the Exclusive sentinel.
+storage/upgrade.rs verify get 2 | Upgrade verifies its private destination before activation.
+storage/v2_export.rs export_inner get 2 | P1 defers the export fence. Local export reads metadata from its physical snapshot.
+storage/v2_export.rs export_inner range 2 | P1 defers the export fence. Local export reads counters and checks Kernel in its physical snapshot.
+storage/v2_export.rs get range 1 | The import verifier reads staged export records through an in-memory adapter.
+storage/v2_sql.rs execute_v2_inner get 1 | Transaction::get reads the selected MVCC snapshot.
+storage/v2_sql.rs fk_key_changed_since range 1 | The raw witness check can only add a retryable FK conflict.
+storage/v2_sql_sequences.rs callback get 1 | Transaction::get reads the selected MVCC snapshot.
+storage/v2_sql_sequences.rs committed_value get 1 | The slot drains earlier acknowledgments and the published catalog excludes a DDL counter for an unpublished incarnation. RESTART or rewrite DDL can delete the old incarnation's key before publication. A cold slot then reads None, which forces a synchronous write_counter that validate_counter rejects with SequenceGone.
+task/approval.rs current_row get 1 | Transaction::get reads the selected MVCC snapshot.
+task/approval.rs load_approval get 1 | Transaction::get reads the selected MVCC snapshot.
+task/approval.rs load_header get 1 | Transaction::get reads the selected MVCC snapshot.
+task/approval.rs show_change get 1 | Transaction::get reads the selected MVCC snapshot.
+task/approval.rs show_undo get 1 | Transaction::get reads the selected MVCC snapshot.
+task/authority.rs charge get 1 | Transaction::get reads the selected MVCC snapshot.
+task/authority.rs load_head get 1 | Transaction::get reads the selected MVCC snapshot.
+task/catalog.rs check_table_ddl range 2 | presence probe only: an unpublished kind-19 key makes the DDL take the task-catalog lock and wait for the writer's ack (conservative); must stay unbounded because schema CASCADE reaches it before its table locks. The second range reads under the writers' AccessExclusive task-catalog lock.
+task/exposure.rs build get 2 | Transaction::get reads the selected MVCC snapshot.
+task/preview.rs approval_state get 2 | Transaction::get reads the selected MVCC snapshot.
+task/preview.rs checked get 1 | Transaction::get reads the selected MVCC snapshot.
+task/preview.rs set_task_preview_def_version get 1 | Transaction::get reads the selected MVCC snapshot.
+task/preview.rs task_previews get 1 | Transaction::get reads the selected MVCC snapshot.
+task/readlog.rs verify get 1 | Transaction::get reads the selected MVCC snapshot.
+task/readlog.rs write_final get 2 | Transaction::get reads the selected MVCC snapshot.
+task/release.rs stage get 1 | Transaction::get reads the selected MVCC snapshot.
+task/release.rs task_disclosure get 1 | Transaction::get reads the selected MVCC snapshot.
+task/rows.rs get get 1 | Transaction::get reads the selected MVCC snapshot.
+task/undo.rs open_undo_header get 1 | Transaction::get reads the selected MVCC snapshot.
+task/undo.rs read_row get 1 | Transaction::get reads the selected MVCC snapshot.
+task/undo.rs undo_stage get 1 | Transaction::get reads the selected MVCC snapshot.

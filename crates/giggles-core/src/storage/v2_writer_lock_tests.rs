@@ -61,6 +61,41 @@ impl Pending {
 }
 
 #[test]
+fn key_share_reads_the_published_value_without_waiting_for_a_non_key_update() {
+    use super::engine::{codec, kv::Keyspace, mvcc, txn::Isolation};
+
+    let f = Fixture::new();
+    f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+    f.exec("INSERT INTO t VALUES(1,10)");
+    let db = f.admin().test_v2();
+    let parts = db.catalog().parts(&mut db.begin(Isolation::ReadCommitted)).unwrap();
+    let mut key = parts.tables["t"].id.to_be_bytes().to_vec();
+    key.extend(codec::pk_bytes(&[Int(1)]).unwrap());
+    let hook = crate::CommitSyncHook::before_publish();
+    f.admin().set_commit_sync_hook(Some(hook.clone()));
+    let writer = Pending::start(&f, "UPDATE t SET n=20 WHERE id=1");
+    let entered = hook.wait_entered(Duration::from_secs(10));
+    let physical = mvcc::latest_version(db.kv.as_ref(), Keyspace::Rows, &key);
+    let visible = db.sequencer.visible_ts();
+    let sql = "SELECT n FROM t WHERE id=1 FOR KEY SHARE";
+    let reader = Pending::start(&f, sql);
+    let while_paused = reader.done.recv_timeout(Duration::from_secs(10));
+    hook.release(false);
+    writer.finish().unwrap();
+    reader.worker.join().unwrap();
+    f.admin().set_commit_sync_hook(None);
+
+    assert!(entered, "writer never reached the publication hook");
+    let (ts, value) = physical.unwrap().expect("missing physical row while paused");
+    assert!(ts > visible, "paused UPDATE was already visible");
+    let record = codec::decode_row(&key, &value.expect("paused UPDATE deleted the row")).unwrap();
+    assert_eq!(record.values, vec![Int(1), Int(20)]);
+    let before = while_paused.expect("KEY SHARE waited for the non-key updater").unwrap();
+    assert_eq!(before.rows[0].values, vec![Int(10)]);
+    assert_eq!(run(&mut f.sql(), sql).rows[0].values, vec![Int(20)]);
+}
+
+#[test]
 fn distinct_primary_keys_proceed_with_first_transaction_open() {
     let f = Fixture::new();
     f.exec("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");

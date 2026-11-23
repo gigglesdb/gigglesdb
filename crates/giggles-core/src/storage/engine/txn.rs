@@ -872,18 +872,15 @@ impl Transaction {
     pub(crate) fn catalog_latest_committed(&self, key: &[u8]) -> Result<Option<Vec<u8>>, TxnError> {
         let version = match self.services() {
             TxnServices::Local { seq, .. } => {
-                mvcc::latest_version(seq.kv(), Keyspace::Catalog, key)?
+                mvcc::latest_committed_at_most(seq.kv(), Keyspace::Catalog, key, seq.visible_ts())?
             }
             TxnServices::Cluster(cluster) => {
-                // The reader holds only versions at or below a fresh oracle timestamp.
                 let ts = cluster.snapshot(self.id)?;
-                mvcc::latest_version(cluster.reader(ts).as_ref(), Keyspace::Catalog, key)?
+                mvcc::latest_committed_at_most(cluster.reader(ts).as_ref(), Keyspace::Catalog, key, ts)?
             }
         };
         Ok(version.and_then(|(_, value)| value))
     }
-    /// Latest committed Kernel value, ignoring this transaction's snapshot and
-    /// its own buffered writes (GD-0061 C6).
     /// Limits the bytes this transaction may buffer (`write_bytes`: keys and
     /// values of its pending writes) from now on; `None` lifts the limit. A
     /// `put` past it fails with `PendingWriteLimit` before anything is
@@ -891,12 +888,15 @@ impl Transaction {
     pub(crate) fn set_write_limit(&mut self, limit: Option<usize>) {
         self.write_limit = limit;
     }
+    /// Latest published Kernel value, ignoring this transaction's snapshot and
+    /// its own buffered writes (GD-0061 C6).
     pub(crate) fn kernel_latest_committed(&self, key: &[u8]) -> Result<Option<Vec<u8>>, TxnError> {
         // Protected records are local-only (GD-0061); a cluster gateway has no form yet.
         let TxnServices::Local { seq, .. } = self.services() else {
             return Err(TxnError::Unsupported);
         };
-        Ok(mvcc::latest_version(seq.kv(), Keyspace::Kernel, key)?.and_then(|(_, value)| value))
+        Ok(mvcc::latest_committed_at_most(seq.kv(), Keyspace::Kernel, key, seq.visible_ts())?
+            .and_then(|(_, value)| value))
     }
     pub(crate) fn privilege_writes(&self) -> Arc<PrivilegeWrites> { self.writes.clone() }
     pub(crate) fn catalog_writes(&self) -> impl Iterator<Item = (&Vec<u8>, &Option<Vec<u8>>)> {
@@ -1110,15 +1110,29 @@ impl Transaction {
         };
         self.lock_cleanup_needed.store(true, Ordering::Relaxed);
         self.acquire_tracked(&requested, true, deadline, cancel)?;
+        // KEY SHARE coexists with non-key updates. Use the physical latest for
+        // change detection and cap the READ COMMITTED value at publication.
+        let visible = (mode == RowLock::KeyShare && self.isolation == Isolation::ReadCommitted)
+            .then(|| seq.visible_ts());
         let latest = mvcc::latest_version(seq.kv(), Keyspace::Rows, &physical)?;
         let changed = latest.as_ref().is_some_and(|(latest, _)| *latest > ts);
         let own = self.writes.get(&(Keyspace::Rows, physical.clone()));
         if self.isolation != Isolation::ReadCommitted && changed && own.is_none() {
             return Err(TxnError::Serialization(SerializationReason::WriteConflict));
         }
-        let current = if let Some(own) = own { own.clone() }
-            else if self.isolation == Isolation::ReadCommitted { latest.and_then(|(_, v)| v) }
-            else { mvcc::read_at(snapshot_view(self.services(), &self.snapshot), Keyspace::Rows, &physical, ts)? };
+        let current = if let Some(own) = own {
+            own.clone()
+        } else if self.isolation == Isolation::ReadCommitted {
+            let version = match visible {
+                Some(bound) if latest.as_ref().is_some_and(|(ts, _)| *ts > bound) => {
+                    mvcc::latest_committed_at_most(seq.kv(), Keyspace::Rows, &physical, bound)?
+                }
+                _ => latest,
+            };
+            version.and_then(|(_, value)| value)
+        } else {
+            mvcc::read_at(snapshot_view(self.services(), &self.snapshot), Keyspace::Rows, &physical, ts)?
+        };
         Ok(WriteTarget { current, changed_since_snapshot: changed })
     }
 

@@ -608,3 +608,5 @@ mod sql_dml_sources;
 
 #[path = "window_grouping_sets.rs"]
 mod window_grouping_sets;
+#[path = "unbounded_kv_reads.rs"]
+mod unbounded_kv_reads;
