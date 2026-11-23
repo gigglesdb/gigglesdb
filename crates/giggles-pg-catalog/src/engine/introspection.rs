@@ -1,6 +1,6 @@
 use super::*;
 use Value::{Bool as B, Int as I, Null as N, Text as S};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Catalog reads performed by scalar functions, including calls made by the
 /// executor itself (for example, the visibility check in pg_get_indexdef).
@@ -15,7 +15,7 @@ pub(super) fn dependencies(name: &str, args: usize) -> &'static [&'static str] {
             "pg_namespace",
             "pg_indexes",
         ],
-        "pg_get_expr" => &["pg_attrdef", "pg_constraint"],
+        "pg_get_expr" => &["pg_attrdef", "pg_constraint", "pg_index"],
         "_regcollation_display" => &["pg_collation", "pg_namespace"],
         "pg_collation_actual_version" => &["pg_collation"],
         "_regclass_display" | "pg_table_is_visible" => &["pg_class", "pg_namespace"],
@@ -72,6 +72,7 @@ pub(super) struct Lookups<'a> {
     attributes: Option<AttributeNames<'a>>,
     constraints: Option<(catalog::Definitions<'a>, OidRows<'a>)>,
     indexes: Option<IndexDefinitions<'a>>,
+    expressions: Option<HashSet<(&'a str, i64)>>,
     visibility: Option<Visibility<'a>>,
 }
 
@@ -89,6 +90,42 @@ impl<'a> Runtime<'a> {
             self.introspection.attributes = Some(attributes);
         }
         Ok(self.introspection.attributes.as_ref().unwrap())
+    }
+
+    pub(super) fn expression_definition(&mut self, args: &[Value]) -> R<Value> {
+        let (S(expression), I(relation)) = (&args[0], &args[1]) else {
+            return Err(Error::Unsupported);
+        };
+        if self.introspection.expressions.is_none() {
+            let mut expressions = HashSet::new();
+            for (name, expression, relation) in [
+                ("pg_attrdef", "adbin", "adrelid"),
+                ("pg_constraint", "conbin", "conrelid"),
+                ("pg_index", "indpred", "indrelid"),
+            ] {
+                let catalog = &self.catalogs[name];
+                let field = |name| catalog.fields.iter().position(|f| f.name == name);
+                let (Some(expression), Some(relation)) = (field(expression), field(relation)) else {
+                    continue;
+                };
+                self.charge(catalog.rows.len())?;
+                for row in &catalog.rows {
+                    if let (S(expr), I(oid)) = (&row[expression], &row[relation]) {
+                        expressions.insert((expr.as_str(), *oid));
+                    }
+                }
+            }
+            self.introspection.expressions = Some(expressions);
+        }
+        if !self.introspection.expressions.as_ref().unwrap().contains(&(expression.as_str(), *relation)) {
+            return Err(Error::Unsupported);
+        }
+        let result = if args.get(2) == Some(&B(true)) {
+            expression.strip_prefix('(').and_then(|e| e.strip_suffix(')')).unwrap_or(expression)
+        } else {
+            expression
+        };
+        Ok(S(result.to_owned()))
     }
 
     pub(super) fn constraint_definition(&mut self, args: &[Value]) -> R<Value> {

@@ -1231,7 +1231,7 @@ fn qualified_table_without_its_schema_is_corrupt() {
         }),
     );
     assert!(matches!(
-        finish_view(view, BTreeMap::from([("missing\0t".into(), 1)])),
+        finish_view(view, BTreeMap::from([("missing\0t".into(), 1)]), None),
         Err(CoreError::Corrupt(_))
     ));
 }
@@ -1311,4 +1311,36 @@ fn referenced_key_and_birth_catalog_roundtrip_and_validation() {
     let mut entry = (*loaded.by_id[&p]).clone(); entry.primary_index_birth = Some(index);
     forged.insert(table_key(p), encode_entry(&entry).unwrap());
     assert!(matches!(load(forged), Err(CoreError::Corrupt(_))));
+}
+
+#[test]
+fn partial_index_catalog_rejects_bad_saved_predicates() {
+    use crate::relational::{Prepared, Relational};
+    let mut sql = Relational::default();
+    for text in [
+        "CREATE TABLE t(id int PRIMARY KEY, g int)",
+        "CREATE INDEX t_g ON t(g) WHERE g <> 1",
+    ] {
+        sql.execute(&Prepared::parse(text, 1, sql.epoch).unwrap(), &[], None).unwrap();
+    }
+    let (tables, ext, _, _) = sql.catalog_parts();
+    let parts = CatalogParts {
+        tables, ext, indexes: sql.secondary_descriptors_engine().to_vec(), ..Default::default()
+    };
+    let records = parts_records(&parts).unwrap();
+    let deep = (1..=75).map(|i| format!("g <> {i}")).collect::<Vec<_>>().join(" AND ");
+    for invalid in [deep, "g > 'abc'".into()] {
+        let mut descriptor = parts.indexes[0].clone();
+        descriptor.predicate.as_mut().unwrap().sql = invalid;
+        let mut records = records.clone();
+        records.insert(super::super::indexes::descriptor_key(descriptor.id),
+            super::super::indexes::encode_descriptor(&descriptor).unwrap());
+        let mem = MemKv::new();
+        let mut batch = WriteBatch::default();
+        for (key, value) in records {
+            batch.put(Keyspace::Catalog, super::super::codec::user_key_seek_at(&key, Ts(1)), mvcc::encode_live(&value));
+        }
+        mem.write(batch, Durability::Sync).unwrap();
+        assert!(matches!(load_view(&Kv::new(Arc::new(mem)), Ts(1)), Err(CoreError::Corrupt(_))));
+    }
 }

@@ -58,7 +58,7 @@ pub(crate) fn index_tuple_bytes(
         let mut component = if matches!(value, Value::Null) {
             vec![0xff]
         } else {
-            encode_key(std::slice::from_ref(value))?
+            crate::relational::secondary_index_keys::component(value)?
         };
         if *direction == Direction::Desc {
             for byte in &mut component {

@@ -399,10 +399,12 @@ fn internal_reserved_identifiers_remain_rejected_when_quoted() {
             "CREATE TABLE pg_x (id BIGINT PRIMARY KEY)",
             r#"CREATE TABLE "giggles_rowid" (id BIGINT PRIMARY KEY)"#,
             r#"CREATE TABLE safe ("giggles_rowid" BIGINT PRIMARY KEY)"#,
-            "CREATE TABLE safe (pg_x BIGINT PRIMARY KEY)",
         ] {
             error(s, sql, E::Reserved);
         }
+        // Column names follow PostgreSQL 18.6, which accepts pg_-prefixed and
+        // other internal-looking names as columns (AM-4); relation names stay reserved.
+        run(s, "CREATE TABLE safe (pg_x BIGINT PRIMARY KEY)");
     });
 }
 
@@ -419,7 +421,6 @@ fn reserved_create_names_preserve_catalog_and_quoted_case_boundary() {
         r#"CREATE TABLE "internal_x" (id int primary key)"#,
         r#"CREATE TABLE "tasks" (id int primary key)"#,
         r#"CREATE TABLE "receipts" (id int primary key)"#,
-        r#"CREATE TABLE t2 (id int primary key, "pg_col" int)"#,
     ] {
         let path = path();
         let admin = Admin::create(&path, Limits::default()).unwrap();

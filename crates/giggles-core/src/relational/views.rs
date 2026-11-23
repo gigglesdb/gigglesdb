@@ -33,8 +33,8 @@ pub(super) fn parse(p: &mut Parser) -> R<Ddl> {
     let mut columns = Vec::new();
     let query = if create {
         if p.sym('(') {
-            columns.push(p.name()?);
-            while p.sym(',') { columns.push(p.name()?); }
+            columns.push(p.column_name()?);
+            while p.sym(',') { columns.push(p.column_name()?); }
             p.punct(')')?;
         }
         p.need("as")?;

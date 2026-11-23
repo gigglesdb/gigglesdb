@@ -55,7 +55,7 @@ fn fixture(values: Vec<Vec<Value>>) -> (Relational, Descriptor) {
             table: 1,
             name: "unique_ab".into(),
             columns: vec![3, 4],
-            key_encoding: 1,
+            predicate: None, key_encoding: 1,
             unique: false,
         },
     )
@@ -197,7 +197,7 @@ fn boolean_and_integer_boundaries_use_legacy_admission() {
 }
 
 #[test]
-fn unsupported_declared_keys_reject_even_empty() {
+fn primary_and_secondary_key_types_are_admitted_separately_even_when_empty() {
     for ty in [
         DataType::Numeric,
         DataType::Real,
@@ -210,7 +210,16 @@ fn unsupported_declared_keys_reject_even_empty() {
         DataType::Interval,
     ] {
         let (mut state, d) = fixture(vec![]);
-        std::sync::Arc::make_mut(&mut state.tables).get_mut("things").unwrap().columns[1].data_type = ty;
+        let table = std::sync::Arc::make_mut(&mut state.tables).get_mut("things").unwrap();
+        table.columns[1].data_type = ty.clone();
+        if ty.is_temporal() {
+            assert!(result(&state, &d).is_ok(), "{ty:?}");
+        } else {
+            assert_eq!(error(&state, &d), SqlError::Unsupported);
+        }
+        let table = std::sync::Arc::make_mut(&mut state.tables).get_mut("things").unwrap();
+        table.columns[1].data_type = DataType::Text;
+        table.columns[0].data_type = ty;
         assert_eq!(error(&state, &d), SqlError::Unsupported);
     }
 }

@@ -192,6 +192,7 @@ fn v2_statement_classes_and_reachable_refusals() {
                 },
             )],
             resolution_error: None,
+            column_names: ColumnNamePolicy::Sql,
         }),
         1,
         0,

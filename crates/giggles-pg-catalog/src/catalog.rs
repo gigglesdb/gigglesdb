@@ -2113,7 +2113,7 @@ fn build_with_budget(
                     B(false),
                     B(true),
                     key.clone(),
-                    N,
+                    snapshot.index_predicates.get(&index.id).map_or(N, |p| s(p)),
                     N,
                     Value::Array(vec![I(0); keys.len()]),
                     Value::Array(vec![I(0); keys.len()]),
@@ -2703,7 +2703,7 @@ fn index_definition(
     keys: &[usize],
 ) -> String {
     let unique = index.is_none_or(|index| index.unique);
-    format!(
+    let mut definition = format!(
         "CREATE {}INDEX {} ON {}.{} USING btree ({})",
         if unique { "UNIQUE " } else { "" },
         quote_identifier(name),
@@ -2733,7 +2733,12 @@ fn index_definition(
             })
             .collect::<Vec<_>>()
             .join(", ")
-    )
+    );
+    if let Some(predicate) = index.and_then(|index| snapshot.index_predicates.get(&index.id)) {
+        definition.push_str(" WHERE ");
+        definition.push_str(predicate);
+    }
+    definition
 }
 
 // Copied from the committed core quoting_keywords.rs; keep category policy aligned.

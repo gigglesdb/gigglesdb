@@ -261,7 +261,7 @@ pub(super) fn map_scalar(s: &mut Scalar, f: &mut impl FnMut(&mut Scalar) -> R<()
     }
     f(s)
 }
-fn map_filter(p: &mut Filter, f: &mut impl FnMut(&mut Scalar) -> R<()>) -> R<()> {
+pub(in crate::relational::query) fn map_filter(p: &mut Filter, f: &mut impl FnMut(&mut Scalar) -> R<()>) -> R<()> {
     match p {
         Filter::Clauses(c) => {
             for p in c.filter.iter_mut().chain(&mut c.having) {

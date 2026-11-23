@@ -143,7 +143,7 @@ pub(super) fn parse(
         for set in splits(&tokens[p.at..from_at])? {
             let mut a = parse::parser(set);
             let tuple = a.tokens.first() == Some(&Token::Symbol('('));
-            let names = if tuple { a.names()? } else { vec![a.name()?] };
+            let names = if tuple { a.names()? } else { vec![a.column_name()?] };
             if a.tokens.get(a.at) != Some(&Token::Op("=".into())) {
                 return Err(SqlError::Syntax.into());
             }

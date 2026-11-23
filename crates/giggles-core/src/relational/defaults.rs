@@ -266,14 +266,14 @@ fn options(p: &mut Parser, spec: &mut SequenceSpec, parenthesized: bool, alter: 
                         .owned_by_error
                         .take()
                         .or_else(|| ident::ident(&second).err())
-                        .or_else(|| ident::ident(&column).err());
+                        .or_else(|| column_ident(&column).err());
                     Some((format!("{first}\0{second}"), column))
                 } else {
                     p.relations
                         .push(schemas::Reference::read(first.clone(), None));
                     spec.owned_by_error = ident::ident(&first)
                         .err()
-                        .or_else(|| ident::ident(&second).err());
+                        .or_else(|| column_ident(&second).err());
                     Some((first, second))
                 }
             });

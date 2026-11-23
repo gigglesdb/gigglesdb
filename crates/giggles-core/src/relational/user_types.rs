@@ -14,6 +14,7 @@ pub struct DuplicateKeyDetail {
 pub enum SqlErrorDetail {
     Text(String),
     DuplicateKey(DuplicateKeyDetail),
+    ForeignKey { key: DuplicateKeyDetail, redacted: String },
 }
 
 type SqlNotice = (String, Option<String>, Option<&'static str>);
@@ -30,7 +31,7 @@ pub(super) fn sql_error_hint(hint: &'static str) { SQL_ERROR_HINT.with(|v| *v.bo
 pub fn take_sql_error_detail() -> Option<String> {
     take_sql_diagnostic_detail().map(|detail| match detail {
         SqlErrorDetail::Text(text) => text,
-        SqlErrorDetail::DuplicateKey(detail) => detail.values,
+        SqlErrorDetail::DuplicateKey(detail) | SqlErrorDetail::ForeignKey { key: detail, .. } => detail.values,
     })
 }
 pub fn take_sql_diagnostic_detail() -> Option<SqlErrorDetail> {
@@ -39,16 +40,25 @@ pub fn take_sql_diagnostic_detail() -> Option<SqlErrorDetail> {
 /// Keep ordinary details and discard key values when the caller cannot read them.
 pub fn retain_sql_duplicate_key_detail(allowed: impl FnOnce(&DuplicateKeyDetail) -> bool) {
     let detail = take_sql_diagnostic_detail();
-    if let Some(SqlErrorDetail::DuplicateKey(key)) = &detail
-        && !allowed(key)
-    {
-        return;
-    }
+    let key = match &detail {
+        Some(SqlErrorDetail::DuplicateKey(key) | SqlErrorDetail::ForeignKey { key, .. }) => Some(key),
+        _ => None,
+    };
+    let detail = if key.is_none_or(allowed) {
+        detail
+    } else if let Some(SqlErrorDetail::ForeignKey { redacted, .. }) = detail {
+        Some(SqlErrorDetail::Text(redacted))
+    } else {
+        None
+    };
     SQL_ERROR_DETAIL.with(|v| *v.borrow_mut() = detail);
 }
 
 pub(super) fn sql_duplicate_key_detail(detail: DuplicateKeyDetail) {
     SQL_ERROR_DETAIL.with(|v| *v.borrow_mut() = Some(SqlErrorDetail::DuplicateKey(detail)));
+}
+pub(super) fn sql_foreign_key_detail(key: DuplicateKeyDetail, redacted: String) {
+    SQL_ERROR_DETAIL.with(|v| *v.borrow_mut() = Some(SqlErrorDetail::ForeignKey { key, redacted }));
 }
 pub(super) fn sql_error_detail(detail: String) {
     SQL_ERROR_DETAIL.with(|v| *v.borrow_mut() = Some(SqlErrorDetail::Text(detail)));

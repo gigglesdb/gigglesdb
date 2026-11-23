@@ -359,7 +359,7 @@ fn build(path: &Path, s: &State, roles: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<(
             put(&mut batch, Keyspace::Rows, key, value);
         }
         for (key, value) in
-            engine::indexes::entries(table, &rows, s.sql.secondary_descriptors_engine())?
+            engine::indexes::entries(Some(&s.sql), table, &rows, s.sql.secondary_descriptors_engine())?
         {
             put(&mut batch, Keyspace::Index, key, value);
         }

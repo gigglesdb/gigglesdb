@@ -33,6 +33,7 @@ impl SqlSession {
         }
         if !state.sql.secondary_descriptors_engine().iter().any(|d| {
             d.table == table.id
+                && d.predicate.is_none()
                 && request.equal.len() <= d.columns.len()
                 && request
                     .equal

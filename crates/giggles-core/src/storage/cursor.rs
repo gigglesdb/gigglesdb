@@ -421,7 +421,8 @@ impl SqlSession {
                             #[cfg(test)]
                             index_reads: std::cell::Cell::new(0),
                             indexes: catalog.parts.indexes.iter().filter(|d| {
-                                !catalog.parts.ext.column_collations.contains_key(&d.id)
+                                d.predicate.is_none()
+                                    && !catalog.parts.ext.column_collations.contains_key(&d.id)
                                     && d.columns.iter().all(|id|image.deterministic_column(*id) && image.byte_ordered(*id))
                             }).cloned().collect(),
                             kv: db.cluster_services().map_or_else(

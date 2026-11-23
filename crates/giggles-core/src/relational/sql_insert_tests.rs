@@ -1029,6 +1029,7 @@ fn sql_insert_admission_rejects_parameters_and_conflict_operands_before_copy() {
     insert.conflict = Some(Conflict {
         columns: Some(vec!["id".into()]),
         constraint: None,
+        predicate: None,
         update: None,
     });
     insert.rows[0][1] = Expr::Literal(Value::Text("x".repeat(MAX_ROW_BYTES + 1)));
@@ -1041,6 +1042,7 @@ fn sql_insert_admission_rejects_parameters_and_conflict_operands_before_copy() {
         insert.conflict = Some(Conflict {
             columns: Some(vec!["id".into()]),
             constraint: None,
+            predicate: None,
             update: Some(Update {
                 sets: vec![("email".into(), operand)],
                 guard: None,
@@ -1052,6 +1054,7 @@ fn sql_insert_admission_rejects_parameters_and_conflict_operands_before_copy() {
     insert.conflict = Some(Conflict {
         columns: Some(vec!["id".into()]),
         constraint: None,
+        predicate: None,
         update: Some(Update {
             sets: vec![(
                 "n".into(),
@@ -1077,6 +1080,7 @@ fn sql_insert_admission_cancel_at_entry_before_any_copy() {
         Some(Conflict {
             columns: None,
             constraint: None,
+            predicate: None,
             update: None,
         }),
     ] {
@@ -1220,6 +1224,7 @@ fn sql_insert_admission_witness_counters_observe_successful_boundaries() {
     insert.conflict = Some(Conflict {
         columns: Some(vec!["id".into()]),
         constraint: None,
+        predicate: None,
         update: None,
     });
     Relational::sql_insert_test_reset();

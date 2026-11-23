@@ -76,6 +76,72 @@ fn alter_matrix_matches_sql() {
     }
 }
 #[test]
+fn native_alter_reserves_new_column_names_and_native_dml_can_use_sql_columns() {
+    use giggles_language::{Bindings, Value};
+
+    for storage in storages() {
+        let (db, admin) = Database::fresh(storage);
+        let mut sql = admin.sql_session();
+        for statement in [
+            "CREATE TABLE settings (id bigint PRIMARY KEY, approvals boolean)",
+            "ALTER TABLE settings ADD COLUMN pg_x integer",
+            "CREATE INDEX settings_pg_x ON settings (pg_x)",
+            "INSERT INTO settings (id, approvals, pg_x) VALUES (1, false, 7)",
+        ] {
+            sql.execute(statement, &[], None).unwrap();
+        }
+        drop(sql);
+        drop(admin);
+
+        let admin = Admin::open(&db.0, Limits::default()).unwrap();
+        let mut sql = admin.sql_session();
+        let engine = Engine::with_version(admin.clone(), VERSION);
+        let before = admin.catalog().unwrap();
+        for statement in [
+            "alter table settings add column deliveries nullable text",
+            "alter table settings rename column pg_x to pg_new",
+        ] {
+            assert_eq!(
+                with_sql_parser_forbidden(|| engine.execute_catalog_text(statement)),
+                Err(Error::Sql { sqlstate: "0A000".into() }),
+                "{statement}"
+            );
+        }
+        assert_eq!(admin.catalog().unwrap(), before);
+
+        let native = |statement| {
+            with_sql_parser_forbidden(|| engine.execute_text(statement, &Bindings::new())).unwrap()
+        };
+        assert_eq!(
+            native("settings where id=1 select approvals,pg_x").rows[0].values,
+            [Value::Bool(false), Value::Int(7)]
+        );
+        native("insert into settings (id,approvals,pg_x) values (2,false,8)");
+        native("update settings where id=2 set approvals=true,pg_x=9");
+        let rows = sql
+            .execute(
+                "SELECT approvals, pg_x FROM settings WHERE pg_x=9",
+                &[],
+                None,
+            )
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, [Value::Bool(true), Value::Int(9)]);
+
+        // Renaming an existing reserved source to an ordinary name is valid.
+        with_sql_parser_forbidden(|| {
+            engine.execute_catalog_text("alter table settings rename column pg_x to score")
+        })
+        .unwrap();
+        assert_eq!(
+            native("settings where id=2 select score").rows[0].values,
+            [Value::Int(9)]
+        );
+    }
+}
+
+#[test]
 fn alter_schema_qualified_matches_sql() {
     for storage in storages() {
         let (_ldb, left) = Database::fresh(storage); let (_rdb, right) = Database::fresh(storage);

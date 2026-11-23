@@ -7,8 +7,11 @@ pub(crate) const COLUMN_COLLATIONS: u64 = 1 << 23;
 pub(crate) const USER_COLLATIONS: u64 = 1 << 22;
 pub(crate) const UUID_ARRAY_COLUMNS: u64 = crate::storage::engine::meta::UUID_ARRAY_COLUMNS;
 const WIDE_CATALOG: u64 = super::engine::meta::WIDE_CATALOG;
+pub(crate) const PARTIAL_INDEXES: u64 = 1 << 33;
+pub(crate) const TEMPORAL_INDEXES: u64 = 1 << 34;
 pub(super) const NEW_BITS: u64 =
-    0x3c0 | KEY_DEPENDENCY_IDENTITY | USER_COLLATIONS | COLUMN_COLLATIONS | UUID_ARRAY_COLUMNS | WIDE_CATALOG;
+    0x3c0 | KEY_DEPENDENCY_IDENTITY | USER_COLLATIONS | COLUMN_COLLATIONS | UUID_ARRAY_COLUMNS | WIDE_CATALOG
+        | PARTIAL_INDEXES | TEMPORAL_INDEXES;
 pub(super) const ROLE_BOOTSTRAP: u64 = 1 << 9;
 
 /// E1 B0b: true when CatalogExt is nonempty.
@@ -57,6 +60,9 @@ pub(super) fn feature_bits_present(s: &State) -> Result<u64, CoreError> {
         || s.native_outcomes
             .as_ref()
             .is_some_and(|n| n.contains_typed().unwrap_or(true));
+    let temporal_indexes = crate::relational::secondary_index::has_temporal_indexes(
+        s.sql.secondary_descriptors_engine(), s.sql.tables.values(),
+    );
     Ok(u64::from(typed)
         | (u64::from(s.native_outcomes.is_some()) << 1)
         | (u64::from(s.sql.has_secondary_indexes_engine()) << 2)
@@ -67,6 +73,8 @@ pub(super) fn feature_bits_present(s: &State) -> Result<u64, CoreError> {
         | (u64::from(sequence_counters_present(s)) << 8)
         | (u64::from(role_bootstrap_present(s)) << 9)
         | if wide_catalog_present(s) { WIDE_CATALOG } else { 0 }
+        | if s.sql.has_partial_indexes_engine() { PARTIAL_INDEXES } else { 0 }
+        | if temporal_indexes { TEMPORAL_INDEXES } else { 0 }
         | if !s.sql.catalog_ext().column_collations.is_empty() { COLUMN_COLLATIONS } else { 0 }
         | if !s.sql.catalog_ext().collations.is_empty() { USER_COLLATIONS } else { 0 }
         | if uuid_array_columns_present(s) { UUID_ARRAY_COLUMNS } else { 0 }
@@ -104,6 +112,9 @@ pub(super) fn decode_bits(
     }
     if import && bits & ROLE_BOOTSTRAP != 0 {
         return Err(CoreError::Unsupported);
+    }
+    if bits & (PARTIAL_INDEXES | TEMPORAL_INDEXES) != 0 && bits & 4 == 0 {
+        return Err(CoreError::Corrupt("index features require secondary indexes".into()));
     }
     if bits & NEW_BITS == 0 || (bits & (256 | KEY_DEPENDENCY_IDENTITY | USER_COLLATIONS | COLUMN_COLLATIONS) != 0 && bits & 64 == 0) {
         return Err(CoreError::Corrupt("noncanonical feature bits".into()));

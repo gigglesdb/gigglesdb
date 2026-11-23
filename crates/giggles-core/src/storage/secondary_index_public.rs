@@ -7,6 +7,30 @@ pub struct IndexInfo {
     pub name: String,
     pub columns: Vec<u64>,
     pub unique: bool,
+    pub predicate: Option<String>,
+}
+
+impl IndexInfo {
+    pub(super) fn from_descriptor(
+        state: &crate::relational::Relational,
+        d: &crate::relational::secondary_index::Descriptor,
+    ) -> Result<Self, CoreError> {
+        let predicate = if let Some(p) = &d.predicate {
+            let table = state.tables.values().find(|t| t.id == d.table)
+                .ok_or_else(|| CoreError::Corrupt("index table absent".into()))?;
+            Some(p.deparse(state, table).map_err(CoreError::Sql)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            id: d.id,
+            table: d.table,
+            name: crate::relational::split_key(&d.name).1.into(),
+            columns: d.columns.clone(),
+            unique: d.unique,
+            predicate,
+        })
+    }
 }
 
 impl Admin {
@@ -19,14 +43,8 @@ impl Admin {
                 .sql
                 .secondary_descriptors_engine()
                 .iter()
-                .map(|descriptor| IndexInfo {
-                    id: descriptor.id,
-                    table: descriptor.table,
-                    name: crate::relational::split_key(&descriptor.name).1.into(),
-                    columns: descriptor.columns.clone(),
-                    unique: descriptor.unique,
-                })
-                .collect::<Vec<_>>();
+                .map(|d| IndexInfo::from_descriptor(&s.sql, d))
+                .collect::<Result<Vec<_>, _>>()?;
             indexes.sort_by_key(|index| (index.table, index.id));
             crate::cancellation::check()?;
             Ok((s.sql.epoch, indexes))

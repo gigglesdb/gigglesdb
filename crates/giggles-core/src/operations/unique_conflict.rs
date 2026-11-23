@@ -34,6 +34,7 @@ pub(super) enum Arbiter<'a> {
     Unique(&'a Descriptor),
     /// The table's primary key.
     PrimaryKey,
+    Inferred { primary: bool, indexes: Vec<&'a Descriptor> },
     /// PK plus every unique descriptor; valid only for DO NOTHING.
     AnyUnique,
 }
@@ -51,8 +52,12 @@ struct ResolvedArbiter<'a> {
 impl ResolvedArbiter<'_> {
     fn tuple(
         &self,
+        count: usize,
         value: impl Fn(usize) -> Value,
     ) -> std::result::Result<Option<Vec<u8>>, PlanError> {
+        if self.equality.partial() {
+            return self.equality.tuple(&(0..count).map(value).collect::<Vec<_>>()).map_err(sql);
+        }
         let values = self
             .columns
             .iter()
@@ -98,7 +103,10 @@ fn tick(cancel: &mut dyn FnMut() -> bool) -> std::result::Result<(), PlanError> 
 fn sql(error: SqlError) -> PlanError {
     PlanError::Sql(error)
 }
-fn legacy(column: &ColumnDef) -> bool {
+fn supports_arbiter(column: &ColumnDef, semantics: Semantics) -> bool {
+    if semantics == Semantics::Sql {
+        return secondary_index::Kind::for_type(&column.data_type).is_some();
+    }
     matches!(
         column.data_type,
         DataType::Boolean
@@ -238,7 +246,11 @@ fn plan_unique_conflict_evaluated<'s>(
     }
     let sidecar = src.secondary_state_engine(&mut *cancel).map_err(sql)?;
     let mut targets = Vec::new();
-    let include_pk = hidden_rowid.is_none() && !matches!(arbiter, Arbiter::Unique(_));
+    let include_pk = hidden_rowid.is_none() && match &arbiter {
+        Arbiter::Unique(_) => false,
+        Arbiter::Inferred { primary, .. } => *primary,
+        _ => true,
+    };
     match arbiter {
         Arbiter::Unique(target) => {
             let descriptor = sidecar
@@ -250,12 +262,14 @@ fn plan_unique_conflict_evaluated<'s>(
                 || descriptor.columns != target.columns
                 || descriptor.key_encoding != target.key_encoding
                 || descriptor.unique != target.unique
+                || descriptor.predicate != target.predicate
             {
                 return Err(Error::Unsupported.into());
             }
             targets.push(target);
         }
         Arbiter::PrimaryKey => {}
+        Arbiter::Inferred { indexes, .. } => targets = indexes,
         Arbiter::AnyUnique => {
             targets.extend(
                 sidecar
@@ -283,13 +297,13 @@ fn plan_unique_conflict_evaluated<'s>(
                 .iter()
                 .position(|column| column.id == *id)
                 .ok_or(Error::Unsupported)?;
-            if !legacy(&table.columns[index]) {
+            if !supports_arbiter(&table.columns[index], semantics) {
                 return Err(Error::Unsupported.into());
             }
             columns.push(index);
         }
         arbiters.push(ResolvedArbiter {
-            equality: crate::relational::collation_keys::Key::new(src, table, &target.columns, Some(target.id)).map_err(sql)?,
+            equality: crate::relational::collation_keys::Key::for_index(src, table, target).map_err(sql)?,
             columns,
             descriptor: Some(target),
         });
@@ -298,7 +312,9 @@ fn plan_unique_conflict_evaluated<'s>(
     // Sidecar validation and the publisher retain their own key restrictions.
     if !include_pk {
         for index in &table.primary_key {
-            if !table.columns.get(*index).is_some_and(legacy) {
+            if !table.columns.get(*index).is_some_and(|column| {
+                !column.data_type.is_temporal() && supports_arbiter(column, semantics)
+            }) {
                 return Err(Error::Unsupported.into());
             }
         }
@@ -324,7 +340,7 @@ fn plan_unique_conflict_evaluated<'s>(
         let mut winner = None;
         let mut tuples = Vec::new();
         for arbiter in &arbiters {
-            let tuple = arbiter.tuple(|index| row[index].clone())?;
+            let tuple = arbiter.equality.tuple(row).map_err(sql)?;
             if winner.is_none()
                 && let Some(tuple) = &tuple
             {
@@ -548,7 +564,7 @@ fn plan_unique_conflict_evaluated<'s>(
             for (arbiter, prior) in arbiters.iter().zip(&mut proposed) {
                 tick(cancel)?;
                 if let Some(tuple) =
-                    arbiter.tuple(|index| value(&post, resolved, proposal, index).clone())?
+                    arbiter.tuple(table.columns.len(), |index| value(&post, resolved, proposal, index).clone())?
                 {
                     prior.insert(tuple);
                 }
@@ -834,7 +850,7 @@ impl Relational {
     ) -> std::result::Result<crate::relational::SqlResult, SqlError> {
         self.sql_conflict_engine_captured(
             table,
-            target,
+            (target.0, target.1, None),
             incoming,
             action,
             None,
@@ -851,7 +867,7 @@ impl Relational {
     pub(crate) fn sql_conflict_engine_captured(
         &mut self,
         table: &TableDef,
-        target: (Option<&[String]>, Option<&str>),
+        target: (Option<&[String]>, Option<&str>, Option<&crate::relational::partial_index::Predicate>),
         incoming: &[Vec<Value>],
         action: &ConflictAction,
         evaluation: Option<&dyn SqlConflictEvaluation>,
@@ -890,23 +906,34 @@ impl Relational {
                 })
                 .collect::<std::result::Result<BTreeSet<_>, _>>()?;
             let primary = table.primary_key.iter().copied().collect::<BTreeSet<_>>();
-            if columns == primary {
-                Arbiter::PrimaryKey
+            let primary = table.hidden_rowid().is_none() && columns == primary;
+            let ids = columns.iter().map(|index| table.columns[*index].id).collect::<BTreeSet<_>>();
+            let mut matches = Vec::new();
+            let mut has_partial = false;
+            for d in descriptors.iter().filter(|d| d.table == table.id && d.unique
+                && d.columns.iter().copied().collect::<BTreeSet<_>>() == ids)
+            {
+                if let Some(required) = &d.predicate {
+                    has_partial = true;
+                    let Some(actual) = target.2 else { continue };
+                    if !actual.implies(required, &src, table)? { continue; }
+                }
+                matches.push(d);
+            }
+            if !primary && matches.is_empty() {
+                if has_partial || target.2.is_some() {
+                    return Err(crate::relational::partial_index::missing_arbiter());
+                }
+                return Err(SqlError::Unsupported);
+            }
+            if target.2.is_none() {
+                if primary {
+                    Arbiter::PrimaryKey
+                } else {
+                    Arbiter::Unique(matches.into_iter().min_by_key(|d| d.id).expect("inferred index"))
+                }
             } else {
-                let ids = columns
-                    .iter()
-                    .map(|index| table.columns[*index].id)
-                    .collect::<BTreeSet<_>>();
-                let descriptor = descriptors
-                    .iter()
-                    .filter(|descriptor| {
-                        descriptor.table == table.id
-                            && descriptor.unique
-                            && descriptor.columns.iter().copied().collect::<BTreeSet<_>>() == ids
-                    })
-                    .min_by_key(|descriptor| descriptor.id)
-                    .ok_or(SqlError::Unsupported)?;
-                Arbiter::Unique(descriptor)
+                Arbiter::Inferred { primary, indexes: matches }
             }
         } else if let Some(name) = target.1 {
             if let Some(descriptor) = descriptors.iter().find(|descriptor| {
@@ -914,6 +941,9 @@ impl Relational {
                     && descriptor.unique
                     && crate::relational::split_key(&descriptor.name).1 == name
             }) {
+                if descriptor.predicate.is_some() {
+                    return Err(crate::relational::partial_index::missing_constraint(table, name));
+                }
                 Arbiter::Unique(descriptor)
             } else if src.primary_key_constraint_name(table).as_deref() == Some(name) {
                 Arbiter::PrimaryKey
@@ -948,7 +978,9 @@ impl Relational {
                         let mut seen = BTreeSet::new();
                         let mut assignments = Vec::new();
                         for (name, expression) in values {
-                            let index = binder.field(name)?;
+                            // SQL identifiers are already parsed and may use quoted spelling.
+                            let index = table.columns.iter().position(|column| column.name == *name)
+                                .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownColumn)))?;
                             if !seen.insert(index) {
                                 return Err(Error::Bind("duplicate assignment".into()));
                             }

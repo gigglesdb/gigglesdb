@@ -4332,7 +4332,18 @@ impl Runtime<'_> {
                 _ => return Err(Error::Type),
             },
             K::Is(e, v, neg) => B((ev(e)? == *v) ^ neg),
-            K::Cast(e, t) => cast(ev(e)?, *t)?,
+            K::Cast(e, t) => match ev(e)? {
+                Value::Array(values)
+                    if *t == PgType::Text && e.ty == PgType::Int2Vector =>
+                {
+                    let parts = values.into_iter().map(|value| match value {
+                        I(n) => Ok(n.to_string()),
+                        _ => Err(Error::Type),
+                    }).collect::<R<Vec<_>>>()?;
+                    S(parts.join(" "))
+                }
+                value => cast(value, *t)?,
+            },
             K::IntegerOid(e, source) => integer_oid(ev(e)?, *source)?,
             K::Regclass(e) => match ev(e)? {
                 N => N,
@@ -5324,14 +5335,7 @@ impl Runtime<'_> {
             .filter(|c| *c != '\0')
             .ok_or(Error::Type)?
             .to_string()),
-            "pg_get_expr" => {
-                let known = [("pg_attrdef", 3, 1), ("pg_constraint", 27, 8)].iter().any(|(name, expr, rel)|
-                    self.catalogs[*name].rows.iter().any(|r| r[*expr] == v[0] && r[*rel] == v[1]));
-                if !known { return Err(Error::Unsupported); }
-                if v.get(2) == Some(&B(true)) && let S(expr) = &v[0] {
-                    S(expr.strip_prefix('(').and_then(|e| e.strip_suffix(')')).unwrap_or(expr).into())
-                } else { v[0].clone() }
-            },
+            "pg_get_expr" => self.expression_definition(&v)?,
             "pg_relation_size" | "pg_total_relation_size" | "pg_table_size" | "pg_indexes_size" | "pg_stat_get_numscans" => {
                 if n == "pg_relation_size" && v.get(1).is_some_and(|f| !matches!(f, S(s) if matches!(s.as_str(), "main" | "fsm" | "vm" | "init"))) { return Err(Error::Unsupported); }
                 // No PostgreSQL heap/index files or scan counters are maintained.

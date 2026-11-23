@@ -66,6 +66,46 @@ fn reject_definition(admin: &Admin, engine: &Engine, request: &CatalogRequest, e
 }
 
 #[test]
+fn native_table_creation_rejects_reserved_columns() {
+    for storage in [
+        giggles_core::Engine::Legacy,
+        #[cfg(feature = "engine-rocksdb")]
+        giggles_core::Engine::V2,
+    ] {
+        let path = common::fresh("native-reserved-columns");
+        let admin = Admin::create_engine(&path, Limits::default(), storage).unwrap();
+        let engine = Engine::new(admin.clone());
+        let before = admin.catalog().unwrap();
+        let reserved = Error::Sql {
+            sqlstate: "0A000".into(),
+        };
+        for name in ["approvals", "pg_x"] {
+            let request = CatalogRequest::CreateTable {
+                table: "candidate".into(),
+                columns: vec![
+                    column("id", DataType::BigInt, true),
+                    column(name, DataType::BigInt, false),
+                ],
+                primary_key: vec!["id".into()],
+            };
+            reject_definition(&admin, &engine, &request, reserved.clone());
+            assert_eq!(
+                engine.execute_catalog_with_constraints(&request, &[]),
+                Err(reserved.clone())
+            );
+            assert_eq!(
+                admin.sql_session().execute_catalog_native(&request),
+                Err(reserved.clone())
+            );
+            assert_eq!(admin.catalog().unwrap(), before);
+        }
+        drop(engine);
+        drop(admin);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[test]
 fn native_index_prepare_and_execute_reject_empty_and_populated_heaps() {
     for populated in [false, true] {
         let (_, admin, engine) = database();
@@ -378,14 +418,10 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
         "repair_x",
         "internal_x",
     ] {
-        reject_definition(
-            &admin,
-            &engine,
-            &create(name),
-            Error::Sql {
-                sqlstate: "0A000".into(),
-            },
-        );
+        let reserved = Error::Sql {
+            sqlstate: "0A000".into(),
+        };
+        reject_definition(&admin, &engine, &create(name), reserved.clone());
         let request = CatalogRequest::CreateTable {
             table: "candidate".into(),
             columns: vec![
@@ -394,15 +430,22 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
             ],
             primary_key: vec!["id".into()],
         };
-        reject_definition(
-            &admin,
-            &engine,
-            &request,
-            Error::Sql {
-                sqlstate: "0A000".into(),
-            },
-        );
+        reject_definition(&admin, &engine, &request, reserved);
     }
+    let heap_marker = CatalogRequest::CreateTable {
+        table: "candidate".into(),
+        columns: vec![
+            column("id", DataType::BigInt, true),
+            column("giggles_rowid", DataType::BigInt, false),
+        ],
+        primary_key: vec!["id".into()],
+    };
+    reject_definition(
+        &admin,
+        &engine,
+        &heap_marker,
+        Error::Sql { sqlstate: "0A000".into() },
+    );
     for (columns, primary_key, expected) in [
         (vec![], vec!["id".into()], Error::Bind("columns".into())),
         (
@@ -486,14 +529,8 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
         )
         .unwrap();
     let long_column = "b".repeat(63);
-    let names = (0..MAX_COLUMNS)
-        .map(|i| {
-            if i == 0 {
-                long_column.clone()
-            } else {
-                format!("c{i}")
-            }
-        })
+    let names = std::iter::once(long_column)
+        .chain((1..MAX_COLUMNS).map(|i| format!("c{i}")))
         .collect::<Vec<_>>();
     let wide = CatalogRequest::CreateTable {
         table: "wide".into(),

@@ -144,7 +144,7 @@ fn alias(p: &mut Parser) -> R<Option<(String, Vec<String>)>> {
     let mut columns = vec![];
     if p.sym('(') {
         loop {
-            columns.push(p.name()?);
+            columns.push(p.column_name()?);
             if columns.len() > MAX_COLUMNS {
                 return Err(SqlError::Limit);
             }

@@ -47,7 +47,8 @@ use schema_binding::AuthorizationBinding;
 pub use catalog_presentation::{CatalogConstraint, CatalogPresentation, CatalogView, ForeignKeyTarget};
 use catalog_ext::*;
 mod ident;
-use ident::ident;
+use ident::{ColumnNamePolicy, ident};
+pub(crate) use ident::column_ident;
 mod like;
 mod numeric;
 mod projector_inspection;
@@ -74,12 +75,14 @@ pub(crate) mod secondary_index_access;
 mod secondary_index_adapter;
 pub(crate) use secondary_index_adapter::{BatchRowChange, UpdateUnique};
 mod secondary_index_catalog;
+pub(crate) mod secondary_index_keys;
 mod secondary_index_unique_readiness;
 pub(crate) mod secondary_unique_lookup;
 mod sql_copy;
 mod copy_encoding;
 pub use copy_encoding::CopyEncoding;
 mod sql_index;
+pub(crate) mod partial_index;
 mod sql_insert;
 pub(crate) use giggles_pg_types::temporal::Time;
 pub use giggles_pg_types::temporal::{
@@ -349,6 +352,11 @@ pub enum SqlError {
     /// XX000: transient executor invariant failure, never persisted.
     #[serde(skip)]
     InternalError,
+    #[serde(skip)]
+    InvalidIndexPredicate,
+    /// 42P02: a parameter reference where no parameters are defined.
+    #[serde(skip)]
+    UndefinedParameter,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -517,12 +525,12 @@ impl TableDef {
             .collect()
     }
 
-    // Existing catalog names may bypass ident only for the exact heap marker.
+    // Only the engine-created heap marker bypasses column-name validation.
     fn validate_column_ident(&self, index: usize) -> R<()> {
         if self.hidden_rowid() == Some(index) {
             Ok(())
         } else {
-            ident(&self.columns[index].name)
+            column_ident(&self.columns[index].name)
         }
     }
 }
@@ -1336,9 +1344,9 @@ impl Parser {
     }
     fn names(&mut self) -> R<Vec<String>> {
         self.punct('(')?;
-        let mut v = vec![self.name()?];
+        let mut v = vec![self.column_name()?];
         while self.sym(',') {
-            v.push(self.name()?);
+            v.push(self.column_name()?);
         }
         self.punct(')')?;
         Ok(v)
@@ -1514,7 +1522,7 @@ impl Parser {
                     keys = self.names()?;
                     primary_name = constraint_name;
                 } else {
-                    let name = self.name()?;
+                    let name = self.column_name()?;
                     let serial = if self.word("smallserial") || self.word("serial2") {
                         Some(DataType::SmallInt)
                     } else if self.word("serial") || self.word("serial4") {
@@ -1684,7 +1692,7 @@ impl Parser {
             self.need("set")?;
             let mut sets = vec![];
             loop {
-                let c = self.name()?;
+                let c = self.column_name()?;
                 if self.tokens.get(self.at) != Some(&Token::Op("=".into())) {
                     return Err(SqlError::Syntax);
                 }
@@ -1878,12 +1886,29 @@ pub struct Scan {
     pub reverse: bool,
     pub limit: usize,
 }
-/// Shared CREATE definition checks. SQL keeps its own nullability policy;
-/// engine catalog intents additionally reject explicitly nullable key fields.
 pub(crate) fn validate_create_definition(
     name: &str,
     columns: &[ColumnDef],
     keys: &[String],
+) -> R<()> {
+    validate_create_columns(name, columns, keys, ColumnNamePolicy::Sql)
+}
+
+pub(crate) fn validate_native_create_definition(
+    name: &str,
+    columns: &[ColumnDef],
+    keys: &[String],
+) -> R<()> {
+    validate_create_columns(name, columns, keys, ColumnNamePolicy::Native)
+}
+
+/// Shared CREATE checks. Native catalog intents preserve the original name
+/// restrictions and separately reject explicitly nullable key fields.
+fn validate_create_columns(
+    name: &str,
+    columns: &[ColumnDef],
+    keys: &[String],
+    column_names: ColumnNamePolicy,
 ) -> R<()> {
     ident(name)?;
     if columns.is_empty() || columns.len() > MAX_COLUMNS {
@@ -1895,10 +1920,10 @@ pub(crate) fn validate_create_definition(
     unique(columns.iter().map(|column| &column.name))?;
     unique(keys)?;
     for column in columns {
-        ident(&column.name)?;
+        column_names.validate(&column.name)?;
     }
     for key in keys {
-        ident(key)?;
+        column_names.validate(key)?;
         if columns.iter().any(|column| {
             column.name == *key
                 && (column.data_type.is_temporal() || column.data_type == DataType::Bpchar)
@@ -1933,7 +1958,7 @@ fn native_check_tokens(expression: &crate::operations::Expr, parent: u8) -> R<Ve
             Value::Null => vec![word("null")],
             _ => return Err(SqlError::Unsupported),
         },
-        E::Field(name) => { ident(name)?; vec![Token::QuotedIdent(name.clone())] }
+        E::Field(name) => { column_ident(name)?; vec![Token::QuotedIdent(name.clone())] }
         E::Compare(left, op, right) => {
             let mut out = native_check_tokens(left, precedence + 1)?;
             out.push(Token::Op(match op { C::Eq => "=", C::Ne => "<>", C::Lt => "<", C::Le => "<=", C::Gt => ">", C::Ge => ">=" }.into()));
@@ -2118,7 +2143,7 @@ impl Prepared {
         };
         let mut bytes = insert.table.len();
         for name in &insert.columns {
-            ident(name)?;
+            column_ident(name)?;
             if name.contains('.') { return Err(SqlError::Syntax); }
             bytes = bytes.checked_add(name.len()).ok_or(SqlError::Limit)?;
         }
@@ -2254,6 +2279,7 @@ impl Prepared {
                 columns,
                 unique: false,
                 if_not_exists: false,
+                predicate: None,
             }),
             domain,
             epoch,
@@ -2302,6 +2328,7 @@ impl Prepared {
         };
         let mut prepared = Self::engine(Statement::AlterTable(alter_table::AlterTable {
             table: table.clone(), actions: vec![action], resolution_error: None,
+            column_names: ColumnNamePolicy::Native,
         }), domain, epoch);
         prepared.relations.push(schemas::Reference::read(table, None));
         Ok(prepared)
@@ -2313,7 +2340,7 @@ impl Prepared {
         use crate::operations::{CatalogRequest as C, ConstraintSpec as S, ForeignKeyAction as F};
         let names = |columns: &[String]| -> R<()> {
             if columns.is_empty() || columns.len() > MAX_COLUMNS { return Err(SqlError::Limit); }
-            for name in columns { ident(name)?; }
+            for name in columns { column_ident(name)?; }
             Ok(())
         };
         let action = |a: F| match a { F::NoAction => catalog_ext::Action::NoAction, F::Restrict => catalog_ext::Action::Restrict, F::Cascade => catalog_ext::Action::Cascade, F::SetNull => catalog_ext::Action::SetNull, F::SetDefault => catalog_ext::Action::SetDefault };
@@ -2341,7 +2368,7 @@ impl Prepared {
             _ => return Err(SqlError::Unsupported),
         };
         ident(split_key(table).0)?; ident(split_key(table).1)?;
-        let mut prepared = Self::engine(Statement::AlterTable(alter_table::AlterTable { table: table.clone(), actions: vec![action], resolution_error: None }), domain, epoch);
+        let mut prepared = Self::engine(Statement::AlterTable(alter_table::AlterTable { table: table.clone(), actions: vec![action], resolution_error: None, column_names: ColumnNamePolicy::Sql }), domain, epoch);
         prepared.relations.push(schemas::Reference::read(table.clone(), None));
         if let Some(parent) = parent { prepared.relations.push(schemas::Reference::read(parent, None)); }
         Ok(prepared)
@@ -4452,12 +4479,15 @@ impl Relational {
                     if let Some(c)=c { column_collations::resolve_column(self,column,self.ext.columns.get(&column.id).and_then(|c|c.type_id),Some(c),&prepared.search_path).map(|r|r.or(Some(column_collations::Reference::Builtin(100)))) }
                     else {Ok(self.column_collation(column.id).cloned())}
                 }).collect::<R<Vec<_>>>()?;
+                let predicate = index.predicate.as_deref().map(|tokens|
+                    partial_index::Predicate::create(self, &table, tokens)).transpose()?;
                 self.create_secondary_index_populated_engine(
                     &table,
                     self.epoch,
                     &index.name,
                     &ids,
                     index.unique,
+                    predicate,
                     index.collations.iter().any(Option::is_some).then_some(collations.as_slice()),
                     &mut cancel,
                 )?;

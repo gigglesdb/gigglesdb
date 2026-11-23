@@ -2499,6 +2499,7 @@ include!("table_free_scalar_routing_network.inc");
 include!("deferred_routine_surface_network.inc");
 
 include!("sql_upsert_network.inc");
+include!("partial_indexes_network.inc");
 
 #[tokio::test]
 async fn datagrip_ssl_probe_reports_tls_on_certificate_listener() {
@@ -2765,3 +2766,5 @@ fn task_prototype_probes() -> Vec<proto::ExecuteRequest> {
 }
 
 include!("catalog_scale_network.inc");
+#[path = "temporal_index_network.inc"]
+mod temporal_index_network;

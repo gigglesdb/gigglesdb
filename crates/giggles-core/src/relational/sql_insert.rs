@@ -30,6 +30,7 @@ pub(super) struct LockConflict<'a> {
 struct Conflict {
     columns: Option<Vec<String>>,
     constraint: Option<String>,
+    predicate: Option<Vec<Token>>,
     update: Option<Update>,
 }
 #[derive(Debug, Clone)]
@@ -129,9 +130,9 @@ pub(super) fn claims(tokens: &[Token]) -> bool {
 
 fn names(p: &mut Parser) -> R<Vec<String>> {
     p.punct('(')?;
-    let mut names = vec![p.name()?];
+    let mut names = vec![p.column_name()?];
     while p.sym(',') {
-        names.push(p.name()?);
+        names.push(p.column_name()?);
     }
     p.punct(')')?;
     Ok(names)
@@ -248,6 +249,15 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
             p.need("constraint")?;
             constraint = Some(p.name()?);
         }
+        let predicate = if columns.is_some() && p.word("where") {
+            let tokens = partial_index::predicate_tokens(p, "do");
+            if tokens.is_empty() {
+                return Err(SqlError::Syntax);
+            }
+            Some(tokens)
+        } else {
+            None
+        };
         p.need("do")?;
         let update = if p.word("nothing") {
             None
@@ -260,7 +270,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
             let mut sets = Vec::new();
             loop {
                 let tuple = p.tokens.get(p.at) == Some(&Token::Symbol('('));
-                let targets = if tuple { names(p)? } else { vec![p.name()?] };
+                let targets = if tuple { names(p)? } else { vec![p.column_name()?] };
                 if p.tokens.get(p.at) != Some(&Token::Op("=".into())) {
                     return Err(SqlError::Syntax);
                 }
@@ -291,6 +301,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
         Some(Conflict {
             columns,
             constraint,
+            predicate,
             update,
         })
     } else {
@@ -462,6 +473,7 @@ impl Insert {
     }
     pub(super) fn lock_conflict(&self) -> Option<LockConflict<'_>> {
         let c = self.conflict.as_ref()?;
+        if c.predicate.is_some() { return None; }
         Some(LockConflict {
             columns: c.columns.as_deref(),
             constraint: c.constraint.as_deref(),
@@ -516,11 +528,15 @@ impl Insert {
         }
         let name = conflict.constraint.as_deref()?;
         if let Some(descriptor) = descriptors.iter().find(|d| d.table == table.id
-            && d.unique && split_key(&d.name).1 == name) {
+            && d.unique && d.predicate.is_none() && split_key(&d.name).1 == name) {
             return Some(descriptor.columns.iter().copied().collect());
         }
         (state.primary_key_constraint_name(table).as_deref() == Some(name))
             .then(|| table.primary_key.iter().map(|index| table.columns[*index].id).collect())
+    }
+    pub(super) fn arbiter_predicate(&self, state: &Relational, table: &TableDef) -> R<Option<partial_index::Predicate>> {
+        self.conflict.as_ref().and_then(|c| c.predicate.as_deref())
+            .map(|tokens| partial_index::Predicate::for_conflict(state, table, tokens)).transpose()
     }
     pub(super) fn updates_conflicts(&self) -> bool {
         self.conflict.as_ref().is_some_and(|c| c.update.is_some())
@@ -1587,6 +1603,7 @@ pub(super) fn execute_declared(
         incoming.push(row);
     }
     if let Some(conflict) = &insert.conflict {
+        let predicate = insert.arbiter_predicate(state, &table)?;
         let parameters = insert
             .describe(state, params.len(), declared)?
             .parameters
@@ -1629,7 +1646,7 @@ pub(super) fn execute_declared(
         let mut result = if returning.is_some() {
             state.sql_conflict_engine_captured(
                 &table,
-                (conflict.columns.as_deref(), conflict.constraint.as_deref()),
+                (conflict.columns.as_deref(), conflict.constraint.as_deref(), predicate.as_ref()),
                 &incoming,
                 &action,
                 evaluation
@@ -1642,7 +1659,7 @@ pub(super) fn execute_declared(
         } else {
             state.sql_conflict_engine_captured(
                 &table,
-                (conflict.columns.as_deref(), conflict.constraint.as_deref()),
+                (conflict.columns.as_deref(), conflict.constraint.as_deref(), predicate.as_ref()),
                 &incoming,
                 &action,
                 evaluation

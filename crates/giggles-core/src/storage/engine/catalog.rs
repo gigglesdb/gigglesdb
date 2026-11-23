@@ -92,6 +92,7 @@ pub(crate) struct CatalogView {
     pub(crate) column_collations: BTreeMap<u64, relational::column_collations::Binding>,
     pub(crate) schemas: BTreeMap<String, relational::schemas::Schema>,
     pub(crate) indexes: BTreeMap<u64, relational::secondary_index::Descriptor>,
+    index_predicates: Arc<IndexPredicateImage>,
     /// Task definitions (kind 19), live and revoked. Not part of `parts()`:
     /// SQL DDL rebuilds parts from the relational image, and tasks have
     /// their own writer, like roles.
@@ -1030,11 +1031,16 @@ impl Catalog {
             if old_records.get(key) != Some(value) || txn.catalog_own(key).is_some() {
                 let bits = super::content_check::required_bits_for_catalog_value(key, value)
                     .map_err(|e| corrupt(&e.to_string()))?;
-                // UUID arrays are admitted from the final catalog overlay.
-                txn.require_features(bits & !super::meta::UUID_ARRAY_COLUMNS);
+                // Publish UUID arrays and partial indexes from the final catalog.
+                txn.require_features(bits & !(super::meta::UUID_ARRAY_COLUMNS | super::meta::PARTIAL_INDEXES));
             }
         }
         self.lock_and_write(txn, &old_records, &new_records, deadline, cancel)?;
+        let partial = new.indexes.iter().any(|index| index.predicate.is_some());
+        let temporal = relational::secondary_index::has_temporal_indexes(
+            &new.indexes, new.tables.values(),
+        );
+        txn.set_secondary_index_features(partial, temporal);
         if !new.indexes.is_empty() {
             txn.require_features(super::meta::SECONDARY_INDEXES);
         }
@@ -1375,7 +1381,7 @@ impl Catalog {
         cancel: &dyn Fn() -> bool,
     ) -> Result<Arc<TableEntry>, CatalogError> {
         let current = self.resolve(txn, name, LockMode::AccessExclusive, deadline, cancel)?;
-        validate_identifier(&column.name)?;
+        relational::column_ident(&column.name)?;
         if current
             .def
             .columns
@@ -1505,6 +1511,12 @@ impl Catalog {
         if final_view.has_uuid_arrays() {
             txn.require_features(super::meta::UUID_ARRAY_COLUMNS);
         }
+        txn.set_secondary_index_features(
+            !final_view.index_predicates.predicates.is_empty(),
+            final_view.indexes.values().any(|index| {
+                index.has_temporal_key(&final_view.by_id[&index.table].def)
+            }),
+        );
         // A gateway's catalog commit also replaces the generation record, so other gateways
         // see that their cached catalog is stale (GD-0075 P7-1).
         let token = match self.services {
@@ -1727,7 +1739,7 @@ fn load_view_until(
         }
         apply_record(&mut view, &mut names, &key, Some(&value))?;
     }
-    finish_view(view, names).map_err(loaded_catalog_error)
+    finish_view(view, names, None).map_err(loaded_catalog_error)
 }
 /// A range leader has the final physical batch for both one-range commit
 /// and prepared finalize. All SQL catalog records live in the system range.
@@ -1759,6 +1771,79 @@ pub(crate) fn range_batch_needs_wide_catalog(
     let previous = load_view_until(kv, Ts(u64::MAX), Bound::Excluded(CLUSTER_RECORDS))?;
     Ok(overlay_view(&previous, writes.iter())?.needs_wide_catalog())
 }
+
+/// Derived, bounded predicate bindings for one catalog image.
+#[derive(Default)]
+pub(super) struct IndexPredicateImage {
+    tables: BTreeMap<u64, Arc<TableEntry>>,
+    predicates: BTreeMap<u64, (relational::secondary_index::Descriptor, relational::partial_index::BoundPredicate)>,
+}
+
+impl std::fmt::Debug for IndexPredicateImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexPredicateImage")
+            .field("tables", &self.tables.keys())
+            .field("indexes", &self.predicates.keys())
+            .finish()
+    }
+}
+
+impl PartialEq for IndexPredicateImage {
+    fn eq(&self, other: &Self) -> bool {
+        // The enclosing CatalogView compares the binding environment separately.
+        self.tables == other.tables
+            && self.predicates.values().map(|(d, _)| d)
+                .eq(other.predicates.values().map(|(d, _)| d))
+    }
+}
+
+impl IndexPredicateImage {
+    fn matches_plain_overlay(&self, view: &CatalogView, base: &CatalogView) -> bool {
+        // Complex catalog metadata can influence type and collation binding.
+        // Rebind those catalogs; plain catalogs can reuse exact descriptor and
+        // owning table definitions even when unrelated tables change.
+        [view, base].iter().all(|v| {
+            v.types.is_empty() && v.schemas.is_empty() && v.extensions.is_empty()
+                && v.collations.is_empty() && v.column_collations.is_empty()
+        }) && self.tables.iter().all(|(id, table)| view.by_id.get(id) == Some(table))
+            && self.predicates.values().map(|(d, _)| d)
+                .eq(view.indexes.values().filter(|d| d.predicate.is_some()))
+    }
+
+    pub(super) fn get(
+        &self,
+        table: &TableDef,
+        index: &relational::secondary_index::Descriptor,
+    ) -> Result<&relational::partial_index::BoundPredicate, CoreError> {
+        // TableEntry can include a schema prefix. Bound slots depend on the
+        // table identity and physical layout, regardless of the name spelling.
+        let same_layout = self.tables.get(&index.table).is_some_and(|expected| {
+            expected.def.id == table.id
+                && expected.def.columns == table.columns
+                && expected.def.primary_key == table.primary_key
+        });
+        self.predicates.get(&index.id)
+            .filter(|(descriptor, _)| descriptor == index && same_layout)
+            .map(|(_, predicate)| predicate)
+            .ok_or_else(|| corrupt("index predicate does not match catalog snapshot"))
+    }
+}
+
+// RowStore callers have no CatalogStore. Build this only for native operations
+// on partial indexes. Transaction reuses it at the same snapshot and DDL generation.
+pub(super) fn index_predicate_image(txn: &mut Transaction) -> Result<Arc<IndexPredicateImage>, CoreError> {
+    let mut view = CatalogView::default();
+    let mut names = BTreeMap::new();
+    let end = catalog_end(txn.services());
+    for record in txn.scan(Keyspace::Catalog, Bound::Unbounded, end, Direction::Forward, None)? {
+        let (key, value) = record?;
+        if key != GENERATION_KEY {
+            apply_record(&mut view, &mut names, &key, Some(&value))?;
+        }
+    }
+    finish_view(view, names, None).map(|view| view.index_predicates)
+}
+
 fn loaded_catalog_error(e: CoreError) -> CoreError {
     match e {
         CoreError::Limit => e,
@@ -1799,7 +1884,7 @@ fn overlay_view<'a>(
             }
         }
     }
-    finish_view(view, names)
+    finish_view(view, names, Some(base))
 }
 fn apply_record(
     view: &mut CatalogView,
@@ -1979,6 +2064,7 @@ fn apply_record(
 fn finish_view(
     mut view: CatalogView,
     names: BTreeMap<String, u64>,
+    base: Option<&CatalogView>,
 ) -> Result<CatalogView, CoreError> {
     let mut by_name = BTreeMap::new();
     catalog_codec::validate_comments(&view.comments, view.by_id.values().map(|entry| &entry.def), &view.sql_views)?;
@@ -2058,6 +2144,9 @@ fn finish_view(
         object_ids(&parts)?;
         relational::catalog_ext::validate_key_targets(&parts.ext, parts.tables.values(), parts.indexes.iter(), u64::MAX).map_err(|_| corrupt("invalid referenced key or primary birth"))?;
     }
+    if !base.is_some_and(|base| base.index_predicates.matches_plain_overlay(&view, base)) {
+        view.index_predicates = Arc::new(bind_index_predicates(&view)?);
+    }
     view.by_name = Arc::new(by_name);
     view.names = Arc::new(names);
     for (task, _) in view.task_credentials.values() {
@@ -2088,6 +2177,28 @@ fn finish_view(
             .map_err(|e| corrupt(&format!("invalid catalog image: {e:?}")))?;
     }
     Ok(view)
+}
+
+fn bind_index_predicates(view: &CatalogView) -> Result<IndexPredicateImage, CoreError> {
+    let mut predicates = IndexPredicateImage::default();
+    let mut partial = view.indexes.values().filter_map(|index| {
+        index.predicate.as_ref().map(|predicate| (index, predicate))
+    }).peekable();
+    if partial.peek().is_none() {
+        return Ok(predicates);
+    }
+    let parts = view.parts();
+    let state = relational::Relational::catalog_image(parts.tables, parts.ext, u64::MAX, u64::MAX)
+        .map_err(|e| corrupt(&format!("invalid index predicate catalog: {e:?}")))?;
+    for (index, predicate) in partial {
+        // The binding limits input bytes, tokens and expression complexity.
+        let table = &view.by_id[&index.table];
+        let bound = predicate.bind(&state, &table.def)
+            .map_err(|e| corrupt(&format!("invalid stored index predicate: {e:?}")))?;
+        predicates.tables.entry(index.table).or_insert_with(|| table.clone());
+        predicates.predicates.insert(index.id, (index.clone(), bound));
+    }
+    Ok(predicates)
 }
 fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreError> {
     let mut result = BTreeMap::new();
@@ -2375,7 +2486,7 @@ fn validate_definition(def: &TableDef) -> Result<(), SqlError> {
     }
     let mut names = BTreeSet::new();
     for column in &def.columns {
-        validate_identifier(&column.name)?;
+        relational::column_ident(&column.name)?;
         if !names.insert(&column.name) {
             return Err(SqlError::Duplicate);
         }

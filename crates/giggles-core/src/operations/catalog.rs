@@ -345,7 +345,7 @@ fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
     }
     validate_size(request)?;
     let definition = columns_for_create(columns);
-    crate::relational::validate_create_definition(table.rsplit('.').next().unwrap(), &definition, primary_key)
+    crate::relational::validate_native_create_definition(table.rsplit('.').next().unwrap(), &definition, primary_key)
         .map_err(|error| core(CoreError::Sql(error)))?;
     for key in primary_key {
         let column = columns

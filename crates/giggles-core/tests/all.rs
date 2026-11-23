@@ -563,6 +563,8 @@ mod sql_float_glibc;
 mod sql_extensions;
 #[path = "sql_volatile_uuid.rs"]
 mod sql_volatile_uuid;
+#[path = "temporal_secondary_indexes.rs"]
+mod temporal_secondary_indexes;
 
 #[path = "sql_array_ordering.rs"]
 mod sql_array_ordering;
@@ -597,3 +599,6 @@ mod sql_catalog_scale;
 mod truncated_clauses;
 
 #[path = "ddl_scale_probe.rs"] mod ddl_scale_probe;
+
+#[path = "partial_indexes.rs"]
+mod partial_indexes;

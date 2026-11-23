@@ -48,7 +48,7 @@ impl Relational {
             let mut ids = BTreeSet::from([table.id]);
             for column in &table.columns {
                 tick(cancel)?;
-                ident(&column.name)?;
+                column_ident(&column.name)?;
                 if column.id == 0 || column.id >= self.next_id || !ids.insert(column.id) {
                     return Err(SqlError::Type);
                 }

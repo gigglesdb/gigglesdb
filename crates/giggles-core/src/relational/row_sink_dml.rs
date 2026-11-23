@@ -173,6 +173,7 @@ impl Prepared {
         if state.has_nondeterministic_keys(table) { return None; }
         let primary = table.primary_key.iter().map(|i| table.columns[*i].id).collect::<BTreeSet<_>>();
         let unique = indexes.iter().filter(|d| d.table == table.id && d.unique).collect::<Vec<_>>();
+        if unique.iter().any(|d| d.predicate.is_some()) { return None; }
         let target: BTreeSet<u64> = if let Some(names) = columns {
             let ids = names.iter().map(|name| table.columns.iter().find(|c| &c.name == name).map(|c| c.id))
                 .collect::<Option<BTreeSet<_>>>()?;

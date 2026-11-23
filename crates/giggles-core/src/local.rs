@@ -158,6 +158,8 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::InvalidArgumentForPowerFunction => 68,
                 relational::SqlError::InvalidArgumentForWidthBucket => 70,
                 relational::SqlError::InternalError => 69,
+                relational::SqlError::InvalidIndexPredicate => 71,
+                relational::SqlError::UndefinedParameter => 72,
             }
         }
     };

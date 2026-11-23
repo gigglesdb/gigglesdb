@@ -41,18 +41,7 @@ pub(super) fn choose<'a>(table: &TableDef, filter: &'a Bound) -> Option<Choice<'
     let mut range: Option<Range<'a>> = None;
     for (i, op, value) in ts {
         let c = table.columns.get(i)?;
-        if !matches!(
-            c.data_type,
-            DataType::Boolean
-                | DataType::SmallInt
-                | DataType::Integer
-                | DataType::BigInt
-                | DataType::Text
-                | DataType::Varchar
-                | DataType::Bytes
-        ) {
-            return None;
-        }
+        crate::relational::secondary_index::Kind::for_type(&c.data_type)?;
         if op == Compare::Eq {
             if range.is_some() || equal.iter().any(|(id, _)| *id == c.id) {
                 return None;
@@ -114,6 +103,7 @@ impl Choice<'_> {
         ds.iter()
             .filter(|d| {
                 d.table == table.id
+                    && d.predicate.is_none()
                     && self.equal.len() <= d.columns.len()
                     && self
                         .equal

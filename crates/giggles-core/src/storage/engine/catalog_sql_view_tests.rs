@@ -150,7 +150,7 @@ fn view_schema_race_and_relation_namespace_errors() {
         let mut p = wanted.clone();
         let mut seq = serial_parts(&ids).ext.sequences.into_values().next().unwrap(); seq.name = "s\0v".into(); seq.owned_by = None; seq.identity = false;
         if sequence { p.ext.sequences.insert(ids.start+5, seq); }
-        else { p.indexes.push(relational::secondary_index::Descriptor { id: ids.start+5, table: ids.start, name: "s\0v".into(), columns: vec![ids.start+1], unique: false, key_encoding: 1 }); }
+        else { p.indexes.push(relational::secondary_index::Descriptor { id: ids.start+5, table: ids.start, name: "s\0v".into(), columns: vec![ids.start+1], unique: false, predicate: None, key_encoding: 1 }); }
         assert!(matches!(parts_records(&p), Err(CoreError::Sql(SqlError::Duplicate))));
     }
     let mut p = wanted.clone();

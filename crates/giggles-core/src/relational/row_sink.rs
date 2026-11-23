@@ -596,14 +596,25 @@ impl Relational {
             if append && is_target {
                 continue;
             }
-            let keys = if is_target && conflict_rows.is_some() {
-                std::iter::once((table.primary_key.iter().map(|i| table.columns[*i].id).collect::<Vec<_>>(), None))
-                    .chain(sink.indexes().into_iter().filter(|d| d.table == table.id && d.unique)
-                        .map(|d| (d.columns, Some(d.id))))
-                    .map(|(columns, index)| collation_keys::Key::new(self, table, &columns, index)
-                        .map(|key| (columns, key)))
-                    .collect::<R<Vec<_>>>().map_err(CoreError::Sql)?
-            } else { Vec::new() };
+            let mut keys = Vec::new();
+            if is_target && conflict_rows.is_some() {
+                let columns = table.primary_key.iter().map(|i| table.columns[*i].id).collect::<Vec<_>>();
+                let primary = collation_keys::Key::new(self, table, &columns, None).map_err(CoreError::Sql)?;
+                keys.push((columns, primary, true));
+                let actual = match &prepared.statement {
+                    Statement::InsertMulti(insert) => insert.arbiter_predicate(self, table).map_err(CoreError::Sql)?,
+                    _ => None,
+                };
+                for descriptor in sink.indexes().into_iter().filter(|d| d.table == table.id && d.unique) {
+                    let inferred = match (&descriptor.predicate, &actual) {
+                        (Some(required), Some(actual)) => actual.implies(required, self, table).map_err(CoreError::Sql)?,
+                        (Some(_), None) => false,
+                        (None, _) => true,
+                    };
+                    let key = collation_keys::Key::for_index(self, table, &descriptor).map_err(CoreError::Sql)?;
+                    keys.push((descriptor.columns, key, inferred));
+                }
+            }
             let rows = self
                 .rows
                 .get_mut(&table.id)
@@ -633,18 +644,18 @@ impl Relational {
                 Ok(())
             };
             if is_target && let Some(proposals) = &conflict_rows {
-                for (columns, key) in &keys {
-                    if !key.nondeterministic() { continue; }
+                for (columns, key, inferred) in &keys {
+                    if !key.nondeterministic() && !key.partial() { continue; }
                     let tuples = proposals.iter().map(|row| key.tuple(row))
                         .collect::<R<Vec<_>>>().map_err(CoreError::Sql)?
                         .into_iter().flatten().collect();
-                    let arbiter = arbiter.as_ref().is_some_and(|ids| ids.len() == columns.len()
+                    let arbiter = *inferred && arbiter.as_ref().is_some_and(|ids| ids.len() == columns.len()
                         && columns.iter().all(|id| ids.contains(id)));
                     sink.collated_lookup(table, key, &tuples, arbiter, &mut visit)?;
                 }
                 for proposal in proposals {
-                    for (columns, key) in &keys {
-                        if key.nondeterministic() { continue; }
+                    for (columns, key, _) in &keys {
+                        if key.nondeterministic() || key.partial() { continue; }
                         let values = columns
                             .iter()
                             .map(|id| {

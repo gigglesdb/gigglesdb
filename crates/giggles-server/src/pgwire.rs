@@ -212,13 +212,18 @@ impl Diagnostic {
                 self.duplicate_key_visible = None;
                 None
             }
+            Some(SqlErrorDetail::ForeignKey { key, redacted }) => {
+                self.duplicate_key = Some(key);
+                self.duplicate_key_visible = None;
+                Some(redacted)
+            }
             Some(SqlErrorDetail::Text(detail)) => Some(detail),
             None => None,
         }
     }
 
     fn authorize_duplicate_key(&mut self, code: &str, session: &mut Session) {
-        if code == "23505"
+        if matches!(code, "23503" | "23505")
             && self.duplicate_key_visible.is_none()
             && let Some(detail) = &self.duplicate_key
         {
@@ -246,9 +251,36 @@ impl Diagnostic {
         self.wire_hint = giggles_core::relational::take_sql_error_hint();
         use giggles_core::relational::SqlError;
         let postgres_diagnostic = match (&result, message.as_deref()) {
+            (Err(CoreError::Sql(SqlError::InvalidIndexPredicate)), Some(m)) => {
+                m == "functions in index predicate must be marked IMMUTABLE"
+            }
+            (Err(CoreError::Sql(SqlError::UndefinedParameter)), Some(m)) => {
+                m.starts_with("there is no parameter $")
+            }
+            (Err(CoreError::Sql(SqlError::GroupingError)), Some(m)) => {
+                m == "aggregate functions are not allowed in index predicates"
+            }
+            (Err(CoreError::Sql(SqlError::InvalidColumnReference)), Some(m)) => {
+                m == "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+            }
+            (Err(CoreError::Sql(SqlError::UnknownTable)), Some(m)) => {
+                m.starts_with("missing FROM-clause entry for table ")
+            }
+            (Err(CoreError::Sql(SqlError::UnknownColumn)), Some(m)) => {
+                m.starts_with("column \"") && m.ends_with(" does not exist")
+            }
+            (Err(CoreError::Sql(SqlError::Type)), Some(m)) => {
+                m.starts_with("argument of WHERE must be type boolean, not type ")
+            }
+            (Err(CoreError::Sql(SqlError::UndefinedObject)), Some(m)) => {
+                m.starts_with("constraint \"") && m.contains(" for table \"") && m.ends_with(" does not exist")
+            }
             (Err(CoreError::Sql(SqlError::Duplicate)), Some(m)) if self.duplicate_key.is_some() => {
                 m.starts_with("duplicate key value violates unique constraint ")
                     || m.starts_with("could not create unique index ")
+            }
+            (Err(CoreError::Sql(SqlError::ForeignKeyViolation)), Some(m)) if self.duplicate_key.is_some() => {
+                m.starts_with("insert or update on table ")
             }
             (Err(CoreError::Sql(SqlError::UndefinedFunction | SqlError::AmbiguousFunction)), Some(m)) => {
                 m.strip_prefix("function ")
@@ -492,12 +524,17 @@ fn diagnostic_error(
         &mut b,
     );
     if let Some((diagnostic, key)) = diagnostic
-        .filter(|_| code == "23505")
+        .filter(|_| matches!(code, "23503" | "23505"))
         .and_then(|d| d.duplicate_key.as_ref().map(|key| (d, key)))
     {
-        if diagnostic.duplicate_key_visible == Some(true) {
+        let detail = if diagnostic.duplicate_key_visible == Some(true) {
+            Some(key.values.as_str())
+        } else {
+            diagnostic.sql_detail.as_deref()
+        };
+        if let Some(detail) = detail {
             b.push(b'D');
-            z(&key.values, &mut b);
+            z(detail, &mut b);
         }
         for (field, name) in [(b's', &key.schema), (b't', &key.table), (b'n', &key.constraint)] {
             b.push(field);

@@ -42,7 +42,9 @@ pub(crate) const WIDE_ROWS: u64 = 1 << 28;
 pub(crate) const UUID_ARRAY_COLUMNS: u64 = 1 << 32;
 /// A committed catalog crossed a count accepted by older readers.
 pub(crate) const WIDE_CATALOG: u64 = 1 << 31;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 30] = [
+pub(crate) const PARTIAL_INDEXES: u64 = 1 << 33;
+pub(crate) const TEMPORAL_INDEXES: u64 = 1 << 34;
+pub(crate) const FEATURE_TABLE: [(u64, &str); 32] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -73,6 +75,8 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 30] = [
     (WIDE_ROWS, "wide_rows"),
     (UUID_ARRAY_COLUMNS, "uuid_array_columns"),
     (WIDE_CATALOG, "wide_catalog"),
+    (PARTIAL_INDEXES, "partial_indexes"),
+    (TEMPORAL_INDEXES, "temporal_indexes"),
 ];
 #[path = "meta_range.rs"]
 mod range_local;
@@ -405,7 +409,7 @@ pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
             | WRITE_FENCE
             | USER_COLLATIONS
             | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS | ROLE_MEMBERSHIP | WIDE_ROWS | UUID_ARRAY_COLUMNS
-            | WIDE_CATALOG,
+            | WIDE_CATALOG | PARTIAL_INDEXES | TEMPORAL_INDEXES,
     )
 }
 fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
@@ -415,11 +419,17 @@ fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
     if bits & KEY_DEPENDENCY_IDENTITY != 0 && bits & 64 == 0 {
         return Err(corrupt("key dependency identity requires catalog_ext"));
     }
+    if bits & PARTIAL_INDEXES != 0 && bits & SECONDARY_INDEXES == 0 {
+        return Err(corrupt("partial indexes require secondary indexes"));
+    }
     if bits & RANGES != 0 && bits & REPLICATED == 0 {
         return Err(corrupt("ranges requires replicated"));
     }
     if bits & (TASK_CATALOG | ROLE_MEMBERSHIP) != 0 && bits & 2048 == 0 {
         return Err(corrupt("task catalog requires role_catalog"));
+    }
+    if bits & TEMPORAL_INDEXES != 0 && bits & SECONDARY_INDEXES == 0 {
+        return Err(corrupt("temporal indexes require secondary_indexes"));
     }
     if bits & UNIQUE_CONSTRAINT_IDENTITY != 0 && bits & 68 != 68 {
         return Err(corrupt("unique constraint identity requires catalog_ext and secondary_indexes"));

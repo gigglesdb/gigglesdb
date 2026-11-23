@@ -45,7 +45,7 @@ pub(crate) fn eval(
     query::constraint_eval(state, table, canonical, row)
 }
 
-fn render(tokens: &[Token]) -> R<String> {
+pub(super) fn render(tokens: &[Token]) -> R<String> {
     let mut out = String::new();
     for token in tokens {
         if !out.is_empty() {

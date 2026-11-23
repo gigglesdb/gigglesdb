@@ -43,6 +43,9 @@ impl<'a> Reader<'a> {
         bytes.copy_from_slice(self.take(8)?);
         Ok(u64::from_le_bytes(bytes))
     }
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
+    }
     fn count(&mut self, max: usize) -> Result<usize> {
         let n = usize::try_from(self.u32()?).map_err(|_| Error::Limit)?;
         cap(n, max)?;
@@ -135,6 +138,7 @@ fn parse(bytes: &[u8], owned: bool, cancel: &mut impl FnMut() -> bool) -> Result
                 columns: columns[..arity].to_vec(),
                 key_encoding,
                 unique,
+                predicate: None,
             });
         }
     }
@@ -146,7 +150,7 @@ fn parse(bytes: &[u8], owned: bool, cancel: &mut impl FnMut() -> bool) -> Result
     }
     let mut candidates = 0;
     let mut total = 0;
-    for id in ids {
+    for &id in &ids {
         tick(cancel)?;
         if r.u64()? != id {
             return Err(Error::Corrupt);
@@ -181,6 +185,49 @@ fn parse(bytes: &[u8], owned: bool, cancel: &mut impl FnMut() -> bool) -> Result
         }
         if owned {
             sidecar.entries.insert(id, map);
+        }
+    }
+    // An optional predicate trailer leaves the complete ordinary payload intact.
+    // The enclosing format-53 feature gate must agree with its presence.
+    if r.pos != bytes.len() {
+        let count = usize::try_from(r.u32()?).map_err(|_| Error::Limit)?;
+        // Each predicate needs an ID, two length words and nonempty SQL.
+        if count == 0 || count > ids.len() || count > r.remaining() / 17 {
+            return Err(Error::Corrupt);
+        }
+        let mut previous = 0;
+        for _ in 0..count {
+            tick(cancel)?;
+            let id = r.u64()?;
+            let index = ids.binary_search(&id).map_err(|_| Error::Descriptor)?;
+            if id <= previous {
+                return Err(Error::Descriptor);
+            }
+            previous = id;
+            let text = r.frame(super::super::partial_index::MAX_PREDICATE_BYTES)
+                .map_err(|error| match error {
+                    Error::Limit => Error::Descriptor,
+                    error => error,
+                })?;
+            let sql = std::str::from_utf8(text).map_err(|_| Error::Descriptor)?;
+            if sql.is_empty() {
+                return Err(Error::Descriptor);
+            }
+            let arity = r.count(MAX_ARITY.min(r.remaining() / 8))?;
+            let mut columns = [0u64; MAX_ARITY];
+            for at in 0..arity {
+                let column = r.u64()?;
+                if column == 0 || columns[..at].contains(&column) {
+                    return Err(Error::Descriptor);
+                }
+                columns[at] = column;
+            }
+            if owned {
+                sidecar.descriptors[index].predicate = Some(super::super::partial_index::Predicate {
+                    sql: sql.to_owned(),
+                    columns: columns[..arity].to_vec(),
+                });
+            }
         }
     }
     if r.pos != bytes.len() {
@@ -265,12 +312,18 @@ fn frame(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
 // Exact byte sizing reads lengths only. No clones, sorting or output allocation.
 fn encoded_len(sidecar: &Sidecar, cancel: &mut impl FnMut() -> bool) -> Result<usize> {
     sidecar.stored_preflight()?;
+    let partial = sidecar.descriptors.iter().any(|d| d.predicate.is_some());
     let unique = sidecar.descriptors.iter().any(|d| d.unique);
-    let mut size = 20usize;
+    let mut size = 20 + if partial { 4 } else { 0 };
     for d in &sidecar.descriptors {
         tick(cancel)?;
         cap(d.name.len(), MAX_NAME)?;
         cap(d.columns.len(), MAX_ARITY)?;
+        if let Some(p) = &d.predicate {
+            cap(p.sql.len(), super::super::partial_index::MAX_PREDICATE_BYTES)?;
+            cap(p.columns.len(), MAX_ARITY)?;
+            size = add(size, add(16 + p.sql.len(), mul(p.columns.len(), 8)?)?)?;
+        }
         size = add(
             size,
             add(
@@ -335,6 +388,7 @@ fn encode_with_limits(
     }
     let mut out = Vec::with_capacity(size);
     out.extend_from_slice(MAGIC);
+    let partial = sidecar.descriptors.iter().filter(|d| d.predicate.is_some()).count();
     let unique = sidecar.descriptors.iter().any(|d| d.unique);
     put32(
         &mut out,
@@ -368,6 +422,20 @@ fn encode_with_limits(
             tick(cancel)?;
             frame(&mut out, key)?;
             frame(&mut out, pk)?;
+        }
+    }
+    if partial != 0 {
+        put32(&mut out, partial)?;
+        for descriptor in &sidecar.descriptors {
+            if let Some(p) = &descriptor.predicate {
+                tick(cancel)?;
+                out.extend_from_slice(&descriptor.id.to_le_bytes());
+                frame(&mut out, p.sql.as_bytes())?;
+                put32(&mut out, p.columns.len())?;
+                for column in &p.columns {
+                    out.extend_from_slice(&column.to_le_bytes());
+                }
+            }
         }
     }
     if out.len() != size {

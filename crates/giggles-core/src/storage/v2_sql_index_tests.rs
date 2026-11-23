@@ -342,3 +342,190 @@ fn native_unique_wait_preserves_row_store_deadline() {
             .is_none()
     );
 }
+
+#[test]
+fn partial_index_descriptor_and_feature_commit_together() {
+    let mut f = Fixture::new();
+    f.execute("CREATE TABLE t(id int PRIMARY KEY,v int,f boolean)");
+    f.execute("INSERT INTO t VALUES (1,1,true),(2,1,false)");
+    f.execute("CREATE INDEX iv ON t(v)");
+    let bit = engine::meta::PARTIAL_INDEXES;
+    let features = |f: &Fixture| {
+        let bytes = f.db().kv.get(Keyspace::Meta, b"features").unwrap().unwrap();
+        u64::from_be_bytes(bytes.try_into().unwrap())
+    };
+    {
+        let mut session = f.admin().sql_session();
+        for sql in ["BEGIN", "CREATE UNIQUE INDEX active ON t(v) WHERE f", "ROLLBACK"] {
+            session.execute(sql, &[], None).unwrap();
+        }
+    }
+    assert_eq!(features(&f) & bit, 0);
+    {
+        let mut session = f.admin().sql_session();
+        for sql in ["BEGIN", "CREATE UNIQUE INDEX active ON t(v) WHERE f", "DROP INDEX active", "COMMIT"] {
+            session.execute(sql, &[], None).unwrap();
+        }
+    }
+    assert_eq!(features(&f) & bit, 0);
+    f.execute("CREATE UNIQUE INDEX active ON t(v) WHERE f");
+    assert_eq!(features(&f) & bit, bit);
+    let parts = f.parts();
+    let partial = parts.indexes.iter().find(|d| d.predicate.is_some()).unwrap();
+    let mut ordinary = partial.clone();
+    ordinary.predicate = None;
+    let ordinary = engine::indexes::encode_descriptor(&ordinary).unwrap();
+    let wire = engine::indexes::encode_descriptor(partial).unwrap();
+    assert_eq!(&wire[..ordinary.len()], ordinary);
+    let mut suffix = 1u64.to_be_bytes().to_vec();
+    suffix.push(b'f');
+    suffix.extend(1u64.to_be_bytes());
+    suffix.extend(parts.tables["t"].columns[2].id.to_be_bytes());
+    assert_eq!(&wire[ordinary.len()..], suffix);
+    let mut batch = WriteBatch::default();
+    batch.put(Keyspace::Meta, b"features".to_vec(), (features(&f) & !bit).to_be_bytes().to_vec());
+    f.db().kv.write(batch, Durability::Sync).unwrap();
+    f.admin.take();
+    assert!(matches!(Admin::open(&f.path, Limits::default()), Err(CoreError::Corrupt(_))));
+}
+
+#[test]
+fn temporal_and_partial_index_features_publish_independently() {
+    use engine::meta::{PARTIAL_INDEXES, TEMPORAL_INDEXES};
+
+    for (key, predicate, expected) in [
+        ("g", " WHERE active", PARTIAL_INDEXES),
+        ("dt", "", TEMPORAL_INDEXES),
+        ("dt", " WHERE active", PARTIAL_INDEXES | TEMPORAL_INDEXES),
+    ] {
+        let mut f = Fixture::new();
+        f.execute("CREATE TABLE t(id int PRIMARY KEY, g int, dt timestamp(3), active boolean)");
+        let features = |f: &Fixture| {
+            let bytes = f.db().kv.get(Keyspace::Meta, b"features").unwrap().unwrap();
+            u64::from_be_bytes(bytes.try_into().unwrap()) & (PARTIAL_INDEXES | TEMPORAL_INDEXES)
+        };
+        assert_eq!(features(&f), 0);
+        let create = format!("CREATE UNIQUE INDEX t_ix ON t({key}){predicate}");
+        {
+            let mut session = f.admin().sql_session();
+            for statements in [
+                vec!["BEGIN", &create, "ROLLBACK"],
+                vec!["BEGIN", "SAVEPOINT before_index", &create, "ROLLBACK TO before_index", "COMMIT"],
+                vec!["BEGIN", &create, "DROP INDEX t_ix", "COMMIT"],
+            ] {
+                for sql in statements {
+                    session.execute(sql, &[], None).unwrap();
+                }
+                assert_eq!(features(&f), 0);
+            }
+        }
+        assert_eq!(features(&f), 0);
+        f.execute(&create);
+        assert_eq!(features(&f), expected);
+        f.reopen();
+        assert_eq!(features(&f), expected);
+    }
+}
+
+
+#[test]
+fn partial_temporal_catalog_publication_matches_durable_reload() {
+    let mut f = Fixture::new();
+    for sql in [
+        "CREATE TABLE t(id int PRIMARY KEY, spare int, live boolean, dt timestamp)",
+        "CREATE UNIQUE INDEX ix ON t(dt) WHERE live",
+        "CREATE TABLE unrelated(id int PRIMARY KEY)",
+        "ALTER TABLE t RENAME COLUMN live TO active",
+        "ALTER TABLE t DROP COLUMN spare",
+    ] {
+        f.execute(sql);
+        f.db().catalog().assert_current_matches_reload();
+    }
+    f.execute("INSERT INTO t VALUES (1,true,'2026-01-01'),(2,false,'2026-01-01')");
+    {
+        let mut session = f.admin().sql_session();
+        for sql in [
+            "BEGIN",
+            "SAVEPOINT replace_index",
+            "DROP INDEX ix",
+            "CREATE UNIQUE INDEX ix ON t(dt) WHERE NOT active",
+            "ROLLBACK TO replace_index",
+            "COMMIT",
+        ] {
+            session.execute(sql, &[], None).unwrap();
+        }
+    }
+    f.db().catalog().assert_current_matches_reload();
+    f.execute("INSERT INTO t VALUES (3,false,'2026-01-01')");
+    f.execute("DELETE FROM t WHERE id=3");
+    f.execute("DROP INDEX ix");
+    f.execute("CREATE UNIQUE INDEX ix ON t(dt) WHERE NOT active");
+    f.db().catalog().assert_current_matches_reload();
+    f.reopen();
+    f.execute("INSERT INTO t VALUES (4,true,'2026-01-01')");
+    assert_eq!(
+        rows(&f, "SELECT id FROM t WHERE dt >= '2026-01-01' ORDER BY id"),
+        [vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Int(4)]],
+    );
+}
+
+#[test]
+fn f1_native_predicate_probe() {
+    for extra in [0, 48] {
+        let f = Fixture::new();
+        f.execute("CREATE TABLE t(id int PRIMARY KEY, g int, active boolean)");
+        for i in 0..extra {
+            f.execute(&format!("CREATE TABLE extra_{i}(id int PRIMARY KEY, x int, y text)"));
+        }
+        f.execute("CREATE INDEX t_partial ON t(g) WHERE active");
+        let parts = f.parts();
+        let descriptor = &parts.indexes[0];
+        let table = TableEntry {
+            def: parts.tables["t"].clone(),
+            heap: false,
+            primary_index_birth: None,
+            columns_ext: BTreeMap::new(),
+        };
+        let mut txn = f.db().begin(Isolation::RepeatableRead);
+        let start = std::time::Instant::now();
+        for i in 1..=400 {
+            f.db().rows.insert(&mut txn, &table, vec![Value::Int(i), Value::Int(i), Value::Bool(true)], None, &|| false).unwrap();
+        }
+        let writes = start.elapsed();
+        let start = std::time::Instant::now();
+        let mut seen = 0;
+        let mut after = None;
+        loop {
+            after = engine::indexes::visit_page(&mut txn, &table, descriptor, Bound::Unbounded, Bound::Unbounded,
+                after, &mut |_, _| { seen += 1; Ok(()) }, 4).unwrap();
+            if after.is_none() { break; }
+        }
+        assert_eq!(seen, 400);
+        eprintln!(
+            "F1 native {extra} extra tables: 400 writes {writes:?}, 101 pages {:?}",
+            start.elapsed(),
+        );
+
+        // An in-transaction catalog change must invalidate the old binding.
+        let savepoint = txn.savepoint();
+        let mut changed = descriptor.clone();
+        changed.predicate.as_mut().unwrap().sql = "not active".into();
+        txn.put(
+            Keyspace::Catalog,
+            engine::indexes::descriptor_key(changed.id),
+            engine::indexes::encode_descriptor(&changed).unwrap(),
+        ).unwrap();
+        f.db().rows.insert(
+            &mut txn,
+            &table,
+            vec![Value::Int(401), Value::Int(401), Value::Bool(false)],
+            None,
+            &|| false,
+        ).unwrap();
+        txn.rollback_to(&savepoint).unwrap();
+        let rows = engine::indexes::scan(
+            &mut txn, &table, descriptor, Bound::Unbounded, Bound::Unbounded,
+        ).unwrap();
+        assert_eq!(rows.len(), 400);
+    }
+}

@@ -34,18 +34,6 @@ fn add(a: usize, b: usize) -> R<usize> {
 fn mul(a: usize, b: usize) -> R<usize> {
     a.checked_mul(b).ok_or(SqlError::Limit)
 }
-fn kind(t: &DataType) -> Option<Kind> {
-    Some(match t {
-        DataType::Boolean => Kind::Boolean,
-        DataType::SmallInt => Kind::SmallInt,
-        DataType::Integer => Kind::Integer,
-        DataType::BigInt => Kind::BigInt,
-        DataType::Text | DataType::Varchar | DataType::Uuid => Kind::Text,
-        DataType::Bpchar => return None,
-        DataType::Bytes => Kind::Bytes,
-        _ => return None,
-    })
-}
 struct CatalogView<'a>(BTreeMap<u64, &'a TableDef>);
 impl<'a> CatalogView<'a> {
     fn new(state: &'a Relational) -> Self {
@@ -61,7 +49,7 @@ impl Catalog for CatalogView<'_> {
             .columns
             .iter()
             .find(|c| c.id == column)
-            .and_then(|c| kind(&c.data_type))
+            .and_then(|c| Kind::for_type(&c.data_type))
     }
 }
 fn table(state: &Relational, id: u64) -> R<&TableDef> {
@@ -79,7 +67,7 @@ fn column(t: &TableDef, id: u64) -> R<usize> {
 }
 
 /// Exact legacy encoded size, without cloning or encoding a borrowed scalar.
-fn scalar_len(v: &Value) -> R<usize> {
+pub(super) fn scalar_len(v: &Value) -> R<usize> {
     Ok(match v {
         Value::Null => 1,
         Value::Bool(_) => 2,
@@ -89,7 +77,7 @@ fn scalar_len(v: &Value) -> R<usize> {
             3,
         )?,
         Value::Bytes(s) => add(add(s.len(), s.iter().filter(|b| **b == 0).count())?, 3)?,
-        _ => return Err(SqlError::Unsupported),
+        _ => secondary_index_keys::temporal_len(v).ok_or(SqlError::Unsupported)?,
     })
 }
 pub(super) fn tuple_len<'a>(values: impl Iterator<Item = &'a Value>) -> R<usize> {
@@ -97,12 +85,13 @@ pub(super) fn tuple_len<'a>(values: impl Iterator<Item = &'a Value>) -> R<usize>
     let mut encoded = 0;
     let mut arity = 0;
     for v in values {
-        // Read lengths before scanning variable bytes. Typed values never reach
-        // value_bytes (Numeric's display conversion would allocate).
+        // Read lengths before scanning variable bytes. Numeric remains outside
+        // this path because its display conversion would allocate.
         let n = match v {
             Value::Text(s) => s.len(),
             Value::Bytes(b) => b.len(),
             Value::Null | Value::Bool(_) | Value::Int(_) => 9,
+            _ if v.is_temporal() => value_bytes(v),
             _ => return Err(SqlError::Unsupported),
         };
         raw = add(raw, n)?;
@@ -115,12 +104,10 @@ pub(super) fn tuple_len<'a>(values: impl Iterator<Item = &'a Value>) -> R<usize>
     Ok(encoded)
 }
 pub(super) fn encode_tuple<'a>(values: impl Iterator<Item = &'a Value>) -> R<Vec<u8>> {
-    // Each individual component uses the existing canonical encoder. Its
-    // concatenative encoding equals encode_key(the complete tuple), while
-    // avoiding clones of Text/Bytes. Whole-tuple admission precedes this call.
+    // Whole-tuple admission precedes this call.
     let mut out = Vec::new();
     for v in values {
-        out.extend(encode_key(std::slice::from_ref(v))?);
+        out.extend(secondary_index_keys::component(v)?);
     }
     Ok(out)
 }
@@ -224,7 +211,7 @@ fn descriptors(state: &Relational, ds: &[Descriptor], cancel: &mut impl FnMut() 
         }
         for p in &t.primary_key {
             let c = t.columns.get(*p).ok_or(SqlError::Type)?;
-            if !c.not_null || kind(&c.data_type).is_none() {
+            if !c.not_null || c.data_type.is_temporal() || Kind::for_type(&c.data_type).is_none() {
                 return Err(SqlError::Unsupported);
             }
         }
@@ -232,7 +219,7 @@ fn descriptors(state: &Relational, ds: &[Descriptor], cancel: &mut impl FnMut() 
             if *c == 0 || d.columns[..j].contains(c) {
                 return Err(SqlError::Type);
             }
-            if kind(&t.columns[column(t, *c)?].data_type).is_none() {
+            if Kind::for_type(&t.columns[column(t, *c)?].data_type).is_none() {
                 return Err(SqlError::Unsupported);
             }
         }
@@ -378,21 +365,32 @@ fn admit(
     )?;
     tick(cancel)
 }
+fn bind_predicates(
+    state: &Relational, ds: &[Descriptor],
+) -> R<BTreeMap<u64, partial_index::BoundPredicate>> {
+    ds.iter().filter_map(|d| d.predicate.as_ref().map(|p| {
+        Ok((d.id, p.bind(state, table(state, d.table)?)?))
+    })).collect()
+}
 fn encoded(
     t: &TableDef,
     key: &[u8],
     row: &SqlRow,
     ds: &[Descriptor],
+    predicates: &BTreeMap<u64, partial_index::BoundPredicate>,
     cancel: &mut impl FnMut() -> bool,
 ) -> R<EncodedRow> {
     tick(cancel)?;
-    let pk = encode_tuple(t.primary_key.iter().map(|p| &row.values[*p]))?;
+    let pk = pk(t, &row.values)?;
     if pk != key {
         return Err(SqlError::Type);
     }
     let mut tuples = Vec::new();
     for d in ds.iter().filter(|d| d.table == t.id) {
         tick(cancel)?;
+        if predicates.get(&d.id).map(|p| p.matches(&row.values)).transpose()? == Some(false) {
+            continue;
+        }
         let tuple = encode_tuple(
             d.columns
                 .iter()
@@ -418,8 +416,19 @@ fn snapshot(
     overlay: Overlay<'_>,
     cancel: &mut impl FnMut() -> bool,
 ) -> R<Snapshot> {
+    snapshot_with_bind(state, ds, overlay, cancel, bind_predicates)
+}
+
+fn snapshot_with_bind(
+    state: &Relational,
+    ds: &[Descriptor],
+    overlay: Overlay<'_>,
+    cancel: &mut impl FnMut() -> bool,
+    bind: impl FnOnce(&Relational, &[Descriptor]) -> R<BTreeMap<u64, partial_index::BoundPredicate>>,
+) -> R<Snapshot> {
     admit(state, ds, overlay, cancel)?;
     let indexed_tables: BTreeSet<_> = ds.iter().map(|descriptor| descriptor.table).collect();
+    let predicates = bind(state, ds)?;
     let mut out = Vec::new();
     for (id, map) in &state.rows {
         if map.is_empty() || !indexed_tables.contains(id) {
@@ -431,11 +440,11 @@ fn snapshot(
             if overlay.old.is_some_and(|w| w.table == *id && w.key == key) {
                 continue;
             }
-            out.push(encoded(t, key, row, ds, cancel)?);
+            out.push(encoded(t, key, row, ds, &predicates, cancel)?);
         }
     }
     if let Some(w) = overlay.new.filter(|w| indexed_tables.contains(&w.table)) {
-        out.push(encoded(table(state, w.table)?, w.key, w.row, ds, cancel)?);
+        out.push(encoded(table(state, w.table)?, w.key, w.row, ds, &predicates, cancel)?);
     }
     Ok(Snapshot(out))
 }
@@ -579,7 +588,7 @@ impl UpdateUnique {
             keys.push((primary, state.primary_collision_name(table)));
         }
         for d in state.secondary.descriptors().iter().filter(|d| d.table == table.id && d.unique) {
-            keys.push((collation_keys::Key::new(state, table, &d.columns, Some(d.id))?, d.name.clone()));
+            keys.push((collation_keys::Key::for_index(state, table, d)?, d.name.clone()));
         }
         for (key, name) in keys {
             let mut occupied = BTreeMap::new();
@@ -607,7 +616,8 @@ impl UpdateUnique {
                     .get(tuple)
                     .is_some_and(|owner| old.is_none_or(|(old_key, _)| owner.as_slice() != old_key))
             {
-                return Err(collation_keys::uuid_duplicate(table, name, &equality.columns, values, false)
+                let detail = equality.duplicate_detail(table, name, values, false);
+                return Err(detail
                     .unwrap_or_else(|| if equality.nondeterministic() { collation_keys::duplicate(name) } else { SqlError::Duplicate }));
             }
             if let Some((_, old)) = old
@@ -883,11 +893,12 @@ impl Relational {
         cap(candidates, si::MAX_CANDIDATES)?;
         cap(index_bytes, si::MAX_BYTES)?;
         cap(add(work, mul(index_bytes, 64)?)?, STATEMENT_MAX_WORK)?;
+        let predicates = bind_predicates(self, ds)?;
         let mut projected = Vec::new();
         for (id, original) in &self.rows {
             if referenced(ds, *id) {
                 for (key, row) in rows.get(id).unwrap_or(original) {
-                    projected.push(encoded(table(self, *id)?, key, row, ds, cancel)?);
+                    projected.push(encoded(table(self, *id)?, key, row, ds, &predicates, cancel)?);
                 }
             }
         }
@@ -901,8 +912,10 @@ impl Relational {
                 if failure == SqlError::Duplicate {
                     for (id, map) in &rows {
                         let table = table(self, *id).expect("projected table");
-                        if self.validate_uuid_indexes(table, map, ds, false, cancel)
-                            == Err(SqlError::Duplicate)
+                        if self.validate_index_details(table, map, ds, false, |pk| {
+                            proposal.changes.iter().any(|change| change.table == *id
+                                && change.new.is_some_and(|(key, _)| key == pk))
+                        }, cancel) == Err(SqlError::Duplicate)
                         {
                             break;
                         }
@@ -978,7 +991,14 @@ impl Relational {
         if ds.is_empty() || ds.iter().any(|d| d.id >= self.next_id) {
             return Err(SqlError::Type);
         }
-        let snap = snapshot(self, ds, NONE, &mut cancel)?;
+        let snap = snapshot_with_bind(self, ds, NONE, &mut cancel, |state, descriptors| {
+            // An over-limit expression in a stored descriptor is corrupt. Keep
+            // ordinary sidecar resource limits and cancellation distinct.
+            bind_predicates(state, descriptors).map_err(|error| match error {
+                SqlError::Limit => SqlError::Type,
+                error => error,
+            })
+        })?;
         let tuples = snap.tuples();
         let staged = pending
             .validate_complete(&snap.rows(&tuples), &CatalogView::new(self), &mut cancel)
@@ -1192,6 +1212,7 @@ impl Relational {
             columns: columns.to_vec(),
             key_encoding: 1,
             unique: false,
+            predicate: None,
         });
         let snap = snapshot(self, &ds, NONE, &mut cancel)?;
         let tuples = snap.tuples();

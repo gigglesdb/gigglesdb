@@ -842,7 +842,7 @@ impl SqlSession {
                                     let mut keys = BTreeSet::new();
                                     for row in rows {
                                         let rows = BTreeMap::from([(Vec::new(), row)]);
-                                        keys.extend(engine::indexes::entries(&projection, &rows,
+                                        keys.extend(engine::indexes::entries(None, &projection, &rows,
                                             std::slice::from_ref(&descriptor)).ok()?.into_keys());
                                     }
                                     keys
@@ -1650,7 +1650,7 @@ impl RowSink for SqlRows<'_> {
                     key.extend(codec::pk_bytes(values)?);
                     Some((Keyspace::Rows, key))
                 } else if let Some(index) = self.parts.indexes.iter()
-                    .find(|d| d.table == table.id && d.unique && d.columns == columns)
+                    .find(|d| d.table == table.id && d.unique && d.predicate.is_none() && d.columns == columns)
                 {
                     let mut key = index.id.to_be_bytes().to_vec();
                     key.extend(codec::index_tuple_bytes(values,
@@ -1984,7 +1984,8 @@ impl RowSink for SqlRows<'_> {
                 break;
             };
             lower = Bound::Excluded(last);
-            let entries = engine::indexes::build_entries(table, &rows, index)?;
+            let image = self.catalog.image().map_err(CoreError::Sql)?;
+            let entries = engine::indexes::build_entries(&image, table, &rows, index)?;
             // The outer transaction holds the DDL table locks. Chunk commits
             // publish only entries under a fresh, durably reserved ID; queries
             // cannot discover it until the outer catalog commit succeeds.
@@ -2056,9 +2057,9 @@ impl RowSink for SqlRows<'_> {
             && ids[..columns.len()].iter().all(|id| columns.contains(id));
         let primary_matches = matches(&primary) && !values.contains(&relational::Value::Null);
         let descriptor = self.parts.indexes.iter().find(|d| d.table == table.id
-            && d.columns.len() == columns.len() && matches(&d.columns))
+            && d.predicate.is_none() && d.columns.len() == columns.len() && matches(&d.columns))
             .or_else(|| (!primary_matches).then(|| self.parts.indexes.iter()
-                .find(|d| d.table == table.id && matches(&d.columns))).flatten());
+                .find(|d| d.table == table.id && d.predicate.is_none() && matches(&d.columns))).flatten());
         let page = if descriptor.is_some() || primary_matches {
             let ids = descriptor.map_or(primary.as_slice(), |d| d.columns.as_slice());
             let ordered = ids[..columns.len()].iter().map(|id|
@@ -2149,8 +2150,10 @@ impl RowSink for SqlRows<'_> {
         after: &BTreeMap<Vec<u8>, SqlRow>,
         descriptors: &[relational::secondary_index::Descriptor],
     ) -> Result<(), CoreError> {
+        let image = self.catalog.image().map_err(CoreError::Sql)?;
         engine::indexes::apply(
             self.txn,
+            Some(&image),
             table,
             after_table,
             before,
@@ -2334,15 +2337,14 @@ impl RowSink for SqlRows<'_> {
                     if let Some(tuple) = key.tuple(&row.values)?
                         && let Some(proposed) = tuples.get(&tuple)
                     {
-                        return Err(relational::collation_keys::uuid_duplicate(
-                            table, name, &key.columns, proposed, false,
-                        ).unwrap_or_else(|| relational::collation_keys::duplicate(name)));
+                        return Err(key.duplicate_detail(table, name, proposed, false)
+                            .unwrap_or_else(|| relational::collation_keys::duplicate(name)));
                     }
                 }
                 Ok(())
             }))?;
         }
-        engine::indexes::check_occupancy(self.txn, table, before, after, &self.parts.indexes)
+        engine::indexes::check_occupancy(self.txn, &image, table, before, after, &self.parts.indexes)
     }
     fn apply(
         &mut self,
@@ -2438,7 +2440,7 @@ pub(super) fn secondary_read_native(
     db: &v2::V2Db, txn: &mut Transaction, table: &TableDef,
     request: &relational::secondary_index_access::Request<'_>,
 ) -> Result<relational::SqlResult, CoreError> {
-    use relational::{DataType, Value, MAX_COLUMNS, MAX_RESULT_BYTES, MAX_ROWS};
+    use relational::{Value, MAX_COLUMNS, MAX_RESULT_BYTES, MAX_ROWS};
     let unsupported = CoreError::Sql(SqlError::Unsupported);
     crate::cancellation::check()?;
     let catalog = db.catalog().snapshot(txn)?;
@@ -2460,8 +2462,7 @@ pub(super) fn secondary_read_native(
     let mut predicate = |id, op: &str, value: &Value| -> Result<(), CoreError> {
         let i = offset(id)?;
         let column = &table.columns[i];
-        if !matches!(column.data_type, DataType::Boolean | DataType::SmallInt
-            | DataType::Integer | DataType::BigInt | DataType::Text | DataType::Varchar | DataType::Bytes)
+        if relational::secondary_index::Kind::for_type(&column.data_type).is_none()
             || matches!(value, Value::Null)
             || catalog.parts.ext.columns.get(&id).is_some_and(|c| c.type_id.is_some())
         { return Err(CoreError::Sql(SqlError::Unsupported)); }
@@ -2499,6 +2500,7 @@ pub(super) fn secondary_read_native(
         // SQL selects on the leading index column. Check every native term,
         // including remaining equality columns and a composite range suffix.
         for (i, op, bound) in &checks {
+            if row.values[*i] == Value::Null { return Ok(()); }
             let value = codec::index_tuple_bytes(std::slice::from_ref(&row.values[*i]), &[codec::Direction::Asc])?;
             let matches = match op.as_str() {
                 "=" => value == *bound, ">" => value > *bound, ">=" => value >= *bound,
@@ -2511,6 +2513,7 @@ pub(super) fn secondary_read_native(
             let size = match &row.values[*i] {
                 Value::Numeric(_) => giggles_pg_types::MAX_TEXT,
                 Value::Float4(_) => 4, Value::Float8(_) => 8,
+                value if value.is_temporal() => relational::value_bytes(value),
                 Value::Text(s) => s.len(), Value::Bytes(b) => b.len(), _ => 9,
             };
             bytes = bytes.checked_add(size).ok_or(CoreError::Sql(SqlError::Limit))?;
@@ -2715,6 +2718,7 @@ impl SqlRows<'_> {
             .iter()
             .filter(|d| {
                 d.table == table.id
+                    && d.predicate.is_none()
                     && d.columns.len() >= columns.len()
                     && (!unique || d.unique && d.columns.len() == columns.len())
             })
@@ -2832,7 +2836,7 @@ impl SqlRows<'_> {
         (!predicates.is_empty())
             .then(|| {
                 parts.indexes.iter().find_map(|d| {
-                    if d.table != table.id {
+                    if d.table != table.id || d.predicate.is_some() {
                         return None;
                     }
                     let column = table.columns.iter().find(|c| c.id == d.columns[0])?;

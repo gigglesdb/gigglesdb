@@ -138,7 +138,7 @@ fn parse_scope(
             Some(Search {
                 depth,
                 by,
-                column: p.name()?,
+                column: p.column_name()?,
             })
         } else {
             None
@@ -146,7 +146,7 @@ fn parse_scope(
         let cycle = if p.word("cycle") {
             let by = names_list(&mut p, false)?;
             p.need("set")?;
-            let column = p.name()?;
+            let column = p.column_name()?;
             let (mark, default) = if p.word("to") {
                 let mark = Scalar::parse_expr(&mut p, 0, false)?;
                 p.need("default")?;
@@ -161,7 +161,7 @@ fn parse_scope(
             Some(Cycle {
                 by,
                 column,
-                path: p.name()?,
+                path: p.column_name()?,
                 mark,
                 default,
             })
@@ -268,7 +268,7 @@ fn parse_dml(tokens: &[Token], owner: &mut Parser) -> R<Box<Prepared>> {
 fn names_list(p: &mut Parser, close: bool) -> R<Vec<String>> {
     let mut names = vec![];
     loop {
-        names.push(p.name()?);
+        names.push(p.column_name()?);
         if names.len() > MAX_COLUMNS {
             return Err(SqlError::Limit);
         }

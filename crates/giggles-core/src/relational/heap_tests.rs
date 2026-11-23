@@ -103,7 +103,8 @@ fn heap_marker_is_exact_and_invalid_offsets_are_safe() {
     assert_eq!(malformed.validate(), Err(SqlError::Reserved));
     let mut malformed = state;
     std::sync::Arc::make_mut(&mut malformed.tables).get_mut("h").unwrap().columns[0].name = "giggles_other".into();
-    assert_eq!(malformed.validate(), Err(SqlError::Reserved));
+    // Only the exact marker name is reserved for columns (AM-4); a similar name is ordinary.
+    assert_eq!(malformed.validate(), Ok(()));
 }
 
 #[test]

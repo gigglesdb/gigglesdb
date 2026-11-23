@@ -947,6 +947,9 @@ impl Filter {
                     aggregate_argument,
                 )?),
             );
+            if index_predicate::bounded_parse() {
+                f.admit_shape(depth, &mut 0)?;
+            }
         }
         Ok(f)
     }
@@ -2532,7 +2535,7 @@ impl Query {
                 return Err(SqlError::Syntax);
             }
             let alias = if p.word("as") || bare_label {
-                Some(p.name()?)
+                Some(p.column_name()?)
             } else {
                 None
             };
@@ -6925,6 +6928,7 @@ mod deferred_routine_only_tests {
 }
 
 mod constraints;
+pub(super) mod index_predicate;
 pub(super) use constraints::{
     constraint_check, constraint_columns, constraint_deparse, constraint_eval, constraint_key,
     constraint_key_supported, constraint_quote, constraint_shape, constraint_types_compatible,

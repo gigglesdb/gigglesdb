@@ -109,6 +109,10 @@ pub(crate) trait RowSource {
 }
 pub(crate) struct LegacyRows<'a>(pub(crate) &'a Relational);
 impl RowSource for LegacyRows<'_> {
+    fn index_input<'s>(&'s self, table: &TableDef, predicates: &[(usize, &str, Value)])
+        -> R<Option<SourceRows<'s>>> {
+        super::secondary_index_access::sql_temporal_candidates(self.0, table, predicates)
+    }
     fn scan<'s>(
         &'s self,
         table: &TableDef,

@@ -6,6 +6,7 @@ pub(super) struct AlterTable {
     pub table: String,
     pub actions: Vec<Action>,
     pub resolution_error: Option<SqlError>,
+    pub column_names: ColumnNamePolicy,
 }
 #[derive(Debug, Clone)]
 pub(super) enum Action {
@@ -227,6 +228,7 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
         table,
         actions,
         resolution_error,
+        column_names: ColumnNamePolicy::Sql,
     })
 }
 fn parse_type(p:&mut Parser)->R<(ddl_type::Parsed,Option<String>)> {
@@ -428,7 +430,7 @@ pub(super) fn execute(
                     && column.name != "ctid"
                     && table.columns.iter().any(|c| c.name == column.name)
                 {
-                    ident::ident(&column.name)?;
+                    alter.column_names.validate(&column.name)?;
                     user_types::duplicate_column_notice(&column.name, &table.name);
                     continue;
                 }
@@ -439,7 +441,7 @@ pub(super) fn execute(
                     validate_typmod(&column.data_type, *typmod)
                         .map_err(|_| SqlError::InvalidParameterValue)?;
                 }
-                ident::ident(&column.name)?;
+                alter.column_names.validate(&column.name)?;
                 if column.name == "ctid" {
                     return Err(SqlError::DuplicateColumn);
                 }
@@ -523,6 +525,19 @@ pub(super) fn execute(
                 let old=table.columns[at].clone();
                 let mut new=old.clone(); new.data_type=ty.clone();
                 let type_id=if let Some(n)=user_type {let (id,ty)=candidate.resolve_type(n,path)?.ok_or(SqlError::UndefinedObject)?;new.data_type=ty.storage_type()?;Some(id)} else {None};
+                // The v2 layout rewrite leaves same-width rows and existing
+                // index tuples in place. Admit only a byte-preserving text change.
+                let representation_unchanged = matches!(
+                    (&old.data_type, &new.data_type),
+                    (DataType::Text, DataType::Varchar) | (DataType::Varchar, DataType::Text)
+                ) && typmod.is_none() && type_id.is_none() && collation.is_none()
+                    && candidate.column_collation(old.id).is_none()
+                    && candidate.ext.columns.get(&old.id).is_none_or(|c| c.type_id.is_none());
+                if !representation_unchanged && candidate.secondary_descriptors_engine().iter().any(|d| {
+                    d.table == table.id && d.predicate.as_ref().is_some_and(|p| p.columns.contains(&old.id))
+                }) {
+                    return Err(SqlError::Unsupported);
+                }
                 let reference=column_collations::resolve_column(&candidate,&new,type_id,collation.as_deref(),path)?;
                 let rows=candidate.rows.get(&table.id).ok_or(SqlError::Type)?.clone();
                 table.columns[at]=new.clone();
@@ -572,10 +587,10 @@ pub(super) fn execute(
                 let descriptors = candidate
                     .secondary_descriptors_engine()
                     .iter()
-                    .filter(|d| !(d.table == table.id && d.columns.contains(&id)))
+                    .filter(|d| !(d.table == table.id && d.uses_column(id)))
                     .cloned()
                     .collect::<Vec<_>>();
-                let removed_indexes=candidate.secondary_descriptors_engine().iter().filter(|d|d.table==table.id && d.columns.contains(&id)).map(|d|d.id).collect::<Vec<_>>();
+                let removed_indexes=candidate.secondary_descriptors_engine().iter().filter(|d|d.table==table.id && d.uses_column(id)).map(|d|d.id).collect::<Vec<_>>();
                 for id in removed_indexes {std::sync::Arc::make_mut(&mut candidate.ext).column_collations.remove(&id);}
                 table.columns.remove(at);
                 if replace_primary {
@@ -598,7 +613,7 @@ pub(super) fn execute(
             }
             Action::RenameColumn(old, new) => {
                 let at = position(&table, old)?;
-                ident::ident(new)?;
+                alter.column_names.validate(new)?;
                 if table.columns.iter().any(|c| &c.name == new) {
                     return Err(SqlError::DuplicateColumn);
                 }

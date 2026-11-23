@@ -1,10 +1,39 @@
 //! Identifier resolution shared by the SQL frontends and stored catalogs.
-use super::{Parser, R, SqlError, Token};
+use super::{HIDDEN_ROWID, Parser, R, SqlError, Token};
 
-pub(super) fn ident(s: &str) -> R<()> {
+fn shape(s: &str) -> R<()> {
     if s.is_empty() || s.len() > 63 || s.contains('\0') {
         return Err(SqlError::Syntax);
     }
+    Ok(())
+}
+
+pub(crate) fn column_ident(s: &str) -> R<()> {
+    shape(s)?;
+    // The physical heap key uses this name as a persisted marker.
+    if s == HIDDEN_ROWID {
+        return Err(SqlError::Reserved);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ColumnNamePolicy {
+    Sql,
+    Native,
+}
+
+impl ColumnNamePolicy {
+    pub(super) fn validate(self, name: &str) -> R<()> {
+        match self {
+            Self::Sql => column_ident(name),
+            Self::Native => ident(name),
+        }
+    }
+}
+
+pub(super) fn ident(s: &str) -> R<()> {
+    shape(s)?;
     if [
         "deliveries",
         "giggles",
@@ -53,6 +82,11 @@ impl Parser {
         ident(&value)?;
         Ok(value)
     }
+    pub(super) fn column_name(&mut self) -> R<String> {
+        let value = self.raw_name()?;
+        column_ident(&value)?;
+        Ok(value)
+    }
     pub(super) fn table_name(&mut self) -> R<String> {
         self.table_name_with_schema_error(SqlError::UnknownTable)
     }
@@ -78,19 +112,19 @@ impl Parser {
     pub(super) fn qualified_name(&mut self) -> R<(Option<String>, String)> {
         let first = self.raw_name()?;
         if !self.sym('.') {
-            ident(&first)?;
+            column_ident(&first)?;
             return Ok((None, first));
         }
         let second = self.raw_name()?;
         if !self.sym('.') {
             ident(&first)?;
-            ident(&second)?;
+            column_ident(&second)?;
             return Ok((Some(first), second));
         }
         self.relations
             .push(super::schemas::Reference::read(second.clone(), Some(first)));
         ident(&second)?;
-        Ok((Some(second), self.name()?))
+        Ok((Some(second), self.column_name()?))
     }
 }
 #[cfg(test)]

@@ -1,11 +1,44 @@
 //! Transient equality keys. Persisted row and secondary-index codecs stay byte based.
 use super::*;
 use std::sync::Arc;
+use giggles_pg_types::temporal::{DateStyleSettings, SessionZone};
+
+thread_local! {
+    static DETAIL_PRESENTATION: std::cell::Cell<Option<(DateStyleSettings, SessionZone)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Session settings for diagnostics from the synchronous DDL and DML helpers.
+pub(crate) struct DetailPresentation(Option<(DateStyleSettings, SessionZone)>);
+
+impl DetailPresentation {
+    pub(crate) fn enter(style: DateStyleSettings, zone: Option<SessionZone>) -> Self {
+        Self(DETAIL_PRESENTATION.replace(Some((style, zone.unwrap_or(SessionZone::Fixed(0))))))
+    }
+}
+
+impl Drop for DetailPresentation {
+    fn drop(&mut self) {
+        DETAIL_PRESENTATION.set(self.0);
+    }
+}
+
+pub(super) fn detail_text(value: &Value) -> Option<String> {
+    let (style, zone) = DETAIL_PRESENTATION.get()
+        .unwrap_or_else(|| (DateStyleSettings::default(), SessionZone::Fixed(0)));
+    match value {
+        Value::Date(date) => Some(date.format_with_style(style.style, style.order)),
+        Value::Timestamp(time) => Some(time.format_with_style(style.style, style.order)),
+        Value::TimestampTz(time) => time.format_with_style(zone, style.style, style.order).ok(),
+        _ => query::output_text(value).ok().flatten(),
+    }
+}
 
 pub(crate) struct Key {
     pub(crate) columns: Vec<usize>,
     collators: Vec<Option<Arc<giggles_icu::Collator>>>,
     arrays: Vec<bool>,
+    predicate: Option<partial_index::BoundPredicate>,
 }
 impl Key {
     pub(crate) fn new(
@@ -53,12 +86,28 @@ impl Key {
             collators.push(collator);
         }
         let arrays = columns.iter().map(|i| table.columns[*i].data_type == DataType::TextArray).collect();
-        Ok(Self { columns, collators, arrays })
+        Ok(Self { columns, collators, arrays, predicate: None })
+    }
+    pub(crate) fn for_index(
+        state: &Relational, table: &TableDef, index: &secondary_index::Descriptor,
+    ) -> R<Self> {
+        let mut key = Self::new(state, table, &index.columns, Some(index.id))?;
+        key.predicate = index.predicate.as_ref().map(|p| p.bind(state, table)).transpose()?;
+        Ok(key)
+    }
+    pub(crate) fn partial(&self) -> bool { self.predicate.is_some() }
+    pub(crate) fn duplicate_detail(
+        &self, table: &TableDef, name: &str, values: &[Value], build: bool,
+    ) -> Option<SqlError> {
+        detailed_duplicate(table, name, &self.columns, values, build, self.partial())
     }
     pub(crate) fn nondeterministic(&self) -> bool {
         self.collators.iter().any(Option::is_some)
     }
     pub(crate) fn tuple(&self, row: &[Value]) -> R<Option<Vec<u8>>> {
+        if self.predicate.as_ref().map(|p| p.matches(row)).transpose()? == Some(false) {
+            return Ok(None);
+        }
         self.values(
             &self
                 .columns
@@ -86,6 +135,9 @@ impl Key {
             }
             transformed.push(value);
         }
+        if transformed.iter().any(Value::is_temporal) {
+            return secondary_index_adapter::encode_tuple(transformed.iter()).map(Some);
+        }
         encode_key(&transformed).map(Some)
     }
 }
@@ -104,20 +156,29 @@ fn has_uuid_columns(table: &TableDef, positions: &[usize]) -> bool {
     positions.iter().any(|i| table.columns[*i].data_type == DataType::Uuid)
 }
 
-pub(crate) fn uuid_duplicate(
+fn detailed_duplicate(
     table: &TableDef,
     name: &str,
     positions: &[usize],
     values: &[Value],
     build: bool,
+    partial: bool,
 ) -> Option<SqlError> {
-    if !primary_has_uuid(table) && !has_uuid_columns(table, positions) {
+    if !build && !partial && !primary_has_uuid(table) && !has_uuid_columns(table, positions)
+        && !positions.iter().any(|i| table.columns[*i].data_type.is_temporal())
+    {
         return None;
     }
+    key_duplicate(table, name, positions, values, build)
+}
+
+fn key_duplicate(
+    table: &TableDef, name: &str, positions: &[usize], values: &[Value], build: bool,
+) -> Option<SqlError> {
     let columns = positions.iter().map(|i| query::quote_identifier(&table.columns[*i].name))
         .collect::<Vec<_>>().join(", ");
     let values = positions.iter()
-        .map(|i| query::output_text(values.get(*i)?).ok().flatten())
+        .map(|i| detail_text(values.get(*i)?))
         .collect::<Option<Vec<_>>>()?.join(", ");
     let (schema, name) = split_key(name);
     let outcome = if build {
@@ -145,7 +206,8 @@ pub(crate) fn index_duplicate(
 ) -> SqlError {
     let positions = index.columns.iter().filter_map(|id| table.columns.iter()
         .position(|column| column.id == *id)).collect::<Vec<_>>();
-    uuid_duplicate(table, &index.name, &positions, values, build).unwrap_or(SqlError::Duplicate)
+    detailed_duplicate(table, &index.name, &positions, values, build, index.predicate.is_some())
+        .unwrap_or(SqlError::Duplicate)
 }
 
 impl Relational {
@@ -192,7 +254,7 @@ impl Relational {
 
     pub(crate) fn primary_duplicate(&self, table: &TableDef, row: &[Value]) -> SqlError {
         if primary_has_uuid(table) {
-            return uuid_duplicate(table, &self.primary_collision_name(table), &table.primary_key, row, false)
+            return key_duplicate(table, &self.primary_collision_name(table), &table.primary_key, row, false)
                 .unwrap_or(SqlError::Duplicate);
         }
         if table
@@ -232,7 +294,7 @@ impl Relational {
                         return Err(SqlError::Limit);
                     }
                     if !occupied.insert(tuple) {
-                        return Err(uuid_duplicate(table, &name, &key.columns, &row.values, false)
+                        return Err(key.duplicate_detail(table, &name, &row.values, false)
                             .unwrap_or_else(|| duplicate(&name)));
                     }
                 }
@@ -241,25 +303,36 @@ impl Relational {
         Ok(())
     }
 
-    // The legacy sidecar reports collisions without column context. Check UUID
-    // index keys while their table and losing row are available for diagnostics.
-    pub(super) fn validate_uuid_indexes(
+    // Recover key details when the legacy sidecar reports an unadorned collision.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn validate_index_details(
         &self,
         table: &TableDef,
         rows: &BTreeMap<Vec<u8>, SqlRow>,
         descriptors: &[secondary_index::Descriptor],
         build: bool,
+        proposed: impl Fn(&[u8]) -> bool,
         cancel: &mut impl FnMut() -> bool,
     ) -> R<()> {
         for index in descriptors.iter().filter(|d| d.unique && d.table == table.id) {
-            if !primary_has_uuid(table) && !index.columns.iter().any(|id| table.columns.iter()
-                .any(|column| column.id == *id && column.data_type == DataType::Uuid)) {
+            if !build && index.predicate.is_none() && !primary_has_uuid(table)
+                && !index.columns.iter().any(|id| {
+                    table.columns.iter().any(|column| {
+                        column.id == *id
+                            && (column.data_type == DataType::Uuid || column.data_type.is_temporal())
+                    })
+                })
+            {
                 continue;
             }
-            let key = Key::new(self, table, &index.columns, Some(index.id))?;
+            let key = Key::for_index(self, table, index)?;
             let mut occupied = BTreeSet::new();
             let mut bytes = 0usize;
-            for row in rows.values() {
+            // Check surviving rows before proposals so DETAIL describes the
+            // attempted value even if a proposed PK sorts before its witness.
+            let candidates = rows.iter().filter(|(pk, _)| !proposed(pk))
+                .chain(rows.iter().filter(|(pk, _)| proposed(pk)));
+            for (_, row) in candidates {
                 if cancel() {
                     return Err(SqlError::Aborted);
                 }
@@ -269,7 +342,8 @@ impl Relational {
                         return Err(SqlError::Limit);
                     }
                     if !occupied.insert(tuple) {
-                        return Err(index_duplicate(table, index, &row.values, build));
+                        return Err(key.duplicate_detail(table, &index.name, &row.values, build)
+                            .unwrap_or(SqlError::Duplicate));
                     }
                 }
             }
@@ -299,7 +373,7 @@ impl Relational {
             .iter()
             .filter(|d| d.table == table.id && d.unique)
         {
-            let key = Key::new(self, table, &d.columns, Some(d.id))?;
+            let key = Key::for_index(self, table, d)?;
             if key.nondeterministic() {
                 keys.push((key, d.name.clone()));
             }

@@ -588,3 +588,18 @@ AND i.indrelid = c2.oid;"#;
         ]]
     );
 }
+
+#[test]
+fn partial_index_predicate_is_visible_in_catalog_order() {
+    let mut snapshot = snapshot();
+    snapshot.index_predicates.insert(12, "(a > 1)".into());
+    let sql = "SELECT c.relname, i.indpred IS NOT NULL, pg_get_expr(i.indpred, i.indrelid), pg_get_indexdef(i.indexrelid) FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid ORDER BY c.relname";
+    assert_eq!(run_on(sql, &snapshot).rows, vec![
+        vec![s("t_ab_idx"), B(true), s("(a > 1)"),
+             s("CREATE INDEX t_ab_idx ON public.t USING btree (b, a) WHERE (a > 1)")],
+        vec![s("t_email_key"), B(false), N,
+             s("CREATE UNIQUE INDEX t_email_key ON public.t USING btree (email)")],
+        vec![s("t_pkey"), B(false), N,
+             s("CREATE UNIQUE INDEX t_pkey ON public.t USING btree (id)")],
+    ]);
+}

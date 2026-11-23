@@ -17,7 +17,7 @@ fn fixture() -> (Vec<TableDef>, CatalogExt, Vec<secondary_index::Descriptor>) {
     ext.constraints.insert(4, vec![fk(ReferencedKey::Secondary(11))]);
     Relational::normalize_ext(&mut ext);
     (vec![table(1, 2, 3), table(4, 5, 6)], ext, vec![secondary_index::Descriptor {
-        id: 11, table: 1, name: "u".into(), columns: vec![2, 3], key_encoding: 1, unique: true,
+        id: 11, table: 1, name: "u".into(), columns: vec![2, 3], predicate: None, key_encoding: 1, unique: true,
     }])
 }
 #[test]

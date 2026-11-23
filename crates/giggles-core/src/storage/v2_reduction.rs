@@ -198,7 +198,7 @@ impl RowSource for Source<'_> {
             .copied().collect::<Vec<_>>();
         let mut ids = prefix(&primary);
         let mut index = None;
-        for descriptor in rows.parts.indexes.iter().filter(|d| d.table == table.id) {
+        for descriptor in rows.parts.indexes.iter().filter(|d| d.table == table.id && d.predicate.is_none()) {
             let candidate = prefix(&descriptor.columns);
             if candidate.len() > ids.len() { ids = candidate; index = Some(descriptor.clone()); }
         }

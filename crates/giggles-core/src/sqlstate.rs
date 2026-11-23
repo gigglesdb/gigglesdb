@@ -83,6 +83,8 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::InvalidRowCountInResultOffsetClause) => "2201X",
         CoreError::Sql(S::CardinalityViolation) => "21000",
         CoreError::Sql(S::InvalidColumnReference) => "42P10",
+        CoreError::Sql(S::InvalidIndexPredicate) => "42P17",
+        CoreError::Sql(S::UndefinedParameter) => "42P02",
         CoreError::Sql(S::CollationMismatch) => "42P21",
         CoreError::Sql(S::IndeterminateCollation) => "42P22",
         CoreError::Task(e) => e.sqlstate(),

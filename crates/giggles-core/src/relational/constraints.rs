@@ -118,7 +118,7 @@ pub(super) fn parse_foreign(
         vec![]
     };
     if resolution_error.is_none() {
-        resolution_error = references.iter().find_map(|name| ident::ident(name).err());
+        resolution_error = references.iter().find_map(|name| column_ident(name).err());
     }
     let (mut on_delete, mut on_update) =
         (catalog_ext::Action::NoAction, catalog_ext::Action::NoAction);
@@ -243,7 +243,7 @@ fn referenced_key(
         candidates.push((state.primary_key_order(parent.id), ReferencedKey::PrimaryKey));
     }
     candidates.extend(state.secondary_descriptors_engine().iter()
-        .filter(|d| d.table == parent.id && d.unique && same_set(&d.columns, columns))
+        .filter(|d| d.table == parent.id && d.unique && d.predicate.is_none() && same_set(&d.columns, columns))
         .map(|d| (d.id, ReferencedKey::Secondary(d.id))));
     candidates.into_iter().min_by_key(|(order, _)| *order)
         .map(|(_, target)| target).ok_or(SqlError::InvalidForeignKey)
@@ -251,7 +251,9 @@ fn referenced_key(
 fn key_values(row: &SqlRow, positions: &[usize]) -> Vec<Value> {
     positions.iter().map(|i| row.values[*i].clone()).collect()
 }
-fn fk_row(state: &Relational, table: &TableDef, row: &SqlRow, kind: &ConstraintKind) -> R<()> {
+fn fk_row(
+    state: &Relational, table: &TableDef, row: &SqlRow, kind: &ConstraintKind, name: Option<&str>,
+) -> R<()> {
     let ConstraintKind::ForeignKey {
         columns,
         ref_table,
@@ -268,6 +270,9 @@ fn fk_row(state: &Relational, table: &TableDef, row: &SqlRow, kind: &ConstraintK
     }
     let parent = table_by_id(state, *ref_table)?;
     let positions = id_positions(parent, ref_columns)?;
+    let missing = || name.map_or(SqlError::ForeignKeyViolation, |name| {
+        missing_parent(state, table, parent, name, &child_positions, row)
+    });
     let key = key
         .iter()
         .zip(child_positions.iter().zip(&positions))
@@ -279,14 +284,45 @@ fn fk_row(state: &Relational, table: &TableDef, row: &SqlRow, kind: &ConstraintK
             )
         })
         .collect::<R<Option<Vec<_>>>>()?
-        .ok_or(SqlError::ForeignKeyViolation)?;
+        .ok_or_else(missing)?;
     if !constraint_lookup::exists(state, parent, ref_columns, &key, &mut || {
         crate::cancellation::check().is_err()
     })? {
-        return Err(SqlError::ForeignKeyViolation);
+        return Err(missing());
     }
     Ok(())
 }
+/// A child row failed to find a matching referenced key.
+fn missing_parent(
+    state: &Relational,
+    child: &TableDef,
+    parent: &TableDef,
+    name: &str,
+    positions: &[usize],
+    row: &SqlRow,
+) -> SqlError {
+    user_types::view_replace_error(format!(
+        "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+        child.name, name,
+    ));
+    let redacted = format!("Key is not present in table \"{}\".", parent.name);
+    let names = positions.iter().map(|i| child.columns[*i].name.as_str())
+        .collect::<Vec<_>>().join(", ");
+    let values = positions.iter().map(|i| collation_keys::detail_text(&row.values[*i]))
+        .collect::<Option<Vec<_>>>();
+    let detail = values.map_or_else(|| redacted.clone(), |values| format!(
+        "Key ({names})=({}) is not present in table \"{}\".", values.join(", "), parent.name,
+    ));
+    user_types::sql_foreign_key_detail(DuplicateKeyDetail {
+        table_id: child.id,
+        schema: state.table_schema(child.id).to_owned(),
+        table: child.name.clone(),
+        constraint: name.to_owned(),
+        values: detail,
+    }, redacted);
+    SqlError::ForeignKeyViolation
+}
+
 pub(super) fn install_unique(
     state: &mut Relational,
     table: &TableDef,
@@ -312,7 +348,7 @@ pub(super) fn install_unique(
         return Err(SqlError::DuplicateObject);
     }
     let epoch = state.epoch;
-    let index = state.create_secondary_index_populated_engine(table, epoch, &name, &ids, true, None, &mut *cancel)?;
+    let index = state.create_secondary_index_populated_engine(table, epoch, &name, &ids, true, None, None, &mut *cancel)?;
     let id = allocate(&mut state.next_id)?;
     std::sync::Arc::make_mut(&mut state.ext).constraints.entry(table.id).or_default().push(Constraint {
         id, name, kind: ConstraintKind::Unique { columns: ids, index },
@@ -480,7 +516,7 @@ pub(super) fn install(
         }
     );
     if !skip {
-        validate_kind(state, table, &kind, None, cancel)?;
+        validate_kind(state, table, &kind, None, None, cancel)?;
     }
     let id = allocate(&mut state.next_id)?;
     std::sync::Arc::make_mut(&mut state.ext)
@@ -495,6 +531,7 @@ fn validate_kind(
     table: &TableDef,
     kind: &ConstraintKind,
     keys: Option<&BTreeSet<Vec<u8>>>,
+    diagnostic: Option<(&str, &BTreeSet<Vec<u8>>)>,
     cancel: &mut impl FnMut() -> bool,
 ) -> R<()> {
     for (key, row) in state.rows.get(&table.id).ok_or(SqlError::Type)? {
@@ -506,7 +543,10 @@ fn validate_kind(
         }
         match kind {
             ConstraintKind::Check { expr, .. } => query::constraint_check(state, table, expr, row)?,
-            ConstraintKind::ForeignKey { .. } => fk_row(state, table, row, kind)?,
+            ConstraintKind::ForeignKey { .. } => {
+                let name = diagnostic.filter(|(_, changed)| changed.contains(key)).map(|(name, _)| name);
+                fk_row(state, table, row, kind, name)?;
+            }
             ConstraintKind::PrimaryKey | ConstraintKind::Unique { .. } => (),
         }
     }
@@ -525,7 +565,7 @@ pub(super) fn validate_named(
         .and_then(|cs| cs.iter().find(|c| c.name == name))
         .ok_or(SqlError::UndefinedObject)?
         .clone();
-    validate_kind(state, table, &constraint.kind, None, cancel)?;
+    validate_kind(state, table, &constraint.kind, None, None, cancel)?;
     let constraint = std::sync::Arc::make_mut(&mut state.ext)
         .constraints.get_mut(&table.id)
         .and_then(|cs| cs.iter_mut().find(|c| c.id == constraint.id))
@@ -817,6 +857,7 @@ pub(super) fn enforce_with_rows<'a>(
                             table_by_id(state, *table_id)?,
                             &prior.kind,
                             Some(keys),
+                            None,
                             cancel,
                         )?;
                     }
@@ -978,7 +1019,8 @@ pub(super) fn enforce_with_rows<'a>(
                 if let Some(parent) = parent_checks.get(&(constraint.id, *table_id)) {
                     keys.extend(parent.iter().cloned());
                 }
-                validate_kind(state, table, &constraint.kind, Some(&keys), cancel)?;
+                validate_kind(state, table, &constraint.kind, Some(&keys),
+                    Some((&constraint.name, &changed)), cancel)?;
             }
         }
     }
@@ -1016,6 +1058,7 @@ impl Relational {
                     table_by_id(self, *table_id)?,
                     &c.kind,
                     Some(keys),
+                    None,
                     &mut cancel,
                 )?;
             }
@@ -1081,6 +1124,7 @@ impl Relational {
                         table_by_id(self, *table_id)?,
                         &c.kind,
                         Some(keys),
+                        None,
                         &mut cancel,
                     )?;
                 }

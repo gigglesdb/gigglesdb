@@ -328,7 +328,7 @@ pub(crate) fn validate_unique_indexes<'a>(
     for (table, constraint) in constraints {
         if let ConstraintKind::Unique { columns, index } = &constraint.kind {
             let d = indexes.get(index).ok_or(SqlError::Type)?;
-            if d.table != table || !d.unique || d.columns != *columns {
+            if d.table != table || !d.unique || d.predicate.is_some() || d.columns != *columns {
                 return Err(SqlError::Type);
             }
         }
@@ -377,7 +377,7 @@ pub(crate) fn validate_key_targets<'a>(ext: &CatalogExt, tables: impl Iterator<I
             }
             ReferencedKey::Secondary(id) => {
                 let d = indexes.get(id).ok_or(SqlError::Type)?;
-                if *id == 0 || *id >= next_id || d.table != *ref_table || !d.unique { return Err(SqlError::Type); }
+                if *id == 0 || *id >= next_id || d.table != *ref_table || !d.unique || d.predicate.is_some() { return Err(SqlError::Type); }
                 d.columns.clone()
             }
         };

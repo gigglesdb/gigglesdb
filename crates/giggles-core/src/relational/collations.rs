@@ -483,7 +483,7 @@ pub(super) fn execute(state: &mut Relational, ddl: &Ddl, prepared: &Prepared) ->
                 return Err(SqlError::DependentObjects);
             }
             for (table,column,_) in dependents {
-                alter_table::execute(state,&alter_table::AlterTable {table,actions:vec![alter_table::Action::Drop(column,false,true)],resolution_error:None},&prepared.search_path,None,&mut ||crate::cancellation::check().is_err())?;
+                alter_table::execute(state,&alter_table::AlterTable {table,actions:vec![alter_table::Action::Drop(column,false,true)],resolution_error:None,column_names:ColumnNamePolicy::Sql},&prepared.search_path,None,&mut ||crate::cancellation::check().is_err())?;
             }
             let index_ids:Vec<_>=state.ext.column_collations.iter().filter_map(|(id,b)|match b {
                 column_collations::Binding::Index(rs) if rs.iter().flatten().any(|r|matches!(r,column_collations::Reference::User(id) if ids.contains(id)))=>Some(*id),_=>None

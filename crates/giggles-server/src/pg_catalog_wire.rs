@@ -485,6 +485,7 @@ fn snapshot_owned(
         user: context.identity.user,
         database: context.identity.database,
         column_typmods,
+        index_predicates: indexes.iter().filter_map(|i| i.predicate.as_ref().map(|p| (i.id, p.clone()))).collect(),
         indexes: indexes
             .into_iter()
             .filter(|index| {
@@ -1679,6 +1680,7 @@ mod tests {
             name: "heap_b".into(),
             columns: vec![heap.columns.iter().find(|c| c.name == "b").unwrap().id],
             unique: false,
+            predicate: None,
         });
         indexes.push(giggles_core::IndexInfo {
             id: 100,
@@ -1686,6 +1688,7 @@ mod tests {
             name: "hidden_storage_index".into(),
             columns: vec![hidden],
             unique: true,
+            predicate: None,
         });
         // Even stale presentation metadata for the storage marker is removed.
         typmods.insert(hidden, 123);

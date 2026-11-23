@@ -648,3 +648,106 @@ fn monotone_catalog_bits_open_without_content() {
     }
     assert_eq!(feature_bits_present(&state).unwrap() & bits, bits);
 }
+
+#[test]
+fn partial_index_format_envelope_matches_payload() {
+    use crate::relational::Prepared;
+    let mut state = empty(17);
+    for (sql, expected_bits, revision) in [
+        ("CREATE TABLE t(id int PRIMARY KEY, g int, active boolean, dt timestamp(3))", 0, None),
+        ("CREATE INDEX t_g ON t(g)", 0, Some(1u32)),
+        ("CREATE UNIQUE INDEX t_g_unique ON t(g)", 0, Some(2)),
+        ("DROP INDEX t_g_unique", 0, Some(1)),
+        ("CREATE UNIQUE INDEX t_active ON t(g) WHERE active", PARTIAL_INDEXES, Some(2)),
+        ("DROP INDEX t_active", 0, Some(1)),
+        ("CREATE UNIQUE INDEX t_dt ON t(dt)", TEMPORAL_INDEXES, Some(2)),
+        ("DROP INDEX t_dt", 0, Some(1)),
+        ("CREATE UNIQUE INDEX t_dt_active ON t(dt) WHERE active", PARTIAL_INDEXES | TEMPORAL_INDEXES, Some(2)),
+        ("DROP INDEX t_dt_active", 0, Some(1)),
+    ] {
+        let p = Prepared::parse(sql, 17, state.sql.epoch).unwrap();
+        state.sql.execute(&p, &[], None).unwrap();
+        let encoded = records(&state).unwrap();
+        let payload = encoded.get(&vec![8]);
+        assert_eq!(payload.map(|p| u32::from_le_bytes(p[8..12].try_into().unwrap())), revision);
+        let bits = encoded.get(&vec![10]).map_or(0, |b|
+            u64::from_be_bytes(b.as_slice().try_into().unwrap()));
+        assert_eq!(bits & (PARTIAL_INDEXES | TEMPORAL_INDEXES), expected_bits);
+        assert_eq!(records(&normal(encoded.clone()).unwrap()).unwrap(), encoded);
+        if expected_bits != 0 {
+            let old_allowed = 1023 | KEY_DEPENDENCY_IDENTITY | USER_COLLATIONS | COLUMN_COLLATIONS
+                 | UUID_ARRAY_COLUMNS | crate::storage::engine::meta::WIDE_CATALOG;
+            assert_eq!(bits & !old_allowed, expected_bits);
+            let mut ungated = encoded;
+            ungated.remove(&vec![10]);
+            let mut metadata: Metadata = decode(&ungated[&vec![0]]).unwrap();
+            metadata.format = format_policy::bits_to_legacy_version(bits & 63).unwrap();
+            ungated.insert(vec![0], encode(&metadata).unwrap());
+            assert!(matches!(normal(ungated), Err(CoreError::Corrupt(_))));
+        }
+    }
+}
+
+#[test]
+fn partial_index_format_envelope_transactions() {
+    for (key, predicate, bit) in [
+        ("g", " WHERE active", PARTIAL_INDEXES),
+        ("dt", "", TEMPORAL_INDEXES),
+        ("dt", " WHERE active", PARTIAL_INDEXES | TEMPORAL_INDEXES),
+    ] {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let path = std::env::temp_dir().join(format!("am4-legacy-{:032x}", u128::from_be_bytes(nonce)));
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::Legacy).unwrap();
+        let mut session = admin.sql_session();
+        let mut run = |sql: &str| session.execute(sql, &[], None).unwrap();
+        let features = || {
+            let encoded = records(&admin.inner.read().unwrap()).unwrap();
+            encoded.get(&vec![10]).map_or(0, |b| u64::from_be_bytes(b.as_slice().try_into().unwrap()))
+                & (PARTIAL_INDEXES | TEMPORAL_INDEXES)
+        };
+        run("CREATE TABLE t(id int PRIMARY KEY, g int, active boolean, dt timestamp)");
+        let create = format!("CREATE INDEX t_ix ON t({key}){predicate}");
+        for statements in [
+            vec!["BEGIN", &create, "ROLLBACK"],
+            vec!["BEGIN", "SAVEPOINT before_index", &create, "ROLLBACK TO before_index", "COMMIT"],
+            vec!["BEGIN", &create, "DROP INDEX t_ix", "COMMIT"],
+        ] {
+            for sql in statements { run(sql); }
+            assert_eq!(features(), 0);
+        }
+        run(&create);
+        assert_eq!(features(), bit);
+        run("DROP INDEX t_ix");
+        assert_eq!(features(), 0);
+        drop(session);
+        drop(admin);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[test]
+fn partial_index_format_envelope_rejects_deep_saved_predicate() {
+    let mut state = empty(17);
+    for sql in [
+        "CREATE TABLE t(id int PRIMARY KEY, g int)",
+        "CREATE INDEX t_g ON t(g) WHERE g <> 1",
+    ] {
+        let p = crate::relational::Prepared::parse(sql, 17, state.sql.epoch).unwrap();
+        state.sql.execute(&p, &[], None).unwrap();
+    }
+    let mut encoded = records(&state).unwrap();
+    let old = b"g <> 1";
+    let at = encoded[&vec![8]].windows(old.len()).position(|bytes| bytes == old).unwrap();
+    let mut oversized = encoded.clone();
+    let bad_size = crate::relational::partial_index::MAX_PREDICATE_BYTES as u32 + 1;
+    oversized.get_mut(&vec![8]).unwrap()[at - 4..at].copy_from_slice(&bad_size.to_le_bytes());
+    assert!(matches!(normal(oversized), Err(CoreError::Corrupt(_))));
+
+    let deep = (1..=75).map(|i| format!("g <> {i}")).collect::<Vec<_>>().join(" AND ");
+    encoded.get_mut(&vec![8]).unwrap().splice(
+        at - 4..at + old.len(),
+        (deep.len() as u32).to_le_bytes().into_iter().chain(deep.bytes()),
+    );
+    assert!(matches!(normal(encoded), Err(CoreError::Corrupt(_))));
+}

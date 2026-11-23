@@ -166,6 +166,7 @@ fn system_range_marks_only_the_committed_wide_catalog() {
             columns: vec![2],
             key_encoding: 1,
             unique: false,
+            predicate: None,
         };
         put(
             batch,

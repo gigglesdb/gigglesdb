@@ -123,8 +123,10 @@ pub(crate) fn required_bits_for_catalog_value(
         // so the commit guard must refuse it too (DD-0068 X1).
         CatalogKind::RoleBootstrap => Ok(512),
         CatalogKind::Index => {
-            super::indexes::decode_descriptor(value).map_err(corrupt)?;
-            Ok(super::meta::SECONDARY_INDEXES)
+            let descriptor = super::indexes::decode_descriptor(value).map_err(corrupt)?;
+            Ok(super::meta::SECONDARY_INDEXES | if descriptor.predicate.is_some() {
+                super::meta::PARTIAL_INDEXES
+            } else { 0 })
         }
         CatalogKind::SqlView => {
             let view = catalog_codec::sql_views::decode_view(value).map_err(corrupt)?;

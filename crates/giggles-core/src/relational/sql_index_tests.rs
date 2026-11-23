@@ -54,6 +54,7 @@ fn parsed(text: &str) -> CreateIndex {
 fn sql_index_grammar_accept_matrix() {
     for text in [
         "CREATE INDEX ix ON items (email)",
+        "CREATE INDEX ix ON items (email) WHERE id > 0",
         "create unique index if not exists ix on only items using btree (email asc nulls last, other ASC);",
         "CREATE INDEX \"ix\" ON \"items\" (\"email\")",
     ] {
@@ -62,6 +63,7 @@ fn sql_index_grammar_accept_matrix() {
         assert_eq!(p.table, "items");
         assert_eq!(p.columns[0], "email");
     }
+    assert!(parsed("CREATE INDEX ix ON items (email) WHERE id > 0").predicate.is_some());
     let p = parsed("CREATE UNIQUE INDEX IF NOT EXISTS ON items (email, other);");
     assert_eq!(p.name, "items_email_other_idx");
     assert_eq!(p.columns, ["email", "other"]);
@@ -93,7 +95,6 @@ fn sql_index_grammar_reject_matrix() {
         "CREATE INDEX ix ON items ((email))",
         "CREATE INDEX ix ON items (lower(email))",
         "CREATE INDEX ix ON items (email) INCLUDE (other)",
-        "CREATE INDEX ix ON items (email) WHERE id > 0",
         "CREATE INDEX ix ON items (email) WITH (fillfactor=50)",
         "CREATE INDEX ix ON items (email) TABLESPACE foo",
         "CREATE INDEX ix ON items USING hash (email)",

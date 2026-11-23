@@ -412,7 +412,7 @@ fn mark_unique(s: &mut Relational) {
 }
 
 #[test]
-fn unsupported_keys_and_pk_refuse_even_valid_empty_source_and_null() {
+fn key_types_are_checked_even_on_an_empty_source_and_null_probe() {
     let (mut s, t, d) = fixture();
     s.rows.get_mut(&1).unwrap().clear();
     // Empty the test mirror's maps while retaining exact descriptor identities.
@@ -440,6 +440,11 @@ fn unsupported_keys_and_pk_refuse_even_valid_empty_source_and_null() {
             let mut t = t.clone();
             t.columns[pos].data_type = typ.clone();
             std::sync::Arc::make_mut(&mut s.tables).insert(t.name.clone(), t.clone());
+            if typ.is_temporal() && pos != 0 {
+                assert_eq!(lookup(&s, &t, &d, &eq()), Err(SqlError::Type));
+                assert!(lookup(&s, &t, &d, &[Value::Null, Value::Null]).unwrap().is_none());
+                continue;
+            }
             for e in [eq(), [Value::Null, Value::Null]] {
                 let mut calls = 0;
                 assert_eq!(

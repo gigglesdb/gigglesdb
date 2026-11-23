@@ -193,14 +193,16 @@ impl Budget {
             }
             ReadExpr::Column(column) => {
                 self.add(column.len(), depth)?;
-                name(&column)?;
+                column_ident(&column)?;
+                if column.contains('.') { return Err(SqlError::Syntax); }
                 Scalar::Column(ColumnRef { qualifier: None, name: column })
             }
             ReadExpr::QualifiedColumn { source, column } => {
                 self.add(source.len(), depth)?;
                 self.add(column.len(), depth)?;
                 name(&source)?;
-                name(&column)?;
+                column_ident(&column)?;
+                if column.contains('.') { return Err(SqlError::Syntax); }
                 Scalar::Column(ColumnRef { qualifier: Some(source), name: column })
             }
             ReadExpr::Literal(value) => {

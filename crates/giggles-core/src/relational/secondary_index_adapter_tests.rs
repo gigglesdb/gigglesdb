@@ -721,6 +721,7 @@ fn snapshot_byte_and_work_budgets_reject_before_materialization() {
             columns: vec![t.columns[1].id],
             key_encoding: 1,
             unique: false,
+            predicate: None,
         })
         .collect::<Vec<_>>();
     // One 8 MiB snapshot fits; three indexes exceed 16 MiB independently of
@@ -747,6 +748,7 @@ fn snapshot_byte_and_work_budgets_reject_before_materialization() {
         columns: vec![t.columns[1].id],
         key_encoding: 1,
         unique: false,
+        predicate: None,
     }];
     // Only ~3.3 MiB, 800 rows and 800 candidates, but quadratic identity
     // comparison work on the 2048-byte PK exceeds the finite work budget.

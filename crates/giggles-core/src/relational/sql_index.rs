@@ -9,6 +9,7 @@ pub(super) struct CreateIndex {
     pub collations: Vec<Option<String>>,
     pub unique: bool,
     pub if_not_exists: bool,
+    pub predicate: Option<Vec<Token>>,
 }
 
 fn opclass_name(p: &mut Parser) -> R<String> {
@@ -59,7 +60,7 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
         {
             return Err(SqlError::Unsupported);
         }
-        columns.push(p.name()?);
+        columns.push(p.column_name()?);
         collations.push(if p.word("collate") {Some(column_collations::parse_name(p)?)} else {None});
         if matches!(p.tokens.get(p.at), Some(Token::QuotedIdent(_)))
             || matches!(p.tokens.get(p.at), Some(Token::Word(w)) if !["asc", "desc", "nulls", "collate"].contains(&w.as_str()))
@@ -100,10 +101,19 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
         }
         return Err(SqlError::Unsupported);
     }
-    if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if ["include", "where", "with", "tablespace"].contains(&w.as_str()))
+    if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if ["include", "with", "tablespace"].contains(&w.as_str()))
     {
         return Err(SqlError::Unsupported);
     }
+    let predicate = if p.word("where") {
+        let tokens = partial_index::predicate_tokens(p, ";");
+        if tokens.is_empty() {
+            return Err(SqlError::Syntax);
+        }
+        Some(tokens)
+    } else {
+        None
+    };
     p.sym(';');
     if p.at != p.tokens.len() {
         return Err(SqlError::Syntax);
@@ -127,6 +137,7 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
         collations,
         unique,
         if_not_exists,
+        predicate,
     })
 }
 

@@ -3,6 +3,8 @@
 //! Equality/NULL and ranges use canonical key order (NULL first, binary strings).
 //! Callers needing SQL three-valued predicates must not lower them blindly here.
 use super::secondary_index::{self as si, Descriptor};
+use super::secondary_index_adapter::{encode_tuple, tuple_len};
+use super::secondary_index_keys::successor;
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -49,18 +51,6 @@ fn tick(cancel: &mut impl FnMut() -> bool) -> R<()> {
         Ok(())
     }
 }
-fn supported(c: &ColumnDef) -> R<()> {
-    match c.data_type {
-        DataType::Boolean
-        | DataType::SmallInt
-        | DataType::Integer
-        | DataType::BigInt
-        | DataType::Text
-        | DataType::Varchar
-        | DataType::Bytes => Ok(()),
-        _ => Err(SqlError::Unsupported),
-    }
-}
 fn column(t: &TableDef, id: u64) -> R<usize> {
     t.columns
         .iter()
@@ -73,6 +63,7 @@ fn raw(v: &Value) -> R<usize> {
         Value::Null | Value::Bool(_) | Value::Int(_) => Ok(9),
         Value::Text(s) => Ok(s.len()),
         Value::Bytes(b) => Ok(b.len()),
+        _ if v.is_temporal() => Ok(value_bytes(v)),
         _ => Err(SqlError::Unsupported),
     }
 }
@@ -91,7 +82,7 @@ fn admit(req: &Request<'_>) -> R<usize> {
             .map(|e| e.value),
     ) {
         bytes = add(bytes, raw(v)?)?;
-        // Reserve one byte for string successor before any owned endpoint copy.
+        // Keep the access path within its original input budget.
         cap(bytes, crate::relational::max_value_bytes() - 1)?;
     }
     if req.descending || !req.residuals.is_empty() {
@@ -102,83 +93,8 @@ fn admit(req: &Request<'_>) -> R<usize> {
     }
     Ok(bytes)
 }
-fn minimum(c: &ColumnDef, nullable: bool) -> R<Value> {
-    supported(c)?;
-    if nullable && !c.not_null {
-        return Ok(Value::Null);
-    }
-    Ok(match c.data_type {
-        DataType::Boolean => Value::Bool(false),
-        DataType::SmallInt => Value::Int(i16::MIN.into()),
-        DataType::Integer => Value::Int(i32::MIN.into()),
-        DataType::BigInt => Value::Int(i64::MIN),
-        DataType::Text | DataType::Varchar => Value::Text(String::new()),
-        DataType::Bytes => Value::Bytes(Vec::new()),
-        _ => return Err(SqlError::Unsupported),
-    })
-}
-/// Immediate successor in this column's finite/binary scalar domain. A string's
-/// successor is itself followed by NUL, not a byte increment in its encoding.
-fn successor(v: &Value, c: &ColumnDef) -> R<Option<Value>> {
-    Ok(match v {
-        Value::Null => Some(minimum(c, false)?),
-        Value::Bool(false) => Some(Value::Bool(true)),
-        Value::Bool(true) => None,
-        Value::Int(n) => {
-            let max = match c.data_type {
-                DataType::SmallInt => i16::MAX.into(),
-                DataType::Integer => i32::MAX.into(),
-                DataType::BigInt => i64::MAX,
-                _ => return Err(SqlError::Type),
-            };
-            if *n == max {
-                None
-            } else {
-                Some(Value::Int(n.checked_add(1).ok_or(SqlError::Type)?))
-            }
-        }
-        Value::Text(s) => {
-            let mut s = s.clone();
-            s.push('\0');
-            Some(Value::Text(s))
-        }
-        Value::Bytes(b) => {
-            let mut b = b.clone();
-            b.push(0);
-            Some(Value::Bytes(b))
-        }
-        _ => return Err(SqlError::Unsupported),
-    })
-}
-// Carry through exhausted columns. None denotes +infinity, not an empty key.
-fn advance(values: &mut Vec<Value>, cols: &[&ColumnDef]) -> R<bool> {
-    while let Some(v) = values.pop() {
-        if let Some(next) = successor(&v, cols[values.len()])? {
-            values.push(next);
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-/// Complete canonical tuple AND complete canonical PK, encoded separately so
-/// valid combined arity >64 is not mistaken for an oversized individual tuple.
-fn complete(mut values: Vec<Value>, cols: &[&ColumnDef], t: &TableDef) -> R<Vec<u8>> {
-    for c in &cols[values.len()..] {
-        values.push(minimum(c, true)?);
-    }
-    let pk: Vec<_> = t
-        .primary_key
-        .iter()
-        .map(|p| minimum(&t.columns[*p], false))
-        .collect::<R<_>>()?;
-    let mut out = encode_key(&values)?;
-    let pk = encode_key(&pk)?;
-    cap(add(out.len(), pk.len())?, si::MAX_KEY)?;
-    out.extend(pk);
-    Ok(out)
-}
 fn matches(d: &Descriptor, req: &Request<'_>) -> bool {
-    req.equal.len() <= d.columns.len()
+    d.predicate.is_none() && req.equal.len() <= d.columns.len()
         && req.equal.iter().zip(&d.columns).all(|((id, _), c)| id == c)
         && req
             .range
@@ -192,6 +108,7 @@ fn output_size(v: &Value) -> usize {
         Value::Numeric(_) => giggles_pg_types::MAX_TEXT,
         Value::Float4(_) => 4,
         Value::Float8(_) => 8,
+        _ if v.is_temporal() => value_bytes(v),
         Value::Text(s) => s.len(),
         Value::Bytes(b) => b.len(),
         _ => 9,
@@ -239,8 +156,8 @@ impl Relational {
             .iter()
             .map(|id| Ok(&table.columns[column(table, *id)?]))
             .collect::<R<Vec<_>>>()?;
-        for c in &cols {
-            supported(c)?;
+        if cols.iter().any(|c| si::Kind::for_type(&c.data_type).is_none()) {
+            return Err(SqlError::Unsupported);
         }
         for (i, (_, v)) in req.equal.iter().enumerate() {
             check(v, cols[i])?;
@@ -259,42 +176,29 @@ impl Relational {
             .map(|id| column(table, *id))
             .collect::<R<Vec<_>>>()?;
         tick(&mut cancel)?;
-        let equal: Vec<_> = req
-            .equal
-            .iter()
-            .map(|(_, v)| {
-                tick(&mut cancel)?;
-                Ok(v.clone())
-            })
-            .collect::<R<_>>()?;
-        tick(&mut cancel)?;
-        let mut lower = equal.clone();
-        let mut exhausted = false;
-        if let Some(e) = req.range.and_then(|r| r.lower) {
-            tick(&mut cancel)?;
-            lower.push(e.value.clone());
-            if !e.inclusive && !advance(&mut lower, &cols)? {
-                exhausted = true;
-            }
-        }
-        tick(&mut cancel)?;
-        let lower = complete(lower, &cols, table)?;
-        tick(&mut cancel)?;
-        let mut upper = equal;
-        let upper = if let Some(e) = req.range.and_then(|r| r.upper) {
-            tick(&mut cancel)?;
-            upper.push(e.value.clone());
-            if e.inclusive && !advance(&mut upper, &cols)? {
-                None
-            } else {
-                Some(complete(upper, &cols, table)?)
-            }
-        } else if advance(&mut upper, &cols)? {
-            Some(complete(upper, &cols, table)?)
-        } else {
-            None
+        let bound = |endpoint: Option<Endpoint<'_>>| {
+            let values = || req.equal.iter().map(|(_, v)| v)
+                .chain(endpoint.map(|e| e.value));
+            tuple_len(values())?;
+            encode_tuple(values())
         };
-        let empty = exhausted || upper.as_ref().is_some_and(|u| lower >= *u);
+        let low_endpoint = req.range.and_then(|r| r.lower);
+        let high_endpoint = req.range.and_then(|r| r.upper);
+        let low = bound(low_endpoint)?;
+        let high = bound(high_endpoint)?;
+        let lower = if low_endpoint.is_some_and(|e| !e.inclusive) {
+            successor(low)
+        } else {
+            Some(low)
+        };
+        let upper = if high_endpoint.is_none_or(|e| e.inclusive) {
+            successor(high)
+        } else {
+            Some(high)
+        };
+        let empty = lower.as_ref().is_none_or(|lower| {
+            upper.as_ref().is_some_and(|upper| lower >= upper)
+        });
         // Reserve worst-case lookup/tree comparisons and key visits BEFORE the
         // borrowed lookup allocates its vector. Complete snapshot is <=1024 rows.
         // Access budget is separate from the accessor's complete-validation budget.
@@ -305,14 +209,14 @@ impl Relational {
                 let v = &row.values[column(table, *c)?];
                 n = add(n, add(raw(v)?.checked_mul(2).ok_or(SqlError::Limit)?, 3)?)?;
             }
-            n = add(n, add(lower.len(), upper.as_ref().map_or(0, Vec::len))?)?;
+            n = add(n, add(lower.as_ref().map_or(0, Vec::len), upper.as_ref().map_or(0, Vec::len))?)?;
             charge(&mut work, n.checked_mul(64).ok_or(SqlError::Limit)?)?;
         }
         let found = if empty {
             Vec::new()
         } else {
             sidecar
-                .lookup(d.id, Some(&lower), upper.as_deref(), &mut cancel)
+                .lookup(d.id, lower.as_deref().filter(|key| !key.is_empty()), upper.as_deref(), &mut cancel)
                 .map_err(|e| match e {
                     si::Error::Cancelled => SqlError::Aborted,
                     si::Error::Limit => SqlError::Limit,
@@ -360,6 +264,73 @@ impl Relational {
         tick(&mut cancel)?;
         Ok(result)
     }
+}
+
+/// Optional SQL path for typed bounds on a leading temporal column. Unknown
+/// literals and coercions fall back to SQL's normal per-row evaluation.
+pub(super) fn sql_temporal_candidates<'a>(
+    state: &'a Relational,
+    table: &TableDef,
+    predicates: &[(usize, &str, Value)],
+) -> R<Option<scan::SourceRows<'a>>> {
+    let ds = state.secondary_descriptors_engine();
+    let Some((descriptor, offset)) = ds.iter().filter(|d| d.table == table.id && d.predicate.is_none())
+        .filter_map(|d| {
+            let offset = table.columns.iter().position(|c| Some(&c.id) == d.columns.first())?;
+            let c = &table.columns[offset];
+            (c.data_type.is_temporal() && state.ext.columns.get(&c.id).is_none_or(|c| c.type_id.is_none())
+                && predicates.iter().any(|(i, _, value)| *i == offset && value.is_temporal()
+                    && check(value, c).is_ok())).then_some((d, offset))
+        })
+        .min_by_key(|(d, _)| d.id)
+    else {
+        return Ok(None);
+    };
+    let mut lower: Option<Vec<u8>> = None;
+    let mut upper: Option<Vec<u8>> = None;
+    for (i, op, value) in predicates {
+        if *i != offset || !value.is_temporal() || check(value, &table.columns[offset]).is_err() {
+            continue;
+        }
+        let key = secondary_index_keys::component(value)?;
+        let (lo, hi) = match *op {
+            "=" => (Some(key.clone()), successor(key)),
+            ">" => (successor(key), None),
+            ">=" => (Some(key), None),
+            "<" => (None, Some(key)),
+            "<=" => (None, successor(key)),
+            _ => continue,
+        };
+        if let Some(lo) = lo {
+            lower = Some(lower.take().map_or(lo.clone(), |old| old.max(lo)));
+        }
+        if let Some(hi) = hi {
+            upper = Some(upper.take().map_or(hi.clone(), |old| old.min(hi)));
+        }
+    }
+    if lower.as_ref().zip(upper.as_ref()).is_some_and(|(lo, hi)| lo >= hi) {
+        return Ok(Some(Box::new(std::iter::empty())));
+    }
+    let mut cancel = || crate::cancellation::check().is_err();
+    let (sidecar, base) = match state.secondary_access_engine(table, state.epoch, &mut cancel) {
+        Ok(ready) => ready,
+        Err(SqlError::Limit | SqlError::Unsupported) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut hits = sidecar.lookup(descriptor.id, lower.as_deref(), upper.as_deref(), &mut cancel)
+        .map_err(|e| match e {
+            si::Error::Cancelled => SqlError::Aborted,
+            si::Error::Limit => SqlError::Limit,
+            _ => SqlError::Type,
+        })?;
+    hits.sort_unstable_by_key(|(_, pk)| *pk);
+    Ok(Some(Box::new(hits.into_iter().map(|(_, key)| {
+        let row = base.get(key).ok_or(SqlError::Type)?;
+        Ok(scan::SourceRow {
+            key: std::borrow::Cow::Borrowed(key),
+            row: std::borrow::Cow::Borrowed(row),
+        })
+    }))))
 }
 
 #[cfg(test)]

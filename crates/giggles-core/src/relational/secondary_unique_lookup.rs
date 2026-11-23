@@ -58,18 +58,8 @@ fn descriptor_shape(d: &Descriptor) -> R<usize> {
     cap(d.columns.len(), si::MAX_ARITY)?;
     add(d.name.len(), mul(d.columns.len(), 8)?)
 }
-fn legacy(c: &ColumnDef) -> R<()> {
-    match c.data_type {
-        DataType::Boolean
-        | DataType::SmallInt
-        | DataType::Integer
-        | DataType::BigInt
-        | DataType::Text
-        | DataType::Varchar
-        | DataType::Uuid
-        | DataType::Bytes => Ok(()),
-        _ => Err(SqlError::Unsupported),
-    }
+fn supported(c: &ColumnDef) -> R<()> {
+    si::Kind::for_type(&c.data_type).map(|_| ()).ok_or(SqlError::Unsupported)
 }
 impl Relational {
     /// `expected` pins table/id/ordered columns/encoding/unique (name is not
@@ -154,14 +144,18 @@ impl Relational {
                 .iter()
                 .find(|c| c.id == *id)
                 .ok_or(SqlError::UnknownColumn)?;
-            legacy(c)?;
+            supported(c)?;
             check(v, c)?;
         }
         if table.primary_key.is_empty() {
             return Err(SqlError::Type);
         }
         for p in &table.primary_key {
-            legacy(table.columns.get(*p).ok_or(SqlError::Type)?)?;
+            let c = table.columns.get(*p).ok_or(SqlError::Type)?;
+            if c.data_type.is_temporal() {
+                return Err(SqlError::Unsupported);
+            }
+            supported(c)?;
         }
         tick(&mut cancel)?;
         let (sidecar, base) = self.secondary_access_engine(table, epoch, &mut cancel)?;

@@ -2,18 +2,6 @@
 use super::secondary_index::{self as si, Catalog, Descriptor, Kind, Sidecar};
 use super::*;
 
-fn kind(t: &DataType) -> Option<Kind> {
-    Some(match t {
-        DataType::Boolean => Kind::Boolean,
-        DataType::SmallInt => Kind::SmallInt,
-        DataType::Integer => Kind::Integer,
-        DataType::BigInt => Kind::BigInt,
-        // Canonical lowercase UUID text has the same byte order as the UUID.
-        DataType::Text | DataType::Varchar | DataType::Uuid => Kind::Text,
-        DataType::Bytes => Kind::Bytes,
-        _ => return None,
-    })
-}
 struct View<'a>(&'a Relational);
 impl Catalog for View<'_> {
     fn table_exists(&self, id: u64) -> bool {
@@ -27,7 +15,7 @@ impl Catalog for View<'_> {
             .columns
             .iter()
             .find(|c| c.id == column)
-            .and_then(|c| kind(&c.data_type))
+            .and_then(|c| Kind::for_type(&c.data_type))
     }
 }
 impl Relational {
@@ -53,7 +41,7 @@ impl Relational {
         unique: bool,
         cancel: impl FnMut() -> bool,
     ) -> R<u64> {
-        self.create_secondary_index_body(table, epoch, name, columns, unique, true, None, cancel)
+        self.create_secondary_index_body(table, epoch, name, columns, unique, true, None, None, cancel)
     }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_secondary_index_populated_engine(
@@ -63,10 +51,11 @@ impl Relational {
         name: &str,
         columns: &[u64],
         unique: bool,
+        predicate: Option<partial_index::Predicate>,
         collations: Option<&[Option<column_collations::Reference>]>,
         cancel: impl FnMut() -> bool,
     ) -> R<u64> {
-        self.create_secondary_index_body(table, epoch, name, columns, unique, false, collations, cancel)
+        self.create_secondary_index_body(table, epoch, name, columns, unique, false, predicate, collations, cancel)
     }
     #[allow(clippy::too_many_arguments)]
     fn create_secondary_index_body(
@@ -77,6 +66,7 @@ impl Relational {
         columns: &[u64],
         unique: bool,
         require_empty: bool,
+        predicate: Option<partial_index::Predicate>,
         collations: Option<&[Option<column_collations::Reference>]>,
         mut cancel: impl FnMut() -> bool,
     ) -> R<u64> {
@@ -99,6 +89,9 @@ impl Relational {
         if self.relation_name_taken(name) {
             return Err(SqlError::DuplicateTable);
         }
+        if table.primary_key.iter().any(|p| table.columns[*p].data_type.is_temporal()) {
+            return Err(SqlError::Unsupported);
+        }
         for id in columns
             .iter()
             .copied()
@@ -109,7 +102,7 @@ impl Relational {
                 .iter()
                 .find(|c| c.id == id)
                 .ok_or(SqlError::UnknownColumn)?;
-            if kind(&c.data_type).is_none() {
+            if Kind::for_type(&c.data_type).is_none() {
                 return Err(SqlError::Unsupported);
             }
         }
@@ -130,6 +123,7 @@ impl Relational {
             columns: columns.to_vec(),
             key_encoding: 1,
             unique,
+            predicate,
         };
         let mut equality_state;
         let equality = if let Some(collations) = collations {
@@ -140,8 +134,9 @@ impl Relational {
         if unique {
             let duplicate = |error, cancel: &mut _| {
                 if error == SqlError::Duplicate {
-                    let _ = equality.validate_uuid_indexes(
-                        table, &self.rows[&table.id], std::slice::from_ref(&descriptor), true, cancel,
+                    let _ = equality.validate_index_details(
+                        table, &self.rows[&table.id], std::slice::from_ref(&descriptor),
+                        true, |_| false, cancel,
                     );
                 }
                 error

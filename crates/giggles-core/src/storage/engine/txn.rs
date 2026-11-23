@@ -455,6 +455,7 @@ pub(crate) struct Transaction {
     writes: Arc<PrivilegeWrites>,
     catalog_generation: u64,
     pub(super) catalog_overlay: std::sync::Mutex<Option<super::catalog::PrivateCatalogSnapshot>>,
+    index_predicates: Option<(Ts, u64, Arc<super::catalog::IndexPredicateImage>)>,
     features_or: u64,
     minimum_subversion: u32,
     pub(crate) reclaim_after_commit: bool,
@@ -512,6 +513,7 @@ impl Transaction {
             minimum_subversion: 0,
             catalog_generation: 0,
             catalog_overlay: std::sync::Mutex::new(None),
+            index_predicates: None,
             reclaim_after_commit: false,
             raw: Vec::new(),
             xact: None,
@@ -851,6 +853,18 @@ impl Transaction {
     }
     pub(crate) fn catalog_generation(&self) -> u64 {
         self.catalog_generation
+    }
+    pub(super) fn index_predicates(&mut self) -> Result<Arc<super::catalog::IndexPredicateImage>, crate::CoreError> {
+        let ts = self.try_snapshot_ts()?;
+        if let Some((cached_ts, generation, image)) = &self.index_predicates
+            && *cached_ts == ts
+            && *generation == self.catalog_generation
+        {
+            return Ok(image.clone());
+        }
+        let image = super::catalog::index_predicate_image(self)?;
+        self.index_predicates = Some((ts, self.catalog_generation, image.clone()));
+        Ok(image)
     }
     pub(crate) fn catalog_own(&self, key: &[u8]) -> Option<&Option<Vec<u8>>> {
         self.writes.get(&(Keyspace::Catalog, key.to_vec()))
@@ -1339,6 +1353,16 @@ impl Transaction {
     }
     pub(crate) fn require_features(&mut self, bits: u64) {
         self.features_or |= bits;
+    }
+    pub(crate) fn set_secondary_index_features(&mut self, partial: bool, temporal: bool) {
+        use super::meta::{PARTIAL_INDEXES, TEMPORAL_INDEXES};
+        // Use the final catalog image so CREATE followed by DROP in the same
+        // transaction cannot enable the feature without an index.
+        self.features_or &= !(PARTIAL_INDEXES | TEMPORAL_INDEXES);
+        self.require_features(
+            (if partial { PARTIAL_INDEXES } else { 0 })
+                | (if temporal { TEMPORAL_INDEXES } else { 0 }),
+        );
     }
     pub(crate) fn require_subversion(&mut self, version: u32) {
         self.minimum_subversion = self.minimum_subversion.max(version);

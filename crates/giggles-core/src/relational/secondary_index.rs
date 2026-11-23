@@ -3,9 +3,10 @@
 //!
 //! Engine-only proof boundary: the caller supplies a complete (never SELECT-page)
 //! snapshot of ALL base rows for ALL referenced tables, including empty tables via
-//! Catalog. Each row supplies exactly one tuple per index on its table. The caller
-//! proves stable ID ownership, snapshot consistency, canonical encode_key(values)
-//! tuples in descriptor order, type/range/nullability checks (NULL sorts first),
+//! Catalog. Each row supplies one tuple for each ordinary index and for each
+//! partial index whose predicate it satisfies. The caller
+//! proves stable ID ownership, snapshot consistency, canonical secondary tuples
+//! in descriptor order, type/range/nullability checks (NULL sorts first),
 //! binary text/bytes order, and a complete non-null immutable encode_key(PK) suffix.
 //! Individual tuple and PK arities satisfy the engine encoder separately; their
 //! sum need not be <=64. Bytes are NOT self-authenticating storage credentials:
@@ -66,6 +67,12 @@ pub(crate) enum Kind {
     BigInt,
     Text,
     Bytes,
+    Date,
+    Time,
+    TimeTz,
+    Timestamp,
+    TimestampTz,
+    Interval,
 }
 impl Kind {
     /// Exact engine type names only: Numeric/Real/DoublePrecision and future
@@ -78,8 +85,35 @@ impl Kind {
             "BigInt" => Ok(Self::BigInt),
             "Text" => Ok(Self::Text),
             "Bytes" => Ok(Self::Bytes),
+            "Date" => Ok(Self::Date),
+            "Time" => Ok(Self::Time),
+            "TimeTz" => Ok(Self::TimeTz),
+            "Timestamp" => Ok(Self::Timestamp),
+            "TimestampTz" => Ok(Self::TimestampTz),
+            "Interval" => Ok(Self::Interval),
             _ => Err(Error::Descriptor),
         }
+    }
+
+    pub(crate) fn for_type(ty: &super::DataType) -> Option<Self> {
+        use super::DataType;
+        let name = match ty {
+            DataType::Boolean => "Boolean",
+            DataType::SmallInt => "SmallInt",
+            DataType::Integer => "Integer",
+            DataType::BigInt => "BigInt",
+            // Canonical lowercase UUID text preserves UUID byte order.
+            DataType::Text | DataType::Varchar | DataType::Uuid => "Text",
+            DataType::Bytes => "Bytes",
+            DataType::Date => "Date",
+            DataType::Time => "Time",
+            DataType::TimeTz => "TimeTz",
+            DataType::Timestamp => "Timestamp",
+            DataType::TimestampTz => "TimestampTz",
+            DataType::Interval => "Interval",
+            _ => return None,
+        };
+        Self::from_engine_name(name).ok()
     }
 }
 pub(crate) trait Catalog {
@@ -98,7 +132,32 @@ pub(crate) struct Descriptor {
     /// Existing engine encode_key v1, NOT a sidecar/envelope version.
     pub key_encoding: u32,
     pub unique: bool,
+    pub predicate: Option<super::partial_index::Predicate>,
 }
+impl Descriptor {
+    pub(crate) fn has_temporal_key(&self, table: &super::TableDef) -> bool {
+        table.id == self.table && table.columns.iter().any(|column| {
+            column.data_type.is_temporal() && self.columns.contains(&column.id)
+        })
+    }
+
+    pub(crate) fn uses_column(&self, id: u64) -> bool {
+        self.columns.contains(&id) || self.predicate.as_ref().is_some_and(|p| p.columns.contains(&id))
+    }
+}
+pub(crate) fn has_temporal_indexes<'a>(
+    descriptors: &[Descriptor],
+    tables: impl Iterator<Item = &'a super::TableDef>,
+) -> bool {
+    if descriptors.is_empty() {
+        return false;
+    }
+    let by_id: BTreeMap<_, _> = tables.map(|table| (table.id, table)).collect();
+    descriptors.iter().any(|index| {
+        by_id.get(&index.table).is_some_and(|table| index.has_temporal_key(table))
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Tuple<'a> {
     pub index: u64,
@@ -188,7 +247,7 @@ fn preflight(
     cap(work, MAX_WORK)?;
     let mut indexes = BTreeMap::new();
     let mut names = BTreeSet::new();
-    let mut table_counts = BTreeMap::new();
+    let mut required_counts = BTreeMap::new();
     // Charge actual possible compared PK bytes for every row identity pair.
     for d in ds {
         tick(cancel)?;
@@ -203,10 +262,13 @@ fn preflight(
         {
             return Err(Error::Descriptor);
         }
-        if indexes.insert(d.id, d.table).is_some() || !names.insert(&d.name) {
+        let required = d.predicate.is_none();
+        if indexes.insert(d.id, (d.table, required)).is_some() || !names.insert(&d.name) {
             return Err(Error::Descriptor);
         }
-        *table_counts.entry(d.table).or_insert(0) += 1;
+        if required {
+            *required_counts.entry(d.table).or_insert(0) += 1;
+        }
         for (j, col) in d.columns.iter().enumerate() {
             if *col == 0
                 || d.columns[..j].contains(col)
@@ -232,24 +294,32 @@ fn preflight(
                 return Err(Error::Rows);
             }
         }
-        let count = table_counts.get(&row.table).copied().unwrap_or(0);
+        let required = required_counts.get(&row.table).copied().unwrap_or(0);
         work = add(work, comparisons)?;
-        work = add(work, mul(count, 2 * comparisons)?)?;
+        work = add(work, mul(row.tuples.len(), 2 * comparisons)?)?;
         cap(work, MAX_WORK)?;
-        if row.tuples.len() != count {
+        if row.tuples.len() < required {
             return Err(Error::Rows);
         }
         let mut seen = BTreeSet::new();
+        let mut present_required = 0;
         for tuple in row.tuples {
             tick(cancel)?;
-            if !seen.insert(tuple.index) || indexes.get(&tuple.index) != Some(&row.table) {
+            let Some(&(table, tuple_required)) = indexes.get(&tuple.index) else {
+                return Err(Error::Rows);
+            };
+            if table != row.table || !seen.insert(tuple.index) {
                 return Err(Error::Rows);
             }
+            present_required += usize::from(tuple_required);
             component(tuple.bytes)?;
             candidates = add(candidates, 1)?;
             cap(candidates, MAX_CANDIDATES)?;
             bytes = add(bytes, entry_size(tuple.bytes.len(), row.pk.len())?)?;
             cap(bytes, MAX_BYTES)?;
+        }
+        if present_required != required {
+            return Err(Error::Rows);
         }
     }
     work = add(work, mul(bytes, 64)?)?;
@@ -598,6 +668,7 @@ mod tests {
             columns: vec![1],
             key_encoding: 1,
             unique: false,
+            predicate: None,
         }
     }
     fn r<'a>(pk: &'a [u8], tuples: &'a [Tuple<'a>]) -> BaseRow<'a> {
@@ -756,7 +827,10 @@ mod tests {
     }
     #[test]
     fn explicit_kind_admission() {
-        for k in ["Boolean", "SmallInt", "Integer", "BigInt", "Text", "Bytes"] {
+        for k in [
+            "Boolean", "SmallInt", "Integer", "BigInt", "Text", "Bytes",
+            "Date", "Time", "TimeTz", "Timestamp", "TimestampTz", "Interval",
+        ] {
             assert!(Kind::from_engine_name(k).is_ok());
         }
         for k in [

@@ -68,7 +68,7 @@ pub(super) fn add(
     }
     let mut offsets = Vec::new();
     for name in columns {
-        ident::ident(name)?;
+        column_ident(name)?;
         let offset = col(table, name)?;
         if offset == hidden {
             return Err(SqlError::Reserved);

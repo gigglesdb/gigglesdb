@@ -61,7 +61,7 @@ fn without_case(s: &Scalar) -> R<()> {
     }
     Ok(())
 }
-fn scalar(s: &Scalar) -> R<String> {
+pub(super) fn scalar(s: &Scalar) -> R<String> {
     Ok(match s {
         Scalar::Predicate(f) => deparse(f)?,
         Scalar::Case(case) => {
@@ -260,7 +260,7 @@ fn query(table: &TableDef, key: &str, expr: &str) -> R<Query> {
     }
     Ok(table_query(table, key, filter))
 }
-fn table_query(table: &TableDef, key: &str, filter: Filter) -> Query {
+pub(super) fn table_query(table: &TableDef, key: &str, filter: Filter) -> Query {
     Query {
         explain: false,
         sources: vec![Source {

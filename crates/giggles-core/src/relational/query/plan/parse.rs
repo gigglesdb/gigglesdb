@@ -592,7 +592,7 @@ fn select_inner(
         let mut aliases = vec![];
         if p.sym('(') {
             loop {
-                aliases.push(p.name()?);
+                aliases.push(p.column_name()?);
                 if !p.sym(',') {
                     break;
                 }

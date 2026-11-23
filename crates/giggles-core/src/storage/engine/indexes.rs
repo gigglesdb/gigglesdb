@@ -1,4 +1,4 @@
-//! MVCC secondary entries. Only new index records require feature bit 2.
+//! MVCC secondary entries. The catalog publishes descriptors and their feature bits.
 use super::{
     codec,
     kv::{Direction, Keyspace},
@@ -8,6 +8,7 @@ use crate::{
     CoreError,
     relational::{self, SqlError, SqlRow, TableDef, Value, secondary_index::Descriptor},
 };
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, ops::Bound, time::Instant};
 
@@ -28,21 +29,37 @@ pub(crate) fn descriptor_key(id: u64) -> Vec<u8> {
 }
 pub(crate) fn encode_descriptor(d: &Descriptor) -> Result<Vec<u8>, CoreError> {
     let mut bytes = vec![1];
-    bytes.extend(crate::storage::encode(&DescriptorDto {
+    let wire = DescriptorDto {
         id: d.id,
         table: d.table,
         name: d.name.clone(),
         columns: d.columns.clone(),
         key_encoding: d.key_encoding,
         unique: d.unique,
-    })?);
+    };
+    bytes.extend(crate::storage::encode(&wire)?);
+    if let Some(predicate) = &d.predicate {
+        bytes.extend(crate::storage::encode(predicate)?);
+    }
     Ok(bytes)
 }
 pub(crate) fn decode_descriptor(bytes: &[u8]) -> Result<Descriptor, CoreError> {
-    if bytes.first() != Some(&1) {
+    let Some((1, wire)) = bytes.split_first() else {
         return Err(CoreError::Corrupt("index descriptor version".into()));
+    };
+    let mut base = std::io::Cursor::new(wire);
+    let d: DescriptorDto = crate::storage::codec().deserialize_from(&mut base)
+        .map_err(|err| CoreError::Corrupt(err.to_string()))?;
+    let suffix = &wire[base.position() as usize..];
+    let predicate: Option<relational::partial_index::Predicate> =
+        if suffix.is_empty() { None } else { Some(crate::storage::decode(suffix)?) };
+    if predicate.as_ref().is_some_and(|p| {
+        p.sql.is_empty() || p.sql.len() > relational::partial_index::MAX_PREDICATE_BYTES
+            || p.columns.len() > relational::secondary_index::MAX_ARITY
+            || p.columns.iter().enumerate().any(|(i, id)| *id == 0 || p.columns[..i].contains(id))
+    }) {
+        return Err(CoreError::Corrupt("invalid index predicate".into()));
     }
-    let d: DescriptorDto = crate::storage::decode(&bytes[1..])?;
     if d.id == 0
         || d.table == 0
         || d.key_encoding != 1
@@ -67,6 +84,7 @@ pub(crate) fn decode_descriptor(bytes: &[u8]) -> Result<Descriptor, CoreError> {
         columns: d.columns,
         key_encoding: d.key_encoding,
         unique: d.unique,
+        predicate,
     })
 }
 pub(crate) fn validate_descriptor(d: &Descriptor, table: &TableDef) -> Result<(), CoreError> {
@@ -77,6 +95,7 @@ pub(crate) fn validate_descriptor(d: &Descriptor, table: &TableDef) -> Result<()
 /// Cross-record checks for a descriptor that has already passed decoding.
 pub(super) fn validate_descriptor_columns(d: &Descriptor, table: &TableDef) -> Result<(), CoreError> {
     if d.table != table.id
+        || d.predicate.as_ref().is_some_and(|p| p.columns.iter().any(|id| !table.columns.iter().any(|c| c.id == *id)))
         || d.columns.iter().enumerate().any(|(i, id)| {
             d.columns[..i].contains(id) || !table.columns.iter().any(|c| c.id == *id)
         })
@@ -105,22 +124,31 @@ pub(crate) fn descriptors(txn: &mut Transaction, table: u64) -> Result<Vec<Descr
     .collect()
 }
 pub(crate) fn entries(
+    state: Option<&relational::Relational>,
     table: &TableDef,
     rows: &BTreeMap<Vec<u8>, SqlRow>,
     ds: &[Descriptor],
 ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
-    entries_for(table, rows, ds, false)
+    entries_for(Predicates::Bind(state), table, rows, ds, false)
 }
 
 pub(crate) fn build_entries(
+    state: &relational::Relational,
     table: &TableDef,
     rows: &BTreeMap<Vec<u8>, SqlRow>,
     index: &Descriptor,
 ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
-    entries_for(table, rows, std::slice::from_ref(index), true)
+    entries_for(Predicates::Bind(Some(state)), table, rows, std::slice::from_ref(index), true)
+}
+
+#[derive(Clone, Copy)]
+enum Predicates<'a> {
+    Bind(Option<&'a relational::Relational>),
+    Cached(&'a super::catalog::IndexPredicateImage),
 }
 
 fn entries_for(
+    predicates: Predicates<'_>,
     table: &TableDef,
     rows: &BTreeMap<Vec<u8>, SqlRow>,
     ds: &[Descriptor],
@@ -129,6 +157,15 @@ fn entries_for(
     let mut entries = BTreeMap::new();
     for d in ds.iter().filter(|d| d.table == table.id) {
         validate_descriptor(d, table)?;
+        let bound;
+        let predicate = match (&d.predicate, predicates) {
+            (None, _) => None,
+            (Some(_), Predicates::Cached(image)) => Some(image.get(table, d)?),
+            (Some(predicate), Predicates::Bind(state)) => {
+                bound = predicate.bind(state.ok_or(CoreError::Sql(SqlError::InternalError))?, table).map_err(CoreError::Sql)?;
+                Some(&bound)
+            }
+        };
         let offsets = d
             .columns
             .iter()
@@ -142,6 +179,9 @@ fn entries_for(
             .collect::<Result<Vec<_>, _>>()?;
         for row in rows.values() {
             crate::cancellation::check()?;
+            if predicate.as_ref().map(|p| p.matches(&row.values)).transpose().map_err(CoreError::Sql)? == Some(false) {
+                continue;
+            }
             let values = offsets
                 .iter()
                 .map(|i| row.values[*i].clone())
@@ -196,6 +236,7 @@ pub(crate) fn occupancy_duplicate(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply(
     txn: &mut Transaction,
+    state: Option<&relational::Relational>,
     table: &TableDef,
     after_table: Option<&TableDef>,
     before: &BTreeMap<Vec<u8>, SqlRow>,
@@ -205,9 +246,16 @@ pub(crate) fn apply(
     deadline: Option<Instant>,
     cancel: &dyn Fn() -> bool,
 ) -> Result<(), CoreError> {
-    let old = entries(table, before, old_ds)?;
+    let image;
+    let predicates = if state.is_none() && old_ds.iter().chain(new_ds).any(|d| d.predicate.is_some()) {
+        image = txn.index_predicates()?;
+        Predicates::Cached(&image)
+    } else {
+        Predicates::Bind(state)
+    };
+    let old = entries_for(predicates, table, before, old_ds, false)?;
     let new = match after_table {
-        Some(table) => entries(table, after, new_ds)?,
+        Some(table) => entries_for(predicates, table, after, new_ds, false)?,
         None => BTreeMap::new(),
     };
     let changes = old
@@ -240,11 +288,11 @@ pub(crate) fn apply(
 }
 /// Lock proposed UNIQUE owners without publishing, preserving FK error precedence.
 pub(crate) fn check_occupancy(
-    txn: &mut Transaction, table: &TableDef, before: &BTreeMap<Vec<u8>, SqlRow>,
+    txn: &mut Transaction, state: &relational::Relational, table: &TableDef, before: &BTreeMap<Vec<u8>, SqlRow>,
     after: &BTreeMap<Vec<u8>, SqlRow>, ds: &[Descriptor],
 ) -> Result<(), CoreError> {
-    let old = entries(table, before, ds)?;
-    for (key, pk) in entries(table, after, ds)? {
+    let old = entries(Some(state), table, before, ds)?;
+    for (key, pk) in entries(Some(state), table, after, ds)? {
         if old.get(&key) == Some(&pk) { continue; }
         let target = txn
             .lock_for_write(Keyspace::Index, &key, crate::task::limits::lock_deadline(),
@@ -285,6 +333,7 @@ pub(crate) fn maintain(
     };
     apply(
         txn,
+        None,
         table,
         Some(table),
         &rows(before),
@@ -345,6 +394,13 @@ pub(crate) fn visit_page(
     page_rows: usize,
 ) -> Result<Option<Vec<u8>>, CoreError> {
     validate_descriptor(descriptor, &table.def)?;
+    let image;
+    let predicates = if descriptor.predicate.is_some() {
+        image = txn.index_predicates()?;
+        Predicates::Cached(&image)
+    } else {
+        Predicates::Bind(None)
+    };
     let prefix = descriptor.id.to_be_bytes().to_vec();
     let prefix_key = |tuple: Vec<u8>| {
         let mut key = prefix.clone();
@@ -409,7 +465,7 @@ pub(crate) fn visit_page(
                 version: row.version,
             },
         )]);
-        let expected = self::entries(&table.def, &witness, std::slice::from_ref(descriptor))?;
+        let expected = entries_for(predicates, &table.def, &witness, std::slice::from_ref(descriptor), false)?;
         if expected.get(&key) != Some(&pk) {
             return Err(CoreError::Corrupt("index entry disagrees with row".into()));
         }

@@ -105,18 +105,8 @@ impl<F: FnMut() -> bool> Meter<F> {
         }
     }
 }
-fn legacy(ty: &DataType) -> R<Kind> {
-    let name = match ty {
-        DataType::Boolean => "Boolean",
-        DataType::SmallInt => "SmallInt",
-        DataType::Integer => "Integer",
-        DataType::BigInt => "BigInt",
-        DataType::Text | DataType::Varchar | DataType::Uuid => "Text",
-        DataType::Bpchar => return Err(SqlError::Unsupported),
-        DataType::Bytes => "Bytes",
-        _ => return Err(SqlError::Unsupported),
-    };
-    Kind::from_engine_name(name).map_err(|_| SqlError::Unsupported)
+fn supported(ty: &DataType) -> R<()> {
+    Kind::for_type(ty).map(|_| ()).ok_or(SqlError::Unsupported)
 }
 // Numeric's private representation is constructed by validated pg-types APIs:
 // coefficient <= MAX_DIGITS, scale <= MAX_SCALE. Display invokes absolute-value
@@ -137,19 +127,18 @@ fn raw(v: &Value) -> usize {
         _ => 9,
     }
 }
-fn key_bound(v: &Value) -> R<usize> {
-    match v {
-        Value::Null => Ok(1),
-        Value::Bool(_) => Ok(2),
-        Value::Int(_) => Ok(9),
-        Value::Text(s) => add(mul(s.len(), 2)?, 3),
-        Value::Bytes(b) => add(mul(b.len(), 2)?, 3),
-        _ => Err(SqlError::Unsupported),
-    }
-}
+
 // Only length admission and fixed-ID selection. Checkpoints keep admission
 // cancellable; each individual shape is admitted before its checkpoint, and
 // the whole source is admitted before any variable comparisons/format/copies.
+fn key_bound(v: &Value) -> R<usize> {
+    match v {
+        Value::Text(s) => add(mul(s.len(), 2)?, 3),
+        Value::Bytes(b) => add(mul(b.len(), 2)?, 3),
+        _ => secondary_index_adapter::scalar_len(v),
+    }
+}
+
 fn admit<F: FnMut() -> bool>(state: &Relational, d: &Descriptor, meter: &mut Meter<F>) -> R<()> {
     cap(d.name.len(), si::MAX_NAME)?;
     cap(d.columns.len(), MAX_COLUMNS)?;
@@ -271,7 +260,11 @@ fn metadata<'a, F: FnMut() -> bool>(
     }
     schema_binding::validate_key(&d.name)?;
     for p in &t.primary_key {
-        legacy(&t.columns[*p].data_type)?;
+        let ty = &t.columns[*p].data_type;
+        if ty.is_temporal() {
+            return Err(SqlError::Unsupported);
+        }
+        supported(ty)?;
     }
     for (i, id) in d.columns.iter().enumerate() {
         meter.checkpoint()?;
@@ -283,7 +276,7 @@ fn metadata<'a, F: FnMut() -> bool>(
             .iter()
             .find(|c| c.id == *id)
             .ok_or(SqlError::UnknownColumn)?;
-        legacy(&col.data_type)?;
+        supported(&col.data_type)?;
     }
     Ok(t)
 }
@@ -367,6 +360,7 @@ fn validate<'a>(
         m.work(mul(row.values.len(), MAX_COLUMNS)?)?;
     }
     m.work(mul(pair_bytes, rows.len().saturating_sub(1))?)?;
+    let predicate = d.predicate.as_ref().map(|p| p.bind(state, t)).transpose()?;
     let mut versions = Vec::new();
     let mut tuples = Vec::new();
     for (key, row) in rows {
@@ -383,17 +377,16 @@ fn validate<'a>(
             }
         }
         versions.push(row.version);
-        let tuple = if positions
+        let tuple = if predicate.as_ref().map(|p| p.matches(&row.values)).transpose()? == Some(false)
+            || positions
             .iter()
             .any(|i| matches!(row.values[*i], Value::Null))
         {
             None
         } else {
-            let mut encoded = Vec::new();
-            for i in &positions {
-                encoded.extend(encode_key(std::slice::from_ref(&row.values[*i]))?);
-            }
-            Some(encoded)
+            Some(secondary_index_adapter::encode_tuple(
+                positions.iter().map(|i| &row.values[*i]),
+            )?)
         };
         tuples.push(tuple);
     }

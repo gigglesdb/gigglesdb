@@ -2493,10 +2493,8 @@ fn catalog_metadata_from(s: &MetadataState<'_>, path: &[String], generation: u64
                 generation,
                 typmods: s.sql.catalog_ext().columns.iter().filter_map(|(&id, c)| c.typmod.map(|m| (id, m)))
                     .chain(s.sql.views.into_iter().flatten().flat_map(|(_, v)| v.columns.iter().map(|c| (c.id, c.typmod)))).collect(),
-                indexes: s.sql.secondary_descriptors_engine().iter().map(|d| IndexInfo {
-                    id: d.id, table: d.table, name: relational::split_key(&d.name).1.into(),
-                    columns: d.columns.clone(), unique: d.unique,
-                }).collect(),
+                indexes: s.sql.secondary_descriptors_engine().iter()
+                    .map(|d| IndexInfo::from_descriptor(&s.sql, d)).collect::<Result<_, _>>()?,
             })
     }
 
@@ -5037,6 +5035,9 @@ impl SqlSession {
         check_reply: Option<&mut SqlReplyCheck<'_>>,
     ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         Self::check_prepared_generation(p, db)?;
+        let _detail = relational::collation_keys::DetailPresentation::enter(
+            self.date_style, clock.and_then(relational::clock::ExecutionClock::zone),
+        );
         let (tag, expanded) = self.statement_tag_leased(p, db)?;
         // GD-0061 R3-308: in a task session a write runs only inside the
         // protected commit; any other write is refused before it runs (and

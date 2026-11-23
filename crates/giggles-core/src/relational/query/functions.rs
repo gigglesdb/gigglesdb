@@ -754,6 +754,9 @@ impl Scalar {
             } else {
                 break;
             }
+            if super::index_predicate::bounded_parse() {
+                arithmetic::admit_shape(&value, depth, &mut 0)?;
+            }
         }
         Ok(value)
     }

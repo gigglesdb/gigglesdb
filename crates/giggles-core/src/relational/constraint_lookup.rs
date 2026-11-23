@@ -48,15 +48,6 @@ fn primary_key(table: &TableDef, columns: &[u64], values: &[Value]) -> R<Option<
     };
     encode_key(&order.iter().map(|i| values[*i].clone()).collect::<Vec<_>>()).map(Some)
 }
-fn successor(mut key: Vec<u8>) -> Option<Vec<u8>> {
-    while let Some(last) = key.pop() {
-        if last != u8::MAX {
-            key.push(last + 1);
-            return Some(key);
-        }
-    }
-    None
-}
 fn indexed(
     state: &Relational,
     table: &TableDef,
@@ -69,7 +60,7 @@ fn indexed(
         .secondary_descriptors_engine()
         .iter()
         .filter(|d| {
-            d.table == table.id && (!unique || d.unique && d.columns.len() == columns.len())
+            d.table == table.id && d.predicate.is_none() && (!unique || d.unique && d.columns.len() == columns.len())
         })
         .filter(|d| {
             d.columns.len() >= columns.len()
@@ -82,7 +73,7 @@ fn indexed(
     let order = permutation(&descriptor.columns[..columns.len()], columns).ok_or(SqlError::Type)?;
     secondary_index_adapter::tuple_len(order.iter().map(|i| &values[*i]))?;
     let lower = secondary_index_adapter::encode_tuple(order.iter().map(|i| &values[*i]))?;
-    let upper = successor(lower.clone());
+    let upper = secondary_index_keys::successor(lower.clone());
     let (sidecar, base) = state.secondary_access_engine(table, state.epoch, &mut *cancel)?;
     let hits = sidecar
         .lookup(descriptor.id, Some(&lower), upper.as_deref(), &mut *cancel)

@@ -133,9 +133,9 @@ impl CopyOptions {
                             if parens {
                                 p.punct('(')?;
                             }
-                            cols.names.push(p.name()?);
+                            cols.names.push(p.column_name()?);
                             while p.sym(',') {
-                                cols.names.push(p.name()?);
+                                cols.names.push(p.column_name()?);
                             }
                             if parens {
                                 p.punct(')')?;
@@ -622,9 +622,9 @@ impl Copy {
         let table = relation_key(split_key(&table).0, split_key(&table).1);
         let mut columns = vec![];
         if p.sym('(') {
-            columns.push(p.name()?);
+            columns.push(p.column_name()?);
             while p.sym(',') {
-                columns.push(p.name()?);
+                columns.push(p.column_name()?);
             }
             p.punct(')')?;
         }
