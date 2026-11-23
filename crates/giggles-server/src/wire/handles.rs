@@ -1,4 +1,4 @@
-//! Connection-local, catalog-free native operation handles.
+//! Connection-local, catalog-free native operation and SQL handles.
 
 use crate::api::{
     codec::{self, Invocation},
@@ -6,9 +6,15 @@ use crate::api::{
     proto,
 };
 use giggles_language::{Bindings, PreparedText};
+use std::sync::Arc;
+
+enum Slot {
+    Native(PreparedText),
+    Sql(Arc<str>),
+}
 
 pub(super) struct HandleTable {
-    slots: Vec<Option<PreparedText>>,
+    slots: Vec<Option<Slot>>,
     free: Vec<u32>,
     cap: usize,
 }
@@ -27,9 +33,7 @@ impl HandleTable {
         text: &str,
         language_version: Option<&str>,
     ) -> Result<u32, ApiError> {
-        if self.free.is_empty() && self.slots.len() >= self.cap {
-            return Err(ApiError::ResourceExhausted);
-        }
+        self.check_capacity()?;
         let input = proto::ExecuteRequest {
             request: Some(proto::execute_request::Request::Text(
                 proto::NativeTextRequest {
@@ -48,14 +52,38 @@ impl HandleTable {
         let prepared =
             giggles_language::prepare_text(text, version).map_err(|_| ApiError::InvalidArgument)?;
 
+        self.insert(Slot::Native(prepared))
+    }
+
+    pub(super) fn prepare_sql(
+        &mut self,
+        text: &str,
+        language_version: Option<&str>,
+    ) -> Result<u32, ApiError> {
+        if language_version.is_some() || text.trim().is_empty() {
+            return Err(ApiError::InvalidArgument);
+        }
+        self.check_capacity()?;
+        self.insert(Slot::Sql(Arc::from(text)))
+    }
+
+    fn check_capacity(&self) -> Result<(), ApiError> {
+        if self.free.is_empty() && self.slots.len() >= self.cap {
+            Err(ApiError::ResourceExhausted)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn insert(&mut self, slot: Slot) -> Result<u32, ApiError> {
         // Number new slots from zero and reuse the most recently closed slot.
         if let Some(handle) = self.free.pop() {
-            self.slots[handle as usize] = Some(prepared);
+            self.slots[handle as usize] = Some(slot);
             Ok(handle)
         } else {
             let handle =
                 u32::try_from(self.slots.len()).map_err(|_| ApiError::ResourceExhausted)?;
-            self.slots.push(Some(prepared));
+            self.slots.push(Some(slot));
             Ok(handle)
         }
     }
@@ -64,14 +92,37 @@ impl HandleTable {
         &self,
         handle: u32,
         bindings: Bindings,
+        params: Vec<proto::Value>,
     ) -> Result<Invocation, ApiError> {
-        self.slots
+        let slot = self
+            .slots
             .get(handle as usize)
             .and_then(Option::as_ref)
-            .ok_or(ApiError::InvalidArgument)?
-            .lower(&bindings)
-            .map(Invocation::from)
-            .map_err(|_| ApiError::InvalidArgument)
+            .ok_or(ApiError::InvalidArgument)?;
+        match slot {
+            Slot::Native(prepared) => {
+                if !params.is_empty() {
+                    return Err(ApiError::InvalidArgument);
+                }
+                prepared
+                    .lower(&bindings)
+                    .map(Invocation::from)
+                    .map_err(|_| ApiError::InvalidArgument)
+            }
+            Slot::Sql(text) => {
+                if !bindings.is_empty() {
+                    return Err(ApiError::InvalidArgument);
+                }
+                codec::decode_execute(proto::ExecuteRequest {
+                    request: Some(proto::execute_request::Request::Sql(proto::SqlRequest {
+                        sql: text.to_string(),
+                        params,
+                    })),
+                    ..Default::default()
+                })
+                .map(|decoded| decoded.request)
+            }
+        }
     }
 
     pub(super) fn close(&mut self, handle: u32) -> bool {
@@ -91,6 +142,130 @@ impl HandleTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_prepare_shares_cap_and_free_list() {
+        let mut handles = HandleTable::new(3);
+        assert_eq!(handles.prepare("t where id=1", None).unwrap(), 0);
+        assert_eq!(handles.prepare_sql("SELECT 1", None).unwrap(), 1);
+        assert_eq!(handles.prepare("t where id=2", None).unwrap(), 2);
+        assert!(matches!(
+            handles.prepare_sql("SELECT 2", None),
+            Err(ApiError::ResourceExhausted)
+        ));
+        assert!(matches!(
+            handles.prepare("t where id=3", None),
+            Err(ApiError::ResourceExhausted)
+        ));
+        assert!(handles.close(0));
+        assert!(handles.close(1));
+        assert_eq!(handles.prepare("t where id=3", None).unwrap(), 1);
+        assert_eq!(handles.prepare_sql("SELECT 2", None).unwrap(), 0);
+        assert!(matches!(
+            handles.prepare_sql("SELECT 3", None),
+            Err(ApiError::ResourceExhausted)
+        ));
+    }
+
+    #[test]
+    fn sql_prepare_refuses_language_version() {
+        let mut handles = HandleTable::new(1);
+        for version in ["", "0.18", "unknown"] {
+            assert!(matches!(
+                handles.prepare_sql("SELECT 1", Some(version)),
+                Err(ApiError::InvalidArgument)
+            ));
+        }
+        assert_eq!(handles.prepare_sql("SELECT 1", None).unwrap(), 0);
+    }
+
+    #[test]
+    fn sql_prepare_refuses_blank_text() {
+        let mut handles = HandleTable::new(1);
+        for text in ["", " \t\r\n", "\u{2003}"] {
+            assert!(matches!(
+                handles.prepare_sql(text, None),
+                Err(ApiError::InvalidArgument)
+            ));
+        }
+        assert_eq!(handles.prepare_sql("SELECT 1", None).unwrap(), 0);
+    }
+
+    #[test]
+    fn run_kind_mismatch_is_invalid_argument() {
+        let mut handles = HandleTable::new(2);
+        let sql = handles.prepare_sql("SELECT 1", None).unwrap();
+        let native = handles.prepare("t where id=1", None).unwrap();
+        let bindings = crate::api::native_codec::bindings(vec![proto::NativeBinding {
+            name: Some("id".into()),
+            value: Some(proto::Value {
+                value: Some(proto::value::Value::IntValue(7)),
+            }),
+        }])
+        .unwrap();
+        assert!(matches!(
+            handles.invocation(sql, bindings, vec![]),
+            Err(ApiError::InvalidArgument)
+        ));
+        assert!(matches!(
+            handles.invocation(
+                native,
+                Default::default(),
+                vec![proto::Value {
+                    value: Some(proto::value::Value::IntValue(7)),
+                }]
+            ),
+            Err(ApiError::InvalidArgument)
+        ));
+    }
+
+    #[test]
+    fn sql_invocation_equals_execute_sql() {
+        for (text, params) in [
+            ("SELECT 1", vec![]),
+            (
+                "SELECT $1",
+                vec![proto::Value {
+                    value: Some(proto::value::Value::IntValue(7)),
+                }],
+            ),
+            ("SELEC 1", vec![]),
+        ] {
+            let expected = codec::decode_execute(proto::ExecuteRequest {
+                request: Some(proto::execute_request::Request::Sql(proto::SqlRequest {
+                    sql: text.into(),
+                    params: params.clone(),
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut handles = HandleTable::new(1);
+            let handle = handles.prepare_sql(text, None).unwrap();
+            let actual = handles
+                .invocation(handle, Default::default(), params)
+                .unwrap();
+            assert_eq!(
+                format!("{actual:?}"),
+                format!("{:?}", expected.request),
+                "{text}"
+            );
+            // QueuedRun::resolve applies this same operation-ID validation.
+            let id = codec::decode_operation_id(Some("sql-run-1")).unwrap();
+            assert!(matches!(
+                codec::validate_operation_id(&actual, id.as_ref()),
+                Err(ApiError::InvalidArgument)
+            ));
+            // Malformed parameter values must use EXECUTE's validation as well.
+            assert!(matches!(
+                handles.invocation(
+                    handle,
+                    Default::default(),
+                    vec![proto::Value { value: None }]
+                ),
+                Err(ApiError::InvalidArgument)
+            ));
+        }
+    }
 
     #[test]
     fn prepare_refuses_task_ddl() {
@@ -118,15 +293,15 @@ mod tests {
             handles.prepare("t where id=2", None),
             Err(ApiError::ResourceExhausted)
         ));
-        assert!(handles.invocation(5, Default::default()).is_ok());
+        assert!(handles.invocation(5, Default::default(), vec![]).is_ok());
         assert!(handles.close(5));
         assert!(!handles.close(5));
         assert!(matches!(
-            handles.invocation(5, Default::default()),
+            handles.invocation(5, Default::default(), vec![]),
             Err(ApiError::InvalidArgument)
         ));
         assert_eq!(handles.prepare("t where id=2", None).unwrap(), 5);
-        assert!(handles.invocation(255, Default::default()).is_ok());
+        assert!(handles.invocation(255, Default::default(), vec![]).is_ok());
     }
 
     #[test]
@@ -159,7 +334,7 @@ mod tests {
             let mut handles = HandleTable::new(1);
             let handle = handles.prepare(text, version).unwrap();
             let bindings = crate::api::native_codec::bindings(bindings).unwrap();
-            let actual = handles.invocation(handle, bindings).unwrap();
+            let actual = handles.invocation(handle, bindings, vec![]).unwrap();
             assert_eq!(
                 format!("{actual:?}"),
                 format!("{:?}", expected.request),

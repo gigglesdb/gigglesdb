@@ -405,6 +405,7 @@ enum QueuedRequest {
 struct QueuedRun {
     handle: u32,
     bindings: giggles_language::Bindings,
+    params: Vec<proto::Value>,
     budget_ms: Option<u32>,
     operation_id: Option<OperationId>,
     received: Instant,
@@ -417,6 +418,7 @@ impl QueuedRun {
         Ok(Self {
             handle: run.handle,
             bindings: native_codec::bindings(run.bindings)?,
+            params: run.params,
             budget_ms: run.budget_ms,
             operation_id,
             received,
@@ -424,7 +426,7 @@ impl QueuedRun {
     }
 
     fn resolve(self, handles: &HandleTable, runtime: &ApiRuntime) -> Result<WireCall, ApiError> {
-        let request = handles.invocation(self.handle, self.bindings)?;
+        let request = handles.invocation(self.handle, self.bindings, self.params)?;
         codec::validate_operation_id(&request, self.operation_id.as_ref())?;
         wire_call(
             runtime,
@@ -1119,7 +1121,12 @@ async fn connection_loop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     Ok(QueuedRequest::Execute(call)) => Ok(*call),
                     Ok(QueuedRequest::Run(run)) => run.resolve(&handles, runtime),
                     Ok(QueuedRequest::Prepare(prepare)) => {
-                        match handles.prepare(&prepare.text, prepare.language_version.as_deref()) {
+                        let result = if prepare.sql == Some(true) {
+                            handles.prepare_sql(&prepare.text, prepare.language_version.as_deref())
+                        } else {
+                            handles.prepare(&prepare.text, prepare.language_version.as_deref())
+                        };
+                        match result {
                             Ok(handle) => {
                                 encode_message(
                                     &mut pending,

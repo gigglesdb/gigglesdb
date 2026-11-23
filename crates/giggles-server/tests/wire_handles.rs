@@ -181,6 +181,7 @@ async fn pipelined_prepare_run_close_see_each_other() {
         &WirePrepare {
             text: "shipments where id=1 select id".into(),
             language_version: Some("0.18".into()),
+            ..Default::default()
         },
     );
     encode_message(&mut out, FrameKind::Run, Flags(0), 3, &run);
@@ -285,6 +286,7 @@ fn encode_handle_prepare(out: &mut Vec<u8>, id: u32) {
         &WirePrepare {
             text: "shipments where id=1 select id".into(),
             language_version: Some(VERSION.into()),
+            ..Default::default()
         },
     );
 }
@@ -895,6 +897,7 @@ async fn run_budget_and_operation_id_match_execute() {
                 bindings,
                 budget_ms: budget,
                 operation_id: operation_id.map(str::to_owned),
+                ..Default::default()
             })
             .await
             .unwrap();

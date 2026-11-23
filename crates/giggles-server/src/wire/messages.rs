@@ -51,6 +51,7 @@ mod tests {
         assert_round_trip(&WirePrepare {
             text: "select id from widgets".into(),
             language_version: Some("1".into()),
+            ..Default::default()
         });
         assert_round_trip(&WirePrepared { handle: 7 });
         let run = WireRun {
@@ -61,6 +62,7 @@ mod tests {
             }],
             budget_ms: Some(200),
             operation_id: Some("run-1".into()),
+            ..Default::default()
         };
         assert_round_trip(&run);
         assert_round_trip(&WireCloseHandle { handle: 7 });

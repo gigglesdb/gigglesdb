@@ -442,6 +442,7 @@ impl Client {
         let request = WirePrepare {
             text: text.into(),
             language_version: language_version.map(str::to_owned),
+            ..Default::default()
         };
         let id = self.send_request(FrameKind::Prepare, &request).await?;
         let reply = self.reader.prepared(id).await?;
