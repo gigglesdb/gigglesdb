@@ -51,7 +51,7 @@ fn top_positions(tokens: &[Token], statement_end: bool) -> R<Vec<usize>> {
     Ok(out)
 }
 impl Plan {
-    pub(in crate::relational) fn requires_grouping_sets(tokens: &[Token]) -> bool {
+    pub(in crate::relational) fn requires_grouping_rewrite(tokens: &[Token]) -> bool {
         let mut depth = 0usize;
         let mut group = false;
         let mut start = false;
@@ -65,6 +65,9 @@ impl Plan {
                     group = true;
                     start = true;
                     at += 2;
+                    if tokens.get(at).is_some_and(|t| word(t, "distinct") || word(t, "all")) {
+                        return true;
+                    }
                     continue;
                 }
                 if group {
@@ -75,7 +78,7 @@ impl Plan {
                         if start && (
                             (word(token, "rollup") || word(token, "cube")) && tokens.get(at + 1) == Some(&Token::Symbol('('))
                             || word(token, "grouping") && tokens.get(at + 1).is_some_and(|t| word(t, "sets"))
-                            || *token == Token::Symbol('(') && tokens.get(at + 1) == Some(&Token::Symbol(')'))
+                            || *token == Token::Symbol('(') && group_sets::parenthesized_list(tokens, at)
                         ) { return true; }
                         start = false;
                     }
@@ -97,7 +100,7 @@ impl Plan {
                 .first()
                 .is_some_and(|t| ["values", "table", "with"].iter().any(|w| word(t, w)));
         }
-        if Self::requires_grouping_sets(tokens)
+        if Self::requires_grouping_rewrite(tokens)
             || tokens.get(1).is_some_and(|t| word(t, "distinct")) && tokens.get(2).is_some_and(|t| word(t, "on"))
         { return true; }
         // Claim detection must still see a planner construct when a later
@@ -656,7 +659,7 @@ pub(super) fn select(
     next: &mut usize,
 ) -> ParseResult<Plan> {
     if paging::claims(tokens)? { paging::parse(tokens, following, owner, depth, next) }
-    else { select_base(tokens, following, owner, depth, next) }
+    else { select_base(tokens, following, owner, depth, next, None, &mut []) }
 }
 
 pub(super) fn select_base(
@@ -665,8 +668,12 @@ pub(super) fn select_base(
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
+    grouping_sets: Option<&group_sets::GroupingSets>,
+    distinct_on: &mut [Scalar],
 ) -> ParseResult<Plan> {
-    if let Some(plan) = window::parse(tokens, following, owner, depth, next)? {
+    if let Some(plan) = window::parse(
+        tokens, following, owner, depth, next, grouping_sets, distinct_on,
+    )? {
         return Ok(plan);
     }
     let (rewritten, applies) = subquery::rewrite(tokens, owner, depth, next)?;

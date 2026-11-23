@@ -123,7 +123,9 @@ impl Plan {
         }
         match &self.body {
             Body::Select(select) if !select.applies.is_empty() => {
-                subquery::resolve(select, state, &mut parameters.to_vec())?;
+                subquery::resolve(
+                    select, self.decorations.grouping_sets.as_ref(), state, &mut parameters.to_vec(),
+                )?;
             }
             Body::Select(select) => {
                 if let Some(from) = &select.from {
@@ -234,7 +236,7 @@ impl Plan {
         }
         let mut meta = match &mut self.body {
             Body::Select(select) if !select.applies.is_empty() => {
-                subquery::resolve(select, state, parameters)?
+                subquery::resolve(select, self.decorations.grouping_sets.as_ref(), state, parameters)?
             }
             Body::Select(select) => {
                 let shape = select
@@ -306,7 +308,7 @@ impl Plan {
                     Err(error) => return Err(error),
                 };
                 let mut description = bound.description(state);
-                group_sets::validate(&query, self.decorations.grouping_sets.as_deref(), state, &description.parameters)?;
+                group_sets::validate(&query, self.decorations.grouping_sets.as_ref(), state, &description.parameters)?;
                 let oids = cte::projection_oids(&bound);
                 if oids.iter().any(|oid| *oid != 0) {
                     description.type_oids = oids;

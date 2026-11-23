@@ -8,7 +8,7 @@ pub(super) struct Options {
     pub with_ties: bool,
     pub distinct_on: usize,
     pub hidden: usize,
-    pub grouping_sets: Option<Vec<Vec<bool>>>,
+    pub grouping_sets: Option<group_sets::GroupingSets>,
     pub sample: Option<Box<Sample>>,
 }
 
@@ -135,7 +135,7 @@ pub(super) fn claims(tokens: &[Token]) -> R<bool> {
     let positions = top(tokens)?;
     let distinct = tokens.get(1).is_some_and(|t| word(t, "distinct"))
         && tokens.get(2).is_some_and(|t| word(t, "on"));
-    let grouped = Plan::requires_grouping_sets(tokens);
+    let grouped = Plan::requires_grouping_rewrite(tokens);
     if distinct || grouped {
         return Ok(true);
     }
@@ -182,12 +182,23 @@ pub(super) fn parse(
         body.drain(1..3 + p.at);
     }
     let grouping_sets = group_sets::rewrite(&mut body, body_end)?;
-    let mut plan = parse::select_base(&body, body_end, owner, depth, next)?;
+    if grouping_sets.is_none() && !distinct && Plan::requires_grouping_rewrite(tokens) {
+        body.extend_from_slice(&tokens[page..]);
+        return parse::select(&body, following, owner, depth, next);
+    }
+    let mut plan = parse::select_base(
+        &body, body_end, owner, depth, next, grouping_sets.as_ref(), &mut keys,
+    )?;
     plan = parse::pagination(plan, &tokens[page..], following)?;
-    plan.decorations.grouping_sets = grouping_sets;
     let Body::Select(select) = &mut plan.body else {
         return Err(ParseError::Decline);
     };
+    if select.windows.is_empty() {
+        plan.decorations.grouping_sets = grouping_sets;
+    } else if let Some(input) = &mut select.input {
+        // Window functions consume the concatenated rows of all grouping sets.
+        input.query.decorations.grouping_sets = grouping_sets;
+    }
     if plan.decorations.with_ties && select.query.order.is_empty() {
         return Err(ParseError::Definite(SqlError::Syntax));
     }

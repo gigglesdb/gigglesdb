@@ -4,7 +4,7 @@ use super::*;
 
 pub(super) struct Grouping {
     keys: Vec<BoundScalar>,
-    empty_set: bool,
+    mask: Option<Vec<bool>>,
     aggregates: Vec<BoundItem>,
     aggregate_filters: Vec<Option<BoundFilter>>,
     direct_inputs: Vec<bool>,
@@ -999,7 +999,7 @@ pub(super) fn bind<'a>(
         volatile_order: vec![],
         aggregate_zone: giggles_pg_types::temporal::SessionZone::Fixed(0),
         grouping: Some(Grouping {
-            empty_set: grouping_mask.as_ref().is_some_and(|m| !m.iter().any(|b| *b)),
+            mask: grouping_mask,
             keys,
             aggregates,
             aggregate_filters,
@@ -1110,6 +1110,10 @@ impl Grouping {
         self.outputs.iter().map(BoundScalar::result_oid).collect()
     }
 
+    pub(super) fn mask(&self) -> Option<&[bool]> {
+        self.mask.as_deref()
+    }
+
     pub(super) fn into_collation_outputs(self) -> Vec<Option<BoundScalar>> {
         self.outputs.into_iter().map(Some).collect()
     }
@@ -1179,13 +1183,14 @@ impl Grouping {
         // (spilling) and stream one group's state at a time; both halves merge
         // in key order. DISTINCT aggregates always take the sorted path.
         let v2 = source.streams_reductions();
-        let sort_groups = v2 && !self.keys.is_empty() && !self.empty_set;
+        let empty_set = self.mask().is_some_and(|mask| !mask.contains(&true));
+        let sort_groups = v2 && !self.keys.is_empty() && !empty_set;
         let hash = sort_groups && !self.aggregates.iter().any(|a| matches!(a, BoundItem::Aggregate(a, _) if a.distinct()));
         let mut hash_bytes = 0usize;
         let mut sorter = spill::Sorter::<GroupInput>::new();
         let mut scope = RetentionScope::new(execution);
         let mut retention = scope.borrow();
-        if self.keys.is_empty() || self.empty_set {
+        if self.keys.is_empty() || empty_set {
             let initial = self.initial();
             retention.charge(retained(&initial) + std::mem::size_of::<Key>())?;
             let mut auxiliary = aggregate_auxiliary(&self.aggregates, &mut retention)?;

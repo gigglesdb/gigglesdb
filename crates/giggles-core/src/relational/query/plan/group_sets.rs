@@ -4,6 +4,45 @@ use parse::{ParseResult, group_clause, top, unqualified, word};
 type Key = Vec<Token>;
 type Sets = Vec<Vec<Key>>;
 
+#[derive(Debug, Clone)]
+pub(super) struct GroupingSets {
+    masks: Vec<Vec<bool>>,
+    distinct: bool,
+}
+
+impl GroupingSets {
+    pub(super) fn has_keys(&self) -> bool {
+        self.masks.first().is_some_and(|mask| !mask.is_empty())
+    }
+}
+
+/// A parenthesized scalar is parsed by the ordinary GROUP BY parser.
+pub(super) fn parenthesized_list(tokens: &[Token], open: usize) -> bool {
+    let leading_parens = tokens[open..]
+        .iter()
+        .take_while(|token| **token == Token::Symbol('('))
+        .count();
+    let mut depth = 1;
+    let mut comma = false;
+    for (at, token) in tokens.iter().enumerate().skip(open + 1) {
+        match token {
+            Token::Symbol('(') => depth += 1,
+            Token::Symbol(')') => {
+                depth -= 1;
+                if depth == 0 {
+                    return (comma || at == open + 1)
+                        && tokens.get(at + 1).is_none_or(|next| {
+                            matches!(next, Token::Symbol(',' | ';')) || ends_group(next)
+                        });
+                }
+            }
+            Token::Symbol(',') if depth <= leading_parens => comma = true,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn list<'a>(tokens: &'a [Token], following: Option<&Token>) -> R<Vec<&'a [Token]>> {
     if tokens.is_empty() {
         return Ok(vec![]);
@@ -43,7 +82,12 @@ fn product(a: Sets, b: Sets) -> R<Sets> {
         })
         .collect())
 }
-fn expand(tokens: &[Token], depth: usize, following: Option<&Token>) -> R<Sets> {
+fn expand(
+    tokens: &[Token],
+    depth: usize,
+    following: Option<&Token>,
+    has_sets: &mut bool,
+) -> R<Sets> {
     if depth >= subplans::MAX_DEPTH {
         return Err(SqlError::Limit);
     }
@@ -57,6 +101,7 @@ fn expand(tokens: &[Token], depth: usize, following: Option<&Token>) -> R<Sets> 
             .is_some_and(|t| word(t, "rollup") || word(t, "cube"))
             && item.get(1) == Some(&Token::Symbol('('));
         let sets = if grouping || rollup_or_cube {
+            *has_sets = true;
             let open = if grouping { 2 } else { 1 };
             if item.get(open) != Some(&Token::Symbol('(')) {
                 return Err(clause_syntax(item.get(open).or(following)));
@@ -71,7 +116,7 @@ fn expand(tokens: &[Token], depth: usize, following: Option<&Token>) -> R<Sets> 
             if grouping {
                 let mut sets = vec![];
                 for item in list(inner, following)? {
-                    sets.extend(expand(item, depth + 1, following)?);
+                    sets.extend(expand(item, depth + 1, following, has_sets)?);
                     if sets.len() > 4096 {
                         return Err(SqlError::Limit);
                     }
@@ -80,7 +125,7 @@ fn expand(tokens: &[Token], depth: usize, following: Option<&Token>) -> R<Sets> 
             } else {
                 let units = list(inner, following)?
                     .into_iter()
-                    .map(|item| expand(item, depth + 1, following))
+                    .map(|item| expand(item, depth + 1, following, has_sets))
                     .collect::<R<Vec<_>>>()?;
                 let cube = word(&item[0], "cube");
                 if units.len() > MAX_COLUMNS || cube && units.len() > 12 {
@@ -110,7 +155,8 @@ fn expand(tokens: &[Token], depth: usize, following: Option<&Token>) -> R<Sets> 
             && item.last() == Some(&Token::Symbol(')'))
             && top(item)?.len() == 2
         {
-            expand(&item[1..item.len() - 1], depth + 1, item.last())?
+            *has_sets |= item.len() == 2;
+            expand(&item[1..item.len() - 1], depth + 1, item.last(), has_sets)?
         } else {
             vec![vec![item.to_vec()]]
         };
@@ -121,7 +167,7 @@ fn expand(tokens: &[Token], depth: usize, following: Option<&Token>) -> R<Sets> 
 pub(super) fn rewrite(
     tokens: &mut Vec<Token>,
     following: Option<&Token>,
-) -> ParseResult<Option<Vec<Vec<bool>>>> {
+) -> ParseResult<Option<GroupingSets>> {
     let positions = top(tokens)?;
     let Some(group) = positions
         .iter()
@@ -146,10 +192,14 @@ pub(super) fn rewrite(
     if body.last() == Some(&Token::Symbol(',')) {
         return Err(ParseError::Definite(clause_syntax(body_end)));
     }
-    if !Plan::requires_grouping_sets(tokens) {
+    if !Plan::requires_grouping_rewrite(tokens) {
         return Ok(None);
     }
-    let sets = expand(body, 0, body_end).map_err(ParseError::Definite)?;
+    let distinct = body.first().is_some_and(|t| word(t, "distinct"));
+    let modified = distinct || body.first().is_some_and(|t| word(t, "all"));
+    let mut has_sets = false;
+    let sets = expand(&body[usize::from(modified)..], 0, body_end, &mut has_sets)
+        .map_err(ParseError::Definite)?;
     if tokens.get(end).is_some_and(|t| word(t, "having")) && end + 1 == tokens.len() {
         return Err(ParseError::Definite(clause_syntax(following)));
     }
@@ -172,12 +222,15 @@ pub(super) fn rewrite(
         }
         replacement.extend(key);
     }
+    if replacement.first().is_some_and(|t| word(t, "distinct") || word(t, "all")) {
+        return Err(ParseError::Definite(clause_syntax(replacement.first())));
+    }
     // An empty grouping list needs the grouped binder even without aggregates.
     if replacement.is_empty() {
         replacement.extend(lex("0::int")?);
     }
     tokens.splice(start..end, replacement);
-    Ok(Some(masks))
+    Ok(has_sets.then_some(GroupingSets { masks, distinct }))
 }
 
 fn masked(query: &Query, mask: &[bool]) -> Query {
@@ -201,12 +254,12 @@ fn masked(query: &Query, mask: &[bool]) -> Query {
 }
 pub(super) fn validate(
     query: &Query,
-    masks: Option<&[Vec<bool>]>,
+    sets: Option<&GroupingSets>,
     state: &Relational,
     parameters: &[DataType],
 ) -> R<()> {
-    if let Some(masks) = masks {
-        for mask in masks {
+    if let Some(sets) = sets {
+        for mask in &sets.masks {
             masked(query, mask)
                 .bind_projection_seeded(state, parameters.iter().cloned().map(Some).collect())?;
         }
@@ -216,7 +269,7 @@ pub(super) fn validate(
 #[expect(clippy::too_many_arguments, reason = "shared query execution context")]
 pub(super) fn execute(
     query: &Query,
-    masks: Option<&[Vec<bool>]>,
+    sets: Option<&GroupingSets>,
     state: &Relational,
     source: &dyn scan::RowSource,
     params: &[Value],
@@ -229,7 +282,8 @@ pub(super) fn execute(
         rows: vec![],
         affected: 0,
     };
-    let passes: Vec<_> = masks.map_or_else(|| vec![None], |masks| masks.iter().map(Some).collect());
+    let passes: Vec<_> = sets.map_or_else(|| vec![None], |sets| sets.masks.iter().map(Some).collect());
+    let mut seen = BTreeSet::new();
     let scope = RetentionScope::new(execution);
     for mask in passes {
         if execution.cancelled() {
@@ -239,6 +293,12 @@ pub(super) fn execute(
         let bound = query
             .bind_projection_seeded(state, parameters.to_vec())?
             .with_clock(clock);
+        if sets.is_some_and(|sets| sets.distinct)
+            && let Some(mask) = bound.grouping.as_ref().and_then(|g| g.mask())
+            && !seen.insert(mask.to_vec())
+        {
+            continue;
+        }
         let rows =
             bound.execute_context(state, source, params, parameters, execution, true, false)?;
         result.columns = rows.columns;

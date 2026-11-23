@@ -605,3 +605,6 @@ mod partial_indexes;
 
 #[path = "sql_dml_sources.rs"]
 mod sql_dml_sources;
+
+#[path = "window_grouping_sets.rs"]
+mod window_grouping_sets;

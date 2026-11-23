@@ -800,6 +800,7 @@ fn prepare(
 }
 pub(super) fn resolve(
     s: &Select,
+    sets: Option<&group_sets::GroupingSets>,
     state: &Relational,
     parameters: &mut [Option<DataType>],
 ) -> R<bind::Meta> {
@@ -814,6 +815,7 @@ pub(super) fn resolve(
     }
     let bound = q.bind_projection_seeded(&catalog, seeded)?;
     let mut d = bound.description(&catalog);
+    group_sets::validate(&q, sets, &catalog, &d.parameters)?;
     for column in &mut d.columns {
         column.id = 0;
     }
@@ -856,8 +858,10 @@ impl Cached {
     }
 }
 
+#[expect(clippy::too_many_arguments, reason = "shared query execution context")]
 pub(super) fn run<'a>(
     s: &Select,
+    sets: Option<&group_sets::GroupingSets>,
     state: &Relational,
     source: &dyn scan::RowSource,
     params: &[Value],
@@ -956,7 +960,13 @@ pub(super) fn run<'a>(
     let bound = q
         .bind_projection_seeded(&catalog, parameters.to_vec())?
         .with_clock(clock);
-    let run = || bound.execute_context(&catalog, &source, params, parameters, execution, true, false);
+    let run = || {
+        if sets.is_some() {
+            group_sets::execute(&q, sets, &catalog, &source, params, parameters, clock, execution)
+        } else {
+            bound.execute_context(&catalog, &source, params, parameters, execution, true, false)
+        }
+    };
     let output = if lazy {
         let retention = RetentionScope::new(execution);
         let cache = RefCell::new(BTreeMap::<(usize, &str), Value>::new());

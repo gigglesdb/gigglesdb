@@ -107,8 +107,16 @@ impl Plan {
         let mut result = Relation::new(meta.columns, meta.typmods, execution);
         match &self.body {
             Body::Select(select) if !select.applies.is_empty() => {
-                result =
-                    subquery::run(select, state, source, params, parameters, clock, execution)?;
+                result = subquery::run(
+                    select,
+                    self.decorations.grouping_sets.as_ref(),
+                    state,
+                    source,
+                    params,
+                    parameters,
+                    clock,
+                    execution,
+                )?;
             }
             Body::Select(select) => {
                 if let Some(from) = &select.from {
@@ -124,7 +132,7 @@ impl Plan {
                         .bind_projection_seeded(&catalog, parameters.to_vec())?
                         .with_clock(clock);
                     result.columns = bound.columns.clone();
-                    for row in group_sets::execute(&query, self.decorations.grouping_sets.as_deref(), &catalog, &wrapper, params, parameters, clock, execution)?.rows
+                    for row in group_sets::execute(&query, self.decorations.grouping_sets.as_ref(), &catalog, &wrapper, params, parameters, clock, execution)?.rows
                     {
                         result.push(row)?;
                     }
@@ -187,7 +195,7 @@ impl Plan {
                         .bind_projection_seeded(state, parameters.to_vec())?
                         .with_clock(clock);
                     result.columns = bound.columns.clone();
-                    let rows = group_sets::execute(&query, self.decorations.grouping_sets.as_deref(), state, source, params, parameters, clock, execution)?;
+                    let rows = group_sets::execute(&query, self.decorations.grouping_sets.as_ref(), state, source, params, parameters, clock, execution)?;
                     for row in rows.rows {
                         result.push(row)?;
                     }

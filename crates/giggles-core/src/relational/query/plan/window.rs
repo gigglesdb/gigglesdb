@@ -295,6 +295,8 @@ pub(super) fn parse(
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
+    grouping_sets: Option<&group_sets::GroupingSets>,
+    distinct_on: &mut [Scalar],
 ) -> ParseResult<Option<Plan>> {
     let positions = top(tokens)?;
     let window = positions
@@ -548,14 +550,22 @@ pub(super) fn parse(
         }
     }
     let mut q = s.query.clone();
-    let mut items = vec![];
+    let mut input = WindowInput {
+        items: vec![],
+        grouped: grouping_sets
+            .map(|sets| {
+                let keys = if sets.has_keys() { s.query.group() } else { &[] };
+                GroupInputs::new(keys, &original)
+            })
+            .transpose()?,
+    };
     for (item, alias) in &mut q.items {
         match item {
             Item::Scalar(v) => {
                 if alias.is_none() {
                     *alias = Some(output_name(v, &calls));
                 }
-                lower(v, &mut items, &calls, 0)?;
+                lower(v, &mut input, &calls, true, 0)?;
             }
             Item::Aggregate(a, arg) => {
                 let v = Scalar::Call(
@@ -563,17 +573,18 @@ pub(super) fn parse(
                     vec![arg.clone().unwrap_or(Scalar::Literal(Value::Int(1)))],
                 );
                 let mut v = v;
-                lower(&mut v, &mut items, &calls, 0)?;
+                lower(&mut v, &mut input, &calls, true, 0)?;
                 if alias.is_none() {
                     *alias = Some(a.base().name().into());
                 }
                 *item = Item::Scalar(v);
             }
-            Item::Star | Item::QualifiedStar { .. } => items.push((item.clone(), None)),
+            Item::Star | Item::QualifiedStar { .. } => input.items.push((item.clone(), None)),
         }
     }
     let outputs = q.items.clone();
-    for (v, _, _) in &mut q.order {
+    let distinct_on = if grouping_sets.is_some() { distinct_on } else { &mut [] };
+    for v in q.order.iter_mut().map(|(v, _, _)| v).chain(distinct_on) {
         if matches!(v, Scalar::Literal(Value::Int(_))) {
             continue;
         }
@@ -585,20 +596,18 @@ pub(super) fn parse(
         {
             continue;
         }
-        lower(v, &mut items, &calls, 0)?;
+        lower(v, &mut input, &calls, true, 0)?;
     }
     for call in &mut calls {
-        for v in call
-            .args
-            .iter_mut()
-            .chain(&mut call.filter)
-            .chain(&mut call.spec.partition)
+        let args = call.args.iter_mut().chain(&mut call.filter).map(|v| (v, false));
+        let keys = call.spec.partition.iter_mut()
             .chain(call.spec.order.iter_mut().map(|(s, _, _)| s))
-        {
+            .map(|v| (v, true));
+        for (v, is_target) in args.chain(keys) {
             if contains_window(v, &[])? {
                 return Err(SqlError::WindowingError.into());
             }
-            lower(v, &mut items, &[], 0)?;
+            lower(v, &mut input, &[], is_target, 0)?;
         }
     }
     // The input retains WHERE/GROUP/HAVING; final projection retains DISTINCT and pagination.
@@ -609,10 +618,10 @@ pub(super) fn parse(
                 |g| matches!(g, Scalar::Column(c) if c.qualifier.is_none() && c.name == *alias),
             )
         {
-            items.push((item.clone(), Some(alias.clone())));
+            input.items.push((item.clone(), Some(alias.clone())));
         }
     }
-    s.query.items = items;
+    s.query.items = input.items;
     s.query.order.clear();
     s.query.limit = None;
     if let Some(Filter::Clauses(c)) = &mut s.query.filter {
@@ -705,15 +714,91 @@ fn output_name(mut s: &Scalar, calls: &[Call]) -> String {
     };
     name.or(cast_name).unwrap_or("?column?").into()
 }
-fn hoist(v: &mut Scalar, items: &mut Vec<(Item, Option<String>)>) {
-    let name = format!("\0window_arg_{}", items.len());
-    items.push((Item::Scalar(v.clone()), Some(name.clone())));
-    *v = column(&name);
+struct WindowInput {
+    items: Vec<(Item, Option<String>)>,
+    grouped: Option<GroupInputs>,
 }
+
+struct GroupInputs {
+    expressions: BTreeSet<String>,
+    slots: BTreeMap<String, String>,
+}
+
+impl GroupInputs {
+    fn new(keys: &[Scalar], outputs: &[(Item, Option<String>)]) -> R<Self> {
+        // The grouped binder gives input columns precedence over SELECT aliases.
+        // Include both shapes here and let that binder resolve the names.
+        let aliases = outputs.iter().filter_map(|(item, alias)| {
+            let (Item::Scalar(scalar), Some(alias)) = (item, alias) else {
+                return None;
+            };
+            keys.iter()
+                .any(|key| matches!(key, Scalar::Column(c) if c.qualifier.is_none() && c.name == *alias))
+                .then_some(scalar)
+        });
+        let expressions = keys
+            .iter()
+            .chain(aliases)
+            .filter(|key| !matches!(key, Scalar::Column(_)))
+            .map(|key| grouping_shape(key).map(|(shape, _)| shape))
+            .collect::<R<_>>()?;
+        Ok(Self { expressions, slots: BTreeMap::new() })
+    }
+
+    fn might_be_key(&self, value: &Scalar, is_target: bool) -> R<bool> {
+        if self.expressions.is_empty() {
+            return Ok(false);
+        }
+        let (shape, has_column) = grouping_shape(value)?;
+        // A constant target or sort key can be filled with NULL. References to
+        // that constant inside a window argument still use the constant value.
+        Ok(self.expressions.contains(&shape)
+            && (is_target || has_column || value.has_volatile_call()))
+    }
+}
+
+// The grouped binder checks the actual column and cast identities. Match
+// possible keys here so a whole key can be NULL-filled before the window.
+fn grouping_shape(value: &Scalar) -> R<(String, bool)> {
+    let mut value = value.clone();
+    let mut has_column = false;
+    subquery::map_scalar(&mut value, &mut |part| {
+        match part {
+            Scalar::Column(column) => {
+                column.qualifier = None;
+                has_column = true;
+            }
+            Scalar::Cast(inner, _) => *part = (**inner).clone(),
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok((format!("{value:?}"), has_column))
+}
+
+impl WindowInput {
+    fn hoist(&mut self, value: &mut Scalar) {
+        let name = format!("\0window_arg_{}", self.items.len());
+        if let Some(grouped) = &mut self.grouped
+            && !value.has_volatile_call()
+        {
+            // ORDER BY and DISTINCT ON must recognize the same lowered expression.
+            let slot = grouped.slots.entry(format!("{value:?}")).or_insert_with(|| name.clone());
+            if *slot != name {
+                *value = column(slot);
+                return;
+            }
+        }
+        self.items.push((Item::Scalar(value.clone()), Some(name.clone())));
+        *value = column(&name);
+    }
+}
+
 fn lower(
     v: &mut Scalar,
-    items: &mut Vec<(Item, Option<String>)>,
+    input: &mut WindowInput,
     calls: &[Call],
+    is_target: bool,
     depth: usize,
 ) -> R<()> {
     if depth >= subplans::MAX_DEPTH {
@@ -721,48 +806,57 @@ fn lower(
     }
     let dependency = match v {
         Scalar::Column(c) => !calls.iter().any(|call| call.output == c.name),
-        Scalar::Call(n, _) if Aggregate::from_name(n).is_some() || n == aggregate_filter::CALL => {
+        Scalar::Call(n, _)
+            if Aggregate::from_name(n).is_some()
+                || n == aggregate_filter::CALL
+                || input.grouped.is_some() && n == "grouping" =>
+        {
             if contains_window(v, calls)? {
                 return Err(SqlError::GroupingError);
             }
             true
         }
+        // Enclosing expressions stay with the window evaluator so dependent
+        // arguments such as lag's default can still be evaluated lazily.
+        _ if let Some(grouped) = &input.grouped && grouped.might_be_key(v, is_target)? => {
+            !contains_window(v, calls)?
+        }
         _ => false,
     };
     if dependency {
-        hoist(v, items);
+        input.hoist(v);
         return Ok(());
     }
     match v {
         Scalar::Column(_) => {}
         Scalar::Unary(_, v) | Scalar::Cast(v, _) | Scalar::Domain(v, ..) => {
-            lower(v, items, calls, depth + 1)?
+            lower(v, input, calls, false, depth + 1)?
         }
         Scalar::Binary(_, a, b) => {
-            lower(a, items, calls, depth + 1)?;
-            lower(b, items, calls, depth + 1)?;
+            lower(a, input, calls, false, depth + 1)?;
+            lower(b, input, calls, false, depth + 1)?;
         }
         Scalar::Call(n, args) => {
             if Aggregate::from_name(n).is_some() {
                 return Err(SqlError::GroupingError);
             }
             for v in args {
-                lower(v, items, calls, depth + 1)?;
+                lower(v, input, calls, false, depth + 1)?;
             }
         }
         Scalar::SubstringOrder(args) => {
             for v in args {
-                lower(v, items, calls, depth + 1)?;
+                lower(v, input, calls, false, depth + 1)?;
             }
         }
-        Scalar::Predicate(f) => lower_filter(f, items, calls, depth + 1)?,
+        Scalar::Predicate(f) => lower_filter(f, input, calls, depth + 1)?,
         Scalar::Case(c) => {
             for (f, v) in &mut c.arms {
-                lower_filter(f, items, calls, depth + 1)?;
-                lower(v, items, calls, depth + 1)?;
+                lower_filter(f, input, calls, depth + 1)?;
+                lower(v, input, calls, false, depth + 1)?;
             }
             if let Some(v) = &mut c.otherwise {
-                lower(v, items, calls, depth + 1)?;
+                lower(v, input, calls, false, depth + 1)?;
             }
         }
         _ => {}
@@ -771,7 +865,7 @@ fn lower(
 }
 fn lower_filter(
     f: &mut Filter,
-    items: &mut Vec<(Item, Option<String>)>,
+    input: &mut WindowInput,
     calls: &[Call],
     depth: usize,
 ) -> R<()> {
@@ -779,15 +873,15 @@ fn lower_filter(
         return Err(SqlError::Limit);
     }
     match f {
-        Filter::Scalar(v) | Filter::Null(v, _) => lower(v, items, calls, depth + 1)?,
+        Filter::Scalar(v) | Filter::Null(v, _) => lower(v, input, calls, false, depth + 1)?,
         Filter::Compare(a, _, b) => {
-            lower(a, items, calls, depth + 1)?;
-            lower(b, items, calls, depth + 1)?;
+            lower(a, input, calls, false, depth + 1)?;
+            lower(b, input, calls, false, depth + 1)?;
         }
-        Filter::Not(f) | Filter::Is(f, ..) => lower_filter(f, items, calls, depth + 1)?,
+        Filter::Not(f) | Filter::Is(f, ..) => lower_filter(f, input, calls, depth + 1)?,
         Filter::Logic(a, _, b) => {
-            lower_filter(a, items, calls, depth + 1)?;
-            lower_filter(b, items, calls, depth + 1)?;
+            lower_filter(a, input, calls, depth + 1)?;
+            lower_filter(b, input, calls, depth + 1)?;
         }
         Filter::Like {
             value,
@@ -795,10 +889,10 @@ fn lower_filter(
             escape,
             ..
         } => {
-            lower(value, items, calls, depth + 1)?;
-            lower(pattern, items, calls, depth + 1)?;
+            lower(value, input, calls, false, depth + 1)?;
+            lower(pattern, input, calls, false, depth + 1)?;
             if let Some(v) = escape {
-                lower(v, items, calls, depth + 1)?;
+                lower(v, input, calls, false, depth + 1)?;
             }
         }
         _ => return Err(SqlError::Unsupported),

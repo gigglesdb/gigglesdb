@@ -426,3 +426,6 @@ mod wire_sql_types;
 
 #[path = "wire_sql_handles.rs"]
 mod wire_sql_handles;
+
+#[path = "window_grouping_sets_network.rs"]
+mod window_grouping_sets_network;

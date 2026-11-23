@@ -2758,7 +2758,7 @@ impl Query {
         Ok(query)
     }
     fn parse_unlocked(p: &mut Parser, following: Option<&Token>) -> R<Self> {
-        if plan::Plan::requires_grouping_sets(&p.tokens[p.at..]) { return Err(SqlError::Unsupported); }
+        if plan::Plan::requires_grouping_rewrite(&p.tokens[p.at..]) { return Err(SqlError::Unsupported); }
         admit_subquery_depth(&p.tokens[p.at..])?;
         if plan::subquery::quantified(&p.tokens[p.at..]) {
             return Err(SqlError::Unsupported);
