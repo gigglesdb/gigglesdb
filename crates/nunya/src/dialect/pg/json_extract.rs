@@ -121,14 +121,45 @@ impl Extract {
         ))
     }
 
+    pub(super) fn grouping(
+        mut self,
+        state: &State<'_>,
+        target: Option<&p::ResTarget>,
+    ) -> Result<(expr::Expr, InputRewrite)> {
+        if self.derived || state.depth != 1 || state.view_body || state.view_depth != 0 {
+            return Err(refusal());
+        }
+        // A plain extraction (an unlisted path under a show-mode filter) is shown
+        // data; its container guards are kept by the predicate rewrite below.
+        if !self.is_plain() {
+            let filter = state.policy.json_filter(&self.source).ok_or_else(refusal)?;
+            extract::require_show_leaf(&self.path, filter, &self.treatment)?;
+        }
+        if let Some(target) = target {
+            self.target_extent(&state.sql, target.location)?;
+        }
+        let (e, mut rewrite) = self.predicate(&state.sql)?;
+        if target.is_some_and(|t| t.name.is_empty())
+            && let InputRewrite::ReplaceSpan { text, .. } = &mut rewrite
+        {
+            text.push_str(" AS \"?column?\"");
+        }
+        Ok((e, rewrite))
+    }
+
+    fn target_extent(&mut self, sql: &str, start: i32) -> Result<()> {
+        self.span.start = usize::try_from(start).map_err(|_| refusal())?;
+        self.span.end = expression_end(sql, self.span.start, self.span.end)?;
+        Ok(())
+    }
+
     pub(super) fn projection(
         mut self,
         sql: &str,
         alias: bool,
-        start: usize,
+        start: i32,
     ) -> Result<(expr::Expr, Option<OutputRewrite>, Option<InputRewrite>)> {
-        self.span.start = start;
-        self.span.end = expression_end(sql, start, self.span.end)?;
+        self.target_extent(sql, start)?;
         let mut e = self.plain_expression();
         let action = match self.treatment {
             Extraction::Plain => {

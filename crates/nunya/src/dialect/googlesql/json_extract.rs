@@ -7,7 +7,10 @@ fn denied() -> Refusal {
 /// A classified direct base-column extraction.
 pub(super) struct Extract {
     source: ColumnRef,
+    column_prefix: String,
+    qualified: bool,
     treatment: Extraction,
+    path: Vec<Step>,
     text: bool,
     /// Exact source boundaries of the original function call.
     pub(super) span: Span,
@@ -15,6 +18,21 @@ pub(super) struct Extract {
     guards: Vec<String>,
     keep_empty: bool,
 }
+impl Extract {
+    pub(super) fn check_clause_aliases(&self, outputs: &[Output]) -> Result<()> {
+        // A SELECT alias can shadow the input name in a grouping or sort key.
+        // Reuse the input binding only when an unqualified alias denotes the
+        // same unchanged column.
+        if outputs.iter().any(|out| {
+            out.ir.name.to_lowercase() == self.column_prefix
+                && (self.qualified || out.ir.source.as_ref() != Some(&self.source))
+        }) {
+            return Err(denied());
+        }
+        Ok(())
+    }
+}
+
 fn offset(sql: &str, location: sqlparser::tokenizer::Location) -> Result<usize> {
     let (mut line, mut column) = (1, 1);
     for (i, c) in sql.char_indices() {
@@ -285,14 +303,18 @@ impl State<'_> {
                 }
             }
         }
+        let keep_empty = matches!(steps.last(), Some(Step::Index(_)));
         Ok(Some(Extract {
             source,
-            treatment: extract::classify(&path(&decoded)?, filter)?,
+            column_prefix: ids.first().ok_or_else(denied)?.value.to_lowercase(),
+            qualified: ids.len() > 1,
+            treatment: extract::classify(&steps, filter)?,
+            path: steps,
             text: f.name.0[0].value.eq_ignore_ascii_case("json_value"),
             span: Span { start, end: i },
             query,
             guards,
-            keep_empty: matches!(steps.last(), Some(Step::Index(_))),
+            keep_empty,
         }))
     }
     /// Attach the output action and any type-preserving SQL replacement.
@@ -328,6 +350,19 @@ impl State<'_> {
         self.json_outputs.push((ordinal, action));
         Ok(out)
     }
+    /// Lower a declared Show scalar using the same guards as a predicate.
+    pub(super) fn json_grouping(&mut self, e: Extract) -> Result<expr::Expr> {
+        if self.depth != 1 || self.view_depth != 0 {
+            return Err(denied());
+        }
+        // A plain extraction (an unlisted path under a show-mode filter) is shown data.
+        if e.treatment != Extraction::Plain {
+            let filter = self.policy.json_filter(&e.source).ok_or_else(denied)?;
+            extract::require_show_leaf(&e.path, filter, &e.treatment)?;
+        }
+        self.json_predicate(e)
+    }
+
     /// Guard a declared leaf and retain its Blind domain for equality.
     pub(super) fn json_predicate(&mut self, e: Extract) -> Result<expr::Expr> {
         use crate::policy::{JsonLeafType, JsonPathTreatment, JsonTokenType};
@@ -638,6 +673,67 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn show_json_value_group_order_and_distinct() {
+        let guarded = "(CASE WHEN JSON_TYPE(JSON_QUERY(doc, '$.shown')) = 'string' THEN JSON_VALUE(doc, '$.shown') END)";
+        for mode in [JsonMode::Show, JsonMode::Tokenize] {
+            for shape in [
+                "SELECT LEAF, COUNT(*) FROM docs GROUP BY LEAF ORDER BY 1",
+                "SELECT LEAF AS v, COUNT(*) FROM docs GROUP BY 1 ORDER BY v",
+                "SELECT LEAF, COUNT(*) FROM docs GROUP BY LEAF ORDER BY LEAF",
+                "SELECT email FROM docs ORDER BY LEAF",
+                "SELECT email FROM docs ORDER BY (LEAF)",
+                "SELECT LEAF AS v FROM docs ORDER BY v",
+                "SELECT LEAF AS v FROM docs ORDER BY (v)",
+                "SELECT LEAF FROM docs ORDER BY 1",
+                "SELECT DISTINCT LEAF FROM docs",
+            ] {
+                let sql = shape.replace("LEAF", "JSON_VALUE(doc, '$.shown')");
+                let allowed = plan(&sql, mode).unwrap();
+                assert_eq!(allowed.outputs[0], if shape.starts_with("SELECT email") {
+                    OutputRewrite::Tokenize { domain: DomainName("d".into()), ty: ColumnType::Text }
+                } else {
+                    OutputRewrite::Pass
+                });
+                let replacements: Vec<_> = allowed.inputs.into_iter().map(|input| match input {
+                    InputRewrite::ReplaceSpan { span, text } => (span, text),
+                    _ => panic!("unexpected input rewrite"),
+                }).collect();
+                assert_eq!(
+                    crate::ir::rewrite::splice(&sql, &replacements).unwrap(),
+                    shape.replace("LEAF", guarded),
+                );
+                if mode == JsonMode::Show {
+                    // Show mode passes unlisted paths through, so they group like any shown value.
+                    let sql = shape.replace("LEAF", "JSON_VALUE(doc, '$.unlisted')");
+                    plan(&sql, mode).expect(&sql);
+                }
+                for (path, reason) in [
+                    ("$.secret", crate::error::JSON_GROUP_BLIND),
+                    ("$.hidden", crate::error::JSON_GROUP_MASKED),
+                    ("$.unlisted", crate::error::JSON_GROUP_UNLISTED),
+                    ("$", crate::error::JSON_GROUP_NOT_LEAF),
+                ] {
+                    if mode == JsonMode::Show && path == "$.unlisted" {
+                        continue;
+                    }
+                    let sql = shape.replace("LEAF", &format!("JSON_VALUE(doc, '{path}')"));
+                    let error = plan(&sql, mode).expect_err(&sql);
+                    assert_eq!(error.code, NyCode::MaskedExpression, "{sql}");
+                    assert_eq!(error.message(), reason, "{sql}");
+                }
+            }
+            for sql in [
+                "SELECT JSON_VALUE(doc, '$.shown') FROM (SELECT doc FROM docs) d GROUP BY 1",
+                "SELECT * FROM (SELECT JSON_VALUE(doc, '$.shown') AS v FROM docs ORDER BY v) d",
+                "SELECT JSON_QUERY(doc, '$') AS doc FROM docs ORDER BY JSON_VALUE(doc, '$.shown')",
+                "SELECT email AS doc FROM docs GROUP BY JSON_VALUE(doc, '$.shown')",
+            ] {
+                assert_eq!(plan(sql, mode).expect_err(sql).code, NyCode::MaskedExpression, "{sql}");
+            }
+        }
+    }
+
     #[test]
     fn generated_functions_and_ambiguous_prefixes_fail_closed() {
         for name in ["json_value", "json_query", "json_type", "to_json_string"] {

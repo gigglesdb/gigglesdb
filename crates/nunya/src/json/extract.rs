@@ -211,6 +211,37 @@ pub fn text_array(text: &str) -> Result<Vec<String>, Refusal> {
     Ok(result)
 }
 
+/// Grouping, sorting and deduplication may observe only a declared Show leaf.
+pub(crate) fn require_show_leaf(
+    path: &[Step],
+    filter: &JsonColumnFilter,
+    treatment: &Extraction,
+) -> Result<(), Refusal> {
+    use crate::error::{JSON_GROUP_BLIND, JSON_GROUP_MASKED, JSON_GROUP_NOT_LEAF, JSON_GROUP_UNLISTED};
+    let reason = match treatment {
+        Extraction::Plain => JSON_GROUP_UNLISTED,
+        Extraction::Masked => {
+            match filter.rules.iter().find(|rule| {
+                rule.path.len() <= path.len()
+                    && path.iter().zip(&rule.path).all(|(step, part)| matches(step, part))
+            }) {
+                Some(rule) if rule.treatment == JsonPathTreatment::Masked => JSON_GROUP_MASKED,
+                Some(_) => JSON_GROUP_NOT_LEAF,
+                None => JSON_GROUP_UNLISTED,
+            }
+        }
+        Extraction::Filter(filter) => match filter.rules.as_slice() {
+            [rule] if rule.path.is_empty() => match rule.treatment {
+                JsonPathTreatment::Show { .. } => return Ok(()),
+                JsonPathTreatment::Blind { .. } => JSON_GROUP_BLIND,
+                JsonPathTreatment::Masked => JSON_GROUP_MASKED,
+            },
+            _ => JSON_GROUP_NOT_LEAF,
+        },
+    };
+    Err(Refusal::new(NyCode::MaskedExpression, reason))
+}
+
 /// Classify a concrete path and rebase descendant rules, rejecting conflicts.
 pub fn classify(path: &[Step], filter: &JsonColumnFilter) -> Result<Extraction, Refusal> {
     // Validation is repeated at this boundary because callers may construct IR

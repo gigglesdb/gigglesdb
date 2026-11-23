@@ -94,10 +94,10 @@ impl Session {
         out
     }
     /// Refuse a local extended request and wait for Sync unless the session must close.
-    pub(super) fn ext_refuse(&mut self, sql: &str, code: NyCode, aborted: bool) -> Actions {
+    pub(super) fn ext_refuse(&mut self, sql: &str, error: &Refusal, aborted: bool) -> Actions {
         self.skip = true;
         self.rollback_on_sync |= self.extended_execute_forwarded;
-        let mut local = self.refuse(sql, code, false);
+        let mut local = self.refuse(sql, error, false);
         if aborted && !local.close {
             local.client[0] = Backend::ErrorResponse(redact_error(&[
                 (b'S', "ERROR".into()), (b'C', "25P02".into()),
@@ -254,7 +254,7 @@ impl Session {
         let result = self.ext_request(msg);
         match result {
             Ok(out) => out,
-            Err((_, e, aborted)) => self.ext_refuse(&sql, e.code, aborted),
+            Err((_, e, aborted)) => self.ext_refuse(&sql, &e, aborted),
         }
     }
     fn ext_request(&mut self, msg: Frontend) -> Result<Actions, (String, Refusal, bool)> {

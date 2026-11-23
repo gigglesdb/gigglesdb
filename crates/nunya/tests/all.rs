@@ -50,6 +50,9 @@ mod upstream_tls;
 #[path = "route_default_live.rs"]
 mod route_default_live;
 
+#[path = "json_group_order.rs"]
+mod json_group_order;
+
 #[path = "json_paths_live.rs"]
 mod json_paths_live;
 

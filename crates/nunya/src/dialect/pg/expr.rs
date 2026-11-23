@@ -96,6 +96,11 @@ impl State<'_> {
                 self.record(&e, UseKind::Other { what: "JSON extraction dependency" }, context);
                 return Ok(e);
             }
+            if matches!(context, Context::GroupBy | Context::OrderBy) {
+                let (e, rewrite) = extraction.grouping(self, None)?;
+                self.replacements.push(rewrite);
+                return Ok(e);
+            }
             if !matches!(context, Context::Where | Context::JoinOn) || self.view_body {
                 return Err(json_extract::refusal());
             }

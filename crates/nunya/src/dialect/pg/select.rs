@@ -1,5 +1,57 @@
 //! SELECT targets, relational query layers and clause contexts.
 use super::*;
+
+enum ClauseReference {
+    Ordinal(usize),
+    Name(String),
+}
+
+impl ClauseReference {
+    fn matches(&self, ordinal: usize, name: &str) -> bool {
+        match self {
+            Self::Ordinal(index) => *index == ordinal,
+            Self::Name(alias) => alias == name,
+        }
+    }
+}
+
+fn sort_expression(n: &p::Node) -> Result<&p::Node> {
+    match node(n)? {
+        NodeEnum::SortBy(sort) if sort.use_op.is_empty() => {
+            sort.node.as_deref().ok_or_else(refuse)
+        }
+        _ => Err(refuse()),
+    }
+}
+
+fn clause_reference(
+    n: &p::Node,
+    scope: &scope::Scope,
+    context: &Context,
+) -> Result<Option<ClauseReference>> {
+    Ok(match node(n)? {
+        NodeEnum::AConst(c) => match &c.val {
+            Some(p::a_const::Val::Ival(i)) => Some(ClauseReference::Ordinal(
+                usize::try_from(i.ival).map_err(|_| refuse())?
+                    .checked_sub(1).ok_or_else(refuse)?,
+            )),
+            _ => None,
+        },
+        NodeEnum::ColumnRef(c) if c.fields.len() == 1 => {
+            let name = strings(&c.fields)?.pop().ok_or_else(refuse)?;
+            // GROUP BY resolves an input column ahead of an output alias.
+            if *context == Context::GroupBy
+                && scope.iter().any(|b| b.unqualified && b.output.name == name)
+            {
+                None
+            } else {
+                Some(ClauseReference::Name(name))
+            }
+        }
+        _ => None,
+    })
+}
+
 impl State<'_> {
     /// Lower one SELECT level with scoped CTE visibility and depth bounds.
     pub(super) fn select(&mut self, s: &p::SelectStmt) -> Result<Vec<scope::Output>> {
@@ -69,7 +121,7 @@ impl State<'_> {
                     self.extract_allowed = self.depth == 1 && !self.view_body && self.view_depth == 0
                         && s.distinct_clause.is_empty() && s.group_clause.is_empty()
                         && s.with_clause.is_none();
-                    let result = self.targets(&s.target_list, &scope);
+                    let result = self.targets(s, &scope);
                     self.extract_allowed = previous;
                     result?
                 } else {
@@ -181,12 +233,8 @@ impl State<'_> {
             self.clause_item(n, &scope, &outputs, Context::GroupBy, UseKind::GroupBy)?;
         }
         for n in &s.sort_clause {
-            let sort = match node(n)? {
-                NodeEnum::SortBy(s) if s.use_op.is_empty() => s,
-                _ => return Err(refuse()),
-            };
             self.clause_item(
-                sort.node.as_deref().ok_or_else(refuse)?,
+                sort_expression(n)?,
                 &scope,
                 &outputs,
                 Context::OrderBy,
@@ -218,9 +266,16 @@ impl State<'_> {
         }
         Ok(outputs)
     }
-    fn targets(&mut self, targets: &[p::Node], scope: &scope::Scope) -> Result<Vec<scope::Output>> {
+    fn targets(&mut self, select: &p::SelectStmt, scope: &scope::Scope) -> Result<Vec<scope::Output>> {
+        let grouped = !select.group_clause.is_empty() || !select.distinct_clause.is_empty();
+        let mut order_references = Vec::new();
+        for sort in &select.sort_clause {
+            if let Some(reference) = clause_reference(sort_expression(sort)?, scope, &Context::OrderBy)? {
+                order_references.push(reference);
+            }
+        }
         let mut outputs = vec![];
-        for n in targets {
+        for n in &select.target_list {
             let target = match node(n)? {
                 NodeEnum::ResTarget(t) if t.indirection.is_empty() => t,
                 _ => return Err(refuse()),
@@ -244,7 +299,18 @@ impl State<'_> {
                 continue;
             }
             if let Some(extraction) = self.json_extraction(n, scope)? {
-                let (e, action, replacement) = extraction.projection(&self.sql, target.name.is_empty(), usize::try_from(target.location).map_err(|_| json_extract::refusal())?)?;
+                let name = if target.name.is_empty() { "?column?" } else { &target.name };
+                if !extraction.unguarded_plain()
+                    && (grouped || order_references.iter().any(|r| r.matches(outputs.len(), name)))
+                {
+                    let (e, rewrite) = extraction.grouping(self, Some(target))?;
+                    self.replacements.push(rewrite);
+                    self.record(&e, UseKind::Output, &Context::SelectList);
+                    outputs.push(scope::Output::from_expr(name.into(), e));
+                    continue;
+                }
+                let (e, action, replacement) =
+                    extraction.projection(&self.sql, target.name.is_empty(), target.location)?;
                 if let Some(action) = action {
                     if !self.extract_allowed { return Err(json_extract::refusal()); }
                     self.extracts.push((outputs.len(), action));
@@ -358,42 +424,20 @@ impl State<'_> {
         context: Context,
         kind: UseKind,
     ) -> Result<()> {
-        let output = match node(n)? {
-            NodeEnum::AConst(c) => match &c.val {
-                Some(p::a_const::Val::Ival(i)) => Some(
-                    outputs
-                        .get(
-                            usize::try_from(i.ival)
-                                .map_err(|_| refuse())?
-                                .checked_sub(1)
-                                .ok_or_else(refuse)?,
-                        )
-                        .ok_or_else(refuse)?
-                        .clone(),
-                ),
-                _ => None,
-            },
-            NodeEnum::ColumnRef(c) if c.fields.len() == 1 => {
-                let names = strings(&c.fields)?;
-                if context == Context::GroupBy
-                    && scope
-                        .iter()
-                        .any(|b| b.unqualified && b.output.name == names[0])
-                {
-                    self.root(n, scope, context, kind)?;
-                    return Ok(());
-                }
-                let mut matches = outputs.iter().filter(|o| o.name == names[0]);
-                let o = matches.next().cloned();
+        let output = match clause_reference(n, scope, &context)? {
+            Some(ClauseReference::Ordinal(index)) => Some(outputs.get(index).ok_or_else(refuse)?),
+            Some(ClauseReference::Name(name)) => {
+                let mut matches = outputs.iter().filter(|o| o.name == name);
+                let output = matches.next();
                 if matches.next().is_some() {
                     return Err(refuse());
                 }
-                o
+                output
             }
-            _ => None,
+            None => None,
         };
         if let Some(o) = output {
-            self.record(&expr::Expr::column(o), kind, &context);
+            self.record(&expr::Expr::column(o.clone()), kind, &context);
         } else {
             self.root(n, scope, context, kind)?;
         }

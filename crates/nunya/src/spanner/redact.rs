@@ -29,6 +29,14 @@ pub fn redact_status(code: Code) -> Status {
 }
 /// Map a Nunya refusal to its fixed public gRPC status.
 pub fn nunya_status(code: NyCode) -> Status {
+    gateway_status(code, code.message())
+}
+
+pub(super) fn nunya_refusal(error: &Refusal) -> Status {
+    gateway_status(error.code, error.message())
+}
+
+fn gateway_status(code: NyCode, message: &'static str) -> Status {
     let grpc = match code {
         NyCode::ServingUnavailable => Code::Unavailable,
         NyCode::SessionEnded => Code::PermissionDenied,
@@ -43,8 +51,8 @@ pub fn nunya_status(code: NyCode) -> Status {
         | NyCode::TokenizeLimit
         | NyCode::ProtocolNotAllowed => Code::PermissionDenied,
     };
-    let mut status = Status::new(grpc, format!("{}: {}", code.sqlstate(), code.message()));
-    status.set_source(Arc::new(Refusal::new(code, code.message())));
+    let mut status = Status::new(grpc, format!("{}: {message}", code.sqlstate()));
+    status.set_source(Arc::new(Refusal::new(code, message)));
     status
 }
 #[cfg(test)]

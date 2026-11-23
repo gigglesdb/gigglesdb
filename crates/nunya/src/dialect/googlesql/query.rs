@@ -1,4 +1,47 @@
 use super::*;
+
+enum ClauseReference<'a> {
+    Ordinal(usize),
+    Name(&'a str),
+}
+
+impl ClauseReference<'_> {
+    fn matches(&self, ordinal: usize, name: &str) -> bool {
+        match self {
+            Self::Ordinal(index) => *index == ordinal,
+            Self::Name(alias) => alias.to_lowercase() == name.to_lowercase(),
+        }
+    }
+}
+
+fn unparenthesized(mut e: &a::Expr) -> &a::Expr {
+    while let a::Expr::Nested(inner) = e {
+        e = inner;
+    }
+    e
+}
+
+fn clause_reference<'a>(
+    e: &'a a::Expr,
+    scope: &Scope,
+    context: &Context,
+) -> Result<Option<ClauseReference<'a>>> {
+    Ok(match unparenthesized(e) {
+        a::Expr::Value(a::Value::Number(n, _)) => Some(ClauseReference::Ordinal(
+            n.parse::<usize>().map_err(|_| refuse())?.checked_sub(1).ok_or_else(refuse)?,
+        )),
+        a::Expr::Identifier(i)
+            if !(*context == Context::GroupBy
+                && scope.iter().any(|b| {
+                    b.visible && b.output.ir.name.to_lowercase() == i.value.to_lowercase()
+                })) =>
+        {
+            Some(ClauseReference::Name(&i.value))
+        }
+        _ => None,
+    })
+}
+
 impl State<'_> {
     /// Lower a correlated expression subquery.
     pub(super) fn nested(&mut self, q: &a::Query, scope: &Scope) -> Result<Vec<Output>> {
@@ -49,7 +92,7 @@ impl State<'_> {
                 );
             }
         }
-        let (scope, outputs) = self.set(&q.body)?;
+        let (scope, outputs) = self.set(&q.body, q.order_by.as_ref())?;
         if let Some(order) = &q.order_by {
             if order.interpolate.is_some() {
                 return Err(refuse());
@@ -72,9 +115,9 @@ impl State<'_> {
         }
         Ok(outputs)
     }
-    fn set(&mut self, set: &a::SetExpr) -> Result<(Scope, Vec<Output>)> {
+    fn set(&mut self, set: &a::SetExpr, order: Option<&a::OrderBy>) -> Result<(Scope, Vec<Output>)> {
         match set {
-            a::SetExpr::Select(s) => self.select(s),
+            a::SetExpr::Select(s) => self.select(s, order),
             a::SetExpr::Query(q) => {
                 let os = self.query(q)?;
                 Ok((
@@ -95,8 +138,8 @@ impl State<'_> {
                     return Err(refuse());
                 }
                 let before = (self.json_outputs.len(), self.json_inputs.len());
-                let (_, l) = self.set(left)?;
-                let (_, r) = self.set(right)?;
+                let (_, l) = self.set(left, None)?;
+                let (_, r) = self.set(right, None)?;
                 if before != (self.json_outputs.len(), self.json_inputs.len()) { return Err(refuse()); }
                 if l.len() != r.len() {
                     return Err(refuse());
@@ -140,42 +183,29 @@ impl State<'_> {
         c: Context,
         k: UseKind,
     ) -> Result<()> {
-        let output = match e {
-            a::Expr::Value(a::Value::Number(n, _)) => Some(
-                os.get(
-                    n.parse::<usize>()
-                        .map_err(|_| refuse())?
-                        .checked_sub(1)
-                        .ok_or_else(refuse)?,
-                )
-                .ok_or_else(refuse)?
-                .clone(),
-            ),
-            a::Expr::Identifier(i)
-                if !(c == Context::GroupBy
-                    && scope.iter().any(|b| {
-                        b.visible && b.output.ir.name.to_lowercase() == i.value.to_lowercase()
-                    })) =>
-            {
-                let mut matches = os
-                    .iter()
-                    .filter(|o| o.ir.name.to_lowercase() == i.value.to_lowercase());
-                let o = matches.next().cloned();
+        let output = match clause_reference(e, scope, &c)? {
+            Some(ClauseReference::Ordinal(index)) => Some(os.get(index).ok_or_else(refuse)?),
+            Some(ClauseReference::Name(name)) => {
+                let mut matches = os.iter().filter(|o| o.ir.name.to_lowercase() == name.to_lowercase());
+                let output = matches.next();
                 if matches.next().is_some() {
                     return Err(refuse());
                 }
-                o
+                output
             }
-            _ => None,
+            None => None,
         };
         if let Some(o) = output {
-            self.record(&expr::Expr::column(o), k, &c)
+            self.record(&expr::Expr::column(o.clone()), k, &c);
+        } else if let Some(extract) = self.json_extraction(unparenthesized(e), scope)? {
+            extract.check_clause_aliases(os)?;
+            self.json_grouping(extract)?;
         } else {
             self.root(e, scope, c, k)?;
         }
         Ok(())
     }
-    fn select(&mut self, s: &a::Select) -> Result<(Scope, Vec<Output>)> {
+    fn select(&mut self, s: &a::Select, order: Option<&a::OrderBy>) -> Result<(Scope, Vec<Output>)> {
         if s.top.is_some()
             || s.into.is_some()
             || !s.lateral_views.is_empty()
@@ -200,14 +230,23 @@ impl State<'_> {
             self.outers.pop();
             scope.extend(result?)
         }
+        let a::GroupByExpr::Expressions(groups, modifiers) = &s.group_by else {
+            return Err(refuse());
+        };
+        if !modifiers.is_empty() {
+            return Err(refuse());
+        }
+        let grouped = !groups.is_empty() || s.distinct.is_some();
+        let mut order_references = Vec::new();
+        for key in order.into_iter().flat_map(|order| &order.exprs) {
+            if let Some(reference) = clause_reference(&key.expr, &scope, &Context::OrderBy)? {
+                order_references.push(reference);
+            }
+        }
         let mut os = vec![];
         for item in &s.projection {
             match item {
                 a::SelectItem::UnnamedExpr(e) | a::SelectItem::ExprWithAlias { expr: e, .. } => {
-                    let e = if let Some(extract) = self.json_extraction(e, &scope)? {
-                        if self.depth != 1 || self.view_depth != 0 { return Err(refuse()); }
-                        self.json_projection(extract, os.len())?
-                    } else { self.root(e, &scope, Context::SelectList, UseKind::Output)? };
                     let name = match item {
                         a::SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
                         a::SelectItem::UnnamedExpr(a::Expr::Function(f)) if f.name.0.len() == 1 && matches!(f.name.0[0].value.to_ascii_lowercase().as_str(), "json_value" | "json_query") => String::new(),
@@ -216,6 +255,18 @@ impl State<'_> {
                             ids.last().ok_or_else(refuse)?.value.clone()
                         }
                         _ => "?column?".into(),
+                    };
+                    let e = if let Some(extract) = self.json_extraction(e, &scope)? {
+                        if grouped || order_references.iter().any(|r| r.matches(os.len(), &name)) {
+                            self.json_grouping(extract)?
+                        } else {
+                            if self.depth != 1 || self.view_depth != 0 {
+                                return Err(refuse());
+                            }
+                            self.json_projection(extract, os.len())?
+                        }
+                    } else {
+                        self.root(e, &scope, Context::SelectList, UseKind::Output)?
                     };
                     os.push(e.output(name))
                 }
@@ -274,13 +325,8 @@ impl State<'_> {
         if let Some(e) = &s.having {
             self.root(e, &scope, Context::Having, UseKind::Comparison)?;
         }
-        match &s.group_by {
-            a::GroupByExpr::Expressions(es, mods) if mods.is_empty() => {
-                for e in es {
-                    self.clause(e, &scope, &os, Context::GroupBy, UseKind::GroupBy)?
-                }
-            }
-            _ => return Err(refuse()),
+        for e in groups {
+            self.clause(e, &scope, &os, Context::GroupBy, UseKind::GroupBy)?;
         }
         if s.distinct.is_some() {
             for o in &os {

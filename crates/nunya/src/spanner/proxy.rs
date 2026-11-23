@@ -538,7 +538,7 @@ fn refusal(code: NyCode) -> Refusal {
     Refusal::new(code, "Spanner request refused")
 }
 fn status(error: Refusal) -> Status {
-    nunya_status(error.code)
+    crate::spanner::redact::nunya_refusal(&error)
 }
 fn invalid() -> Status {
     nunya_status(NyCode::NotAnalysable)

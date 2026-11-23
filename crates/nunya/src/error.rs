@@ -83,12 +83,21 @@ impl NyCode {
         }
     }
 }
-/// A refusal carrying only a fixed code and static internal hint.
+pub(crate) const JSON_GROUP_BLIND: &str =
+    "GROUP BY, ORDER BY and DISTINCT require a JSON show policy for the leaf. The path is blind";
+pub(crate) const JSON_GROUP_MASKED: &str =
+    "GROUP BY, ORDER BY and DISTINCT require a JSON show policy for the leaf. The path is masked";
+pub(crate) const JSON_GROUP_UNLISTED: &str =
+    "GROUP BY, ORDER BY and DISTINCT require a JSON show policy for the leaf. The path is unlisted";
+pub(crate) const JSON_GROUP_NOT_LEAF: &str =
+    "GROUP BY, ORDER BY and DISTINCT require a single JSON show rule covering the leaf";
+
+/// A refusal carrying a fixed code and a static, data-free reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     /// Agent-visible refusal code.
     pub code: NyCode,
-    /// Static internal hint, never shown to agents and never containing data.
+    /// Static, data-free reason. Only explicitly public messages reach agents.
     pub reason: &'static str,
 }
 impl Refusal {
@@ -96,10 +105,21 @@ impl Refusal {
     pub fn new(code: NyCode, reason: &'static str) -> Self {
         Self { code, reason }
     }
+
+    /// Return the fixed public message, including allowlisted policy details.
+    pub(crate) fn message(&self) -> &'static str {
+        match (self.code, self.reason) {
+            (
+                NyCode::MaskedExpression,
+                JSON_GROUP_BLIND | JSON_GROUP_MASKED | JSON_GROUP_UNLISTED | JSON_GROUP_NOT_LEAF,
+            ) => self.reason,
+            _ => self.code.message(),
+        }
+    }
 }
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.code.message())
+        f.write_str(self.message())
     }
 }
 impl std::error::Error for Refusal {}

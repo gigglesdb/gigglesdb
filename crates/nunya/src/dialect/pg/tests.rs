@@ -1582,16 +1582,11 @@ fn json_extraction_refused_forms_and_contexts_are_data_free() {
         sqls.extend([
             "SELECT body#>'{NULL}' FROM notes", "SELECT body#>'{}' FROM notes",
             "SELECT id FROM notes WHERE body->'masked' = 'secret'",
-            "SELECT body->'show' FROM notes ORDER BY 1",
-            "SELECT body->'show' AS x FROM notes ORDER BY x",
-            "SELECT id FROM notes ORDER BY body->'show'",
             "SELECT length(body->>'show') FROM notes",
             "SELECT (body->'show')::text FROM notes",
             "SELECT * FROM (SELECT body->'show' FROM notes) q",
             "WITH q AS (SELECT body->'show' FROM notes) SELECT * FROM q",
             "SELECT body->'show' FROM (SELECT body FROM notes) q",
-            "SELECT DISTINCT body->'show' FROM notes",
-            "SELECT body->'show' FROM notes GROUP BY 1",
             "SELECT body->'show' FROM notes UNION ALL SELECT body->'show' FROM notes",
             "UPDATE notes SET id = 1 RETURNING body->'show'",
         ].into_iter().map(str::to_owned));
@@ -1600,6 +1595,78 @@ fn json_extraction_refused_forms_and_contexts_are_data_free() {
             let error = result.expect_err(&sql);
             assert_eq!(error.code, NyCode::MaskedExpression, "{sql}");
             assert!(!format!("{error:?}").contains("secret"));
+        }
+    }
+}
+
+#[test]
+fn json_show_leaf_group_order_and_distinct() {
+    use crate::json::filter::JsonMode;
+    for mode in [JsonMode::Show, JsonMode::Tokenize] {
+        let (snapshot, policy) = extraction_fixture(mode);
+        let plan = |sql: &str| {
+            let statements = PgLowering.lower(sql, &snapshot, &policy, &[])?;
+            crate::ir::check::check(&statements[0], &policy, &snapshot)
+        };
+        for op in ["->", "->>"] {
+            let expected = format!(
+                "(CASE WHEN pg_catalog.jsonb_typeof(body) = 'object' AND pg_catalog.jsonb_typeof(body->'show') = 'string' THEN body{op}'show' END)"
+            );
+            for (shape, expected_sql) in [
+                (
+                    "SELECT LEAF, count(*) FROM notes GROUP BY LEAF ORDER BY LEAF",
+                    format!("SELECT {expected} AS \"?column?\", count(*) FROM notes GROUP BY {expected} ORDER BY {expected}"),
+                ),
+                (
+                    "SELECT (LEAF), count(*) FROM notes GROUP BY 1 ORDER BY 1",
+                    format!("SELECT (CASE WHEN pg_catalog.jsonb_typeof(body) = 'object' AND pg_catalog.jsonb_typeof((body->'show')) = 'string' THEN (body{op}'show') END) AS \"?column?\", count(*) FROM notes GROUP BY 1 ORDER BY 1"),
+                ),
+                (
+                    "SELECT LEAF AS x, count(*) FROM notes GROUP BY LEAF ORDER BY x DESC",
+                    format!("SELECT {expected} AS x, count(*) FROM notes GROUP BY {expected} ORDER BY x DESC"),
+                ),
+                ("SELECT id FROM notes ORDER BY LEAF", format!("SELECT id FROM notes ORDER BY {expected}")),
+                ("SELECT LEAF FROM notes ORDER BY 1", format!("SELECT {expected} AS \"?column?\" FROM notes ORDER BY 1")),
+                ("SELECT LEAF AS x FROM notes ORDER BY x", format!("SELECT {expected} AS x FROM notes ORDER BY x")),
+                ("SELECT DISTINCT LEAF FROM notes", format!("SELECT DISTINCT {expected} AS \"?column?\" FROM notes")),
+                (
+                    "SELECT DISTINCT ON (LEAF) LEAF FROM notes ORDER BY LEAF",
+                    format!("SELECT DISTINCT ON ({expected}) {expected} AS \"?column?\" FROM notes ORDER BY {expected}"),
+                ),
+            ] {
+                let sql = shape.replace("LEAF", &format!("body{op}'show'"));
+                let allowed = plan(&sql).unwrap();
+                assert!(allowed.outputs.iter().all(|output| *output == OutputRewrite::Pass), "{sql}");
+                let replacements: Vec<_> = allowed.inputs.into_iter().map(|input| match input {
+                    InputRewrite::ReplaceSpan { span, text } => (span, text),
+                    _ => panic!("unexpected input rewrite"),
+                }).collect();
+                let rewritten = crate::ir::rewrite::splice(&sql, &replacements).unwrap();
+                assert_eq!(rewritten, expected_sql, "{sql}");
+                for (path, reason) in [
+                    ("blind", crate::error::JSON_GROUP_BLIND),
+                    ("masked", crate::error::JSON_GROUP_MASKED),
+                    ("unlisted", crate::error::JSON_GROUP_UNLISTED),
+                    ("parent", crate::error::JSON_GROUP_NOT_LEAF),
+                ] {
+                    let sql = shape.replace("LEAF", &format!("body{op}'{path}'"));
+                    if mode == JsonMode::Show && path == "unlisted" {
+                        // Show mode passes unlisted paths through, so they group like any shown value.
+                        plan(&sql).expect(&sql);
+                        continue;
+                    }
+                    let error = plan(&sql).expect_err(&sql);
+                    assert_eq!(error.code, NyCode::MaskedExpression, "{sql}");
+                    assert_eq!(error.message(), reason, "{sql}");
+                }
+            }
+        }
+        for sql in [
+            "SELECT body->>'show' FROM (SELECT body FROM notes) n GROUP BY 1",
+            "SELECT * FROM (SELECT body->>'show' AS v FROM notes ORDER BY v) n",
+            "SELECT id FROM (SELECT id, body FROM notes) n ORDER BY body->>'show'",
+        ] {
+            assert_eq!(plan(sql).expect_err(sql).code, NyCode::MaskedExpression);
         }
     }
 }

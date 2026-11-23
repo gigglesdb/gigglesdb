@@ -3,7 +3,7 @@ use super::{
     auth::{self, ScramServer, ScramStep, ScramVerifier},
     codec::{self, Backend, FieldDescription, Frontend, StartupMessage},
     context::GatewayContext,
-    redact::{nunya_error, redact_error},
+    redact::{nunya_error, nunya_refusal, redact_error},
     upstream::{Upstream, send_cancel},
     values,
 };
@@ -108,6 +108,13 @@ fn check_release(ctx: &GatewayContext, release: &ReleaseSlot, active: &mut Activ
     }
     Ok(())
 }
+#[derive(PartialEq, Eq)]
+enum SimpleJsonResult {
+    Normal,
+    CanDiscard,
+    Discarding(NyCode),
+}
+
 /// Socket-independent simple and extended protocol state with ordered responses.
 pub struct Session {
     ctx: Arc<GatewayContext>,
@@ -122,6 +129,7 @@ pub struct Session {
     connection: Option<u64>,
     active: VecDeque<Active>,
     waiting: bool,
+    simple_json_result: SimpleJsonResult,
     status: u8,
     aborted: bool,
     skip: bool,
@@ -167,6 +175,7 @@ impl Session {
             connection: None,
             active: VecDeque::new(),
             waiting: false,
+            simple_json_result: SimpleJsonResult::Normal,
             status: b'I',
             aborted: false,
             skip: false,
@@ -331,7 +340,8 @@ impl Session {
             tokens_released: vec![],
         }
     }
-    fn refuse(&mut self, sql: &str, code: NyCode, ready: bool) -> Actions {
+    fn refuse(&mut self, sql: &str, error: &Refusal, ready: bool) -> Actions {
+        let code = error.code;
         self.ctx.metrics.refused(code);
         if self.status == b'T' {
             self.aborted = true;
@@ -342,11 +352,11 @@ impl Session {
             .write(&self.record(sql, Outcome::Refused(code)))
             .is_err();
         let mut out = Actions {
-            client: vec![Backend::ErrorResponse(nunya_error(if failed {
-                NyCode::ReadLogUnavailable
+            client: vec![Backend::ErrorResponse(if failed {
+                nunya_error(NyCode::ReadLogUnavailable)
             } else {
-                code
-            }))],
+                nunya_refusal(error)
+            })],
             close: failed || code == NyCode::SessionEnded,
             ..Actions::default()
         };
@@ -583,6 +593,12 @@ impl Session {
                 writes(&a.kind) || matches!(a.kind, StatementKind::Commit)
             });
             self.empty_pending = self.active.is_empty();
+            if self.status == b'I'
+                && self.active.len() == 1
+                && matches!(self.active[0].kind, StatementKind::Select | StatementKind::JsonSelect { .. })
+            {
+                self.simple_json_result = SimpleJsonResult::CanDiscard;
+            }
             self.waiting = true;
             Ok(Some(Actions {
                 upstream: vec![Frontend::Query(rewritten)],
@@ -592,7 +608,7 @@ impl Session {
         match result {
             Ok(Some(out)) => out,
             Ok(None) => {
-                let mut out = self.refuse(sql, NyCode::StatementNotAllowed, true);
+                let mut out = self.refuse(sql, &failure(NyCode::StatementNotAllowed), true);
                 if !out.close {
                     out.client[0] = Backend::ErrorResponse(redact_error(&[
                         (b'S', "ERROR".into()), (b'C', "25P02".into()),
@@ -600,7 +616,7 @@ impl Session {
                 }
                 out
             }
-            Err(e) => self.refuse(sql, e.code, true),
+            Err(e) => self.refuse(sql, &e, true),
         }
     }
     /// Consume an upstream response, sanitizing every data-bearing result.
@@ -608,7 +624,9 @@ impl Session {
         if self.end_requested.is_some() {
             return Actions::default();
         }
-        if matches!(msg, Backend::DataRow(_)) {
+        if matches!(msg, Backend::DataRow(_))
+            && !matches!(self.simple_json_result, SimpleJsonResult::Discarding(_))
+        {
             let now = (self.ctx.clock)();
             if self.last_row_refresh_ms.is_none_or(|last| now.saturating_sub(last) >= 1000) {
                 if self.ctx.serving_state().admit(self.session, Operation::Read).is_err() {
@@ -648,6 +666,22 @@ impl Session {
         }
     }
     fn response(&mut self, msg: Backend) -> Result<Vec<Backend>, Refusal> {
+        let result_error = if let SimpleJsonResult::Discarding(code) = self.simple_json_result {
+            match msg {
+                Backend::ReadyForQuery(b'I') if self.active.is_empty() => Some(code),
+                Backend::DataRow(_) if !self.active.is_empty() => return Ok(vec![]),
+                Backend::NoticeResponse(_) | Backend::ParameterStatus(_, _) | Backend::Refused(b'A') => {
+                    return Ok(vec![]);
+                }
+                Backend::CommandComplete(_) | Backend::ErrorResponse(_) => {
+                    self.active.pop_front().ok_or_else(protocol)?;
+                    return Ok(vec![]);
+                }
+                _ => return Err(protocol()),
+            }
+        } else {
+            None
+        };
         match msg {
             Backend::ReadyForQuery(status) => {
                 if !self.waiting
@@ -658,6 +692,7 @@ impl Session {
                     return Err(protocol());
                 }
                 self.waiting = false;
+                self.simple_json_result = SimpleJsonResult::Normal;
                 self.segment_forwarded_write = false;
                 self.segment_known_failure = false;
                 self.segment_unresolved_before_failure = false;
@@ -668,9 +703,16 @@ impl Session {
                 if status == b'I' {
                     self.aborted = false;
                 }
-                Ok(vec![self.ready()])
+                let mut client = Vec::new();
+                if let Some(code) = result_error {
+                    client.push(Backend::ErrorResponse(nunya_error(code)));
+                }
+                client.push(self.ready());
+                Ok(client)
             }
             Backend::RowDescription(mut fields) => {
+                // A single idle simple-query read can drain to its own ReadyForQuery.
+                // No row or metadata has been sent, and there is no write to roll back.
                 let active = self.active.front_mut().ok_or_else(protocol)?;
                 if active.described
                     || fields.len() != active.plan.outputs.len()
@@ -678,7 +720,16 @@ impl Session {
                 {
                     return Err(failure(NyCode::NotAnalysable));
                 }
-                validate_json_fields(&fields, &active.plan)?;
+                if let Err(error) = validate_json_fields(&fields, &active.plan) {
+                    if self.simple_json_result != SimpleJsonResult::CanDiscard {
+                        return Err(error);
+                    }
+                    active.record.outcome = Outcome::Refused(error.code);
+                    self.ctx.readlog.write(&active.record)?;
+                    self.ctx.metrics.refused(error.code);
+                    self.simple_json_result = SimpleJsonResult::Discarding(error.code);
+                    return Ok(vec![]);
+                }
                 for (field, output) in fields.iter_mut().zip(&active.plan.outputs) {
                     if !matches!(output, OutputRewrite::Pass) {
                         field.type_modifier = -1;
@@ -983,8 +1034,14 @@ fn format_at(formats: &[i16], index: usize, len: usize) -> Result<i16, Refusal> 
 fn validate_json_fields(fields: &[FieldDescription], plan: &RewritePlan) -> Result<(), Refusal> {
     for (field, output) in fields.iter().zip(&plan.outputs) {
         if let OutputRewrite::JsonExtract { base, text, .. } = output {
-            let expected = if *text { Some(25) } else { base.pg_oid() };
-            if !matches!(base, ColumnType::Json | ColumnType::Jsonb) || expected != Some(field.type_oid) {
+            let matches_oid = if *text {
+                // PGAdapter describes text expressions as varchar. Both formats
+                // carry the same string bytes used by the JSON extraction codec.
+                matches!(field.type_oid, 25 | 1043)
+            } else {
+                base.pg_oid() == Some(field.type_oid)
+            };
+            if !matches!(base, ColumnType::Json | ColumnType::Jsonb) || !matches_oid {
                 return Err(failure(NyCode::NotAnalysable));
             }
         }
@@ -1468,7 +1525,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
     session.set_connection(_connection_guard.id().get());
     // Recheck after registration so revocation between login and registration cannot be missed.
     if ctx.serving_state().admit(id, Operation::Read).is_err() {
-        let actions = session.refuse("", NyCode::SessionEnded, false);
+        let actions = session.refuse("", &failure(NyCode::SessionEnded), false);
         agent.send(&actions.client).await?;
         return Ok(());
     }
@@ -3374,6 +3431,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn json_text_row_description_accepts_pgadapter_varchar() {
+        use crate::json::filter::JsonMode;
+        let filter = json_test_filter(JsonMode::Tokenize, true, true);
+        for base in [ColumnType::Json, ColumnType::Jsonb] {
+            for text in [false, true] {
+                let plan = RewritePlan {
+                    outputs: vec![OutputRewrite::JsonExtract {
+                        filter: filter.clone(), base: base.clone(), text, keep_empty: false,
+                    }],
+                    inputs: vec![],
+                    tokenize: None,
+                };
+                for oid in [20, 25, 1043, 114, 3802] {
+                    let mut field = field();
+                    field.type_oid = oid;
+                    let expected = if text { matches!(oid, 25 | 1043) } else { base.pg_oid() == Some(oid) };
+                    assert_eq!(validate_json_fields(std::slice::from_ref(&field), &plan).is_ok(), expected);
+                    assert_eq!(super::extended::rewrite_fields(&mut [field], &plan).is_ok(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn row_mask_null_and_width() {
         let f = Fixture::new();
         let session = f.session();
@@ -3594,9 +3675,9 @@ pub(crate) mod tests {
             let mut s = f.session();
             let sql = "SELECT nunya_tokenize('secret', 'private')";
             let out = if extended {
-                s.ext_refuse(sql, tokenize_refusal(TokenizeError::Store), false)
+                s.ext_refuse(sql, &failure(tokenize_refusal(TokenizeError::Store)), false)
             } else {
-                s.refuse(sql, tokenize_refusal(TokenizeError::Store), true)
+                s.refuse(sql, &failure(tokenize_refusal(TokenizeError::Store)), true)
             };
             assert_eq!(code(&out), "NY009");
             assert!(!out.close);
@@ -4629,6 +4710,15 @@ pub(crate) mod tests {
 
     // Real sockets are essential: an in-memory duplex cannot reproduce Windows RSTs.
     async fn close_test_upstream(f: &mut Fixture) -> tokio::task::JoinHandle<()> {
+        fake_query_upstream(f, |_| {
+            vec![Backend::CommandComplete("SELECT 1".into()), Backend::ReadyForQuery(b'I')]
+        }).await
+    }
+
+    async fn fake_query_upstream(
+        f: &mut Fixture,
+        response: fn(&str) -> Vec<Backend>,
+    ) -> tokio::task::JoinHandle<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ctx = Arc::get_mut(&mut f.ctx).unwrap();
         ctx.upstream.host = "127.0.0.1".into();
@@ -4644,8 +4734,8 @@ pub(crate) mod tests {
                     let mut wire = Agent { io: Box::new(tcp), buffer: BytesMut::new(), ctx };
                     assert!(matches!(wire.startup().await.unwrap(), StartupMessage::Startup { .. }));
                     wire.send(&[Backend::AuthenticationOk, Backend::ReadyForQuery(b'I')]).await.unwrap();
-                    while let Ok(Frontend::Query(_)) = wire.recv().await {
-                        if wire.send(&[Backend::CommandComplete("SELECT 1".into()), Backend::ReadyForQuery(b'I')]).await.is_err() {
+                    while let Ok(Frontend::Query(sql)) = wire.recv().await {
+                        if wire.send(&response(&sql)).await.is_err() {
                             break;
                         }
                     }
@@ -4902,6 +4992,76 @@ pub(crate) mod tests {
         active.io.shutdown().await.unwrap();
         first_server.await.unwrap(); second_server.await.unwrap();
         fake.abort(); let _ = fake.await;
+    }
+
+    #[tokio::test]
+    async fn json_pgadapter_varchar_and_metadata_refusal_keep_connection_usable() {
+        use crate::{json::filter::JsonMode, policy::{JsonLeafType, JsonPathTreatment, PathSegment}};
+        let mut f = Fixture::new();
+        let mut snapshot = (**f.ctx.snapshot.read().unwrap()).clone();
+        snapshot.relations[0].columns[0].ty = ColumnType::Jsonb;
+        *f.ctx.snapshot.write().unwrap() = Arc::new(snapshot);
+        let mut policy = (**f.ctx.policy.read().unwrap()).clone();
+        let mut filter = json_test_filter(JsonMode::Tokenize, false, true);
+        let column = filter.rules[0].column.clone();
+        let mut shown = filter.rules[0].clone();
+        shown.path = vec![PathSegment::Key("locale".into())];
+        shown.treatment = JsonPathTreatment::Show { ty: JsonLeafType::String };
+        filter.rules.push(shown);
+        policy.columns.insert(column.clone(), Treatment::Masked { placeholder: None });
+        policy.json_filters.insert(column, filter);
+        *f.ctx.policy.write().unwrap() = Arc::new(policy);
+        let (id, _) = acquire_login(&f, "postgres");
+        let fake = fake_query_upstream(&mut f, |sql| {
+            let mut frames = Vec::new();
+            if sql.contains("::text") {
+                let fields = (0..2).map(|_| {
+                    let mut field = field();
+                    field.type_oid = if sql.contains("bad_type") { 20 } else { 1043 };
+                    field
+                }).collect();
+                frames.push(Backend::RowDescription(fields));
+                frames.push(Backend::DataRow(vec![
+                    Some(br#""en-US""#.to_vec()), Some(br#""hidden""#.to_vec()),
+                ]));
+            }
+            frames.extend([Backend::CommandComplete("SELECT 1".into()), Backend::ReadyForQuery(b'I')]);
+            frames
+        }).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (mut wire, gateway) = close_test_connect(&f, id, false).await;
+            for alias in ["good_type", "bad_type"] {
+                close_test_send(&mut wire, Frontend::Query(format!(
+                    "SELECT value->>'locale' AS {alias}, value->>'protected' FROM items"
+                ))).await;
+                if alias == "good_type" {
+                    let Backend::RowDescription(fields) = close_test_recv(&mut wire).await else {
+                        panic!("expected metadata");
+                    };
+                    assert!(fields.iter().all(|f| f.type_oid == 1043));
+                    let Backend::DataRow(row) = close_test_recv(&mut wire).await else {
+                        panic!("expected row");
+                    };
+                    assert_eq!(row[0].as_deref(), Some(b"en-US".as_slice()));
+                    let token = row[1].as_deref().unwrap();
+                    assert!(token.starts_with(b"tok_secret_"));
+                    assert_ne!(token, b"hidden");
+                    assert!(matches!(close_test_recv(&mut wire).await, Backend::CommandComplete(_)));
+                } else {
+                    assert!(matches!(close_test_recv(&mut wire).await, Backend::ErrorResponse(fields)
+                        if fields.contains(&(b'C', "NY004".into()))));
+                }
+                assert!(matches!(close_test_recv(&mut wire).await, Backend::ReadyForQuery(b'I')));
+                close_test_send(&mut wire, Frontend::Query("SELECT 1".into())).await;
+                assert!(matches!(close_test_recv(&mut wire).await, Backend::CommandComplete(_)));
+                assert!(matches!(close_test_recv(&mut wire).await, Backend::ReadyForQuery(b'I')));
+            }
+            close_test_send(&mut wire, Frontend::Terminate).await;
+            wire.io.shutdown().await.unwrap();
+            gateway.await.unwrap();
+        }).await.unwrap();
+        fake.abort();
+        let _ = fake.await;
     }
 
     #[test]
