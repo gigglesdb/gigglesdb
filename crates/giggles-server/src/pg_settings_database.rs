@@ -1,5 +1,7 @@
 //! PostgreSQL-listener GUC grammar; deliberately separate from the agent parser.
-use super::{Result, Setting, Show};
+use super::{RegistryName, Result, Setting, SettingName, Show, registry};
+use std::ops::Range;
+
 use giggles_pg_types::{
     bytea::ByteaOutput,
     temporal::{DateOrder, DateStyle, DateStyleSettings},
@@ -121,72 +123,96 @@ pub(crate) enum Token {
     Text(String),
     Comma,
     Equals,
+    Dot,
+    NumericJunk(String),
+    Invalid,
 }
 pub(crate) fn lex(sql: &str) -> Result<Vec<Token>> {
-    let mut chars = sql
-        .trim()
-        .strip_suffix(';')
-        .unwrap_or(sql.trim())
-        .trim()
-        .chars()
-        .peekable();
-    let mut tokens = Vec::new();
-    while let Some(c) = chars.next() {
-        if c.is_whitespace() {
-            continue;
-        }
-        tokens.push(match c {
-            ',' => Token::Comma,
-            '=' => Token::Equals,
-            '\'' | '"' => {
-                let mut value = String::new();
-                loop {
-                    match chars.next() {
-                        Some(x) if x == c => {
-                            if chars.peek() == Some(&c) {
+    setting_tokens(sql, false)
+        .map(|(token, _)| if token == Token::Invalid { Err("42601") } else { Ok(token) })
+        .collect()
+}
+
+fn setting_tokens(sql: &str, for_show: bool) -> impl Iterator<Item = (Token, Range<usize>)> {
+    let sql = sql.trim_end();
+    let sql = sql.strip_suffix(';').unwrap_or(sql);
+    let mut chars = sql.char_indices().peekable();
+    std::iter::from_fn(move || {
+        let (start, c) = chars.by_ref().find(|(_, c)| !c.is_whitespace())?;
+        let token = (|| {
+            Some(match c {
+                ',' => Token::Comma,
+                '=' if !for_show => Token::Equals,
+                '.' if for_show && chars.peek().is_some_and(|(_, c)| *c == '.') => {
+                    chars.next();
+                    Token::Invalid
+                }
+                '.' if !chars.peek().is_some_and(|(_, c)| c.is_ascii_digit()) => Token::Dot,
+                '\'' | '"' => {
+                    let mut value = String::new();
+                    loop {
+                        let (_, x) = chars.next()?;
+                        if x == c {
+                            if chars.peek().is_some_and(|(_, next)| *next == c) {
                                 chars.next();
                                 value.push(c);
                             } else {
                                 break;
                             }
+                        } else {
+                            value.push(x);
                         }
-                        Some(x) => value.push(x),
-                        None => return Err("42601"),
+                    }
+                    if c == '\'' { Token::Text(value) } else { Token::Ident(value) }
+                }
+                c if c.is_alphabetic() || c == '_' => {
+                    while chars.peek().is_some_and(|(_, c)| {
+                        c.is_alphanumeric() || matches!(c, '_' | '$') || (!for_show && *c == '.')
+                    }) {
+                        chars.next();
+                    }
+                    let end = chars.peek().map_or(sql.len(), |(at, _)| *at);
+                    Token::Word(sql[start..end].to_owned())
+                }
+                c if for_show && "+-*/<>=~!@#%^&|`?:".contains(c) => {
+                    while chars.peek().is_some_and(|(_, c)| "*/<>=~!@#%^&|`?:".contains(*c)) {
+                        chars.next();
+                    }
+                    Token::Invalid
+                }
+                '$' if for_show => {
+                    while chars.peek().is_some_and(|(_, c)| c.is_ascii_digit()) {
+                        chars.next();
+                    }
+                    Token::Invalid
+                }
+                c if c.is_ascii_digit() || matches!(c, '-' | '+' | '.') => {
+                    let mut value = String::from(c);
+                    while chars.peek().is_some_and(|(_, c)| {
+                        c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')
+                    }) {
+                        value.push(chars.next().unwrap().1);
+                    }
+                    if value.parse::<f64>().is_err() {
+                        return None;
+                    }
+                    if chars.peek().is_some_and(|(_, c)| c.is_alphabetic() || *c == '_') {
+                        while chars.peek().is_some_and(|(_, c)| c.is_alphanumeric() || *c == '_') {
+                            value.push(chars.next().unwrap().1);
+                        }
+                        Token::NumericJunk(value)
+                    } else if for_show {
+                        Token::Invalid
+                    } else {
+                        Token::Word(value)
                     }
                 }
-                if c == '\'' {
-                    Token::Text(value)
-                } else {
-                    Token::Ident(value)
-                }
-            }
-            c if c.is_alphabetic() || c == '_' => {
-                let mut value = String::from(c);
-                while chars
-                    .peek()
-                    .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '.'))
-                {
-                    value.push(chars.next().unwrap());
-                }
-                Token::Word(value)
-            }
-            c if c.is_ascii_digit() || matches!(c, '-' | '+' | '.') => {
-                let mut value = String::from(c);
-                while chars
-                    .peek()
-                    .is_some_and(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E'))
-                {
-                    value.push(chars.next().unwrap());
-                }
-                if value.parse::<f64>().is_err() {
-                    return Err("42601");
-                }
-                Token::Word(value)
-            }
-            _ => return Err("42601"),
-        });
-    }
-    Ok(tokens)
+                _ => Token::Invalid,
+            })
+        })().unwrap_or(Token::Invalid);
+        let end = chars.peek().map_or(sql.len(), |(at, _)| *at);
+        Some((token, start..end))
+    })
 }
 pub(crate) struct Parser {
     pub tokens: Vec<Token>,
@@ -208,6 +234,15 @@ impl Parser {
             false
         }
     }
+    fn keywords(&mut self, words: &[&str]) -> bool {
+        let start = self.at;
+        if words.iter().all(|word| self.kw(word)) {
+            true
+        } else {
+            self.at = start;
+            false
+        }
+    }
     pub fn need(&mut self, word: &str) -> Result<()> {
         if self.kw(word) { Ok(()) } else { Err("42601") }
     }
@@ -226,17 +261,31 @@ impl Parser {
             false
         }
     }
-    fn name(&mut self) -> Result<Show> {
+    fn name(&mut self) -> Result<String> {
         if self.kw("TIME") {
             self.need("ZONE")?;
-            return Ok(Show::TimeZone);
+            return Ok("timezone".into());
         }
+        let mut name = self.name_part()?;
+        loop {
+            if self.tokens.get(self.at) == Some(&Token::Dot) {
+                self.at += 1;
+                name.push('.');
+            } else if !(name.ends_with('.') && matches!(self.tokens.get(self.at), Some(Token::Ident(_)))) {
+                break;
+            }
+            name.push_str(&self.name_part()?);
+        }
+        Ok(name)
+    }
+    fn name_part(&mut self) -> Result<String> {
         let name = match self.tokens.get(self.at) {
-            Some(Token::Word(s) | Token::Ident(s)) => s.to_ascii_lowercase(),
+            Some(Token::Word(s)) => s.to_ascii_lowercase(),
+            Some(Token::Ident(s)) => s.clone(),
             _ => return Err("42601"),
         };
         self.at += 1;
-        lookup_name(&name)
+        Ok(name)
     }
     fn values(&mut self) -> Result<Vec<Token>> {
         let mut values = Vec::new();
@@ -256,7 +305,7 @@ impl Parser {
         Ok(values)
     }
 }
-pub(crate) fn lookup_name(name: &str) -> Result<Show> {
+pub(crate) fn lookup_native(name: &str) -> Result<Show> {
     match name.to_ascii_lowercase().as_str() {
         "role" => Ok(Show::Role),
         "session_authorization" => Ok(Show::SessionAuthorization),
@@ -278,6 +327,8 @@ pub(crate) fn lookup_name(name: &str) -> Result<Show> {
         "transaction_isolation" => Ok(Show::TransactionIsolation),
         "default_transaction_isolation" => Ok(Show::DefaultTransactionIsolation),
         "transaction_read_only" => Ok(Show::TransactionReadOnly),
+        "transaction_deferrable" => Ok(Show::TransactionDeferrable),
+        "default_transaction_deferrable" => Ok(Show::DefaultTransactionDeferrable),
         "default_transaction_read_only" => Ok(Show::DefaultTransactionReadOnly),
         "transaction_timeout" => Ok(Show::TransactionTimeout),
         "client_min_messages" => Ok(Show::ClientMinMessages),
@@ -299,31 +350,105 @@ pub(crate) fn lookup_name(name: &str) -> Result<Show> {
         _ => Err("42704"),
     }
 }
+pub(crate) fn lookup_name(name: &str) -> std::result::Result<SettingName, registry::Error> {
+    if let Ok(show) = lookup_native(name) {
+        return Ok(SettingName::Native(show));
+    }
+    let lower = name.to_ascii_lowercase();
+    let canonical = match lower.as_str() {
+        "sort_mem" => "work_mem",
+        "vacuum_mem" => "maintenance_work_mem",
+        "ssl_ecdh_curve" => "ssl_groups",
+        _ => lower.as_str(),
+    };
+    if let Some(entry) = registry::find(canonical) {
+        return Ok(SettingName::Registry(RegistryName::Registered(entry)));
+    }
+    if lower.contains('.') && lower.split('.').all(|part| {
+        let mut chars = part.chars();
+        chars.next().is_some_and(|c| c == '_' || c.is_alphabetic())
+            && chars.all(|c| matches!(c, '_' | '$') || c.is_alphanumeric())
+    }) {
+        return Ok(SettingName::Registry(RegistryName::Custom { key: lower, spelling: name.into() }));
+    }
+    Err(registry::Error::unknown(name))
+}
+
+pub(crate) fn lookup_assignment(name: &str) -> std::result::Result<SettingName, registry::Error> {
+    lookup_name(name).map_err(|error| {
+        if name.contains('.') {
+            let mut error = registry::Error::new("42602", format!("invalid configuration parameter name \"{name}\""));
+            error.detail = Some("Custom parameter names must be two or more simple identifiers separated by dots.");
+            error
+        } else {
+            error
+        }
+    })
+}
+
+fn capture<T>(
+    result: std::result::Result<T, registry::Error>,
+    diagnostic: &mut Option<registry::Error>,
+) -> Result<T> {
+    result.map_err(|error| {
+        let code = error.code;
+        *diagnostic = Some(error);
+        code
+    })
+}
+
 fn first(sql: &str, keyword: &str) -> bool {
     sql.trim_start()
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .next()
         .is_some_and(|s| s.eq_ignore_ascii_case(keyword))
 }
-pub(crate) fn show_database(sql: &str) -> Result<Option<Show>> {
+pub(crate) fn show_database(
+    sql: &str,
+    syntax_at: &mut Option<Range<usize>>,
+    diagnostic: &mut Option<registry::Error>,
+) -> Result<Option<SettingName>> {
     if !first(sql, "SHOW") {
         return Ok(None);
     }
-    let mut p = Parser::new(sql)?;
-    p.need("SHOW")?;
-    let name = if p.kw("TRANSACTION") {
-        p.need("ISOLATION")?;
-        p.need("LEVEL")?;
-        Show::TransactionIsolation
-    } else {
-        p.name()?
+    // Keep each token's original span for the wire diagnostic.
+    let (tokens, spans): (Vec<_>, Vec<_>) = setting_tokens(sql, true).unzip();
+    let mut p = Parser { tokens, at: 0 };
+    let name = (|| -> Result<_> {
+        p.need("SHOW")?;
+        let name = if p.kw("ALL") {
+            None
+        } else if p.keywords(&["TIME", "ZONE"]) {
+            Some("timezone".into())
+        } else if p.keywords(&["TRANSACTION", "ISOLATION"]) {
+            p.need("LEVEL")?;
+            Some("transaction_isolation".into())
+        } else if p.keywords(&["SESSION", "AUTHORIZATION"]) {
+            Some("session_authorization".into())
+        } else {
+            let mut name = p.name_part()?;
+            while p.tokens.get(p.at) == Some(&Token::Dot) {
+                p.at += 1;
+                name.push('.');
+                name.push_str(&p.name_part()?);
+            }
+            Some(name)
+        };
+        p.end()?;
+        Ok(name)
+    })().inspect_err(|_| {
+        *syntax_at = Some(spans.get(p.at).cloned().unwrap_or(sql.len()..sql.len()));
+    })?;
+    let name = match name {
+        Some(name) => capture(lookup_name(&name), diagnostic)?,
+        None => SettingName::All,
     };
-    p.end()?;
     Ok(Some(name))
 }
 pub(crate) fn parse_database(
     sql: &str,
     syntax_at: &mut Option<String>,
+    diagnostic: &mut Option<registry::Error>,
 ) -> Result<Option<Vec<Setting>>> {
     if !first(sql, "SET") && !first(sql, "RESET") {
         return Ok(None);
@@ -372,7 +497,15 @@ pub(crate) fn parse_database(
     };
     let time_zone =
         matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w.eq_ignore_ascii_case("TIME"));
-    let name = p.name()?;
+    let raw_name = p.name()?;
+    let name = match capture(lookup_assignment(&raw_name), diagnostic)? {
+        SettingName::Native(name) => name,
+        SettingName::Registry(name) => {
+            let value = parse_registry_value(&mut p, &raw_name, &name, reset, syntax_at, diagnostic)?;
+            return Ok(Some(vec![Setting::Registry { name, value, local, reset }]));
+        }
+        SettingName::All => unreachable!(),
+    };
     if matches!(name, Show::MaxIdentifierLength | Show::BlockSize | Show::IntegerDatetimes) {
         return Err("55P02");
     }
@@ -428,9 +561,19 @@ pub(crate) fn parse_database(
                 *syntax_at = Some(word.clone());
                 return Err("42601");
             }
-            Some(validate(name, values)?)
+            if matches!(name, Show::TransactionDeferrable | Show::DefaultTransactionDeferrable)
+                && let [value] = values.as_slice()
+            {
+                let entry = registry::find(&raw_name.to_ascii_lowercase()).expect("registered setting");
+                Some(capture(entry.parse(text(value)), diagnostic)?)
+            } else {
+                Some(validate(name, values)?)
+            }
         }
     };
+    if name == Show::TransactionDeferrable && value.is_none() {
+        return capture(Err(transaction_deferrable_reset()), diagnostic);
+    }
     Ok(Some(vec![Setting::Database {
         name,
         value,
@@ -438,6 +581,93 @@ pub(crate) fn parse_database(
         reset,
     }]))
 }
+pub(super) fn transaction_deferrable_reset() -> registry::Error {
+    registry::Error::new("0A000", "parameter \"transaction_deferrable\" cannot be reset".into())
+}
+
+fn parse_registry_value(
+    p: &mut Parser,
+    raw_name: &str,
+    name: &RegistryName,
+    reset: bool,
+    syntax_at: &mut Option<String>,
+    diagnostic: &mut Option<registry::Error>,
+) -> Result<Option<String>> {
+    if reset {
+        p.end()?;
+        return Ok(None);
+    }
+    if p.tokens.get(p.at) == Some(&Token::Equals) {
+        p.at += 1;
+    } else {
+        p.need("TO")?;
+    }
+    if p.kw("DEFAULT") {
+        if p.tokens.get(p.at) == Some(&Token::Comma) {
+            *syntax_at = Some(",".into());
+        }
+        p.end()?;
+        return Ok(None);
+    }
+    if let Some(Token::NumericJunk(token)) = p.tokens.get(p.at) {
+        return capture(Err(registry::Error::new(
+            "42601", format!("trailing junk after numeric literal at or near \"{token}\""),
+        )), diagnostic);
+    }
+    let values = p.values()?;
+    if let Some(word) = values.iter().find_map(|token| match token {
+        Token::Word(word) if word.eq_ignore_ascii_case("default") => Some(word),
+        _ => None,
+    }) {
+        *syntax_at = Some(word.clone());
+        return Err("42601");
+    }
+    if name.name() == "temp_tablespaces" {
+        let quoted: Vec<_> = values.iter().map(|token| {
+            let value = match token {
+                Token::Word(word) => word.to_ascii_lowercase(),
+                _ => text(token).into(),
+            };
+            if matches!(value.as_str(), "pg_default" | "pg_global") {
+                value
+            } else {
+                format!("\"{}\"", value.replace('"', "\"\""))
+            }
+        }).collect();
+        return Ok(Some(quoted.join(", ")));
+    }
+    if let [value] = values.as_slice() {
+        return Ok(Some(match value {
+            Token::Word(word) => word.parse::<i32>().map_or_else(
+                |_| word.to_ascii_lowercase(),
+                |integer| integer.to_string(),
+            ),
+            _ => text(value).into(),
+        }));
+    }
+    capture(Err(registry::Error::new("22023", format!("SET {raw_name} takes only one argument"))), diagnostic)
+}
+
+pub(super) fn temp_tablespaces(input: &str) -> std::result::Result<String, registry::Error> {
+    let invalid = || registry::Error::new("22023", "invalid list syntax in parameter \"temp_tablespaces\"".into());
+    let mut parser = Parser::new(input).map_err(|_| invalid())?;
+    if parser.tokens.is_empty() {
+        return Ok(String::new());
+    }
+    let values = parser.values().map_err(|_| invalid())?;
+    for value in values {
+        let name = match value {
+            Token::Word(word) => word.to_ascii_lowercase(),
+            Token::Ident(name) | Token::Text(name) => name,
+            _ => unreachable!(),
+        };
+        if !matches!(name.as_str(), "" | "pg_default" | "pg_global") {
+            return Err(registry::Error::new("42704", format!("tablespace \"{name}\" does not exist")));
+        }
+    }
+    Ok(input.into())
+}
+
 fn text(token: &Token) -> &str {
     match token {
         Token::Word(s) | Token::Ident(s) | Token::Text(s) => s,
@@ -458,6 +688,8 @@ fn validate(name: Show, values: Vec<Token>) -> Result<String> {
     };
     let lower = value.to_ascii_lowercase();
     match name {
+        Show::TransactionDeferrable | Show::DefaultTransactionDeferrable => registry::parse_bool(&value)
+            .map(|on| registry::bool_text(on).into()).ok_or("22023"),
         Show::DefaultTransactionReadOnly => match lower.as_str() {
             "on" | "true" | "yes" | "1" => Ok("on".into()),
             "off" | "false" | "no" | "0" => Ok("off".into()),
@@ -618,7 +850,7 @@ fn boolean(value: &str) -> Result<bool> {
     }
 }
 pub(crate) fn function_assignment(name: &str, value: &str, local: bool) -> Result<(Show, Setting)> {
-    let name = lookup_name(name)?;
+    let name = lookup_native(name)?;
     if matches!(name, Show::MaxIdentifierLength | Show::BlockSize | Show::IntegerDatetimes) {
         return Err("55P02");
     }

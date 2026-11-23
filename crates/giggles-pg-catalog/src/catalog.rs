@@ -172,6 +172,11 @@ fn storage_schema(name: &str) -> Option<Vec<Field>> {
 
 pub(crate) fn pg_schema_columns(name: &str) -> Option<&'static [(&'static str, PgType)]> {
     Some(match name {
+        "pg_prepared_statements" => &[
+            ("name", T::Text), ("statement", T::Text), ("prepare_time", T::TimestampTz),
+            ("parameter_types", T::RegtypeArray), ("result_types", T::RegtypeArray),
+            ("from_sql", T::Bool), ("generic_plans", T::Int8), ("custom_plans", T::Int8),
+        ],
         "pg_views" => &[("schemaname", T::Name), ("viewname", T::Name), ("viewowner", T::Name), ("definition", T::Text)],
         "pg_namespace" => &[
             ("oid", T::Oid),
@@ -1167,6 +1172,9 @@ fn build_with_budget(
         if demand.contains(name) {
             demand.extend(dependencies.iter().map(|name| (*name).to_owned()));
         }
+    }
+    if demand.contains("pg_prepared_statements") && !snapshot.prepared_statements.is_empty() {
+        demand.insert("pg_type".into());
     }
     let needs = |name: &str| demand.contains(name);
     if snapshot.schema_privileges.len() > MAX_ROWS
@@ -2255,6 +2263,35 @@ fn build_with_budget(
                 s(label),
             ]);
         }
+    }
+    if needs("pg_prepared_statements") && !snapshot.prepared_statements.is_empty() {
+        let types = &all["pg_type"].rows;
+        let mut names = HashMap::new();
+        let mut array = |oids: &[u32], budget: &mut Budget| -> R<Value> {
+            let values = oids.iter().map(|&oid| {
+                let name = match names.entry(oid) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        budget.visit(types.len())?;
+                        entry.insert(crate::engine::format_type(i64::from(oid), N, types)
+                            .unwrap_or_else(|_| oid.to_string()))
+                    }
+                };
+                Ok(Value::Regtype(oid, name.clone()))
+            }).collect::<R<_>>()?;
+            Ok(Value::Array(values))
+        };
+        let mut rows = Vec::new();
+        for row in &snapshot.prepared_statements {
+            let parameters = array(&row.parameter_types, budget)?;
+            let result = row.result_types.as_deref()
+                .map_or(Ok(N), |oids| array(oids, budget))?;
+            budget.add(&mut rows, vec![
+                s(&row.name), s(&row.statement), I(row.prepare_time), parameters,
+                result, B(row.from_sql), I(row.generic_plans), I(row.custom_plans),
+            ])?;
+        }
+        all.get_mut("pg_prepared_statements").unwrap().rows = rows;
     }
     for row in rows_mut(&mut all, "pg_type") {
         let oid = match row[0] {

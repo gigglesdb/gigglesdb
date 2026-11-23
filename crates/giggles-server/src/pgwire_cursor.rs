@@ -189,6 +189,8 @@ impl Cursors {
     pub fn description(&self, name: &str) -> Option<&Description> {
         self.0.get(name).map(|c| &c.description)
     }
+    pub(super) fn close_all(&mut self) { self.0.clear(); }
+
     pub fn close(&mut self, name: &str) {
         self.0.remove(name);
     }
@@ -361,7 +363,7 @@ impl Cursors {
                 if let Some(name) = name {
                     self.0.remove(name).ok_or("34000")?;
                 } else {
-                    self.0.clear();
+                    self.close_all();
                 }
                 complete("CLOSE CURSOR", &empty(), out)
             }

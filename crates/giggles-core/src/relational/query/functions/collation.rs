@@ -323,7 +323,10 @@ pub(in crate::relational::query) fn bound_column(c: BoundColumn, d: &ColumnDef) 
     column(
         BoundScalar {
             ty: d.data_type.clone(),
-            node: Node::Column(c, d.name.clone()),
+            node: Node::Column(
+                c,
+                if d.name.starts_with('\0') { "?column?".into() } else { d.name.clone() },
+            ),
         },
         d.id,
     )

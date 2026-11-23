@@ -32,7 +32,7 @@ pub(super) enum Action {
     DropConstraint(String, bool, bool),
 }
 impl AlterTable {
-    pub fn sequence_dependencies(&self) -> Vec<Option<String>> {
+    pub fn sequence_dependencies(&self) -> Vec<SequenceDependency> {
         self.actions
             .iter()
             .filter_map(|action| match action {
@@ -40,7 +40,7 @@ impl AlterTable {
                 _ => None,
             })
             .flat_map(|sql| defaults::dependencies(sql).unwrap_or_default().to_vec())
-            .map(Some)
+            .map(SequenceDependency::Named)
             .collect()
     }
 }

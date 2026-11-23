@@ -1215,9 +1215,9 @@ impl SqlSession {
                                         before.incarnation,
                                     ))?;
                                     if let Some(value) =
-                                        values.get(&(id, before.incarnation)).copied()
+                                        values.current.get(&(id, before.incarnation)).copied()
                                     {
-                                        values.insert((id, definition.incarnation), value);
+                                        values.current.insert((id, definition.incarnation), value);
                                     }
                                 }
                             }

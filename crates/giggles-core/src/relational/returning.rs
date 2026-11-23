@@ -69,7 +69,7 @@ impl Returning {
         self.query.projection_reads_columns()
     }
 
-    pub(super) fn sequence_dependencies(&self) -> Vec<Option<String>> {
+    pub(super) fn sequence_dependencies(&self) -> Vec<SequenceDependency> {
         self.query.sequence_dependencies()
     }
     pub(super) fn parse(p: &mut Parser, table: &str) -> R<Option<Self>> {

@@ -118,3 +118,80 @@ fn prisma_namespace_any_infers_name_array() {
     assert_eq!(p.parameter_types(), &[PgType::NameArray]);
     assert!(execute(&p, &CatalogSnapshot::default(), &[Value::Array(vec![Value::Text("public".into())])]).unwrap().rows.is_empty());
 }
+
+#[test]
+fn regtype_validates_type_modifiers_before_resolving_the_base_oid() {
+    let snapshot = CatalogSnapshot::default();
+    let query = plan("SELECT ($1::regtype)::oid FROM pg_namespace WHERE oid=11")
+        .unwrap()
+        .unwrap();
+    for (name, oid) in [
+        ("integer [4][5]", 1007),
+        ("character varying(8)", 1043),
+        ("numeric(8,2)", 1700),
+        ("numeric(3,-2)", 1700),
+        ("pg_catalog.numeric(3,-2)[]", 1231),
+        (r#""numeric"(3,-2)"#, 1700),
+        ("pg_catalog.varchar(12)", 1043),
+        ("float", 701),
+        ("float(1)", 700),
+        ("float(24)", 700),
+        ("float(25)", 701),
+        ("float(53)", 701),
+        ("float(5)[]", 1021),
+        ("pg_catalog.timestamp(7)", 1114),
+        ("timestamp(3)", 1114),
+        ("pg_catalog.timestamptz(3)", 1184),
+        ("pg_catalog.time(7)", 1083),
+        ("pg_catalog.timetz(3)", 1266),
+        ("interval(7)", 1186),
+        ("pg_catalog.interval(32767,7)", 1186),
+        ("pg_catalog._timestamp(3)", 1115),
+    ] {
+        let result = execute(&query, &snapshot, &[Value::Text(name.into())]).unwrap();
+        assert_eq!(result.rows, vec![vec![Value::Int(oid)]], "{name}");
+    }
+    for (name, expected) in [
+        ("pg_catalog.float4(1)", "pg_catalog.float4"),
+        (r#""float4"(1)"#, "float4"),
+        ("pg_catalog.int4(1)", "pg_catalog.int4"),
+        ("int4(1)", "int4"),
+        (r#""text"(5)"#, "text"),
+        ("pg_catalog.text(5)", "pg_catalog.text"),
+        ("pg_catalog.bool(1)", "pg_catalog.bool"),
+        ("bool(1)", "bool"),
+        ("pg_catalog.int4(1,2)", "pg_catalog.int4"),
+    ] {
+        assert_eq!(
+            execute(&query, &snapshot, &[Value::Text(name.into())]).unwrap_err(),
+            Error::TypeModifierNotAllowed(expected.into()),
+            "{name}"
+        );
+    }
+    for (name, message) in [
+        ("numeric(0)", "NUMERIC precision 0 must be between 1 and 1000"),
+        ("pg_catalog.numeric(0)", "NUMERIC precision 0 must be between 1 and 1000"),
+        ("pg_catalog.varchar(0)", "length for type varchar must be at least 1"),
+        (r#""varchar"(0)"#, "length for type varchar must be at least 1"),
+        ("numeric(1,-1001)", "NUMERIC scale -1001 must be between -1000 and 1000"),
+        ("varchar(0)", "length for type varchar must be at least 1"),
+        ("float(0)", "precision for type float must be at least 1 bit"),
+        ("float(54)", "precision for type float must be less than 54 bits"),
+        ("pg_catalog.timestamp(-1)", "TIMESTAMP(-1) precision must not be negative"),
+        ("pg_catalog.timestamptz(-1)", "TIMESTAMP(-1) WITH TIME ZONE precision must not be negative"),
+        ("pg_catalog.timetz(-1)", "TIME(-1) WITH TIME ZONE precision must not be negative"),
+        ("pg_catalog._timestamp(-1)", "TIMESTAMP(-1) precision must not be negative"),
+        ("pg_catalog.interval(7)", "invalid INTERVAL type modifier"),
+        ("pg_catalog.interval(32767,-1)", "INTERVAL(-1) precision must not be negative"),
+    ] {
+        assert_eq!(
+            execute(&query, &snapshot, &[Value::Text(name.into())]).unwrap_err(),
+            Error::InvalidTypeModifier(message.into()),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        execute(&query, &snapshot, &[Value::Text("timestamp(-1)".into())]).unwrap_err(),
+        Error::TypeNameSyntax { near: "-", input: Some("timestamp(-1)".into()) },
+    );
+}

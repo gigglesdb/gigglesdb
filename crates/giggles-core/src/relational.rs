@@ -40,7 +40,7 @@ pub(crate) fn conflict_duplicate_target() -> SqlError {
 }
 
 pub use extensions::{InstalledExtension, BuiltinExtension, ExtensionFunction, BUILTINS as BUILTIN_EXTENSIONS};
-pub use user_types::{take_sql_diagnostic_hint, take_sql_error_hint};
+pub use user_types::{take_sql_diagnostic_hint, take_sql_error_hint, take_sql_error_message_with_context};
 pub use user_types::{
     DuplicateKeyDetail, SqlErrorDetail, TypeDef, UserTypeCatalog, take_sql_diagnostic_detail,
     retain_sql_duplicate_key_detail, take_sql_error_detail, take_sql_error_message, take_sql_notices, type_oid,
@@ -894,6 +894,25 @@ enum Token {
 /// use it to reject text the SQL layer cannot lex.
 pub(crate) fn lex_tokens(s: &str) -> R<usize> {
     lex(s).map(|t| t.len())
+}
+/// A sequence reference before the statement's relation names are resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SequenceDependency {
+    Named(String),
+    Dynamic,
+    LastValue,
+}
+
+/// Positional parameter references in a statement, in numeric order.
+pub fn parameter_references(sql: &str) -> R<BTreeSet<usize>> {
+    assert_sql_frontend_allowed();
+    Ok(lex(sql)?.into_iter().filter_map(|token| match token {
+        Token::Param(index) => Some(index),
+        _ => None,
+    }).collect())
+}
+pub(crate) fn sequence_session_error(message: String) {
+    user_types::view_replace_error(message);
 }
 fn lex(s: &str) -> R<Vec<Token>> {
     let mut out = Vec::new();
@@ -2915,6 +2934,19 @@ impl Prepared {
             _ => self.table(),
         }
     }
+    pub(crate) fn first_missing_relation(&self, state: &Relational) -> Option<String> {
+        self.write_tables().into_iter().map(|(name, _)| name)
+            .chain(self.read_tables())
+            .find(|name| {
+                let key = state.resolve_relation_key(name, &self.search_path);
+                !state.relation_name_taken(&key)
+            })
+            .map(|name| match name.strip_prefix('\0').and_then(|name| name.split_once('\0')) {
+                Some((schema, relation)) => format!("{schema}.{relation}"),
+                None => name,
+            })
+    }
+
     /// Tables whose rows are read by this statement, in first-seen order.
     /// Mutation targets are included only when an IN subquery reads them.
     pub fn read_tables(&self) -> Vec<String> {
@@ -3234,6 +3266,13 @@ impl Prepared {
             .map(|prepared| prepared.sequences())
             .unwrap_or_default()
     }
+
+    /// Syntactic references for authorization, including session-local lastval().
+    pub fn sequence_calls_from_sql(sql: &str) -> Vec<SequenceDependency> {
+        Self::parse(sql, 0, 0)
+            .map(|prepared| prepared.sequence_calls())
+            .unwrap_or_default()
+    }
     pub fn has_privilege_inquiry(&self) -> bool {
         self.privilege_inquiry || match &self.statement {
             Statement::Query(q) => q.has_privilege_inquiry(),
@@ -3243,7 +3282,8 @@ impl Prepared {
             _ => false,
         }
     }
-    pub fn sequences(&self) -> Vec<Option<String>> {
+    /// Syntactic sequence calls, including session-local lastval().
+    pub fn sequence_calls(&self) -> Vec<SequenceDependency> {
         let mut dependencies = match &self.statement {
             Statement::Query(query) => query.sequence_dependencies(),
             Statement::Plan(plan) => plan.sequences(),
@@ -3254,7 +3294,7 @@ impl Prepared {
                 .iter()
                 .flatten()
                 .flat_map(|sql| defaults::dependencies(sql).unwrap_or_default().to_vec())
-                .map(Some)
+                .map(SequenceDependency::Named)
                 .collect(),
             Statement::UpdateExpressions { sets, .. } => sets
                 .iter()
@@ -3273,6 +3313,14 @@ impl Prepared {
         }
         dependencies
     }
+    /// Sequence names for callers that only distinguish literal and dynamic references.
+    pub fn sequences(&self) -> Vec<Option<String>> {
+        self.sequence_calls().into_iter().map(|dependency| match dependency {
+            SequenceDependency::Named(name) => Some(name),
+            SequenceDependency::Dynamic | SequenceDependency::LastValue => None,
+        }).collect()
+    }
+
     pub(crate) fn implicit_sequences(&self, state: &Relational) -> R<Vec<Option<String>>> {
         if let Statement::InsertMulti(insert) = &self.statement {
             return insert.implicit_sequences_declared(state, &self.parameter_types);
@@ -5095,6 +5143,7 @@ mod catalog_typmods_tests;
 #[cfg(test)]
 mod text_kind_tests;
 
+pub mod execute_arguments;
 pub mod logical_types;
 
 #[cfg(test)]

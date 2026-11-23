@@ -429,7 +429,7 @@ impl Mutation {
     pub(super) fn command(&self) -> &'static str {
         if self.deleting { "DELETE" } else { "UPDATE" }
     }
-    pub(super) fn sequences(&self) -> Vec<Option<String>> {
+    pub(super) fn sequences(&self) -> Vec<SequenceDependency> {
         let mut out = vec![];
         self.from
             .visit_queries(&mut |q| out.extend(q.sequence_dependencies()));

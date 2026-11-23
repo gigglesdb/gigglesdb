@@ -1,4 +1,4 @@
-//! PostgreSQL numeric modifiers (`numerictypmodin` and `apply_typmod`).
+//! PostgreSQL type modifier validation and numeric modifier application.
 use crate::{Numeric, Repr};
 use num_traits::{Signed, Zero};
 use std::fmt;
@@ -12,7 +12,12 @@ pub const NUMERIC_MAX_SCALE: i32 = 1000;
 pub enum TypmodError {
     NumericPrecision(i32),
     NumericScale(i32),
+    FloatPrecisionTooSmall,
+    FloatPrecisionTooLarge,
     InvalidModifier,
+    InvalidTypeModifier,
+    InvalidIntervalModifier,
+    NegativeTemporalPrecision { kind: TemporalType, precision: i32 },
     CharacterLengthTooSmall { type_name: &'static str },
     CharacterLengthTooLarge { type_name: &'static str, max: i32 },
 }
@@ -31,7 +36,21 @@ impl fmt::Display for TypmodError {
                 write!(f, "NUMERIC precision {p} must be between 1 and 1000")
             }
             Self::NumericScale(s) => write!(f, "NUMERIC scale {s} must be between -1000 and 1000"),
+            Self::FloatPrecisionTooSmall => f.write_str("precision for type float must be at least 1 bit"),
+            Self::FloatPrecisionTooLarge => f.write_str("precision for type float must be less than 54 bits"),
             Self::InvalidModifier => f.write_str("invalid NUMERIC type modifier"),
+            Self::InvalidTypeModifier => f.write_str("invalid type modifier"),
+            Self::InvalidIntervalModifier => f.write_str("invalid INTERVAL type modifier"),
+            Self::NegativeTemporalPrecision { kind, precision } => {
+                let (name, zone) = match kind {
+                    TemporalType::Timestamp => ("TIMESTAMP", ""),
+                    TemporalType::TimestampTz => ("TIMESTAMP", " WITH TIME ZONE"),
+                    TemporalType::Time => ("TIME", ""),
+                    TemporalType::TimeTz => ("TIME", " WITH TIME ZONE"),
+                    TemporalType::Interval => ("INTERVAL", ""),
+                };
+                write!(f, "{name}({precision}){zone} precision must not be negative")
+            }
             Self::CharacterLengthTooSmall { type_name } => {
                 write!(f, "length for type {type_name} must be at least 1")
             }
@@ -42,6 +61,51 @@ impl fmt::Display for TypmodError {
     }
 }
 impl std::error::Error for TypmodError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemporalType {
+    Timestamp,
+    TimestampTz,
+    Time,
+    TimeTz,
+    Interval,
+}
+
+impl TemporalType {
+    /// PostgreSQL accepts precision above six and reduces it to six.
+    pub fn precision(self, precision: i32) -> Result<i32, TypmodError> {
+        if precision < 0 {
+            return Err(TypmodError::NegativeTemporalPrecision { kind: self, precision });
+        }
+        Ok(precision.min(6))
+    }
+}
+
+pub const INTERVAL_FULL_RANGE: i32 = 0x7fff;
+
+/// Validate the field mask and optional precision given to intervaltypmodin.
+pub fn interval_typmod(range: i32, precision: Option<i32>) -> Result<(), TypmodError> {
+    if !matches!(range,
+        INTERVAL_FULL_RANGE | 2 | 4 | 6 | 8 | 1024 | 1032 | 2048 | 3072 | 3080
+        | 4096 | 6144 | 7168 | 7176
+    ) {
+        return Err(TypmodError::InvalidIntervalModifier);
+    }
+    if let Some(precision) = precision {
+        TemporalType::Interval.precision(precision)?;
+    }
+    Ok(())
+}
+
+/// Validate FLOAT(p) and choose the four-byte or eight-byte type.
+pub fn float_precision_is_real(precision: u32) -> Result<bool, TypmodError> {
+    match precision {
+        0 => Err(TypmodError::FloatPrecisionTooSmall),
+        1..=24 => Ok(true),
+        25..=53 => Ok(false),
+        _ => Err(TypmodError::FloatPrecisionTooLarge),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NumericTypmod {

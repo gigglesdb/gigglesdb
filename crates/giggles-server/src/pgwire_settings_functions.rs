@@ -21,13 +21,13 @@ pub(super) fn description(function: &crate::pg_settings::Function) -> Descriptio
             }).collect(),
         };
     }
-    if let crate::pg_settings::Function::Inventory { result, .. } = function {
+    if let crate::pg_settings::Function::Inventory { fields, .. } = function {
         return Description {
-            type_oids: result.fields.iter().map(|f| f.data_type.oid()).collect(),
-            typmods: vec![-1; result.fields.len()], parameters: vec![],
-            columns: result.fields.iter().map(|f| giggles_core::relational::ColumnDef {
-                id: 0, name: f.name.clone(), not_null: false,
-                data_type: match f.data_type { giggles_pg_catalog::PgType::Numeric => DataType::Numeric, giggles_pg_catalog::PgType::Bool => DataType::Boolean, _ => DataType::Text },
+            type_oids: vec![],
+            typmods: vec![-1; fields.len()],
+            parameters: vec![],
+            columns: fields.iter().map(|(name, data_type)| giggles_core::relational::ColumnDef {
+                id: 0, name: name.clone(), not_null: false, data_type: data_type.clone(),
             }).collect(),
         };
     }
@@ -57,51 +57,63 @@ pub(super) fn evaluate(
     if session.is_aborted() {
         return Err("25P02");
     }
-    if let crate::pg_settings::Function::Inventory { result, presentation, projection } = function {
-        let live = crate::pg_settings::presentation_inventory_rows(presentation, projection, settings);
+    use crate::pg_settings::{Function, FunctionError};
+    if let Function::Inventory { fields, .. } = function {
+        let values = crate::pg_settings::inventory_rows(function, settings, settings_read_allowed(session)?)?;
         return Ok(SqlResult {
-            columns: result.fields.iter().map(|f| f.name.clone()).collect(), affected: 0,
-            rows: result.rows.iter().chain(&live).map(|r| giggles_core::relational::SqlRow { version: 0, values: r.iter().map(|v| match v {
-                giggles_pg_catalog::Value::Text(s) => Value::Text(s.clone()), giggles_pg_catalog::Value::Numeric(n) => Value::Numeric(n.clone()),
-                giggles_pg_catalog::Value::Bool(b) => Value::Bool(*b), _ => Value::Null,
-            }).collect() }).collect(),
-        });
-    }
-    if function.has_row(settings)
-        && let crate::pg_settings::Function::Set { name, value, .. } = function
-        && let Ok(name) = crate::pg_settings::database::lookup_name(name)
-    {
-        diagnostic.presentation_setting(name, value, &settings.current)?;
-    }
-    if function.has_row(settings)
-        && let crate::pg_settings::Function::Set { name, value, .. } = function
-        && name.eq_ignore_ascii_case("session_replication_role") {
-        diagnostic.replication_role_authorize(session)?;
-        diagnostic.replication_role_value(value)?;
-    }
-    if function.has_row(settings)
-        && let crate::pg_settings::Function::Set { name, value, .. } = function
-        && name.eq_ignore_ascii_case("gigglesdb.max_value_bytes")
-        && !value.parse::<usize>().is_ok_and(|n| (65536..=1073741819).contains(&n)) {
-        diagnostic.wire_message = Some(format!("{value} is outside the valid range for parameter \"gigglesdb.max_value_bytes\" (65536 .. 1073741819)"));
-        return Err("22023");
-    }
-    if function.has_row(settings)
-        && let crate::pg_settings::Function::Set { name, value, .. } = function
-        && name.eq_ignore_ascii_case("gigglesdb.max_statement_tokens")
-        && !value.parse::<i64>().is_ok_and(|n| (0..=i64::from(i32::MAX)).contains(&n)) {
-        diagnostic.wire_message = Some(format!("{value} is outside the valid range for parameter \"gigglesdb.max_statement_tokens\" (0 .. 2147483647)"));
-        return Err("22023");
-    }
-    if let Some(columns) = function.current_columns() {
-        let values = columns.iter().map(|call| diagnostic.settings(call.evaluate(settings)).map(|v| v.map(Value::Text).unwrap_or(Value::Null))).collect::<R<Vec<_>>>()?;
-        return Ok(SqlResult {
-            columns: columns.iter().map(|c| c.column().into()).collect(),
-            rows: if function.has_row(settings) { vec![giggles_core::relational::SqlRow { values, version: 0 }] } else { vec![] }, affected: 0,
+            columns: fields.iter().map(|(name, _)| name.clone()).collect(), affected: 0,
+            rows: values.into_iter().map(|values| giggles_core::relational::SqlRow { version: 0, values }).collect(),
         });
     }
     let before = settings.current.clone();
-    let rows = if function.has_row(settings) {
+    if let Some(columns) = function.current_columns() {
+        let privileged = settings_read_allowed(session)?;
+        let superuser = replication_role_allowed(session)?;
+        let rows = if function.has_row(privileged) {
+            let mut values = Vec::with_capacity(columns.len());
+            for call in &columns {
+                if let Function::Set { name, value, .. } = call {
+                    use crate::pg_settings::database;
+                    if let Ok(name) = database::lookup_native(name) {
+                        if name == crate::pg_settings::Show::TransactionDeferrable {
+                            super::transaction::check_deferrable(settings, diagnostic)?;
+                        }
+                        diagnostic.presentation_setting(name, value, &settings.current)?;
+                    }
+                    if name.eq_ignore_ascii_case("session_replication_role") {
+                        diagnostic.replication_role_authorize(session)?;
+                        diagnostic.replication_role_value(value)?;
+                    }
+                    if name.eq_ignore_ascii_case("gigglesdb.max_value_bytes")
+                        && !value.parse::<usize>().is_ok_and(|n| (65536..=1073741819).contains(&n)) {
+                        diagnostic.wire_message = Some(format!("{value} is outside the valid range for parameter \"gigglesdb.max_value_bytes\" (65536 .. 1073741819)"));
+                        return Err("22023");
+                    }
+                    if name.eq_ignore_ascii_case("gigglesdb.max_statement_tokens")
+                        && !value.parse::<i64>().is_ok_and(|n| (0..=i64::from(i32::MAX)).contains(&n)) {
+                        diagnostic.wire_message = Some(format!("{value} is outside the valid range for parameter \"gigglesdb.max_statement_tokens\" (0 .. 2147483647)"));
+                        return Err("22023");
+                    }
+                }
+                let value = call
+                    .evaluate_with_permissions(settings, superuser, privileged, session.database.as_deref())
+                    .map_err(|error| match error {
+                        FunctionError::Native(code) => diagnostic.settings::<()>(Err(code)).unwrap_err(),
+                        FunctionError::Registry(error) => diagnostic.registry_error(error),
+                    })?;
+                values.push(value.map(Value::Text).unwrap_or(Value::Null));
+            }
+            vec![giggles_core::relational::SqlRow { values, version: 0 }]
+        } else {
+            Vec::new()
+        };
+        settings_status(&before, settings, session, out)?;
+        return Ok(SqlResult {
+            columns: columns.iter().map(|call| call.column().into()).collect(),
+            rows, affected: 0,
+        });
+    }
+    let rows = {
         let value = if let crate::pg_settings::Function::Advisory { name, key, .. } = function {
             let value = session.service.advisory.call(session, name, *key)?;
             if name == "pg_advisory_unlock" && !value && settings.current.client_min_messages != "error" {
@@ -110,13 +122,11 @@ pub(super) fn evaluate(
                 body.push(0); frame(b'N', &body, out)?;
             }
             if name.starts_with("pg_try_") || name == "pg_advisory_unlock" { Value::Bool(value) } else { Value::Text(String::new()) }
-        } else { diagnostic.settings(function.evaluate(settings))?.map(Value::Text).unwrap_or(Value::Null) };
+        } else { unreachable!("standalone advisory function") };
         vec![giggles_core::relational::SqlRow {
             values: vec![value],
             version: 0,
         }]
-    } else {
-        vec![]
     };
     settings_status(&before, settings, session, out)?;
     Ok(SqlResult {

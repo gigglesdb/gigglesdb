@@ -124,11 +124,14 @@ fn bounds_setval_restart_and_pending_across_reopen() {
         assert_eq!(scalar(&mut s, "SELECT nextval('set_called')"), 501);
         assert_eq!(scalar(&mut s, "SELECT nextval('set_uncalled')"), 600);
         assert_eq!(scalar(&mut s, "SELECT nextval('restarted')"), 700);
-        assert!(scalar(&mut s, "SELECT nextval('pending')") > 24);
+        let pending = scalar(&mut s, "SELECT nextval('pending')");
+        assert!(pending > 24);
         assert_eq!(scalar(&mut s, "SELECT currval('restarted')"), 700);
+        assert_eq!(scalar(&mut s, "SELECT lastval()"), pending);
+        s.discard_sequence_state().unwrap();
         assert_eq!(
             s.execute_at("SELECT lastval()", &[], None, &clock()),
-            Err(CoreError::Sql(SqlError::Unsupported))
+            Err(CoreError::Sql(SqlError::ObjectNotInPrerequisiteState))
         );
     }
 }
@@ -1935,16 +1938,57 @@ mod default_memo_tests {
         let drawn = run(&mut sql, "SELECT id FROM resolved ORDER BY slot").rows
             .into_iter().map(|row| row.values[0].clone()).collect::<Vec<_>>();
         let current = scalar(&mut sql, "SELECT currval('resolved_id_seq')");
-        // lastval() is currently unsupported, including after default draws.
-        let last = sql.execute_at("SELECT lastval()", &[], None, &clock());
+        let last = scalar(&mut sql, "SELECT lastval()");
         assert_eq!(
             (drawn, current, last),
-            (
-                vec![Value::Int(1), Value::Int(2), Value::Int(3)],
-                3,
-                Err(CoreError::Sql(SqlError::Unsupported)),
-            ),
+            (vec![Value::Int(1), Value::Int(2), Value::Int(3)], 3, 3),
         );
+    }
+
+    #[test]
+    fn column_default_callback_resolves_each_lastval() {
+        let f = Fixture::new(Engine::V2);
+        let mut sql = session_with_bindings(&f);
+        // The SQL default grammar exposes nextval only. Exercise lastval at
+        // the same cache-enabled callback with a column-default origin.
+        assert_eq!(
+            sql.execute_at(
+                "CREATE TABLE d (a bigserial, b bigint DEFAULT lastval())", &[], None, &clock(),
+            ),
+            Err(CoreError::Sql(SqlError::Unsupported)),
+        );
+        run(&mut sql, "CREATE SEQUENCE odd_draws START 1 INCREMENT BY 2");
+        run(&mut sql, "CREATE SEQUENCE even_draws START 2 INCREMENT BY 2");
+
+        let db = f.admin.as_ref().unwrap().test_v2();
+        let image = Arc::new(db.metadata_state(None).unwrap().sql);
+        let baseline = image.catalog_ext().sequences.iter()
+            .map(|(&id, def)| (id, def.incarnation))
+            .collect();
+        let unsettled = Unsettled::default();
+        let callback = super::super::callback(
+            db.child(Holder::Sequence).unwrap(),
+            image,
+            baseline,
+            Default::default(),
+            sql.sequence_values.clone(),
+            unsettled.clone(),
+            vec!["public".into()],
+            Arc::new(Guard::unrestricted()),
+            true,
+        );
+        let before = SEQUENCE_RESOLUTIONS.get();
+        let origin = SequenceOrigin::ColumnDefault;
+        for (sequence, value) in [
+            ("odd_draws", 1), ("even_draws", 2), ("odd_draws", 3),
+            ("even_draws", 4), ("odd_draws", 5),
+        ] {
+            assert_eq!(callback("nextval", sequence, None, false, origin).unwrap(), Value::Int(value));
+            assert_eq!(callback("lastval", "", None, false, origin).unwrap(), Value::Int(value));
+        }
+        assert_eq!(resolutions_since(before), [7, 0, 0]);
+        settle(&db, &unsettled).unwrap();
+        assert_eq!(scalar(&mut sql, "SELECT lastval()"), 5);
     }
 
     #[test]

@@ -18,11 +18,12 @@ pub enum SqlErrorDetail {
 }
 
 type SqlNotice = (String, Option<String>, Option<&'static str>);
+type SqlErrorMessage = (String, Option<String>);
 thread_local! {
     static SQL_NOTICES: std::cell::RefCell<Vec<SqlNotice>> = const { std::cell::RefCell::new(Vec::new()) };
     static SQL_ERROR_HINT: std::cell::RefCell<Option<std::borrow::Cow<'static, str>>> = const { std::cell::RefCell::new(None) };
     static SQL_ERROR_DETAIL: std::cell::RefCell<Option<SqlErrorDetail>> = const { std::cell::RefCell::new(None) };
-    static SQL_ERROR_MESSAGE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static SQL_ERROR_MESSAGE: std::cell::RefCell<Option<SqlErrorMessage>> = const { std::cell::RefCell::new(None) };
 }
 /// Consume the diagnostic immediately after a synchronous SQL call on this thread.
 /// SQLSTATE remains the stable, field-less SqlError contract.
@@ -76,8 +77,22 @@ pub(super) fn sql_foreign_key_detail(key: DuplicateKeyDetail, redacted: String) 
 pub(super) fn sql_error_detail(detail: String) {
     SQL_ERROR_DETAIL.with(|v| *v.borrow_mut() = Some(SqlErrorDetail::Text(detail)));
 }
+pub(super) fn type_name_syntax_error(near: &str, input: &str) {
+    let message = format!(r#"syntax error at or near "{near}""#);
+    let input = input.replace('\0', "\\0");
+    let context = format!(r#"invalid type name "{input}""#);
+    SQL_ERROR_MESSAGE.with(|pending| *pending.borrow_mut() = Some((message, Some(context))));
+}
 pub fn take_sql_error_message() -> Option<String> {
-    SQL_ERROR_MESSAGE.with(|message| message.borrow_mut().take())
+    take_sql_error_message_with_context().0
+}
+/// Consume an error's primary message and optional PostgreSQL context together.
+pub fn take_sql_error_message_with_context() -> (Option<String>, Option<String>) {
+    SQL_ERROR_MESSAGE.with(|pending| {
+        pending.borrow_mut().take().map_or((None, None), |(message, context)| {
+            (Some(message), context)
+        })
+    })
 }
 /// Keep intentionally swallowed failures from replacing the caller's diagnostic.
 pub(super) fn probe_preserving_error_message<T, E>(probe: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
@@ -89,13 +104,13 @@ pub(super) fn probe_preserving_error_message<T, E>(probe: impl FnOnce() -> Resul
     result
 }
 pub(super) fn invalid_type_modifier_error() {
-    SQL_ERROR_MESSAGE.with(|message| *message.borrow_mut() = Some("invalid type modifier".into()));
+    view_replace_error("invalid type modifier".into());
 }
 pub fn take_sql_notices() -> Vec<SqlNotice> {
     SQL_NOTICES.with(|notices| std::mem::take(&mut *notices.borrow_mut()))
 }
 pub(super) fn view_recreate_error() {
-    SQL_ERROR_MESSAGE.with(|message| *message.borrow_mut() = Some("view projection bindings unavailable; recreate the view".into()));
+    view_replace_error("view projection bindings unavailable; recreate the view".into());
 }
 pub(super) fn sql_notice_detail(message: String, detail: String, code: &'static str) {
     SQL_NOTICES.with(|notices| notices.borrow_mut().push((message, Some(detail), Some(code))));
@@ -119,13 +134,10 @@ pub(super) fn duplicate_column_notice(column: &str, table: &str) {
     )));
 }
 pub(super) fn view_replace_error(message: String) {
-    SQL_ERROR_MESSAGE.with(|pending| *pending.borrow_mut() = Some(message));
+    SQL_ERROR_MESSAGE.with(|pending| *pending.borrow_mut() = Some((message, None)));
 }
 pub(super) fn truncate_reference_error() {
-    SQL_ERROR_MESSAGE.with(|message| {
-        *message.borrow_mut() =
-            Some("cannot truncate a table referenced in a foreign key constraint".into())
-    });
+    view_replace_error("cannot truncate a table referenced in a foreign key constraint".into());
 }
 pub(super) fn clear_sql_error_message() {
     take_sql_notices();
@@ -480,10 +492,7 @@ pub(super) fn execute(state: &mut Relational, ddl: &Ddl, prepared: &Prepared) ->
                 let mut table = original.clone();
                 // The current table validator requires at least one logical column.
                 if table.logical_columns().all(|c| columns.contains(&c.id)) {
-                    SQL_ERROR_MESSAGE.with(|message| {
-                        *message.borrow_mut() =
-                            Some("DROP TYPE CASCADE cannot leave a zero-column table".into())
-                    });
+                    view_replace_error("DROP TYPE CASCADE cannot leave a zero-column table".into());
                     return Err(SqlError::Unsupported);
                 }
                 let heap = table
@@ -632,10 +641,7 @@ fn coerce_domain_opt(ty: Option<&TypeDef>, value: &Value) -> R<()> {
             ..
         }) => {
             if *not_null && *value == Value::Null {
-                SQL_ERROR_MESSAGE.with(|message| {
-                    *message.borrow_mut() =
-                        Some(format!("domain {name} does not allow null values"))
-                });
+                view_replace_error(format!("domain {name} does not allow null values"));
                 return Err(SqlError::Null);
             }
             if let Some(expr) = check {
@@ -652,8 +658,9 @@ fn coerce_domain_opt(ty: Option<&TypeDef>, value: &Value) -> R<()> {
                 .map_err(|e| {
                     if e == SqlError::CheckViolation {
                         {
-                            SQL_ERROR_MESSAGE.with(|message| *message.borrow_mut() = Some(format!(
-                                "value for domain {name} violates check constraint \"{constraint}\"")));
+                            view_replace_error(format!(
+                                "value for domain {name} violates check constraint \"{constraint}\""
+                            ));
                             SqlError::CheckViolation
                         }
                     } else {
@@ -827,7 +834,9 @@ mod tests {
     #[test]
     fn swallowed_probe_restores_prior_message() {
         for saved in [None, Some("division by zero")] {
-            SQL_ERROR_MESSAGE.with(|message| *message.borrow_mut() = saved.map(String::from));
+            SQL_ERROR_MESSAGE.with(|message| {
+                *message.borrow_mut() = saved.map(|text| (text.into(), None));
+            });
             let result: R<()> = probe_preserving_error_message(|| {
                 super::super::logical_types::array_values("{a,b")?;
                 Ok(())
@@ -841,6 +850,14 @@ mod tests {
         });
         assert!(result.is_ok());
         assert_eq!(take_sql_error_message().as_deref(), Some("division by zero"));
+
+        view_replace_error("division by zero".into());
+        let result: R<()> = probe_preserving_error_message(|| {
+            type_name_syntax_error("-", "timestamp(-1)");
+            Err(SqlError::Syntax)
+        });
+        assert_eq!(result, Err(SqlError::Syntax));
+        assert_eq!(take_sql_error_message_with_context(), (Some("division by zero".into()), None));
     }
     #[test]
     fn catalog_ext_six_type_definition_scalar_tags_preserve_logical_kinds() {

@@ -56,7 +56,7 @@ impl Expression {
         matches!(&self.0, Scalar::Cast(value, ty)
             if ty == target && matches!(value.as_ref(), Scalar::Literal(_) | Scalar::Param(_)))
     }
-    pub(in crate::relational) fn sequence_dependencies(&self) -> Vec<Option<String>> {
+    pub(in crate::relational) fn sequence_dependencies(&self) -> Vec<SequenceDependency> {
         let mut dependencies = vec![];
         self.0.sequence_dependencies(&mut dependencies);
         dependencies

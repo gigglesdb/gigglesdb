@@ -239,7 +239,7 @@ impl State {
         }
         let mut implicit = false;
         if !matches!(session.role, Role::Database { .. }) {
-            return self.simple_statement(sql, session, out, received, &mut implicit);
+            return self.simple_statement(sql, None, session, out, received, &mut implicit);
         }
         let statements = split(sql)?;
         if statements.is_empty() {
@@ -248,8 +248,7 @@ impl State {
         if statements.len() == 1 {
             let was_in_transaction = session.in_transaction();
             let completed = out.len();
-            let result =
-                self.simple_statement(&statements[0], session, out, received, &mut implicit);
+            let result = self.simple_statement(&statements[0], Some(sql), session, out, received, &mut implicit);
             if let Err(code) = result {
                 if implicit {
                     self.simple_failure(code, true, completed, session, out);
@@ -269,7 +268,7 @@ impl State {
             return Ok(());
         }
         let output = self.output.take();
-        let result = self.simple_batch(statements, session, out, received, &output);
+        let result = self.simple_batch(statements, sql, session, out, received, &output);
         self.output = output;
         result
     }
@@ -277,6 +276,7 @@ impl State {
     fn simple_batch(
         &mut self,
         statements: Vec<String>,
+        source: &str,
         session: &mut Session,
         out: &mut Vec<u8>,
         received: std::time::Instant,
@@ -296,6 +296,7 @@ impl State {
         }
         self.continue_simple_batch(
             statements.into_iter(),
+            Some(source),
             session,
             out,
             received,
@@ -304,9 +305,11 @@ impl State {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn continue_simple_batch(
         &mut self,
         mut statements: impl Iterator<Item = String>,
+        source: Option<&str>,
         session: &mut Session,
         out: &mut Vec<u8>,
         received: std::time::Instant,
@@ -332,7 +335,7 @@ impl State {
                 {
                     begin_implicit(session, &mut implicit, &mut self.settings)?;
                 }
-                self.simple_statement(&sql, session, out, received, &mut implicit)
+                self.simple_statement(&sql, source, session, out, received, &mut implicit)
             })();
             if let Err(code) = result {
                 self.simple_failure(code, implicit, completed, session, out);
@@ -340,6 +343,9 @@ impl State {
             }
             if let Some(copy) = self.copy.as_mut() {
                 copy.remaining = statements.collect();
+                if copy.remaining.iter().any(|sql| prepare::is_prepare(sql)) {
+                    copy.prepare_source = source.map(str::to_owned);
+                }
                 return Ok(());
             }
             // A later BEGIN in this message must not preserve portals from a
@@ -544,6 +550,7 @@ impl State {
     pub(super) fn simple_statement(
         &mut self,
         sql: &str,
+        source: Option<&str>,
         session: &mut Session,
         out: &mut Vec<u8>,
         received: std::time::Instant,
@@ -565,7 +572,7 @@ impl State {
         session.set_max_value_bytes(self.settings.current.max_value_bytes);
         session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
         super::statement_deadline(&self.settings.current);
-        let result = self.simple_statement_inner(sql, session, out, received, implicit);
+        let result = self.simple_statement_inner(sql, source, session, out, received, implicit);
         if !self.copy_receiving() && let Some(admission) = self.execution_admission.as_mut() {
             admission.permits().role_permit = None;
         }
@@ -600,6 +607,7 @@ impl State {
     fn simple_statement_inner(
         &mut self,
         sql: &str,
+        source: Option<&str>,
         session: &mut Session,
         out: &mut Vec<u8>,
         _received: std::time::Instant,
@@ -674,6 +682,17 @@ impl State {
                     complete(crate::task_ddl::command(&stmt), &result, out)
                 }
             };
+        }
+        if prepare::recognized(sql) {
+            prepare::guard(session)?;
+            if let Some(mut command) = prepare::parse(sql, &mut self.diagnostic)? {
+                if let prepare::Command::Prepare { source: text, .. } = &mut command
+                    && let Some(source) = source
+                {
+                    *text = source.to_owned();
+                }
+                return self.simple_prepared_command(command, session, implicit, out);
+            }
         }
         if let Some(command) = cursor::parse(sql)? {
             self.cursors.execute(
@@ -790,7 +809,7 @@ impl State {
                 self.cursors.transaction_end(actual);
             }
         } else if let Some(show) = show_settings(sql, session, &mut self.diagnostic)? {
-            let (description, result) = inspect(show, &self.settings.current, session)?;
+            let (description, result) = inspect(&show, &self.settings, session, &mut self.diagnostic)?;
             let result = &result;
             row_description(&description, &[], out)?;
             rows(
@@ -800,7 +819,7 @@ impl State {
                 &description,
                 &[],
                 0,
-                1,
+                result.get().rows.len(),
                 out,
             )?;
             complete("SHOW", result, out)?;
@@ -843,19 +862,12 @@ impl State {
             self.settings.queried = session.in_transaction();
             let (epoch, tables, indexes, typmods, types) =
                 core(session.catalog_snapshot_with_typmods())?;
-            let result = catalog_wire::execute(
-                &plan,
-                &catalog_wire::with_application_rows(
-                    session,
-                    &plan,
-                    catalog_wire::with_search_path(
-                        catalog_wire::snapshot(session, epoch, tables, indexes, typmods, types)?,
-                        &self.settings.current.search_path,
-                    ),
-                )?,
-                &[],
-            )
-            .map_err(catalog_wire::error)?;
+            let snapshot = catalog_wire::snapshot(session, epoch, tables, indexes, typmods, types)?;
+            let snapshot = catalog_wire::with_search_path(snapshot, &self.settings.current.search_path);
+            let snapshot = self.prepared_snapshot(&plan, snapshot);
+            let snapshot = catalog_wire::with_application_rows(session, &plan, snapshot)?;
+            let result = catalog_wire::execute(&plan, &snapshot, &[])
+                .map_err(|error| self.diagnostic.catalog_error(error))?;
             catalog_wire::retained_bytes(&result)?;
             catalog_wire::description(&result.fields, &[], out)?;
             let total = result.rows.len();
@@ -1098,45 +1110,8 @@ pub(super) fn split(sql: &str) -> R<Vec<String>> {
             statement.push(b' ');
             continue;
         }
-        if matches!(b[at], b'\'' | b'"') {
-            let quote = b[at];
-            let escape = quote == b'\''
-                && at > 0
-                && matches!(b[at - 1], b'e' | b'E')
-                && (at == 1 || !identifier(b[at - 2]));
-            at += 1;
-            loop {
-                if at == b.len() {
-                    return Err("42601");
-                }
-                if escape && b[at] == b'\\' {
-                    at += 1;
-                    if at == b.len() {
-                        return Err("42601");
-                    }
-                    at += 1;
-                } else if b[at] == quote {
-                    at += 1;
-                    if b.get(at) == Some(&quote) {
-                        at += 1;
-                    } else {
-                        break;
-                    }
-                } else {
-                    at += 1;
-                }
-            }
-        } else if b[at] == b'$'
-            && (at == 0 || !identifier(b[at - 1]))
-            && let Some(delimiter) = dollar_delimiter(&b[at..])
-        {
-            at += delimiter.len();
-            let tail = &b[at..];
-            let end = tail
-                .windows(delimiter.len())
-                .position(|w| w == delimiter)
-                .ok_or("42601")?;
-            at += end + delimiter.len();
+        if let Some(end) = quoted_end(b, at)? {
+            at = end;
         } else if b[at] == b';' {
             push_statement(&mut statements, &mut statement);
             at += 1;
@@ -1148,6 +1123,52 @@ pub(super) fn split(sql: &str) -> R<Vec<String>> {
     }
     push_statement(&mut statements, &mut statement);
     Ok(statements)
+}
+
+pub(super) fn quoted_end(b: &[u8], mut at: usize) -> R<Option<usize>> {
+    if matches!(b[at], b'\'' | b'"') {
+        let quote = b[at];
+        let escape = quote == b'\''
+            && at > 0
+            && matches!(b[at - 1], b'e' | b'E')
+            && (at == 1 || !identifier(b[at - 2]));
+        at += 1;
+        loop {
+            if at == b.len() {
+                return Err("42601");
+            }
+            if escape && b[at] == b'\\' {
+                at += 1;
+                if at == b.len() {
+                    return Err("42601");
+                }
+                at += 1;
+            } else if b[at] == quote {
+                at += 1;
+                if b.get(at) == Some(&quote) {
+                    at += 1;
+                } else {
+                    break;
+                }
+            } else {
+                at += 1;
+            }
+        }
+    } else if b[at] == b'$'
+        && (at == 0 || !identifier(b[at - 1]))
+        && let Some(delimiter) = dollar_delimiter(&b[at..])
+    {
+        at += delimiter.len();
+        let tail = &b[at..];
+        let end = tail
+            .windows(delimiter.len())
+            .position(|w| w == delimiter)
+            .ok_or("42601")?;
+        at += end + delimiter.len();
+    } else {
+        return Ok(None);
+    }
+    Ok(Some(at))
 }
 
 fn identifier(b: u8) -> bool {
@@ -1207,10 +1228,15 @@ pub(super) fn parse_settings(
             }
         }
         let mut syntax_at = None;
+        let mut registry_error = None;
         let result = diagnostic.settings(crate::pg_settings::database::parse_database(
             sql,
             &mut syntax_at,
+            &mut registry_error,
         ));
+        if let Some(error) = registry_error {
+            return Err(diagnostic.registry_error(error));
+        }
         if let Some(token) = syntax_at {
             diagnostic.wire_message = Some(format!(r#"syntax error at or near "{token}""#));
         }
@@ -1249,11 +1275,36 @@ pub(super) fn show_settings(
     sql: &str,
     session: &Session,
     diagnostic: &mut Diagnostic,
-) -> R<Option<crate::pg_settings::Show>> {
+) -> R<Option<crate::pg_settings::SettingName>> {
     if matches!(session.role, Role::Database { .. }) {
-        diagnostic.settings(crate::pg_settings::show_database(sql))
+        let mut registry_error = None;
+        let mut syntax_at = None;
+        let result = diagnostic.settings(crate::pg_settings::show_database(
+            sql,
+            &mut syntax_at,
+            &mut registry_error,
+        ));
+        if let Some(token) = syntax_at {
+            let message = if token.is_empty() {
+                "syntax error at end of input".into()
+            } else {
+                let bytes = sql.as_bytes();
+                let start = token.start;
+                let quote_start = start + usize::from(matches!(
+                    bytes.get(start..start + 2),
+                    Some([b'e' | b'E', b'\''])
+                ));
+                let end = quoted_end(bytes, quote_start).ok().flatten().unwrap_or(token.end);
+                format!(r#"syntax error at or near "{}""#, &sql[start..end])
+            };
+            diagnostic.wire_message = Some(message);
+        }
+        if let Some(error) = registry_error {
+            return Err(diagnostic.registry_error(error));
+        }
+        result
     } else {
-        crate::pg_settings::show(sql)
+        crate::pg_settings::show(sql).map(|show| show.map(crate::pg_settings::SettingName::Native))
     }
 }
 pub(super) fn settings_status(
@@ -1357,6 +1408,9 @@ pub(super) fn execute_settings(
     }
     for assignment in assignments {
         if let crate::pg_settings::Setting::Database { name, value: Some(value), .. } = assignment {
+            if *name == crate::pg_settings::Show::TransactionDeferrable {
+                super::transaction::check_deferrable(settings, diagnostic)?;
+            }
             diagnostic.presentation_setting(*name, value, &settings.current)?;
         }
         if matches!(assignment, crate::pg_settings::Setting::Database { name: crate::pg_settings::Show::SessionReplicationRole, .. }) {
@@ -1368,10 +1422,24 @@ pub(super) fn execute_settings(
         // RESET ALL skips superuser-only parameters for unprivileged sessions.
         let preserve_replication_role = matches!(assignment, crate::pg_settings::Setting::ResetAll)
             && !replication_role_allowed(session)?;
-        let local = matches!(
-            assignment,
-            crate::pg_settings::Setting::Database { local: true, .. }
-        );
+        let local = assignment.is_local();
+        let normalized;
+        let assignment = if let crate::pg_settings::Setting::Registry { name, value, local, reset } = assignment {
+            let superuser = if matches!(name, crate::pg_settings::RegistryName::Registered(entry)
+                if entry.context == crate::pg_settings::registry::Context::Superuser) {
+                replication_role_allowed(session)?
+            } else {
+                false
+            };
+            let value = name.normalize(value.as_deref(), superuser, session.database.as_deref())
+                .map_err(|error| diagnostic.registry_error(error))?;
+            normalized = crate::pg_settings::Setting::Registry {
+                name: name.clone(), value, local: *local, reset: *reset,
+            };
+            &normalized
+        } else {
+            assignment
+        };
         let warn = if preserve_replication_role {
             settings.reset_all(false, session.in_transaction());
             false

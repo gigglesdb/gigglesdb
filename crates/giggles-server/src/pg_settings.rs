@@ -4,7 +4,75 @@ pub(crate) mod database;
 pub(crate) use database::show_database;
 #[path = "pg_settings_functions.rs"]
 mod functions;
-pub(crate) use functions::{Function, parse_function, presentation_inventory_rows};
+pub(crate) use functions::{Function, FunctionError, parse_function, inventory_rows, show_all};
+#[path = "pg_settings_value.rs"]
+pub(crate) mod registry;
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RegistryName {
+    Registered(&'static registry::Entry),
+    Custom { key: String, spelling: String },
+}
+impl RegistryName {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Registered(entry) => entry.name,
+            Self::Custom { key, .. } => key,
+        }
+    }
+
+    pub(crate) fn normalize(
+        &self,
+        value: Option<&str>,
+        superuser: bool,
+        database: Option<&str>,
+    ) -> std::result::Result<Option<String>, registry::Error> {
+        match self {
+            Self::Registered(entry) => {
+                entry.check_set(superuser)?;
+                value.map(|value| entry.parse_in_database(value, database)).transpose()
+            }
+            Self::Custom { .. } => Ok(value.map(str::to_owned)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SettingName {
+    Native(Show),
+    Registry(RegistryName),
+    All,
+}
+impl SettingName {
+    pub(crate) fn name<'a>(&'a self, settings: &'a SessionSettings) -> &'a str {
+        match self {
+            Self::Native(show) => show.value(&settings.current).0,
+            Self::Registry(RegistryName::Custom { key, spelling }) => settings.placeholders.get(key).map_or(spelling, String::as_str),
+            Self::Registry(name) => name.name(),
+            Self::All => "all",
+        }
+    }
+
+    pub(crate) fn read(
+        &self,
+        settings: &SessionSettings,
+        privileged: bool,
+    ) -> std::result::Result<String, registry::Error> {
+        match self {
+            Self::Native(show) => Ok(show.value(&settings.current).1),
+            Self::Registry(RegistryName::Registered(entry)) => {
+                entry.check_visible(privileged)?;
+                Ok(entry.display(settings.registry_base(entry), true))
+            }
+            Self::Registry(RegistryName::Custom { key, .. }) if settings.placeholders.contains_key(key) => {
+                Ok(settings.current.registered.get(key).cloned().unwrap_or_default())
+            }
+            Self::Registry(RegistryName::Custom { spelling, .. }) => Err(registry::Error::unknown(spelling)),
+            Self::All => unreachable!("SHOW ALL"),
+        }
+    }
+}
 use giggles_pg_types::{bytea::ByteaOutput, temporal::DateStyleSettings};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Setting {
@@ -12,6 +80,12 @@ pub(crate) enum Setting {
     ExtraFloatDigits(i32),
     Database {
         name: Show,
+        value: Option<String>,
+        local: bool,
+        reset: bool,
+    },
+    Registry {
+        name: RegistryName,
         value: Option<String>,
         local: bool,
         reset: bool,
@@ -49,6 +123,10 @@ pub(crate) struct Settings {
     pub restrict_nonsystem_relation_kind: String,
     /// Presentation only: the engine has no XML type.
     pub xmloption: String,
+    pub(crate) registered: BTreeMap<String, String>,
+    pub(crate) assigned: BTreeSet<Show>,
+    pub default_deferrable: bool,
+    pub transaction_deferrable: bool,
     pub default_read_only: bool,
     pub transaction_read_only: bool,
     /// Requested levels, as PostgreSQL keeps them; reporting maps them to the
@@ -82,6 +160,10 @@ impl Default for Settings {
             synchronize_seqscans: "on".into(),
             restrict_nonsystem_relation_kind: String::new(),
             xmloption: "content".into(),
+            registered: BTreeMap::new(),
+            assigned: BTreeSet::new(),
+            default_deferrable: false,
+            transaction_deferrable: false,
             default_read_only: false,
             transaction_read_only: false,
             default_isolation: crate::pg_transaction::DEFAULT_ISOLATION,
@@ -96,15 +178,15 @@ impl Settings {
         match setting {
             Setting::ApplicationName(value) => self.application_name.clone_from(value),
             Setting::ExtraFloatDigits(value) => self.extra_float_digits = *value,
-            Setting::Database { .. } | Setting::ResetAll => unreachable!("session assignment"),
+            Setting::Database { .. } | Setting::Registry { .. } | Setting::ResetAll => unreachable!("session assignment"),
         }
     }
 }
 struct SavepointSettings {
     name: String,
     current: Settings,
-    local: std::collections::BTreeMap<Show, (String, Option<u32>)>,
-    queried: bool,
+    local: BTreeMap<Show, (String, Option<u32>, bool)>,
+    local_registered: BTreeMap<String, Option<String>>,
 }
 #[derive(Default)]
 pub(crate) struct SessionSettings {
@@ -112,20 +194,27 @@ pub(crate) struct SessionSettings {
     saved: Option<Settings>,
     pub defaults: Settings,
     pub queried: bool,
-    local: std::collections::BTreeMap<Show, (String, Option<u32>)>,
+    local: BTreeMap<Show, (String, Option<u32>, bool)>,
+    local_registered: BTreeMap<String, Option<String>>,
     savepoints: Vec<SavepointSettings>,
+    // PostgreSQL retains the placeholder definition even when its value rolls back.
+    placeholders: BTreeMap<String, String>,
 }
 impl SessionSettings {
     #[allow(dead_code)] // E8c wires this into the core statement context.
     pub(crate) fn replication_role_replica(&self) -> bool {
         self.current.session_replication_role == "replica"
     }
+    pub(super) fn in_subtransaction(&self) -> bool {
+        !self.savepoints.is_empty()
+    }
+
     pub fn savepoint(&mut self, name: String) {
         self.savepoints.push(SavepointSettings {
             name,
             current: self.current.clone(),
             local: self.local.clone(),
-            queried: self.queried,
+            local_registered: self.local_registered.clone(),
         });
     }
     pub fn release(&mut self, name: &str) {
@@ -138,12 +227,12 @@ impl SessionSettings {
             let saved = &self.savepoints[at];
             self.current = saved.current.clone();
             self.local = saved.local.clone();
-            self.queried = saved.queried;
+            self.local_registered = saved.local_registered.clone();
             self.savepoints.truncate(at + 1);
         }
     }
     pub(crate) fn post_commit_value(&self, show: Show) -> Option<&str> {
-        self.local.get(&show).map(|(value, _)| value.as_str())
+        self.local.get(&show).map(|(value, ..)| value.as_str())
     }
 
     pub fn transaction(&mut self, was: bool, now: bool, command: &str) {
@@ -152,7 +241,9 @@ impl SessionSettings {
             self.queried = false;
             self.current.transaction_read_only = self.current.default_read_only;
             self.current.transaction_isolation = self.current.default_isolation;
+            self.current.transaction_deferrable = self.current.default_deferrable;
             self.local.clear();
+            self.local_registered.clear();
         }
         if was && !now {
             self.savepoints.clear();
@@ -162,15 +253,30 @@ impl SessionSettings {
                 }
             } else {
                 self.saved = None;
-                for (name, (value, oid)) in std::mem::take(&mut self.local) {
+                for (name, (value, oid, assigned)) in std::mem::take(&mut self.local) {
                     self.current.assign(name, value);
                     self.current.assign_oid(name, oid);
+                    if assigned {
+                        self.current.assigned.insert(name);
+                    } else {
+                        self.current.assigned.remove(&name);
+                    }
+                }
+                for (name, value) in std::mem::take(&mut self.local_registered) {
+                    if let Some(value) = value {
+                        self.current.registered.insert(name, value);
+                    } else {
+                        self.current.registered.remove(&name);
+                    }
                 }
             }
             self.local.clear();
+            self.local_registered.clear();
+            self.current.assigned.remove(&Show::TransactionDeferrable);
             self.queried = false;
             self.current.transaction_read_only = self.current.default_read_only;
             self.current.transaction_isolation = self.current.default_isolation;
+            self.current.transaction_deferrable = self.current.default_deferrable;
         }
     }
     pub(crate) fn reset_all(&mut self, replication_role_allowed: bool, in_transaction: bool) {
@@ -178,16 +284,44 @@ impl SessionSettings {
             if *name == Show::SessionReplicationRole && !replication_role_allowed { continue; }
             self.local.remove(name);
             self.current.assign(*name, name.value(&self.defaults).1);
+            self.current.assigned.remove(name);
         }
+        self.current.registered.clear();
+        self.local_registered.clear();
         if !in_transaction {
             self.current.transaction_read_only = self.current.default_read_only;
             self.current.transaction_isolation = self.current.default_isolation;
+            self.current.transaction_deferrable = self.current.default_deferrable;
         }
     }
+    pub(crate) fn registry_base(&self, entry: &'static registry::Entry) -> &str {
+        self.current.registered.get(entry.name).map_or(entry.default, String::as_str)
+    }
+
     pub fn apply(&mut self, setting: &Setting, in_transaction: bool) -> bool {
         match setting {
             Setting::ResetAll => {
                 self.reset_all(true, in_transaction);
+            }
+            Setting::Registry { name, value, local, .. } => {
+                let key = name.name();
+                if let RegistryName::Custom { spelling, .. } = name {
+                    self.placeholders.entry(key.into()).or_insert_with(|| spelling.clone());
+                }
+                if *local && !in_transaction {
+                    return true;
+                }
+                if *local {
+                    self.local_registered.entry(key.into())
+                        .or_insert_with(|| self.current.registered.get(key).cloned());
+                } else {
+                    self.local_registered.remove(key);
+                }
+                if let Some(value) = value {
+                    self.current.registered.insert(key.into(), value.clone());
+                } else {
+                    self.current.registered.remove(key);
+                }
             }
             Setting::Database {
                 name, value, local, ..
@@ -196,7 +330,7 @@ impl SessionSettings {
                     return true;
                 }
                 if *name == Show::SessionAuthorization {
-                    if *local { self.local.entry(Show::Role).or_insert_with(|| (self.current.selected_role.clone(), self.current.selected_role_oid)); }
+                    if *local { self.local.entry(Show::Role).or_insert_with(|| (self.current.selected_role.clone(), self.current.selected_role_oid, self.current.assigned.contains(&Show::Role))); }
                     else { self.local.remove(&Show::Role); }
                     self.current.selected_role = "none".into();
                     self.current.selected_role_oid = None;
@@ -204,9 +338,17 @@ impl SessionSettings {
                 if *local {
                     self.local
                         .entry(*name)
-                        .or_insert_with(|| (name.value(&self.current).1, self.current.role_oid(*name)));
+                        .or_insert_with(|| (name.value(&self.current).1, self.current.role_oid(*name), self.current.assigned.contains(name)));
                 } else {
                     self.local.remove(name);
+                }
+                if *name == Show::TransactionDeferrable && !in_transaction {
+                    return false;
+                }
+                if value.is_some() {
+                    self.current.assigned.insert(*name);
+                } else {
+                    self.current.assigned.remove(name);
                 }
                 let value = value
                     .clone()
@@ -218,13 +360,18 @@ impl SessionSettings {
         if !in_transaction {
             self.current.transaction_read_only = self.current.default_read_only;
             self.current.transaction_isolation = self.current.default_isolation;
+            self.current.transaction_deferrable = self.current.default_deferrable;
         }
         false
     }
 }
 impl Setting {
+    pub(crate) fn is_local(&self) -> bool {
+        matches!(self, Self::Database { local: true, .. } | Self::Registry { local: true, .. })
+    }
+
     pub fn tag(&self) -> &'static str {
-        if matches!(self, Self::ResetAll | Self::Database { reset: true, .. }) {
+        if matches!(self, Self::ResetAll | Self::Database { reset: true, .. } | Self::Registry { reset: true, .. }) {
             "RESET"
         } else {
             "SET"
@@ -266,6 +413,8 @@ impl Settings {
             Show::RestrictNonsystemRelationKind => self.restrict_nonsystem_relation_kind = value,
             Show::XmlOption => self.xmloption = value,
             Show::DefaultTransactionReadOnly => self.default_read_only = value == "on",
+            Show::DefaultTransactionDeferrable => self.default_deferrable = value == "on",
+            Show::TransactionDeferrable => self.transaction_deferrable = value == "on",
             Show::DefaultTransactionIsolation => {
                 self.default_isolation =
                     crate::pg_transaction::IsolationLevel::parse(&value).expect("validated GUC")
@@ -291,6 +440,7 @@ pub(crate) const RESETTABLE: &[Show] = &[
     Show::LockTimeout,
     Show::IdleInTransactionSessionTimeout,
     Show::DefaultTransactionReadOnly,
+    Show::DefaultTransactionDeferrable,
     Show::DefaultTransactionIsolation,
     Show::TransactionTimeout,
     Show::ClientMinMessages,
@@ -322,6 +472,8 @@ pub(crate) enum Show {
     DefaultTransactionIsolation,
     TransactionReadOnly,
     DefaultTransactionReadOnly,
+    TransactionDeferrable,
+    DefaultTransactionDeferrable,
     SearchPath,
     ClientEncoding,
     ServerEncoding,
@@ -400,6 +552,8 @@ impl Show {
                 }
                 .into(),
             ),
+            Self::TransactionDeferrable => ("transaction_deferrable", registry::bool_text(settings.transaction_deferrable).into()),
+            Self::DefaultTransactionDeferrable => ("default_transaction_deferrable", registry::bool_text(settings.default_deferrable).into()),
             Self::SearchPath => ("search_path", settings.search_path.clone()),
             Self::ClientEncoding => ("client_encoding", "UTF8".into()),
             Self::ServerEncoding => ("server_encoding", "UTF8".into()),
@@ -652,7 +806,7 @@ pub(crate) fn parse(sql: &str) -> Result<Option<Vec<Setting>>> {
 }
 #[cfg(test)]
 fn parse_database(sql: &str) -> Result<Option<Vec<Setting>>> {
-    database::parse_database(sql, &mut None)
+    database::parse_database(sql, &mut None, &mut None)
 }
 
 #[cfg(test)]
@@ -740,8 +894,8 @@ mod tests {
                 .unwrap();
             state.apply(&settings[0], false);
             assert_eq!(
-                show_database("SHOW intervalstyle"),
-                Ok(Some(Show::IntervalStyle))
+                show_database("SHOW intervalstyle", &mut None, &mut None),
+                Ok(Some(SettingName::Native(Show::IntervalStyle)))
             );
             assert_eq!(Show::IntervalStyle.value(&state.current).1, style);
         }
@@ -916,7 +1070,7 @@ mod replication_role_tests {
     fn pg_settings_replication_role_values_and_reset() {
         let mut s = SessionSettings::default();
         assert!(!s.replication_role_replica());
-        assert_eq!(show_database("SHOW session_replication_role"), Ok(Some(Show::SessionReplicationRole)));
+        assert_eq!(show_database("SHOW session_replication_role", &mut None, &mut None), Ok(Some(SettingName::Native(Show::SessionReplicationRole))));
         for (value, expected) in [("ORIGIN", "origin"), ("RePlIcA", "replica"), ("LOCAL", "local")] {
             apply(&mut s, &format!("SET session_replication_role = '{value}'"), false);
             assert_eq!(Show::SessionReplicationRole.value(&s.current), ("session_replication_role", expected.into()));
@@ -977,8 +1131,8 @@ mod replication_role_tests {
         assert_eq!(columns[1].evaluate(&mut s), Ok(Some("postgres".into())));
         assert_eq!(columns[0].column(), "r");
         assert_eq!(columns[1].column(), "i");
-        for sql in ["SELECT current_setting('session_replication_role'), set_config('application_name','x',false)", "SELECT current_setting('session_replication_role'), current_setting('intervalstyle') FROM x"] {
-            assert!(parse_function(sql).unwrap().is_none());
-        }
+        let call = parse_function("SELECT current_setting('session_replication_role'), set_config('application_name','x',false)").unwrap().unwrap();
+        assert_eq!(call.current_columns().unwrap().len(), 2);
+        assert!(parse_function("SELECT current_setting('session_replication_role'), current_setting('intervalstyle') FROM x").unwrap().is_none());
     }
 }

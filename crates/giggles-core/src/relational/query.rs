@@ -836,7 +836,7 @@ impl Filter {
         });
         found
     }
-    fn sequence_dependencies(&self, out: &mut Vec<Option<String>>) {
+    fn sequence_dependencies(&self, out: &mut Vec<SequenceDependency>) {
         let _ = self.visit_scalars(&mut |s| {
             s.sequence_dependencies(out);
             Ok(())
@@ -3377,8 +3377,8 @@ impl Query {
             && self.subquery_tables().is_empty()
             && !self.sequence_dependencies().is_empty()
     }
-    pub(super) fn sequence_dependencies(&self) -> Vec<Option<String>> {
-        fn filter(f: &Filter, out: &mut Vec<Option<String>>) {
+    pub(super) fn sequence_dependencies(&self) -> Vec<SequenceDependency> {
+        fn filter(f: &Filter, out: &mut Vec<SequenceDependency>) {
             match f {
                 Filter::Clauses(c) => {
                     if let Some(f) = &c.filter {
@@ -6953,7 +6953,7 @@ mod deferred_routine_only_tests {
             let query = query(sql);
             assert_eq!(
                 query.sequence_dependencies(),
-                vec![Some("s".into())],
+                vec![SequenceDependency::Named("s".into())],
                 "{sql}"
             );
             assert!(!query.is_table_free(), "{sql}");

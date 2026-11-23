@@ -57,6 +57,9 @@ pub(super) fn execute_mode(
                 if let Some(read_only) = modes.read_only {
                     settings.current.transaction_read_only = read_only;
                 }
+                if let Some(deferrable) = modes.deferrable {
+                    settings.current.transaction_deferrable = deferrable;
+                }
             }
             if start_tag { "START TRANSACTION" } else { actual }
         }
@@ -126,10 +129,15 @@ pub(super) fn execute_mode(
                     out,
                 )?;
             } else {
-                if settings.queried {
+                let changes_isolation = modes.isolation
+                    .is_some_and(|isolation| isolation != settings.current.transaction_isolation);
+                if settings.queried && (changes_isolation || modes.deferrable.is_none()) {
                     diagnostic.message =
                         Some("SET TRANSACTION ISOLATION LEVEL must be called before any query");
                     return Err("25001");
+                }
+                if modes.deferrable.is_some() {
+                    check_deferrable(settings, diagnostic)?;
                 }
                 if let Some(isolation) = modes.isolation {
                     if session
@@ -145,6 +153,9 @@ pub(super) fn execute_mode(
                 }
                 if let Some(read_only) = modes.read_only {
                     settings.current.transaction_read_only = read_only;
+                }
+                if let Some(deferrable) = modes.deferrable {
+                    settings.current.transaction_deferrable = deferrable;
                 }
             }
             "SET"
@@ -165,6 +176,10 @@ pub(super) fn execute_mode(
                         .read_only
                         .map(|on| if on { "on" } else { "off" }.into()),
                 ),
+                (
+                    Show::DefaultTransactionDeferrable,
+                    modes.deferrable.map(|on| if on { "on" } else { "off" }.into()),
+                ),
             ] {
                 if let Some(value) = value {
                     settings.apply(
@@ -184,6 +199,21 @@ pub(super) fn execute_mode(
     complete(actual, &empty(), out)?;
     Ok(actual)
 }
+pub(super) fn check_deferrable(
+    settings: &crate::pg_settings::SessionSettings,
+    diagnostic: &mut Diagnostic,
+) -> R<()> {
+    let message = if settings.in_subtransaction() {
+        "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a subtransaction"
+    } else if settings.queried {
+        "SET TRANSACTION [NOT] DEFERRABLE must be called before any query"
+    } else {
+        return Ok(());
+    };
+    diagnostic.message = Some(message);
+    Err("25001")
+}
+
 pub(super) fn admin_command(stmt: &crate::auth::statements::AdminStatement) -> &'static str {
     use crate::auth::statements::AdminStatement;
     match stmt {

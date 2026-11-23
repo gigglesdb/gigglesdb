@@ -1,7 +1,9 @@
 //! Explicit cast target grammar and in-memory type modifiers.
 use super::*;
 use giggles_pg_types::character::{CharKind, CharTypmod};
-use giggles_pg_types::typmod::NumericTypmod;
+use giggles_pg_types::typmod::{
+    NumericTypmod, TemporalType, TypmodError, float_precision_is_real, interval_typmod,
+};
 
 pub(super) fn explicit_target(value: &Scalar) -> Option<&DataType> {
     match value {
@@ -109,7 +111,14 @@ fn integer(item: &str) -> R<i32> {
     }))
 }
 
-fn character_modifier(ty: &DataType, length: i32) -> R<i32> {
+fn typmod_error(error: TypmodError, diagnose: bool) -> SqlError {
+    if diagnose {
+        user_types::view_replace_error(error.message());
+    }
+    SqlError::InvalidParameterValue
+}
+
+fn character_modifier(ty: &DataType, length: i32, diagnose: bool) -> R<i32> {
     CharTypmod::new(
         if *ty == DataType::Varchar {
             CharKind::Varchar
@@ -119,10 +128,14 @@ fn character_modifier(ty: &DataType, length: i32) -> R<i32> {
         length,
     )
     .map(CharTypmod::to_typmod)
-    .map_err(|_| SqlError::InvalidParameterValue)
+    .map_err(|error| typmod_error(error, diagnose))
 }
 
-fn generic_modifier(ty: &DataType, items: Option<Vec<String>>) -> R<Option<i32>> {
+fn generic_modifier(
+    ty: &DataType,
+    items: Option<Vec<String>>,
+    diagnose: bool,
+) -> R<Option<i32>> {
     let Some(items) = items else {
         return Ok(None);
     };
@@ -134,24 +147,35 @@ fn generic_modifier(ty: &DataType, items: Option<Vec<String>>) -> R<Option<i32>>
             let precision = integer(&items[0])?;
             let scale = items.get(1).map_or(Ok(0), |item| integer(item))?;
             NumericTypmod::new(precision, scale)
-                .map_err(|_| SqlError::InvalidParameterValue)?
+                .map_err(|error| typmod_error(error, diagnose))?
                 .to_typmod()
         }
         DataType::Varchar | DataType::Bpchar => {
             if items.len() != 1 {
                 return Err(SqlError::InvalidParameterValue);
             }
-            character_modifier(ty, integer(&items[0])?)?
+            character_modifier(ty, integer(&items[0])?, diagnose)?
         }
         DataType::Time | DataType::TimeTz | DataType::Timestamp | DataType::TimestampTz => {
-            if items.len() != 1 {
-                return Err(SqlError::InvalidParameterValue);
-            }
-            let precision = integer(&items[0])?;
-            if precision < 0 {
-                return Err(SqlError::InvalidParameterValue);
-            }
-            precision.min(6)
+            let [precision] = items.as_slice() else {
+                return Err(typmod_error(TypmodError::InvalidTypeModifier, diagnose));
+            };
+            let kind = match ty {
+                DataType::Time => TemporalType::Time,
+                DataType::TimeTz => TemporalType::TimeTz,
+                DataType::Timestamp => TemporalType::Timestamp,
+                _ => TemporalType::TimestampTz,
+            };
+            kind.precision(integer(precision)?).map_err(|e| typmod_error(e, diagnose))?
+        }
+        DataType::Interval if diagnose => {
+            let (range, precision) = match items.as_slice() {
+                [range] => (range, None),
+                [range, precision] => (range, Some(integer(precision)?)),
+                _ => return Err(typmod_error(TypmodError::InvalidIntervalModifier, diagnose)),
+            };
+            interval_typmod(integer(range)?, precision).map_err(|e| typmod_error(e, diagnose))?;
+            return Ok(None);
         }
         DataType::Interval => return Err(SqlError::Unsupported),
         _ => return Err(SqlError::Syntax),
@@ -159,7 +183,9 @@ fn generic_modifier(ty: &DataType, items: Option<Vec<String>>) -> R<Option<i32>>
     Ok(Some(modifier))
 }
 
-fn generic(p: &mut Parser, name: &str) -> R<(DataType, Option<i32>)> {
+fn generic(
+    p: &mut Parser, name: &str, schema: Option<&str>, diagnose: bool,
+) -> R<(DataType, Option<i32>)> {
     // Modifier syntax is checked before catalog lookup, even for unknown types.
     let items = modifiers(p)?;
     let ty = match name {
@@ -191,11 +217,18 @@ fn generic(p: &mut Parser, name: &str) -> R<(DataType, Option<i32>)> {
             });
         }
     };
-    let modifier = generic_modifier(&ty, items)?;
+    let modifier = generic_modifier(&ty, items, diagnose).inspect_err(|error| {
+        if diagnose && *error == SqlError::Syntax {
+            let qualified = schema.map_or_else(|| name.to_owned(), |schema| format!("{schema}.{name}"));
+            user_types::view_replace_error(format!(
+                r#"type modifier is not allowed for type "{qualified}""#
+            ));
+        }
+    })?;
     Ok((ty, modifier))
 }
 
-pub(super) fn target(p: &mut Parser) -> R<(DataType, Option<i32>)> {
+pub(super) fn target(p: &mut Parser, diagnose: bool) -> R<(DataType, Option<i32>)> {
     let (name, quoted) = match p.tokens.get(p.at) {
         Some(Token::Word(name)) => (name.clone(), false),
         Some(Token::QuotedIdent(name)) => (name.clone(), true),
@@ -212,9 +245,9 @@ pub(super) fn target(p: &mut Parser) -> R<(DataType, Option<i32>)> {
             modifiers(p)?;
             return Err(SqlError::Unsupported);
         }
-        generic(p, &name2)?
+        generic(p, &name2, Some(&name), diagnose)?
     } else if quoted {
-        generic(p, &name)?
+        generic(p, &name, None, diagnose)?
     } else {
         match name.as_str() {
             "smallint" | "int" | "integer" | "bigint" | "real" | "boolean" => {
@@ -231,11 +264,15 @@ pub(super) fn target(p: &mut Parser) -> R<(DataType, Option<i32>)> {
             "float" => {
                 let ty = match unsigned_modifier(p)? {
                     None => DataType::DoublePrecision,
-                    Some(precision) => match precision.parse::<u32>() {
-                        Ok(1..=24) => DataType::Real,
-                        Ok(25..=53) => DataType::DoublePrecision,
-                        _ => return Err(SqlError::InvalidParameterValue),
-                    },
+                    Some(precision) => {
+                        let precision = precision.parse::<u32>()
+                            .map_err(|_| SqlError::InvalidParameterValue)?;
+                        if float_precision_is_real(precision).map_err(|error| typmod_error(error, diagnose))? {
+                            DataType::Real
+                        } else {
+                            DataType::DoublePrecision
+                        }
+                    }
                 };
                 (ty, None)
             }
@@ -243,7 +280,7 @@ pub(super) fn target(p: &mut Parser) -> R<(DataType, Option<i32>)> {
                 let items = modifiers(p)?;
                 (
                     DataType::Numeric,
-                    generic_modifier(&DataType::Numeric, items)?,
+                    generic_modifier(&DataType::Numeric, items, diagnose)?,
                 )
             }
             "varchar" | "char" | "character" | "nchar" | "national" => {
@@ -262,6 +299,7 @@ pub(super) fn target(p: &mut Parser) -> R<(DataType, Option<i32>)> {
                         length
                             .parse()
                             .map_err(|_| SqlError::InvalidParameterValue)?,
+                        diagnose,
                     )?),
                     None if !varying => Some(5),
                     None => None,
@@ -281,6 +319,13 @@ pub(super) fn target(p: &mut Parser) -> R<(DataType, Option<i32>)> {
                     precision,
                 )
             }
+            "interval" if diagnose && p.tokens.get(p.at) == Some(&Token::Symbol('(')) => {
+                if let Some(precision) = unsigned_modifier(p)? {
+                    TemporalType::Interval.precision(integer(&precision)?)
+                        .map_err(|e| typmod_error(e, diagnose))?;
+                }
+                (DataType::Interval, None)
+            }
             "interval" => {
                 if matches!(p.tokens.get(p.at), Some(Token::Symbol('(')))
                     || matches!(p.tokens.get(p.at), Some(Token::Word(word)) if ["year", "month", "day", "hour", "minute", "second"].contains(&word.as_str()))
@@ -290,7 +335,7 @@ pub(super) fn target(p: &mut Parser) -> R<(DataType, Option<i32>)> {
                 (DataType::Interval, None)
             }
             "bit" => return Err(SqlError::Unsupported),
-            _ => generic(p, &name)?,
+            _ => generic(p, &name, None, diagnose)?,
         }
     };
     // A second modifier or zone suffix is never a projection alias.

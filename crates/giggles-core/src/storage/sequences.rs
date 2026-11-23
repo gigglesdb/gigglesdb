@@ -19,7 +19,29 @@ pub(super) struct Live {
     counters: BTreeMap<u64, SeqCounter>,
     stamp: u64,
 }
-pub(super) type SessionValues = Arc<Mutex<BTreeMap<(u64, u128), i64>>>;
+pub(super) type SessionValues = Arc<Mutex<SessionSequenceValues>>;
+#[derive(Default)]
+pub(super) struct SessionSequenceValues {
+    pub(super) current: BTreeMap<(u64, u128), i64>,
+    last: Option<(u64, u128)>,
+}
+impl SessionSequenceValues {
+    pub(super) fn record(&mut self, operation: &str, called: bool, key: (u64, u128), value: i64) {
+        if operation == "nextval" {
+            self.last = Some(key);
+        }
+        if operation == "nextval" || called {
+            self.current.insert(key, value);
+        }
+    }
+    pub(super) fn last(&self) -> Result<(u64, u128), CoreError> {
+        self.last.ok_or_else(lastval_undefined)
+    }
+}
+pub(super) fn lastval_undefined() -> CoreError {
+    relational::sequence_session_error("lastval is not yet defined in this session".into());
+    CoreError::Sql(E::ObjectNotInPrerequisiteState)
+}
 pub(super) type Pending = Arc<Mutex<BTreeMap<u64, SeqCounter>>>;
 
 fn definition(s: &State, id: u64) -> R<SequenceDef> {
@@ -164,11 +186,18 @@ pub(crate) fn set(c: &mut SeqCounter, value: i64, called: bool, stamp: u64) {
     c.log_hw = value;
     c.stamp = stamp;
 }
-pub(crate) fn currval(values: &BTreeMap<(u64, u128), i64>, id: u64, incarnation: u128) -> R<i64> {
-    values
-        .get(&(id, incarnation))
-        .copied()
-        .ok_or(E::ObjectNotInPrerequisiteState)
+pub(super) fn session_value(
+    values: &SessionSequenceValues, id: u64, def: &SequenceDef, operation: &str,
+) -> Result<relational::Value, CoreError> {
+    if let Some(&value) = values.current.get(&(id, def.incarnation)) {
+        return Ok(relational::Value::Int(value));
+    }
+    if operation == "lastval" {
+        return Err(lastval_undefined());
+    }
+    let name = def.name.rsplit('\0').next().unwrap_or(&def.name);
+    relational::sequence_session_error(format!(r#"currval of sequence "{name}" is not yet defined in this session"#));
+    Err(CoreError::Sql(E::ObjectNotInPrerequisiteState))
 }
 pub(super) fn merge(s: &mut State, source: &BTreeMap<u64, SeqCounter>) {
     for (&id, value) in source {
@@ -291,26 +320,30 @@ impl Inner {
         let inner = self.clone();
         // Legacy keeps its statement scope; the origin only steers V2 (GD-0084 Q24).
         Arc::new(move |operation, text, value, called, _origin| {
-            if allowed_tables
-                .as_ref()
-                .is_some_and(|tables| tables.is_empty())
+            // lastval has no sequence to authorize until it finds a session
+            // observation. The resolved sequence uses the same check below.
+            if operation != "lastval"
+                && allowed_tables.as_ref().is_some_and(|tables| tables.is_empty())
             {
                 return Err(CoreError::SequencePrivilege);
             }
-            let name = sequence_name(text).map_err(CoreError::Sql)?;
-            let name = snapshot.sql.resolve_relation_key(&name, &search_path);
-            let (&id, def) = snapshot
-                .sql
-                .catalog_ext()
-                .sequences
-                .iter()
-                .find(|(_, d)| d.name == name)
-                .ok_or(CoreError::Sql(E::UnknownTable))?;
+            let definitions = &snapshot.sql.catalog_ext().sequences;
+            let (&id, def) = if operation == "lastval" {
+                let (id, incarnation) = values.lock().map_err(|_| CoreError::Fenced)?.last()?;
+                definitions.get_key_value(&id).filter(|(_, def)| def.incarnation == incarnation)
+                    .ok_or_else(lastval_undefined)?
+            } else {
+                let name = sequence_name(text).map_err(CoreError::Sql)?;
+                let name = snapshot.sql.resolve_relation_key(&name, &search_path);
+                definitions.iter().find(|(_, d)| d.name == name)
+                    .ok_or(CoreError::Sql(E::UnknownTable))?
+            };
+            let name = &def.name;
             if let Some(allowed) = &allowed_tables {
                 let owner = def
                     .owned_by
                     .and_then(|(id, _)| snapshot.sql.tables.values().find(|t| t.id == id));
-                if !allowed.contains(&name)
+                if !allowed.contains(name)
                     && owner.is_none_or(|t| !allowed.contains(&snapshot.sql.table_key(t)))
                 {
                     return Err(CoreError::SequencePrivilege);
@@ -328,18 +361,16 @@ impl Inner {
                 .get(&id)
                 .is_some_and(|d| d.incarnation == def.incarnation);
             if !committed && baseline.get(&id) == Some(&def.incarnation) {
-                return Err(CoreError::Sql(E::UnknownTable));
+                return Err(if operation == "lastval" { lastval_undefined() } else { CoreError::Sql(E::UnknownTable) });
             }
             let mut pending = pending.lock().map_err(|_| CoreError::Fenced)?;
             if !committed {
                 current = (*snapshot).clone();
                 merge(&mut current, &pending);
             }
-            if operation == "currval" {
+            if matches!(operation, "currval" | "lastval") {
                 let values = values.lock().map_err(|_| CoreError::Fenced)?;
-                return currval(&values, id, def.incarnation)
-                    .map(relational::Value::Int)
-                    .map_err(CoreError::Sql);
+                return session_value(&values, id, def, operation);
             }
             let mut live = inner.sequences.lock().map_err(|_| CoreError::Fenced)?;
             let stamp = live
@@ -393,12 +424,12 @@ impl Inner {
                 // session state and follows the logical sequence across rollback.
                 // Keys remain incarnation-aware so rolled-back CREATE id reuse
                 // cannot expose a previous object's currval.
-                for ((sequence_id, _), value) in values.iter_mut() {
+                for ((sequence_id, _), value) in &mut values.current {
                     if *sequence_id == id {
                         *value = result;
                     }
                 }
-                values.insert((id, def.incarnation), result);
+                values.record(operation, called, (id, def.incarnation), result);
             }
             Ok(relational::Value::Int(result))
         })

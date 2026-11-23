@@ -675,17 +675,35 @@ fn contains_window(s: &Scalar, calls: &[Call]) -> R<bool> {
     Ok(yes)
 }
 fn output_name(mut s: &Scalar, calls: &[Call]) -> String {
-    while let Scalar::Cast(inner, _) | Scalar::Domain(inner, ..) = s {
-        s = inner;
+    // Name the projection before lowering replaces references with window slots.
+    let mut cast_name = None;
+    loop {
+        match s {
+            Scalar::Cast(inner, ty) => {
+                cast_name.get_or_insert_with(|| functions::cast_type_name(ty));
+                s = inner;
+            }
+            Scalar::Domain(inner, ..) => s = inner,
+            Scalar::Call(name, args)
+                if functions::collation::internal(name)
+                    || matches!(name.as_str(), "\0array_subscript" | functions::CAST_TYPMOD) =>
+            {
+                s = &args[0];
+            }
+            _ => break,
+        }
     }
-    match s {
+    let name = match s {
         Scalar::Column(c) => calls
             .iter()
             .find(|w| w.output == c.name)
-            .map_or_else(|| c.name.clone(), |w| w.name.clone()),
-        Scalar::Call(n, _) => n.clone(),
-        _ => "?column?".into(),
-    }
+            .map(|w| w.name.as_str())
+            .or_else(|| (!c.name.starts_with('\0')).then_some(c.name.as_str())),
+        Scalar::Call(n, _) if n == "\0array_constructor" => Some("array"),
+        Scalar::Call(n, _) if !n.starts_with('\0') => Some(n.as_str()),
+        _ => None,
+    };
+    name.or(cast_name).unwrap_or("?column?").into()
 }
 fn hoist(v: &mut Scalar, items: &mut Vec<(Item, Option<String>)>) {
     let name = format!("\0window_arg_{}", items.len());

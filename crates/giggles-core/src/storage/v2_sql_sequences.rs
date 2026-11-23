@@ -59,7 +59,7 @@ enum SequencePrivilege {
 const OWNER_ANALOGUE: &[SequencePrivilege] =
     &[SequencePrivilege::Usage, SequencePrivilege::Select, SequencePrivilege::Update];
 /// Any one of these suffices (PostgreSQL 18 sequence.c): nextval needs USAGE or
-/// UPDATE, setval UPDATE, currval (and lastval, unsupported) USAGE or SELECT.
+/// UPDATE, setval UPDATE, currval and lastval USAGE or SELECT.
 fn required(operation: &str) -> &'static [SequencePrivilege] {
     use SequencePrivilege::*;
     match operation {
@@ -623,8 +623,9 @@ pub(super) fn callback(
     Arc::new(move |operation, name, value, called, origin| {
         let db = db.lease(Holder::Sequence)?;
         crate::cancellation::check()?;
+        let lastval = operation == "lastval";
         let mut cache = defaults.as_ref()
-            .filter(|_| origin == SequenceOrigin::ColumnDefault && !db.catalog().is_poisoned())
+            .filter(|_| !lastval && origin == SequenceOrigin::ColumnDefault && !db.catalog().is_poisoned())
             .map(|cache| cache.lock().map_err(|_| CoreError::Fenced))
             .transpose()?;
         let (id, def, committed) = if let Some(&(id, committed)) =
@@ -643,14 +644,18 @@ pub(super) fn callback(
                 counts[index] += 1;
                 SEQUENCE_RESOLUTIONS.set(counts);
             }
-            let parsed = sequences::sequence_name(name).map_err(CoreError::Sql)?;
-            let key = image.resolve_relation_key(&parsed, &search_path);
-            let (&id, def) = image
-                .catalog_ext()
-                .sequences
-                .iter()
-                .find(|(_, def)| def.name == key)
-                .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
+            let definitions = &image.catalog_ext().sequences;
+            let (&id, def) = if lastval {
+                let (id, incarnation) = values.lock().map_err(|_| CoreError::Fenced)?.last()?;
+                definitions.get_key_value(&id)
+                    .filter(|(_, def)| def.incarnation == incarnation)
+                    .ok_or_else(sequences::lastval_undefined)?
+            } else {
+                let parsed = sequences::sequence_name(name).map_err(CoreError::Sql)?;
+                let key = image.resolve_relation_key(&parsed, &search_path);
+                definitions.iter().find(|(_, def)| def.name == key)
+                    .ok_or(CoreError::Sql(SqlError::UnknownTable))?
+            };
             let committed = if db.cluster_services().is_some() {
                 // Gateways retain the routed fresh read; their cache can lag remote DDL.
                 let mut check = db.begin(Isolation::ReadCommitted);
@@ -680,7 +685,11 @@ pub(super) fn callback(
                 }
             };
             if !committed && baseline.get(&id) == Some(&def.incarnation) {
-                return Err(CoreError::Sql(SqlError::UnknownTable));
+                return Err(if lastval {
+                    sequences::lastval_undefined()
+                } else {
+                    CoreError::Sql(SqlError::UnknownTable)
+                });
             }
             if let Some(cache) = cache.as_mut() {
                 cache.insert(name.to_owned(), (id, committed));
@@ -691,11 +700,9 @@ pub(super) fn callback(
         // Authority on this resolved id and incarnation, before session values,
         // counters or the cluster sequence RPC; every use below names the same pair.
         guard.check(&db, &image, operation, origin, id, def, committed)?;
-        if operation == "currval" {
+        if matches!(operation, "currval" | "lastval") {
             let values = values.lock().map_err(|_| CoreError::Fenced)?;
-            return sequences::currval(&values, id, def.incarnation)
-                .map(relational::Value::Int)
-                .map_err(CoreError::Sql);
+            return sequences::session_value(&values, id, def, operation);
         }
         if committed && let Some(services) = db.cluster_services() {
             // A cluster gateway keeps no counter: the system range leader evaluates every
@@ -728,7 +735,7 @@ pub(super) fn callback(
                 values
                     .lock()
                     .map_err(|_| CoreError::Fenced)?
-                    .insert((id, def.incarnation), result);
+                    .record(operation, called, (id, def.incarnation), result);
             }
             return Ok(relational::Value::Int(result));
         }
@@ -742,7 +749,7 @@ pub(super) fn callback(
                 values
                     .lock()
                     .map_err(|_| CoreError::Fenced)?
-                    .insert((id, def.incarnation), result);
+                    .record(operation, called, (id, def.incarnation), result);
             }
             #[cfg(all(test, feature = "engine-rocksdb"))]
             if origin == SequenceOrigin::ColumnDefault
@@ -782,7 +789,7 @@ pub(super) fn callback(
             values
                 .lock()
                 .map_err(|_| CoreError::Fenced)?
-                .insert((id, def.incarnation), result);
+                .record(operation, called, (id, def.incarnation), result);
         }
         Ok(relational::Value::Int(result))
     })

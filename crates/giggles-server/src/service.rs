@@ -2368,10 +2368,10 @@ impl Session {
     /// Ownership of the owning table is this profile's analogue of PostgreSQL
     /// sequence USAGE/UPDATE privileges; ordinary table grants do not confer it.
     pub(crate) fn authorize_sequence_sql(&mut self, sql: &str) -> Result<(), CoreError> {
-        self.authorize_sequence_dependencies(&Prepared::sequence_dependencies(sql))
+        self.authorize_sequence_dependencies(&Prepared::sequence_calls_from_sql(sql))
     }
     pub(crate) fn authorize_sequence_dependencies(
-        &mut self, dependencies: &[Option<String>],
+        &mut self, dependencies: &[relational::SequenceDependency],
     ) -> Result<(), CoreError> {
         if dependencies.is_empty() {
             return Ok(());
@@ -2403,7 +2403,11 @@ impl Session {
         }
         Ok(())
     }
-    fn authorize_sequences(&mut self, dependencies: &[Option<String>]) -> Result<(), CoreError> {
+    fn authorize_sequences(&mut self, dependencies: &[relational::SequenceDependency]) -> Result<(), CoreError> {
+        if !dependencies.is_empty() && !self.role.is_sql() && self.sql.task().is_none() {
+            self.sql.abort();
+            return Err(CoreError::Policy(Error::Scope));
+        }
         let sequences = self.sql.sequence_owners_shared()?;
         let image = match self.effective_role.as_ref().unwrap_or(&self.role) {
             Role::Database { .. } => Some(self.service.admin.roles().image()
@@ -2451,29 +2455,33 @@ impl Session {
             .collect()
         };
         let live_context = superuser || !allowed_tables.is_empty();
-        let allowed = live_context
-            && dependencies.iter().all(|dependency| {
-                if superuser {
-                    return true;
-                }
-                // Dynamic names are judged at execution, before any counter state
-                // is read or changed: on V2 by the sequence callback's owner check
-                // on the resolved sequence (GD-0084 Q24), on Legacy and COPY by this
-                // statement's table scope.
-                let Some(name) = dependency else {
-                    return true;
-                };
-                let Ok(name) = self.sql.normalize_sequence_reference(name) else {
-                    return true;
-                };
-                sequences
-                    .iter()
-                    .find(|(sequence, _)| sequence == &name)
-                    .is_none_or(|(sequence, table)| match table {
-                        Some(table) => allowed_table(table),
-                        None => allowed_standalone(sequence),
-                    })
-            });
+        let allowed = dependencies.iter().all(|dependency| {
+            use relational::SequenceDependency::{Dynamic, LastValue, Named};
+            // lastval resolves a session observation before checking the
+            // resolved sequence's authority in the callback.
+            if superuser || matches!(dependency, LastValue) {
+                return true;
+            }
+            if !live_context {
+                return false;
+            }
+            // Dynamic names still require a live sequence context. Their
+            // resolved sequence is checked at execution.
+            let name = match dependency {
+                Named(name) => name,
+                Dynamic | LastValue => return true,
+            };
+            let Ok(name) = self.sql.normalize_sequence_reference(name) else {
+                return true;
+            };
+            sequences
+                .iter()
+                .find(|(sequence, _)| sequence == &name)
+                .is_none_or(|(sequence, table)| match table {
+                    Some(table) => allowed_table(table),
+                    None => allowed_standalone(sequence),
+                })
+        });
         self.sql
             .set_sequence_tables((!superuser).then_some(allowed_tables));
         if dependencies.is_empty() {
@@ -2791,7 +2799,7 @@ impl Session {
         })
     }
     pub(crate) fn authorize_native_sequence(&mut self, name: &str) -> Result<(), CoreError> {
-        self.authority_scope(|session| session.authorize_sequences(&[Some(name.to_owned())]))
+        self.authority_scope(|session| session.authorize_sequences(&[relational::SequenceDependency::Named(name.to_owned())]))
     }
     pub(crate) fn authorize_native_catalog(&mut self, request: &giggles_core::operations::CatalogRequest) -> Result<(), CoreError> {
         use giggles_core::operations::CatalogRequest as C;
@@ -3019,7 +3027,7 @@ impl Session {
             }
             return Ok(());
         }
-        self.authorize_sequences(&p.sequences())?;
+        self.authorize_sequences(&p.sequence_calls())?;
         if p.sequence_only() {
             return Ok(());
         }
@@ -3168,7 +3176,13 @@ impl Session {
         }
         // Ordinary table/DDL authority precedes implicit default metadata:
         // denied sessions must not discover whether a target table exists.
-        let implicit = self.sql.implicit_sequence_dependencies(p)?;
+        let implicit = self.sql.implicit_sequence_dependencies(p)?
+            .into_iter()
+            .map(|reference| reference.map_or(
+                relational::SequenceDependency::Dynamic,
+                relational::SequenceDependency::Named,
+            ))
+            .collect::<Vec<_>>();
         self.authorize_sequences(&implicit)?;
         Ok(())
     }
@@ -3447,7 +3461,7 @@ impl Session {
     }
     /// Recheck fresh application-Parse authority without parsing or describing.
     /// Caller proves this is an unchanged non-DDL SELECT outside a transaction.
-    pub(crate) fn reauthorize_unnamed_parse(&mut self, _sql: &str, dependencies: &[Option<String>], p: &Prepared) -> Result<(), CoreError> {
+    pub(crate) fn reauthorize_unnamed_parse(&mut self, _sql: &str, dependencies: &[relational::SequenceDependency], p: &Prepared) -> Result<(), CoreError> {
         #[cfg(test)]
         if _sql.contains("r3_parse_source") && crate::pgwire::UNNAMED_REAUTHORIZE_FAIL.swap(false, std::sync::atomic::Ordering::SeqCst) {
             return Err(CoreError::Policy(Error::Scope));
@@ -5103,6 +5117,28 @@ mod lifecycle_tests {
             bindings,
         )
     }
+    #[test]
+    fn prepare_lastval_requires_sql_scope() {
+        let (service, mut bindings) = fixture();
+        let mut sql = service.session(&bindings[0].fingerprint).unwrap();
+        let prepared = sql.prepare("SELECT lastval()").unwrap();
+        let error = sql.execute_prepared(&prepared, &[]).unwrap_err();
+        assert_eq!(sqlstate(&error), "55000");
+        assert_eq!(
+            relational::take_sql_error_message().as_deref(),
+            Some("lastval is not yet defined in this session"),
+        );
+
+        bindings[0].role = Role::NoSql {
+            domain: service.admin.authority_metadata().unwrap().0.to_string(),
+        };
+        service.reload_bindings(bindings.clone()).unwrap();
+        let mut nosql = service.session(&bindings[0].fingerprint).unwrap();
+        for query in ["SELECT 1", "SELECT lastval()"] {
+            assert!(matches!(nosql.prepare(query), Err(CoreError::Policy(Error::Scope))));
+        }
+    }
+
     #[test]
     fn nosql_binding_allows_ping_only() {
         let role: Role = serde_json::from_str(r#"{"role":"NoSql","domain":"d"}"#).unwrap();

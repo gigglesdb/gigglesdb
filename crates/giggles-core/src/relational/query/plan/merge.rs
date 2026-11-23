@@ -467,7 +467,7 @@ impl Merge {
             .into_iter()
             .collect()
     }
-    pub(super) fn sequences(&self) -> Vec<Option<String>> {
+    pub(super) fn sequences(&self) -> Vec<SequenceDependency> {
         self.input
             .sequences()
             .into_iter()

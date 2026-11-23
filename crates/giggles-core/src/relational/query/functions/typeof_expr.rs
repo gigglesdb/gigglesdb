@@ -81,7 +81,14 @@ pub(super) fn regtype(value: Value) -> R<Value> {
         params: BTreeSet::new(),
         relations: Vec::new(),
     };
-    let (ty, _) = cast_type(&mut parser)?;
+    if let [Token::Word(name), Token::Symbol('('), Token::Op(sign), ..] = parser.tokens.as_slice()
+        && matches!(name.as_str(), "time" | "timestamp" | "interval")
+        && matches!(sign.as_str(), "-" | "+")
+    {
+        user_types::type_name_syntax_error(sign, &input);
+        return Err(SqlError::Syntax);
+    }
+    let (ty, _) = cast_type_with_diagnostics(&mut parser, true)?;
     if parser.at != parser.tokens.len() {
         return Err(SqlError::InvalidTextRepresentation);
     }

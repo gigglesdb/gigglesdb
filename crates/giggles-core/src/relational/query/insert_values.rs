@@ -243,7 +243,7 @@ impl InsertExpressions {
         }
         Ok(())
     }
-    pub(in super::super) fn sequence_dependencies(&self) -> Vec<Option<String>> {
+    pub(in super::super) fn sequence_dependencies(&self) -> Vec<SequenceDependency> {
         let mut dependencies = vec![];
         for value in &self.values {
             value.sequence_dependencies(&mut dependencies);

@@ -590,14 +590,25 @@ async fn pg_dump_set_config_from_pg_settings_simple_and_extended() {
         let c = f.client().await;
         for (sql, expected) in [
             ("SHOW restrict_nonsystem_relation_kind", Some("")),
+            // PostgreSQL 18.6 compares pg_settings names case-sensitively (TimeZone, DateStyle).
             (
-                "SELECT set_config(name, 'UTC', false) FROM pg_settings WHERE name = 'timezone'",
+                "SELECT set_config(name, 'UTC', false) FROM pg_settings WHERE name = 'TimeZone'",
                 Some("UTC"),
             ),
             (
-                "SELECT set_config(name, 'ISO, MDY', false) FROM pg_settings WHERE name = 'datestyle'",
+                "SELECT set_config(name, 'Europe/Paris', false) FROM pg_settings WHERE name = 'timezone'",
+                None,
+            ),
+            ("SHOW TimeZone", Some("UTC")),
+            (
+                "SELECT set_config(name, 'ISO, MDY', false) FROM pg_settings WHERE name = 'DateStyle'",
                 Some("ISO, MDY"),
             ),
+            (
+                "SELECT set_config(name, 'SQL, DMY', false) FROM pg_settings WHERE name = 'datestyle'",
+                None,
+            ),
+            ("SHOW DateStyle", Some("ISO, MDY")),
             (
                 "SELECT set_config(name, 'view, foreign-table', false) FROM pg_settings WHERE name = 'restrict_nonsystem_relation_kind'",
                 Some("view, foreign-table"),

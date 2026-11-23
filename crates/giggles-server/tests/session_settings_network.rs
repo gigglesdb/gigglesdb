@@ -624,7 +624,7 @@ async fn common_gucs_simple_and_extended_and_invalid_values() {
         let e = c.simple_query(sql).await.unwrap_err();
         assert_eq!(
             e.as_db_error().unwrap().message(),
-            "unrecognized configuration parameter"
+            "unrecognized configuration parameter \"nonexistent\""
         );
         assert_eq!(code(e), "42704");
         assert_eq!(code(c.query(sql, &[]).await.unwrap_err()), "42704");
@@ -828,7 +828,7 @@ async fn settings_diagnostics_do_not_rewrite_core_parameter_errors() {
             (
                 "SHOW nonexistent",
                 "42704",
-                "unrecognized configuration parameter",
+                "unrecognized configuration parameter \"nonexistent\"",
             ),
             (
                 "DROP ROLE missing_settings_diagnostic_role",

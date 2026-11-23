@@ -9,7 +9,7 @@
 //! never called: the `Session` backstops refuse what slips past.
 use super::*;
 use crate::agent::statement::{self as protected, ProtectedHead, ProtectedStatement};
-use crate::pg_settings::{Function, Setting, Show};
+use crate::pg_settings::{Function, Setting, SettingName, Show, database};
 use giggles_core::task::readlog::{ENTRY_PGWIRE_EXTENDED, ENTRY_PGWIRE_SIMPLE};
 use giggles_core::task::{StatementClass, TaskError};
 
@@ -44,7 +44,13 @@ pub(super) fn plan_class(plan: &Plan) -> Option<StatementClass> {
         }
         Plan::Settings(_) => StatementClass::Set,
         Plan::Inspect(_) => StatementClass::Show,
-        Plan::SettingsFunction(Function::Current { .. }) => StatementClass::Show,
+        Plan::SettingsFunction(function @ Function::Current { .. }) => {
+            if function.current_columns().is_some_and(|columns| columns.iter().any(|call| matches!(call, Function::Set { .. }))) {
+                StatementClass::Set
+            } else {
+                StatementClass::Show
+            }
+        }
         Plan::SettingsFunction(Function::Set { .. }) => StatementClass::Set,
         Plan::SettingsFunction(Function::Advisory { .. }) => StatementClass::Lock,
         Plan::SettingsFunction(Function::Inventory { .. }) => StatementClass::Catalog,
@@ -54,7 +60,7 @@ pub(super) fn plan_class(plan: &Plan) -> Option<StatementClass> {
         #[cfg(feature = "legacy-task")]
         Plan::Task(_) => StatementClass::Other,
         // R3-707: the approver forms are never admitted in a task session (D7.1).
-        Plan::Change(_) => StatementClass::Other,
+        Plan::Change(_) | Plan::PreparedCommand(_) => StatementClass::Other,
         // R3-110: task statements are authorization DDL, never run by a task.
         Plan::TaskDdl(_) => StatementClass::RoleStatement,
         Plan::Sql(p) => p.task_class(),
@@ -69,7 +75,7 @@ pub(super) fn setting_allowed(setting: &Setting) -> bool {
     match setting {
         Setting::ApplicationName(_) | Setting::ExtraFloatDigits(_) => true,
         Setting::Database { name, local, .. } => !*local && show_allowed(*name),
-        Setting::ResetAll => false,
+        Setting::Registry { .. } | Setting::ResetAll => false,
     }
 }
 
@@ -89,6 +95,17 @@ fn show_allowed(name: Show) -> bool {
 
 /// `set_config(name, value, is_local)`: the same allow-list, and never local.
 fn function_allowed(function: &Function) -> bool {
+    function.current_columns().is_some_and(|columns| {
+        // The base task grammar admits a list of current_setting calls, or a
+        // standalone set_config. New multi-call forms cannot mutate task settings.
+        if columns.len() > 1 && columns.iter().any(|call| !matches!(call, Function::Current { .. })) {
+            return false;
+        }
+        columns.into_iter().all(function_column_allowed)
+    })
+}
+
+fn function_column_allowed(function: &Function) -> bool {
     match function {
         Function::Set { name, local, .. } => {
             !*local
@@ -105,7 +122,10 @@ fn function_allowed(function: &Function) -> bool {
                 .iter()
                 .any(|allowed| name.eq_ignore_ascii_case(allowed))
         }
-        Function::Current { .. } => true,
+        Function::Current { name, .. } => !matches!(
+            database::lookup_name(name),
+            Ok(SettingName::Registry(_) | SettingName::Native(Show::TransactionDeferrable | Show::DefaultTransactionDeferrable))
+        ),
         Function::Advisory { .. } | Function::Inventory { .. } => false,
     }
 }
@@ -123,6 +143,7 @@ fn leading_word_is(sql: &str, words: &[&str]) -> bool {
 /// until the caller logs it with the statement text (R3-309/R3-310).
 fn refuse(diagnostic: &mut Diagnostic, class: StatementClass) -> &'static str {
     let error = TaskError::NotAllowedInTaskSession(class);
+    diagnostic.wire_registry_error = None;
     diagnostic.message = Some(error.message());
     let code = error.sqlstate();
     diagnostic.task_refusal = Some((class, CoreError::Task(error)));
@@ -239,6 +260,8 @@ impl State {
             #[cfg(test)]
             constant_validations: 0,
             sql_bytes: sql.len(),
+            origin: None,
+            discarded: false,
             sql: sql.to_owned(),
             declared_oids: oids,
             p: Arc::new(p),
@@ -309,7 +332,7 @@ impl State {
         }
         if let Some(plan) = detect_task_settings(sql, session, &mut self.diagnostic)? {
             let description = match &plan {
-                Plan::Inspect(show) => inspect(*show, &self.settings.current, session)?.0,
+                Plan::Inspect(show) => inspect(show, &self.settings, session, &mut self.diagnostic)?.0,
                 Plan::SettingsFunction(function) => settings_functions::description(function),
                 _ => no_shape(),
             };
@@ -333,13 +356,16 @@ impl State {
         session: &mut Session,
     ) -> R<Option<(Plan, Description)>> {
         self.diagnostic.phase = "catalog planning";
-        if Prepared::application_dml(sql, giggles_pg_catalog::catalog_identifier)
-            || !Prepared::sequence_dependencies(sql).is_empty()
-            || Prepared::extension_routine_call(sql)
-        {
+        if Prepared::application_dml(sql, giggles_pg_catalog::catalog_identifier) {
             return Ok(None);
         }
-        let planned = match giggles_pg_catalog::plan_gateway(sql) {
+        let use_core =
+            !Prepared::sequence_dependencies(sql).is_empty() || Prepared::extension_routine_call(sql);
+        let planned = match giggles_pg_catalog::plan_task_gateway(sql) {
+            Err(giggles_pg_catalog::Error::TaskRestrictedRelation) => {
+                return Err(refuse(&mut self.diagnostic, StatementClass::Catalog));
+            }
+            _ if use_core => return Ok(None),
             Err(giggles_pg_catalog::Error::MixedRelations) => {
                 admit(&mut self.diagnostic, session, StatementClass::Catalog)?;
                 let (epoch, tables, indexes, typmods, types) =
@@ -623,7 +649,7 @@ impl State {
         };
         match &*s.p {
             Plan::Inspect(show) => {
-                let (description, result) = inspect(*show, &self.settings.current, session)?;
+                let (description, result) = inspect(show, &self.settings, session, &mut self.diagnostic)?;
                 let result = &result;
                 if describe {
                     row_description(&description, &[], out)?;
@@ -778,6 +804,7 @@ impl State {
             | Plan::Copy(..)
             | Plan::CopyOut(_)
             | Plan::Change(_)
+            | Plan::PreparedCommand(_)
             | Plan::TaskDdl(_) => Err(refuse(&mut self.diagnostic, class)),
             #[cfg(feature = "legacy-task")]
             Plan::Task(_) => Err(refuse(&mut self.diagnostic, class)),
@@ -910,6 +937,11 @@ fn detect_task_settings(sql: &str, session: &mut Session, diagnostic: &mut Diagn
         }
         if let Some(show) = show_settings(sql, session, diagnostic)? {
             admit(diagnostic, session, StatementClass::Show)?;
+            if !matches!(show, SettingName::Native(name) if !matches!(
+                name, Show::TransactionDeferrable | Show::DefaultTransactionDeferrable
+            )) {
+                return Err(refuse(diagnostic, StatementClass::Show));
+            }
             return Ok(Some(Plan::Inspect(show)));
         }
         match parse_settings(sql, session, diagnostic) {
@@ -924,6 +956,9 @@ fn detect_task_settings(sql: &str, session: &mut Session, diagnostic: &mut Diagn
                 return Ok(Some(Plan::Settings(settings)));
             }
             Ok(None) => {}
+            Err(_) if diagnostic.wire_registry_error.is_some() => {
+                return Err(refuse(diagnostic, StatementClass::Set));
+            }
             Err(code) => return Err(code),
         }
         if sql

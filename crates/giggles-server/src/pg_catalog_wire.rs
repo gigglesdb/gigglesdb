@@ -6,7 +6,7 @@ use giggles_core::task::Released;
 type Result<T> = std::result::Result<T, &'static str>;
 pub(crate) fn value_bytes(value: &Value) -> Result<usize> {
     let extra = match value {
-        Value::Text(s) => s.len(),
+        Value::Text(s) | Value::Regtype(_, s) => s.len(),
         Value::Bytes(b) => b.len(),
         Value::Numeric(v) => v.to_string().len(),
         Value::Array(values) | Value::Record(values) => {
@@ -29,7 +29,7 @@ pub(crate) fn error(error: giggles_pg_catalog::Error) -> &'static str {
     use giggles_pg_catalog::Error as E;
     match error {
         E::Inquiry(state) => state,
-        E::Syntax => "42601",
+        E::Syntax | E::TypeModifierNotAllowed(_) | E::TypeNameSyntax { .. } => "42601",
         E::MixedRelations | E::Mutation => "42501",
         E::UnknownColumn => "42703",
         E::AmbiguousColumn => "42702",
@@ -38,10 +38,10 @@ pub(crate) fn error(error: giggles_pg_catalog::Error) -> &'static str {
         E::Parameters => "08P01",
         E::Limit => "54000",
         E::InvalidSnapshot => "55000",
-        E::InvalidPrivilege(_) => "22023",
+        E::InvalidPrivilege(_) | E::InvalidTypeModifier(_) => "22023",
         E::UnknownRelation(_) => "42P01",
         E::UnknownRole(_) => "42704",
-        E::Unsupported => "0A000",
+        E::Unsupported | E::TaskRestrictedRelation => "0A000",
     }
 }
 
@@ -431,6 +431,7 @@ fn snapshot_owned(
             }).collect(),
         generation,
         backend_pid: context.identity.backend_pid,
+        prepared_statements: Vec::new(),
         table_locks: context.identity.locks.into_iter()
             .filter(|(_, table, _, _)| visible.contains(table))
             .map(|(txn, table, mode, fastpath)| (txn, table, context.identity.backend_pid, mode, fastpath)).collect(),
@@ -788,6 +789,32 @@ pub(crate) fn with_search_path(
     snapshot
 }
 
+fn application_relation_query(name: &str) -> Result<String> {
+    // Identifiers came from the binder; quote them again for the core parser.
+    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let target = if let Some(qualified) = name.strip_prefix('\0') {
+        let (schema, table) = qualified.split_once('\0').ok_or("XX000")?;
+        format!("{}.{}", quote(schema), quote(table))
+    } else {
+        quote(name)
+    };
+    Ok(format!(
+        "SELECT * FROM {target} LIMIT {}",
+        giggles_pg_catalog::MAX_ROWS + 1
+    ))
+}
+
+pub(crate) fn authorize_application_relations(
+    session: &mut crate::Session,
+    plan: &giggles_pg_catalog::Plan,
+) -> Result<()> {
+    for name in plan.user_relations().keys() {
+        session.prepare(&application_relation_query(name)?)
+            .map_err(|error| crate::service::sqlstate(&error))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn with_application_rows(
     session: &mut crate::Session,
     plan: &giggles_pg_catalog::Plan,
@@ -796,18 +823,7 @@ pub(crate) fn with_application_rows(
     use giggles_core::relational::Value as V;
     let mut bytes = 0usize;
     for (name, fields) in plan.user_relations() {
-        // Identifiers came from the binder; quote them again for the core parser.
-        let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-        let target = if let Some(qualified) = name.strip_prefix('\0') {
-            let (schema, table) = qualified.split_once('\0').ok_or("XX000")?;
-            format!("{}.{}", quote(schema), quote(table))
-        } else {
-            quote(name)
-        };
-        let sql = format!(
-            "SELECT * FROM {target} LIMIT {}",
-            giggles_pg_catalog::MAX_ROWS + 1
-        );
+        let sql = application_relation_query(name)?;
         // GD-0061 R3-312: the rows go through the release protocol before
         // they are read. In a task session the generated `SELECT *` is
         // expanded to the shown columns by the task's column rules, and the
@@ -982,6 +998,32 @@ pub(crate) fn parameter_type(oid: u32) -> Result<PgType> {
     })
 }
 
+/// OID text input uses base-zero integer syntax and also accepts the signed
+/// 32-bit representation used by older PostgreSQL clients.
+pub(crate) fn parse_oid_text(text: &str) -> Result<u32> {
+    let text = text.trim_ascii();
+    let negative = text.starts_with('-');
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let (digits, radix) = if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+        (hex, 16)
+    } else if digits.starts_with('0') {
+        (digits, 8)
+    } else {
+        (digits, 10)
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return Err("22P02");
+    }
+    let magnitude = u32::from_str_radix(digits, radix).map_err(|_| "22003")?;
+    if negative {
+        if magnitude > i32::MIN.unsigned_abs() {
+            return Err("22003");
+        }
+        return Ok(magnitude.wrapping_neg());
+    }
+    Ok(magnitude)
+}
+
 pub(crate) fn decode(bytes: &[u8], ty: PgType, format: u16) -> Result<Value> {
     use giggles_core::relational::{DataType as T, Value as V};
     if bytes.len() > crate::transport::MAX_FRAME {
@@ -998,11 +1040,8 @@ pub(crate) fn decode(bytes: &[u8], ty: PgType, format: u16) -> Result<Value> {
     }
     if matches!(ty, PgType::Oid | PgType::Xid) {
         return if format == 0 {
-            std::str::from_utf8(bytes)
-                .map_err(|_| "22021")?
-                .parse::<u32>()
+            parse_oid_text(std::str::from_utf8(bytes).map_err(|_| "22021")?)
                 .map(|v| Value::Int(v.into()))
-                .map_err(|_| "22P02")
         } else {
             let bytes: [u8; 4] = bytes.try_into().map_err(|_| "22P03")?;
             Ok(Value::Int(u32::from_be_bytes(bytes).into()))
@@ -1177,6 +1216,19 @@ fn encode_with_settings(
                 if *v { b"t".to_vec() } else { b"f".to_vec() }
             } else {
                 vec![u8::from(*v)]
+            }
+        }
+        (Value::Regtype(oid, name), PgType::Regtype) => {
+            if format == 0 { name.as_bytes().to_vec() } else { oid.to_be_bytes().to_vec() }
+        }
+        (Value::Int(value), PgType::TimestampTz) => {
+            let time = giggles_pg_types::temporal::TimestampTz::from_microseconds(*value)
+                .map_err(|_| "22008")?;
+            if format == 0 {
+                time.format_in_zone(giggles_pg_types::temporal::SessionZone::Fixed(0))
+                    .map_err(|_| "22008")?.into_bytes()
+            } else {
+                time.to_binary().to_vec()
             }
         }
         (Value::Int(v), PgType::Int2) => {
@@ -1396,8 +1448,20 @@ pub(crate) fn rows(
         }
         let mut bytes = (row.len() as u16).to_be_bytes().to_vec();
         for (i, (value, field)) in row.iter().zip(&result.fields).enumerate() {
-            match encode_with_settings(value, field.data_type, pgwire::format_at(formats, i),
-                settings.extra_float_digits, settings.bytea_output)? {
+            let format = pgwire::format_at(formats, i);
+            let encoded = if let (0, PgType::TimestampTz, Value::Int(us)) =
+                (format, field.data_type, value)
+            {
+                use giggles_pg_types::temporal::{SessionZone, TimestampTz};
+                let (zone, _) = SessionZone::setting(&settings.timezone).map_err(|_| "22023")?;
+                let time = TimestampTz::from_microseconds(*us).map_err(|_| "22008")?;
+                Some(time.format_with_style(zone, settings.datestyle.style, settings.datestyle.order)
+                    .map_err(|_| "22008")?.into_bytes())
+            } else {
+                encode_with_settings(value, field.data_type, format,
+                    settings.extra_float_digits, settings.bytea_output)?
+            };
+            match encoded {
                 None => bytes.extend((-1i32).to_be_bytes()),
                 Some(value) => {
                     bytes.extend((value.len() as i32).to_be_bytes());

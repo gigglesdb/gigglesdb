@@ -106,7 +106,7 @@ pub(crate) fn parse_startup_with_diagnostics(
                 }
             }
             if matches!(policy, StartupPolicy::Postgresql { .. })
-                && let Ok(name) = crate::pg_settings::database::lookup_name(&k)
+                && let Ok(name) = crate::pg_settings::database::lookup_native(&k)
             {
                 k = name.value(&startup_settings).0.into();
             }
@@ -164,7 +164,7 @@ pub(crate) fn parse_startup_with_diagnostics(
         }
         if let Some(rejected) = fields.keys().find(|k| {
             if matches!(policy, StartupPolicy::Postgresql { .. })
-                && crate::pg_settings::database::lookup_name(k).is_ok()
+                && crate::pg_settings::database::lookup_native(k).is_ok()
             {
                 return false;
             }

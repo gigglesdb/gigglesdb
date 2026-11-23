@@ -1,15 +1,19 @@
-//! Literal configuration SELECTs and the bounded pg_dump pg_settings lookup.
-use super::{Result, SessionSettings, Show, database};
+//! Standalone configuration SELECTs and the PostgreSQL settings inventory.
+use super::{RegistryName, Result, SessionSettings, Setting, SettingName, Show, database, registry};
+use giggles_core::relational::{DataType, Value};
 
 #[derive(Clone)]
 pub(crate) enum Function {
     Inventory {
-        result: giggles_pg_catalog::ResultSet,
-        presentation: Vec<Show>,
-        projection: Vec<usize>,
+        fields: Vec<(String, DataType)>,
+        projection: Vec<(usize, bool)>,
+        filter: Option<Vec<String>>,
+        count: bool,
+        order: bool,
     },
     Advisory { name: String, key: (bool, i64), column: String },
     Set {
+        additional: Vec<Function>,
         name: String,
         value: String,
         local: bool,
@@ -20,98 +24,212 @@ pub(crate) enum Function {
         additional: Vec<Function>,
         name: String,
         missing_ok: bool,
-        from_settings: bool,
         column: String,
     },
 }
+
+pub(crate) enum FunctionError {
+    Native(&'static str),
+    Registry(registry::Error),
+}
+impl From<registry::Error> for FunctionError {
+    fn from(error: registry::Error) -> Self {
+        Self::Registry(error)
+    }
+}
+impl From<&'static str> for FunctionError {
+    fn from(code: &'static str) -> Self {
+        Self::Native(code)
+    }
+}
+
 impl Function {
     pub fn current_columns(&self) -> Option<Vec<&Function>> {
-        if let Self::Current { additional, .. } = self {
-            let mut columns = vec![self];
-            columns.extend(additional);
-            Some(columns)
-        } else { None }
+        match self {
+            Self::Current { additional, .. } | Self::Set { additional, .. } => {
+                let mut columns = vec![self];
+                columns.extend(additional);
+                Some(columns)
+            }
+            _ => None,
+        }
     }
+
     pub fn column(&self) -> &str {
         match self {
             Self::Inventory { .. } => "setting",
             Self::Set { column, .. } | Self::Current { column, .. } | Self::Advisory { column, .. } => column,
         }
     }
-    /// pg_settings.name comparisons are case-sensitive; absent rows never run set_config.
-    pub fn has_row(&self, settings: &SessionSettings) -> bool {
+
+    /// The catalog filter compares names case-sensitively before calling set_config.
+    pub fn has_row(&self, privileged: bool) -> bool {
         match self {
-            Self::Set {
-                name,
-                from_settings: true,
-                ..
+            Self::Set { name, from_settings: true, .. } => {
+                let lower = name.to_ascii_lowercase();
+                match registry::find(&lower) {
+                    Some(entry) => entry.name == name && (!entry.restricted || privileged),
+                    None => database::lookup_native(name)
+                        .is_ok_and(|show| show.value(&super::Settings::default()).0 == name),
+                }
             }
-            | Self::Current {
-                name,
-                from_settings: true,
-                ..
-            } => database::lookup_name(name).is_ok_and(|setting| {
-                setting.value(&settings.current).0.to_ascii_lowercase() == *name
-            }),
             _ => true,
         }
     }
+
     /// Called within a real SQL transaction, including a statement's implicit one.
-    /// Thus set_config(..., true) returns the local value even in autocommit;
-    /// the wire dispatcher restores it at that transaction's end, without WARNING.
-    pub fn evaluate(&self, settings: &mut SessionSettings) -> Result<Option<String>> {
+    pub fn evaluate_with_permissions(
+        &self,
+        settings: &mut SessionSettings,
+        superuser: bool,
+        privileged: bool,
+        database: Option<&str>,
+    ) -> std::result::Result<Option<String>, FunctionError> {
         match self {
-            Self::Inventory { .. } => unreachable!("settings inventory"),
-            Self::Advisory { .. } => unreachable!("wire session function"),
-            Self::Set {
-                name, value, local, ..
-            } => {
-                let (name, assignment) = database::function_assignment(name, value, *local)?;
-                match name {
-                    Show::DateStyle => {
-                        database::date_style(value, settings.current.datestyle).map_err(|_| "22023")?;
+            Self::Inventory { .. } | Self::Advisory { .. } => unreachable!("wire session function"),
+            Self::Set { name, value, local, .. } => {
+                let name = database::lookup_assignment(name)?;
+                let assignment = match &name {
+                    SettingName::Native(show) => {
+                        match show {
+                            Show::DateStyle => {
+                                database::date_style(value, settings.current.datestyle).map_err(|_| "22023")?;
+                            }
+                            Show::ByteaOutput => { database::bytea_output(value)?; }
+                            Show::TransactionDeferrable | Show::DefaultTransactionDeferrable => {
+                                registry::find(name.name(settings)).expect("registered setting").parse(value)?;
+                            }
+                            _ => {}
+                        }
+                        let (_, assignment) = database::function_assignment(name.name(settings), value, *local)?;
+                        assignment
                     }
-                    Show::ByteaOutput => {
-                        database::bytea_output(value)?;
-                    }
-                    _ => {}
-                }
+                    SettingName::Registry(name) => Setting::Registry {
+                        value: name.normalize(Some(value), superuser, database)?,
+                        name: name.clone(),
+                        local: *local,
+                        reset: false,
+                    },
+                    SettingName::All => unreachable!(),
+                };
                 settings.apply(&assignment, true);
-                Ok(Some(name.value(&settings.current).1))
+                Ok(Some(name.read(settings, privileged)?))
             }
-            Self::Current {
-                name, missing_ok, ..
-            } => match database::lookup_name(name) {
-                Ok(name) => Ok(Some(name.value(&settings.current).1)),
-                Err("42704") if *missing_ok => Ok(None),
-                Err(code) => Err(code),
-            },
+            Self::Current { name, missing_ok, .. } => {
+                match database::lookup_name(name).and_then(|name| name.read(settings, privileged)) {
+                    Ok(value) => Ok(Some(value)),
+                    Err(error) if error.code == "42704" && *missing_ok => Ok(None),
+                    Err(error) => Err(error.into()),
+                }
+            }
         }
+    }
+
+    #[cfg(test)]
+    pub fn evaluate(&self, settings: &mut SessionSettings) -> Result<Option<String>> {
+        self.evaluate_with_permissions(settings, true, true, None).map_err(|error| match error {
+            FunctionError::Native(code) => code,
+            FunctionError::Registry(error) => error.code,
+        })
     }
 }
 
-pub(crate) fn presentation_inventory_rows(
-    presentation: &[Show],
-    projection: &[usize],
+const INVENTORY_COLUMNS: &[&str] = &[
+    "name", "setting", "unit", "category", "short_desc", "extra_desc", "context", "vartype",
+    "source", "min_val", "max_val", "enumvals", "boot_val", "reset_val", "sourcefile",
+    "sourceline", "pending_restart",
+];
+
+pub(crate) fn inventory_rows(
+    function: &Function,
     settings: &SessionSettings,
-) -> Vec<Vec<giggles_pg_catalog::Value>> {
-    use giggles_pg_catalog::Value;
-    let boot = super::Settings::default();
-    presentation.iter().map(|&setting| {
-        let (name, current) = setting.value(&settings.current);
-        let (_, reset) = setting.value(&settings.defaults);
-        let (_, boot) = setting.value(&boot);
-        let kind = if setting == Show::ByteaOutput { "enum" } else { "string" };
-        let source = if current == reset { "default" } else { "session" };
-        let fields = [Some(name), Some(&current), None, None, None, Some(kind), Some("user"),
-            Some(source), Some(&boot), Some(&reset)];
-        projection.iter().map(|&index| {
-            if index == 10 {
-                Value::Bool(false)
-            } else {
-                fields[index].map_or(Value::Null, |text| Value::Text(text.into()))
+    privileged: bool,
+) -> Result<Vec<Vec<Value>>> {
+    let Function::Inventory { projection, filter, count, order, .. } = function else {
+        unreachable!("settings inventory");
+    };
+    let mut entries: Vec<_> = registry::ENTRIES.iter().filter(|entry| {
+        (!entry.restricted || privileged)
+            && filter.as_ref().is_none_or(|names| names.iter().any(|name| name == entry.name))
+    }).map(|entry| (entry.name, Some(entry))).collect();
+    // Native-only entries were directly queryable by name before the registry.
+    // Preserve those lookups while enumeration uses the PostgreSQL inventory.
+    if let Some(names) = filter {
+        for name in names {
+            let Ok(show) = database::lookup_native(name) else { continue };
+            let canonical = show.value(&settings.current).0;
+            if canonical == name
+                && registry::find(&name.to_ascii_lowercase()).is_none()
+                && !entries.iter().any(|(listed, _)| *listed == canonical)
+            {
+                entries.push((canonical, None));
+            }
+        }
+    }
+    if *count {
+        return Ok(vec![vec![Value::Int(entries.len() as i64)]]);
+    }
+    if *order {
+        entries.sort_by_key(|(name, _)| *name);
+    }
+    entries.into_iter().map(|(name, entry)| {
+        let (current, reset, source) = if let Ok(show) = database::lookup_native(name) {
+            let (current, reset) = match show {
+                Show::StatementTimeout => (
+                    settings.current.statement_timeout.to_string(), settings.defaults.statement_timeout.to_string(),
+                ),
+                Show::LockTimeout => (
+                    settings.current.lock_timeout.to_string(), settings.defaults.lock_timeout.to_string(),
+                ),
+                _ => (show.value(&settings.current).1, show.value(&settings.defaults).1),
+            };
+            let source = settings.current.assigned.contains(&show) || current != reset;
+            (current, reset, source)
+        } else {
+            let entry = entry.expect("registry entry");
+            (
+                entry.display(settings.registry_base(entry), false),
+                entry.default.into(),
+                settings.current.registered.contains_key(entry.name),
+            )
+        };
+        let values = [
+            Some(name), Some(current.as_str()), entry.and_then(|e| e.unit), entry.map(|e| e.category),
+            entry.map(|e| e.short_desc), entry.and_then(|e| e.extra_desc), entry.map(|e| e.context_name),
+            entry.map(|e| e.kind.name()), Some(if source { "session" } else { "default" }),
+            entry.and_then(|e| e.min), entry.and_then(|e| e.max), None, entry.and_then(|e| e.boot),
+            Some(reset.as_str()), None, None, None,
+        ];
+        projection.iter().map(|&(index, numeric)| {
+            if index == 16 {
+                return Ok(Value::Bool(false));
+            }
+            if index == 11 && let Some(entry) = entry && !entry.enum_values.is_empty() {
+                let members: Vec<_> = entry.enum_values.iter()
+                    .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .collect();
+                let array = Value::Text(format!("{{{}}}", members.join(",")));
+                return giggles_core::relational::logical_types::coerce(array, &DataType::TextArray)
+                    .map_err(|_| "XX000");
+            }
+            match values[index] {
+                Some(text) if numeric => giggles_pg_types::Numeric::parse(text)
+                    .map(Value::Numeric).map_err(|_| "22P02"),
+                Some(text) => Ok(Value::Text(text.into())),
+                None => Ok(Value::Null),
             }
         }).collect()
+    }).collect()
+}
+
+pub(crate) fn show_all(settings: &SessionSettings, privileged: bool) -> Vec<Vec<Value>> {
+    registry::ENTRIES.iter().filter(|entry| !entry.restricted || privileged).map(|entry| {
+        let value = match database::lookup_name(entry.name).expect("registered name") {
+            SettingName::Native(show) => show.value(&settings.current).1,
+            SettingName::Registry(RegistryName::Registered(entry)) => entry.display(settings.registry_base(entry), true),
+            _ => unreachable!("registered name"),
+        };
+        vec![Value::Text(entry.name.into()), Value::Text(value), Value::Text(entry.short_desc.into())]
     }).collect()
 }
 #[derive(Clone, PartialEq)]
@@ -126,6 +244,7 @@ enum Token {
     Equals,
     Number(i64),
     Cast,
+    Star,
 }
 fn lex(sql: &str) -> Option<Vec<Token>> {
     let mut chars = sql
@@ -147,6 +266,7 @@ fn lex(sql: &str) -> Option<Vec<Token>> {
             '.' => Token::Dot,
             ',' => Token::Comma,
             '=' => Token::Equals,
+            '*' => Token::Star,
             '\'' | '"' => {
                 let mut value = String::new();
                 loop {
@@ -222,89 +342,112 @@ impl Parser {
         }
     }
 }
-// Read-only compatibility defaults, not evidence of an autovacuum worker.
-// Keep the finite inventory explicit; unknown settings have no row.
+// This is the existing bounded inventory SELECT, with rows supplied at execution.
 fn inventory(tokens: Vec<Token>) -> Option<Function> {
-    use giggles_pg_catalog::{Field, PgType, ResultSet, Value};
     let mut p = Parser { tokens, at: 0 };
     p.token(Token::Word("select".into()))?;
-    let names = ["name","setting","unit","min_val","max_val","vartype","context","source","boot_val","reset_val","pending_restart"];
-    let mut columns = Vec::new();
-    loop {
-        let name = p.word()?;
-        let index = names.iter().position(|n| *n == name)?;
-        let numeric = if p.tokens.get(p.at) == Some(&Token::Cast) {
-            p.at += 1;
-            if p.word()? != "numeric" || !matches!(index, 1 | 3 | 4 | 8 | 9) { return None; }
-            true
-        } else { false };
-        let alias = if p.tokens.get(p.at) == Some(&Token::Word("as".into())) { p.at += 1; p.word()? } else { name };
-        columns.push((index,numeric,alias));
-        if columns.len() > 128 { return None; }
-        if p.tokens.get(p.at) != Some(&Token::Comma) { break; }
-        p.at += 1;
+    let mut fields = Vec::new();
+    let mut projection = Vec::new();
+    let mut count = false;
+    if p.token(Token::Star).is_some() {
+        for (index, name) in INVENTORY_COLUMNS.iter().enumerate() {
+            fields.push(((*name).into(), inventory_type(index)));
+            projection.push((index, false));
+        }
+    } else {
+        loop {
+            let name = p.word()?;
+            if name == "count" && fields.is_empty() {
+                p.token(Token::Left)?;
+                p.token(Token::Star)?;
+                p.token(Token::Right)?;
+                let alias = if p.token(Token::Word("as".into())).is_some() { p.word()? } else { name };
+                fields.push((alias, DataType::BigInt));
+                count = true;
+                break;
+            }
+            let index = INVENTORY_COLUMNS.iter().position(|&n| n == name)?;
+            let numeric = p.token(Token::Cast).is_some();
+            if numeric && (p.word()?.as_str() != "numeric" || !matches!(index, 1 | 9 | 10 | 12 | 13)) {
+                return None;
+            }
+            let alias = if p.token(Token::Word("as".into())).is_some() { p.word()? } else { name };
+            fields.push((alias, if numeric { DataType::Numeric } else { inventory_type(index) }));
+            projection.push((index, numeric));
+            if fields.len() > 128 {
+                return None;
+            }
+            if p.token(Token::Comma).is_none() {
+                break;
+            }
+        }
     }
     p.token(Token::Word("from".into()))?;
     let mut relation = p.word()?;
-    if relation == "pg_catalog" { p.token(Token::Dot)?; relation = p.word()?; }
-    if relation == "pg_show_all_settings" { p.token(Token::Left)?; p.token(Token::Right)?; }
-    else if relation != "pg_settings" { return None; }
-    p.token(Token::Word("where".into()))?;
-    p.token(Token::Word("name".into()))?;
-    let filter = if p.tokens.get(p.at) == Some(&Token::Equals) {
-        p.at += 1;
-        let name = p.text()?;
-        if !matches!(name.as_str(), "DateStyle" | "bytea_output") {
-            return None;
-        }
-        vec![name]
-    } else {
-        p.token(Token::Word("in".into()))?;
+    if relation == "pg_catalog" {
+        p.token(Token::Dot)?;
+        relation = p.word()?;
+    }
+    if relation == "pg_show_all_settings" {
         p.token(Token::Left)?;
-        let mut names = Vec::new();
-        loop {
-            names.push(p.text()?);
-            if names.len() > 256 { return None; }
-            if p.tokens.get(p.at) != Some(&Token::Comma) { break; }
-            p.at += 1;
-        }
         p.token(Token::Right)?;
-        names
-    };
-    if p.at != p.tokens.len() {
-        for word in ["order","by","name"] { p.token(Token::Word(word.into()))?; }
-    }
-    if p.at != p.tokens.len() { return None; }
-    let mut rows = Vec::new();
-    for (name,value,unit,min,max,kind,context) in [
-        ("autovacuum_analyze_scale_factor","0.1",None,"0","100","real","sighup"),
-        ("autovacuum_analyze_threshold","50",None,"0","2147483647","integer","sighup"),
-        ("autovacuum_freeze_max_age","200000000",None,"100000","2000000000","integer","postmaster"),
-        ("autovacuum_vacuum_cost_delay","2",Some("ms"),"-1","100","real","sighup"),
-        ("autovacuum_vacuum_cost_limit","-1",None,"-1","10000","integer","sighup"),
-        ("autovacuum_vacuum_scale_factor","0.2",None,"0","100","real","sighup"),
-        ("autovacuum_vacuum_threshold","50",None,"0","2147483647","integer","sighup"),
-        ("vacuum_freeze_min_age","50000000",None,"0","1000000000","integer","user"),
-        ("vacuum_freeze_table_age","150000000",None,"0","2000000000","integer","user"),
-    ] {
-        if !filter.iter().any(|n| n == name) { continue; }
-        let values = [Some(name),Some(value),unit,Some(min),Some(max),Some(kind),Some(context),Some("default"),Some(value),Some(value),None];
-        rows.push(columns.iter().map(|(i,numeric,_)| {
-            if *i == 10 { Value::Bool(false) }
-            else if *numeric { Value::Numeric(giggles_pg_types::Numeric::parse(values[*i].unwrap()).expect("numeric defaults")) }
-            else { values[*i].map(|s| Value::Text(s.into())).unwrap_or(Value::Null) }
-        }).collect());
-    }
-    let presentation: Vec<_> = [("DateStyle", Show::DateStyle), ("bytea_output", Show::ByteaOutput)]
-        .into_iter().filter(|(name, _)| filter.iter().any(|value| value == name))
-        .map(|(_, setting)| setting).collect();
-    if !presentation.is_empty() && columns.iter().any(|(_, numeric, _)| *numeric) {
+    } else if relation != "pg_settings" {
         return None;
     }
-    let projection = columns.iter().map(|(i, _, _)| *i).collect();
-    let fields = columns.into_iter().map(|(i,numeric,name)| Field { name, data_type: if numeric { PgType::Numeric } else if i == 10 { PgType::Bool } else { PgType::Text } }).collect();
-    Some(Function::Inventory { result: ResultSet { fields, rows }, presentation, projection })
+    let filter = if p.token(Token::Word("where".into())).is_some() {
+        p.token(Token::Word("name".into()))?;
+        if p.token(Token::Equals).is_some() {
+            Some(vec![p.text()?])
+        } else {
+            p.token(Token::Word("in".into()))?;
+            p.token(Token::Left)?;
+            let mut names = Vec::new();
+            loop {
+                names.push(p.text()?);
+                if names.len() > 399 {
+                    return None;
+                }
+                if p.token(Token::Comma).is_none() {
+                    break;
+                }
+            }
+            p.token(Token::Right)?;
+            Some(names)
+        }
+    } else {
+        None
+    };
+    let order = p.at != p.tokens.len();
+    if order {
+        p.token(Token::Word("order".into()))?;
+        p.token(Token::Word("by".into()))?;
+        if p.token(Token::Word("name".into())).is_some() {
+            if (count && fields.first()?.0 != "name")
+                || fields.iter().zip(&projection).any(|((alias, _), (index, _))| {
+                    alias == "name" && *index != 0
+                })
+            {
+                return None;
+            }
+        } else {
+            p.token(Token::Number(1))?;
+            if fields.first()?.0 != "name" || (!count && projection.first()?.0 != 0) {
+                return None;
+            }
+        }
+    }
+    (p.at == p.tokens.len()).then_some(Function::Inventory { fields, projection, filter, count, order })
 }
+
+fn inventory_type(index: usize) -> DataType {
+    match index {
+        11 => DataType::TextArray,
+        15 => DataType::Integer,
+        16 => DataType::Boolean,
+        _ => DataType::Text,
+    }
+}
+
 fn parse(sql: &str) -> Option<Function> {
     let tokens = lex(sql)?;
     let mut depth = 0;
@@ -325,11 +468,14 @@ fn parse(sql: &str) -> Option<Function> {
         for mut part in parts {
             part.insert(0, Token::Word("select".into()));
             let call = parse_tokens(part)?;
-            if !matches!(call, Function::Current { from_settings: false, .. }) { return None; }
+            if !matches!(call, Function::Current { .. } | Function::Set { from_settings: false, .. }) { return None; }
             calls.push(call);
         }
         let mut first = calls.remove(0);
-        if let Function::Current { additional, .. } = &mut first { *additional = calls; }
+        match &mut first {
+            Function::Current { additional, .. } | Function::Set { additional, .. } => *additional = calls,
+            _ => unreachable!(),
+        }
         return Some(first);
     }
     parse_tokens(tokens)
@@ -341,29 +487,6 @@ fn parse_tokens(tokens: Vec<Token>) -> Option<Function> {
     if function == "pg_catalog" {
         p.token(Token::Dot)?;
         function = p.word()?;
-    }
-    // Bounded, case-sensitive pg_settings read using the same session values as SHOW.
-    if function == "setting" {
-        p.token(Token::Word("from".into()))?;
-        let mut relation = p.word()?;
-        if relation == "pg_catalog" {
-            p.token(Token::Dot)?;
-            relation = p.word()?;
-        }
-        if relation != "pg_settings" {
-            return None;
-        }
-        p.token(Token::Word("where".into()))?;
-        p.token(Token::Word("name".into()))?;
-        p.token(Token::Equals)?;
-        let name = p.text()?;
-        return (p.at == p.tokens.len()).then_some(Function::Current {
-            additional: vec![],
-            name,
-            missing_ok: true,
-            from_settings: true,
-            column: "setting".into(),
-        });
     }
     if matches!(function.as_str(), "pg_advisory_lock" | "pg_try_advisory_lock" | "pg_advisory_unlock" | "pg_advisory_unlock_all" | "pg_advisory_xact_lock" | "pg_try_advisory_xact_lock") {
         p.token(Token::Left)?;
@@ -402,6 +525,7 @@ fn parse_tokens(tokens: Vec<Token>) -> Option<Function> {
         p.token(Token::Comma)?;
         let local = p.boolean()?;
         Function::Set {
+            additional: vec![],
             name,
             value,
             local,
@@ -419,7 +543,6 @@ fn parse_tokens(tokens: Vec<Token>) -> Option<Function> {
             additional: vec![],
             name,
             missing_ok,
-            from_settings: false,
             column: function,
         }
     };
@@ -501,11 +624,11 @@ mod tests {
                 "SELECT set_config('bytea_output','hex',false) FROM {source} WHERE name = 'bytea_output'"
             );
             let call = parse_function(&sql).unwrap().unwrap();
-            assert!(call.has_row(&settings));
+            assert!(call.has_row(true));
             assert_eq!(call.evaluate(&mut settings), Ok(Some("hex".into())));
         }
         let call = parse_function("SELECT set_config(name,'hex',false) FROM pg_show_all_settings() WHERE name='BYTEA_OUTPUT'").unwrap().unwrap();
-        assert!(!call.has_row(&settings));
+        assert!(!call.has_row(true));
         assert!(parse_function("SELECT set_config('bytea_output','hex',false) FROM pg_show_all_settings() WHERE name='other'").unwrap().is_none());
     }
 
@@ -513,23 +636,24 @@ mod tests {
     fn numeric_inventory_defaults_are_bounded_and_case_sensitive() {
         let names = "'autovacuum_analyze_scale_factor','autovacuum_analyze_threshold','autovacuum_freeze_max_age','autovacuum_vacuum_cost_delay','autovacuum_vacuum_cost_limit','autovacuum_vacuum_scale_factor','autovacuum_vacuum_threshold','vacuum_freeze_min_age','vacuum_freeze_table_age'";
         let sql = format!("SELECT name,setting::numeric AS setting FROM pg_show_all_settings() WHERE name IN ({names}) ORDER BY name");
-        let Function::Inventory { result, .. } = parse_function(&sql).unwrap().unwrap() else { panic!("inventory") };
+        let inventory = parse_function(&sql).unwrap().unwrap();
+        let rows = inventory_rows(&inventory, &SessionSettings::default(), true).unwrap();
         let expected = ["0.1","50","200000000","2","-1","0.2","50","50000000","150000000"];
-        assert_eq!(result.rows.iter().map(|r| r[1].clone()).collect::<Vec<_>>(), expected.into_iter().map(|s| giggles_pg_catalog::Value::Numeric(giggles_pg_types::Numeric::parse(s).unwrap())).collect::<Vec<_>>());
+        assert_eq!(rows.iter().map(|r| r[1].clone()).collect::<Vec<_>>(), expected.into_iter().map(|s| Value::Numeric(giggles_pg_types::Numeric::parse(s).unwrap())).collect::<Vec<_>>());
         assert!(parse_function(&(sql.clone() + "; DELETE FROM x")).unwrap().is_none());
         assert!(parse_function(&sql.replace("ORDER BY name", "ORDER BY setting")).unwrap().is_none());
     }
 
     #[test]
     fn jdbc_max_index_keys_is_read_only() {
-        let mut settings = SessionSettings::default();
+        let settings = SessionSettings::default();
         let call = parse_function(
             "SELECT setting FROM pg_catalog.pg_settings WHERE name='max_index_keys'",
         )
         .unwrap()
         .unwrap();
-        assert!(call.has_row(&settings));
-        assert_eq!(call.evaluate(&mut settings), Ok(Some("32".into())));
+        assert!(call.has_row(true));
+        assert_eq!(inventory_rows(&call, &settings, true), Ok(vec![vec![Value::Text("32".into())]]));
         assert_eq!(
             database::function_assignment("max_index_keys", "32", false).err(),
             Some("22023")

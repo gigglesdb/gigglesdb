@@ -493,11 +493,11 @@ fn integer(t: &DataType) -> bool {
     matches!(t, DataType::SmallInt | DataType::Integer | DataType::BigInt)
 }
 pub(super) fn sequence_name(name: &str) -> bool {
-    matches!(name, "nextval" | "currval" | "setval")
+    matches!(name, "nextval" | "currval" | "setval" | "lastval")
 }
 impl Scalar {
     /// Catalog dependencies are distinct from the positive table-free proof.
-    pub(in crate::relational) fn sequence_dependencies(&self, out: &mut Vec<Option<String>>) {
+    pub(in crate::relational) fn sequence_dependencies(&self, out: &mut Vec<SequenceDependency>) {
         match self {
             Self::Predicate(filter) => filter.sequence_dependencies(out),
             Self::Case(case) => {
@@ -510,7 +510,9 @@ impl Scalar {
                 }
             }
             Self::Call(name, args) => {
-                if sequence_name(name) {
+                if name == "lastval" && args.is_empty() {
+                    out.push(SequenceDependency::LastValue);
+                } else if sequence_name(name) {
                     fn literal(arg: &Scalar) -> Option<String> {
                         match arg {
                             Scalar::Literal(Value::Text(name)) => Some(name.clone()),
@@ -518,7 +520,10 @@ impl Scalar {
                             _ => None,
                         }
                     }
-                    out.push(args.first().and_then(literal));
+                    out.push(args.first().and_then(literal).map_or(
+                        SequenceDependency::Dynamic,
+                        SequenceDependency::Named,
+                    ));
                 }
                 for arg in args {
                     arg.sequence_dependencies(out);
@@ -634,6 +639,7 @@ impl Scalar {
                     "uuid_generate_v1" | "uuid_generate_v1mc" | "uuid_generate_v4" | "nextval"
                         | "setval"
                         | "currval"
+                        | "lastval"
                         | "random"
                         | "gen_random_uuid"
                         | "clock_timestamp"
@@ -1466,12 +1472,16 @@ impl Scalar {
         resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
         tables: &[&TableDef],
     ) -> R<BoundScalar> {
-        let c = resolve(c, tables.len())?;
-        let column = &tables[c.source].columns[c.column];
+        let bound = resolve(c, tables.len())?;
+        let column = &tables[bound.source].columns[bound.column];
+        // Binding identity is in BoundColumn; use the SQL-visible name
+        // when a derived input has a synthetic catalog name.
+        let name = if column.name.starts_with('\0') { &c.name } else { &column.name };
+        let name = if name.starts_with('\0') { "?column?" } else { name };
         collation::column(
             BoundScalar {
                 ty: column.data_type.clone(),
-                node: Node::Column(c, column.name.clone()),
+                node: Node::Column(bound, name.to_owned()),
             },
             column.id,
         )
@@ -1840,7 +1850,8 @@ impl Scalar {
         parameters: &[Option<DataType>],
     ) -> R<BoundScalar> {
         if !(matches!(name, "nextval" | "currval") && args.len() == 1
-            || name == "setval" && matches!(args.len(), 2 | 3))
+            || name == "setval" && matches!(args.len(), 2 | 3)
+            || name == "lastval" && args.is_empty())
         {
             return Err(SqlError::UndefinedFunction);
         }
@@ -2499,33 +2510,7 @@ impl BoundScalar {
                 if let Some(name) = a.strong_name() {
                     name
                 } else {
-                    match self.ty {
-                        DataType::SmallInt => "int2",
-                        DataType::Integer => "int4",
-                        DataType::BigInt => "int8",
-                        DataType::Text => "text",
-                        DataType::RegType => "regtype",
-                        DataType::Varchar => "varchar",
-                        DataType::Bpchar => "bpchar",
-                        DataType::Uuid => "uuid",
-                        DataType::Jsonb => "jsonb",
-                        DataType::IntArray => "int4",
-                        DataType::BigIntArray => "int8",
-                        DataType::TextArray => "text",
-                        DataType::UuidArray => "uuid",
-
-                        DataType::Boolean => "bool",
-                        DataType::Bytes => "bytea",
-                        DataType::Numeric => "numeric",
-                        DataType::Real => "float4",
-                        DataType::DoublePrecision => "float8",
-                        DataType::Date => "date",
-                        DataType::Time => "time",
-                        DataType::TimeTz => "timetz",
-                        DataType::Timestamp => "timestamp",
-                        DataType::TimestampTz => "timestamptz",
-                        DataType::Interval => "interval",
-                    }
+                    cast_type_name(&self.ty)
                 }
             }
             Node::Column(_, name) => name,
@@ -2651,8 +2636,10 @@ impl BoundScalar {
                 if values.contains(&Value::Null) {
                     return Ok(Value::Null);
                 }
-                let Value::Text(sequence) = &values[0] else {
-                    return Err(SqlError::Type);
+                let sequence = match values.first() {
+                    Some(Value::Text(sequence)) => sequence.as_str(),
+                    None if name == "lastval" => "",
+                    _ => return Err(SqlError::Type),
                 };
                 let value = match values.get(1) {
                     Some(Value::Int(value)) => Some(*value),
@@ -3059,6 +3046,35 @@ impl Query {
         admit(value, bytes)
     }
 }
+pub(super) fn cast_type_name(ty: &DataType) -> &'static str {
+    match ty {
+        DataType::SmallInt => "int2",
+        DataType::Integer => "int4",
+        DataType::BigInt => "int8",
+        DataType::Text => "text",
+        DataType::RegType => "regtype",
+        DataType::Varchar => "varchar",
+        DataType::Bpchar => "bpchar",
+        DataType::Uuid => "uuid",
+        DataType::Jsonb => "jsonb",
+        DataType::IntArray => "int4",
+        DataType::BigIntArray => "int8",
+        DataType::TextArray => "text",
+        DataType::UuidArray => "uuid",
+        DataType::Boolean => "bool",
+        DataType::Bytes => "bytea",
+        DataType::Numeric => "numeric",
+        DataType::Real => "float4",
+        DataType::DoublePrecision => "float8",
+        DataType::Date => "date",
+        DataType::Time => "time",
+        DataType::TimeTz => "timetz",
+        DataType::Timestamp => "timestamp",
+        DataType::TimestampTz => "timestamptz",
+        DataType::Interval => "interval",
+    }
+}
+
 // Scalar arguments/results have a value bound; the parent charge function
 // is the independent capped result collector used by non-streaming queries.
 fn charge(budget: &mut usize, value: &Value) -> R<()> {
@@ -3081,7 +3097,10 @@ fn reserve(budget: &mut usize, bytes: usize) -> R<()> {
 }
 
 fn cast_type(p: &mut Parser) -> R<(DataType, Option<i32>)> {
-    let (mut ty, modifier) = cast::target(p)?;
+    cast_type_with_diagnostics(p, false)
+}
+fn cast_type_with_diagnostics(p: &mut Parser, diagnose: bool) -> R<(DataType, Option<i32>)> {
+    let (mut ty, modifier) = cast::target(p, diagnose)?;
     if p.sym('[') {
         p.punct(']')?;
         ty = match ty {
@@ -3293,6 +3312,12 @@ fn cast_with_date_order(
             };
             Value::Int(parsed.map_err(|e| match e {
                 giggles_pg_types::integer::IntegerError::Syntax => {
+                    let name = match t {
+                        DataType::SmallInt => "smallint",
+                        DataType::Integer => "integer",
+                        _ => "bigint",
+                    };
+                    user_types::view_replace_error(format!(r#"invalid input syntax for type {name}: "{s}""#));
                     SqlError::InvalidTextRepresentation
                 }
                 giggles_pg_types::integer::IntegerError::Range => SqlError::Overflow,

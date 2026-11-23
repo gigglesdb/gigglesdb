@@ -61,7 +61,7 @@ pub(crate) fn row_bytes(row: &[Value]) -> usize {
     // Include row storage and the owned payload of variable-width values.
     fn payload(value: &Value) -> usize {
         match value {
-            Value::Text(s) => s.capacity(),
+            Value::Text(s) | Value::Regtype(_, s) => s.capacity(),
             Value::Bytes(b) => b.capacity(),
             Value::Array(v) | Value::Record(v) => {
                 v.capacity() * size_of::<Value>() + v.iter().map(payload).sum::<usize>()

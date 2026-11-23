@@ -2731,6 +2731,37 @@ impl SqlSession {
             None => self.inspect_metadata(resolve),
         }
     }
+    pub fn coerce_execute_argument(
+        &self,
+        value: relational::Value,
+        source: &relational::DataType,
+        target: &relational::DataType,
+        untyped: bool,
+        clock: &relational::StatementClock,
+    ) -> Result<relational::Value, CoreError> {
+        let clock = relational::clock::ExecutionClock::new(clock)
+            .with_text_settings(self.date_style, self.bytea_output)
+            .with_extra_float_digits(self.extra_float_digits);
+        relational::execute_arguments::coerce(value, source, target, untyped, &clock)
+            .map_err(CoreError::Sql)
+    }
+
+    /// Recover the missing name after an authorized PREPARE failed with 42P01.
+    pub fn missing_prepared_relation(&self, sql: &str) -> Option<String> {
+        let prepared = relational::Prepared::parse(sql, 0, 0).ok()?;
+        let resolve = |s: &MetadataState<'_>| {
+            let mut prepared = prepared.clone();
+            prepared.set_schema_context(self.search_path.clone(), self.schema_user.clone());
+            Ok(prepared.first_missing_relation(&s.sql))
+        };
+        match &self.staged {
+            Some(s) => resolve(&MetadataState::borrow(s)),
+            None => self.inspect_metadata(resolve),
+        }
+        .ok()
+        .flatten()
+    }
+
     /// Retain exact binding identities for a gateway that memoizes SQL authorization.
     pub fn enable_authorization_bindings(&mut self) {
         self.authorization_bindings = true;
@@ -4287,6 +4318,12 @@ impl SqlSession {
     pub fn is_aborted(&self) -> bool {
         self.aborted
     }
+    /// Forget the sequence values observed by this session.
+    pub fn discard_sequence_state(&mut self) -> Result<(), CoreError> {
+        *self.sequence_values.lock().map_err(|_| CoreError::Fenced)? = Default::default();
+        Ok(())
+    }
+
     /// Start a protocol preparation boundary against the transaction's visible catalog.
     /// READ COMMITTED advances; repeatable snapshots and private DDL stay intact.
     pub fn begin_prepared_statement(&mut self) {
@@ -5659,9 +5696,9 @@ impl SqlSession {
             for (id, counter) in before {
                 if let Some(definition) = s.sql.catalog_ext().sequences.get(&id)
                     && definition.incarnation != counter.incarnation
-                    && let Some(value) = values.get(&(id, counter.incarnation)).copied()
+                    && let Some(value) = values.current.get(&(id, counter.incarnation)).copied()
                 {
-                    values.insert((id, definition.incarnation), value);
+                    values.current.insert((id, definition.incarnation), value);
                 }
             }
         }

@@ -872,11 +872,11 @@ fn unnamed_cache_sequence_dependency_equivalence() {
     ] {
         parse_sql(&mut state, &mut session, sql).unwrap();
         let cached = state.unnamed_cache.iter().find(|entry| entry.sql == sql).unwrap();
-        let unbound = Prepared::sequence_dependencies(sql);
+        let unbound = Prepared::sequence_calls_from_sql(sql);
         assert!(!unbound.is_empty(), "{sql}");
         assert_eq!(&*cached.sequence_dependencies, unbound.as_slice(), "{sql}");
         let Plan::Sql(bound) = &*cached.p else { panic!("SQL plan expected") };
-        println!("sequence equivalence: {sql}: bound_equal={} unbound={unbound:?} bound={:?}", bound.sequences() == unbound, bound.sequences());
+        println!("sequence equivalence: {sql}: bound_equal={} unbound={unbound:?} bound={:?}", bound.sequence_calls() == unbound, bound.sequence_calls());
     }
     for sql in [
         "CREATE TABLE defaults (id int DEFAULT nextval('s'))",

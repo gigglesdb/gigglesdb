@@ -7,6 +7,7 @@ mod numeric_literals;
 mod join_selection;
 mod introspection;
 mod regtype;
+pub use regtype::resolve_type_names;
 mod viewdef;
 pub(crate) mod explain;
 mod subscripts;
@@ -47,11 +48,16 @@ pub struct Plan {
     projection_parameters: bool,
     text_cast_parameters: Vec<bool>,
     view_definitions: bool,
+    prepared_statements: bool,
 }
 impl Plan {
     /// Whether the parsed statement contains a nested query or a WITH clause.
     pub fn contains_subquery(&self) -> bool {
         self.contains_subquery
+    }
+    /// Whether the host should supply rows from its session's statement store.
+    pub fn reads_prepared_statements(&self) -> bool {
+        self.prepared_statements
     }
     pub fn refreshes_view_definitions(&self) -> bool {
         self.view_definitions && self.user_relations.is_empty()
@@ -331,13 +337,19 @@ fn binary(l: E, op: Op, r: E) -> E {
 
 /// Parse/classify structurally. No snapshot or authority is cached in a plan.
 pub fn plan(sql: &str) -> R<Option<Plan>> {
-    plan_inner(sql, false, None)
+    plan_inner(sql, false, None, false)
 }
 
 /// Classify a gateway query, including table-free catalog introspection.
 /// Other scalars must pass the core binder and gateway authority.
 pub fn plan_gateway(sql: &str) -> R<Option<Plan>> {
-    plan_inner(sql, true, None)
+    plan_inner(sql, true, None, false)
+}
+
+/// Refuse task-restricted catalog relations during classification, before a
+/// mixed query can request application schemas.
+pub fn plan_task_gateway(sql: &str) -> R<Option<Plan>> {
+    plan_inner(sql, true, None, true)
 }
 
 /// Bind mixed read-only queries against caller-authorized application schemas.
@@ -345,12 +357,13 @@ pub fn plan_gateway_with_relations(
     sql: &str,
     relations: &BTreeMap<String, Vec<Field>>,
 ) -> R<Option<Plan>> {
-    plan_inner(sql, true, Some(relations))
+    plan_inner(sql, true, Some(relations), false)
 }
 struct Scan {
     queries: usize,
     contains_subquery: bool,
     view_definitions: bool,
+    prepared_statements: bool,
     catalog: bool,
     explicit_catalog: bool,
     core_scalar: bool,
@@ -383,6 +396,11 @@ impl Visitor for Scan {
     fn pre_visit_relation(&mut self, n: &a::ObjectName) -> ControlFlow<Error> {
         self.has_relations = true;
         let p = object(n);
+        self.prepared_statements |= match p.as_slice() {
+            [name] => name == "pg_prepared_statements",
+            [schema, name] => schema == "pg_catalog" && name == "pg_prepared_statements",
+            _ => false,
+        };
         let is_catalog = match p.as_slice() {
             [n] => {
                 unqualified_catalog(n)
@@ -493,6 +511,7 @@ impl Scan {
             queries: 0,
             contains_subquery: false,
             view_definitions: false,
+            prepared_statements: false,
             catalog: false,
             explicit_catalog: false,
             core_scalar: false,
@@ -661,6 +680,7 @@ fn plan_inner(
     sql: &str,
     gateway: bool,
     relations: Option<&BTreeMap<String, Vec<Field>>>,
+    task: bool,
 ) -> R<Option<Plan>> {
     if sql.len() > MAX_SQL {
         return admission::decline_or_limit(sql);
@@ -693,15 +713,15 @@ fn plan_inner(
         if !admission::may_own(sql) {
             return Ok(None);
         }
-        return flat_union::plan(tokens, gateway);
+        return flat_union::plan(tokens, gateway, task);
     }
-    // Core carries collation derivation through scalar binding and execution.
-    if gateway && tokens.iter().any(|t| matches!(t, Token::Word(w) if w.quote_style.is_none() && (w.value.eq_ignore_ascii_case("collate") || w.value.eq_ignore_ascii_case("pg_collation_for"))))
-        && !catalog_default_collation(&tokens) {
-        return Ok(None);
-    }
-    // Core owns pg_typeof expression typing, including nested regtype results.
-    if tokens.windows(2).any(|pair| matches!(&pair[0], Token::Word(w) if w.value.eq_ignore_ascii_case("pg_typeof")) && pair[1] == Token::LParen) {
+    // Core owns collation derivation and pg_typeof expression typing.
+    let core_projection = (gateway && tokens.iter().any(|t| matches!(t, Token::Word(w) if w.quote_style.is_none() && (w.value.eq_ignore_ascii_case("collate") || w.value.eq_ignore_ascii_case("pg_collation_for"))))
+        && !catalog_default_collation(&tokens))
+        || tokens.windows(2).any(|pair| matches!(&pair[0], Token::Word(w) if w.value.eq_ignore_ascii_case("pg_typeof")) && pair[1] == Token::LParen);
+    if core_projection && (!task || !tokens.iter().any(|token| {
+        token_name(Some(token)).as_deref() == Some("pg_prepared_statements")
+    })) {
         return Ok(None);
     }
     // sqlparser 0.53 cannot parse OPERATOR(pg_catalog.=) ANY (...).
@@ -775,6 +795,7 @@ fn plan_inner(
         .parse_statements()
     {
         Ok(statements) => statements,
+        Err(_) if core_projection => return Ok(None),
         Err(sqlparser::parser::ParserError::RecursionLimitExceeded)
             if !admission::may_own(sql) => return Ok(None),
         Err(_) => return Err(Error::Syntax),
@@ -789,6 +810,12 @@ fn plan_inner(
         } else {
             Err(e)
         };
+    }
+    if task && scan.prepared_statements {
+        return Err(Error::TaskRestrictedRelation);
+    }
+    if core_projection {
+        return Ok(None);
     }
     struct CoreConcat(bool);
     impl a::Visitor for CoreConcat {
@@ -853,6 +880,7 @@ fn plan_inner(
         plan.contains_subquery = scan.contains_subquery;
         plan.user_relations = c.used_relations;
         plan.view_definitions = scan.view_definitions;
+        plan.prepared_statements = scan.prepared_statements;
         let mut uses = TextCastParameters(BTreeMap::new(), BTreeMap::new());
         let _ = q.visit(&mut uses);
         plan.text_cast_parameters = uses.flags(plan.parameters);
@@ -885,6 +913,7 @@ fn finish_plan(
         parameter_types,
         text_cast_parameters: vec![false; parameters],
         view_definitions: false,
+        prepared_statements: false,
     }))
 }
 pub fn describe(plan: &Plan) -> R<Vec<Field>> {
@@ -5417,7 +5446,7 @@ fn compare_keys(l: &[Value], r: &[Value], order: &[Order]) -> std::cmp::Ordering
     }
     std::cmp::Ordering::Equal
 }
-fn format_type(oid: i64, typmod: Value, rows: &[Vec<Value>]) -> R<String> {
+pub(crate) fn format_type(oid: i64, typmod: Value, rows: &[Vec<Value>]) -> R<String> {
     let r = rows
         .iter()
         .find(|r| r[0] == Value::Int(oid))

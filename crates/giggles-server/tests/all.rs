@@ -103,6 +103,10 @@ mod session_identity_network;
 mod session_settings_network;
 #[path = "presentation_settings_network.rs"]
 mod presentation_settings_network;
+#[path = "row_description_names_network.rs"]
+mod row_description_names_network;
+#[path = "settings_registry_network.rs"]
+mod settings_registry_network;
 #[path = "session_zone_float_network.rs"]
 mod session_zone_float_network;
 #[path = "startup_params_network.rs"]
@@ -159,6 +163,8 @@ mod mixed_catalog_app_query;
 mod sql_column_types;
 #[path = "sql_cursors_network.rs"]
 mod sql_cursors_network;
+#[path = "sql_prepare_network.rs"]
+mod sql_prepare_network;
 #[path = "transaction_isolation_reporting.rs"]
 mod transaction_isolation_reporting;
 

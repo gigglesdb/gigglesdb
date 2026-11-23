@@ -135,6 +135,29 @@ fn table_free_regtype_and_enum() {
     );
 }
 #[test]
+fn regtype_cast_validates_qualified_and_signed_type_modifiers() {
+    use giggles_core::{CoreError, relational::{SqlError, take_sql_error_message}};
+
+    let a = Admin::create(common::fresh("pgparity-typeof-regtype-modifiers"), Limits::default())
+        .unwrap();
+    let mut s = a.sql_session();
+    assert_eq!(
+        run(&mut s, r#"SELECT 'numeric(3,-2)'::regtype, '"pg_catalog"."varchar"(8)'::regtype"#),
+        vec![texts(&["numeric", "character varying"])]
+    );
+    for (ty, error, message) in [
+        ("pg_catalog.numeric(0)", SqlError::InvalidParameterValue, "NUMERIC precision 0 must be between 1 and 1000"),
+        ("pg_catalog.varchar(0)", SqlError::InvalidParameterValue, "length for type varchar must be at least 1"),
+        ("numeric(1,-1001)", SqlError::InvalidParameterValue, "NUMERIC scale -1001 must be between -1000 and 1000"),
+        ("pg_catalog.float4(1)", SqlError::Syntax, r#"type modifier is not allowed for type "pg_catalog.float4""#),
+    ] {
+        let sql = format!("SELECT '{ty}'::regtype");
+        assert_eq!(s.execute(&sql, &[], None), Err(CoreError::Sql(error)), "{ty}");
+        assert_eq!(take_sql_error_message().as_deref(), Some(message), "{ty}");
+    }
+}
+
+#[test]
 fn regtype_serializes_as_legacy_text() {
     assert_eq!(
         bincode::serialize(&DataType::RegType).unwrap(),

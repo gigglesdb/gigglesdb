@@ -155,13 +155,15 @@ impl Plan {
         }
         error.map_or(Ok(out), Err)
     }
-    pub(in crate::relational) fn sequences(&self) -> Vec<Option<String>> {
+    pub(in crate::relational) fn sequences(&self) -> Vec<SequenceDependency> {
         let mut out = self.mutation.as_ref().map_or_else(Vec::new, |m| m.sequences());
         if let Some(m) = &self.merge { out.extend(m.sequences()); }
-        if let Some(insert) = &self.insert { out.extend(insert.prepared.sequences()); }
+        if let Some(insert) = &self.insert {
+            out.extend(insert.prepared.sequence_calls());
+        }
         for cte in &self.ctes {
             if let Some(dml) = &cte.dml {
-                out.extend(dml.sequences());
+                out.extend(dml.sequence_calls());
             }
         }
         self.visit_queries(&mut |q| out.extend(q.sequence_dependencies()));

@@ -374,7 +374,7 @@ mod tests {
         let deps = q.dependencies().unwrap();
         assert_eq!(deps.relations, ["a", "b", "c", "d", "e", "f"].map(String::from).into());
         assert_eq!(deps.routines, ["abs", "length", "count", "lower", "nextval"].map(String::from).into());
-        assert_eq!(q.sequence_dependencies(), vec![Some("seq".into())]);
+        assert_eq!(q.sequence_dependencies(), vec![SequenceDependency::Named("seq".into())]);
         assert_eq!(q.read_tables().into_iter().collect::<BTreeSet<_>>(), deps.relations);
     }
 

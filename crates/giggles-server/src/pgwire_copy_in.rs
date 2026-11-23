@@ -23,6 +23,7 @@ pub(super) struct CopyIn {
     failed: bool,
     pub(super) simple_implicit: bool,
     pub(super) remaining: Vec<String>,
+    pub(super) prepare_source: Option<String>,
 }
 impl CopyIn {
     fn normalize_rows(&mut self, rows: Vec<Vec<Option<Value>>>, session: &mut Session) -> R<(Prepared, Vec<Vec<Value>>)> {
@@ -312,6 +313,7 @@ impl State {
             failed: false,
             simple_implicit,
             remaining: vec![],
+            prepare_source: None,
             descriptor,
         });
         if self.copy.as_ref().unwrap().descriptor.target_is_view {
@@ -522,6 +524,7 @@ impl State {
             } else {
                 self.continue_simple_batch(
                     copy.remaining.into_iter(),
+                    copy.prepare_source.as_deref(),
                     session,
                     out,
                     received,

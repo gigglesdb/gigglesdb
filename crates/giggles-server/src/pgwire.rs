@@ -32,6 +32,8 @@ use copy_in::{CopyIn, is_copy_sql};
 use simple::{execute_settings, parse_settings, settings_status, show_settings};
 #[path = "pgwire_cursor.rs"]
 mod cursor;
+#[path = "pgwire_prepare.rs"]
+mod prepare;
 #[path = "pgwire_transaction.rs"]
 mod transaction;
 #[path = "pgwire_task.rs"]
@@ -180,6 +182,7 @@ struct Diagnostic {
     wire_detail: Option<String>,
     wire_context: Option<String>,
     wire_hint: Option<std::borrow::Cow<'static, str>>,
+    wire_registry_error: Option<crate::pg_settings::registry::Error>,
     sql_detail: Option<String>,
     duplicate_key: Option<DuplicateKeyDetail>,
     duplicate_key_visible: Option<bool>,
@@ -195,9 +198,25 @@ fn replication_role_allowed(session: &Session) -> R<bool> {
         _ => Ok(false),
     }
 }
+fn settings_read_allowed(session: &Session) -> R<bool> {
+    if replication_role_allowed(session)? {
+        return Ok(true);
+    }
+    let Role::Database { name } = session.authority_role() else {
+        return Ok(false);
+    };
+    Ok(name == "pg_read_all_settings" || session.service.admin.roles().privileges_of(name)
+        .map_err(|_| "42501")?.contains("pg_read_all_settings"))
+}
 impl Diagnostic {
     fn reply_error(&self, code: &'static str) -> &'static str {
         if self.committed { "08007" } else { code }
+    }
+
+    fn registry_error(&mut self, error: crate::pg_settings::registry::Error) -> &'static str {
+        let code = error.code;
+        self.wire_registry_error = Some(error);
+        code
     }
 
     /// GD-0061 R3-110: a task statement's error keeps its SQLSTATE and message.
@@ -231,8 +250,34 @@ impl Diagnostic {
         }
     }
 
+    fn catalog_error(&mut self, error: giggles_pg_catalog::Error) -> &'static str {
+        use giggles_pg_catalog::Error as E;
+        if matches!(&error, E::InvalidTypeModifier(_) | E::TypeModifierNotAllowed(_)
+            | E::TypeNameSyntax { .. })
+        {
+            self.wire_message = Some(error.to_string());
+        }
+        if let E::TypeNameSyntax { input: Some(input), .. } = &error {
+            let input = input.replace('\0', "\\0");
+            self.wire_context = Some(format!(r#"invalid type name "{input}""#));
+        }
+        catalog_wire::error(error)
+    }
+
+    fn oid_text_error(&mut self, code: &str, text: &str) {
+        let text = text.replace('\0', "\\0");
+        self.wire_message = match code {
+            "22003" => Some(format!(r#"value "{text}" is out of range for type oid"#)),
+            "22P02" => Some(format!(r#"invalid input syntax for type oid: "{text}""#)),
+            _ => None,
+        };
+    }
+
     fn core<T>(&mut self, result: Result<T, CoreError>) -> R<T> {
-        let message = giggles_core::relational::take_sql_error_message();
+        let (message, context) = giggles_core::relational::take_sql_error_message_with_context();
+        if result.is_err() && context.is_some() {
+            self.wire_context = context;
+        }
         if result.is_err() && message.as_deref().is_some_and(|m|
             m.starts_with("FOR ") || m.starts_with("syntax error at or near ")
                 || m == "syntax error at end of input"
@@ -241,7 +286,9 @@ impl Diagnostic {
                 || m == "VARIADIC argument must be an array"
                 || m.starts_with("function pg_catalog.normalize(") || m.starts_with("function num_nulls(")
                 || m.starts_with("function num_nonnulls(") || m.starts_with("invalid input syntax for type ") || m.starts_with("could not obtain lock on row ")
+                || m.starts_with("currval of sequence ") || m == "lastval is not yet defined in this session"
                 || m == "canceling statement due to lock timeout"
+                || m.starts_with("type modifier is not allowed for type ")
                 || m.starts_with("permission denied for table ") || m.starts_with("view ") || m.starts_with("sequence ") || m.starts_with("index ")
                 || m.starts_with("relation ") && m.contains(" clause not found in FROM clause")
                 || m.starts_with("invalid reference to FROM-clause entry for table ")
@@ -534,12 +581,10 @@ fn diagnostic_error(
     b.push(b'C');
     z(code, &mut b);
     b.push(b'M');
-    z(
-        diagnostic
-            .and_then(|d| d.wire_message.as_deref())
-            .unwrap_or(message),
-        &mut b,
-    );
+    let registry_error = diagnostic.and_then(|d| d.wire_registry_error.as_ref());
+    let wire_message = registry_error.map(|error| error.message.as_str())
+        .or_else(|| diagnostic.and_then(|d| d.wire_message.as_deref()));
+    z(wire_message.unwrap_or(message), &mut b);
     if let Some((diagnostic, key)) = diagnostic
         .filter(|_| matches!(code, "23503" | "23505"))
         .and_then(|d| d.duplicate_key.as_ref().map(|key| (d, key)))
@@ -557,12 +602,20 @@ fn diagnostic_error(
             b.push(field);
             z(name, &mut b);
         }
-    } else if let Some(detail) = detail {
+    } else if let Some(detail) = match registry_error {
+        Some(error) => error.detail,
+        None => detail.as_deref().map(|detail| {
+            diagnostic
+                .and_then(|d| d.sql_detail.as_deref().or(d.wire_detail.as_deref()))
+                .unwrap_or(detail)
+        }),
+    } {
         b.push(b'D');
-        z(diagnostic.and_then(|d| d.sql_detail.as_deref().or(d.wire_detail.as_deref())).unwrap_or(&detail), &mut b);
+        z(detail, &mut b);
     }
     if let Some(context) = diagnostic.and_then(|d| d.wire_context.as_deref()) { b.push(b'W'); z(context, &mut b); }
-    if let Some(hint) = diagnostic.and_then(|d| d.wire_hint.as_deref()) {
+    if let Some(hint) = registry_error.and_then(|error| error.hint.as_deref())
+        .or_else(|| diagnostic.and_then(|d| d.wire_hint.as_deref())) {
         b.push(b'H');
         z(hint, &mut b);
     }
@@ -644,8 +697,11 @@ pub fn formats(r: &mut Reader<'_>, count: usize) -> R<Vec<u16>> {
     if n != 0 && n != 1 && n != count {
         return Err("08P01");
     }
-    let mut v = Vec::with_capacity(n);
-    for _ in 0..n {
+    read_formats(r, n)
+}
+fn read_formats(r: &mut Reader<'_>, count: usize) -> R<Vec<u16>> {
+    let mut v = Vec::with_capacity(count);
+    for _ in 0..count {
         let f = r.u16()?;
         if f > 1 {
             return Err("0A000");
@@ -662,6 +718,9 @@ pub fn row_description(d: &Description, formats: &[u16], out: &mut Vec<u8>) -> R
     b.extend((d.columns.len() as u16).to_be_bytes());
     let type_oids = result_type_oids(d);
     for (i, c) in d.columns.iter().enumerate() {
+        if c.name.contains('\0') {
+            return Err("XX000");
+        }
         z(&c.name, &mut b);
         b.extend(0u32.to_be_bytes());
         b.extend(0i16.to_be_bytes());
@@ -1114,7 +1173,7 @@ fn catalog_plan(
     }
     // Sequence and extension calls use the database execution context, never
     // the immutable catalog evaluator or the positive table-free allowlist.
-    if !Prepared::sequence_dependencies(sql).is_empty() || Prepared::extension_routine_call(sql) {
+    if !Prepared::sequence_calls_from_sql(sql).is_empty() || Prepared::extension_routine_call(sql) {
         return Ok(None);
     }
     let planned = match giggles_pg_catalog::plan_gateway(sql) {
@@ -1254,11 +1313,12 @@ enum Plan {
     Explain(giggles_pg_catalog::ExplainQuery),
     Empty,
     Cursor(cursor::Command),
+    PreparedCommand(Box<prepare::Invocation>),
     AccessShare(crate::auth::statements::TableLockRequest),
     Admin(crate::auth::statements::AdminStatement),
     Control(crate::pg_transaction::Command),
     Settings(Vec<crate::pg_settings::Setting>),
-    Inspect(crate::pg_settings::Show),
+    Inspect(crate::pg_settings::SettingName),
     SettingsFunction(crate::pg_settings::Function),
     Catalog(
         Box<giggles_pg_catalog::Plan>,
@@ -1299,7 +1359,7 @@ impl ParseContext {
 struct Statement {
     id: u64,
     // Syntax-only dependencies: binding may qualify names or add defaults.
-    sequence_dependencies: std::sync::Arc<[Option<String>]>,
+    sequence_dependencies: std::sync::Arc<[giggles_core::relational::SequenceDependency]>,
     // Only an unnamed application SELECT prepared outside a transaction gets a key.
     parse_context: Option<std::sync::Arc<ParseContext>>,
     description_version: Option<u64>,
@@ -1307,6 +1367,8 @@ struct Statement {
     #[cfg(test)]
     constant_validations: usize,
     sql_bytes: usize,
+    origin: Option<Box<prepare::Origin>>,
+    discarded: bool,
     sql: String,
     declared_oids: Vec<u32>,
     // Parse finishes building both before a statement can be cached or bound.
@@ -1316,6 +1378,48 @@ struct Statement {
     query_id: Option<String>,
 }
 impl Statement {
+    fn catalog_fields(&self) -> Option<&[giggles_pg_catalog::Field]> {
+        match self.p.as_ref() {
+            Plan::Catalog(_, fields, _) => Some(fields),
+            Plan::PreparedCommand(invocation) => invocation.target.as_ref()
+                .and_then(|target| target.catalog_fields()),
+            _ => None,
+        }
+    }
+
+    fn same_result(&self, other: &Self) -> bool {
+        self.d.columns.len() == other.d.columns.len()
+            && self.d.columns.iter().zip(&other.d.columns).all(|(old, new)| {
+                old.name == new.name && old.data_type == new.data_type
+            })
+            && self.d.type_oids == other.d.type_oids
+            && self.d.typmods == other.d.typmods
+            && self.catalog_fields() == other.catalog_fields()
+    }
+
+    fn execute_result_mismatch(&self, live: &Self) -> Option<String> {
+        let expected_oids = result_type_oids(&self.d);
+        let returned_oids = result_type_oids(&live.d);
+        for (i, (expected_oid, returned_oid)) in expected_oids.into_iter().zip(returned_oids).enumerate() {
+            let expected_typmod = self.d.typmods.get(i).copied().unwrap_or(-1);
+            let returned_typmod = live.d.typmods.get(i).copied().unwrap_or(-1);
+            if returned_oid != expected_oid || expected_typmod >= 0 && returned_typmod != expected_typmod {
+                let name = |oid| prepare::argument_type_name(oid).map_or_else(
+                    |_| format!("type with OID {oid}"),
+                    str::to_owned,
+                );
+                return Some(format!(
+                    r#"Returned type {} does not match expected type {} in column "{}" (position {})."#,
+                    name(returned_oid), name(expected_oid), self.d.columns[i].name, i + 1,
+                ));
+            }
+        }
+        (self.d.columns.len() != live.d.columns.len()).then(|| format!(
+            "Number of returned columns ({}) does not match expected column count ({}).",
+            live.d.columns.len(), self.d.columns.len(),
+        ))
+    }
+
     // Binding reads the immutable Prepared (including its captured search_path,
     // types, schema user and literal DateOrder) and the catalog. Query binding installs catalog enum
     // and collation scopes; plan_constant excludes runtime/session nodes and only
@@ -1344,7 +1448,12 @@ impl Statement {
     }
 
     fn authorize_description(&self, session: &mut Session) -> R<()> {
-        if let Plan::Sql(p) = &*self.p
+        if let Plan::PreparedCommand(invocation) = self.p.as_ref()
+            && let Some(target) = &invocation.target
+        {
+            target.authorize_execute_description(session)?;
+        }
+        if let Plan::Sql(p) = self.p.as_ref()
             && session.task().is_none()
         {
             // An aborted transaction reports 25P02 before any authorization,
@@ -1395,7 +1504,7 @@ impl Statement {
                 core(session.copy_columns(copy, p))?;
                 Ok(Arc::clone(&self.d))
             }
-            Plan::CopyOut(_) | Plan::Explain(_) | Plan::Cursor(_)
+            Plan::CopyOut(_) | Plan::Explain(_) | Plan::Cursor(_) | Plan::PreparedCommand(_)
             | Plan::AccessShare(_)
             | Plan::Admin(_)
             | Plan::Empty
@@ -1411,6 +1520,9 @@ impl Statement {
 }
 struct Portal {
     s: Statement,
+    // EXECUTE can run a replacement statement while retaining the result
+    // description promised when the portal was bound.
+    bound_execute_target: Option<Box<Statement>>,
     params: Vec<Value>,
     formats: Vec<u16>,
     /// GD-0061 R3-310: a retained result is released (masked and charged)
@@ -1425,6 +1537,14 @@ struct Portal {
     at: usize,
 }
 impl Portal {
+    fn new(
+        s: Statement, params: Vec<Value>, catalog_params: Vec<giggles_pg_catalog::Value>,
+        formats: Vec<u16>, parameter_bytes: usize,
+    ) -> Self {
+        Self { s, bound_execute_target: None, params, formats, result: None, spilled: None, cursor: None,
+            catalog_params, catalog_result: None, parameter_bytes, at: 0 }
+    }
+
     fn retained_bytes(&self) -> R<usize> {
         let sql = self
             .result
@@ -1697,37 +1817,50 @@ fn control(sql: &str) -> Option<&'static str> {
         .find(|command| sql.eq_ignore_ascii_case(command))
 }
 fn inspect(
-    show: crate::pg_settings::Show,
-    settings: &crate::pg_settings::Settings,
+    show: &crate::pg_settings::SettingName,
+    settings: &crate::pg_settings::SessionSettings,
     session: &Session,
+    diagnostic: &mut Diagnostic,
 ) -> R<(Description, Released<SqlResult>)> {
+    use crate::pg_settings::{RegistryName, SettingName, Show};
     if !session.role.is_sql() {
         return Err("42501");
     }
     if session.is_aborted() {
         return Err("25P02");
     }
-    let (name, mut value) = show.value(settings);
-    if show == crate::pg_settings::Show::SessionAuthorization && value.is_empty() { value = session.session_user_name().unwrap_or("giggles").into(); }
+    let (names, rows) = if *show == SettingName::All {
+        (
+            vec!["name".into(), "setting".into(), "description".into()],
+            crate::pg_settings::show_all(settings, settings_read_allowed(session)?),
+        )
+    } else {
+        let privileged = if matches!(show, SettingName::Registry(RegistryName::Registered(entry)) if entry.restricted) {
+            settings_read_allowed(session)?
+        } else {
+            false
+        };
+        let mut value = show.read(settings, privileged).map_err(|error| diagnostic.registry_error(error))?;
+        if *show == SettingName::Native(Show::SessionAuthorization) && value.is_empty() {
+            value = session.session_user_name().unwrap_or("giggles").into();
+        }
+        (vec![show.name(settings).into()], vec![vec![Value::Text(value)]])
+    };
     Ok((
         Description {
             type_oids: vec![],
-            typmods: vec![-1],
+            typmods: vec![-1; names.len()],
             parameters: vec![],
-            columns: vec![giggles_core::relational::ColumnDef {
+            columns: names.iter().map(|name: &String| giggles_core::relational::ColumnDef {
                 id: 0,
-                name: name.into(),
+                name: name.clone(),
                 data_type: DataType::Text,
                 not_null: true,
-            }],
+            }).collect(),
         },
-        // A setting's value, built here: never core rows.
         Released::synthetic(SqlResult {
-            columns: vec![name.into()],
-            rows: vec![giggles_core::relational::SqlRow {
-                values: vec![Value::Text(value)],
-                version: 0,
-            }],
+            columns: names,
+            rows: rows.into_iter().map(|values| giggles_core::relational::SqlRow { values, version: 0 }).collect(),
             affected: 0,
         }),
     ))
@@ -1858,6 +1991,7 @@ impl State {
         &mut self,
         sql: &str,
         oids: Vec<u32>,
+        unused_slots: &[usize],
         session: &mut Session,
         unnamed: bool,
     ) -> R<Statement> {
@@ -1890,6 +2024,7 @@ impl State {
                 #[cfg(test)]
                 constant_validations: 0,
                 sql_bytes: sql.len(),
+                origin: None, discarded: false,
                 sql: sql.to_owned(),
                 declared_oids: oids,
                 p: Arc::new(Plan::Change(Box::new(change))),
@@ -1918,6 +2053,7 @@ impl State {
                 #[cfg(test)]
                 constant_validations: 0,
                 sql_bytes: sql.len(),
+                origin: None, discarded: false,
                 sql: sql.to_owned(),
                 declared_oids: oids,
                 p: Arc::new(Plan::TaskDdl(Box::new(stmt))),
@@ -1957,6 +2093,9 @@ impl State {
                     parameters: vec![],
                 },
             )
+        } else if let Some(command) = prepare::parse_protocol(sql, &mut self.diagnostic)? {
+            prepare::guard(session)?;
+            self.prepare_command(command, &oids)?
         } else if let Some(mut command) = cursor::parse(sql)? {
             if !session.role.is_sql() {
                 return Err("42501");
@@ -1997,7 +2136,7 @@ impl State {
                 },
             )
         } else if let Some(show) = show_settings(sql, session, &mut self.diagnostic)? {
-            let (description, _) = inspect(show, &self.settings.current, session)?;
+            let (description, _) = inspect(&show, &self.settings, session, &mut self.diagnostic)?;
             (Plan::Inspect(show), description)
         } else if let Some(settings) = parse_settings(sql, session, &mut self.diagnostic)? {
             if !session.role.is_sql() {
@@ -2046,7 +2185,7 @@ impl State {
             let (epoch, _, _) = core(session.catalog_snapshot())?;
             let fields = giggles_pg_catalog::describe(&plan).map_err(catalog_wire::error)?;
             let d = Description {
-                type_oids: vec![],
+                type_oids: fields.iter().map(|field| field.data_type.oid()).collect(),
                 typmods: vec![-1; fields.len()],
                 parameters: vec![DataType::Text; plan.parameter_count()],
                 columns: fields
@@ -2080,7 +2219,10 @@ impl State {
                     .zip(&parameter_oids)
                     .enumerate()
                     .any(|(i, (o, inferred))| {
-                        *o != 0 && o != inferred && !catalog_input_override(plan, i, *o, *inferred)
+                        *o != 0
+                            && o != inferred
+                            && unused_slots.binary_search(&i).is_err()
+                            && !catalog_input_override(plan, i, *o, *inferred)
                     });
             if session.role.is_sql()
                 && mismatch
@@ -2113,6 +2255,13 @@ impl State {
         self.diagnostic.phase = "parameter type declaration";
         for (i, (o, t)) in oids.iter().copied().zip(&mut d.parameters).enumerate() {
             if matches!(p, Plan::Catalog(..)) {
+                if unused_slots.binary_search(&i).is_ok() {
+                    // The declaration governs input validation for this slot.
+                    // The catalog plan has no reference to its value.
+                    *t = core_declared_type(o).unwrap_or(DataType::Text);
+                    parameter_oids[i] = o;
+                    continue;
+                }
                 if o != 0 {
                     catalog_wire::parameter_type(o)?;
                     // The catalog compiler fixes parameter and result
@@ -2154,7 +2303,7 @@ impl State {
             && matches!(&p, Plan::Sql(p) if !p.is_ddl() && p.command() == "SELECT"))
             .then(|| std::sync::Arc::new(ParseContext::current(&self.settings.current, session)));
         let sequence_dependencies = if parse_context.is_some() {
-            Prepared::sequence_dependencies(sql).into()
+            Prepared::sequence_calls_from_sql(sql).into()
         } else {
             Default::default()
         };
@@ -2167,6 +2316,7 @@ impl State {
             #[cfg(test)]
             constant_validations: 0,
             sql_bytes: sql.len(),
+            origin: None, discarded: false,
             sql: sql.to_owned(),
             declared_oids: oids,
             p: Arc::new(p),
@@ -2258,7 +2408,7 @@ impl State {
     }
     fn refresh_statement(&mut self, name: &str, session: &mut Session) -> R<()> {
         let old = self.statements.get(name).ok_or("26000")?;
-        let stale = match &*old.p {
+        let stale = old.discarded || match old.p.as_ref() {
             Plan::Sql(p) if session.task().is_none() && !p.is_ddl() => {
                 !session.sql.prepared_is_current(p)
                     || match session.sql.prepared_catalog_state() {
@@ -2273,7 +2423,9 @@ impl State {
             Plan::Sql(p) => !session.sql.prepared_is_current(p),
             Plan::Copy(_, p) => !session.sql.prepared_is_current(p),
             Plan::Catalog(_, _, _) if session.task().is_some() => false,
-            Plan::Catalog(plan, _, epoch) if !plan.depends_on_relations() => {
+            Plan::Catalog(plan, _, epoch)
+                if !plan.depends_on_relations() || plan.reads_prepared_statements() =>
+            {
                 let (current, _, _) = core(session.catalog_snapshot())?;
                 current != *epoch
             }
@@ -2288,23 +2440,312 @@ impl State {
             preparation.datestyle.order = prepared.literal_date_order();
         }
         session.set_text_settings(&preparation);
-        let new = self.prepare_statement(&old.sql, old.declared_oids.clone(), session, false);
+        let unused_slots: &[usize] = old.origin.as_ref().map_or(&[], |origin| &origin.unused_slots);
+        let new = self.prepare_statement(
+            &old.sql, old.declared_oids.clone(), unused_slots, session, false,
+        );
         session.set_text_settings(&self.settings.current);
-        let new = new?;
-        if old.parameter_oids != new.parameter_oids
-            || old.d.columns.len() != new.d.columns.len()
-            || old.d.columns.iter().zip(&new.d.columns).any(|(old, new)| {
-                // Rebinding can change storage identities without changing the
-                // result shape promised to the client.
-                old.name != new.name || old.data_type != new.data_type
-            })
-            || old.d.type_oids != new.d.type_oids
-            || old.d.typmods != new.d.typmods
-        {
+        let mut new = new?;
+        if let Some(origin) = &old.origin {
+            new.append_unused_parameters(&origin.unused_types);
+        }
+        new.origin = old.origin.clone();
+        new.sql_bytes = old.sql_bytes;
+        // Rebinding can change storage identities without changing the
+        // result shape promised to the client.
+        if old.parameter_oids != new.parameter_oids || !old.same_result(&new) {
             self.diagnostic.message = Some("cached plan must not change result type");
             return Err("0A000");
         }
         self.statements.insert(name.to_owned(), new);
+        Ok(())
+    }
+    fn bind_statement(
+        &mut self, name: &str, session: &mut Session, implicit: &mut bool,
+    ) -> R<Statement> {
+        let statement = self.statements.get(name).ok_or("26000")?;
+        if let Plan::Sql(prepared) = statement.p.as_ref()
+            && session.task().is_none()
+            && needs_implicit_transaction(prepared)
+        {
+            if !prepared.is_ddl() {
+                begin_implicit(session, implicit, &mut self.settings)?;
+                session.sql.begin_prepared_statement();
+            }
+            core(session.bind_prepared_relations(prepared))?;
+        }
+        // One version comparison, after locks have stabilized dependencies.
+        self.refresh_statement(name, session)?;
+        let statement = self.statements.get(name).ok_or("26000")?.clone();
+        self.diagnostic.query_id = statement.query_id.clone();
+        statement.describe(session)?;
+        Ok(statement)
+    }
+    fn validate_statement_binding(
+        &mut self, name: &str, statement: &mut Statement, session: &mut Session,
+    ) -> R<()> {
+        if matches!(statement.p.as_ref(), Plan::Sql(_)) {
+            let validation = statement.validate_constants(session, &mut self.diagnostic);
+            if name.is_empty() {
+                if validation.is_err() {
+                    statement.validated = None;
+                }
+                // A Bind refresh can replace the live statement while the
+                // Parse cache still holds its earlier preparation.
+                if let Some(entry) = self.unnamed_cache.iter_mut().find(|entry| {
+                    entry.id == statement.id
+                        && entry.sql == statement.sql
+                        && entry.declared_oids == statement.declared_oids
+                }) {
+                    entry.validated = statement.validated;
+                    #[cfg(test)]
+                    { entry.constant_validations = statement.constant_validations; }
+                }
+            }
+            if validation.is_ok() || name.is_empty() {
+                let stored = self.statements.get_mut(name).ok_or("26000")?;
+                stored.validated = statement.validated;
+                #[cfg(test)]
+                { stored.constant_validations = statement.constant_validations; }
+            }
+            validation?;
+        }
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn execute_session_portal(
+        &mut self, p: &mut Portal, session: &mut Session, implicit: &mut bool,
+        max: u32, mut retained: usize, out: &mut Vec<u8>,
+    ) -> R<()> {
+        self.diagnostic.query_id = p.s.query_id.clone();
+        p.s.describe(session)?;
+        if let Plan::PreparedCommand(invocation) = p.s.p.as_ref() {
+            if p.result.is_some() { return Err("55000"); }
+            let invocation = invocation.clone();
+            if let prepare::Command::Execute { name, args } = &invocation.command {
+                let mut target = self.bind_sql_execute(name, args, session, implicit)?;
+                if let Some(bound) = &invocation.target
+                    && let Some(detail) = bound.execute_result_mismatch(&target.s)
+                {
+                    self.diagnostic.message = Some("query result type does not match portal result type");
+                    self.diagnostic.wire_detail = Some(detail);
+                    return Err("42804");
+                }
+                target.bound_execute_target = invocation.target;
+                if p.formats.len() > 1 && p.formats.len() != target.s.d.columns.len() {
+                    return Err("08P01");
+                }
+                retained = (retained - p.parameter_bytes)
+                    .checked_add(target.parameter_bytes).ok_or("54000")?;
+                if retained > MAX_RESPONSE { return Err("54000"); }
+                let formats = std::mem::take(&mut p.formats);
+                *p = target;
+                p.formats = formats;
+            } else {
+                self.execute_prepared_utility(invocation.command, session, *implicit, out)?;
+                p.result = ran();
+                return Ok(());
+            }
+        }
+        let was_transaction = session.in_transaction();
+        if let Plan::Catalog(plan, fields, epoch) = p.s.p.as_ref() {
+            self.diagnostic.phase = "catalog execution";
+            begin_implicit(session, implicit, &mut self.settings)?;
+            let (current, tables, indexes, typmods, types) =
+                core(session.catalog_snapshot_with_typmods())?;
+            if current != *epoch && !plan.refreshes_view_definitions() {
+                return Err("0A000");
+            }
+            if p.catalog_result.is_none() {
+                self.settings.queried = true;
+                let snapshot = catalog_wire::snapshot(session, current, tables, indexes, typmods, types)?;
+                let snapshot = catalog_wire::with_search_path(snapshot, &self.settings.current.search_path);
+                let snapshot = self.prepared_snapshot(plan, snapshot);
+                let snapshot = catalog_wire::with_application_rows(session, plan, snapshot)?;
+                let result = catalog_wire::execute(plan, &snapshot, &p.catalog_params)
+                    .map_err(|error| self.diagnostic.catalog_error(error))?;
+                if result.fields != *fields {
+                    return Err("0A000");
+                }
+                if retained
+                    .checked_add(catalog_wire::retained_bytes(&result)?)
+                    .ok_or("54000")?
+                    > MAX_RESPONSE
+                {
+                    return Err("54000");
+                }
+                // Built from the catalog snapshot, whose application
+                // rows were released as they were read
+                // (`with_application_rows`, GD-0061 R3-312).
+                p.catalog_result = Some(Released::synthetic(result));
+            }
+            let result = p.catalog_result.as_ref().unwrap();
+            let total = result.get().rows.len();
+            let end = if max == 0 {
+                total
+            } else {
+                p.at.saturating_add(max as usize).min(total)
+            };
+            catalog_wire::rows(
+                &self.settings.current,
+                result,
+                &p.formats,
+                p.at,
+                end,
+                out,
+            )?;
+            p.at = end;
+            if end < total {
+                frame(b's', &[], out)?;
+            } else {
+                catalog_complete(total, out)?;
+            }
+            return Ok(());
+        }
+        let Plan::Sql(prepared) = p.s.p.as_ref() else {
+            unreachable!()
+        };
+        if prepared.command() == "SELECT" && prepared.write_tables().is_empty() {
+            if p.cursor.is_none() {
+                read_only_check(prepared.row_lock_command().filter(|_| !prepared.row_lock_tables().is_empty()).unwrap_or("SELECT"), &self.settings, session, &mut self.diagnostic)?;
+                begin_implicit(session, implicit, &mut self.settings)?;
+                self.settings.queried = true;
+                p.cursor = Some(
+                    self.diagnostic
+                        .core(session.open_cursor(prepared, &p.params))?,
+                );
+            }
+            let cursor = p.cursor.as_mut().expect("opened cursor");
+            let mut remaining = if max == 0 { usize::MAX } else { max as usize };
+            while remaining > 0 && !cursor.is_exhausted() {
+                // GD-0061 R3-310: fetch unreleased, release, then encode.
+                let chunk = self.diagnostic.core(session.fetch_cursor_unreleased(
+                    cursor,
+                    remaining.min(CURSOR_ROWS),
+                    CURSOR_BYTES,
+                ))?;
+                let chunk = self.diagnostic.core(session.release_page(chunk))?;
+                let result = chunk.map(|rows| SqlResult {
+                    rows,
+                    ..SqlResult::default()
+                });
+                let count = result.get().rows.len();
+                rows(
+                    &self.settings.current,
+                    session.zone().unwrap_or(SessionZone::Fixed(0)),
+                    &result,
+                    &p.s.d,
+                    &p.formats,
+                    0,
+                    count,
+                    out,
+                )?;
+                p.at += count;
+                remaining -= count;
+                flush_output(&self.output, out)?;
+            }
+            if cursor.is_exhausted() {
+                catalog_complete(p.at, out)?;
+            } else {
+                frame(b's', &[], out)?;
+            }
+            return Ok(());
+        }
+        if p.result.is_some() && p.s.d.columns.is_empty() {
+            return Err("55000");
+        }
+        if p.result.is_none() {
+            let command = prepared.command();
+            read_only_check(prepared.row_lock_command().filter(|_| !prepared.row_lock_tables().is_empty()).unwrap_or_else(|| prepared.write_tables().first().map_or(command, |(_, command)| *command)), &self.settings, session, &mut self.diagnostic)?;
+            if needs_implicit_transaction(prepared) {
+                begin_implicit(session, implicit, &mut self.settings)?;
+            }
+            if needs_implicit_transaction(prepared) {
+                self.settings.queried = true;
+            }
+            let (result, spilled) = if command == "BEGIN" && *implicit {
+                *implicit = false;
+                (Released::synthetic(SqlResult::default()), None)
+            } else {
+                self.diagnostic.core(session.sync_replication_role(&self.settings))?;
+                // GD-0061 R3-310: the whole result is released once,
+                // here. A task session's spill never reaches this
+                // handle: core materialises it behind the release tag.
+                let (result, spilled) = giggles_core::relational::spill::streaming(
+                    || session.execute_prepared_unreleased(prepared, &p.params));
+                self.retain_durability_permits |= spilled.is_some();
+                let result = self.diagnostic.core(result)?;
+                (self.diagnostic.core(session.release_page(result))?, spilled)
+            };
+            if !session.in_transaction() {
+                *implicit = false;
+            }
+            self.settings.transaction(
+                was_transaction,
+                session.in_transaction(),
+                prepared.command(),
+            );
+            let bytes = serde_json::to_vec(result.get()).map_err(|_| "54000")?.len();
+            if retained.checked_add(bytes).ok_or("54000")? > MAX_RESPONSE {
+                return Err("54000");
+            }
+            // Admit retained bytes before caching OR appending any rows.
+            p.result = Some(result);
+            p.spilled = spilled;
+        } else {
+            revalidate(session, p.at, &mut self.diagnostic)?;
+        }
+        if let Some(spilled) = p.spilled.as_mut() {
+            // A task session's spill is materialised behind its
+            // release tag (core), so a spill handle only ever holds
+            // the rows of a plain session (GD-0061 R3-314).
+            if session.task().is_some() {
+                return Err("XX000");
+            }
+            // Stream spilled rows like a cursor; an exhausted handle replays completion.
+            let mut remaining = if max == 0 { usize::MAX } else { max as usize };
+            while remaining > 0 && !spilled.is_empty() {
+                let chunk = spilled.by_ref().take(remaining.min(CURSOR_ROWS))
+                    .collect::<Result<Vec<_>, _>>();
+                // Released as a plain session's release is: a move.
+                let chunk = Released::synthetic(SqlResult { rows: self.diagnostic.core(chunk)?, ..SqlResult::default() });
+                let count = chunk.get().rows.len();
+                rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
+                    &chunk, &p.s.d, &p.formats, 0, count, out)?;
+                p.at += count;
+                remaining -= count;
+                flush_output(&self.output, out)?;
+            }
+            if spilled.is_empty() {
+                complete(prepared.command(), p.result.as_ref().expect("spilled result"), out)?;
+            } else {
+                frame(b's', &[], out)?;
+            }
+            return Ok(());
+        }
+        let result = p.result.as_ref().unwrap();
+        let total = result.get().rows.len();
+        let end = if max == 0 {
+            total
+        } else {
+            p.at.saturating_add(max as usize).min(total)
+        };
+        rows(
+            &self.settings.current,
+            session.zone().unwrap_or(SessionZone::Fixed(0)),
+            result,
+            &p.s.d,
+            &p.formats,
+            p.at,
+            end,
+            out,
+        )?;
+        p.at = end;
+        if end < total {
+            frame(b's', &[], out)?;
+        } else {
+            complete(prepared.command(), result, out)?;
+        }
         Ok(())
     }
     fn handle_inner(
@@ -2410,52 +2851,37 @@ impl State {
                 if name.len() > 63 {
                     return Err("54000");
                 }
-                if !name.is_empty() && self.statements.contains_key(&name) {
-                    return Err("42P05");
-                }
-                if !name.is_empty()
-                    && (self.statements.keys().filter(|name| !name.is_empty()).count()
-                        >= MAX_NAMED_STATEMENTS
-                        || self.named_statement_bytes.checked_add(sql.len()).ok_or("54000")? > MAX_NAMED_STATEMENT_BYTES)
-                {
-                    return Err("54000");
+                if !name.is_empty() {
+                    self.check_named_statement(&name, sql.len())?;
                 }
                 let reused = if name.is_empty() { self.reuse_unnamed(&sql, &oids, session)? } else { None };
-                let statement = match reused {
+                let mut statement = match reused {
                     Some(statement) => statement,
-                    None => self.prepare_statement(&sql, oids, session, name.is_empty())?,
+                    None => self.prepare_statement(&sql, oids, &[], session, name.is_empty())?,
                 };
                 if name.is_empty() {
                     self.cache_unnamed(&statement);
                 }
-                if !name.is_empty() {
-                    self.named_statement_bytes += sql.len();
+                if name.is_empty() {
+                    self.statements.insert(name, statement);
+                } else {
+                    statement.origin = Some(Box::new(prepare::Origin::protocol(session)));
+                    self.store_named_statement(name, statement);
                 }
-                self.statements.insert(
-                    name,
-                    statement,
-                );
                 frame(b'1', &[], out)?;
             }
             b'B' => {
                 let name = r.text()?;
                 let stmt = r.text()?;
-                let s = self.statements.get(&stmt).ok_or("26000")?;
-                if let Plan::Sql(p) = &*s.p
-                    && session.task().is_none()
-                    && needs_implicit_transaction(p)
-                {
-                    if !p.is_ddl() {
-                        begin_implicit(session, &mut self.implicit, &mut self.settings)?;
-                        session.sql.begin_prepared_statement();
-                    }
-                    core(session.bind_prepared_relations(p))?;
+                let mut implicit = self.implicit;
+                let statement = self.bind_statement(&stmt, session, &mut implicit);
+                self.implicit = implicit;
+                let mut s = statement?;
+                if let Plan::PreparedCommand(invocation) = s.p.as_ref() {
+                    let mut invocation = invocation.clone();
+                    self.bind_execute_description(&mut invocation, Arc::make_mut(&mut s.d), session)?;
+                    s.p = Arc::new(Plan::PreparedCommand(invocation));
                 }
-                // One version comparison, after locks have stabilized dependencies.
-                self.refresh_statement(&stmt, session)?;
-                let mut s = self.statements.get(&stmt).ok_or("26000")?.clone();
-                self.diagnostic.query_id = s.query_id.clone();
-                s.describe(session)?;
                 let fmts = formats(&mut r, s.d.parameters.len())?;
                 let n = r.u16()?;
                 if n != s.d.parameters.len() {
@@ -2465,26 +2891,43 @@ impl State {
                 let mut catalog_params = vec![];
                 let mut parameter_bytes = 0usize;
                 let mut transaction_us = None;
+                let catalog = matches!(s.p.as_ref(), Plan::Catalog(..));
                 for (i, ty) in s.d.parameters.iter().enumerate() {
                     let n = r.u32()?;
-                    if matches!(&*s.p, Plan::Catalog(..)) {
+                    let unused = s.has_unused_slot(i);
+                    let wire_oid = s.parameter_oids[i];
+                    if (catalog && !unused)
+                        || (unused && (catalog || core_declared_type(wire_oid).is_none())
+                            && catalog_wire::parameter_type(wire_oid).is_ok())
+                    {
                         let value = if n == u32::MAX {
                             giggles_pg_catalog::Value::Null
                         } else {
-                            catalog_wire::decode(
-                                r.take(usize::try_from(n).map_err(|_| "54000")?)?,
-                                catalog_wire::parameter_type(s.parameter_oids[i])?,
-                                format_at(&fmts, i),
-                            )?
+                            let bytes = r.take(usize::try_from(n).map_err(|_| "54000")?)?;
+                            let format = format_at(&fmts, i);
+                            catalog_wire::decode(bytes, catalog_wire::parameter_type(wire_oid)?, format)
+                                .inspect_err(|&code| {
+                                    if wire_oid == 26 && format == 0
+                                        && let Ok(text) = std::str::from_utf8(bytes)
+                                    {
+                                        self.diagnostic.oid_text_error(code, text);
+                                    }
+                                })?
                         };
                         // Count decoded allocation, including array element overhead.
                         parameter_bytes = parameter_bytes
                             .checked_add(catalog_wire::value_bytes(&value)?)
                             .ok_or("54000")?;
-                        catalog_params.push(value);
+                        if catalog {
+                            catalog_params.push(if unused {
+                                giggles_pg_catalog::Value::Null
+                            } else {
+                                value
+                            });
+                        }
                         continue;
                     }
-                    params.push(if n == u32::MAX {
+                    let value = if n == u32::MAX {
                         Value::Null
                     } else {
                         decode_with_order(
@@ -2500,13 +2943,36 @@ impl State {
                             },
                             self.settings.current.datestyle.order,
                         )?
-                    });
+                    };
+                    if catalog {
+                        // An unused declaration can use a type only core decodes.
+                        catalog_params.push(giggles_pg_catalog::Value::Null);
+                    } else {
+                        params.push(value);
+                    }
                 }
                 #[cfg(feature = "legacy-task")]
                 if let Plan::Task(task) = &*s.p {
                     task.bind(&params)?;
                 }
-                let output = formats(&mut r, s.d.columns.len())?;
+                let retained_slots = s.plan_parameter_count();
+                params.truncate(retained_slots);
+                catalog_params.truncate(retained_slots);
+                let output = if let Plan::PreparedCommand(invocation) = s.p.as_ref()
+                    && matches!(&invocation.command, prepare::Command::Execute { .. })
+                {
+                    let count = r.u16()?;
+                    if invocation.target.is_some() && count > 1 && count != s.d.columns.len() {
+                        self.diagnostic.wire_message = Some(format!(
+                            "bind message has {count} result formats but query has {} columns",
+                            s.d.columns.len(),
+                        ));
+                        return Err("08P01");
+                    }
+                    read_formats(&mut r, count)?
+                } else {
+                    formats(&mut r, s.d.columns.len())?
+                };
                 r.end()?;
                 if name.len() > 63 {
                     return Err("54000");
@@ -2526,51 +2992,9 @@ impl State {
                 if bound.checked_add(parameter_bytes).ok_or("54000")? > MAX_RESPONSE {
                     return Err("54000");
                 }
-                if matches!(&*s.p, Plan::Sql(_)) {
-                    let validation = s.validate_constants(session, &mut self.diagnostic);
-                    if stmt.is_empty() {
-                        if validation.is_err() {
-                            s.validated = None;
-                        }
-                        // A Bind refresh can replace the live statement while
-                        // the Parse cache still holds its earlier preparation.
-                        if let Some(entry) = self.unnamed_cache.iter_mut().find(|entry| {
-                            entry.id == s.id
-                                && entry.sql == s.sql
-                                && entry.declared_oids == s.declared_oids
-                        }) {
-                            entry.validated = s.validated;
-                            #[cfg(test)]
-                            {
-                                entry.constant_validations = s.constant_validations;
-                            }
-                        }
-                    }
-                    if validation.is_ok() || stmt.is_empty() {
-                        let statement = self.statements.get_mut(&stmt).ok_or("26000")?;
-                        statement.validated = s.validated;
-                        #[cfg(test)]
-                        {
-                            statement.constant_validations = s.constant_validations;
-                        }
-                    }
-                    validation?;
-                }
-                self.portals.insert(
-                    name,
-                    Portal {
-                        s,
-                        params,
-                        formats: output,
-                        result: None,
-                        spilled: None,
-                        cursor: None,
-                        catalog_params,
-                        catalog_result: None,
-                        parameter_bytes,
-                        at: 0,
-                    },
-                );
+                self.validate_statement_binding(&stmt, &mut s, session)?;
+                self.note_plan_use(&stmt);
+                self.portals.insert(name, Portal::new(s, params, catalog_params, output, parameter_bytes));
                 frame(b'2', &[], out)?;
             }
             b'D' => {
@@ -2585,6 +3009,9 @@ impl State {
                         self.statements.get(&name).ok_or("26000")?.authorize_description(session)?;
                         self.refresh_statement(&name, session)?;
                         let s = self.statements.get(&name).ok_or("26000")?;
+                        if let Plan::PreparedCommand(invocation) = s.p.as_ref() {
+                            self.authorize_live_execute_target(invocation, session)?;
+                        }
                         self.diagnostic.query_id = s.query_id.clone();
                         let d = s.describe(session)?;
                         let mut b = vec![];
@@ -2593,7 +3020,7 @@ impl State {
                             b.extend(oid.to_be_bytes());
                         }
                         frame(b't', &b, out)?;
-                        if let Plan::Catalog(_, fields, _) = &*s.p {
+                        if let Some(fields) = s.catalog_fields() {
                             catalog_wire::description(fields, &[], out)?;
                         } else {
                             row_description(&d, &[], out)?;
@@ -2613,8 +3040,14 @@ impl State {
                         let p = self.portals.get(&name).ok_or("34000")?;
                         self.diagnostic.query_id = p.s.query_id.clone();
                         p.s.authorize_description(session)?;
-                        let d = p.s.describe(session)?;
-                        if let Plan::Catalog(_, fields, _) = &*p.s.p {
+                        let described = if let Some(bound) = &p.bound_execute_target {
+                            bound.authorize_execute_description(session)?;
+                            bound.as_ref()
+                        } else {
+                            &p.s
+                        };
+                        let d = described.describe(session)?;
+                        if let Some(fields) = described.catalog_fields() {
                             catalog_wire::description(fields, &p.formats, out)?;
                         } else {
                             row_description(&d, &p.formats, out)?;
@@ -2627,7 +3060,6 @@ impl State {
                 let retained = self.portals.values().try_fold(0usize, |sum, p| {
                     sum.checked_add(p.retained_bytes()?).ok_or("54000")
                 })?;
-                let was_transaction = session.in_transaction();
                 let name = r.text()?;
                 let max = r.u32()?;
                 r.end()?;
@@ -2637,6 +3069,23 @@ impl State {
                 // GD-0061 R3-206: a task session's portal runs on its own path.
                 if session.task().is_some() {
                     return self.task_execute(&name, max, retained, session, out).map(|()| true);
+                }
+                if self.portals.get(&name).is_some_and(|p| {
+                    matches!(p.s.p.as_ref(), Plan::PreparedCommand(_) | Plan::Sql(_) | Plan::Catalog(..))
+                }) {
+                    let mut portal = self.portals.remove(&name).expect("checked portal");
+                    let mut implicit = self.implicit;
+                    let was_transaction = session.in_transaction();
+                    let result = self.execute_session_portal(
+                        &mut portal, session, &mut implicit, max, retained, out,
+                    );
+                    self.implicit = implicit;
+                    if was_transaction && !session.in_transaction() {
+                        self.portals.clear();
+                    } else {
+                        self.portals.insert(name, portal);
+                    }
+                    return result.map(|()| true);
                 }
                 let p = self.portals.get_mut(&name).ok_or("34000")?;
                 self.diagnostic.query_id = p.s.query_id.clone();
@@ -2772,70 +3221,7 @@ impl State {
                     complete(tag, &empty(), out)?;
                     return Ok(true);
                 }
-                if let Plan::Catalog(plan, fields, epoch) = &*p.s.p {
-                    self.diagnostic.phase = "catalog execution";
-                    begin_implicit(session, &mut self.implicit, &mut self.settings)?;
-                    let (current, tables, indexes, typmods, types) =
-                        core(session.catalog_snapshot_with_typmods())?;
-                    if current != *epoch && !plan.refreshes_view_definitions() {
-                        return Err("0A000");
-                    }
-                    if p.catalog_result.is_none() {
-                        self.settings.queried = true;
-                        let result = catalog_wire::execute(
-                            plan,
-                            &catalog_wire::with_application_rows(
-                                session,
-                                plan,
-                                catalog_wire::with_search_path(
-                                    catalog_wire::snapshot(
-                                        session, current, tables, indexes, typmods, types,
-                                    )?,
-                                    &self.settings.current.search_path,
-                                ),
-                            )?,
-                            &p.catalog_params,
-                        )
-                        .map_err(catalog_wire::error)?;
-                        if result.fields != *fields {
-                            return Err("0A000");
-                        }
-                        if retained
-                            .checked_add(catalog_wire::retained_bytes(&result)?)
-                            .ok_or("54000")?
-                            > MAX_RESPONSE
-                        {
-                            return Err("54000");
-                        }
-                        // Built from the catalog snapshot, whose application
-                        // rows were released as they were read
-                        // (`with_application_rows`, GD-0061 R3-312).
-                        p.catalog_result = Some(Released::synthetic(result));
-                    }
-                    let result = p.catalog_result.as_ref().unwrap();
-                    let total = result.get().rows.len();
-                    let end = if max == 0 {
-                        total
-                    } else {
-                        p.at.saturating_add(max as usize).min(total)
-                    };
-                    catalog_wire::rows(
-                        &self.settings.current,
-                        result,
-                        &p.formats,
-                        p.at,
-                        end,
-                        out,
-                    )?;
-                    p.at = end;
-                    if end < total {
-                        frame(b's', &[], out)?;
-                    } else {
-                        catalog_complete(total, out)?;
-                    }
-                    return Ok(true);
-                }
-                if let Plan::Explain(query) = &*p.s.p {
+                if let Plan::Explain(query) = p.s.p.as_ref() {
                     begin_implicit(session, &mut self.implicit, &mut self.settings)?;
                     if p.result.is_none() {
                         // Plan text the server builds (its core reads use the
@@ -2913,10 +3299,7 @@ impl State {
                     if p.result.is_some() {
                         return Err("55000");
                     }
-                    if !matches!(
-                        settings.as_slice(),
-                        [crate::pg_settings::Setting::Database { local: true, .. }]
-                    ) {
+                    if !settings.iter().all(crate::pg_settings::Setting::is_local) {
                         begin_implicit(session, &mut self.implicit, &mut self.settings)?;
                     }
                     execute_settings(
@@ -2932,9 +3315,9 @@ impl State {
                 }
                 // Task results are never retained in a portal. Each Execute is a
                 // fresh native invocation, including completed-portal replays.
-                if let Plan::Inspect(show) = &*p.s.p {
+                if let Plan::Inspect(show) = p.s.p.as_ref() {
                     // Recheck role/transaction even when releasing cached rows.
-                    let (_, current) = inspect(*show, &self.settings.current, session)?;
+                    let (_, current) = inspect(show, &self.settings, session, &mut self.diagnostic)?;
                     if p.result.is_none() {
                         let bytes = serde_json::to_vec(current.get()).map_err(|_| "54000")?.len();
                         if retained.checked_add(bytes).ok_or("54000")? > MAX_RESPONSE {
@@ -2986,156 +3369,7 @@ impl State {
                     complete("SELECT", result, out)?;
                     return Ok(true);
                 }
-                let Plan::Sql(prepared) = &*p.s.p else {
-                    unreachable!()
-                };
-                if prepared.command() == "SELECT" && prepared.write_tables().is_empty() {
-                    if p.cursor.is_none() {
-                        read_only_check(prepared.row_lock_command().filter(|_| !prepared.row_lock_tables().is_empty()).unwrap_or("SELECT"), &self.settings, session, &mut self.diagnostic)?;
-                        begin_implicit(session, &mut self.implicit, &mut self.settings)?;
-                        self.settings.queried = true;
-                        p.cursor = Some(
-                            self.diagnostic
-                                .core(session.open_cursor(prepared, &p.params))?,
-                        );
-                    }
-                    let cursor = p.cursor.as_mut().expect("opened cursor");
-                    let mut remaining = if max == 0 { usize::MAX } else { max as usize };
-                    while remaining > 0 && !cursor.is_exhausted() {
-                        // GD-0061 R3-310: fetch unreleased, release, then encode.
-                        let chunk = self.diagnostic.core(session.fetch_cursor_unreleased(
-                            cursor,
-                            remaining.min(CURSOR_ROWS),
-                            CURSOR_BYTES,
-                        ))?;
-                        let chunk = self.diagnostic.core(session.release_page(chunk))?;
-                        let result = chunk.map(|rows| SqlResult {
-                            rows,
-                            ..SqlResult::default()
-                        });
-                        let count = result.get().rows.len();
-                        rows(
-                            &self.settings.current,
-                            session.zone().unwrap_or(SessionZone::Fixed(0)),
-                            &result,
-                            &p.s.d,
-                            &p.formats,
-                            0,
-                            count,
-                            out,
-                        )?;
-                        p.at += count;
-                        remaining -= count;
-                        flush_output(&self.output, out)?;
-                    }
-                    if cursor.is_exhausted() {
-                        catalog_complete(p.at, out)?;
-                    } else {
-                        frame(b's', &[], out)?;
-                    }
-                    return Ok(true);
-                }
-                if p.result.is_some() && p.s.d.columns.is_empty() {
-                    return Err("55000");
-                }
-                if p.result.is_none() {
-                    let command = prepared.command();
-                    read_only_check(prepared.row_lock_command().filter(|_| !prepared.row_lock_tables().is_empty()).unwrap_or_else(|| prepared.write_tables().first().map_or(command, |(_, command)| *command)), &self.settings, session, &mut self.diagnostic)?;
-                    if needs_implicit_transaction(prepared) {
-                        begin_implicit(session, &mut self.implicit, &mut self.settings)?;
-                    }
-                    if needs_implicit_transaction(prepared) {
-                        self.settings.queried = true;
-                    }
-                    let (result, spilled) = if command == "BEGIN" && self.implicit {
-                        self.implicit = false;
-                        (Released::synthetic(SqlResult::default()), None)
-                    } else {
-                        self.diagnostic.core(session.sync_replication_role(&self.settings))?;
-                        // GD-0061 R3-310: the whole result is released once,
-                        // here. A task session's spill never reaches this
-                        // handle: core materialises it behind the release tag.
-                        let (result, spilled) = giggles_core::relational::spill::streaming(
-                            || session.execute_prepared_unreleased(prepared, &p.params));
-                        self.retain_durability_permits |= spilled.is_some();
-                        let result = self.diagnostic.core(result)?;
-                        (self.diagnostic.core(session.release_page(result))?, spilled)
-                    };
-                    if !session.in_transaction() {
-                        self.implicit = false;
-                    }
-                    self.settings.transaction(
-                        was_transaction,
-                        session.in_transaction(),
-                        prepared.command(),
-                    );
-                    let bytes = serde_json::to_vec(result.get()).map_err(|_| "54000")?.len();
-                    if retained.checked_add(bytes).ok_or("54000")? > MAX_RESPONSE {
-                        return Err("54000");
-                    }
-                    // Admit retained bytes before caching OR appending any rows.
-                    p.result = Some(result);
-                    p.spilled = spilled;
-                } else {
-                    revalidate(session, p.at, &mut self.diagnostic)?;
-                }
-                if let Some(spilled) = p.spilled.as_mut() {
-                    // A task session's spill is materialised behind its
-                    // release tag (core), so a spill handle only ever holds
-                    // the rows of a plain session (GD-0061 R3-314).
-                    if session.task().is_some() {
-                        return Err("XX000");
-                    }
-                    // Stream spilled rows like a cursor; an exhausted handle replays completion.
-                    let mut remaining = if max == 0 { usize::MAX } else { max as usize };
-                    while remaining > 0 && !spilled.is_empty() {
-                        let chunk = spilled.by_ref().take(remaining.min(CURSOR_ROWS))
-                            .collect::<Result<Vec<_>, _>>();
-                        // Released as a plain session's release is: a move.
-                        let chunk = Released::synthetic(SqlResult { rows: self.diagnostic.core(chunk)?, ..SqlResult::default() });
-                        let count = chunk.get().rows.len();
-                        rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
-                            &chunk, &p.s.d, &p.formats, 0, count, out)?;
-                        p.at += count;
-                        remaining -= count;
-                        flush_output(&self.output, out)?;
-                    }
-                    if spilled.is_empty() {
-                        complete(prepared.command(), p.result.as_ref().expect("spilled result"), out)?;
-                    } else {
-                        frame(b's', &[], out)?;
-                    }
-                    if was_transaction && !session.in_transaction() {
-                        self.portals.clear();
-                    }
-                    return Ok(true);
-                }
-                let result = p.result.as_ref().unwrap();
-                let total = result.get().rows.len();
-                let end = if max == 0 {
-                    total
-                } else {
-                    p.at.saturating_add(max as usize).min(total)
-                };
-                rows(
-                    &self.settings.current,
-                    session.zone().unwrap_or(SessionZone::Fixed(0)),
-                    result,
-                    &p.s.d,
-                    &p.formats,
-                    p.at,
-                    end,
-                    out,
-                )?;
-                p.at = end;
-                if end < total {
-                    frame(b's', &[], out)?;
-                } else {
-                    complete(prepared.command(), result, out)?;
-                }
-                if was_transaction && !session.in_transaction() {
-                    self.portals.clear();
-                }
+                unreachable!("all portal plan variants have a dispatch path");
             }
             b'C' => {
                 let kind = r.byte()?;
@@ -3143,12 +3377,7 @@ impl State {
                 r.end()?;
                 match kind {
                     b'S' => {
-                        if let Some(statement) = self.statements.remove(&name)
-                            && !name.is_empty()
-                        {
-                            self.named_statement_bytes -= statement.sql_bytes;
-                        }
-                        debug_assert_eq!(self.named_statement_bytes, self.statements.iter().filter(|(name, _)| !name.is_empty()).map(|(_, statement)| statement.sql_bytes).sum::<usize>());
+                        self.remove_statement(&name);
                     }
                     b'P' => {
                         self.portals.remove(&name);
@@ -3451,6 +3680,7 @@ impl State {
             wire_detail: None,
             wire_context: None,
             wire_hint: None,
+            wire_registry_error: None,
             sql_detail: None,
             duplicate_key: None,
             duplicate_key_visible: None,
@@ -4514,7 +4744,7 @@ mod prepared_validation_tests {
         let d = session.sql.describe(&p).unwrap();
         Statement { id: 0, sequence_dependencies: Default::default(), parse_context: None,
             description_version: None, validated: None, constant_validations: 0,
-            sql_bytes: sql.len(), sql: sql.into(), declared_oids: vec![],
+            sql_bytes: sql.len(), origin: None, discarded: false, sql: sql.into(), declared_oids: vec![],
             p: Arc::new(Plan::Sql(Box::new(p))), d: Arc::new(d), parameter_oids: vec![], query_id: None }
     }
     fn wire_state() -> State {

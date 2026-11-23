@@ -88,7 +88,7 @@ fn split(tokens: Vec<Token>) -> R<Vec<Vec<Token>>> {
     Ok(arms)
 }
 
-pub(super) fn plan(tokens: Vec<Token>, gateway: bool) -> R<Option<Plan>> {
+pub(super) fn plan(tokens: Vec<Token>, gateway: bool, task: bool) -> R<Option<Plan>> {
     let arms = split(tokens)?;
     let mut scan = Scan::new();
     let mut projections = ProjectionParameters(false);
@@ -117,6 +117,9 @@ pub(super) fn plan(tokens: Vec<Token>, gateway: bool) -> R<Option<Plan>> {
         scan.ctes.clear();
         if let ControlFlow::Break(e) = statements.visit(&mut scan) {
             return Err(e);
+        }
+        if task && scan.prepared_statements {
+            return Err(Error::TaskRestrictedRelation);
         }
         let a::Statement::Query(q) = &statements[0] else {
             return Err(Error::Mutation);
@@ -183,6 +186,7 @@ pub(super) fn plan(tokens: Vec<Token>, gateway: bool) -> R<Option<Plan>> {
     let mut plan = finish_plan(query, compiler.parameters, projections.0)?;
     if let Some(plan) = &mut plan {
         plan.text_cast_parameters = text_casts.flags(plan.parameters);
+        plan.prepared_statements = scan.prepared_statements;
     }
     Ok(plan)
 }

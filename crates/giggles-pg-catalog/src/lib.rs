@@ -35,7 +35,7 @@ pub const BUILD_ID: &str = env!("GIGGLES_BUILD_ID");
 pub const CAPABILITIES: &str =
     "add_column_if_not_exists,role_session_termination,server_encoding,union_common_type";
 
-pub use engine::catalog_identifier;
+pub use engine::{catalog_identifier, resolve_type_names};
 pub use engine::explain::{ExplainQuery, explain_query, explain_statement};
 /// Quote an identifier for PostgreSQL plan text using the catalog's rules.
 pub fn quote_explain_identifier(name: &str) -> String { catalog::quote_identifier(name) }
@@ -43,7 +43,7 @@ mod engine;
 pub mod privilege_inquiry;
 pub use engine::{
     Plan, application_read_hint, describe, execute, execute_with_startup, plan, plan_gateway,
-    plan_gateway_with_relations,
+    plan_gateway_with_relations, plan_task_gateway,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +171,19 @@ pub struct UserType {
     pub not_null: bool,
     pub labels: Vec<String>,
 }
+/// A prepared statement visible only to its owning session.
+#[derive(Debug, Clone)]
+pub struct PreparedStatementRow {
+    pub name: String,
+    pub statement: String,
+    pub prepare_time: i64,
+    pub parameter_types: Vec<u32>,
+    pub result_types: Option<Vec<u32>>,
+    pub from_sql: bool,
+    pub generic_plans: i64,
+    pub custom_plans: i64,
+}
+
 /// The caller must supply a coherent, freshly authorized set, including on repeated Execute.
 /// Roles include exactly one bootstrap role (OID 10); predefined PostgreSQL roles
 /// are supplied by the catalog. Ownership references snapshot roles, with omitted
@@ -195,6 +208,8 @@ pub struct CatalogSnapshot {
     pub comments: std::collections::BTreeMap<(u64, u64), String>,
     /// Current wire backend identity, supplied by the host (0 in offline snapshots).
     pub backend_pid: i32,
+    /// Named prepared statements supplied by the host for the current session.
+    pub prepared_statements: Vec<PreparedStatementRow>,
     /// Granted relation locks supplied by the engine: (transaction, table ID, pid, mode, fastpath).
     pub table_locks: Vec<(u64, u64, i32, String, bool)>,
     /// Optional explicit Unix second for deterministic timezone presentation.
@@ -256,6 +271,7 @@ impl Default for CatalogSnapshot {
             column_identities: Default::default(), primary_names: Default::default(),
             comments: Default::default(),
             backend_pid: 0,
+            prepared_statements: Vec::new(),
             table_locks: Vec::new(),
             timezone_now: None,
             timezone: giggles_pg_types::temporal::SessionZone::Fixed(0),
@@ -328,6 +344,8 @@ pub enum PgType {
     Float8,
     /// Metadata descriptor for finite catalog handler OIDs, not a routine registry.
     Regproc,
+    Regtype,
+    RegtypeArray,
     /// Metadata descriptor only; non-NULL wire I/O is unsupported.
     PgNodeTree,
     /// Metadata descriptor only; missing-value arrays are always NULL.
@@ -370,6 +388,8 @@ impl PgType {
             Self::Float4 => 700,
             Self::Float8 => 701,
             Self::Regproc => 24,
+            Self::Regtype => 2206,
+            Self::RegtypeArray => 2211,
             Self::PgNodeTree => 194,
             Self::AnyArray => 2277,
             Self::PgLsn => 3220,
@@ -381,7 +401,7 @@ impl PgType {
         match self {
             Self::Bool | Self::Char => 1,
             Self::Int2 => 2,
-            Self::Int4 | Self::Oid | Self::Xid | Self::Float4 | Self::Regproc => 4,
+            Self::Int4 | Self::Oid | Self::Xid | Self::Float4 | Self::Regproc | Self::Regtype => 4,
             Self::Int8 | Self::Float8 | Self::PgLsn | Self::TimestampTz => 8,
             Self::Name => 64,
             Self::Interval => 16,
@@ -397,6 +417,7 @@ impl PgType {
             Self::Int4Array => Self::Int4,
             Self::Int8Array => Self::Int8,
             Self::OidArray => Self::Oid,
+            Self::RegtypeArray => Self::Regtype,
             Self::TextArray => Self::Text,
             Self::NameArray => Self::Name,
             Self::BoolArray => Self::Bool,
@@ -415,6 +436,7 @@ pub enum Value {
     Bytes(Vec<u8>),
     Array(Vec<Value>),
     Record(Vec<Value>),
+    Regtype(u32, String),
     Numeric(giggles_pg_types::Numeric),
     Float4(giggles_pg_types::Float4),
     Float8(giggles_pg_types::Float8),
@@ -428,7 +450,7 @@ impl Value {
             Self::Numeric(v) => v.to_string().len(),
             Self::Float4(_) | Self::Float8(_) => 32,
             // Includes quoting/escaping when the value is nested in a PG text array.
-            Self::Text(s) => s.len() * 2 + 8,
+            Self::Text(s) | Self::Regtype(_, s) => s.len() * 2 + 8,
             Self::Bytes(b) => b.len() * 2 + 6,
             Self::Array(v) | Self::Record(v) => {
                 v.iter().map(Self::bytes).sum::<usize>() + v.len() * 4 + 8
@@ -453,6 +475,7 @@ pub enum Error {
     Syntax,
     Unsupported,
     MixedRelations,
+    TaskRestrictedRelation,
     Mutation,
     UnknownColumn,
     UnknownRelation(String),
@@ -463,13 +486,22 @@ pub enum Error {
     Parameters,
     InvalidSnapshot,
     InvalidPrivilege(String),
+    InvalidTypeModifier(String),
+    TypeModifierNotAllowed(String),
+    TypeNameSyntax { near: &'static str, input: Option<String> },
     Limit,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Self::UnknownRole(name) = self { return write!(f, "role \"{name}\" does not exist"); }
-        if let Self::InvalidPrivilege(message) = self {
+        if let Self::InvalidPrivilege(message) | Self::InvalidTypeModifier(message) = self {
             return f.write_str(message);
+        }
+        if let Self::TypeModifierNotAllowed(name) = self {
+            return write!(f, r#"type modifier is not allowed for type "{name}""#);
+        }
+        if let Self::TypeNameSyntax { near, .. } = self {
+            return write!(f, r#"syntax error at or near "{near}""#);
         }
         write!(f, "catalog {self:?}")
     }

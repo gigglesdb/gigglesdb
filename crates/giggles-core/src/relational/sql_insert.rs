@@ -672,7 +672,7 @@ impl Insert {
             .map(|row| row.values.into_iter().map(Expr::Literal).collect()).collect();
         page
     }
-    pub(super) fn sequence_dependencies(&self) -> Vec<Option<String>> {
+    pub(super) fn sequence_dependencies(&self) -> Vec<SequenceDependency> {
         let mut dependencies = self
             .source
             .as_ref()
