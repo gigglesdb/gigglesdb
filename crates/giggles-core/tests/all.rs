@@ -595,3 +595,5 @@ mod sql_catalog_scale;
 
 #[path = "truncated_clauses.rs"]
 mod truncated_clauses;
+
+#[path = "ddl_scale_probe.rs"] mod ddl_scale_probe;

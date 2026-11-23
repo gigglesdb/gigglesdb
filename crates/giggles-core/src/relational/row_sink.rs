@@ -74,6 +74,12 @@ pub(crate) trait RowSink {
             Ok(())
         })
     }
+    /// Whether this sink keeps exact FK parent lookups stable during a DDL
+    /// statement. The first lookup must still perform all checks and locks.
+    fn stable_fk_ddl_reads(&self) -> bool {
+        false
+    }
+
     /// `read_page` of referencing rows queued for a NO ACTION check, read like
     /// `fk_lookup`'s referencing rows.
     fn fk_read_page(
@@ -468,7 +474,7 @@ impl Relational {
         let collated = self.tables.values().any(|t| self.has_nondeterministic_keys(t))
             || matches!(&prepared.statement, Statement::CreateIndex(i) if i.collations.iter().any(Option::is_some));
         if index_build && sink.streams_index_builds() && !collated {
-            let old = sink.indexes();
+            let old: BTreeSet<_> = sink.indexes().iter().map(|index| index.id).collect();
             let result = self
                 .execute_statement_inner(
                     prepared,
@@ -481,7 +487,7 @@ impl Relational {
                 )
                 .map_err(CoreError::Sql)?;
             for index in self.secondary_descriptors_engine() {
-                if !old.iter().any(|old| old.id == index.id) {
+                if !old.contains(&index.id) {
                     let table = self
                         .tables
                         .values()
@@ -717,18 +723,31 @@ impl Relational {
             }
         }
         let write_targets = constraint_rows::write_targets(self, prepared, &edges);
+        // This ALTER adds metadata without rewriting either row image. A
+        // successful exact parent lookup can serve later passes over the same
+        // FK edge while the sink holds the DDL and parent-key locks.
+        let stable_fk = matches!(&prepared.statement, Statement::AlterTable(alter)
+            if matches!(alter.actions.as_slice(), [alter_table::Action::Constraint(
+                constraints::Definition::ForeignKey { .. }
+            )])) && sink.stable_fk_ddl_reads();
+        let mut parent_probes = stable_fk.then(constraint_rows::ParentProbes::default);
         if writing && actions.is_none() {
-            while hydrate(
-                &self.clone(),
-                &edges,
-                &mut before,
-                self,
-                sink,
-                &mut retention,
-                append,
-                &write_targets,
-            )? > 0
-            {}
+            loop {
+                let seeds = (!stable_fk).then(|| self.clone());
+                if hydrate_with_probes(
+                    seeds.as_ref(),
+                    &edges,
+                    &mut before,
+                    self,
+                    sink,
+                    &mut retention,
+                    append,
+                    &write_targets,
+                    parent_probes.as_mut(),
+                )? == 0 {
+                    break;
+                }
+            }
         }
         rebuild(&mut before, &sink.indexes())?;
         rebuild(self, &sink.indexes())?;
@@ -811,16 +830,18 @@ impl Relational {
                     Some(&mut |state, old| {
                         let result = (|| {
                             loop {
-                                let seeds = state.clone();
-                                if hydrate(
-                                    &seeds,
-                                    &seeds.ext.constraints,
+                                let seeds = (!stable_fk).then(|| state.clone());
+                                let ext = state.ext.clone();
+                                if hydrate_with_probes(
+                                    seeds.as_ref(),
+                                    &ext.constraints,
                                     old,
                                     state,
                                     sink,
                                     &mut retention,
                                     append,
                                     &write_targets,
+                                    parent_probes.as_mut(),
                                 )? == 0
                                 {
                                     break;
@@ -853,6 +874,12 @@ impl Relational {
             ));
         }
         if writing {
+            let mut after_tables = BTreeMap::new();
+            for table in self.tables.values() {
+                after_tables.entry(table.id).or_insert(table);
+            }
+            let same_indexes =
+                before.secondary_descriptors_engine() == self.secondary_descriptors_engine();
             for table in before.tables.values() {
                 if append && prepared.table() == Some(before.table_key(table).as_str()) {
                     continue;
@@ -860,11 +887,8 @@ impl Relational {
                 let old = &before.rows[&table.id];
                 let empty = BTreeMap::new();
                 let after = self.rows.get(&table.id).unwrap_or(&empty);
-                let after_table = self.tables.values().find(|t| t.id == table.id);
-                if old == after
-                    && after_table == Some(table)
-                    && before.secondary_descriptors_engine() == self.secondary_descriptors_engine()
-                {
+                let after_table = after_tables.get(&table.id).copied();
+                if old == after && after_table == Some(table) && same_indexes {
                     continue;
                 }
                 if collated && after_table == Some(table) { sink.check_occupancy(table, old, after)?; }
@@ -883,9 +907,14 @@ impl Relational {
             }
         }
         if writing {
-            for table in self.tables.values().filter(|t|!before.tables.values().any(|old|old.id==t.id)) {
-                let rows=&self.rows[&table.id];
-                if !rows.is_empty() {sink.apply(table,&BTreeMap::new(),rows)?;}
+            debug_assert!(before.rows.keys().copied().eq(
+                before.tables.values().map(|table| table.id).collect::<BTreeSet<_>>()
+            ));
+            for table in self.tables.values() {
+                let rows = &self.rows[&table.id];
+                if !rows.is_empty() && !before.rows.contains_key(&table.id) {
+                    sink.apply(table, &BTreeMap::new(), rows)?;
+                }
             }
         }
         if let Some(deferred) = deferred {
@@ -955,7 +984,7 @@ mod constraint_rows;
 mod paged_dml;
 #[path = "row_sink_insert.rs"]
 mod paged_insert;
-use constraint_rows::{hydrate, paged_pending, rebuild};
+use constraint_rows::{hydrate, hydrate_with_probes, paged_pending, rebuild};
 
 #[cfg(test)]
 mod tests {

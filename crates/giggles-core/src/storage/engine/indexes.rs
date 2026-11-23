@@ -71,6 +71,11 @@ pub(crate) fn decode_descriptor(bytes: &[u8]) -> Result<Descriptor, CoreError> {
 }
 pub(crate) fn validate_descriptor(d: &Descriptor, table: &TableDef) -> Result<(), CoreError> {
     decode_descriptor(&encode_descriptor(d)?)?;
+    validate_descriptor_columns(d, table)
+}
+
+/// Cross-record checks for a descriptor that has already passed decoding.
+pub(super) fn validate_descriptor_columns(d: &Descriptor, table: &TableDef) -> Result<(), CoreError> {
     if d.table != table.id
         || d.columns.iter().enumerate().any(|(i, id)| {
             d.columns[..i].contains(id) || !table.columns.iter().any(|c| c.id == *id)

@@ -218,7 +218,7 @@ fn private_ddl_bypasses_cache_through_partial_and_complete_savepoint_rollback() 
     let rolled = catalog.snapshot(&mut own).unwrap();
     assert_eq!(rolled.image().unwrap().tables["private"].columns.len(), 1);
     assert!(!Arc::ptr_eq(&rolled, &private));
-    assert!(!Arc::ptr_eq(&rolled, &catalog.snapshot(&mut own).unwrap()));
+    assert!(Arc::ptr_eq(&rolled, &catalog.snapshot(&mut own).unwrap()));
     let mut other = txn(&seq, &locks, 3);
     assert!(Arc::ptr_eq(
         &committed,

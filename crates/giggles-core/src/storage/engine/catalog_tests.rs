@@ -1296,7 +1296,7 @@ fn referenced_key_and_birth_catalog_roundtrip_and_validation() {
     let loaded = load(records.clone()).unwrap();
     assert_eq!(loaded.by_id[&p].primary_index_birth, Some(birth));
     assert_eq!(loaded.parts(), parts);
-    assert_eq!(CatalogSnapshot::new(&loaded).allocation_floor().unwrap(), birth + 1);
+    assert_eq!(CatalogSnapshot::new(&loaded, None).allocation_floor().unwrap(), birth + 1);
     for id in [parts.indexes.iter().find(|d| d.name == "wrong").unwrap().id, 999] {
         let mut bad = parts.clone();
         let constraint = &mut bad.ext.constraints.get_mut(&c).unwrap()[0];

@@ -743,7 +743,7 @@ fn post_image_invalid_constraint_is_corrupt() {
         .unwrap();
     foreign_key[0] = u64::MAX;
     assert!(matches!(
-        check_post_image(&tables, &ext, next_id),
+        check_post_image(Arc::new(tables), ext, next_id),
         Err(CoreError::Corrupt(message)) if message.starts_with("v2 DDL produced an invalid catalog: ")
     ));
 }
@@ -752,7 +752,7 @@ fn post_image_invalid_constraint_is_corrupt() {
 fn post_image_check_is_valid() {
     let (tables, ext, next_id, _) =
         created_catalog("CREATE TABLE t (id bigint PRIMARY KEY, n bigint CHECK (n > 0))");
-    check_post_image(&tables, &ext, next_id).unwrap();
+    check_post_image(Arc::new(tables), ext, next_id).unwrap();
 }
 
 #[test]
@@ -768,14 +768,14 @@ fn post_image_text_backed_column_types_are_valid() {
     ] {
         let (tables, ext, next_id, _) =
             created_catalog(&format!("CREATE TABLE t (id bigint PRIMARY KEY, v {ty})"));
-        check_post_image(&tables, &ext, next_id).unwrap();
+        check_post_image(Arc::new(tables), ext, next_id).unwrap();
     }
 }
 
 #[test]
 fn post_image_primary_key_is_valid() {
     let (tables, ext, next_id, _) = created_catalog("CREATE TABLE t (id bigint PRIMARY KEY)");
-    check_post_image(&tables, &ext, next_id).unwrap();
+    check_post_image(Arc::new(tables), ext, next_id).unwrap();
 }
 
 #[test]
@@ -2185,4 +2185,145 @@ fn catalog_scale_main_shaped_sequences_preserve_feature_word() {
     f.reopen();
     f.execute("INSERT INTO ordinary VALUES (1)");
     assert_eq!(features(&f), old);
+}
+
+#[test]
+fn ddl_rejects_duplicate_index_and_missing_fk_column() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE parent(id int PRIMARY KEY)");
+    f.execute("CREATE TABLE child(id int PRIMARY KEY, parent_id int)");
+    f.execute("CREATE INDEX child_parent_idx ON child(parent_id)");
+    let mut session = f.admin().sql_session();
+    let before = f.parts();
+    assert_eq!(before.indexes.len(), 1);
+    session
+        .execute("CREATE INDEX child_parent_idx ON child(id)", &[], None)
+        .unwrap_err();
+    f.db().catalog().assert_current_matches_reload();
+    assert_eq!(f.parts(), before);
+
+    let statement = "ALTER TABLE child ADD CONSTRAINT child_parent_fk FOREIGN KEY(parent_id) REFERENCES parent(missing)";
+    let error = session.execute(statement, &[], None).unwrap_err();
+    assert_eq!(crate::sqlstate(&error), "42703", "{statement}: {error:?}");
+    f.db().catalog().assert_current_matches_reload();
+    assert_eq!(f.parts(), before);
+}
+
+#[test]
+fn ddl_rejects_a_post_image_with_a_dangling_column_collation() {
+    let f = Fixture::new();
+    f.execute("CREATE SCHEMA collation_schema");
+    f.execute("CREATE COLLATION collation_schema.local_c FROM \"C\"");
+    f.execute("CREATE TABLE t(id int PRIMARY KEY, label text COLLATE collation_schema.local_c)");
+    let before = f.parts();
+    let error = f
+        .admin()
+        .sql_session()
+        .execute("DROP SCHEMA collation_schema CASCADE", &[], None)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CoreError::Corrupt(ref message) if message.starts_with("v2 DDL produced an invalid catalog: ")
+    ), "{error:?}");
+    f.db().catalog().assert_current_matches_reload();
+    assert_eq!(f.parts(), before);
+}
+
+#[test]
+fn mixed_sql_ddl_catalog_publication_matches_durable_reload() {
+    let f = Fixture::new();
+    let mut session = f.admin().sql_session();
+    let run = |session: &mut SqlSession, sql| {
+        session.execute(sql, &[], None).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        f.db().catalog().assert_current_matches_reload();
+    };
+    for sql in [
+        "CREATE SCHEMA ddl_test",
+        "CREATE TABLE ddl_test.parent(id serial PRIMARY KEY)",
+        "CREATE TABLE ddl_test.child(id int PRIMARY KEY, parent_id int)",
+        "COMMENT ON TABLE ddl_test.child IS 'child table'",
+        "COMMENT ON COLUMN ddl_test.child.parent_id IS 'parent reference'",
+        "CREATE INDEX parent_lookup ON ddl_test.child(parent_id)",
+        "ALTER TABLE ddl_test.child ADD CONSTRAINT child_parent_fk FOREIGN KEY(parent_id) REFERENCES ddl_test.parent(id)",
+        "ALTER TABLE ddl_test.child ADD COLUMN extra int",
+        "ALTER TABLE ddl_test.child RENAME COLUMN extra TO renamed",
+        "BEGIN",
+        "ALTER TABLE ddl_test.child DROP CONSTRAINT child_parent_fk",
+        "DROP INDEX ddl_test.parent_lookup",
+        "ALTER TABLE ddl_test.child DROP COLUMN parent_id",
+        "COMMIT",
+        "ALTER TABLE ddl_test.child RENAME TO renamed_child",
+        "BEGIN",
+        "DROP TABLE ddl_test.renamed_child",
+        "CREATE TABLE ddl_test.renamed_child(id int PRIMARY KEY)",
+        "COMMIT",
+    ] {
+        run(&mut session, sql);
+    }
+
+    let before = f.parts();
+    run(&mut session, "BEGIN");
+    run(&mut session, "ALTER TABLE ddl_test.renamed_child ADD COLUMN rolled_back int");
+    session
+        .execute("ALTER TABLE ddl_test.renamed_child DROP COLUMN missing", &[], None)
+        .unwrap_err();
+    f.db().catalog().assert_current_matches_reload();
+    run(&mut session, "ROLLBACK");
+    assert_eq!(f.parts(), before);
+
+    for sql in [
+        "BEGIN",
+        "SAVEPOINT before_ddl",
+        "ALTER TABLE ddl_test.renamed_child ADD COLUMN savepoint_column int",
+        "ROLLBACK TO SAVEPOINT before_ddl",
+        "COMMIT",
+    ] {
+        run(&mut session, sql);
+    }
+    assert_eq!(f.parts(), before);
+    for sql in [
+        "DROP TABLE ddl_test.renamed_child",
+        "DROP TABLE ddl_test.parent",
+        "DROP SCHEMA ddl_test",
+    ] {
+        run(&mut session, sql);
+    }
+}
+
+#[test]
+fn waiting_sql_ddl_catalog_publication_matches_durable_reload() {
+    use std::time::{Duration, Instant};
+
+    let f = Fixture::new();
+    f.execute("CREATE TABLE a(id int PRIMARY KEY)");
+    f.db().catalog().assert_current_matches_reload();
+    f.execute("CREATE TABLE b(id int PRIMARY KEY)");
+    f.db().catalog().assert_current_matches_reload();
+    std::thread::scope(|scope| {
+        let mut first = f.admin().sql_session();
+        for sql in ["BEGIN", "ALTER TABLE a ADD COLUMN first_change int"] {
+            first.execute(sql, &[], None).unwrap();
+            f.db().catalog().assert_current_matches_reload();
+        }
+
+        // Even on another table, the second DDL waits for the catalog barrier.
+        let other = scope.spawn(|| {
+            f.execute("ALTER TABLE b ADD COLUMN second_change int");
+            f.db().catalog().assert_current_matches_reload();
+        });
+        let until = Instant::now() + Duration::from_secs(10);
+        while first.v2_transaction.as_ref().unwrap().sql_waiting_count() == 0 {
+            assert!(!other.is_finished(), "second DDL did not wait");
+            assert!(Instant::now() < until, "second DDL never reached the barrier");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        f.db().catalog().assert_current_matches_reload();
+        first.execute("COMMIT", &[], None).unwrap();
+        f.db().catalog().assert_current_matches_reload();
+        other.join().unwrap();
+    });
+
+    let parts = f.parts();
+    assert_eq!(parts.tables["a"].columns[1].name, "first_change");
+    assert_eq!(parts.tables["b"].columns[1].name, "second_change");
 }

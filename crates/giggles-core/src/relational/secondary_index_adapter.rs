@@ -285,19 +285,20 @@ fn admit(
         shape(*w)?;
     }
     descriptors(state, ds, cancel)?;
+    let indexed_tables: BTreeSet<_> = ds.iter().map(|descriptor| descriptor.table).collect();
     let mut rows = 0;
     for (id, map) in &state.rows {
-        if referenced(ds, *id) {
+        if indexed_tables.contains(id) {
             rows = add(rows, map.len())?;
             cap(rows, si::MAX_ROWS)?;
         }
     }
     // The new row may replace an old row; reserve conservatively only on insert.
-    if overlay.old.is_none() && overlay.new.is_some_and(|w| referenced(ds, w.table)) {
+    if overlay.old.is_none() && overlay.new.is_some_and(|w| indexed_tables.contains(&w.table)) {
         cap(add(rows, 1)?, si::MAX_ROWS)?;
     }
     for (id, map) in &state.rows {
-        if referenced(ds, *id) {
+        if indexed_tables.contains(id) {
             for (key, row) in map {
                 shape(Witness {
                     table: *id,
@@ -316,7 +317,7 @@ fn admit(
         }
     }
     for (id, map) in &state.rows {
-        if !referenced(ds, *id) {
+        if map.is_empty() || !indexed_tables.contains(id) {
             continue;
         }
         let t = table(state, *id)?;
@@ -335,7 +336,7 @@ fn admit(
     for (witness, size) in [(overlay.old, &mut old_size), (overlay.new, &mut new_size)] {
         if let Some(w) = witness {
             tick(cancel)?;
-            if referenced(ds, w.table) {
+            if indexed_tables.contains(&w.table) {
                 *size = row_size(table(state, w.table)?, w.key, w.row, ds)?;
                 max_pk = max_pk.max(w.key.len());
             }
@@ -418,9 +419,10 @@ fn snapshot(
     cancel: &mut impl FnMut() -> bool,
 ) -> R<Snapshot> {
     admit(state, ds, overlay, cancel)?;
+    let indexed_tables: BTreeSet<_> = ds.iter().map(|descriptor| descriptor.table).collect();
     let mut out = Vec::new();
     for (id, map) in &state.rows {
-        if !referenced(ds, *id) {
+        if map.is_empty() || !indexed_tables.contains(id) {
             continue;
         }
         let t = table(state, *id)?;
@@ -432,7 +434,7 @@ fn snapshot(
             out.push(encoded(t, key, row, ds, cancel)?);
         }
     }
-    if let Some(w) = overlay.new.filter(|w| referenced(ds, w.table)) {
+    if let Some(w) = overlay.new.filter(|w| indexed_tables.contains(&w.table)) {
         out.push(encoded(table(state, w.table)?, w.key, w.row, ds, cancel)?);
     }
     Ok(Snapshot(out))

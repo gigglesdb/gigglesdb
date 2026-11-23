@@ -589,6 +589,15 @@ impl Relational {
     #[allow(dead_code)] // Awaiting v2 catalog integration.
     pub(crate) fn catalog_image(
         tables: BTreeMap<String, TableDef>,
+        ext: CatalogExt,
+        next_id: u64,
+        next_version: u64,
+    ) -> R<Relational> {
+        Self::catalog_image_shared(Arc::new(tables), ext, next_id, next_version)
+    }
+
+    pub(crate) fn catalog_image_shared(
+        tables: Arc<BTreeMap<String, TableDef>>,
         mut ext: CatalogExt,
         next_id: u64,
         next_version: u64,
@@ -601,7 +610,7 @@ impl Relational {
                 .values()
                 .map(|table| (table.id, BTreeMap::new()))
                 .collect(),
-            tables: Arc::new(tables),
+            tables,
             ext: Arc::new(ext),
             next_id,
             next_version,

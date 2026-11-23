@@ -1148,7 +1148,6 @@ impl LockManager {
         state.key(&hashed).and_then(|s| s.holders.get(&txn)).copied().unwrap_or_default()
     }
 
-    #[cfg(debug_assertions)]
     pub(crate) fn holds_mode(&self, txn: TxnId, key: LockKey, mode: LockMode) -> bool {
         self.modes_for_key(txn, key).iter().any(|held| held == mode)
     }

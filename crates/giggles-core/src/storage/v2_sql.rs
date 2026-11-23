@@ -1227,7 +1227,7 @@ impl SqlSession {
                                 "v2 DDL exceeded ID reservation".into(),
                             ));
                         }
-                        check_post_image(&tables, &ext, next_id)?;
+                        let checked = check_post_image(image.tables.clone(), ext.clone(), next_id)?;
                         let heap = tables
                             .values()
                             .filter(|def| def.hidden_rowid().is_some())
@@ -1269,7 +1269,8 @@ impl SqlSession {
                                         .collect::<BTreeSet<_>>();
                                     old.indexes.iter().any(|index| !new_indexes.contains(&index.id))
                                 };
-                        db.catalog().apply_diff(txn, old, &new, &ids, None, &|| {
+                        let new = Arc::new(new);
+                        db.catalog().apply_sql_diff(txn, old, new.clone(), checked, &ids, &|| {
                             crate::cancellation::check().is_err()
                         })?;
                         roles::engine::assign_created(txn, old, &new, self.ddl_owner.as_deref())?;
@@ -1354,7 +1355,7 @@ fn commit_sql(
         return Err(CoreError::Storage("injected before commit".into()));
     }
     let reclaim = txn.reclaim_after_commit;
-    db.catalog().commit_ddl_with_tail(txn, release_admission)?;
+    db.catalog().commit_sql_ddl(txn, release_admission)?;
     if point == CrashPoint::AfterCommit {
         crash_now();
     }
@@ -1423,12 +1424,11 @@ pub(super) fn validate_pending(
 /// catalog changes. Unsupported features and invalid images must fail while the
 /// statement can still roll back without publishing an unenforced catalog.
 fn check_post_image(
-    tables: &BTreeMap<String, relational::TableDef>,
-    ext: &relational::catalog_ext::CatalogExt,
+    tables: Arc<BTreeMap<String, relational::TableDef>>,
+    ext: relational::catalog_ext::CatalogExt,
     next_id: u64,
-) -> Result<(), CoreError> {
-    relational::Relational::catalog_image(tables.clone(), ext.clone(), next_id, 1)
-        .map(|_| ())
+) -> Result<relational::Relational, CoreError> {
+    relational::Relational::catalog_image_shared(tables, ext, next_id, 1)
         .map_err(|error| match error {
             relational::SqlError::Unsupported => CoreError::EngineUnsupported {
                 engine: "v2",
@@ -1609,6 +1609,12 @@ impl RowSink for SqlRows<'_> {
         if let Some(error) = source.error.into_inner() { return Err(error); }
         result.map_err(CoreError::Sql)
     }
+    fn stable_fk_ddl_reads(&self) -> bool {
+        matches!(self.txn.services(), engine::txn::TxnServices::Local { locks, .. }
+            if self.txn.isolation() == Isolation::ReadCommitted
+                && locks.holds_mode(self.txn.id(), engine::locks::LockKey::Table(0), LockMode::AccessExclusive))
+    }
+
     // FK row locks (GD-0084 A2): Local child checks find latest parents, take
     // RowKey Shared (KEY SHARE), then read latest again. Fixed snapshots retain
     // their witnesses and crosscheck every committed version for key changes/deletes.

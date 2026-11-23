@@ -81,9 +81,9 @@ pub(crate) struct CatalogView {
     pub(crate) comments: BTreeMap<(u64, u64), String>,
     /// Kind 21 column labels: (table id, column id) -> flags (GD-0061 R3-307).
     pub(crate) column_labels: BTreeMap<(u64, u64), u8>,
-    pub(crate) by_name: BTreeMap<String, Arc<TableEntry>>,
+    pub(crate) by_name: Arc<BTreeMap<String, Arc<TableEntry>>>,
     pub(crate) by_id: BTreeMap<u64, Arc<TableEntry>>,
-    pub(crate) names: BTreeMap<String, u64>,
+    pub(crate) names: Arc<BTreeMap<String, u64>>,
     pub(crate) constraints: BTreeMap<u64, BTreeMap<u64, Constraint>>,
     pub(crate) sequences: BTreeMap<u64, SequenceDef>,
     pub(crate) types: BTreeMap<u64, TypeDef>,
@@ -216,6 +216,7 @@ impl CatalogView {
 /// mutated by a statement. Failed/cancelled construction is not cached.
 pub(crate) struct CatalogSnapshot {
     pub(crate) parts: CatalogParts,
+    checked_base: Option<Arc<relational::Relational>>,
     image: OnceLock<Arc<relational::Relational>>,
     cursor_image: OnceLock<Arc<relational::Relational>>,
     image_build: Mutex<()>,
@@ -225,9 +226,14 @@ pub(crate) struct CatalogSnapshot {
     roles_build: Mutex<()>,
 }
 impl CatalogSnapshot {
-    fn new(view: &CatalogView) -> Self {
+    fn new(view: &CatalogView, checked: Option<&CheckedCatalogParts>) -> Self {
+        let parts = view.parts();
+        let checked_base = checked
+            .filter(|checked| *checked.parts == parts)
+            .map(|checked| checked.base.clone());
         Self {
-            parts: view.parts(),
+            parts,
+            checked_base,
             image: OnceLock::new(),
             cursor_image: OnceLock::new(),
             image_build: Mutex::new(()),
@@ -270,12 +276,16 @@ impl CatalogSnapshot {
         if let Some(image) = self.image.get() {
             return Ok(image.clone());
         }
-        let mut image = relational::Relational::catalog_image(
-            self.parts.tables.clone(),
-            self.parts.ext.clone(),
-            u64::MAX,
-            u64::MAX,
-        )?;
+        let mut image = if let Some(base) = &self.checked_base {
+            base.catalog_image_for_statement(u64::MAX, u64::MAX)
+        } else {
+            relational::Relational::catalog_image(
+                self.parts.tables.clone(),
+                self.parts.ext.clone(),
+                u64::MAX,
+                u64::MAX,
+            )?
+        };
         image.catalog_indexes(&self.parts.indexes)?;
         image.catalog_views(&self.parts.sql_views)?;
         let image = Arc::new(image);
@@ -427,12 +437,28 @@ fn read_current_version(visible: Ts, version: &std::sync::atomic::AtomicU64) -> 
     (version != 0 && version <= visible.0).then_some(version)
 }
 
+struct CheckedCatalogParts {
+    parts: Arc<CatalogParts>,
+    // The row-free base passed the full post-DDL Relational::validate. The
+    // snapshot runs the ordinary index and view checks when its image is used.
+    base: Arc<relational::Relational>,
+}
+
+pub(super) struct PrivateCatalogSnapshot {
+    version: Ts,
+    generation: u64,
+    snapshot: Arc<CatalogSnapshot>,
+}
+
 /// One catalog and allocator are shared by all transactions of an engine.
 /// Callers must use transactions from the same sequencer and lock manager.
 /// The cache mutex also orders DDL commit, rebuild and publication. It is never
 /// held while waiting for a transaction lock.
 pub(crate) struct Catalog {
     cache: Mutex<CatalogCache>,
+    /// The exact inputs of a previously checked SQL diff. This is an encoding
+    /// proof only; it is never used to resolve names or to select a snapshot.
+    checked_parts: Mutex<Option<Arc<CheckedCatalogParts>>>,
     // Recovery observes this while holding the cause mutex. Catalog reload
     // records its cause with the cache mutex already held.
     poisoned: std::sync::atomic::AtomicBool,
@@ -474,6 +500,7 @@ impl Catalog {
         }
         Ok(Self {
             cache: Mutex::new(cache),
+            checked_parts: Mutex::new(None),
             poisoned: std::sync::atomic::AtomicBool::new(false),
             current: RwLock::new(None),
             current_version: Arc::new(std::sync::atomic::AtomicU64::new(visible.0)),
@@ -762,18 +789,35 @@ impl Catalog {
             return Ok(Arc::new(CatalogSnapshot::new(&overlay_view(
                 &view,
                 txn.catalog_writes(),
-            )?)));
+            )?, None)));
         };
         let (version, view) = &cache.versions[index];
         if txn.catalog_writes().next().is_some() {
+            if matches!(self.services, TxnServices::Local { .. }) {
+                let generation = txn.catalog_generation();
+                let mut private = txn.catalog_overlay.lock().map_err(|_| TxnError::Misuse)?;
+                if let Some(cached) = private.as_ref()
+                    && cached.version == *version && cached.generation == generation
+                {
+                    return Ok(cached.snapshot.clone());
+                }
+                let view = overlay_view(view, txn.catalog_writes())?;
+                let snapshot = self.make_snapshot(&view);
+                *private = Some(PrivateCatalogSnapshot {
+                    version: *version,
+                    generation,
+                    snapshot: snapshot.clone(),
+                });
+                return Ok(snapshot);
+            }
             return Ok(Arc::new(CatalogSnapshot::new(&overlay_view(
                 view,
                 txn.catalog_writes(),
-            )?)));
+            )?, None)));
         }
         let version = *version;
         let snapshot = cache.snapshots.entry(version)
-            .or_insert_with(|| Arc::new(CatalogSnapshot::new(view))).clone();
+            .or_insert_with(|| self.make_snapshot(view)).clone();
         if matches!(self.services, TxnServices::Local { .. })
             && cache.versions.last().is_some_and(|(latest, _)| *latest == version)
         {
@@ -783,6 +827,11 @@ impl Catalog {
         }
         Ok(snapshot)
     }
+    fn make_snapshot(&self, view: &CatalogView) -> Arc<CatalogSnapshot> {
+        let checked = self.checked_parts.lock().ok().and_then(|proof| proof.clone());
+        Arc::new(CatalogSnapshot::new(view, checked.as_deref()))
+    }
+
     /// Cluster gateways (GD-0075 P7-1): DDL committed through another gateway reaches this
     /// cache only here. When the catalog-generation token at `ts` differs from the one the
     /// version serving `ts` was loaded with, the catalog is reloaded at `ts` and published there.
@@ -895,11 +944,48 @@ impl Catalog {
         deadline: Option<Instant>,
         cancel: &dyn Fn() -> bool,
     ) -> Result<(), CoreError> {
+        self.apply_diff_inner(txn, old, new, ids, deadline, cancel, false)
+    }
+
+    pub(crate) fn apply_sql_diff(
+        &self,
+        txn: &mut Transaction,
+        old: &CatalogParts,
+        new: Arc<CatalogParts>,
+        validated_base: relational::Relational,
+        ids: &Range<u64>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), CoreError> {
+        let checked = self.checked_parts.lock().map_err(|_| TxnError::Misuse)?.clone();
+        let reuse = checked.as_ref().is_some_and(|checked| checked.parts.as_ref() == old);
+        self.apply_diff_inner(txn, old, &new, ids, None, cancel, reuse)?;
+        *self.checked_parts.lock().map_err(|_| TxnError::Misuse)? = Some(Arc::new(CheckedCatalogParts {
+            parts: new,
+            base: Arc::new(validated_base),
+        }));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_diff_inner(
+        &self,
+        txn: &mut Transaction,
+        old: &CatalogParts,
+        new: &CatalogParts,
+        ids: &Range<u64>,
+        deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+        reuse: bool,
+    ) -> Result<(), CoreError> {
         self.check().map_err(CoreError::from)?;
-        let old_records = parts_records(old)?;
-        let new_records = parts_records(new)?;
-        let old_ids = object_ids(old)?;
-        let new_ids = object_ids(new)?;
+        let skip = if reuse {
+            let own = txn.catalog_writes().map(|(key, _)| key.as_slice()).collect();
+            UnchangedRecords::between(old, new, &own)
+        } else {
+            UnchangedRecords::default()
+        };
+        let (old_records, old_ids) = encode_parts(old, &skip, reuse)?;
+        let (new_records, new_ids) = encode_parts(new, &skip, false)?;
         for (id, kind) in &new_ids {
             match old_ids.get(id) {
                 Some(old_kind) if old_kind != kind => {
@@ -1332,15 +1418,21 @@ impl Catalog {
 
     /// Retain the transaction (and therefore its locks) through cache publication.
     pub(crate) fn commit_ddl(&self, txn: Transaction) -> Result<Ts, TxnError> {
-        self.commit_ddl_inner(txn, None, None)
+        self.commit_ddl_inner(txn, None, None, false)
     }
-    pub(crate) fn commit_ddl_with_tail(&self, txn: Transaction, release_admission: Option<&mut dyn FnMut()>) -> Result<Ts, TxnError> {
-        self.commit_ddl_inner(txn, None, release_admission)
+    pub(crate) fn commit_sql_ddl(&self, txn: Transaction, release_admission: Option<&mut dyn FnMut()>) -> Result<Ts, TxnError> {
+        self.commit_ddl_inner(txn, None, release_admission, true)
     }
     pub(crate) fn commit_ddl_guarded(&self, txn: Transaction, guard: CommitGuard) -> Result<Ts, TxnError> {
-        self.commit_ddl_inner(txn, Some(guard), None)
+        self.commit_ddl_inner(txn, Some(guard), None, false)
     }
-    fn commit_ddl_inner(&self, mut txn: Transaction, guard: Option<CommitGuard>, release_admission: Option<&mut dyn FnMut()>) -> Result<Ts, TxnError> {
+    fn commit_ddl_inner(
+        &self,
+        mut txn: Transaction,
+        guard: Option<CommitGuard>,
+        release_admission: Option<&mut dyn FnMut()>,
+        sql: bool,
+    ) -> Result<Ts, TxnError> {
         fn finish(txn: Transaction, guard: Option<CommitGuard>, publish: impl FnOnce(Ts) -> Result<(), TxnError>) -> Result<Ts, TxnError> {
             match guard { Some(guard) => txn.commit_guarded(guard, publish), None => txn.commit_then(publish) }
         }
@@ -1433,6 +1525,22 @@ impl Catalog {
             self.current_version.store(0, std::sync::atomic::Ordering::Release);
             *self.current.write().map_err(|_| TxnError::Misuse)? = None;
         }
+        // The local cache mutex orders all SQL catalog writers. For an overlay
+        // whose entries have no user-type or view normalization, the same
+        // decoded records already form the view that a durable scan would see.
+        // Gateways still reload against the commit timestamp to include changes
+        // that were made outside this cache's publication mutex.
+        if sql && token.is_none()
+            && latest.types.is_empty() && final_view.types.is_empty()
+            && latest.sql_views.is_empty() && final_view.sql_views.is_empty()
+        {
+            return finish(txn, guard, |ts| {
+                cache.publish(ts, final_view);
+                self.current_version.store(ts.0, std::sync::atomic::Ordering::Release);
+                cache.prune(self.services.oldest_active(), ts);
+                Ok(())
+            });
+        }
         finish(txn, guard, |ts| {
             let state = match &self.services {
                 TxnServices::Local { seq, .. } => Some(&*seq.kv().causes),
@@ -1498,6 +1606,13 @@ impl Catalog {
         cache.prune(oldest, visible);
         Ok(())
     }
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn assert_current_matches_reload(&self) {
+        let cache = self.cache.lock().unwrap();
+        let (ts, current) = cache.versions.last().unwrap();
+        assert_eq!(current.as_ref(), &self.load_at(*ts).unwrap());
+    }
+
     #[cfg(test)]
     pub(crate) fn cache_versions(&self) -> Vec<Ts> {
         let cache = self.cache.lock().unwrap();
@@ -1655,7 +1770,7 @@ fn overlay_view<'a>(
     records: impl Iterator<Item = (&'a Vec<u8>, &'a Option<Vec<u8>>)>,
 ) -> Result<CatalogView, CoreError> {
     let mut view = base.clone();
-    let mut names = base.names.clone();
+    let mut names = (*base.names).clone();
     // Apply deletions before inserts so a transaction may reuse a dropped name.
     let records: Vec<_> = records.collect();
     for (key, value) in records.iter().filter(|(_, value)| value.is_none()) {
@@ -1758,10 +1873,14 @@ fn apply_record(
                     .entry(table)
                     .or_default()
                     .insert(id, constraint);
-            } else if let Some(cs) = view.constraints.get_mut(&table) {
-                cs.remove(&id);
+            } else if let std::collections::btree_map::Entry::Occupied(mut entry) =
+                view.constraints.entry(table)
+            {
+                entry.get_mut().remove(&id);
+                if entry.get().is_empty() {
+                    entry.remove();
+                }
             }
-            view.constraints.retain(|_, cs| !cs.is_empty());
         }
         CatalogKind::Sequence => {
             let id = decode_id(&key[1..])?;
@@ -1861,7 +1980,7 @@ fn finish_view(
     mut view: CatalogView,
     names: BTreeMap<String, u64>,
 ) -> Result<CatalogView, CoreError> {
-    view.by_name.clear();
+    let mut by_name = BTreeMap::new();
     catalog_codec::validate_comments(&view.comments, view.by_id.values().map(|entry| &entry.def), &view.sql_views)?;
     super::catalog_label_codec::validate_labels(&view.column_labels, view.by_id.values().map(|entry| &entry.def))?;
     if !view.sql_views.is_empty() {
@@ -1871,27 +1990,23 @@ fn finish_view(
     }
     let mut expected = BTreeMap::new();
     for entry in view.by_id.values_mut() {
-        let entry = Arc::make_mut(entry);
-        for column in &mut entry.def.columns {
-            if let Some(id) = entry
-                .columns_ext
-                .get(&column.id)
-                .and_then(|ext| ext.type_id)
-            {
-                column.data_type = view
-                    .types
-                    .get(&id)
-                    .ok_or_else(|| corrupt("column user type absent"))?
-                    .storage_type()
-                    .map_err(|_| corrupt("unsupported user type column"))?;
-                let ext = entry.columns_ext.get_mut(&column.id).unwrap();
-                ext.text_kind = match column.data_type {
-                    relational::DataType::Varchar => {
-                        Some(relational::catalog_ext::TextKind::Varchar)
-                    }
-                    relational::DataType::Bpchar => Some(relational::catalog_ext::TextKind::Bpchar),
-                    _ => None,
-                };
+        if entry.columns_ext.values().any(|ext| ext.type_id.is_some()) {
+            let entry = Arc::make_mut(entry);
+            for column in &mut entry.def.columns {
+                if let Some(id) = entry.columns_ext.get(&column.id).and_then(|ext| ext.type_id) {
+                    column.data_type = view
+                        .types
+                        .get(&id)
+                        .ok_or_else(|| corrupt("column user type absent"))?
+                        .storage_type()
+                        .map_err(|_| corrupt("unsupported user type column"))?;
+                    let ext = entry.columns_ext.get_mut(&column.id).unwrap();
+                    ext.text_kind = match column.data_type {
+                        relational::DataType::Varchar => Some(relational::catalog_ext::TextKind::Varchar),
+                        relational::DataType::Bpchar => Some(relational::catalog_ext::TextKind::Bpchar),
+                        _ => None,
+                    };
+                }
             }
         }
         if expected
@@ -1900,8 +2015,7 @@ fn finish_view(
         {
             return Err(corrupt("duplicate catalog relation name"));
         }
-        view.by_name
-            .insert(entry.def.name.clone(), Arc::new(entry.clone()));
+        by_name.insert(entry.def.name.clone(), entry.clone());
     }
     for (id, def) in &view.sql_views {
         let name = catalog_codec::sql_views::relation_name(def, &view.schemas)?;
@@ -1914,7 +2028,7 @@ fn finish_view(
             .by_id
             .get(&descriptor.table)
             .ok_or_else(|| corrupt("index table absent"))?;
-        super::indexes::validate_descriptor(descriptor, &table.def)?;
+        super::indexes::validate_descriptor_columns(descriptor, &table.def)?;
         if expected
             .insert(descriptor.name.clone(), descriptor.id)
             .is_some()
@@ -1944,7 +2058,8 @@ fn finish_view(
         object_ids(&parts)?;
         relational::catalog_ext::validate_key_targets(&parts.ext, parts.tables.values(), parts.indexes.iter(), u64::MAX).map_err(|_| corrupt("invalid referenced key or primary birth"))?;
     }
-    view.names = names;
+    view.by_name = Arc::new(by_name);
+    view.names = Arc::new(names);
     for (task, _) in view.task_credentials.values() {
         if !view.tasks.contains_key(task) {
             return Err(corrupt("credential task absent"));
@@ -2023,14 +2138,104 @@ fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreErro
     }
     Ok(result)
 }
-pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
-    catalog_codec::validate_comments(&parts.comments, parts.tables.values(), &parts.sql_views)?;
-    catalog_codec::sql_views::validate_catalog(parts)?;
-    relational::catalog_ext::validate_unique_indexes(parts.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))), parts.indexes.iter()).map_err(|_| corrupt("invalid UNIQUE backing index"))?;
-    relational::column_collations::validate_index_bindings(&parts.ext,&parts.indexes).map_err(|_|corrupt("invalid index collation binding"))?;
-    object_ids(parts)?;
-    relational::catalog_ext::validate_key_targets(&parts.ext, parts.tables.values(), parts.indexes.iter(), u64::MAX).map_err(|_| corrupt("invalid referenced key or primary birth"))?;
-    super::catalog_label_codec::validate_labels(&parts.column_labels, parts.tables.values())?;
+/// Shared inputs are safe to elide only after the complete old parts passed
+/// these same checks. Ownership, names and catalog-wide checks still run.
+#[derive(Default)]
+struct UnchangedRecords<'a> {
+    names: BTreeSet<&'a str>,
+    tables: BTreeSet<u64>,
+    constraints: BTreeSet<u64>,
+    indexes: BTreeSet<u64>,
+}
+
+impl<'a> UnchangedRecords<'a> {
+    fn between(old: &'a CatalogParts, new: &'a CatalogParts, own: &BTreeSet<&[u8]>) -> Self {
+        let mut unchanged = Self::default();
+        let owned_names: BTreeSet<_> = own
+            .iter()
+            .filter(|key| key.first() == Some(&3) && key.len() >= 2)
+            .map(|key| &key[1..key.len() - 1])
+            .collect();
+        let mut unchanged_defs = BTreeSet::new();
+        let has_own = |kind, first: u64, second: Option<u64>| {
+            let mut key = [0; 17];
+            key[0] = kind;
+            key[1..9].copy_from_slice(&first.to_be_bytes());
+            let len = if let Some(second) = second {
+                key[9..].copy_from_slice(&second.to_be_bytes());
+                17
+            } else {
+                9
+            };
+            own.contains(&key[..len])
+        };
+        for (name, table) in &old.tables {
+            let Some(next) = new.tables.get(name) else { continue; };
+            if table.id == next.id && !owned_names.contains(name.as_bytes()) {
+                unchanged.names.insert(name);
+            }
+            if next != table {
+                continue;
+            }
+            unchanged_defs.insert(table.id);
+            if !has_own(1, table.id, None)
+                && old.heap.contains(&table.id) == new.heap.contains(&table.id)
+                && old.ext.primary_index_birth.get(&table.id) == new.ext.primary_index_birth.get(&table.id)
+                && table.columns.iter().all(|column| {
+                    old.ext.columns.get(&column.id) == new.ext.columns.get(&column.id)
+                })
+            {
+                unchanged.tables.insert(table.id);
+            }
+            if let Some(constraints) = old.ext.constraints.get(&table.id)
+                && new.ext.constraints.get(&table.id) == Some(constraints)
+                && !constraints.iter().any(|c| has_own(4, table.id, Some(c.id)))
+            {
+                unchanged.constraints.insert(table.id);
+            }
+        }
+        let indexes: BTreeMap<_, _> = old.indexes.iter().map(|d| (d.id, d)).collect();
+        for index in &new.indexes {
+            let Some(previous) = indexes.get(&index.id) else { continue; };
+            if previous.name == index.name && !owned_names.contains(index.name.as_bytes()) {
+                unchanged.names.insert(&index.name);
+            }
+            if unchanged_defs.contains(&index.table)
+                && *previous == index
+                && !has_own(16, index.id, None)
+            {
+                unchanged.indexes.insert(index.id);
+            }
+        }
+        unchanged
+    }
+}
+
+type CatalogRecords = BTreeMap<Vec<u8>, Vec<u8>>;
+type ObjectIds = BTreeMap<u64, (u8, u64)>;
+
+pub(crate) fn parts_records(parts: &CatalogParts) -> Result<CatalogRecords, CoreError> {
+    encode_parts(parts, &UnchangedRecords::default(), false).map(|(records, _)| records)
+}
+
+fn encode_parts(
+    parts: &CatalogParts,
+    unchanged: &UnchangedRecords<'_>,
+    checked_old: bool,
+) -> Result<(CatalogRecords, ObjectIds), CoreError> {
+    // A checked old image is exactly equal to previously validated parts.
+    // Direct callers and every new image still run the catalog-wide checks.
+    if !checked_old {
+        catalog_codec::validate_comments(&parts.comments, parts.tables.values(), &parts.sql_views)?;
+        catalog_codec::sql_views::validate_catalog(parts)?;
+        relational::catalog_ext::validate_unique_indexes(parts.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))), parts.indexes.iter()).map_err(|_| corrupt("invalid UNIQUE backing index"))?;
+        relational::column_collations::validate_index_bindings(&parts.ext,&parts.indexes).map_err(|_|corrupt("invalid index collation binding"))?;
+    }
+    let ids = object_ids(parts)?;
+    if !checked_old {
+        relational::catalog_ext::validate_key_targets(&parts.ext, parts.tables.values(), parts.indexes.iter(), u64::MAX).map_err(|_| corrupt("invalid referenced key or primary birth"))?;
+        super::catalog_label_codec::validate_labels(&parts.column_labels, parts.tables.values())?;
+    }
     let mut records = BTreeMap::new();
     for (&(table, column), &flags) in &parts.column_labels {
         records.insert(
@@ -2044,11 +2249,13 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
             catalog_codec::encode_comment(text)?,
         );
     }
+    use std::borrow::Cow;
     let mut names = BTreeSet::new();
     for (id, view) in &parts.sql_views {
         let name = catalog_codec::sql_views::relation_name(view, &parts.ext.schemas)?;
-        if !names.insert(name.clone()) { return Err(CoreError::Sql(SqlError::Duplicate)); }
-        records.insert(name_key(&name), id.to_be_bytes().to_vec());
+        let key = name_key(&name);
+        if !names.insert(Cow::Owned(name)) { return Err(CoreError::Sql(SqlError::Duplicate)); }
+        records.insert(key, id.to_be_bytes().to_vec());
         records.insert(catalog_codec::sql_views::view_key(*id), catalog_codec::sql_views::encode_view(view)?);
     }
     let mut columns = BTreeSet::new();
@@ -2062,15 +2269,21 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
         if *name != relational::relation_key(schema, &def.name) {
             return Err(corrupt("catalog table name mismatch"));
         }
-        if !names.insert(name.clone()) { return Err(CoreError::Sql(SqlError::Duplicate)); }
+        if !names.insert(Cow::Borrowed(name.as_str())) {
+            return Err(CoreError::Sql(SqlError::Duplicate));
+        }
         table_ids.insert(def.id, def);
-        let ext = def
-            .columns
-            .iter()
-            .filter_map(|c| {
-                columns.insert(c.id);
-                parts.ext.columns.get(&c.id).map(|v| (c.id, v.clone()))
-            })
+        if !parts.ext.columns.is_empty() {
+            columns.extend(def.columns.iter().map(|c| c.id));
+        }
+        if !unchanged.names.contains(name.as_str()) {
+            records.insert(name_key(name), def.id.to_be_bytes().to_vec());
+        }
+        if unchanged.tables.contains(&def.id) {
+            continue;
+        }
+        let ext = def.columns.iter()
+            .filter_map(|c| parts.ext.columns.get(&c.id).map(|v| (c.id, v.clone())))
             .collect();
         let mut stored_def = def.clone();
         stored_def.name = name.clone();
@@ -2083,7 +2296,6 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
         let value = encode_entry(&entry)?;
         decode_entry(&value)?;
         records.insert(table_key(def.id), value);
-        records.insert(name_key(name), def.id.to_be_bytes().to_vec());
     }
     if parts.heap.iter().any(|id| !table_ids.contains_key(id))
         || parts.ext.columns.keys().any(|id| !columns.contains(id))
@@ -2092,6 +2304,9 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
     }
     for (table, cs) in &parts.ext.constraints {
         let def = table_ids.get(table).ok_or_else(|| corrupt("constraint table absent"))?;
+        if unchanged.constraints.contains(table) {
+            continue;
+        }
         for c in cs {
             let value = catalog_codec::encode_constraint(c, &def.name)?;
             catalog_codec::decode_constraint(&value, def)?;
@@ -2100,21 +2315,28 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
     }
     for descriptor in &parts.indexes {
         let table = table_ids.get(&descriptor.table).ok_or_else(|| corrupt("index table absent"))?;
-        super::indexes::validate_descriptor(descriptor, table)?;
-        if !names.insert(descriptor.name.clone()) {
+        let changed = !unchanged.indexes.contains(&descriptor.id);
+        if changed {
+            super::indexes::validate_descriptor(descriptor, table)?;
+        }
+        if !names.insert(Cow::Borrowed(descriptor.name.as_str())) {
             return Err(CoreError::Sql(SqlError::Duplicate));
         }
-        records.insert(
-            super::indexes::descriptor_key(descriptor.id),
-            super::indexes::encode_descriptor(descriptor)?,
-        );
-        records.insert(
-            name_key(&descriptor.name),
-            descriptor.id.to_be_bytes().to_vec(),
-        );
+        if changed {
+            records.insert(
+                super::indexes::descriptor_key(descriptor.id),
+                super::indexes::encode_descriptor(descriptor)?,
+            );
+        }
+        if !unchanged.names.contains(descriptor.name.as_str()) {
+            records.insert(
+                name_key(&descriptor.name),
+                descriptor.id.to_be_bytes().to_vec(),
+            );
+        }
     }
     for (id, def) in &parts.ext.sequences {
-        if !names.insert(def.name.clone()) {
+        if !names.insert(Cow::Borrowed(def.name.as_str())) {
             return Err(CoreError::Sql(SqlError::Duplicate));
         }
         let value = catalog_codec::encode_sequence(def)?;
@@ -2143,7 +2365,7 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
             catalog_codec::encode_schema(schema)?,
         );
     }
-    Ok(records)
+    Ok((records, ids))
 }
 
 fn validate_definition(def: &TableDef) -> Result<(), SqlError> {

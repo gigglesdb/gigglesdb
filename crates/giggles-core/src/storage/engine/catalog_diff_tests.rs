@@ -528,3 +528,65 @@ fn diff_rejects_ids_outside_reservation_without_buffering_writes() {
         tx.rollback();
     }
 }
+
+#[test]
+fn diff_rejects_a_tampered_unchanged_catalog_part() {
+    let (_, seq, locks, catalog) = setup();
+    let ids = catalog.reserve_ids(5).unwrap();
+    let before = Arc::new(serial_parts(&ids));
+    let checked = relational::Relational::catalog_image(
+        before.tables.clone(),
+        before.ext.clone(),
+        ids.end,
+        1,
+    )
+    .unwrap();
+    let mut create = sequence_ddl_txn(&seq, &locks, 1);
+    catalog
+        .apply_sql_diff(
+            &mut create,
+            &empty(),
+            before.clone(),
+            checked.clone(),
+            &ids,
+            &|| false,
+        )
+        .unwrap();
+    let visible = catalog.commit_sql_ddl(create, None).unwrap();
+
+    let mut orphan = before.as_ref().clone();
+    orphan.ext.columns.insert(ids.end, ColumnExt::default());
+    let mut collision = before.as_ref().clone();
+    // The unchanged table record's column ID now collides with a sequence ID.
+    let mut sequence = before.ext.sequences[&(ids.start + 2)].clone();
+    sequence.name = "other_sequence".into();
+    sequence.owned_by = None;
+    sequence.identity = false;
+    collision.ext.sequences.insert(ids.start + 1, sequence);
+
+    for (txn_id, invalid, message) in [
+        (2, orphan, "catalog extension owner absent"),
+        (3, collision, "duplicate or zero catalog object id"),
+    ] {
+        assert_eq!(
+            catalog.checked_parts.lock().unwrap().as_ref().unwrap().parts,
+            before
+        );
+        let mut ddl = sequence_ddl_txn(&seq, &locks, txn_id);
+        let skip = UnchangedRecords::between(&before, &invalid, &BTreeSet::new());
+        assert!(skip.tables.contains(&ids.start));
+        assert_eq!(
+            catalog.apply_sql_diff(
+                &mut ddl,
+                &before,
+                Arc::new(invalid),
+                checked.clone(),
+                &(0..0),
+                &|| false,
+            ),
+            Err(corrupt(message))
+        );
+        assert!(!ddl.writes_keyspace(Keyspace::Catalog));
+        assert_eq!(catalog.commit_sql_ddl(ddl, None).unwrap(), visible);
+    }
+}
