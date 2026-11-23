@@ -414,3 +414,6 @@ mod prepared_validation_network;
 #[path = "wire_role.rs"]
 mod wire_role;
 #[path = "wire_handles.rs"] mod wire_handles;
+
+#[path = "wire_sql_types.rs"]
+mod wire_sql_types;

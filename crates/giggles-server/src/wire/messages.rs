@@ -46,6 +46,7 @@ mod tests {
             max_frame: 65_536,
             max_handles: 64,
             max_shapes: 128,
+            protocol_minor: 1,
         });
         assert_round_trip(&WirePrepare {
             text: "select id from widgets".into(),
@@ -90,11 +91,13 @@ mod tests {
             position: 0,
             shape_id: Some(9),
             columns: vec!["id".into()],
+            type_oids: vec![23],
         };
         let inline_shape = WireShapeRef {
             position: 1,
             shape_id: None,
             columns: vec!["name".into()],
+            type_oids: vec![],
         };
         assert_round_trip(&registered_shape);
         assert_round_trip(&inline_shape);

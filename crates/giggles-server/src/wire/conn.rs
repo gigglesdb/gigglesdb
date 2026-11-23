@@ -327,6 +327,7 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
                 max_frame: MAX_FRAME as u32,
                 max_handles: limits.max_handles as u32,
                 max_shapes: limits.max_shapes as u32,
+                protocol_minor: 1,
             };
             encode_message(&mut out, FrameKind::Ready, Flags(0), id, &ready);
             return Ok((session, out));

@@ -1,11 +1,11 @@
-//! Connection-local table for column-name lists in native wire replies.
+//! Connection-local table for column-name and type-OID lists in native wire replies.
 
 use crate::api::proto::{self, execute_reply::NativeResult};
 use std::{collections::HashMap, fmt};
 
 pub(crate) struct ShapeTable {
-    by_id: Vec<Vec<String>>,
-    ids: HashMap<Vec<String>, u32>,
+    by_id: Vec<(Vec<String>, Vec<u32>)>,
+    ids: HashMap<(Vec<String>, Vec<u32>), u32>,
     cap: usize,
 }
 
@@ -32,18 +32,22 @@ impl ShapeTable {
     pub(crate) fn compress(&mut self, reply: &mut proto::ExecuteReply) -> Vec<proto::WireShapeRef> {
         let mut refs = Vec::new();
         for (position, field) in column_fields(reply).into_iter().enumerate() {
-            let Some(field) = field.filter(|columns| !columns.is_empty()) else {
+            let Some(field) = field.filter(|(columns, _)| !columns.is_empty()) else {
                 continue;
             };
-            let mut columns = std::mem::take(field);
-            let shape_id = if let Some(&id) = self.ids.get(&columns) {
+            let (names, types) = field;
+            let mut columns = std::mem::take(names);
+            let mut type_oids = types.map(std::mem::take).unwrap_or_default();
+            let key = (columns.clone(), type_oids.clone());
+            let shape_id = if let Some(&id) = self.ids.get(&key) {
                 columns = Vec::new();
+                type_oids = Vec::new();
                 Some(id)
             } else if self.by_id.len() < self.cap
                 && let Ok(id) = u32::try_from(self.by_id.len())
             {
-                self.ids.insert(columns.clone(), id);
-                self.by_id.push(columns.clone());
+                self.ids.insert(key.clone(), id);
+                self.by_id.push(key);
                 Some(id)
             } else {
                 None
@@ -52,6 +56,7 @@ impl ShapeTable {
                 position: position as u32,
                 shape_id,
                 columns,
+                type_oids,
             });
         }
         refs
@@ -65,10 +70,15 @@ impl ShapeTable {
 // WireShapeRef.columns (wire envelope).
 // Transaction emits carry repeated NativeColumn messages with typed metadata.
 // Absent and empty fields keep their positions, and emit no shape reference.
-fn column_fields(reply: &mut proto::ExecuteReply) -> [Option<&mut Vec<String>>; 2] {
-    let sql = reply.sql.as_mut().map(|sql| &mut sql.columns);
+type ColumnFields<'a> = [Option<(&'a mut Vec<String>, Option<&'a mut Vec<u32>>)>; 2];
+
+fn column_fields(reply: &mut proto::ExecuteReply) -> ColumnFields<'_> {
+    let sql = reply
+        .sql
+        .as_mut()
+        .map(|sql| (&mut sql.columns, Some(&mut sql.column_types)));
     let operation = match &mut reply.native_result {
-        Some(NativeResult::OperationOutcome(outcome)) => Some(&mut outcome.columns),
+        Some(NativeResult::OperationOutcome(outcome)) => Some((&mut outcome.columns, None)),
         _ => None,
     };
     [sql, operation]
@@ -96,32 +106,46 @@ impl fmt::Display for ShapeError {
 impl std::error::Error for ShapeError {}
 
 pub(crate) fn expand(
-    client_table: &mut Vec<Vec<String>>,
+    client_table: &mut Vec<(Vec<String>, Vec<u32>)>,
     reply: &mut proto::ExecuteReply,
     refs: &[proto::WireShapeRef],
 ) -> Result<(), ShapeError> {
     let mut fields = column_fields(reply);
     let checkpoint = client_table.len();
     let result = refs.iter().try_for_each(|shape| {
-        let field = fields
+        if !shape.type_oids.is_empty()
+            && (shape.type_oids.len() != shape.columns.len() || shape.position != 0)
+        {
+            return Err(ShapeError::InvalidPosition(shape.position));
+        }
+        let (columns, types) = fields
             .get_mut(shape.position as usize)
             .and_then(Option::take)
-            .filter(|columns| columns.is_empty())
+            .filter(|(columns, types)| {
+                columns.is_empty() && types.as_ref().is_none_or(|t| t.is_empty())
+            })
             .ok_or(ShapeError::InvalidPosition(shape.position))?;
-
-        match shape.shape_id {
-            None => field.clone_from(&shape.columns),
+        let restored = match shape.shape_id {
+            None => (shape.columns.clone(), shape.type_oids.clone()),
             Some(id) if shape.columns.is_empty() => {
-                let columns = client_table
+                let value = client_table
                     .get(id as usize)
                     .ok_or(ShapeError::UnknownId(id))?;
-                field.clone_from(columns);
+                if shape.position == 1 && !value.1.is_empty() {
+                    return Err(ShapeError::InvalidPosition(shape.position));
+                }
+                value.clone()
             }
             Some(id) if id as usize == client_table.len() => {
-                field.clone_from(&shape.columns);
-                client_table.push(shape.columns.clone());
+                let value = (shape.columns.clone(), shape.type_oids.clone());
+                client_table.push(value.clone());
+                value
             }
             Some(id) => return Err(ShapeError::UnexpectedDefinition(id)),
+        };
+        *columns = restored.0;
+        if let Some(types) = types {
+            *types = restored.1;
         }
         Ok(())
     });
@@ -150,6 +174,127 @@ mod tests {
         }
     }
 
+    fn typed(oid: u32) -> ExecuteReply {
+        let mut reply = sql(&["id"]);
+        reply.sql.as_mut().unwrap().column_types = vec![oid];
+        reply
+    }
+
+    #[test]
+    fn types_distinguish_shapes() {
+        let mut table = ShapeTable::new(256);
+        assert_eq!(table.compress(&mut typed(23))[0].shape_id, Some(0));
+        assert_eq!(table.compress(&mut typed(25))[0].shape_id, Some(1));
+        assert_eq!(table.compress(&mut typed(23))[0].shape_id, Some(0));
+    }
+
+    #[test]
+    fn definition_carries_types_reference_carries_none() {
+        let mut table = ShapeTable::new(256);
+        let mut reply = typed(23);
+        let refs = table.compress(&mut reply);
+        assert_eq!(refs[0].columns, ["id"]);
+        assert_eq!(refs[0].type_oids, [23]);
+        assert!(reply.sql.unwrap().column_types.is_empty());
+        let refs = table.compress(&mut typed(23));
+        assert!(refs[0].columns.is_empty());
+        assert!(refs[0].type_oids.is_empty());
+    }
+
+    #[test]
+    fn cap_inline_carries_types() {
+        let mut table = ShapeTable::new(1);
+        table.compress(&mut typed(23));
+        let mut reply = typed(25);
+        let refs = table.compress(&mut reply);
+        assert_eq!(refs[0].shape_id, None);
+        assert_eq!(refs[0].type_oids, [25]);
+        expand(&mut Vec::new(), &mut reply, &refs).unwrap();
+        assert_eq!(reply, typed(25));
+    }
+
+    #[test]
+    fn expand_restores_column_types() {
+        let mut table = ShapeTable::new(256);
+        let mut client = Vec::new();
+        for _ in 0..2 {
+            let mut reply = typed(23);
+            let refs = table.compress(&mut reply);
+            expand(&mut client, &mut reply, &refs).unwrap();
+            assert_eq!(reply, typed(23));
+        }
+    }
+
+    #[test]
+    fn expand_rejects_type_length_mismatch() {
+        let refs = [WireShapeRef {
+            columns: vec!["id".into()],
+            type_oids: vec![23, 25],
+            ..Default::default()
+        }];
+        assert!(expand(&mut Vec::new(), &mut sql(&[]), &refs).is_err());
+    }
+
+    #[test]
+    fn expand_rejects_types_at_native_position() {
+        let mut reply = ExecuteReply {
+            native_result: Some(NativeResult::OperationOutcome(NativeOutcome::default())),
+            ..Default::default()
+        };
+        let refs = [WireShapeRef {
+            position: 1,
+            columns: vec!["id".into()],
+            type_oids: vec![23],
+            ..Default::default()
+        }];
+        assert!(expand(&mut Vec::new(), &mut reply, &refs).is_err());
+    }
+
+    #[test]
+    fn expand_rejects_types_on_reference() {
+        let refs = [WireShapeRef {
+            shape_id: Some(0),
+            type_oids: vec![23],
+            ..Default::default()
+        }];
+        let mut client = vec![(vec!["id".into()], vec![23])];
+        assert!(expand(&mut client, &mut sql(&[]), &refs).is_err());
+    }
+
+    #[test]
+    fn expand_rejects_nonempty_destinations_and_rolls_back() {
+        for mut reply in [typed(23), {
+            let mut r = sql(&[]);
+            r.sql.as_mut().unwrap().column_types = vec![23];
+            r
+        }] {
+            let refs = [WireShapeRef {
+                columns: vec!["id".into()],
+                type_oids: vec![23],
+                shape_id: Some(0),
+                ..Default::default()
+            }];
+            let mut client = Vec::new();
+            assert!(expand(&mut client, &mut reply, &refs).is_err());
+            assert!(client.is_empty());
+        }
+        let mut client = Vec::new();
+        let refs = [
+            WireShapeRef {
+                columns: vec!["id".into()],
+                type_oids: vec![23],
+                shape_id: Some(0),
+                ..Default::default()
+            },
+            WireShapeRef {
+                position: 1,
+                type_oids: vec![23],
+                ..Default::default()
+            },
+        ];
+        assert!(expand(&mut client, &mut sql(&[]), &refs).is_err());
+        assert!(client.is_empty());
+    }
     #[test]
     fn first_reply_carries_columns_then_id_only() {
         let mut table = ShapeTable::new(256);
@@ -161,6 +306,7 @@ mod tests {
                 position: 0,
                 shape_id: Some(0),
                 columns: vec!["id".into(), "name".into()],
+                type_oids: vec![],
             }]
         );
         assert!(first.sql.unwrap().columns.is_empty());
@@ -172,6 +318,7 @@ mod tests {
                 position: 0,
                 shape_id: Some(0),
                 columns: vec![],
+                type_oids: vec![],
             }]
         );
         assert!(second.sql.unwrap().columns.is_empty());
@@ -187,6 +334,7 @@ mod tests {
                 position: 0,
                 shape_id: Some(1),
                 columns: vec!["id".into(), "name".into(), "email".into()],
+                type_oids: vec![],
             }]
         );
     }
@@ -206,6 +354,7 @@ mod tests {
                     position: 0,
                     shape_id: (i < 256).then_some(i),
                     columns: vec![name],
+                    type_oids: vec![],
                 }]
             );
             expand(&mut client, &mut reply, &refs).unwrap();
@@ -222,6 +371,7 @@ mod tests {
                     position: 0,
                     shape_id: id,
                     columns,
+                    type_oids: vec![],
                 }]
             );
         }
@@ -296,22 +446,24 @@ mod tests {
             position: 0,
             shape_id: Some(0),
             columns: vec![],
+            type_oids: vec![],
         }];
         assert!(expand(&mut client, &mut reply, &refs).is_err());
     }
 
     #[test]
     fn expand_rejects_out_of_sequence_definitions() {
-        let mut client = vec![vec!["id".into()]];
+        let mut client = vec![(vec!["id".into()], vec![])];
         let mut reply = sql(&[]);
         for id in [0, 2] {
             let refs = [WireShapeRef {
                 position: 0,
                 shape_id: Some(id),
                 columns: vec!["name".into()],
+                type_oids: vec![],
             }];
             assert!(expand(&mut client, &mut reply, &refs).is_err());
-            assert_eq!(client, [vec!["id".to_owned()]]);
+            assert_eq!(client, [(vec!["id".to_owned()], vec![])]);
         }
     }
 }

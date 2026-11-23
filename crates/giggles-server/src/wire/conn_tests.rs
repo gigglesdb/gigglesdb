@@ -135,6 +135,7 @@ impl Fixture {
         let ready = WireReady::decode(body.as_slice()).unwrap();
         assert_eq!(ready.max_in_flight as usize, expected);
         assert_eq!(ready.max_frame as usize, crate::MAX_FRAME);
+        assert_eq!(ready.protocol_minor, 1);
         assert_eq!((ready.max_handles, ready.max_shapes), (256, 256));
         assert!(!ready.session.unwrap().session_id.is_empty());
         connection.writes.store(0, Relaxed);
@@ -992,6 +993,7 @@ async fn check_spilled_reply_reassembly() {
             position: 0,
             shape_id: Some(0),
             columns: vec!["body".into()],
+            type_oids: vec![25],
         }]
     );
     let mut large = wire.reply.unwrap();
@@ -1031,4 +1033,11 @@ async fn eof_with_open_transaction_closes_session() {
             .is_empty()
     );
     replacement.finish().await;
+}
+
+#[tokio::test]
+async fn ready_reports_protocol_minor_1() {
+    let fixture = Fixture::new(0);
+    let connection = fixture.ready(4096, WireLimits::default(), None).await;
+    connection.finish().await;
 }

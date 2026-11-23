@@ -185,6 +185,7 @@ four rounds is a fatal `protocol` error.
 | `max_frame` | 262,144 | Maximum bytes in a frame body |
 | `max_handles` | 256 | Maximum live prepared handles per connection |
 | `max_shapes` | 256 | Maximum committed shape definitions per connection |
+| `protocol_minor` (field 6) | 1 | Supported protocol feature set |
 
 `session` contains a nonempty `session_id` and the session lifetime fields
 `idle_timeout_seconds`, `max_age_seconds` and `transaction_timeout_seconds`.
@@ -253,55 +254,67 @@ non-streaming execution path. An oversized materialized result is replaced
 by an `ExecuteReply` with code `08007`, since execution may already have
 taken effect.
 
+## Protocol minor version
+
+`WireReady.protocol_minor` reports the feature set: `0` (field absent) is
+v1.0; `1` adds result column types (and later SQL handles). The preface minor
+stays informational.
+
+## Result column types
+
+`SqlResult.column_types` contains one PostgreSQL type OID per column, in the
+same order. These equal the OIDs in the pgwire RowDescription for the same
+statement in the same session state. Types are derived before execution, so
+empty results are typed. The list is empty when `columns` is empty; native
+operation results carry none. Only OIDs are included, with no typmods.
+HTTP JSON renders `"column_types": [23, 25]`.
+
 ## Column shapes
 
-Each connection starts with an empty table of ordered column-name lists. A
-`WireShapeRef` holds a `position`, an optional `shape_id` and repeated
-`columns`. The server visits these fixed positions in order and moves each
-nonempty list from its reply field into a ref.
+Each connection starts with an empty table of ordered pairs of column-name
+and type-OID lists. Equal names with different types are different shapes.
+`WireShapeRef` has `position`, optional `shape_id`, repeated `columns`, and
+repeated `type_oids` (field 4). Both lists move out of the reply into the ref.
 
-| Position | Field within `ExecuteReply` |
-| --- | --- |
-| 0 | `sql.columns` (`SqlResult.columns`) |
-| 1 | `operation_outcome.columns` (`NativeOutcome.columns`) |
+| Position | Names field | Types field |
+| --- | --- | --- |
+| 0 | `sql.columns` | `sql.column_types` |
+| 1 | `operation_outcome.columns` | None; type list always empty |
 
-An absent or empty field produces no ref and does not shift subsequent
+An absent or empty columns field produces no ref and does not shift subsequent
 positions. Typed `NativeColumn` lists in transaction emits stay inline.
 
-| List state | `shape_id` | `columns` | Client action |
-| --- | --- | --- | --- |
-| First occurrence with space in the table | Present, next ID starting at `0` | Full list | Append the definition to the table and restore the list at `position`. |
-| Previously defined list | Present, existing ID | Empty | Look up the ID and restore the list. |
-| New list at the cap | Absent | Full list | Restore the list without caching it. |
+| Shape state | `shape_id` | `columns` | `type_oids` | Client action |
+| --- | --- | --- | --- | --- |
+| First occurrence with table space | Next ID from 0 | Full | Full at position 0; may be empty | Append pair and restore both lists |
+| Previously defined shape | Existing ID | Empty | Empty | Look up pair and restore both lists |
+| New shape at cap | Absent | Full | Full at position 0; may be empty | Restore without caching |
 
-Test presence of `shape_id` explicitly because zero is a valid definition
-or reference. Process refs in order, restoring each to its existing,
-empty destination field. Reject an invalid or repeated position, an unknown
-ID or a definition whose ID is not the next table index. A definition earlier
-in the same reply can supply a later ref. Commit new definitions only after
-accepting the whole reply. Definitions added during a failed expansion are
-rolled back.
+Test presence of `shape_id` explicitly: zero is valid. Process refs in order.
+Reject invalid or repeated positions, unknown IDs, and definitions out of
+sequence. Reject nonempty `type_oids` whose length differs from `columns`,
+nonempty types at position 1, or nonempty types on an ID-only reference.
+Both destination lists at position 0 must already be empty. A definition
+earlier in the reply can supply a later ref. Commit definitions only after
+accepting the whole reply; roll back tentative definitions on failure.
 
-Committed shape IDs are never evicted or reused on the connection. If a
-reply aborts during delivery, the server rolls back any tentative definitions
-it added for that reply. An ID from an aborted reply can be assigned by a
-later complete reply. Discard incomplete replies without applying their refs.
-
-For example, two SQL replies with columns `["id", "name"]`, on a connection
-with an empty shape table, carry these message fields. Rows are omitted here.
+Committed IDs are never evicted or reused. The server rolls back tentative
+definitions if delivery aborts; discard incomplete replies without applying
+refs. Including types in the shape lowers the number of distinct name lists
+that fit under `max_shapes`.
 
 ~~~text
 First WireReply
   reply.sql.columns = []
-  shapes = [{position: 0, shape_id: 0, columns: ["id", "name"]}]
-
+  reply.sql.column_types = []
+  shapes = [{position: 0, shape_id: 0, columns: ["id", "name"], type_oids: [23, 25]}]
 Second WireReply
   reply.sql.columns = []
-  shapes = [{position: 0, shape_id: 0, columns: []}]
+  reply.sql.column_types = []
+  shapes = [{position: 0, shape_id: 0}]
 ~~~
 
-After decoding the first reply, store `["id", "name"]` at index `0` and restore
-`reply.sql.columns`. On the second reply, copy the same list from the table.
+Store `(["id", "name"], [23, 25])` at index 0 and restore both lists on each reply.
 
 ## Prepared handles
 
@@ -446,7 +459,7 @@ C -> S   TLS handshake with a bound client certificate
 C -> S   GGLN 00 01 00 00
 C -> S   HELLO(1) {}
 S -> C   READY(1) {session: {...}, max_in_flight: 64, max_frame: 262144,
-                   max_handles: 256, max_shapes: 256}
+                   max_handles: 256, max_shapes: 256, protocol_minor: 1}
 
 C -> S   PREPARE(2) {text: "shipments where id=$id select id"}
 S -> C   PREPARED(2) {handle: 0}

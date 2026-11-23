@@ -727,7 +727,9 @@ message NativeCatalogOutcome { uint64 catalog_epoch = 1; string table = 2; repea
 // HELLO carries OpenSessionRequest.
 // AUTH carries ScramChallenge (server to client) or ScramContinue (client to server).
 message WireReady { OpenSessionReply session = 1; uint32 max_in_flight = 2; uint32 max_frame = 3;
-                    uint32 max_handles = 4; uint32 max_shapes = 5; }
+                    uint32 max_handles = 4; uint32 max_shapes = 5;
+                    // 0 (unset) on servers without SQL handles and column types; 1 with them.
+                    uint32 protocol_minor = 6; }
 message WirePrepare { string text = 1; optional string language_version = 2; }
 message WirePrepared { uint32 handle = 1; }
 message WireRun { uint32 handle = 1; repeated NativeBinding bindings = 2; optional uint32 budget_ms = 3;
@@ -737,8 +739,8 @@ enum WireBatchMode { WIRE_BATCH_MODE_ALL = 0; WIRE_BATCH_MODE_STOP_ON_ERROR = 1;
 message WireBatchEntry { uint32 request_id = 1; oneof entry { ExecuteRequest execute = 2; WireRun run = 3; } }
 message WireBatch { WireBatchMode mode = 1; repeated WireBatchEntry entries = 2; }
 // One per `repeated string columns` field present in the reply, in a fixed traversal order.
-// Each shape is a list of column names. Replies currently carry names only.
-message WireShapeRef { uint32 position = 1; optional uint32 shape_id = 2; repeated string columns = 3; }
+// Each shape is a list of column names plus, at position 0, their type OIDs.
+message WireShapeRef { uint32 position = 1; optional uint32 shape_id = 2; repeated string columns = 3; repeated uint32 type_oids = 4; }
 message WireReply { ExecuteReply reply = 1; repeated WireShapeRef shapes = 2; }
 message WireCancel { uint32 target_request_id = 1; }
 message WireConnError { string code = 1; string message = 2; repeated uint32 supported_major = 3; }

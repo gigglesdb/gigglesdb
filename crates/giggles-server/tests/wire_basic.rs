@@ -266,9 +266,11 @@ async fn wire_large_result_more_frames_then_small_reply() {
             position: 0,
             shape_id: Some(0),
             columns: vec![],
+            type_oids: vec![],
         }]
     );
     expected.sql.as_mut().unwrap().columns.clear();
+    expected.sql.as_mut().unwrap().column_types.clear();
     assert_eq!(wire.reply.unwrap(), expected);
     let (id, result) = client.recv().await.unwrap();
     assert_eq!(id, small);
@@ -648,6 +650,7 @@ async fn wire_reuses_select_shape_and_client_restores_columns() {
             position: 0,
             shape_id: Some(0),
             columns: vec![],
+            type_oids: vec![],
         }]
     );
     assert!(wire.reply.unwrap().sql.unwrap().columns.is_empty());

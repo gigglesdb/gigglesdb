@@ -144,7 +144,7 @@ struct Reader {
     stream: ReadHalf<Box<dyn Connection>>,
     decoder: FrameDecoder,
     reply: Vec<u8>,
-    shapes: Vec<Vec<String>>,
+    shapes: Vec<(Vec<String>, Vec<u32>)>,
 }
 
 impl Reader {
@@ -280,6 +280,7 @@ impl Writer {
 
 /// One connection-bound session. Calls are never retried.
 pub struct Client {
+    protocol_minor: u32,
     reader: Reader,
     writer: Writer,
     next_id: u32,
@@ -296,6 +297,11 @@ struct PendingReply {
 }
 
 impl Client {
+    /// Feature set advertised by READY (zero on older servers).
+    pub fn protocol_minor(&self) -> u32 {
+        self.protocol_minor
+    }
+
     pub async fn connect(
         addr: SocketAddr,
         tls: Option<ClientTls>,
@@ -407,6 +413,7 @@ impl Client {
         writer.max_frame = (ready.max_frame as usize).min(MAX_FRAME);
         // Handshake IDs are scoped to the handshake. The first Execute uses 1.
         let client = Self {
+            protocol_minor: ready.protocol_minor,
             reader,
             writer,
             next_id: 1,

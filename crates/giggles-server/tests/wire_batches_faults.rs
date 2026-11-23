@@ -161,6 +161,7 @@ async fn assert_native_shape(client: &mut Client, handle: u32, shape_id: u32, co
             position: 1,
             shape_id: Some(shape_id),
             columns: columns.iter().map(|name| (*name).into()).collect(),
+            type_oids: vec![],
         }]
     );
     assert!(native_columns(wire.reply.unwrap()).is_empty());
@@ -207,6 +208,7 @@ async fn wire_lease_failure_after_shape_head_ends_connection_without_completing_
             position: 0,
             shape_id: Some(0),
             columns: vec!["id".into(), "revoked_body".into()],
+            type_oids: vec![20, 25],
         }]
     );
     let sql = reply.sql.unwrap();
