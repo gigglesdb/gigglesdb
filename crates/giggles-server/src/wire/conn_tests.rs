@@ -1041,3 +1041,88 @@ async fn ready_reports_protocol_minor_1() {
     let connection = fixture.ready(4096, WireLimits::default(), None).await;
     connection.finish().await;
 }
+
+#[tokio::test]
+async fn prepare_sql_returns_prepared() {
+    let f = Fixture::new(1);
+    let mut c = f.ready(64 * 1024, WireLimits::default(), None).await;
+    let mut bytes = Vec::new();
+    encode_message(
+        &mut bytes,
+        FrameKind::Prepare,
+        Flags(0),
+        2,
+        &super::messages::WirePrepare {
+            text: "SELEC 1".into(),
+            sql: Some(true),
+            ..Default::default()
+        },
+    );
+    send(&mut c.client, &bytes).await;
+    let (kind, flags, id, body) = recv(&mut c.client).await;
+    assert_eq!((kind, flags, id), (FrameKind::Prepared as u8, 0, 2));
+    assert_eq!(
+        super::messages::WirePrepared::decode(body.as_slice())
+            .unwrap()
+            .handle,
+        0
+    );
+    drop(c.client);
+    c.task.await.unwrap().unwrap();
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn pipelined_sql_runs_follow_close_order() {
+    let f = Fixture::new(1);
+    let mut c = f.ready(64 * 1024, WireLimits::default(), None).await;
+    let mut bytes = Vec::new();
+    encode_message(
+        &mut bytes,
+        FrameKind::Prepare,
+        Flags(0),
+        2,
+        &super::messages::WirePrepare {
+            text: "SELECT id FROM app WHERE id = $1".into(),
+            sql: Some(true),
+            ..Default::default()
+        },
+    );
+    let run = super::messages::WireRun {
+        handle: 0,
+        params: vec![proto::Value {
+            value: Some(proto::value::Value::IntValue(1)),
+        }],
+        ..Default::default()
+    };
+    encode_message(&mut bytes, FrameKind::Run, Flags(0), 3, &run);
+    encode_message(
+        &mut bytes,
+        FrameKind::CloseHandle,
+        Flags(0),
+        4,
+        &super::messages::WireCloseHandle { handle: 0 },
+    );
+    encode_message(&mut bytes, FrameKind::Run, Flags(0), 5, &run);
+    send(&mut c.client, &bytes).await;
+    let (kind, _, id, body) = recv(&mut c.client).await;
+    assert_eq!((kind, id), (FrameKind::Prepared as u8, 2));
+    assert_eq!(
+        super::messages::WirePrepared::decode(body.as_slice())
+            .unwrap()
+            .handle,
+        0
+    );
+    for id in [3, 4] {
+        assert_eq!(reply(&mut c.client, id).await.0.code, "ok");
+    }
+    let (kind, _, id, body) = recv(&mut c.client).await;
+    assert_eq!((kind, id), (FrameKind::ConnError as u8, 5));
+    assert_eq!(
+        WireConnError::decode(body.as_slice()).unwrap().code,
+        "INVALID_ARGUMENT"
+    );
+    drop(c.client);
+    c.task.await.unwrap().unwrap();
+    f.runtime.shutdown().await;
+}

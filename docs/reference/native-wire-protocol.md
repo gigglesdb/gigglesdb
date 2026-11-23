@@ -257,8 +257,10 @@ taken effect.
 ## Protocol minor version
 
 `WireReady.protocol_minor` reports the feature set: `0` (field absent) is
-v1.0; `1` adds result column types (and later SQL handles). The preface minor
-stays informational.
+v1.0; `1` adds result column types and SQL prepared handles. The preface minor
+stays informational. Clients must check `protocol_minor >= 1` before sending
+`WirePrepare.sql` or `WireRun.params`: an older server ignores those fields
+and would treat SQL text as native text.
 
 ## Result column types
 
@@ -318,7 +320,7 @@ Store `(["id", "name"], [23, 25])` at index 0 and restore both lists on each rep
 
 ## Prepared handles
 
-Send `PREPARE` with `WirePrepare.text` and optionally `language_version`.
+Send native `PREPARE` with `WirePrepare.text`, absent or false `sql`, and optionally `language_version`.
 On success, `PREPARED` returns `WirePrepared.handle` under the request's ID.
 The server checks syntax and lowering and caches the parsed and lowered
 native data operation or transaction block and its language version. The
@@ -346,6 +348,42 @@ an unspecified `transaction_state` and no shapes. Closing a handle only
 changes the handle table. Lookups and table changes follow request order, so
 a pipelined `RUN` uses the slot contents when that entry executes and a
 following `CLOSE_HANDLE` cannot affect it retroactively.
+
+### SQL handles
+
+Send `PREPARE` with `sql = true` and `text` containing one SQL statement
+with positional parameters `$1` through `$n`. `language_version` must be
+absent. `PREPARED` returns a handle from the same table as native handles:
+numbering, most-recently-closed slot reuse, `max_handles` and `CLOSE_HANDLE`
+are shared.
+
+SQL `PREPARE` checks only that `language_version` is absent and `text`
+contains a non-whitespace character. It never parses SQL or reads the
+catalog. A failed check returns `INVALID_ARGUMENT`; a full table returns
+`RESOURCE_EXHAUSTED`.
+
+Send `RUN` with `handle`, positional `params` and optional `budget_ms`.
+It behaves exactly as `EXECUTE` with `SqlRequest { sql, params }` and the
+same budget: parsing, binding and authorization happen on every run against
+the current catalog and session state. Task-session admission, budgeting,
+streaming and replies follow EXECUTE rules. SQLSTATEs appear in
+`ExecuteReply.code`, and SQL replies include `column_types`. A syntax error
+is reported by each RUN, never by PREPARE.
+
+| Invalid RUN combination | Per-request CONN_ERROR code |
+| --- | --- |
+| SQL handle with nonempty `bindings` | `INVALID_ARGUMENT` |
+| Native handle with nonempty `params` | `INVALID_ARGUMENT` |
+| SQL handle with `operation_id` | `INVALID_ARGUMENT` |
+
+These errors carry the RUN request ID and leave the connection usable.
+SQL handles work as BATCH `run` entries in both modes. HTTP and gRPC have
+no handles.
+
+| Frame | Fields |
+| --- | --- |
+| `PREPARE` (`WirePrepare`) | `text` (1), optional `language_version` (2), optional bool `sql` (3); true selects SQL |
+| `RUN` (`WireRun`) | `handle` (1), native `bindings` (2), optional `budget_ms` (3), optional `operation_id` (4), SQL `params` (5) |
 
 ## Batches
 
@@ -477,6 +515,23 @@ S -> C   REPLY(6) {reply: {code: "ok"}}
 S -> C   REPLY(7) {reply: {code: "ok", operation_outcome: {columns: [], ...}},
                    shapes: [{position: 1, shape_id: 0, columns: []}]}
 C -> S   GOODBYE(8) <empty>
+~~~
+
+A SQL exchange on a connection advertising `protocol_minor: 1` (assuming
+`t(id integer, name text)` contains `(1, 'one')`):
+
+~~~text
+C -> S   PREPARE(2) {text: "SELECT id, name FROM t WHERE id = $1", sql: true}
+S -> C   PREPARED(2) {handle: 0}
+C -> S   RUN(3) {handle: 0, params: [{int_value: 1}]}
+S -> C   REPLY(3) {reply: {version: 1, code: "ok", sql: {
+                   columns: [], column_types: [],
+                   rows: [{values: [{int_value: 1}, {text_value: "one"}]}]}},
+                   shapes: [{position: 0, shape_id: 0,
+                     columns: ["id", "name"], type_oids: [23, 25]}]}
+C -> S   CLOSE_HANDLE(4) {handle: 0}
+S -> C   REPLY(4) {reply: {version: 1, code: "ok"}}
+C -> S   GOODBYE(5) <empty>
 ~~~
 
 ## Limits summary

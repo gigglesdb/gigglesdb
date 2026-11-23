@@ -15,7 +15,7 @@ use crate::{
     MAX_FRAME,
     api::proto::{
         ExecuteReply, ExecuteRequest, NativeBinding, OpenSessionRequest, ScramChallenge,
-        ScramContinue, ScramStart, open_session_request,
+        ScramContinue, ScramStart, Value, open_session_request,
     },
     auth::scram::ClientExchange,
     tls,
@@ -107,6 +107,8 @@ impl std::error::Error for WireError {}
 #[allow(clippy::large_enum_variant, reason = "the batch API takes ExecuteRequest by value")]
 pub enum BatchEntry {
     Execute(ExecuteRequest),
+    /// A complete RUN, including SQL params and optional budget.
+    RunRequest(WireRun),
     Run {
         handle: u32,
         bindings: Vec<NativeBinding>,
@@ -450,6 +452,32 @@ impl Client {
         Ok(reply)
     }
 
+    /// Prepare SQL text for reuse. Check `protocol_minor() >= 1` first.
+    pub async fn prepare_sql(&mut self, sql: &str) -> io::Result<Result<u32, WireConnError>> {
+        self.require_idle()?;
+        let request = WirePrepare {
+            text: sql.into(),
+            sql: Some(true),
+            ..Default::default()
+        };
+        let id = self.send_request(FrameKind::Prepare, &request).await?;
+        let reply = self.reader.prepared(id).await?;
+        self.pending.pop_front();
+        Ok(reply)
+    }
+
+    /// Run SQL with positional parameters. Check `protocol_minor() >= 1` first.
+    pub async fn run_sql(&mut self, handle: u32, params: Vec<Value>) -> io::Result<ExecuteReply> {
+        self.require_idle()?;
+        self.send_run(WireRun {
+            handle,
+            params,
+            ..Default::default()
+        })
+        .await?;
+        self.recv().await?.1.map_err(server_error)
+    }
+
     /// Execute a handle with the default budget and no operation ID.
     pub async fn run(
         &mut self,
@@ -526,6 +554,7 @@ impl Client {
                 .map(|(request_id, entry)| {
                     let entry = match entry {
                         BatchEntry::Execute(request) => wire_batch_entry::Entry::Execute(request),
+                        BatchEntry::RunRequest(request) => wire_batch_entry::Entry::Run(request),
                         BatchEntry::Run { handle, bindings } => {
                             wire_batch_entry::Entry::Run(WireRun {
                                 handle,

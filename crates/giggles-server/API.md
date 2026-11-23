@@ -12,6 +12,12 @@ server CPU per request and supports pipelining, prepared handles and batches.
 See the [native wire protocol reference](../../docs/reference/native-wire-protocol.md)
 and [choosing a transport](../../docs/release-notes/native-wire.md#choosing-a-transport).
 
+SQL prepared handles use `PREPARE` with `sql=true` and `RUN` with positional
+`params`; check `protocol_minor >= 1` first. They share native handles' slots,
+cap and close operation, and can be run in batches. See the protocol
+reference's [prepared handles](../../docs/reference/native-wire-protocol.md#prepared-handles)
+for per-run authorization, budgets and errors. HTTP and gRPC have no handles.
+
 Design: [DD-0056](https://app.archdocs.io/design-docs/f82329f8-0d03-4077-b584-9b2579b941d9).
 The executable contract is [giggles.proto](proto/giggles/v1/giggles.proto), with
 [OpenAPI 3.1](docs/http-api.openapi.json) for HTTP clients.

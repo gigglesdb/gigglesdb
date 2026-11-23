@@ -417,3 +417,6 @@ mod wire_role;
 
 #[path = "wire_sql_types.rs"]
 mod wire_sql_types;
+
+#[path = "wire_sql_handles.rs"]
+mod wire_sql_handles;
