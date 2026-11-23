@@ -2119,7 +2119,7 @@ impl RowSink for SqlRows<'_> {
         self.lookup_all(table, &[], None, true, &mut |row| {
             if key.tuple(&row.values)?.is_some_and(|tuple| tuples.contains(&tuple)) {
                 if arbiter && floor.is_some_and(|v| row.version >= v) {
-                    return Err(SqlError::CardinalityViolation);
+                    return Err(relational::conflict_duplicate_target());
                 }
                 visit(row)?;
             }
@@ -2135,7 +2135,7 @@ impl RowSink for SqlRows<'_> {
     ) -> Result<(), CoreError> {
         let floor = self.conflict_floor;
         self.lookup_all(table, columns, Some(values), true, &mut |row| {
-            if floor.is_some_and(|v| row.version >= v) { return Err(SqlError::CardinalityViolation); }
+            if floor.is_some_and(|v| row.version >= v) { return Err(relational::conflict_duplicate_target()); }
             visit(row)
         })
     }

@@ -413,6 +413,7 @@ pub(super) fn parse(
             from,
             predicate: projection(&[Token::Word("true".into())], owner, depth, next)?,
             groups: vec![],
+            qualified_target: None,
             returning,
             images,
         },
@@ -1133,6 +1134,8 @@ impl Plan {
     pub(in crate::relational) fn implicit_sequences(
         &self,
         state: &Relational,
+        count: usize,
+        declared: &[Option<DataType>],
     ) -> R<Vec<Option<String>>> {
         let mut out = self
             .merge
@@ -1140,15 +1143,24 @@ impl Plan {
             .map(|m| m.implicit_sequences(state))
             .transpose()?
             .unwrap_or_default();
+        if let Some(insert) = &self.insert {
+            let mut parameters = vec![None; count];
+            parameters.get_mut(..declared.len()).ok_or(SqlError::Parameters)?
+                .clone_from_slice(declared);
+            let catalog = cte::resolve(&mut self.ctes.clone(), state, &mut parameters)?;
+            let mut prepared = insert.prepared.clone();
+            prepared.parameter_types = parameters;
+            out.extend(prepared.implicit_sequences(&catalog)?);
+        }
         for cte in &self.ctes {
             // Other DML keeps its existing dependency path; MERGE's literal
             // templates need no virtual CTE catalog to discover defaults.
             if let Some(p) = &cte.dml {
                 if let Statement::Plan(plan) = &p.statement {
-                    out.extend(plan.implicit_sequences(state)?);
+                    out.extend(plan.implicit_sequences(state, count, declared)?);
                 }
             } else {
-                out.extend(cte.query.implicit_sequences(state)?);
+                out.extend(cte.query.implicit_sequences(state, count, declared)?);
             }
         }
         Ok(out)

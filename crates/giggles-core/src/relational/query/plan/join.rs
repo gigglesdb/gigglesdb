@@ -53,6 +53,7 @@ pub(super) enum From {
 pub(in crate::relational::query) struct Namespace {
     pub(super) visible: Vec<(String, usize)>,
     pub(super) hidden: Vec<(String, usize)>,
+    pub(super) scalar_rows: Vec<(String, usize)>,
     pub(super) qualified: Vec<(String, Vec<(String, usize)>)>,
 }
 impl Namespace {
@@ -91,7 +92,14 @@ impl Namespace {
             &self.visible
         };
         let mut found = columns.iter().filter(|(name, _)| *name == c.name);
-        let n = found.next().ok_or(SqlError::UnknownColumn)?.1;
+        let n = match found.next() {
+            Some((_, n)) => *n,
+            None if c.qualifier.is_none() => {
+                return self.scalar_rows.iter().find(|(name, _)| name == &c.name)
+                    .map(|(_, n)| *n).ok_or(SqlError::UnknownColumn);
+            }
+            None => return Err(SqlError::UnknownColumn),
+        };
         if found.next().is_some() {
             return Err(SqlError::AmbiguousColumn);
         }
@@ -106,6 +114,7 @@ impl Namespace {
             return Err(SqlError::DuplicateAlias);
         }
         let mut out = self.clone();
+        out.scalar_rows.extend(right.scalar_rows.iter().map(|(n, i)| (n.clone(), i + offset)));
         out.hidden
             .extend(right.hidden.iter().map(|(n, i)| (n.clone(), i + offset)));
         out.visible
@@ -639,8 +648,13 @@ impl From {
                 aliases,
             } => {
                 let (mut columns, typmods) = function.resolve(state, parameters)?;
-                if aliases.is_empty() { columns[0].name = alias.clone(); }
+                for (column, name) in columns.iter_mut().zip(function.column_names(alias, aliases)) {
+                    column.name = name;
+                }
                 let mut shape = leaf_shape(columns, typmods, alias, aliases)?;
+                if function.scalar_element_row() {
+                    shape.namespace.scalar_rows.push((alias.clone(), 0));
+                }
                 shape.collations = function.collations(state, parameters)?;
                 Ok(shape)
             }
@@ -720,6 +734,10 @@ pub(super) fn leaf_shape(
     aliases: &[String],
 ) -> R<Shape> {
     if aliases.len() > columns.len() {
+        user_types::view_replace_error(format!(
+            r#"table "{alias}" has {} columns available but {} columns specified"#,
+            columns.len(), aliases.len()
+        ));
         return Err(SqlError::InvalidColumnReference);
     }
     for (column, alias) in columns.iter_mut().zip(aliases) {
@@ -736,6 +754,7 @@ pub(super) fn leaf_shape(
         typmods,
         namespace: Namespace {
             hidden: vec![],
+            scalar_rows: vec![],
             qualified: vec![(alias.into(), visible.clone())],
             visible,
         },
@@ -748,6 +767,7 @@ fn alias_shape(mut shape: Shape, alias: &str, aliases: &[String]) -> R<Shape> {
     for ((name, _), alias) in shape.namespace.visible.iter_mut().zip(aliases) {
         *name = alias.clone();
     }
+    shape.namespace.scalar_rows.clear();
     shape.namespace.qualified = vec![(alias.into(), shape.namespace.visible.clone())];
     Ok(shape)
 }
@@ -1300,7 +1320,10 @@ impl From {
                 right.locals(state, parameters, out);
             }
             Self::Lateral(input) => input.locals(state, parameters, out),
-            Self::Leaf { alias, .. } | Self::Function { alias, .. } | Self::Alias { alias, .. } => {
+            Self::Function { function, alias, aliases } => {
+                out.push((alias.clone(), function.column_names(alias, aliases)));
+            }
+            Self::Leaf { alias, .. } | Self::Alias { alias, .. } => {
                 let columns = self
                     .clone()
                     .resolve(state, &mut parameters.to_vec())

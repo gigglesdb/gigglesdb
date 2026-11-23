@@ -317,7 +317,7 @@ impl State {
         if self.copy.as_ref().unwrap().descriptor.target_is_view {
             let name = self.copy.as_ref().unwrap().descriptor.table.rsplit('\0').next().unwrap();
             self.diagnostic.wire_message = Some(format!("cannot copy to view \"{name}\""));
-            self.diagnostic.wire_hint = Some("To enable copying to a view, provide an INSTEAD OF INSERT trigger.");
+            self.diagnostic.wire_hint = Some("To enable copying to a view, provide an INSTEAD OF INSERT trigger.".into());
             session.sql.abort();
             self.copy_error("42809", session, out);
             return Ok(());

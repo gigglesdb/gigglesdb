@@ -179,7 +179,7 @@ struct Diagnostic {
     wire_message: Option<String>,
     wire_detail: Option<String>,
     wire_context: Option<String>,
-    wire_hint: Option<&'static str>,
+    wire_hint: Option<std::borrow::Cow<'static, str>>,
     sql_detail: Option<String>,
     duplicate_key: Option<DuplicateKeyDetail>,
     duplicate_key_visible: Option<bool>,
@@ -244,11 +244,28 @@ impl Diagnostic {
                 || m == "canceling statement due to lock timeout"
                 || m.starts_with("permission denied for table ") || m.starts_with("view ") || m.starts_with("sequence ") || m.starts_with("index ")
                 || m.starts_with("relation ") && m.contains(" clause not found in FROM clause")
+                || m.starts_with("invalid reference to FROM-clause entry for table ")
+                || m.starts_with("column ") && m.contains(" does not exist")
+                || m.starts_with("table ") && m.contains(" columns available but ")
+                || ["UNION types ", "INTERSECT types ", "EXCEPT types "].iter().any(|prefix| m.starts_with(prefix))
+                    && m.ends_with(" cannot be matched")
+                || matches!(m, "VALUES lists must all be the same length"
+                    | "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
+                    | "more than one row returned by a subquery used as an expression"
+                    | "ON CONFLICT DO UPDATE command cannot affect row a second time")
+                || m.starts_with("cannot assign to field ") && m.ends_with(" is not a composite type")
+                || matches!(m, "field name must not be null" | "null value not allowed for object key"
+                    | "key value must be scalar, not array, composite, or json"
+                    | "could not identify an equality operator for type json")
+                || m.starts_with("cannot extract elements from ")
+                || m.starts_with("cannot call jsonb_")
+                || m == "cannot set path in scalar"
+                || m.starts_with("path element at position ")
                 || m.starts_with("ORDER BY \"") && m.ends_with("\" is ambiguous")) {
             self.wire_message = message.clone();
         }
         self.sql_detail = self.read_core_detail();
-        self.wire_hint = giggles_core::relational::take_sql_error_hint();
+        self.wire_hint = giggles_core::relational::take_sql_diagnostic_hint();
         use giggles_core::relational::SqlError;
         let postgres_diagnostic = match (&result, message.as_deref()) {
             (Err(CoreError::Sql(SqlError::InvalidIndexPredicate)), Some(m)) => {
@@ -414,7 +431,7 @@ impl Diagnostic {
             }
             ("2BP01", A::Membership { .. }) => {
                 self.wire_message = Some("dependent privileges exist".into());
-                self.wire_hint = Some("Use CASCADE to revoke them too.");
+                self.wire_hint = Some("Use CASCADE to revoke them too.".into());
             }
             _ => {}
         }
@@ -432,7 +449,7 @@ impl Diagnostic {
     fn replication_role_value(&mut self, value: &str) -> R<()> {
         crate::pg_settings::database::replication_role(value).map(|_| ()).inspect_err(|_| {
             self.wire_message = Some(format!("invalid value for parameter \"session_replication_role\": \"{value}\""));
-            self.wire_hint = Some("Available values: origin, replica, local.");
+            self.wire_hint = Some("Available values: origin, replica, local.".into());
         })
     }
     fn presentation_setting(
@@ -452,7 +469,7 @@ impl Diagnostic {
                 }),
             Show::ByteaOutput => database::bytea_output(value).map(|_| ()).inspect_err(|_| {
                 self.wire_message = Some(format!("invalid value for parameter \"bytea_output\": \"{value}\""));
-                self.wire_hint = Some("Available values: escape, hex.");
+                self.wire_hint = Some("Available values: escape, hex.".into());
             }),
             _ => Ok(()),
         }
@@ -545,7 +562,7 @@ fn diagnostic_error(
         z(diagnostic.and_then(|d| d.sql_detail.as_deref().or(d.wire_detail.as_deref())).unwrap_or(&detail), &mut b);
     }
     if let Some(context) = diagnostic.and_then(|d| d.wire_context.as_deref()) { b.push(b'W'); z(context, &mut b); }
-    if let Some(hint) = diagnostic.and_then(|d| d.wire_hint) {
+    if let Some(hint) = diagnostic.and_then(|d| d.wire_hint.as_deref()) {
         b.push(b'H');
         z(hint, &mut b);
     }
@@ -4419,7 +4436,7 @@ mod replication_role_diagnostic_tests {
         assert!(diagnostic.wire_hint.is_none());
         assert_eq!(diagnostic.replication_role_value("Bogus"), Err("22023"));
         assert_eq!(diagnostic.wire_message.as_deref(), Some("invalid value for parameter \"session_replication_role\": \"Bogus\""));
-        assert_eq!(diagnostic.wire_hint, Some("Available values: origin, replica, local."));
+        assert_eq!(diagnostic.wire_hint.as_deref(), Some("Available values: origin, replica, local."));
         let mut out = vec![];
         diagnostic_error("22023", GENERIC_MESSAGE, Some(&diagnostic), &mut out);
         assert_eq!(out[0], b'E');

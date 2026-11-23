@@ -399,6 +399,7 @@ fn values(body: &[Token]) -> ParseResult<Plan> {
             .first()
             .is_some_and(|r: &Vec<Scalar>| r.len() != row.len())
         {
+            user_types::view_replace_error("VALUES lists must all be the same length".into());
             return Err(ParseError::Definite(SqlError::Syntax));
         }
         rows.push(row);

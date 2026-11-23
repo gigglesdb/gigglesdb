@@ -45,6 +45,7 @@ pub(super) fn parse(
     // WITH bodies form a continuation chain. Store those scopes on the heap
     // so scalar parsing in the innermost body has the same stack as a root query.
     let mut remaining = tokens;
+    let outermost = depth == 0;
     let mut depth = depth;
     let mut scopes = Vec::new();
     loop {
@@ -59,7 +60,25 @@ pub(super) fn parse(
             break;
         }
     }
-    let mut body = parse::expression(remaining, following, owner, depth, next)?;
+    if !outermost && remaining.first().is_some_and(|token|
+        ["insert", "update", "delete", "merge"].iter().any(|word| parse::word(token, word)))
+    {
+        return Err(ParseError::Definite(SqlError::Unsupported));
+    }
+    let mut body = match remaining.first() {
+        Some(Token::Word(word)) if word == "insert" => {
+            let mut plan = Plan::new(Body::Values(vec![]));
+            plan.insert = Some(Box::new(dml::MainInsert {
+                prepared: dml::parse(remaining, owner)?,
+                parameters: dml::parameters(remaining),
+            }));
+            plan
+        }
+        Some(Token::Word(word)) if word == "update" || word == "delete" => {
+            mutation::parse(remaining, owner, depth, next)?
+        }
+        _ => parse::expression(remaining, following, owner, depth, next)?,
+    };
     for scope in scopes.into_iter().rev() {
         body = finish(scope.definitions, scope.recursive, scope.names, body, owner)?;
     }
@@ -116,13 +135,7 @@ fn parse_scope(
         } else {
             parse::child_expression(tokens, p.tokens.get(close), owner, depth, next)?
         };
-        let dml_parameters = tokens
-            .iter()
-            .filter_map(|t| match t {
-                Token::Param(n) => Some(*n),
-                _ => None,
-            })
-            .collect();
+        let dml_parameters = dml::parameters(tokens);
         p.at = close + 1;
         let search = if p.word("search") {
             let depth = if p.word("depth") {
@@ -242,7 +255,7 @@ fn finish(
                         || other
                             .dml
                             .as_ref()
-                            .is_some_and(|p| p.read_tables().contains(&cte.name))
+                            .is_some_and(|p| dml::references(p, &cte.name))
                 });
             if referenced {
                 return Err(ParseError::Definite(SqlError::Unsupported));
@@ -284,6 +297,7 @@ fn names_list(p: &mut Parser, close: bool) -> R<Vec<String>> {
 pub(super) fn remap(plan: &mut Plan, alias: &str, name: &str) {
     if let Some(m) = &mut plan.mutation { m.remap(alias, name); }
     if let Some(m) = &mut plan.merge { m.remap(alias, name); }
+    if let Some(insert) = &mut plan.insert { dml::remap(&mut insert.prepared, alias, name); }
     for cte in &mut plan.ctes {
         remap(&mut cte.query, alias, name);
         if let Some(dml) = &mut cte.dml {
@@ -404,7 +418,7 @@ fn remap_filter(f: &mut Filter, alias: &str, name: &str) {
         }
     }
 }
-fn references(plan: &Plan, name: &str) -> usize {
+pub(super) fn references(plan: &Plan, name: &str) -> usize {
     fn query_references(q: &Query, name: &str) -> usize {
         let mut n = q.sources.iter().filter(|s| s.name == name).count();
         if let Some(child) = q.derived() {
@@ -418,7 +432,17 @@ fn references(plan: &Plan, name: &str) -> usize {
         }
         n
     }
-    let mut n = 0;
+    let mut n = usize::from(plan.insert.as_ref().is_some_and(|insert| {
+        dml::references(&insert.prepared, name)
+    }));
+    if let Some(mutation) = &plan.mutation {
+        mutation.from.visit_queries(&mut |q| n += query_references(q, name));
+        for expression in mutation.groups.iter().filter_map(|(_, p)| p.as_ref())
+            .chain([&mutation.predicate]).chain(mutation.returning.as_ref())
+        {
+            n += references(expression, name);
+        }
+    }
     plan.visit_queries(&mut |q| n += query_references(q, name));
     n
 }
@@ -477,20 +501,18 @@ pub(super) fn install(
     columns: &[ColumnDef],
     typmods: &[i32],
 ) -> R<()> {
-    let mut id = state
-        .tables
-        .values()
-        .flat_map(|t| std::iter::once(t.id).chain(t.columns.iter().map(|c| c.id)))
-        .chain(state.ext.columns.keys().copied())
-        .filter(|id| *id < (1 << 62))
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or(SqlError::Limit)?;
-    let table_id = id;
+    // Virtual tables and columns live alongside the real catalog during DML.
+    // Keep their IDs away from persisted objects, including secondary indexes.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1 << 62);
+    let table_id = NEXT
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            id.checked_add(columns.len() as u64 + 1)
+        })
+        .map_err(|_| SqlError::Limit)?;
     let mut columns = columns.to_vec();
     for (i, column) in columns.iter_mut().enumerate() {
-        id = id.checked_add(1).ok_or(SqlError::Limit)?;
+        let id = table_id + i as u64 + 1;
         column.id = id;
         if let Some(typmod) = typmods.get(i).filter(|m| **m >= 0) {
             std::sync::Arc::make_mut(&mut state.ext).columns.insert(
@@ -796,7 +818,25 @@ pub(super) fn run_inner<'e>(
     let _metadata = functions::collation::ColumnScope::enter(&[], &[])?;
     let mut catalog = catalog(state);
     let mut materialized: Vec<(String, Relation<'e>)> = vec![];
-    for cte in &plan.ctes {
+    let mut body = plan.clone();
+    body.ctes.clear();
+    let needed = if body.mutation.is_some() || body.insert.is_some() {
+        let mut needed = vec![false; plan.ctes.len()];
+        for (index, cte) in plan.ctes.iter().enumerate().rev() {
+            needed[index] = cte.dml.is_some() || references(&body, &cte.name) != 0
+                || plan.ctes[index + 1..].iter().zip(&needed[index + 1..]).any(|(later, needed)| {
+                    *needed && (references(&later.query, &cte.name) != 0
+                        || later.dml.as_ref().is_some_and(|dml| dml::references(dml, &cte.name)))
+                });
+        }
+        needed
+    } else {
+        vec![true; plan.ctes.len()]
+    };
+    for (cte, needed) in plan.ctes.iter().zip(needed) {
+        if !needed {
+            continue;
+        }
         let wrapper = VirtualRows {
             base: source,
             relations: materialized.iter().map(|(n, r)| (n.clone(), r)).collect(),
@@ -838,8 +878,10 @@ pub(super) fn run_inner<'e>(
         base: source,
         relations: materialized.iter().map(|(n, r)| (n.clone(), r)).collect(),
     };
-    let mut body = plan.clone();
-    body.ctes.clear();
+    if let Some(insert) = &body.insert {
+        let (target, events) = writes.as_mut().ok_or(SqlError::Unsupported)?;
+        return dml::execute(&insert.prepared, state, &catalog, &wrapper, target, events, params, parameters, clock, execution);
+    }
     if body.mutation.is_some() || body.merge.is_some() {
         let (target,events)=writes.as_mut().ok_or(SqlError::Unsupported)?;
         let prepared=Prepared::engine(Statement::Plan(body),0,state.epoch);
@@ -1364,16 +1406,7 @@ pub(super) fn install_collated(
     metadata: &[Option<BoundScalar>],
 ) -> R<()> {
     install(state, name, columns, typmods)?;
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 62);
-    let table = std::sync::Arc::make_mut(&mut state.tables).get_mut(name).unwrap();
-    for c in &mut table.columns {
-        let old = c.id;
-        c.id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(ext) = std::sync::Arc::make_mut(&mut state.ext).columns.remove(&old) {
-            std::sync::Arc::make_mut(&mut state.ext).columns.insert(c.id, ext);
-        }
-    }
-    functions::collation::register(&table.columns, metadata)
+    functions::collation::register(&state.tables[name].columns, metadata)
 }
 
 #[cfg(test)]

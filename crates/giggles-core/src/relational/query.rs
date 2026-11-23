@@ -13,6 +13,7 @@ pub(super) mod typed_read;
 pub(super) use functions::assignment;
 pub(super) mod conflict;
 mod grouping;
+mod json_aggregate;
 mod insert_values;
 mod schema_names;
 mod extension_dependencies;
@@ -74,6 +75,14 @@ enum Aggregate {
     MaxDistinct,
     Min,
     Max,
+    Json,
+    Jsonb,
+    JsonDistinct,
+    JsonbDistinct,
+    JsonObject,
+    JsonbObject,
+    JsonObjectDistinct,
+    JsonbObjectDistinct,
 }
 impl Aggregate {
     fn base(self) -> Self {
@@ -83,6 +92,10 @@ impl Aggregate {
             Self::AvgDistinct => Self::Avg,
             Self::MinDistinct => Self::Min,
             Self::MaxDistinct => Self::Max,
+            Self::JsonDistinct => Self::Json,
+            Self::JsonbDistinct => Self::Jsonb,
+            Self::JsonObjectDistinct => Self::JsonObject,
+            Self::JsonbObjectDistinct => Self::JsonbObject,
             a => a,
         }
     }
@@ -94,6 +107,10 @@ impl Aggregate {
                 | Self::AvgDistinct
                 | Self::MinDistinct
                 | Self::MaxDistinct
+                | Self::JsonDistinct
+                | Self::JsonbDistinct
+                | Self::JsonObjectDistinct
+                | Self::JsonbObjectDistinct
         )
     }
     fn with_distinct(self) -> Self {
@@ -103,6 +120,10 @@ impl Aggregate {
             Self::Avg => Self::AvgDistinct,
             Self::Min => Self::MinDistinct,
             Self::Max => Self::MaxDistinct,
+            Self::Json => Self::JsonDistinct,
+            Self::Jsonb => Self::JsonbDistinct,
+            Self::JsonObject => Self::JsonObjectDistinct,
+            Self::JsonbObject => Self::JsonbObjectDistinct,
             _ => unreachable!(),
         }
     }
@@ -113,6 +134,10 @@ impl Aggregate {
             Self::Avg => "avg",
             Self::Min => "min",
             Self::Max => "max",
+            Self::Json => "json_agg",
+            Self::Jsonb => "jsonb_agg",
+            Self::JsonObject => "json_object_agg",
+            Self::JsonbObject => "jsonb_object_agg",
             _ => unreachable!(),
         }
     }
@@ -136,6 +161,10 @@ impl Aggregate {
             "avg" => Self::Avg,
             "min" => Self::Min,
             "max" => Self::Max,
+            "json_agg" => Self::Json,
+            "jsonb_agg" => Self::Jsonb,
+            "json_object_agg" => Self::JsonObject,
+            "jsonb_object_agg" => Self::JsonbObject,
             _ => return None,
         };
         Some(if distinct { a.with_distinct() } else { a })
@@ -1507,6 +1536,7 @@ struct Execution<'a> {
     visits: Cell<usize>,
     subqueries: RefCell<BTreeMap<usize, MaterializedSubquery>>,
     plan_applies: RefCell<BTreeMap<String, plan::subquery::Cached>>,
+    correlation_rows: plan::correlation::Cache,
     retention: RefCell<scan::Retention>,
     declared: Vec<Option<DataType>>,
     exists: RefCell<BTreeMap<usize, bool>>,
@@ -1528,6 +1558,7 @@ impl<'a> Execution<'a> {
             visits: Cell::new(0),
             subqueries: RefCell::new(BTreeMap::new()),
             plan_applies: RefCell::new(BTreeMap::new()),
+            correlation_rows: plan::correlation::Cache::default(),
             retention: RefCell::new(scan::Retention::new(scan::retention_limit())),
             capture: Cell::new(false),
             captured: RefCell::new(None),
@@ -2450,7 +2481,13 @@ impl Query {
                         None
                     } else {
                         let input = Scalar::parse_expr(p, 0, true)?;
-                        Some(aggregate_order::parse(p, input, 0)?)
+                        Some(if json_aggregate::object(a) {
+                            p.punct(',')?;
+                            let value = Scalar::parse_expr(p, 0, true)?;
+                            aggregate_order::parse_object(p, vec![input, value], 0)?
+                        } else {
+                            aggregate_order::parse(p, input, 0)?
+                        })
                     };
                     p.punct(')')?;
                     Item::Aggregate(a, c)
@@ -3926,12 +3963,15 @@ impl Query {
                 }
             }
         }
-        for ((column, unknown), target) in bound.columns.iter().zip(outputs).zip(targets) {
+        let description = bound.description(state);
+        for (i, ((column, unknown), target)) in description.columns.iter().zip(outputs).zip(targets).enumerate() {
             if let Some(value) = unknown {
                 if !functions::zone_dependent_literal(&value, target) {
                     assignment::literal(value, target, None)?;
                 }
-            } else if !assignment::compatible(&column.data_type, target) {
+            } else if !assignment::SourceType::new(&column.data_type, description.type_oids.get(i))
+                .compatible(target)
+            {
                 return Err(SqlError::Type);
             }
         }
@@ -4320,7 +4360,9 @@ impl Query {
                     let c = c.map(|e| {
                         if let Some(ty) = e.enum_type(&tables) { e.with_enum(&ty) } else { e }
                     });
-                    if c.as_ref().is_some_and(|c| c.ty == DataType::Bpchar) {
+                    if json_aggregate::result_type(*a).is_none()
+                        && c.as_ref().is_some_and(|c| c.ty == DataType::Bpchar)
+                    {
                         return Err(SqlError::Unsupported);
                     }
                     if let Some(c) = &c { aggregate_order::check_types(c)?; }
@@ -4374,6 +4416,8 @@ impl Query {
                         }
                     } else if matches!(a.base(), Aggregate::Count) {
                         DataType::BigInt
+                    } else if let Some(ty) = json_aggregate::result_type(*a) {
+                        ty
                     } else {
                         ty.ok_or(SqlError::Type)?
                     };
@@ -4489,6 +4533,7 @@ impl Query {
             outer_slots: outer_slots.into_inner(),
             subqueries,
             declared: vec![],
+            aggregate_zone: giggles_pg_types::temporal::SessionZone::Fixed(0),
         })
     }
 }
@@ -4531,6 +4576,7 @@ pub(super) struct BoundQuery<'a> {
     outer_slots: Vec<outer::OuterSlot>,
     subqueries: Subplans<'a>,
     declared: Vec<Option<DataType>>,
+    aggregate_zone: giggles_pg_types::temporal::SessionZone,
 }
 #[derive(Clone, Serialize, Deserialize)]
 // Transient executor/spill tuple, never stored in the database.
@@ -5006,14 +5052,18 @@ impl BoundQuery<'_> {
         let oid = |item: &BoundItem| match item {
             BoundItem::Ctid(_) => 27,
             BoundItem::Scalar(value) => value.result_oid(),
+            BoundItem::Aggregate(kind, _) if json_aggregate::json_result(*kind) => json_aggregate::OID,
             _ => 0,
         };
+        let type_oids = if self.query.explain {
+            vec![]
+        } else if let Some(grouping) = &self.grouping {
+            grouping.result_oids()
+        } else {
+            self.items.iter().map(oid).collect()
+        };
         Description {
-            type_oids: if !self.query.explain && self.items.iter().map(oid).any(|oid| oid != 0) {
-                self.items.iter().map(oid).collect()
-            } else {
-                vec![]
-            },
+            type_oids: if type_oids.iter().any(|oid| *oid != 0) { type_oids } else { vec![] },
             parameters: self.parameters.clone(),
             typmods: if self.query.explain {
                 vec![result_typmod(state, TypmodSource::Other)]
@@ -5863,6 +5913,9 @@ impl BoundQuery<'_> {
                 .collect::<Vec<_>>();
             let scope = RetentionScope::new(execution);
             let mut auxiliary = aggregate_auxiliary(&self.items, &mut scope.borrow())?;
+            for aux in &mut auxiliary {
+                aux.zone = self.aggregate_zone;
+            }
             if source.streams_reductions() {
                 for (aux, (item, _)) in auxiliary.iter_mut().zip(&self.query.items) {
                     aux.stream_column = matches!(item, Item::Aggregate(_, Some(Scalar::Column(_))));
@@ -6198,6 +6251,8 @@ impl BoundQuery<'_> {
         self
     }
     fn attach_execution_clock(&mut self, clock: Option<&super::clock::ExecutionClock>) {
+        self.aggregate_zone = clock.and_then(|clock| clock.zone())
+            .unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0));
         self.subqueries.attach_clock(clock);
         if let Some(grouping) = &mut self.grouping {
             grouping.attach_clock(clock, &mut self.joins);
@@ -6234,6 +6289,7 @@ fn parse_like_escape(pattern: &Value, escape: &Value) -> R<Option<super::like::E
 
 struct AggregateAuxiliary {
     stream_column: bool,
+    zone: giggles_pg_types::temporal::SessionZone,
     // V2: argument evaluation and SUM/AVG numeric transitions charge a per-value
     // budget, not the statement-wide one (DD-0068 Q4), so no 54000 from input size.
     local_transition: bool,
@@ -6252,6 +6308,7 @@ fn aggregate_auxiliary(
         .iter()
         .map(|_| AggregateAuxiliary {
             stream_column: false,
+            zone: giggles_pg_types::temporal::SessionZone::Fixed(0),
             local_transition: false,
             count: 0,
             ordered: None,
@@ -6277,34 +6334,47 @@ fn flush_distinct(
             let (name, args) = aggregate_order::parts(input).ok_or(SqlError::Type)?;
             let error = RefCell::new(None);
             let compare = |a: &Vec<Value>, b: &Vec<Value>| {
-                aggregate_order::compare(name,args,a,b).unwrap_or_else(|e| {
+                aggregate_order::compare(name, args, a, b, kind.distinct()).unwrap_or_else(|e| {
                     *error.borrow_mut() = Some(e);
                     Ordering::Equal
                 })
             };
             let sorted = sorter.finish(compare,retention)?;
             if let Some(e) = error.borrow_mut().take() {return Err(e);}
-            let mut last = None;
+            let mut last: Option<Vec<Value>> = None;
             for input in sorted {
                 let input = input?;
                 if let Some(e) = error.borrow_mut().take() {return Err(e);}
-                let value = input.into_iter().next().ok_or(SqlError::Type)?;
-                if value == Value::Null {continue;}
+                let width = aggregate_order::input_width(name, args.len());
+                let inputs = &input[..width];
                 if kind.distinct() {
-                    if let Some(last) = &last
-                        && args[0].try_compare_values(last,&value)? == Ordering::Equal {continue;}
-                    last = Some(value.clone());
+                    if let Some(previous) = &last
+                        && aggregate_order::same_inputs(&args[..width], previous, inputs)?
+                    {
+                        continue;
+                    }
+                    last = Some(inputs.to_vec());
                 }
-                update_filtered_aggregates(items, &[], columns, values, auxiliary, retention,
-                    &empty, &[], work, Some((index,value)))?;
+                if json_aggregate::object(*kind) {
+                    json_aggregate::push_object(&mut values[index], inputs, args, *kind,
+                        auxiliary[index].zone, retention)?;
+                } else {
+                    let value = input.into_iter().next().ok_or(SqlError::Type)?;
+                    if value != Value::Null || json_aggregate::result_type(*kind).is_some() {
+                        update_filtered_aggregates(items, &[], columns, values, auxiliary, retention,
+                            &empty, &[], work, Some((index,value)))?;
+                    }
+                }
             }
         }
         let Some(sorter) = auxiliary[index].pending.take() else { continue };
         let mut last: Option<Value> = None;
-        let scalar = match &items[index] { BoundItem::Aggregate(_,c) => c.as_ref(), _ => None };
+        let BoundItem::Aggregate(kind, scalar) = &items[index] else { return Err(SqlError::Type) };
+        let scalar = scalar.as_ref();
         let error = RefCell::new(None);
-        let compare = |a: &Value, b: &Value| scalar.map_or_else(|| Ok(cmp(a,b)), |s| s.try_compare_values(a,b)).unwrap_or_else(|e| {
-            *error.borrow_mut() = Some(e); Ordering::Equal
+        let compare = |a: &Value, b: &Value| distinct_input_order(*kind, scalar, a, b).unwrap_or_else(|e| {
+            *error.borrow_mut() = Some(e);
+            Ordering::Equal
         });
         let sorted = sorter.finish(compare, retention)?;
         if let Some(e) = error.borrow_mut().take() {return Err(e);}
@@ -6312,7 +6382,7 @@ fn flush_distinct(
             let value = value?;
             if let Some(e) = error.borrow_mut().take() {return Err(e);}
             if let Some(last) = &last {
-                let order = scalar.map_or_else(|| Ok(cmp(last,&value)), |s|s.try_compare_values(last,&value))?;
+                let order = distinct_input_order(*kind, scalar, last, &value)?;
                 if order == Ordering::Equal {continue;}
             }
             last = Some(value.clone());
@@ -6321,6 +6391,13 @@ fn flush_distinct(
         }
     }
     Ok(())
+}
+fn distinct_input_order(kind: Aggregate, input: Option<&BoundScalar>, a: &Value, b: &Value) -> R<Ordering> {
+    if json_aggregate::result_type(kind).is_some() {
+        json_aggregate::compare_distinct(input, a, b)
+    } else {
+        input.map_or_else(|| Ok(cmp(a, b)), |input| input.try_compare_values(a, b))
+    }
 }
 fn aggregate_retained(values: &[Value]) -> usize {
     std::mem::size_of_val(values) + values.iter().map(value_bytes).sum::<usize>()
@@ -6332,6 +6409,11 @@ fn finish_aggregates(
     work: &mut usize,
 ) -> R<()> {
     for ((item, value), state) in items.iter().zip(values).zip(auxiliary) {
+        if let BoundItem::Aggregate(a, _) = item
+            && json_aggregate::result_type(*a).is_some()
+        {
+            json_aggregate::finish(value, *a, work)?;
+        }
         if let BoundItem::Aggregate(a, _) = item
             && matches!(a.base(), Aggregate::Avg)
             && state.count != 0
@@ -6406,10 +6488,15 @@ fn update_filtered_aggregates(
         }
         if inject.is_none() && let Some((name,args)) = c.as_ref().and_then(aggregate_order::parts) {
             let input = args.iter().map(|s|s.eval(row,params,&mut 0)).collect::<R<Vec<_>>>()?;
+            if json_aggregate::object(*a) && !a.distinct() && name == aggregate_order::PREFIX {
+                json_aggregate::push_object(&mut values[index], &input, args, *a,
+                    auxiliary[index].zone, retention)?;
+                continue;
+            }
             let bytes = aggregate_retained(&input);
             let error = RefCell::new(None);
             auxiliary[index].ordered.get_or_insert_with(spill::Sorter::new).push(input,bytes,
-                |a: &Vec<Value>,b: &Vec<Value>| aggregate_order::compare(name,args,a,b).unwrap_or_else(|e| {
+                |left: &Vec<Value>, right: &Vec<Value>| aggregate_order::compare(name, args, left, right, a.distinct()).unwrap_or_else(|e| {
                     *error.borrow_mut()=Some(e); Ordering::Equal
                 }), retention)?;
             if let Some(e)=error.into_inner() {return Err(e);}
@@ -6432,16 +6519,18 @@ fn update_filtered_aggregates(
         let transition: &mut usize =
             if auxiliary[index].local_transition { &mut transition_work } else { &mut *work };
         let v = evaluated.as_ref();
-        if v == Some(&Value::Null) {
+        if v == Some(&Value::Null) && json_aggregate::result_type(*a).is_none() {
             continue;
         }
         let state = &mut auxiliary[index];
-        if a.distinct() && inject.is_none() && state.local_transition {
+        if a.distinct() && inject.is_none()
+            && (state.local_transition || json_aggregate::result_type(*a).is_some())
+        {
             let input = evaluated.ok_or(SqlError::Type)?;
             let bytes = std::mem::size_of::<Value>() + value_bytes(&input);
             let error = RefCell::new(None);
             state.pending.get_or_insert_with(spill::Sorter::new)
-                .push(input, bytes, |a: &Value, b: &Value| c.as_ref().map_or_else(|| Ok(cmp(a,b)), |s| s.try_compare_values(a,b)).unwrap_or_else(|e| {
+                .push(input, bytes, |left: &Value, right: &Value| distinct_input_order(*a, c.as_ref(), left, right).unwrap_or_else(|e| {
                     *error.borrow_mut()=Some(e); Ordering::Equal
                 }), retention)?;
             if let Some(e)=error.into_inner() {return Err(e);}
@@ -6563,6 +6652,12 @@ fn update_filtered_aggregates(
                     | DataType::TimestampTz
                     | DataType::Interval => return Err(SqlError::Type),
                 };
+            }
+            Aggregate::Json | Aggregate::Jsonb => {
+                json_aggregate::push(
+                    &mut value, v.ok_or(SqlError::Type)?, c.as_ref().ok_or(SqlError::Type)?,
+                    a.base(), state.zone, retention,
+                )?;
             }
             Aggregate::Min | Aggregate::Max => {
                 let v = v.ok_or(SqlError::Type)?;

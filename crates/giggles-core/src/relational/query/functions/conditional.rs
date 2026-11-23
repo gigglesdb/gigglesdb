@@ -95,6 +95,29 @@ fn types(
     tables: &[&TableDef],
     parameters: &[Option<DataType>],
 ) -> R<(Vec<DataType>, DataType)> {
+    if name == "nullif" {
+        let [a, b] = args else {
+            return Err(SqlError::UndefinedFunction);
+        };
+        let bind_known = |arg: &Scalar| -> R<Option<BoundScalar>> {
+            if arg.aggregate_unknown(parameters) {
+                Ok(None)
+            } else {
+                arg.bind(resolve, tables, parameters).map(Some)
+            }
+        };
+        let (a, b) = (bind_known(a)?, bind_known(b)?);
+        let left = a.as_ref().map_or("unknown", json_aggregate::type_name);
+        let right = b.as_ref().map_or("unknown", json_aggregate::type_name);
+        if left == "json" || right == "json" {
+            user_types::view_replace_error(format!("operator does not exist: {left} = {right}"));
+            user_types::sql_error_hint(
+                "No operator matches the given name and argument types. You might need to add explicit type casts.",
+            );
+            return Err(SqlError::UndefinedFunction);
+        }
+        return nullif_types(a.map(|a| a.ty), b.map(|b| b.ty));
+    }
     let types = args
         .iter()
         .map(|arg| {
@@ -105,12 +128,7 @@ fn types(
             }
         })
         .collect::<R<Vec<_>>>()?;
-    if name == "nullif" {
-        let [a, b] = types.try_into().map_err(|_| SqlError::UndefinedFunction)?;
-        nullif_types(a, b)
-    } else {
-        bucket_types(&types)
-    }
+    bucket_types(&types)
 }
 
 // Leave ordinary literals on the usual expression path. Represent a wider
@@ -250,15 +268,17 @@ pub(super) fn eval(
             return Err(SqlError::InternalError);
         };
         if *a != Value::Null && *b != Value::Null {
-            let order = if matches!(
+            let equal = if args[0].ty == DataType::Jsonb {
+                jsonb_mutation::equal(a, b, budget)?
+            } else if matches!(
                 (a, b),
                 (Value::Float4(_), Value::Float8(_)) | (Value::Float8(_), Value::Float4(_))
             ) {
-                comparison::compare_cross(a, b, None)?
+                comparison::compare_cross(a, b, None)?.is_eq()
             } else {
-                collation::compare_pair(&args[0], &args[1], a, b)?
+                collation::compare_pair(&args[0], &args[1], a, b)?.is_eq()
             };
-            if order.is_eq() {
+            if equal {
                 return Ok(Value::Null);
             }
         }

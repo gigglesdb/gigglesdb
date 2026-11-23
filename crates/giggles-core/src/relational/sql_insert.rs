@@ -1,5 +1,6 @@
 //! Bounded SQL multi-row INSERT and ON CONFLICT frontend.
 use super::*;
+use query::assignment::SourceType;
 use crate::operations::{self, ConflictAction};
 
 #[derive(Debug, Clone)]
@@ -9,7 +10,7 @@ pub(super) struct Insert {
     copy_input: Option<Vec<DataType>>,
     normalized: Option<Vec<Vec<Value>>>,
     copy_precoerced: bool,
-    source_types: Option<Vec<Option<DataType>>>,
+    source_types: Option<Vec<Option<SourceType>>>,
     columns: Vec<String>,
     rows: Vec<Vec<Expr>>,
     casts: BTreeMap<(usize, usize), query::conflict::Expression>,
@@ -18,8 +19,28 @@ pub(super) struct Insert {
     overriding: Option<bool>,
     conflict: Option<Conflict>,
     pub(super) returning: Option<returning::Returning>,
-    pub(super) source: Option<Box<query::Query>>,
+    pub(super) source: Option<Source>,
 }
+#[derive(Debug, Clone)]
+pub(super) enum Source {
+    Query(Box<query::Query>),
+    Plan(Box<query::plan::Plan>, usize),
+}
+impl Source {
+    pub(super) fn query(&self) -> Option<&query::Query> {
+        match self {
+            Self::Query(query) => Some(query),
+            Self::Plan(..) => None,
+        }
+    }
+    pub(super) fn read_tables(&self) -> Vec<String> {
+        match self {
+            Self::Query(query) => query.read_tables(),
+            Self::Plan(plan, _) => plan.read_tables(),
+        }
+    }
+}
+
 /// Borrowed syntax needed by static lock classification, without expression internals.
 pub(super) struct LockConflict<'a> {
     pub(super) columns: Option<&'a [String]>,
@@ -186,7 +207,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
         && (matches!(p.tokens.get(p.at), Some(Token::Word(word)) if word == "select")
             || p.tokens.get(p.at) == Some(&Token::Symbol('(')))
     {
-        Some(Box::new(parse_source(p)?))
+        Some(parse_source(p)?)
     } else {
         if !p.word("values") {
             return Err(unsupported_or_syntax(p));
@@ -329,12 +350,18 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
         source,
     })
 }
-fn parse_source(p: &mut Parser) -> R<query::Query> {
+fn parse_source(p: &mut Parser) -> R<Source> {
     let start = p.at;
     let mut end = start;
     let mut depth = 0usize;
+    let mut union_all = None;
     while let Some(token) = p.tokens.get(end) {
         match token {
+            Token::Word(word) if depth == 0 && matches!(word.as_str(), "union" | "intersect" | "except") => {
+                let append = word == "union"
+                    && matches!(p.tokens.get(end + 1), Some(Token::Word(word)) if word == "all");
+                union_all = Some(union_all.unwrap_or(true) && append);
+            }
             Token::Word(word) if depth == 0 && word == "returning" => break,
             Token::Word(word)
                 if depth == 0
@@ -379,7 +406,28 @@ fn parse_source(p: &mut Parser) -> R<query::Query> {
         params: BTreeSet::new(),
         relations: Vec::new(),
     };
-    let source = query::Query::parse_insert_source(&mut parser)?;
+    let conflict_union_all = union_all == Some(true)
+        && matches!(p.tokens.get(end), Some(Token::Word(word)) if word == "on");
+    let source = match query::Query::parse_insert_source(&mut parser) {
+        Ok(query) => Source::Query(Box::new(query)),
+        Err(error @ (SqlError::Syntax | SqlError::Unsupported | SqlError::Reserved))
+            if conflict_union_all || p.tokens[start..end].windows(2).any(|pair| {
+                pair[0] == Token::Symbol('(')
+                    && matches!(&pair[1], Token::Word(word) if word == "values")
+            }) =>
+        {
+            parser = Parser { tokens: p.tokens[start..end].to_vec(), at: 0,
+                params: BTreeSet::new(), relations: vec![], privilege_seen: false,
+                privilege_casts: false };
+            let plan = query::plan::Plan::parse(&mut parser).map_err(|failure| match failure {
+                query::plan::ParseError::Decline => error,
+                query::plan::ParseError::Definite(error) => error,
+            })?;
+            let count = parser.params.last().copied().unwrap_or(0);
+            Source::Plan(Box::new(plan), count)
+        }
+        Err(error) => return Err(error),
+    };
     p.privilege_seen |= parser.privilege_seen;
         p.params.extend(parser.params);
     p.relations.extend(parser.relations);
@@ -409,10 +457,15 @@ fn indexes(insert: &Insert, table: &TableDef) -> R<Vec<usize>> {
     }
     Ok(indexes)
 }
-fn source_indexes(insert: &Insert, state: &Relational, table: &TableDef) -> R<Vec<usize>> {
+fn source_indexes(
+    insert: &Insert, state: &Relational, table: &TableDef, declared: &[Option<DataType>],
+) -> R<Vec<usize>> {
     let mut indexes = indexes(insert, table)?;
     if let Some(source) = &insert.source {
-        let width = source.insert_outputs(state)?.len();
+        let width = match source {
+            Source::Query(query) => query.insert_outputs(state)?.len(),
+            Source::Plan(plan, count) => plan.describe(state, (*count).max(declared.len()), declared)?.columns.len(),
+        };
         if width > indexes.len() || !insert.columns.is_empty() && width < indexes.len() {
             return Err(SqlError::Syntax);
         }
@@ -623,7 +676,10 @@ impl Insert {
         let mut dependencies = self
             .source
             .as_ref()
-            .map_or_else(Vec::new, |source| source.sequence_dependencies());
+            .map_or_else(Vec::new, |source| match source {
+                Source::Query(query) => query.sequence_dependencies(),
+                Source::Plan(plan, _) => plan.sequences(),
+            });
         for expression in self.casts.values() {
             dependencies.extend(expression.sequence_dependencies());
         }
@@ -653,7 +709,7 @@ impl Insert {
             casts: BTreeMap::new(), defaults, default_values, overriding, conflict: None, returning: None }
     }
     pub(super) fn from_query(table: String, columns: Vec<String>, source: query::Query) -> Self {
-        Self { table, columns, source: Some(Box::new(source)), alias: None,
+        Self { table, columns, source: Some(Source::Query(Box::new(source))), alias: None,
             copy_input: None, normalized: None, copy_precoerced: false, source_types: None, rows: vec![],
             casts: BTreeMap::new(), defaults: vec![], default_values: false,
             overriding: None, conflict: None, returning: None }
@@ -721,6 +777,12 @@ impl Insert {
     }
 
     pub(super) fn implicit_sequences(&self, state: &Relational) -> R<Vec<Option<String>>> {
+        self.implicit_sequences_declared(state, &[])
+    }
+
+    pub(super) fn implicit_sequences_declared(
+        &self, state: &Relational, declared: &[Option<DataType>],
+    ) -> R<Vec<Option<String>>> {
         // COPY rejects views after its input response; no table defaults run.
         if self.copy_input.is_some() && state.view_names.contains_key(&self.table) {
             return Ok(Vec::new());
@@ -729,7 +791,7 @@ impl Insert {
             .tables
             .get(&self.table)
             .ok_or(SqlError::UnknownTable)?;
-        let indexes = source_indexes(self, state, table)?;
+        let indexes = source_indexes(self, state, table, declared)?;
         let mut dependencies = vec![];
         // Each column's stored default text is built once per call. The syntax
         // lookup still runs on every use, as before: its thread-local cache and
@@ -793,7 +855,7 @@ impl Insert {
             .tables
             .get(&self.table)
             .ok_or(SqlError::UnknownTable)?;
-        let indexes = source_indexes(self, state, table)?;
+        let indexes = source_indexes(self, state, table, declared)?;
         let mut parameters = vec![None; count];
         if declared.len() > count {
             return Err(SqlError::Parameters);
@@ -852,7 +914,10 @@ impl Insert {
                 .iter()
                 .map(|index| table.columns[*index].data_type.clone())
                 .collect::<Vec<_>>();
-            source.bind_insert_source(state, &targets, &mut parameters, declared)?;
+            match source {
+                Source::Query(query) => { query.bind_insert_source(state, &targets, &mut parameters, declared)?; }
+                Source::Plan(plan, _) => { plan.bind_insert_outputs(state, &targets, &mut parameters)?; }
+            }
             if self.overriding.is_none() {
                 for index in &indexes {
                     defaults::check_explicit(state, &table.columns[*index])?;
@@ -887,7 +952,7 @@ impl Insert {
 }
 struct SourceRows {
     insert: Insert,
-    types: Vec<Option<DataType>>,
+    types: Vec<Option<SourceType>>,
     stored: Option<(SqlResult, Option<spill::Store<SqlRow>>)>,
 }
 #[expect(clippy::too_many_arguments, reason = "statement inputs plus an optional source and capture mode")]
@@ -906,7 +971,7 @@ fn materialize_source(
         .tables
         .get(&insert.table)
         .ok_or(SqlError::UnknownTable)?;
-    let indexes = source_indexes(insert, state, table)?;
+    let indexes = source_indexes(insert, state, table, declared)?;
     let targets = indexes
         .iter()
         .map(|index| table.columns[*index].data_type.clone())
@@ -917,24 +982,38 @@ fn materialize_source(
         .into_iter()
         .map(Some)
         .collect::<Vec<_>>();
-    let bound = source
-        .bind_insert_source(state, &targets, &mut parameters, declared)?
-        .with_clock(clock);
-    let columns = bound.description(state).columns;
-    let unknown = source.insert_outputs(state)?;
-    // Input conversion is a binding obligation even when WHERE produces no rows.
-    for (value, target) in unknown.iter().zip(&targets) {
-        if let Some(value) = value {
-            query::assignment::literal(value.clone(), target, clock)?;
-        }
-    }
     let legacy = scan::LegacyRows(state);
-    let source = injected_source.unwrap_or(&legacy);
-    let (result, stored) = if capture {
-        let (result, store) = bound.execute_insert_source_captured(state, source, params, cancel, declared)?;
-        (SqlResult::default(), Some((result, store)))
-    } else {
-        (bound.execute_insert_source(state, source, params, cancel, declared)?, None)
+    let rows = injected_source.unwrap_or(&legacy);
+    let (result, stored, types) = match source {
+        Source::Query(query) => {
+            let bound = query.bind_insert_source(state, &targets, &mut parameters, declared)?
+                .with_clock(clock);
+            let description = bound.description(state);
+            let unknown = query.insert_outputs(state)?;
+            // Input conversion is a binding obligation even when WHERE produces no rows.
+            for (value, target) in unknown.iter().zip(&targets) {
+                if let Some(value) = value {
+                    query::assignment::literal(value.clone(), target, clock)?;
+                }
+            }
+            let (result, stored) = if capture {
+                let captured = bound.execute_insert_source_captured(state, rows, params, cancel, declared)?;
+                (SqlResult::default(), Some(captured))
+            } else {
+                (bound.execute_insert_source(state, rows, params, cancel, declared)?, None)
+            };
+            let types = description.columns.into_iter().zip(unknown).enumerate()
+                .map(|(i, (column, unknown))| {
+                    unknown.is_none().then(|| SourceType::new(&column.data_type, description.type_oids.get(i)))
+                })
+                .collect();
+            (result, stored, types)
+        }
+        Source::Plan(plan, _) => {
+            let types = plan.bind_insert_outputs(state, &targets, &mut parameters)?;
+            let result = plan.execute(state, rows, params.len(), params, &parameters, clock, cancel)?;
+            (result, None, types)
+        }
     };
     if result.rows.len() > MAX_ROWS {
         return Err(SqlError::Limit);
@@ -951,11 +1030,6 @@ fn materialize_source(
         .map(|row| row.values.into_iter().map(Expr::Literal).collect())
         .collect();
     materialized.defaults = vec![vec![false; indexes.len()]; materialized.rows.len()];
-    let types = columns
-        .into_iter()
-        .zip(unknown)
-        .map(|(column, unknown)| unknown.is_none().then_some(column.data_type))
-        .collect();
     Ok(SourceRows {
         insert: materialized,
         types,
@@ -996,7 +1070,7 @@ fn normalize_row(
     params: &[Value],
     declared: &[Option<DataType>],
     clock: Option<&clock::ExecutionClock>,
-    source_types: Option<&[Option<DataType>]>,
+    source_types: Option<&[Option<SourceType>]>,
 ) -> R<Vec<Value>> {
     let replaced = |index: usize, default: bool| {
         default
@@ -1017,9 +1091,8 @@ fn normalize_row(
                 source_types.and_then(|types| types.get(slot))
             {
                 // Allocate defaults in input order before a row's assignment can fail.
-                query::assignment::convert(
+                source_type.convert(
                     expression.value(params)?,
-                    source_type,
                     &table.columns[*index].data_type,
                     clock,
                 )?

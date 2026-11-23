@@ -2,6 +2,7 @@
 //! references are substituted with typed values, never statement parameters.
 use super::*;
 use exec::Relation;
+pub(in crate::relational::query) mod lazy;
 
 #[derive(Debug, Clone)]
 pub(super) enum Right {
@@ -534,6 +535,7 @@ fn bind_scalar(
     s: &Scalar,
     shape: &join::Shape,
     parameters: &mut [Option<DataType>],
+    row_slot: Option<usize>,
 ) -> R<BoundScalar> {
     let table = TableDef {
         id: 0,
@@ -568,6 +570,12 @@ fn bind_scalar(
                         .is_some_and(|col| col.name == format!("{}_many", name))
             })
         {
+            if let Some(slot) = row_slot {
+                *s = lazy::scalar(
+                    &c.name, &shape.columns[*n].data_type, slot, shape.collations[*n].as_ref(),
+                )?;
+                return Ok(());
+            }
             *s = Scalar::Case(Box::new(functions::CaseExpr {
                 arms: vec![(
                     Filter::Scalar(join::col(n + 1)),
@@ -598,12 +606,15 @@ fn prepare(
     state: &Relational,
     parameters: &mut [Option<DataType>],
     cached: Option<&BTreeMap<String, Cached>>,
+    lazy: bool,
 ) -> R<(Query, join::Shape)> {
     let mut shape = input_shape(s, state, parameters)?;
+    let row_slot = shape.columns.len() + 2 * s.applies.len();
     let mut names = vec![];
     let mut constants = BTreeMap::new();
     for a in &s.applies {
         let mut metadata;
+        let mut json = false;
         let (ty, name) = match &a.right {
             Right::Query(q) => {
                 let (mut q, correlated) = instantiate(q, &shape, None, state, parameters)?;
@@ -611,8 +622,19 @@ fn prepare(
                 if !a.exists && meta.columns.len() != 1 {
                     return Err(SqlError::Syntax);
                 }
+                // A scalar SELECT resolves an otherwise unconstrained output
+                // parameter to text at the subquery boundary.
+                if !a.exists && a.comparison.is_none()
+                    && let Body::Select(select) = &q.body
+                    && let Some((Item::Scalar(Scalar::Param(n)), _)) = select.query.items.first()
+                    && let Some(slot) = parameters.get_mut(n - 1)
+                {
+                    slot.get_or_insert(DataType::Text);
+                }
                 metadata = meta.collations.into_iter().next().flatten().map(|m| functions::collation::materialized(Some(&m),m.ty.clone())).transpose()?;
                 let col = meta.columns.first().ok_or(SqlError::Syntax)?;
+                json = a.comparison.is_none() && !a.exists
+                    && meta.type_oids.first() == Some(&json_aggregate::OID);
                 if !correlated && !a.contextual && a.comparison.is_none() && !a.exists {
                     let value = cached.and_then(|c| c.get(&a.name));
                     let literal = typed(
@@ -634,7 +656,7 @@ fn prepare(
                 (col.data_type.clone(), col.name.clone())
             }
             Right::Array(s) => {
-                let bound = bind_scalar(s, &shape, parameters)?;
+                let bound = bind_scalar(s, &shape, parameters, None)?;
                 let ty = srf::element(&bound.ty)?;
                 metadata = Some(functions::collation::combined(Some(&bound),None,ty.clone())?);
                 (ty, "?column?".into())
@@ -715,32 +737,56 @@ fn prepare(
             } else {
                 name
             },
+            json,
         ));
+    }
+    if lazy {
+        let name = "\0plan_apply_row";
+        shape.namespace.hidden.push((name.into(), row_slot));
+        shape.columns.push(ColumnDef {
+            id: 0, name: name.into(), data_type: DataType::BigInt, not_null: true,
+        });
+        shape.typmods.push(-1);
+        shape.collations.push(None);
     }
     let mut query = s.query.clone();
     for (item, alias) in &mut query.items {
         if alias.is_none()
             && let Item::Scalar(Scalar::Column(c)) = item
-            && let Some((_, _, name)) = names.iter().find(|(n, _, _)| *n == c.name)
+            && let Some((_, _, name, _)) = names.iter().find(|(n, _, _, _)| *n == c.name)
         {
             *alias = Some(name.clone());
         }
     }
+    if lazy {
+        let filter = match &mut query.filter {
+            Some(Filter::Clauses(c)) => &mut c.filter,
+            filter => filter,
+        };
+        if let Some(filter) = filter {
+            lazy::subplans_last(filter)?;
+        }
+    }
     map_query(&mut query, &mut |s| {
         if let Scalar::Column(c) = s
-            && let Some((_, n, _)) = names.iter().find(|(name, _, _)| *name == c.name)
+            && let Some((_, n, _, json)) = names.iter().find(|(name, _, _, _)| *name == c.name)
         {
-            if let Some(value) = constants.get(&c.name) {
-                *s = value.clone();
-                return Ok(());
-            }
-            *s = Scalar::Case(Box::new(functions::CaseExpr {
-                arms: vec![(
-                    Filter::Scalar(join::col(n + 1)),
-                    cardinality(&shape.columns[*n].data_type),
-                )],
-                otherwise: Some(join::col(*n)),
-            }));
+            let value = if lazy {
+                lazy::scalar(
+                    &c.name, &shape.columns[*n].data_type, row_slot, shape.collations[*n].as_ref(),
+                )?
+            } else if let Some(value) = constants.get(&c.name) {
+                value.clone()
+            } else {
+                Scalar::Case(Box::new(functions::CaseExpr {
+                    arms: vec![(
+                        Filter::Scalar(join::col(n + 1)),
+                        cardinality(&shape.columns[*n].data_type),
+                    )],
+                    otherwise: Some(join::col(*n)),
+                }))
+            };
+            *s = if *json { json_aggregate::typed_text(value) } else { value };
         }
         Ok(())
     })?;
@@ -757,15 +803,22 @@ pub(super) fn resolve(
     state: &Relational,
     parameters: &mut [Option<DataType>],
 ) -> R<bind::Meta> {
-    let (q, shape) = prepare(s, state, parameters, None)?;
+    let (q, shape) = prepare(s, state, parameters, None, false)?;
     let catalog = join::catalog(state, &shape)?;
-    let bound = q.bind_projection_seeded(&catalog, parameters.to_vec())?;
+    let used = q.used_parameters();
+    let mut seeded = parameters.to_vec();
+    for (i, slot) in seeded.iter_mut().enumerate() {
+        if !used.contains(&(i + 1)) {
+            slot.get_or_insert(DataType::Text);
+        }
+    }
+    let bound = q.bind_projection_seeded(&catalog, seeded)?;
     let mut d = bound.description(&catalog);
     for column in &mut d.columns {
         column.id = 0;
     }
-    for (slot, ty) in parameters.iter_mut().zip(d.parameters) {
-        *slot = Some(ty);
+    for n in used {
+        parameters[n - 1] = Some(d.parameters[n - 1].clone());
     }
     // Apply queries can aggregate or group before being materialized too.
     // Keep output derivations exactly as the ordinary SELECT resolver does;
@@ -812,7 +865,16 @@ pub(super) fn run<'a>(
     clock: Option<&super::super::super::clock::ExecutionClock>,
     execution: &'a Execution<'_>,
 ) -> R<Relation<'a>> {
-    let (_, shape) = prepare(s, state, &mut parameters.to_vec(), None)?;
+    // Aggregate transitions hold the retention ledger while evaluating their
+    // inputs. Keep their existing materialized apply path.
+    let lazy = s.query.group().is_empty() && s.query.having().is_none()
+        && !s.query.items.iter().any(|(item, _)| match item {
+            Item::Aggregate(..) => true,
+            Item::Scalar(s) => grouping::contains_aggregate(s),
+            _ => false,
+        })
+        && !s.query.order.iter().any(|(s, _, _)| grouping::contains_aggregate(s));
+    let (_, shape) = prepare(s, state, &mut parameters.to_vec(), None, lazy)?;
     let input = if let Some(from) = &s.from {
         from.run(state, source, params, parameters, clock, execution)?
     } else {
@@ -824,7 +886,7 @@ pub(super) fn run<'a>(
         r
     };
     let base_shape = input_shape(s, state, &mut parameters.to_vec())?;
-    for a in &s.applies {
+    for a in s.applies.iter().filter(|_| !lazy) {
         if a.contextual
             || a.exists
             || a.comparison.is_some()
@@ -836,7 +898,7 @@ pub(super) fn run<'a>(
             let (child, correlated) = instantiate(child, &base_shape, None, state, parameters)?;
             if !correlated {
                 let rhs = query_values(
-                    &child, state, source, params, parameters, clock, execution, true,
+                    &child, state, source, params, parameters, clock, execution, true, false,
                 )?;
                 execution
                     .retention
@@ -849,8 +911,10 @@ pub(super) fn run<'a>(
             }
         }
     }
+    let row_slot = base_shape.columns.len() + 2 * s.applies.len();
+    let context = ApplyContext { state, source, params, parameters, clock, execution };
     let mut rows = Relation::new(shape.columns.clone(), shape.typmods.clone(), execution);
-    for row in &input.rows {
+    for (index, row) in input.rows.iter().enumerate() {
         execution.comparison()?;
         let scratch = RetentionScope::new(execution);
         scratch.borrow().charge(
@@ -858,169 +922,12 @@ pub(super) fn run<'a>(
                 + row.values.iter().map(value_bytes).sum::<usize>(),
         )?;
         let mut values = row.values.clone();
-        for a in &s.applies {
-            let evaluated = (|| -> R<(Value, bool)> {
-                let (child, correlated) = match &a.right {
-                    Right::Query(child) => {
-                        let (q, c) = instantiate(
-                            child,
-                            &shape,
-                            Some(&SqlRow {
-                                values: values.clone(),
-                                version: row.version,
-                            }),
-                            state,
-                            parameters,
-                        )?;
-                        (Some(q), c || a.contextual)
-                    }
-                    Right::Array(_) => (None, true),
-                };
-                let cached = if !correlated {
-                    execution.plan_applies.borrow().get(&a.name).cloned()
-                } else {
-                    None
-                };
-                let rhs = if let Some(cached) = cached {
-                    cached
-                } else {
-                    let rhs = if let Some(child) = child {
-                        query_values(
-                            &child,
-                            state,
-                            source,
-                            params,
-                            parameters,
-                            clock,
-                            execution,
-                            !a.exists && a.comparison.is_none(),
-                        )?
-                    } else if let Right::Array(array) = &a.right {
-                        let mut array = bind_scalar(array, &shape, &mut parameters.to_vec())?;
-                        let ty = srf::element(&array.ty)?;
-                        array.attach_clock(clock);
-                        let value = array.eval(
-                            &Tuple {
-                                source_versions: vec![],
-                                values: vec![values.clone()],
-                                version: row.version,
-                            },
-                            params,
-                            &mut 0,
-                        )?;
-                        let null_array = value == Value::Null;
-                        let values = srf::array_values(value, &ty)?;
-                        Cached {
-                            collation: Some(functions::collation::scalar(
-                                typed(Value::Null, &ty),
-                                Some(&array),
-                            )?),
-                            values,
-                            ty,
-                            null_array,
-                            many: false,
-                        }
-                    } else {
-                        unreachable!()
-                    };
-                    if !correlated {
-                        execution
-                            .retention
-                            .borrow_mut()
-                            .charge(rhs.bytes() + a.name.len() + 128)?;
-                        execution
-                            .plan_applies
-                            .borrow_mut()
-                            .insert(a.name.clone(), rhs.clone());
-                    }
-                    rhs
-                };
-                scratch.borrow().charge(rhs.bytes())?;
-                let (value, many) = if a.exists {
-                    (Value::Bool(!rhs.values.is_empty()), false)
-                } else if let Some((lhs, op, all)) = &a.comparison {
-                    if rhs.null_array {
-                        (Value::Null, false)
-                    } else {
-                        let syntax = lhs;
-                        let mut lhs = bind_scalar(lhs, &shape, &mut parameters.to_vec())?;
-                        lhs.attach_clock(clock);
-                        let lv = lhs.eval(
-                            &Tuple {
-                                source_versions: vec![],
-                                values: vec![values.clone()],
-                                version: row.version,
-                            },
-                            params,
-                            &mut 0,
-                        )?;
-                        let lt = lhs.ty.clone();
-                        let mut unknown = false;
-                        let mut outcome = *all;
-                        for rv in rhs.values {
-                            execution.comparison()?;
-                            let left = if matches!(
-                                syntax,
-                                Scalar::Literal(Value::Text(_) | Value::Null)
-                            ) {
-                                Scalar::Literal(lv.clone())
-                            } else {
-                                typed(lv.clone(), &lt)
-                            };
-                            let left = functions::collation::scalar(left, Some(&lhs))?;
-                            let right_metadata = rhs
-                                .collation
-                                .as_ref()
-                                .map(|s| {
-                                    s.bind(&|_, _| Err(SqlError::UnknownColumn), &[], parameters)
-                                })
-                                .transpose()?;
-                            let f = comparison(
-                                left,
-                                op,
-                                functions::collation::scalar(
-                                    typed(rv, &rhs.ty),
-                                    right_metadata.as_ref(),
-                                )?,
-                            );
-                            let mut bound =
-                                f.bind(parameters, &|_, _| Err(SqlError::UnknownColumn), &[])?;
-                            bound.attach_clock(clock);
-                            match bound.eval(
-                                &Tuple {
-                                    source_versions: vec![],
-                                    values: vec![],
-                                    version: 0,
-                                },
-                                params,
-                                &mut 0,
-                            )? {
-                                None => unknown = true,
-                                Some(b) if b != *all => {
-                                    outcome = b;
-                                    unknown = false;
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                        (
-                            if unknown {
-                                Value::Null
-                            } else {
-                                Value::Bool(outcome)
-                            },
-                            false,
-                        )
-                    }
-                } else {
-                    (
-                        rhs.values.first().cloned().unwrap_or(Value::Null),
-                        rhs.many || rhs.values.len() > 1,
-                    )
-                };
-                Ok((value, many))
-            })();
+        if lazy {
+            values.resize(shape.columns.len(), Value::Null);
+            values[row_slot] = Value::Int(index as i64);
+        }
+        for a in s.applies.iter().filter(|_| !lazy) {
+            let evaluated = evaluate_apply(a, &shape, &values, row.version, &context, None);
             // A cardinality error is consumed lazily with the enclosing scalar.
             let (value, many) = match evaluated {
                 Ok(v) => v,
@@ -1039,6 +946,7 @@ pub(super) fn run<'a>(
         state,
         &mut parameters.to_vec(),
         Some(&execution.plan_applies.borrow()),
+        lazy,
     )?;
     let catalog = join::catalog(state, &shape)?;
     let source = cte::VirtualRows {
@@ -1048,15 +956,266 @@ pub(super) fn run<'a>(
     let bound = q
         .bind_projection_seeded(&catalog, parameters.to_vec())?
         .with_clock(clock);
-    let output = bound.execute_context(
-        &catalog, &source, params, parameters, execution, true, false,
-    )?;
+    let run = || bound.execute_context(&catalog, &source, params, parameters, execution, true, false);
+    let output = if lazy {
+        let retention = RetentionScope::new(execution);
+        let cache = RefCell::new(BTreeMap::<(usize, &str), Value>::new());
+        lazy::with(
+            &|index, name| {
+                let a = s.applies.iter().find(|a| a.name == name).ok_or(SqlError::Type)?;
+                let key = (index, a.name.as_str());
+                if let Some(value) = cache.borrow().get(&key) {
+                    return Ok(value.clone());
+                }
+                let row = rows.rows.get(index).ok_or(SqlError::Type)?;
+                let (value, many) = evaluate_apply(a, &shape, &row.values, row.version, &context, Some(row_slot))?;
+                if many {
+                    return Err(cardinality_error());
+                }
+                retention.borrow().charge(std::mem::size_of::<Value>() + value_bytes(&value) + 64)?;
+                cache.borrow_mut().insert(key, value.clone());
+                Ok(value)
+            },
+            run,
+        )?
+    } else {
+        run()?
+    };
     let d = bound.description(&catalog);
     let mut result = Relation::new(d.columns, d.typmods, execution);
     for row in output.rows {
         result.push(row)?;
     }
     Ok(result)
+}
+
+pub(super) struct ScalarProjection<'a> {
+    apply: &'a Apply,
+    pub(super) source_type: assignment::SourceType,
+}
+
+impl<'a> ScalarProjection<'a> {
+    pub(super) fn bind(
+        plan: &'a Plan,
+        shape: &join::Shape,
+        state: &Relational,
+        parameters: &[Option<DataType>],
+    ) -> R<Option<Self>> {
+        let Body::Select(select) = &plan.body else { return Ok(None) };
+        // A single-column tuple assignment may contain a full SELECT.
+        // Bypass only the table-free projection synthesized around a scalar.
+        if select.from.is_some() || select.input.is_some() || !select.windows.is_empty()
+            || !select.query.sources.is_empty() || select.query.filter.is_some()
+            || !select.query.order.is_empty() || select.query.limit.is_some()
+            || !plan.ctes.is_empty() || !plan.order.is_empty() || plan.limit.is_some()
+            || plan.offset.is_some()
+        {
+            return Ok(None);
+        }
+        let [apply] = &select.applies[..] else { return Ok(None) };
+        let [(Item::Scalar(Scalar::Column(column)), _)] = &select.query.items[..] else { return Ok(None) };
+        if column.name != apply.name || apply.comparison.is_some() || apply.exists {
+            return Ok(None);
+        }
+        let Right::Query(child) = &apply.right else { return Ok(None) };
+        let (mut child, _) = instantiate(child, shape, None, state, parameters)?;
+        let meta = child.resolve(state, &mut parameters.to_vec())?;
+        let column = meta.columns.first().ok_or(SqlError::Syntax)?;
+        let source_type = assignment::SourceType::new(&column.data_type, meta.type_oids.first());
+        Ok(Some(Self { apply, source_type }))
+    }
+
+    pub(super) fn evaluate(&self, shape: &join::Shape, row: &SqlRow, context: &ApplyContext<'_, '_>) -> R<Value> {
+        let (value, many) = evaluate_apply(self.apply, shape, &row.values, row.version, context, None)?;
+        if many { Err(cardinality_error()) } else { Ok(value) }
+    }
+}
+
+pub(super) struct ApplyContext<'a, 'e> {
+    pub(super) state: &'a Relational,
+    pub(super) source: &'a dyn scan::RowSource,
+    pub(super) params: &'a [Value],
+    pub(super) parameters: &'a [Option<DataType>],
+    pub(super) clock: Option<&'a super::super::super::clock::ExecutionClock>,
+    pub(super) execution: &'a Execution<'e>,
+}
+
+fn evaluate_apply(
+    a: &Apply,
+    shape: &join::Shape,
+    values: &[Value],
+    version: u64,
+    context: &ApplyContext<'_, '_>,
+    row_slot: Option<usize>,
+) -> R<(Value, bool)> {
+    let ApplyContext { state, source, params, parameters, clock, execution } = *context;
+    let (child, correlated) = match &a.right {
+        Right::Query(child) => {
+            let (q, c) = instantiate(
+                child,
+                shape,
+                Some(&SqlRow {
+                    values: values.to_vec(),
+                    version,
+                }),
+                state,
+                parameters,
+            )?;
+            (Some(q), c || a.contextual)
+        }
+        Right::Array(_) => (None, true),
+    };
+    let cached = if !correlated {
+        execution.plan_applies.borrow().get(&a.name).cloned()
+    } else {
+        None
+    };
+    let rhs = if let Some(cached) = cached {
+        cached
+    } else {
+        let rhs = if let Some(child) = child {
+            query_values(
+                &child,
+                state,
+                source,
+                params,
+                parameters,
+                clock,
+                execution,
+                !a.exists && a.comparison.is_none(),
+                correlated,
+            )?
+        } else if let Right::Array(array) = &a.right {
+            let mut array = bind_scalar(array, shape, &mut parameters.to_vec(), row_slot)?;
+            let ty = srf::element(&array.ty)?;
+            array.attach_clock(clock);
+            let value = array.eval(
+                &Tuple {
+                    source_versions: vec![],
+                    values: vec![values.to_vec()],
+                    version,
+                },
+                params,
+                &mut 0,
+            )?;
+            let null_array = value == Value::Null;
+            let values = srf::array_values(value, &ty)?;
+            Cached {
+                collation: Some(functions::collation::scalar(
+                    typed(Value::Null, &ty),
+                    Some(&array),
+                )?),
+                values,
+                ty,
+                null_array,
+                many: false,
+            }
+        } else {
+            unreachable!()
+        };
+        if !correlated {
+            execution
+                .retention
+                .borrow_mut()
+                .charge(rhs.bytes() + a.name.len() + 128)?;
+            execution
+                .plan_applies
+                .borrow_mut()
+                .insert(a.name.clone(), rhs.clone());
+        }
+        rhs
+    };
+    let scratch = RetentionScope::new(execution);
+    scratch.borrow().charge(rhs.bytes())?;
+    let (value, many) = if a.exists {
+        (Value::Bool(!rhs.values.is_empty()), false)
+    } else if let Some((lhs, op, all)) = &a.comparison {
+        if rhs.null_array {
+            (Value::Null, false)
+        } else {
+            let syntax = lhs;
+            let mut lhs = bind_scalar(lhs, shape, &mut parameters.to_vec(), row_slot)?;
+            lhs.attach_clock(clock);
+            let lv = lhs.eval(
+                &Tuple {
+                    source_versions: vec![],
+                    values: vec![values.to_vec()],
+                    version,
+                },
+                params,
+                &mut 0,
+            )?;
+            let lt = lhs.ty.clone();
+            let mut unknown = false;
+            let mut outcome = *all;
+            for rv in rhs.values {
+                execution.comparison()?;
+                let left = if matches!(
+                    syntax,
+                    Scalar::Literal(Value::Text(_) | Value::Null)
+                ) {
+                    Scalar::Literal(lv.clone())
+                } else {
+                    typed(lv.clone(), &lt)
+                };
+                let left = functions::collation::scalar(left, Some(&lhs))?;
+                let right_metadata = rhs
+                    .collation
+                    .as_ref()
+                    .map(|s| {
+                        s.bind(&|_, _| Err(SqlError::UnknownColumn), &[], parameters)
+                    })
+                    .transpose()?;
+                let f = comparison(
+                    left,
+                    op,
+                    functions::collation::scalar(
+                        typed(rv, &rhs.ty),
+                        right_metadata.as_ref(),
+                    )?,
+                );
+                let mut bound =
+                    f.bind(parameters, &|_, _| Err(SqlError::UnknownColumn), &[])?;
+                bound.attach_clock(clock);
+                match bound.eval(
+                    &Tuple {
+                        source_versions: vec![],
+                        values: vec![],
+                        version: 0,
+                    },
+                    params,
+                    &mut 0,
+                )? {
+                    None => unknown = true,
+                    Some(b) if b != *all => {
+                        outcome = b;
+                        unknown = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            (
+                if unknown {
+                    Value::Null
+                } else {
+                    Value::Bool(outcome)
+                },
+                false,
+            )
+        }
+    } else {
+        (
+            rhs.values.first().cloned().unwrap_or(Value::Null),
+            rhs.many || rhs.values.len() > 1,
+        )
+    };
+    Ok((value, many))
+}
+
+pub(in crate::relational::query) fn cardinality_error() -> SqlError {
+    user_types::view_replace_error("more than one row returned by a subquery used as an expression".into());
+    SqlError::CardinalityViolation
 }
 
 fn cardinality(ty: &DataType) -> Scalar {
@@ -1072,16 +1231,18 @@ fn query_values(
     clock: Option<&super::super::super::clock::ExecutionClock>,
     execution: &Execution<'_>,
     scalar: bool,
+    correlated: bool,
 ) -> R<Cached> {
+    let lookup = correlated.then(|| correlation::Lookup::new(child, state, source, execution)).flatten();
+    let source: &dyn scan::RowSource = lookup.as_ref().map_or(source, |lookup| lookup);
     match child.run(state, source, params, parameters, clock, execution) {
         Ok(rows) => {
-            let metadata = child
-                .clone()
-                .resolve(state, &mut parameters.to_vec())?
-                .collations
-                .into_iter()
-                .next()
-                .flatten();
+            let metadata = if scalar {
+                None
+            } else {
+                child.clone().resolve(state, &mut parameters.to_vec())?
+                    .collations.into_iter().next().flatten()
+            };
             let metadata = metadata.map(|m| functions::collation::materialized(Some(&m),m.ty.clone())).transpose()?;
             let ty = rows
                 .columns

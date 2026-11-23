@@ -1,5 +1,5 @@
 mod common;
-use giggles_core::{Admin, Engine, Limits};
+use giggles_core::{Admin, Engine, Limits, relational::Value};
 
 fn exercise(engine: Engine) {
     let path = common::fresh("bare_alias");
@@ -162,14 +162,39 @@ fn exercise(engine: Engine) {
     for sql in [
         "UPDATE t u SET name = u.name WHERE u.id IN (SELECT id FROM t u)",
         "UPDATE t u SET name = u.name WHERE u.id IN (SELECT id FROM t AS u)",
-        "DELETE FROM t u WHERE u.id IN (SELECT id FROM t AS u)",
     ] {
+        let result = s
+            .execute(sql, &[], None)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert_eq!(result.affected, 1, "{sql}");
+        let rows = s
+            .execute("SELECT id, name FROM t", &[], None)
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1, "{sql}");
         assert_eq!(
-            s.execute(sql, &[], None).unwrap_err(),
-            giggles_core::CoreError::Sql(giggles_core::relational::SqlError::Unsupported),
-            "0A000: {sql}"
+            rows[0].values,
+            [Value::Int(1), Value::Text("u.name".into())],
+            "{sql}"
         );
     }
+    // Roll back the deletion so the remaining alias checks still have a row.
+    s.execute("BEGIN", &[], None).unwrap();
+    let deleted = s
+        .execute(
+            "DELETE FROM t u WHERE u.id IN (SELECT id FROM t AS u)",
+            &[],
+            None,
+        )
+        .unwrap();
+    assert_eq!(deleted.affected, 1);
+    assert!(
+        s.execute("SELECT id FROM t", &[], None)
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    s.execute("ROLLBACK", &[], None).unwrap();
     for sql in [
         "SELECT sum(id) total FROM t",
         "SELECT id, count(*) n FROM t GROUP BY id",

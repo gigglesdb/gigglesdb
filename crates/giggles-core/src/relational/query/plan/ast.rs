@@ -6,6 +6,7 @@ pub(in crate::relational) struct Plan {
     pub(super) body: Body,
     pub(super) mutation: Option<Box<mutation::Mutation>>,
     pub(super) merge: Option<Box<merge::Merge>>,
+    pub(super) insert: Option<Box<dml::MainInsert>>,
     pub(super) ctes: Vec<cte::Cte>,
     pub(super) order: Vec<(Scalar, bool, bool)>,
     pub(super) limit: Option<Scalar>,
@@ -52,6 +53,7 @@ impl Plan {
             body,
             mutation: None,
             merge: None,
+            insert: None,
             ctes: vec![],
             order: vec![],
             limit: None,
@@ -65,6 +67,12 @@ impl Plan {
     pub(in crate::relational) fn read_tables(&self) -> Vec<String> {
         let mut out = self.mutation.as_ref().map_or_else(Vec::new, |m| m.read_tables());
         if let Some(m) = &self.merge { out.extend(m.read_tables()); }
+        if let Some(insert) = &self.insert {
+            out.extend(insert.prepared.read_tables().into_iter().filter(|name| !name.starts_with("\0plan_")));
+            if let Some(target) = insert.prepared.table() && !out.iter().any(|name| name == target) {
+                out.push(target.into());
+            }
+        }
         self.visit_queries(&mut |q| {
             for name in q.read_tables() {
                 if !name.starts_with("\0plan_") && !out.contains(&name) {
@@ -113,11 +121,15 @@ impl Plan {
             .collect();
         if let Some(m) = &self.mutation { tables.push((m.target.clone(),m.command())); }
         if let Some(m) = &self.merge { tables.extend(m.write_tables()); }
+        if let Some(insert) = &self.insert { tables.extend(insert.prepared.write_tables()); }
         tables
     }
     pub(in crate::relational) fn authorization_tables(&self) -> R<Vec<String>> {
         let mut out = self.mutation.as_ref().map_or_else(Vec::new, |m| m.read_tables());
         if let Some(m) = &self.merge { out.extend(m.read_tables()); }
+        if let Some(insert) = &self.insert {
+            out.extend(insert.prepared.authorization_tables()?.into_iter().filter(|name| !name.starts_with("\0plan_")));
+        }
         let mut error = None;
         self.visit_queries(&mut |q| match q.authorization_tables() {
             Ok(names) => {
@@ -146,6 +158,7 @@ impl Plan {
     pub(in crate::relational) fn sequences(&self) -> Vec<Option<String>> {
         let mut out = self.mutation.as_ref().map_or_else(Vec::new, |m| m.sequences());
         if let Some(m) = &self.merge { out.extend(m.sequences()); }
+        if let Some(insert) = &self.insert { out.extend(insert.prepared.sequences()); }
         for cte in &self.ctes {
             if let Some(dml) = &cte.dml {
                 out.extend(dml.sequences());
@@ -216,6 +229,10 @@ impl Plan {
     ) -> R<()> {
         if let Some(m) = &mut self.mutation { m.bind_schema_names(bind, state, path)?; }
         if let Some(m) = &mut self.merge { m.bind_schema_names(bind, state, path)?; }
+        if let Some(insert) = &mut self.insert {
+            insert.prepared.search_path = path.to_vec();
+            insert.prepared = insert.prepared.bind_schemas(state)?;
+        }
         for cte in &mut self.ctes {
             if let Some(dml) = &mut cte.dml {
                 dml.search_path = path.to_vec();
@@ -280,7 +297,8 @@ impl Plan {
         let mut found = false;
         self.visit_queries(&mut |q| found |= q.has_privilege_inquiry());
         self.visit_scalars(&mut |s| found |= s.has_privilege_inquiry());
-        found || self.mutation.as_ref().is_some_and(|m| m.has_privilege_inquiry())
+        found || self.insert.as_ref().is_some_and(|p| p.prepared.has_privilege_inquiry())
+            || self.mutation.as_ref().is_some_and(|m| m.has_privilege_inquiry())
             || self.merge.as_ref().is_some_and(|m| m.has_privilege_inquiry())
             || self.ctes.iter().any(|c| c.dml.as_ref().is_some_and(|p| p.has_privilege_inquiry()))
     }

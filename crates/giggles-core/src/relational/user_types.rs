@@ -20,14 +20,27 @@ pub enum SqlErrorDetail {
 type SqlNotice = (String, Option<String>, Option<&'static str>);
 thread_local! {
     static SQL_NOTICES: std::cell::RefCell<Vec<SqlNotice>> = const { std::cell::RefCell::new(Vec::new()) };
-    static SQL_ERROR_HINT: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
+    static SQL_ERROR_HINT: std::cell::RefCell<Option<std::borrow::Cow<'static, str>>> = const { std::cell::RefCell::new(None) };
     static SQL_ERROR_DETAIL: std::cell::RefCell<Option<SqlErrorDetail>> = const { std::cell::RefCell::new(None) };
     static SQL_ERROR_MESSAGE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 /// Consume the diagnostic immediately after a synchronous SQL call on this thread.
 /// SQLSTATE remains the stable, field-less SqlError contract.
-pub fn take_sql_error_hint() -> Option<&'static str> { SQL_ERROR_HINT.with(|v| v.borrow_mut().take()) }
-pub(super) fn sql_error_hint(hint: &'static str) { SQL_ERROR_HINT.with(|v| *v.borrow_mut()=Some(hint)); }
+pub fn take_sql_error_hint() -> Option<&'static str> {
+    match take_sql_diagnostic_hint()? {
+        std::borrow::Cow::Borrowed(hint) => Some(hint),
+        std::borrow::Cow::Owned(_) => None,
+    }
+}
+pub fn take_sql_diagnostic_hint() -> Option<std::borrow::Cow<'static, str>> {
+    SQL_ERROR_HINT.with(|v| v.borrow_mut().take())
+}
+pub(super) fn sql_error_hint(hint: &'static str) {
+    SQL_ERROR_HINT.with(|v| *v.borrow_mut() = Some(hint.into()));
+}
+pub(super) fn sql_error_hint_owned(hint: String) {
+    SQL_ERROR_HINT.with(|v| *v.borrow_mut() = Some(hint.into()));
+}
 pub fn take_sql_error_detail() -> Option<String> {
     take_sql_diagnostic_detail().map(|detail| match detail {
         SqlErrorDetail::Text(text) => text,

@@ -602,3 +602,6 @@ mod truncated_clauses;
 
 #[path = "partial_indexes.rs"]
 mod partial_indexes;
+
+#[path = "sql_dml_sources.rs"]
+mod sql_dml_sources;

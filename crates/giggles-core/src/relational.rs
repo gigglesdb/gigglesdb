@@ -30,8 +30,17 @@ mod constraint_primary_key;
 mod ddl_type;
 pub use ddl_type::take_sql_warnings;
 mod user_types;
+
+pub(crate) fn conflict_duplicate_target() -> SqlError {
+    user_types::view_replace_error("ON CONFLICT DO UPDATE command cannot affect row a second time".into());
+    user_types::sql_error_hint(
+        "Ensure that no rows proposed for insertion within the same command have duplicate constrained values.",
+    );
+    SqlError::CardinalityViolation
+}
+
 pub use extensions::{InstalledExtension, BuiltinExtension, ExtensionFunction, BUILTINS as BUILTIN_EXTENSIONS};
-pub use user_types::take_sql_error_hint;
+pub use user_types::{take_sql_diagnostic_hint, take_sql_error_hint};
 pub use user_types::{
     DuplicateKeyDetail, SqlErrorDetail, TypeDef, UserTypeCatalog, take_sql_diagnostic_detail,
     retain_sql_duplicate_key_detail, take_sql_error_detail, take_sql_error_message, take_sql_notices, type_oid,
@@ -1250,13 +1259,27 @@ impl Parser {
             }
         }
         let start = self.at + usize::from(update);
+        let targets = if update {
+            query::plan::assignment_target_starts(self.tokens.get(start..).unwrap_or_default())?
+        } else {
+            vec![]
+        };
         for i in (start..self.tokens.len().saturating_sub(2)).rev() {
-            if self.tokens[i + 1] != Token::Symbol('.') || ident(&self.tokens[i + 2]).is_none() {
+            if targets.binary_search(&(i - start)).is_ok()
+                || self.tokens[i + 1] != Token::Symbol('.')
+                || ident(&self.tokens[i + 2]).is_none()
+            {
                 continue;
             }
             if ident(&self.tokens[i]) == Some(alias.as_str()) {
                 self.tokens[i] = Token::QuotedIdent(table.into());
             } else if alias != table && ident(&self.tokens[i]) == Some(table) {
+                user_types::view_replace_error(format!(
+                    r#"invalid reference to FROM-clause entry for table "{table}""#
+                ));
+                user_types::sql_error_hint_owned(format!(
+                    r#"Perhaps you meant to reference the table alias "{alias}"."#
+                ));
                 return Err(SqlError::UnknownTable);
             }
         }
@@ -1693,6 +1716,13 @@ impl Parser {
             let mut sets = vec![];
             loop {
                 let c = self.column_name()?;
+                if self.tokens.get(self.at) == Some(&Token::Symbol('.')) {
+                    user_types::view_replace_error(format!(
+                        r#"column "{c}" of relation "{}" does not exist"#, split_key(&name).1
+                    ));
+                    user_types::sql_error_hint("SET target columns cannot be qualified with the relation name.");
+                    return Err(SqlError::UnknownColumn);
+                }
                 if self.tokens.get(self.at) != Some(&Token::Op("=".into())) {
                     return Err(SqlError::Syntax);
                 }
@@ -2973,7 +3003,7 @@ impl Prepared {
             Statement::View(ddl) => ddl.query.as_ref(),
             Statement::Query(query) => Some(query),
             Statement::Create {as_query:Some((query,_)),..} => Some(query.as_ref()),
-            Statement::InsertMulti(insert) => insert.source.as_deref(),
+            Statement::InsertMulti(insert) => insert.source.as_ref().and_then(sql_insert::Source::query),
             _ => searched::target(self).filter(|query| query.has_in_subquery()),
         };
         let mut tables = match query {
@@ -2986,7 +3016,13 @@ impl Prepared {
                 }
                 tables
             }
-            None => self.read_tables(),
+            None => match &self.statement {
+                Statement::InsertMulti(insert) => match &insert.source {
+                    Some(sql_insert::Source::Plan(plan, _)) => plan.authorization_tables()?,
+                    _ => self.read_tables(),
+                },
+                _ => self.read_tables(),
+            },
         };
         if self.authorization_reads_target() && let Some(table) = self.table()
             && !tables.iter().any(|read| read == table)
@@ -3202,6 +3238,8 @@ impl Prepared {
         self.privilege_inquiry || match &self.statement {
             Statement::Query(q) => q.has_privilege_inquiry(),
             Statement::Plan(p) => p.has_privilege_inquiry(),
+            Statement::InsertMulti(insert) => matches!(&insert.source,
+                Some(sql_insert::Source::Plan(plan, _)) if plan.has_privilege_inquiry()),
             _ => false,
         }
     }
@@ -3237,9 +3275,11 @@ impl Prepared {
     }
     pub(crate) fn implicit_sequences(&self, state: &Relational) -> R<Vec<Option<String>>> {
         if let Statement::InsertMulti(insert) = &self.statement {
-            return insert.implicit_sequences(state);
+            return insert.implicit_sequences_declared(state, &self.parameter_types);
         }
-        if let Statement::Plan(plan) = &self.statement { return plan.implicit_sequences(state); }
+        if let Statement::Plan(plan) = &self.statement {
+            return plan.implicit_sequences(state, self.params, &self.parameter_types);
+        }
         let mut dependencies: Vec<Option<String>> = vec![];
         let mut add = |column: &ColumnDef| -> R<()> {
             if let Some(sql) = defaults::default_sql(state, column) {
@@ -3536,7 +3576,10 @@ impl Prepared {
             relations: Vec::new(),
         };
         let original_tokens = p.tokens.clone();
-        let existing = (|| -> R<Statement> { Ok(if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "select" || word == "explain")
+        let existing = (|| -> R<Statement> { Ok(if query::plan::Plan::requires_planned_update(&original_tokens) {
+            // The legacy alias normalizer has no nested SQL scope.
+            return Err(SqlError::Syntax);
+        } else if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "select" || word == "explain")
         {
             if user_types::CompositeSelect::claims(&p) {
                 Statement::CompositeSelect(user_types::CompositeSelect::parse(&mut p)?)
@@ -4525,6 +4568,10 @@ impl Relational {
                         && description.columns.iter().any(|c| !names.insert(&c.name))
                     {
                         return Err(SqlError::DuplicateColumn);
+                    }
+                    // JSON has a wire type, but no durable column representation.
+                    if description.type_oids.contains(&114) && !self.relation_name_taken(name) {
+                        return Err(SqlError::Unsupported);
                     }
                     collations=bound.output_collations()?.into_iter().map(|n|n.map(|n|n.split('\0').next().unwrap_or(&n).to_owned())).collect();
                     columns=description.columns; for c in &mut columns {c.id=0;c.not_null=false;}

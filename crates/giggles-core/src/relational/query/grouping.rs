@@ -47,6 +47,14 @@ fn slot(n: usize) -> Scalar {
         name: format!("__group_slot_{n}"),
     })
 }
+fn aggregate_slot(kind: Aggregate, index: usize) -> Scalar {
+    let scalar = slot(index);
+    if json_aggregate::json_result(kind) {
+        json_aggregate::typed_text(scalar)
+    } else {
+        scalar
+    }
+}
 fn col(name: String, ty: DataType, not_null: bool) -> ColumnDef {
     ColumnDef {
         id: 0,
@@ -251,7 +259,7 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
                 let (a, arg, filter) = aggregate_filter::parts(args, self.resolve, self.tables)?;
                 let index = self.groups.len() + self.aggregates.len();
                 self.aggregates.push((a, arg, Some(filter)));
-                slot(index)
+                aggregate_slot(a, index)
             }
             Scalar::Call(n, args) if aggregate(n).is_some() => {
                 if args.len() != 1 {
@@ -259,12 +267,9 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
                 }
                 reject_nested_aggregate(&args[0])?;
                 let index = self.groups.len() + self.aggregates.len();
-                self.aggregates.push((
-                    aggregate(n).ok_or(SqlError::UndefinedFunction)?,
-                    Some(args[0].clone()),
-                    None,
-                ));
-                slot(index)
+                let kind = aggregate(n).ok_or(SqlError::UndefinedFunction)?;
+                self.aggregates.push((kind, Some(args[0].clone()), None));
+                aggregate_slot(kind, index)
             }
             Scalar::Unary(op, a) => Scalar::Unary(*op, Box::new(self.scalar(a)?)),
             Scalar::Domain(a, name, ty) => {
@@ -733,7 +738,7 @@ pub(super) fn bind<'a>(
         let legacy_column = matches!(arg, Scalar::Column(_));
         if a.distinct() {aggregate_order::validate_distinct(&arg,resolve,tables)?;}
         let b = arg.bind(resolve, tables, &parameters)?;
-        if b.ty == DataType::Bpchar {
+        if json_aggregate::result_type(a).is_none() && b.ty == DataType::Bpchar {
             return Err(SqlError::Unsupported);
         }
         aggregate_order::check_types(&b)?;
@@ -741,6 +746,8 @@ pub(super) fn bind<'a>(
         if matches!(a.base(), Aggregate::Min | Aggregate::Max) && let Some(n)=b.explicit_collation()? { functions::collation::ready(n)?; }
         let ty = match a.base() {
             Aggregate::Count => DataType::BigInt,
+            Aggregate::Json | Aggregate::JsonObject => DataType::Text,
+            Aggregate::Jsonb | Aggregate::JsonbObject => DataType::Jsonb,
             Aggregate::Avg => match b.ty {
                 DataType::SmallInt | DataType::Integer | DataType::BigInt | DataType::Numeric => {
                     DataType::Numeric
@@ -990,6 +997,7 @@ pub(super) fn bind<'a>(
         declared: vec![],
         distinct_order_slots: vec![],
         volatile_order: vec![],
+        aggregate_zone: giggles_pg_types::temporal::SessionZone::Fixed(0),
         grouping: Some(Grouping {
             empty_set: grouping_mask.as_ref().is_some_and(|m| !m.iter().any(|b| *b)),
             keys,
@@ -1098,6 +1106,10 @@ fn page_expr(query: &Query, expr: Option<&Expr>, params: &[Value], limit: bool) 
     }
 }
 impl Grouping {
+    pub(super) fn result_oids(&self) -> Vec<u32> {
+        self.outputs.iter().map(BoundScalar::result_oid).collect()
+    }
+
     pub(super) fn into_collation_outputs(self) -> Vec<Option<BoundScalar>> {
         self.outputs.into_iter().map(Some).collect()
     }
@@ -1177,6 +1189,9 @@ impl Grouping {
             let initial = self.initial();
             retention.charge(retained(&initial) + std::mem::size_of::<Key>())?;
             let mut auxiliary = aggregate_auxiliary(&self.aggregates, &mut retention)?;
+            for aux in &mut auxiliary {
+                aux.zone = query.aggregate_zone;
+            }
             if source.streams_reductions() {
                 for (aux, direct) in auxiliary.iter_mut().zip(&self.direct_inputs) {
                     aux.stream_column = *direct;
@@ -1225,6 +1240,9 @@ impl Grouping {
                     hash_bytes += bytes + self.aggregates.len() * std::mem::size_of::<AggregateAuxiliary>();
                     retention.charge(bytes)?;
                     let mut auxiliary = aggregate_auxiliary(&self.aggregates, &mut retention)?;
+            for aux in &mut auxiliary {
+                aux.zone = query.aggregate_zone;
+            }
                     if source.streams_reductions() {
                         for (aux, direct) in auxiliary.iter_mut().zip(&self.direct_inputs) {
                             aux.stream_column = *direct;
@@ -1294,6 +1312,9 @@ impl Grouping {
                     let mut values = self.initial();
                     values.extend(self.dependents.iter().map(|c| row.get(*c).clone()));
                     let mut auxiliary = aggregate_auxiliary(&self.aggregates, &mut retention)?;
+            for aux in &mut auxiliary {
+                aux.zone = query.aggregate_zone;
+            }
                     for (aux, direct) in auxiliary.iter_mut().zip(&self.direct_inputs) {
                         aux.stream_column = *direct;
                         aux.local_transition = true;

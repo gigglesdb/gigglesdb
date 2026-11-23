@@ -3,7 +3,7 @@ use super::*;
 
 pub(super) const NAME: &str = "pg_typeof";
 
-pub(super) fn name(ty: &DataType) -> &'static str {
+pub(in crate::relational::query) fn name(ty: &DataType) -> &'static str {
     match ty {
         DataType::Boolean => "boolean",
         DataType::SmallInt => "smallint",
@@ -44,6 +44,8 @@ pub(super) fn bind(
     let bound = arg.bind(resolve, tables, parameters)?;
     let display = if bound.result_oid() == random_uuid::VOID_OID {
         "void".into()
+    } else if bound.result_oid() == json_aggregate::OID {
+        "json".into()
     } else if let Some(ty) = bound.enum_type(tables) {
         ty.name().to_owned()
     } else if matches!(arg, Scalar::Literal(Value::Text(_) | Value::Null)) {

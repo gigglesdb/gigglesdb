@@ -1029,6 +1029,7 @@ pub(super) fn prepare(select: &Select, state: &Relational) -> R<Query> {
         visible: visible.clone(),
         hidden: vec![],
         qualified: vec![(query.sources[0].alias.clone(), visible)],
+        scalar_rows: vec![],
     };
     join::prepare(
         &query,

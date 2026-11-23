@@ -18,8 +18,17 @@ pub(super) fn parse(p: &mut Parser, input: Scalar, depth: usize) -> R<Scalar> {
     if !p.word("order") {
         return Ok(input);
     }
+    parse_order(p, vec![input], depth)
+}
+pub(super) fn parse_object(p: &mut Parser, inputs: Vec<Scalar>, depth: usize) -> R<Scalar> {
+    if p.word("order") {
+        parse_order(p, inputs, depth)
+    } else {
+        Ok(Scalar::Call(PREFIX.into(), inputs))
+    }
+}
+fn parse_order(p: &mut Parser, mut args: Vec<Scalar>, depth: usize) -> R<Scalar> {
     p.need("by")?;
-    let mut args = vec![input];
     let mut name = PREFIX.to_owned();
     loop {
         if args.len() >= MAX_COLUMNS {
@@ -52,8 +61,8 @@ pub(super) fn parts(input: &BoundScalar) -> Option<(&str, &[BoundScalar])> {
     input.aggregate_order_parts()
 }
 pub(super) fn check_types(input: &BoundScalar) -> R<()> {
-    if let Some((_, args)) = parts(input)
-        && args[1..].iter().any(|key| key.ty == DataType::Bpchar)
+    if let Some((name, args)) = parts(input)
+        && args[input_width(name, args.len())..].iter().any(|key| key.ty == DataType::Bpchar)
     {
         return Err(SqlError::Unsupported);
     }
@@ -65,9 +74,11 @@ pub(super) fn validate_distinct(
     tables: &[&TableDef],
 ) -> R<()> {
     if let Scalar::Call(name, args) = input && internal(name) {
-        let value = grouping::canonical(&args[0], resolve, tables.len(), tables)?;
-        for key in &args[1..] {
-            if grouping::canonical(key, resolve, tables.len(), tables)? != value {
+        let width = input_width(name, args.len());
+        let inputs = args[..width].iter().map(|s| grouping::canonical(s, resolve, tables.len(), tables))
+            .collect::<R<Vec<_>>>()?;
+        for key in &args[width..] {
+            if !inputs.contains(&grouping::canonical(key, resolve, tables.len(), tables)?) {
                 user_types::view_replace_error(
                     "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list".into(),
                 );
@@ -77,12 +88,24 @@ pub(super) fn validate_distinct(
     }
     Ok(())
 }
-pub(super) fn compare(name: &str, args: &[BoundScalar], a: &[Value], b: &[Value]) -> R<Ordering> {
+pub(super) fn input_width(name: &str, args: usize) -> usize {
+    args - (name.len() - PREFIX.len()) / 2
+}
+pub(super) fn same_inputs(args: &[BoundScalar], a: &[Value], b: &[Value]) -> R<bool> {
+    for ((arg, a), b) in args.iter().zip(a).zip(b) {
+        if arg.try_compare_values(a, b)? != Ordering::Equal {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+pub(super) fn compare(name: &str, args: &[BoundScalar], a: &[Value], b: &[Value], distinct: bool) -> R<Ordering> {
+    let width = input_width(name, args.len());
     for (((flags, scalar), a), b) in name.as_bytes()[PREFIX.len()..]
         .as_chunks::<2>().0.iter()
-        .zip(&args[1..])
-        .zip(&a[1..])
-        .zip(&b[1..])
+        .zip(&args[width..])
+        .zip(&a[width..])
+        .zip(&b[width..])
     {
         let first = flags[1] == b'f';
         let order = match (a, b) {
@@ -112,6 +135,16 @@ pub(super) fn compare(name: &str, args: &[BoundScalar], a: &[Value], b: &[Value]
         };
         if order != Ordering::Equal {
             return Ok(order);
+        }
+    }
+    // PostgreSQL adds DISTINCT inputs that aren't ORDER BY keys as ascending
+    // tiebreakers. Use the already evaluated argument values.
+    if distinct && width > 1 {
+        for ((arg, a), b) in args[..width].iter().zip(a).zip(b) {
+            let order = json_aggregate::compare_distinct(Some(arg), a, b)?;
+            if order != Ordering::Equal {
+                return Ok(order);
+            }
         }
     }
     Ok(Ordering::Equal)

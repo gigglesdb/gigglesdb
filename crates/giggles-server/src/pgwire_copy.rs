@@ -190,9 +190,9 @@ impl Decoder {
         if let Some(b) = self.newline_error {
             let cr = b == b'\r';
             d.wire_message = Some(format!("{} {} found in data", if self.csv { "unquoted" } else { "literal" }, if cr { "carriage return" } else { "newline" }));
-            d.wire_hint = Some(if self.csv {
+            d.wire_hint = Some((if self.csv {
                 if cr { "Use quoted CSV field to represent carriage return." } else { "Use quoted CSV field to represent newline." }
-            } else if cr { "Use \"\\r\" to represent carriage return." } else { "Use \"\\n\" to represent newline." });
+            } else if cr { "Use \"\\r\" to represent carriage return." } else { "Use \"\\n\" to represent newline." }).into());
         }
     }
     fn newline(&mut self, at: usize) -> Result<()> {

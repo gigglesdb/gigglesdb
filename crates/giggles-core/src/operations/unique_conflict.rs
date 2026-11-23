@@ -799,7 +799,7 @@ fn into_sql(error: PlanError) -> SqlError {
     match error {
         PlanError::Sql(error) => error,
         PlanError::Engine(error) => match error {
-            Error::DuplicateTarget => SqlError::CardinalityViolation,
+            Error::DuplicateTarget => crate::relational::conflict_duplicate_target(),
             Error::Unsupported => SqlError::Unsupported,
             Error::Type => SqlError::Type,
             Error::Sql { sqlstate } if sqlstate == "23502" => SqlError::Null,

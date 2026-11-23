@@ -299,6 +299,13 @@ fn signature(
     }
     if matches!(op, Contains | ContainedBy | Overlap) {
         let types = [a.as_ref(), b.as_ref()];
+        if op != Overlap && types.contains(&Some(&Jsonb)) {
+            return if types.into_iter().flatten().all(|ty| *ty == Jsonb) {
+                Ok((Jsonb, Jsonb, Boolean))
+            } else {
+                Err(undefined_operator(op, types))
+            };
+        }
         if types.contains(&Some(&UuidArray)) {
             return if types.into_iter().flatten().all(|ty| *ty == UuidArray) {
                 Ok((UuidArray, UuidArray, Boolean))
@@ -583,7 +590,13 @@ pub(super) fn eval(
         return Ok(Value::Int(!n));
     }
     if matches!(op, "@>" | "<@" | "&&") {
-        let value = uuid_array_operators::eval(op, values)?;
+        let value = if args[0].ty == DataType::Jsonb {
+            let [a, b] = values else { return Err(SqlError::Type) };
+            let (left, right) = if op == "@>" { (a, b) } else { (b, a) };
+            Value::Bool(jsonb_mutation::contains(left, right, budget)?)
+        } else {
+            uuid_array_operators::eval(op, values)?
+        };
         charge(budget, &value)?;
         return Ok(value);
     }

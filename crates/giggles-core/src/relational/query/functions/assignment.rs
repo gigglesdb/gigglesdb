@@ -31,6 +31,38 @@ pub(in crate::relational) fn compatible(source: &DataType, target: &DataType) ->
         )
 }
 
+/// Assignment source metadata. JSON expressions use text values with a distinct OID.
+#[derive(Debug, Clone)]
+pub(in crate::relational) struct SourceType {
+    data_type: DataType,
+    json: bool,
+}
+
+impl SourceType {
+    pub(in crate::relational) fn new(data_type: &DataType, oid: Option<&u32>) -> Self {
+        Self {
+            data_type: data_type.clone(),
+            json: oid == Some(&json_aggregate::OID),
+        }
+    }
+
+    pub(in crate::relational) fn compatible(&self, target: &DataType) -> bool {
+        self.json && *target == DataType::Jsonb || compatible(&self.data_type, target)
+    }
+
+    pub(in crate::relational) fn convert(
+        &self,
+        value: Value,
+        target: &DataType,
+        clock: Option<&ExecutionClock>,
+    ) -> R<Value> {
+        if self.json && *target == DataType::Jsonb {
+            return cast_value(value, target, &mut 0);
+        }
+        convert(value, &self.data_type, target, clock)
+    }
+}
+
 /// Preserve nulls and unknown text input errors; assign typed literals by source type.
 pub(in crate::relational) fn literal(
     value: Value,

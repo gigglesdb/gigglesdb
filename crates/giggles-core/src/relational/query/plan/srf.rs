@@ -20,7 +20,9 @@ pub(super) fn parse(
         .strip_prefix("pg_catalog\0")
         .unwrap_or(name)
         .to_string();
-    if !["generate_series", "unnest"].contains(&name.as_str()) {
+    if !["generate_series", "unnest"].contains(&name.as_str())
+        && !json_srf::known(&name)
+    {
         return Err(SqlError::UndefinedFunction);
     }
     let open = p.at;
@@ -93,7 +95,7 @@ pub(super) fn parse(
         ordinality,
     })
 }
-pub(super) fn element(ty: &DataType) -> R<DataType> {
+pub(in crate::relational::query) fn element(ty: &DataType) -> R<DataType> {
     match ty {
         DataType::IntArray => Ok(DataType::Integer),
         DataType::BigIntArray => Ok(DataType::BigInt),
@@ -118,6 +120,25 @@ pub(super) fn array_values(value: Value, ty: &DataType) -> R<Vec<Value>> {
 }
 impl Function {
     fn ty(&self, state: &Relational, parameters: &mut [Option<DataType>]) -> R<DataType> {
+        if json_srf::known(&self.name) {
+            if self.args.len() != 1 {
+                return Err(SqlError::UndefinedFunction);
+            }
+            let argument = &self.args[0];
+            let ty = if let Some(input) = &self.input {
+                let meta = input.clone().resolve(state, parameters)?;
+                meta.columns[0].data_type.clone()
+            } else if argument.aggregate_unknown(parameters) {
+                argument.infer(Some(&DataType::Jsonb), parameters, &|_, _| Err(SqlError::UnknownColumn), &[])?;
+                DataType::Jsonb
+            } else {
+                bind::scalar_type(argument, parameters)?
+            };
+            if ty != DataType::Jsonb {
+                return Err(SqlError::UndefinedFunction);
+            }
+            return Ok(json_srf::output_type(&self.name));
+        }
         if let Some(input) = &self.input {
             let meta = input.clone().resolve(state, parameters)?;
             if self.name == "unnest" {
@@ -174,12 +195,15 @@ impl Function {
         state: &Relational,
         parameters: &mut [Option<DataType>],
     ) -> R<(Vec<ColumnDef>, Vec<i32>)> {
-        let mut columns = vec![ColumnDef {
-            id: 0,
-            name: self.name.clone(),
-            data_type: self.ty(state, parameters)?,
-            not_null: false,
-        }];
+        let ty = self.ty(state, parameters)?;
+        let mut columns = if json_srf::record(&self.name) {
+            vec![
+                ColumnDef { id: 0, name: "key".into(), data_type: DataType::Text, not_null: false },
+                ColumnDef { id: 0, name: "value".into(), data_type: ty, not_null: false },
+            ]
+        } else {
+            vec![ColumnDef { id: 0, name: self.column_names(&self.name, &[]).remove(0), data_type: ty, not_null: false }]
+        };
         if self.ordinality {
             columns.push(ColumnDef {
                 id: 0,
@@ -212,7 +236,12 @@ impl Function {
         } else {
             let mut values = vec![];
             for s in &self.args {
-                let mut b = s.bind(&|_, _| Err(SqlError::UnknownColumn), &[], parameters)?;
+                let scalar = if json_srf::known(&self.name) && s.aggregate_unknown(parameters) {
+                    Scalar::Cast(Box::new(s.clone()), DataType::Jsonb)
+                } else {
+                    s.clone()
+                };
+                let mut b = scalar.bind(&|_, _| Err(SqlError::UnknownColumn), &[], parameters)?;
                 b.attach_clock(clock);
                 values.push(b.eval(
                     &Tuple {
@@ -229,9 +258,8 @@ impl Function {
         if values.contains(&Value::Null) {
             return Ok(out);
         }
-        let mut emit = |value: Value| -> R<()> {
+        let mut emit = |mut values: Vec<Value>| -> R<()> {
             execution.comparison()?;
-            let mut values = vec![value];
             if self.ordinality {
                 values.push(Value::Int(out.rows.len() as i64 + 1));
             }
@@ -240,8 +268,10 @@ impl Function {
         if self.name == "unnest" {
             let ty = self.ty(state, &mut parameters.to_vec())?;
             for value in array_values(values.remove(0), &ty)? {
-                emit(value)?;
+                emit(vec![value])?;
             }
+        } else if json_srf::known(&self.name) {
+            json_srf::emit(&self.name, &values[0], &mut emit)?;
         } else {
             let Value::Int(mut n) = values[0] else {
                 return Err(SqlError::Type);
@@ -258,7 +288,7 @@ impl Function {
                 return Err(SqlError::InvalidParameterValue);
             }
             while if step > 0 { n <= stop } else { n >= stop } {
-                emit(Value::Int(n))?;
+                emit(vec![Value::Int(n)])?;
                 let Some(next) = n.checked_add(step) else {
                     break;
                 };
@@ -270,6 +300,27 @@ impl Function {
 }
 
 impl Function {
+    pub(super) fn scalar_element_row(&self) -> bool {
+        json_srf::element_column(&self.name) && !self.ordinality
+    }
+
+    pub(super) fn column_names(&self, alias: &str, aliases: &[String]) -> Vec<String> {
+        let mut names = if json_srf::record(&self.name) {
+            vec!["key".into(), "value".into()]
+        } else if json_srf::element_column(&self.name) {
+            vec!["value".into()]
+        } else {
+            vec![alias.to_owned()]
+        };
+        if self.ordinality {
+            names.push("ordinality".into());
+        }
+        for (column, name) in names.iter_mut().zip(aliases) {
+            column.clone_from(name);
+        }
+        names
+    }
+
     pub(super) fn collations(
         &self,
         state: &Relational,

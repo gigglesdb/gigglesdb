@@ -2768,3 +2768,5 @@ fn task_prototype_probes() -> Vec<proto::ExecuteRequest> {
 include!("catalog_scale_network.inc");
 #[path = "temporal_index_network.inc"]
 mod temporal_index_network;
+
+include!("dml_sources_network.inc");

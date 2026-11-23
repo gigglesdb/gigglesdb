@@ -374,6 +374,11 @@ pub(super) fn parse_expression(p: &mut Parser, value: Scalar) -> R<Scalar> {
             if p.tokens.get(p.at) == Some(&Token::Symbol('(')) {
                 return Err(SqlError::Unsupported);
             }
+            if matches!(name.as_str(), "json" | "pg_catalog.json")
+                && p.tokens.get(p.at) != Some(&Token::Symbol('['))
+            {
+                return Ok(Scalar::Call(json_aggregate::INPUT.into(), vec![value]));
+            }
             Ok(Scalar::Domain(Box::new(value), name, Box::new(Err(error))))
         }
         Err(error) => Err(error),

@@ -6,6 +6,7 @@ pub(super) mod uuid_array_operators;
 mod array_order;
 pub(super) mod collation;
 mod concat;
+mod jsonb_mutation;
 pub(in crate::relational) mod assignment;
 mod binary;
 mod cast;
@@ -33,7 +34,7 @@ fn v2_value_ceiling_allows_argument_and_result_accounting() {
 #[cfg(test)]
 mod cross_binding_tests;
 mod pg18_types;
-mod typeof_expr;
+pub(super) mod typeof_expr;
 pub(super) use comparison::{comparable, compare_cross, cross_compare};
 mod datetime_input;
 mod degree_math;
@@ -242,6 +243,19 @@ fn cast_node(value: BoundScalar, target: &DataType) -> Node {
     } else {
         Node::Cast(Box::new(value))
     }
+}
+
+fn json_literal(value: &Value) -> R<BoundScalar> {
+    if let Value::Text(text) = value {
+        json_aggregate::validate_input(text)?;
+    }
+    Ok(BoundScalar {
+        ty: DataType::Text,
+        node: Node::Call(json_aggregate::TEXT_RESULT.into(), vec![BoundScalar {
+            ty: DataType::Text,
+            node: Node::Literal(value.clone()),
+        }]),
+    })
 }
 
 fn attach_text_cast(argument: &mut BoundScalar) {
@@ -1125,7 +1139,15 @@ impl Scalar {
                             p.punct(')')?;
                             break;
                         }
-                        if Aggregate::from_name(&name).is_some() && args.len() == 1
+                        let aggregate = Aggregate::from_name(&name);
+                        if aggregate.is_some_and(json_aggregate::object) {
+                            if args.len() == 2 {
+                                let inputs = std::mem::take(&mut args);
+                                args.push(aggregate_order::parse_object(p, inputs, depth + 1)?);
+                                p.punct(')')?;
+                                break;
+                            }
+                        } else if aggregate.is_some() && args.len() == 1
                             || aggregate_order::deferred(&name).is_some() {
                             aggregate_order::parse_args(p, &mut args, depth + 1)?;
                         }
@@ -1273,20 +1295,27 @@ impl Scalar {
             .map(|(_, result)| result)
             .chain(case.otherwise.iter())
             .collect();
-        let ty = common_result_type(
-            originals
-                .iter()
-                .filter(|result| !matches!(result, Self::Literal(Value::Null | Value::Text(_))))
-                .map(|result| {
-                    result
-                        .bind(resolve, tables, parameters)
-                        .map_err(|error| Self::expression_parameter_error(error, parameters))
-                        .map(|bound| bound.ty)
-                })
-                .collect::<R<Vec<_>>>()?,
-        )?;
+        let bind_known = |result: &&Scalar| {
+            if matches!(result, Self::Literal(Value::Null | Value::Text(_))) {
+                Ok(None)
+            } else {
+                result
+                    .bind(resolve, tables, parameters)
+                    .map_err(|error| Self::expression_parameter_error(error, parameters))
+                    .map(Some)
+            }
+        };
+        let known = originals.iter().map(bind_known).collect::<R<Vec<_>>>()?;
+        // PostgreSQL considers ELSE before the THEN branches for type selection.
+        let otherwise_first = known.get(case.arms.len()).into_iter()
+            .chain(known.iter().take(case.arms.len()));
+        let json = json_aggregate::common_branches("CASE", otherwise_first.flatten())?;
+        let ty = common_result_type(known.into_iter().flatten().map(|bound| bound.ty))?;
         let result = |value: &Scalar| -> R<BoundScalar> {
             if let Self::Literal(value @ (Value::Text(_) | Value::Null)) = value {
+                if json {
+                    return json_literal(value);
+                }
                 return Ok(BoundScalar {
                     ty: ty.clone(),
                     node: literal_cast_node(value.clone(), &ty)?,
@@ -1483,11 +1512,30 @@ impl Scalar {
         match name {
             array_constructor::NAME => array_constructor::bind(args, None, resolve, tables, parameters),
             name if uuid_array_operators::is_quantified(name) => uuid_array_operators::bind_quantified(name, args, resolve, tables, parameters),
-            "\0plan_cardinality" if args.len() == 1 => {
+            plan::subquery::lazy::NAME if args.len() == 3 => {
+                Self::bind_passthrough_inputs(name, args, resolve, tables, parameters)
+            }
+            json_aggregate::INPUT if args.len() == 1 => {
+                if let Self::Literal(value @ (Value::Text(_) | Value::Null)) = &args[0] {
+                    return json_literal(value);
+                }
+                let inner = args[0].bind(resolve, tables, parameters)?;
+                if inner.result_oid() == json_aggregate::OID {
+                    return Ok(inner);
+                }
+                if !matches!(inner.ty, DataType::Text | DataType::Varchar | DataType::Bpchar | DataType::Jsonb) {
+                    return Err(SqlError::CannotCoerce);
+                }
+                Ok(BoundScalar {
+                    ty: DataType::Text,
+                    node: Node::Call(name.into(), vec![inner]),
+                })
+            }
+            "\0plan_cardinality" | json_aggregate::TEXT_RESULT if args.len() == 1 => {
                 Self::bind_plan_cardinality(name, args, resolve, tables, parameters)
             }
             name if aggregate_order::internal(name) => {
-                Self::bind_aggregate_order(name, args, resolve, tables, parameters)
+                Self::bind_passthrough_inputs(name, args, resolve, tables, parameters)
             }
             name if let Some(distinct) = aggregate_order::deferred(name) => {
                 Self::bind_deferred_aggregate(distinct, args, resolve, tables, parameters)
@@ -1571,7 +1619,7 @@ impl Scalar {
     }
 
     #[inline(never)]
-    fn bind_aggregate_order(
+    fn bind_passthrough_inputs(
         name: &str,
         args: &[Self],
         resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
@@ -1915,7 +1963,13 @@ impl Scalar {
             }
         }
         let null = |a: &BoundScalar| matches!(a.node, Node::Literal(Value::Null));
-        let ty = if name == "cardinality"
+        let ty = if name == "jsonb_set" {
+            jsonb_mutation::bind_set(original, &mut args)?;
+            DataType::Jsonb
+        } else if name == "jsonb_typeof" {
+            jsonb_mutation::bind_type(original, &mut args)?;
+            DataType::Text
+        } else if name == "cardinality"
             && matches!(args.as_slice(), [arg] if arg.ty == DataType::UuidArray)
         {
             DataType::Integer
@@ -2286,16 +2340,21 @@ impl Scalar {
                     DataType::Text
                 }
                 "coalesce" if !args.is_empty() => {
-                    let ty = common_result_type(
-                        args.iter()
-                            .zip(original)
-                            .filter(|(a, original)| {
-                                !matches!(original, Self::Literal(Value::Text(_))) && !null(a)
-                            })
-                            .map(|(a, _)| a.ty.clone()),
-                    )?;
+                    let known = args.iter()
+                        .zip(original)
+                        .filter(|(a, original)| {
+                            !matches!(original, Self::Literal(Value::Text(_) | Value::Null))
+                                && (!null(a) || a.result_oid() == json_aggregate::OID)
+                        })
+                        .map(|(a, _)| a);
+                    let json = json_aggregate::common_branches("COALESCE", known.clone())?;
+                    let ty = common_result_type(known.map(|a| a.ty.clone()))?;
                     for (a, original) in args.iter_mut().zip(original) {
-                        if let Self::Literal(Value::Text(s)) = original {
+                        if json {
+                            if let Self::Literal(value @ (Value::Text(_) | Value::Null)) = original {
+                                *a = json_literal(value)?;
+                            }
+                        } else if let Self::Literal(Value::Text(s)) = original {
                             a.node = literal_cast_node(Value::Text(s.clone()), &ty)?;
                             a.ty = ty.clone();
                         }
@@ -2329,10 +2388,23 @@ impl Scalar {
 }
 impl BoundScalar {
     pub(super) fn result_oid(&self) -> u32 {
-        if matches!(&self.node, Node::Call(name, _) if name == "setseed") {
-            random_uuid::VOID_OID
-        } else {
-            0
+        fn json_in_branches<'a>(branches: impl Iterator<Item = &'a BoundScalar>) -> u32 {
+            let mut json = false;
+            for branch in branches {
+                if branch.result_oid() == json_aggregate::OID {
+                    json = true;
+                } else if !matches!(branch.node, Node::Literal(Value::Null)) {
+                    return 0;
+                }
+            }
+            if json { json_aggregate::OID } else { 0 }
+        }
+        match &self.node {
+            Node::Call(name, _) if name == "setseed" => random_uuid::VOID_OID,
+            Node::Call(name, _) if matches!(name.as_str(), json_aggregate::TEXT_RESULT | json_aggregate::INPUT) => json_aggregate::OID,
+            Node::Case(arms, other) => json_in_branches(arms.iter().map(|(_, value)| value).chain(other.as_deref())),
+            Node::Call(name, args) if name == "coalesce" => json_in_branches(args.iter()),
+            _ => 0,
         }
     }
 
@@ -2676,7 +2748,23 @@ impl BoundScalar {
                 charge(budget, v)?;
                 Ok(v.clone())
             }
-            Node::Call(n, _) if n == "\0plan_cardinality" => Err(SqlError::CardinalityViolation),
+            Node::Call(n, _) if n == "\0plan_cardinality" => Err(plan::subquery::cardinality_error()),
+            Node::Call(n, args) if n == json_aggregate::TEXT_RESULT => args[0].eval(row, params, budget),
+            Node::Call(n, args) if n == json_aggregate::INPUT => {
+                let value = args[0].eval(row, params, budget)?;
+                let value = cast_value(value, &DataType::Text, budget)?;
+                if let Value::Text(text) = &value {
+                    json_aggregate::validate_input(text)?;
+                }
+                Ok(value)
+            }
+            Node::Call(n, args) if n == plan::subquery::lazy::NAME => {
+                let index = args[1].eval(row, params, budget)?;
+                let name = args[2].eval(row, params, budget)?;
+                let value = plan::subquery::lazy::evaluate(index, name)?;
+                charge(budget, &value)?;
+                Ok(value)
+            }
             Node::Call(n, args) => {
                 if collation::internal(n) || aggregate_order::internal(n) { return args[0].eval(row, params, budget); }
                 if n == typeof_expr::NAME {
@@ -2736,6 +2824,16 @@ impl BoundScalar {
                     && values.contains(&Value::Null)
                 {
                     return Ok(Value::Null);
+                }
+                if n == "jsonb_typeof" {
+                    let value = jsonb_mutation::json_type(&values[0])?;
+                    charge(budget, &value)?;
+                    return Ok(value);
+                }
+                if n == "jsonb_set" {
+                    let value = jsonb_mutation::set(&values)?;
+                    charge(budget, &value)?;
+                    return Ok(value);
                 }
                 if random_uuid::known(n) {
                     let value = random_uuid::eval(n, &values)?;
@@ -3268,17 +3366,16 @@ impl Scalar {
                 for result in &results {
                     result.infer(None, parameters, resolve, tables)?;
                 }
-                let ty = common_result_type(
-                    results
-                        .iter()
-                        .filter(|result| !result.aggregate_unknown(parameters))
-                        .map(|result| {
-                            result
-                                .bind(resolve, tables, parameters)
-                                .map(|bound| bound.ty)
-                        })
-                        .collect::<R<Vec<_>>>()?,
-                )?;
+                let known = results
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, result)| !result.aggregate_unknown(parameters))
+                    .map(|(i, result)| result.bind(resolve, tables, parameters).map(|bound| (i, bound)))
+                    .collect::<R<Vec<_>>>()?;
+                let otherwise_first = known.iter().filter(|(i, _)| *i == case.arms.len())
+                    .chain(known.iter().filter(|(i, _)| *i < case.arms.len()));
+                json_aggregate::common_branches("CASE", otherwise_first.map(|(_, bound)| bound))?;
+                let ty = common_result_type(known.into_iter().map(|(_, bound)| bound.ty))?;
                 for result in results {
                     if result.aggregate_unknown(parameters) {
                         result.infer(Some(&ty), parameters, resolve, tables)?;
@@ -3357,7 +3454,17 @@ impl Scalar {
             Self::Call(n, args) if uuid_array_operators::is_quantified(n) => {
                 uuid_array_operators::infer_quantified(n, args, parameters, resolve, tables)?;
             }
-            Self::Call(n, args) if n == "\0plan_cardinality" && args.len() == 1 => {
+            Self::Call(n, args) if n == plan::subquery::lazy::NAME && args.len() == 3 => {
+                args[0].infer(expected, parameters, resolve, tables)?;
+            }
+            Self::Call(n, args) if n == json_aggregate::INPUT && args.len() == 1 => {
+                if args[0].aggregate_unknown(parameters) {
+                    args[0].infer(Some(&DataType::Text), parameters, resolve, tables)?;
+                } else {
+                    args[0].infer(None, parameters, resolve, tables)?;
+                }
+            }
+            Self::Call(n, args) if matches!(n.as_str(), "\0plan_cardinality" | json_aggregate::TEXT_RESULT) && args.len() == 1 => {
                 args[0].infer(expected, parameters, resolve, tables)?;
             }
             Self::Call(n, args) if n == CAST_TYPMOD => {
@@ -3432,6 +3539,15 @@ impl Scalar {
             Self::Call(n, args) if n == "pg_xact_status" => {
                 for arg in args {
                     arg.infer(Some(&DataType::BigInt), parameters, resolve, tables)?;
+                }
+            }
+            Self::Call(n, args) if n == "jsonb_typeof" => {
+                let [arg] = args.as_slice() else { return Err(SqlError::UndefinedFunction) };
+                arg.infer(Some(&DataType::Jsonb), parameters, resolve, tables)?;
+            }
+            Self::Call(n, args) if n == "jsonb_set" => {
+                for (arg, ty) in args.iter().zip(jsonb_mutation::SET_TYPES.iter()) {
+                    arg.infer(Some(ty), parameters, resolve, tables)?;
                 }
             }
             Self::Call(n, args) if sequence_name(n) => {

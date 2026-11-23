@@ -3,6 +3,19 @@ use super::*;
 use bind::Meta;
 use exec::Relation;
 
+#[derive(Debug, Clone)]
+pub(super) struct MainInsert {
+    pub prepared: Prepared,
+    pub parameters: BTreeSet<usize>,
+}
+
+pub(super) fn parameters(tokens: &[Token]) -> BTreeSet<usize> {
+    tokens.iter().filter_map(|token| match token {
+        Token::Param(n) => Some(*n),
+        _ => None,
+    }).collect()
+}
+
 pub(super) fn parse(tokens: &[Token], owner: &mut Parser) -> R<Prepared> {
     let mut p = parse::parser(tokens);
     let statement = match p.parse() {
@@ -23,17 +36,20 @@ pub(super) fn parse(tokens: &[Token], owner: &mut Parser) -> R<Prepared> {
         Err(error) => return Err(error),
     };
     let mut prepared = Prepared::engine(statement, 0, 0);
-    prepared.params = tokens
-        .iter()
-        .filter_map(|t| match t {
-            Token::Param(n) => Some(*n),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0);
+    prepared.params = parameters(tokens).last().copied().unwrap_or(0);
     prepared.relations = p.relations;
     owner.relations.extend(prepared.relations.clone());
     Ok(prepared)
+}
+
+pub(super) fn references(prepared: &Prepared, name: &str) -> bool {
+    match &prepared.statement {
+        Statement::Plan(plan) => cte::references(plan, name) > 0,
+        Statement::InsertMulti(insert) if let Some(sql_insert::Source::Plan(plan, _)) = &insert.source => {
+            cte::references(plan, name) > 0
+        }
+        _ => prepared.read_tables().iter().any(|table| table == name),
+    }
 }
 
 pub(super) fn remap(p: &mut Prepared, alias: &str, name: &str) {
@@ -41,7 +57,10 @@ pub(super) fn remap(p: &mut Prepared, alias: &str, name: &str) {
     if let Statement::InsertMulti(insert) = &mut p.statement
         && let Some(source) = &mut insert.source
     {
-        cte::remap_query(source, alias, name);
+        match source {
+            sql_insert::Source::Query(query) => cte::remap_query(query, alias, name),
+            sql_insert::Source::Plan(plan, _) => cte::remap(plan, alias, name),
+        }
     }
     if let Statement::Update { search, .. }
     | Statement::UpdateExpressions { search, .. }

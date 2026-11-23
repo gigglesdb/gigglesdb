@@ -219,8 +219,10 @@ impl Prepared {
             }
             Statement::InsertMulti(insert) => {
                 read(&mut insert.table);
-                if let Some(query) = &mut insert.source {
-                    query.bind_schema_names(&read, state, &self.search_path);
+                match &mut insert.source {
+                    Some(sql_insert::Source::Query(query)) => query.bind_schema_names(&read, state, &self.search_path),
+                    Some(sql_insert::Source::Plan(plan, _)) => plan.bind_schema_names(&read, state, &self.search_path)?,
+                    None => {}
                 }
             }
             Statement::AlterTable(alter) => {

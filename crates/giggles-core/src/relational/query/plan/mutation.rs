@@ -2,6 +2,28 @@
 use super::*;
 use std::borrow::Cow;
 type Publisher<'a> = dyn FnMut(&Prepared) -> R<()> + 'a;
+type Point = (Vec<u8>, Vec<(String, Expr)>);
+
+fn collect_point(table: &TableDef, point: &Prepared) -> R<Point> {
+    let (predicates, sets) = match &point.statement {
+        Statement::Update { predicates, sets, .. } => (predicates, sets.clone()),
+        Statement::Delete { predicates, .. } => (predicates, vec![]),
+        _ => return Err(SqlError::Unsupported),
+    };
+    Ok((bounds(table, predicates, &[])?.low, sets))
+}
+
+fn batch_assignments(points: Vec<Point>) -> R<Vec<(String, super::super::super::assign::Value)>> {
+    let mut columns: BTreeMap<String, BTreeMap<Vec<u8>, Value>> = BTreeMap::new();
+    for (key, sets) in points {
+        for (name, value) in sets {
+            columns.entry(name).or_default().insert(key.clone(), value.value(&[])?);
+        }
+    }
+    Ok(columns.into_iter().map(|(name, values)| {
+        (name, super::super::super::assign::Value::Rows(std::sync::Arc::new(values)))
+    }).collect())
+}
 pub(super) const KEY: &str = "\0mutation_key";
 #[derive(Debug, Clone)]
 pub(in crate::relational) struct Mutation {
@@ -11,14 +33,72 @@ pub(in crate::relational) struct Mutation {
     pub(super) from: join::From,
     pub(super) predicate: Plan,
     pub(super) groups: Vec<(Vec<String>, Option<Plan>)>,
+    pub(super) qualified_target: Option<(String, String)>,
     pub(super) returning: Option<Plan>,
     pub(super) images: [String; 2],
 }
 impl Plan {
     pub(in crate::relational) fn mutation_command(&self) -> Option<&'static str> {
-        self.mutation.as_ref().map(|m| m.command()).or_else(|| self.merge.as_ref().map(|_| "MERGE"))
+        self.mutation.as_ref().map(|m| m.command())
+            .or_else(|| self.merge.as_ref().map(|_| "MERGE"))
+            .or_else(|| self.insert.as_ref().map(|_| "INSERT"))
     }
 }
+impl Plan {
+    pub(in crate::relational) fn requires_planned_update(tokens: &[Token]) -> bool {
+        if !tokens.first().is_some_and(|token| parse::word(token, "update")) {
+            return false;
+        }
+        let Ok(top) = parse::top(tokens) else {
+            return false;
+        };
+        let Some(set) = top.iter().copied().find(|i| parse::word(&tokens[*i], "set")) else {
+            return false;
+        };
+        let end = top.iter().copied().find(|i| *i > set && parse::word(&tokens[*i], "returning"))
+            .unwrap_or(tokens.len());
+        has_scalar_subquery(&tokens[..end], set + 1)
+            || qualified_assignment(&tokens[set + 1..end])
+            || nested_target_source(&tokens[1..set], &tokens[set + 1..end])
+    }
+}
+
+fn qualified_assignment(tokens: &[Token]) -> bool {
+    assignment_target_starts(tokens).is_ok_and(|starts| {
+        starts.into_iter().any(|i| tokens.get(i + 1) == Some(&Token::Symbol('.')))
+    })
+}
+
+fn nested_target_source(target_tokens: &[Token], tokens: &[Token]) -> bool {
+    let mut target = parse::parser(target_tokens);
+    target.word("only");
+    let Ok(name) = target.table_name() else { return false };
+    target.sym('*');
+    if target.at == target.tokens.len() {
+        return false;
+    }
+    let table = split_key(&name).1;
+    (0..tokens.len()).filter(|i| is_subquery_open(tokens, *i)).any(|i| {
+        let Ok(close) = subquery_end(tokens, i) else { return false };
+        let inner = &tokens[i + 1..close];
+        parse::top(inner).is_ok_and(|positions| positions.into_iter().any(|i| {
+            if !["from", "join"].iter().any(|word| parse::word(&inner[i], word)) {
+                return false;
+            }
+            let mut from = parse::parser(&inner[i + 1..]);
+            from.table_name().is_ok_and(|local| split_key(&local).1 == table)
+        }))
+    })
+}
+
+fn has_scalar_subquery(tokens: &[Token], start: usize) -> bool {
+    (start..tokens.len()).any(|i| {
+        is_subquery_open(tokens, i)
+            && !["exists", "in", "any", "some", "all"]
+                .iter().any(|word| parse::word(&tokens[i - 1], word))
+    })
+}
+
 pub(super) fn claims(tokens: &[Token]) -> bool {
     let update = tokens.first().is_some_and(|t| parse::word(t, "update"));
     let delete = tokens.first().is_some_and(|t| parse::word(t, "delete"));
@@ -34,12 +114,27 @@ pub(super) fn claims(tokens: &[Token]) -> bool {
         .find(|i| parse::word(&tokens[*i], "where") || parse::word(&tokens[*i], "returning"))
         .unwrap_or(tokens.len());
     if delete {
-        return top.iter().any(|i| {
+        if top.iter().any(|i| {
             *i >= 3
                 && *i < end
                 && parse::word(&tokens[*i], "using")
                 && tokens.get(i - 1) != Some(&Token::Symbol('.'))
-        });
+        }) {
+            return true;
+        }
+        if end <= 2
+            || !parse::word(&tokens[1], "from")
+            || !tokens.get(end).is_some_and(|t| parse::word(t, "where"))
+        {
+            return false;
+        }
+        let returning = top
+            .iter()
+            .copied()
+            .find(|i| *i > end && parse::word(&tokens[*i], "returning"))
+            .unwrap_or(tokens.len());
+        // As with UPDATE, bind nested references to an aliased target in their own scope.
+        return nested_target_source(&tokens[2..end], &tokens[end + 1..returning]);
     }
     let Some(set) = top
         .iter()
@@ -48,7 +143,9 @@ pub(super) fn claims(tokens: &[Token]) -> bool {
     else {
         return false;
     };
-    top.iter().any(|i| {
+    let returning = top.iter().copied().find(|i| *i > set && parse::word(&tokens[*i], "returning"))
+        .unwrap_or(tokens.len());
+    Plan::requires_planned_update(&tokens[..returning]) || top.iter().any(|i| {
         *i > set
             && *i < end
             && parse::word(&tokens[*i], "from")
@@ -60,6 +157,22 @@ pub(super) fn claims(tokens: &[Token]) -> bool {
             && tokens[pair[1]] == Token::Symbol('(')
     })
 }
+// The legacy alias normalizer may rewrite column references, never SET targets.
+pub(in crate::relational) fn assignment_target_starts(tokens: &[Token]) -> R<Vec<usize>> {
+    let mut targets = vec![0];
+    for index in parse::top(tokens)? {
+        if ["from", "where", "returning"].iter().any(|word| parse::word(&tokens[index], word))
+            && (index == 0 || !parse::word(&tokens[index - 1], "distinct"))
+        {
+            break;
+        }
+        if tokens[index] == Token::Symbol(',') {
+            targets.push(index + 1);
+        }
+    }
+    Ok(targets)
+}
+
 pub(super) fn splits(tokens: &[Token]) -> R<Vec<&[Token]>> {
     let mut start = 0;
     let mut out = vec![];
@@ -138,12 +251,20 @@ pub(super) fn parse(
         })
         .unwrap_or(where_at);
     let mut groups = vec![];
+    let mut qualified_target = None;
     if !deleting {
         p.need("set")?;
         for set in splits(&tokens[p.at..from_at])? {
             let mut a = parse::parser(set);
             let tuple = a.tokens.first() == Some(&Token::Symbol('('));
             let names = if tuple { a.names()? } else { vec![a.column_name()?] };
+            if !tuple && a.sym('.') {
+                let field = a.column_name()?;
+                qualified_target.get_or_insert_with(|| (names[0].clone(), field));
+                while a.sym('.') {
+                    a.column_name()?;
+                }
+            }
             if a.tokens.get(a.at) != Some(&Token::Op("=".into())) {
                 return Err(SqlError::Syntax.into());
             }
@@ -259,11 +380,30 @@ pub(super) fn parse(
         from,
         predicate,
         groups,
+        qualified_target,
         returning,
         images,
     }));
     Ok(plan)
 }
+fn missing_assignment_column(plan: &Plan) {
+    let Body::Select(select) = &plan.body else { return };
+    if !select.applies.is_empty() || select.from.is_some() || !select.query.sources.is_empty() {
+        return;
+    }
+    let mut query = select.query.clone();
+    let mut column = None;
+    let _ = subquery::map_query(&mut query, &mut |scalar| {
+        if column.is_none() && let Scalar::Column(c) = scalar && c.qualifier.is_none() {
+            column = Some(c.name.clone());
+        }
+        Ok(())
+    });
+    if let Some(name) = column {
+        user_types::view_replace_error(format!(r#"column "{name}" does not exist"#));
+    }
+}
+
 impl Mutation {
     pub(super) fn has_returning(&self) -> bool {
         self.returning.is_some()
@@ -400,6 +540,20 @@ impl Mutation {
     }
     pub(super) fn resolve_shape(&mut self, state: &Relational, parameters: &mut [Option<DataType>], shape: &join::Shape) -> R<bind::Meta> {
         let table = &state.tables[&self.target];
+        if let Some((column, field)) = &self.qualified_target {
+            if let Some(c) = table.columns.iter().find(|c| &c.name == column) {
+                let ty = defaults::type_name(&c.data_type);
+                user_types::view_replace_error(format!(
+                    r#"cannot assign to field "{field}" of column "{column}" because its type {ty} is not a composite type"#
+                ));
+                return Err(SqlError::Type);
+            }
+            user_types::view_replace_error(format!(
+                r#"column "{column}" of relation "{}" does not exist"#, split_key(&self.target).1
+            ));
+            user_types::sql_error_hint("SET target columns cannot be qualified with the relation name.");
+            return Err(SqlError::UnknownColumn);
+        }
         let names = self
             .groups
             .iter()
@@ -430,16 +584,18 @@ impl Mutation {
                 }
                 let (mut instantiated, _) =
                     subquery::instantiate(plan, shape, None, state, parameters)?;
-                let meta = instantiated.resolve(state, parameters)?;
+                let meta = instantiated.resolve(state, parameters).inspect_err(|error| {
+                    if *error == SqlError::UnknownColumn {
+                        missing_assignment_column(&instantiated);
+                    }
+                })?;
                 if meta.columns.len() != names.len() {
                     return Err(SqlError::Syntax);
                 }
                 for (i, (column, name)) in meta.columns.iter().zip(names.iter()).enumerate() {
                     if !meta.unknown[i]
-                        && !assignment::compatible(
-                            &column.data_type,
-                            &table.columns[super::super::super::col(table, name)?].data_type,
-                        )
+                        && !assignment::SourceType::new(&column.data_type, meta.type_oids.get(i))
+                            .compatible(&table.columns[super::super::super::col(table, name)?].data_type)
                     {
                         return Err(SqlError::Type);
                     }
@@ -486,7 +642,7 @@ impl Mutation {
         deferred: Option<&mut super::super::super::DeferralState>,
     ) -> Result<SqlResult, crate::CoreError> {
         let _metadata = functions::collation::ColumnScope::enter(&[], &[]).map_err(crate::CoreError::Sql)?;
-        use super::super::super::{assign, returning};
+        use super::super::super::returning;
         let mut snapshot = state.clone();
         let mut retention = scan::Retention::new(scan::retention_limit());
         for name in self.read_tables() {
@@ -513,15 +669,7 @@ impl Mutation {
             .map_err(crate::CoreError::Sql)?;
         let mut points = vec![];
         let mut collect = |point: &Prepared| -> R<()> {
-            let (predicates, sets) = match &point.statement {
-                Statement::Update {
-                    predicates, sets, ..
-                } => (predicates, sets.clone()),
-                Statement::Delete { predicates, .. } => (predicates, vec![]),
-                _ => return Err(SqlError::Unsupported),
-            };
-            let key = super::super::super::bounds(&table, predicates, &[])?.low;
-            points.push((key, sets));
+            points.push(collect_point(&table, point)?);
             Ok(())
         };
         let output = self
@@ -566,19 +714,7 @@ impl Mutation {
                 returning,
             }
         } else {
-            let mut columns: BTreeMap<String, BTreeMap<Vec<u8>, Value>> = BTreeMap::new();
-            for (key, sets) in points {
-                for (name, value) in sets {
-                    columns.entry(name).or_default().insert(
-                        key.clone(),
-                        value.value(&[]).map_err(crate::CoreError::Sql)?,
-                    );
-                }
-            }
-            let sets = columns
-                .into_iter()
-                .map(|(name, values)| (name, assign::Value::Rows(std::sync::Arc::new(values))))
-                .collect();
+            let sets = batch_assignments(points).map_err(crate::CoreError::Sql)?;
             Statement::UpdateExpressions {
                 name: self.target.clone(),
                 sets,
@@ -591,6 +727,30 @@ impl Mutation {
         generated.search_path = prepared.search_path.clone();
         state.execute_with_sink(&generated, &[], None, clock, sink, version_end, deferred)
     }
+    fn bulk_target(&self, state: &Relational) -> Option<TableDef> {
+        if self.deleting {
+            return None;
+        }
+        let table = state.tables.get(&self.target)?;
+        let assigned = |column: usize| self.groups.iter().any(|(names, _)| names.contains(&table.columns[column].name));
+        // Without key or constraint changes, all computed postimages can go
+        // through the ordinary searched UPDATE publisher in one batch.
+        if table.primary_key.iter().any(|i| assigned(*i))
+            || state.ext.constraints.get(&table.id).is_some_and(|constraints| {
+                constraints.iter().any(|c| !matches!(c.kind, super::super::super::catalog_ext::ConstraintKind::PrimaryKey))
+            })
+            || state.ext.constraints.values().flatten().any(|c| {
+                matches!(c.kind, super::super::super::catalog_ext::ConstraintKind::ForeignKey { ref_table, .. } if ref_table == table.id)
+            })
+            || state.secondary.descriptors().iter().any(|d| d.table == table.id && d.unique)
+            || table.columns.iter().enumerate().any(|(i, c)| assigned(i)
+                && (c.not_null || state.column_type(c.id).is_some()))
+        {
+            return None;
+        }
+        Some(table.clone())
+    }
+
     #[expect(clippy::too_many_arguments, reason = "statement mutation context")]
     pub(super) fn execute(
         &self,
@@ -602,16 +762,32 @@ impl Mutation {
         events: &mut Vec<super::super::super::constraints::Event>,
         injected_source: Option<&dyn scan::RowSource>,
     ) -> R<SqlResult> {
-        self.execute_inner(
-            state,
-            prepared,
-            params,
-            clock,
-            cancel,
-            events,
-            injected_source,
-            None,
-        )
+        let Some(table) = injected_source.is_none().then(|| self.bulk_target(state)).flatten() else {
+            return self.execute_inner(state, prepared, params, clock, cancel, events, injected_source, None);
+        };
+        let mut points = vec![];
+        let output = self.execute_inner(state, prepared, params, clock, cancel, events, None, Some(&mut |point| {
+            points.push(collect_point(&table, point)?);
+            Ok(())
+        }))?;
+        let mut points = points.into_iter();
+        loop {
+            let chunk: Vec<_> = points.by_ref().take(MAX_ROWS).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let keys = chunk.iter().map(|(key, _)| key.clone()).collect();
+            let mut batch = Prepared::engine(Statement::UpdateExpressions {
+                name: self.target.clone(),
+                sets: batch_assignments(chunk)?,
+                predicates: vec![],
+                search: Some(Box::new(Query::mutation_input(&self.target, keys))),
+                returning: None,
+            }, prepared.domain, state.epoch);
+            batch.search_path = prepared.search_path.clone();
+            state.execute_statement_inner(&batch, &[], None, &mut *cancel, clock, None, events)?;
+        }
+        Ok(output)
     }
     #[expect(
         clippy::too_many_arguments,
@@ -677,6 +853,13 @@ impl Mutation {
             affected: 0,
         };
         let returning_shape = self.returning_shape(&shape, table);
+        let direct = self.groups.iter().map(|(names, plan)| match (names.as_slice(), plan) {
+            ([_], Some(plan)) => subquery::ScalarProjection::bind(plan, &shape, &snapshot, &parameters),
+            _ => Ok(None),
+        }).collect::<R<Vec<_>>>()?;
+        let apply_context = subquery::ApplyContext {
+            state: &snapshot, source: base, params, parameters: &parameters, clock, execution: &execution,
+        };
         for matched in &joined.rows {
             if execution.cancelled() {
                 return Err(SqlError::Aborted);
@@ -710,14 +893,18 @@ impl Mutation {
                 .ok_or(SqlError::UnknownColumn)?;
             let mut new = old.clone();
             let mut sets = vec![];
-            for (names, plan) in &self.groups {
-                let values = if let Some(plan) = plan {
+            for ((names, plan), direct) in self.groups.iter().zip(&direct) {
+                let values = if let Some(direct) = direct {
+                    let value = direct.evaluate(&shape, matched, &apply_context)?;
+                    let target = &table.columns[super::super::super::col(table, &names[0])?].data_type;
+                    vec![direct.source_type.convert(value, target, clock)?]
+                } else if let Some(plan) = plan {
                     let (mut plan, _) =
                         subquery::instantiate(plan, &shape, Some(matched), &snapshot, &parameters)?;
                     let meta = plan.resolve(&snapshot, &mut parameters.clone())?;
                     let rows = plan.run(&snapshot, base, params, &parameters, clock, &execution)?;
                     if rows.rows.len() > 1 {
-                        return Err(SqlError::CardinalityViolation);
+                        return Err(subquery::cardinality_error());
                     }
                     if let Some(row) = rows.rows.first() {
                         row.values
@@ -731,7 +918,8 @@ impl Mutation {
                                 if meta.unknown[i] {
                                     assignment::literal(v.clone(), target, clock)
                                 } else {
-                                    assignment::convert(v.clone(), &c.data_type, target, clock)
+                                    assignment::SourceType::new(&c.data_type, meta.type_oids.get(i))
+                                        .convert(v.clone(), target, clock)
                                 }
                             })
                             .collect::<R<Vec<_>>>()?

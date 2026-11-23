@@ -61,6 +61,26 @@ fn implicit(from: &DataType, to: &DataType) -> bool {
                 | (IntArray, BigIntArray)
         )
 }
+fn values_cell(
+    scalar: &mut Scalar, ty: &DataType, parameters: &[Option<DataType>],
+) -> R<BoundScalar> {
+    let cast = Scalar::Cast(Box::new(scalar.clone()), ty.clone());
+    let bound = cast.bind(&no_column, &[], parameters);
+    if matches!(bound, Err(SqlError::InvalidTextRepresentation))
+        && let Scalar::Literal(Value::Text(text)) = scalar
+        && let Some(type_name) = match ty {
+            DataType::SmallInt => Some("smallint"),
+            DataType::Integer => Some("integer"),
+            DataType::BigInt => Some("bigint"),
+            _ => None,
+        }
+    {
+        user_types::view_replace_error(format!(r#"invalid input syntax for type {type_name}: "{text}""#));
+    }
+    *scalar = cast;
+    bound
+}
+
 fn unknown(s: &Scalar, parameters: &[Option<DataType>]) -> bool {
     matches!(s, Scalar::Literal(Value::Null | Value::Text(_)))
         || matches!(s, Scalar::Param(n) if parameters.get(n - 1).is_some_and(Option::is_none))
@@ -90,7 +110,7 @@ impl Plan {
         parameters: &[Option<DataType>],
     ) -> R<()> {
         let _metadata = functions::collation::ColumnScope::enter(&[], &[])?;
-        if self.mutation.is_some() || self.merge.is_some() { return Ok(()); }
+        if self.mutation.is_some() || self.merge.is_some() || self.insert.is_some() { return Ok(()); }
         if !self.ctes.is_empty() {
             let mut plan = self.clone();
             let mut parameters = parameters.to_vec();
@@ -198,6 +218,9 @@ impl Plan {
         let state = catalog.as_ref().unwrap_or(state);
         if let Some(m) = &mut self.mutation { return m.resolve(state, parameters); }
         if let Some(m) = &mut self.merge { return m.resolve(state, parameters); }
+        if let Some(insert) = &mut self.insert {
+            return dml::resolve(&mut insert.prepared, state, parameters, &insert.parameters);
+        }
         // Pagination can determine an otherwise unknown projection parameter.
         for s in self.limit.iter().chain(&self.offset) {
             s.infer(Some(&DataType::BigInt), parameters,
@@ -366,8 +389,7 @@ impl Plan {
                     let mut metadata = None;
                     for row in rows.iter_mut() {
                         row[i].infer(Some(&ty), parameters, &no_column, &[])?;
-                        row[i] = Scalar::Cast(Box::new(row[i].clone()), ty.clone());
-                        let value = row[i].bind(&no_column, &[], parameters)?;
+                        let value = values_cell(&mut row[i], &ty, parameters)?;
                         metadata = Some(functions::collation::combined(
                             metadata.as_ref(),
                             Some(&value),
@@ -422,7 +444,33 @@ impl Plan {
                 if a.columns.len() != b.columns.len() {
                     return Err(SqlError::Syntax);
                 }
-                for i in 0..a.columns.len() {
+                let mut oids = vec![0; a.columns.len()];
+                for (i, oid) in oids.iter_mut().enumerate() {
+                    let a_json = a.type_oids.get(i) == Some(&json_aggregate::OID);
+                    let b_json = b.type_oids.get(i) == Some(&json_aggregate::OID);
+                    if a_json || b_json {
+                        if a_json != b_json && !(if a_json { b.unknown[i] } else { a.unknown[i] }) {
+                            let name = match op {
+                                SetOp::Union => "UNION",
+                                SetOp::Intersect => "INTERSECT",
+                                SetOp::Except => "EXCEPT",
+                            };
+                            let types = [&a, &b].into_iter().map(|m| {
+                                if m.type_oids.get(i) == Some(&json_aggregate::OID) {
+                                    "json"
+                                } else {
+                                    defaults::type_name(&m.columns[i].data_type)
+                                }
+                            }).collect::<Vec<_>>();
+                            user_types::view_replace_error(format!("{name} types {} and {} cannot be matched", types[0], types[1]));
+                            return Err(SqlError::Type);
+                        }
+                        if !matches!(op, SetOp::Union) || !*all {
+                            user_types::view_replace_error("could not identify an equality operator for type json".into());
+                            return Err(SqlError::UndefinedFunction);
+                        }
+                        *oid = json_aggregate::OID;
+                    }
                     let types = [&a, &b]
                         .into_iter()
                         .filter(|m| !m.unknown[i])
@@ -440,7 +488,7 @@ impl Plan {
                     }
                     a.unknown[i] = false;
                 }
-                a.type_oids.clear();
+                a.type_oids = if oids.contains(&json_aggregate::OID) { oids } else { vec![] };
                 a
             }
         };

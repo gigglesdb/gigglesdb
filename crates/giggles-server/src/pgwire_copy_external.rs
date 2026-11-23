@@ -98,7 +98,7 @@ impl State {
         } else {
             "Only roles with privileges of the \"pg_write_server_files\" role may COPY to a file."
         }.into());
-        self.diagnostic.wire_hint = Some(CLIENT_HINT);
+        self.diagnostic.wire_hint = Some(CLIENT_HINT.into());
         Err("42501")
     }
     pub(super) fn copy_source_privilege(
@@ -229,11 +229,11 @@ fn file_error(
         if from { "reading" } else { "writing" }
     ));
     if matches!(n, 2 | 13) {
-        d.wire_hint = Some(if from {
+        d.wire_hint = Some((if from {
             "COPY FROM instructs the PostgreSQL server process to read a file. You may want a client-side facility such as psql's \\copy."
         } else {
             "COPY TO instructs the PostgreSQL server process to write a file. You may want a client-side facility such as psql's \\copy."
-        });
+        }).into());
     }
     code
 }

@@ -14,7 +14,8 @@ pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
         return false;
     }
     matches!(&prepared.statement, Statement::InsertMulti(i) if i.needs_pages()
-        && i.source.as_ref().is_none_or(|q| paged_source(state, i, q) || stored_source(state, q)))
+        && i.source.as_ref().is_none_or(|source| source.query()
+            .is_some_and(|q| paged_source(state, i, q) || stored_source(state, q))))
 }
 
 /// Row-local SELECTs of another table are evaluated one source page at a time.
@@ -59,7 +60,8 @@ pub(super) fn execute(
         .then(|| paged_dml::ActionWork::new(deferred.as_deref().cloned().unwrap_or_default()));
     let foreign_keys = state.ext.constraints.get(&table.id).into_iter().flatten()
         .any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. }));
-    let stored = match &insert.source {
+    let query = insert.source.as_ref().and_then(sql_insert::Source::query);
+    let stored = match query {
         Some(query) if !paged_source(state, insert, query) => {
             let mut stored = None;
             let image = &*state;
@@ -85,7 +87,7 @@ pub(super) fn execute(
                 break;
             }
             (template.literal_page(page), false)
-        } else if let Some(query) = &insert.source {
+        } else if let Some(query) = query {
             let table = &state.tables[&query.read_tables()[0]];
             let next = sink.read_page(table, after.take())?;
             let done = next.is_none();
