@@ -37,6 +37,7 @@ struct Scope {
 
 pub(super) fn parse(
     tokens: &[Token],
+    following: Option<&Token>,
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
@@ -58,7 +59,7 @@ pub(super) fn parse(
             break;
         }
     }
-    let mut body = parse::expression(remaining, owner, depth, next)?;
+    let mut body = parse::expression(remaining, following, owner, depth, next)?;
     for scope in scopes.into_iter().rev() {
         body = finish(scope.definitions, scope.recursive, scope.names, body, owner)?;
     }
@@ -113,7 +114,7 @@ fn parse_scope(
         let query = if dml.is_some() {
             Plan::new(Body::Values(vec![]))
         } else {
-            parse::child_expression(tokens, owner, depth, next)?
+            parse::child_expression(tokens, p.tokens.get(close), owner, depth, next)?
         };
         let dml_parameters = tokens
             .iter()

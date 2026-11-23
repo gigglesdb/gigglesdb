@@ -1,10 +1,10 @@
 //! Bounded expansion of grouping syntax; transitions stay in query::grouping.
 use super::*;
-use parse::{ParseResult, top, word};
+use parse::{ParseResult, group_clause, top, unqualified, word};
 type Key = Vec<Token>;
 type Sets = Vec<Vec<Key>>;
 
-fn list(tokens: &[Token]) -> R<Vec<&[Token]>> {
+fn list<'a>(tokens: &'a [Token], following: Option<&Token>) -> R<Vec<&'a [Token]>> {
     if tokens.is_empty() {
         return Ok(vec![]);
     }
@@ -12,14 +12,17 @@ fn list(tokens: &[Token]) -> R<Vec<&[Token]>> {
     let mut items = vec![];
     for i in top(tokens)? {
         if tokens[i] == Token::Symbol(',') {
+            if start == i {
+                return Err(clause_syntax(tokens.get(i)));
+            }
             items.push(&tokens[start..i]);
             start = i + 1;
         }
     }
-    items.push(&tokens[start..]);
-    if items.iter().any(|s| s.is_empty()) {
-        return Err(SqlError::Syntax);
+    if start == tokens.len() {
+        return Err(clause_syntax(following));
     }
+    items.push(&tokens[start..]);
     Ok(items)
 }
 fn product(a: Sets, b: Sets) -> R<Sets> {
@@ -40,39 +43,44 @@ fn product(a: Sets, b: Sets) -> R<Sets> {
         })
         .collect())
 }
-fn expand(tokens: &[Token], depth: usize) -> R<Sets> {
+fn expand(tokens: &[Token], depth: usize, following: Option<&Token>) -> R<Sets> {
     if depth >= subplans::MAX_DEPTH {
         return Err(SqlError::Limit);
     }
-    let items = list(tokens)?;
+    let items = list(tokens, following)?;
     let mut result = vec![vec![]];
     for item in items {
-        let special = item
+        let grouping = item.first().is_some_and(|t| word(t, "grouping"))
+            && item.get(1).is_some_and(|t| word(t, "sets"));
+        let rollup_or_cube = item
             .first()
-            .is_some_and(|t| ["grouping", "rollup", "cube"].iter().any(|w| word(t, w)));
-        let sets = if special {
-            let grouping = word(&item[0], "grouping");
+            .is_some_and(|t| word(t, "rollup") || word(t, "cube"))
+            && item.get(1) == Some(&Token::Symbol('('));
+        let sets = if grouping || rollup_or_cube {
             let open = if grouping { 2 } else { 1 };
-            if grouping && !item.get(1).is_some_and(|t| word(t, "sets"))
-                || item.get(open) != Some(&Token::Symbol('('))
-                || item.last() != Some(&Token::Symbol(')'))
-            {
-                return Err(SqlError::Syntax);
+            if item.get(open) != Some(&Token::Symbol('(')) {
+                return Err(clause_syntax(item.get(open).or(following)));
             }
-            let inner = &item[open + 1..item.len() - 1];
+            let close = subquery_end(item, open)?;
+            let after = item.get(close + 1);
+            if close == open + 1 || after.is_some() {
+                return Err(clause_syntax(after.or(item.get(close))));
+            }
+            let inner = &item[open + 1..close];
+            let following = item.get(close);
             if grouping {
                 let mut sets = vec![];
-                for item in list(inner)? {
-                    sets.extend(expand(item, depth + 1)?);
+                for item in list(inner, following)? {
+                    sets.extend(expand(item, depth + 1, following)?);
                     if sets.len() > 4096 {
                         return Err(SqlError::Limit);
                     }
                 }
                 sets
             } else {
-                let units = list(inner)?
+                let units = list(inner, following)?
                     .into_iter()
-                    .map(|item| expand(item, depth + 1))
+                    .map(|item| expand(item, depth + 1, following))
                     .collect::<R<Vec<_>>>()?;
                 let cube = word(&item[0], "cube");
                 if units.len() > MAX_COLUMNS || cube && units.len() > 12 {
@@ -102,7 +110,7 @@ fn expand(tokens: &[Token], depth: usize) -> R<Sets> {
             && item.last() == Some(&Token::Symbol(')'))
             && top(item)?.len() == 2
         {
-            expand(&item[1..item.len() - 1], depth + 1)?
+            expand(&item[1..item.len() - 1], depth + 1, item.last())?
         } else {
             vec![vec![item.to_vec()]]
         };
@@ -110,28 +118,41 @@ fn expand(tokens: &[Token], depth: usize) -> R<Sets> {
     }
     Ok(result)
 }
-pub(super) fn rewrite(tokens: &mut Vec<Token>) -> ParseResult<Option<Vec<Vec<bool>>>> {
+pub(super) fn rewrite(
+    tokens: &mut Vec<Token>,
+    following: Option<&Token>,
+) -> ParseResult<Option<Vec<Vec<bool>>>> {
     let positions = top(tokens)?;
     let Some(group) = positions
         .iter()
         .copied()
-        .find(|i| word(&tokens[*i], "group"))
+        .find(|&i| group_clause(tokens, i))
     else {
         return Ok(None);
     };
+    let by = tokens.get(group + 1);
+    if !by.is_some_and(|token| word(token, "by")) {
+        return Err(ParseError::Definite(clause_syntax(by.or(following))));
+    }
+    let start = group + 2;
     let end = positions
         .iter()
         .copied()
-        .find(|i| *i > group && ["having", "order"].iter().any(|w| word(&tokens[*i], w)))
+        .find(|&i| i >= start && unqualified(tokens, i) && ends_group(&tokens[i]))
         .unwrap_or(tokens.len());
-    let body = &tokens[group + 2..end];
-    if !body
-        .iter()
-        .any(|t| ["grouping", "rollup", "cube"].iter().any(|w| word(t, w)))
-    {
+    let body_end = tokens.get(end).or(following);
+    let body = &tokens[start..end];
+    require_group_operand(body.first(), body.get(1), body_end).map_err(ParseError::Definite)?;
+    if body.last() == Some(&Token::Symbol(',')) {
+        return Err(ParseError::Definite(clause_syntax(body_end)));
+    }
+    if !Plan::requires_grouping_sets(tokens) {
         return Ok(None);
     }
-    let sets = expand(body, 0)?;
+    let sets = expand(body, 0, body_end).map_err(ParseError::Definite)?;
+    if tokens.get(end).is_some_and(|t| word(t, "having")) && end + 1 == tokens.len() {
+        return Err(ParseError::Definite(clause_syntax(following)));
+    }
     let mut keys: Vec<Key> = vec![];
     for set in &sets {
         for key in set {
@@ -155,7 +176,7 @@ pub(super) fn rewrite(tokens: &mut Vec<Token>) -> ParseResult<Option<Vec<Vec<boo
     if replacement.is_empty() {
         replacement.extend(lex("0::int")?);
     }
-    tokens.splice(group + 2..end, replacement);
+    tokens.splice(start..end, replacement);
     Ok(Some(masks))
 }
 

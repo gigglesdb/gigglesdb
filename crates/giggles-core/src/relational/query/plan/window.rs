@@ -291,6 +291,7 @@ fn spec(tokens: &[Token], named: &[(String, Spec)]) -> ParseResult<Spec> {
 
 pub(super) fn parse(
     tokens: &[Token],
+    following: Option<&Token>,
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
@@ -299,7 +300,7 @@ pub(super) fn parse(
     let window = positions
         .iter()
         .copied()
-        .find(|i| word(&tokens[*i], "window"));
+        .find(|&i| word(&tokens[i], "window") && parse::unqualified(tokens, i));
     let mut named = vec![];
     let mut rewritten = tokens.to_vec();
     if let Some(start) = window {
@@ -313,15 +314,18 @@ pub(super) fn parse(
                         .any(|w| word(&tokens[*i], w))
             })
             .unwrap_or(tokens.len());
+        let window_end = tokens.get(end).or(following);
         let mut p = parser(&tokens[start + 1..end]);
         loop {
+            if p.tokens.get(p.at).is_none() {
+                return Err(ParseError::Definite(clause_syntax(window_end)));
+            }
             let n = p.name()?;
             if named.iter().any(|(old, _)| *old == n) {
                 return Err(SqlError::WindowingError.into());
             }
-            p.need("as")?;
-            if !p.sym('(') {
-                return Err(ParseError::Decline);
+            if !p.word("as") || !p.sym('(') {
+                return Err(ParseError::Definite(clause_syntax(p.tokens.get(p.at).or(window_end))));
             }
             let end = close(&p.tokens, p.at - 1)?;
             let s = spec(&p.tokens[p.at..end], &named)?;
@@ -497,7 +501,7 @@ pub(super) fn parse(
         return Err(SqlError::Limit.into());
     }
     if calls.is_empty() {
-        return parse::select(&rewritten, owner, depth + 1, next).map(Some);
+        return parse::select(&rewritten, following, owner, depth + 1, next).map(Some);
     }
     let tail = top(&rewritten)?
         .into_iter()
@@ -505,7 +509,7 @@ pub(super) fn parse(
         .unwrap_or(rewritten.len());
     let page = rewritten[tail..].to_vec();
     rewritten.truncate(tail);
-    let mut base = parse::select(&rewritten, owner, depth + 1, next)?;
+    let mut base = parse::select(&rewritten, page.first().or(following), owner, depth + 1, next)?;
     let Body::Select(s) = &mut base.body else {
         return Err(ParseError::Decline);
     };
@@ -658,7 +662,7 @@ pub(super) fn parse(
             aliases: vec![],
         }),
     })));
-    Ok(Some(parse::pagination(plan, &page)?))
+    Ok(Some(parse::pagination(plan, &page, following)?))
 }
 fn contains_window(s: &Scalar, calls: &[Call]) -> R<bool> {
     let mut yes = false;

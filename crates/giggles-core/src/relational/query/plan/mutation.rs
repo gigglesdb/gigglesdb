@@ -80,7 +80,7 @@ pub(super) fn projection(
 ) -> parse::ParseResult<Plan> {
     let mut t = vec![Token::Word("select".into())];
     t.extend_from_slice(tokens);
-    let mut plan = parse::child_expression(&t, owner, depth, next)?;
+    let mut plan = parse::child_expression(&t, None, owner, depth, next)?;
     if let Body::Select(select) = &mut plan.body {
         for (item, alias) in &mut select.query.items {
             if alias.is_none() && let Item::Scalar(Scalar::Column(c)) = item {
@@ -172,7 +172,7 @@ pub(super) fn parse(
                 }) {
                     groups.push((
                         names,
-                        Some(parse::child_expression(rhs, owner, depth, next)?),
+                        Some(parse::child_expression(rhs, None, owner, depth, next)?),
                     ));
                 } else {
                     let fields = splits(rhs)?;
@@ -216,7 +216,7 @@ pub(super) fn parse(
         from_tokens.extend_from_slice(&tokens[from_at + 1..where_at]);
     }
     let from_plan =
-        join::parse_select(&from_tokens, owner, depth, next)?.ok_or(ParseError::Decline)?;
+        join::parse_select(&from_tokens, None, owner, depth, next)?.ok_or(ParseError::Decline)?;
     let Body::Select(select) = from_plan.body else {
         return Err(ParseError::Decline);
     };

@@ -13,12 +13,23 @@ pub(super) fn parser(tokens: &[Token]) -> Parser {
 pub(super) fn word(t: &Token, w: &str) -> bool {
     matches!(t, Token::Word(s) if s == w)
 }
+pub(super) fn unqualified(tokens: &[Token], at: usize) -> bool {
+    at == 0 || !(tokens[at - 1] == Token::Symbol('.') || word(&tokens[at - 1], "as"))
+}
+pub(super) fn group_clause(tokens: &[Token], at: usize) -> bool {
+    word(&tokens[at], "group")
+        && unqualified(tokens, at)
+        && (at == 0 || !word(&tokens[at - 1], "within"))
+}
 pub(super) fn top(tokens: &[Token]) -> R<Vec<usize>> {
+    top_positions(tokens, false)
+}
+fn top_positions(tokens: &[Token], statement_end: bool) -> R<Vec<usize>> {
     let mut depth = 0usize;
     let mut out = vec![];
     for (i, t) in tokens.iter().enumerate() {
         if *t == Token::Symbol(')') {
-            depth = depth.checked_sub(1).ok_or(SqlError::Syntax)?;
+            depth = depth.checked_sub(1).ok_or_else(|| clause_syntax(Some(t)))?;
         }
         if depth == 0 {
             out.push(i);
@@ -31,7 +42,11 @@ pub(super) fn top(tokens: &[Token]) -> R<Vec<usize>> {
         }
     }
     if depth != 0 {
-        return Err(SqlError::Syntax);
+        return Err(if statement_end {
+            clause_syntax(tokens.last().filter(|t| **t == Token::Symbol(';')))
+        } else {
+            SqlError::Syntax
+        });
     }
     Ok(out)
 }
@@ -44,21 +59,24 @@ impl Plan {
         while at < tokens.len() {
             let token = &tokens[at];
             if *token == Token::Symbol(')') { depth = depth.saturating_sub(1); }
-            let qualified = at > 0 && tokens[at - 1] == Token::Symbol('.');
+            let qualified = !unqualified(tokens, at);
             if depth == 0 {
-                if !qualified && word(token, "group") && tokens.get(at + 1).is_some_and(|t| word(t, "by")) {
+                if group_clause(tokens, at) && tokens.get(at + 1).is_some_and(|t| word(t, "by")) {
                     group = true;
                     start = true;
                     at += 2;
                     continue;
                 }
                 if group {
-                    if !qualified && ["having", "order", "limit", "offset", "fetch", "for", "union", "intersect", "except"].iter().any(|w| word(token, w)) {
+                    if !qualified && ends_group(token) {
                         group = false;
                     } else if *token == Token::Symbol(',') { start = true; }
                     else {
-                        if start && ((word(token, "rollup") || word(token, "cube")) && tokens.get(at + 1) == Some(&Token::Symbol('('))
-                            || word(token, "grouping") && tokens.get(at + 1).is_some_and(|t| word(t, "sets"))) { return true; }
+                        if start && (
+                            (word(token, "rollup") || word(token, "cube")) && tokens.get(at + 1) == Some(&Token::Symbol('('))
+                            || word(token, "grouping") && tokens.get(at + 1).is_some_and(|t| word(t, "sets"))
+                            || *token == Token::Symbol('(') && tokens.get(at + 1) == Some(&Token::Symbol(')'))
+                        ) { return true; }
                         start = false;
                     }
                 }
@@ -115,18 +133,21 @@ impl Plan {
                 .copied()
                 .find(|i| {
                     *i > start
-                        && [
-                            "where", "group", "having", "order", "limit", "offset", "fetch", "for",
-                        ]
-                        .iter()
-                        .any(|w| word(&tokens[*i], w))
+                        && (group_clause(tokens, *i)
+                            || ["where", "having", "order", "limit", "offset", "fetch", "for"]
+                                .iter()
+                                .any(|w| word(&tokens[*i], w)))
                 })
                 .unwrap_or(tokens.len());
             let mut probe = vec![Token::Word("select".into()), Token::Symbol('*')];
             probe.extend_from_slice(&tokens[start..end]);
-            Query::parse(&mut parser(&probe)).ok().map(|_| start + 1)
+            user_types::probe_preserving_error_message(|| Query::parse(&mut parser(&probe)))
+                .ok()
+                .map(|_| start + 1)
         });
-        if tokens.iter().any(|t| word(t, "over") || word(t, "window"))
+        if tokens.iter().enumerate().any(|(i, t)| {
+            word(t, "over") || word(t, "window") && unqualified(tokens, i)
+        })
             || subquery::quantified(tokens)
             || tokens.windows(2).enumerate().any(|(i, pair)| {
                 Some(i) != legacy_derived
@@ -144,8 +165,12 @@ impl Plan {
         for i in positions {
             let t = &tokens[i];
             let qualified = i > 0 && tokens[i - 1] == Token::Symbol('.');
-            if !qualified && word(t, "fetch") && tokens.get(i + 1).is_some_and(|t| word(t, "first") || word(t, "next")) { return true; }
-            if (word(t, "limit") || word(t, "offset")) && Query::parse(&mut parser(tokens)).is_err() {
+            if i > 1 && !qualified && !word(&tokens[i - 1], "as") && word(t, "fetch")
+                && tokens.get(i + 1).is_none_or(|t| word(t, "first") || word(t, "next") || *t == Token::Symbol(';'))
+            { return true; }
+            if (word(t, "limit") || word(t, "offset"))
+                && user_types::probe_preserving_error_message(|| Query::parse(&mut parser(tokens))).is_err()
+            {
                 return true;
             }
             if ["union", "intersect", "except"].iter().any(|w| word(t, w)) {
@@ -158,8 +183,8 @@ impl Plan {
             {
                 from = true;
                 from_item = true;
-            } else if [
-                "where", "group", "having", "order", "limit", "offset", "fetch", "for",
+            } else if group_clause(tokens, i) || [
+                "where", "having", "order", "limit", "offset", "fetch", "for",
             ]
             .iter()
             .any(|w| word(t, w))
@@ -191,19 +216,20 @@ impl Plan {
         false
     }
     pub(in crate::relational) fn parse(p: &mut Parser) -> ParseResult<Self> {
-        let mut tokens = p.tokens[p.at..].to_vec();
-        if tokens.last() == Some(&Token::Symbol(';')) {
-            tokens.pop();
-        }
-        if tokens.len() > max_statement_tokens() {
+        let tokens = p.tokens[p.at..].to_vec();
+        let (body, following) = match tokens.split_last() {
+            Some((semicolon @ Token::Symbol(';'), body)) => (body, Some(semicolon)),
+            _ => (tokens.as_slice(), None),
+        };
+        if body.len() > max_statement_tokens() {
             return Err(SqlError::Limit.into());
         }
         admit_subquery_depth(&tokens)?;
         // Admit parentheses before entering WITH or any recursive planner frame.
-        top(&tokens)?;
-        let plan = expression(&tokens, p, 0, &mut 0)?;
+        top_positions(&tokens, true).map_err(ParseError::Definite)?;
+        let plan = expression(body, following, p, 0, &mut 0)?;
         // Query's normalizer may rewrite tokens; collect original parameter numbers.
-        p.params.extend(tokens.iter().filter_map(|t| {
+        p.params.extend(body.iter().filter_map(|t| {
             if let Token::Param(n) = t {
                 Some(*n)
             } else {
@@ -216,6 +242,7 @@ impl Plan {
 }
 pub(super) fn child_expression(
     tokens: &[Token],
+    following: Option<&Token>,
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
@@ -223,10 +250,11 @@ pub(super) fn child_expression(
     if depth >= subplans::MAX_DEPTH {
         return Err(SqlError::Limit.into());
     }
-    expression(tokens, owner, depth + 1, next)
+    expression(tokens, following, owner, depth + 1, next)
 }
 pub(super) fn expression(
     tokens: &[Token],
+    following: Option<&Token>,
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
@@ -241,15 +269,16 @@ pub(super) fn expression(
     if merge::claims(tokens) { return merge::parse(tokens, owner, depth, next); }
     if mutation::claims(tokens) { return mutation::parse(tokens, owner, depth, next); }
     if tokens.first().is_some_and(|t| word(t, "with")) {
-        return cte::parse(tokens, owner, depth, next);
+        return cte::parse(tokens, following, owner, depth, next);
     }
-    query_expression(tokens, owner, depth, next)
+    query_expression(tokens, following, owner, depth, next)
 }
 
 // Keep WITH dispatch out of this larger frame: nested WITH bodies must not
 // reserve space for unrelated VALUES, pagination and SELECT parsing locals.
 fn query_expression(
     tokens: &[Token],
+    following: Option<&Token>,
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
@@ -293,9 +322,10 @@ fn query_expression(
         Plan::new(Body::Set {
             op,
             all,
-            left: Box::new(child_expression(&body[..i], owner, depth, next)?),
+            left: Box::new(child_expression(&body[..i], tokens.get(i), owner, depth, next)?),
             right: Box::new(child_expression(
                 &body[i + 1 + usize::from(modifier)..],
+                tokens.get(tail).or(following),
                 owner,
                 depth,
                 next,
@@ -306,7 +336,7 @@ fn query_expression(
             return Err(SqlError::Syntax.into());
         }
         // Keep both pagination boundaries, even for ((SELECT ...) LIMIT ...).
-        let child = child_expression(&body[1..body.len() - 1], owner, depth, next)?;
+        let child = child_expression(&body[1..body.len() - 1], body.last(), owner, depth, next)?;
         if tail == tokens.len() {
             return Ok(child);
         }
@@ -314,9 +344,9 @@ fn query_expression(
     } else if body.first().is_some_and(|t| word(t, "values")) {
         values(body)?
     } else {
-        return select(tokens, owner, depth, next);
+        return select(tokens, following, owner, depth, next);
     };
-    pagination(plan, &tokens[tail..])
+    pagination(plan, &tokens[tail..], following)
 }
 
 fn identity(child: Plan) -> ParseResult<Plan> {
@@ -385,11 +415,18 @@ fn values(body: &[Token]) -> ParseResult<Plan> {
     Ok(Plan::new(Body::Values(rows)))
 }
 
-pub(super) fn pagination(mut plan: Plan, tokens: &[Token]) -> ParseResult<Plan> {
+pub(super) fn pagination(
+    mut plan: Plan,
+    tokens: &[Token],
+    following: Option<&Token>,
+) -> ParseResult<Plan> {
     let mut p = parser(tokens);
     if p.word("order") {
-        p.need("by")?;
+        if !p.word("by") {
+            return Err(ParseError::Definite(clause_syntax(p.tokens.get(p.at).or(following))));
+        }
         loop {
+            require_clause_operand(&p, following).map_err(ParseError::Definite)?;
             let scalar = Scalar::parse_expr(&mut p, 0, false)?;
             let desc = if p.word("using") {
                 match p.tokens.get(p.at) {
@@ -398,6 +435,7 @@ pub(super) fn pagination(mut plan: Plan, tokens: &[Token]) -> ParseResult<Plan> 
                         p.at += 1;
                         desc
                     }
+                    None => return Err(ParseError::Definite(clause_syntax(following))),
                     _ => return Err(ParseError::Definite(SqlError::UndefinedFunction)),
                 }
             } else {
@@ -429,23 +467,36 @@ pub(super) fn pagination(mut plan: Plan, tokens: &[Token]) -> ParseResult<Plan> 
         if !seen_limit && p.word("limit") {
             seen_limit = true;
             if !p.word("all") {
+                require_clause_operand(&p, following).map_err(ParseError::Definite)?;
                 plan.limit = Some(Scalar::parse_expr(&mut p, 0, false)?);
             }
         } else if !seen_offset && p.word("offset") {
             seen_offset = true;
+            require_clause_operand(&p, following).map_err(ParseError::Definite)?;
             plan.offset = Some(Scalar::parse_expr(&mut p, 0, false)?);
             if !p.word("rows") {
                 p.word("row");
             }
         } else if !seen_limit && p.word("fetch") {
             seen_limit = true;
-            if !p.word("first") { p.need("next")?; }
+            if !p.word("first") && !p.word("next") {
+                return Err(ParseError::Definite(clause_syntax(p.tokens.get(p.at).or(following))));
+            }
+            require_clause_operand(&p, following).map_err(ParseError::Definite)?;
             plan.limit = Some(if p.tokens.get(p.at).is_some_and(|t| word(t, "row") || word(t, "rows")) {
                 Scalar::Literal(Value::Int(1))
             } else { Scalar::parse_expr(&mut p, 0, false)? });
-            if !p.word("row") { p.need("rows")?; }
-            if p.word("with") { p.need("ties")?; plan.decorations.with_ties = true; }
-            else { p.need("only")?; }
+            if !p.word("row") && !p.word("rows") {
+                return Err(ParseError::Definite(clause_syntax(p.tokens.get(p.at).or(following))));
+            }
+            if p.word("with") {
+                if !p.word("ties") {
+                    return Err(ParseError::Definite(clause_syntax(p.tokens.get(p.at).or(following))));
+                }
+                plan.decorations.with_ties = true;
+            } else if !p.word("only") {
+                return Err(ParseError::Definite(clause_syntax(p.tokens.get(p.at).or(following))));
+            }
         } else {
             break;
         }
@@ -460,6 +511,7 @@ pub(super) fn pagination(mut plan: Plan, tokens: &[Token]) -> ParseResult<Plan> 
 }
 fn select_inner(
     tokens: &[Token],
+    following: Option<&Token>,
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
@@ -488,10 +540,11 @@ fn select_inner(
         .find(|i| word(&tokens[*i], "order"));
     if let Some(order) = order {
         let mut i = order + 2;
-        while i + 1 < tokens.len() {
-            if word(&tokens[i], "using") {
-                let desc = match &tokens[i + 1] {
-                    Token::Op(op) if op == "<" || op == ">" => op == ">",
+        while i < tokens.len() {
+            if tokens[i - 1] != Token::Symbol('.') && word(&tokens[i], "using") {
+                let desc = match tokens.get(i + 1) {
+                    Some(Token::Op(op)) if op == "<" || op == ">" => op == ">",
+                    None => return Err(ParseError::Definite(clause_syntax(following))),
                     _ => return Err(ParseError::Definite(SqlError::UndefinedFunction)),
                 };
                 tokens.splice(
@@ -506,24 +559,26 @@ fn select_inner(
     // The legacy parser continues to own its established scans and ON joins.
     // The planner's general FROM tree is used only when that parse declines.
     let mut probe = parser(&tokens);
-    match Query::parse(&mut probe) {
+    match Query::parse_with_following(&mut probe, following) {
         Err(SqlError::Unsupported | SqlError::Syntax | SqlError::Reserved) => {
-            if let Some(plan) = join::parse_select(&tokens, owner, depth, next)? {
+            if let Some(plan) = join::parse_select(&tokens, following, owner, depth, next)? {
                 return Ok(plan);
             }
         }
         Err(error) => return Err(error.into()),
         Ok(_) => {}
     }
-    if let Some(from) = positions
-        .iter()
-        .copied()
+    // Normalizing ORDER BY USING can shift the token positions.
+    if let Some(from) = top(&tokens)?
+        .into_iter()
         .find(|i| word(&tokens[*i], "from"))
         && tokens.get(from + 1) == Some(&Token::Symbol('('))
     {
         let open = from + 1;
         let close = subquery_end(&tokens, open)?;
-        let child = child_expression(&tokens[open + 1..close], owner, depth, next)?;
+        let child = child_expression(
+            &tokens[open + 1..close], tokens.get(close), owner, depth, next,
+        )?;
         let mut p = parser(&tokens[close + 1..]);
         let explicit = p.word("as");
         let alias = if explicit
@@ -561,12 +616,17 @@ fn select_inner(
             aliases,
         });
     }
-    select_query(&tokens, input, owner)
+    select_query(&tokens, following, input, owner)
 }
 
-fn select_query(tokens: &[Token], input: Option<Input>, owner: &mut Parser) -> ParseResult<Plan> {
+fn select_query(
+    tokens: &[Token],
+    following: Option<&Token>,
+    input: Option<Input>,
+    owner: &mut Parser,
+) -> ParseResult<Plan> {
     let mut p = parser(tokens);
-    let mut query = Query::parse(&mut p)?;
+    let mut query = Query::parse_with_following(&mut p, following)?;
     if let Some(input) = &input {
         query.sources[0].name = input.name.clone();
     }
@@ -589,35 +649,40 @@ fn select_query(tokens: &[Token], input: Option<Input>, owner: &mut Parser) -> P
 
 pub(super) fn select(
     tokens: &[Token],
+    following: Option<&Token>,
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
 ) -> ParseResult<Plan> {
-    if paging::claims(tokens)? { paging::parse(tokens, owner, depth, next) }
-    else { select_base(tokens, owner, depth, next) }
+    if paging::claims(tokens)? { paging::parse(tokens, following, owner, depth, next) }
+    else { select_base(tokens, following, owner, depth, next) }
 }
 
 pub(super) fn select_base(
-    tokens: &[Token], owner: &mut Parser, depth: usize, next: &mut usize,
+    tokens: &[Token],
+    following: Option<&Token>,
+    owner: &mut Parser,
+    depth: usize,
+    next: &mut usize,
 ) -> ParseResult<Plan> {
-    if let Some(plan) = window::parse(tokens, owner, depth, next)? {
+    if let Some(plan) = window::parse(tokens, following, owner, depth, next)? {
         return Ok(plan);
     }
     let (rewritten, applies) = subquery::rewrite(tokens, owner, depth, next)?;
     let mut plan = if !applies.is_empty() {
         // Rewriting must not let the FROM planner bypass a definite parser error.
         let mut probe = parser(&rewritten);
-        match Query::parse(&mut probe) {
+        match Query::parse_with_following(&mut probe, following) {
             Ok(_) | Err(SqlError::Unsupported | SqlError::Syntax | SqlError::Reserved) => {}
             Err(error) => return Err(error.into()),
         }
-        if let Some(plan) = join::parse_select(&rewritten, owner, depth, next)? {
+        if let Some(plan) = join::parse_select(&rewritten, following, owner, depth, next)? {
             plan
         } else {
-            select_inner(&rewritten, owner, depth, next)?
+            select_inner(&rewritten, following, owner, depth, next)?
         }
     } else {
-        select_inner(&rewritten, owner, depth, next)?
+        select_inner(&rewritten, following, owner, depth, next)?
     };
     if let Body::Select(s) = &mut plan.body {
         s.applies = applies;

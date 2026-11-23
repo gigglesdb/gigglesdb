@@ -183,7 +183,7 @@ pub(super) fn rewrite(
                     .iter()
                     .any(|w| parse::word(t, w))
             }) {
-                Right::Query(Box::new(parse::child_expression(inner, owner, depth, next)?))
+                Right::Query(Box::new(parse::child_expression(inner, tokens.get(close), owner, depth, next)?))
             } else {
                 if depth >= subplans::MAX_DEPTH {
                     return Err(SqlError::Limit.into());
@@ -209,7 +209,7 @@ pub(super) fn rewrite(
         let open = if exists { i + 1 } else { i };
         if is_subquery_open(tokens, open) {
             let close = subquery_end(tokens, open)?;
-            let child = parse::child_expression(&tokens[open + 1..close], owner, depth, next)?;
+            let child = parse::child_expression(&tokens[open + 1..close], tokens.get(close), owner, depth, next)?;
             let name = fresh(tokens, next);
             out.push(Token::QuotedIdent(name.clone()));
             applies.push(Apply {

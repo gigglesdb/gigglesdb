@@ -110,7 +110,7 @@ fn frozen_parenthesized_join_depth() {
     let tokens = lex("SELECT * FROM (a CROSS JOIN b)").unwrap();
     let mut p = parse::parser(&tokens);
     assert!(matches!(
-        join::parse_select(&tokens, &mut p, subplans::MAX_DEPTH, &mut 0),
+        join::parse_select(&tokens, None, &mut p, subplans::MAX_DEPTH, &mut 0),
         Err(ParseError::Definite(SqlError::Limit))
     ));
 }
@@ -464,7 +464,7 @@ fn deeply_nested_scalar_subqueries_preserve_parser_depth_error() {
         let mut owner = parse::parser(&tokens);
         assert!(
             matches!(
-                parse::expression(&tokens, &mut owner, subplans::MAX_DEPTH, &mut 0),
+                parse::expression(&tokens, None, &mut owner, subplans::MAX_DEPTH, &mut 0),
                 Err(ParseError::Definite(SqlError::Limit))
             ),
             "{sql}"

@@ -143,10 +143,11 @@ pub(super) fn claims(tokens: &[Token]) -> R<bool> {
         ["limit", "offset", "fetch"]
             .iter()
             .any(|w| word(&tokens[*i], w))
-    }) && Query::parse(&mut parser(tokens)).is_err())
+    }) && user_types::probe_preserving_error_message(|| Query::parse(&mut parser(tokens))).is_err())
 }
 pub(super) fn parse(
     tokens: &[Token],
+    following: Option<&Token>,
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
@@ -163,11 +164,14 @@ pub(super) fn parse(
         .unwrap_or(tokens.len());
     let distinct = tokens.get(1).is_some_and(|t| word(t, "distinct"))
         && tokens.get(2).is_some_and(|t| word(t, "on"));
+    let body_end = tokens.get(page).or(following);
     let mut body = tokens[..page].to_vec();
     let mut keys = vec![];
     if distinct {
         let mut p = parser(&body[3..]);
-        p.punct('(')?;
+        if !p.sym('(') {
+            return Err(ParseError::Definite(clause_syntax(p.tokens.get(p.at).or(body_end))));
+        }
         loop {
             keys.push(Scalar::parse_expr(&mut p, 0, false)?);
             if !p.sym(',') {
@@ -177,9 +181,9 @@ pub(super) fn parse(
         p.punct(')')?;
         body.drain(1..3 + p.at);
     }
-    let grouping_sets = group_sets::rewrite(&mut body)?;
-    let mut plan = parse::select_base(&body, owner, depth, next)?;
-    plan = parse::pagination(plan, &tokens[page..])?;
+    let grouping_sets = group_sets::rewrite(&mut body, body_end)?;
+    let mut plan = parse::select_base(&body, body_end, owner, depth, next)?;
+    plan = parse::pagination(plan, &tokens[page..], following)?;
     plan.decorations.grouping_sets = grouping_sets;
     let Body::Select(select) = &mut plan.body else {
         return Err(ParseError::Decline);
@@ -529,16 +533,15 @@ mod tests {
             "SELECT d,count(*) FROM h GROUP BY ROLLUP(id)",
             SqlError::GroupingError,
         );
-        assert!(
-            rows(
-                &mut state,
-                "SELECT count(*) FROM h GROUP BY GROUPING SETS ()"
-            )
-            .is_empty()
+        error(
+            &mut state,
+            "SELECT count(*) FROM h GROUP BY GROUPING SETS ()",
+            SqlError::Syntax,
         );
-        assert_eq!(
-            rows(&mut state, "SELECT count(*) FROM h GROUP BY ROLLUP()"),
-            vec![vec![I(3)]]
+        error(
+            &mut state,
+            "SELECT count(*) FROM h GROUP BY ROLLUP()",
+            SqlError::Syntax,
         );
         error(
             &mut state,

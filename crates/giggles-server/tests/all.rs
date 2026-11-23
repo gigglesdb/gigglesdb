@@ -10,6 +10,8 @@ mod explain_text_network;
 mod view_select_network;
 #[path = "comments_network.rs"]
 mod comments_network;
+#[path = "group_parser_network.rs"]
+mod group_parser_network;
 #[path = "constraint_catalog_network.rs"]
 mod constraint_catalog_network;
 

@@ -230,6 +230,7 @@ impl Diagnostic {
         let message = giggles_core::relational::take_sql_error_message();
         if result.is_err() && message.as_deref().is_some_and(|m|
             m.starts_with("FOR ") || m.starts_with("syntax error at or near ")
+                || m == "syntax error at end of input"
                 || matches!(m, "invalid Unicode escape" | "invalid Unicode surrogate pair" | "unequal number of entries in row expressions")
                 || m.starts_with("operator does not exist: ") || m.starts_with("operator is not unique: ")
                 || m == "VARIADIC argument must be an array"

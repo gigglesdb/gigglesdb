@@ -201,7 +201,7 @@ fn item(
             let alias = format!("\0unnamed_subquery_{next}");
             *next += 1;
             From::Leaf {
-                query: Box::new(parse::child_expression(inner, owner, depth, next)?),
+                query: Box::new(parse::child_expression(inner, p.tokens.get(end), owner, depth, next)?),
                 alias,
                 aliases: vec![],
             }
@@ -387,6 +387,7 @@ fn joined(left: From, right: From, kind: Kind, condition: Condition) -> R<From> 
 }
 pub(super) fn parse_select(
     tokens: &[Token],
+    following: Option<&Token>,
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
@@ -404,9 +405,10 @@ pub(super) fn parse_select(
         .copied()
         .find(|i| {
             *i > start
-                && ["where", "group", "having", "order", "limit", "offset"]
-                    .iter()
-                    .any(|w| parse::word(&tokens[*i], w))
+                && (parse::group_clause(tokens, *i)
+                    || ["where", "having", "order", "limit", "offset"]
+                        .iter()
+                        .any(|w| parse::word(&tokens[*i], w)))
         })
         .unwrap_or(tokens.len());
     let mut p = parse::parser(&tokens[start + 1..end]);
@@ -419,7 +421,7 @@ pub(super) fn parse_select(
     rewritten.push(Token::QuotedIdent("plan_join".into()));
     rewritten.extend_from_slice(&tokens[end..]);
     let mut p = parse::parser(&rewritten);
-    let mut query = Query::parse(&mut p)?;
+    let mut query = Query::parse_with_following(&mut p, following)?;
     // Remove only our placeholder, retaining real references with the same
     // spelling in projection qualifiers or WHERE subqueries.
     if let Some(i) = p

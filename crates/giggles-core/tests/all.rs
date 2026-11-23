@@ -592,3 +592,6 @@ mod pgparity_scalars_w06;
 
 #[path = "sql_catalog_scale.rs"]
 mod sql_catalog_scale;
+
+#[path = "truncated_clauses.rs"]
+mod truncated_clauses;

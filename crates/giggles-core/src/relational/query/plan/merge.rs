@@ -183,7 +183,7 @@ pub(super) fn parse(
         return Err(ParseError::Decline);
     }
     owner.relations.extend(on_parser.relations);
-    let plan = join::parse_select(&from, owner, depth, next)?.ok_or(ParseError::Decline)?;
+    let plan = join::parse_select(&from, None, owner, depth, next)?.ok_or(ParseError::Decline)?;
     let Body::Select(select) = plan.body else {
         return Err(ParseError::Decline);
     };

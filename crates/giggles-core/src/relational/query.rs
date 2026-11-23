@@ -389,6 +389,55 @@ fn admit_expansion(lhs: &Scalar, copies: usize) -> R<()> {
     Ok(())
 }
 
+fn clause_syntax(token: Option<&Token>) -> SqlError {
+    let spelling = match token {
+        Some(Token::Word(s) | Token::Number(s) | Token::Op(s)) => s.clone(),
+        Some(Token::Symbol(c)) => c.to_string(),
+        Some(Token::Param(n)) => format!("${n}"),
+        Some(Token::QuotedIdent(s)) => format!("\"{}\"", s.replace('"', "\"\"")),
+        Some(Token::String(s)) => format!("'{}'", s.replace('\'', "''")),
+        None => {
+            user_types::view_replace_error("syntax error at end of input".into());
+            return SqlError::Syntax;
+        }
+    };
+    user_types::view_replace_error(format!("syntax error at or near \"{spelling}\""));
+    SqlError::Syntax
+}
+
+fn require_clause_operand(p: &Parser, following: Option<&Token>) -> R<()> {
+    let token = p.tokens.get(p.at);
+    if matches!(token, None | Some(Token::Symbol(';'))) {
+        return Err(clause_syntax(token.or(following)));
+    }
+    Ok(())
+}
+
+fn ends_group(token: &Token) -> bool {
+    matches!(token, Token::Word(w) if [
+        "having", "window", "order", "limit", "offset", "fetch", "for",
+        "union", "intersect", "except",
+    ].contains(&w.as_str()))
+}
+
+fn require_group_operand(
+    token: Option<&Token>,
+    next: Option<&Token>,
+    following: Option<&Token>,
+) -> R<()> {
+    let invalid = |token: Option<&Token>| match token {
+        None | Some(Token::Symbol(',' | ';')) => true,
+        Some(token) => ends_group(token) || matches!(token, Token::Word(w) if w == "group"),
+    };
+    if invalid(token) {
+        return Err(clause_syntax(token.or(following)));
+    }
+    if matches!(token, Some(Token::Word(w)) if w == "distinct" || w == "all") && invalid(next) {
+        return Err(clause_syntax(next.or(following)));
+    }
+    Ok(())
+}
+
 fn is_subquery_open(tokens: &[Token], at: usize) -> bool {
     tokens.get(at) == Some(&Token::Symbol('('))
         && matches!(tokens.get(at + 1), Some(Token::Word(w)) if w == "select")
@@ -825,7 +874,7 @@ impl Filter {
             params: BTreeSet::new(),
             relations: Vec::new(),
         };
-        let query = Query::parse(&mut child)?;
+        let query = Query::parse_with_following(&mut child, p.tokens.get(end))?;
         if query.derived().is_some() { return Err(SqlError::Unsupported); }
         p.privilege_seen |= child.privilege_seen;
         p.params.extend(child.params);
@@ -1883,7 +1932,7 @@ impl Parser {
         let name = self.table_name()?;
         let aliased = self.word("as")
             || matches!(self.tokens.get(self.at), Some(Token::QuotedIdent(_)))
-            || matches!(self.tokens.get(self.at), Some(Token::Word(w)) if !["inner", "left", "join", "where", "order", "limit", "offset", "group", "having", "on", "right", "full", "cross"].contains(&w.as_str()));
+            || matches!(self.tokens.get(self.at), Some(Token::Word(w)) if !["inner", "left", "join", "where", "order", "limit", "offset", "fetch", "group", "having", "window", "on", "right", "full", "cross"].contains(&w.as_str()));
         let alias = if aliased {
             self.name()?
         } else {
@@ -2656,16 +2705,19 @@ impl Query {
         Self::parse(p)
     }
     pub(super) fn parse(p: &mut Parser) -> R<Self> {
+        Self::parse_with_following(p, None)
+    }
+    fn parse_with_following(p: &mut Parser, following: Option<&Token>) -> R<Self> {
         row_locks::reject_plan(&p.tokens[p.at..])?;
         let locks = row_locks::extract(p)?;
-        let mut query = Self::parse_unlocked(p)?;
+        let mut query = Self::parse_unlocked(p, following)?;
         if !locks.is_empty() {
             query.clauses_mut().row_locks = locks;
             row_locks::validate(&query)?;
         }
         Ok(query)
     }
-    fn parse_unlocked(p: &mut Parser) -> R<Self> {
+    fn parse_unlocked(p: &mut Parser, following: Option<&Token>) -> R<Self> {
         if plan::Plan::requires_grouping_sets(&p.tokens[p.at..]) { return Err(SqlError::Unsupported); }
         admit_subquery_depth(&p.tokens[p.at..])?;
         if plan::subquery::quantified(&p.tokens[p.at..]) {
@@ -2698,11 +2750,11 @@ impl Query {
         }
         Self::parse_tail(p, QueryPrefix {
             explain, distinct, aggregate_filters, items, sources, aliased_sources, derived,
-        })
+        }, following)
     }
     // Derived children parse before this frame is entered. Keep the later
     // clauses' temporary scalar/filter trees off every derived-query level.
-    fn parse_tail(p: &mut Parser, prefix: QueryPrefix) -> R<Self> {
+    fn parse_tail(p: &mut Parser, prefix: QueryPrefix, following: Option<&Token>) -> R<Self> {
         let QueryPrefix {
             explain, distinct, aggregate_filters, mut items, mut sources,
             mut aliased_sources, derived,
@@ -2743,6 +2795,7 @@ impl Query {
             aliased_sources.clear();
         }
         let mut filter = if p.word("where") {
+            require_clause_operand(p, following)?;
             Some(Filter::parse(p, 0, 0)?)
         } else {
             None
@@ -2753,8 +2806,11 @@ impl Query {
         }
         let mut group = vec![];
         if p.word("group") {
-            p.need("by")?;
+            if !p.word("by") {
+                return Err(clause_syntax(p.tokens.get(p.at).or(following)));
+            }
             loop {
+                require_group_operand(p.tokens.get(p.at), p.tokens.get(p.at + 1), following)?;
                 group.push(Scalar::parse_aggregate_argument(p, 0)?);
                 if group.len() > MAX_COLUMNS {
                     return Err(SqlError::Limit);
@@ -2784,14 +2840,18 @@ impl Query {
             }
         }
         let mut having = if p.word("having") {
+            require_clause_operand(p, following)?;
             Some(Filter::parse(p, 0, 0)?)
         } else {
             None
         };
         let mut order = vec![];
         if p.word("order") {
-            p.need("by")?;
+            if !p.word("by") {
+                return Err(clause_syntax(p.tokens.get(p.at).or(following)));
+            }
             loop {
+                require_clause_operand(p, following)?;
                 let c = Scalar::parse_expr(p, 0, false)?;
                 let desc = p.word("desc");
                 if !desc {
@@ -2820,12 +2880,14 @@ impl Query {
             Some(if p.word("all") {
                 (Expr::Literal(Value::Null), None)
             } else {
+                require_clause_operand(p, following)?;
                 Self::parse_page(p)?
             })
         } else {
             None
         };
         let offset = if p.word("offset") {
+            require_clause_operand(p, following)?;
             Some(Self::parse_page(p)?)
         } else {
             None
