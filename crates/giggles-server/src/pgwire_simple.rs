@@ -909,8 +909,7 @@ impl State {
                 read_only_check(command, &self.settings, session, &mut self.diagnostic)?;
                 self.settings.queried = session.in_transaction();
                 if p.command() == "SELECT" && writes.is_empty() {
-                    let mut cursor = self.diagnostic.core(session.open_cursor(&p, &[]))?;
-                    session.sql.forget_cursor_plan(&p);
+                    let mut cursor = self.diagnostic.core(session.open_uncached_cursor(&p, &[]))?;
                     row_description(&d, &[], out)?;
                     let mut count = 0;
                     while !cursor.is_exhausted() {

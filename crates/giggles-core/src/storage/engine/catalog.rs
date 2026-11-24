@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::{Bound, Range},
-    sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::Instant,
 };
 
@@ -399,18 +399,20 @@ impl CatalogCache {
             Err(index) => self.versions.insert(index, (ts, Arc::new(view))),
         }
     }
-    pub(crate) fn prune(&mut self, oldest_active: Option<Ts>, visible: Ts) {
+    /// Detach retired snapshots so the caller can drop their plans outside the cache lock.
+    fn prune(&mut self, oldest_active: Option<Ts>, visible: Ts, retired: &mut Vec<Arc<CatalogSnapshot>>) {
         if self.poisoned {
             return;
         }
         let horizon = oldest_active.unwrap_or(visible).min(visible);
         let end = self.versions.partition_point(|(ts, _)| *ts <= horizon);
-        if let Some(anchor) = end.checked_sub(1) {
-            self.versions.drain(..anchor);
-            let first = self.versions[0].0;
-            self.snapshots.retain(|ts, _| *ts >= first);
-            self.tokens.retain(|ts, _| *ts >= first);
-        }
+        let Some(anchor) = end.checked_sub(1) else {
+            return;
+        };
+        self.versions.drain(..anchor);
+        let first = self.versions[0].0;
+        self.tokens.retain(|ts, _| *ts >= first);
+        retired.extend(self.snapshots.extract_if(..first, |_, _| true).map(|(_, snapshot)| snapshot));
     }
     fn ensure_live(&self) -> Result<(), TxnError> {
         if self.poisoned {
@@ -517,11 +519,15 @@ impl Catalog {
         })
     }
     // Only the local snapshot paths call this helper. Gateway oracle reads
-    // happen before acquiring the cache mutex in snapshot_cache/prune.
-    fn prune_locked(&self, cache: &mut CatalogCache) -> Result<(), TxnError> {
+    // happen before acquiring the cache mutex in with_snapshot_cache/prune.
+    fn prune_locked(
+        &self,
+        cache: &mut CatalogCache,
+        retired: &mut Vec<Arc<CatalogSnapshot>>,
+    ) -> Result<(), TxnError> {
         // Read visible FIRST: a newly registered snapshot cannot be older than it.
         let visible = self.services.visible_ts()?;
-        cache.prune(self.services.oldest_active(), visible);
+        cache.prune(self.services.oldest_active(), visible, retired);
         Ok(())
     }
 
@@ -600,11 +606,12 @@ impl Catalog {
             let next = hits.get() + 1;
             let reclaim = next == CURRENT_PRUNE_INTERVAL;
             hits.set(if reclaim { 0 } else { next });
+            let mut retired = Vec::new();
             if reclaim
                 && let Ok(mut cache) = self.cache.try_lock()
                 && !cache.poisoned
             {
-                let _ = self.prune_locked(&mut cache);
+                let _ = self.prune_locked(&mut cache, &mut retired);
             }
         });
         Some(current)
@@ -677,8 +684,7 @@ impl Catalog {
             return Ok(snapshot);
         }
         self.check().map_err(CoreError::from)?;
-        let mut cache = self.snapshot_cache(ts)?;
-        self.snapshot_locked(&mut cache, writes, ts)
+        self.with_snapshot_cache(ts, |cache| self.snapshot_locked(cache, writes, ts))
     }
 
     /// Does not refresh or assign a transaction snapshot; metadata preserves the
@@ -703,8 +709,7 @@ impl Catalog {
             return Ok(snapshot);
         }
         self.check().map_err(CoreError::from)?;
-        let mut cache = self.snapshot_cache(ts)?;
-        self.snapshot_locked(&mut cache, txn, ts)
+        self.with_snapshot_cache(ts, |cache| self.snapshot_locked(cache, txn, ts))
     }
 
     /// The committed catalog version `txn`'s statement snapshot reads, as a cache
@@ -742,38 +747,46 @@ impl Catalog {
             return Ok((snapshot, Some(version)));
         }
         self.check().map_err(CoreError::from)?;
-        let mut cache = self.snapshot_cache(ts)?;
-        let snapshot = self.snapshot_locked(&mut cache, txn, ts)?;
-        let end = cache
-            .versions
-            .partition_point(|(version, _)| *version <= ts);
-        let version = end.checked_sub(1).map(|index| cache.versions[index].0);
-        Ok((snapshot, version))
+        self.with_snapshot_cache(ts, |cache| {
+            let snapshot = self.snapshot_locked(cache, txn, ts)?;
+            let end = cache
+                .versions
+                .partition_point(|(version, _)| *version <= ts);
+            let version = end.checked_sub(1).map(|index| cache.versions[index].0);
+            Ok((snapshot, version))
+        })
     }
 
-    fn snapshot_cache(&self, ts: Ts) -> Result<MutexGuard<'_, CatalogCache>, CoreError> {
-        if matches!(self.services, TxnServices::Local { .. }) {
-            let mut cache = self
-                .cache
-                .lock()
-                .map_err(|_| corrupt("catalog cache mutex poisoned"))?;
-            cache.ensure_live()?;
-            self.prune_locked(&mut cache)?;
-            return Ok(cache);
-        }
-        // Read visible FIRST: a newly registered snapshot cannot be older than it.
-        // Neither the oracle nor the token range read may hold the cache mutex.
-        let visible = self.services.visible_ts()?;
-        let oldest = self.services.oldest_active();
-        let token = self.refresh_token(ts)?;
+    fn with_snapshot_cache<T>(
+        &self,
+        ts: Ts,
+        read: impl FnOnce(&mut CatalogCache) -> Result<T, CoreError>,
+    ) -> Result<T, CoreError> {
+        let cluster = if matches!(self.services, TxnServices::Local { .. }) {
+            None
+        } else {
+            // Read visible FIRST: a newly registered snapshot cannot be older than it.
+            // Neither the oracle nor the token range read may hold the cache mutex.
+            let visible = self.services.visible_ts()?;
+            let oldest = self.services.oldest_active();
+            let token = self.refresh_token(ts)?;
+            Some((oldest, visible, token))
+        };
+        // Declare retired snapshots before the guard so the guard drops first,
+        // including on errors and unwinding.
+        let mut retired = Vec::new();
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| corrupt("catalog cache mutex poisoned"))?;
         cache.ensure_live()?;
-        cache.prune(oldest, visible);
-        self.refresh_locked(&mut cache, ts, token)?;
-        Ok(cache)
+        if let Some((oldest, visible, token)) = cluster {
+            cache.prune(oldest, visible, &mut retired);
+            self.refresh_locked(&mut cache, ts, token)?;
+        } else {
+            self.prune_locked(&mut cache, &mut retired)?;
+        }
+        read(&mut cache)
     }
 
     fn snapshot_locked(
@@ -1464,6 +1477,7 @@ impl Catalog {
             }
             return finish(txn, guard, |_| Ok(()));
         }
+        let mut retired = Vec::new();
         let mut cache = self.cache.lock().map_err(|_| TxnError::Misuse)?;
         cache.ensure_live()?;
         let latest = &cache.versions.last().unwrap().1;
@@ -1559,7 +1573,7 @@ impl Catalog {
             return finish(txn, guard, |ts| {
                 cache.publish(ts, final_view);
                 self.current_version.store(ts.0, std::sync::atomic::Ordering::Release);
-                cache.prune(self.services.oldest_active(), ts);
+                cache.prune(self.services.oldest_active(), ts, &mut retired);
                 Ok(())
             });
         }
@@ -1612,7 +1626,7 @@ impl Catalog {
             }
             // The just-committed timestamp is a safe pruning horizon; no
             // oracle round trip is needed while holding the publication lock.
-            cache.prune(self.services.oldest_active(), ts);
+            cache.prune(self.services.oldest_active(), ts, &mut retired);
             Ok(())
         })
     }
@@ -1620,12 +1634,13 @@ impl Catalog {
     pub(crate) fn prune(&self) -> Result<(), CoreError> {
         let visible = self.services.visible_ts()?;
         let oldest = self.services.oldest_active();
+        let mut retired = Vec::new();
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| corrupt("catalog cache mutex poisoned"))?;
         cache.ensure_live().map_err(CoreError::from)?;
-        cache.prune(oldest, visible);
+        cache.prune(oldest, visible, &mut retired);
         Ok(())
     }
     #[cfg(all(test, feature = "engine-rocksdb"))]

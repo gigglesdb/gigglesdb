@@ -264,7 +264,7 @@ impl SqlSession {
         p: &relational::Prepared,
         params: &[Value],
     ) -> Result<Cursor, CoreError> {
-        self.open_cursor_inner(p, params, None, DEFAULT_CURSOR_BUFFER_BYTES)
+        self.open_cursor_inner(p, params, None, DEFAULT_CURSOR_BUFFER_BYTES, true)
     }
     pub fn open_cursor_at(
         &mut self,
@@ -272,8 +272,30 @@ impl SqlSession {
         params: &[Value],
         clock: &relational::StatementClock,
     ) -> Result<Cursor, CoreError> {
-        self.guard_clock(clock)?;
-        self.open_cursor_inner(p, params, Some(clock), DEFAULT_CURSOR_BUFFER_BYTES)
+        self.open_cursor_inner(p, params, Some(clock), DEFAULT_CURSOR_BUFFER_BYTES, true)
+    }
+
+    /// Open a one-shot statement without looking up or retaining a cursor binding.
+    pub fn open_uncached_cursor_at(
+        &mut self,
+        p: &relational::Prepared,
+        params: &[Value],
+        clock: &relational::StatementClock,
+    ) -> Result<Cursor, CoreError> {
+        self.open_cursor_inner(p, params, Some(clock), DEFAULT_CURSOR_BUFFER_BYTES, false)
+    }
+
+    #[cfg(feature = "test-cursor-bindings")]
+    #[doc(hidden)]
+    pub fn test_cursor_query_binds() -> usize {
+        relational::cursor::query_binds()
+    }
+
+    /// A weak probe of the binding's lifetime, including after it leaves the slot.
+    #[cfg(feature = "test-cursor-bindings")]
+    #[doc(hidden)]
+    pub fn test_cursor_binding_liveness(&self) -> Option<impl Fn() -> bool + use<>> {
+        self.cursor_plan_cache.binding_liveness()
     }
     /// Set the independent budget for statement shapes that require buffering.
     pub fn open_cursor_with_buffer_limit(
@@ -282,7 +304,7 @@ impl SqlSession {
         params: &[Value],
         max_buffer_bytes: usize,
     ) -> Result<Cursor, CoreError> {
-        self.open_cursor_inner(p, params, None, max_buffer_bytes)
+        self.open_cursor_inner(p, params, None, max_buffer_bytes, true)
     }
     fn open_cursor_inner(
         &mut self,
@@ -290,7 +312,11 @@ impl SqlSession {
         params: &[Value],
         clock: Option<&relational::StatementClock>,
         buffer_limit: usize,
+        use_plan_cache: bool,
     ) -> Result<Cursor, CoreError> {
+        if let Some(clock) = clock {
+            self.guard_clock(clock)?;
+        }
         let _date_order = relational::clock::LiteralDateOrder::enter(p.literal_date_order);
         let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
@@ -355,7 +381,9 @@ impl SqlSession {
                             || t.writes_keyspace(engine::kv::Keyspace::Index)
                             || t.isolation() == engine::txn::Isolation::Serializable
                     }) {
-                        self.cursor_plan_cache.clear();
+                        if use_plan_cache {
+                            self.cursor_plan_cache.clear();
+                        }
                         discard(&tag);
                         return self.buffer_cursor(&p, params, clock, buffer_limit, lease);
                     }
@@ -372,7 +400,9 @@ impl SqlSession {
                         implicit.insert(db.begin(engine::txn::Isolation::ReadCommitted))
                     });
                     let catalog = db.catalog().snapshot(txn)?;
-                    self.cursor_plan_cache.observe(catalog.cursor_plan_owners.as_ref());
+                    if use_plan_cache {
+                        self.cursor_plan_cache.observe(catalog.cursor_plan_owners.as_ref());
+                    }
                     let parts = &catalog.parts;
                     for name in p.read_tables() {
                         let name = parts.tables.keys().find(|key| **key == name).cloned();
@@ -400,14 +430,18 @@ impl SqlSession {
                         return Err(error.clone().into());
                     }
                     let catalog = db.catalog().snapshot(txn)?;
-                    self.cursor_plan_cache.observe(catalog.cursor_plan_owners.as_ref());
+                    if use_plan_cache {
+                        self.cursor_plan_cache.observe(catalog.cursor_plan_owners.as_ref());
+                    }
                     // Cursors allocate no catalog IDs. Match metadata snapshots:
                     // include every validated schema/type/enum-label ID without
                     // duplicating the catalog allocator's object inventory.
                     let image = catalog.cursor_image().map_err(CoreError::Sql)?;
                     // Sequence-bearing selects use the established execution path.
                     if !p.sequences().is_empty() {
-                        self.cursor_plan_cache.clear();
+                        if use_plan_cache {
+                            self.cursor_plan_cache.clear();
+                        }
                         discard(&tag);
                         return self.buffer_cursor(&p, params, clock, buffer_limit, lease);
                     }
@@ -486,7 +520,7 @@ impl SqlSession {
             });
             let cache = plan_catalog.as_ref()
                 .and_then(|catalog| catalog.cursor_plan_owners.as_ref())
-                .filter(|_| self.task.is_none())
+                .filter(|_| use_plan_cache && self.task.is_none())
                 .map(|owners| (&mut self.cursor_plan_cache, owners));
             match Plan::new(&image, &p, params, context.clone(), cache).map_err(CoreError::Sql)? {
                 Some(plan) => Ok(Cursor {

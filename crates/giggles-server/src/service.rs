@@ -3510,6 +3510,24 @@ impl Session {
         })
     }
     pub fn open_cursor(&mut self, p: &Prepared, params: &[Value]) -> Result<Cursor, CoreError> {
+        self.open_cursor_inner(p, params, true)
+    }
+
+    pub(crate) fn open_uncached_cursor(&mut self, p: &Prepared, params: &[Value]) -> Result<Cursor, CoreError> {
+        self.open_cursor_inner(p, params, false)
+    }
+
+    fn open_cursor_inner(
+        &mut self,
+        p: &Prepared,
+        params: &[Value],
+        use_plan_cache: bool,
+    ) -> Result<Cursor, CoreError> {
+        let open = if use_plan_cache {
+            SqlSession::open_cursor_at
+        } else {
+            SqlSession::open_uncached_cursor_at
+        };
         self.authority_scope(|session| {
             let bound = session.sql.bind_relation_context(p)?;
             session.reconcile_sequence_owners()?;
@@ -3532,8 +3550,10 @@ impl Session {
             };
             let result = if bound.has_privilege_inquiry() {
                 let callback = crate::pg_catalog_wire::privilege_callback(session);
-                session.sql.with_privilege_callback(callback, |sql| sql.open_cursor_at(&bound, params, &clock))
-            } else { session.sql.open_cursor_at(&bound, params, &clock) };
+                session.sql.with_privilege_callback(callback, |sql| open(sql, &bound, params, &clock))
+            } else {
+                open(&mut session.sql, &bound, params, &clock)
+            };
             if !session.sql.in_transaction() {
                 session.transaction_us = None;
             } else if clock.unavailable.is_none() {

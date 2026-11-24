@@ -51,7 +51,7 @@ tonic-prost-build = "0.14"
 giggles-server = { path = ".", default-features = false, features = ["test-hooks"] }
 redb = "3.1"
 futures-core = "0.3"
-giggles-core = { path = "../giggles-core", default-features = false, features = ["test-sql-parser-trap", "test-metadata-counts", "test-commit-sync"] }
+giggles-core = { path = "../giggles-core", default-features = false, features = ["test-sql-parser-trap", "test-metadata-counts", "test-commit-sync", "test-cursor-bindings"] }
 giggles-faultlab = { path = "../giggles-faultlab" }
 giggles-history = { path = "../giggles-history" }
 prost-types = "0.14"

@@ -286,10 +286,11 @@ impl Cursors {
                 reject_row_locks(&p, *hold, diagnostic)?;
                 let mut description = core(session.describe(&p))?;
                 description.parameters.clear();
-                let result = core(session.open_cursor(&p, params))?;
-                if prepared.is_none() {
-                    session.sql.forget_cursor_plan(&p);
-                }
+                let result = core(if prepared.is_some() {
+                    session.open_cursor(&p, params)
+                } else {
+                    session.open_uncached_cursor(&p, params)
+                })?;
                 self.0.insert(
                     name.clone(),
                     Cursor {

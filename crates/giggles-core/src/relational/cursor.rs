@@ -63,12 +63,12 @@ impl CursorQuery {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-cursor-bindings"))]
 thread_local! {
     static QUERY_BINDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(all(test, feature = "engine-rocksdb"))]
+#[cfg(any(all(test, feature = "engine-rocksdb"), feature = "test-cursor-bindings"))]
 pub(crate) fn query_binds() -> usize {
     QUERY_BINDS.get()
 }
@@ -80,7 +80,7 @@ fn bind_query<'a>(
     let Statement::Query(query) = prepared.statement.get() else {
         return Ok(None);
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-cursor-bindings"))]
     QUERY_BINDS.set(QUERY_BINDS.get() + 1);
     query.bind(state, prepared.params, &prepared.parameter_types).map(Some)
 }
@@ -133,8 +133,9 @@ struct PlanCacheEntry {
 impl Drop for PlanCacheEntry {
     fn drop(&mut self) {
         if let Some(owners) = self.owners.upgrade() {
-            owners.0.lock().unwrap_or_else(|e| e.into_inner())
+            let removed = owners.0.lock().unwrap_or_else(|e| e.into_inner())
                 .remove(&(self.binding.as_ptr() as usize));
+            drop(removed);
         }
     }
 }
@@ -146,6 +147,13 @@ impl Drop for PlanCacheEntry {
 pub(crate) struct PlanCache(Mutex<Option<PlanCacheEntry>>);
 
 impl PlanCache {
+    #[cfg(feature = "test-cursor-bindings")]
+    pub(crate) fn binding_liveness(&self) -> Option<impl Fn() -> bool + use<>> {
+        let entry = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let binding = entry.as_ref()?.binding.clone();
+        Some(move || binding.strong_count() != 0)
+    }
+
     pub(crate) fn clear(&self) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
     }

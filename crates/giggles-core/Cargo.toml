@@ -16,6 +16,8 @@ test-commit-sync = []
 test-sql-parser-trap = []
 # Scoped metadata acquisition instrumentation for protocol tests.
 test-metadata-counts = []
+# Binding and lifetime instrumentation for protocol tests.
+test-cursor-bindings = []
 
 [dependencies]
 giggles-glibm-loader = { path = "../giggles-glibm-loader" }

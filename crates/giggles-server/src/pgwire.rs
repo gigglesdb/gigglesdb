@@ -11,7 +11,7 @@ use giggles_core::{
     task::Released,
 };
 use giggles_pg_types::temporal::SessionZone;
-use std::{borrow::Borrow, collections::BTreeMap, io, sync::Arc};
+use std::{borrow::Borrow, collections::{BTreeMap, btree_map::Entry}, io, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     time::timeout,
@@ -2874,8 +2874,17 @@ impl State {
                     self.cache_unnamed(&statement);
                 }
                 if name.is_empty() {
-                    if let Some(previous) = self.statements.insert(name, statement) {
-                        previous.forget_cursor_plan(session);
+                    match self.statements.entry(name) {
+                        Entry::Occupied(mut entry) => {
+                            let previous = entry.get();
+                            if !Arc::ptr_eq(&previous.p, &statement.p) {
+                                previous.forget_cursor_plan(session);
+                            }
+                            entry.insert(statement);
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert(statement);
+                        }
                     }
                 } else {
                     statement.origin = Some(Box::new(prepare::Origin::protocol(session)));
@@ -4801,6 +4810,81 @@ mod prepared_validation_tests {
         assert_eq!(result?[0], b'2');
         Ok(())
     }
+    fn run_cursor_cycle(
+        state: &mut State,
+        session: &mut Session,
+        bind: &[u8],
+        describe: &[u8],
+        execute: &[u8],
+    ) {
+        assert_eq!(message(state, session, b'B', bind).unwrap()[0], b'2');
+        assert_eq!(message(state, session, b'D', describe).unwrap()[0], b'T');
+        assert_eq!(message(state, session, b'E', execute).unwrap()[0], b'D');
+        assert_eq!(message(state, session, b'S', &[]).unwrap()[0], b'Z');
+    }
+
+    #[test]
+    fn repeated_unnamed_parse_reuses_cursor_binding_until_replaced() {
+        let mut session = fixture();
+        let mut state = wire_state();
+        session.execute_sql("CREATE TABLE t(id int PRIMARY KEY)", &[]).unwrap();
+        session.execute_sql("INSERT INTO t VALUES (7), (8)", &[]).unwrap();
+        let sql = "SELECT id FROM public.t WHERE id = 7";
+        let version = session.sql.committed_catalog_version().unwrap();
+        let before = giggles_core::SqlSession::test_cursor_query_binds();
+
+        for _ in 0..2 {
+            parse_unnamed(&mut state, &mut session, sql, &[]);
+            run_cursor_cycle(&mut state, &mut session, b"\0\0\0\0\0\0\0\0", b"P\0", b"\0\0\0\0\0");
+            assert_eq!(giggles_core::SqlSession::test_cursor_query_binds(), before + 1);
+        }
+        let original_is_live = session.sql.test_cursor_binding_liveness().unwrap();
+        assert!(original_is_live());
+        parse_unnamed(&mut state, &mut session, "SELECT id FROM public.t WHERE id = 8", &[]);
+        assert!(!original_is_live());
+        assert_eq!(session.sql.committed_catalog_version(), Some(version));
+        run_cursor_cycle(&mut state, &mut session, b"\0\0\0\0\0\0\0\0", b"P\0", b"\0\0\0\0\0");
+        assert_eq!(giggles_core::SqlSession::test_cursor_query_binds(), before + 2);
+    }
+
+    fn warm_named_cursor(state: &mut State, session: &mut Session) {
+        session.execute_sql("CREATE TABLE t(id int PRIMARY KEY)", &[]).unwrap();
+        session.execute_sql("INSERT INTO t VALUES (7)", &[]).unwrap();
+        let parse = b"s\0SELECT id FROM public.t WHERE id = 7\0\0\0";
+        assert_eq!(message(state, session, b'P', parse).unwrap()[0], b'1');
+        run_cursor_cycle(state, session, b"p\0s\0\0\0\0\0\0\0", b"Pp\0", b"p\0\0\0\0\0");
+    }
+
+    #[test]
+    fn close_statement_releases_cursor_binding_on_current_snapshot() {
+        let mut session = fixture();
+        let mut state = wire_state();
+        warm_named_cursor(&mut state, &mut session);
+        let version = session.sql.committed_catalog_version().unwrap();
+        let binding_is_live = session.sql.test_cursor_binding_liveness().unwrap();
+        assert!(binding_is_live());
+        assert_eq!(message(&mut state, &mut session, b'C', b"Ss\0").unwrap()[0], b'3');
+        assert!(!binding_is_live());
+        assert_eq!(session.sql.committed_catalog_version(), Some(version));
+    }
+
+    #[test]
+    fn one_shot_cursors_leave_warmed_binding_intact() {
+        let mut session = fixture();
+        let mut state = wire_state();
+        warm_named_cursor(&mut state, &mut session);
+        let binding_is_live = session.sql.test_cursor_binding_liveness().unwrap();
+        for query in [
+            b"SELECT id FROM public.t WHERE id = 7\0".as_slice(),
+            b"DECLARE c CURSOR WITH HOLD FOR SELECT id FROM public.t WHERE id = 7\0",
+        ] {
+            let before = giggles_core::SqlSession::test_cursor_query_binds();
+            message(&mut state, &mut session, b'Q', query).unwrap();
+            assert_eq!(giggles_core::SqlSession::test_cursor_query_binds(), before + 1);
+            assert!(binding_is_live());
+        }
+    }
+
     #[test]
     fn success_memo_tracks_catalog_budgets_and_private_ddl() {
         let mut session = fixture();

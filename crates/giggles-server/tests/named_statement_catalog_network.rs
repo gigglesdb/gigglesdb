@@ -51,7 +51,7 @@ async fn case(label: &str, setup: &str, sql: &str, change: &str, expected: Optio
     let mut tasks = Vec::new();
     for role in [
         "owner",
-        if matches!(label, "e" | "h" | "seq" | "implicit-seq" | "cursor-revoke") {
+        if matches!(label, "e" | "h" | "seq" | "implicit-seq") {
             "r"
         } else {
             "owner"
@@ -113,8 +113,11 @@ async fn case(label: &str, setup: &str, sql: &str, change: &str, expected: Optio
     } else if label.starts_with("portal") {
         portal_probe(pg.address, &clients[0], &admin, label, change).await;
         None
+    } else if matches!(label, "cursor-revoke" | "cursor-role") {
+        cursor_execute_authority_probe(pg.address, &clients[0], label).await;
+        None
     } else if label.starts_with("cursor-") {
-        cached_cursor_probe(&clients[0], &clients[1], label).await;
+        cached_cursor_probe(&clients[1], label).await;
         None
     } else {
         let statement = clients[1].prepare(sql).await.unwrap();
@@ -242,8 +245,68 @@ async fn case(label: &str, setup: &str, sql: &str, change: &str, expected: Optio
     }
 }
 
-async fn cached_cursor_probe(
+async fn cursor_execute_authority_probe(
+    address: std::net::SocketAddr,
     owner: &tokio_postgres::Client,
+    label: &str,
+) {
+    let revoke = label == "cursor-revoke";
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    let mut startup = b"\0\x03\0\0user\0".to_vec();
+    giggles_server::pgwire::z(if revoke { "r" } else { "owner" }, &mut startup);
+    startup.extend_from_slice(b"database\0postgres\0\0");
+    stream.write_u32((startup.len() + 4) as u32).await.unwrap();
+    stream.write_all(&startup).await.unwrap();
+    receive(&mut stream, b'Z').await;
+
+    send(&mut stream, &[(b'Q', b"BEGIN\0")]).await;
+    let begun = receive(&mut stream, b'Z').await;
+    assert_eq!(response_code(&begun), None);
+    assert_eq!(begun.last().unwrap().1, b"T");
+
+    send(
+        &mut stream,
+        &[
+            (b'P', b"s\0SELECT a FROM t WHERE a = 7\0\0\0"),
+            (b'B', b"warm\0s\0\0\0\0\0\0\0"),
+            (b'E', b"warm\0\0\0\0\0"),
+            (b'S', b""),
+        ],
+    )
+    .await;
+    let warmed = receive(&mut stream, b'Z').await;
+    assert_eq!(response_code(&warmed), None, "{warmed:?}");
+    let row = &warmed.iter().find(|(tag, _)| *tag == b'D').unwrap().1;
+    assert_eq!(&row[6..], b"7");
+
+    send(&mut stream, &[(b'B', b"p\0s\0\0\0\0\0\0\0"), (b'S', b"")]).await;
+    let bound = receive(&mut stream, b'Z').await;
+    assert_eq!(response_code(&bound), None, "{bound:?}");
+    assert!(bound.iter().any(|(tag, _)| *tag == b'2'));
+    assert_eq!(bound.last().unwrap().1, b"T");
+
+    if revoke {
+        owner.batch_execute("REVOKE SELECT ON t FROM r").await.unwrap();
+    } else {
+        send(&mut stream, &[(b'Q', b"SET ROLE r\0")]).await;
+        let changed = receive(&mut stream, b'Z').await;
+        assert_eq!(response_code(&changed), None, "{changed:?}");
+        assert_eq!(changed.last().unwrap().1, b"T");
+    }
+
+    // The portal already exists and has never been executed. No Bind or Describe
+    // can supply the error expected from this Execute.
+    send(&mut stream, &[(b'E', b"p\0\0\0\0\0"), (b'S', b"")]).await;
+    let executed = receive(&mut stream, b'Z').await;
+    assert_eq!(response_code(&executed), Some("42501"), "{label}: {executed:?}");
+    assert!(!executed.iter().any(|(tag, _)| *tag == b'D'));
+
+    send(&mut stream, &[(b'Q', b"ROLLBACK\0")]).await;
+    assert_eq!(response_code(&receive(&mut stream, b'Z').await), None);
+    send(&mut stream, &[(b'X', b"")]).await;
+}
+
+async fn cached_cursor_probe(
     reader: &tokio_postgres::Client,
     label: &str,
 ) {
@@ -252,10 +315,6 @@ async fn cached_cursor_probe(
     assert_eq!(first.get::<_, i32>(0), 7);
 
     match label {
-        "cursor-revoke" => {
-            owner.batch_execute("REVOKE SELECT ON t FROM r").await.unwrap();
-        }
-        "cursor-role" => reader.batch_execute("SET ROLE r").await.unwrap(),
         "cursor-path" => reader.batch_execute("SET search_path TO alternate, public").await.unwrap(),
         "cursor-rollback" => {
             reader.batch_execute("BEGIN; ALTER TABLE t ADD COLUMN b int").await.unwrap();
@@ -268,10 +327,6 @@ async fn cached_cursor_probe(
 
     let second = reader.query_one(&statement, &[]).await;
     match label {
-        "cursor-revoke" | "cursor-role" => {
-            let error = second.unwrap_err();
-            assert_eq!(error.code().unwrap().code(), "42501");
-        }
         "cursor-path" => assert_eq!(second.unwrap().get::<_, i32>(0), 11),
         "cursor-rollback" => assert_eq!(second.unwrap().get::<_, i32>(0), 7),
         _ => unreachable!(),
