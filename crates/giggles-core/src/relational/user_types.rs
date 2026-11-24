@@ -172,6 +172,40 @@ pub(super) fn view_replace_error(message: String) {
 pub(super) fn truncate_reference_error() {
     view_replace_error("cannot truncate a table referenced in a foreign key constraint".into());
 }
+/// Isolate diagnostics produced by nested SQL parsing on the same thread.
+pub(crate) struct SqlDiagnosticScope {
+    warnings: Vec<String>,
+    notices: Vec<SqlNotice>,
+    hint: Option<std::borrow::Cow<'static, str>>,
+    detail: Option<SqlErrorDetail>,
+    message: Option<SqlErrorMessage>,
+    routine: Option<Box<routines::RoutineDiagnostic>>,
+}
+
+impl SqlDiagnosticScope {
+    pub(crate) fn enter() -> Self {
+        Self {
+            warnings: take_sql_warnings(),
+            notices: take_sql_notices(),
+            hint: take_sql_diagnostic_hint(),
+            detail: take_sql_diagnostic_detail(),
+            message: SQL_ERROR_MESSAGE.with(|pending| pending.borrow_mut().take()),
+            routine: routines::take_diagnostic(),
+        }
+    }
+}
+
+impl Drop for SqlDiagnosticScope {
+    fn drop(&mut self) {
+        ddl_type::restore_warnings(std::mem::take(&mut self.warnings));
+        SQL_NOTICES.with(|pending| *pending.borrow_mut() = std::mem::take(&mut self.notices));
+        SQL_ERROR_HINT.with(|pending| *pending.borrow_mut() = self.hint.take());
+        SQL_ERROR_DETAIL.with(|pending| *pending.borrow_mut() = self.detail.take());
+        SQL_ERROR_MESSAGE.with(|pending| *pending.borrow_mut() = self.message.take());
+        routines::restore_diagnostic(self.routine.take());
+    }
+}
+
 pub(super) fn clear_sql_error_message() {
     routines::clear_diagnostic();
     take_sql_notices();

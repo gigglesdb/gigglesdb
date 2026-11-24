@@ -35,8 +35,6 @@ pub use storage::Executor;
 
 pub mod local;
 pub mod operations;
-// The trigger catalog and SPI adapter are integrated in the next stack.
-#[allow(dead_code)]
 pub(crate) mod plpgsql;
 pub mod relational;
 pub mod task;

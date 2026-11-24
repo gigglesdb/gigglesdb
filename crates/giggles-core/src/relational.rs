@@ -38,6 +38,7 @@ mod constraint_primary_key;
 mod ddl_type;
 pub mod text_search_types;
 pub use ddl_type::take_sql_warnings;
+pub(crate) use user_types::SqlDiagnosticScope;
 mod user_types;
 
 pub(crate) fn conflict_duplicate_target() -> SqlError {

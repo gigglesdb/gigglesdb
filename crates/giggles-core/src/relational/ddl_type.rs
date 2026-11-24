@@ -8,7 +8,10 @@ pub fn take_sql_warnings() -> Vec<String> {
     WARNINGS.with(|warnings| std::mem::take(&mut *warnings.borrow_mut()))
 }
 pub(super) fn publish(warnings: &[String]) {
-    WARNINGS.with(|pending| *pending.borrow_mut() = warnings.to_vec());
+    restore_warnings(warnings.to_vec());
+}
+pub(super) fn restore_warnings(warnings: Vec<String>) {
+    WARNINGS.with(|pending| *pending.borrow_mut() = warnings);
 }
 
 #[derive(Clone, Copy)]

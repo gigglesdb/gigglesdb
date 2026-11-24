@@ -1,6 +1,6 @@
 //! PL/pgSQL compilation and trigger execution. SQL runs through the caller's SPI.
 use crate::CoreError;
-use crate::relational::{DataType, Value};
+use crate::relational::{DataType, SqlDiagnosticScope, Value};
 use std::sync::Arc;
 
 mod compiler;
@@ -28,6 +28,7 @@ pub(crate) struct FunctionSignature {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FunctionKind {
     Trigger,
+    #[allow(dead_code)] // Reserved for the interpreter's ordinary routine entry point.
     Routine,
 }
 
@@ -35,6 +36,7 @@ pub(crate) enum FunctionKind {
 pub(crate) struct FunctionArgument {
     /// The caller supplies the normalized name, when one was declared.
     pub name: Option<String>,
+    #[allow(dead_code, reason = "Ordinary routine execution will use the parameter type")]
     pub data_type: DataType,
 }
 
@@ -50,6 +52,9 @@ pub(crate) fn compile(
     body: &str,
     sig: &FunctionSignature,
 ) -> Result<CompiledFunction, PlCompileError> {
+    // Declaration types and embedded SQL use parsers that publish diagnostics
+    // for their caller. Keep those probes local to the body compilation.
+    let _diagnostics = SqlDiagnosticScope::enter();
     compiler::compile(body, sig)
 }
 
@@ -91,6 +96,7 @@ pub(crate) trait Spi {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code, reason = "The trigger-firing stack supplies the timing")]
 pub(crate) enum TriggerWhen {
     Before,
     After,
@@ -99,11 +105,13 @@ pub(crate) enum TriggerWhen {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TriggerLevel {
+    #[allow(dead_code, reason = "The trigger-firing stack supplies the level")]
     Row,
     Statement,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code, reason = "The trigger-firing stack supplies the event")]
 pub(crate) enum TriggerOp {
     Insert,
     Update,
@@ -135,6 +143,7 @@ pub(crate) enum TriggerReturn {
 #[derive(Debug)]
 pub(crate) struct PlRuntimeError {
     pub sqlstate: Box<str>,
+    #[allow(dead_code, reason = "The trigger-firing stack reports the message")]
     pub message: Box<str>,
     pub detail: Option<Box<str>>,
     pub hint: Option<Box<str>>,
@@ -162,6 +171,8 @@ pub(crate) struct PlNotice {
     pub hint: Option<Box<str>>,
 }
 
+// The trigger-firing stack will call this interpreter entry point.
+#[allow(dead_code)]
 pub(crate) fn exec_trigger(
     f: &CompiledFunction,
     ctx: &TriggerData,

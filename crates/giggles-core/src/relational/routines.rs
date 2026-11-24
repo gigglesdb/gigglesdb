@@ -42,6 +42,12 @@ thread_local! {
 pub(super) fn clear_diagnostic() {
     DIAGNOSTIC.set(None);
 }
+pub(super) fn take_diagnostic() -> Option<Box<RoutineDiagnostic>> {
+    DIAGNOSTIC.take()
+}
+pub(super) fn restore_diagnostic(diagnostic: Option<Box<RoutineDiagnostic>>) {
+    DIAGNOSTIC.set(diagnostic);
+}
 pub(crate) fn promote(error: crate::CoreError) -> crate::CoreError {
     match error {
         crate::CoreError::Sql(SqlError::RoutineDdl) => into_core(SqlError::RoutineDdl),
@@ -52,7 +58,7 @@ pub(crate) fn into_core(error: SqlError) -> crate::CoreError {
     if error != SqlError::RoutineDdl {
         return crate::CoreError::Sql(error);
     }
-    DIAGNOSTIC.take().map_or(crate::CoreError::Sql(SqlError::InternalError), crate::CoreError::RoutineDdl)
+    take_diagnostic().map_or(crate::CoreError::Sql(SqlError::InternalError), crate::CoreError::RoutineDdl)
 }
 pub(super) fn error(state: &'static str, message: impl Into<String>) -> SqlError {
     RoutineDiagnostic::new(state, message).error()
@@ -729,5 +735,45 @@ impl Prepared {
             self.statement.get(),
             Statement::Routine(_) | Statement::Trigger(_)
         ) || matches!(self.statement.get(), Statement::AlterTable(alter) if alter.actions.iter().any(|a| matches!(a, alter_table::Action::TriggerState(..))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compiling_body_preserves_statement_diagnostics() {
+        for (body, succeeds) in [
+            ("DECLARE t timestamp(7); BEGIN PERFORM 1; RETURN NEW; END", true),
+            ("DECLARE t timestamp(7); BEGIN DELETE FRM t; RETURN NEW; END", false),
+        ] {
+            let sql = format!(
+                "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $body${body}$body$"
+            );
+            let prepared = Prepared::parse(&sql, 0, 0).unwrap();
+            let Statement::Routine(Ddl::Create(create)) = prepared.statement.get() else {
+                panic!("expected CREATE FUNCTION");
+            };
+            ddl_type::publish(&["outer warning".into()]);
+            user_types::sql_notice("outer notice".into(), "00000");
+            user_types::sql_error_hint("outer hint");
+            user_types::sql_error_detail("outer detail".into());
+            user_types::view_replace_error("outer message".into());
+            let outer = RoutineDiagnostic::new("XX000", "outer routine diagnostic");
+            let error = outer.clone().error();
+
+            assert_eq!(create.def.compiled_function().is_ok(), succeeds);
+
+            assert_eq!(take_sql_warnings(), ["outer warning"]);
+            assert_eq!(take_sql_notices(), [("outer notice".into(), None, Some("00000"))]);
+            assert_eq!(user_types::take_sql_error_hint(), Some("outer hint"));
+            assert_eq!(user_types::take_sql_error_detail().as_deref(), Some("outer detail"));
+            assert_eq!(take_sql_error_message().as_deref(), Some("outer message"));
+            let crate::CoreError::RoutineDdl(diagnostic) = into_core(error) else {
+                panic!("expected outer routine diagnostic");
+            };
+            assert_eq!(*diagnostic, outer);
+        }
     }
 }
