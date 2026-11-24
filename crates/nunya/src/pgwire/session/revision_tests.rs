@@ -20,11 +20,9 @@ fn assert_revision_row(out: &Actions, tokenized: bool) {
     assert_eq!(row[0].as_deref() != Some(b"private".as_slice()), tokenized);
 }
 fn assert_revision_refusal(f: &Fixture, out: &Actions) {
-    assert!(out.close);
-    assert!(matches!(out.client.as_slice(), [Backend::ErrorResponse(fields)]
-        if fields.iter().any(|(key, value)| *key == b'C' && value == "NY008")));
-    assert!(f.identities.lock().unwrap().iter().any(|r|
-        matches!(r.outcome, Outcome::Refused(NyCode::SchemaStale))));
+    assert_result_error(out, NyCode::SchemaStale, false);
+    assert_eq!(f.identities.lock().unwrap().iter().filter(|r|
+        matches!(r.outcome, Outcome::Refused(NyCode::SchemaStale))).count(), 1);
     let index = NyCode::ALL.iter().position(|c| *c == NyCode::SchemaStale).unwrap();
     assert_eq!(f.ctx.metrics.snapshot().statements_refused[index], 1);
 }

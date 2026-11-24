@@ -376,13 +376,24 @@ pub(crate) struct RefreshSettings {
     /// Settings revision of background captures.
     pub(crate) generation: u64,
 }
-/// Wait for the current period, restarting the sleep whenever settings change.
-pub(crate) async fn refresh_tick<T: Clone>(rx: &mut tokio::sync::watch::Receiver<T>, period: impl Fn(&T) -> u64) {
+/// Recalculate the wait whenever settings change.
+pub(crate) async fn refresh_tick<T: Clone>(
+    rx: &mut tokio::sync::watch::Receiver<T>,
+    delay_ms: impl Fn(&T) -> u64,
+) {
     loop {
-        let ms = period(&rx.borrow_and_update());
+        let settings = rx.borrow_and_update().clone();
+        let ms = delay_ms(&settings);
+        let sleep = tokio::time::sleep(std::time::Duration::from_millis(ms));
+        tokio::pin!(sleep);
         tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => return,
-            changed = rx.changed() => { if changed.is_err() { std::future::pending::<()>().await; } }
+            _ = &mut sleep => return,
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    sleep.await;
+                    return;
+                }
+            }
         }
     }
 }

@@ -6,13 +6,13 @@ use crate::{
     error::{NyCode, Refusal},
     value::ColumnType,
 };
-use tokio_postgres::{Client, Row, types::FromSqlOwned};
+use std::collections::BTreeMap;
+use tokio_postgres::{Client, types::ToSql};
 
 const TABLES: &str = "SELECT table_schema,table_name,table_type FROM information_schema.tables WHERE table_type IN ('BASE TABLE','VIEW') AND ((COALESCE(array_length($1::text[],1),0)>0 AND table_schema=ANY($1)) OR (COALESCE(array_length($1::text[],1),0)=0 AND table_schema NOT IN ('information_schema','pg_catalog','spanner_sys'))) ORDER BY table_schema,table_name";
-const COLUMNS: &str = "SELECT column_name,COALESCE(spanner_type,data_type),is_nullable,is_generated,generation_expression,column_default FROM information_schema.columns WHERE table_schema=$1 AND table_name=$2 ORDER BY ordinal_position";
-const VIEW: &str =
-    "SELECT view_definition FROM information_schema.views WHERE table_schema=$1 AND table_name=$2";
-const PRIMARY_KEY: &str = "SELECT column_name FROM information_schema.index_columns WHERE table_schema=$1 AND table_name=$2 AND index_type='PRIMARY_KEY' ORDER BY ordinal_position";
+const COLUMNS: &str = "SELECT table_schema,table_name,column_name,COALESCE(spanner_type,data_type),is_nullable,is_generated,generation_expression,column_default FROM information_schema.columns WHERE ((COALESCE(array_length($1::text[],1),0)>0 AND table_schema=ANY($1)) OR (COALESCE(array_length($1::text[],1),0)=0 AND table_schema NOT IN ('information_schema','pg_catalog','spanner_sys'))) ORDER BY table_schema,table_name,ordinal_position";
+const VIEWS: &str = "SELECT table_schema,table_name,view_definition FROM information_schema.views WHERE ((COALESCE(array_length($1::text[],1),0)>0 AND table_schema=ANY($1)) OR (COALESCE(array_length($1::text[],1),0)=0 AND table_schema NOT IN ('information_schema','pg_catalog','spanner_sys'))) ORDER BY table_schema,table_name";
+const PRIMARY_KEY: &str = "SELECT table_schema,table_name,column_name FROM information_schema.index_columns WHERE index_type='PRIMARY_KEY' AND ((COALESCE(array_length($1::text[],1),0)>0 AND table_schema=ANY($1)) OR (COALESCE(array_length($1::text[],1),0)=0 AND table_schema NOT IN ('information_schema','pg_catalog','spanner_sys'))) ORDER BY table_schema,table_name,ordinal_position";
 const STREAM_CATALOGS: &str = "SELECT table_name FROM information_schema.tables WHERE table_schema='information_schema' AND table_name IN ('change_streams','change_stream_tables','change_stream_columns')";
 const SCHEMAS: &str = "SELECT schema_name FROM information_schema.schemata WHERE ((COALESCE(array_length($1::text[],1),0)>0 AND schema_name=ANY($1)) OR (COALESCE(array_length($1::text[],1),0)=0 AND schema_name NOT IN ('information_schema','pg_catalog','spanner_sys'))) ORDER BY schema_name";
 const STREAMS: &str =
@@ -23,8 +23,35 @@ const STREAM_COLUMNS: &str = "SELECT change_stream_name,table_schema,table_name 
 fn unavailable() -> Refusal {
     Refusal::new(NyCode::SchemaStale, "catalog snapshot unavailable")
 }
-fn get<T: FromSqlOwned>(row: &Row, index: usize) -> Result<T, Refusal> {
-    row.try_get(index).map_err(|_| unavailable())
+type CatalogRow = Vec<Option<String>>;
+
+async fn query_catalog(
+    client: &Client,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+) -> Result<Vec<CatalogRow>, Refusal> {
+    client
+        .query(sql, params)
+        .await
+        .map_err(|_| unavailable())?
+        .iter()
+        .map(|row| {
+            (0..row.len())
+                .map(|index| row.try_get(index).map_err(|_| unavailable()))
+                .collect()
+        })
+        .collect()
+}
+fn required(row: &[Option<String>], index: usize) -> Result<&str, Refusal> {
+    row.get(index)
+        .and_then(Option::as_deref)
+        .ok_or_else(unavailable)
+}
+fn optional(row: &[Option<String>], index: usize) -> Result<Option<String>, Refusal> {
+    row.get(index).cloned().ok_or_else(unavailable)
+}
+fn relation_key(row: &[Option<String>]) -> Result<(String, String), Refusal> {
+    Ok((required(row, 0)?.into(), required(row, 1)?.into()))
 }
 fn column_identity(
     schema: &str,
@@ -94,85 +121,97 @@ pub async fn load_spanner_pg_snapshot(
     search_path: &[String],
     now_unix_ms: u64,
 ) -> Result<Snapshot, Refusal> {
-    let selected = schemas.to_vec();
-    let captured_schemas = client
-        .query(SCHEMAS, &[&selected])
-        .await
-        .map_err(|_| unavailable())?
+    load_snapshot(
+        move |sql, filtered| async move {
+            let selected = [&schemas as &(dyn ToSql + Sync)];
+            let params: &[_] = if filtered { &selected } else { &[] };
+            query_catalog(client, sql, params).await
+        },
+        search_path,
+        now_unix_ms,
+    )
+    .await
+}
+
+async fn load_snapshot<F>(
+    query: impl Fn(&'static str, bool) -> F,
+    search_path: &[String],
+    now_unix_ms: u64,
+) -> Result<Snapshot, Refusal>
+where
+    F: Future<Output = Result<Vec<CatalogRow>, Refusal>>,
+{
+    let captured_schemas = query(SCHEMAS, true)
+        .await?
         .iter()
-        .map(|row| get::<String>(row, 0))
+        .map(|row| required(row, 0).map(str::to_owned))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut column_ids = std::collections::BTreeMap::new();
+    let mut column_ids = BTreeMap::new();
     let mut relations = Vec::new();
-    for row in client
-        .query(TABLES, &[&selected])
-        .await
-        .map_err(|_| unavailable())?
-    {
-        let schema: String = get(&row, 0)?;
-        let name: String = get(&row, 1)?;
-        let kind = match get::<String>(&row, 2)?.as_str() {
+    let mut relation_indexes = BTreeMap::new();
+    for row in query(TABLES, true).await? {
+        let (schema, name) = relation_key(&row)?;
+        let kind = match required(&row, 2)? {
             "BASE TABLE" => RelationKind::Table,
             "VIEW" => RelationKind::View,
             _ => return Err(unavailable()),
         };
-        let mut columns = Vec::new();
-        for row in client
-            .query(COLUMNS, &[&schema, &name])
-            .await
-            .map_err(|_| unavailable())?
-        {
-            let nullable = match get::<String>(&row, 2)?.as_str() {
-                "YES" => true,
-                "NO" => false,
-                _ => return Err(unavailable()),
-            };
-            let column_name: String = get(&row, 0)?;
-            let raw_type: String = get(&row, 1)?;
-            let (column_ref, id) = column_identity(&schema, &name, &column_name, &raw_type);
-            column_ids.insert(column_ref, id);
-            columns.push(Column {
-                name: column_name,
-                ty: map_spanner_pg_type(&raw_type),
-                nullable,
-                generated: generated(&get::<String>(&row, 3)?, get(&row, 4)?)?,
-                default: get(&row, 5)?,
-            });
-        }
-        let view_definition = if kind == RelationKind::View {
-            let rows = client
-                .query(VIEW, &[&schema, &name])
-                .await
-                .map_err(|_| unavailable())?;
-            if rows.len() != 1 {
-                return Err(unavailable());
-            }
-            Some(
-                get::<Option<String>>(&rows[0], 0)?
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(unavailable)?,
-            )
-        } else {
-            None
-        };
-        let primary_key = client
-            .query(PRIMARY_KEY, &[&schema, &name])
-            .await
-            .map_err(|_| unavailable())?
-            .iter()
-            .map(|row| get(row, 0))
-            .collect::<Result<Vec<String>, _>>()?;
+        relation_indexes.insert((schema.clone(), name.clone()), relations.len());
         relations.push(Relation {
             schema,
             name,
             kind,
-            columns,
-            view_definition,
-            primary_key,
+            columns: vec![],
+            view_definition: None,
+            primary_key: vec![],
         });
+    }
+    for row in query(COLUMNS, true).await? {
+        let Some(&index) = relation_indexes.get(&relation_key(&row)?) else {
+            continue;
+        };
+        let relation = &mut relations[index];
+        let nullable = match required(&row, 4)? {
+            "YES" => true,
+            "NO" => false,
+            _ => return Err(unavailable()),
+        };
+        let column_name = required(&row, 2)?;
+        let raw_type = required(&row, 3)?;
+        let (column_ref, id) =
+            column_identity(&relation.schema, &relation.name, column_name, raw_type);
+        column_ids.insert(column_ref, id);
+        relation.columns.push(Column {
+            name: column_name.into(),
+            ty: map_spanner_pg_type(raw_type),
+            nullable,
+            generated: generated(required(&row, 5)?, optional(&row, 6)?)?,
+            default: optional(&row, 7)?,
+        });
+    }
+    for row in query(VIEWS, true).await? {
+        let Some(&index) = relation_indexes.get(&relation_key(&row)?) else {
+            continue;
+        };
+        let relation = &mut relations[index];
+        if relation.kind == RelationKind::View {
+            let definition = required(&row, 2)?;
+            if relation.view_definition.is_some() || definition.trim().is_empty() {
+                return Err(unavailable());
+            }
+            relation.view_definition = Some(definition.into());
+        }
+    }
+    for row in query(PRIMARY_KEY, true).await? {
+        if let Some(&index) = relation_indexes.get(&relation_key(&row)?) {
+            relations[index].primary_key.push(required(&row, 2)?.into());
+        }
     }
     let mut dependents = Vec::new();
     for relation in &relations {
+        if relation.kind == RelationKind::View && relation.view_definition.is_none() {
+            return Err(unavailable());
+        }
         for column in &relation.columns {
             if column.generated.is_some() {
                 dependents.push(DependentObject {
@@ -192,12 +231,10 @@ pub async fn load_spanner_pg_snapshot(
             });
         }
     }
-    let catalogs = client
-        .query(STREAM_CATALOGS, &[])
-        .await
-        .map_err(|_| unavailable())?
+    let catalog_rows = query(STREAM_CATALOGS, false).await?;
+    let catalogs = catalog_rows
         .iter()
-        .map(|row| get::<String>(row, 0))
+        .map(|row| required(row, 0))
         .collect::<Result<Vec<_>, _>>()?;
     // Partial catalogs fail closed to avoid silently missing change-stream dependencies.
     if !catalogs.is_empty() {
@@ -207,18 +244,15 @@ pub async fn load_spanner_pg_snapshot(
             "change_stream_columns",
         ]
         .iter()
-        .all(|name| catalogs.iter().any(|found| found == name))
+        .all(|name| catalogs.contains(name))
         {
             return Err(unavailable());
         }
         let mut streams = Vec::new();
-        for row in client
-            .query(STREAMS, &[])
-            .await
-            .map_err(|_| unavailable())?
-        {
-            let name: String = get(&row, 0)?;
-            let all = match get::<String>(&row, 1)?.as_str() {
+        let stream_rows = query(STREAMS, false).await?;
+        for row in &stream_rows {
+            let name = required(row, 0)?;
+            let all = match required(row, 1)? {
                 "true" | "YES" => true,
                 "false" | "NO" => false,
                 _ => return Err(unavailable()),
@@ -226,25 +260,21 @@ pub async fn load_spanner_pg_snapshot(
             if all {
                 for relation in &relations {
                     if relation.kind == RelationKind::Table {
-                        add_stream(&mut dependents, &name, relation);
+                        add_stream(&mut dependents, name, relation);
                     }
                 }
             }
             streams.push(name);
         }
         for sql in [STREAM_TABLES, STREAM_COLUMNS] {
-            for row in client.query(sql, &[]).await.map_err(|_| unavailable())? {
-                let stream: String = get(&row, 0)?;
-                let schema: String = get(&row, 1)?;
-                let table: String = get(&row, 2)?;
+            for row in query(sql, false).await? {
+                let stream = required(&row, 0)?;
                 if !streams.contains(&stream) {
                     return Err(unavailable());
                 }
-                if let Some(relation) = relations
-                    .iter()
-                    .find(|relation| relation.schema == schema && relation.name == table)
-                {
-                    add_stream(&mut dependents, &stream, relation);
+                let key = (required(&row, 1)?.into(), required(&row, 2)?.into());
+                if let Some(&index) = relation_indexes.get(&key) {
+                    add_stream(&mut dependents, stream, &relations[index]);
                 }
             }
         }
@@ -301,34 +331,55 @@ pub fn map_spanner_pg_type(spanner_type: &str) -> ColumnType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct FakeColumns;
-    impl super::super::spanner_gsql::SqlRunner for FakeColumns {
-        fn query<'a>(&'a self, sql: &'a str) -> super::super::spanner_gsql::QueryResult<'a> {
-            Box::pin(async move {
-                if sql != COLUMNS {
-                    return Err(unavailable());
-                }
-                Ok(vec![
-                    vec![Some("id".into()), Some("bigint".into())],
-                    vec![Some("Label".into()), Some("character varying(42)".into())],
-                ])
-            })
-        }
+    fn cells<const N: usize>(cells: [Option<&str>; N]) -> CatalogRow {
+        cells.map(|cell| cell.map(str::to_owned)).into()
     }
+
+    fn text<const N: usize>(row: [&str; N]) -> CatalogRow {
+        cells(row.map(Some))
+    }
+
+    fn column(fields: [&str; 6], generated: Option<&str>, default: Option<&str>) -> CatalogRow {
+        let mut row = text(fields);
+        row.extend([generated.map(str::to_owned), default.map(str::to_owned)]);
+        row
+    }
+
     #[tokio::test]
     async fn fake_column_query_preserves_exact_identity() {
-        use super::super::spanner_gsql::SqlRunner;
-        let mut ids = std::collections::BTreeMap::new();
-        for row in FakeColumns.query(COLUMNS).await.unwrap() {
-            let (column, id) = column_identity(
-                "public",
-                "items",
-                row[0].as_deref().unwrap(),
-                row[1].as_deref().unwrap(),
-            );
-            ids.insert(column, id);
-        }
-        let snapshot = Snapshot::new(vec![], vec![], vec![], 0).with_column_ids(ids);
+        let snapshot = load_snapshot(
+            |sql, _| async move {
+                match sql {
+                    SCHEMAS => Ok(vec![text(["public"])]),
+                    TABLES => Ok(vec![text(["public", "items", "BASE TABLE"])]),
+                    COLUMNS => Ok(vec![
+                        column(
+                            ["public", "items", "id", "bigint", "NO", "NEVER"],
+                            None,
+                            None,
+                        ),
+                        column(
+                            [
+                                "public",
+                                "items",
+                                "Label",
+                                "character varying(42)",
+                                "YES",
+                                "NEVER",
+                            ],
+                            None,
+                            None,
+                        ),
+                    ]),
+                    VIEWS | PRIMARY_KEY | STREAM_CATALOGS => Ok(vec![]),
+                    _ => panic!("unexpected catalog query"),
+                }
+            },
+            &[],
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(snapshot.column_ids.len(), 2);
         for (column, spanner_type) in [("id", "bigint"), ("Label", "character varying(42)")] {
             assert_eq!(
@@ -346,6 +397,238 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn batched_catalog_matches_per_relation_snapshot() {
+        let definition = "SELECT id FROM public.items";
+        let queries = std::cell::RefCell::new(Vec::new());
+        let calls = &queries;
+        let search_path = vec!["public".into(), "archive".into()];
+        let snapshot = load_snapshot(
+            |sql, filtered| async move {
+                calls.borrow_mut().push((sql, filtered));
+                Ok(match sql {
+                    SCHEMAS => vec![text(["archive"]), text(["public"])],
+                    TABLES => vec![
+                        text(["archive", "items", "BASE TABLE"]),
+                        text(["public", "empty", "BASE TABLE"]),
+                        text(["public", "item_view", "VIEW"]),
+                        text(["public", "items", "BASE TABLE"]),
+                    ],
+                    COLUMNS => vec![
+                        column(
+                            ["archive", "items", "id", "text", "YES", "NEVER"],
+                            None,
+                            None,
+                        ),
+                        column(
+                            ["public", "item_view", "id", "bigint", "YES", "NEVER"],
+                            None,
+                            None,
+                        ),
+                        column(
+                            ["public", "items", "id", "bigint", "NO", "NEVER"],
+                            None,
+                            Some("0"),
+                        ),
+                        column(
+                            ["public", "items", "derived", "bigint", "NO", "ALWAYS"],
+                            Some("id + 1"),
+                            None,
+                        ),
+                        cells([
+                            Some("public"),
+                            Some("orphan"),
+                            Some("ignored"),
+                            None,
+                            Some("UNKNOWN"),
+                            None,
+                            None,
+                            None,
+                        ]),
+                    ],
+                    VIEWS => vec![text(["public", "item_view", definition])],
+                    PRIMARY_KEY => vec![
+                        text(["archive", "items", "id"]),
+                        text(["public", "items", "derived"]),
+                        text(["public", "items", "id"]),
+                    ],
+                    STREAM_CATALOGS => vec![
+                        text(["change_streams"]),
+                        text(["change_stream_tables"]),
+                        text(["change_stream_columns"]),
+                    ],
+                    STREAMS => vec![text(["audit", "false"])],
+                    STREAM_TABLES => vec![text(["audit", "public", "items"])],
+                    STREAM_COLUMNS => vec![text(["audit", "public", "items"])],
+                    _ => panic!("unexpected catalog query"),
+                })
+            },
+            &search_path,
+            123,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            queries.into_inner(),
+            [
+                (SCHEMAS, true),
+                (TABLES, true),
+                (COLUMNS, true),
+                (VIEWS, true),
+                (PRIMARY_KEY, true),
+                (STREAM_CATALOGS, false),
+                (STREAMS, false),
+                (STREAM_TABLES, false),
+                (STREAM_COLUMNS, false),
+            ]
+        );
+
+        let expected_relations = vec![
+            Relation {
+                schema: "archive".into(),
+                name: "items".into(),
+                kind: RelationKind::Table,
+                columns: vec![Column {
+                    name: "id".into(),
+                    ty: ColumnType::Text,
+                    nullable: true,
+                    generated: None,
+                    default: None,
+                }],
+                view_definition: None,
+                primary_key: vec!["id".into()],
+            },
+            Relation {
+                schema: "public".into(),
+                name: "empty".into(),
+                kind: RelationKind::Table,
+                columns: vec![],
+                view_definition: None,
+                primary_key: vec![],
+            },
+            Relation {
+                schema: "public".into(),
+                name: "item_view".into(),
+                kind: RelationKind::View,
+                columns: vec![Column {
+                    name: "id".into(),
+                    ty: ColumnType::Int8,
+                    nullable: true,
+                    generated: None,
+                    default: None,
+                }],
+                view_definition: Some(definition.into()),
+                primary_key: vec![],
+            },
+            Relation {
+                schema: "public".into(),
+                name: "items".into(),
+                kind: RelationKind::Table,
+                columns: vec![
+                    Column {
+                        name: "id".into(),
+                        ty: ColumnType::Int8,
+                        nullable: false,
+                        generated: None,
+                        default: Some("0".into()),
+                    },
+                    Column {
+                        name: "derived".into(),
+                        ty: ColumnType::Int8,
+                        nullable: false,
+                        generated: Some("id + 1".into()),
+                        default: None,
+                    },
+                ],
+                view_definition: None,
+                primary_key: vec!["derived".into(), "id".into()],
+            },
+        ];
+        let column_ref = |schema: &str, table: &str, column: &str| ColumnRef {
+            schema: schema.into(),
+            table: table.into(),
+            column: column.into(),
+        };
+        let item_columns = vec![
+            column_ref("public", "items", "id"),
+            column_ref("public", "items", "derived"),
+        ];
+        let expected_dependents = vec![
+            DependentObject {
+                kind: DependentKind::View,
+                name: "public.item_view".into(),
+                reads: [
+                    vec![column_ref("archive", "items", "id")],
+                    item_columns.clone(),
+                ]
+                .concat(),
+                writes_table: None,
+            },
+            DependentObject {
+                kind: DependentKind::GeneratedColumn,
+                name: "public.items.derived".into(),
+                reads: item_columns.clone(),
+                writes_table: None,
+            },
+            DependentObject {
+                kind: DependentKind::Rule,
+                name: "change_stream:audit".into(),
+                reads: item_columns,
+                writes_table: None,
+            },
+        ];
+        let expected_ids = [
+            ("archive", "items", "id", "text"),
+            ("public", "item_view", "id", "bigint"),
+            ("public", "items", "id", "bigint"),
+            ("public", "items", "derived", "bigint"),
+        ]
+        .into_iter()
+        .map(|(schema, table, column, raw_type)| {
+            (
+                column_ref(schema, table, column),
+                ColumnId::Spanner {
+                    schema: schema.into(),
+                    table: table.into(),
+                    column: column.into(),
+                    spanner_type: raw_type.into(),
+                },
+            )
+        })
+        .collect();
+        let expected = Snapshot::new(expected_relations, expected_dependents, search_path, 123)
+            .with_column_ids(expected_ids)
+            .with_captured_schemas(vec!["archive".into(), "public".into()]);
+        assert_eq!(snapshot.fingerprint, expected.fingerprint);
+        assert_eq!(snapshot, expected);
+    }
+
+    #[tokio::test]
+    async fn batched_catalog_rejects_unknown_table_or_nullability_metadata() {
+        for (table_type, is_nullable) in [("UNKNOWN", "YES"), ("BASE TABLE", "UNKNOWN")] {
+            let error = load_snapshot(
+                |sql, _| async move {
+                    match sql {
+                        SCHEMAS => Ok(vec![]),
+                        TABLES => Ok(vec![text(["public", "items", table_type])]),
+                        COLUMNS => Ok(vec![column(
+                            ["public", "items", "id", "bigint", is_nullable, "NEVER"],
+                            None,
+                            None,
+                        )]),
+                        _ => panic!("invalid metadata must end the capture"),
+                    }
+                },
+                &[],
+                0,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, NyCode::SchemaStale);
+        }
+    }
+
     #[test]
     fn type_mapping() {
         for (name, expected) in [

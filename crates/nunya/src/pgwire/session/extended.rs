@@ -25,9 +25,13 @@ pub(super) struct Portal {
     token_value: Option<SqlValue>,
     exhausted: bool,
 }
+pub(super) enum AckSource {
+    Local,
+    Upstream,
+}
 pub(super) enum Pending {
     Local(Actions),
-    Ack(u8, String, [u8; 16]),
+    Ack(u8, String, [u8; 16], AckSource),
     Hidden(u8),
     RefusalError,
     Describe(Prepared, bool, Vec<i16>),
@@ -72,19 +76,53 @@ impl Prepared {
 }
 impl Session {
     fn drain_local(&mut self, out: &mut Actions) {
-        while matches!(self.pending.front(), Some(Pending::Local(_))) {
-            if let Some(Pending::Local(local)) = self.pending.pop_front() {
-                if self.status == b'T'
-                    && local
-                        .client
-                        .iter()
-                        .any(|m| matches!(m, Backend::ErrorResponse(_)))
-                {
-                    self.aborted = true;
+        while matches!(
+            self.pending.front(),
+            Some(Pending::Local(_) | Pending::Ack(_, _, _, AckSource::Local))
+        ) {
+            match self.pending.pop_front() {
+                Some(Pending::Local(local)) if !self.discard_result || local.close => {
+                    if self.status == b'T'
+                        && local.client.iter().any(|m| matches!(m, Backend::ErrorResponse(_)))
+                    {
+                        self.aborted = true;
+                    }
+                    out.client.extend(local.client);
+                    out.close |= local.close;
                 }
-                out.client.extend(local.client);
-                out.close |= local.close;
+                Some(Pending::Local(_)) => {}
+                Some(Pending::Ack(tag, name, generation, AckSource::Local)) => {
+                    if self.discard_result {
+                        self.drop_unacknowledged(tag, &name, generation);
+                    } else {
+                        out.client.push(match tag {
+                            b'1' => Backend::ParseComplete,
+                            b'2' => Backend::BindComplete,
+                            b'3' => Backend::CloseComplete,
+                            _ => unreachable!(),
+                        });
+                    }
+                }
+                _ => unreachable!(),
             }
+        }
+    }
+    fn local_ack(&mut self, tag: u8, name: String, generation: [u8; 16]) -> Actions {
+        self.pending
+            .push_back(Pending::Ack(tag, name, generation, AckSource::Local));
+        let mut out = Actions::default();
+        self.drain_local(&mut out);
+        out
+    }
+    fn drop_unacknowledged(&mut self, tag: u8, name: &str, generation: [u8; 16]) {
+        match tag {
+            b'1' if self.prepared.get(name).is_some_and(|p| p.generation == generation) => {
+                self.prepared.remove(name);
+            }
+            b'2' if self.portals.get(name).is_some_and(|p| p.generation == generation) => {
+                self.portals.remove(name);
+            }
+            _ => {}
         }
     }
     fn local(&mut self, local: Actions) -> Actions {
@@ -271,18 +309,16 @@ impl Session {
                         Ok(p) => p,
                         Err(e) => return Err(e),
                     };
+                    let generation = p.generation;
                     if p.local() {
-                        self.prepared.insert(name, p);
-                        out = self.local(Actions {
-                            client: vec![Backend::ParseComplete],
-                            ..Actions::default()
-                        });
+                        self.prepared.insert(name.clone(), p);
+                        out = self.local_ack(b'1', name, generation);
                     } else {
                         let rewritten = p.rewritten.clone();
-                        let generation = p.generation;
                         self.prepared.insert(name.clone(), p);
-                        self.pending
-                            .push_back(Pending::Ack(b'1', name.clone(), generation));
+                        self.pending.push_back(Pending::Ack(
+                            b'1', name.clone(), generation, AckSource::Upstream,
+                        ));
                         out.upstream.push(Frontend::Parse {
                             name,
                             query: rewritten,
@@ -365,13 +401,11 @@ impl Session {
                         },
                     );
                     if local {
-                        out = self.local(Actions {
-                            client: vec![Backend::BindComplete],
-                            ..Actions::default()
-                        });
+                        out = self.local_ack(b'2', portal, generation);
                     } else {
-                        self.pending
-                            .push_back(Pending::Ack(b'2', portal.clone(), generation));
+                        self.pending.push_back(Pending::Ack(
+                            b'2', portal.clone(), generation, AckSource::Upstream,
+                        ));
                         out.upstream.push(Frontend::Bind {
                             portal,
                             statement,
@@ -588,13 +622,11 @@ impl Session {
                         _ => return Err(protocol()),
                     };
                     if local {
-                        out = self.local(Actions {
-                            client: vec![Backend::CloseComplete],
-                            ..Actions::default()
-                        });
+                        out = self.local_ack(b'3', name, [0; 16]);
                     } else {
-                        self.pending
-                            .push_back(Pending::Ack(b'3', String::new(), [0; 16]));
+                        self.pending.push_back(Pending::Ack(
+                            b'3', String::new(), [0; 16], AckSource::Upstream,
+                        ));
                         out.upstream.push(Frontend::Close { kind, name });
                     }
                 }
@@ -650,15 +682,48 @@ impl Session {
                 self.drain_deferred(&mut out);
                 out
             }
-            Err(e) => {
-                self.ctx.metrics.refused(e.code);
-                Actions {
-                    client: vec![Backend::ErrorResponse(nunya_error(e.code))],
-                    close: true,
-                    ..Actions::default()
-                }
-            },
+            Err(error) => self.ext_result_error(error.code),
         }
+    }
+    fn ext_result_error(&mut self, code: NyCode) -> Actions {
+        let sync_forwarded = self.pending.iter().any(|p| matches!(p, Pending::Sync));
+        if self.discard_result
+            || !is_statement_refusal(code)
+            || (self.status != b'T' && self.segment_forwarded_write && sync_forwarded)
+            || self.segment_unresolved_before_failure
+            || !self.pending.iter()
+                .skip(1)
+                .take_while(|p| !matches!(p, Pending::Sync))
+                .all(|p| match p {
+                    Pending::Execute(a, _) => is_read(&a.kind),
+                    Pending::Ack(b'1' | b'2', name, _, _) => name.is_empty(),
+                    Pending::Ack(b'3', ..) => false,
+                    _ => true,
+                })
+        {
+            return self.result_error(code, true);
+        }
+        let logged = match self.pending.front_mut() {
+            Some(Pending::Execute(a, _)) if is_read(&a.kind) => a.log_refusal(&self.ctx, code),
+            Some(Pending::Describe(p, _, _)) if is_read(&p.kind) => {
+                let sql = p.sql.clone();
+                let revision = p.policy_revision.clone();
+                let mut record = self.record(&sql, Outcome::Refused(code));
+                record.policy_revision = revision;
+                // The refusing RowDescription already consumed the Describe response.
+                self.pending.pop_front();
+                self.ctx.readlog.write(&record)
+            }
+            _ => return self.result_error(code, true),
+        };
+        if let Err(error) = logged {
+            return self.result_error(error.code, true);
+        }
+        self.skip = true;
+        self.rollback_on_sync |= !sync_forwarded;
+        let mut out = self.start_result_discard(code);
+        self.drain_local(&mut out);
+        out
     }
     pub(super) fn drain_deferred(&mut self, out: &mut Actions) {
         while !out.close
@@ -676,12 +741,17 @@ impl Session {
         }
     }
     fn ext_response(&mut self, msg: Backend) -> Result<Vec<Backend>, Refusal> {
+        let discard = self.discard_result;
         match msg {
             Backend::NoticeResponse(fields) => {
-                return Ok(vec![Backend::NoticeResponse(redact_error(&fields))]);
+                return Ok(if discard {
+                    vec![]
+                } else {
+                    vec![Backend::NoticeResponse(redact_error(&fields))]
+                });
             }
             Backend::ParameterStatus(n, v) => {
-                return Ok(if allowed_status(&n) {
+                return Ok(if !discard && allowed_status(&n) {
                     vec![Backend::ParameterStatus(n, v)]
                 } else {
                     vec![]
@@ -690,19 +760,26 @@ impl Session {
             Backend::Refused(b'A') => return Ok(vec![]),
             Backend::ErrorResponse(fields) => {
                 // Terminating errors are intercepted by Upstream::recv.
+                if discard && self.segment_known_failure {
+                    return Err(protocol());
+                }
                 self.segment_known_failure = true;
                 if matches!(self.pending.front(), Some(Pending::Sync)) {
                     // Sync can fail while committing the implicit transaction. Its
                     // ReadyForQuery still ends this segment; later work is deferred.
                     self.rollback_on_sync = false;
                     self.extended_execute_forwarded = false;
-                    return Ok(vec![Backend::ErrorResponse(redact_error(&fields))]);
+                    return Ok(if discard {
+                        vec![]
+                    } else {
+                        vec![Backend::ErrorResponse(redact_error(&fields))]
+                    });
                 }
                 let hidden = matches!(self.pending.front(), Some(Pending::RefusalError));
                 if !matches!(
                     self.pending.front(),
                     Some(
-                        Pending::Ack(_, _, _)
+                        Pending::Ack(_, _, _, AckSource::Upstream)
                             | Pending::Hidden(_)
                             | Pending::Describe(_, _, _)
                             | Pending::Execute(_, _)
@@ -711,7 +788,7 @@ impl Session {
                 ) {
                     return Err(protocol());
                 }
-                if let Some(Pending::Execute(a, _)) = self.pending.front() {
+                if !discard && let Some(Pending::Execute(a, _)) = self.pending.front() {
                     self.ctx.readlog.write(&a.record)?;
                 }
                 // An earlier upstream failure already aborts this segment; only the
@@ -720,23 +797,8 @@ impl Session {
                 self.extended_execute_forwarded = false;
                 while !matches!(self.pending.front(), Some(Pending::Sync) | None) {
                     match self.pending.pop_front() {
-                        Some(Pending::Ack(b'1', name, generation)) => {
-                            if self
-                                .prepared
-                                .get(&name)
-                                .is_some_and(|p| p.generation == generation)
-                            {
-                                self.prepared.remove(&name);
-                            }
-                        }
-                        Some(Pending::Ack(b'2', name, generation)) => {
-                            if self
-                                .portals
-                                .get(&name)
-                                .is_some_and(|p| p.generation == generation)
-                            {
-                                self.portals.remove(&name);
-                            }
+                        Some(Pending::Ack(tag, name, generation, _)) => {
+                            self.drop_unacknowledged(tag, &name, generation);
                         }
                         Some(
                             Pending::Local(_)
@@ -744,14 +806,13 @@ impl Session {
                             | Pending::RefusalError
                             | Pending::Describe(_, _, _)
                             | Pending::Execute(_, _)
-                            | Pending::Ack(_, _, _)
                             | Pending::Sync,
                         )
                         | None => {}
                     }
                 }
                 self.skip = true;
-                return Ok(if hidden {
+                return Ok(if discard || hidden {
                     vec![]
                 } else {
                     vec![Backend::ErrorResponse(redact_error(&fields))]
@@ -768,9 +829,15 @@ impl Session {
                 self.pending.pop_front();
                 return Ok(vec![]);
             }
-            (Pending::Ack(b'1', _, _), Backend::ParseComplete) => Backend::ParseComplete,
-            (Pending::Ack(b'2', _, _), Backend::BindComplete) => Backend::BindComplete,
-            (Pending::Ack(b'3', _, _), Backend::CloseComplete) => Backend::CloseComplete,
+            (Pending::Ack(b'1', _, _, AckSource::Upstream), Backend::ParseComplete) => {
+                Backend::ParseComplete
+            }
+            (Pending::Ack(b'2', _, _, AckSource::Upstream), Backend::BindComplete) => {
+                Backend::BindComplete
+            }
+            (Pending::Ack(b'3', _, _, AckSource::Upstream), Backend::CloseComplete) => {
+                Backend::CloseComplete
+            }
             (Pending::Describe(_, parameter, _), Backend::ParameterDescription(oids))
                 if *parameter =>
             {
@@ -779,17 +846,17 @@ impl Session {
                 Backend::ParameterDescription(oids)
             }
             (Pending::Describe(p, false, formats), Backend::RowDescription(mut fields)) => {
-                rewrite_fields(&mut fields, &p.plan)?;
-                for (i, field) in fields.iter().enumerate() {
-                    if field.format != format_at(formats, i, fields.len())? {
-                        return Err(failure(NyCode::NotAnalysable));
-                    }
+                if !discard {
+                    rewrite_result_fields(&mut fields, &p.plan, formats)?;
                 }
                 Backend::RowDescription(fields)
             }
-            (Pending::Describe(p, false, _), Backend::NoData) if p.plan.outputs.is_empty() => {
+            (Pending::Describe(p, false, _), Backend::NoData)
+                if discard || p.plan.outputs.is_empty() =>
+            {
                 Backend::NoData
             }
+            (Pending::Execute(_, _), Backend::DataRow(_)) if discard => return Ok(vec![]),
             (Pending::Execute(a, formats), Backend::DataRow(row)) => {
                 if row.len() != a.plan.outputs.len() {
                     return Err(failure(NyCode::NotAnalysable));
@@ -814,14 +881,17 @@ impl Session {
                     return Err(protocol());
                 }
                 a.described = true;
-                rewrite_fields(&mut fields, &a.plan)?;
-                for (i, field) in fields.iter().enumerate() {
-                    if field.format != format_at(formats, i, fields.len())? {
-                        return Err(failure(NyCode::NotAnalysable));
-                    }
+                if !discard {
+                    rewrite_result_fields(&mut fields, &a.plan, formats)?;
                 }
                 done = false;
                 Backend::RowDescription(fields)
+            }
+            (Pending::Execute(_, _), Backend::CommandComplete(_) | Backend::PortalSuspended)
+                if discard =>
+            {
+                self.pending.pop_front();
+                return Ok(vec![]);
             }
             (Pending::Execute(a, _), Backend::CommandComplete(tag)) => {
                 self.ctx.readlog.write(&a.record)?;
@@ -846,26 +916,32 @@ impl Session {
             (Pending::Sync, Backend::ReadyForQuery(status))
                 if matches!(status, b'I' | b'T' | b'E') =>
             {
-                self.segment_forwarded_write = false;
-                self.segment_known_failure = false;
-                self.segment_unresolved_before_failure = false;
-                self.status = status;
-                if status == b'E' {
-                    self.aborted = true;
-                }
                 self.skip = false;
-                if status == b'I' {
-                    self.aborted = false;
-                }
-                self.ready()
+                self.finish_segment(status)
             }
             _ => return Err(protocol()),
         };
         if done {
-            self.pending.pop_front();
+            let completed = self.pending.pop_front();
+            if discard && let Some(Pending::Ack(tag, name, generation, _)) = completed {
+                self.drop_unacknowledged(tag, &name, generation);
+            }
         }
-        Ok(vec![response])
+        Ok(if self.discard_result { vec![] } else { vec![response] })
     }
+}
+fn rewrite_result_fields(
+    fields: &mut [FieldDescription],
+    plan: &RewritePlan,
+    formats: &[i16],
+) -> Result<(), Refusal> {
+    rewrite_fields(fields, plan)?;
+    for (i, field) in fields.iter().enumerate() {
+        if field.format != format_at(formats, i, fields.len())? {
+            return Err(failure(NyCode::NotAnalysable));
+        }
+    }
+    Ok(())
 }
 /// Validate upstream output types and clear modifiers for rewritten fields.
 pub(super) fn rewrite_fields(fields: &mut [FieldDescription], plan: &RewritePlan) -> Result<(), Refusal> {

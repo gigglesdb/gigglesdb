@@ -66,3 +66,6 @@ mod policy_revisions_live;
 
 #[path = "policy_fencing_live.rs"]
 mod policy_fencing_live;
+
+#[path = "result_refusal.rs"]
+mod result_refusal;

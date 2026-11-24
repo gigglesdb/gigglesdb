@@ -81,6 +81,16 @@ struct Active {
     epoch: u64,
     described: bool,
 }
+impl Active {
+    fn log_refusal(&mut self, ctx: &GatewayContext, code: NyCode) -> Result<(), Refusal> {
+        // A release check may already have recorded this refusal.
+        if matches!(self.record.outcome, Outcome::Refused(current) if current == code) {
+            return Ok(());
+        }
+        self.record.outcome = Outcome::Refused(code);
+        ctx.readlog.write(&self.record)
+    }
+}
 fn check_serving(ctx: &GatewayContext) -> Result<(), Refusal> {
     if ctx.serving_gate.as_ref().is_some_and(|g| !g.allow()) || !ctx.serving_state().available() {
         return Err(failure(NyCode::ServingUnavailable));
@@ -89,18 +99,14 @@ fn check_serving(ctx: &GatewayContext) -> Result<(), Refusal> {
 }
 fn check_release(ctx: &GatewayContext, release: &ReleaseSlot, active: &mut Active) -> Result<(), Refusal> {
     if let Err(e) = check_serving(ctx) {
-        let mut record = active.record.clone();
-        record.outcome = Outcome::Refused(NyCode::ServingUnavailable);
-        ctx.readlog.write(&record)?;
+        active.log_refusal(ctx, e.code)?;
         return Err(e);
     }
     let epoch = release.begin(&ctx.fence);
     if epoch != active.epoch {
         let current = ctx.policy.read().map_err(|_| protocol())?;
         if tightens(&active.policy, &current) {
-            let mut record = active.record.clone();
-            record.outcome = Outcome::Refused(NyCode::SchemaStale);
-            ctx.readlog.write(&record)?;
+            active.log_refusal(ctx, NyCode::SchemaStale)?;
             return Err(failure(NyCode::SchemaStale));
         }
         active.epoch = epoch;
@@ -108,11 +114,11 @@ fn check_release(ctx: &GatewayContext, release: &ReleaseSlot, active: &mut Activ
     }
     Ok(())
 }
-#[derive(PartialEq, Eq)]
-enum SimpleJsonResult {
-    Normal,
-    CanDiscard,
-    Discarding(NyCode),
+fn is_statement_refusal(code: NyCode) -> bool {
+    matches!(
+        code,
+        NyCode::NotAnalysable | NyCode::BlindOperation | NyCode::MaskedExpression | NyCode::SchemaStale
+    )
 }
 
 /// Socket-independent simple and extended protocol state with ordered responses.
@@ -129,7 +135,8 @@ pub struct Session {
     connection: Option<u64>,
     active: VecDeque<Active>,
     waiting: bool,
-    simple_json_result: SimpleJsonResult,
+    // Keep matching upstream replies against their queue until ReadyForQuery.
+    discard_result: bool,
     status: u8,
     aborted: bool,
     skip: bool,
@@ -175,7 +182,7 @@ impl Session {
             connection: None,
             active: VecDeque::new(),
             waiting: false,
-            simple_json_result: SimpleJsonResult::Normal,
+            discard_result: false,
             status: b'I',
             aborted: false,
             skip: false,
@@ -235,7 +242,7 @@ impl Session {
             || self.pending.iter().any(|pending| match pending {
                 Pending::Execute(active, _) => indeterminate(active),
                 Pending::Local(_)
-                | Pending::Ack(_, _, _)
+                | Pending::Ack(..)
                 | Pending::Hidden(_)
                 | Pending::RefusalError
                 | Pending::Describe(_, _, _)
@@ -593,12 +600,6 @@ impl Session {
                 writes(&a.kind) || matches!(a.kind, StatementKind::Commit)
             });
             self.empty_pending = self.active.is_empty();
-            if self.status == b'I'
-                && self.active.len() == 1
-                && matches!(self.active[0].kind, StatementKind::Select | StatementKind::JsonSelect { .. })
-            {
-                self.simple_json_result = SimpleJsonResult::CanDiscard;
-            }
             self.waiting = true;
             Ok(Some(Actions {
                 upstream: vec![Frontend::Query(rewritten)],
@@ -624,9 +625,7 @@ impl Session {
         if self.end_requested.is_some() {
             return Actions::default();
         }
-        if matches!(msg, Backend::DataRow(_))
-            && !matches!(self.simple_json_result, SimpleJsonResult::Discarding(_))
-        {
+        if matches!(msg, Backend::DataRow(_)) && !self.discard_result {
             let now = (self.ctx.clock)();
             if self.last_row_refresh_ms.is_none_or(|last| now.saturating_sub(last) >= 1000) {
                 if self.ctx.serving_state().admit(self.session, Operation::Read).is_err() {
@@ -642,9 +641,10 @@ impl Session {
                 self.last_row_refresh_ms = Some(now);
             }
         }
-        if !self.pending.is_empty() {
+        if !self.pending.is_empty() || (self.discard_result && !self.waiting) {
             return self.extended_backend(msg);
         }
+        let completed = matches!(msg, Backend::CommandComplete(_));
         let result = self.response(msg);
         match result {
             Ok(client) => {
@@ -655,33 +655,53 @@ impl Session {
                 self.drain_deferred(&mut out);
                 out
             }
-            Err(e) => {
-                self.ctx.metrics.refused(e.code);
-                Actions {
-                    client: vec![Backend::ErrorResponse(nunya_error(e.code))],
-                    close: true,
-                    ..Actions::default()
-                }
-            }
+            Err(error) => self.simple_result_error(error.code, completed),
         }
     }
-    fn response(&mut self, msg: Backend) -> Result<Vec<Backend>, Refusal> {
-        let result_error = if let SimpleJsonResult::Discarding(code) = self.simple_json_result {
-            match msg {
-                Backend::ReadyForQuery(b'I') if self.active.is_empty() => Some(code),
-                Backend::DataRow(_) if !self.active.is_empty() => return Ok(vec![]),
-                Backend::NoticeResponse(_) | Backend::ParameterStatus(_, _) | Backend::Refused(b'A') => {
-                    return Ok(vec![]);
-                }
-                Backend::CommandComplete(_) | Backend::ErrorResponse(_) => {
-                    self.active.pop_front().ok_or_else(protocol)?;
-                    return Ok(vec![]);
-                }
-                _ => return Err(protocol()),
-            }
-        } else {
-            None
+    fn simple_result_error(&mut self, code: NyCode, completed: bool) -> Actions {
+        if self.discard_result
+            || !is_statement_refusal(code)
+            || (self.status != b'T' && self.segment_forwarded_write)
+            || self.segment_unresolved_before_failure
+            || !self.active.iter().all(|a| is_read(&a.kind))
+        {
+            return self.result_error(code, true);
+        }
+        let Some(active) = self.active.front_mut() else {
+            return self.result_error(NyCode::ProtocolNotAllowed, true);
         };
+        if let Err(error) = active.log_refusal(&self.ctx, code) {
+            return self.result_error(error.code, true);
+        }
+        if completed {
+            self.active.pop_front();
+        }
+        self.start_result_discard(code)
+    }
+    fn result_error(&self, code: NyCode, close: bool) -> Actions {
+        self.ctx.metrics.refused(code);
+        Actions {
+            client: vec![Backend::ErrorResponse(nunya_error(code))],
+            close,
+            ..Actions::default()
+        }
+    }
+    fn start_result_discard(&mut self, code: NyCode) -> Actions {
+        self.discard_result = true;
+        self.aborted |= self.status == b'T';
+        self.result_error(code, false)
+    }
+    fn finish_segment(&mut self, status: u8) -> Backend {
+        self.status = status;
+        self.aborted = status == b'E'
+            || (status == b'T' && (self.aborted || self.discard_result));
+        self.discard_result = false;
+        self.segment_forwarded_write = false;
+        self.segment_known_failure = false;
+        self.segment_unresolved_before_failure = false;
+        self.ready()
+    }
+    fn response(&mut self, msg: Backend) -> Result<Vec<Backend>, Refusal> {
         match msg {
             Backend::ReadyForQuery(status) => {
                 if !self.waiting
@@ -692,55 +712,32 @@ impl Session {
                     return Err(protocol());
                 }
                 self.waiting = false;
-                self.simple_json_result = SimpleJsonResult::Normal;
-                self.segment_forwarded_write = false;
-                self.segment_known_failure = false;
-                self.segment_unresolved_before_failure = false;
-                self.status = status;
-                if status == b'E' {
-                    self.aborted = true;
-                }
-                if status == b'I' {
-                    self.aborted = false;
-                }
-                let mut client = Vec::new();
-                if let Some(code) = result_error {
-                    client.push(Backend::ErrorResponse(nunya_error(code)));
-                }
-                client.push(self.ready());
-                Ok(client)
+                Ok(vec![self.finish_segment(status)])
             }
             Backend::RowDescription(mut fields) => {
-                // A single idle simple-query read can drain to its own ReadyForQuery.
-                // No row or metadata has been sent, and there is no write to roll back.
                 let active = self.active.front_mut().ok_or_else(protocol)?;
-                if active.described
-                    || fields.len() != active.plan.outputs.len()
-                    || fields.iter().any(|f| f.format != 0)
-                {
-                    return Err(failure(NyCode::NotAnalysable));
-                }
-                if let Err(error) = validate_json_fields(&fields, &active.plan) {
-                    if self.simple_json_result != SimpleJsonResult::CanDiscard {
-                        return Err(error);
-                    }
-                    active.record.outcome = Outcome::Refused(error.code);
-                    self.ctx.readlog.write(&active.record)?;
-                    self.ctx.metrics.refused(error.code);
-                    self.simple_json_result = SimpleJsonResult::Discarding(error.code);
-                    return Ok(vec![]);
-                }
-                for (field, output) in fields.iter_mut().zip(&active.plan.outputs) {
-                    if !matches!(output, OutputRewrite::Pass) {
-                        field.type_modifier = -1;
-                    }
+                if active.described {
+                    return Err(protocol());
                 }
                 active.described = true;
+                if self.discard_result {
+                    return Ok(vec![]);
+                }
+                if fields.iter().any(|f| f.format != 0) {
+                    return Err(failure(NyCode::NotAnalysable));
+                }
+                extended::rewrite_fields(&mut fields, &active.plan)?;
                 Ok(vec![Backend::RowDescription(fields)])
             }
             Backend::DataRow(row) => {
                 let active = self.active.front_mut().ok_or_else(protocol)?;
-                if !active.described || row.len() != active.plan.outputs.len() {
+                if !active.described {
+                    return Err(protocol());
+                }
+                if self.discard_result {
+                    return Ok(vec![]);
+                }
+                if row.len() != active.plan.outputs.len() {
                     return Err(failure(NyCode::NotAnalysable));
                 }
                 check_release(&self.ctx, &self.release, active)?;
@@ -758,7 +755,11 @@ impl Session {
                 Ok(vec![Backend::DataRow(row)])
             }
             Backend::CommandComplete(tag) => {
-                let mut active = self.active.pop_front().ok_or_else(protocol)?;
+                if self.discard_result {
+                    self.active.pop_front().ok_or_else(protocol)?;
+                    return Ok(vec![]);
+                }
+                let active = self.active.front_mut().ok_or_else(protocol)?;
                 let rows = tag
                     .split_whitespace()
                     .last()
@@ -769,15 +770,20 @@ impl Session {
                 }
                 active.record.rows = rows;
                 self.ctx.readlog.write(&active.record)?;
+                let kind = &active.kind;
                 if self.segment_forwarded_write
-                    && matches!(active.kind, StatementKind::Commit | StatementKind::Rollback)
+                    && matches!(kind, StatementKind::Commit | StatementKind::Rollback)
                 {
                     self.segment_unresolved_before_failure = true;
                 }
-                let commit = self.aborted && matches!(active.kind, StatementKind::Commit);
-                if recovery(&active.kind) {
+                let commit = self.aborted && matches!(kind, StatementKind::Commit);
+                if matches!(kind, StatementKind::Begin) {
+                    self.status = b'T';
+                }
+                if recovery(kind) {
                     self.aborted = false;
                 }
+                self.active.pop_front();
                 Ok(vec![Backend::CommandComplete(if commit {
                     "ROLLBACK".into()
                 } else {
@@ -792,7 +798,7 @@ impl Session {
                 Ok(vec![Backend::EmptyQueryResponse])
             }
             Backend::ErrorResponse(fields) => {
-                if !self.waiting {
+                if !self.waiting || (self.discard_result && self.segment_known_failure) {
                     return Err(protocol());
                 }
                 // Upstream::recv already excludes FATAL/PANIC. An ordinary error
@@ -802,16 +808,22 @@ impl Session {
                 // the Query still owns responses until its ReadyForQuery.
                 self.empty_pending = false;
                 // An upstream error terminates this query and skips its remaining statements.
+                if self.discard_result {
+                    self.active.clear();
+                    return Ok(vec![]);
+                }
                 if let Some(active) = self.active.pop_front() {
                     self.ctx.readlog.write(&active.record)?;
                 }
                 self.active.clear();
                 Ok(vec![Backend::ErrorResponse(redact_error(&fields))])
             }
-            Backend::NoticeResponse(fields) => {
-                Ok(vec![Backend::NoticeResponse(redact_error(&fields))])
-            }
-            Backend::ParameterStatus(name, value) => Ok(if allowed_status(&name) {
+            Backend::NoticeResponse(fields) => Ok(if self.discard_result {
+                vec![]
+            } else {
+                vec![Backend::NoticeResponse(redact_error(&fields))]
+            }),
+            Backend::ParameterStatus(name, value) => Ok(if !self.discard_result && allowed_status(&name) {
                 vec![Backend::ParameterStatus(name, value)]
             } else {
                 vec![]
@@ -832,6 +844,9 @@ impl Session {
             | Backend::Refused(_) => Err(protocol()),
         }
     }
+}
+fn is_read(kind: &StatementKind) -> bool {
+    matches!(kind, StatementKind::Select | StatementKind::JsonSelect { .. })
 }
 fn writes(kind: &StatementKind) -> bool {
     match kind {
@@ -1613,6 +1628,7 @@ pub(crate) mod tests {
     include!("session/send_failure_tests.rs");
     include!("session/sql_error_tests.rs");
     include!("session/segment_tests.rs");
+    include!("session/result_refusal_tests.rs");
     use super::*;
     use crate::value::ColumnType;
     use crate::{
@@ -3319,7 +3335,10 @@ pub(crate) mod tests {
         assert!(!session.backend(Backend::ReadyForQuery(b'I')).close);
         assert_eq!(*f.records.lock().unwrap(), vec![(0, 0), (1, 1)]);
         session.frontend(Frontend::Query("SELECT value FROM items".into()));
-        assert!(session.backend(Backend::RowDescription(vec![])).close);
+        let mismatch = session.backend(Backend::RowDescription(vec![]));
+        assert_result_error(&mismatch, NyCode::NotAnalysable, false);
+        assert_discarded(session.backend(Backend::CommandComplete("SELECT 0".into())));
+        assert_result_ready(&mut session, b'I', b'I');
     }
     /// Construct a path filter for wire-format and prepared-policy regression tests.
     pub(super) fn json_test_filter(mode: crate::json::filter::JsonMode, root: bool, blind: bool) -> crate::policy::JsonColumnFilter {

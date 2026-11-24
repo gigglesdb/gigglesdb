@@ -24,6 +24,7 @@ use tokio::{
     io::AsyncWriteExt,
     sync::mpsc,
     task::{JoinHandle, JoinSet},
+    time::Instant,
 };
 
 // Require intentionally skips certificate trust and hostname validation, but verifies
@@ -353,6 +354,97 @@ pub(crate) async fn snapshot(
     })
     .await
 }
+const MIN_SNAPSHOT_READ_GAP_MS: u64 = 1_000;
+
+fn next_snapshot_read_ms(
+    finished_at_ms: u64,
+    taken_at_ms: u64,
+    max_age_ms: u64,
+    refresh_ms: u64,
+    last_duration_ms: u64,
+) -> u64 {
+    let lead = last_duration_ms
+        .saturating_mul(2)
+        .saturating_add(MIN_SNAPSHOT_READ_GAP_MS);
+    let deadline = taken_at_ms.saturating_add(max_age_ms).saturating_sub(lead);
+    finished_at_ms
+        .saturating_add(refresh_ms)
+        .min(deadline)
+        .max(finished_at_ms.saturating_add(MIN_SNAPSHOT_READ_GAP_MS))
+}
+
+/// The preceding catalog read's timing, tracked independently of publication.
+pub(crate) struct SnapshotRead {
+    finished: Instant,
+    finished_at_ms: u64,
+    duration_ms: u64,
+}
+impl SnapshotRead {
+    /// Measure a read through completion using the monotonic clock.
+    pub(crate) async fn measure<T>(read: impl Future<Output = T>) -> (T, Self) {
+        let started = Instant::now();
+        let result = read.await;
+        let finished = Instant::now();
+        let duration_ms = finished.duration_since(started).as_millis() as u64;
+        (
+            result,
+            Self {
+                finished,
+                finished_at_ms: now(),
+                duration_ms,
+            },
+        )
+    }
+
+    /// Rate-limit retries when reconnecting fails before a read can start.
+    fn defer_retry(&mut self) {
+        self.finished = Instant::now();
+        self.finished_at_ms = now();
+    }
+
+    /// Recalculate the delay using the route's currently published policy and catalog.
+    pub(crate) fn delay(
+        &self,
+        policy: &RwLock<Arc<Policy>>,
+        snapshot: &RwLock<Arc<Snapshot>>,
+        refresh_ms: u64,
+    ) -> u64 {
+        let policy = policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = next_snapshot_read_ms(
+            self.finished_at_ms,
+            snapshot.taken_at_unix_ms,
+            policy.snapshot_max_age_ms,
+            refresh_ms,
+            self.duration_ms,
+        );
+        let wait_ms = next.saturating_sub(self.finished_at_ms);
+        wait_ms.saturating_sub(self.finished.elapsed().as_millis() as u64)
+    }
+
+    /// Warn once per completed capture when its duration approaches the policy limit.
+    pub(crate) fn warn_if_slow(&self, route: &str, policy: &RwLock<Arc<Policy>>) {
+        let max_age_ms = policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot_max_age_ms;
+        let duration_ms = self.duration_ms;
+        if duration_ms >= max_age_ms {
+            eprintln!(
+                "{route}: schema snapshot read took {duration_ms} ms, reaching snapshot_max_age_ms ({max_age_ms} ms); stale snapshots cause NY008; raise snapshot_max_age_ms or reduce the schemas read"
+            );
+        } else if duration_ms >= max_age_ms.div_ceil(2) {
+            eprintln!(
+                "{route}: warning: schema snapshot read took {duration_ms} ms, close to snapshot_max_age_ms ({max_age_ms} ms)"
+            );
+        }
+    }
+}
+
 /// Parse policy bytes and resolve its audit path relative to the policy file.
 pub(crate) fn parse_policy_bytes(path: &Path, bytes: &[u8], service: &crate::policy::ServicePolicySettings) -> Result<crate::policy::PolicyDocument, Vec<PolicyError>> {
     let text = std::str::from_utf8(bytes).map_err(|_| {
@@ -1155,9 +1247,8 @@ async fn run_postgres(
         .upstream_config()
         .ok_or("PostgreSQL route unavailable")?;
     let schema = connect_schema(&upstream).await?;
-    let first = snapshot(&schema.client, &config)
-        .await
-        .map_err(|error| error.to_string())?;
+    let (first, mut last_read) = SnapshotRead::measure(snapshot(&schema.client, &config)).await;
+    let first = first.map_err(|error| error.to_string())?;
 
     let tls = transports.postgres.clone();
     let root_hex = zeroize::Zeroizing::new(data_encoding::HEXLOWER.encode(&*config.root_key));
@@ -1192,6 +1283,7 @@ async fn run_postgres(
             .await
             .map_err(|_| "agent listener unavailable")?;
     hub.register(crate::reload::Route::Postgres(ctx.clone()))?;
+    last_read.warn_if_slow("serve", &ctx.policy);
     config_reload.attach_catalog(
         ctx.clone(),
         Arc::new(|cfg| {
@@ -1209,11 +1301,15 @@ async fn run_postgres(
     let config = Arc::new(config);
     let refresh_config = config.clone();
     let mut settings_rx = transports.refresh.subscribe();
-    let (snapshot_tx, mut snapshot_rx) = mpsc::channel(1);
+    let refresh_ctx = ctx.clone();
     let _refresher = AbortTask(tokio::spawn(async move {
         let mut schema = schema;
+        let route = crate::reload::Route::Postgres(refresh_ctx.clone());
         loop {
-            crate::config_reload::refresh_tick(&mut settings_rx, |s| s.refresh_ms).await;
+            crate::config_reload::refresh_tick(&mut settings_rx, |s| {
+                last_read.delay(&refresh_ctx.policy, &refresh_ctx.snapshot, s.refresh_ms)
+            })
+            .await;
             let settings = settings_rx.borrow().clone();
             let mut capture_config = crate::config_reload::copy_config(&refresh_config);
             capture_config.schemas = settings.schemas;
@@ -1223,14 +1319,21 @@ async fn run_postgres(
                     Ok(new) => schema = new,
                     Err(_) => {
                         eprintln!("serve: schema reconnect failed");
+                        last_read.defer_retry();
                         continue;
                     }
                 }
             }
-            match snapshot(&schema.client, &capture_config).await {
+            let (result, read) =
+                SnapshotRead::measure(snapshot(&schema.client, &capture_config)).await;
+            last_read = read;
+            match result {
                 Ok(new) => {
-                    if snapshot_tx.send((settings.generation, new)).await.is_err() {
-                        break;
+                    last_read.warn_if_slow("serve", &refresh_ctx.policy);
+                    if let Err(error) = hub.refresh_if(&route, new, || {
+                        settings_rx.borrow().generation == settings.generation
+                    }) {
+                        eprintln!("serve: refresh validation failed: {error}");
                     }
                 }
                 Err(SnapshotError::Unavailable) => eprintln!("serve: snapshot refresh failed"),
@@ -1269,11 +1372,6 @@ async fn run_postgres(
                 }
             }
             _ = sessions.join_next(), if !sessions.is_empty() => {},
-            Some((generation, new)) = snapshot_rx.recv() => {
-                if let Err(e) = hub.refresh_if(&crate::reload::Route::Postgres(ctx.clone()), new, || transports.refresh.borrow().generation == generation) {
-                    eprintln!("serve: refresh validation failed: {e}");
-                }
-            }
         }
     };
     eprintln!("serve: shutting down");
@@ -1296,6 +1394,171 @@ async fn run_postgres(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    #[test]
+    fn next_snapshot_read_reserves_twice_the_previous_read_plus_one_second() {
+        // (previous finish, current capture start, max age, interval, read duration, next start)
+        for (finish, taken_at, max_age, refresh, duration, expected) in [
+            (10_100, 10_000, 60_000, 90_000, 100, 68_800),
+            (20_000, 10_000, 60_000, 90_000, 10_000, 49_000),
+            (75_000, 10_000, 60_000, 30_000, 65_000, 76_000),
+            (10_100, 10_000, 0, 30_000, 100, 11_100),
+            (10_100, 10_000, 60_000, 30_000, 100, 40_100),
+            (10_100, 10_000, 60_000, 1, 100, 11_100),
+        ] {
+            assert_eq!(
+                next_snapshot_read_ms(finish, taken_at, max_age, refresh, duration),
+                expected
+            );
+        }
+    }
+
+    fn refresh_test_session(ctx: Arc<GatewayContext>) -> crate::pgwire::session::Session {
+        use crate::{
+            pgwire::auth::ScramVerifier,
+            state::{
+                authority::AcquireRequest,
+                model::{Mode, PrincipalKind, Verifier},
+            },
+            token::keys::derive_scope_v2,
+        };
+        let authority = &ctx.authority;
+        let principal = authority
+            .create_principal("refresh-test", PrincipalKind::Agent, false, "test")
+            .unwrap();
+        authority
+            .set_grants(principal.id, vec![(ctx.route.clone(), Mode::ReadWrite)])
+            .unwrap();
+        let verifier = Verifier(ScramVerifier::from_password("test", b"test-salt", 4096));
+        authority
+            .add_principal_credential(principal.id, verifier.clone(), None)
+            .unwrap();
+        let row = authority
+            .acquire_session(
+                principal.id,
+                AcquireRequest {
+                    route: ctx.route.clone(),
+                    mode: None,
+                    lifetime_ms: None,
+                    isolated: false,
+                    label: None,
+                    idempotency_key: "refresh-test".into(),
+                    verifier,
+                    secret_sha256: [1; 32],
+                },
+            )
+            .unwrap();
+        let scope = authority.scope(row.scope).unwrap();
+        let keys = derive_scope_v2(
+            &ctx.root_key,
+            &scope.salt,
+            &scope.deployment_id,
+            scope.route.as_str(),
+        )
+        .unwrap();
+        crate::pgwire::session::Session::new(ctx, keys, row.id, principal.id, None, scope.id)
+    }
+
+    fn check_snapshot_refresh(duration_ms: u64, max_age_ms: u64) {
+        use crate::pgwire::{
+            codec::{Backend, FieldDescription, Frontend},
+            redact::nunya_error,
+            session::tests::Fixture,
+        };
+        use std::sync::atomic::AtomicU64;
+
+        let mut fixture = Fixture::new();
+        let clock = Arc::new(AtomicU64::new(0));
+        let request_clock = clock.clone();
+        Arc::get_mut(&mut fixture.ctx).unwrap().clock =
+            Arc::new(move || request_clock.load(Ordering::Relaxed));
+        let mut policy = (**fixture.ctx.policy.read().unwrap()).clone();
+        policy.snapshot_max_age_ms = max_age_ms;
+        *fixture.ctx.policy.write().unwrap() = Arc::new(policy);
+
+        let template = fixture.ctx.snapshot.read().unwrap().clone();
+        let load = |started_at| {
+            let snapshot = Snapshot::new(
+                template.relations.clone(),
+                vec![],
+                template.search_path.clone(),
+                started_at,
+            );
+            (started_at + duration_ms, Arc::new(snapshot))
+        };
+        let (mut finish, mut snapshot) = load(0);
+        *fixture.ctx.snapshot.write().unwrap() = snapshot.clone();
+        let mut session = refresh_test_session(fixture.ctx.clone());
+
+        let end = finish + 4 * max_age_ms;
+        while finish < end {
+            let next = next_snapshot_read_ms(
+                finish,
+                snapshot.taken_at_unix_ms,
+                max_age_ms,
+                30_000,
+                duration_ms,
+            );
+            let (next_finish, next_snapshot) = load(next);
+            for time in (finish..next_finish).step_by(100).chain([next_finish - 1]) {
+                clock.store(time, Ordering::Relaxed);
+                let actions = session.frontend(Frontend::Query("SELECT 1".into()));
+                if duration_ms > max_age_ms {
+                    assert!(actions.upstream.is_empty());
+                    assert!(actions.client.iter().any(|message| {
+                        matches!(message, Backend::ErrorResponse(fields)
+                            if *fields == nunya_error(crate::error::NyCode::SchemaStale))
+                    }));
+                    return;
+                }
+                assert!(
+                    matches!(actions.upstream.as_slice(), [Frontend::Query(_)]),
+                    "at {time} ms"
+                );
+                assert!(actions.client.is_empty());
+                let description =
+                    session.backend(Backend::RowDescription(vec![FieldDescription {
+                        name: "?column?".into(),
+                        table_oid: 0,
+                        column_attr: 0,
+                        type_oid: 23,
+                        type_size: 4,
+                        type_modifier: -1,
+                        format: 0,
+                    }]));
+                assert!(matches!(
+                    description.client.as_slice(),
+                    [Backend::RowDescription(_)]
+                ));
+                let row = session.backend(Backend::DataRow(vec![Some(b"1".to_vec())]));
+                assert!(
+                    matches!(row.client.as_slice(), [Backend::DataRow(values)] if values[0].as_deref() == Some(b"1"))
+                );
+                assert!(
+                    !session
+                        .backend(Backend::CommandComplete("SELECT 1".into()))
+                        .close
+                );
+                assert!(!session.backend(Backend::ReadyForQuery(b'I')).close);
+                session.release_done();
+            }
+            finish = next_finish;
+            snapshot = next_snapshot;
+            *fixture.ctx.snapshot.write().unwrap() = snapshot.clone();
+        }
+        assert!(finish >= end);
+    }
+
+    #[test]
+    fn slow_snapshot_reads_keep_statements_fresh_across_multiple_intervals() {
+        // Two 600 ms reads and the 1 s minimum gap require at least 2.2 s.
+        check_snapshot_refresh(600, 2_400);
+    }
+
+    #[test]
+    fn snapshot_read_slower_than_max_age_refuses_statements_with_ny008() {
+        check_snapshot_refresh(2_500, 2_400);
+    }
+
     #[tokio::test]
     async fn snapshot_deadline_is_independent_of_connect_timeout() {
         use crate::config_reload::tests::{Fixture, edit};

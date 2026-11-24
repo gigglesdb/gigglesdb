@@ -2,6 +2,7 @@
 use crate::{
     policy::Policy,
     readlog::ReadLog,
+    serve::SnapshotRead,
     spanner::{
         catalog::CatalogRunner,
         proxy::{self, SpannerContext, SpannerUpstream},
@@ -154,9 +155,11 @@ pub(crate) async fn run_spanner_with_hub(
         let runner = CatalogRunner::new(&upstream, section.database.clone())
             .await
             .map_err(|_| "spanner: catalog unavailable".to_owned())?;
-        let snapshot = crate::schema::spanner_gsql::load_gsql_snapshot(&runner, now())
-            .await
-            .map_err(|_| "spanner: catalog unavailable".to_owned())?;
+        let (snapshot, mut last_read) = SnapshotRead::measure(async {
+            crate::schema::spanner_gsql::load_gsql_snapshot(&runner, now()).await
+        })
+        .await;
+        let snapshot = snapshot.map_err(|_| "spanner: catalog unavailable".to_owned())?;
         // The standalone API accepts legacy Policy only; configured routes use the Hub document.
         let declared = legacy_document((*policy).clone());
         let policy = if hub.is_none() {
@@ -185,6 +188,7 @@ pub(crate) async fn run_spanner_with_hub(
         if let Some(hub) = &hub {
             hub.register(crate::reload::Route::Spanner(ctx.clone()))?;
         }
+        last_read.warn_if_slow("spanner", &ctx.policy);
         let svc = proxy::build(ctx.clone())
             .await
             .map_err(|_| "spanner: upstream unavailable".to_owned())?;
@@ -192,10 +196,17 @@ pub(crate) async fn run_spanner_with_hub(
             let (_keepalive, fallback) = tokio::sync::watch::channel(period);
             let mut refresh_period = refresh_period.unwrap_or(fallback);
             loop {
-                crate::config_reload::refresh_tick(&mut refresh_period, |ms| *ms).await;
-                if let Ok(snapshot) =
+                crate::config_reload::refresh_tick(&mut refresh_period, |ms| {
+                    last_read.delay(&ctx.policy, &ctx.snapshot, *ms)
+                })
+                .await;
+                let (snapshot, read) = SnapshotRead::measure(async {
                     crate::schema::spanner_gsql::load_gsql_snapshot(&runner, now()).await
-                {
+                })
+                .await;
+                last_read = read;
+                if let Ok(snapshot) = snapshot {
+                    last_read.warn_if_slow("spanner", &ctx.policy);
                     if let Some(hub) = &hub {
                         let _ = hub.refresh(&crate::reload::Route::Spanner(ctx.clone()), snapshot);
                         continue;
