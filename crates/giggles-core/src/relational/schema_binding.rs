@@ -193,7 +193,9 @@ impl Prepared {
                 name, constraints, as_query, ..
             } => {
                 *name = create(name)?;
-                if let Some((q,_))=as_query {q.bind_schema_names(&read,state,&self.search_path);}
+                if let Some(create) = as_query {
+                    create.source.bind_schema_names(&read, state, &self.search_path)?;
+                }
                 definitions(constraints);
             }
             Statement::Insert { name, .. }

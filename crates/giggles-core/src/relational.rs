@@ -107,6 +107,8 @@ mod sql_index;
 pub(crate) mod partial_index;
 pub(crate) mod gin_indexes;
 pub(crate) mod generated_columns;
+mod select_source;
+mod create_table_as;
 mod sql_insert;
 pub(crate) use giggles_pg_types::temporal::Time;
 pub use giggles_pg_types::temporal::{
@@ -1297,7 +1299,7 @@ enum Statement {
         keys: Vec<String>,
         constraints: Vec<constraints::Definition>,
         primary_name: Option<String>,
-        as_query: Option<(Box<query::Query>, bool)>,
+        as_query: Option<Box<create_table_as::CreateAs>>,
     },
     InsertExpressions(query::InsertExpressions),
     Insert {
@@ -1665,7 +1667,9 @@ impl Parser {
                 false
             };
             let name = self.create_table_name()?;
-            if self.word("as") {return column_collations::parse_create_as(self,name,optional);}
+            if let Some(statement) = create_table_as::parse(self, &name, optional)? {
+                return Ok(statement);
+            }
             let table_name = name.clone();
             self.punct('(')?;
             let mut columns = vec![];
@@ -2939,6 +2943,9 @@ impl Prepared {
                 .get(&alter.table)
                 .ok_or(SqlError::UnknownTable)?;
         }
+        if let Statement::Create { as_query: Some(create), .. } = self.statement.get() {
+            return create.describe(state, self);
+        }
         if let Statement::InsertMulti(insert) = self.statement.get() {
             return insert.describe(state, self.params, &self.parameter_types);
         }
@@ -3175,7 +3182,7 @@ impl Prepared {
             Statement::View(ddl) => ddl.query.as_ref().map_or_else(Vec::new, query::Query::read_tables),
             Statement::Query(query) => query.read_tables(),
             Statement::Plan(plan) => plan.read_tables(),
-            Statement::Create {as_query:Some((query,_)),..} => query.read_tables(),
+            Statement::Create { as_query: Some(create), .. } => create.source.read_tables(),
             Statement::InsertMulti(insert) => insert
                 .source
                 .as_ref()
@@ -3264,8 +3271,6 @@ impl Prepared {
         let query = match self.statement.get() {
             Statement::View(ddl) => ddl.query.as_ref(),
             Statement::Query(query) => Some(query),
-            Statement::Create {as_query:Some((query,_)),..} => Some(query.as_ref()),
-            Statement::InsertMulti(insert) => insert.source.as_ref().and_then(sql_insert::Source::query),
             _ => searched::target(self).filter(|query| query.has_in_subquery()),
         };
         let mut tables = match query {
@@ -3279,10 +3284,9 @@ impl Prepared {
                 tables
             }
             None => match self.statement.get() {
-                Statement::InsertMulti(insert) => match &insert.source {
-                    Some(sql_insert::Source::Plan(plan, _)) => plan.authorization_tables()?,
-                    _ => self.read_tables(),
-                },
+                Statement::Create { as_query: Some(create), .. } => create.source.authorization_tables(invoker)?,
+                Statement::InsertMulti(insert) => insert.source.as_ref()
+                    .map_or_else(|| Ok(vec![]), |source| source.authorization_tables(invoker))?,
                 _ => self.read_tables(),
             },
         };
@@ -3294,7 +3298,18 @@ impl Prepared {
         Ok(tables)
     }
 
-    pub(crate) fn is_create_as(&self)->bool {matches!(self.statement.get(),Statement::Create {as_query:Some(_),..})}
+    /// Whether this DDL statement takes its definition from a query.
+    pub fn is_create_as(&self) -> bool {
+        matches!(self.statement.get(), Statement::Create { as_query: Some(_), .. })
+    }
+
+    /// Command used when formatting completion frames after execution.
+    pub fn completion_command(&self) -> &'static str {
+        match self.statement.get() {
+            Statement::Create { as_query: Some(create), .. } => create.completion_command(),
+            _ => self.command(),
+        }
+    }
     pub fn is_ddl(&self) -> bool {
         matches!(
             self.statement.get(),
@@ -3467,7 +3482,7 @@ impl Prepared {
             }),
         })
     }
-    /// Declare input types for SELECT, INSERT VALUES, UPDATE and DELETE before type inference.
+    /// Declare input types for queries and query-backed DDL or DML before inference.
     /// A shorter slice or `None` entries leave the corresponding inputs inferred.
     /// Other statement kinds retain their existing parameter inference.
     pub fn with_parameter_types(mut self, types: &[Option<DataType>]) -> R<Self> {
@@ -3493,7 +3508,7 @@ impl Prepared {
                 | Statement::Update { .. }
                 | Statement::UpdateExpressions { .. }
                 | Statement::Delete { .. }
-        ) {
+        ) || self.is_create_as() {
             self.parameter_types = types.to_vec();
         }
         Ok(self)
@@ -3530,8 +3545,9 @@ impl Prepared {
         self.privilege_inquiry || match self.statement.get() {
             Statement::Query(q) => q.has_privilege_inquiry(),
             Statement::Plan(p) => p.has_privilege_inquiry(),
-            Statement::InsertMulti(insert) => matches!(&insert.source,
-                Some(sql_insert::Source::Plan(plan, _)) if plan.has_privilege_inquiry()),
+            Statement::Create { as_query: Some(create), .. } => create.source.has_privilege_inquiry(),
+            Statement::InsertMulti(insert) => insert.source.as_ref()
+                .is_some_and(select_source::SelectSource::has_privilege_inquiry),
             _ => false,
         }
     }
@@ -3543,6 +3559,7 @@ impl Prepared {
             Statement::InsertExpressions(values) => values.sequence_dependencies(),
             Statement::InsertMulti(insert) => insert.sequence_dependencies(),
             Statement::AlterTable(alter) => alter.sequence_dependencies(),
+            Statement::Create { as_query: Some(create), .. } => create.source.sequences(),
             Statement::Create { defaults, .. } => defaults
                 .iter()
                 .flatten()
@@ -4955,35 +4972,16 @@ impl Relational {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
                 }
-                let mut columns = columns.clone();
-                let mut typmods = typmods.clone();
-                let mut collations=collations.clone();
-                let mut ctas_rows=None;
-                if let Some((query,no_data))=as_query {
-                    let bound=query.bind(self,prepared.params,&prepared.parameter_types)?.with_clock(clock);
-                    let description=bound.description(self);
-                    // PG reports an existing relation (42P07 / IF NOT EXISTS skip)
-                    // before duplicate output names (42701); both before any row runs.
-                    let mut names = BTreeSet::new();
-                    if !self.relation_name_taken(name)
-                        && self.type_by_name(split_key(name).1).is_none()
-                        && description.columns.iter().any(|c| !names.insert(&c.name))
-                    {
-                        return Err(SqlError::DuplicateColumn);
-                    }
-                    // JSON has a wire type, but no durable column representation.
-                    if description.type_oids.contains(&114) && !self.relation_name_taken(name) {
-                        return Err(SqlError::Unsupported);
-                    }
-                    collations=bound.output_collations()?.into_iter().map(|n|n.map(|n|n.split('\0').next().unwrap_or(&n).to_owned())).collect();
-                    columns=description.columns; for c in &mut columns {c.id=0;c.not_null=false;}
-                    typmods=description.typmods.into_iter().map(|n|(n>=0).then_some(n)).collect();
-                    if !no_data {
-                        let legacy=scan::LegacyRows(&*self);
-                        ctas_rows=Some(bound.execute_declared(self,injected_source.unwrap_or(&legacy),params,&mut cancel,&prepared.parameter_types)?.rows);
-                    }
-                }
-                let mut type_ids = vec![None; columns.len()];
+                let (mut columns, mut typmods, collations, mut type_ids, ctas_rows) =
+                    if let Some(create) = as_query {
+                        if create_table_as::CreateAs::skip(self, name, *optional)? {
+                            return Ok(result);
+                        }
+                        let definition = create.bind_and_read(self, prepared, params, clock, &mut cancel, injected_source)?;
+                        (definition.columns, definition.typmods, definition.collations, definition.type_ids, definition.rows)
+                    } else {
+                        (columns.clone(), typmods.clone(), collations.clone(), vec![None; columns.len()], vec![])
+                    };
                 for (i, name) in user_types.iter().enumerate() {
                     if let Some(name) = name {
                         let (id, ty) = name.resolve(self, &prepared.search_path)?;
@@ -5101,16 +5099,12 @@ impl Relational {
                 if let Some(name) = chosen_primary {
                     constraint_primary_key::record_name(self, &table, &name)?;
                 }
-                if let Some(rows)=ctas_rows {
-                    let quoted=|n:&str|format!("\"{}\"",n.replace('"',"\"\""));
-                    let (schema,leaf)=split_key(name);
-                    let sql=format!("INSERT INTO {}.{} VALUES ({})",quoted(schema),quoted(leaf),(1..=columns.len()).map(|i|format!("${i}")).collect::<Vec<_>>().join(","));
-                    for row in rows {
-                        let mut insert=Prepared::parse(&sql,prepared.domain,self.epoch)?;
-                        insert.search_path=prepared.search_path.clone();
-                        let ctas_cancel: &mut dyn FnMut()->bool = &mut cancel;
-                        self.execute_statement_inner(&insert,&row.values,None,ctas_cancel,clock,None,events)?;
-                        result.affected+=1;
+                if !ctas_rows.is_empty() {
+                    let insert = create_table_as::CreateAs::population(prepared, name, self.epoch, columns.len())?;
+                    for row in ctas_rows {
+                        let ctas_cancel: &mut dyn FnMut() -> bool = &mut cancel;
+                        self.execute_statement_inner(&insert, &row.values, None, ctas_cancel, clock, None, events)?;
+                        result.affected += 1;
                     }
                 }
                 // Candidate keys must exist before self-referencing FKs bind,

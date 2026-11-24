@@ -255,45 +255,6 @@ impl Relational {
     }
 }
 
-pub(super) fn parse_create_as(p: &mut Parser, name: String, optional: bool) -> R<Statement> {
-    let mut no_data = false;
-    p.sym(';');
-    if p.tokens.last() == Some(&Token::Symbol(';')) {
-        p.tokens.pop();
-    }
-    let len = p.tokens.len();
-    if len >= 3
-        && p.tokens[len - 3..]
-            == [
-                Token::Word("with".into()),
-                Token::Word("no".into()),
-                Token::Word("data".into()),
-            ]
-    {
-        no_data = true;
-        p.tokens.truncate(len - 3);
-    } else if len >= 2
-        && p.tokens[len - 2..] == [Token::Word("with".into()), Token::Word("data".into())]
-    {
-        p.tokens.truncate(len - 2);
-    }
-    let query = query::Query::parse(p)?;
-    Ok(Statement::Create {
-        name,
-        optional,
-        columns: vec![],
-        typmods: vec![],
-        user_types: vec![],
-        collations: vec![],
-        defaults: vec![],
-        generated: vec![],
-        sequences: vec![],
-        keys: vec![],
-        constraints: vec![],
-        primary_name: None,
-        as_query: Some((Box::new(query), no_data)),
-    })
-}
 pub(super) fn rewrite_into(mut tokens: Vec<Token>) -> R<Vec<Token>> {
     if !matches!(tokens.first(),Some(Token::Word(w)) if w=="select") {
         return Ok(tokens);

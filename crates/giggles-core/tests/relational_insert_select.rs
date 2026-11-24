@@ -794,18 +794,17 @@ fn more_than_max_rows_is_rejected_before_any_insert() {
 }
 
 #[test]
-fn unsupported_source_forms_keep_existing_errors() {
+fn union_sources_and_invalid_insert_forms() {
     let mut db = Db::new();
     let s = db.session();
     fixture(s);
-    error(
-        s,
-        "INSERT INTO dst(id) SELECT 600 UNION SELECT 601",
-        E::Unsupported,
+    assert_eq!(
+        run(s, "INSERT INTO dst(id) SELECT 600 UNION SELECT 601").affected,
+        2
     );
     error(s, "INSERT INTO dst VALUES((SELECT 1))", E::Syntax);
     error(s, "EXPLAIN INSERT INTO dst(id) SELECT 1", E::Syntax);
-    assert!(rows(s, "SELECT * FROM dst").is_empty());
+    assert_eq!(rows(s, "SELECT id FROM dst ORDER BY id"), ints(&[600, 601]));
 }
 
 #[test]

@@ -13,6 +13,18 @@ pub(super) struct Function {
     pub input: Option<Box<Plan>>,
     ordinality: bool,
 }
+fn known(name: &str) -> bool {
+    projection_function(name)
+        || json_srf::record(name)
+        || text_search_srf::known(name)
+        || regexp::set_type(name).is_some()
+}
+
+pub(super) fn projection_function(name: &str) -> bool {
+    matches!(name, "generate_series" | "unnest")
+        || (json_srf::known(name) && !json_srf::record(name))
+}
+
 pub(super) fn parse(
     p: &mut Parser,
     name: &str,
@@ -24,11 +36,7 @@ pub(super) fn parse(
         .strip_prefix("pg_catalog\0")
         .unwrap_or(name)
         .to_string();
-    if !["generate_series", "unnest"].contains(&name.as_str())
-        && !json_srf::known(&name)
-        && !text_search_srf::known(&name)
-        && regexp::set_type(&name).is_none()
-    {
+    if !known(&name) {
         return Err(SqlError::UndefinedFunction);
     }
     let open = p.at;

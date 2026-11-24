@@ -1968,10 +1968,10 @@ impl Session {
         self.service.binding_changes.send_replace(());
         result
     }
-    /// Wire description of a prepared statement. DDL returns no rows and takes
-    /// no parameters; core does not describe it, so report an empty shape.
+    /// Wire description of a prepared statement. Ordinary DDL has an empty
+    /// shape. CTAS may inherit parameters from its source query.
     pub fn describe(&mut self, p: &Prepared) -> Result<relational::Description, CoreError> {
-        if p.is_ddl() {
+        if p.is_ddl() && !p.is_create_as() {
             return Ok(relational::Description {
                 type_oids: vec![],
                 typmods: vec![],

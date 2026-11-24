@@ -2869,9 +2869,6 @@ impl Query {
             limit: None,
         })
     }
-    pub(super) fn parse_insert_source(p: &mut Parser) -> R<Self> {
-        Self::parse(p)
-    }
     pub(super) fn parse(p: &mut Parser) -> R<Self> {
         Self::parse_with_following(p, None)
     }
@@ -2886,7 +2883,11 @@ impl Query {
         Ok(query)
     }
     fn parse_unlocked(p: &mut Parser, following: Option<&Token>) -> R<Self> {
-        if plan::Plan::requires_grouping_rewrite(&p.tokens[p.at..]) { return Err(SqlError::Unsupported); }
+        if plan::Plan::requires_grouping_rewrite(&p.tokens[p.at..])
+            || plan::Plan::requires_project_set(&p.tokens[p.at..])
+        {
+            return Err(SqlError::Unsupported);
+        }
         admit_subquery_depth(&p.tokens[p.at..])?;
         if plan::subquery::quantified(&p.tokens[p.at..]) {
             return Err(SqlError::Unsupported);

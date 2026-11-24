@@ -9,6 +9,17 @@ pub(super) struct Meta {
     // Binding-only scalar metadata for set-operation collation diagnostics.
     pub collations: Vec<Option<BoundScalar>>,
 }
+impl Meta {
+    fn description(self, parameters: Vec<Option<DataType>>) -> Description {
+        Description {
+            columns: self.columns,
+            typmods: self.typmods,
+            type_oids: self.type_oids,
+            parameters: parameters.into_iter().map(|ty| ty.unwrap_or(DataType::Text)).collect(),
+        }
+    }
+}
+
 pub(super) struct BoundPlan {
     pub plan: Plan,
     pub description: Description,
@@ -95,6 +106,21 @@ impl Plan {
     ) -> R<Description> {
         Ok(self.bind(state, count, declared)?.description)
     }
+    pub(in crate::relational) fn describe_create_as(
+        &self,
+        state: &Relational,
+        count: usize,
+        declared: &[Option<DataType>],
+    ) -> R<(Description, Vec<Option<String>>)> {
+        let (_, meta, parameters) = self.resolve_for_bind(state, count, declared)?;
+        let collations = meta.collations.iter().map(|value| {
+            value.as_ref().map_or(Ok(None), |value| {
+                value.explicit_collation().map(|name| name.map(str::to_owned))
+            })
+        }).collect::<R<Vec<_>>>()?;
+        Ok((meta.description(parameters), collations))
+    }
+
     pub(in crate::relational) fn validate_immutable_constants(
         &self,
         state: &Relational,
@@ -187,6 +213,16 @@ impl Plan {
         count: usize,
         declared: &[Option<DataType>],
     ) -> R<BoundPlan> {
+        let (plan, meta, parameters) = self.resolve_for_bind(state, count, declared)?;
+        Ok(BoundPlan { plan, description: meta.description(parameters) })
+    }
+
+    fn resolve_for_bind(
+        &self,
+        state: &Relational,
+        count: usize,
+        declared: &[Option<DataType>],
+    ) -> R<(Plan, Meta, Vec<Option<DataType>>)> {
         let _metadata = functions::collation::ColumnScope::enter(&[], &[])?;
         if count > MAX_PARAMS || declared.len() > count {
             return Err(SqlError::Parameters);
@@ -195,18 +231,7 @@ impl Plan {
         parameters[..declared.len()].clone_from_slice(declared);
         let mut plan = self.clone();
         let meta = plan.resolve(state, &mut parameters)?;
-        Ok(BoundPlan {
-            plan,
-            description: Description {
-                columns: meta.columns,
-                typmods: meta.typmods,
-                type_oids: meta.type_oids,
-                parameters: parameters
-                    .into_iter()
-                    .map(|t| t.unwrap_or(DataType::Text))
-                    .collect(),
-            },
-        })
+        Ok((plan, meta, parameters))
     }
     pub(super) fn resolve(
         &mut self,

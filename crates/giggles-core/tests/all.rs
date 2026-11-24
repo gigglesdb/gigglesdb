@@ -335,6 +335,8 @@ mod logical_columns;
 mod relational_insert_select;
 #[path = "sql_insert_select_literals.rs"]
 mod sql_insert_select_literals;
+#[path = "sql_insert_select_sources.rs"]
+mod sql_insert_select_sources;
 #[path = "user_schemas.rs"]
 mod user_schemas;
 

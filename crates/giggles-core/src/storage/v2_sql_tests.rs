@@ -1470,7 +1470,11 @@ fn legacy_unsupported_read_forms_keep_exact_errors() {
         let result = parity(&mut a, &mut b, sql, &[]).unwrap();
         assert_eq!(result.rows.into_iter().map(|r| r.values).collect::<Vec<_>>(), expected, "{sql}");
     }
-    parity(&mut a, &mut b, "INSERT INTO b SELECT id FROM a UNION SELECT id FROM b", &[]).unwrap_err();
+    assert_eq!(
+        parity(&mut a, &mut b, "INSERT INTO b SELECT id FROM a UNION SELECT id FROM b WHERE false", &[])
+            .unwrap().affected,
+        1,
+    );
     drop((a, b, legacy));
     fs::remove_dir_all(path).unwrap();
 }

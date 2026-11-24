@@ -1254,9 +1254,11 @@ fn completion_frames(
         body.push(0);
         limit.frame(b'N', &body, out)?;
     }
-    sql_notice_frames(out, limit)?;
+    let duplicate_table = sql_notice_frames(out, limit)?;
     let tag = match command {
         "SELECT" => format!("SELECT {}", r.rows.len()),
+        "CREATE TABLE AS" if !duplicate_table => format!("SELECT {}", r.affected),
+        "CREATE TABLE AS WITH NO DATA" => "CREATE TABLE AS".into(),
         "INSERT" => format!("INSERT 0 {}", r.affected),
         "UPDATE" | "DELETE" | "MERGE" => format!("{command} {}", r.affected),
         _ => command.into(),
@@ -1266,8 +1268,10 @@ fn completion_frames(
     limit.frame(b'C', &b, out)
 }
 
-fn sql_notice_frames(out: &mut Vec<u8>, limit: ReplyLimit) -> R<()> {
+fn sql_notice_frames(out: &mut Vec<u8>, limit: ReplyLimit) -> R<bool> {
+    let mut duplicate_table = false;
     for (message, detail, code) in giggles_core::relational::take_sql_notices() {
+        duplicate_table |= code == Some("42P07");
         let severity = if matches!(code, Some("22023" | "01000")) { "WARNING" } else { "NOTICE" };
         let mut body = vec![];
         for (field, value) in [
@@ -1286,7 +1290,7 @@ fn sql_notice_frames(out: &mut Vec<u8>, limit: ReplyLimit) -> R<()> {
         body.push(0);
         limit.frame(b'N', &body, out)?;
     }
-    Ok(())
+    Ok(duplicate_table)
 }
 fn core<T>(r: Result<T, CoreError>) -> R<T> {
     r.map_err(|e| crate::service::sqlstate(&e))
@@ -1454,7 +1458,7 @@ fn prepare_declared_sql_diagnostic(
     } else {
         prepared
     };
-    let (description, enum_parameters) = if prepared.is_ddl() {
+    let (description, enum_parameters) = if prepared.is_ddl() && !prepared.is_create_as() {
         (diagnostic.core(session.describe(&prepared))?, Default::default())
     } else {
         diagnostic.core(session.sql.describe_with_enum_parameters(&prepared))?
@@ -3003,7 +3007,7 @@ impl State {
                 flush_output(&self.output, out)?;
             }
             if spilled.is_empty() {
-                complete(prepared.command(), p.result.as_ref().expect("spilled result"), out)?;
+                complete(prepared.completion_command(), p.result.as_ref().expect("spilled result"), out)?;
             } else {
                 frame(b's', &[], out)?;
             }
@@ -3030,7 +3034,7 @@ impl State {
         if end < total {
             frame(b's', &[], out)?;
         } else {
-            complete(prepared.command(), result, out)?;
+            complete(prepared.completion_command(), result, out)?;
         }
         Ok(())
     }

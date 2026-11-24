@@ -51,6 +51,10 @@ fn top_positions(tokens: &[Token], statement_end: bool) -> R<Vec<usize>> {
     Ok(out)
 }
 impl Plan {
+    pub(in crate::relational) fn requires_project_set(tokens: &[Token]) -> bool {
+        project_set::requires_plan(tokens)
+    }
+
     pub(in crate::relational) fn requires_grouping_rewrite(tokens: &[Token]) -> bool {
         let mut depth = 0usize;
         let mut group = false;
@@ -101,6 +105,7 @@ impl Plan {
                 .is_some_and(|t| ["values", "table", "with"].iter().any(|w| word(t, w)));
         }
         if Self::requires_grouping_rewrite(tokens)
+            || project_set::claims(tokens)
             || tokens.get(1).is_some_and(|t| word(t, "distinct")) && tokens.get(2).is_some_and(|t| word(t, "on"))
         { return true; }
         // Claim detection must still see a planner construct when a later
@@ -671,6 +676,11 @@ pub(super) fn select_base(
     grouping_sets: Option<&group_sets::GroupingSets>,
     distinct_on: &mut [Scalar],
 ) -> ParseResult<Plan> {
+    let rewritten_projection = project_set::rewrite(tokens)?;
+    if rewritten_projection.is_some() && grouping_sets.is_some() {
+        return Err(SqlError::Unsupported.into());
+    }
+    let tokens = rewritten_projection.as_deref().unwrap_or(tokens);
     if let Some(plan) = window::parse(
         tokens, following, owner, depth, next, grouping_sets, distinct_on,
     )? {

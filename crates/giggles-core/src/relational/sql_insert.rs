@@ -1,5 +1,6 @@
 //! Bounded SQL multi-row INSERT and ON CONFLICT frontend.
 use super::*;
+pub(super) use select_source::SelectSource as Source;
 use query::assignment::SourceType;
 use crate::operations::{self, ConflictAction};
 
@@ -21,26 +22,6 @@ pub(super) struct Insert {
     pub(super) returning: Option<returning::Returning>,
     pub(super) source: Option<Source>,
 }
-#[derive(Debug, Clone)]
-pub(super) enum Source {
-    Query(Box<query::Query>),
-    Plan(Box<query::plan::Plan>, usize),
-}
-impl Source {
-    pub(super) fn query(&self) -> Option<&query::Query> {
-        match self {
-            Self::Query(query) => Some(query),
-            Self::Plan(..) => None,
-        }
-    }
-    pub(super) fn read_tables(&self) -> Vec<String> {
-        match self {
-            Self::Query(query) => query.read_tables(),
-            Self::Plan(plan, _) => plan.read_tables(),
-        }
-    }
-}
-
 /// Borrowed syntax needed by static lock classification, without expression internals.
 pub(super) struct LockConflict<'a> {
     pub(super) columns: Option<&'a [String]>,
@@ -101,7 +82,12 @@ pub(super) fn claims(tokens: &[Token]) -> bool {
     let mut has_values_clause = false;
     for (index, token) in tokens.iter().enumerate() {
         match token {
-            Token::Word(word) if index >= 3 && word == "select" && !has_values_clause => {
+            Token::Word(word) if index >= 3 && !has_values_clause
+                && (word == "select"
+                    || depth == 0 && matches!(word.as_str(), "with" | "table")
+                        && tokens[index - 1] != Token::Symbol('.')
+                        && !matches!(&tokens[index - 1], Token::Word(previous) if previous == "as")) =>
+            {
                 return true;
             }
             Token::Word(word) if depth == 0 && word == "on" => {
@@ -182,10 +168,8 @@ impl Insert {
         path: &[String],
     ) -> R<()> {
         bind(&mut self.table);
-        match &mut self.source {
-            Some(Source::Query(query)) => query.bind_schema_names(bind, state, path),
-            Some(Source::Plan(plan, _)) => plan.bind_schema_names(bind, state, path)?,
-            None => {}
+        if let Some(source) = &mut self.source {
+            source.bind_schema_names(bind, state, path)?;
         }
         for expression in self.casts.values_mut() {
             expression.bind_schema_names(bind, state, path);
@@ -209,10 +193,9 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
     p.need("into")?;
     let table = p.table_name()?;
     let alias = if p.word("as") { Some(p.name()?) } else { None };
-    let columns = if p.tokens.get(p.at) == Some(&Token::Symbol('('))
-        && !matches!(p.tokens.get(p.at + 1), Some(Token::Word(word)) if word == "select")
-        && p.tokens.get(p.at + 1) != Some(&Token::Symbol('('))
-    {
+    let parenthesized_source = Source::starts(p.tokens.get(p.at + 1))
+        && !matches!(p.tokens.get(p.at + 2), Some(Token::Symbol(',' | ')')));
+    let columns = if !parenthesized_source && p.tokens.get(p.at) == Some(&Token::Symbol('(')) {
         names(p)?
     } else {
         vec![]
@@ -234,8 +217,8 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
     let mut casts = BTreeMap::new();
     let mut defaults = Vec::new();
     let source = if !default_values
-        && (matches!(p.tokens.get(p.at), Some(Token::Word(word)) if word == "select")
-            || p.tokens.get(p.at) == Some(&Token::Symbol('(')))
+        && !matches!(p.tokens.get(p.at), Some(Token::Word(word)) if word == "values")
+        && Source::starts(p.tokens.get(p.at))
     {
         Some(parse_source(p)?)
     } else {
@@ -384,14 +367,8 @@ fn parse_source(p: &mut Parser) -> R<Source> {
     let start = p.at;
     let mut end = start;
     let mut depth = 0usize;
-    let mut union_all = None;
     while let Some(token) = p.tokens.get(end) {
         match token {
-            Token::Word(word) if depth == 0 && matches!(word.as_str(), "union" | "intersect" | "except") => {
-                let append = word == "union"
-                    && matches!(p.tokens.get(end + 1), Some(Token::Word(word)) if word == "all");
-                union_all = Some(union_all.unwrap_or(true) && append);
-            }
             Token::Word(word) if depth == 0 && word == "returning" => break,
             Token::Word(word)
                 if depth == 0
@@ -414,55 +391,7 @@ fn parse_source(p: &mut Parser) -> R<Source> {
     if depth != 0 {
         return Err(SqlError::Syntax);
     }
-    let mut tokens = p.tokens[start..end].to_vec();
-    while tokens.first() == Some(&Token::Symbol('(')) {
-        let mut nesting = 0usize;
-        let wraps = tokens.iter().enumerate().all(|(index, token)| {
-            match token {
-                Token::Symbol('(') => nesting += 1,
-                Token::Symbol(')') => nesting = nesting.saturating_sub(1),
-                _ => {}
-            }
-            nesting != 0 || index + 1 == tokens.len()
-        });
-        if !wraps || tokens.last() != Some(&Token::Symbol(')')) {
-            break;
-        }
-        tokens = tokens[1..tokens.len() - 1].to_vec();
-    }
-    let mut parser = Parser { privilege_seen: false, privilege_casts: false,
-        tokens,
-        at: 0,
-        params: BTreeSet::new(),
-        relations: Vec::new(),
-    };
-    let conflict_union_all = union_all == Some(true)
-        && matches!(p.tokens.get(end), Some(Token::Word(word)) if word == "on");
-    let source = match query::Query::parse_insert_source(&mut parser) {
-        Ok(query) => Source::Query(Box::new(query)),
-        Err(error @ (SqlError::Syntax | SqlError::Unsupported | SqlError::Reserved))
-            if conflict_union_all || p.tokens[start..end].windows(2).any(|pair| {
-                pair[0] == Token::Symbol('(')
-                    && matches!(&pair[1], Token::Word(word) if word == "values")
-            }) =>
-        {
-            parser = Parser { tokens: p.tokens[start..end].to_vec(), at: 0,
-                params: BTreeSet::new(), relations: vec![], privilege_seen: false,
-                privilege_casts: false };
-            let plan = query::plan::Plan::parse(&mut parser).map_err(|failure| match failure {
-                query::plan::ParseError::Decline => error,
-                query::plan::ParseError::Definite(error) => error,
-            })?;
-            let count = parser.params.last().copied().unwrap_or(0);
-            Source::Plan(Box::new(plan), count)
-        }
-        Err(error) => return Err(error),
-    };
-    p.privilege_seen |= parser.privilege_seen;
-        p.params.extend(parser.params);
-    p.relations.extend(parser.relations);
-    p.at = end;
-    Ok(source)
+    Source::parse(p, end)
 }
 fn operand(p: &mut Parser) -> R<Operand> {
     if p.word("default") {
@@ -716,10 +645,7 @@ impl Insert {
         let mut dependencies = self
             .source
             .as_ref()
-            .map_or_else(Vec::new, |source| match source {
-                Source::Query(query) => query.sequence_dependencies(),
-                Source::Plan(plan, _) => plan.sequences(),
-            });
+            .map_or_else(Vec::new, Source::sequences);
         for expression in self.casts.values() {
             dependencies.extend(expression.sequence_dependencies());
         }

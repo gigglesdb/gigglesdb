@@ -997,7 +997,7 @@ impl State {
                         giggles_core::cancellation::check()
                     })?;
                     let suffix = scratch.len();
-                    completion_frames(p.command(), &result, &mut scratch, ReplyLimit::Checked)
+                    completion_frames(p.completion_command(), &result, &mut scratch, ReplyLimit::Checked)
                         .map_err(CoreError::SqlReplyEncoding)?;
                     spill_completion.extend_from_slice(&scratch[suffix..]);
                     Ok(())
@@ -1005,7 +1005,7 @@ impl State {
                     // The per-message output is private until execution succeeds.
                     row_description(d, &[], out).map_err(CoreError::SqlReplyEncoding)?;
                     encoder.encode(&result, out).map_err(CoreError::SqlReplyEncoding)?;
-                    completion_frames(p.command(), &result, out, ReplyLimit::Checked)
+                    completion_frames(p.completion_command(), &result, out, ReplyLimit::Checked)
                         .map_err(CoreError::SqlReplyEncoding)
                 }
             };
@@ -1058,7 +1058,7 @@ impl State {
                 .map_err(|code| if autocommit_write { "08007" } else { code })?;
         }
         if !checked {
-            completion_frames(p.command(), &result, out, ReplyLimit::after_commit(autocommit_write))?;
+            completion_frames(p.completion_command(), &result, out, ReplyLimit::after_commit(autocommit_write))?;
         }
         Ok(())
     }
