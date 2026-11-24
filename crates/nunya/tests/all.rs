@@ -71,3 +71,5 @@ mod policy_fencing_live;
 mod result_refusal;
 #[path = "housekeeping_live.rs"]
 mod housekeeping_live;
+#[path = "first_run.rs"]
+mod first_run;

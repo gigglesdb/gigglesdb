@@ -40,3 +40,5 @@ pub mod spanner_serve;
 
 mod reload;
 mod config_reload;
+mod first_run;
+mod private_file;

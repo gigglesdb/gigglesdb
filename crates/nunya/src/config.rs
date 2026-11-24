@@ -229,8 +229,11 @@ pub struct Config {
     pub postgres_policy: Option<PathBuf>,
     /// Effective native Spanner route policy path, when configured.
     pub spanner_policy: Option<PathBuf>,
-    /// Root key bytes erased on drop.
-    pub root_key: Zeroizing<[u8; 32]>,
+    pub(crate) postgres_policy_is_default: bool,
+    pub(crate) spanner_policy_is_default: bool,
+    pub(crate) root_key_file: Option<PathBuf>,
+    /// Resolved root key bytes, erased on drop. Set during startup or reload.
+    pub root_key: Option<Zeroizing<[u8; 32]>>,
     /// Resolved state directory.
     pub state_dir: PathBuf,
     /// Selected schemas.
@@ -275,6 +278,11 @@ impl Config {
     /// Read and validate a configuration file.
     pub fn load(path: &Path) -> Result<Self, Vec<String>> {
         load(path)
+    }
+    pub(crate) fn root_key_hex(&self) -> Result<Zeroizing<String>, String> {
+        self.root_key.as_ref()
+            .map(|key| Zeroizing::new(data_encoding::HEXLOWER.encode(key.as_ref())))
+            .ok_or_else(|| "root key unavailable".into())
     }
     /// Advertised PostgreSQL host and port for the configured listener.
     pub(crate) fn postgres_endpoint(&self) -> Option<(String, u16)> {
@@ -440,7 +448,7 @@ fn secret(p: Option<PathBuf>, env: &str) -> Option<Zeroizing<Vec<u8>>> {
             .map(|s| Zeroizing::new(s.into_bytes())),
     }
 }
-fn key(bytes: &[u8]) -> Option<Zeroizing<[u8; 32]>> {
+pub(crate) fn key(bytes: &[u8]) -> Option<Zeroizing<[u8; 32]>> {
     let mut out = Zeroizing::new([0; 32]);
     if bytes.len() == 32 {
         out.copy_from_slice(bytes);
@@ -477,6 +485,14 @@ fn effective_schemas(schemas: Vec<String>, search_path: &[String]) -> Vec<String
 
 /// Read settings and collect independent validation failures without source snippets.
 pub fn load(path: &Path) -> Result<Config, Vec<String>> {
+    load_config(path, true)
+}
+
+pub(crate) fn load_for_management_client(path: &Path) -> Result<Config, Vec<String>> {
+    load_config(path, false)
+}
+
+fn load_config(path: &Path, read_upstream_password: bool) -> Result<Config, Vec<String>> {
     let text = Zeroizing::new(
         std::fs::read_to_string(path).map_err(|_| vec!["config: cannot read file".into()])?,
     );
@@ -551,12 +567,10 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         }
         age
     });
-    let policy_settings = crate::policy::ServicePolicySettings { readlog, snapshot_max_age_ms };
+    let mut policy_settings = crate::policy::ServicePolicySettings { readlog, snapshot_max_age_ms };
     let has_upstream = m.contains_key("upstream");
-    let listen = get(&mut m, "listen", &mut e);
-    if has_upstream && listen.is_none() {
-        err(&mut e, "listen", "valid address required for upstream");
-    }
+    let listen = get(&mut m, "listen", &mut e)
+        .or_else(|| has_upstream.then_some(SocketAddr::from(([127, 0, 0, 1], 6432))));
     let advertise_host: Option<String> = get(&mut m, "advertise_host", &mut e);
     if advertise_host
         .as_ref()
@@ -614,22 +628,9 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     let policy = path_field(&mut m, "policy", &mut e).map(|p| resolve(base, p));
     let state_dir = resolve(
         base,
-        path_field(&mut m, "state_dir", &mut e).unwrap_or_else(|| {
-            err(&mut e, "state_dir", "required path missing");
-            PathBuf::new()
-        }),
+        path_field(&mut m, "state_dir", &mut e).unwrap_or_else(|| PathBuf::from("state")),
     );
-    let rp = path_field(&mut m, "root_key_file", &mut e).map(|p| resolve(base, p));
-    let root_key = secret(rp, "NUNYA_ROOT_KEY")
-        .and_then(|s| key(&s))
-        .unwrap_or_else(|| {
-            err(
-                &mut e,
-                "root key",
-                "missing, unreadable or invalid credential",
-            );
-            Zeroizing::new([0; 32])
-        });
+    let root_key_file = path_field(&mut m, "root_key_file", &mut e).map(|p| resolve(base, p));
     let schemas = get(&mut m, "schemas", &mut e).unwrap_or_else(|| vec!["public".into()]);
     let search_path: Vec<String> = get(&mut m, "search_path", &mut e).unwrap_or_else(|| vec!["public".into()]);
     let schemas = effective_schemas(schemas, &search_path);
@@ -650,7 +651,10 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     if !(1..=10000).contains(&max_connections) {
         err(&mut e, "max_connections", "must be from 1 to 10000");
     }
-    let allow_plaintext = get(&mut m, "allow_plaintext", &mut e).unwrap_or(false);
+    let native_address = spanner_native.as_ref().and_then(|s| s.listen.parse::<SocketAddr>().ok());
+    let implicit_plaintext = !m.contains_key("tls")
+        && listen.into_iter().chain(native_address).all(|addr| addr.ip().is_loopback());
+    let allow_plaintext = get(&mut m, "allow_plaintext", &mut e).unwrap_or(implicit_plaintext);
     let tls = m
         .remove("tls")
         .and_then(|v| parse_tls(v, base, "tls", &mut e));
@@ -721,20 +725,24 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         let application_name =
             get(&mut u, "application_name", &mut e).unwrap_or_else(|| "nunya".into());
         let pp = path_field(&mut u, "password_file", &mut e).map(|p| resolve(base, p));
-        let password = secret(pp, "NUNYA_UPSTREAM_PASSWORD")
-            .and_then(|b| {
-                std::str::from_utf8(&b)
-                    .ok()
-                    .map(|s| Zeroizing::new(s.trim_end_matches(['\r', '\n']).to_owned()))
-            })
-            .unwrap_or_else(|| {
-                err(
-                    &mut e,
-                    "upstream password",
-                    "missing, unreadable or invalid credential",
-                );
-                Zeroizing::new(String::new())
-            });
+        let password = if read_upstream_password {
+            secret(pp, "NUNYA_UPSTREAM_PASSWORD")
+                .and_then(|b| {
+                    std::str::from_utf8(&b)
+                        .ok()
+                        .map(|s| Zeroizing::new(s.trim_end_matches(['\r', '\n']).to_owned()))
+                })
+                .unwrap_or_else(|| {
+                    err(
+                        &mut e,
+                        "upstream password",
+                        "missing, unreadable or invalid credential",
+                    );
+                    Zeroizing::new(String::new())
+                })
+        } else {
+            Zeroizing::new(String::new())
+        };
         crate::pgwire::upstream::UpstreamConfig {
             host,
             port,
@@ -752,16 +760,22 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
             application_name,
         }
     });
-    for (configured, effective, field) in [
-        (has_upstream, &mut postgres_policy, "upstream.policy"),
-        (has_spanner, &mut spanner_policy, "spanner_native.policy"),
-    ] {
-        if configured && effective.is_none() {
-            *effective = policy.clone();
-            if effective.is_none() {
-                err(&mut e, field, "required path missing (no service-level policy)");
-            }
-        }
+    let postgres_policy_is_default = has_upstream && postgres_policy.is_none() && policy.is_none();
+    let spanner_policy_is_default = has_spanner && spanner_policy.is_none() && policy.is_none();
+    if has_upstream {
+        postgres_policy = postgres_policy.or_else(|| policy.clone()).or_else(|| Some(base.join("policy.toml")));
+    }
+    if has_spanner {
+        spanner_policy = spanner_policy.or(policy).or_else(|| Some(base.join("policy.toml")));
+    }
+    if (postgres_policy_is_default || spanner_policy_is_default) && policy_settings.readlog.is_none() {
+        // Version 2 policies take their audit destination from the service. Reuse any
+        // legacy destination named by a route before falling back to stdout.
+        let legacy_readlog = [&postgres_policy, &spanner_policy].into_iter().flatten().find_map(|path| {
+            let bytes = std::fs::read(path).ok()?;
+            crate::serve::parse_policy_bytes(path, &bytes, &Default::default()).ok()?.file_readlog
+        });
+        policy_settings.readlog = legacy_readlog.or(Some(crate::policy::ReadLogSink::Stdout));
     }
     let mut standing = Vec::new();
     let mut names = std::collections::BTreeSet::new();
@@ -799,6 +813,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         .remove("session")
         .map(|v| parse_session(v, &mut e))
         .unwrap_or_default();
+    let default_management = !m.contains_key("management");
     let management = m.remove("management").and_then(|v| {
         let mut t = table(v, &["listen", "tls", "admin"], "management", &mut e);
         let address = t
@@ -842,22 +857,21 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         if !address.ip().is_loopback() && tls.is_none() {
             err(&mut e, "management", "non-loopback listen requires tls");
         }
-        let native_address = spanner_native
-            .as_ref()
-            .and_then(|s| s.listen.parse::<SocketAddr>().ok());
-        if Some(address) == listen || address == admin_listen || Some(address) == native_address {
-            err(
-                &mut e,
-                "management",
-                "listen conflicts with another listener",
-            );
-        }
         Some(ManagementSection {
             listen: address,
             tls,
             admins,
         })
-    });
+    }).or_else(|| default_management.then(|| ManagementSection {
+        listen: SocketAddr::from(([127, 0, 0, 1], 6481)),
+        tls: None,
+        admins: Vec::new(),
+    }));
+    if management.as_ref().is_some_and(|m| {
+        Some(m.listen) == listen || m.listen == admin_listen || Some(m.listen) == native_address
+    }) {
+        err(&mut e, "management", "listen conflicts with another listener");
+    }
     if management.as_ref().is_some_and(|m| {
         m.admins
             .iter()
@@ -892,8 +906,11 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         file_policy_routes: [(postgres_file_owner, &postgres_route_id), (spanner_file_owner, &spanner_route_id)].into_iter().filter_map(|(release, route)| if release { route.clone() } else { None }).collect(),
         postgres_policy,
         spanner_policy,
+        postgres_policy_is_default,
+        spanner_policy_is_default,
         state_dir,
-        root_key,
+        root_key_file,
+        root_key: None,
         schemas,
         search_path,
         schema_snapshot_timeout_ms,
@@ -1375,17 +1392,27 @@ tls = "disable"
         assert_eq!(c.spanner_policy, c.postgres_policy);
     }
     #[test]
-    fn missing_route_policy_is_a_clear_error() {
+    fn missing_route_policy_uses_config_directory_default() {
         let f = Fixture::new();
         let text = EXAMPLE.replace("policy = \"policy.toml\"\n", "");
-        let pg_error = "upstream.policy: required path missing (no service-level policy)";
-        let spanner_error = "spanner_native.policy: required path missing (no service-level policy)";
-        assert_eq!(f.load(&text).unwrap_err(), vec![pg_error]);
-        assert_eq!(f.load(&format!("{text}{NATIVE}policy='s.toml'\n")).unwrap_err(), vec![pg_error]);
+        let default_path = Some(f.0.join("policy.toml"));
+        let pg = f.load(&text).unwrap();
+        assert_eq!(pg.postgres_policy, default_path);
+        assert!(pg.postgres_policy_is_default);
+        let native_own = f.load(&format!("{text}{NATIVE}policy='s.toml'\n")).unwrap();
+        assert_eq!(native_own.postgres_policy, default_path);
+        assert!(native_own.postgres_policy_is_default);
+        assert!(!native_own.spanner_policy_is_default);
         let pg_own = text.replace("[upstream]", "[upstream]\npolicy='p.toml'");
-        assert_eq!(f.load(&format!("{pg_own}{NATIVE}")).unwrap_err(), vec![spanner_error]);
+        let pg_own = f.load(&format!("{pg_own}{NATIVE}")).unwrap();
+        assert_eq!(pg_own.spanner_policy, default_path);
+        assert!(pg_own.spanner_policy_is_default);
+        assert!(!pg_own.postgres_policy_is_default);
         let native_only = format!("{}{NATIVE}", text.split("[upstream]").next().unwrap());
-        assert_eq!(f.load(&native_only).unwrap_err(), vec![spanner_error]);
+        let native_only = f.load(&native_only).unwrap();
+        assert_eq!(native_only.spanner_policy, default_path);
+        assert!(native_only.spanner_policy_is_default);
+        assert!(!f.0.join("policy.toml").exists());
     }
     #[test]
     fn route_policy_key_invalid_or_unknown_neighbour_refused() {
@@ -1458,7 +1485,7 @@ tls = "disable"
         assert_eq!(c.session, SessionSettings::default());
         assert_eq!(c.session.max_lifetime, Duration::from_secs(28800));
         assert_eq!(c.session.idle_timeout, Some(Duration::from_secs(3600)));
-        assert!(c.management.is_none());
+        assert_eq!(c.management.unwrap().listen, "127.0.0.1:6481".parse().unwrap());
         assert_eq!(c.session.lifetime_for(None), Ok(c.session.max_lifetime));
         assert_eq!(
             c.session.lifetime_for(Some(Duration::from_nanos(1))),
@@ -1691,10 +1718,8 @@ tls = "disable"
         assert!(config.listen.is_none());
         assert!(config.spanner_native.is_some());
         assert!(f.load(&base).is_err());
-        assert!(
-            f.load(&EXAMPLE.replace("listen = \"127.0.0.1:6432\"", ""))
-                .is_err()
-        );
+        let pg = f.load(&EXAMPLE.replace("listen = \"127.0.0.1:6432\"", "")).unwrap();
+        assert_eq!(pg.listen, Some("127.0.0.1:6432".parse().unwrap()));
         for invalid in [
             native.replace(
                 "projects/p/instances/i/databases/d",
@@ -1853,8 +1878,10 @@ tls = "disable"
     fn invalid_tls_and_root_key_are_sanitized() {
         let f = Fixture::new();
         std::fs::write(f.0.join("root.key"), "secret-invalid-key").unwrap();
-        let errors = f.load(EXAMPLE).unwrap_err();
-        assert!(!format!("{errors:?}").contains("secret-invalid-key"));
+        let mut config = f.load(EXAMPLE).unwrap();
+        assert!(config.root_key.is_none());
+        let error = crate::first_run::load_root_key(&mut config, false).unwrap_err();
+        assert_eq!(error, "root key: missing, unreadable or invalid credential");
         assert!(
             load_tls(&TlsSection {
                 cert_file: f.0.join("missing"),
@@ -1862,6 +1889,40 @@ tls = "disable"
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn first_run_listener_defaults_and_plaintext_rules() {
+        let f = Fixture::new();
+        let native = "[spanner_native]\nroute_id='data'\ndatabase='projects/p/instances/i/databases/d'\n";
+        let c = f.load(native).unwrap();
+        assert_eq!(c.state_dir, f.0.join("state"));
+        assert!(!c.state_dir.exists());
+        assert_eq!(c.policy_settings.readlog, Some(crate::policy::ReadLogSink::Stdout));
+        assert_eq!(c.spanner_native.unwrap().listen, "127.0.0.1:6433");
+        let management = c.management.unwrap();
+        assert_eq!(management.listen, "127.0.0.1:6481".parse().unwrap());
+        assert!(management.tls.is_none());
+        assert!(c.allow_plaintext);
+
+        let upstream = EXAMPLE.split_once("[upstream]").unwrap().1;
+        let pg = format!("[upstream]{upstream}");
+        let c = f.load(&pg).unwrap();
+        assert_eq!(c.listen, Some("127.0.0.1:6432".parse().unwrap()));
+        assert!(c.allow_plaintext);
+        let tls_error = "tls: required unless allow_plaintext is true";
+        for text in [
+            format!("allow_plaintext=false\n{native}"),
+            format!("{native}listen='0.0.0.0:6433'"),
+            format!("listen='0.0.0.0:6432'\n{pg}{native}"),
+        ] {
+            assert_eq!(f.load(&text).unwrap_err(), vec![tls_error]);
+        }
+        assert!(f.load(&format!("allow_plaintext=true\n{native}listen='0.0.0.0:6433'")).is_ok());
+        let conflict = format!("{native}listen='127.0.0.1:6481'");
+        assert_eq!(f.load(&conflict).unwrap_err(), vec!["management: listen conflicts with another listener"]);
+        let conflict = format!("[management]\nlisten='127.0.0.1:6432'\n{pg}");
+        assert_eq!(f.load(&conflict).unwrap_err(), vec!["management: listen conflicts with another listener"]);
     }
 
     #[test]

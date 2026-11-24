@@ -506,6 +506,43 @@ impl Authority {
     pub fn set_session_limits(&self, limits: SessionLimits) {
         *self.limits.write().unwrap_or_else(std::sync::PoisonError::into_inner) = limits;
     }
+    /// Persist the local bootstrap administrator and its verifier together.
+    pub(crate) fn bootstrap_operator(&self, verifier: Verifier) -> Result<(), AuthorityError> {
+        let _writer = self.writer.lock().unwrap();
+        let p = Principal {
+            id: PrincipalId::random(),
+            name: "operator".into(),
+            kind: PrincipalKind::Person,
+            state: PrincipalState::Enabled,
+            source: PrincipalSource::Api,
+            administrator: true,
+            revision: 1,
+        };
+        if self.view.read().unwrap().principals.values().any(|existing| {
+            existing.administrator || existing.name == p.name
+        }) {
+            return Err(AuthorityError::NameTaken);
+        }
+        let c = PrincipalCredential {
+            id: CredentialId::random(),
+            principal: p.id,
+            verifier,
+            state: CredentialState::Active,
+            expires_ms: None,
+        };
+        let mut tx = self.store.write()?;
+        tx.put(Table::Principals, &keys::principal(p.id), &encode(&p))?;
+        tx.put(
+            Table::PrincipalCredentials,
+            &keys::principal_credential(p.id, c.id),
+            &encode(&c),
+        )?;
+        tx.commit()?;
+        let mut view = self.view.write().unwrap();
+        view.principals.insert(p.id, p);
+        view.credentials.insert(c.id, c);
+        Ok(())
+    }
     /// Create an API principal with the legacy global retry owner.
     pub fn create_principal(
         &self,

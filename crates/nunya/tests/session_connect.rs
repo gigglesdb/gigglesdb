@@ -68,6 +68,7 @@ async fn postgres_sessions_advertise_route_connection() -> ServeResult<()> {
         let store = HelperStore::at(&store_path);
         let opts = AcquireOpts {
             connection: ConnectionOpts {
+                config: None,
                 server: Some(server),
                 follow_leader: false,
                 ca_file: None,
@@ -75,7 +76,7 @@ async fn postgres_sessions_advertise_route_connection() -> ServeResult<()> {
                 principal_secret_file: None,
                 context: None,
             },
-            route: "postgres".into(),
+            route: Some("postgres".into()),
             mode: Some(mode),
             ttl: None,
             label: None,

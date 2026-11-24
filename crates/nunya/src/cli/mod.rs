@@ -59,37 +59,73 @@ enum StandingCommand {
 enum KeyCommand {
     Generate,
 }
-fn load_policy(path: &Path, service: &crate::policy::ServicePolicySettings) -> Result<crate::policy::Policy, Vec<String>> {
-    let bytes = std::fs::read(path).map_err(|_| vec!["policy file unavailable".into()])?;
-    crate::serve::parse_policy_bytes(path, &bytes, service).map(|doc| doc.policy).map_err(|errors| {
+fn load_policy(
+    path: &Path,
+    service: &crate::policy::ServicePolicySettings,
+    implicit: bool,
+) -> Result<(crate::policy::Policy, bool), Vec<String>> {
+    let (bytes, builtin) = match std::fs::read(path) {
+        Ok(bytes) if implicit && bytes.is_empty() => {
+            return Err(vec![format!(
+                "default policy file unavailable or empty: {}",
+                path.display()
+            )]);
+        }
+        Ok(bytes) => (bytes, false),
+        Err(error) if implicit && error.kind() == io::ErrorKind::NotFound => {
+            (crate::first_run::DEFAULT_POLICY.to_vec(), true)
+        }
+        Err(_) => return Err(vec![format!("policy file unavailable: {}", path.display())]),
+    };
+    crate::serve::parse_policy_bytes(path, &bytes, service).map(|doc| (doc.policy, builtin)).map_err(|errors| {
         errors
             .into_iter()
             .map(|e| e.to_string())
             .collect::<Vec<_>>()
     })
 }
+
+fn check_readlog(sink: &crate::policy::ReadLogSink) -> io::Result<()> {
+    if let crate::policy::ReadLogSink::File { path, .. } = sink {
+        match std::fs::OpenOptions::new().append(true).open(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let parent = path.parent().filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                if !std::fs::metadata(parent)?.is_dir() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 async fn validate(path: &Path) -> Result<(), Vec<String>> {
     let cfg = Config::load(path)?;
+    crate::first_run::check_explicit_root_key(&cfg).map_err(|e| vec![e])?;
     if let Some(tls) = &cfg.tls {
         crate::config::load_tls(tls).map_err(|e| vec![e])?;
     }
-    let postgres_policy = cfg.postgres_policy.as_deref().map(|path| load_policy(path, &cfg.policy_settings)).transpose()?;
-    let spanner_policy = cfg.spanner_policy.as_deref().map(|path| load_policy(path, &cfg.policy_settings)).transpose()?;
-    if let (Some(pg), Some(spanner)) = (&postgres_policy, &spanner_policy)
+    let postgres_policy = cfg.postgres_policy.as_deref().map(|path| {
+        load_policy(path, &cfg.policy_settings, cfg.postgres_policy_is_default)
+    }).transpose()?;
+    let spanner_policy = cfg.spanner_policy.as_deref().map(|path| {
+        load_policy(path, &cfg.policy_settings, cfg.spanner_policy_is_default)
+    }).transpose()?;
+    if let (Some((pg, _)), Some((spanner, _))) = (&postgres_policy, &spanner_policy)
         && crate::serve::readlog_key(&pg.readlog) != crate::serve::readlog_key(&spanner.readlog)
     {
         return Err(vec!["policy files name different read logs".into()]);
     }
-    let policy = postgres_policy
+    let (policy, _) = postgres_policy
         .as_ref()
         .or(spanner_policy.as_ref())
         .ok_or_else(|| vec!["route policy unavailable".into()])?;
-    let _sink = crate::readlog::open_sink(&policy.readlog)
-        .map_err(|_| vec!["read log unavailable".into()])?;
-    if let Some(upstream) = cfg.upstream_config() {
-        let policy = postgres_policy
-            .as_ref()
-            .ok_or_else(|| vec!["route policy unavailable".into()])?;
+    check_readlog(&policy.readlog).map_err(|_| vec!["read log unavailable".into()])?;
+    // The built-in policy has no catalog-bound declarations to validate.
+    if let (Some(upstream), Some((policy, false))) = (cfg.upstream_config(), &postgres_policy) {
         let schema = crate::serve::connect_schema(&upstream)
             .await
             .map_err(|e| vec![e])?;
@@ -103,22 +139,8 @@ async fn validate(path: &Path) -> Result<(), Vec<String>> {
                 .collect::<Vec<_>>()
         })?;
     }
-    if let Some(section) = &cfg.spanner_native {
-        let policy = spanner_policy
-            .as_ref()
-            .ok_or_else(|| vec!["route policy unavailable".into()])?;
-        use crate::spanner::proxy::SpannerUpstream;
-        let upstream = match &section.emulator_endpoint {
-            Some(endpoint) => SpannerUpstream::Emulator {
-                endpoint: endpoint.clone(),
-            },
-            None => SpannerUpstream::Google {
-                endpoint: section
-                    .endpoint
-                    .clone()
-                    .unwrap_or_else(|| "https://spanner.googleapis.com".into()),
-            },
-        };
+    if let (Some(section), Some((policy, false))) = (&cfg.spanner_native, &spanner_policy) {
+        let upstream = crate::spanner_serve::resolve_upstream(section).map_err(|e| vec![e])?;
         let runner =
             crate::spanner::catalog::CatalogRunner::new(&upstream, section.database.clone())
                 .await
@@ -237,7 +259,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.as_path().join("policy.toml");
         std::fs::write(&path, "[readlog]\nsink='file'\npath='./read.log'\n").unwrap();
-        let checked = load_policy(&path, &crate::policy::ServicePolicySettings::default()).unwrap();
+        let (checked, builtin) =
+            load_policy(&path, &crate::policy::ServicePolicySettings::default(), false).unwrap();
+        assert!(!builtin);
         let served =
             crate::serve::parse_policy_bytes(&path, &std::fs::read(&path).unwrap(), &crate::policy::ServicePolicySettings::default()).unwrap();
         assert_eq!(checked.readlog, served.policy.readlog);

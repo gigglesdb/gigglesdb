@@ -1926,6 +1926,7 @@ async fn helper_acquire_resume_scope_replacement_and_isolation() -> TransportRes
     let store = HelperStore::at(f.dir.join("helper"));
     let mut opts = AcquireOpts {
         connection: ConnectionOpts {
+            config: None,
             follow_leader: false,
             server: Some(format!(
                 "http://{}",
@@ -1936,7 +1937,7 @@ async fn helper_acquire_resume_scope_replacement_and_isolation() -> TransportRes
             principal_secret_file: None,
             context: None,
         },
-        route: "postgres".into(),
+        route: Some("postgres".into()),
         mode: Some(Mode::ReadOnly),
         ttl: Some("30m".into()),
         label: None,
@@ -2109,6 +2110,7 @@ async fn principal_cli_lifecycle() -> TransportResult {
     let store = HelperStore::at(f.dir.join("principal-cli-helper"));
     let acquire = AcquireOpts {
         connection: ConnectionOpts {
+            config: None,
             follow_leader: false,
             server: Some(format!(
                 "http://{}",
@@ -2119,7 +2121,7 @@ async fn principal_cli_lifecycle() -> TransportResult {
             principal_secret_file: None,
             context: None,
         },
-        route: "postgres".into(),
+        route: Some("postgres".into()),
         mode: Some(Mode::ReadWrite),
         ttl: Some("30m".into()),
         label: None,

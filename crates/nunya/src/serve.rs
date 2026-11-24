@@ -780,7 +780,9 @@ impl crate::mgmt::policy::PolicySource for ManagementPolicy {
 }
 
 /// Serve agents until a shutdown signal, draining active sessions for thirty seconds.
-pub async fn run(config: Config) -> Result<(), String> {
+pub async fn run(mut config: Config) -> Result<(), String> {
+    crate::first_run::load_root_key(&mut config, true)?;
+    crate::first_run::prepare_state_dir(&config.state_dir)?;
     #[cfg(feature = "kubernetes")]
     let mut election_task = None;
     let result = run_inner(config, #[cfg(feature = "kubernetes")] &mut election_task).await;
@@ -844,7 +846,7 @@ async fn run_inner(mut config: Config, #[cfg(feature = "kubernetes")] election_t
                 retry_period: Duration::from_secs(k.retry_period_secs),
             }).map_err(|_| "Kubernetes election configuration invalid")?))
     } else { None };
-    let root_hex = zeroize::Zeroizing::new(data_encoding::HEXLOWER.encode(&*config.root_key));
+    let root_hex = config.root_key_hex()?;
     let root_key =
         crate::token::keys::RootKey::from_hex(&root_hex).map_err(|_| "root key unavailable")?;
     #[cfg(feature = "kubernetes")]
@@ -867,6 +869,7 @@ async fn run_inner(mut config: Config, #[cfg(feature = "kubernetes")] election_t
     #[cfg(not(feature = "kubernetes"))]
     let runtime = crate::state::runtime::StateRuntime::open(&config.state_dir, &root_key, &config.session, &config.standing)?;
     drop(root_hex);
+    crate::first_run::create_default_policy(&config)?;
     let maintenance = AbortTask(tokio::spawn(runtime.clone().run_maintenance(crate::state::runtime::MAINTENANCE_INTERVAL)));
     #[cfg(feature = "kubernetes")]
     let principals = Arc::new(Mutex::new(crate::state::runtime::config_principals(&config.standing)));
@@ -926,6 +929,7 @@ async fn run_inner(mut config: Config, #[cfg(feature = "kubernetes")] election_t
     hub.set_store(runtime.store())?;
     hub.set_file_owners(&config.file_policy_routes)?;
     hub.set_revision_store(revision_store)?;
+    crate::first_run::bootstrap_admin(&config, &runtime.authority)?;
     #[cfg(feature = "kubernetes")]
     let (peer_state, _peer_task) = if let Some(peer) = config.kubernetes.as_ref().map(|k| &k.peer) {
         let (_, leader) = serving_client.as_ref().ok_or("peer mode requires Kubernetes serving leases")?;
@@ -1115,7 +1119,7 @@ async fn run_inner(mut config: Config, #[cfg(feature = "kubernetes")] election_t
         let readlog = Box::new(hub.route_log(&state.route)?);
         let policy = hub.policy_for(&state.route)?;
         let tls = config.tls.as_ref().map(|_| transports.spanner.clone());
-        let root_hex = zeroize::Zeroizing::new(data_encoding::HEXLOWER.encode(&*config.root_key));
+        let root_hex = config.root_key_hex()?;
         let root_key =
             crate::token::keys::RootKey::from_hex(&root_hex).map_err(|_| "root key unavailable")?;
         let route_hub = hub.clone();
@@ -1251,7 +1255,7 @@ async fn run_postgres(
     let first = first.map_err(|error| error.to_string())?;
 
     let tls = transports.postgres.clone();
-    let root_hex = zeroize::Zeroizing::new(data_encoding::HEXLOWER.encode(&*config.root_key));
+    let root_hex = config.root_key_hex()?;
     let root_key =
         crate::token::keys::RootKey::from_hex(&root_hex).map_err(|_| "root key unavailable")?;
     let ctx = Arc::new(GatewayContext {

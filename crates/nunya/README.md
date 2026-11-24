@@ -22,9 +22,39 @@ Agents must have no direct route to the database. Enforce this with network isol
 
 ## Quick start
 
-Deploy once, provision a principal, then connect through an access session. The [site quickstart](site/docs/quickstart.html) has the complete local PostgreSQL configuration and Windows instructions. [Concepts](site/docs/concepts.html), [configuration](site/docs/configuration.html) and [CLI reference](site/docs/cli.html) explain scope continuity, lifetime settings and commands.
+Deploy once, provision a principal, then connect through an access session. The [site quickstart](site/docs/quickstart.html) has the local harness and Windows instructions. See [configuration](site/docs/configuration.html) for other deployment options.
 
-### 1. Deploy once
+### Start with the Spanner emulator
+
+Start the [local Spanner emulator harness](site/docs/spanner.html#emulator). In a private directory, save this as `nunya.toml`.
+
+```toml
+[spanner_native]
+database = "projects/test-project/instances/test-instance/databases/gsql"
+emulator_endpoint = "http://127.0.0.1:9010"
+```
+
+Start the gateway.
+
+```sh
+nunya serve --config nunya.toml
+```
+
+On a fresh local start, Nunya creates `state/root.key`, `state/operator.secret` and a version 2 `policy.toml` with `default = "tokenize"`. The management listener defaults to `127.0.0.1:6481` and native Spanner listens on `127.0.0.1:6433`. The root key comes from `root_key_file` when configured, then `NUNYA_ROOT_KEY` if set, then `state_dir/root.key`. On Unix, Nunya creates the state directory with mode `0700` and the generated credentials with mode `0600`. On Windows, `root.key`, `operator.secret` and the state directory inherit their parent directory's ACL. Keep configuration and state where only the service account can read them, such as under its user profile. Tighten the ACL before using a shared location such as `C:\ProgramData`.
+
+**Upgrading.** A config without `[management]` gets a loopback management listener on `127.0.0.1:6481`. Set `[management] listen` to move it. If the store has no administrator and the config has none, the next local `serve` creates the `operator` administrator with `<state_dir>/operator.secret`.
+
+In another terminal in the same directory, provision the agent and acquire a session.
+
+```sh
+nunya principal create reporting-agent --kind agent --generate-secret --secret-out principal.secret
+nunya principal grant reporting-agent --route spanner-native=read-only
+nunya session acquire --principal reporting-agent --principal-secret-file principal.secret --route spanner-native --ttl 1h
+```
+
+Use `nunya session env` for the native Spanner connection environment.
+
+### PostgreSQL: deploy once
 
 Build from this crate with `cargo build --release` and put `target/release` on PATH. On Windows, point `LIBCLANG_PATH` at the LLVM bin directory before building because `pg_query` uses bindgen.
 
@@ -33,48 +63,34 @@ $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
 cargo build --release
 ```
 
-Copy `examples/nunya.toml` and `examples/policy.toml` into a private configuration directory. Set the upstream host, port and database, and mark every sensitive column before exposing the gateway. The example points to the [local harness](#local-harness) on loopback port 16432. Create a private local `state_dir` and preserve it across restarts.
+Copy `examples/nunya.toml` and `examples/policy.toml` into a private configuration directory. Set the upstream host, port and database, and mark every sensitive column before exposing the gateway. The example points to the [local harness](#local-harness) on loopback port 16432.
 
-From the private directory, set `umask 077` on Unix or use a private directory ACL on Windows. Save a private administrator password as one UTF-8 line without a byte-order mark in `operator.secret`. Generate its verifier with `nunya standing hash < operator.secret` in Bash or `Get-Content operator.secret | nunya standing hash` in PowerShell. Add the management listener and paste in the generated verifier before starting the service.
-
-```toml
-[management]
-listen = "127.0.0.1:6481"
-
-[[management.admin]]
-name = "operator"
-verifier = "REPLACE_WITH_GENERATED_SCRAM_VERIFIER"
-```
-
-Set `root_key_file = "root.key"` at the top level and `password_file = "upstream.password"` under `[upstream]`. From the private directory in Bash:
+Set `password_file = "upstream.password"` under `[upstream]`. In the private directory, use `umask 077` on Unix or a private ACL on Windows. In Bash, write the upstream password and start Nunya.
 
 ```sh
-mkdir -p state
-nunya key generate > root.key
 printf '%s\n' 'your-upstream-password' > upstream.password
-nunya policy check --config nunya.toml
 nunya serve --config nunya.toml
 ```
 
-Use `nunya-harness-only` for the isolated local harness. For Windows file creation commands, see the [site quickstart](site/docs/quickstart.html#deploy). Keep serve running. Use verified TLS for remote database traffic. Management requires TLS off loopback. The service also accepts `NUNYA_ROOT_KEY` (64 hex characters) and `NUNYA_UPSTREAM_PASSWORD` as alternatives to files. Keep all secret files private.
+Use `nunya-harness-only` for the isolated local harness. For Windows file creation commands, see the [site quickstart](site/docs/quickstart.html#deploy). Keep serve running. Use verified TLS for remote database traffic. Management requires TLS off loopback. Preserve the private state directory across restarts.
 
-### 2. Provision an identity
+### PostgreSQL: provision an identity
 
 In a second trusted terminal in the private configuration directory, create the agent principal and grant read-only access.
 
 ```sh
-nunya principal create reporting-agent --kind agent --generate-secret --secret-out principal.secret --server http://127.0.0.1:6481 --principal operator --principal-secret-file operator.secret
-nunya principal grant reporting-agent --route postgres=read-only --server http://127.0.0.1:6481 --principal operator --principal-secret-file operator.secret
+nunya principal create reporting-agent --kind agent --generate-secret --secret-out principal.secret
+nunya principal grant reporting-agent --route postgres=read-only
 ```
 
 The create command prints the principal ID and saves the generated agent secret to the new `principal.secret` file. On Unix, the [administrator socket](site/docs/configuration.html#management) can also provision identities.
 
-### 3. Connect
+### PostgreSQL: connect
 
 For this example, select a fresh helper state directory with `export NUNYA_HOME="$PWD/session-home"` in Bash or `$env:NUNYA_HOME = Join-Path $PWD 'session-home'` in PowerShell. Acquire an access session into the default context using the agent's management credential.
 
 ```sh
-nunya session acquire --server http://127.0.0.1:6481 --principal reporting-agent --principal-secret-file principal.secret --route postgres --ttl 1h
+nunya session acquire --principal reporting-agent --principal-secret-file principal.secret --route postgres --ttl 1h
 ```
 
 Load the session environment and connect with plain `psql`. In Bash:
@@ -208,7 +224,6 @@ or expose the native GoogleSQL gRPC route:
 
 ```toml
 [spanner_native]
-listen = "127.0.0.1:6433"
 database = "projects/my-project/instances/my-instance/databases/my-database"
 # For a trusted local emulator:
 # emulator_endpoint = "http://127.0.0.1:9010"
@@ -232,7 +247,8 @@ For default-schema policy tables, use the leading-dot form `table = ".Customers"
 
 Production native upstreams use Google credentials and HTTPS (the default endpoint
 is `https://spanner.googleapis.com`; `endpoint` can select a trusted HTTPS endpoint).
-Set `emulator_endpoint` explicitly to the emulator's `http://host:port` address to
-use plaintext without Google credentials. The database must still use the full
-resource path above. `allow_plaintext = true` permits plaintext agent connections
-for trusted local development; otherwise supply `[tls]` certificate and key files.
+For a trusted local emulator, set `emulator_endpoint` to its `http://host:port`
+address or set `SPANNER_EMULATOR_HOST` to `host:port` before running `nunya serve`.
+An explicit endpoint wins. The emulator uses plaintext without Google credentials.
+The database still needs the full resource path above. Agent listeners default to
+plaintext when they all bind to loopback and `[tls]` is absent.

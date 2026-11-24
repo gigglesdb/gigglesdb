@@ -327,15 +327,7 @@ fn print_secret(secret: Option<Zeroizing<String>>) {
     }
 }
 fn write_secret_out(path: &Path, secret: &str) -> Result<(), AdminError> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    // On Windows the secret file inherits the directory ACL.
-    let mut file = options.open(path).map_err(|error| {
+    let mut file = crate::private_file::create(path).map_err(|error| {
         if error.kind() == io::ErrorKind::AlreadyExists {
             AdminError::Invalid("the --secret-out file already exists")
         } else {

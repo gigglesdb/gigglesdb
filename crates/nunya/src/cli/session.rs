@@ -1,8 +1,8 @@
 //! Owner-private session persistence and PostgreSQL command helpers.
 use crate::{
-    config::parse_duration,
+    config::{load_for_management_client, parse_duration},
     mgmt::client::{
-        AcquireParams, ClientError, ConnectInfo, Credentials, MgmtClient, SessionCredential,
+        AcquireParams, ClientError, ConnectInfo, Credentials, Endpoint, MgmtClient, SessionCredential,
         SessionSecret, SessionView,
     },
     state::model::{Mode, SessionState},
@@ -14,6 +14,7 @@ use std::{
     fmt,
     fs::{self, OpenOptions},
     io::{BufRead, Write},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -47,12 +48,20 @@ pub enum HelperError {
     PrincipalMissing,
     /// No bearer secret was supplied.
     PrincipalSecretMissing,
+    /// The discovered config's bootstrap secret file is missing.
+    OperatorSecretMissing(PathBuf),
+    /// The discovered config's bootstrap secret file could not be used.
+    OperatorSecret(String),
     /// Explicit secret file could not be read.
     PrincipalSecretFileUnreadable,
     /// Explicit secret file did not provide a secret.
     PrincipalSecretFileEmpty,
+    /// Config discovery or validation failed.
+    Config(PathBuf, String),
     /// The stored session cannot be used without revalidation.
     ExpiredWithoutSecret,
+    /// An explicit exec option cannot be satisfied by the stored session.
+    StoredOptionMismatch(&'static str),
     /// The command runtime could not start.
     Runtime,
     /// Management request refused or unavailable.
@@ -71,19 +80,35 @@ impl fmt::Display for HelperError {
             Self::Version => "unsupported session helper version",
             Self::Missing => "session context not found",
             Self::Conflict => "session context already exists or belongs to another connection",
-            Self::ServerMissing => "server URL missing: pass --server or set NUNYA_SERVER",
+            Self::ServerMissing => "server URL missing: pass --server, set NUNYA_SERVER, or run next to nunya.toml (--config / NUNYA_CONFIG)",
             Self::ServerInvalid => "invalid --server URL",
             Self::PrincipalMissing => "principal name missing: pass --principal or set NUNYA_PRINCIPAL",
             Self::PrincipalSecretMissing => "principal secret missing: pass --principal-secret-file PATH or set NUNYA_PRINCIPAL_SECRET",
+            Self::OperatorSecretMissing(path) => {
+                return write!(f, "principal secret missing: pass --principal-secret-file, set NUNYA_PRINCIPAL_SECRET, or create {} by running nunya serve once", path.display());
+            }
+            Self::OperatorSecret(error) => error,
             Self::PrincipalSecretFileUnreadable => "cannot read the principal secret file given by --principal-secret-file",
             Self::PrincipalSecretFileEmpty => "principal secret file is empty",
+            Self::Config(path, error) => return write!(f, "config {}: {error}", path.display()),
             Self::ExpiredWithoutSecret => "stored session has expired locally and the principal secret is missing: pass --principal-secret-file PATH or set NUNYA_PRINCIPAL_SECRET",
+            Self::StoredOptionMismatch(option) => {
+                return write!(f, "cannot reuse stored session with {option}: the stored value differs or is unknown, and the principal secret is missing");
+            }
             Self::Runtime => "session helper runtime unavailable",
             Self::Management(error) => {
                 return write!(f, "session management request failed: {error}");
             }
             Self::Child => "unable to start child command",
         })
+    }
+}
+impl HelperError {
+    fn missing_secret(&self) -> bool {
+        matches!(
+            self,
+            Self::PrincipalSecretMissing | Self::OperatorSecretMissing(_)
+        )
     }
 }
 impl std::error::Error for HelperError {}
@@ -133,6 +158,12 @@ pub struct Context {
     pub scope: String,
     /// Expiration timestamp.
     pub expires_ms: u64,
+    /// Last server-reported access mode, absent in legacy contexts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
+    /// Issued session lifetime, absent in legacy contexts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime_ms: Option<u64>,
     /// PostgreSQL host persisted by older helpers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pg_host: Option<String>,
@@ -156,6 +187,8 @@ pub struct Context {
 impl Context {
     fn refresh(&mut self, view: &SessionView) {
         self.expires_ms = view.expires_ms;
+        self.mode = Some(view.mode);
+        self.lifetime_ms = view.expires_ms.checked_sub(view.created_ms);
         self.route_kind.clone_from(&view.route_kind);
         self.connect.clone_from(&view.connect);
     }
@@ -172,6 +205,25 @@ impl Context {
     fn ensure_unexpired(&self, now_ms: u128) -> Result<(), HelperError> {
         if u128::from(self.expires_ms) <= now_ms {
             return Err(HelperError::ExpiredWithoutSecret);
+        }
+        Ok(())
+    }
+
+    fn check_exec_options(&self, opts: &AcquireOpts) -> Result<(), HelperError> {
+        if opts.route.as_ref().is_some_and(|route| route != &self.route) {
+            return Err(HelperError::StoredOptionMismatch("--route"));
+        }
+        if opts.mode.is_some() && opts.mode != self.mode {
+            return Err(HelperError::StoredOptionMismatch("--mode"));
+        }
+        if let Some(ttl) = &opts.ttl {
+            let stored = self.lifetime_ms.map(std::time::Duration::from_millis);
+            if stored.is_none() || parse_duration(ttl) != stored {
+                return Err(HelperError::StoredOptionMismatch("--ttl"));
+            }
+        }
+        if opts.label.is_some() && opts.label != self.label {
+            return Err(HelperError::StoredOptionMismatch("--label"));
         }
         Ok(())
     }
@@ -354,8 +406,11 @@ impl HelperStore {
     }
 }
 /// Common management connection options.
-#[derive(Args, Clone)]
+#[derive(Args, Clone, Default)]
 pub struct ConnectionOpts {
+    /// Config file for connection defaults (defaults to ./nunya.toml if present).
+    #[arg(long, env = "NUNYA_CONFIG")]
+    pub config: Option<PathBuf>,
     /// Management URL.
     #[arg(long, env = "NUNYA_SERVER")]
     pub server: Option<String>,
@@ -375,6 +430,46 @@ pub struct ConnectionOpts {
     #[arg(long)]
     pub context: Option<String>,
 }
+struct ConnectionDefaults {
+    server: String,
+    operator_secret_file: PathBuf,
+}
+impl ConnectionDefaults {
+    fn discover(config: Option<&Path>, local: &Path) -> Result<Option<Self>, HelperError> {
+        let path = match config {
+            Some(path) => path,
+            None => match local.symlink_metadata() {
+                Ok(_) => local,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(HelperError::Config(local.into(), error.to_string())),
+            },
+        };
+        let config = load_for_management_client(path)
+            .map_err(|errors| HelperError::Config(path.into(), errors.join("; ")))?;
+        let management = config.management.ok_or(HelperError::ServerMissing)?;
+        Ok(Some(Self {
+            server: management_url(management.listen, management.tls.is_some()),
+            operator_secret_file: config.state_dir.join("operator.secret"),
+        }))
+    }
+}
+
+fn management_url(listen: SocketAddr, tls: bool) -> String {
+    let ip = match listen.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => Ipv4Addr::LOCALHOST.into(),
+        IpAddr::V6(ip) if ip.is_unspecified() => Ipv6Addr::LOCALHOST.into(),
+        ip => ip,
+    };
+    let scheme = if tls { "https" } else { "http" };
+    format!("{scheme}://{}", SocketAddr::new(ip, listen.port()))
+}
+
+struct ResolvedConnection {
+    server: String,
+    principal: Option<String>,
+    client: MgmtClient,
+}
+
 impl ConnectionOpts {
     fn name(&self) -> &str {
         self.context.as_deref().unwrap_or("default")
@@ -384,60 +479,90 @@ impl ConnectionOpts {
     }
 
     fn client_with_context(&self, context: Option<&Context>) -> Result<MgmtClient, HelperError> {
+        Ok(self.connect(context)?.client)
+    }
+
+    fn connect(&self, context: Option<&Context>) -> Result<ResolvedConnection, HelperError> {
+        self.connect_with(context, Path::new("nunya.toml"), || {
+            std::env::var("NUNYA_PRINCIPAL_SECRET").ok()
+        })
+    }
+
+    fn connect_with(
+        &self,
+        context: Option<&Context>,
+        local_config: &Path,
+        secret_env: impl FnOnce() -> Option<String>,
+    ) -> Result<ResolvedConnection, HelperError> {
         let server = self
             .server
             .as_deref()
-            .or_else(|| context.map(|ctx| ctx.server.as_str()))
-            .ok_or(HelperError::ServerMissing)?;
-        let endpoint = server.parse().map_err(|_| HelperError::ServerInvalid)?;
+            .or_else(|| context.map(|ctx| ctx.server.as_str()));
+        let defaults = if server.is_none() {
+            ConnectionDefaults::discover(self.config.as_deref(), local_config)?
+        } else {
+            None
+        };
+        let server = server
+            .or_else(|| defaults.as_ref().map(|config| config.server.as_str()))
+            .ok_or(HelperError::ServerMissing)?
+            .to_owned();
+        let endpoint: Endpoint = server.parse().map_err(|_| HelperError::ServerInvalid)?;
+        let mut principal = self
+            .principal
+            .clone()
+            .or_else(|| context.and_then(|ctx| ctx.principal.clone()));
         let credentials = if server.starts_with("unix:") {
             Credentials::None
         } else {
-            let secret = self.principal_secret()?;
-            let name = self
-                .principal
+            let mut secret = match &self.principal_secret_file {
+                Some(path) => Some(read_principal_secret(path)?),
+                None => secret_env()
+                    .map(Zeroizing::new)
+                    .filter(|text| !text.is_empty()),
+            };
+            if let Some(config) = &defaults
+                && (principal.is_none()
+                    || (principal.as_deref() == Some("operator") && secret.is_none()))
+            {
+                let path = &config.operator_secret_file;
+                let exists = path.try_exists().map_err(|error| {
+                    HelperError::OperatorSecret(format!(
+                        "cannot read administrator secret at {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                if exists {
+                    if secret.is_none() {
+                        secret = Some(crate::first_run::read_operator_secret(path)
+                            .map_err(HelperError::OperatorSecret)?);
+                    }
+                    principal.get_or_insert_with(|| "operator".into());
+                } else if secret.is_none() {
+                    return Err(HelperError::OperatorSecretMissing(path.clone()));
+                }
+            }
+            let name = principal
                 .as_ref()
-                .or_else(|| context.and_then(|ctx| ctx.principal.as_ref()))
                 .filter(|name| !name.is_empty())
-                .ok_or(HelperError::PrincipalMissing)?;
-            Credentials::Bearer {
-                name: name.clone(),
-                secret,
-            }
+                .ok_or(HelperError::PrincipalMissing)?
+                .clone();
+            let secret = secret.ok_or(HelperError::PrincipalSecretMissing)?;
+            Credentials::Bearer { name, secret }
         };
-        MgmtClient::new(endpoint, self.ca_file.as_deref(), credentials)
-            .map(|client| client.follow_leader_redirect(self.follow_leader))
-            .map_err(Into::into)
-    }
-
-    fn principal_secret(&self) -> Result<Zeroizing<String>, HelperError> {
-        if let Some(path) = &self.principal_secret_file {
-            let file =
-                fs::File::open(path).map_err(|_| HelperError::PrincipalSecretFileUnreadable)?;
-            let mut text = Zeroizing::new(String::new());
-            std::io::BufReader::new(file)
-                .read_line(&mut text)
-                .map_err(|_| HelperError::PrincipalSecretFileUnreadable)?;
-            while text.ends_with(['\r', '\n']) {
-                text.pop();
-            }
-            if text.is_empty() {
-                return Err(HelperError::PrincipalSecretFileEmpty);
-            }
-            Ok(text)
-        } else {
-            std::env::var("NUNYA_PRINCIPAL_SECRET")
-                .ok()
-                .filter(|text| !text.is_empty())
-                .map(Zeroizing::new)
-                .ok_or(HelperError::PrincipalSecretMissing)
-        }
+        let client = MgmtClient::new(endpoint, self.ca_file.as_deref(), credentials)?
+            .follow_leader_redirect(self.follow_leader);
+        Ok(ResolvedConnection {
+            server,
+            principal,
+            client,
+        })
     }
 
     fn revalidation_client(&self, ctx: &Context) -> Result<Option<MgmtClient>, HelperError> {
         match self.client_with_context(Some(ctx)) {
             Ok(client) => Ok(Some(client)),
-            Err(HelperError::PrincipalSecretMissing) => Ok(None),
+            Err(error) if error.missing_secret() => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -458,6 +583,21 @@ impl ConnectionOpts {
         Ok(ctx)
     }
 }
+
+fn read_principal_secret(path: &Path) -> Result<Zeroizing<String>, HelperError> {
+    let file = fs::File::open(path).map_err(|_| HelperError::PrincipalSecretFileUnreadable)?;
+    let mut text = Zeroizing::new(String::new());
+    std::io::BufReader::new(file)
+        .read_line(&mut text)
+        .map_err(|_| HelperError::PrincipalSecretFileUnreadable)?;
+    while text.ends_with(['\r', '\n']) {
+        text.pop();
+    }
+    if text.is_empty() {
+        return Err(HelperError::PrincipalSecretFileEmpty);
+    }
+    Ok(text)
+}
 fn mode(text: &str) -> Result<Mode, String> {
     match text {
         "read-only" => Ok(Mode::ReadOnly),
@@ -476,9 +616,9 @@ pub struct AcquireOpts {
     /// Connection and context options.
     #[command(flatten)]
     pub connection: ConnectionOpts,
-    /// Route identifier.
-    #[arg(long, default_value = "postgres")]
-    pub route: String,
+    /// Route identifier (defaults to postgres for a new session).
+    #[arg(long)]
+    pub route: Option<String>,
     /// Requested mode.
     #[arg(long, value_parser = mode)]
     pub mode: Option<Mode>,
@@ -541,6 +681,8 @@ pub enum SessionCommand {
         #[arg(long, value_enum, default_value = "sh")]
         format: EnvFormat,
     },
+    /// Acquire or resume a session and run a child command.
+    Exec(ExecOpts),
 }
 /// Child process options.
 #[derive(Args)]
@@ -638,7 +780,7 @@ pub async fn acquire_or_resume(
     let secret = SessionSecret::generate();
     let view = client
         .acquire(AcquireParams {
-            route: opts.route.clone(),
+            route: opts.route.clone().unwrap_or_else(|| "postgres".into()),
             mode: opts.mode,
             lifetime: opts.ttl.clone(),
             isolated: opts.isolated,
@@ -671,6 +813,8 @@ pub async fn acquire_or_resume(
             scram_iterations: Some(secret.scram_iterations),
             scope: view.scope,
             expires_ms: view.expires_ms,
+            mode: Some(view.mode),
+            lifetime_ms: view.expires_ms.checked_sub(view.created_ms),
             pg_host: None,
             pg_port: None,
             pg_host_override: opts.pg_host.clone(),
@@ -838,7 +982,8 @@ async fn dispatch(command: SessionCommand) -> Result<i32, HelperError> {
     match command {
         SessionCommand::Acquire { mut opts, isolated } => {
             opts.isolated = isolated;
-            let client = opts.connection.client()?;
+            let existing = acquisition_context(&opts, &store)?;
+            let client = connect_acquisition(&mut opts, existing.as_ref())?;
             let mut ctx = acquire_or_resume(&client, &store, &opts).await?;
             summary(&client, &store, &mut ctx).await?;
         }
@@ -901,6 +1046,7 @@ async fn dispatch(command: SessionCommand) -> Result<i32, HelperError> {
                 }
             }
         }
+        SessionCommand::Exec(opts) => return exec(opts, &store).await,
     }
     Ok(0)
 }
@@ -925,21 +1071,58 @@ fn runtime(result: impl std::future::Future<Output = Result<i32, HelperError>>) 
 pub fn run_command(command: SessionCommand) -> i32 {
     runtime(dispatch(command))
 }
+
+fn acquisition_context(
+    opts: &AcquireOpts,
+    store: &HelperStore,
+) -> Result<Option<Context>, HelperError> {
+    if opts.isolated {
+        return Ok(None);
+    }
+    match opts.connection.context(store) {
+        Ok(ctx) => Ok(Some(ctx)),
+        Err(HelperError::Missing) if !opts.rotate => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn connect_acquisition(
+    opts: &mut AcquireOpts,
+    ctx: Option<&Context>,
+) -> Result<MgmtClient, HelperError> {
+    let resolved = opts.connection.connect(ctx)?;
+    opts.connection.server = Some(resolved.server);
+    opts.connection.principal = resolved.principal;
+    Ok(resolved.client)
+}
+
+async fn exec(mut opts: ExecOpts, store: &HelperStore) -> Result<i32, HelperError> {
+    let existing = acquisition_context(&opts.opts, store)?;
+    let ctx = match connect_acquisition(&mut opts.opts, existing.as_ref()) {
+        Ok(client) => acquire_or_resume(&client, store, &opts.opts).await?,
+        Err(error) if error.missing_secret() && !opts.opts.rotate && !opts.opts.new_scope => {
+            let mut ctx = existing.ok_or(error)?;
+            ctx.ensure_unexpired(UNIX_EPOCH.elapsed().map_or(u128::MAX, |now| now.as_millis()))?;
+            ctx.check_exec_options(&opts.opts)?;
+            ctx.apply_pg_overrides(&opts.opts);
+            eprintln!("{UNVALIDATED}");
+            ctx
+        }
+        Err(error) => return Err(error),
+    };
+    let program = opts.command.first().ok_or(HelperError::Child)?;
+    let mut child = std::process::Command::new(program);
+    child.args(&opts.command[1..]);
+    for (key, value) in pg_env(&ctx) {
+        child.env(key, value.as_str());
+    }
+    let status = child.status().map_err(|_| HelperError::Child)?;
+    Ok(status.code().unwrap_or(1))
+}
+
 /// Acquire a session and execute a child with inherited standard streams.
 pub fn run_exec(opts: ExecOpts) -> i32 {
-    runtime(async {
-        let client = opts.opts.connection.client()?;
-        let store = HelperStore::discover()?;
-        let ctx = acquire_or_resume(&client, &store, &opts.opts).await?;
-        let program = opts.command.first().ok_or(HelperError::Child)?;
-        let mut child = std::process::Command::new(program);
-        child.args(&opts.command[1..]);
-        for (key, value) in pg_env(&ctx) {
-            child.env(key, value.as_str());
-        }
-        let status = child.status().map_err(|_| HelperError::Child)?;
-        Ok(status.code().unwrap_or(1))
-    })
+    runtime(dispatch(SessionCommand::Exec(opts)))
 }
 #[cfg(test)]
 mod tests {
@@ -971,6 +1154,8 @@ mod tests {
             scram_iterations: None,
             scope: "34".repeat(16),
             expires_ms: 12345,
+            mode: None,
+            lifetime_ms: None,
             pg_host: None,
             pg_port: None,
             pg_host_override: None,
@@ -1120,12 +1305,8 @@ mod tests {
         let secret_file = temp.0.join("principal.secret");
         fs::write(&secret_file, "private-principal-secret\r\n").unwrap();
         let mut opts = ConnectionOpts {
-            server: None,
-            principal: None,
-            ca_file: None,
             principal_secret_file: Some(secret_file),
-            context: None,
-            follow_leader: false,
+            ..Default::default()
         };
         assert!(
             opts.client_with_context(Some(&opts.context(&store).unwrap()))
@@ -1148,17 +1329,19 @@ mod tests {
         fs::create_dir(&temp.0).unwrap();
         let secret_file = temp.0.join("principal.secret");
         let mut opts = ConnectionOpts {
-            server: None,
-            principal: None,
-            ca_file: None,
             principal_secret_file: Some(secret_file.clone()),
-            context: None,
-            follow_leader: false,
+            ..Default::default()
         };
-        let error = |opts: &ConnectionOpts| opts.client().err().unwrap().to_string();
+        let local_config = temp.0.join("nunya.toml");
+        let error = |opts: &ConnectionOpts| {
+            opts.connect_with(None, &local_config, || None)
+                .err()
+                .unwrap()
+                .to_string()
+        };
         assert_eq!(
             error(&opts),
-            "server URL missing: pass --server or set NUNYA_SERVER"
+            "server URL missing: pass --server, set NUNYA_SERVER, or run next to nunya.toml (--config / NUNYA_CONFIG)"
         );
         opts.server = Some("private-invalid-server".into());
         assert_eq!(error(&opts), "invalid --server URL");
@@ -1182,6 +1365,48 @@ mod tests {
             HelperError::ExpiredWithoutSecret
                 .to_string()
                 .contains("principal secret is missing")
+        );
+    }
+    #[test]
+    fn config_discovery_is_read_only_and_reports_the_selected_path() {
+        let temp = Temp::new();
+        fs::create_dir(&temp.0).unwrap();
+        let local = temp.0.join("nunya.toml");
+        let missing = temp.0.join("missing.toml");
+        let source = "[upstream]\nhost='localhost'\nuser='nunya'\ndbname='app'\n";
+        fs::write(&local, source).unwrap();
+
+        let defaults = ConnectionDefaults::discover(None, &local).unwrap().unwrap();
+        assert_eq!(defaults.server, "http://127.0.0.1:6481");
+        let secret = temp.0.join("state").join("operator.secret");
+        assert_eq!(defaults.operator_secret_file, secret);
+        let opts = ConnectionOpts::default();
+        let error = opts.connect_with(None, &local, || None).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            format!("principal secret missing: pass --principal-secret-file, set NUNYA_PRINCIPAL_SECRET, or create {} by running nunya serve once", secret.display())
+        );
+        assert_eq!(fs::read_dir(&temp.0).unwrap().count(), 1);
+        assert_eq!(fs::read_to_string(&local).unwrap(), source);
+        let error = ConnectionDefaults::discover(Some(&missing), &local).err().unwrap();
+        assert!(error.to_string().contains(&missing.display().to_string()));
+        fs::write(&local, "[broken").unwrap();
+        let error = ConnectionDefaults::discover(None, &local).err().unwrap();
+        assert!(error.to_string().contains(&local.display().to_string()));
+    }
+    #[test]
+    fn management_defaults_use_matching_loopback_family_and_tls_scheme() {
+        assert_eq!(
+            management_url("0.0.0.0:6481".parse().unwrap(), false),
+            "http://127.0.0.1:6481"
+        );
+        assert_eq!(
+            management_url("[::]:6481".parse().unwrap(), true),
+            "https://[::1]:6481"
+        );
+        assert_eq!(
+            management_url("192.0.2.24:6481".parse().unwrap(), true),
+            "https://192.0.2.24:6481"
         );
     }
     #[test]

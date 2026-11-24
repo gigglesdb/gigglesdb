@@ -19,6 +19,7 @@ use std::{
 #[serde(deny_unknown_fields)]
 pub struct SpannerNativeSection {
     /// Agent listener address.
+    #[serde(default = "default_listen")]
     pub listen: String,
     /// Fully qualified upstream database.
     pub database: String,
@@ -28,6 +29,45 @@ pub struct SpannerNativeSection {
     pub endpoint: Option<String>,
     /// Snapshot refresh period, defaulting to thirty seconds.
     pub snapshot_refresh_ms: Option<u64>,
+}
+fn default_listen() -> String {
+    "127.0.0.1:6433".into()
+}
+fn emulator_endpoint(
+    section: &SpannerNativeSection,
+    env: impl FnOnce() -> Result<String, std::env::VarError>,
+) -> Result<Option<String>, String> {
+    if let Some(endpoint) = &section.emulator_endpoint {
+        return Ok(Some(endpoint.clone()));
+    }
+    let host = match env() {
+        Ok(host) => host,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("spanner: SPANNER_EMULATOR_HOST must be host:port".into());
+        }
+    };
+    if !host.parse::<http::uri::Authority>().is_ok_and(|authority| {
+        !authority.host().is_empty() && authority.port_u16().is_some_and(|port| port != 0)
+    }) || host.contains('@')
+    {
+        return Err("spanner: SPANNER_EMULATOR_HOST must be host:port".into());
+    }
+    let endpoint = format!("http://{host}");
+    eprintln!("using Spanner emulator at {endpoint} from SPANNER_EMULATOR_HOST");
+    Ok(Some(endpoint))
+}
+
+pub(crate) fn resolve_upstream(section: &SpannerNativeSection) -> Result<SpannerUpstream, String> {
+    Ok(match emulator_endpoint(section, || std::env::var("SPANNER_EMULATOR_HOST"))? {
+        Some(endpoint) => SpannerUpstream::Emulator { endpoint },
+        None => SpannerUpstream::Google {
+            endpoint: section
+                .endpoint
+                .clone()
+                .unwrap_or_else(|| "https://spanner.googleapis.com".into()),
+        },
+    })
 }
 /// Parse and validate native Spanner settings without exposing source values.
 pub fn parse_section(value: &toml::Value) -> Result<SpannerNativeSection, String> {
@@ -141,17 +181,7 @@ pub(crate) async fn run_spanner_with_hub(
         if period == 0 {
             return Err("spanner: invalid refresh interval".into());
         }
-        let upstream = match &section.emulator_endpoint {
-            Some(endpoint) => SpannerUpstream::Emulator {
-                endpoint: endpoint.clone(),
-            },
-            None => SpannerUpstream::Google {
-                endpoint: section
-                    .endpoint
-                    .clone()
-                    .unwrap_or_else(|| "https://spanner.googleapis.com".into()),
-            },
-        };
+        let upstream = resolve_upstream(section)?;
         let runner = CatalogRunner::new(&upstream, section.database.clone())
             .await
             .map_err(|_| "spanner: catalog unavailable".to_owned())?;
@@ -228,6 +258,29 @@ pub(crate) async fn run_spanner_with_hub(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    #[test]
+    fn emulator_env_applies_only_without_an_explicit_endpoint() {
+        let value = toml::from_str("database='projects/p/instances/i/databases/d'").unwrap();
+        let mut section = parse_section(&value).unwrap();
+        assert!(section.emulator_endpoint.is_none());
+        assert_eq!(
+            emulator_endpoint(&section, || Err(std::env::VarError::NotPresent)).unwrap(),
+            None
+        );
+        assert_eq!(
+            emulator_endpoint(&section, || Ok("localhost:9010".into())).unwrap().as_deref(),
+            Some("http://localhost:9010")
+        );
+        assert!(emulator_endpoint(&section, || Ok("invalid".into())).is_err());
+        section.emulator_endpoint = Some("http://127.0.0.1:9010".into());
+        assert_eq!(
+            emulator_endpoint(&section, || panic!("explicit config should skip the environment"))
+                .unwrap()
+                .as_deref(),
+            section.emulator_endpoint.as_deref()
+        );
+    }
+
     #[test]
     fn section_is_strict_and_errors_are_sanitized() {
         let base: toml::Value = toml::from_str(

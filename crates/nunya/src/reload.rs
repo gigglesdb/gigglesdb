@@ -2024,7 +2024,7 @@ pub(crate) mod tests {
         let files = crate::config_reload::tests::Fixture::new();
         let route = id("pg");
         let hub = Hub::new(&[(route, files.dir.join("policy"))], Some(5), crate::policy::ServicePolicySettings::default()).unwrap();
-        let startup = crate::config::Config::load(&files.path).unwrap();
+        let startup = files.load(&files.text);
         let config = Arc::new(crate::config_reload::ConfigReloader::new(startup, Arc::downgrade(&hub)));
         files.load(&files.text.replace("max_connections=256", "max_connections=257"));
         let worker = hub.clone(); let worker_config = config.clone();
@@ -2053,7 +2053,7 @@ pub(crate) mod tests {
     async fn manual_trigger_reloads_config_before_policy_attempt() {
         let files = crate::config_reload::tests::Fixture::new();
         let hub = files.hub();
-        let startup = crate::config::Config::load(&files.path).unwrap();
+        let startup = files.load(&files.text);
         let config = crate::config_reload::ConfigReloader::new(startup, Arc::downgrade(&hub));
         let new = files.load(&files.text.replace("max_connections=256", "max_connections=257"));
         config_before_policy(Some(&config), || {

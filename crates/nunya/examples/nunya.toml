@@ -1,30 +1,38 @@
-listen = "127.0.0.1:6432"
-admin_listen = "127.0.0.1:6480"
-policy = "policy.toml" # Optional fallback for routes without their own policy key.
-state_dir = "state"
-schemas = ["public"]
-search_path = ["public"]
-snapshot_refresh_ms = 30000
+listen = "127.0.0.1:6432" # Optional PostgreSQL listen address. Default shown.
+admin_listen = "127.0.0.1:6480" # Optional private admin address. Default shown.
+# policy = "policy.toml" # Optional. Without a policy path, serve uses policy.toml beside this config.
+state_dir = "state" # Optional. Default is state/ beside this config.
+# root_key_file = "root.key" # Optional. Use this file, then NUNYA_ROOT_KEY if unset, then state/root.key.
+# schemas = ["public"] # Optional. Default shown.
+# search_path = ["public"] # Optional. Default shown.
+# snapshot_refresh_ms = 30000 # Optional. Default shown.
 # policy_watch_ms is top-level and watches every distinct policy file independently.
-max_connections = 256
-allow_plaintext = true
-# Supply NUNYA_ROOT_KEY and NUNYA_UPSTREAM_PASSWORD in the environment.
+# max_connections = 256 # Optional. Default shown.
+# allow_plaintext = true # Optional. Defaults to true only for loopback agent listeners without TLS.
+# Supply NUNYA_UPSTREAM_PASSWORD or set upstream.password_file.
+# With no configured root key and an empty store, serve creates state/root.key.
+
+# [management] # Optional. When omitted, management listens on 127.0.0.1:6481.
+# listen = "127.0.0.1:6481"
+# With no configured or stored administrator, local serve creates operator in the store
+# and saves the credential in state/operator.secret.
+
 [upstream]
 # policy = "pg-policy.toml" # Optional override; relative to this config file.
-dialect = "postgres" # Use "spanner-pg" for Google PGAdapter.
+dialect = "postgres" # Optional. Use "spanner-pg" for Google PGAdapter.
 host = "127.0.0.1"
-port = 16432
+port = 16432 # Optional. Defaults to 5432. The local harness uses 16432.
 user = "nunya"
 dbname = "app"
-tls = "disable"
-connect_timeout_ms = 5000
-application_name = "nunya"
+tls = "disable" # Optional. Default shown.
+# connect_timeout_ms = 5000 # Optional. Default shown.
+# application_name = "nunya" # Optional. Default shown.
 
 # All policy files must name the same read-log sink; shared files reload together.
 # Optional native GoogleSQL route; omit the upstream section and top-level listen for native only.
 # [spanner_native]
 # policy = "spanner-policy.toml" # Optional override; validates only against this route catalog.
-# listen = "127.0.0.1:6433"
+# listen = "127.0.0.1:6433" # Optional. Default shown.
 # database = "projects/my-project/instances/my-instance/databases/my-database"
-# emulator_endpoint = "http://127.0.0.1:9010" # Trusted local emulator only.
-# snapshot_refresh_ms = 30000
+# emulator_endpoint = "http://127.0.0.1:9010" # Optional. Otherwise serve checks SPANNER_EMULATOR_HOST.
+# snapshot_refresh_ms = 30000 # Optional. Default shown.

@@ -75,6 +75,9 @@ pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
         admin_listen: a_admin_listen,
         postgres_policy: a_postgres_policy,
         spanner_policy: a_spanner_policy,
+        postgres_policy_is_default: _,
+        spanner_policy_is_default: _,
+        root_key_file: _,
         root_key: a_root_key,
         state_dir: a_state_dir,
         schemas: a_schemas,
@@ -109,6 +112,9 @@ pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
         admin_listen: b_admin_listen,
         postgres_policy: b_postgres_policy,
         spanner_policy: b_spanner_policy,
+        postgres_policy_is_default: _,
+        spanner_policy_is_default: _,
+        root_key_file: _,
         root_key: b_root_key,
         state_dir: b_state_dir,
         schemas: b_schemas,
@@ -316,6 +322,9 @@ pub(crate) fn copy_config(c: &Config) -> Config {
         admin_listen: c.admin_listen,
         postgres_policy: c.postgres_policy.clone(),
         spanner_policy: c.spanner_policy.clone(),
+        postgres_policy_is_default: c.postgres_policy_is_default,
+        spanner_policy_is_default: c.spanner_policy_is_default,
+        root_key_file: c.root_key_file.clone(),
         root_key: c.root_key.clone(),
         state_dir: c.state_dir.clone(),
         schemas: c.schemas.clone(),
@@ -594,6 +603,10 @@ impl ConfigReloader {
         };
         let prepared = Config::load(&self.path)
             .map_err(|errors| errors.join("; "))
+            .and_then(|mut new| {
+                crate::first_run::load_root_key(&mut new, false)?;
+                Ok(new)
+            })
             .and_then(|new| prepare(&running, new, self.appliers.get().map(|(a, _)| a.as_ref())).map_err(str::to_owned));
         let candidate = if let (Ok(prepared), Some(catalog)) = (&prepared, self.catalog.get()) {
             if prepared.diff.reloadable.iter().any(|s| ["schemas", "search_path"].contains(s)) {
@@ -858,7 +871,9 @@ key_file='key'
         }
         pub(crate) fn load(&self, text: &str) -> Config {
             std::fs::write(&self.path, text).unwrap();
-            Config::load(&self.path).unwrap()
+            let mut config = Config::load(&self.path).unwrap();
+            crate::first_run::load_root_key(&mut config, false).unwrap();
+            config
         }
         pub(crate) fn hub(&self) -> Arc<Hub> {
             let id = crate::state::model::RouteId::new("pg").unwrap();
@@ -1240,7 +1255,7 @@ key_file='key'
                 "'127.0.0.1:7490'",
                 false,
             ),
-            ("management.enabled", "management", "REMOVE", false),
+            ("management.admins", "management", "REMOVE", true),
             ("management.tls.enabled", "management.tls", "REMOVE", false),
             ("tls", "tls.cert_file", "'cert2'", true),
             ("tls", "tls.key_file", "'key2'", true),
@@ -1317,7 +1332,10 @@ key_file='key'
             );
             assert_eq!(
                 diff.restart_only,
-                if reloadable { vec![] } else { vec![name] },
+                if path == "management" {
+                    // Removing the table restores the default management listener.
+                    vec!["management.listen", "management.tls.enabled"]
+                } else if reloadable { vec![] } else { vec![name] },
                 "{path}"
             );
             // Section enable/disable and path replacements are symmetric.
