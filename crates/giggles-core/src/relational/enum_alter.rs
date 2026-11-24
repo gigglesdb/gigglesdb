@@ -28,7 +28,7 @@ pub(crate) struct EnumTransaction(Arc<BTreeMap<String, BTreeMap<String, EnumChan
 
 #[derive(Clone, Default)]
 struct EnumChanges {
-    created: bool,
+    created_at_top_level: bool,
     unsafe_labels: BTreeSet<String>,
 }
 
@@ -36,11 +36,15 @@ thread_local! {
     static TRANSACTION: RefCell<Option<EnumTransaction>> = const { RefCell::new(None) };
 }
 
-pub(crate) struct EnumScope(Option<EnumTransaction>);
+thread_local! {
+    static IN_SAVEPOINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct EnumScope(Option<EnumTransaction>, bool);
 
 impl EnumScope {
-    pub(crate) fn enter(transaction: Option<&EnumTransaction>) -> Self {
-        Self(TRANSACTION.replace(transaction.cloned()))
+    pub(crate) fn enter(transaction: Option<&EnumTransaction>, in_savepoint: bool) -> Self {
+        Self(TRANSACTION.replace(transaction.cloned()), IN_SAVEPOINT.replace(in_savepoint))
     }
 
     pub(crate) fn changes(&self) -> EnumTransaction {
@@ -51,6 +55,7 @@ impl EnumScope {
 impl Drop for EnumScope {
     fn drop(&mut self) {
         TRANSACTION.replace(self.0.take());
+        IN_SAVEPOINT.set(self.1);
     }
 }
 
@@ -68,7 +73,7 @@ pub(super) fn created(ty: &TypeDef) {
     if matches!(ty, TypeDef::Enum { .. }) {
         change(ty, |changes| {
             *changes = EnumChanges {
-                created: true,
+                created_at_top_level: !IN_SAVEPOINT.get(),
                 ..Default::default()
             }
         });
@@ -514,10 +519,10 @@ pub(super) fn execute(
             if labels.len() >= MAX_COLUMNS {
                 return Err(SqlError::Limit);
             }
-            type_oid(
-                id.checked_add(labels.len() as u64 + 1)
-                    .ok_or(SqlError::Limit)?,
-            )?;
+            let label_id = allocate(&mut candidate.next_id)?;
+            type_oid(label_id)?;
+            Arc::make_mut(&mut candidate.ext)
+                .added_enum_labels.entry(id).or_default().0.insert(label.clone(), label_id);
             labels.insert(position, label.clone());
         }
         Action::Rename { old, new } => {
@@ -528,6 +533,11 @@ pub(super) fn execute(
                 return Err(SqlError::DuplicateObject);
             }
             rewrite(&mut candidate, id, ty, old, new, cancel)?;
+            if let Some(added) = Arc::make_mut(&mut candidate.ext).added_enum_labels.get_mut(&id)
+                && let Some(label_id) = added.0.remove(old)
+            {
+                added.0.insert(new.clone(), label_id);
+            }
             labels[position] = new.clone();
         }
     }
@@ -537,13 +547,15 @@ pub(super) fn execute(
         return Err(SqlError::Type);
     };
     *stored = labels;
+    Arc::make_mut(&mut candidate.ext).ext_version = candidate.ext.wire_version();
+    candidate.validate_ext()?;
     candidate.epoch = state.epoch.checked_add(1).ok_or(SqlError::Limit)?;
     if cancel() {
         return Err(SqlError::Aborted);
     }
     match &alter.action {
         Action::Add { label, .. } => change(ty, |changes| {
-            if !changes.created {
+            if !changes.created_at_top_level || IN_SAVEPOINT.get() {
                 changes.unsafe_labels.insert(label.clone());
             }
         }),

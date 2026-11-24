@@ -35,6 +35,7 @@ fn v2_value_ceiling_allows_argument_and_result_accounting() {
 mod cross_binding_tests;
 mod pg18_types;
 pub(super) mod typeof_expr;
+pub(super) use typeof_expr::name as type_display;
 pub(super) use comparison::{comparable, compare_cross, cross_compare};
 mod datetime_input;
 mod degree_math;
@@ -2500,6 +2501,7 @@ impl BoundScalar {
             | Node::Sequence(name, ..)
             | Node::Privilege(name, ..)
             | Node::Xact(name, ..) => Some(name),
+            Node::Domain(inner, TypeDef::Enum { .. }) if matches!(inner.node, Node::Column(..)) => inner.strong_name(),
             Node::Cast(a) | Node::SessionCast(a, _) | Node::TypmodCast(a, _) => a.strong_name(),
             _ => None,
         }
@@ -2511,6 +2513,7 @@ impl BoundScalar {
             Node::ZonedOperator(name, ..) if matches!(name.as_str(), "date_trunc" | "uuidv7") => name,
             Node::CrossCompare(..) | Node::ZonedOperator(..) => "?column?",
             Node::Param(_) => "?column?",
+            Node::Domain(inner, TypeDef::Enum { .. }) if matches!(inner.node, Node::Column(..)) => inner.name(),
             Node::Domain(inner, TypeDef::Enum { .. }) if inner.strong_name() == Some("array") => "array",
             Node::Domain(_, ty) => ty.name(),
             Node::TypmodCast(inner, _) => inner.name(),

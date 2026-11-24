@@ -808,6 +808,21 @@ pub(crate) fn decode_column_collation(v: &[u8]) -> Result<crate::relational::col
     crate::relational::column_collations::validate_binding(&b).map_err(|_| corrupt("invalid column collation"))?;
     Ok(b)
 }
+/// Added label identities are separate from kind 24 credentials and kind 25 extensions.
+pub(crate) const ENUM_LABELS_KIND: u8 = 26;
+
+pub(crate) fn enum_labels_key(id: u64) -> Vec<u8> {
+    object_key(ENUM_LABELS_KIND, id)
+}
+
+pub(crate) fn encode_enum_labels(labels: &crate::relational::catalog_ext::AddedEnumLabels) -> Result<Vec<u8>, CoreError> {
+    encode_version(1, labels)
+}
+
+pub(crate) fn decode_enum_labels(value: &[u8]) -> Result<crate::relational::catalog_ext::AddedEnumLabels, CoreError> {
+    decode_version(1, value)
+}
+
 pub(crate) fn collation_key(id: u64) -> Vec<u8> { object_key(22, id) }
 pub(crate) fn encode_collation(v: &crate::relational::collations::Collation) -> Result<Vec<u8>, CoreError> {
     crate::relational::collations::validate(v).map_err(CoreError::Sql)?;
@@ -871,6 +886,7 @@ pub(crate) enum CatalogKind {
     TypeDefinition,
     Collation,
     ColumnCollation,
+    EnumLabels,
     Extensions,
     Index,
     SqlView,
@@ -904,6 +920,7 @@ pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError>
         }
         Some(15) if key.len() == 9 => CatalogKind::TypeDefinition,
         Some(&EXTENSIONS_KIND) if key.len() == 1 => CatalogKind::Extensions,
+        Some(&ENUM_LABELS_KIND) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::EnumLabels,
         Some(23) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::ColumnCollation,
         Some(22) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::Collation,
         Some(kind)

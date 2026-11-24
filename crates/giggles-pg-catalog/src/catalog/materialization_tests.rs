@@ -12,6 +12,7 @@ fn snapshot(tables: u64, explicit_indexes: u64) -> CatalogSnapshot {
             typmod: -1,
             not_null: false,
             labels: vec!["draft".into(), "published".into()],
+            label_oids: vec![900_004, 900_008],
         }],
         ..CatalogSnapshot::default()
     };

@@ -69,6 +69,8 @@ enum Aggregate {
     Sum,
     Avg,
     CountDistinct,
+    ArrayAgg,
+    ArrayAggDistinct,
     SumDistinct,
     AvgDistinct,
     MinDistinct,
@@ -88,6 +90,7 @@ impl Aggregate {
     fn base(self) -> Self {
         match self {
             Self::CountDistinct => Self::Count,
+            Self::ArrayAggDistinct => Self::ArrayAgg,
             Self::SumDistinct => Self::Sum,
             Self::AvgDistinct => Self::Avg,
             Self::MinDistinct => Self::Min,
@@ -103,6 +106,7 @@ impl Aggregate {
         matches!(
             self,
             Self::CountDistinct
+                | Self::ArrayAggDistinct
                 | Self::SumDistinct
                 | Self::AvgDistinct
                 | Self::MinDistinct
@@ -116,6 +120,7 @@ impl Aggregate {
     fn with_distinct(self) -> Self {
         match self.base() {
             Self::Count => Self::CountDistinct,
+            Self::ArrayAgg => Self::ArrayAggDistinct,
             Self::Sum => Self::SumDistinct,
             Self::Avg => Self::AvgDistinct,
             Self::Min => Self::MinDistinct,
@@ -130,6 +135,7 @@ impl Aggregate {
     fn name(self) -> &'static str {
         match self.base() {
             Self::Count => "count",
+            Self::ArrayAgg => "array_agg",
             Self::Sum => "sum",
             Self::Avg => "avg",
             Self::Min => "min",
@@ -141,6 +147,22 @@ impl Aggregate {
             _ => unreachable!(),
         }
     }
+    fn enum_result(self, input: &BoundScalar) -> Option<BoundScalar> {
+        let ty = input.attached_enum()?;
+        match self.base() {
+            Self::ArrayAgg => Some(BoundScalar::enum_metadata(DataType::TextArray, ty)),
+            Self::Min | Self::Max => Some(BoundScalar::enum_metadata(input.ty.clone(), ty)),
+            _ => None,
+        }
+    }
+
+    fn result_metadata(self, input: BoundScalar, result: &DataType) -> Option<BoundScalar> {
+        self.enum_result(&input).or_else(|| {
+            (!json_aggregate::json_result(self) && functions::collation::is_collatable(result))
+                .then_some(input)
+        })
+    }
+
     fn call_name(self) -> String {
         if self.distinct() {
             format!("\0aggregate_distinct_{}", self.name())
@@ -157,6 +179,7 @@ impl Aggregate {
         let name = name.strip_prefix("\0aggregate_distinct_").unwrap_or(name);
         let a = match name {
             "count" => Self::Count,
+            "array_agg" => Self::ArrayAgg,
             "sum" => Self::Sum,
             "avg" => Self::Avg,
             "min" => Self::Min,
@@ -1461,7 +1484,36 @@ impl Filter {
             Self::Compare(a, op, b) => {
                 let mut av = bind(a)?;
                 let mut bv = bind(b)?;
-                if let Some(ty) = av.enum_type(tables).or_else(|| bv.enum_type(tables)) {
+                let a_enum = av.enum_type(tables);
+                let b_enum = bv.enum_type(tables);
+                let enum_array = av.ty == DataType::TextArray && a_enum.is_some()
+                    || bv.ty == DataType::TextArray && b_enum.is_some();
+                if enum_array {
+                    let unknown = |scalar: &Scalar| matches!(scalar, Scalar::Literal(Value::Text(_) | Value::Null));
+                    let ty = if let (Some(a_ty), Some(b_ty)) = (&a_enum, &b_enum)
+                        && a_ty == b_ty && av.ty == bv.ty
+                    {
+                        a_ty
+                    } else if let Some(ty) = &a_enum && av.ty == DataType::TextArray && unknown(b) {
+                        bv = bind(&Scalar::Cast(Box::new(b.clone()), DataType::TextArray))?;
+                        ty
+                    } else if let Some(ty) = &b_enum && bv.ty == DataType::TextArray && unknown(a) {
+                        av = bind(&Scalar::Cast(Box::new(a.clone()), DataType::TextArray))?;
+                        ty
+                    } else {
+                        let display = |value: &BoundScalar, ty: Option<&TypeDef>| ty.map_or_else(
+                            || functions::type_display(&value.ty).to_owned(),
+                            |ty| user_types::enum_display(ty, value.ty == DataType::TextArray),
+                        );
+                        user_types::view_replace_error(format!(
+                            "operator does not exist: {} {op} {}",
+                            display(&av, a_enum.as_ref()), display(&bv, b_enum.as_ref())
+                        ));
+                        user_types::sql_error_hint("No operator matches the given name and argument types. You might need to add explicit type casts.");
+                        return Err(SqlError::UndefinedFunction);
+                    };
+                    return Ok(BoundFilter::Compare(av.with_enum(ty), op.clone(), bv.with_enum(ty)));
+                } else if let Some(ty) = a_enum.or(b_enum) {
                     av = av.enum_rank(&ty)?;
                     bv = bv.enum_rank(&ty)?;
                 }
@@ -4363,7 +4415,7 @@ impl Query {
                         (None, d)
                     };
                     let item = match source_column {
-                        Some(column) if classify_plain_columns && !functions::collation::has_column(d.id) => BoundItem::Column(column),
+                        Some(column) if classify_plain_columns && !functions::collation::has_column_metadata(d.id) => BoundItem::Column(column),
                         _ => BoundItem::Scalar(e),
                     };
                     push(item, d);
@@ -4426,7 +4478,13 @@ impl Query {
                     {
                         return Err(SqlError::UndefinedFunction);
                     }
-                    let data_type = if matches!(a.base(), Aggregate::Avg) {
+                    let data_type = if matches!(a.base(), Aggregate::ArrayAgg) {
+                        let input = c.as_ref().ok_or(SqlError::Syntax)?;
+                        if input.ty != DataType::Text || input.attached_enum().is_none() {
+                            return Err(SqlError::Unsupported);
+                        }
+                        DataType::TextArray
+                    } else if matches!(a.base(), Aggregate::Avg) {
                         match ty {
                             Some(DataType::Real | DataType::DoublePrecision) => {
                                 DataType::DoublePrecision
@@ -4476,7 +4534,7 @@ impl Query {
                                 d.not_null = false;
                             }
                             let c=BoundColumn {source,column};
-                            let item = if functions::collation::has_column(d.id)
+                            let item = if functions::collation::has_column_metadata(d.id)
                                 || self.distinct() && d.data_type.is_array()
                             {
                                 BoundItem::Scalar(functions::collation::bound_column(c, &d)?)
@@ -5080,14 +5138,16 @@ impl BoundQuery<'_> {
             BoundItem::Scalar(value) => {
                 let oid = value.result_oid();
                 if oid == 0 { value.cast_enum_oid(state) } else { oid }
-            }
+            },
             BoundItem::Aggregate(kind, _) if json_aggregate::json_result(*kind) => json_aggregate::OID,
+            BoundItem::Aggregate(kind, Some(value)) => kind.enum_result(value)
+                .map_or(0, |result| result.cast_enum_oid(state)),
             _ => 0,
         };
         let type_oids = if self.query.explain {
             vec![]
         } else if let Some(grouping) = &self.grouping {
-            grouping.result_oids()
+            grouping.result_oids(state)
         } else {
             self.items.iter().map(oid).collect()
         };
@@ -6338,6 +6398,7 @@ struct AggregateAuxiliary {
     // budget, not the statement-wide one (DD-0068 Q4), so no 54000 from input size.
     local_transition: bool,
     count: i64,
+    array: String,
     ordered: Option<spill::Sorter<Vec<Value>>>,
     distinct: std::collections::BTreeSet<grouping::Key>,
     /// V2 DISTINCT aggregate inputs, deduplicated by an external sort at finish.
@@ -6355,6 +6416,7 @@ fn aggregate_auxiliary(
             zone: giggles_pg_types::temporal::SessionZone::Fixed(0),
             local_transition: false,
             count: 0,
+            array: String::new(),
             ordered: None,
             distinct: std::collections::BTreeSet::new(),
             pending: None,
@@ -6404,7 +6466,10 @@ fn flush_distinct(
                         auxiliary[index].zone, retention)?;
                 } else {
                     let value = input.into_iter().next().ok_or(SqlError::Type)?;
-                    if value != Value::Null || json_aggregate::result_type(*kind).is_some() {
+                    if value != Value::Null
+                        || json_aggregate::result_type(*kind).is_some()
+                        || matches!(kind.base(), Aggregate::ArrayAgg)
+                    {
                         update_filtered_aggregates(items, &[], columns, values, auxiliary, retention,
                             &empty, &[], work, Some((index,value)))?;
                     }
@@ -6453,6 +6518,11 @@ fn finish_aggregates(
     work: &mut usize,
 ) -> R<()> {
     for ((item, value), state) in items.iter().zip(values).zip(auxiliary) {
+        if matches!(item, BoundItem::Aggregate(kind, _) if matches!(kind.base(), Aggregate::ArrayAgg))
+            && !state.array.is_empty()
+        {
+            *value = Value::Text(format!("{}{}", state.array, "}"));
+        }
         if let BoundItem::Aggregate(a, _) = item
             && json_aggregate::result_type(*a).is_some()
         {
@@ -6563,7 +6633,9 @@ fn update_filtered_aggregates(
         let transition: &mut usize =
             if auxiliary[index].local_transition { &mut transition_work } else { &mut *work };
         let v = evaluated.as_ref();
-        if v == Some(&Value::Null) && json_aggregate::result_type(*a).is_none() {
+        if v == Some(&Value::Null) && json_aggregate::result_type(*a).is_none()
+            && !matches!(a.base(), Aggregate::ArrayAgg)
+        {
             continue;
         }
         let state = &mut auxiliary[index];
@@ -6597,6 +6669,19 @@ fn update_filtered_aggregates(
         }
         let mut value = std::mem::replace(&mut values[index], Value::Null);
         match a.base() {
+            Aggregate::ArrayAgg => {
+                let element = match v.ok_or(SqlError::Type)? {
+                    Value::Text(label) => logical_types::array_quote(label),
+                    Value::Null => "NULL".into(),
+                    _ => return Err(SqlError::Type),
+                };
+                if state.array.len() + element.len() + 2 > super::DEFAULT_MAX_VALUE_BYTES {
+                    return Err(SqlError::Limit);
+                }
+                retention.charge(element.len() + 1)?;
+                state.array.push(if state.array.is_empty() { '{' } else { ',' });
+                state.array.push_str(&element);
+            }
             Aggregate::Count => {
                 if let Value::Int(n) = &mut value {
                     *n = n.checked_add(1).ok_or(SqlError::Overflow)?;

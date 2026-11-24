@@ -334,11 +334,7 @@ impl Plan {
                         .zip(&description.columns)
                         .map(|(item, column)| match item {
                             BoundItem::Scalar(value) => Some(value),
-                            BoundItem::Aggregate(_, Some(value))
-                                if functions::collation::is_collatable(&column.data_type) =>
-                            {
-                                Some(value)
-                            }
+                            BoundItem::Aggregate(kind, Some(value)) => kind.result_metadata(value, &column.data_type),
                             _ => None,
                         })
                         .collect()

@@ -1265,8 +1265,9 @@ fn build_with_budget(
                 return Err(Error::InvalidSnapshot);
             }
         }
-        let last_oid = u64::from(ty.oid) + ty.labels.len() as u64 * 4;
-        if last_oid > u32::MAX as u64 {
+        if ty.label_oids.len() != ty.labels.len()
+            || ty.label_oids.iter().any(|&oid| oid < 65536 || (oid - 65536) % 4 != 0)
+        {
             return Err(Error::InvalidSnapshot);
         }
     }
@@ -2226,17 +2227,21 @@ fn build_with_budget(
     } else {
         BTreeSet::new()
     };
-    let mut user_type_names: BTreeSet<_> = if needs("pg_type") {
-        snapshot.user_types.iter().map(|ty| (ty.schema.as_str(), ty.name.clone())).collect()
-    } else {
-        BTreeSet::new()
+    let namespace_oid = |name: &str| {
+        if name == "public" { Ok(2200) } else {
+            snapshot.schemas.get(name).map(|(oid, _)| i64::from(*oid)).ok_or(Error::InvalidSnapshot)
+        }
     };
-    let type_oids = if needs("pg_enum") {
-        snapshot.user_types.iter().map(|ty| ty.oid).collect::<BTreeSet<_>>()
-    } else {
-        BTreeSet::new()
-    };
-    let mut overflow_label_oid = u32::MAX;
+    let mut user_type_names: BTreeSet<_> = all.get("pg_type").into_iter().flat_map(|relation| &relation.rows)
+        .filter_map(|r| match (&r[2], &r[1]) {
+            (I(namespace), Value::Text(name)) => Some((*namespace, name.clone())),
+            _ => None,
+        }).collect();
+    if needs("pg_type") {
+        for ty in &snapshot.user_types {
+            user_type_names.insert((namespace_oid(&ty.schema)?, ty.name.clone()));
+        }
+    }
     for ty in &snapshot.user_types {
         if needs("pg_type") {
             let len = match (ty.kind, ty.base) {
@@ -2247,15 +2252,8 @@ fn build_with_budget(
                 _ => -1,
             };
             let mut row = type_row(ty.oid, &ty.name, len, 0, 0, false);
-            row[2] = I(if ty.schema == "public" {
-                2200
-            } else {
-                snapshot
-                    .schemas
-                    .get(&ty.schema)
-                    .ok_or(Error::InvalidSnapshot)?
-                    .0 as i64
-            });
+            let namespace = namespace_oid(&ty.schema)?;
+            row[2] = I(namespace);
             row[4] = s(&ty.kind.to_string());
             row[5] = s(match ty.kind {
                 'e' => "E",
@@ -2269,20 +2267,18 @@ fn build_with_budget(
             // for the array type. Label IDs are allocated in separate slots.
             if ty.kind == 'e' {
                 let array_oid = ty.oid + 1;
-                let mut prefix = "_".to_owned();
+                let mut serial = 0u32;
                 let name = loop {
-                    let mut end = ty.name.len().min(63 - prefix.len());
+                    let suffix = if serial == 0 { String::new() } else { format!("_{serial}") };
+                    let mut end = ty.name.len().min(62 - suffix.len());
                     while !ty.name.is_char_boundary(end) {
                         end -= 1;
                     }
-                    let candidate = format!("{prefix}{}", &ty.name[..end]);
-                    if user_type_names.insert((ty.schema.as_str(), candidate.clone())) {
+                    let candidate = format!("_{}{suffix}", &ty.name[..end]);
+                    if user_type_names.insert((namespace, candidate.clone())) {
                         break candidate;
                     }
-                    if prefix.len() == 63 {
-                        return Err(Error::Limit);
-                    }
-                    prefix.push('_');
+                    serial = serial.checked_add(1).ok_or(Error::Limit)?;
                 };
                 let mut array = type_row(array_oid, &name, -1, ty.oid, 0, true);
                 array[2] = row[2].clone();
@@ -2292,20 +2288,7 @@ fn build_with_budget(
             add!("pg_type", row);
         }
         if !needs("pg_enum") { continue; }
-        for (i, label) in ty.labels.iter().enumerate() {
-            // Keep the original positional OIDs while they fit in the
-            // range preceding the next type. Growing an enum can cross
-            // that boundary; use a disjoint residue for those labels.
-            let position_oid = ty.oid + 4 * (i as u32 + 1);
-            let oid = if type_oids.range((std::ops::Bound::Excluded(ty.oid), std::ops::Bound::Included(position_oid)))
-                .next().is_some()
-            {
-                let oid = overflow_label_oid;
-                overflow_label_oid -= 4;
-                oid
-            } else {
-                position_oid
-            };
+        for (i, (label, &oid)) in ty.labels.iter().zip(&ty.label_oids).enumerate() {
             add!("pg_enum", vec![
                 I(i64::from(oid)),
                 I(ty.oid as i64),
@@ -2438,7 +2421,10 @@ fn build_with_budget(
     }
     // PG18 discovers NOT NULL via pg_constraint rather than attnotnull.
     // These are snapshot-only identities; no persisted format is changed.
-    let mut used_oids = if needs("pg_constraint") || needs("pg_attrdef") || !snapshot.constraints.is_empty() {
+    let mut used_oids = if needs("pg_constraint") || needs("pg_attrdef")
+        || !snapshot.constraints.is_empty()
+        || snapshot.user_types.iter().any(|ty| !ty.label_oids.is_empty())
+    {
         materialize::occupied_oids(snapshot, &lookup, budget)?
     } else {
         BTreeSet::new()

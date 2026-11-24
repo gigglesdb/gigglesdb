@@ -393,7 +393,9 @@ fn column_row(
         _ => {}
     }
     row[25] = s(&snapshot.database);
-    row[26] = s("pg_catalog");
+    row[26] = s(snapshot.user_types.iter()
+        .find(|ty| ty.kind == 'e' && ty.oid.checked_add(1) == Some(oid))
+        .map_or("pg_catalog", |ty| ty.schema.as_str()));
     row[27] = udt;
     row[32] = s(&position.to_string());
     row[33] = s("NO");

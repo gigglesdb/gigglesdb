@@ -47,8 +47,7 @@ pub(super) fn bind(
     } else if bound.result_oid() == json_aggregate::OID {
         "json".into()
     } else if let Some(ty) = bound.user_enum_type(tables) {
-        let name = user_types::quote_type_ident(ty.name());
-        if bound.ty == DataType::TextArray { format!("{name}[]") } else { name }
+        user_types::enum_display(&ty, bound.ty == DataType::TextArray)
     } else if matches!(arg, Scalar::Literal(Value::Text(_) | Value::Null)) {
         "unknown".into()
     } else {

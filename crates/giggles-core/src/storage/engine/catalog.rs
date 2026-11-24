@@ -89,6 +89,7 @@ pub(crate) struct CatalogView {
     pub(crate) constraints: BTreeMap<u64, BTreeMap<u64, Constraint>>,
     pub(crate) sequences: BTreeMap<u64, SequenceDef>,
     pub(crate) types: BTreeMap<u64, TypeDef>,
+    pub(crate) added_enum_labels: BTreeMap<u64, relational::catalog_ext::AddedEnumLabels>,
     pub(crate) collations: BTreeMap<u64, relational::collations::Collation>,
     pub(crate) extensions: BTreeMap<String, relational::InstalledExtension>,
     pub(crate) column_collations: BTreeMap<u64, relational::column_collations::Binding>,
@@ -185,6 +186,7 @@ impl CatalogView {
         parts.indexes = self.indexes.values().cloned().collect();
         parts.ext.sequences = self.sequences.clone();
         parts.ext.types = self.types.clone();
+        parts.ext.added_enum_labels = self.added_enum_labels.clone();
         parts.ext.collations = self.collations.clone();
         parts.ext.extensions = self.extensions.clone();
         parts.ext.column_collations = self.column_collations.clone();
@@ -339,7 +341,12 @@ impl CatalogSnapshot {
                     .chain(self.parts.ext.constraints.values().flatten().map(|c| c.id))
                     .chain(self.parts.ext.sequences.keys().copied())
                     .chain(self.parts.ext.collations.keys().copied())
-                    .chain(self.parts.ext.types.keys().copied())
+                    .chain(self.parts.ext.types.iter().map(|(&id, ty)| match ty {
+                        TypeDef::Enum { labels, .. } => id + labels.len() as u64
+                            - self.parts.ext.added_enum_labels.get(&id).map_or(0, |added| added.0.len()) as u64,
+                        _ => id,
+                    }))
+                    .chain(self.parts.ext.added_enum_labels.values().flat_map(|labels| labels.0.values().copied()))
                     .chain(self.parts.ext.schemas.values().map(|schema| schema.id))
                     .max()
                     .unwrap_or(0)
@@ -2031,6 +2038,14 @@ fn apply_record(
                 view.collations.insert(id, catalog_codec::decode_collation(value)?);
             } else { view.collations.remove(&id); }
         }
+        CatalogKind::EnumLabels => {
+            let id = decode_id(&key[1..])?;
+            if let Some(value) = value {
+                view.added_enum_labels.insert(id, catalog_codec::decode_enum_labels(value)?);
+            } else {
+                view.added_enum_labels.remove(&id);
+            }
+        }
         CatalogKind::TypeDefinition => {
             let id = decode_id(&key[1..])?;
             if let Some(value) = value {
@@ -2210,13 +2225,13 @@ fn finish_view(
         }
     }
     if !view.schemas.is_empty()
-        || !view.types.is_empty()
+        || !view.types.is_empty() || !view.added_enum_labels.is_empty()
         || !view.extensions.is_empty() || !view.collations.is_empty() || !view.column_collations.is_empty()
         || view.by_name.keys().any(|name| name.contains('\0'))
     {
         let parts = view.parts();
         relational::column_collations::validate_index_bindings(&parts.ext,&parts.indexes).map_err(|_|corrupt("invalid index collation binding"))?;
-        if !view.collations.is_empty() { object_ids(&parts)?; }
+        if !view.collations.is_empty() || !view.types.is_empty() || !view.added_enum_labels.is_empty() { object_ids(&parts)?; }
         relational::Relational::catalog_image(parts.tables, parts.ext, u64::MAX, 1)
             .map_err(|e| corrupt(&format!("invalid catalog image: {e:?}")))?;
     }
@@ -2244,7 +2259,7 @@ fn bind_index_predicates(view: &CatalogView) -> Result<IndexPredicateImage, Core
     }
     Ok(predicates)
 }
-fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreError> {
+pub(super) fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreError> {
     let mut result = BTreeMap::new();
     let mut insert = |id, kind| {
         if id == 0 || result.insert(id, kind).is_some() {
@@ -2275,10 +2290,15 @@ fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreErro
         insert(*id, (5, 0))?;
     }
     for id in parts.ext.collations.keys() { insert(*id, (22, 0))?; }
-    // Type definitions own catalog records. Their pg_enum label rows
-    // are projected from the definition and do not allocate catalog objects.
     for id in parts.ext.types.keys() {
         insert(*id, (15, 0))?;
+    }
+    let extension_oids: BTreeSet<_> = parts.ext.extensions.values().map(|extension| extension.oid).collect();
+    for (owner, id) in parts.ext.enum_label_ids().map_err(|_| corrupt("invalid enum label identity"))? {
+        if extension_oids.contains(&relational::type_oid(id).map_err(CoreError::Sql)?) {
+            return Err(corrupt("enum label identity collides with an extension"));
+        }
+        insert(id, (catalog_codec::ENUM_LABELS_KIND, owner))?;
     }
     for (table, birth) in &parts.ext.primary_index_birth { insert(*birth, (18, *table))?; }
     for schema in parts.ext.schemas.values() {
@@ -2500,6 +2520,9 @@ fn encode_parts(
     }
     for (id, c) in &parts.ext.collations {
         records.insert(catalog_codec::collation_key(*id), catalog_codec::encode_collation(c)?);
+    }
+    for (id, labels) in &parts.ext.added_enum_labels {
+        records.insert(catalog_codec::enum_labels_key(*id), catalog_codec::encode_enum_labels(labels)?);
     }
     for (id, ty) in &parts.ext.types {
         records.insert(

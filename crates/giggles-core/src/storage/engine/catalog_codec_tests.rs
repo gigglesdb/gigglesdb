@@ -809,3 +809,40 @@ fn enum_array_columns_use_a_new_tag_only_with_enum_elements() {
         domain_bits | meta::TEXT_BACKED_COLUMN_TYPES | meta::ENUM_ARRAY_COLUMNS,
     );
 }
+
+#[test]
+fn pre_am2_enum_definition_has_the_same_v2_records_until_add_value() {
+    use super::super::{catalog, content_check, meta};
+    use crate::relational::catalog_ext::AddedEnumLabels;
+
+    // V2 kind 15, version 1 TypeDefinition from the pre-AM-2 encoder.
+    let frozen = hex("01000000000000000000000005706861736500000000000000067075626c6963000000000000000200000000000000017a000000000000000161");
+    let ty = decode_type(&frozen).unwrap();
+    let mut parts = catalog::CatalogParts::default();
+    parts.ext.types.insert(1, ty);
+    let key = hex("0f0000000000000001");
+    let old = catalog::parts_records(&parts).unwrap();
+    assert_eq!(old, BTreeMap::from([(key.clone(), frozen)]));
+    assert_eq!(
+        content_check::required_bits_for_catalog_value(&key, &old[&key]).unwrap(),
+        meta::SCHEMAS_AND_USER_TYPES,
+    );
+
+    let TypeDef::Enum { labels, .. } = parts.ext.types.get_mut(&1).unwrap() else { panic!() };
+    labels.insert(1, "new".into());
+    parts.ext.added_enum_labels.insert(1, AddedEnumLabels(BTreeMap::from([("new".into(), 9)])));
+    let records = catalog::parts_records(&parts).unwrap();
+    let added_key = hex("1a0000000000000001");
+    assert_eq!(classify_catalog_key(&added_key).unwrap(), CatalogKind::EnumLabels);
+    let added_bytes = hex("01000000000000000100000000000000036e65770000000000000009");
+    assert_eq!(records[&added_key], added_bytes);
+    assert_eq!(decode_enum_labels(&added_bytes).unwrap(), parts.ext.added_enum_labels[&1]);
+    assert_eq!(content_check::required_bits_for_catalog_value(&added_key, &added_bytes).unwrap(),
+        64 | meta::SCHEMAS_AND_USER_TYPES | meta::ENUM_LABEL_IDENTITIES);
+    assert_eq!(content_check::required_bits_for_catalog_key(&added_key).unwrap(), meta::ENUM_LABEL_IDENTITIES);
+    assert_eq!(parts.ext.enum_label_ids().unwrap(), [(1, 2), (1, 9), (1, 3)]);
+
+    // The newly allocated label reserves the entire catalog object slot.
+    parts.ext.types.insert(9, TypeDef::Enum { name: "collision".into(), schema: "public".into(), labels: vec![] });
+    assert!(catalog::parts_records(&parts).is_err());
+}

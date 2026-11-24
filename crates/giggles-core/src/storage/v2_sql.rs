@@ -614,7 +614,10 @@ impl SqlSession {
                     let mut implicit = None;
                     let protected = self.protected.is_some();
                     let explicit = self.v2_transaction.is_some() && !protected;
-                    let enum_scope = relational::EnumScope::enter(explicit.then_some(&self.enum_transaction));
+                    let enum_scope = relational::EnumScope::enter(
+                        explicit.then_some(&self.enum_transaction),
+                        !self.v2_savepoints.is_empty(),
+                    );
                     let (txn, mut protected_effects) = match (&mut self.protected, &mut self.v2_transaction) {
                         (Some(run), _) => (&mut run.txn, Some(&mut run.effects)),
                         (None, Some(txn)) => (txn, None),

@@ -5570,7 +5570,10 @@ impl SqlSession {
         };
         let freeze_before = p.copy_freeze_created(&s.sql);
         let mut deferral = self.deferral.clone();
-        let enum_scope = relational::EnumScope::enter(self.staged.as_ref().map(|_| &self.enum_transaction));
+        let enum_scope = relational::EnumScope::enter(
+            self.staged.as_ref().map(|_| &self.enum_transaction),
+            !self.savepoints.is_empty(),
+        );
         let result = if let Some((names, deferred)) = p.set_constraints() {
             // Outside a block PostgreSQL still resolves named constraints;
             // ALL succeeds while the ephemeral mode change is discarded.

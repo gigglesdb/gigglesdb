@@ -41,7 +41,7 @@ fn extension_v8_rejects_version_tag_empty_and_truncated_births() {
     let (_, mut ext, _) = fixture();
     ext.constraints.clear();
     let bytes = codec().serialize(&ext).unwrap();
-    let mut unknown = bytes.clone(); unknown[..4].copy_from_slice(&12u32.to_be_bytes());
+    let mut unknown = bytes.clone(); unknown[..4].copy_from_slice(&13u32.to_be_bytes());
     assert!(codec().deserialize::<CatalogExt>(&unknown).unwrap_err().to_string().contains(UNSUPPORTED_CATALOG_EXT));
     // Seven empty maps followed by a birth map.
     let mut empty = codec().serialize(&(8u32, [0u64; 8])).unwrap();
@@ -136,14 +136,14 @@ fn births_cannot_collide_with_types_enum_labels_or_schemas() {
     let (tables, mut ext, indexes) = fixture();
     ext.types.insert(12, TypeDef::Enum { name: "e".into(), schema: "public".into(), labels: vec!["a".into()] });
     ext.schemas.insert("s".into(), schemas::Schema { id: 14, owner: "giggles".into() });
-    for birth in [12, 14] {
+    let TypeDef::Enum { labels, .. } = ext.types.get_mut(&12).unwrap() else { unreachable!() };
+    labels.push("b".into());
+    ext.added_enum_labels.insert(12, AddedEnumLabels(BTreeMap::from([("b".into(), 15)])));
+    for birth in [12, 13, 14, 15] {
         ext.primary_index_birth.insert(1, birth);
         assert!(validate_key_targets(&ext, tables.iter(), indexes.iter(), 30).is_err());
     }
-    // pg_enum label rows are projections of the type definition (ALTER TYPE
-    // ADD VALUE grows them past the IDs reserved at CREATE TYPE), so label
-    // offsets no longer occupy catalog object IDs.
-    ext.primary_index_birth.insert(1, 13);
+    ext.primary_index_birth.insert(1, 16);
     assert!(validate_key_targets(&ext, tables.iter(), indexes.iter(), 30).is_ok());
 }
 

@@ -174,6 +174,36 @@ fn unsupported_or_syntax(p: &Parser) -> SqlError {
         SqlError::Unsupported
     }
 }
+impl Insert {
+    pub(super) fn bind_schema_names(
+        &mut self,
+        bind: &impl Fn(&mut String),
+        state: &Relational,
+        path: &[String],
+    ) -> R<()> {
+        bind(&mut self.table);
+        match &mut self.source {
+            Some(Source::Query(query)) => query.bind_schema_names(bind, state, path),
+            Some(Source::Plan(plan, _)) => plan.bind_schema_names(bind, state, path)?,
+            None => {}
+        }
+        for expression in self.casts.values_mut() {
+            expression.bind_schema_names(bind, state, path);
+        }
+        if let Some(update) = self.conflict.as_mut().and_then(|c| c.update.as_mut()) {
+            for (_, set) in &mut update.sets {
+                if let Operand::Scalar(expression) = set {
+                    expression.bind_schema_names(bind, state, path);
+                }
+            }
+            if let Some(guard) = &mut update.guard {
+                guard.bind_schema_names(bind, state, path);
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn parse(p: &mut Parser) -> R<Insert> {
     p.need("insert")?;
     p.need("into")?;

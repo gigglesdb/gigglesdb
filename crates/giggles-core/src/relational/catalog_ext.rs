@@ -12,6 +12,7 @@ pub(crate) struct CatalogExt {
     pub(crate) constraints: BTreeMap<u64, Vec<Constraint>>,
     pub(crate) sequences: BTreeMap<u64, SequenceDef>,
     pub(crate) types: BTreeMap<u64, TypeDef>,
+    pub(crate) added_enum_labels: BTreeMap<u64, AddedEnumLabels>,
     pub(crate) logical_kinds: BTreeMap<u64, LogicalKind>,
     pub(crate) schemas: BTreeMap<String, schemas::Schema>,
     pub(crate) table_schemas: BTreeMap<u64, String>,
@@ -20,6 +21,36 @@ pub(crate) struct CatalogExt {
     pub(crate) extensions: BTreeMap<String, super::extensions::InstalledExtension>,
     pub(crate) column_collations: BTreeMap<u64, super::column_collations::Binding>,
 }
+/// Initial labels use their original creation slots. Only ADD VALUE needs
+/// an explicit identity; rename keeps the same ID under the new spelling.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AddedEnumLabels(#[serde(deserialize_with = "added_labels")] pub(crate) BTreeMap<String, u64>);
+
+fn added_labels<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, u64>, D::Error> {
+    #[derive(Deserialize)]
+    struct Label(#[serde(deserialize_with = "name")] String);
+
+    struct Labels;
+    impl<'de> Visitor<'de> for Labels {
+        type Value = BTreeMap<String, u64>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("bounded enum label identities")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut labels = BTreeMap::new();
+            while let Some((Label(label), id)) = map.next_entry::<Label, u64>()? {
+                if labels.len() == MAX_COLUMNS || labels.insert(label, id).is_some() {
+                    return Err(de::Error::custom("invalid enum label identities"));
+                }
+            }
+            Ok(labels)
+        }
+    }
+    d.deserialize_map(Labels)
+}
+
 impl Default for CatalogExt {
     fn default() -> Self {
         Self {
@@ -28,6 +59,7 @@ impl Default for CatalogExt {
             constraints: BTreeMap::new(),
             sequences: BTreeMap::new(),
             types: BTreeMap::new(),
+            added_enum_labels: BTreeMap::new(),
             logical_kinds: BTreeMap::new(),
             schemas: BTreeMap::new(),
             table_schemas: BTreeMap::new(),
@@ -45,6 +77,7 @@ impl CatalogExt {
             && self.constraints.is_empty()
             && self.sequences.is_empty()
             && self.types.is_empty()
+            && self.added_enum_labels.is_empty()
             && self.logical_kinds.is_empty()
             && self.schemas.is_empty()
             && self.table_schemas.is_empty()
@@ -356,6 +389,11 @@ pub(crate) fn validate_key_targets<'a>(ext: &CatalogExt, tables: impl Iterator<I
         .chain(indexes.keys().copied()).chain(ext.constraints.values().flatten().map(|c| c.id))
         .chain(ext.sequences.keys().copied()).chain(ext.schemas.values().map(|s| s.id)).collect();
     used.extend(ext.types.keys().copied());
+    for id in ext.enum_label_ids()?.into_iter().map(|(_, id)| id) {
+        if !used.insert(id) || id >= next_id {
+            return Err(SqlError::Type);
+        }
+    }
     validate_births(ext, &tables, next_id, &mut used)?;
     for c in ext.constraints.values().flatten() {
         let ConstraintKind::ForeignKey { ref_table, ref_columns, target, .. } = &c.kind else { continue };
@@ -383,6 +421,46 @@ pub(crate) fn validate_key_targets<'a>(ext: &CatalogExt, tables: impl Iterator<I
     Ok(())
 }
 impl CatalogExt {
+    /// Return each label's object ID in enum order. An ADD VALUE never
+    /// occupies or shifts any of the slots originally allocated by CREATE TYPE.
+    pub(crate) fn enum_ids(&self, id: u64, labels: &[String]) -> R<Vec<u64>> {
+        let added = self.added_enum_labels.get(&id);
+        if let Some(added) = added
+            && (added.0.is_empty() || added.0.keys().any(|label| !labels.contains(label)))
+        {
+            return Err(SqlError::Type);
+        }
+        let initial_count = labels.len() - added.map_or(0, |added| added.0.len());
+        let last_initial = id.checked_add(initial_count as u64).ok_or(SqlError::Limit)?;
+        let mut initial = id;
+        labels.iter().map(|label| {
+            let oid = if let Some(added_id) = added.and_then(|added| added.0.get(label)).copied() {
+                if added_id <= last_initial {
+                    return Err(SqlError::Type);
+                }
+                added_id
+            } else {
+                initial += 1;
+                initial
+            };
+            super::user_types::type_oid(oid)?;
+            Ok(oid)
+        }).collect()
+    }
+
+    pub(crate) fn enum_label_ids(&self) -> R<Vec<(u64, u64)>> {
+        if self.added_enum_labels.keys().any(|id| !matches!(self.types.get(id), Some(TypeDef::Enum { .. }))) {
+            return Err(SqlError::Type);
+        }
+        let mut ids = Vec::new();
+        for (&id, ty) in &self.types {
+            if let TypeDef::Enum { labels, .. } = ty {
+                ids.extend(self.enum_ids(id, labels)?.into_iter().map(|label| (id, label)));
+            }
+        }
+        Ok(ids)
+    }
+
     fn has_text_kind(&self) -> bool {
         self.columns.values().any(|c| c.text_kind.is_some())
     }
@@ -394,7 +472,9 @@ impl CatalogExt {
             || self.types.values().any(TypeDef::has_uuid_arrays)
     }
     pub(crate) fn wire_version(&self) -> u32 {
-        if !self.extensions.is_empty() {
+        if !self.added_enum_labels.is_empty() {
+            12
+        } else if !self.extensions.is_empty() {
             11
         } else if !self.column_collations.is_empty() {
             10
@@ -427,6 +507,7 @@ impl Serialize for CatalogExt {
         use serde::ser::SerializeTuple;
         let version = self.wire_version();
         let mut out = serializer.serialize_tuple(match version {
+            12 => 13,
             11 => 12,
             10 => 11,
             9 => 10,
@@ -499,6 +580,7 @@ impl Serialize for CatalogExt {
         if version >= 9 { out.serialize_element(&self.collations)?; }
         if version >= 10 { out.serialize_element(&self.column_collations)?; }
         if version >= 11 { out.serialize_element(&self.extensions)?; }
+        if version >= 12 { out.serialize_element(&self.added_enum_labels)?; }
         out.end()
     }
 }
@@ -612,6 +694,11 @@ impl<'de> Deserialize<'de> for CatalogExt {
         fn collation_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, super::collations::Collation>, D::Error> {
             catalog_map::<D, super::collations::Collation>(d)
         }
+        #[derive(Deserialize)]
+        struct EnumLabels(#[serde(deserialize_with = "enum_labels_map")] BTreeMap<u64, AddedEnumLabels>);
+        fn enum_labels_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, AddedEnumLabels>, D::Error> {
+            catalog_map::<D, AddedEnumLabels>(d)
+        }
         struct V;
         impl<'de> Visitor<'de> for V {
             type Value = CatalogExt;
@@ -626,7 +713,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     };
                 }
                 let ext_version = next!(u32);
-                if !matches!(ext_version, 1..=11) {
+                if !matches!(ext_version, 1..=12) {
                     return Err(de::Error::custom(UNSUPPORTED_CATALOG_EXT));
                 }
                 let columns = if ext_version >= 6 {
@@ -695,6 +782,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     collations: if ext_version >= 9 { next!(Collations).0 } else { BTreeMap::new() },
                     column_collations: if ext_version >= 10 { next!(ColumnCollations).0 } else { BTreeMap::new() },
                     extensions: if ext_version >= 11 { next!(Extensions).0 } else { BTreeMap::new() },
+                    added_enum_labels: if ext_version >= 12 { next!(EnumLabels).0 } else { BTreeMap::new() },
                 };
                 if ext_version != out.wire_version() {
                     return Err(de::Error::custom("noncanonical catalog extension version"));
@@ -702,7 +790,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                 Ok(out)
             }
         }
-        d.deserialize_tuple(12, V)
+        d.deserialize_tuple(13, V)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1221,7 +1309,7 @@ impl Relational {
         next_id: u64,
         excluded_table: Option<u64>,
     ) -> R<()> {
-        if !matches!(ext.ext_version, 1..=11) {
+        if !matches!(ext.ext_version, 1..=12) {
             return Err(SqlError::Unsupported);
         }
         self.validate_schemas(ext, next_id, excluded_table)?;
@@ -1273,16 +1361,24 @@ impl Relational {
             if *id == 0 || *id >= next_id || !used.insert(*id) || !type_names.insert(ty.name()) {
                 return Err(SqlError::Type);
             }
-            if let TypeDef::Enum { labels, .. } = ty {
-                // pg_enum labels are virtual rows. ADD VALUE can grow the
-                // projection beyond the IDs reserved when the type was created.
-                let last_label = id.checked_add(labels.len() as u64).ok_or(SqlError::Limit)?;
-                super::user_types::type_oid(last_label)?;
-            }
             super::user_types::type_oid(*id)?;
             super::user_types::validate_type(ty)?;
             if ty.schema() != "public" && !ext.schemas.contains_key(ty.schema()) {
                 return Err(SqlError::InvalidSchema);
+            }
+        }
+        let label_ids = ext.enum_label_ids()?;
+        let indexes: BTreeSet<_> = if label_ids.is_empty() {
+            BTreeSet::new()
+        } else {
+            self.secondary.descriptors().iter().map(|d| d.id).collect()
+        };
+        let extension_oids: BTreeSet<_> = ext.extensions.values().map(|extension| extension.oid).collect();
+        for (_, id) in label_ids {
+            if id >= next_id || !used.insert(id) || indexes.contains(&id)
+                || extension_oids.contains(&super::user_types::type_oid(id)?)
+            {
+                return Err(SqlError::Type);
             }
         }
         for (id, (_, column)) in &columns {

@@ -40,12 +40,13 @@ pub(crate) const BUILTIN_EXTENSIONS: u64 = 1 << 25;
 pub(crate) const ROLE_MEMBERSHIP: u64 = 1 << 27;
 pub(crate) const WIDE_ROWS: u64 = 1 << 28;
 pub(crate) const ENUM_ARRAY_COLUMNS: u64 = 1 << 29;
+pub(crate) const ENUM_LABEL_IDENTITIES: u64 = 1 << 30;
 pub(crate) const UUID_ARRAY_COLUMNS: u64 = 1 << 32;
 /// A committed catalog crossed a count accepted by older readers.
 pub(crate) const WIDE_CATALOG: u64 = 1 << 31;
 pub(crate) const PARTIAL_INDEXES: u64 = 1 << 33;
 pub(crate) const TEMPORAL_INDEXES: u64 = 1 << 34;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 33] = [
+pub(crate) const FEATURE_TABLE: [(u64, &str); 34] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -75,6 +76,7 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 33] = [
     (ROLE_MEMBERSHIP, "role_membership"),
     (WIDE_ROWS, "wide_rows"),
     (ENUM_ARRAY_COLUMNS, "enum_array_columns"),
+    (ENUM_LABEL_IDENTITIES, "enum_label_identities"),
     (UUID_ARRAY_COLUMNS, "uuid_array_columns"),
     (WIDE_CATALOG, "wide_catalog"),
     (PARTIAL_INDEXES, "partial_indexes"),
@@ -411,7 +413,7 @@ pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
             | WRITE_FENCE
             | USER_COLLATIONS
             | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS | ROLE_MEMBERSHIP | WIDE_ROWS | UUID_ARRAY_COLUMNS
-            | ENUM_ARRAY_COLUMNS | WIDE_CATALOG | PARTIAL_INDEXES | TEMPORAL_INDEXES,
+            | ENUM_ARRAY_COLUMNS | ENUM_LABEL_IDENTITIES | WIDE_CATALOG | PARTIAL_INDEXES | TEMPORAL_INDEXES,
     )
 }
 fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
@@ -427,6 +429,10 @@ fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
     let enum_array_dependencies = 64 | TEXT_BACKED_COLUMN_TYPES | SCHEMAS_AND_USER_TYPES;
     if bits & ENUM_ARRAY_COLUMNS != 0 && bits & enum_array_dependencies != enum_array_dependencies {
         return Err(corrupt("enum array columns require catalog_ext, text-backed types and user types"));
+    }
+    let enum_label_dependencies = 64 | SCHEMAS_AND_USER_TYPES;
+    if bits & ENUM_LABEL_IDENTITIES != 0 && bits & enum_label_dependencies != enum_label_dependencies {
+        return Err(corrupt("enum label identities require catalog_ext and user types"));
     }
     if bits & RANGES != 0 && bits & REPLICATED == 0 {
         return Err(corrupt("ranges requires replicated"));

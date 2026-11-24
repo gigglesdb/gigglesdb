@@ -254,7 +254,9 @@ impl Relational {
             }
             std::sync::Arc::make_mut(&mut self.ext)
                 .sequences.retain(|_, sequence| split_key(&sequence.name).0 != ddl.name);
-            std::sync::Arc::make_mut(&mut self.ext).types.retain(|id, _| !types.contains(id));
+            let ext = Arc::make_mut(&mut self.ext);
+            ext.types.retain(|id, _| !types.contains(id));
+            ext.added_enum_labels.retain(|id, _| !types.contains(id));
             std::sync::Arc::make_mut(&mut self.ext).collations.retain(|_,c| c.schema != ddl.name);
             std::sync::Arc::make_mut(&mut self.ext).schemas.remove(&ddl.name);
         }

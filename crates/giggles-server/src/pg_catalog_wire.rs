@@ -329,6 +329,7 @@ fn snapshot_owned(
                 typmod,
                 not_null,
                 labels,
+                label_oids: types.enum_label_oids.get(id).cloned().unwrap_or_default(),
             }
         })
         .collect();

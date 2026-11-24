@@ -95,7 +95,10 @@ pub(super) fn occupied_oids(snapshot: &CatalogSnapshot, lookup: &Lookup<'_>, bud
     }
     for ty in &snapshot.user_types {
         budget.visit(1 + ty.labels.len())?;
-        used.extend((0..=ty.labels.len()).map(|n| i64::from(ty.oid) + 4 * n as i64));
+        used.insert(i64::from(ty.oid));
+        if ty.kind == 'e' {
+            used.insert(i64::from(ty.oid) + 1);
+        }
     }
     budget.visit(snapshot.schemas.len() + snapshot.roles.len()
         + snapshot.extensions.len() + snapshot.collations.len())?;
@@ -108,6 +111,11 @@ pub(super) fn occupied_oids(snapshot: &CatalogSnapshot, lookup: &Lookup<'_>, bud
         I(oid) => Some(oid),
         _ => None,
     }));
+    for &oid in snapshot.user_types.iter().flat_map(|ty| &ty.label_oids) {
+        if !used.insert(i64::from(oid)) {
+            return Err(Error::InvalidSnapshot);
+        }
+    }
     Ok(used)
 }
 

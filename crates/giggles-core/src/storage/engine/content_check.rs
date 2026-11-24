@@ -34,6 +34,9 @@ pub(crate) fn required_bits_for_catalog_key(key: &[u8]) -> Result<u64, FormatErr
     } else if key.first() == Some(&catalog_codec::EXTENSIONS_KIND) {
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::meta::BUILTIN_EXTENSIONS)
+    } else if key.first() == Some(&catalog_codec::ENUM_LABELS_KIND) {
+        catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
+        Ok(super::meta::ENUM_LABEL_IDENTITIES)
     } else if key.first() == Some(&23) {
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::meta::COLUMN_COLLATIONS)
@@ -112,6 +115,10 @@ pub(crate) fn required_bits_for_catalog_value(
         CatalogKind::Extensions => {
             catalog_codec::decode_extensions(value).map_err(corrupt)?;
             Ok(super::meta::BUILTIN_EXTENSIONS)
+        }
+        CatalogKind::EnumLabels => {
+            catalog_codec::decode_enum_labels(value).map_err(corrupt)?;
+            Ok(64 | super::meta::SCHEMAS_AND_USER_TYPES | super::meta::ENUM_LABEL_IDENTITIES)
         }
         CatalogKind::ColumnCollation => {
             catalog_codec::decode_column_collation(value).map_err(corrupt)?;
@@ -303,6 +310,10 @@ fn check_protected_kernel(kv: &dyn KvRead, features: u64) -> Result<(), FormatEr
 pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, FormatError> {
     check_protected_kernel(kv, features)?;
     let mut stale = Vec::new();
+    let mut types = BTreeMap::new();
+    let mut added_enum_labels = BTreeMap::new();
+    let mut extensions = BTreeMap::new();
+    let mut primary_index_birth = BTreeMap::new();
     let mut previous = None;
     let mut tables = BTreeMap::new();
     let mut sequences = BTreeMap::new();
@@ -362,10 +373,11 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
             }
             CatalogKind::Table => {
                 let (entry, _) = catalog_codec::decode_table(value).map_err(corrupt)?;
-                tables.insert(
-                    u64::from_be_bytes(user[1..9].try_into().unwrap()),
-                    entry.def,
-                );
+                let id = u64::from_be_bytes(user[1..9].try_into().unwrap());
+                if let Some(birth) = entry.primary_index_birth {
+                    primary_index_birth.insert(id, birth);
+                }
+                tables.insert(id, entry.def);
             }
             CatalogKind::Name => {
                 let _: [u8; 8] = value
@@ -384,12 +396,16 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
                     catalog_codec::decode_sequence(value).map_err(corrupt)?,
                 );
             }
-            CatalogKind::Type | CatalogKind::TypeDefinition => {
-                catalog_codec::decode_type(value)
-                    .map(|_| ())
-                    .map_err(corrupt)?;
+            CatalogKind::Type => { catalog_codec::decode_type(value).map_err(corrupt)?; }
+            CatalogKind::TypeDefinition => {
+                let id = u64::from_be_bytes(user[1..9].try_into().unwrap());
+                types.insert(id, catalog_codec::decode_type(value).map_err(corrupt)?);
             }
-            CatalogKind::Extensions => { catalog_codec::decode_extensions(value).map_err(corrupt)?; }
+            CatalogKind::EnumLabels => {
+                let id = u64::from_be_bytes(user[1..9].try_into().unwrap());
+                added_enum_labels.insert(id, catalog_codec::decode_enum_labels(value).map_err(corrupt)?);
+            }
+            CatalogKind::Extensions => { extensions = catalog_codec::decode_extensions(value).map_err(corrupt)?; }
             CatalogKind::ColumnCollation => {column_collations.insert(u64::from_be_bytes(user[1..9].try_into().unwrap()),catalog_codec::decode_column_collation(value).map_err(corrupt)?);}
             CatalogKind::Collation => {collations.insert(u64::from_be_bytes(user[1..9].try_into().unwrap()),catalog_codec::decode_collation(value).map_err(corrupt)?);}
             CatalogKind::Index => {
@@ -444,11 +460,13 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
         };
         if refs.iter().any(|r|matches!(r,Reference::User(id) if !collations.contains_key(id))) {return Err(corrupt("collation dependency absent"));}
     }
+    let mut constraints_by_table = BTreeMap::<_, Vec<_>>::new();
     for (id, value) in constraints {
         let table = tables
             .get(&id)
             .ok_or_else(|| corrupt("constraint table is absent"))?;
-        catalog_codec::decode_constraint(&value, table).map_err(corrupt)?;
+        let constraint = catalog_codec::decode_constraint(&value, table).map_err(corrupt)?;
+        constraints_by_table.entry(id).or_default().push(constraint);
     }
     catalog_codec::validate_comments(&comments, tables.values(), &views).map_err(corrupt)?;
     super::catalog_label_codec::validate_labels(&labels, tables.values()).map_err(corrupt)?;
@@ -471,6 +489,17 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
     parts.tables = tables.into_iter().map(|(id, t)| (id.to_string(), t)).collect();
     parts.ext.schemas = schemas;
     catalog_codec::sql_views::validate_catalog(&parts).map_err(corrupt)?;
+    if !types.is_empty() || !added_enum_labels.is_empty() {
+        parts.ext.types = types;
+        parts.ext.added_enum_labels = added_enum_labels;
+        parts.ext.extensions = extensions;
+        parts.ext.primary_index_birth = primary_index_birth;
+        parts.ext.constraints = constraints_by_table;
+        parts.ext.collations = collations;
+        parts.ext.sequences = sequences.clone();
+        parts.indexes = indexes.into_values().collect();
+        super::catalog::object_ids(&parts).map_err(corrupt)?;
+    }
     for item in kv
         .range(
             Keyspace::Seq,

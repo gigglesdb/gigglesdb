@@ -12,6 +12,7 @@ fn psycopg_type_discovery_and_regtype_names() {
         typmod: -1,
         not_null: false,
         labels: vec!["a".into()],
+        label_oids: vec![65544],
     });
     let p = plan("SELECT typname AS name, oid, typarray AS array_oid, oid::regtype::text AS regtype, typdelim AS delimiter FROM pg_type t WHERE t.oid = to_regtype($1) ORDER BY t.oid").unwrap().unwrap();
     assert_eq!(p.parameter_types(), &[PgType::Text]);

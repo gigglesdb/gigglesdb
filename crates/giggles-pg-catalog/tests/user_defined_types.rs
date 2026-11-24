@@ -15,6 +15,7 @@ fn user_type_and_enum_rows() {
             base,
             typmod: -1,
             not_null: kind == 'd',
+            label_oids: if kind == 'e' { vec![65544, 65548] } else { vec![] },
             labels,
         });
     }
@@ -57,6 +58,7 @@ fn user_type_namespace_matches_pg_namespace() {
         typmod: -1,
         not_null: false,
         labels: vec!["first".into()],
+        label_oids: vec![65544],
     });
     let p = plan("SELECT n.nspname,t.typname FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE t.typname='mood'").unwrap().unwrap();
     assert_eq!(
@@ -71,13 +73,14 @@ fn user_type_namespace_matches_pg_namespace() {
 #[test]
 fn growing_an_enum_keeps_catalog_label_oids_distinct() {
     let mut snapshot = CatalogSnapshot::default();
-    for (oid, name, labels) in [
+    for (oid, name, labels, label_oids) in [
         (
             65540,
             "first",
             vec!["start".into(), "inserted".into(), "end".into()],
+            vec![65544, 65560, 65548],
         ),
-        (65548, "second", vec!["kept".into()]),
+        (65552, "second", vec!["kept".into()], vec![65556]),
     ] {
         snapshot.user_types.push(UserType {
             schema: "public".into(),
@@ -88,6 +91,7 @@ fn growing_an_enum_keeps_catalog_label_oids_distinct() {
             typmod: -1,
             not_null: false,
             labels,
+            label_oids,
         });
     }
     let sql = "SELECT oid,enumlabel FROM pg_enum ORDER BY enumtypid,enumsortorder";
@@ -99,14 +103,14 @@ fn growing_an_enum_keeps_catalog_label_oids_distinct() {
         vec![
             vec![Value::Int(65544), Value::Text("start".into())],
             vec![
-                Value::Int(i64::from(u32::MAX)),
+                Value::Int(65560),
                 Value::Text("inserted".into())
             ],
             vec![
-                Value::Int(i64::from(u32::MAX - 4)),
+                Value::Int(65548),
                 Value::Text("end".into())
             ],
-            vec![Value::Int(65552), Value::Text("kept".into())],
+            vec![Value::Int(65556), Value::Text("kept".into())],
         ]
     );
 }

@@ -218,12 +218,7 @@ impl Prepared {
                 insert.bind_schema_names(&read, state, &self.search_path)
             }
             Statement::InsertMulti(insert) => {
-                read(&mut insert.table);
-                match &mut insert.source {
-                    Some(sql_insert::Source::Query(query)) => query.bind_schema_names(&read, state, &self.search_path),
-                    Some(sql_insert::Source::Plan(plan, _)) => plan.bind_schema_names(&read, state, &self.search_path)?,
-                    None => {}
-                }
+                insert.bind_schema_names(&read, state, &self.search_path)?;
             }
             Statement::AlterTable(alter) => {
                 read(&mut alter.table);

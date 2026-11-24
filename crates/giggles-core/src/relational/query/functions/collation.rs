@@ -259,6 +259,7 @@ struct Metadata {
     name: Option<String>,
     explicit: bool,
     conflict: Option<(String, String)>,
+    enum_type: Option<TypeDef>,
 }
 std::thread_local! { static MATERIALIZED: std::cell::RefCell<BTreeMap<u64, Metadata>> = const { std::cell::RefCell::new(BTreeMap::new()) }; }
 pub(in crate::relational::query) fn has_materialized_columns() -> bool {
@@ -289,6 +290,7 @@ impl ColumnScope {
                 c.id,
                 Metadata {
                     name: d.name.map(str::to_owned),
+                    enum_type: m.and_then(BoundScalar::attached_enum).cloned(),
                     explicit: d.explicit,
                     conflict: d.conflict.map(|(a, b)| (a.to_owned(), b.to_owned())),
                 },
@@ -309,12 +311,18 @@ impl Drop for ColumnScope {
 }
 pub(in crate::relational::query) fn column(value: BoundScalar, id: u64) -> R<BoundScalar> {
     if let Some(d) = MATERIALIZED.with(|c| c.borrow().get(&id).cloned()) {
+        let value = if let Some(ty) = &d.enum_type { value.with_enum(ty) } else { value };
         return value.inherit_derivation(Derivation {
             name: d.name.as_deref(),
             explicit: d.explicit,
             conflict: d.conflict.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
         });
     }
+    let value = if let Some(ty) = enum_order::column_type(id) {
+        value.with_enum(&ty)
+    } else {
+        value
+    };
     let n = COLUMNS.with(|c| c.borrow().get(&id).cloned());
     if let Some(n) = n {
         bind(&format!("{IMPLICIT}{n}"), value)
@@ -338,6 +346,12 @@ pub(in crate::relational::query) fn has_column(id: u64) -> bool {
     MATERIALIZED.with(|c| {
         c.borrow().get(&id).map(|m| m.name.is_some() || m.conflict.is_some())
     }).unwrap_or_else(|| COLUMNS.with(|c| c.borrow().contains_key(&id)))
+}
+
+pub(in crate::relational::query) fn has_column_metadata(id: u64) -> bool {
+    has_column(id) || MATERIALIZED.with_borrow(|columns| {
+        columns.get(&id).map_or_else(|| enum_order::has_column(id), |m| m.enum_type.is_some())
+    })
 }
 type Cache = Mutex<std::collections::HashMap<String, Arc<giggles_icu::Collator>>>;
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -419,6 +433,11 @@ pub(in crate::relational::query) fn compare_pair(
     av: &Value,
     bv: &Value,
 ) -> R<Ordering> {
+    if a.ty == DataType::TextArray
+        && let Some(TypeDef::Enum { labels, .. }) = a.attached_enum().or_else(|| b.attached_enum())
+    {
+        return enum_order::compare_arrays(labels, av, bv);
+    }
     if a.ty == DataType::TextArray {
         logical_types::validate_text_array(av)?;
         logical_types::validate_text_array(bv)?;
@@ -666,6 +685,13 @@ pub(in crate::relational::query) fn scalar(
     let Some(metadata) = metadata else {
         return Ok(value);
     };
+    if let Some(ty) = metadata.attached_enum() {
+        return Ok(Scalar::Domain(
+            Box::new(value),
+            user_types::TypeReference { name: ty.name().into(), array: metadata.ty == DataType::TextArray },
+            Box::new(Ok(ty.clone())),
+        ));
+    }
     let d = metadata.collation_derivation()?;
     if let Some((a, b)) = d.conflict {
         let carrier =
@@ -689,11 +715,15 @@ pub(in crate::relational::query) fn combined(
     b: Option<&BoundScalar>,
     ty: DataType,
 ) -> R<BoundScalar> {
-    BoundScalar {
-        ty,
-        node: Node::Literal(Value::Null),
-    }
-    .inherit_derivation(merge(a.into_iter().chain(b))?)
+    let value = BoundScalar { ty, node: Node::Literal(Value::Null) }
+        .inherit_derivation(merge(a.into_iter().chain(b))?)?;
+    let enum_type = match (a.and_then(BoundScalar::attached_enum), b.and_then(BoundScalar::attached_enum)) {
+        (Some(a), Some(b)) if a == b => Some(a),
+        (Some(a), None) if b.is_none() => Some(a),
+        (None, Some(b)) if a.is_none() => Some(b),
+        _ => None,
+    };
+    Ok(if let Some(ty) = enum_type { value.with_enum(ty) } else { value })
 }
 
 pub(in crate::relational::query) fn register(
@@ -711,6 +741,7 @@ pub(in crate::relational::query) fn register(
                 c.id,
                 Metadata {
                     name: d.name.map(str::to_owned),
+                    enum_type: m.as_ref().and_then(BoundScalar::attached_enum).cloned(),
                     explicit: false,
                     conflict: d.conflict.map(|(a, b)| (a.to_owned(), b.to_owned())),
                 },
@@ -741,7 +772,12 @@ pub(in crate::relational::query) fn equality_key(
 pub(in crate::relational::query) fn materialized(metadata: Option<&BoundScalar>, ty: DataType) -> R<BoundScalar> {
     let mut d = merge(metadata.into_iter())?;
     d.explicit = false;
-    BoundScalar { ty, node: Node::Literal(Value::Null) }.inherit_derivation(d)
+    let value = BoundScalar { ty, node: Node::Literal(Value::Null) }.inherit_derivation(d)?;
+    Ok(if let Some(ty) = metadata.and_then(BoundScalar::attached_enum) {
+        value.with_enum(ty)
+    } else {
+        value
+    })
 }
 
 #[cfg(test)]

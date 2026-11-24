@@ -135,6 +135,15 @@ impl Expression {
             })
         }
     }
+    pub(in crate::relational) fn bind_schema_names(
+        &mut self,
+        bind: &impl Fn(&mut String),
+        state: &Relational,
+        path: &[String],
+    ) {
+        schema_names::scalar(&mut self.0, bind, state, path);
+    }
+
     fn assignment_target(target: &DataType) -> &DataType {
         // Keep scalar operators' result type as text during evaluation. Relabeling
         // their nodes as varchar/bpchar makes text overloads reject the result;

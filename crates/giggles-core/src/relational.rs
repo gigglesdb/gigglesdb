@@ -2665,6 +2665,7 @@ impl Prepared {
     }
     pub(crate) fn validate_immutable_constants_at_epoch(&self, state: &Relational, epoch: u64) -> R<()> {
         let _date_order = clock::LiteralDateOrder::enter(self.literal_date_order);
+        let _type_path = user_types::TypeDisplayScope::enter(&self.search_path);
         let bound = self.bind_schemas(state)?;
         let this = &bound;
         // Schema binding copies the epoch but never reads it. Accept the
@@ -2693,6 +2694,7 @@ impl Prepared {
     }
     pub(crate) fn describe(&self, state: &Relational) -> R<Description> {
         let _date_order = clock::LiteralDateOrder::enter(self.literal_date_order);
+        let _type_path = user_types::TypeDisplayScope::enter(&self.search_path);
         let bound = self.bind_schemas(state)?;
         let this = &bound;
         this.validate_schemas(state)?;
@@ -4261,6 +4263,7 @@ impl Relational {
         injected_source: Option<&dyn scan::RowSource>,
         events: &mut Vec<constraints::Event>,
     ) -> R<SqlResult> {
+        let _type_path = user_types::TypeDisplayScope::enter(&prepared.search_path);
         let bound = prepared.bind_schemas(self)?;
         let prepared = &bound;
         prepared.validate_schemas(self)?;

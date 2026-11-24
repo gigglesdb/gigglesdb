@@ -173,3 +173,6 @@ ALTER TABLE "OAuthClient" ADD COLUMN "linkDismissals" TEXT[] NOT NULL DEFAULT AR
     drop(pg);
     f.stop().await;
 }
+
+#[path = "am2_fix1_network.inc"]
+mod am2_fix1_network;

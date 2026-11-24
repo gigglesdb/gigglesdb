@@ -245,6 +245,36 @@ impl TypeReference {
     }
 }
 
+thread_local! {
+    static TYPE_DISPLAY_PATH: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) struct TypeDisplayScope(Option<Vec<String>>);
+impl TypeDisplayScope {
+    pub(super) fn enter(path: &[String]) -> Self {
+        Self(TYPE_DISPLAY_PATH.replace(Some(path.to_vec())))
+    }
+}
+impl Drop for TypeDisplayScope {
+    fn drop(&mut self) {
+        TYPE_DISPLAY_PATH.replace(self.0.take());
+    }
+}
+
+pub(super) fn enum_display(ty: &TypeDef, array: bool) -> String {
+    let visible = TYPE_DISPLAY_PATH.with_borrow(|path| {
+        path.as_ref().map_or(ty.schema() == "public", |path| path.iter().any(|schema| schema == ty.schema()))
+    });
+    let mut name = quote_type_ident(ty.name());
+    if !visible {
+        name = format!("{}.{name}", quote_type_ident(ty.schema()));
+    }
+    if array {
+        name.push_str("[]");
+    }
+    name
+}
+
 pub(super) fn quote_type_ident(name: &str) -> String {
     query::quote_identifier(name)
 }
@@ -523,12 +553,20 @@ pub(super) fn execute(
             let mut ids = BTreeSet::new();
             let mut notices = Vec::new();
             for name in names {
-                let Some((id, ty)) = state.resolve_type(name, &prepared.search_path)? else {
-                    if !optional {
-                        return Err(SqlError::UndefinedObject);
+                let (id, ty) = match state.resolve_type(name, &prepared.search_path) {
+                    Ok(Some(found)) => found,
+                    Ok(None) if *optional => {
+                        let name = name.replace('\0', ".");
+                        notices.push((format!("type \"{name}\" does not exist, skipping"), None, None));
+                        continue;
                     }
-                    notices.push((format!("type \"{name}\" does not exist, skipping"), None, None));
-                    continue;
+                    Err(SqlError::InvalidSchema) if *optional => {
+                        let (schema, _) = name.split_once('\0').expect("qualified type name");
+                        notices.push((format!("schema \"{schema}\" does not exist, skipping"), None, None));
+                        continue;
+                    }
+                    Ok(None) => return Err(SqlError::UndefinedObject),
+                    Err(error) => return Err(error),
                 };
                 if *domain && !matches!(ty, TypeDef::Domain { .. }) {
                     return Err(SqlError::WrongObjectType);
@@ -633,7 +671,9 @@ pub(super) fn execute(
             for constraints in std::sync::Arc::make_mut(&mut candidate.ext).constraints.values_mut() {
                 constraints.retain(|c| !matches!(&c.kind, ConstraintKind::ForeignKey { columns: local, ref_columns, .. } if local.iter().chain(ref_columns).any(|id| columns.contains(id))));
             }
-            std::sync::Arc::make_mut(&mut candidate.ext).types.retain(|id, _| !ids.contains(id));
+            let ext = Arc::make_mut(&mut candidate.ext);
+            ext.types.retain(|id, _| !ids.contains(id));
+            ext.added_enum_labels.retain(|id, _| !ids.contains(id));
             Relational::normalize_ext(std::sync::Arc::make_mut(&mut candidate.ext));
             candidate.secondary =
                 candidate.secondary_build_complete_engine(&descriptors, &mut || false)?;
@@ -883,6 +923,7 @@ pub struct UserTypeCatalog {
     pub extensions: BTreeMap<String, super::extensions::InstalledExtension>,
     pub epoch: u64,
     pub types: BTreeMap<u64, TypeDef>,
+    pub enum_label_oids: BTreeMap<u64, Vec<u32>>,
     pub column_types: BTreeMap<u64, u64>,
     pub enum_array_columns: BTreeSet<u64>,
 }
@@ -892,6 +933,11 @@ impl Relational {
             extensions: self.ext.extensions.clone(),
             epoch: self.epoch,
             types: self.ext.types.clone(),
+            enum_label_oids: self.ext.types.iter().filter_map(|(&id, ty)| {
+                let TypeDef::Enum { labels, .. } = ty else { return None };
+                let ids = self.ext.enum_ids(id, labels).expect("validated enum label IDs");
+                Some((id, ids.into_iter().map(|id| type_oid(id).expect("validated OID")).collect()))
+            }).collect(),
             enum_array_columns: self.ext.logical_kinds.iter().filter_map(|(&id, kind)| {
                 (*kind == catalog_ext::LogicalKind::TextArray
                     && matches!(self.column_type(id), Some(TypeDef::Enum { .. }))).then_some(id)

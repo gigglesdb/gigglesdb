@@ -748,6 +748,12 @@ pub(super) fn bind<'a>(
             Aggregate::Count => DataType::BigInt,
             Aggregate::Json | Aggregate::JsonObject => DataType::Text,
             Aggregate::Jsonb | Aggregate::JsonbObject => DataType::Jsonb,
+            Aggregate::ArrayAgg => {
+                if b.ty != DataType::Text || b.attached_enum().is_none() {
+                    return Err(SqlError::Unsupported);
+                }
+                DataType::TextArray
+            }
             Aggregate::Avg => match b.ty {
                 DataType::SmallInt | DataType::Integer | DataType::BigInt | DataType::Numeric => {
                     DataType::Numeric
@@ -815,6 +821,10 @@ pub(super) fn bind<'a>(
         .iter()
         .map(|c| functions::collation::bound_column(*c, &tables[c.source].columns[c.column]))
         .collect::<R<Vec<_>>>()?;
+    let enum_results = aggregates.iter().map(|item| match item {
+        BoundItem::Aggregate(kind, Some(value)) => kind.enum_result(value),
+        _ => None,
+    }).collect::<Vec<_>>();
     let metadata = keys
         .iter()
         .map(Some)
@@ -822,9 +832,12 @@ pub(super) fn bind<'a>(
             aggregates
                 .iter()
                 .zip(&aggregate_columns)
-                .map(|(a, column)| match a {
-                    BoundItem::Aggregate(_, Some(value))
-                        if functions::collation::is_collatable(&column.data_type) =>
+                .zip(&enum_results)
+                .map(|((a, column), enum_result)| match a {
+                    _ if enum_result.is_some() => enum_result.as_ref(),
+                    BoundItem::Aggregate(kind, Some(value))
+                        if !json_aggregate::json_result(*kind)
+                            && functions::collation::is_collatable(&column.data_type) =>
                     {
                         Some(value)
                     }
@@ -1106,8 +1119,11 @@ fn page_expr(query: &Query, expr: Option<&Expr>, params: &[Value], limit: bool) 
     }
 }
 impl Grouping {
-    pub(super) fn result_oids(&self) -> Vec<u32> {
-        self.outputs.iter().map(BoundScalar::result_oid).collect()
+    pub(super) fn result_oids(&self, state: &Relational) -> Vec<u32> {
+        self.outputs.iter().map(|value| {
+            let oid = value.result_oid();
+            if oid == 0 { value.cast_enum_oid(state) } else { oid }
+        }).collect()
     }
 
     pub(super) fn mask(&self) -> Option<&[bool]> {

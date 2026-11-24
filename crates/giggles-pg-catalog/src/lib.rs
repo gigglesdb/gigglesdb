@@ -170,6 +170,7 @@ pub struct UserType {
     pub typmod: i32,
     pub not_null: bool,
     pub labels: Vec<String>,
+    pub label_oids: Vec<u32>,
 }
 /// A prepared statement visible only to its owning session.
 #[derive(Debug, Clone)]
