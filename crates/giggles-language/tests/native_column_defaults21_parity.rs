@@ -94,8 +94,8 @@ fn default_errors_match_sql() {
             assert_eq!(err, Error::Sql { sqlstate: state.into() });
             assert_eq!(giggles_core::sqlstate(&left.sql_session().execute(&format!("CREATE TABLE t ({sql}, PRIMARY KEY(id))"), &[], None).unwrap_err()), state);
         }
-        // Repo SQL's DEFAULT-before-GENERATED spelling is narrower than PG18.6/native.
-        assert_eq!(giggles_core::sqlstate(&left.sql_session().execute("CREATE TABLE syntax_order(id BIGINT DEFAULT 1 GENERATED ALWAYS AS IDENTITY PRIMARY KEY)", &[], None).unwrap_err()), "0A000");
+        // PostgreSQL 18.6 returns 42601 when DEFAULT and IDENTITY are combined in either order.
+        assert_eq!(giggles_core::sqlstate(&left.sql_session().execute("CREATE TABLE syntax_order(id BIGINT DEFAULT 1 GENERATED ALWAYS AS IDENTITY PRIMARY KEY)", &[], None).unwrap_err()), "42601");
         // Native typed text defaults do not acquire SQL's unknown-literal coercion.
         assert_eq!(trap(|| engine.execute_catalog_text("create table t(id int64 default '5', primary key(id))")), Err(Error::Sql { sqlstate: "42804".into() }));
         left.sql_session().execute("CREATE TABLE t(id BIGINT DEFAULT '5' PRIMARY KEY)", &[], None).unwrap();

@@ -403,26 +403,110 @@ fn pg_dump_language_inventory() {
 #[test]
 fn pg_dump_access_method_inventory_preserves_regproc() {
     let r = run(
-        "SELECT tableoid,oid,amname,amtype,amhandler::pg_catalog.regproc AS amhandler FROM pg_am",
+        "SELECT tableoid,oid,amname,amtype,amhandler::pg_catalog.regproc AS amhandler FROM pg_am ORDER BY oid",
     )
     .unwrap();
-    assert_eq!(r.rows.len(), 2);
     assert_eq!(r.fields[4].data_type, PgType::Regproc);
-    assert_eq!(r.rows[0][4], Value::Int(3));
-    assert_eq!(r.rows[1][4], Value::Int(330));
+    // PostgreSQL 18.6 pg_am, ordered by OID with handlers compared as OIDs.
+    let expected = [
+        (2, "heap", "t", 3),
+        (403, "btree", "i", 330),
+        (405, "hash", "i", 331),
+        (783, "gist", "i", 332),
+        (2742, "gin", "i", 333),
+        (3580, "brin", "i", 335),
+        (4000, "spgist", "i", 334),
+    ]
+    .map(|(oid, name, kind, handler)| {
+        vec![
+            Value::Int(2601),
+            Value::Int(oid),
+            Value::Text(name.into()),
+            Value::Text(kind.into()),
+            Value::Int(handler),
+        ]
+    });
+    assert_eq!(r.rows, expected);
 }
 
 #[test]
-fn pg_dump_text_search_inventory_is_typed_and_empty() {
-    for sql in [
-        "SELECT tableoid,oid,prsname,prsnamespace,prsstart::oid,prstoken::oid,prsend::oid,prsheadline::oid,prslextype::oid FROM pg_ts_parser",
-        "SELECT tableoid,oid,dictname,dictnamespace,dictowner,dicttemplate,dictinitoption FROM pg_ts_dict",
-        "SELECT tableoid,oid,tmplname,tmplnamespace,tmplinit::oid,tmpllexize::oid FROM pg_ts_template",
-        "SELECT tableoid,oid,cfgname,cfgnamespace,cfgowner,cfgparser FROM pg_ts_config",
-        "SELECT mapcfg,maptokentype,mapseqno,mapdict FROM pg_ts_config_map",
-    ] {
-        assert!(run(sql).unwrap().rows.is_empty(), "{sql}");
-    }
+fn pg_dump_text_search_inventory_lists_supported_configurations() {
+    use Value::{Int as I, Null as N};
+    let s = |text: &str| Value::Text(text.into());
+
+    // PostgreSQL 18.6 catalog rows for the default parser and the objects used
+    // by the supported simple and english configurations.
+    assert_eq!(
+        run("SELECT tableoid,oid,prsname,prsnamespace,prsstart::oid,prstoken::oid,prsend::oid,prsheadline::oid,prslextype::oid FROM pg_ts_parser ORDER BY oid")
+            .unwrap()
+            .rows,
+        [vec![I(3601), I(3722), s("default"), I(11), I(3717), I(3718), I(3719), I(3720), I(3721)]]
+    );
+    assert_eq!(
+        run("SELECT tableoid,oid,dictname,dictnamespace,dictowner,dicttemplate,dictinitoption FROM pg_ts_dict ORDER BY oid")
+            .unwrap()
+            .rows,
+        [
+            vec![I(3600), I(3765), s("simple"), I(11), I(10), I(3727), N],
+            vec![I(3600), I(13247), s("english_stem"), I(11), I(10), I(13234), s("language = 'english', stopwords = 'english'")],
+        ]
+    );
+    assert_eq!(
+        run("SELECT tableoid,oid,tmplname,tmplnamespace,tmplinit::oid,tmpllexize::oid FROM pg_ts_template ORDER BY oid")
+            .unwrap()
+            .rows,
+        [
+            vec![I(3764), I(3727), s("simple"), I(11), I(3725), I(3726)],
+            vec![I(3764), I(13234), s("snowball"), I(11), I(13232), I(13233)],
+        ]
+    );
+    assert_eq!(
+        run("SELECT tableoid,oid,cfgname,cfgnamespace,cfgowner,cfgparser FROM pg_ts_config ORDER BY oid")
+            .unwrap()
+            .rows,
+        [
+            vec![I(3602), I(3748), s("simple"), I(11), I(10), I(3722)],
+            vec![I(3602), I(13248), s("english"), I(11), I(10), I(3722)],
+        ]
+    );
+
+    // PostgreSQL 18.6 mapping rows, written as (token, simple dict, english dict).
+    let mappings = [
+        (1, 3765, 13247),
+        (2, 3765, 13247),
+        (3, 3765, 3765),
+        (4, 3765, 3765),
+        (5, 3765, 3765),
+        (6, 3765, 3765),
+        (7, 3765, 3765),
+        (8, 3765, 3765),
+        (9, 3765, 3765),
+        (10, 3765, 13247),
+        (11, 3765, 13247),
+        (15, 3765, 3765),
+        (16, 3765, 13247),
+        (17, 3765, 13247),
+        (18, 3765, 3765),
+        (19, 3765, 3765),
+        (20, 3765, 3765),
+        (21, 3765, 3765),
+        (22, 3765, 3765),
+    ];
+    let expected: Vec<_> = mappings
+        .iter()
+        .map(|&(token, simple, _)| vec![I(3748), I(token), I(1), I(simple)])
+        .chain(
+            mappings
+                .iter()
+                .map(|&(token, _, english)| vec![I(13248), I(token), I(1), I(english)]),
+        )
+        .collect();
+    assert_eq!(
+        run("SELECT mapcfg::oid,maptokentype,mapseqno,mapdict::oid FROM pg_ts_config_map ORDER BY 1,2,3")
+            .unwrap()
+            .rows,
+        expected
+    );
 }
 
 #[test]

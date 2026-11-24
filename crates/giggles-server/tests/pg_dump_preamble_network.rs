@@ -858,13 +858,22 @@ async fn access_share_lock_validates_transactions_tables_and_any_write_grant() {
 async fn pg_dump_access_method_handlers_are_named_on_the_wire() {
     let f = Fixture::new().await;
     let c = f.client().await;
+    // PostgreSQL 18.6 displays these access-method handlers as regproc names.
     assert_eq!(
         values(
             &c.simple_query("SELECT amhandler::pg_catalog.regproc FROM pg_am ORDER BY oid")
                 .await
                 .unwrap()
         ),
-        ["heap_tableam_handler", "bthandler"]
+        [
+            "heap_tableam_handler",
+            "bthandler",
+            "hashhandler",
+            "gisthandler",
+            "ginhandler",
+            "brinhandler",
+            "spghandler",
+        ]
     );
     drop(c);
     f.stop().await;

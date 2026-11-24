@@ -183,7 +183,25 @@ fn verbatim_npgsql_9_0_4_startup_batch() {
     }
     expected.insert(vec![s("information_schema"),Value::Int(13307),s("cardinal_number"),s("d"),Value::Bool(false),Value::Int(23)]);
     expected.insert(vec![s("information_schema"),Value::Int(13306),s("_cardinal_number"),s("b"),Value::Bool(false),Value::Null]);
-    assert_eq!(types.rows.len(), 85);
+    // PostgreSQL 18.6 text-search type OIDs, with the G1-a2 array projection above.
+    for (oid, name) in [
+        (3614, "tsvector"),
+        (3643, "_tsvector"),
+        (3615, "tsquery"),
+        (3645, "_tsquery"),
+        (3642, "gtsvector"),
+        (3644, "_gtsvector"),
+    ] {
+        expected.insert(vec![
+            s("pg_catalog"),
+            Value::Int(oid),
+            s(name),
+            s("b"),
+            Value::Bool(false),
+            Value::Null,
+        ]);
+    }
+    assert_eq!(types.rows.len(), 91);
     assert_eq!(
         types.rows.iter().cloned().collect::<BTreeSet<_>>(),
         expected

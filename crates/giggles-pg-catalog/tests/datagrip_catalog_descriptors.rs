@@ -48,7 +48,9 @@ fn exact_nominal_descriptors_and_attribute_type_links() {
         ("pg_trigger", "tgqual", PgType::PgNodeTree, 194, -1),
     ] {
         let result = run(&format!("select {column} from pg_catalog.{relation}"));
-        assert!(result.rows.is_empty());
+        // The 23 supported text-search operator OIDs come from PostgreSQL 18.6.
+        let expected_rows = if relation == "pg_operator" { 23 } else { 0 };
+        assert_eq!(result.rows.len(), expected_rows, "{relation}.{column}");
         assert_eq!(
             result.fields,
             vec![Field {

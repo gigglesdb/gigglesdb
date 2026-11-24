@@ -644,7 +644,7 @@ pub(crate) fn pg_schema_columns(name: &str) -> Option<&'static [(&'static str, P
             ("trffromsql", T::Regproc),
             ("trftosql", T::Regproc),
         ],
-        // No text-search configurations, dictionaries or parser runtimes are installed.
+        // Built-in text-search inventory for the default parser, simple and english.
         "pg_ts_config" => &[
             ("oid", T::Oid),
             ("cfgname", T::Name),
@@ -1809,6 +1809,16 @@ fn build_with_budget(
     }
     add!("pg_ts_config", vec![I(3748), s("simple"), I(11), I(10), I(3722)]);
     add!("pg_ts_config", vec![I(13248), s("english"), I(11), I(10), I(3722)]);
+    // PostgreSQL 18.6 pg_ts_config_map for the two supported configurations.
+    // Token IDs and dictionaries agree with giggles-pg-tsearch's Config::dictionary.
+    for token in (1..=11).chain(15..=22) {
+        let english_dict = match token {
+            1 | 2 | 10 | 11 | 16 | 17 => 13247,
+            _ => 3765,
+        };
+        add!("pg_ts_config_map", vec![I(3748), I(token), I(1), I(3765)]);
+        add!("pg_ts_config_map", vec![I(13248), I(token), I(1), I(english_dict)]);
+    }
     add!("pg_ts_dict", vec![I(3765), s("simple"), I(11), I(10), I(3727), N]);
     add!("pg_ts_dict", vec![I(13247), s("english_stem"), I(11), I(10), I(13234), s("language = 'english', stopwords = 'english'")]);
     add!("pg_ts_parser", vec![I(3722), s("default"), I(11), I(3717), I(3718), I(3719), I(3720), I(3721)]);
