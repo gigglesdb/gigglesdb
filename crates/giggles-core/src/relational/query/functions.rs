@@ -178,6 +178,24 @@ pub(super) enum Scalar {
 pub(super) struct CaseExpr {
     pub(super) arms: Vec<(super::Filter, Scalar)>,
     pub(super) otherwise: Option<Scalar>,
+    pub(super) simple: bool,
+}
+
+impl CaseExpr {
+    fn operand(&self) -> Option<&Scalar> {
+        match &self.arms.first()?.0 {
+            super::Filter::Compare(operand, _, _) if self.simple => Some(operand),
+            _ => None,
+        }
+    }
+
+    fn when_placement(condition: &super::Filter) -> regexp::SetPlacement {
+        let ty = match condition {
+            super::Filter::Scalar(Scalar::Call(name, _)) => regexp::set_type(name),
+            _ => None,
+        };
+        regexp::SetPlacement::CaseWhen(ty.as_ref().map(typeof_expr::name))
+    }
 }
 pub(in crate::relational) struct BoundScalar {
     pub(super) ty: DataType,
@@ -686,6 +704,17 @@ impl Scalar {
         arithmetic::admit_shape(&value, depth, &mut 0)?;
         Ok(value)
     }
+    // LIKE and BETWEEN take operands above the non-associative predicate tier.
+    pub(super) fn parse_predicate_operand(
+        p: &mut Parser,
+        depth: usize,
+        aggregate_argument: bool,
+    ) -> R<Self> {
+        let value = Self::parse_binary(p, depth, aggregate_argument, 0)?;
+        regexp::reject_similar(p)?;
+        arithmetic::admit_shape(&value, depth, &mut 0)?;
+        Ok(value)
+    }
     fn parse_binary(
         p: &mut Parser,
         depth: usize,
@@ -872,6 +901,7 @@ impl Scalar {
                 None
             };
             p.need("end")?;
+            let simple = operand.is_some();
             if let Some(operand) = operand {
                 super::admit_expansion(&operand, arms.len())?;
                 for (condition, _) in &mut arms {
@@ -881,7 +911,7 @@ impl Scalar {
                     *condition = super::Filter::Compare(operand.clone(), "=".into(), value.clone());
                 }
             }
-            return Ok(Self::Case(Box::new(CaseExpr { arms, otherwise })));
+            return Ok(Self::Case(Box::new(CaseExpr { arms, otherwise, simple })));
         }
         if matches!(p.tokens.get(p.at), Some(Token::Word(word)) if matches!(word.as_str(), "when" | "then" | "else" | "end"))
         {
@@ -1338,6 +1368,9 @@ impl Scalar {
         tables: &[&TableDef],
         parameters: &[Option<DataType>],
     ) -> R<BoundScalar> {
+        if let Some(operand) = case.operand() {
+            regexp::SetPlacement::Case.scope(|| operand.bind(resolve, tables, parameters))?;
+        }
         let originals: Vec<_> = case
             .arms
             .iter()
@@ -1349,8 +1382,8 @@ impl Scalar {
             .enumerate()
             .filter(|(_, result)| !matches!(result, Self::Literal(Value::Null | Value::Text(_))))
             .map(|(i, result)| {
-                result
-                    .bind(resolve, tables, parameters)
+                regexp::SetPlacement::Case
+                    .scope(|| result.bind(resolve, tables, parameters))
                     .map(|bound| (i, bound))
                     .map_err(|error| Self::expression_parameter_error(error, parameters))
             })
@@ -1390,8 +1423,8 @@ impl Scalar {
             .iter()
             .map(|(condition, value)| {
                 Ok((
-                    condition
-                        .bind(parameters, resolve, tables)
+                    CaseExpr::when_placement(condition)
+                        .scope(|| condition.bind(parameters, resolve, tables))
                         .map_err(|error| Self::expression_parameter_error(error, parameters))?,
                     result(value)?,
                 ))
@@ -2015,6 +2048,7 @@ impl Scalar {
         {
             return Err(SqlError::AmbiguousFunction);
         }
+        let _placement = (name == "coalesce").then(|| regexp::SetPlacement::Coalesce.enter());
         let bound = args
             .iter()
             .map(|a| a.bind(resolve, tables, parameters))
@@ -3138,7 +3172,9 @@ impl Query {
         // Parentheses around an otherwise plain unknown value still receive
         // the assignment context, just as INSERT scalar values do.
         let expected = matches!(value, Scalar::Param(_)).then_some(target);
-        value.infer(expected, parameters, &resolve, &[table])?;
+        regexp::SetPlacement::Update.scope(|| {
+            value.infer(expected, parameters, &resolve, &[table])
+        })?;
         if matches!(value, Scalar::Literal(Value::Text(_) | Value::Null)) {
             Scalar::Cast(Box::new(value.clone()), target.clone()).bind(
                 &resolve,
@@ -3159,7 +3195,8 @@ impl Query {
         parameters: Vec<Option<DataType>>,
         target: &DataType,
     ) -> R<BoundQuery<'a>> {
-        let mut bound = self.bind_seeded(state, parameters)?;
+        let mut bound =
+            regexp::SetPlacement::Update.scope(|| self.bind_seeded(state, parameters))?;
         let item = bound.items.pop().ok_or(SqlError::Type)?;
         let BoundItem::Scalar(value) = item else {
             return Err(SqlError::Unsupported);
@@ -3602,8 +3639,13 @@ impl Scalar {
         match self {
             Self::Predicate(filter) => filter.infer(parameters, resolve, tables)?,
             Self::Case(case) => {
+                if let Some(operand) = case.operand() {
+                    regexp::SetPlacement::Case
+                        .scope(|| operand.infer(None, parameters, resolve, tables))?;
+                }
                 for (condition, _) in &case.arms {
-                    condition.infer(parameters, resolve, tables)?;
+                    CaseExpr::when_placement(condition)
+                        .scope(|| condition.infer(parameters, resolve, tables))?;
                 }
                 let results: Vec<_> = case
                     .arms
@@ -3611,9 +3653,12 @@ impl Scalar {
                     .map(|(_, result)| result)
                     .chain(case.otherwise.iter())
                     .collect();
-                for result in &results {
-                    result.infer(None, parameters, resolve, tables)?;
-                }
+                regexp::SetPlacement::Case.scope(|| {
+                    for result in &results {
+                        result.infer(None, parameters, resolve, tables)?;
+                    }
+                    Ok(())
+                })?;
                 let known = results
                     .iter()
                     .enumerate()
@@ -3869,6 +3914,7 @@ impl Scalar {
                 integer_formats::argument_type(ty.as_ref())?;
             }
             Self::Call(n, args) => {
+                let _placement = (n == "coalesce").then(|| regexp::SetPlacement::Coalesce.enter());
                 if regexp::infer(n, args, parameters, resolve, tables)? {
                     return Ok(());
                 }

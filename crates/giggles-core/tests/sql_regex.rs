@@ -314,6 +314,98 @@ fn oracle_examples() {
 }
 
 #[test]
+fn similar_predicate_precedence() {
+    let mut s = session();
+    for (sql, near) in [
+        ("select 'a' like 'a' similar to 'a'", "similar"),
+        ("select 'a' ilike 'A' similar to 'a'", "similar"),
+        ("select 'a' between 'a' and 'b' similar to 'b'", "similar"),
+        ("select 'a' between 'a' similar to 'a' and 'b'", "similar"),
+        ("select 'a' similar to 'a' like 'a'", "like"),
+        ("select 'a' similar to 'a' between 'a' and 'b'", "between"),
+        ("select 'a' similar to 'a' similar to 'a'", "similar"),
+        ("select 'a' like 'a' escape '!' not similar to 'b'", "not"),
+    ] {
+        diagnostic(
+            &mut s,
+            sql,
+            "42601",
+            &format!(r#"syntax error at or near "{near}""#),
+            None,
+        );
+    }
+    diagnostic(
+        &mut s,
+        "select ('a' like 'a') similar to 'true'",
+        "42883",
+        "operator does not exist: boolean ~ text",
+        Some("No operator matches the given name and argument types. You might need to add explicit type casts."),
+    );
+    for sql in [
+        "select 'a' not similar to 'b' = true",
+        "select ('a' like 'a')::text similar to 'true'",
+        "select 'a' similar to 'a' escape '!' = true",
+    ] {
+        assert_eq!(run(&mut s, sql), vec![vec![Bool(true)]], "{sql}");
+    }
+}
+
+#[test]
+fn set_calls_are_rejected_during_binding() {
+    let mut s = session();
+    run(&mut s, "CREATE TABLE regex_empty (id INT PRIMARY KEY, c TEXT)");
+    let lateral = Some("You might be able to move the set-returning function into a LATERAL FROM item.");
+    let cases = [
+        ("UPDATE regex_empty SET c = regexp_split_to_table('q', ',') WHERE id = 9", "UPDATE", None),
+        ("UPDATE regex_empty SET c = regexp_matches('q', 'q')::text WHERE id = 9", "UPDATE", None),
+        ("UPDATE regex_empty SET c = regexp_split_to_table(c, ',') WHERE id > 9", "UPDATE", None),
+        ("SELECT id FROM regex_empty WHERE regexp_matches(c, 'a') IS NOT NULL", "WHERE", None),
+        ("SELECT id FROM regex_empty WHERE regexp_split_to_table(c, ',') = 'a'", "WHERE", None),
+        ("SELECT id FROM regex_empty WHERE coalesce(regexp_split_to_table(c, ','), c) = c", "WHERE", None),
+        ("SELECT coalesce(regexp_matches(c, 'a'), NULL) FROM regex_empty", "COALESCE", lateral),
+        ("SELECT coalesce(regexp_split_to_table(c, ','), c) FROM regex_empty", "COALESCE", lateral),
+        ("SELECT CASE WHEN id = 1 THEN regexp_split_to_table(c, ',') ELSE c END FROM regex_empty", "CASE", lateral),
+        ("SELECT CASE WHEN id = 1 THEN NULL ELSE regexp_matches(c, 'a') END FROM regex_empty", "CASE", lateral),
+        ("SELECT CASE regexp_split_to_table(c, ',') WHEN 'a' THEN c END FROM regex_empty", "CASE", lateral),
+    ];
+    diagnostic(
+        &mut s,
+        "SELECT CASE WHEN regexp_matches(c, 'a') IS NOT NULL THEN c END FROM regex_empty",
+        "42804",
+        "argument of CASE/WHEN must not return a set",
+        None,
+    );
+    diagnostic(
+        &mut s,
+        "SELECT CASE WHEN regexp_matches(c, 'a') THEN c END FROM regex_empty",
+        "42804",
+        "argument of CASE/WHEN must be type boolean, not type text[]",
+        None,
+    );
+    for (sql, placement, hint) in cases {
+        diagnostic(
+            &mut s,
+            sql,
+            "0A000",
+            &format!("set-returning functions are not allowed in {placement}"),
+            hint,
+        );
+    }
+    run(&mut s, "INSERT INTO regex_empty VALUES (1, 'a')");
+    diagnostic(
+        &mut s,
+        cases[0].0,
+        "0A000",
+        "set-returning functions are not allowed in UPDATE",
+        None,
+    );
+    assert_eq!(
+        run(&mut s, "SELECT regexp_split_to_table(c, ',') FROM regex_empty"),
+        vec![vec![text("a")]]
+    );
+}
+
+#[test]
 fn set_projection_rejects_row_locking() {
     let mut s = session();
     run(

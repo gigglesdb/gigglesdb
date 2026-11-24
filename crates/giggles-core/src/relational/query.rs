@@ -735,6 +735,16 @@ impl Filter {
             _ => self.infer(params, resolve, tables),
         }
     }
+    fn infer_where(
+        &self,
+        params: &mut [Option<DataType>],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        subqueries: &Subplans<'_>,
+    ) -> R<()> {
+        functions::regexp::SetPlacement::Where
+            .scope(|| self.infer_with_subqueries(params, resolve, tables, subqueries))
+    }
     fn infer_with_subqueries(
         &self,
         params: &mut [Option<DataType>],
@@ -1047,6 +1057,9 @@ impl Filter {
                 Scalar::parse(p, depth)
             }
         };
+        let parse_operand = |p: &mut Parser| {
+            Scalar::parse_predicate_operand(p, depth + 1, aggregate_argument)
+        };
         let not = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "not")
             && matches!(p.tokens.get(p.at + 1), Some(Token::Word(w)) if w == "in" || w == "between" || w == "like" || w == "ilike");
         if not {
@@ -1057,9 +1070,9 @@ impl Filter {
             if !insensitive {
                 p.need("like")?;
             }
-            let pattern = parse_scalar(p, depth + 1)?;
+            let pattern = parse_operand(p)?;
             let escape = if p.word("escape") {
-                Some(parse_scalar(p, depth + 1)?)
+                Some(parse_operand(p)?)
             } else {
                 None
             };
@@ -1094,9 +1107,9 @@ impl Filter {
         } else if p.word("between") {
             let symmetric = p.word("symmetric");
             if !symmetric { p.word("asymmetric"); }
-            let lower = parse_scalar(p, depth + 1)?;
+            let lower = parse_operand(p)?;
             p.need("and")?;
-            let upper = parse_scalar(p, depth + 1)?;
+            let upper = parse_operand(p)?;
             admit_expansion(&a, if symmetric { 4 } else { 2 })?;
             let (low_op, high_op) = if not { ("<", ">") } else { (">=", "<=") };
             let range = |a: Scalar, lower, upper| Self::Logic(
@@ -2780,13 +2793,15 @@ impl Query {
         let subqueries = self.bind_subqueries(state, parameters, &[], &resolve, &[table])?;
         if let Some(filter) = self.where_filter() {
             if self.has_in_subquery() {
-                return filter.infer_with_subqueries(parameters, &resolve, &[table], &subqueries);
+                return filter.infer_where(parameters, &resolve, &[table], &subqueries);
             }
             // Infer independently of SET to retain undeclared column conflicts.
             // Plain comparisons preserve explicit declarations, including widths.
             let mut inferred = vec![None; parameters.len()];
             inferred[..declared.len()].clone_from_slice(declared);
-            let inference = filter.infer_mutation(&mut inferred, declared, &resolve, &[table]);
+            let inference = functions::regexp::SetPlacement::Where.scope(|| {
+                filter.infer_mutation(&mut inferred, declared, &resolve, &[table])
+            });
             for (parameter, inferred) in parameters.iter_mut().zip(inferred) {
                 if let Some(inferred) = inferred {
                     if parameter.as_ref().is_some_and(|old| old != &inferred) {
@@ -4161,7 +4176,9 @@ impl Query {
         }
         let subqueries = self.bind_subqueries(state, &mut parameters, outer, &resolve, &tables)?;
         if let Some(filter) = self.where_filter() {
-            aggregate_filter::validate_filter(filter, &parameters, &resolve, &tables)?;
+            functions::regexp::SetPlacement::Where.scope(|| {
+                aggregate_filter::validate_filter(filter, &parameters, &resolve, &tables)
+            })?;
         }
         if self.where_filter().is_some_and(filter_contains_aggregate) {
             return Err(SqlError::GroupingError);
@@ -4256,7 +4273,7 @@ impl Query {
             }
         }
         if let Some(f) = self.where_filter() {
-            f.infer_with_subqueries(&mut parameters, &resolve, &tables, &subqueries)?;
+            f.infer_where(&mut parameters, &resolve, &tables, &subqueries)?;
         }
         for (i, (e, _, _)) in self.order.iter().enumerate() {
             let e = distinct_order.as_ref().map_or(e, |(order, _)| &order[i].0);

@@ -585,6 +585,7 @@ fn bind_scalar(
                     cardinality(&shape.columns[*n].data_type, shape.collations[*n].as_ref())?,
                 )],
                 otherwise: Some(join::col(*n)),
+                simple: false,
             }));
         }
         Ok(())
@@ -795,6 +796,7 @@ fn prepare(
                         cardinality(&shape.columns[*n].data_type, shape.collations[*n].as_ref())?,
                     )],
                     otherwise: Some(join::col(*n)),
+                    simple: false,
                 }))
             };
             *s = if *json { json_aggregate::typed_text(value) } else { value };

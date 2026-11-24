@@ -1,5 +1,6 @@
 //! SQL binding and result conversion for PostgreSQL regular expressions.
 use super::*;
+use std::cell::Cell;
 use giggles_pg_regex::api::{self, RegexError, RegexLocale, RegexpContext, ReplaceOptions};
 
 pub(super) const SIMILAR_TO: &str = "\0regexp_similar_to";
@@ -28,8 +29,31 @@ pub(super) fn parse_similar(
             0,
         )?);
     }
+    let next = match parser.tokens.get(parser.at) {
+        Some(Token::Word(word)) if word == "not" => parser.at + 1,
+        _ => parser.at,
+    };
+    if matches!(parser.tokens.get(next), Some(Token::Word(word))
+        if matches!(word.as_str(), "like" | "ilike" | "similar" | "between" | "in"))
+    {
+        return Err(super::super::clause_syntax(parser.tokens.get(parser.at)));
+    }
     let name = if negated { NOT_SIMILAR_TO } else { SIMILAR_TO };
     Ok(Scalar::Call(name.into(), args))
+}
+
+pub(super) fn reject_similar(parser: &Parser) -> R<()> {
+    let tokens = &parser.tokens[parser.at..];
+    let starts_similar = |tokens: &[Token]| {
+        matches!(tokens, [Token::Word(similar), Token::Word(to), ..]
+            if similar == "similar" && to == "to")
+    };
+    if starts_similar(tokens)
+        || matches!(tokens, [Token::Word(word), rest @ ..] if word == "not" && starts_similar(rest))
+    {
+        return Err(super::super::clause_syntax(tokens.first()));
+    }
+    Ok(())
 }
 
 pub(super) fn parse_similar_substring(
@@ -74,6 +98,69 @@ pub(in crate::relational::query) fn set_type(name: &str) -> Option<DataType> {
         "regexp_matches" => Some(DataType::TextArray),
         "regexp_split_to_table" => Some(DataType::Text),
         _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::relational::query) enum SetPlacement {
+    Where,
+    Update,
+    Coalesce,
+    Case,
+    CaseWhen(Option<&'static str>),
+}
+
+thread_local! {
+    static SET_PLACEMENT: Cell<Option<SetPlacement>> = const { Cell::new(None) };
+}
+
+impl SetPlacement {
+    pub(in crate::relational::query) fn scope<T>(self, bind: impl FnOnce() -> T) -> T {
+        let _restore = self.enter();
+        bind()
+    }
+
+    pub(super) fn enter(self) -> impl Drop {
+        struct Restore(Option<SetPlacement>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SET_PLACEMENT.set(self.0);
+            }
+        }
+        // A clause forbids SRFs even inside conditional expressions.
+        let old = SET_PLACEMENT.get();
+        if !matches!(old, Some(Self::Where | Self::Update)) {
+            SET_PLACEMENT.set(Some(self));
+        }
+        Restore(old)
+    }
+
+    fn error(self) -> SqlError {
+        let (message, error) = match self {
+            Self::Where => ("set-returning functions are not allowed in WHERE".into(), SqlError::Unsupported),
+            Self::Update => ("set-returning functions are not allowed in UPDATE".into(), SqlError::Unsupported),
+            Self::Coalesce => (
+                "set-returning functions are not allowed in COALESCE".into(),
+                SqlError::Unsupported,
+            ),
+            Self::Case => ("set-returning functions are not allowed in CASE".into(), SqlError::Unsupported),
+            Self::CaseWhen(Some(ty)) => (
+                format!("argument of CASE/WHEN must be type boolean, not type {ty}"),
+                SqlError::Type,
+            ),
+            Self::CaseWhen(None) => (
+                "argument of CASE/WHEN must not return a set".into(),
+                SqlError::Type,
+            ),
+        };
+        user_types::view_replace_error(message);
+        user_types::exact_sql_error_detail(None);
+        if matches!(self, Self::Coalesce | Self::Case) {
+            user_types::sql_error_hint(
+                "You might be able to move the set-returning function into a LATERAL FROM item.",
+            );
+        }
+        error
     }
 }
 
@@ -146,7 +233,16 @@ pub(super) fn infer(
     let Some(signature) = signature(name, &types) else {
         return Ok(false);
     };
-    for ((arg, known), ty) in args.iter().zip(known).zip(signature?.0) {
+    let (arg_types, _) = signature?;
+    if set_type(name).is_some()
+        && let Some(placement) = SET_PLACEMENT.get()
+    {
+        if known.iter().any(|ty| ty.as_ref().is_some_and(|ty| !text_type(ty))) {
+            return Err(SqlError::UndefinedFunction);
+        }
+        return Err(placement.error());
+    }
+    for ((arg, known), ty) in args.iter().zip(known).zip(arg_types) {
         if known.is_none() {
             arg.infer(Some(ty), parameters, resolve, tables)?;
         }
@@ -194,8 +290,21 @@ pub(super) fn bind(
             };
             arg.node = cast_node(old, ty);
         } else {
+            if i == 0 && matches!(name, SIMILAR_TO | NOT_SIMILAR_TO) {
+                let op = if name == SIMILAR_TO { "~" } else { "!~" };
+                return Err(arithmetic::operator_error(
+                    op,
+                    Some(Some(&arg.ty)),
+                    Some(&DataType::Text),
+                ));
+            }
             return Err(SqlError::UndefinedFunction);
         }
+    }
+    if set_type(name).is_some()
+        && let Some(placement) = SET_PLACEMENT.get()
+    {
+        return Err(placement.error());
     }
     Ok(Some(output))
 }

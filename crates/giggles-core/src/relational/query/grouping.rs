@@ -297,6 +297,7 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
                     .map(|(f, s)| Ok((self.filter(f)?, self.scalar(s)?)))
                     .collect::<R<Vec<_>>>()?,
                 otherwise: c.otherwise.as_ref().map(|s| self.scalar(s)).transpose()?,
+                simple: c.simple,
             })),
             _ => s.clone(),
         })
@@ -527,7 +528,7 @@ pub(super) fn bind<'a>(
         s.infer(None, &mut parameters, resolve, tables)?;
     }
     if let Some(f) = q.where_filter() {
-        f.infer_with_subqueries(&mut parameters, resolve, tables, &subqueries)?;
+        f.infer_where(&mut parameters, resolve, tables, &subqueries)?;
     }
     for expr in q.limit.iter().chain(q.offset()) {
         if let Expr::Param(n) = expr {
