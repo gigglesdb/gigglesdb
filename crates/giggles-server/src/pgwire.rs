@@ -911,7 +911,7 @@ fn decode_with_order(
         };
     }
     if ty.is_extended_text() {
-        return logical_binary_input(ty, b);
+        return logical_binary_input(ty, b, None);
     }
     let temporal_size = match ty {
         DataType::Date => Some(4),
@@ -1314,19 +1314,30 @@ fn core_declared_type(oid: u32) -> Option<DataType> {
 
 fn prepare_declared_sql(session: &mut Session, sql: &str, oids: &[u32], unnamed: bool) -> R<(Plan, Description)> {
     prepare_declared_sql_diagnostic(&mut Diagnostic::default(), session, sql, oids, unnamed)
+        .map(|(plan, description, _)| (plan, description))
 }
 
-fn prepare_declared_sql_diagnostic(diagnostic: &mut Diagnostic, session: &mut Session, sql: &str, oids: &[u32], unnamed: bool) -> R<(Plan, Description)> {
+fn prepare_declared_sql_diagnostic(
+    diagnostic: &mut Diagnostic,
+    session: &mut Session,
+    sql: &str,
+    oids: &[u32],
+    unnamed: bool,
+) -> R<(Plan, Description, giggles_core::relational::EnumParameters)> {
     let declared = oids
         .iter()
         .map(|&o| core_declared_type(o))
         .collect::<Vec<_>>();
     let prepared = diagnostic.core(if unnamed { session.prepare_unnamed(sql, &declared) } else { session.prepare_with_parameter_types(sql, &declared) })?;
-    let description = diagnostic.core(session.describe(&prepared))?;
+    let (description, enum_parameters) = if prepared.is_ddl() {
+        (diagnostic.core(session.describe(&prepared))?, Default::default())
+    } else {
+        diagnostic.core(session.sql.describe_with_enum_parameters(&prepared))?
+    };
     if oids.len() > description.parameters.len() {
         return Err("08P01");
     }
-    Ok((Plan::Sql(Box::new(prepared)), description))
+    Ok((Plan::Sql(Box::new(prepared)), description, enum_parameters))
 }
 
 /// R3-207/615: `prepare_declared_sql` for the UPDATE wrapped by a protected
@@ -1417,6 +1428,7 @@ struct Statement {
     p: Arc<Plan>,
     d: Arc<Description>,
     parameter_oids: Vec<u32>,
+    enum_parameters: giggles_core::relational::EnumParameters,
     query_id: Option<String>,
 }
 impl Statement {
@@ -2089,6 +2101,7 @@ impl State {
                 p: Arc::new(Plan::Change(Box::new(change))),
                 d: Arc::new(d),
                 parameter_oids: vec![],
+                enum_parameters: Default::default(),
                 query_id: self.diagnostic.query_id.clone(),
             });
         }
@@ -2118,6 +2131,7 @@ impl State {
                 p: Arc::new(Plan::TaskDdl(Box::new(stmt))),
                 d: Arc::new(d),
                 parameter_oids: vec![],
+                enum_parameters: Default::default(),
                 query_id: self.diagnostic.query_id.clone(),
             });
         }
@@ -2125,6 +2139,7 @@ impl State {
             core(session.authorize_sequence_sql(sql))?;
         }
         let mut plain_application = false;
+        let mut enum_parameters = giggles_core::relational::EnumParameters::new();
         let (mut p, mut d) = if let Some(tables) =
             crate::auth::statements::access_share_tables(sql)?
         {
@@ -2261,7 +2276,10 @@ impl State {
         } else {
             plain_application = true;
             self.diagnostic.phase = "application prepare";
-            prepare_declared_sql_diagnostic(&mut self.diagnostic, session, sql, &oids, unnamed)?
+            let (plan, description, enums) =
+                prepare_declared_sql_diagnostic(&mut self.diagnostic, session, sql, &oids, unnamed)?;
+            enum_parameters = enums;
+            (plan, description)
         };
         if oids.len() > d.parameters.len() {
             return Err("08P01");
@@ -2293,7 +2311,7 @@ impl State {
             {
                 let was_aborted = session.is_aborted();
                 match prepare_declared_sql_diagnostic(&mut self.diagnostic, session, sql, &oids, unnamed) {
-                    Ok((application, description))
+                    Ok((application, description, enums))
                         if oids.len() <= description.parameters.len()
                             && oids
                                 .iter()
@@ -2302,6 +2320,7 @@ impl State {
                     {
                         p = application;
                         d = description;
+                        enum_parameters = enums;
                         parameter_oids = d.parameters.iter().map(oid).collect();
                     }
                     Err(error) if !was_aborted && session.is_aborted() => {
@@ -2310,6 +2329,9 @@ impl State {
                     _ => {}
                 }
             }
+        }
+        for (&i, parameter) in &enum_parameters {
+            parameter_oids[i] = parameter.oid();
         }
         self.diagnostic.phase = "parameter type declaration";
         for (i, (o, t)) in oids.iter().copied().zip(&mut d.parameters).enumerate() {
@@ -2338,7 +2360,7 @@ impl State {
                 }
                 continue;
             }
-            if o != 0 && o != oid(t) {
+            if o != 0 && o != parameter_oids[i] {
                 // Application integer parameters share Value::Int, but
                 // decode using the client's declared wire width. Core
                 // still enforces the destination range at execution.
@@ -2381,6 +2403,7 @@ impl State {
             p: Arc::new(p),
             d: Arc::new(d),
             parameter_oids,
+            enum_parameters,
             query_id: self.diagnostic.query_id.clone(),
         })
     }
@@ -3002,23 +3025,32 @@ impl State {
                         }
                         continue;
                     }
+                    let input = s.enum_parameters.get(&i);
                     let value = if n == u32::MAX {
                         Value::Null
                     } else {
-                        decode_with_order(
-                            r.take(usize::try_from(n).map_err(|_| "54000")?)?,
-                            ty,
-                            format_at(&fmts, i),
-                            session.zone().unwrap_or(SessionZone::Fixed(0)),
-                            if matches!(ty, DataType::TimeTz) && format_at(&fmts, i) == 0 {
-                                *transaction_us
-                                    .get_or_insert_with(|| session.copy_clock().transaction_us)
-                            } else {
-                                0
-                            },
-                            self.settings.current.datestyle.order,
-                        )?
+                        let raw = r.take(usize::try_from(n).map_err(|_| "54000")?)?;
+                        let format = format_at(&fmts, i);
+                        if let Some(parameter) = input
+                            && *ty == DataType::TextArray && format == 1
+                        {
+                            logical_binary_input(ty, raw, Some(parameter.oid() - 1))?
+                        } else {
+                            decode_with_order(
+                                raw, ty, format,
+                                session.zone().unwrap_or(SessionZone::Fixed(0)),
+                                if matches!(ty, DataType::TimeTz) && format == 0 {
+                                    *transaction_us.get_or_insert_with(|| session.copy_clock().transaction_us)
+                                } else {
+                                    0
+                                },
+                                self.settings.current.datestyle.order,
+                            )?
+                        }
                     };
+                    if let Some(parameter) = input {
+                        self.diagnostic.core(parameter.validate(&value).map_err(CoreError::Sql))?;
+                    }
                     if catalog {
                         // An unused declaration can use a type only core decodes.
                         catalog_params.push(giggles_pg_catalog::Value::Null);
@@ -4546,7 +4578,7 @@ fn logical_binary_output(ty: &DataType, s: &str, type_oid: u32) -> R<Vec<u8>> {
     }
     Ok(b)
 }
-fn logical_binary_input(ty: &DataType, b: &[u8]) -> R<Value> {
+fn logical_binary_input(ty: &DataType, b: &[u8], element_oid: Option<u32>) -> R<Value> {
     use giggles_core::relational::logical_types::{array_quote, coerce};
     if *ty == DataType::Uuid {
         if b.len() != 16 {
@@ -4569,14 +4601,16 @@ fn logical_binary_input(ty: &DataType, b: &[u8]) -> R<Value> {
     }
     let ndim = int(b, &mut at)?;
     let hasnull = int(b, &mut at)?;
-    let elem = int(b, &mut at)?;
-    let expected = match ty {
+    let elem = int(b, &mut at)? as u32;
+    let expected = element_oid.unwrap_or(match ty {
         DataType::IntArray => 23,
         DataType::BigIntArray => 20,
         DataType::UuidArray => 2950,
         _ => 25,
-    };
-    if !(0..=1).contains(&ndim) || !(0..=1).contains(&hasnull) || elem != expected {
+    });
+    // Binary enum elements carry label bytes, including text and varchar headers.
+    let element_matches = elem == expected || element_oid.is_some() && matches!(elem, 25 | 1043);
+    if !(0..=1).contains(&ndim) || !(0..=1).contains(&hasnull) || !element_matches {
         return Err("22P03");
     }
     let count = if ndim == 1 {
@@ -4660,7 +4694,7 @@ mod logical_wire_tests {
         ] {
             let binary = logical_binary_output(&ty, text, 0).unwrap();
             assert_eq!(
-                logical_binary_input(&ty, &binary),
+                logical_binary_input(&ty, &binary, None),
                 Ok(Value::Text(text.into()))
             );
             if ty == DataType::Uuid {
@@ -4825,7 +4859,7 @@ mod prepared_validation_tests {
         Statement { id: 0, sequence_dependencies: Default::default(), parse_context: None,
             description_version: None, validated: None, constant_validations: 0,
             sql_bytes: sql.len(), origin: None, discarded: false, sql: sql.into(), declared_oids: vec![],
-            p: Arc::new(Plan::Sql(Box::new(p))), d: Arc::new(d), parameter_oids: vec![], query_id: None }
+            p: Arc::new(Plan::Sql(Box::new(p))), d: Arc::new(d), parameter_oids: vec![], enum_parameters: Default::default(), query_id: None }
     }
     fn wire_state() -> State {
         State {

@@ -1393,11 +1393,13 @@ impl Filter {
                 if let Ok(bound) = a.bind(resolve, tables, params)
                     && !matches!(b, Scalar::Param(n) if params.get(n - 1).is_some_and(Option::is_some))
                 {
+                    b.infer_enum_parameter(&bound.ty, bound.attached_enum(), params)?;
                     b.infer(Some(&bound.ty), params, resolve, tables)?;
                 }
                 if let Ok(bound) = b.bind(resolve, tables, params)
                     && !matches!(a, Scalar::Param(n) if params.get(n - 1).is_some_and(Option::is_some))
                 {
+                    a.infer_enum_parameter(&bound.ty, bound.attached_enum(), params)?;
                     a.infer(Some(&bound.ty), params, resolve, tables)?;
                 }
                 Ok(())
@@ -3870,11 +3872,20 @@ impl Query {
     }
     /// Preserve unknown INSERT output literals without treating expanded columns as unknown.
     pub(super) fn insert_outputs(&self, state: &Relational) -> R<Vec<Option<Value>>> {
+        Ok(self.projection_item_indices(state)?.into_iter().map(|i| {
+            match &self.items[i].0 {
+                Item::Scalar(Scalar::Literal(value @ (Value::Text(_) | Value::Null))) => Some(value.clone()),
+                _ => None,
+            }
+        }).collect())
+    }
+
+    fn projection_item_indices(&self, state: &Relational) -> R<Vec<usize>> {
         if !self.is_table_free() && state.sequence_by_name(self.target()).is_some() {
             return Err(SqlError::Unsupported);
         }
         let mut outputs = Vec::new();
-        for (item, _) in &self.items {
+        for (i, (item, _)) in self.items.iter().enumerate() {
             match item {
                 Item::Star | Item::QualifiedStar { .. } => {
                     for source in self.star_sources(item)? {
@@ -3883,13 +3894,10 @@ impl Query {
                             .tables
                             .get(&source.name)
                             .ok_or(SqlError::UnknownTable)?;
-                        outputs.extend(table.logical_columns().map(|_| None));
+                        outputs.extend(table.logical_columns().map(|_| i));
                     }
                 }
-                Item::Scalar(Scalar::Literal(value @ (Value::Text(_) | Value::Null))) => {
-                    outputs.push(Some(value.clone()));
-                }
-                _ => outputs.push(None),
+                _ => outputs.push(i),
             }
         }
         Ok(outputs)
@@ -5683,6 +5691,7 @@ impl BoundQuery<'_> {
             {
                 continue;
             }
+            enum_parameters::validate(index, ty, v)?;
             check(
                 v,
                 &ColumnDef {

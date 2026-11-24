@@ -67,24 +67,20 @@ pub(super) fn hint(
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     tables: &[&TableDef],
     parameters: &[Option<DataType>],
-) -> R<DataType> {
+) -> R<(DataType, Option<std::sync::Arc<TypeDef>>)> {
     if args.is_empty() {
         return Err(SqlError::Syntax);
     }
-    let types = args
+    let bound = args
         .iter()
         .filter(|arg| !arg.aggregate_unknown(parameters))
-        .map(|arg| {
-            arg.bind(resolve, tables, parameters).map(|bound| {
-                if bound.ty == DataType::Varchar {
-                    DataType::Text
-                } else {
-                    bound.ty
-                }
-            })
-        })
+        .map(|arg| arg.bind(resolve, tables, parameters))
         .collect::<R<Vec<_>>>()?;
-    result_type(&types)
+    let ty = result_type(&bound.iter().map(|value| {
+        if value.ty == DataType::Varchar { DataType::Text } else { value.ty.clone() }
+    }).collect::<Vec<_>>())?;
+    let definition = bound.iter().find_map(BoundScalar::enum_definition).cloned();
+    Ok((ty, definition))
 }
 
 pub(super) fn bind(

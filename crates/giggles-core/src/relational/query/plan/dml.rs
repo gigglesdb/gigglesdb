@@ -97,7 +97,7 @@ pub(super) fn resolve(
         parameters[*n - 1] = Some(description.parameters[*n - 1].clone());
     }
     Ok(Meta {
-        unknown: vec![false; description.columns.len()],
+        unknown: vec![None; description.columns.len()],
         columns: description.columns,
         typmods: description.typmods,
         type_oids: description.type_oids,

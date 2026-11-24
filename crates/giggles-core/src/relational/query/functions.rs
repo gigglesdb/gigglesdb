@@ -323,16 +323,21 @@ fn coalesce_hint(
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     tables: &[&TableDef],
     parameters: &[Option<DataType>],
-) -> Option<DataType> {
+) -> Option<(DataType, Option<std::sync::Arc<TypeDef>>)> {
     // Retain COALESCE's established first-known-argument parameter inference.
     args.iter()
-        .find_map(|a| {
-            cast::explicit_target(a).cloned().or_else(|| match a {
-                Scalar::Literal(Value::Null | Value::Text(_)) => None,
-                _ => user_types::probe_preserving_error_message(|| a.bind(resolve, tables, parameters)).ok().map(|b| b.ty),
-            })
+        .find_map(|arg| {
+            if matches!(arg, Scalar::Literal(Value::Null | Value::Text(_))) {
+                return None;
+            }
+            if let Some(ty) = cast::explicit_target(arg) {
+                return Some((ty.clone(), None));
+            }
+            let bound = user_types::probe_preserving_error_message(|| arg.bind(resolve, tables, parameters)).ok()?;
+            let definition = bound.enum_definition().cloned();
+            Some((bound.ty, definition))
         })
-        .and_then(|ty| common_result_type([ty]).ok())
+        .and_then(|(ty, definition)| common_result_type([ty]).ok().map(|ty| (ty, definition)))
 }
 pub(in crate::relational) fn zone_dependent_literal(value: &Value, target: &DataType) -> bool {
     if !datetime_input::target(target) || !matches!(value, Value::Text(_)) {
@@ -1259,13 +1264,19 @@ impl Scalar {
             }
             // Grouping identity probes omit parameter types before inference.
             // Report an unresolved binding so those probes retain the syntax.
-            Self::Param(n) => Ok(BoundScalar {
-                ty: parameters
-                    .get(n - 1)
-                    .and_then(Clone::clone)
-                    .ok_or(SqlError::Parameters)?,
-                node: Node::Param(*n),
-            }),
+            Self::Param(n) => {
+                let ty = parameters.get(n - 1).and_then(Clone::clone).ok_or(SqlError::Parameters)?;
+                let definition = enum_parameters::definition(n - 1, &ty);
+                let parameter = BoundScalar { ty, node: Node::Param(*n) };
+                Ok(if let Some(definition) = definition {
+                    BoundScalar {
+                        ty: parameter.ty.clone(),
+                        node: Node::Domain(Box::new(parameter), definition),
+                    }
+                } else {
+                    parameter
+                })
+            }
             Self::Domain(a, name, target) => Self::bind_domain(a, (name, target), resolve, tables, parameters),
             Self::Cast(a, ty) => Self::bind_cast(a, ty, resolve, tables, parameters),
             Self::Column(c) => Self::bind_column(c, resolve, tables),
@@ -2536,7 +2547,7 @@ impl BoundScalar {
             Node::CrossCompare(..) | Node::ZonedOperator(..) => "?column?",
             Node::Param(_) => "?column?",
             Node::Domain(inner, ty) if matches!(ty.as_ref(), TypeDef::Enum { .. }) => {
-                if matches!(inner.node, Node::Column(..)) {
+                if matches!(inner.node, Node::Column(..) | Node::Param(_)) {
                     inner.name()
                 } else if inner.strong_name() == Some("array") {
                     "array"
@@ -3426,6 +3437,19 @@ fn cast_with_date_order(
     Ok(out)
 }
 impl Scalar {
+    pub(super) fn infer_enum_parameter(
+        &self,
+        storage: &DataType,
+        definition: Option<&TypeDef>,
+        parameters: &mut [Option<DataType>],
+    ) -> R<()> {
+        if let (Self::Param(n), Some(definition)) = (self, definition) {
+            let slot = parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?;
+            enum_parameters::infer(n - 1, slot, storage, definition);
+        }
+        Ok(())
+    }
+
     pub(super) fn infer(
         &self,
         expected: Option<&DataType>,
@@ -3457,10 +3481,11 @@ impl Scalar {
                 let otherwise_first = known.iter().filter(|(i, _)| *i == case.arms.len())
                     .chain(known.iter().filter(|(i, _)| *i < case.arms.len()));
                 json_aggregate::common_branches("CASE", otherwise_first.map(|(_, bound)| bound))?;
-                case_result_enum(&known, case.arms.len())?;
-                let ty = common_result_type(known.into_iter().map(|(_, bound)| bound.ty))?;
+                let definition = case_result_enum(&known, case.arms.len())?;
+                let ty = common_result_type(known.iter().map(|(_, bound)| bound.ty.clone()))?;
                 for result in results {
                     if result.aggregate_unknown(parameters) {
+                        result.infer_enum_parameter(&ty, definition, parameters)?;
                         result.infer(Some(&ty), parameters, resolve, tables)?;
                     }
                 }
@@ -3480,6 +3505,9 @@ impl Scalar {
             Self::Domain(a, name, target) => {
                 let ty = target.as_ref().as_ref().map_err(Clone::clone)?;
                 let base = user_types::storage_type(ty, name.array)?;
+                if matches!(ty, TypeDef::Enum { .. }) {
+                    a.infer_enum_parameter(&base, Some(ty), parameters)?;
+                }
                 Self::Cast(a.clone(), base).infer(expected, parameters, resolve, tables)?;
             }
             Self::Cast(a, ty) => {
@@ -3653,8 +3681,9 @@ impl Scalar {
                 for arg in args {
                     arg.infer(None, parameters, resolve, tables)?;
                 }
-                let ty = greatest::hint(args, resolve, tables, parameters)?;
+                let (ty, definition) = greatest::hint(args, resolve, tables, parameters)?;
                 for arg in args {
+                    arg.infer_enum_parameter(&ty, definition.as_deref(), parameters)?;
                     let expected = match arg {
                         Self::Param(slot)
                             if parameters.get(slot - 1).is_some_and(Option::is_some) =>
@@ -3816,10 +3845,13 @@ impl Scalar {
                             "round" | "trunc" | "ceil" | "ceiling" | "floor" | "sign" => {
                                 Some(DataType::DoublePrecision)
                             }
-                            "coalesce" => common.clone(),
+                            "coalesce" => common.as_ref().map(|(ty, _)| ty.clone()),
                             _ => None,
                         }
                     };
+                    if let Some((ty, definition)) = &common {
+                        a.infer_enum_parameter(ty, definition.as_deref(), parameters)?;
+                    }
                     // Preserve declared parameter types for overload resolution at bind time.
                     let expected = if n != "coalesce"
                         && matches!(a, Self::Param(slot) if parameters.get(slot - 1).is_some_and(Option::is_some))

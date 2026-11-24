@@ -7,6 +7,7 @@ use parse::{ParseResult, parser, top, word};
 pub(super) struct Options {
     pub with_ties: bool,
     pub distinct_on: usize,
+    pub distinct_outputs: Vec<usize>,
     pub hidden: usize,
     pub grouping_sets: Option<group_sets::GroupingSets>,
     pub sample: Option<Box<Sample>>,
@@ -101,19 +102,20 @@ impl Sample {
 fn scalar(item: &Item) -> R<Scalar> {
     super::super::grouping::output_scalar(item)
 }
-fn output(s: &Scalar, query: &Query) -> R<Scalar> {
+fn output(s: &Scalar, query: &Query) -> R<(Scalar, Option<usize>)> {
     if let Scalar::Column(c) = s
         && c.qualifier.is_none()
     {
         let mut matches = query
             .items
             .iter()
-            .filter(|(_, alias)| alias.as_ref() == Some(&c.name));
-        if let Some((item, _)) = matches.next() {
+            .enumerate()
+            .filter(|(_, (_, alias))| alias.as_ref() == Some(&c.name));
+        if let Some((index, (item, _))) = matches.next() {
             if matches.next().is_some() {
                 return Err(SqlError::AmbiguousColumn);
             }
-            return scalar(item);
+            return Ok((scalar(item)?, Some(index)));
         }
     }
     if let Scalar::Literal(Value::Int(n)) = s {
@@ -121,15 +123,10 @@ fn output(s: &Scalar, query: &Query) -> R<Scalar> {
             .ok()
             .and_then(|n| n.checked_sub(1))
             .ok_or(SqlError::InvalidColumnReference)?;
-        return scalar(
-            &query
-                .items
-                .get(i)
-                .ok_or(SqlError::InvalidColumnReference)?
-                .0,
-        );
+        let (item, _) = query.items.get(i).ok_or(SqlError::InvalidColumnReference)?;
+        return Ok((scalar(item)?, Some(i)));
     }
-    Ok(s.clone())
+    Ok((s.clone(), None))
 }
 pub(super) fn claims(tokens: &[Token]) -> R<bool> {
     let positions = top(tokens)?;
@@ -209,7 +206,7 @@ pub(super) fn parse(
             let scalar = if matches!(s, Scalar::Literal(_)) {
                 s.clone()
             } else {
-                output(s, &select.query)?
+                output(s, &select.query)?.0
             };
             Ok((scalar, *d, *n))
         })
@@ -218,7 +215,8 @@ pub(super) fn parse(
         .iter()
         .map(|s| output(s, &select.query))
         .collect::<R<Vec<_>>>()?;
-    for (i, s) in keys.into_iter().enumerate() {
+    for (i, (s, output)) in keys.into_iter().enumerate() {
+        plan.decorations.distinct_outputs.extend(output);
         select
             .query
             .items

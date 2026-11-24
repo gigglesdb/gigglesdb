@@ -160,6 +160,7 @@ pub(super) fn describe(
         match value {
             Value::Default | Value::Rows(_) => {}
             Value::Plain(value) => {
+                enum_parameters::infer_column(value, &table.columns[index], state, &mut parameters)?;
                 infer_mutation_parameter(value, target, &mut parameters, declared, true)?
             }
             Value::Scalar(value) => value.infer_assignment(

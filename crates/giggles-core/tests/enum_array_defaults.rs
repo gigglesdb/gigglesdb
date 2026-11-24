@@ -521,3 +521,613 @@ fn implicit_enum_literals_are_validated_without_input_rows() {
         vec![vec![Value::Int(1), text("{z}"), text("z")]],
     );
 }
+
+fn oracle_rows(result: giggles_core::relational::SqlResult) -> Vec<String> {
+    result
+        .rows
+        .into_iter()
+        .map(|row| {
+            row.values
+                .into_iter()
+                .map(|value| match value {
+                    Value::Null => "<NULL>".into(),
+                    Value::Text(text) => text,
+                    Value::Int(n) => n.to_string(),
+                    Value::Bool(b) => if b { "t" } else { "f" }.into(),
+                    other => panic!("unexpected oracle value {other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
+}
+
+#[test]
+fn prisma_infers_enum_parameter_identity() {
+    use giggles_core::relational::{DataType, type_oid};
+
+    let db = Admin::create(common::fresh("prisma-enum-parameters"), Limits::default()).unwrap();
+    let mut sql = db.sql_session();
+    for statement in [
+        r#"CREATE TYPE "Status" AS ENUM ('TRIALING','ACTIVE','CANCELED')"#,
+        "CREATE TYPE pe AS ENUM ('z','a')",
+        r#"CREATE TABLE "Sub"(id int PRIMARY KEY, "status" "Status" NOT NULL DEFAULT 'TRIALING', tags "Status"[] DEFAULT ARRAY[]::"Status"[], a pe[], v pe)"#,
+        r#"INSERT INTO "Sub" VALUES (1,'ACTIVE','{ACTIVE}','{z}','z'),(2,'CANCELED',NULL,NULL,NULL)"#,
+    ] {
+        run(&mut sql, statement);
+    }
+    let types = sql.user_type_catalog().unwrap().types;
+    let oid = |name| {
+        type_oid(
+            *types
+                .iter()
+                .find(|(_, definition)| definition.name() == name)
+                .unwrap()
+                .0,
+        )
+        .unwrap()
+    };
+    let (pe, status) = (oid("pe"), oid("Status"));
+    let array = (DataType::TextArray, pe + 1);
+    let scalar = (DataType::Text, pe);
+    let status_scalar = (DataType::Text, status);
+    let status_array = (DataType::TextArray, status + 1);
+    let integer = (DataType::Integer, 0);
+    let sql_text = (DataType::Text, 0);
+    type Case<'a> = (&'a str, &'a [(DataType, u32)], &'a [Value], &'a [&'a str]);
+    let cases: [Case<'_>; 16] = [
+        (
+            r#"SELECT coalesce(a,$1) FROM "Sub""#,
+            std::slice::from_ref(&array),
+            &[text("{a}")],
+            &["{z}", "{a}"],
+        ),
+        (
+            r#"SELECT CASE WHEN id=1 THEN a ELSE $1 END FROM "Sub""#,
+            std::slice::from_ref(&array),
+            &[text("{a}")],
+            &["{z}", "{a}"],
+        ),
+        (
+            r#"SELECT nullif(a,$1) FROM "Sub""#,
+            std::slice::from_ref(&array),
+            &[text("{z}")],
+            &["<NULL>", "<NULL>"],
+        ),
+        (
+            r#"SELECT greatest(a,$1), least($2,a) FROM "Sub""#,
+            &[array.clone(), array.clone()],
+            &[text("{a}"), text("{a}")],
+            &["{a}|{z}", "{a}|{a}"],
+        ),
+        (
+            r#"SELECT lag(a,1,$1) OVER (ORDER BY id) FROM "Sub""#,
+            std::slice::from_ref(&array),
+            &[text("{a}")],
+            &["{a}", "{z}"],
+        ),
+        (
+            r#"SELECT coalesce(v,$1), CASE WHEN id=1 THEN v ELSE $2 END, nullif(v,$3), greatest(v,$4), lag(v,1,$5) OVER (ORDER BY id) FROM "Sub""#,
+            &[
+                scalar.clone(),
+                scalar.clone(),
+                scalar.clone(),
+                scalar.clone(),
+                scalar.clone(),
+            ],
+            &[text("a"), text("a"), text("z"), text("a"), text("a")],
+            &["z|z|<NULL>|a|a", "a|a|<NULL>|a|z"],
+        ),
+        (
+            r#"SELECT id FROM "Sub" WHERE "status" = $1"#,
+            std::slice::from_ref(&status_scalar),
+            &[text("ACTIVE")],
+            &["1"],
+        ),
+        (
+            r#"SELECT id FROM "Sub" WHERE "status" IN ($1,$2)"#,
+            &[status_scalar.clone(), status_scalar.clone()],
+            &[text("ACTIVE"), text("CANCELED")],
+            &["1", "2"],
+        ),
+        (
+            r#"SELECT id FROM "Sub" WHERE "status" = ANY($1)"#,
+            std::slice::from_ref(&status_array),
+            &[text("{ACTIVE,CANCELED}")],
+            &["1", "2"],
+        ),
+        (
+            r#"UPDATE "Sub" SET "status" = $1, tags = $2 WHERE id = $3"#,
+            &[status_scalar.clone(), status_array.clone(), integer.clone()],
+            &[text("CANCELED"), text("{CANCELED,ACTIVE}"), Value::Int(1)],
+            &[],
+        ),
+        (
+            r#"INSERT INTO "Sub"(id,"status",tags) VALUES ($1,$2,$3)"#,
+            &[integer.clone(), status_scalar.clone(), status_array.clone()],
+            &[Value::Int(3), text("TRIALING"), text("{}")],
+            &[],
+        ),
+        (
+            r#"SELECT id FROM "Sub" WHERE tags @> $1"#,
+            std::slice::from_ref(&status_array),
+            &[text("{ACTIVE}")],
+            &["1"],
+        ),
+        (
+            r#"SELECT coalesce($1, v) FROM "Sub""#,
+            std::slice::from_ref(&scalar),
+            &[text("a")],
+            &["a", "a"],
+        ),
+        (
+            r#"SELECT CASE WHEN id=1 THEN $1 ELSE v END FROM "Sub""#,
+            std::slice::from_ref(&scalar),
+            &[text("a")],
+            &["a", "<NULL>"],
+        ),
+        (
+            r#"SELECT a FROM "Sub" UNION ALL SELECT $1"#,
+            std::slice::from_ref(&array),
+            &[text("{a}")],
+            &["{z}", "<NULL>", "{a}"],
+        ),
+        (
+            r#"SELECT id FROM "Sub" WHERE "status"::text = $1"#,
+            std::slice::from_ref(&sql_text),
+            &[text("ACTIVE")],
+            &["1"],
+        ),
+    ];
+    let mut prepared = Vec::new();
+    for (statement, expected, _, _) in &cases {
+        let plan = sql.prepare(statement).unwrap();
+        let (desc, enums) = sql
+            .describe_with_enum_parameters(&plan)
+            .unwrap_or_else(|error| {
+                panic!("{statement}: {error:?} ({:?})", take_sql_error_message())
+            });
+        let inferred = desc
+            .parameters
+            .into_iter()
+            .enumerate()
+            .map(|(i, storage)| (storage, enums.get(&i).map_or(0, |ty| ty.oid())))
+            .collect::<Vec<_>>();
+        assert_eq!(inferred.as_slice(), *expected, "{statement}");
+        prepared.push(plan);
+    }
+    for (i, ((statement, _, values, expected), plan)) in cases.iter().zip(&prepared).enumerate() {
+        if i == 9 {
+            run(&mut sql, "BEGIN");
+        }
+        let result = sql
+            .execute_prepared(plan, values, None)
+            .unwrap_or_else(|error| {
+                panic!("{statement}: {error:?} ({:?})", take_sql_error_message())
+            });
+        if matches!(i, 9 | 10) {
+            assert_eq!(result.affected, 1, "{statement}");
+        }
+        assert_eq!(oracle_rows(result), *expected, "{statement}");
+        if i == 10 {
+            assert_eq!(
+                oracle_rows(
+                    sql.execute(
+                        r#"SELECT id,"status",tags FROM "Sub" ORDER BY id"#,
+                        &[],
+                        None
+                    )
+                    .unwrap()
+                ),
+                [
+                    "1|CANCELED|{CANCELED,ACTIVE}",
+                    "2|CANCELED|<NULL>",
+                    "3|TRIALING|{}"
+                ]
+            );
+        } else if i == 11 {
+            run(&mut sql, "ROLLBACK");
+        }
+    }
+    assert_eq!(
+        oracle_rows(
+            sql.execute(
+                r#"SELECT id,"status",tags FROM "Sub" ORDER BY id"#,
+                &[],
+                None
+            )
+            .unwrap()
+        ),
+        ["1|ACTIVE|{ACTIVE}", "2|CANCELED|<NULL>"]
+    );
+
+    for (i, bad, type_name) in [
+        (0, vec![text("{BOGUS}")], "pe"),
+        (
+            5,
+            vec![text("BOGUS"), text("a"), text("z"), text("a"), text("a")],
+            "pe",
+        ),
+        (6, vec![text("BOGUS")], r#""Status""#),
+        (14, vec![text("{BOGUS}")], "pe"),
+    ] {
+        assert_eq!(
+            sql.execute_prepared(&prepared[i], &bad, None),
+            Err(CoreError::Sql(SqlError::InvalidTextRepresentation))
+        );
+        assert_eq!(
+            take_sql_error_message().as_deref(),
+            Some(format!("invalid input value for enum {type_name}: \"BOGUS\"").as_str())
+        );
+    }
+
+    for (statement, value, expected) in [
+        (
+            r#"SELECT coalesce(v,$1), pg_typeof(coalesce(v,$1)) FROM "Sub" WHERE id=2"#,
+            "a",
+            &["a|pe"][..],
+        ),
+        (
+            r#"SELECT greatest(a,$1) > '{z}'::pe[] FROM "Sub" WHERE id=1"#,
+            "{a}",
+            &["t"],
+        ),
+        (
+            r#"SELECT id FROM "Sub" ORDER BY coalesce(v,$1), id"#,
+            "a",
+            &["1", "2"],
+        ),
+    ] {
+        let plan = sql.prepare(statement).unwrap();
+        let result = sql
+            .execute_prepared(&plan, &[text(value)], None)
+            .unwrap_or_else(|error| {
+                panic!("{statement}: {error:?} ({:?})", take_sql_error_message())
+            });
+        assert_eq!(oracle_rows(result), expected, "{statement}");
+    }
+}
+
+#[test]
+fn parameterized_enum_and_ordinary_array_controls() {
+    let db = Admin::create(common::fresh("enum-parameter-controls"), Limits::default()).unwrap();
+    let mut sql = db.sql_session();
+    run(&mut sql, "CREATE TYPE param_e AS ENUM ('z','a')");
+    run(
+        &mut sql,
+        "CREATE TABLE param_rows(id int PRIMARY KEY, a param_e[], v param_e, x int[], y text[])",
+    );
+    run(
+        &mut sql,
+        "INSERT INTO param_rows VALUES (1,'{z}','z','{2}','{Z}'),(2,NULL,NULL,NULL,NULL)",
+    );
+
+    for (column, value, first) in [("a", "{a}", "{z}"), ("v", "a", "z"), ("x", "{10}", "{2}")] {
+        for (projection, tail, input, expected) in [
+            (
+                format!("coalesce({column},$1)"),
+                "WHERE id=2",
+                value,
+                vec![value],
+            ),
+            (
+                format!("CASE WHEN id=1 THEN {column} ELSE $1 END"),
+                "WHERE id=2",
+                value,
+                vec![value],
+            ),
+            (
+                format!("nullif({column},$1)"),
+                "WHERE id=1",
+                first,
+                vec!["<NULL>"],
+            ),
+            (
+                format!("greatest({column},$1)"),
+                "WHERE id=1",
+                value,
+                vec![value],
+            ),
+            (
+                format!("lag({column},1,$1) OVER (ORDER BY id)"),
+                "",
+                value,
+                vec![value, first],
+            ),
+            (
+                format!("lead({column},1,$1) OVER (ORDER BY id)"),
+                "",
+                value,
+                vec!["<NULL>", value],
+            ),
+        ] {
+            let statement = format!("SELECT {projection} FROM param_rows {tail}");
+            let plan = sql.prepare(&statement).unwrap();
+            let result = sql
+                .execute_prepared(&plan, &[text(input)], None)
+                .unwrap_or_else(|error| {
+                    panic!("{statement}: {error:?} ({:?})", take_sql_error_message())
+                });
+            assert_eq!(oracle_rows(result), expected, "{statement}");
+        }
+    }
+    let statement = r#"SELECT greatest(y COLLATE "C",$1) FROM param_rows WHERE id=1"#;
+    let plan = sql.prepare(statement).unwrap();
+    assert_eq!(
+        oracle_rows(sql.execute_prepared(&plan, &[text("{a}")], None).unwrap()),
+        ["{a}"]
+    );
+}
+
+#[test]
+fn set_arms_resolve_sorted_unknowns_and_literals_after_stars() {
+    let db = Admin::create(common::fresh("enum-set-arms"), Limits::default()).unwrap();
+    let mut sql = db.sql_session();
+    for statement in [
+        "CREATE TYPE ue AS ENUM ('z','a')",
+        "CREATE TABLE ut(id int PRIMARY KEY, k int, a ue[], s ue)",
+        "INSERT INTO ut VALUES (1,10,'{z}','z'),(2,20,'{a}','a')",
+        "CREATE TABLE us(id int PRIMARY KEY, k int)",
+        "INSERT INTO us VALUES (4,40)",
+    ] {
+        run(&mut sql, statement);
+    }
+    for (statement, types) in [
+        (
+            "SELECT pg_typeof(a), a FROM (SELECT a FROM ut UNION ALL (SELECT '{a}' ORDER BY 1)) q",
+            "ue[] and text",
+        ),
+        (
+            "SELECT pg_typeof(a), a FROM (SELECT a FROM ut UNION ALL (SELECT DISTINCT '{a}')) q ORDER BY 2",
+            "ue[] and text",
+        ),
+        (
+            "SELECT pg_typeof(a), a FROM (SELECT a FROM ut UNION (SELECT '{a}' FROM us GROUP BY id ORDER BY 1)) q ORDER BY 2",
+            "ue[] and text",
+        ),
+        (
+            "SELECT pg_typeof(a), a FROM (SELECT a FROM ut UNION ALL (SELECT '{a}' FROM us GROUP BY 1)) q ORDER BY 2",
+            "ue[] and text",
+        ),
+        (
+            "SELECT pg_typeof(s), s FROM (SELECT s FROM ut UNION ALL (SELECT 'a' ORDER BY 1)) q",
+            "ue and text",
+        ),
+        (
+            "SELECT a FROM (SELECT a FROM ut UNION ALL (SELECT '{a}' ORDER BY 1)) q WHERE a < '{a}'::ue[]",
+            "ue[] and text",
+        ),
+        (
+            "SELECT pg_typeof(x), x FROM ((SELECT '{a}' AS x ORDER BY 1) UNION ALL SELECT a FROM ut) q",
+            "text and ue[]",
+        ),
+        (
+            "SELECT pg_typeof(x), x FROM (SELECT x FROM (SELECT '{a}' AS x ORDER BY 1) s UNION ALL SELECT a FROM ut) q",
+            "text and ue[]",
+        ),
+        (
+            "SELECT pg_typeof(x), x FROM (SELECT x FROM (SELECT '{a}' AS x) s UNION ALL SELECT a FROM ut) q ORDER BY 2",
+            "text and ue[]",
+        ),
+        (
+            "SELECT pg_typeof(t), t FROM (SELECT 1::int AS t UNION ALL (SELECT '2' ORDER BY 1)) q",
+            "integer and text",
+        ),
+    ] {
+        error(
+            &mut sql,
+            statement,
+            SqlError::Type,
+            &format!("UNION types {types} cannot be matched"),
+        );
+    }
+    for (statement, expected) in [
+        (
+            "SELECT pg_typeof(a), a FROM (SELECT a FROM ut UNION ALL (SELECT '{a}' LIMIT 1)) q ORDER BY 2",
+            &["ue[]|{z}", "ue[]|{a}", "ue[]|{a}"][..],
+        ),
+        (
+            "SELECT pg_typeof(a), a FROM (SELECT a FROM ut UNION ALL (SELECT '{a}' OFFSET 0)) q ORDER BY 2",
+            &["ue[]|{z}", "ue[]|{a}", "ue[]|{a}"],
+        ),
+        (
+            "SELECT pg_typeof(s), s FROM (SELECT s FROM ut UNION ALL (SELECT 'a' LIMIT 1)) q ORDER BY 2",
+            &["ue|z", "ue|a", "ue|a"],
+        ),
+        (
+            "SELECT a FROM (SELECT a FROM ut WHERE id=1 UNION ALL (SELECT '{a}' LIMIT 1)) q WHERE a < '{a}'::ue[]",
+            &["{z}"],
+        ),
+        (
+            "SELECT pg_typeof(t), t FROM (SELECT 'x'::text AS t UNION ALL (SELECT 'y' ORDER BY 1)) q ORDER BY 2",
+            &["text|x", "text|y"],
+        ),
+        (
+            "SELECT 1 UNION ALL (SELECT '2' FROM us ORDER BY id)",
+            &["1", "2"],
+        ),
+        (
+            "SELECT 1 UNION ALL (SELECT '2' FROM us GROUP BY id)",
+            &["1", "2"],
+        ),
+        (
+            "SELECT id,k,a FROM ut UNION ALL SELECT *,'{a}' FROM us ORDER BY 1",
+            &["1|10|{z}", "2|20|{a}", "4|40|{a}"],
+        ),
+        (
+            "SELECT id,k,s FROM ut UNION ALL SELECT *,'a' FROM us ORDER BY 1",
+            &["1|10|z", "2|20|a", "4|40|a"],
+        ),
+        (
+            "SELECT id,k,s FROM ut UNION ALL SELECT us.*,'a' FROM us ORDER BY 1",
+            &["1|10|z", "2|20|a", "4|40|a"],
+        ),
+        (
+            "SELECT id,k,a,s FROM ut UNION ALL SELECT *,'{a}','a' FROM us ORDER BY 1",
+            &["1|10|{z}|z", "2|20|{a}|a", "4|40|{a}|a"],
+        ),
+        (
+            "SELECT id,a,k FROM ut UNION ALL SELECT id,'{a}',k FROM us ORDER BY 1",
+            &["1|{z}|10", "2|{a}|20", "4|{a}|40"],
+        ),
+        (
+            "SELECT *,'{a}' FROM us UNION ALL SELECT id,k,a FROM ut ORDER BY 1",
+            &["1|10|{z}", "2|20|{a}", "4|40|{a}"],
+        ),
+        (
+            "SELECT id,k,a FROM ut INTERSECT SELECT *,'{a}' FROM us",
+            &[],
+        ),
+        (
+            "SELECT id,k,a FROM ut EXCEPT SELECT *,'{z}' FROM us ORDER BY 1",
+            &["1|10|{z}", "2|20|{a}"],
+        ),
+    ] {
+        let result = sql.execute(statement, &[], None).unwrap_or_else(|error| {
+            panic!("{statement}: {error:?} ({:?})", take_sql_error_message())
+        });
+        assert_eq!(oracle_rows(result), expected, "{statement}");
+    }
+    for statement in [
+        "SELECT id,k,a FROM ut UNION ALL SELECT *,'{BOGUS}' FROM us",
+        "SELECT id,k,s FROM ut UNION ALL SELECT *,'BOGUS' FROM us",
+    ] {
+        error(
+            &mut sql,
+            statement,
+            SqlError::InvalidTextRepresentation,
+            r#"invalid input value for enum ue: "BOGUS""#,
+        );
+    }
+}
+
+
+#[test]
+fn set_arm_group_by_prefers_input_names() {
+    let db = Admin::create(common::fresh("set-group-input"), Limits::default()).unwrap();
+    let mut sql = db.sql_session();
+    for statement in [
+        "CREATE TYPE xe AS ENUM ('z','a')",
+        "CREATE TABLE gt(id int PRIMARY KEY, n int, d date, s xe)",
+        "INSERT INTO gt VALUES (1,1,'2020-01-01','z')",
+        "CREATE TABLE gs(id int PRIMARY KEY, k int)",
+        "INSERT INTO gs VALUES (4,40)",
+    ] {
+        run(&mut sql, statement);
+    }
+    for (statement, expected) in [
+        (
+            "SELECT n FROM gt UNION ALL SELECT '3' AS k FROM gs GROUP BY k",
+            &["1", "3"][..],
+        ),
+        (
+            "SELECT n FROM gt UNION ALL SELECT '3' AS k FROM gs JOIN gt ON true GROUP BY k",
+            &["1", "3"],
+        ),
+        (
+            "SELECT pg_typeof(n), n FROM (SELECT n FROM gt UNION ALL SELECT '3' AS id FROM gs GROUP BY id) q ORDER BY 2",
+            &["integer|1", "integer|3"],
+        ),
+        (
+            "SELECT pg_typeof(d), d::text FROM (SELECT d FROM gt UNION ALL SELECT '2021-01-01' AS id FROM gs GROUP BY id) q ORDER BY 2",
+            &["date|2020-01-01", "date|2021-01-01"],
+        ),
+        (
+            "SELECT pg_typeof(s), s FROM (SELECT s FROM gt UNION ALL SELECT 'a' AS id FROM gs GROUP BY id) q ORDER BY 2",
+            &["xe|z", "xe|a"],
+        ),
+        (
+            "SELECT pg_typeof(s), s FROM (SELECT s FROM gt UNION ALL SELECT 'a' AS k FROM gs GROUP BY k) q ORDER BY 2",
+            &["xe|z", "xe|a"],
+        ),
+    ] {
+        let result = sql.execute(statement, &[], None).unwrap_or_else(|error| {
+            panic!("{statement}: {error:?} ({:?})", take_sql_error_message())
+        });
+        assert_eq!(oracle_rows(result), expected, "{statement}");
+    }
+
+    for statement in [
+        "SELECT n FROM gt UNION ALL SELECT '3' AS zz FROM gs GROUP BY zz",
+        "SELECT n FROM gt UNION ALL (SELECT '3' AS k FROM gs ORDER BY k)",
+    ] {
+        error(
+            &mut sql,
+            statement,
+            SqlError::Type,
+            "UNION types integer and text cannot be matched",
+        );
+    }
+}
+
+#[test]
+fn set_arm_distinct_on_resolves_referenced_unknown_outputs() {
+    let db = Admin::create(common::fresh("set-distinct-on"), Limits::default()).unwrap();
+    let mut sql = db.sql_session();
+    for statement in [
+        "CREATE TYPE xe AS ENUM ('z','a')",
+        "CREATE TABLE xt(id int PRIMARY KEY, s xe, a xe[], n int)",
+        "INSERT INTO xt VALUES (1,'z','{z}',1)",
+        "CREATE TABLE xs(id int PRIMARY KEY, k int)",
+        "INSERT INTO xs VALUES (4,40)",
+    ] {
+        run(&mut sql, statement);
+    }
+    for (statement, types) in [
+        (
+            "SELECT a FROM (SELECT a FROM xt UNION ALL SELECT DISTINCT ON (1) '{a}') q WHERE a < '{a}'::xe[]",
+            "xe[] and text",
+        ),
+        (
+            "SELECT s FROM (SELECT s FROM xt UNION ALL SELECT DISTINCT ON (1) 'a') q WHERE s < 'a'::xe",
+            "xe and text",
+        ),
+        (
+            "SELECT pg_typeof(n), n FROM (SELECT n FROM xt UNION ALL SELECT DISTINCT ON (1) '3') q ORDER BY 2",
+            "integer and text",
+        ),
+        (
+            "SELECT n FROM xt UNION ALL SELECT DISTINCT ON (target) '3' AS target FROM xs",
+            "integer and text",
+        ),
+        (
+            "SELECT n FROM xt UNION ALL SELECT DISTINCT ON (k) '3' AS k FROM xs",
+            "integer and text",
+        ),
+    ] {
+        error(
+            &mut sql,
+            statement,
+            SqlError::Type,
+            &format!("UNION types {types} cannot be matched"),
+        );
+    }
+    assert_eq!(
+        run(
+            &mut sql,
+            "SELECT pg_typeof(s), s FROM (SELECT s FROM xt UNION ALL SELECT DISTINCT ON (k) 'a' FROM xs) q ORDER BY 2",
+        ),
+        [vec![text("xe"), text("z")], vec![text("xe"), text("a")]]
+    );
+}
+
+#[test]
+fn ordinary_containment_with_untyped_parameters_stays_unsupported() {
+    let db = Admin::create(common::fresh("ordinary-containment"), Limits::default()).unwrap();
+    let mut sql = db.sql_session();
+    run(
+        &mut sql,
+        "CREATE TABLE ordinary(id int PRIMARY KEY, xi int[], xt text[], j jsonb)",
+    );
+    for expression in ["xi @> $1", "xt <@ $1", "j @> $1"] {
+        let statement = format!("SELECT id FROM ordinary WHERE {expression}");
+        let plan = sql.prepare(&statement).unwrap();
+        assert!(
+            matches!(
+                sql.describe_with_enum_parameters(&plan),
+                Err(CoreError::Sql(SqlError::Unsupported))
+            ),
+            "{statement}"
+        );
+    }
+}

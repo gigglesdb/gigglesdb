@@ -593,7 +593,7 @@ impl Mutation {
                     return Err(SqlError::Syntax);
                 }
                 for (i, (column, name)) in meta.columns.iter().zip(names.iter()).enumerate() {
-                    if !meta.unknown[i]
+                    if meta.unknown[i].is_none()
                         && !assignment::SourceType::new(&column.data_type, meta.type_oids.get(i))
                             .compatible(&table.columns[super::super::super::col(table, name)?].data_type)
                     {
@@ -915,7 +915,7 @@ impl Mutation {
                             .map(|(i, ((v, c), n))| {
                                 let target =
                                     &table.columns[super::super::super::col(table, n)?].data_type;
-                                if meta.unknown[i] {
+                                if meta.unknown[i].is_some() {
                                     assignment::literal(v.clone(), target, clock)
                                 } else {
                                     assignment::SourceType::new(&c.data_type, meta.type_oids.get(i))

@@ -167,6 +167,24 @@ fn alias(p: &mut Parser) -> R<Option<(String, Vec<String>)>> {
     }
     Ok(Some((name, columns)))
 }
+fn starts_query(mut tokens: &[Token]) -> R<bool> {
+    // A derived set expression can begin with a parenthesized arm. A
+    // grouped join beginning with a subquery still belongs to FROM parsing.
+    while tokens.first() == Some(&Token::Symbol('(')) {
+        let close = subquery_end(tokens, 0)?;
+        if tokens.get(close + 1).is_some_and(|token| {
+            !["union", "intersect", "except", "order", "limit", "offset", "fetch"]
+                .iter().any(|word| parse::word(token, word))
+        }) {
+            return Ok(false);
+        }
+        tokens = &tokens[1..close];
+    }
+    Ok(tokens.first().is_some_and(|token| {
+        ["select", "values", "table", "with"].iter().any(|word| parse::word(token, word))
+    }))
+}
+
 fn item(
     p: &mut Parser,
     owner: &mut Parser,
@@ -201,12 +219,7 @@ fn item(
         let open = p.at - 1;
         let end = subquery_end(&p.tokens, open)?;
         let inner = &p.tokens[p.at..end];
-        let query = inner.first().is_some_and(|t| {
-            ["select", "values", "table", "with"]
-                .iter()
-                .any(|w| parse::word(t, w))
-        });
-        let mut result = if query {
+        let mut result = if starts_query(inner)? {
             let alias = format!("\0unnamed_subquery_{next}");
             *next += 1;
             From::Leaf {
@@ -1008,27 +1021,40 @@ pub(super) fn catalog(base: &Relational, shape: &Shape) -> R<Relational> {
     )?;
     Ok(state)
 }
+fn star_columns<'a>(item: &Item, shape: &'a Shape) -> R<Option<&'a [(String, usize)]>> {
+    Ok(match item {
+        Item::Star => Some(shape.namespace.visible.as_slice()),
+        Item::QualifiedStar {
+            schema: None,
+            relation,
+        } => Some(
+            shape
+                .namespace
+                .qualified
+                .iter()
+                .find(|(a, _)| a == relation)
+                .ok_or(SqlError::UnknownTable)?
+                .1.as_slice(),
+        ),
+        Item::QualifiedStar { .. } => return Err(SqlError::UnknownTable),
+        _ => None,
+    })
+}
+
+pub(super) fn projection_item_indices(query: &Query, shape: &Shape) -> R<Vec<usize>> {
+    let mut outputs = Vec::new();
+    for (i, (item, _)) in query.items.iter().enumerate() {
+        let width = star_columns(item, shape)?.map_or(1, <[_]>::len);
+        outputs.extend(std::iter::repeat_n(i, width));
+    }
+    Ok(outputs)
+}
+
 pub(super) fn prepare(query: &Query, shape: &Shape) -> R<Query> {
     let mut query = query.clone();
     let mut items = vec![];
     for (item, alias) in &query.items {
-        let columns = match item {
-            Item::Star => Some(&shape.namespace.visible),
-            Item::QualifiedStar {
-                schema: None,
-                relation,
-            } => Some(
-                &shape
-                    .namespace
-                    .qualified
-                    .iter()
-                    .find(|(a, _)| a == relation)
-                    .ok_or(SqlError::UnknownTable)?
-                    .1,
-            ),
-            Item::QualifiedStar { .. } => return Err(SqlError::UnknownTable),
-            _ => None,
-        };
+        let columns = star_columns(item, shape)?;
         if let Some(columns) = columns {
             for (name, n) in columns {
                 items.push((Item::Scalar(col(*n)), Some(name.clone())));

@@ -211,3 +211,309 @@ ALTER TABLE "OAuthClient" ADD COLUMN "linkDismissals" TEXT[] NOT NULL DEFAULT AR
 
 #[path = "am2_fix1_network.inc"]
 mod am2_fix1_network;
+
+use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
+
+#[derive(Debug, PartialEq)]
+struct EnumLabel(String);
+
+impl ToSql for EnumLabel {
+    fn to_sql(
+        &self,
+        _: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(self.0.as_bytes());
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty.kind(), Kind::Enum(_))
+    }
+
+    to_sql_checked!();
+}
+
+impl<'a> FromSql<'a> for EnumLabel {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(std::str::from_utf8(raw)?.into()))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        <Self as ToSql>::accepts(ty)
+    }
+}
+
+#[tokio::test]
+async fn prisma_prepares_enum_parameters_without_oids() {
+    let engine = if cfg!(feature = "engine-rocksdb") {
+        Engine::V2
+    } else {
+        Engine::Legacy
+    };
+    let fixture = Fixture::with_engine(engine).await;
+    let pg = fixture.client().await;
+    pg.batch_execute(
+        r#"
+        CREATE TYPE "Status" AS ENUM ('TRIALING','ACTIVE','CANCELED');
+        CREATE TYPE pe AS ENUM ('z','a');
+        CREATE TABLE "Sub"(id int PRIMARY KEY, "status" "Status" NOT NULL DEFAULT 'TRIALING',
+            tags "Status"[] DEFAULT ARRAY[]::"Status"[], a pe[], v pe);
+        INSERT INTO "Sub" VALUES (1,'ACTIVE','{ACTIVE}','{z}','z'),(2,'CANCELED',NULL,NULL,NULL);
+    "#,
+    )
+    .await
+    .unwrap();
+
+    let mut types = std::collections::BTreeMap::new();
+    for row in rows(
+        &pg,
+        "SELECT typname, oid, typarray FROM pg_type WHERE typname IN ('pe','Status')",
+    )
+    .await
+    {
+        let name = row[0].as_deref().unwrap();
+        types.insert(
+            name.to_owned(),
+            row[1].as_deref().unwrap().parse::<u32>().unwrap(),
+        );
+        types.insert(
+            format!("_{name}"),
+            row[2].as_deref().unwrap().parse::<u32>().unwrap(),
+        );
+    }
+    types.insert("int4".into(), Type::INT4.oid());
+
+    let mut plans = Vec::new();
+    for (query, names) in [
+        (r#"SELECT coalesce(a,$1) FROM "Sub""#, &["_pe"][..]),
+        (
+            r#"SELECT coalesce(v,$1), CASE WHEN id=1 THEN v ELSE $2 END, nullif(v,$3),
+            greatest(v,$4), lag(v,1,$5) OVER (ORDER BY id) FROM "Sub""#,
+            &["pe"; 5],
+        ),
+        (r#"SELECT id FROM "Sub" WHERE "status" = $1"#, &["Status"]),
+        (
+            r#"SELECT id FROM "Sub" WHERE "status" = ANY($1)"#,
+            &["_Status"],
+        ),
+        (
+            r#"UPDATE "Sub" SET "status" = $1, tags = $2 WHERE id = $3"#,
+            &["Status", "_Status", "int4"],
+        ),
+        (
+            r#"INSERT INTO "Sub"(id,"status",tags) VALUES ($1,$2,$3)"#,
+            &["int4", "Status", "_Status"],
+        ),
+    ] {
+        let plan = pg
+            .prepare(query)
+            .await
+            .unwrap_or_else(|error| panic!("{query}: {error:?}"));
+        let params: Vec<_> = plan
+            .params()
+            .iter()
+            .map(|ty| (ty.name(), ty.oid()))
+            .collect();
+        assert_eq!(
+            params,
+            names
+                .iter()
+                .map(|name| (*name, types[*name]))
+                .collect::<Vec<_>>(),
+            "{query}"
+        );
+        plans.push(plan);
+    }
+
+    let label = |text: &str| EnumLabel(text.into());
+    let array = |labels: &[&str]| labels.iter().map(|text| label(text)).collect::<Vec<_>>();
+    let result = pg.query(&plans[0], &[&array(&["a"])]).await.unwrap();
+    assert_eq!(
+        result
+            .iter()
+            .map(|row| row.get::<_, Vec<EnumLabel>>(0))
+            .collect::<Vec<_>>(),
+        [array(&["z"]), array(&["a"])]
+    );
+    let result = pg
+        .query(
+            &plans[1],
+            &[
+                &label("a"),
+                &label("a"),
+                &label("z"),
+                &label("a"),
+                &label("a"),
+            ],
+        )
+        .await
+        .unwrap();
+    let actual: Vec<_> = result
+        .iter()
+        .map(|row| {
+            (0..row.len())
+                .map(|i| row.get::<_, Option<EnumLabel>>(i))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            vec![
+                Some(label("z")),
+                Some(label("z")),
+                None,
+                Some(label("a")),
+                Some(label("a"))
+            ],
+            vec![
+                Some(label("a")),
+                Some(label("a")),
+                None,
+                Some(label("a")),
+                Some(label("z"))
+            ],
+        ]
+    );
+    assert_eq!(
+        pg.query_one(&plans[2], &[&label("ACTIVE")])
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        1
+    );
+    let result = pg
+        .query(&plans[3], &[&array(&["ACTIVE", "CANCELED"])])
+        .await
+        .unwrap();
+    assert_eq!(
+        result
+            .iter()
+            .map(|row| row.get::<_, i32>(0))
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+
+    for (plan, values, name) in [
+        (
+            &plans[2],
+            &[&label("BOGUS") as &(dyn ToSql + Sync)][..],
+            r#""Status""#,
+        ),
+        (
+            &plans[0],
+            &[&array(&["BOGUS"]) as &(dyn ToSql + Sync)][..],
+            "pe",
+        ),
+    ] {
+        let error = pg.query(plan, values).await.unwrap_err();
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), "22P02");
+        assert_eq!(
+            error.message(),
+            format!("invalid input value for enum {name}: \"BOGUS\"")
+        );
+    }
+
+    assert_eq!(
+        pg.execute(
+            &plans[4],
+            &[&label("CANCELED"), &array(&["CANCELED", "ACTIVE"]), &1i32]
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        pg.execute(&plans[5], &[&3i32, &label("TRIALING"), &array(&[])])
+            .await
+            .unwrap(),
+        1
+    );
+    expect_rows(
+        &pg,
+        r#"SELECT id,"status",tags FROM "Sub" ORDER BY id"#,
+        &[
+            &[Some("1"), Some("CANCELED"), Some("{CANCELED,ACTIVE}")],
+            &[Some("2"), Some("CANCELED"), None],
+            &[Some("3"), Some("TRIALING"), Some("{}")],
+        ],
+    )
+    .await;
+}
+
+
+#[derive(Debug)]
+struct BinaryEnumArray<'a> {
+    element_oid: u32,
+    labels: &'a [&'a str],
+}
+
+impl ToSql for BinaryEnumArray<'_> {
+    fn to_sql(
+        &self,
+        _: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(&1i32.to_be_bytes()); // dimensions
+        out.extend_from_slice(&0i32.to_be_bytes()); // no nulls
+        out.extend_from_slice(&self.element_oid.to_be_bytes());
+        out.extend_from_slice(&i32::try_from(self.labels.len())?.to_be_bytes());
+        out.extend_from_slice(&1i32.to_be_bytes()); // lower bound
+        for label in self.labels {
+            out.extend_from_slice(&i32::try_from(label.len())?.to_be_bytes());
+            out.extend_from_slice(label.as_bytes());
+        }
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty.kind(), Kind::Array(element) if <EnumLabel as ToSql>::accepts(element))
+    }
+
+    to_sql_checked!();
+}
+
+#[tokio::test]
+async fn inferred_enum_array_binary_bind_accepts_text_and_varchar_headers() {
+    let engine = if cfg!(feature = "engine-rocksdb") {
+        Engine::V2
+    } else {
+        Engine::Legacy
+    };
+    let fixture = Fixture::with_engine(engine).await;
+    let pg = fixture.client().await;
+    pg.batch_execute(
+        "CREATE TYPE qe AS ENUM ('z','a');
+         CREATE TABLE q(id int PRIMARY KEY, a qe[]);
+         INSERT INTO q VALUES (1,'{z}'),(2,'{a,z}');",
+    )
+    .await
+    .unwrap();
+
+    let plan = pg.prepare("SELECT id FROM q WHERE a = $1").await.unwrap();
+    let Kind::Array(element) = plan.params()[0].kind() else {
+        panic!("expected inferred enum-array parameter, got {:?}", plan.params());
+    };
+    assert_eq!(element.name(), "qe");
+    for element_oid in [element.oid(), Type::TEXT.oid(), Type::VARCHAR.oid()] {
+        let valid = BinaryEnumArray {
+            element_oid,
+            labels: &["a", "z"],
+        };
+        let row = pg.query_one(&plan, &[&valid]).await.unwrap();
+        assert_eq!(row.get::<_, i32>(0), 2, "element OID {element_oid}");
+
+        let invalid = BinaryEnumArray {
+            element_oid,
+            labels: &["BOGUS"],
+        };
+        let error = pg.query(&plan, &[&invalid]).await.unwrap_err();
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), "22P02", "element OID {element_oid}");
+        assert_eq!(error.message(), r#"invalid input value for enum qe: "BOGUS""#);
+    }
+    drop(pg);
+    fixture.stop().await;
+}

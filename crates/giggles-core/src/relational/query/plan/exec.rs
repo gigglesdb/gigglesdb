@@ -64,6 +64,9 @@ impl Plan {
         cancel: &mut dyn FnMut() -> bool,
     ) -> R<SqlResult> {
         let bound = self.bind(state, count, declared)?;
+        for (index, (storage, value)) in bound.description.parameters.iter().zip(params).enumerate() {
+            enum_parameters::validate(index, storage, value)?;
+        }
         let parameters: Vec<_> = bound
             .description
             .parameters

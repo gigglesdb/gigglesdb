@@ -3127,6 +3127,14 @@ impl SqlSession {
         &mut self,
         p: &relational::Prepared,
     ) -> Result<relational::Description, CoreError> {
+        self.describe_with_enum_parameters(p).map(|(description, _)| description)
+    }
+
+    /// Return the logical enum input types alongside the storage description.
+    pub fn describe_with_enum_parameters(
+        &mut self,
+        p: &relational::Prepared,
+    ) -> Result<(relational::Description, relational::EnumParameters), CoreError> {
         relational::assert_sql_frontend_allowed();
         let lease = self.statement_lease()?;
         self.describe_bound_engine(p, lease.as_deref())
@@ -3135,7 +3143,7 @@ impl SqlSession {
         &mut self,
         p: &relational::Prepared,
         db: Option<&EngineLease>,
-    ) -> Result<relational::Description, CoreError> {
+    ) -> Result<(relational::Description, relational::EnumParameters), CoreError> {
         Self::check_prepared_generation(p, db)?;
         let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
@@ -3154,7 +3162,7 @@ impl SqlSession {
                 if matches!(self.admin.inner.backend, Backend::V2(_)) {
                     metadata_plan.epoch = s.sql.image.epoch;
                 }
-                metadata_plan.describe(&s.sql).map_err(CoreError::Sql)
+                metadata_plan.describe_with_enum_parameters(&s.sql).map_err(CoreError::Sql)
             };
             if let Some(s) = &self.staged {
                 describe(&MetadataState::borrow(s))
@@ -4972,7 +4980,7 @@ impl SqlSession {
         let lease = self.statement_lease()?;
         let p = self.prepare_typed_read(lease.as_deref(), vec![read.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_single_source_read(domain, epoch, read))?;
-        self.describe_bound_engine(&p, lease.as_deref())
+        self.describe_bound_engine(&p, lease.as_deref()).map(|(description, _)| description)
     }
     /// Typed leaf reads use the same transaction/snapshot kernel as prepared SQL.
     pub fn execute_typed_read(&mut self, read: relational::SingleSourceRead, expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
@@ -4996,7 +5004,7 @@ impl SqlSession {
         let lease = self.statement_lease()?;
         let p = self.prepare_typed_read(lease.as_deref(), vec![read.left.table.replace('.', "\0"), read.right.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_two_source_read(domain, epoch, read))?;
-        self.describe_bound_engine(&p, lease.as_deref())
+        self.describe_bound_engine(&p, lease.as_deref()).map(|(description, _)| description)
     }
     pub fn execute_typed_join(&mut self, read: relational::TwoSourceRead, expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
         self.refuse_task_session()?;
@@ -5258,6 +5266,7 @@ impl SqlSession {
         db: Option<&EngineLease>,
         check_reply: Option<&mut SqlReplyCheck<'_>>,
     ) -> Result<relational::SqlResult, CoreError> {
+        let _enum_parameters = relational::enum_parameters::Scope::enter();
         let _date_order = relational::clock::LiteralDateOrder::enter(p.literal_date_order);
         let _value_budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));

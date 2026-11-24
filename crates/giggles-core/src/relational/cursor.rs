@@ -83,6 +83,7 @@ fn bind_query<'a>(
     let Statement::Query(query) = prepared.statement.get() else {
         return Ok(None);
     };
+    let _enum_parameters = enum_parameters::Scope::enter();
     #[cfg(any(test, feature = "test-cursor-bindings"))]
     QUERY_BINDS.set(QUERY_BINDS.get() + 1);
     query.bind(state, prepared.params, &prepared.parameter_types).map(Some)

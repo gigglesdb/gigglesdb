@@ -34,7 +34,7 @@ impl Plan {
             .zip(targets)
             .enumerate()
             .map(|(i, ((column, unknown), target))| {
-                if unknown {
+                if unknown.is_some() {
                     return Ok(None);
                 }
                 let source = assignment::SourceType::new(&column.data_type, meta.type_oids.get(i));

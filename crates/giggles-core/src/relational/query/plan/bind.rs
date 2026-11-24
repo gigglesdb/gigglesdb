@@ -4,7 +4,8 @@ pub(super) struct Meta {
     pub columns: Vec<ColumnDef>,
     pub typmods: Vec<i32>,
     pub type_oids: Vec<u32>,
-    pub unknown: Vec<bool>,
+    // Expanded output ordinal to original SELECT item for SQL unknowns.
+    pub unknown: Vec<Option<usize>>,
     // Binding-only scalar metadata for set-operation collation diagnostics.
     pub collations: Vec<Option<BoundScalar>>,
 }
@@ -272,6 +273,22 @@ impl Plan {
                     cte::prepare_query(&q, state)?
                 };
                 paging::validate_distinct(&query, self.decorations.distinct_on, &self.order, state)?;
+                let origins = if let Some(shape) = &shape {
+                    join::projection_item_indices(&select.query, shape)?
+                } else if !select.windows.is_empty() {
+                    let table = &state.tables[&select.input.as_ref().unwrap().name];
+                    let visible = table.columns.iter().filter(|c| !c.name.starts_with('\0')).count();
+                    select.query.items.iter().enumerate().flat_map(|(i, (item, _))| {
+                        let width = if matches!(item, Item::Star | Item::QualifiedStar { .. }) {
+                            visible
+                        } else {
+                            1
+                        };
+                        std::iter::repeat_n(i, width)
+                    }).collect()
+                } else {
+                    select.query.projection_item_indices(state)?
+                };
                 let mut unknown_parameters: Vec<_> = select
                     .query
                     .items
@@ -313,14 +330,33 @@ impl Plan {
                 if oids.iter().any(|oid| *oid != 0) {
                     description.type_oids = oids;
                 }
-                let unknown = query
-                    .insert_outputs(state)?
-                    .iter()
-                    .map(Option::is_some)
-                    .collect();
+                let resolves_unknown = |output: usize, item: usize| {
+                    let (_, alias) = &select.query.items[item];
+                    let names_output = |key: &Scalar| match key {
+                        Scalar::Literal(Value::Int(n)) => usize::try_from(*n).ok() == Some(output + 1),
+                        Scalar::Column(c) if c.qualifier.is_none() => alias.as_ref() == Some(&c.name),
+                        _ => false,
+                    };
+                    query.distinct()
+                        || self.decorations.distinct_outputs.contains(&item)
+                        || bound.grouping.as_ref().is_some_and(|group| group.group_outputs.contains(&output))
+                        || query.order.iter().chain(&self.order).any(|(key, _, _)| names_output(key))
+                };
+                let unknown = origins.into_iter().enumerate().map(|(output, item)| {
+                    let Item::Scalar(scalar) = &select.query.items[item].0 else { return None };
+                    let is_unknown = match scalar {
+                        Scalar::Literal(Value::Null | Value::Text(_)) => true,
+                        Scalar::Param(n) => unknown_parameters.contains(n),
+                        _ => false,
+                    };
+                    (is_unknown && !resolves_unknown(output, item)).then_some(item)
+                }).collect::<Vec<_>>();
                 for (i, ty) in description.parameters.into_iter().enumerate() {
                     if select.parameters.contains(&(i + 1))
-                        && !unknown_parameters.contains(&(i + 1))
+                        && (!unknown_parameters.contains(&(i + 1))
+                            || !unknown.iter().flatten().any(|item| matches!(
+                                &select.query.items[*item].0, Item::Scalar(Scalar::Param(n)) if *n == i + 1
+                            )))
                     {
                         parameters[i] = Some(ty);
                     }
@@ -346,14 +382,6 @@ impl Plan {
                     unknown,
                     collations,
                 };
-                if select.query.items.len() == meta.columns.len() {
-                    for (i, (item, _)) in select.query.items.iter().enumerate() {
-                        if matches!(item, Item::Scalar(Scalar::Param(n)) if unknown_parameters.contains(n))
-                        {
-                            meta.unknown[i] = true;
-                        }
-                    }
-                }
                 // Synthetic IDs exist only to carry typmods inside the temporary
                 // binder catalog. Never expose them to the real catalog's OID lookup.
                 if select.input.is_some()
@@ -423,7 +451,7 @@ impl Plan {
                     columns,
                     typmods: vec![-1; width],
                     type_oids: if type_oids.iter().any(|oid| *oid != 0) { type_oids } else { vec![] },
-                    unknown: vec![false; width],
+                    unknown: vec![None; width],
                     collations,
                 }
             }
@@ -457,7 +485,7 @@ impl Plan {
                     let a_json = a_oids.get(i) == Some(&json_aggregate::OID);
                     let b_json = b.type_oids.get(i) == Some(&json_aggregate::OID);
                     if a_json || b_json {
-                        if a_json != b_json && !(if a_json { b.unknown[i] } else { a.unknown[i] }) {
+                        if a_json != b_json && (if a_json { b.unknown[i] } else { a.unknown[i] }).is_none() {
                             let types = [(&a, a_json), (&b, b_json)].map(|(m, json)| {
                                 if json {
                                     "json"
@@ -473,7 +501,7 @@ impl Plan {
                             return Err(SqlError::UndefinedFunction);
                         }
                     }
-                    let typed = [&a, &b].into_iter().filter(|m| !m.unknown[i]);
+                    let typed = [&a, &b].into_iter().filter(|m| m.unknown[i].is_none());
                     let enum_type = functions::enum_order::common_enum(
                         construct,
                         typed.clone().map(|m| {
@@ -481,13 +509,22 @@ impl Plan {
                                 .and_then(BoundScalar::attached_enum))
                         }),
                     )?;
-                    let ty = common(typed.map(|m| m.columns[i].data_type.clone()))?;
-                    left.retarget(i, &ty, enum_type, parameters)?;
-                    right.retarget(i, &ty, enum_type, parameters)?;
+                    let ty = common(typed.map(|m| m.columns[i].data_type.clone())).inspect_err(|_| {
+                        let left = &a.columns[i].data_type;
+                        let right = &b.columns[i].data_type;
+                        if matches!((left, right), (DataType::Text, _) | (_, DataType::Text)) {
+                            user_types::view_replace_error(format!(
+                                "{construct} types {} and {} cannot be matched",
+                                functions::type_display(left), functions::type_display(right),
+                            ));
+                        }
+                    })?;
+                    left.retarget(a.unknown[i], &ty, enum_type, parameters)?;
+                    right.retarget(b.unknown[i], &ty, enum_type, parameters)?;
                     let value = functions::collation::combined(
-                        a.collations[i].as_ref().filter(|_| !a.unknown[i] || enum_type.is_none()),
+                        a.collations[i].as_ref().filter(|_| a.unknown[i].is_none() || enum_type.is_none()),
                         b.collations.get(i).and_then(Option::as_ref)
-                            .filter(|_| !b.unknown[i] || enum_type.is_none()),
+                            .filter(|_| b.unknown[i].is_none() || enum_type.is_none()),
                         ty.clone(),
                     )?;
                     if !matches!(op, SetOp::Union) || !*all {
@@ -503,7 +540,7 @@ impl Plan {
                     if !same {
                         a.typmods[i] = -1;
                     }
-                    a.unknown[i] = false;
+                    a.unknown[i] = None;
                 }
                 if a.type_oids.iter().all(|oid| *oid == 0) {
                     a.type_oids.clear();
@@ -553,16 +590,17 @@ impl Plan {
     }
     fn retarget(
         &mut self,
-        i: usize,
+        item: Option<usize>,
         ty: &DataType,
         enum_type: Option<&TypeDef>,
         parameters: &mut [Option<DataType>],
     ) -> R<()> {
-        if let Body::Select(select) = &mut self.body
-            && select.query.items.len() > i
-            && let (Item::Scalar(s), alias) = &mut select.query.items[i]
+        if let Some(item) = item
+            && let Body::Select(select) = &mut self.body
+            && let (Item::Scalar(s), alias) = &mut select.query.items[item]
             && unknown(s, parameters)
         {
+            s.infer_enum_parameter(ty, enum_type, parameters)?;
             s.infer(Some(ty), parameters, &no_column, &[])?;
             let name = s.bind(&no_column, &[], parameters)?.name().to_string();
             if alias.is_none() {

@@ -677,7 +677,7 @@ impl State {
             self.diagnostic.wire_message = Some(format!("there is no parameter ${parameter}"));
             return Err("42P02");
         }
-        let (Plan::Sql(arguments), description) =
+        let (Plan::Sql(arguments), description, _) =
             prepare_declared_sql_diagnostic(&mut self.diagnostic, session, &sql, &[], false)?
         else {
             unreachable!()

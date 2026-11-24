@@ -4,6 +4,7 @@ use super::*;
 
 pub(super) struct Grouping {
     keys: Vec<BoundScalar>,
+    pub(super) group_outputs: Vec<usize>,
     mask: Option<Vec<bool>>,
     aggregates: Vec<BoundItem>,
     aggregate_filters: Vec<Option<BoundFilter>>,
@@ -513,14 +514,13 @@ pub(super) fn bind<'a>(
             s.infer(None, &mut parameters, resolve, tables)?;
         }
     }
-    let groups = q
-        .group()
-        .iter()
-        .map(|s| {
-            resolve_output(s, &projection, true, resolve, tables.len(), tables)
-                .map(|(scalar, _)| scalar)
-        })
-        .collect::<R<Vec<_>>>()?;
+    let mut groups = Vec::new();
+    let mut group_outputs = Vec::new();
+    for key in q.group() {
+        let (scalar, output) = resolve_output(key, &projection, true, resolve, tables.len(), tables)?;
+        groups.push(scalar);
+        group_outputs.extend(output);
+    }
     for s in &groups {
         aggregate_filter::validate_scalar(s, &parameters, resolve, tables)?;
         reject_nested_aggregate(s)?;
@@ -1014,6 +1014,7 @@ pub(super) fn bind<'a>(
         grouping: Some(Grouping {
             mask: grouping_mask,
             keys,
+            group_outputs,
             aggregates,
             aggregate_filters,
             direct_inputs,

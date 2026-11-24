@@ -577,7 +577,7 @@ fn extra(meta: &mut Meta, name: &str, ty: DataType) -> R<()> {
         not_null: false,
     });
     meta.typmods.push(-1);
-    meta.unknown.push(false);
+    meta.unknown.push(None);
     Ok(())
 }
 fn generated(cte: &Cte, meta: &mut Meta, parameters: &mut [Option<DataType>]) -> R<()> {
@@ -695,7 +695,7 @@ pub(super) fn validate_constants(
         let (seed, step, _) = recursive_parts(cte)?;
         let description = seed.describe(state, parameters.len(), parameters)?;
         let mut meta = Meta {
-            unknown: vec![false; description.columns.len()],
+            unknown: vec![None; description.columns.len()],
             columns: description.columns,
             typmods: description.typmods,
             type_oids: description.type_oids,
@@ -950,7 +950,7 @@ fn recurse<'e>(
         columns: seed.columns.clone(),
         typmods: seed.typmods.clone(),
         type_oids: vec![],
-        unknown: vec![false; seed.columns.len()],
+        unknown: vec![None; seed.columns.len()],
         collations: seed_metadata.collations,
     };
     aliases(&mut meta, &cte.aliases)?;

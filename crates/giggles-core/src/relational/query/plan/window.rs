@@ -982,6 +982,9 @@ fn bind_call(
         }
         let ty = bind::common(candidates.iter().map(|bound| bound.ty.clone()))?;
         for i in [0, 2] {
+            call.args[i].infer_enum_parameter(
+                &ty, candidates.iter().find_map(BoundScalar::attached_enum), parameters,
+            )?;
             call.args[i].infer(
                 Some(&ty),
                 parameters,

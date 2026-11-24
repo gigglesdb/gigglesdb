@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 mod alter_table;
 mod enum_alter;
+pub(crate) mod enum_parameters;
+pub use enum_parameters::{EnumParameter, EnumParameters};
 pub(crate) use enum_alter::{EnumScope, EnumTransaction};
 mod comments;
 mod security_label;
@@ -2664,6 +2666,7 @@ impl Prepared {
         self.validate_immutable_constants_at_epoch(state, self.epoch)
     }
     pub(crate) fn validate_immutable_constants_at_epoch(&self, state: &Relational, epoch: u64) -> R<()> {
+        let _enum_parameters = enum_parameters::Scope::enter();
         let _date_order = clock::LiteralDateOrder::enter(self.literal_date_order);
         let _type_path = user_types::TypeDisplayScope::enter(&self.search_path);
         let bound = self.bind_schemas(state)?;
@@ -2693,6 +2696,14 @@ impl Prepared {
         Ok(())
     }
     pub(crate) fn describe(&self, state: &Relational) -> R<Description> {
+        self.describe_with_enum_parameters(state).map(|(description, _)| description)
+    }
+
+    pub(crate) fn describe_with_enum_parameters(
+        &self,
+        state: &Relational,
+    ) -> R<(Description, EnumParameters)> {
+        let _enum_parameters = enum_parameters::Scope::enter();
         let _date_order = clock::LiteralDateOrder::enter(self.literal_date_order);
         let _type_path = user_types::TypeDisplayScope::enter(&self.search_path);
         let bound = self.bind_schemas(state)?;
@@ -2725,7 +2736,7 @@ impl Prepared {
                 *oid = type_oid(id)? + u32::from(column.data_type == DataType::TextArray);
             }
         }
-        Ok(description)
+        Ok((description, enum_parameters::describe(state)?))
     }
     fn describe_inner(&self, state: &Relational) -> R<Description> {
         if matches!(self.command(), "INSERT" | "UPDATE" | "DELETE") && self.table().is_some_and(|n| state.view_names.contains_key(n)) { return Err(SqlError::Unsupported); }
@@ -2820,6 +2831,7 @@ impl Prepared {
                 } => {
                     let indexes = insert_value_indexes(t, names, values.len())?;
                     for (i, e) in indexes.into_iter().zip(values) {
+                        enum_parameters::infer_column(e, &t.columns[i], state, &mut params)?;
                         infer_mutation_parameter(
                             e,
                             &t.columns[i].data_type,
@@ -2857,9 +2869,11 @@ impl Prepared {
                     sets, predicates, ..
                 } => {
                     for (n, e) in sets {
+                        let column = &t.columns[col(t, n)?];
+                        enum_parameters::infer_column(e, column, state, &mut params)?;
                         infer_mutation_parameter(
                             e,
-                            &t.columns[col(t, n)?].data_type,
+                            &column.data_type,
                             &mut params,
                             &self.parameter_types,
                             true,

@@ -232,15 +232,16 @@ pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description
         return Err(SqlError::Parameters);
     }
     parameters[..prepared.parameter_types.len()].clone_from_slice(&prepared.parameter_types);
-    let infer = |value: &Expr, ty: &DataType, parameters: &mut [Option<DataType>]| -> R<()> {
-        infer_mutation_parameter(value, ty, parameters, &prepared.parameter_types, true)
+    let infer = |value: &Expr, column: &ColumnDef, parameters: &mut [Option<DataType>]| -> R<()> {
+        enum_parameters::infer_column(value, column, state, parameters)?;
+        infer_mutation_parameter(value, &column.data_type, parameters, &prepared.parameter_types, true)
     };
     match prepared.statement.get() {
         Statement::Update { sets, .. } => {
             for (name, value) in sets {
                 infer(
                     value,
-                    &table.columns[col(table, name)?].data_type,
+                    &table.columns[col(table, name)?],
                     &mut parameters,
                 )?;
             }
@@ -254,7 +255,7 @@ pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description
                 let ty = &table.columns[index].data_type;
                 match value {
                     assign::Value::Default | assign::Value::Rows(_) => {}
-                    assign::Value::Plain(value) => infer(value, ty, &mut parameters)?,
+                    assign::Value::Plain(value) => infer(value, &table.columns[index], &mut parameters)?,
                     assign::Value::Scalar(value) => {
                         value.infer_assignment(
                             &{

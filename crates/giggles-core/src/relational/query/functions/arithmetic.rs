@@ -433,6 +433,21 @@ pub(super) fn infer(
         Scalar::Binary(op, a, b) => {
             a.infer(None, parameters, resolve, tables)?;
             b.infer(None, parameters, resolve, tables)?;
+            if matches!(op, BinaryOp::Contains | BinaryOp::ContainedBy) {
+                for (target, source) in [(a, b), (b, a)] {
+                    if matches!(target.as_ref(), Scalar::Param(_)) && target.aggregate_unknown(parameters) {
+                        if !source.aggregate_unknown(parameters) {
+                            let bound = source.bind(resolve, tables, parameters)?;
+                            if bound.ty == DataType::TextArray && bound.attached_enum().is_some() {
+                                target.infer_enum_parameter(&bound.ty, bound.attached_enum(), parameters)?;
+                                return Ok(());
+                            }
+                        }
+                        return Err(SqlError::Unsupported);
+                    }
+                }
+                return bind_enum_containment(*op, a, b, resolve, tables, parameters).map(|_| ());
+            }
             let (at, bt, _) = signature(
                 *op,
                 known(a, resolve, tables, parameters)?,
@@ -485,6 +500,33 @@ pub(super) fn operand(
         })
     }
 }
+fn bind_enum_containment(
+    op: BinaryOp,
+    a: &Scalar,
+    b: &Scalar,
+    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+    tables: &[&TableDef],
+    parameters: &[Option<DataType>],
+) -> R<BoundScalar> {
+    let mut left = a.bind(resolve, tables, parameters)?;
+    let mut right = b.bind(resolve, tables, parameters)?;
+    let definition = [&left, &right].into_iter()
+        .find(|value| value.ty == DataType::TextArray && value.attached_enum().is_some())
+        .and_then(BoundScalar::enum_definition)
+        .cloned()
+        .ok_or(SqlError::Unsupported)?;
+    if let Scalar::Literal(value @ (Value::Null | Value::Text(_))) = a {
+        left = BoundScalar::enum_literal(value, &DataType::TextArray, &definition)?;
+    }
+    if let Scalar::Literal(value @ (Value::Null | Value::Text(_))) = b {
+        right = BoundScalar::enum_literal(value, &DataType::TextArray, &definition)?;
+    }
+    if left.type_identity() != right.type_identity() {
+        return Err(enum_order::missing_operator(name(op).strip_prefix(PREFIX).unwrap(), &left, &right));
+    }
+    Ok(BoundScalar { ty: DataType::Boolean, node: Node::Call(name(op).into(), vec![left, right]) })
+}
+
 pub(super) fn bind(
     value: &Scalar,
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
@@ -510,6 +552,9 @@ pub(super) fn bind(
                     vec![a],
                 ),
             })
+        }
+        Scalar::Binary(op @ (BinaryOp::Contains | BinaryOp::ContainedBy), a, b) => {
+            bind_enum_containment(*op, a, b, resolve, tables, parameters)
         }
         Scalar::Binary(op, a, b) => {
             let (at, bt, ty) = signature(
@@ -585,6 +630,16 @@ pub(super) fn eval(
             })?;
         charge(budget, &value)?;
         return Ok(value);
+    }
+    if matches!(op, "@>" | "<@")
+        && let [Value::Text(left), Value::Text(right)] = values
+    {
+        let (container, subset) = if op == "@>" { (left, right) } else { (right, left) };
+        let container: BTreeSet<_> = logical_types::array_values(container)?.into_iter().flatten().collect();
+        let subset = logical_types::array_values(subset)?;
+        return Ok(Value::Bool(subset.iter().all(|value| {
+            value.as_ref().is_some_and(|value| container.contains(value))
+        })));
     }
     if op == "@" {
         return eval_abs(ty, &values[0], budget);

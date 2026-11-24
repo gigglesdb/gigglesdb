@@ -902,9 +902,11 @@ impl Insert {
                     )?;
                     continue;
                 }
+                let column = &table.columns[*index];
+                enum_parameters::infer_column(expression, column, state, &mut parameters)?;
                 infer_mutation_parameter(
                     expression,
-                    &table.columns[*index].data_type,
+                    &column.data_type,
                     &mut parameters,
                     declared,
                     true,

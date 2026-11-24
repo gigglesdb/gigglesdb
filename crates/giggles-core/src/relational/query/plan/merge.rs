@@ -1202,7 +1202,7 @@ fn check_value(
     if meta.columns.len() != 1 {
         return Err(SqlError::Syntax);
     }
-    if !meta.unknown[0]
+    if meta.unknown[0].is_none()
         && !assignment::compatible(
             &meta.columns[0].data_type,
             &table.columns[super::super::super::col(table, name)?].data_type,
@@ -1242,7 +1242,7 @@ fn evaluate(
         .enumerate()
         .map(|(i, ((value, c), name))| {
             let target = &table.columns[super::super::super::col(table, name)?].data_type;
-            if meta.unknown[i] {
+            if meta.unknown[i].is_some() {
                 assignment::literal(value.clone(), target, clock)
             } else {
                 assignment::convert(value.clone(), &c.data_type, target, clock)

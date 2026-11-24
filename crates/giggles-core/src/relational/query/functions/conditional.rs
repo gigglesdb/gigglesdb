@@ -289,6 +289,16 @@ pub(super) fn infer(
         arg.infer(None, parameters, resolve, tables)?;
     }
     if !count_nulls(name) {
+        if name == "nullif" && let [left, right] = args {
+            for (target, source) in [(left, right), (right, left)] {
+                if matches!(target, Scalar::Param(_)) && target.aggregate_unknown(parameters)
+                    && !source.aggregate_unknown(parameters)
+                {
+                    let bound = source.bind(resolve, tables, parameters)?;
+                    target.infer_enum_parameter(&bound.ty, bound.attached_enum(), parameters)?;
+                }
+            }
+        }
         let (targets, _) = types(name, args, resolve, tables, parameters)?;
         for (arg, target) in args.iter().zip(targets) {
             if arg.aggregate_unknown(parameters) {

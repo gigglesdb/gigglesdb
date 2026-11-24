@@ -656,6 +656,14 @@ fn prepare(
                 (col.data_type.clone(), col.name.clone())
             }
             Right::Array(s) => {
+                if matches!(s, Scalar::Param(_)) && s.aggregate_unknown(parameters)
+                    && let Some((lhs, _, _)) = &a.comparison
+                {
+                    let left = bind_scalar(lhs, &shape, parameters, None)?;
+                    if left.ty == DataType::Text {
+                        s.infer_enum_parameter(&DataType::TextArray, left.attached_enum(), parameters)?;
+                    }
+                }
                 let bound = bind_scalar(s, &shape, parameters, None)?;
                 let ty = srf::element(&bound.ty)?;
                 metadata = Some(functions::collation::combined(Some(&bound),None,ty.clone())?);
@@ -836,7 +844,7 @@ pub(super) fn resolve(
     };
     Ok(bind::Meta {
         collations,
-        unknown: vec![false; d.columns.len()],
+        unknown: vec![None; d.columns.len()],
         columns: d.columns,
         typmods: d.typmods,
         type_oids: d.type_oids,

@@ -268,6 +268,7 @@ impl State {
             d: Arc::new(d),
             parameter_oids,
             query_id: self.diagnostic.query_id.clone(),
+            enum_parameters: Default::default(),
         })
     }
 
