@@ -179,11 +179,10 @@ fn feature_positions_and_validation() {
     assert_eq!(
         FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit),
         0x1FFFF | KEY_DEPENDENCY_IDENTITY | RANGES | WIDE_ONCE_RECEIPTS | TASK_CATALOG | PROTECTED_RECORDS | WRITE_FENCE | USER_COLLATIONS | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS | ROLE_MEMBERSHIP | WIDE_ROWS
-            | ENUM_ARRAY_COLUMNS | ENUM_LABEL_IDENTITIES | UUID_ARRAY_COLUMNS | WIDE_CATALOG | PARTIAL_INDEXES | TEMPORAL_INDEXES | TEXT_SEARCH_TYPES
+            | ENUM_ARRAY_COLUMNS | ENUM_LABEL_IDENTITIES | UUID_ARRAY_COLUMNS | WIDE_CATALOG | PARTIAL_INDEXES | TEMPORAL_INDEXES | GENERATED_COLUMNS | TEXT_SEARCH_TYPES | GIN_INDEXES
     );
-    assert_eq!(FEATURE_TABLE.len(), 35);
+    assert_eq!(FEATURE_TABLE.len(), 37);
     assert_eq!(FEATURE_TABLE[30], (UUID_ARRAY_COLUMNS, "uuid_array_columns"));
-    assert_eq!(FEATURE_TABLE[34], (TEXT_SEARCH_TYPES, "text_search_types"));
     assert_eq!(TEXT_SEARCH_TYPES, 1 << 37);
     assert!(check_features(TEXT_SEARCH_TYPES).is_ok());
     assert!(matches!(
@@ -222,6 +221,14 @@ fn feature_positions_and_validation() {
             Err(FormatError::Unsupported(_))));
         assert!(matches!(check_features(bits), Err(FormatError::Corrupt(_))));
         check_features(SECONDARY_INDEXES | bits).unwrap();
+    }
+    assert_eq!(FEATURE_TABLE[34], (1 << 36, "generated_columns"));
+    assert_eq!(FEATURE_TABLE[35], (1 << 37, "text_search_types"));
+    assert_eq!(FEATURE_TABLE[36], (1 << 38, "gin_indexes"));
+    let old_mask = FEATURE_TABLE[..34].iter().fold(0, |bits, (bit, _)| bits | bit);
+    for bits in [GENERATED_COLUMNS, TEXT_SEARCH_TYPES, GIN_INDEXES, GENERATED_COLUMNS | TEXT_SEARCH_TYPES | GIN_INDEXES] {
+        assert!(matches!(check_features_allowed(bits, old_mask), Err(FormatError::Unsupported(_))));
+        check_features(bits).unwrap();
     }
     assert_eq!(ROLE_MEMBERSHIP, 1 << 27);
     assert_eq!(FEATURE_TABLE[26], (ROLE_MEMBERSHIP, "role_membership"));
@@ -267,6 +274,7 @@ fn feature_positions_and_validation() {
                 | UUID_ARRAY_COLUMNS | TEXT_SEARCH_TYPES
                 | super::super::super::feature_envelope::USER_COLLATIONS
                 | super::super::super::feature_envelope::COLUMN_COLLATIONS
+                | GENERATED_COLUMNS | GIN_INDEXES
                 | WIDE_CATALOG
                 | super::super::super::feature_envelope::PARTIAL_INDEXES
                 | super::super::super::feature_envelope::TEMPORAL_INDEXES)

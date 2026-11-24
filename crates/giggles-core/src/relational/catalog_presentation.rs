@@ -27,6 +27,8 @@ pub struct CatalogPresentation {
     pub comments: BTreeMap<(u64, u64), String>,
     pub defaults: BTreeMap<u64, String>,
     pub identities: BTreeMap<u64, char>,
+    pub gin_indexes: BTreeMap<u64, gin_indexes::GinIndex>,
+    pub generated_columns: BTreeMap<u64, generated_columns::GeneratedColumn>,
     pub primary_names: BTreeMap<u64, String>,
     pub constraints: Vec<CatalogConstraint>,
 }
@@ -37,6 +39,8 @@ impl Relational {
     }
     pub(crate) fn catalog_presentation_in_path(&self, path: &[String]) -> R<CatalogPresentation> {
         let mut out = CatalogPresentation { epoch: self.epoch, ..Default::default() };
+        out.gin_indexes.clone_from(&self.ext.gin_indexes);
+        out.generated_columns.clone_from(&self.ext.generated_columns);
         let action = |a: &Action| match a {
             Action::NoAction => 'a', Action::Restrict => 'r', Action::Cascade => 'c',
             Action::SetNull => 'n', Action::SetDefault => 'd',

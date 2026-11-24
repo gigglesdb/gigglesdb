@@ -10,6 +10,7 @@ pub(super) struct CreateIndex {
     pub unique: bool,
     pub if_not_exists: bool,
     pub predicate: Option<Vec<Token>>,
+    pub gin: Option<gin_indexes::Definition>,
 }
 
 fn opclass_name(p: &mut Parser) -> R<String> {
@@ -42,9 +43,18 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
     };
     p.word("only");
     let table = p.table_name()?;
-    if p.word("using") && !p.word("btree") {
-        return Err(SqlError::Unsupported);
-    }
+    let mut gin = if p.word("using") {
+        let method = opclass_name(p)?;
+        match method.as_str() {
+            "gin" => Some(gin_indexes::Definition::default()),
+            "btree" => None,
+            "brin" | "gist" | "hash" | "heap" | "spgist" => return Err(SqlError::Unsupported),
+            _ => {
+                user_types::view_replace_error(format!("access method \"{method}\" does not exist"));
+                return Err(SqlError::UndefinedObject);
+            }
+        }
+    } else { None };
     p.punct('(')?;
     if p.sym(')') {
         return Err(SqlError::Unsupported);
@@ -58,10 +68,18 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
         ) || (matches!(p.tokens.get(p.at), Some(Token::Op(sign)) if sign == "+" || sign == "-")
             && matches!(p.tokens.get(p.at + 1), Some(Token::Number(_))))
         {
+            if gin.is_some() {
+                user_types::view_replace_error("expression GIN indexes are not supported".into());
+            }
             return Err(SqlError::Unsupported);
         }
         columns.push(p.column_name()?);
+        if gin.is_some() && p.tokens.get(p.at) == Some(&Token::Symbol('(')) {
+            user_types::view_replace_error("expression GIN indexes are not supported".into());
+            return Err(SqlError::Unsupported);
+        }
         collations.push(if p.word("collate") {Some(column_collations::parse_name(p)?)} else {None});
+        let mut explicit_class = None;
         if matches!(p.tokens.get(p.at), Some(Token::QuotedIdent(_)))
             || matches!(p.tokens.get(p.at), Some(Token::Word(w)) if !["asc", "desc", "nulls", "collate"].contains(&w.as_str()))
         {
@@ -72,7 +90,7 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
                 if schema != "pg_catalog" { return Err(SqlError::UndefinedObject); }
             }
             // Syntax-only compatibility: descriptors and indclass retain the default.
-            if ![
+            if gin.is_none() && ![
                 "text_pattern_ops", "varchar_pattern_ops", "bpchar_pattern_ops",
                 "array_ops", "bit_ops", "bool_ops", "bpchar_ops", "bytea_ops", "char_ops",
                 "date_ops", "enum_ops", "float4_ops", "float8_ops", "inet_ops", "int2_ops",
@@ -82,6 +100,13 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
                 "timestamp_ops", "timestamptz_ops", "timetz_ops", "tsquery_ops", "tsvector_ops",
                 "uuid_ops", "varbit_ops", "varchar_ops", "xid8_ops",
             ].contains(&opclass.as_str()) { return Err(SqlError::UndefinedObject); }
+            explicit_class = Some(opclass);
+        }
+        if let Some(gin) = &mut gin {
+            gin.opclasses.push(explicit_class);
+            if matches!(p.tokens.get(p.at), Some(Token::Word(word)) if matches!(word.as_str(), "asc" | "desc" | "nulls")) {
+                return Err(SqlError::Unsupported);
+            }
         }
         p.word("asc");
         if p.word("nulls") {
@@ -101,7 +126,12 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
         }
         return Err(SqlError::Unsupported);
     }
-    if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if ["include", "with", "tablespace"].contains(&w.as_str()))
+    if let Some(gin) = &mut gin
+        && p.word("with")
+    {
+        gin.options = gin_indexes::parse_options(p)?;
+    }
+    if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if ["include", "with", "tablespace"].contains(&w.as_str()) || (gin.is_some() && w == "where"))
     {
         return Err(SqlError::Unsupported);
     }
@@ -138,6 +168,7 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
         unique,
         if_not_exists,
         predicate,
+        gin,
     })
 }
 
@@ -147,6 +178,7 @@ pub(super) struct DropIndex {
     pub table: Option<String>,
     pub optional: bool,
     pub cascade: bool,
+    pub rename: Option<String>,
 }
 
 pub(super) fn primary_table<'a>(state: &'a Relational, name: &str) -> Option<&'a TableDef> {
@@ -165,7 +197,10 @@ pub(super) fn parse_drop_authority_target(p: &mut Parser) -> R<DropIndex> {
 }
 
 fn parse_drop_impl(p: &mut Parser, authority_only: bool) -> R<DropIndex> {
-    p.need("drop")?;
+    let alter = p.word("alter");
+    if !alter {
+        p.need("drop")?;
+    }
     p.need("index")?;
     if p.word("concurrently") {
         return Err(SqlError::Unsupported);
@@ -180,8 +215,13 @@ fn parse_drop_impl(p: &mut Parser, authority_only: bool) -> R<DropIndex> {
     } else {
         p.table_name()?
     };
-    let cascade = p.word("cascade");
-    if !cascade {
+    let rename = if alter {
+        p.need("rename")?;
+        p.need("to")?;
+        Some(p.name()?)
+    } else { None };
+    let cascade = !alter && p.word("cascade");
+    if !alter && !cascade {
         p.word("restrict");
     }
     p.sym(';');
@@ -193,6 +233,7 @@ fn parse_drop_impl(p: &mut Parser, authority_only: bool) -> R<DropIndex> {
         table: None,
         optional,
         cascade,
+        rename,
     })
 }
 

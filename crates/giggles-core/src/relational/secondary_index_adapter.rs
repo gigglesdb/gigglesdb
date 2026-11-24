@@ -572,6 +572,7 @@ pub(crate) struct UpdateUnique {
 struct UpdateUniqueIndex {
     key: collation_keys::Key,
     name: String,
+    generated_key: bool,
     occupied: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 impl UpdateUnique {
@@ -596,7 +597,8 @@ impl UpdateUnique {
                 tick(cancel)?;
                 if let Some(tuple) = key.tuple(&row.values)? { occupied.insert(tuple, owner.clone()); }
             }
-            indexes.push(UpdateUniqueIndex { key, name, occupied });
+            let generated_key = key.columns.iter().any(|i| state.generated_column(table.columns[*i].id).is_some());
+            indexes.push(UpdateUniqueIndex { key, name, generated_key, occupied });
         }
         Ok(Self { indexes })
     }
@@ -608,7 +610,7 @@ impl UpdateUnique {
         values: &[Value],
         cancel: &mut impl FnMut() -> bool,
     ) -> R<()> {
-        for UpdateUniqueIndex { key: equality, name, occupied } in &mut self.indexes {
+        for UpdateUniqueIndex { key: equality, name, generated_key, occupied } in &mut self.indexes {
             tick(cancel)?;
             let tuple = equality.tuple(values)?;
             if let Some(tuple) = &tuple
@@ -616,7 +618,11 @@ impl UpdateUnique {
                     .get(tuple)
                     .is_some_and(|owner| old.is_none_or(|(old_key, _)| owner.as_slice() != old_key))
             {
-                let detail = equality.duplicate_detail(table, name, values, false);
+                let detail = if *generated_key {
+                    collation_keys::key_duplicate(table, name, &equality.columns, values, false)
+                } else {
+                    equality.duplicate_detail(table, name, values, false)
+                };
                 return Err(detail
                     .unwrap_or_else(|| if equality.nondeterministic() { collation_keys::duplicate(name) } else { SqlError::Duplicate }));
             }

@@ -5,6 +5,17 @@ use std::fmt;
 pub(crate) const UNSUPPORTED_CATALOG_EXT: &str = "unsupported relational catalog extension";
 const MAX_EXPR: usize = 65536;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableMetadata {
+    pub(crate) gin: BTreeMap<u64, gin_indexes::GinIndex>,
+    pub(crate) generated: BTreeMap<u64, generated_columns::GeneratedColumn>,
+}
+impl TableMetadata {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.gin.is_empty() && self.generated.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatalogExt {
     pub(crate) ext_version: u32,
@@ -20,6 +31,9 @@ pub(crate) struct CatalogExt {
     pub(crate) collations: BTreeMap<u64, super::collations::Collation>,
     pub(crate) extensions: BTreeMap<String, super::extensions::InstalledExtension>,
     pub(crate) column_collations: BTreeMap<u64, super::column_collations::Binding>,
+    // Serialized in the feature-gated table metadata trailer.
+    pub(crate) gin_indexes: BTreeMap<u64, gin_indexes::GinIndex>,
+    pub(crate) generated_columns: BTreeMap<u64, generated_columns::GeneratedColumn>,
 }
 /// Initial labels use their original creation slots. Only ADD VALUE needs
 /// an explicit identity; rename keeps the same ID under the new spelling.
@@ -67,6 +81,8 @@ impl Default for CatalogExt {
             collations: BTreeMap::new(),
             extensions: BTreeMap::new(),
             column_collations: BTreeMap::new(),
+            gin_indexes: BTreeMap::new(),
+            generated_columns: BTreeMap::new(),
         }
     }
 }
@@ -789,6 +805,8 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     column_collations: if ext_version >= 10 { next!(ColumnCollations).0 } else { BTreeMap::new() },
                     extensions: if ext_version >= 11 { next!(Extensions).0 } else { BTreeMap::new() },
                     added_enum_labels: if ext_version >= 12 { next!(EnumLabels).0 } else { BTreeMap::new() },
+                    gin_indexes: BTreeMap::new(),
+                    generated_columns: BTreeMap::new(),
                 };
                 if ext_version != out.wire_version() {
                     return Err(de::Error::custom("noncanonical catalog extension version"));
@@ -1222,6 +1240,7 @@ impl Relational {
         self.tables.contains_key(name)
             || self.view_names.contains_key(name)
             || self.secondary.descriptors().iter().any(|d| d.name == name)
+            || self.gin_index(name).is_some()
             || self.sequence_by_name(name).is_some()
     }
 
@@ -1563,6 +1582,33 @@ impl Relational {
             }
         }
         validate_births(ext, &tables, next_id, &mut used)?;
+        let mut gin_names = BTreeSet::new();
+        for (id, index) in &ext.gin_indexes {
+            let table = tables.get(&index.table).ok_or(SqlError::Type)?;
+            let schema = ext.table_schemas.get(&index.table).map_or("public", String::as_str);
+            if *id == 0 || *id >= next_id || !used.insert(*id)
+                || split_key(&index.name).0 != schema
+                || !gin_names.insert(&index.name)
+                || self.tables.contains_key(&index.name)
+                || self.secondary.descriptors().iter().any(|d| d.id == *id || d.name == index.name)
+            {
+                return Err(SqlError::Type);
+            }
+            super::user_types::type_oid(*id)?;
+            index.validate(table)?;
+        }
+        for (id, generation) in &ext.generated_columns {
+            let (table, column) = columns.get(id).ok_or(SqlError::Type)?;
+            if column.name == HIDDEN_ROWID || generation.sql.is_empty() || generation.sql.len() > MAX_EXPR
+                || ext.columns.get(id).is_some_and(|ext| ext.default.is_some() || ext.identity.is_some())
+                || !generation.references.windows(2).all(|w| w[0] < w[1])
+                || generation.references.iter().any(|id| {
+                    ext.generated_columns.contains_key(id) || columns.get(id).is_none_or(|(owner, _)| owner != table)
+                })
+            {
+                return Err(SqlError::Type);
+            }
+        }
         Ok(())
     }
     fn require_column(&self, id: u64) -> R<()> {

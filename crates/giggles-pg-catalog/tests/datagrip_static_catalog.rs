@@ -157,7 +157,7 @@ fn static_catalog_descriptors_and_empty_rows() {
         vec![vec![Value::Int(3456)]]
     );
     let result = run("select * from pg_catalog.pg_opclass", &[]);
-    assert!(result.rows.is_empty(), "pg_opclass");
+    assert_eq!(result.rows.len(), 6, "pg_opclass");
     assert_eq!(
         result
             .fields

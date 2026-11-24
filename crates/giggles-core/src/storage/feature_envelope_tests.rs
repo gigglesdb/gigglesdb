@@ -11,6 +11,38 @@ fn forged(bits: u64) -> BTreeMap<Vec<u8>, Vec<u8>> {
 fn normal(r: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<State, CoreError> {
     from_records_mode(r, &mut || false, false)
 }
+
+#[test]
+fn generated_columns_and_gin_format_53_framing() {
+    let mut state = empty(17);
+    let execute = |sql: &str, state: &mut State| {
+        let prepared = relational::Prepared::parse(sql, 17, state.sql.epoch).unwrap();
+        state.sql.execute(&prepared, &[], None).unwrap();
+    };
+    execute("CREATE TABLE t (a int PRIMARY KEY, tags int[])", &mut state);
+    let ordinary = records(&state).unwrap();
+    let original_bits = feature_bits_present(&state).unwrap();
+    assert_eq!(original_bits & (GENERATED_COLUMNS | GIN_INDEXES), 0);
+    assert_eq!(ordinary[&vec![5]], encode(&state.sql).unwrap());
+
+    execute("CREATE INDEX t_tags ON t USING GIN (tags)", &mut state);
+    execute("ALTER TABLE t ADD COLUMN plus_one int GENERATED ALWAYS AS (a + 1) STORED", &mut state);
+    let gated = records(&state).unwrap();
+    let bits = u64::from_be_bytes(gated[&vec![10]].as_slice().try_into().unwrap());
+    assert_eq!(bits & (GENERATED_COLUMNS | GIN_INDEXES), GENERATED_COLUMNS | GIN_INDEXES);
+    assert!(gated[&vec![5]].starts_with(&encode(&state.sql).unwrap()));
+    assert!(!gated.contains_key(&vec![8]));
+    let reopened = normal(gated.clone()).unwrap();
+    assert_eq!(records(&reopened).unwrap(), gated);
+
+    let mut ungated = gated;
+    ungated.insert(vec![10], (bits & !GIN_INDEXES).to_be_bytes().to_vec());
+    assert!(matches!(normal(ungated), Err(CoreError::Corrupt(_))));
+
+    execute("DROP INDEX t_tags", &mut state);
+    execute("ALTER TABLE t ALTER COLUMN plus_one DROP EXPRESSION", &mut state);
+    assert_eq!(feature_bits_present(&state).unwrap(), original_bits);
+}
 #[test]
 fn feature_record_precedes_payload_and_is_canonical() {
     for bit in [10, 29, 30] {

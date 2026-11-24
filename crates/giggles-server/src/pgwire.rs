@@ -183,6 +183,9 @@ struct Diagnostic {
     wire_context: Option<String>,
     wire_hint: Option<std::borrow::Cow<'static, str>>,
     wire_registry_error: Option<crate::pg_settings::registry::Error>,
+    wire_position: Option<usize>,
+    wire_names: Option<giggles_core::relational::SqlErrorNames>,
+    wire_exact: bool,
     sql_detail: Option<String>,
     duplicate_key: Option<DuplicateKeyDetail>,
     duplicate_key_visible: Option<bool>,
@@ -318,6 +321,8 @@ impl Diagnostic {
         }
         self.sql_detail = self.read_core_detail();
         self.wire_hint = giggles_core::relational::take_sql_diagnostic_hint();
+        self.wire_position = giggles_core::relational::take_sql_error_position();
+        self.wire_names = giggles_core::relational::take_sql_error_names();
         use giggles_core::relational::SqlError;
         let postgres_diagnostic = match (&result, message.as_deref()) {
             (Err(CoreError::Sql(SqlError::InvalidIndexPredicate)), Some(m)) => {
@@ -369,6 +374,22 @@ impl Diagnostic {
         };
         if postgres_diagnostic {
             self.wire_message = message.clone();
+        }
+        if result.is_err() && message.as_deref().is_some_and(|message| {
+            self.wire_position.is_some()
+                || matches!(&result, Err(CoreError::Sql(SqlError::InvalidObjectDefinition)))
+                || message.starts_with("cannot insert a non-DEFAULT value into column ")
+                || message.starts_with("access method ")
+                || message == "expression GIN indexes are not supported"
+                || message.starts_with("operator class ")
+                || message.starts_with("data type ") && message.contains("operator class")
+                || message.starts_with("cannot drop column ") && self.sql_detail.is_some()
+                || message.starts_with("column \"") && message.contains("generated column")
+                || message.starts_with("column \"") && message.ends_with("can only be updated to DEFAULT")
+                || message.starts_with("invalid ON ") && message.ends_with("constraint containing generated column")
+        }) {
+            self.wire_message = message.clone();
+            self.wire_exact = true;
         }
         if result.is_err() && message.as_deref().is_some_and(|m| m.starts_with("function uuid_") || m.starts_with("extension ") || m.starts_with("cannot drop extension ") || m.starts_with("schema ")) { self.wire_message = message.clone(); }
         if matches!(
@@ -651,11 +672,9 @@ fn diagnostic_error(
         }
     } else if let Some(detail) = match registry_error {
         Some(error) => error.detail,
-        None => detail.as_deref().map(|detail| {
-            diagnostic
-                .and_then(|d| d.sql_detail.as_deref().or(d.wire_detail.as_deref()))
-                .unwrap_or(detail)
-        }),
+        None => diagnostic
+            .and_then(|d| d.sql_detail.as_deref().or(d.wire_detail.as_deref()))
+            .or(detail.as_deref().filter(|_| !diagnostic.is_some_and(|d| d.wire_exact))),
     } {
         b.push(b'D');
         z(detail, &mut b);
@@ -665,6 +684,23 @@ fn diagnostic_error(
         .or_else(|| diagnostic.and_then(|d| d.wire_hint.as_deref())) {
         b.push(b'H');
         z(hint, &mut b);
+    }
+    if let Some(position) = diagnostic.and_then(|d| d.wire_position) {
+        b.push(b'P');
+        z(&position.to_string(), &mut b);
+    }
+    if let Some(names) = diagnostic.and_then(|d| d.wire_names.as_ref()) {
+        for (field, name) in [
+            (b's', Some(names.schema.as_str())),
+            (b't', Some(names.table.as_str())),
+            (b'c', names.column.as_deref()),
+            (b'n', names.constraint.as_deref()),
+        ] {
+            if let Some(name) = name {
+                b.push(field);
+                z(name, &mut b);
+            }
+        }
     }
     if code == "0A000" && diagnostic.and_then(|d| d.wire_message.as_deref()) == Some("view projection bindings unavailable; recreate the view") {
         b.push(b'H');
@@ -2581,6 +2617,8 @@ impl State {
         giggles_core::relational::take_sql_error_message();
         giggles_core::relational::take_sql_error_detail();
         giggles_core::relational::take_sql_error_hint();
+        giggles_core::relational::take_sql_error_position();
+        giggles_core::relational::take_sql_error_names();
         giggles_core::relational::take_sql_warnings();
         let mut statement = old.clone();
         statement.query_id = self.diagnostic.query_id.clone();
@@ -3914,18 +3952,6 @@ impl State {
             || (matches!(tag, b'c' | b'f') && self.copy.as_ref().is_some_and(|c| c.simple));
         let context = active.context.clone();
         self.diagnostic = Diagnostic {
-            unknown_outcome: false,
-            committed: false,
-            pre_rollback_settings: None,
-            wire_detail: None,
-            wire_context: None,
-            wire_hint: None,
-            wire_registry_error: None,
-            sql_detail: None,
-            duplicate_key: None,
-            duplicate_key_visible: None,
-            wire_message: None,
-            message: None,
             phase: match tag {
                 b'Q' => "simple query",
                 b'P' => "parse",
@@ -3935,8 +3961,7 @@ impl State {
                 b'S' => "sync",
                 _ => "protocol message",
             },
-            query_id: None,
-            task_refusal: None,
+            ..Diagnostic::default()
         };
         if admission_message.is_some() {
             self.diagnostic.phase = "admission";

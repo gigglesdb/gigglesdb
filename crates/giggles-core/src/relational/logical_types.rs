@@ -82,13 +82,17 @@ fn uuid_input(input: &str) -> R<String> {
     })
 }
 
-pub(super) fn uuid_array_not_null(table: &TableDef, column: &ColumnDef, values: &[Value]) {
-    use std::borrow::Cow;
+pub(super) fn not_null_violation(table: &TableDef, column: &ColumnDef, values: &[Value]) {
     let table_name = split_key(&table.name).1;
     user_types::view_replace_error(format!(
         "null value in column \"{}\" of relation \"{table_name}\" violates not-null constraint",
         column.name,
     ));
+    user_types::sql_error_detail(failing_row_detail(table, values));
+}
+
+pub(super) fn failing_row_detail(table: &TableDef, values: &[Value]) -> String {
+    use std::borrow::Cow;
     let fields = table.logical_offsets().into_iter().map(|offset| {
         let text = match &values[offset] {
             Value::Null => Cow::Borrowed("null"),
@@ -103,7 +107,7 @@ pub(super) fn uuid_array_not_null(table: &TableDef, column: &ColumnDef, values: 
             text.into_owned()
         }
     }).collect::<Vec<_>>();
-    user_types::sql_error_detail(format!("Failing row contains ({}).", fields.join(", ")));
+    format!("Failing row contains ({}).", fields.join(", "))
 }
 
 pub fn json_output(v: &serde_json::Value) -> R<String> {

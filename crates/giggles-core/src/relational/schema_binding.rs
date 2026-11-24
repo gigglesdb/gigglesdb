@@ -92,7 +92,9 @@ impl Relational {
         self.secondary_descriptors_engine()
             .iter()
             .find(|d| d.name == key)
-            .and_then(|d| self.tables.values().find(|t| t.id == d.table))
+            .map(|d| d.table)
+            .or_else(|| self.gin_index(key).map(|(_, index)| index.table))
+            .and_then(|id| self.tables.values().find(|t| t.id == id))
             .or_else(|| sql_index::primary_table(self, key))
             .map(|t| self.table_key(t))
     }
@@ -224,8 +226,10 @@ impl Prepared {
             Statement::AlterTable(alter) => {
                 read(&mut alter.table);
                 for action in &mut alter.actions {
-                    if let alter_table::Action::Constraint(definition) = action {
-                        definitions(std::slice::from_mut(definition));
+                    match action {
+                        alter_table::Action::Constraint(definition) => definitions(std::slice::from_mut(definition)),
+                        alter_table::Action::Add(_, _, _, _, _, _, _, _, constraints) => definitions(&mut constraints.definitions),
+                        _ => {}
                     }
                 }
             }

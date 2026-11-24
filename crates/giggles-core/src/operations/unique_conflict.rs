@@ -523,6 +523,14 @@ fn plan_unique_conflict_evaluated<'s>(
                         .map_err(sql)?,
                     );
                 }
+                if semantics == Semantics::Sql && src.has_generated_columns(table) {
+                    let mut values = old.values.clone();
+                    for (offset, value) in &evaluated {
+                        values[*offset] = value.as_ref().clone();
+                    }
+                    src.materialize_generated(table, &mut values).map_err(sql)?;
+                    evaluated = values.into_iter().enumerate().map(|(offset, value)| (offset, Cow::Owned(value))).collect();
+                }
                 Postimage::Update {
                     values: evaluated,
                     changed: false,

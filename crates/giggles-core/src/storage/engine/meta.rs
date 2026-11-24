@@ -48,8 +48,10 @@ pub(crate) const UUID_ARRAY_COLUMNS: u64 = 1 << 32;
 pub(crate) const WIDE_CATALOG: u64 = 1 << 31;
 pub(crate) const PARTIAL_INDEXES: u64 = 1 << 33;
 pub(crate) const TEMPORAL_INDEXES: u64 = 1 << 34;
+pub(crate) const GENERATED_COLUMNS: u64 = 1 << 36;
 pub(crate) const TEXT_SEARCH_TYPES: u64 = 1 << 37;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 35] = [
+pub(crate) const GIN_INDEXES: u64 = 1 << 38;
+pub(crate) const FEATURE_TABLE: [(u64, &str); 37] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -84,7 +86,9 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 35] = [
     (WIDE_CATALOG, "wide_catalog"),
     (PARTIAL_INDEXES, "partial_indexes"),
     (TEMPORAL_INDEXES, "temporal_indexes"),
+    (GENERATED_COLUMNS, "generated_columns"),
     (TEXT_SEARCH_TYPES, "text_search_types"),
+    (GIN_INDEXES, "gin_indexes"),
 ];
 #[path = "meta_range.rs"]
 mod range_local;
@@ -512,7 +516,7 @@ pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
             | WRITE_FENCE
             | USER_COLLATIONS
             | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS | ROLE_MEMBERSHIP | WIDE_ROWS | UUID_ARRAY_COLUMNS
-            | ENUM_ARRAY_COLUMNS | ENUM_LABEL_IDENTITIES | WIDE_CATALOG | PARTIAL_INDEXES | TEMPORAL_INDEXES | TEXT_SEARCH_TYPES,
+            | ENUM_ARRAY_COLUMNS | ENUM_LABEL_IDENTITIES | WIDE_CATALOG | PARTIAL_INDEXES | TEMPORAL_INDEXES | GENERATED_COLUMNS | TEXT_SEARCH_TYPES | GIN_INDEXES,
     )
 }
 fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {

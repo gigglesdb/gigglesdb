@@ -18,6 +18,8 @@ pub(super) enum Action {
         bool,
         Option<String>,
         Option<user_types::TypeReference>,
+        Option<generated_columns::Definition>,
+        AddConstraints,
     ),
     Type(
         String,
@@ -31,12 +33,23 @@ pub(super) enum Action {
     RenameColumn(String, String),
     RenameTable(String),
     Default(String, Option<String>),
+    Expression(String, Option<generated_columns::Definition>),
     NotNull(String, bool),
     Unique(Option<String>, Vec<String>),
     PrimaryKey(Option<String>, Vec<String>),
     Constraint(constraints::Definition),
     Validate(String),
     DropConstraint(String, bool, bool),
+}
+#[derive(Debug, Clone, Default)]
+pub(super) struct AddConstraints {
+    pub primary: Option<Option<String>>,
+    pub definitions: Vec<constraints::Definition>,
+}
+impl AddConstraints {
+    pub(super) fn is_empty(&self) -> bool {
+        self.primary.is_none() && self.definitions.is_empty()
+    }
 }
 impl AlterTable {
     pub fn sequence_dependencies(&self) -> Vec<SequenceDependency> {
@@ -70,7 +83,6 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
         (first, error)
     };
     let mut actions = Vec::new();
-    let mut unsupported_type=false;
 
     loop {
         if p.at == p.tokens.len() || matches!(p.tokens.get(p.at), Some(Token::Symbol(';'))) {
@@ -126,7 +138,9 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
                     default,
                     collation,
                     user_type,
-                ) = parse_add_definition(p, if_not_exists)?;
+                    generation,
+                    constraints,
+                ) = parse_add_definition(p, if_not_exists, &table, &name)?;
                 Action::Add(
                     ColumnDef {
                         id: 0,
@@ -140,6 +154,8 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
                     if_not_exists,
                     collation,
                     user_type,
+                    generation,
+                    constraints,
                 )
             }
         } else if p.word("drop") {
@@ -213,6 +229,13 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
                     None
                 };
                 Action::Default(name, sql)
+            } else if p.word("expression") {
+                let expression = if set {
+                    p.need("as")?;
+                    let (tokens, locations) = generated_columns::expression_tokens(p)?;
+                    Some(generated_columns::Definition { tokens, locations, stored: false })
+                } else { None };
+                Action::Expression(name, expression)
             } else if p.word("not") {
                 p.need("null")?;
                 Action::NotNull(name, set)
@@ -237,7 +260,6 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
         return Err(SqlError::Syntax);
     }
 
-    if unsupported_type {return Err(SqlError::Unsupported);}
     Ok(AlterTable {
         table,
         actions,
@@ -249,7 +271,9 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
 fn parse_add_definition(
     p: &mut Parser,
     if_not_exists: bool,
-) -> R<(ddl_type::Parsed, bool, Option<String>, Option<String>, Option<user_types::TypeReference>)> {
+    table: &str,
+    column: &str,
+) -> R<(ddl_type::Parsed, bool, Option<String>, Option<String>, Option<user_types::TypeReference>, Option<generated_columns::Definition>, AddConstraints)> {
     let type_start = p.at;
     let (mut parsed, user_type) = match ddl_type::parse_column_type(p, ddl_type::Site::Alter) {
         Ok(parsed) => parsed,
@@ -280,12 +304,19 @@ fn parse_add_definition(
     let mut collation=None;
     let mut not_null = false;
     let mut default = None;
+    let mut generation = None;
+    let mut constraints = AddConstraints::default();
     loop {
+        let named = if p.word("constraint") { Some(raw_name(p)?) } else { None };
         if p.word("collate") { collation=Some(column_collations::parse_name(p)?);
         } else if p.word("not") {
             p.need("null")?;
             not_null = true;
         } else if p.word("default") {
+            if generation.is_some() {
+                generated_columns::error_at(p.at - 1);
+                return Err(generated_columns::conflicting_default(table, column));
+            }
             if default.is_some() {
                 return Err(SqlError::Syntax);
             }
@@ -303,11 +334,32 @@ fn parse_add_definition(
                 }
                 Err(error) => return Err(error),
             }
+        } else if p.word("generated") {
+            if default.is_some() {
+                generated_columns::error_at(p.at - 1);
+                return Err(generated_columns::conflicting_default(table, column));
+            }
+            if generation.is_some() {
+                return Err(SqlError::Syntax);
+            }
+            generation = Some(generated_columns::parse(p)?);
+        } else if p.word("check") {
+            constraints.definitions.push(constraints::parse_check(p, named)?);
+        } else if p.word("references") {
+            constraints.definitions.push(constraints::parse_foreign(p, named, vec![column.into()])?);
+        } else if p.word("unique") {
+            constraints.definitions.push(constraints::Definition::Unique { name: named, columns: vec![column.into()] });
+        } else if p.word("primary") {
+            p.need("key")?;
+            if constraints.primary.replace(named).is_some() { return Err(SqlError::InvalidTableDefinition); }
+        } else if p.word("null") {
+            // An explicit NULL clause has the same default as an omitted clause.
         } else {
+            if named.is_some() { return Err(SqlError::Syntax); }
             break;
         }
     }
-    Ok((parsed, not_null, default, collation, user_type))
+    Ok((parsed, not_null, default, collation, user_type, generation, constraints))
 }
 fn parse_skippable_default(p: &mut Parser) -> R<()> {
     let start = p.at;
@@ -426,7 +478,7 @@ pub(super) fn execute(
             Action::DropConstraint(name, optional, cascade) => {
                 constraints::drop_named_cascade(&mut candidate, &table, name, *optional, *cascade, cancel)?
             }
-            Action::Add(column, typmod, default, semantic_error, if_not_exists, collation, user_type) => {
+            Action::Add(column, typmod, default, semantic_error, if_not_exists, collation, user_type, generation, constraints) => {
                 if *if_not_exists
                     && column.name != "ctid"
                     && table.columns.iter().any(|c| c.name == column.name)
@@ -515,6 +567,14 @@ pub(super) fn execute(
                     candidate.set_column_typmod(column.id, Some(typmod))?;
                 }
                 defaults::install_alter(&mut candidate, &column, default.as_deref(), path)?;
+                if let Some(generation) = generation {
+                    generated_columns::install(&mut candidate, &table, &column, generation)?;
+                    if !generation.stored {
+                        column.not_null = false;
+                        table.columns[at].not_null = false;
+                        Arc::make_mut(&mut candidate.tables).insert(name.clone(), table.clone());
+                    }
+                }
                 let mut rows = candidate.rows.get(&table.id).ok_or(SqlError::Type)?.clone();
                 for row in rows.values_mut() {
                     if cancel() {
@@ -525,13 +585,30 @@ pub(super) fn execute(
                         return Err(null_column_error(&table, &column.name));
                     }
                     row.values.insert(at, value);
+                    candidate.materialize_generated(&table, &mut row.values)?;
                     row_check(&table, &row.values)?;
                 }
                 candidate.rows.insert(table.id, rows);
+                if let Some(explicit) = &constraints.primary {
+                    generated_columns::check_virtual_primary(&candidate, &column)?;
+                    constraint_primary_key::add(&mut candidate, &table, explicit.as_deref(), std::slice::from_ref(&column.name), &mut *cancel)?;
+                    table = candidate.tables[&name].clone();
+                }
+                for definition in &constraints.definitions {
+                    constraints::install(&mut candidate, &table, definition, &mut *cancel)?;
+                }
             }
             Action::Type(column, ty, typmod, collation, user_type, conversion) => {
                 let at = position(&table, column)?;
                 let old = &table.columns[at];
+                generated_columns::check_referenced_type(&candidate, &table, old)?;
+                if collation.is_none() && user_type.is_none()
+                    && !ty.is_text_search()
+                    && !matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
+                    && candidate.generated_column(old.id).is_none()
+                {
+                    return Err(SqlError::Unsupported);
+                }
                 let mut new = old.clone();
                 new.data_type = ty.clone();
                 let mut typmod = *typmod;
@@ -671,7 +748,29 @@ pub(super) fn execute(
                 };
                 views::drop_column_views(&mut candidate, table.columns[at].id, *cascade)?;
                 let id = table.columns[at].id;
-                let collation_cascade=*cascade && candidate.column_collation(id).is_some();
+                let dependents: Vec<_> = generated_columns::dependent_columns(&candidate, &table, id)
+                    .into_iter().map(|column| column.name.clone()).collect();
+                if !dependents.is_empty() {
+                    if !cascade {
+                        user_types::view_replace_error(format!("cannot drop column {column} of table {} because other objects depend on it", table.name));
+                        user_types::sql_error_detail(dependents.iter().map(|dependent|
+                            format!("column {dependent} of table {} depends on column {column} of table {}", table.name, table.name)
+                        ).collect::<Vec<_>>().join("\n"));
+                        user_types::sql_error_hint("Use DROP ... CASCADE to drop the dependent objects too.");
+                        return Err(SqlError::DependentObjects);
+                    }
+                    let dependent_drops = AlterTable {
+                        table: name.clone(),
+                        actions: dependents.into_iter().map(|column| Action::Drop(column, false, true)).collect(),
+                        resolution_error: None,
+                    };
+                    execute(&mut candidate, &dependent_drops, path, clock, cancel)?;
+                    table = candidate.tables[&name].clone();
+                }
+                let at = position(&table, column)?;
+                let was_generated = Arc::make_mut(&mut candidate.ext).generated_columns.remove(&id).is_some();
+                Arc::make_mut(&mut candidate.ext).gin_indexes.retain(|_, index| !index.columns.contains(&id));
+                let collation_cascade=was_generated || *cascade && candidate.column_collation(id).is_some();
                 let replace_primary=table.primary_key.contains(&at);
                 if (table.logical_columns().count() <= 1 || replace_primary) && !collation_cascade {return Err(SqlError::Unsupported);}
                 if collation_cascade {
@@ -722,6 +821,7 @@ pub(super) fn execute(
                 if table.columns.iter().any(|c| &c.name == new) {
                     return Err(SqlError::DuplicateColumn);
                 }
+                generated_columns::rename_reference(&mut candidate, &table, &table.columns[at], new)?;
                 table.columns[at].name = new.clone();
                 std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(), table.clone());
             }
@@ -740,6 +840,11 @@ pub(super) fn execute(
             }
             Action::Default(column, default) => {
                 let at = position(&table, column)?;
+                if candidate.generated_column(table.columns[at].id).is_some() {
+                    user_types::view_replace_error(format!("column \"{column}\" of relation \"{}\" is a generated column", table.name));
+                    user_types::sql_error_hint("Use ALTER TABLE ... ALTER COLUMN ... SET EXPRESSION instead.");
+                    return Err(SqlError::Syntax);
+                }
                 if default.is_none() && alter.actions.iter().any(|action| {
                     matches!(action, Action::Default(name, Some(_)) if name == column)
                 }) {
@@ -751,6 +856,10 @@ pub(super) fn execute(
                     default.as_deref(),
                     path,
                 )?;
+            }
+            Action::Expression(column, expression) => {
+                let target = &table.columns[position(&table, column)?];
+                generated_columns::alter(&mut candidate, &table, target, expression.as_ref(), cancel)?;
             }
             Action::NotNull(column, set) => {
                 let at = position(&table, column)?;

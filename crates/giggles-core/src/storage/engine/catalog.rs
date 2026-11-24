@@ -96,6 +96,7 @@ pub(crate) struct CatalogView {
     pub(crate) schemas: BTreeMap<String, relational::schemas::Schema>,
     pub(crate) indexes: BTreeMap<u64, relational::secondary_index::Descriptor>,
     index_predicates: Arc<IndexPredicateImage>,
+    metadata: BTreeMap<u64, catalog_codec::TableMetadata>,
     /// Task definitions (kind 19), live and revoked. Not part of `parts()`:
     /// SQL DDL rebuilds parts from the relational image, and tasks have
     /// their own writer, like roles.
@@ -192,6 +193,10 @@ impl CatalogView {
             .map(|(id, cs)| (*id, cs.values().cloned().collect()))
             .collect();
         parts.indexes = self.indexes.values().cloned().collect();
+        for table in self.metadata.values() {
+            parts.ext.gin_indexes.extend(table.gin.clone());
+            parts.ext.generated_columns.extend(table.generated.clone());
+        }
         parts.ext.sequences = self.sequences.clone();
         parts.ext.types = self.types.clone();
         parts.ext.added_enum_labels = self.added_enum_labels.clone();
@@ -345,6 +350,7 @@ impl CatalogSnapshot {
                     })
                     .chain(self.parts.sql_views.iter().flat_map(|(id, v)| std::iter::once(*id).chain(v.columns.iter().map(|c| c.id))))
                     .chain(self.parts.indexes.iter().map(|index| index.id))
+                    .chain(self.parts.ext.gin_indexes.keys().copied())
                     .chain(self.parts.ext.primary_index_birth.values().copied())
                     .chain(self.parts.ext.constraints.values().flatten().map(|c| c.id))
                     .chain(self.parts.ext.sequences.keys().copied())
@@ -1070,8 +1076,10 @@ impl Catalog {
             if old_records.get(key) != Some(value) || txn.catalog_own(key).is_some() {
                 let bits = super::content_check::required_bits_for_catalog_value(key, value)
                     .map_err(|e| corrupt(&e.to_string()))?;
-                // Publish UUID arrays, partial indexes and text-search types from the final catalog.
-                txn.require_features(bits & !(super::meta::UUID_ARRAY_COLUMNS | super::meta::PARTIAL_INDEXES | super::meta::TEXT_SEARCH_TYPES));
+                // Admit these features from the final catalog overlay.
+                txn.require_features(bits & !(super::meta::UUID_ARRAY_COLUMNS
+                    | super::meta::GENERATED_COLUMNS | super::meta::TEXT_SEARCH_TYPES
+                    | super::meta::GIN_INDEXES | super::meta::PARTIAL_INDEXES));
             }
         }
         self.lock_and_write(txn, &old_records, &new_records, deadline, cancel)?;
@@ -1080,6 +1088,7 @@ impl Catalog {
             &new.indexes, new.tables.values(),
         );
         txn.set_secondary_index_features(partial, temporal);
+        txn.set_table_metadata_features(!new.ext.gin_indexes.is_empty(), !new.ext.generated_columns.is_empty());
         if !new.indexes.is_empty() {
             txn.require_features(super::meta::SECONDARY_INDEXES);
         }
@@ -1399,8 +1408,10 @@ impl Catalog {
         new.column_labels.retain(|(table, _), _| *table != entry.def.id);
         new.heap.remove(&entry.def.id);
         new.indexes.retain(|d| d.table != entry.def.id);
+        new.ext.gin_indexes.retain(|_, index| index.table != entry.def.id);
         for column in &entry.def.columns {
             new.ext.columns.remove(&column.id);
+            new.ext.generated_columns.remove(&column.id);
         }
         new.ext.constraints.remove(&entry.def.id);
         new.ext.primary_index_birth.remove(&entry.def.id);
@@ -1978,16 +1989,23 @@ fn apply_record(
                 }
             }
             if let Some(value) = value {
-                let entry = decode_entry(value)?;
+                let (mut entry, columns_ext, metadata) = catalog_codec::decode_table_with_metadata(value)?;
+                entry.columns_ext = columns_ext;
                 if entry.def.id != id {
                     return Err(corrupt("catalog table key/id mismatch"));
                 }
                 view.enum_array_columns.extend(catalog_codec::decoded_enum_array_columns(
                     &entry.def, &entry.columns_ext,
                 ));
+                if metadata.is_empty() {
+                    view.metadata.remove(&id);
+                } else {
+                    view.metadata.insert(id, metadata);
+                }
                 view.by_id.insert(id, Arc::new(entry));
             } else {
                 view.by_id.remove(&id);
+                view.metadata.remove(&id);
             }
         }
         CatalogKind::Name => {
@@ -2192,6 +2210,18 @@ fn finish_view(
             return Err(corrupt("duplicate catalog relation name"));
         }
     }
+    for (table, metadata) in &view.metadata {
+        let entry = view.by_id.get(table).ok_or_else(|| corrupt("GIN table absent"))?;
+        if metadata.generated.keys().any(|id| !entry.def.columns.iter().any(|c| c.id == *id)) {
+            return Err(corrupt("generated column absent"));
+        }
+        for (id, index) in &metadata.gin {
+            index.validate(&entry.def).map_err(|_| corrupt("invalid GIN index"))?;
+            if expected.insert(index.name.clone(), *id).is_some() {
+                return Err(corrupt("duplicate catalog relation name"));
+            }
+        }
+    }
     for (id, seq) in &view.sequences {
         if expected.insert(seq.name.clone(), *id).is_some() {
             return Err(corrupt("duplicate catalog relation name"));
@@ -2238,11 +2268,12 @@ fn finish_view(
     if !view.schemas.is_empty()
         || !view.types.is_empty() || !view.added_enum_labels.is_empty()
         || !view.extensions.is_empty() || !view.collations.is_empty() || !view.column_collations.is_empty()
+        || !view.metadata.is_empty()
         || view.by_name.keys().any(|name| name.contains('\0'))
     {
         let parts = view.parts();
         relational::column_collations::validate_index_bindings(&parts.ext,&parts.indexes).map_err(|_|corrupt("invalid index collation binding"))?;
-        if !view.collations.is_empty() || !view.types.is_empty() || !view.added_enum_labels.is_empty() { object_ids(&parts)?; }
+        if !view.collations.is_empty() || !view.types.is_empty() || !view.added_enum_labels.is_empty() || !view.metadata.is_empty() { object_ids(&parts)?; }
         relational::Relational::catalog_image(parts.tables, parts.ext, u64::MAX, 1)
             .map_err(|e| corrupt(&format!("invalid catalog image: {e:?}")))?;
     }
@@ -2296,6 +2327,9 @@ pub(super) fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)
     }
     for descriptor in &parts.indexes {
         insert(descriptor.id, (16, descriptor.table))?;
+    }
+    for (id, index) in &parts.ext.gin_indexes {
+        insert(*id, (16, index.table))?;
     }
     for id in parts.ext.sequences.keys() {
         insert(*id, (5, 0))?;
@@ -2472,12 +2506,19 @@ fn encode_parts(
             heap: parts.heap.contains(&def.id),
             columns_ext: ext,
         };
-        let value = catalog_codec::encode_table_with_types(&entry, &entry.columns_ext, &parts.ext.types)?;
+        let metadata = catalog_codec::TableMetadata {
+            gin: parts.ext.gin_indexes.iter().filter(|(_, index)| index.table == def.id)
+                .map(|(id, index)| (*id, index.clone())).collect(),
+            generated: def.columns.iter().filter_map(|column|
+                parts.ext.generated_columns.get(&column.id).map(|generation| (column.id, generation.clone()))
+            ).collect(),
+        };
+        let value = catalog_codec::encode_table_with_metadata(&entry, &entry.columns_ext, &parts.ext.types, &metadata)?;
         decode_entry(&value)?;
         records.insert(table_key(def.id), value);
     }
     if parts.heap.iter().any(|id| !table_ids.contains_key(id))
-        || parts.ext.columns.keys().any(|id| !columns.contains(id))
+        || parts.ext.columns.keys().chain(parts.ext.generated_columns.keys()).any(|id| !columns.contains(id))
     {
         return Err(corrupt("catalog extension owner absent"));
     }
@@ -2513,6 +2554,14 @@ fn encode_parts(
                 descriptor.id.to_be_bytes().to_vec(),
             );
         }
+    }
+    for (id, index) in &parts.ext.gin_indexes {
+        let table = table_ids.get(&index.table).ok_or_else(|| corrupt("GIN table absent"))?;
+        index.validate(table).map_err(|_| corrupt("invalid GIN index"))?;
+        if !names.insert(Cow::Owned(index.name.clone())) {
+            return Err(CoreError::Sql(SqlError::Duplicate));
+        }
+        records.insert(name_key(&index.name), id.to_be_bytes().to_vec());
     }
     for (id, def) in &parts.ext.sequences {
         if !names.insert(Cow::Borrowed(def.name.as_str())) {

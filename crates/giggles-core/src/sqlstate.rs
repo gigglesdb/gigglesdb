@@ -82,6 +82,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::ForeignKeyViolation) => "23503",
         CoreError::Sql(S::DependentObjects) => "2BP01",
         CoreError::Sql(S::GeneratedAlways) => "428C9",
+        CoreError::Sql(S::InvalidObjectDefinition) => "42P17",
         CoreError::Sql(S::ObjectNotInPrerequisiteState) => "55000",
         CoreError::Sql(S::SequenceLimit) => "2200H",
         CoreError::Sql(S::NoActiveTransaction) => "25P01",
@@ -151,6 +152,15 @@ mod tests {
             assert_eq!(sqlstate(&error), state);
             assert_eq!(crate::local::failure(error).code, code);
         }
+    }
+
+    #[test]
+    fn transient_invalid_object_definition() {
+        let error = relational::SqlError::InvalidObjectDefinition;
+        assert!(bincode::serialize(&error).is_err());
+        let error = CoreError::Sql(error);
+        assert_eq!(sqlstate(&error), "42P17");
+        assert_eq!(crate::local::failure(error).code, 276);
     }
 
     #[test]

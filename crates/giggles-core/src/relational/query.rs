@@ -4100,6 +4100,7 @@ impl Query {
     ) -> R<BoundQuery<'a>> {
         let _enum_scope = functions::enum_order::Scope::enter(state);
         let _collation_scope = functions::collation::Scope::enter(state);
+        let _generated_scope = generated::Scope::enter(state);
         if parameters.len() > MAX_PARAMS {
             return Err(SqlError::Limit);
         }
@@ -4441,7 +4442,8 @@ impl Query {
                         (None, d)
                     };
                     let item = match source_column {
-                        Some(column) if classify_plain_columns && !functions::collation::has_column_metadata(d.id) => BoundItem::Column(column),
+                        Some(column) if classify_plain_columns && !functions::collation::has_column_metadata(d.id)
+                            && !generated::is_virtual(d.id) => BoundItem::Column(column),
                         _ => BoundItem::Scalar(e),
                     };
                     push(item, d);
@@ -4565,7 +4567,9 @@ impl Query {
                                 d.not_null = false;
                             }
                             let c=BoundColumn {source,column};
-                            let item = if functions::collation::has_column_metadata(d.id)
+                            let item = if let Some(value) = generated::virtual_binding(&tables, c)? {
+                                BoundItem::Scalar(functions::collation::column(value, d.id)?)
+                            } else if functions::collation::has_column_metadata(d.id)
                                 || self.distinct() && d.data_type.is_array()
                             {
                                 BoundItem::Scalar(functions::collation::bound_column(c, &d)?)
@@ -7188,6 +7192,11 @@ mod deferred_routine_only_tests {
 
 mod constraints;
 pub(super) mod index_predicate;
+mod generated;
+pub(super) use generated::{
+    bind_definition as bind_generated_definition, pretty as pretty_generated_expression,
+    rename_reference as rename_generated_reference, value as generated_expression_value,
+};
 pub(super) use constraints::{
     constraint_check, constraint_columns, constraint_deparse, constraint_eval, constraint_key,
     constraint_key_supported, constraint_quote, constraint_shape, constraint_types_compatible,

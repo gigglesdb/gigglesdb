@@ -1,6 +1,6 @@
 use super::*;
 use Value::{Bool as B, Int as I, Null as N, Text as S};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Catalog reads performed by scalar functions, including calls made by the
 /// executor itself (for example, the visibility check in pg_get_indexdef).
@@ -72,7 +72,7 @@ pub(super) struct Lookups<'a> {
     attributes: Option<AttributeNames<'a>>,
     constraints: Option<(catalog::Definitions<'a>, OidRows<'a>)>,
     indexes: Option<IndexDefinitions<'a>>,
-    expressions: Option<HashSet<(&'a str, i64)>>,
+    expressions: Option<HashMap<(&'a str, i64), Option<&'a str>>>,
     visibility: Option<Visibility<'a>>,
 }
 
@@ -97,7 +97,14 @@ impl<'a> Runtime<'a> {
             return Err(Error::Unsupported);
         };
         if self.introspection.expressions.is_none() {
-            let mut expressions = HashSet::new();
+            let mut expressions = HashMap::new();
+            let generated_tables: HashMap<_, _> = if self.snapshot.generated_columns.is_empty() {
+                HashMap::new()
+            } else {
+                self.snapshot.tables.iter().filter_map(|table| {
+                    Some((i64::from(catalog::table_oid(table.id).ok()?), table))
+                }).collect()
+            };
             for (name, expression, relation) in [
                 ("pg_attrdef", "adbin", "adrelid"),
                 ("pg_constraint", "conbin", "conrelid"),
@@ -109,19 +116,29 @@ impl<'a> Runtime<'a> {
                     continue;
                 };
                 self.charge(catalog.rows.len())?;
+                let position = (name == "pg_attrdef" && !generated_tables.is_empty())
+                    .then(|| field("adnum")).flatten();
                 for row in &catalog.rows {
                     if let (S(expr), I(oid)) = (&row[expression], &row[relation]) {
-                        expressions.insert((expr.as_str(), *oid));
+                        let pretty = position.and_then(|position| {
+                            let I(position) = row[position] else { return None; };
+                            let column = generated_tables.get(oid)?.columns
+                                .get(usize::try_from(position.checked_sub(1)?).ok()?)?;
+                            self.snapshot.generated_columns.get(&column.id)
+                                .map(|column| column.pretty_expression.as_str())
+                        });
+                        expressions.entry((expr.as_str(), *oid)).or_insert(pretty);
                     }
                 }
             }
             self.introspection.expressions = Some(expressions);
         }
-        if !self.introspection.expressions.as_ref().unwrap().contains(&(expression.as_str(), *relation)) {
-            return Err(Error::Unsupported);
-        }
+        let pretty = self.introspection.expressions.as_ref().unwrap()
+            .get(&(expression.as_str(), *relation)).ok_or(Error::Unsupported)?;
         let result = if args.get(2) == Some(&B(true)) {
-            expression.strip_prefix('(').and_then(|e| e.strip_suffix(')')).unwrap_or(expression)
+            pretty.unwrap_or_else(|| {
+                expression.strip_prefix('(').and_then(|e| e.strip_suffix(')')).unwrap_or(expression)
+            })
         } else {
             expression
         };

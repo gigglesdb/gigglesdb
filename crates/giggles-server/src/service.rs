@@ -3069,7 +3069,7 @@ impl Session {
             } else if matches!(p.command(), "COMMENT" | "SECURITY LABEL") || p.is_alter_table()
                 || (p.is_view_replacement() && self.sql.relation_exists(p.table().unwrap_or(""))?)
                 || p.is_drop_table()
-                || (p.command() == "DROP INDEX" && p.table().is_some())
+                || (matches!(p.command(), "DROP INDEX" | "ALTER INDEX") && p.table().is_some())
             {
                 let targets = if p.is_drop_table() { p.drop_tables().iter().map(String::as_str).collect() }
                     else { vec![p.table().ok_or(CoreError::Policy(Error::Scope))?] };
@@ -3081,7 +3081,7 @@ impl Session {
                         .map_err(|_| CoreError::Policy(Error::Scope))?.as_ref().is_some_and(|owner| self.service.admin.roles().privileges_of(name).is_ok_and(|roles| roles.contains(owner)));
                 }
                 owns_all
-            } else if p.command() == "DROP INDEX" && p.table().is_none() {
+            } else if matches!(p.command(), "DROP INDEX" | "ALTER INDEX") && p.table().is_none() {
                 true
             } else if p.is_ddl() {
                 let schema = if matches!(p.command(), "CREATE TABLE" | "CREATE VIEW") {

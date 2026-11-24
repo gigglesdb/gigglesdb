@@ -884,6 +884,11 @@ pub(super) fn default_sql(state: &Relational, column: &ColumnDef) -> Option<Stri
     }
 }
 pub(super) fn check_explicit(state: &Relational, column: &ColumnDef) -> R<()> {
+    state.check_generated_explicit(column, false)?;
+    check_explicit_identity(state, column)
+}
+
+pub(super) fn check_explicit_identity(state: &Relational, column: &ColumnDef) -> R<()> {
     if state.column_identity(column.id).is_some_and(|i| i.always) {
         Err(SqlError::GeneratedAlways)
     } else {

@@ -83,10 +83,15 @@ fn secondary_relations_keys_flags_and_primary_constraint() {
     );
     assert_eq!(run("SELECT c.relname,a.attnum,a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid WHERE c.relkind='i' ORDER BY c.oid,a.attnum").rows,vec![vec![s("t_pkey"),I(1),s("id")],vec![s("t_email_key"),I(1),s("email")],vec![s("t_ab_idx"),I(1),s("b")],vec![s("t_ab_idx"),I(2),s("a")]]);
     assert_eq!(
-        run("SELECT oid,amname,amhandler,amtype FROM pg_am").rows,
+        run("SELECT oid,amname,amhandler,amtype FROM pg_am ORDER BY oid").rows,
         vec![
             vec![I(2), s("heap"), I(3), s("t")],
-            vec![I(403), s("btree"), I(330), s("i")]
+            vec![I(403), s("btree"), I(330), s("i")],
+            vec![I(405), s("hash"), I(331), s("i")],
+            vec![I(783), s("gist"), I(332), s("i")],
+            vec![I(2742), s("gin"), I(333), s("i")],
+            vec![I(3580), s("brin"), I(335), s("i")],
+            vec![I(4000), s("spgist"), I(334), s("i")],
         ]
     );
     assert!(

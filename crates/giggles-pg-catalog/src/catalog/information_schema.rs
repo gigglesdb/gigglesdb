@@ -217,7 +217,13 @@ pub(super) fn populate(
                 !view,
                 types.get(oid).copied(),
             );
-            if let Some(default) = defaults.get(&(*relation_id, *position)) {
+            let generated = lookup.relations.get(relation_id)
+                .and_then(|table| table.columns.get((*position - 1) as usize))
+                .and_then(|column| snapshot.generated_columns.get(&column.id));
+            if let Some(generated) = generated {
+                column[41] = s("ALWAYS");
+                column[42] = s(&generated.expression);
+            } else if let Some(default) = defaults.get(&(*relation_id, *position)) {
                 column[5] = (*default).clone();
             }
             let collation = row_oid(&attribute[19]);

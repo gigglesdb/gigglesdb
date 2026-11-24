@@ -90,7 +90,8 @@ pub(super) fn indexes(
         .map(|(name, value)| {
             let index = col(table, name)?;
             if !matches!(value, Value::Default | Value::Rows(_)) {
-                defaults::check_explicit(state, &table.columns[index])?;
+                state.check_generated_explicit(&table.columns[index], true)?;
+                defaults::check_explicit_identity(state, &table.columns[index])?;
             }
             Ok(index)
         })
@@ -255,7 +256,8 @@ impl<'a> Plan<'a> {
                 .iter()
                 .map(|(name, value)| {
                     let index = col(table, name)?;
-                    defaults::check_explicit(state, &table.columns[index])?;
+                    state.check_generated_explicit(&table.columns[index], true)?;
+                    defaults::check_explicit_identity(state, &table.columns[index])?;
                     let mut column = table.columns[index].clone();
                     column.not_null = false;
                     let value = plain_value(

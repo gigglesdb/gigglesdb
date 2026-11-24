@@ -8,6 +8,10 @@ mod write_fence_embedded;
 mod native_paging;
 #[path = "alter_add_column_if_not_exists.rs"]
 mod alter_add_column_if_not_exists;
+#[path = "generated_columns.rs"]
+mod generated_columns;
+#[path = "gin_indexes.rs"]
+mod gin_indexes;
 #[path = "native_once_v2_replay.rs"] mod native_once_v2_replay;
 #[path = "typed_leaf_read.rs"]
 mod typed_leaf_read;

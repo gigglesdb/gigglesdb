@@ -172,7 +172,7 @@ fn detailed_duplicate(
     key_duplicate(table, name, positions, values, build)
 }
 
-fn key_duplicate(
+pub(crate) fn key_duplicate(
     table: &TableDef, name: &str, positions: &[usize], values: &[Value], build: bool,
 ) -> Option<SqlError> {
     let columns = positions.iter().map(|i| query::quote_identifier(&table.columns[*i].name))
@@ -203,11 +203,16 @@ pub(crate) fn index_duplicate(
     index: &secondary_index::Descriptor,
     values: &[Value],
     build: bool,
+    generated_key: bool,
 ) -> SqlError {
     let positions = index.columns.iter().filter_map(|id| table.columns.iter()
         .position(|column| column.id == *id)).collect::<Vec<_>>();
-    detailed_duplicate(table, &index.name, &positions, values, build, index.predicate.is_some())
-        .unwrap_or(SqlError::Duplicate)
+    if generated_key {
+        key_duplicate(table, &index.name, &positions, values, build)
+    } else {
+        detailed_duplicate(table, &index.name, &positions, values, build, index.predicate.is_some())
+    }
+    .unwrap_or(SqlError::Duplicate)
 }
 
 impl Relational {
@@ -258,7 +263,7 @@ impl Relational {
 
     pub(super) fn primary_collision_name(&self, table: &TableDef) -> String {
         let name = self.primary_key_constraint_name(table).unwrap_or_default();
-        if primary_has_uuid(table) {
+        if primary_has_uuid(table) || self.primary_has_generated(table) {
             schema_binding::relation_key(self.table_schema(table.id), &name)
         } else {
             name
@@ -266,7 +271,7 @@ impl Relational {
     }
 
     pub(crate) fn primary_duplicate(&self, table: &TableDef, row: &[Value]) -> SqlError {
-        if primary_has_uuid(table) {
+        if primary_has_uuid(table) || self.primary_has_generated(table) {
             return key_duplicate(table, &self.primary_collision_name(table), &table.primary_key, row, false)
                 .unwrap_or(SqlError::Duplicate);
         }
@@ -307,7 +312,12 @@ impl Relational {
                         return Err(SqlError::Limit);
                     }
                     if !occupied.insert(tuple) {
-                        return Err(key.duplicate_detail(table, &name, &row.values, false)
+                        let detail = if key.columns.iter().any(|i| self.generated_column(table.columns[*i].id).is_some()) {
+                            key_duplicate(table, &name, &key.columns, &row.values, false)
+                        } else {
+                            key.duplicate_detail(table, &name, &row.values, false)
+                        };
+                        return Err(detail
                             .unwrap_or_else(|| duplicate(&name)));
                     }
                 }
@@ -328,7 +338,8 @@ impl Relational {
         cancel: &mut impl FnMut() -> bool,
     ) -> R<()> {
         for index in descriptors.iter().filter(|d| d.unique && d.table == table.id) {
-            if !build && index.predicate.is_none() && !primary_has_uuid(table)
+            let generated_key = index.columns.iter().any(|id| self.generated_column(*id).is_some());
+            if !generated_key && !build && index.predicate.is_none() && !primary_has_uuid(table)
                 && !index.columns.iter().any(|id| {
                     table.columns.iter().any(|column| {
                         column.id == *id
@@ -355,8 +366,7 @@ impl Relational {
                         return Err(SqlError::Limit);
                     }
                     if !occupied.insert(tuple) {
-                        return Err(key.duplicate_detail(table, &index.name, &row.values, build)
-                            .unwrap_or(SqlError::Duplicate));
+                        return Err(index_duplicate(table, index, &row.values, build, generated_key));
                     }
                 }
             }

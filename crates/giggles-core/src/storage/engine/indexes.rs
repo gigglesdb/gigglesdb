@@ -129,7 +129,7 @@ pub(crate) fn entries(
     rows: &BTreeMap<Vec<u8>, SqlRow>,
     ds: &[Descriptor],
 ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
-    entries_for(Predicates::Bind(state), table, rows, ds, false)
+    entries_for(Predicates::Bind(state), table, rows, ds, false, &|_| false)
 }
 
 pub(crate) fn build_entries(
@@ -137,8 +137,9 @@ pub(crate) fn build_entries(
     table: &TableDef,
     rows: &BTreeMap<Vec<u8>, SqlRow>,
     index: &Descriptor,
+    generated: &dyn Fn(u64) -> bool,
 ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
-    entries_for(Predicates::Bind(Some(state)), table, rows, std::slice::from_ref(index), true)
+    entries_for(Predicates::Bind(Some(state)), table, rows, std::slice::from_ref(index), true, generated)
 }
 
 #[derive(Clone, Copy)]
@@ -153,6 +154,7 @@ fn entries_for(
     rows: &BTreeMap<Vec<u8>, SqlRow>,
     ds: &[Descriptor],
     build: bool,
+    generated: &dyn Fn(u64) -> bool,
 ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
     let mut entries = BTreeMap::new();
     for d in ds.iter().filter(|d| d.table == table.id) {
@@ -205,7 +207,7 @@ fn entries_for(
             }
             if entries.insert(key, pk).is_some() {
                 return Err(CoreError::Sql(relational::collation_keys::index_duplicate(
-                    table, d, &row.values, build,
+                    table, d, &row.values, build, d.columns.iter().copied().any(generated),
                 )));
             }
         }
@@ -219,13 +221,14 @@ pub(crate) fn occupancy_duplicate(
     key: &[u8],
     pk: &[u8],
     build: bool,
+    generated: &dyn Fn(u64) -> bool,
 ) -> CoreError {
     let index = ds.iter().find(|d| d.unique && key.starts_with(&d.id.to_be_bytes()));
     // The native single-row publisher uses an empty key for its one row.
     let row = rows.get(pk).or_else(|| rows.get(&[][..]));
     CoreError::Sql(match (index, row) {
         (Some(index), Some(row)) => relational::collation_keys::index_duplicate(
-            table, index, &row.values, build,
+            table, index, &row.values, build, index.columns.iter().copied().any(generated),
         ),
         _ => SqlError::Duplicate,
     })
@@ -245,6 +248,7 @@ pub(crate) fn apply(
     new_ds: &[Descriptor],
     deadline: Option<Instant>,
     cancel: &dyn Fn() -> bool,
+    generated: &dyn Fn(u64) -> bool,
 ) -> Result<(), CoreError> {
     let image;
     let predicates = if state.is_none() && old_ds.iter().chain(new_ds).any(|d| d.predicate.is_some()) {
@@ -253,9 +257,9 @@ pub(crate) fn apply(
     } else {
         Predicates::Bind(state)
     };
-    let old = entries_for(predicates, table, before, old_ds, false)?;
+    let old = entries_for(predicates, table, before, old_ds, false, &|_| false)?;
     let new = match after_table {
-        Some(table) => entries_for(predicates, table, after, new_ds, false)?,
+        Some(table) => entries_for(predicates, table, after, new_ds, false, generated)?,
         None => BTreeMap::new(),
     };
     let changes = old
@@ -270,7 +274,7 @@ pub(crate) fn apply(
             .map_err(crate::task::limits::lock_error)?;
         if target.current.is_some() && target.current.as_ref() != old.get(key) {
             return Err(match (after_table, new.get(key)) {
-                (Some(table), Some(pk)) => occupancy_duplicate(table, after, new_ds, key, pk, false),
+                (Some(table), Some(pk)) => occupancy_duplicate(table, after, new_ds, key, pk, false, generated),
                 _ => CoreError::Sql(SqlError::Duplicate),
             });
         }
@@ -290,16 +294,17 @@ pub(crate) fn apply(
 pub(crate) fn check_occupancy(
     txn: &mut Transaction, state: &relational::Relational, table: &TableDef, before: &BTreeMap<Vec<u8>, SqlRow>,
     after: &BTreeMap<Vec<u8>, SqlRow>, ds: &[Descriptor],
+    generated: &dyn Fn(u64) -> bool,
 ) -> Result<(), CoreError> {
     let old = entries(Some(state), table, before, ds)?;
-    for (key, pk) in entries(Some(state), table, after, ds)? {
+    for (key, pk) in entries_for(Predicates::Bind(Some(state)), table, after, ds, false, generated)? {
         if old.get(&key) == Some(&pk) { continue; }
         let target = txn
             .lock_for_write(Keyspace::Index, &key, crate::task::limits::lock_deadline(),
                 &|| crate::cancellation::check().is_err())
             .map_err(crate::task::limits::lock_error)?;
         if target.current.is_some() && target.current.as_ref() != old.get(&key) {
-            return Err(occupancy_duplicate(table, after, ds, &key, &pk, false));
+            return Err(occupancy_duplicate(table, after, ds, &key, &pk, false, generated));
         }
     }
     Ok(())
@@ -342,6 +347,7 @@ pub(crate) fn maintain(
         &ds,
         deadline,
         cancel,
+        &|_| false,
     )
 }
 
@@ -465,7 +471,7 @@ pub(crate) fn visit_page(
                 version: row.version,
             },
         )]);
-        let expected = entries_for(predicates, &table.def, &witness, std::slice::from_ref(descriptor), false)?;
+        let expected = entries_for(predicates, &table.def, &witness, std::slice::from_ref(descriptor), false, &|_| false)?;
         if expected.get(&key) != Some(&pk) {
             return Err(CoreError::Corrupt("index entry disagrees with row".into()));
         }

@@ -12,7 +12,9 @@ fn depend(budget: &mut Budget, all: &mut BTreeMap<String, Relation>, class: i64,
 }
 pub(super) fn populate(snapshot: &CatalogSnapshot, lookup: &Lookup<'_>, budget: &mut Budget, all: &mut BTreeMap<String, Relation>, used: &mut BTreeSet<i64>, next: &mut i64) -> R<()> {
     if snapshot.constraints.len() > 8192 { return Err(Error::Limit); }
-    let bytes = snapshot.column_defaults.values().map(String::len).chain(snapshot.constraints.iter().map(|c| c.name.len() + c.expression.as_ref().map_or(0, String::len)))
+    let bytes = snapshot.column_defaults.values().map(String::len)
+        .chain(snapshot.generated_columns.values().map(|column| column.expression.len()))
+        .chain(snapshot.constraints.iter().map(|c| c.name.len() + c.expression.as_ref().map_or(0, String::len)))
         .try_fold(0usize, |n, v| n.checked_add(v).ok_or(Error::Limit))?;
     if bytes > MAX_CATALOG_BYTES { return Err(Error::Limit); }
     for c in &snapshot.constraints {
@@ -78,7 +80,9 @@ pub(super) fn populate(snapshot: &CatalogSnapshot, lookup: &Lookup<'_>, budget: 
         let rel = i64::from(table_oid(table.id)?);
         for (i, col) in table.columns.iter().enumerate() {
             let identity = snapshot.column_identities.get(&col.id);
-            let default = snapshot.column_defaults.get(&col.id).filter(|_| identity.is_none());
+            let generated = snapshot.generated_columns.get(&col.id);
+            let default = generated.map(|column| &column.expression)
+                .or_else(|| snapshot.column_defaults.get(&col.id).filter(|_| identity.is_none()));
             if default.is_some_and(|e| e.len() > 65536) || identity.is_some_and(|c| !matches!(c, 'a' | 'd')) { return Err(Error::InvalidSnapshot); }
             if let Some(expr) = default && (all.contains_key("pg_attrdef") || all.contains_key("pg_depend")) {
                 while !used.insert(*next) {
@@ -88,7 +92,13 @@ pub(super) fn populate(snapshot: &CatalogSnapshot, lookup: &Lookup<'_>, budget: 
                 if let Some(relation) = all.get_mut("pg_attrdef") {
                     budget.add(&mut relation.rows, vec![I(*next), I(rel), I(i as i64 + 1), s(expr)])?;
                 }
-                depend(budget, all, 2604, *next, rel, I(i as i64 + 1), "a")?; *next -= 1;
+                depend(budget, all, 2604, *next, rel, I(i as i64 + 1), if generated.is_some() { "i" } else { "a" })?;
+                if let Some(generated) = generated {
+                    for reference in key(lookup, table, &generated.references)? {
+                        depend(budget, all, 2604, *next, rel, reference, "n")?;
+                    }
+                }
+                *next -= 1;
             }
         }
     }

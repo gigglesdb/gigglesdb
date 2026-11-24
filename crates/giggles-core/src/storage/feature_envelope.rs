@@ -7,12 +7,14 @@ pub(crate) const COLUMN_COLLATIONS: u64 = 1 << 23;
 pub(crate) const USER_COLLATIONS: u64 = 1 << 22;
 pub(crate) const UUID_ARRAY_COLUMNS: u64 = crate::storage::engine::meta::UUID_ARRAY_COLUMNS;
 pub(crate) const TEXT_SEARCH_TYPES: u64 = super::engine::meta::TEXT_SEARCH_TYPES;
+pub(crate) const GIN_INDEXES: u64 = crate::storage::engine::meta::GIN_INDEXES;
+pub(crate) const GENERATED_COLUMNS: u64 = crate::storage::engine::meta::GENERATED_COLUMNS;
 const WIDE_CATALOG: u64 = super::engine::meta::WIDE_CATALOG;
 pub(crate) const PARTIAL_INDEXES: u64 = 1 << 33;
 pub(crate) const TEMPORAL_INDEXES: u64 = 1 << 34;
 pub(super) const NEW_BITS: u64 =
     0x3c0 | KEY_DEPENDENCY_IDENTITY | USER_COLLATIONS | COLUMN_COLLATIONS | UUID_ARRAY_COLUMNS | WIDE_CATALOG
-        | PARTIAL_INDEXES | TEMPORAL_INDEXES | TEXT_SEARCH_TYPES;
+        | PARTIAL_INDEXES | TEMPORAL_INDEXES | GENERATED_COLUMNS | TEXT_SEARCH_TYPES | GIN_INDEXES;
 pub(super) const ROLE_BOOTSTRAP: u64 = 1 << 9;
 
 /// E1 B0b: true when CatalogExt is nonempty.
@@ -84,6 +86,8 @@ pub(super) fn feature_bits_present(s: &State) -> Result<u64, CoreError> {
         | if !s.sql.catalog_ext().collations.is_empty() { USER_COLLATIONS } else { 0 }
         | if text_search_types_present(s) { TEXT_SEARCH_TYPES } else { 0 }
         | if uuid_array_columns_present(s) { UUID_ARRAY_COLUMNS } else { 0 }
+        | if s.sql.catalog_ext().gin_indexes.is_empty() { 0 } else { GIN_INDEXES }
+        | if s.sql.catalog_ext().generated_columns.is_empty() { 0 } else { GENERATED_COLUMNS }
         | if s.sql.catalog_ext().has_key_dependency_identity() { KEY_DEPENDENCY_IDENTITY } else { 0 })
 }
 
@@ -130,15 +134,51 @@ pub(super) fn decode_bits(
 
 /// Decode the relational payload once while preserving forward-version errors.
 pub(super) fn decode_relational(bytes: &[u8]) -> Result<Relational, CoreError> {
-    codec().deserialize(bytes).map_err(|error| {
-        if matches!(error.as_ref(), bincode::ErrorKind::Custom(message)
+    codec().deserialize(bytes).map_err(|error| relational_error(&error))
+}
+
+fn relational_error(error: &bincode::ErrorKind) -> CoreError {
+        if matches!(error, bincode::ErrorKind::Custom(message)
             if message == crate::relational::catalog_ext::UNSUPPORTED_CATALOG_EXT)
         {
             CoreError::Unsupported
         } else {
             CoreError::Corrupt(error.to_string())
         }
-    })
+}
+
+pub(super) fn append_relational_metadata(base: &mut Vec<u8>, sql: &Relational) -> Result<(), CoreError> {
+    if !sql.catalog_ext().gin_indexes.is_empty() {
+        base.extend(encode(&sql.catalog_ext().gin_indexes)?);
+    }
+    if !sql.catalog_ext().generated_columns.is_empty() {
+        base.extend(encode(&sql.catalog_ext().generated_columns)?);
+    }
+    Ok(())
+}
+
+pub(super) fn decode_relational_with_bits(bytes: &[u8], bits: u64) -> Result<Relational, CoreError> {
+    if bits & (GENERATED_COLUMNS | GIN_INDEXES) == 0 {
+        return decode_relational(bytes);
+    }
+    let mut input = std::io::Cursor::new(bytes);
+    let mut sql: Relational = codec().deserialize_from(&mut input).map_err(|error| relational_error(&error))?;
+    let gin = if bits & GIN_INDEXES == 0 { BTreeMap::new() } else {
+        codec().deserialize_from(&mut input).map_err(|error| relational_error(&error))?
+    };
+    let generated = if bits & GENERATED_COLUMNS == 0 { BTreeMap::new() } else {
+        codec().deserialize_from(&mut input).map_err(|error| relational_error(&error))?
+    };
+    if input.position() != bytes.len() as u64 {
+        return Err(CoreError::Corrupt("trailing relational catalog bytes".into()));
+    }
+    if (bits & GIN_INDEXES != 0) == gin.is_empty()
+        || (bits & GENERATED_COLUMNS != 0) == generated.is_empty()
+    {
+        return Err(CoreError::Corrupt("feature content mismatch".into()));
+    }
+    sql.restore_table_metadata(gin, generated);
+    Ok(sql)
 }
 
 #[cfg(test)]

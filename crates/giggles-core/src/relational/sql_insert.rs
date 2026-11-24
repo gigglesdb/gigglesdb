@@ -528,17 +528,27 @@ impl Insert {
         state.tables.contains_key(&self.table) && self.conflict.is_some()
     }
     fn check_explicit(&self, state: &Relational, table: &TableDef, indexes: &[usize]) -> R<()> {
+        // COPY validates the user's target list before accepting data. The
+        // internal INSERT can then carry complete, computed row values.
+        if self.copy_input.is_some() {
+            return Ok(());
+        }
         if let Some(update) = self.conflict.as_ref().and_then(|c| c.update.as_ref()) {
             for (name, operand) in &update.sets {
                 if !matches!(operand, Operand::Default) {
-                    defaults::check_explicit(state, &table.columns[col(table, name)?])?;
+                    let column = &table.columns[col(table, name)?];
+                    state.check_generated_explicit(column, true)?;
+                    defaults::check_explicit_identity(state, column)?;
                 }
             }
         }
         for row_defaults in &self.defaults {
             for (index, default) in indexes.iter().zip(row_defaults) {
-                if !default && self.overriding.is_none() {
-                    defaults::check_explicit(state, &table.columns[*index])?;
+                if !default {
+                    state.check_generated_explicit(&table.columns[*index], false)?;
+                    if self.overriding.is_none() {
+                        defaults::check_explicit_identity(state, &table.columns[*index])?;
+                    }
                 }
             }
         }
@@ -547,7 +557,7 @@ impl Insert {
     pub(super) fn stable_referenced_keys(&self, state: &Relational, table: &TableDef) -> bool {
         self.conflict.as_ref().and_then(|c| c.update.as_ref()).is_none_or(|u| {
             u.sets.iter().all(|(name, _)| table.columns.iter().all(|c| {
-                name != &c.name || !state.ext.constraints.values().flatten().any(|constraint| {
+                !state.column_written_by(table, c, |written| written == name) || !state.ext.constraints.values().flatten().any(|constraint| {
                     matches!(&constraint.kind, ConstraintKind::ForeignKey { ref_table, ref_columns, .. }
                         if *ref_table == table.id && ref_columns.contains(&c.id))
                 })
@@ -923,7 +933,8 @@ impl Insert {
             for (name, operand) in &update.sets {
                 let index = col(table, name)?;
                 if let Operand::Scalar(expression) = operand {
-                    defaults::check_explicit(state, &table.columns[index])?;
+                    state.check_generated_explicit(&table.columns[index], true)?;
+                    defaults::check_explicit_identity(state, &table.columns[index])?;
                     expression.infer(
                         table,
                         self.alias.as_deref(),
@@ -953,9 +964,10 @@ impl Insert {
                 }
                 Source::Plan(plan, _) => { plan.bind_insert_outputs(state, &targets, &mut parameters)?; }
             }
-            if self.overriding.is_none() {
-                for index in &indexes {
-                    defaults::check_explicit(state, &table.columns[*index])?;
+            for index in &indexes {
+                state.check_generated_explicit(&table.columns[*index], false)?;
+                if self.overriding.is_none() {
+                    defaults::check_explicit_identity(state, &table.columns[*index])?;
                 }
             }
         }
@@ -1153,6 +1165,7 @@ fn finish_row(
             *value = coerce_to_column(state, column, value.clone())?;
         }
     }
+    state.materialize_generated(table, &mut row)?;
     Relational::secondary_admit_values(row.iter())?;
     if let Some(hidden) = hidden_rowid {
         // The NULL placeholder has the same fixed byte budget as its future Int.
@@ -1162,7 +1175,7 @@ fn finish_row(
             if index != hidden {
                 check(value, column).inspect_err(|error| {
                     if *error == SqlError::Null && column.data_type == DataType::UuidArray {
-                        logical_types::uuid_array_not_null(table, column, &row);
+                        logical_types::not_null_violation(table, column, &row);
                     }
                 })?;
             }
@@ -1409,7 +1422,9 @@ impl operations::SqlConflictEvaluation for ConflictPlan<'_> {
                         value.evaluate(old, incoming, self.params, &mut bytes)?
                     }
                 };
-                check(&value, &table.columns[*index])?;
+                let mut column = table.columns[*index].clone();
+                column.not_null = false;
+                check(&value, &column)?;
                 Ok((*index, value))
             })
             .collect::<R<Vec<_>>>()?;

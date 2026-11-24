@@ -624,6 +624,15 @@ pub(crate) fn encode_table_with_types(
     ext: &BTreeMap<u64, ColumnExt>,
     types: &BTreeMap<u64, TypeDef>,
 ) -> Result<Vec<u8>, CoreError> {
+    encode_table_with_metadata(entry, ext, types, &TableMetadata::default())
+}
+
+pub(crate) fn encode_table_with_metadata(
+    entry: &TableEntry,
+    ext: &BTreeMap<u64, ColumnExt>,
+    types: &BTreeMap<u64, TypeDef>,
+    metadata: &TableMetadata,
+) -> Result<Vec<u8>, CoreError> {
     for (id, column_ext) in ext {
         let column = entry
             .def
@@ -636,18 +645,45 @@ pub(crate) fn encode_table_with_types(
         }
     }
     let dto = TableEntryV2Dto::from_entry(entry, ext, types)?;
-    if let Some(birth) = entry.primary_index_birth {
+    let mut encoded = if let Some(birth) = entry.primary_index_birth {
         validate_primary_birth(entry, birth)?;
         encode_version(3, &(dto, birth))
-    } else { encode_version(2, &dto) }
+    } else { encode_version(2, &dto) }?;
+    if !metadata.is_empty() {
+        encoded.extend(super::super::encode(metadata)?);
+    }
+    Ok(encoded)
 }
+
+pub(crate) use crate::relational::catalog_ext::TableMetadata;
+
 pub(crate) fn decode_table(
     value: &[u8],
 ) -> Result<(TableEntry, BTreeMap<u64, ColumnExt>), CoreError> {
+    decode_table_with_metadata(value).map(|(entry, ext, _)| (entry, ext))
+}
+
+pub(crate) fn decode_table_with_metadata(
+    value: &[u8],
+) -> Result<(TableEntry, BTreeMap<u64, ColumnExt>, TableMetadata), CoreError> {
+    use bincode::Options;
+    let mut input = std::io::Cursor::new(value.get(1..).ok_or_else(|| corrupt("missing table version"))?);
+    let error = |error: Box<bincode::ErrorKind>| corrupt(&error.to_string());
     let (dto, birth): (TableEntryV2Dto, Option<u64>) = match value.first() {
-        Some(2) => (decode_version(2, value)?, None),
-        Some(3) => { let (dto, birth) = decode_version(3, value)?; (dto, Some(birth)) }
+        Some(2) => (super::super::codec().deserialize_from(&mut input).map_err(error)?, None),
+        Some(3) => {
+            let (dto, birth) = super::super::codec().deserialize_from(&mut input).map_err(error)?;
+            (dto, Some(birth))
+        }
         _ => return Err(corrupt("unsupported table version")),
+    };
+    let tail = &value[1 + input.position() as usize..];
+    let metadata = if tail.is_empty() { TableMetadata::default() } else {
+        let metadata: TableMetadata = super::super::decode(tail)?;
+        if metadata.is_empty() {
+            return Err(corrupt("empty table metadata trailer"));
+        }
+        metadata
     };
     if dto
             .columns_ext
@@ -672,7 +708,7 @@ pub(crate) fn decode_table(
                 .map_err(|_| corrupt("invalid catalog column typmod"))?;
         }
     }
-    Ok((entry, ext))
+    Ok((entry, ext, metadata))
 }
 // On a freshly decoded entry only UserTypeArray has both a textual
 // array storage type and a user-type binding. Ordinary UserType is

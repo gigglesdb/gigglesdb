@@ -98,6 +98,20 @@ pub struct IndexDef {
     pub columns: Vec<u64>,
     pub unique: bool,
 }
+
+#[derive(Debug, Clone)]
+pub struct GinIndexMetadata {
+    pub opclasses: Vec<u32>,
+    pub options: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GeneratedColumn {
+    pub kind: char,
+    pub expression: String,
+    pub pretty_expression: String,
+    pub references: Vec<u64>,
+}
 /// Persisted referenced key; index IDs identify secondary index descriptors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForeignKeyTarget { PrimaryKey, Index(u64) }
@@ -205,6 +219,7 @@ pub struct CatalogSnapshot {
     pub views: std::collections::BTreeMap<u64, String>,
     pub constraints: Vec<ConstraintDef>,
     pub column_defaults: std::collections::BTreeMap<u64, String>,
+    pub generated_columns: std::collections::BTreeMap<u64, GeneratedColumn>,
     pub column_identities: std::collections::BTreeMap<u64, char>,
     pub primary_names: std::collections::BTreeMap<u64, String>,
     /// Stable (table ID, column ID), with zero identifying a table comment.
@@ -232,6 +247,7 @@ pub struct CatalogSnapshot {
     pub table_schemas: std::collections::BTreeMap<u64, String>,
     pub indexes: Vec<IndexDef>,
     pub index_predicates: std::collections::BTreeMap<u64, String>,
+    pub gin_indexes: std::collections::BTreeMap<u64, GinIndexMetadata>,
     pub user: String,
     pub session_user: Option<String>,
     pub role_memberships: Vec<Vec<Value>>,
@@ -271,6 +287,8 @@ impl Default for CatalogSnapshot {
             generation: 0,
             views: Default::default(),
             constraints: Vec::new(), column_defaults: Default::default(),
+            gin_indexes: Default::default(),
+            generated_columns: Default::default(),
             column_identities: Default::default(), primary_names: Default::default(),
             comments: Default::default(),
             backend_pid: 0,

@@ -118,6 +118,7 @@ pub(super) fn route(
             for (index, value) in assignments.evaluate(table, old, params, cancel)? {
                 row.values[index] = value;
             }
+            state.materialize_generated(table, &mut row.values)?;
             row_check(table, &row.values)?;
             state.check_insert_candidate(table, &row.values)?;
             let new_key = pk(table, &row.values)?;

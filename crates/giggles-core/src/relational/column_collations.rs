@@ -286,6 +286,7 @@ pub(super) fn parse_create_as(p: &mut Parser, name: String, optional: bool) -> R
         user_types: vec![],
         collations: vec![],
         defaults: vec![],
+        generated: vec![],
         sequences: vec![],
         keys: vec![],
         constraints: vec![],

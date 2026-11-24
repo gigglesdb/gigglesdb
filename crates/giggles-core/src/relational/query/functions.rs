@@ -1516,6 +1516,9 @@ impl Scalar {
     ) -> R<BoundScalar> {
         let bound = resolve(c, tables.len())?;
         let column = &tables[bound.source].columns[bound.column];
+        if let Some(value) = super::generated::virtual_binding(tables, bound)? {
+            return collation::column(value, column.id);
+        }
         // Binding identity is in BoundColumn; use the SQL-visible name
         // when a derived input has a synthetic catalog name.
         let name = if column.name.starts_with('\0') { &c.name } else { &column.name };
@@ -2452,6 +2455,17 @@ impl Scalar {
     }
 }
 impl BoundScalar {
+    pub(super) fn null_extend(self, column: BoundColumn, definition: &ColumnDef) -> Self {
+        let key = Self {
+            ty: definition.data_type.clone(),
+            node: Node::Column(column, definition.name.clone()),
+        };
+        Self {
+            ty: self.ty.clone(),
+            node: Node::Case(vec![(super::BoundFilter::Null(key, true), self)], None),
+        }
+    }
+
     pub(super) fn result_oid(&self) -> u32 {
         fn json_in_branches<'a>(branches: impl Iterator<Item = &'a BoundScalar>) -> u32 {
             let mut json = false;

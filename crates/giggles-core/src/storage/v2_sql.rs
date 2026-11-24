@@ -897,7 +897,7 @@ impl SqlSession {
                                 }
                             }
                             let key_prelock = matches!(txn.services(), engine::txn::TxnServices::Local { .. })
-                                && bound.mutation_changes_key(table, &parts.indexes);
+                                && bound.mutation_changes_key(&binding, table, &parts.indexes);
                             if let Some(keys) = candidates {
                                 let physical = keys.iter().map(|key| {
                                     let mut physical = table.id.to_be_bytes().to_vec();
@@ -1966,6 +1966,7 @@ impl RowSink for SqlRows<'_> {
         table: &TableDef,
         index: &relational::secondary_index::Descriptor,
     ) -> Result<(), CoreError> {
+        let generated = |id| self.parts.ext.generated_columns.contains_key(&id);
         let entry = TableEntry {
             primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(),
             def: table.clone(),
@@ -2003,7 +2004,7 @@ impl RowSink for SqlRows<'_> {
             };
             lower = Bound::Excluded(last);
             let image = self.catalog.image().map_err(CoreError::Sql)?;
-            let entries = engine::indexes::build_entries(&image, table, &rows, index)?;
+            let entries = engine::indexes::build_entries(&image, table, &rows, index, &generated)?;
             // The outer transaction holds the DDL table locks. Chunk commits
             // publish only entries under a fresh, durably reserved ID; queries
             // cannot discover it until the outer catalog commit succeeds.
@@ -2017,7 +2018,7 @@ impl RowSink for SqlRows<'_> {
                 }).map_err(crate::task::limits::lock_error)?;
                 if target.current.is_some() {
                     return Err(engine::indexes::occupancy_duplicate(
-                        table, &rows, std::slice::from_ref(index), &key, &pk, true,
+                        table, &rows, std::slice::from_ref(index), &key, &pk, true, &generated,
                     ));
                 }
                 chunk.put(Keyspace::Index, key, pk)?;
@@ -2180,6 +2181,7 @@ impl RowSink for SqlRows<'_> {
             descriptors,
             crate::task::limits::lock_deadline(),
             &|| crate::cancellation::check().is_err(),
+            &|id| self.parts.ext.generated_columns.contains_key(&id),
         )?;
         if let Some(new) = after_table
             && (new.primary_key != table.primary_key || new.columns.len() != table.columns.len())
@@ -2362,7 +2364,8 @@ impl RowSink for SqlRows<'_> {
                 Ok(())
             }))?;
         }
-        engine::indexes::check_occupancy(self.txn, &image, table, before, after, &self.parts.indexes)
+        engine::indexes::check_occupancy(self.txn, &image, table, before, after, &self.parts.indexes,
+            &|id| self.parts.ext.generated_columns.contains_key(&id))
     }
     fn apply(
         &mut self,
@@ -2406,7 +2409,11 @@ impl RowSink for SqlRows<'_> {
             }).map_err(crate::task::limits::lock_error)?;
             match (old, target.current) {
                 (None, Some(_)) => {
-                    let error = if let Some(row) = new.filter(|_| !self.prepared.is_ddl() || relational::collation_keys::primary_has_uuid(table)) {
+                    let generated_key = table.primary_key.iter().any(|i|
+                        self.parts.ext.generated_columns.contains_key(&table.columns[*i].id));
+                    let error = if let Some(row) = new.filter(|_| {
+                        !self.prepared.is_ddl() || relational::collation_keys::primary_has_uuid(table) || generated_key
+                    }) {
                         self.catalog.image().map_err(CoreError::Sql)?
                             .primary_duplicate_values(table, &row.values)
                     } else {

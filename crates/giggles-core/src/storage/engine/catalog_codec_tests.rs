@@ -50,6 +50,29 @@ const FK: &str = "010000000000000004010000000000000002666b0000000100000000000000
 const SEQUENCE: &str = "0100000000000000017300000003000000000000000100000000000000010000000000000001000000000000006300000000000000040001000000000000000100000000000000020100000000000000000000000000000007";
 const COUNTER: &str = "00000000000000080100000000000000080000000000000003";
 #[test]
+fn generated_columns_v2_table_trailer() {
+    let entry = table();
+    let columns = BTreeMap::new();
+    let metadata = TableMetadata {
+        generated: BTreeMap::from([(2, crate::relational::generated_columns::GeneratedColumn {
+            sql: "1".into(),
+            stored: true,
+            not_null: false,
+            references: vec![],
+        })]),
+        ..TableMetadata::default()
+    };
+    let bytes = encode_table_with_metadata(&entry, &columns, &BTreeMap::new(), &metadata).unwrap();
+    assert!(bytes.starts_with(&hex(TABLE)));
+    assert_corrupt(decode_version::<TableEntryV2Dto>(2, &bytes));
+    assert_eq!(decode_table_with_metadata(&bytes).unwrap(), (entry, columns, metadata));
+    assert_eq!(
+        super::super::content_check::required_bits_for_catalog_value(&table_key(1), &bytes).unwrap(),
+        super::super::meta::GENERATED_COLUMNS,
+    );
+}
+
+#[test]
 fn frozen_table_goldens() {
     let mut entry = table();
     let mut ext = BTreeMap::new();

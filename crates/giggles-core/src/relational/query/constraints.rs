@@ -276,24 +276,32 @@ pub(super) fn table_query(table: &TableDef, key: &str, filter: Filter) -> Query 
     }
 }
 pub(super) fn immutable(filter: &BoundFilter) -> bool {
+    immutable_for(filter, false)
+}
+pub(super) fn immutable_for(filter: &BoundFilter, generation: bool) -> bool {
+    let scalar = |value: &BoundScalar| if generation {
+        value.generation_immutable()
+    } else {
+        value.constraint_immutable()
+    };
     match filter {
         BoundFilter::InSubquery { .. } | BoundFilter::Exists { .. } => false,
-        BoundFilter::Scalar(s) | BoundFilter::Null(s, _) => s.constraint_immutable(),
-        BoundFilter::Compare(a, _, b) => a.constraint_immutable() && b.constraint_immutable(),
+        BoundFilter::Scalar(s) | BoundFilter::Null(s, _) => scalar(s),
+        BoundFilter::Compare(a, _, b) => scalar(a) && scalar(b),
         BoundFilter::Like {
             value,
             pattern,
             escape,
             ..
         } => {
-            value.constraint_immutable()
-                && pattern.constraint_immutable()
+            scalar(value)
+                && scalar(pattern)
                 && escape
                     .as_deref()
-                    .is_none_or(BoundScalar::constraint_immutable)
+                    .is_none_or(scalar)
         }
-        BoundFilter::Not(a) | BoundFilter::Is(a, _, _) => immutable(a),
-        BoundFilter::Logic(a, _, b) => immutable(a) && immutable(b),
+        BoundFilter::Not(a) | BoundFilter::Is(a, _, _) => immutable_for(a, generation),
+        BoundFilter::Logic(a, _, b) => immutable_for(a, generation) && immutable_for(b, generation),
     }
 }
 fn cast_subset(filter: &Filter, table: &TableDef) -> R<()> {

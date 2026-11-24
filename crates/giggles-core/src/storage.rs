@@ -442,11 +442,14 @@ fn records(s: &State) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
         out.insert(key(6, &[task.0]), encode(account)?);
     }
     if s.sql.has_secondary_indexes_engine() {
-        let (base, payload) = secondary_index::persist(&s.sql)?;
+        let (mut base, payload) = secondary_index::persist(&s.sql)?;
+        feature_envelope::append_relational_metadata(&mut base, &s.sql)?;
         out.insert(vec![5], base);
         out.insert(vec![8], payload);
     } else {
-        out.insert(vec![5], encode(&s.sql)?);
+        let mut base = encode(&s.sql)?;
+        feature_envelope::append_relational_metadata(&mut base, &s.sql)?;
+        out.insert(vec![5], base);
     }
     out.insert(
         vec![0],
@@ -574,7 +577,7 @@ fn from_records_mode(
         }
     }
     match records.get(&vec![5]) {
-        Some(v) if base_version >= 2 => s.sql = feature_envelope::decode_relational(v)?,
+        Some(v) if base_version >= 2 => s.sql = feature_envelope::decode_relational_with_bits(v, bits.unwrap_or_default())?,
         None if base_version == 1 => {}
         _ => {
             return Err(CoreError::Corrupt(
@@ -5890,7 +5893,11 @@ impl SqlSession {
         // Read the legacy SQL namespace and roles from the same redb transaction.
         let records = read.open_table(RECORDS).map_err(io)?;
         let Some(payload) = records.get(&[5][..]).map_err(io)? else { return Ok(None) };
-        let sql = feature_envelope::decode_relational(payload.value())?;
+        let bits = records.get(&[10][..]).map_err(io)?
+            .map(|record| record.value().try_into().map(u64::from_be_bytes))
+            .transpose().map_err(|_| CoreError::Corrupt("malformed feature record".into()))?
+            .unwrap_or_default();
+        let sql = feature_envelope::decode_relational_with_bits(payload.value(), bits)?;
         if self.staged.is_some() {
             // A preexisting table may have been renamed in this session.
             let Some((key, _)) = sql.tables.iter().find(|(_, table)| table.id == id) else { return Ok(None) };

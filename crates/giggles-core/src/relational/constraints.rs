@@ -331,6 +331,10 @@ pub(super) fn install_unique(
     cancel: &mut impl FnMut() -> bool,
 ) -> R<()> {
     let ids = named_ids(table, columns)?;
+    if ids.iter().any(|id| state.generated_column(*id).is_some_and(|generation| !generation.stored)) {
+        user_types::view_replace_error("unique constraints on virtual generated columns are not supported".into());
+        return Err(SqlError::Unsupported);
+    }
     if let Some(explicit) = explicit {
         ident::ident(explicit)?;
     }
@@ -436,6 +440,23 @@ pub(super) fn install(
             }
             let ids = named_ids(table, columns)?;
             let ref_ids = named_ids(parent, &refs)?;
+            if ids.iter().chain(&ref_ids).any(|id| state.generated_column(*id).is_some_and(|generation| !generation.stored)) {
+                user_types::view_replace_error("foreign key constraints on virtual generated columns are not supported".into());
+                return Err(SqlError::Unsupported);
+            }
+            if ids.iter().any(|id| state.generated_column(*id).is_some()) {
+                let event = if matches!(on_update, Action::Cascade | Action::SetNull | Action::SetDefault) {
+                    Some("UPDATE")
+                } else if matches!(on_delete, Action::SetNull | Action::SetDefault) {
+                    Some("DELETE")
+                } else {
+                    None
+                };
+                if let Some(event) = event {
+                    user_types::view_replace_error(format!("invalid ON {event} action for foreign key constraint containing generated column"));
+                    return Err(SqlError::Syntax);
+                }
+            }
             unique(&ids)?;
             unique(&ref_ids).map_err(|_| SqlError::InvalidForeignKey)?;
             let target = referenced_key(state, parent, &ref_ids, references.is_empty())?;
@@ -516,7 +537,7 @@ pub(super) fn install(
         }
     );
     if !skip {
-        validate_kind(state, table, &kind, None, None, cancel)?;
+        validate_kind(state, table, &name, &kind, None, None, cancel)?;
     }
     let id = allocate(&mut state.next_id)?;
     std::sync::Arc::make_mut(&mut state.ext)
@@ -529,6 +550,7 @@ pub(super) fn install(
 fn validate_kind(
     state: &Relational,
     table: &TableDef,
+    name: &str,
     kind: &ConstraintKind,
     keys: Option<&BTreeSet<Vec<u8>>>,
     diagnostic: Option<(&str, &BTreeSet<Vec<u8>>)>,
@@ -542,7 +564,7 @@ fn validate_kind(
             return Err(SqlError::Aborted);
         }
         match kind {
-            ConstraintKind::Check { expr, .. } => query::constraint_check(state, table, expr, row)?,
+            ConstraintKind::Check { expr, .. } => check_row(state, table, name, expr, row)?,
             ConstraintKind::ForeignKey { .. } => {
                 let name = diagnostic.filter(|(_, changed)| changed.contains(key)).map(|(name, _)| name);
                 fk_row(state, table, row, kind, name)?;
@@ -551,6 +573,15 @@ fn validate_kind(
         }
     }
     Ok(())
+}
+fn check_row(state: &Relational, table: &TableDef, name: &str, expr: &str, row: &SqlRow) -> R<()> {
+    query::constraint_check(state, table, expr, row).inspect_err(|error| {
+        if *error == SqlError::CheckViolation && state.has_generated_columns(table) {
+            user_types::view_replace_error(format!("new row for relation \"{}\" violates check constraint \"{name}\"", table.name));
+            user_types::sql_error_detail(logical_types::failing_row_detail(table, &row.values));
+            user_types::sql_error_names(state, table, None, Some(name));
+        }
+    })
 }
 pub(super) fn validate_named(
     state: &mut Relational,
@@ -565,7 +596,7 @@ pub(super) fn validate_named(
         .and_then(|cs| cs.iter().find(|c| c.name == name))
         .ok_or(SqlError::UndefinedObject)?
         .clone();
-    validate_kind(state, table, &constraint.kind, None, None, cancel)?;
+    validate_kind(state, table, &constraint.name, &constraint.kind, None, None, cancel)?;
     let constraint = std::sync::Arc::make_mut(&mut state.ext)
         .constraints.get_mut(&table.id)
         .and_then(|cs| cs.iter_mut().find(|c| c.id == constraint.id))
@@ -882,6 +913,7 @@ pub(super) fn enforce_with_rows<'a>(
                         validate_kind(
                             state,
                             table_by_id(state, *table_id)?,
+                            &prior.name,
                             &prior.kind,
                             Some(keys),
                             None,
@@ -938,6 +970,7 @@ pub(super) fn enforce_with_rows<'a>(
                                 _ => unreachable!(),
                             };
                         }
+                        state.materialize_generated(&child, &mut row.values)?;
                         row_check(&child, &row.values)?;
                         row.version = allocate(&mut state.next_version)?;
                         Some(row)
@@ -1046,7 +1079,7 @@ pub(super) fn enforce_with_rows<'a>(
                 if let Some(parent) = parent_checks.get(&(constraint.id, *table_id)) {
                     keys.extend(parent.iter().cloned());
                 }
-                validate_kind(state, table, &constraint.kind, Some(&keys),
+                validate_kind(state, table, &constraint.name, &constraint.kind, Some(&keys),
                     Some((&constraint.name, &changed)), cancel)?;
             }
         }
@@ -1062,7 +1095,7 @@ impl Relational {
             };
             for constraint in constraints {
                 if let ConstraintKind::Check { expr, .. } = &constraint.kind {
-                    query::constraint_check(self, table, expr, &row)?;
+                    check_row(self, table, &constraint.name, expr, &row)?;
                 }
             }
         }
@@ -1083,6 +1116,7 @@ impl Relational {
                 validate_kind(
                     self,
                     table_by_id(self, *table_id)?,
+                    &c.name,
                     &c.kind,
                     Some(keys),
                     None,
@@ -1149,6 +1183,7 @@ impl Relational {
                     validate_kind(
                         self,
                         table_by_id(self, *table_id)?,
+                        &c.name,
                         &c.kind,
                         Some(keys),
                         None,

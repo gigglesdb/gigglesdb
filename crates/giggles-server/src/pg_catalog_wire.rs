@@ -410,6 +410,17 @@ fn snapshot_owned(
             if !granted.is_empty() {schema_privileges.insert((role.oid,name.to_owned()),[granted.contains(&P::Create),granted.contains(&P::Usage)]);}
         }
     }
+    let (gin_defs, gin_indexes): (Vec<_>, std::collections::BTreeMap<_, _>) = presentation.gin_indexes
+        .into_iter()
+        .filter(|(_, index)| visible.contains(&index.table) && index.columns.iter().all(|id| columns.contains(id)))
+        .map(|(id, index)| (
+            giggles_pg_catalog::IndexDef {
+                id, table: index.table, name: index.name.rsplit('\0').next().unwrap_or_default().into(),
+                columns: index.columns, unique: false,
+            },
+            (id, giggles_pg_catalog::GinIndexMetadata { opclasses: index.opclasses, options: index.options }),
+        ))
+        .unzip();
     let snapshot = giggles_pg_catalog::CatalogSnapshot {
         schema_privileges,
         sequences,
@@ -418,6 +429,14 @@ fn snapshot_owned(
         views: presentation.views.into_iter().map(|(id, v)| (id, v.definition)).collect(),
         comments: presentation.comments,
         column_defaults: presentation.defaults, column_identities: presentation.identities,
+        generated_columns: presentation.generated_columns.iter().filter(|(id, _)| columns.contains(id))
+            .map(|(id, generation)| (*id, giggles_pg_catalog::GeneratedColumn {
+                kind: if generation.stored { 's' } else { 'v' },
+                expression: generation.sql.clone(),
+                pretty_expression: generation.pretty_expression(),
+                references: generation.references.clone(),
+            })).collect(),
+        gin_indexes,
         primary_names: presentation.primary_names,
         constraints: presentation.constraints.into_iter().filter(|c| visible.contains(&c.table)
             && (c.foreign_table == 0 || visible.contains(&c.foreign_table)))
@@ -502,6 +521,7 @@ fn snapshot_owned(
                 columns: index.columns,
                 unique: index.unique,
             })
+            .chain(gin_defs)
             .collect(),
         tables: tables
             .into_iter()
@@ -515,7 +535,7 @@ fn snapshot_owned(
                     .map(|column| giggles_pg_catalog::ColumnDef {
                         id: column.id,
                         name: column.name,
-                        not_null: column.not_null,
+                        not_null: column.not_null || presentation.generated_columns.get(&column.id).is_some_and(|generation| generation.not_null),
                         data_type: match column.data_type {
                             C::Boolean => P::Boolean,
                             C::SmallInt => P::SmallInt,
@@ -1260,6 +1280,11 @@ fn encode_with_settings(
                     match v {
                         3 => b"heap_tableam_handler".to_vec(),
                         330 => b"bthandler".to_vec(),
+                        331 => b"hashhandler".to_vec(),
+                        332 => b"gisthandler".to_vec(),
+                        333 => b"ginhandler".to_vec(),
+                        334 => b"spghandler".to_vec(),
+                        335 => b"brinhandler".to_vec(),
                         3717 => b"prsd_start".to_vec(),
                         3718 => b"prsd_nexttoken".to_vec(),
                         3719 => b"prsd_end".to_vec(),
@@ -1275,6 +1300,9 @@ fn encode_with_settings(
                     v.to_string().into_bytes()
                 }
             } else {
+                if ty == PgType::Regproc && !matches!(v, 3 | 330..=335 | 3717..=3721 | 3725 | 3726 | 13232 | 13233) {
+                    return Err("0A000");
+                }
                 v.to_be_bytes().to_vec()
             }
         }

@@ -1565,8 +1565,27 @@ fn build_with_budget(
             ],
         );
     }
-    add!("pg_am", vec![I(2), s("heap"), I(3), s("t"), N]);
-    add!("pg_am", vec![I(403), s("btree"), I(330), s("i"), N]);
+    for (oid, name, handler, kind) in [
+        (2, "heap", 3, "t"),
+        (403, "btree", 330, "i"),
+        (405, "hash", 331, "i"),
+        (783, "gist", 332, "i"),
+        (2742, "gin", 333, "i"),
+        (3580, "brin", 335, "i"),
+        (4000, "spgist", 334, "i"),
+    ] {
+        add!("pg_am", vec![I(oid), s(name), I(handler), s(kind), N]);
+    }
+    for (oid, name, method, family, input, default, key) in [
+        (1978, "int4_ops", 403, 1976, 23, true, 0),
+        (10064, "array_ops", 2742, 2745, 2277, true, 2283),
+        (10071, "tsvector_ops", 403, 3626, 3614, true, 0),
+        (10073, "tsvector_ops", 2742, 3659, 3614, true, 25),
+        (10090, "jsonb_ops", 2742, 4036, 3802, true, 25),
+        (10091, "jsonb_path_ops", 2742, 4037, 3802, false, 23),
+    ] {
+        add!("pg_opclass", vec![I(oid), s(name), I(11), I(method), B(default), I(10), I(family), I(input), I(key), N]);
+    }
     // Snapshot flags and predefined identities are presentation metadata, not
     // authentication, privileges, memberships, or enforced role policies.
     let predefined = PREDEFINED_ROLES
@@ -1953,6 +1972,7 @@ fn build_with_budget(
         }
         for (i, c) in t.columns.iter().enumerate() {
             let (ty, _, len, _) = scalar(c.data_type);
+            let generated = snapshot.generated_columns.get(&c.id);
             add!(
                 "pg_attribute",
                 vec![
@@ -1967,8 +1987,8 @@ fn build_with_budget(
                     I(len),
                     B(false),
                     s(&snapshot.column_identities.get(&c.id).map_or(String::new(), char::to_string)),
-                    s(""),
-                    B(snapshot.column_defaults.contains_key(&c.id) && !snapshot.column_identities.contains_key(&c.id)),
+                    s(&generated.map_or(String::new(), |column| column.kind.to_string())),
+                    B(generated.is_some() || snapshot.column_defaults.contains_key(&c.id) && !snapshot.column_identities.contains_key(&c.id)),
                     I(0),
                     N,
                     I(i64::from(view.is_none() && c.data_type == ScalarType::UuidArray)),
@@ -2189,16 +2209,25 @@ fn build_with_budget(
     for row in rows_mut(&mut all, "pg_index") {
         let Some(&table) = lookup.relations.get(&row_oid(&row[1])) else { continue };
         let index = lookup.index_relations.get(&row_oid(&row[0]));
+        let gin = index.and_then(|index| snapshot.gin_indexes.get(&index.id));
         let keys = index.map(|i| i.columns.clone())
             .unwrap_or_else(|| table.primary_key.iter().map(|i| table.columns[*i].id).collect());
         let overrides = index.and_then(|i| snapshot.collation_oids.get(&i.id));
         budget.rewrite(row, |row| {
+            if let Some(gin) = gin {
+                row[12] = Value::Array(gin.opclasses.iter().map(|oid| I(i64::from(*oid))).collect());
+                return;
+            }
             row[11] = Value::Array(keys.iter().enumerate().map(|(offset, id)| {
                 let column = lookup.column(table, *id).unwrap();
                 let collation = overrides.and_then(|v| v.get(offset)).copied()
                     .filter(|oid| *oid != 0)
                     .unwrap_or_else(|| column_collation(snapshot, &lookup, column));
                 I(i64::from(collation))
+            }).collect());
+            row[12] = Value::Array(keys.iter().map(|id| {
+                let column = lookup.column(table, *id).unwrap();
+                I(if column.data_type == ScalarType::Integer { 1978 } else { 0 })
             }).collect());
         })?;
     }
@@ -2211,6 +2240,14 @@ fn build_with_budget(
         budget.rewrite(row, |row| {
             if row[2] == I(2200) && row[3] != s("v") {
                 row[10] = I(if row[3] == s("i") { 403 } else { 2 });
+            }
+            if let Some(gin) = lookup.index_relations.get(&row_oid(&row[0]))
+                .and_then(|index| snapshot.gin_indexes.get(&index.id))
+            {
+                row[10] = I(2742);
+                if !gin.options.is_empty() {
+                    row[12] = Value::Array(gin.options.iter().map(|(name, value)| s(&format!("{name}={value}"))).collect());
+                }
             }
             row.extend([
                 I(0),
@@ -2798,6 +2835,25 @@ fn index_definition(
     keys: &[usize],
 ) -> String {
     let unique = index.is_none_or(|index| index.unique);
+    if let Some(gin) = index.and_then(|index| snapshot.gin_indexes.get(&index.id)) {
+        let keys = keys.iter().zip(&gin.opclasses).map(|(offset, oid)| {
+            let name = quote_identifier(&t.columns[*offset].name);
+            if *oid == 10091 { format!("{name} jsonb_path_ops") } else { name }
+        }).collect::<Vec<_>>().join(", ");
+        let options = if gin.options.is_empty() { String::new() } else {
+            let options = gin.options.iter().map(|(name, value)| {
+                let value = if quote_identifier(value) == *value {
+                    value.clone()
+                } else {
+                    format!("'{}'", value.replace('\'', "''"))
+                };
+                format!("{name}={value}")
+            }).collect::<Vec<_>>().join(", ");
+            format!(" WITH ({options})")
+        };
+        return format!("CREATE INDEX {} ON {}.{} USING gin ({keys}){options}",
+            quote_identifier(name), quote_identifier(schema), quote_identifier(&t.name));
+    }
     let mut definition = format!(
         "CREATE {}INDEX {} ON {}.{} USING btree ({})",
         if unique { "UNIQUE " } else { "" },

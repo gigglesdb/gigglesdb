@@ -75,8 +75,14 @@ pub(crate) fn required_bits_for_catalog_value(
     }
     match catalog_codec::classify_catalog_key(key).map_err(corrupt)? {
         CatalogKind::Table => {
-            let (entry, ext) = catalog_codec::decode_table(value).map_err(corrupt)?;
+            let (entry, ext, metadata) = catalog_codec::decode_table_with_metadata(value).map_err(corrupt)?;
             let mut required = if ext.is_empty() { 0 } else { 64 };
+            if !metadata.gin.is_empty() {
+                required |= super::meta::GIN_INDEXES;
+            }
+            if !metadata.generated.is_empty() {
+                required |= super::meta::GENERATED_COLUMNS;
+            }
             if entry.primary_index_birth.is_some() {
                 required |= 64 | super::meta::KEY_DEPENDENCY_IDENTITY;
             }

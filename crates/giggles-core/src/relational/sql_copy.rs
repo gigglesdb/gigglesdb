@@ -658,7 +658,7 @@ impl Copy {
     pub(crate) fn columns_in(&self, state: &Relational) -> R<Vec<ColumnDef>> {
         let table = state.tables.get(&self.table).ok_or(SqlError::UnknownTable)?;
         if self.columns.is_empty() {
-            return Ok(table.logical_columns().cloned().collect());
+            return Ok(table.logical_columns().filter(|column| state.generated_column(column.id).is_none()).cloned().collect());
         }
         if self.columns.len() > MAX_COLUMNS {
             return Err(SqlError::Limit);
@@ -669,6 +669,14 @@ impl Copy {
             .map(|name| col(table, name))
             .collect::<R<Vec<_>>>()?;
         unique(&indexes)?;
+        for &offset in &indexes {
+            let column = &table.columns[offset];
+            if state.generated_column(column.id).is_some() {
+                user_types::view_replace_error(format!("column \"{}\" is a generated column", column.name));
+                user_types::sql_error_detail("Generated columns cannot be used in COPY.".into());
+                return Err(SqlError::InvalidColumnReference);
+            }
+        }
         Ok(indexes
             .into_iter()
             .map(|i| table.columns[i].clone())
@@ -688,9 +696,9 @@ impl Copy {
         }
         let columns = copy.columns_in(state)?;
         let table = &state.tables[&copy.table];
+        let names = columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
         copy.options.validate_columns(split_key(&copy.table).1,
-            &table.logical_columns().map(|c| c.name.clone()).collect::<Vec<_>>(),
-            &columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())?;
+            &table.logical_columns().map(|c| c.name.clone()).collect::<Vec<_>>(), &names)?;
         let width = columns.len();
         let types = columns.into_iter().map(|c| c.data_type).collect();
         Ok(Prepared {
@@ -719,7 +727,7 @@ impl Copy {
                     if copy.target_is_view { split_key(&copy.table).0 } else { state.table_schema(table.id) },
                     split_key(&copy.table).1
                 ),
-                self.columns.clone(),
+                names,
                 types,
                 vec![vec![Value::Null; width]],
             )))),

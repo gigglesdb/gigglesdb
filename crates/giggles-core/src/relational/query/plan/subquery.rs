@@ -231,7 +231,10 @@ pub(super) fn rewrite(
 
 // The mutable walkers stay in the planner. Scalar remains the authority for
 // binding, coercion and evaluation of every ordinary expression.
-pub(super) fn map_scalar(s: &mut Scalar, f: &mut impl FnMut(&mut Scalar) -> R<()>) -> R<()> {
+pub(in crate::relational::query) fn map_scalar(
+    s: &mut Scalar,
+    f: &mut impl FnMut(&mut Scalar) -> R<()>,
+) -> R<()> {
     match s {
         Scalar::Predicate(p) => map_filter(p, f)?,
         Scalar::Case(c) => {

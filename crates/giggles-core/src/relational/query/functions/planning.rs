@@ -519,14 +519,21 @@ impl BoundScalar {
 impl BoundScalar {
     /// CHECK admits only routines and casts marked immutable by this binder's metadata.
     pub(in super::super) fn constraint_immutable(&self) -> bool {
+        self.immutable_for(false)
+    }
+    pub(in crate::relational::query) fn generation_immutable(&self) -> bool {
+        self.immutable_for(true)
+    }
+    pub(in crate::relational::query) fn immutable_for(&self, generation: bool) -> bool {
+        let immutable = |value: &Self| value.immutable_for(generation);
         match &self.node {
-            Node::Predicate(filter) => super::super::constraints::immutable(filter),
+            Node::Predicate(filter) => super::super::constraints::immutable_for(filter, generation),
             Node::Case(arms, otherwise) => {
                 arms.iter().all(|(condition, result)| {
-                    super::super::constraints::immutable(condition) && result.constraint_immutable()
+                    super::super::constraints::immutable_for(condition, generation) && immutable(result)
                 }) && otherwise
                     .as_ref()
-                    .is_none_or(|result| result.constraint_immutable())
+                    .is_none_or(|result| immutable(result))
             }
             Node::EnumSort(..) | Node::Literal(_) | Node::Column(..) => true,
             Node::Domain(..)
@@ -540,21 +547,23 @@ impl BoundScalar {
             // PG18: comparisons through timestamptz or timetz depend on TimeZone (STABLE);
             // date/timestamp and time/interval pairs are immutable.
             Node::CrossCompare(_, a, b, _) => {
-                a.constraint_immutable()
-                    && b.constraint_immutable()
+                immutable(a)
+                    && immutable(b)
                     && ![&a.ty, &b.ty]
                         .iter()
                         .any(|ty| matches!(ty, DataType::TimestampTz | DataType::TimeTz))
             }
-            Node::TypmodCast(value, _) => value.constraint_immutable(),
+            Node::TypmodCast(value, _) => immutable(value),
             Node::Cast(value) => {
-                value.constraint_immutable() && immutable_cast(&value.ty, &self.ty)
+                immutable(value)
+                    && (immutable_cast(&value.ty, &self.ty)
+                        || generation && integer(&value.ty) && self.ty == DataType::Text)
             }
             Node::Call(name, args) if uuid_ossp::known(name) || name == "coalesce" || greatest::known_name(name) => {
-                args.iter().all(Self::constraint_immutable)
+                args.iter().all(immutable)
             }
             Node::Call(name, args) => {
-                args.iter().all(Self::constraint_immutable)
+                args.iter().all(immutable)
                     && arithmetic::internal_name(name)
                         .then_some((true, true))
                         .or_else(|| {

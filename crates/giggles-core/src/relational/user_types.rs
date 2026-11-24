@@ -17,6 +17,13 @@ pub enum SqlErrorDetail {
     ForeignKey { key: DuplicateKeyDetail, redacted: String },
 }
 
+pub struct SqlErrorNames {
+    pub schema: String,
+    pub table: String,
+    pub column: Option<String>,
+    pub constraint: Option<String>,
+}
+
 type SqlNotice = (String, Option<String>, Option<&'static str>);
 type SqlErrorMessage = (String, Option<String>);
 thread_local! {
@@ -24,6 +31,8 @@ thread_local! {
     static SQL_ERROR_HINT: std::cell::RefCell<Option<std::borrow::Cow<'static, str>>> = const { std::cell::RefCell::new(None) };
     static SQL_ERROR_DETAIL: std::cell::RefCell<Option<SqlErrorDetail>> = const { std::cell::RefCell::new(None) };
     static SQL_ERROR_MESSAGE: std::cell::RefCell<Option<SqlErrorMessage>> = const { std::cell::RefCell::new(None) };
+    static SQL_ERROR_POSITION: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static SQL_ERROR_NAMES: std::cell::RefCell<Option<SqlErrorNames>> = const { std::cell::RefCell::new(None) };
 }
 /// Consume the diagnostic immediately after a synchronous SQL call on this thread.
 /// SQLSTATE remains the stable, field-less SqlError contract.
@@ -94,6 +103,24 @@ pub fn take_sql_error_message_with_context() -> (Option<String>, Option<String>)
         })
     })
 }
+pub fn take_sql_error_position() -> Option<usize> {
+    SQL_ERROR_POSITION.with(std::cell::Cell::take)
+}
+pub(super) fn sql_error_position(position: usize) {
+    SQL_ERROR_POSITION.with(|value| value.set(Some(position)));
+}
+pub fn take_sql_error_names() -> Option<SqlErrorNames> {
+    SQL_ERROR_NAMES.with(|value| value.borrow_mut().take())
+}
+pub(super) fn sql_error_names(state: &Relational, table: &TableDef, column: Option<&str>, constraint: Option<&str>) {
+    let names = SqlErrorNames {
+        schema: state.table_schema(table.id).into(),
+        table: table.name.clone(),
+        column: column.map(str::to_owned),
+        constraint: constraint.map(str::to_owned),
+    };
+    SQL_ERROR_NAMES.with(|value| *value.borrow_mut() = Some(names));
+}
 /// Keep intentionally swallowed failures from replacing the caller's diagnostic.
 pub(super) fn probe_preserving_error_message<T, E>(probe: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
     let saved = SQL_ERROR_MESSAGE.with(|message| message.borrow().clone());
@@ -141,9 +168,11 @@ pub(super) fn truncate_reference_error() {
 }
 pub(super) fn clear_sql_error_message() {
     take_sql_notices();
-    take_sql_error_hint();
+    take_sql_diagnostic_hint();
     take_sql_diagnostic_detail();
     take_sql_error_message();
+    take_sql_error_position();
+    take_sql_error_names();
 }
 
 pub(super) const USER_TYPE_OID_BASE: u32 = 65536;

@@ -8,7 +8,8 @@ fn moves_primary_key(state: &Relational, prepared: &Prepared) -> bool {
         Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
         _ => return false,
     };
-    table.primary_key.iter().any(|i| names.contains(&&table.columns[*i].name))
+    table.primary_key.iter().any(|i| state.column_written_by(table, &table.columns[*i],
+        |name| names.iter().any(|written| *written == name)))
 }
 
 pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
@@ -26,7 +27,8 @@ pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
     if table
         .primary_key
         .iter()
-        .any(|i| sets.contains(&&table.columns[*i].name))
+        .any(|i| state.column_written_by(table, &table.columns[*i],
+            |name| sets.iter().any(|written| *written == name)))
     {
         return false;
     }
@@ -36,7 +38,8 @@ pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
         constraints.iter().any(|constraint| {
             let ConstraintKind::ForeignKey { columns, ref_table, ref_columns, .. } = &constraint.kind else { return false; };
             let changed = |ids: &[u64]| ids.iter().any(|id| table.columns.iter()
-                .any(|column| column.id == *id && sets.contains(&&column.name)));
+                .any(|column| column.id == *id && state.column_written_by(table, column,
+                    |name| sets.iter().any(|written| *written == name))));
             let deleting = matches!(prepared.statement.get(), Statement::Delete { .. });
             (*owner == table.id && !deleting && *ref_table == table.id && changed(columns))
                 || (*ref_table == table.id && (deleting || changed(ref_columns)))
@@ -66,7 +69,8 @@ fn point_keys(state: &Relational, prepared: &Prepared, params: &[Value],
             _ => Vec::new(),
         };
         if unique.iter().any(|d| d.columns.iter().any(|id| table.columns.iter()
-            .any(|c| c.id == *id && changed.contains(&&c.name)))) {
+            .any(|c| c.id == *id && state.column_written_by(table, c,
+                |name| changed.iter().any(|written| *written == name))))) {
             point_keys = None;
         }
     }
@@ -119,7 +123,7 @@ pub(crate) struct UpsertLockRows {
 
 impl Prepared {
     /// Conservative prelock decision before the new row image is available.
-    pub(crate) fn mutation_changes_key(&self, table: &TableDef,
+    pub(crate) fn mutation_changes_key(&self, state: &Relational, table: &TableDef,
         indexes: &[secondary_index::Descriptor]) -> bool {
         let names = match self.statement.get() {
             Statement::Delete { .. } => return true,
@@ -127,7 +131,8 @@ impl Prepared {
             Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
             _ => return false,
         };
-        table.columns.iter().enumerate().any(|(i, c)| names.contains(&&c.name)
+        table.columns.iter().enumerate().any(|(i, c)| state.column_written_by(table, c,
+            |name| names.iter().any(|written| *written == name))
             && (table.primary_key.contains(&i) || indexes.iter().any(|d|
                 d.table == table.id && d.unique && d.columns.contains(&c.id))))
     }
@@ -139,6 +144,7 @@ impl Prepared {
         let plan = self.upsert_lock_plan(state, indexes)?;
         let Statement::InsertMulti(insert) = self.statement.get() else { return None; };
         let table = state.tables.get(&insert.table)?;
+        if state.has_generated_columns(table) { return None; }
         let descriptor = match plan.arbiter {
             Arbiter::PrimaryKey => None,
             Arbiter::Unique(id) => Some(indexes.iter().find(|d| d.id == id)?.clone()),
@@ -730,6 +736,7 @@ impl ActionWork {
                                     _ => unreachable!(),
                                 };
                             }
+                            state.materialize_generated(&child, &mut row.values).map_err(CoreError::Sql)?;
                             row_check(&child, &row.values).map_err(CoreError::Sql)?;
                             state.check_insert_candidate(&child, &row.values).map_err(CoreError::Sql)?;
                             row.version = allocate(&mut state.next_version).map_err(CoreError::Sql)?;

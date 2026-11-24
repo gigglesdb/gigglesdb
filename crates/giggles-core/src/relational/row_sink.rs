@@ -423,10 +423,12 @@ impl Relational {
         let streamed_ddl = match prepared.statement.get() {
             Statement::DropIndex(_) | Statement::DropTable { .. } => true,
             Statement::AlterTable(alter) => alter.actions.iter().all(|action| {
+                if let alter_table::Action::Add(_, _, _, _, _, _, _, _, constraints) = action {
+                    return constraints.is_empty();
+                }
                 matches!(
                     action,
                     alter_table::Action::Type(..)
-                        | alter_table::Action::Add(..)
                         | alter_table::Action::NotNull(..)
                         | alter_table::Action::Constraint(constraints::Definition::Check { .. })
                 )

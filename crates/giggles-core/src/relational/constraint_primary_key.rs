@@ -78,6 +78,7 @@ pub(super) fn add(
     for name in columns {
         column_ident(name)?;
         let offset = col(table, name)?;
+        generated_columns::check_virtual_primary(state, &table.columns[offset])?;
         if offset == hidden {
             return Err(SqlError::Reserved);
         }

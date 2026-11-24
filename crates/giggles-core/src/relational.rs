@@ -47,8 +47,8 @@ pub(crate) fn conflict_duplicate_target() -> SqlError {
 pub use extensions::{InstalledExtension, BuiltinExtension, ExtensionFunction, BUILTINS as BUILTIN_EXTENSIONS};
 pub use user_types::{take_sql_diagnostic_hint, take_sql_error_hint, take_sql_error_message_with_context};
 pub use user_types::{
-    DuplicateKeyDetail, SqlErrorDetail, TypeDef, UserTypeCatalog, take_sql_diagnostic_detail,
-    retain_sql_duplicate_key_detail, take_sql_error_detail, take_sql_error_message, take_sql_notices, type_oid,
+    DuplicateKeyDetail, SqlErrorDetail, SqlErrorNames, TypeDef, UserTypeCatalog, take_sql_diagnostic_detail, take_sql_error_names,
+    retain_sql_duplicate_key_detail, take_sql_error_detail, take_sql_error_message, take_sql_error_position, take_sql_notices, type_oid,
 };
 pub(crate) mod defaults;
 pub use clock::StatementClock;
@@ -100,6 +100,8 @@ mod copy_encoding;
 pub use copy_encoding::CopyEncoding;
 mod sql_index;
 pub(crate) mod partial_index;
+pub(crate) mod gin_indexes;
+pub(crate) mod generated_columns;
 mod sql_insert;
 pub(crate) use giggles_pg_types::temporal::Time;
 pub use giggles_pg_types::temporal::{
@@ -419,6 +421,9 @@ pub enum SqlError {
     TextSearchProgramLimit,
     #[serde(skip)]
     TextSearchStatementTooComplex,
+    /// 42P17 invalid_object_definition, transient DDL validation failure.
+    #[serde(skip)]
+    InvalidObjectDefinition,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -874,7 +879,7 @@ pub(crate) fn row_check(t: &TableDef, values: &[Value]) -> R<()> {
     for (v, c) in values.iter().zip(&t.columns) {
         check(v, c).inspect_err(|error| {
             if *error == SqlError::Null && c.data_type == DataType::UuidArray {
-                logical_types::uuid_array_not_null(t, c, values);
+                logical_types::not_null_violation(t, c, values);
             }
         })?;
         size = size.checked_add(value_bytes(v)).ok_or(SqlError::Limit)?;
@@ -996,6 +1001,9 @@ fn lex(s: &str) -> R<Vec<Token>> {
 const SPECIAL_OPERATOR_BYTES: &[u8] = b"~!@#%^&|`?";
 const OPERATOR_BYTES: &[u8] = b"+-*/<>=~!@#%^&|`?";
 fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
+    lex_into_at(s, out, routing, None)
+}
+fn lex_into_at(s: &str, out: &mut Vec<Token>, routing: bool, mut locations: Option<&mut Vec<usize>>) -> R<()> {
     if s.len() > MAX_STATEMENT_SQL {
         return Err(SqlError::Limit);
     }
@@ -1007,6 +1015,7 @@ fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
             continue;
         }
         let c = b[i];
+        let start_location = i;
         if c == b'-' && b.get(i + 1) == Some(&b'-') {
             i += 2;
             while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
@@ -1116,6 +1125,7 @@ fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
                     return Err(SqlError::Limit);
                 }
                 out.push(Token::String(s[start..end].into()));
+                if let Some(locations) = &mut locations { locations.push(start_location); }
                 i = end + 2;
                 if out.len() > token_limit(out, routing) {
                     return Err(SqlError::Limit);
@@ -1159,6 +1169,10 @@ fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
                 out.push(Token::Op(op.into()));
             }
             // Emit the split suffix in one pass, even for long runs of signs.
+            if let Some(locations) = &mut locations {
+                locations.push(start_location);
+                locations.extend(i..end);
+            }
             while i < end {
                 if out.len() >= token_limit(out, routing) {
                     return Err(SqlError::Limit);
@@ -1166,9 +1180,14 @@ fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
                 out.push(Token::Op(char::from(b[i]).to_string()));
                 i += 1;
             }
+            if out.len() > token_limit(out, routing) {
+                return Err(SqlError::Limit);
+            }
+            continue;
         } else {
             return Err(SqlError::Unsupported);
         }
+        if let Some(locations) = &mut locations { locations.push(start_location); }
         if out.len() > token_limit(out, routing) {
             return Err(SqlError::Limit);
         }
@@ -1239,6 +1258,7 @@ enum Statement {
         user_types: Vec<Option<user_types::TypeReference>>,
         collations: Vec<Option<String>>,
         defaults: Vec<Option<String>>,
+        generated: Vec<Option<generated_columns::Definition>>,
         sequences: Vec<Option<defaults::SequenceSpec>>,
         keys: Vec<String>,
         constraints: Vec<constraints::Definition>,
@@ -1524,6 +1544,11 @@ impl Parser {
         {
             return Err(SqlError::Unsupported);
         }
+        if matches!(self.tokens.get(self.at), Some(Token::Word(w)) if w == "alter")
+            && matches!(self.tokens.get(self.at + 1), Some(Token::Word(w)) if w == "index")
+        {
+            return sql_index::parse_drop(self).map(Statement::DropIndex);
+        }
         if matches!(self.tokens.get(self.at), Some(Token::Word(w)) if w == "alter") {
             return alter_table::parse(self).map(Statement::AlterTable);
         }
@@ -1605,9 +1630,11 @@ impl Parser {
             };
             let name = self.create_table_name()?;
             if self.word("as") {return column_collations::parse_create_as(self,name,optional);}
+            let table_name = name.clone();
             self.punct('(')?;
             let mut columns = vec![];
             let mut defaults = vec![];
+            let mut generated = vec![];
             let mut typmods = vec![];
             let mut user_types = vec![];
             let mut collations = vec![];
@@ -1669,6 +1696,7 @@ impl Parser {
                     user_types.push(user_type);
                     let mut not_null = serial.is_some();
                     let mut default = None;
+                    let mut generation = None;
                     let mut collation = None;
                     let mut sequence = serial.map(|_| defaults::SequenceSpec::default());
                     loop {
@@ -1680,12 +1708,27 @@ impl Parser {
                         if self.word("collate") {
                             collation = Some(column_collations::parse_name(self)?);
                         } else if self.word("generated") {
-                            if sequence.is_some() || default.is_some() {
+                            if generated_columns::starts_expression(self) {
+                                if default.is_some() {
+                                    generated_columns::error_at(self.at - 1);
+                                    return Err(generated_columns::conflicting_default(&table_name, &name));
+                                }
+                                if generation.is_some() || sequence.is_some() {
+                                    return Err(SqlError::Syntax);
+                                }
+                                generation = Some(generated_columns::parse(self)?);
+                                continue;
+                            }
+                            if sequence.is_some() || default.is_some() || generation.is_some() {
                                 return Err(SqlError::Syntax);
                             }
                             sequence = Some(defaults::identity(self)?);
                             not_null = true;
                         } else if self.word("default") {
+                            if generation.is_some() {
+                                generated_columns::error_at(self.at - 1);
+                                return Err(generated_columns::conflicting_default(&table_name, &name));
+                            }
                             if default.is_some() || sequence.is_some() {
                                 return Err(SqlError::Syntax);
                             }
@@ -1720,6 +1763,7 @@ impl Parser {
                     }
                     collations.push(collation);
                     defaults.push(default);
+                    generated.push(generation);
                     sequences.push(sequence);
                     columns.push(ColumnDef {
                         id: 0,
@@ -1740,6 +1784,7 @@ impl Parser {
                 collations,
                 typmods,
                 defaults,
+                generated,
                 sequences,
                 columns,
                 keys,
@@ -1921,6 +1966,7 @@ impl Relational {
             *value = coerce_to_column(self, column, value.clone())?;
         }
         Relational::secondary_admit_values(row.iter())?;
+        self.materialize_generated(table, &mut row)?;
         row_check(table, &row)?;
         Ok(row)
     }
@@ -2197,6 +2243,7 @@ impl Prepared {
                         | alter_table::Action::NotNull(_, false) => (),
                         alter_table::Action::Type(..)
                         | alter_table::Action::Add(..)
+                        | alter_table::Action::Expression(..)
                         | alter_table::Action::Drop(..)
                         | alter_table::Action::NotNull(_, true) => (),
                         alter_table::Action::Unique(..)
@@ -2401,6 +2448,7 @@ impl Prepared {
                 collations: vec![None; columns.len()],
                 typmods: vec![None; columns.len()],
                 defaults,
+                generated: vec![],
                 sequences,
                 columns,
                 keys,
@@ -2423,6 +2471,7 @@ impl Prepared {
     ) -> Self {
         Self::engine(
             Statement::CreateIndex(sql_index::CreateIndex {
+                gin: None,
                 name,
                 table,
                 collations: vec![None; columns.len()],
@@ -2460,6 +2509,7 @@ impl Prepared {
     // Names and table ownership are already resolved in the caller's snapshot.
     pub(crate) fn drop_index_engine(name: String, table: Option<String>, cascade: bool, domain: u128, epoch: u64) -> Self {
         Self::engine(Statement::DropIndex(sql_index::DropIndex {
+            rename: None,
             name, table, optional: false, cascade,
         }), domain, epoch)
     }
@@ -2471,7 +2521,7 @@ impl Prepared {
         let action = match action {
             A::AddColumn { column } => Action::Add(ColumnDef {
                 id: 0, name: column.name, data_type: column.data_type, not_null: column.not_null,
-            }, None, None, None, false, None, None),
+            }, None, None, None, false, None, None, None, Default::default()),
             A::DropColumn { name, cascade } => Action::Drop(name, false, cascade),
             A::RenameColumn { from, to } => Action::RenameColumn(from, to),
             A::RenameTable { to } => Action::RenameTable(to),
@@ -3272,7 +3322,7 @@ impl Prepared {
             Statement::View(ddl) => if ddl.query.is_some() { "CREATE VIEW" } else { "DROP VIEW" },
             Statement::Create { .. } => "CREATE TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
-            Statement::DropIndex(_) => "DROP INDEX",
+            Statement::DropIndex(ref index) => if index.rename.is_some() { "ALTER INDEX" } else { "DROP INDEX" },
             Statement::Insert { .. }
             | Statement::InsertExpressions(_)
             | Statement::InsertMulti(_) => "INSERT",
@@ -3655,7 +3705,7 @@ impl Prepared {
     /// Parse an index drop target before binding can report a missing index.
     pub fn drop_index_target(sql: &str) -> R<Option<String>> {
         let Ok(tokens) = lex(sql) else { return Ok(None); };
-        if !matches!(tokens.first(), Some(Token::Word(word)) if word == "drop")
+        if !matches!(tokens.first(), Some(Token::Word(word)) if word == "drop" || word == "alter")
             || !matches!(tokens.get(1), Some(Token::Word(word)) if word == "index") {
             return Ok(None);
         }
@@ -3734,12 +3784,10 @@ impl Prepared {
                 alter
                     .actions
                     .iter()
-                    .filter_map(|a| {
-                        if let alter_table::Action::Constraint(d) = a {
-                            Some(d)
-                        } else {
-                            None
-                        }
+                    .flat_map(|a| match a {
+                        alter_table::Action::Constraint(definition) => std::slice::from_ref(definition),
+                        alter_table::Action::Add(_, _, _, _, _, _, _, _, constraints) => &constraints.definitions,
+                        _ => &[],
                     })
                     .collect(),
                 None,
@@ -3764,8 +3812,10 @@ impl Prepared {
     pub(crate) fn parse(sql: &str, domain: u128, epoch: u64) -> R<Self> {
         assert_sql_frontend_allowed();
         take_sql_warnings();
+        let tokens = lex(sql)?;
+        let _generated_locations = generated_columns::Locations::enter(sql, &tokens)?;
         let mut p = Parser { privilege_seen: false, privilege_casts: false,
-            tokens: column_collations::rewrite_into(lex(sql)?)?,
+            tokens: column_collations::rewrite_into(tokens)?,
             at: 0,
             params: BTreeSet::new(),
             relations: Vec::new(),
@@ -4112,12 +4162,14 @@ impl Relational {
             ext.columns.remove(&column.id);
             ext.column_collations.remove(&column.id);
             ext.logical_kinds.remove(&column.id);
+            ext.generated_columns.remove(&column.id);
         }
         for d in self.secondary_descriptors_engine().iter().filter(|d|d.table==table_id) {ext.column_collations.remove(&d.id);}
         ext.column_collations.remove(&table_id);
         ext.constraints.remove(&table_id);
         ext.table_schemas.remove(&table_id);
         ext.primary_index_birth.remove(&table_id);
+        ext.gin_indexes.retain(|_, index| index.table != table_id);
         for constraints in ext.constraints.values_mut() {
             let incoming = |constraint: &Constraint| matches!(&constraint.kind,ConstraintKind::ForeignKey {ref_table,..} if *ref_table == table_id);
             if !cascade && constraints.iter().any(incoming) {
@@ -4674,12 +4726,18 @@ impl Relational {
             }
             Statement::SetConstraints(_, _) => return Err(SqlError::NoActiveTransaction),
             Statement::DropIndex(index) => {
+                if self.edit_gin_index(&index.name, index.rename.as_deref())? {
+                    return Ok(result);
+                }
                 let descriptor = self
                     .secondary_descriptors_engine()
                     .iter()
                     .find(|d| d.name == index.name)
                     .cloned();
                 if let Some(descriptor) = descriptor {
+                    if index.rename.is_some() {
+                        return Err(SqlError::Unsupported);
+                    }
                     if self.ext.constraints.values().flatten().any(|c|
                         matches!(c.kind, ConstraintKind::Unique { index, .. } if index == descriptor.id)) {
                         return Err(SqlError::DependentObjects);
@@ -4737,11 +4795,16 @@ impl Relational {
                     .get(&index.table)
                     .ok_or(SqlError::UnknownTable)?
                     .clone();
+                if let Some(definition) = &index.gin {
+                    gin_indexes::create(self, &table, index, definition)?;
+                    return Ok(result);
+                }
                 let ids = index
                     .columns
                     .iter()
                     .map(|name| col(&table, name).map(|i| table.columns[i].id))
                     .collect::<R<Vec<_>>>()?;
+                generated_columns::check_index_columns(self, &ids)?;
                 let collations=index.columns.iter().zip(&index.collations).map(|(n,c)| {
                     let column=&table.columns[col(&table,n)?];
                     if let Some(c)=c { column_collations::resolve_column(self,column,self.ext.columns.get(&column.id).and_then(|c|c.type_id),Some(c),&prepared.search_path).map(|r|r.or(Some(column_collations::Reference::Builtin(100)))) }
@@ -4767,6 +4830,7 @@ impl Relational {
                 columns,
                 typmods,
                 defaults,
+                generated,
                 sequences,
                 keys,
                 constraints,
@@ -4877,6 +4941,16 @@ impl Relational {
                 for c in &mut t.columns {
                     c.id = allocate(&mut next_id)?;
                 }
+                let generated = generated_columns::bind_create(&t, generated)?;
+                for (offset, column) in t.columns.iter_mut().enumerate() {
+                    if generated.get(&column.id).is_some_and(|g| !g.stored) {
+                        if t.primary_key.contains(&offset) {
+                            user_types::view_replace_error("primary keys on virtual generated columns are not supported".into());
+                            return Err(SqlError::Unsupported);
+                        }
+                        column.not_null = false;
+                    }
+                }
                 let epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
                 let (primary_name, constraints) =
                     constraints::canonicalize_create(keys, primary_name, constraints);
@@ -4908,6 +4982,7 @@ impl Relational {
                     for (column, reference) in table.columns.iter().zip(&collation_refs) {
                         if let Some(reference) = reference { ext.column_collations.insert(column.id, column_collations::Binding::Column(reference.clone())); }
                     }
+                    ext.generated_columns.extend(generated);
                     Ok(())
                 })?;
                 if let Some(name) = chosen_primary {
@@ -4986,6 +5061,7 @@ impl Relational {
                 for (value, column) in row.iter_mut().zip(&t.columns) {
                     *value = coerce_to_column(self, column, value.clone())?;
                 }
+                self.materialize_generated(t, &mut row)?;
                 row_check(t, &row)?;
                 let key = pk(t, &row)?;
                 let table_id = t.id;
@@ -5140,6 +5216,7 @@ impl Relational {
                     for (i, v) in indexes {
                         row.values[i] = v;
                     }
+                    self.materialize_generated(t, &mut row.values)?;
                     row_check(t, &row.values)?;
                     self.check_insert_candidate(t, &row.values)?;
                     let new_key = pk(t, &row.values)?;

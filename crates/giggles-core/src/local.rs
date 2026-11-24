@@ -182,6 +182,7 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::UndefinedParameter => 72,
                 relational::SqlError::InvalidName => 73,
                 relational::SqlError::UnsafeNewEnumValue => 74,
+                relational::SqlError::InvalidObjectDefinition => 76,
             }
         }
     };
