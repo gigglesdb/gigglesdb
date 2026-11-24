@@ -293,7 +293,7 @@ pub(super) fn evaluate_insert(
 
 pub(super) struct Plan<'a> {
     returning: &'a Returning,
-    description: Description,
+    description: &'a Description,
     clock: Option<super::clock::ExecutionClock>,
     command: &'static str,
 }
@@ -303,11 +303,12 @@ impl<'a> Plan<'a> {
         state: &Relational,
         params: &[Value],
         clock: Option<&super::clock::ExecutionClock>,
+        description: &'a StatementDescription<'_>,
     ) -> R<Option<Self>> {
         let Some(returning) = prepared.returning() else {
             return Ok(None);
         };
-        let description = prepared.describe(state)?;
+        let description = description.describe(prepared, state)?;
         for (value, data_type) in params.iter().zip(&description.parameters) {
             check(
                 value,

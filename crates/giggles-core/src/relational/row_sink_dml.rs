@@ -308,9 +308,10 @@ pub(super) fn execute(
     let table = state.tables[prepared.table().expect("mutation target")].clone();
     // Analyze even an empty table before opening the cursor. No writes escape
     // the outer statement savepoint, including failures on the final page.
+    let description = StatementDescription::new(prepared);
     let mut result = state
-        .execute_statement_inner(
-            prepared,
+        .execute_statement_described(
+            &description,
             params,
             None,
             || crate::cancellation::check().is_err(),
@@ -319,8 +320,10 @@ pub(super) fn execute(
             &mut Vec::new(),
         )
         .map_err(CoreError::Sql)?;
-    let (template, keys) = selection(state, prepared, params, clock, sink)?;
+    let (template, keys) = selection(state, &description, params, clock, sink)?;
+    let page_description = StatementDescription::new(&template);
     let unique = sink.indexes().into_iter().filter(|d| d.table == table.id && d.unique).collect::<Vec<_>>();
+    let description = page_memo(state, &unique, keys.is_some(), &description, &page_description);
     let mut pending = deferred.as_deref().cloned().unwrap_or_default();
     let mut immediate = DeferralState::default();
     let mut checks = scan::Retention::new(scan::retention_limit());
@@ -346,8 +349,8 @@ pub(super) fn execute(
         page.secondary = page.secondary_build_complete_engine(&unique,
             || crate::cancellation::check().is_err()).map_err(CoreError::Sql)?;
         let batch = page
-            .execute_statement_inner(
-                &template,
+            .execute_statement_described(
+                description,
                 params,
                 None,
                 || crate::cancellation::check().is_err(),
@@ -388,17 +391,18 @@ pub(super) fn execute(
 }
 
 // Complete predicate evaluation precedes publication, including self-subqueries.
-type MutationSelection = (Prepared, Option<BTreeSet<Vec<u8>>>);
-fn selection(state: &Relational, prepared: &Prepared, params: &[Value],
+type MutationSelection<'a> = (std::borrow::Cow<'a, Prepared>, Option<BTreeSet<Vec<u8>>>);
+fn selection<'a>(state: &Relational, description: &StatementDescription<'a>, params: &[Value],
     clock: Option<&clock::ExecutionClock>, sink: &mut impl RowSink,
-) -> Result<MutationSelection, CoreError> {
+) -> Result<MutationSelection<'a>, CoreError> {
+    let prepared = description.prepared();
     let supplied = searched::target(prepared).and_then(query::Query::mutation_input_keys);
     let keys = if supplied.is_some() { supplied } else { searched::target(prepared).filter(|q| moves_primary_key(state, prepared) || q.has_in_subquery())
-        .map(|_| sink.mutation_keys(state, prepared, params, clock)).transpose()? };
-    let mut template = prepared.clone();
-    if keys.is_some() {
-        template.parameter_types = prepared.describe(state).map_err(CoreError::Sql)?
-            .parameters.into_iter().map(Some).collect();
+        .map(|_| sink.mutation_keys(state, description, params, clock)).transpose()? };
+    let template = if keys.is_some() {
+        let mut template = prepared.clone();
+        template.parameter_types = description.describe(prepared, state).map_err(CoreError::Sql)?
+            .parameters.iter().cloned().map(Some).collect();
         template.unbound_statement = None;
         match template.statement.get_mut() {
             Statement::Update { predicates, search, .. }
@@ -409,8 +413,42 @@ fn selection(state: &Relational, prepared: &Prepared, params: &[Value],
             }
             _ => unreachable!(),
         }
-    }
+        std::borrow::Cow::Owned(template)
+    } else {
+        std::borrow::Cow::Borrowed(prepared)
+    };
     Ok((template, keys))
+}
+
+fn page_memo<'a, 'p>(
+    state: &Relational,
+    page_indexes: &[secondary_index::Descriptor],
+    rewritten: bool,
+    preflight: &'a StatementDescription<'p>,
+    page: &'a StatementDescription<'p>,
+) -> &'a StatementDescription<'p> {
+    // The page stages rows, suppresses FK checks, and rebuilds index witnesses.
+    // Binding ignores those, sequence positions, and the row version allocator.
+    // But an index name on the search path can shadow an unqualified relation.
+    if rewritten {
+        return page;
+    }
+    let prepared = preflight.prepared();
+    let relevant = |index: &&secondary_index::Descriptor| {
+        let (schema, name) = split_key(&index.name);
+        prepared.search_path.iter().any(|s| s == schema)
+            && prepared
+                .relations
+                .iter()
+                .any(|r| r.schema.is_none() && r.name == name)
+    };
+    let original = state.secondary.descriptors().iter().filter(relevant);
+    let rebuilt = page_indexes.iter().filter(relevant);
+    if original.map(|index| &index.name).eq(rebuilt.map(|index| &index.name)) {
+        preflight
+    } else {
+        page
+    }
 }
 
 // PK moves use the same bounded publisher and referential-action queue.
@@ -465,10 +503,13 @@ pub(super) fn cascade(
     let pending = deferred.as_deref().cloned().unwrap_or_default();
     let table = state.tables[prepared.table().unwrap()].clone();
     let descriptors = sink.indexes();
-    let mut result = state.execute_statement_inner(prepared, params, None,
+    let description = StatementDescription::new(prepared);
+    let mut result = state.execute_statement_described(&description, params, None,
         || crate::cancellation::check().is_err(), clock, None, &mut Vec::new()).map_err(CoreError::Sql)?;
-    let (template, keys) = selection(state, prepared, params, clock, sink)?;
-    let prepared = &template;
+    let (template, keys) = selection(state, &description, params, clock, sink)?;
+    let page_description = StatementDescription::new(&template);
+    let description = page_memo(state, &descriptors, keys.is_some(), &description, &page_description);
+    let prepared = description.prepared();
     let first_version = state.next_version;
     let mut work = ActionWork::new(pending);
     let mut output = spill::RowBuffer::new(std::mem::take(&mut result.rows))?;
@@ -509,7 +550,7 @@ pub(super) fn cascade(
             page.suppress_foreign_keys();
             rebuild(&mut page, &descriptors)?;
             let mut events = Vec::new();
-            let batch = page.execute_statement_inner(prepared, params, None,
+            let batch = page.execute_statement_described(description, params, None,
                 || crate::cancellation::check().is_err(), clock, None, &mut events).map_err(CoreError::Sql)?;
             result.affected += batch.affected;
             output.extend(batch.rows)?;
@@ -759,6 +800,10 @@ impl ActionWork {
         sink.apply(table, &before, &after)
     }
 }
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "statement_description_tests.rs"]
+mod statement_description_tests;
 
 #[cfg(test)]
 #[path = "upsert_classifier_tests.rs"]

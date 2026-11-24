@@ -54,6 +54,7 @@ pub(super) fn target(prepared: &Prepared) -> Option<&query::Query> {
 pub(super) fn route(
     state: &mut Relational,
     prepared: &Prepared,
+    description: &StatementDescription<'_>,
     params: &[Value],
     expected: Option<u64>,
     returning: &Option<returning::Plan<'_>>,
@@ -77,18 +78,16 @@ pub(super) fn route(
         .get(prepared.table().ok_or(SqlError::UnknownTable)?)
         .ok_or(SqlError::UnknownTable)?;
     let table_id = table.id;
-    let parameters = describe(prepared, state)?
-        .parameters
-        .into_iter()
-        .map(Some)
-        .collect();
+    let parameters = description.searched_parameters(prepared, state)?;
     let bound = target.bind_seeded(state, parameters)?.with_clock(clock);
     let updating = matches!(
         prepared.statement.get(),
         Statement::Update { .. } | Statement::UpdateExpressions { .. }
     );
     let assignments = if updating {
-        Some(assign::Plan::new(table, state, prepared, params, clock)?)
+        Some(assign::Plan::new(
+            table, state, prepared, params, clock, description,
+        )?)
     } else {
         None
     };
@@ -222,7 +221,15 @@ pub(super) fn retained_row_bytes(key: &[u8], row: &SqlRow) -> R<usize> {
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static DESCRIBE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description> {
+    #[cfg(test)]
+    DESCRIBE_CALLS.set(DESCRIBE_CALLS.get() + 1);
+
     let table = state
         .tables
         .get(prepared.table().ok_or(SqlError::UnknownTable)?)
@@ -408,7 +415,9 @@ mod tests {
             .unwrap();
         assert_eq!(matched.len(), 1);
         let (key, old) = &matched[0];
-        let assignments = assign::Plan::new(table, &state, &prepared, &[], None).unwrap();
+        let description = StatementDescription::new(&prepared);
+        let assignments = assign::Plan::new(table, &state, &prepared, &[], None, &description)
+            .unwrap();
         let mut postimage = old.clone();
         for (index, value) in assignments
             .evaluate(table, old, &[], &mut || false)

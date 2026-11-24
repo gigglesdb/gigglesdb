@@ -245,6 +245,7 @@ impl<'a> Plan<'a> {
         prepared: &'a Prepared,
         params: &[super::Value],
         clock: Option<&super::clock::ExecutionClock>,
+        description: &StatementDescription<'_>,
     ) -> R<Self> {
         // Plain SQL type checks precede row lookup; NOT NULL checks apply to
         // matched postimages. Scalar inputs need a shared schema
@@ -280,7 +281,7 @@ impl<'a> Plan<'a> {
         };
         let indexes = indexes(sets, table, state)?;
         let parameters: Vec<Option<DataType>> = {
-            let description = prepared.describe(state)?;
+            let description = description.describe(prepared, state)?;
             for (value, ty) in params.iter().zip(&description.parameters) {
                 check(
                     value,
@@ -292,7 +293,7 @@ impl<'a> Plan<'a> {
                     },
                 )?;
             }
-            description.parameters.into_iter().map(Some).collect()
+            description.parameters.iter().cloned().map(Some).collect()
         };
         let values = sets
             .iter()

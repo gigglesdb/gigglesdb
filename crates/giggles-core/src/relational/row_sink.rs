@@ -50,7 +50,7 @@ pub(crate) trait RowSink {
     fn mutation_keys(
         &mut self,
         _state: &Relational,
-        _prepared: &Prepared,
+        _description: &StatementDescription<'_>,
         _params: &[Value],
         _clock: Option<&clock::ExecutionClock>,
     ) -> Result<BTreeSet<Vec<u8>>, CoreError> {
@@ -253,10 +253,11 @@ impl Relational {
     }
 
     pub(crate) fn mutation_keys(
-        &self, prepared: &Prepared, params: &[Value],
+        &self, description: &StatementDescription<'_>, params: &[Value],
         clock: Option<&clock::ExecutionClock>, source: &dyn scan::RowSource,
     ) -> R<BTreeSet<Vec<u8>>> {
-        let parameters = searched::describe(prepared, self)?.parameters.into_iter().map(Some).collect();
+        let prepared = description.prepared();
+        let parameters = description.searched_parameters(prepared, self)?;
         searched::target(prepared).ok_or(SqlError::Unsupported)?
             .bind_seeded(self, parameters)?.with_clock(clock).matching_keys(self, source, params)
     }

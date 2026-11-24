@@ -1604,17 +1604,17 @@ impl SqlRows<'_> {
 
 impl RowSink for SqlRows<'_> {
     fn mutation_keys(
-        &mut self, state: &relational::Relational, prepared: &relational::Prepared,
+        &mut self, state: &relational::Relational, description: &relational::StatementDescription<'_>,
         params: &[relational::Value], clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<BTreeSet<Vec<u8>>, CoreError> {
         let source = MutationRows { db: self.db, txn: std::cell::RefCell::new(&mut *self.txn),
             parts: self.parts, error: std::cell::RefCell::new(None),
             #[cfg(test)]
-            target: state.tables[prepared.table().expect("mutation target")].id,
+            target: state.tables[description.prepared().table().expect("mutation target")].id,
         };
         // R3-306: a task statement selects its keys from the visible rows only.
         let scoped = self.scope.map(|(scope, meter)| crate::task::rows::Scoped::new(&source, scope, meter));
-        let result = state.mutation_keys(prepared, params, clock,
+        let result = state.mutation_keys(description, params, clock,
             scoped.as_ref().map_or(&source as &dyn relational::scan::RowSource,
                 |scoped| scoped as &dyn relational::scan::RowSource));
         if let Some(error) = scoped.as_ref().and_then(|scoped| scoped.take_error()) { return Err(error.into()); }
