@@ -324,7 +324,7 @@ impl Manifest {
             )));
             #[cfg(test)]
             CHECK_SCRATCH_PATHS.with_borrow_mut(|paths| paths.push(scratch.0.clone()));
-            let kv = crate::storage::engine::kv_rocksdb::RocksKv::open(&scratch.0, 1024 * 1024)
+            let kv = crate::storage::engine::kv_rocksdb::RocksKv::open_replicated(&scratch.0, 1024 * 1024)
                 .map_err(kv_error)?;
             kv.ingest_sst(&[(
                 Keyspace::Rows,

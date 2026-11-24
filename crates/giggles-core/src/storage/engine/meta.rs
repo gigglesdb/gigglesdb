@@ -1,5 +1,7 @@
 //! Fail-closed v2 directory and unversioned metadata gate.
-use super::kv::{Direction, Durability, Keyspace, KvBackend, KvError, KvRead, WriteBatch};
+use super::kv::{
+    COMMIT_GROUP_KEY, Direction, Durability, Keyspace, KvBackend, KvError, KvRead, WriteBatch,
+};
 use std::{
     fs,
     io::{Read, Write},
@@ -314,6 +316,12 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
             && let Some((id, sub)) = parse_range_local_key(&key)
         {
             range_local::check_range_value(id, &sub, &value, gate)?;
+            continue;
+        }
+        if gate & REPLICATED == 0 && key == COMMIT_GROUP_KEY {
+            if value.len() != size_of::<u64>() {
+                return Err(corrupt("invalid commit_group"));
+            }
             continue;
         }
         if !matches!(

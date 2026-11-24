@@ -1,5 +1,7 @@
 //! Optional RocksDB implementation of the storage-engine KV seam.
 use super::kv::*;
+#[cfg(any(target_os = "linux", windows))]
+use crate::storage::directory_identity::DirectoryIdentity;
 use crate::storage::directory_identity::PinnedDirectory;
 use rocksdb::{
     AsColumnFamilyRef, AsRawPtr, BlockBasedOptions, Cache, DB, DBCompressionType, DBRecoveryMode,
@@ -7,10 +9,12 @@ use rocksdb::{
 };
 use std::{
     collections::BTreeMap,
+    ffi::{CString, c_char},
     fs::{File, OpenOptions, TryLockError},
     io::{Read, Seek, SeekFrom, Write},
     ops::{Bound, Deref},
     path::{Path, PathBuf},
+    ptr::NonNull,
     sync::{Arc, Condvar, Mutex, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -19,6 +23,107 @@ use std::{
 unsafe extern "C" {
     fn giggles_rocksdb_install_autorecovery_veto(options: *mut librocksdb_sys::rocksdb_options_t);
     fn giggles_rocksdb_uses_default_env(options: *const librocksdb_sys::rocksdb_options_t) -> bool;
+    fn giggles_rocksdb_new_commit_group_filter(
+        meta_name: *const c_char,
+        key: *const u8,
+        key_len: usize,
+    ) -> *mut NativeWalFilter;
+    fn giggles_rocksdb_set_commit_group_filter(
+        options: *mut librocksdb_sys::rocksdb_options_t,
+        filter: *mut NativeWalFilter,
+    );
+    fn giggles_rocksdb_commit_group_filter_live_sst(filter: *mut NativeWalFilter, name: *const c_char);
+    fn giggles_rocksdb_begin_commit_group_replay(filter: *mut NativeWalFilter, seed: u64);
+    fn giggles_rocksdb_commit_group_stop(filter: *const NativeWalFilter, stop: *mut WalStop);
+    fn giggles_rocksdb_drop_commit_group_filter(filter: *mut NativeWalFilter);
+}
+
+#[repr(C)]
+struct NativeWalFilter {
+    _opaque: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WalStop {
+    reason: u64,
+    wal: u64,
+    expected: u64,
+    found: u64,
+    sst_log: u64,
+}
+
+impl WalStop {
+    fn validate(self) -> Result<(), KvError> {
+        let Self { reason, wal, expected, found, sst_log } = self;
+        if reason != 0 {
+            tracing::warn!(
+                wal_number = wal,
+                expected_group = expected,
+                found_group = found,
+                "RocksDB commit group WAL replay stopped"
+            );
+        }
+        let problem = match reason {
+            0 => return Ok(()),
+            1 if sst_log <= wal => return Ok(()),
+            1 => format!("live SST column family starts at WAL {sst_log}, beyond the commit group gap at WAL {wal} (expected {expected}, found {found})"),
+            2 => format!("out-of-order commit group in WAL {wal}: expected {expected}, found {found}"),
+            3 => format!("invalid commit_group value in WAL {wal}"),
+            _ => unreachable!("unknown native commit group stop reason"),
+        };
+        Err(KvError::Corrupt(problem))
+    }
+}
+
+struct WalFilter(NonNull<NativeWalFilter>);
+
+// The filter is used by synchronous native opens. Once LockedDb is published,
+// RocksDB never calls its recovery callbacks again. Only its owner destroys it.
+unsafe impl Send for WalFilter {}
+unsafe impl Sync for WalFilter {}
+
+impl WalFilter {
+    fn new() -> Self {
+        let meta = CString::new(Keyspace::Meta.name()).unwrap();
+        // SAFETY: the shim copies the name and borrows only the static key.
+        let filter = unsafe {
+            giggles_rocksdb_new_commit_group_filter(
+                meta.as_ptr(), COMMIT_GROUP_KEY.as_ptr(), COMMIT_GROUP_KEY.len(),
+            )
+        };
+        Self(NonNull::new(filter).expect("native WAL filter allocation"))
+    }
+
+    fn install(&mut self, options: &mut Options) {
+        // SAFETY: options is live and every clone and DB using it dies before self.
+        unsafe { giggles_rocksdb_set_commit_group_filter(options.as_raw_ptr(), self.0.as_ptr()) };
+    }
+
+    fn note_live_sst(&mut self, name: &str) {
+        let name = CString::new(name).unwrap();
+        // SAFETY: the filter is live and the shim copies the name.
+        unsafe { giggles_rocksdb_commit_group_filter_live_sst(self.0.as_ptr(), name.as_ptr()) };
+    }
+
+    fn begin_replay(&mut self, seed: u64) {
+        // SAFETY: the seed DB and its options have already dropped.
+        unsafe { giggles_rocksdb_begin_commit_group_replay(self.0.as_ptr(), seed) };
+    }
+
+    fn stop(&self) -> WalStop {
+        let mut stop = WalStop::default();
+        // SAFETY: both pointers are live and no recovery callback is running.
+        unsafe { giggles_rocksdb_commit_group_stop(self.0.as_ptr(), &mut stop) };
+        stop
+    }
+}
+
+impl Drop for WalFilter {
+    fn drop(&mut self) {
+        // SAFETY: this owner drops after any DB and options using the filter.
+        unsafe { giggles_rocksdb_drop_commit_group_filter(self.0.as_ptr()) };
+    }
 }
 
 pub(crate) const WRITER_LOCK_FILE: &str = "giggles.lock";
@@ -161,6 +266,7 @@ struct LockedDb {
     points: Mutex<PointPool>,
     // Field order matters: close RocksDB before releasing the explicit lock.
     db: DB,
+    _wal_filter: Option<WalFilter>,
     _writer_lock: WriterLock,
     _directory_pin: Option<File>,
     close: SignalClose,
@@ -184,6 +290,8 @@ impl Deref for LockedDb {
 pub(crate) struct RocksKv {
     db: Arc<LockedDb>,
     pipelined_sync: bool,
+    #[cfg(test)]
+    wal_stop: Option<WalStop>,
 }
 
 impl Drop for RocksKv {
@@ -196,7 +304,11 @@ impl Drop for RocksKv {
 impl RocksKv {
     pub(crate) fn open(path: &Path, cache_bytes: usize) -> Result<Self, KvError> {
         std::fs::create_dir_all(path).map_err(|error| KvError::Io(error.to_string()))?;
-        Self::open_locked(path, cache_bytes, WriterLock::acquire(path)?)
+        let (directory, path) = pin_local_directory(path)?;
+        let writer_lock = WriterLock::acquire(&path)?;
+        Self::open_locked_in_mode(
+            &path, cache_bytes, writer_lock, DBRecoveryMode::PointInTime, directory, true,
+        )
     }
 
     pub(in crate::storage) fn open_recovery(
@@ -211,6 +323,7 @@ impl RocksKv {
             writer_lock,
             DBRecoveryMode::TolerateCorruptedTailRecords,
             Some(directory),
+            true,
         )
     }
 
@@ -251,7 +364,25 @@ impl RocksKv {
         cache_bytes: usize,
         writer_lock: WriterLock,
     ) -> Result<Self, KvError> {
-        Self::open_locked_in_mode(path, cache_bytes, writer_lock, DBRecoveryMode::PointInTime, None)
+        let (directory, path) = pin_local_directory(path)?;
+        Self::open_locked_in_mode(
+            &path, cache_bytes, writer_lock, DBRecoveryMode::PointInTime, directory, true,
+        )
+    }
+
+    pub(crate) fn open_replicated(path: &Path, cache_bytes: usize) -> Result<Self, KvError> {
+        std::fs::create_dir_all(path).map_err(|error| KvError::Io(error.to_string()))?;
+        Self::open_replicated_locked(path, cache_bytes, WriterLock::acquire(path)?)
+    }
+
+    pub(crate) fn open_replicated_locked(
+        path: &Path,
+        cache_bytes: usize,
+        writer_lock: WriterLock,
+    ) -> Result<Self, KvError> {
+        Self::open_locked_in_mode(
+            path, cache_bytes, writer_lock, DBRecoveryMode::PointInTime, None, false,
+        )
     }
 
     fn open_locked_in_mode(
@@ -260,9 +391,10 @@ impl RocksKv {
         writer_lock: WriterLock,
         mode: DBRecoveryMode,
         directory_pin: Option<File>,
+        check_commit_groups: bool,
     ) -> Result<Self, KvError> {
         let options = Self::open_options(cache_bytes, mode)?;
-        Self::open_with_options(path, writer_lock, directory_pin, options)
+        Self::open_with_options(path, writer_lock, directory_pin, options, check_commit_groups)
     }
 
     fn open_options(cache_bytes: usize, mode: DBRecoveryMode) -> Result<Options, KvError> {
@@ -301,11 +433,70 @@ impl RocksKv {
         Ok(options)
     }
 
+    fn read_commit_group_seed(
+        path: &Path,
+        options: &Options,
+        filter: &mut WalFilter,
+    ) -> Result<u64, KvError> {
+        match path.join("CURRENT").symlink_metadata() {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                return Err(KvError::RocksIo {
+                    message: error.to_string(),
+                    status: RocksStatus { code: RocksStatus::IO_ERROR, subcode: 0, severity: None },
+                    site: FenceSite::Open,
+                });
+            }
+        }
+
+        let map_open_error = |error| map_error_at(error, FenceSite::Open);
+        let path = native_path(path);
+        let mut options = options.clone();
+        options.create_if_missing(false);
+        options.create_missing_column_families(false);
+        filter.install(&mut options);
+        // A partially initialized store may lack CFs that the writable open
+        // would create. Use the manifest's list for the read-only open.
+        let families = DB::list_cf(&options, &path).map_err(map_open_error)?;
+        let db = DB::open_cf_with_opts_for_read_only(
+            &options,
+            &path,
+            families.iter().map(|name| {
+                let cf_options = if name == "default" { Options::default() } else { options.clone() };
+                (name, cf_options)
+            }),
+            false,
+        )
+        .map_err(map_open_error)?;
+        for name in &families {
+            let cf = db.cf_handle(name).unwrap();
+            if db.property_int_value_cf(cf, rocksdb::properties::LIVE_SST_FILES_SIZE)
+                .map_err(map_open_error)?
+                .is_some_and(|size| size != 0)
+            {
+                filter.note_live_sst(name);
+            }
+        }
+        let Some(meta) = db.cf_handle(Keyspace::Meta.name()) else {
+            return Ok(0);
+        };
+        match db.get_cf(meta, COMMIT_GROUP_KEY).map_err(map_open_error)? {
+            None => Ok(0),
+            Some(bytes) => bytes
+                .as_slice()
+                .try_into()
+                .map(u64::from_be_bytes)
+                .map_err(|_| KvError::Corrupt("invalid commit_group in SST state".into())),
+        }
+    }
+
     fn open_with_options(
         path: &Path,
         writer_lock: WriterLock,
         directory_pin: Option<File>,
         options: Options,
+        check_commit_groups: bool,
     ) -> Result<Self, KvError> {
         // R-WALB requires one RocksDB write queue and recovery flushes.
         // SAFETY: the native getters and capability check only read live options.
@@ -327,6 +518,14 @@ impl RocksKv {
         if RECOVERY_OPEN_CRASH.get() == Some(RecoveryOpenCrash::BeforeNativeOpen) {
             crate::storage::crash_now();
         }
+        let mut filter = check_commit_groups.then(WalFilter::new);
+        let mut options = options;
+        if let Some(filter) = &mut filter {
+            let seed = Self::read_commit_group_seed(path, &options, filter)?;
+            filter.begin_replay(seed);
+            filter.install(&mut options);
+        }
+
         let open_native = || {
             DB::open_cf_with_opts(
                 &options,
@@ -342,6 +541,8 @@ impl RocksKv {
         };
         #[cfg(not(test))]
         let result = open_native();
+        let stop = filter.as_ref().map_or_else(WalStop::default, WalFilter::stop);
+        stop.validate()?;
         let db = result.map_err(|error| map_error_at(error, FenceSite::Open))?;
         #[cfg(test)]
         if RECOVERY_OPEN_CRASH.get() == Some(RecoveryOpenCrash::AfterNativeOpen) {
@@ -349,15 +550,32 @@ impl RocksKv {
         }
         Ok(Self {
             pipelined_sync,
+            #[cfg(test)]
+            wal_stop: (stop.reason != 0).then_some(stop),
             db: Arc::new(LockedDb {
                 points: Mutex::new(PointPool::default()),
                 db,
+                _wal_filter: filter,
                 _writer_lock: writer_lock,
                 _directory_pin: directory_pin,
                 close: SignalClose(CloseLatch::default()),
             }),
         })
     }
+}
+
+fn pin_local_directory(path: &Path) -> Result<(Option<File>, PathBuf), KvError> {
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        let (directory, path) = DirectoryIdentity::read(path)
+            .map_err(|error| KvError::Io(error.to_string()))?
+            .pin(path)
+            .map_err(|error| KvError::Io(error.to_string()))?
+            .into_parts();
+        Ok((Some(directory), path))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    Ok((None, path.to_path_buf()))
 }
 
 #[cfg(test)]
@@ -1273,6 +1491,10 @@ impl Drop for SnapshotIter<'_> {
 }
 
 #[cfg(test)]
+#[path = "kv_rocksdb_wal_group_tests.rs"]
+mod wal_group_tests;
+
+#[cfg(test)]
 #[path = "kv_rocksdb_sst_tests.rs"]
 mod sst_tests;
 
@@ -1282,9 +1504,9 @@ mod tests {
     use crate::storage::v2::recovery_tests::retry_writer_lock;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct TestDir(PathBuf);
+    pub(super) struct TestDir(pub(super) PathBuf);
     impl TestDir {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             let path = std::env::temp_dir().join(format!(
                 "kv-rocksdb-{}-{}",
@@ -1539,7 +1761,7 @@ mod tests {
         for mode in [DBRecoveryMode::PointInTime, DBRecoveryMode::TolerateCorruptedTailRecords] {
             let cache_bytes = 8 * 1024 * 1024;
             let lock = WriterLock::acquire(&dir.0).unwrap();
-            let db = Arc::new(RocksKv::open_locked_in_mode(&dir.0, cache_bytes, lock, mode, None).unwrap());
+            let db = Arc::new(RocksKv::open_locked_in_mode(&dir.0, cache_bytes, lock, mode, None, true).unwrap());
             assert!(db.pipelined_sync());
             assert!(Kv::new_single_writer(db.clone()).pipelined_sync());
             assert!(!Kv::new(db.clone()).pipelined_sync());
@@ -1557,6 +1779,7 @@ mod tests {
                 "enable_pipelined_write=false",
                 "two_write_queues=false",
                 "avoid_flush_during_recovery=false",
+                "wal_filter=nullptr",
             ] {
                 assert!(options.lines().any(|line| line.trim() == expected), "{expected}");
             }
@@ -1684,7 +1907,7 @@ mod tests {
                 (fault, options)
             };
             let lock = WriterLock::acquire(&dir.0).unwrap();
-            let db = Arc::new(RocksKv::open_with_options(&dir.0, lock, None, options).unwrap());
+            let db = Arc::new(RocksKv::open_with_options(&dir.0, lock, None, options, true).unwrap());
             let kv = Kv::new_single_writer(db.clone());
             assert!(!db.pipelined_sync());
             assert!(!kv.pipelined_sync());

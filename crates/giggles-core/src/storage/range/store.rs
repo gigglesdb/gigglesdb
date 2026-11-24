@@ -68,7 +68,7 @@ impl RangeStore {
         let lock = WriterLock::acquire(path)?;
         let mut concrete = None;
         meta::create_with_features(path, domain, meta::REPLICATED | meta::RANGES, |p| {
-            let kv = Arc::new(RocksKv::open_locked(p, 64 << 20, lock)?);
+            let kv = Arc::new(RocksKv::open_replicated_locked(p, 64 << 20, lock)?);
             concrete = Some(kv.clone());
             Ok(kv)
         })
@@ -82,7 +82,7 @@ impl RangeStore {
         if meta::classify_dir(path).map_err(v2::format_error)? != meta::DirClass::V2 {
             return Err(CoreError::Corrupt("not a v2 directory".into()));
         }
-        let kv = Arc::new(RocksKv::open(path, 64 << 20)?);
+        let kv = Arc::new(RocksKv::open_replicated(path, 64 << 20)?);
         let info = meta::validate_meta(kv.as_ref()).map_err(v2::format_error)?;
         if info.features & meta::RANGES == 0 {
             return Err(CoreError::Unsupported);

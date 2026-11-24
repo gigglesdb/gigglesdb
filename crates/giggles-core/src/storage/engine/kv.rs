@@ -69,6 +69,9 @@ pub(crate) struct WriteBatch {
     ops: Vec<Op>,
 }
 
+/// Local commit pipeline cursor, encoded as a big-endian u64 in Meta.
+pub(crate) const COMMIT_GROUP_KEY: &[u8] = b"commit_group";
+
 const BATCH_WIRE_VERSION: u8 = 1;
 
 impl WriteBatch {
@@ -165,6 +168,11 @@ impl WriteBatch {
     pub(crate) fn put(&mut self, ks: Keyspace, key: Vec<u8>, value: Vec<u8>) {
         self.ops.push(Op::Put { ks, key, value });
     }
+    #[allow(dead_code, reason = "Stage A will assign groups in GD-0084 P3")]
+    pub(crate) fn put_commit_group(&mut self, group: u64) {
+        self.put(Keyspace::Meta, COMMIT_GROUP_KEY.to_vec(), group.to_be_bytes().to_vec());
+    }
+
     pub(crate) fn delete(&mut self, ks: Keyspace, key: Vec<u8>) {
         self.ops.push(Op::Delete { ks, key });
     }
