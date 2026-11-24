@@ -231,7 +231,7 @@ pub(super) fn bind(
             if let Scalar::Call(n, args) = arg
                 && n == array_constructor::NAME
             {
-                return array_constructor::bind(args, Some(target), resolve, tables, parameters);
+                return array_constructor::bind(args, array_constructor::Binding::Cast(target), resolve, tables, parameters);
             }
             if let Scalar::Cast(input, cast_type) = arg
                 && cast_type == target

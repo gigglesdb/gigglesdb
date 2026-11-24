@@ -1554,7 +1554,7 @@ impl Scalar {
             && name == array_constructor::NAME
             && array_constructor::element_type(ty).is_some()
         {
-            return array_constructor::bind(args, Some(ty), resolve, tables, parameters);
+            return array_constructor::bind(args, array_constructor::Binding::Cast(ty), resolve, tables, parameters);
         }
         if let Self::Literal(v @ (Value::Text(_) | Value::Null)) = a
             && datetime_input::target(ty)
@@ -1713,7 +1713,7 @@ impl Scalar {
             return Ok(BoundScalar { ty: DataType::Text, node: Node::TriggerCall(name.into()) });
         }
         match name {
-            array_constructor::NAME => array_constructor::bind(args, None, resolve, tables, parameters),
+            array_constructor::NAME => array_constructor::bind(args, array_constructor::Binding::Inferred, resolve, tables, parameters),
             name if json_array::name(name).is_some() => {
                 json_array::bind(name, args, resolve, tables, parameters)
             }
@@ -2649,6 +2649,12 @@ impl BoundScalar {
         }
         match &self.node {
             Node::Call(name, _) if name == "setseed" => random_uuid::VOID_OID,
+            Node::Call(name, args)
+                if name == array_constructor::NAME
+                    && args.iter().any(|arg| arg.result_oid() == json_aggregate::OID) =>
+            {
+                json_aggregate::ARRAY_OID
+            }
             Node::ZonedOperator(name, ..) if json_array::name(name) == Some("json_build_array") => {
                 json_aggregate::OID
             }

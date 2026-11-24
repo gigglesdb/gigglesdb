@@ -2,6 +2,12 @@
 use super::*;
 pub(super) const NAME: &str = "\0array_constructor";
 
+pub(super) enum Binding<'a> {
+    Inferred,
+    Cast(&'a DataType),
+    VariadicJson,
+}
+
 pub(super) fn parse(p: &mut Parser, depth: usize, aggregate: bool) -> R<Scalar> {
     p.need("array")?;
     p.punct('[')?;
@@ -68,11 +74,15 @@ pub(super) fn infer(
 }
 pub(super) fn bind(
     args: &[Scalar],
-    target: Option<&DataType>,
+    binding: Binding<'_>,
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     tables: &[&TableDef],
     parameters: &[Option<DataType>],
 ) -> R<BoundScalar> {
+    let target = match binding {
+        Binding::Cast(ty) => Some(ty),
+        _ => None,
+    };
     let element = if let Some(ty) = target.and_then(element_type) {
         ty
     } else {
@@ -96,6 +106,26 @@ pub(super) fn bind(
         let typed = bound.iter().zip(args).filter_map(|(bound, source)| {
             (!source.aggregate_unknown(parameters)).then_some(bound)
         });
+        if json_aggregate::common_branches("ARRAY", typed.clone())? {
+            // The variadic builders consume this array directly. Other SQL
+            // array operations lack a general JSON element type.
+            if !matches!(binding, Binding::VariadicJson) {
+                return Err(SqlError::Unsupported);
+            }
+            let args = args
+                .iter()
+                .zip(bound)
+                .map(|(source, bound)| {
+                    if source.aggregate_unknown(parameters) {
+                        Scalar::Call(json_aggregate::INPUT.into(), vec![source.clone()])
+                            .bind(resolve, tables, parameters)
+                    } else {
+                        Ok(bound)
+                    }
+                })
+                .collect::<R<Vec<_>>>()?;
+            return Ok(BoundScalar { ty, node: Node::Call(NAME.into(), args) });
+        }
         if let Some(enum_type) = enum_order::common_enum("ARRAY", typed.map(BoundScalar::type_identity))? {
             let enum_type = enum_type.clone();
             let args = args.iter().zip(bound).map(|(source, bound)| {

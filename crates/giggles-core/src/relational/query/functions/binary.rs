@@ -194,7 +194,13 @@ fn convert(name: &str, args: &[Value], budget: &mut usize) -> R<Value> {
             Ok(Value::Bytes(text.as_bytes().to_vec()))
         }
         (true, Value::Bytes(bytes)) => {
-            // SQL_ASCII copies bytes, and the resulting UTF8 text must still be valid.
+            // SQL_ASCII checks for NUL before the resulting UTF8 text is validated.
+            if encoding.name() == "SQL_ASCII" && bytes.contains(&0) {
+                user_types::view_replace_error(
+                    "invalid byte sequence for encoding \"SQL_ASCII\": 0x00".into(),
+                );
+                return Err(SqlError::CharacterNotInRepertoire);
+            }
             let text = checked_utf8(bytes)?;
             reserve(budget, text.len())?;
             Ok(Value::Text(text.into()))

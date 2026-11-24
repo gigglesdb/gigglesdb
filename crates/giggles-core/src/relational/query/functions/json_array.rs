@@ -34,19 +34,38 @@ pub(super) fn bind(
     tables: &[&TableDef],
     parameters: &[Option<DataType>],
 ) -> R<BoundScalar> {
-    let args = args
-        .iter()
-        .map(|arg| arg.bind(resolve, tables, parameters))
-        .collect::<R<Vec<_>>>()?;
-    if variadic(function) {
-        let [arg] = args.as_slice() else {
+    let args = if variadic(function) {
+        let [arg] = args else {
             return Err(SqlError::UndefinedFunction);
+        };
+        let arg = match arg {
+            Scalar::Call(name, items) if name == array_constructor::NAME => {
+                array_constructor::bind(
+                    items,
+                    array_constructor::Binding::VariadicJson,
+                    resolve,
+                    tables,
+                    parameters,
+                )?
+            }
+            Scalar::Cast(source, ty)
+                if ty.is_array()
+                    && matches!(source.as_ref(), Scalar::Literal(Value::Text(literal)) if multidimensional(literal)) =>
+            {
+                return Err(SqlError::Unsupported);
+            }
+            _ => arg.bind(resolve, tables, parameters)?,
         };
         if !arg.ty.is_array() {
             user_types::view_replace_error("VARIADIC argument must be an array".into());
             return Err(SqlError::Type);
         }
-    }
+        vec![arg]
+    } else {
+        args.iter()
+            .map(|arg| arg.bind(resolve, tables, parameters))
+            .collect::<R<Vec<_>>>()?
+    };
     let ty = if name(function) == Some(JSONB) {
         DataType::Jsonb
     } else {
@@ -56,6 +75,13 @@ pub(super) fn bind(
         ty,
         node: Node::ZonedOperator(function.into(), args, None),
     })
+}
+
+fn multidimensional(literal: &str) -> bool {
+    literal
+        .trim_start()
+        .strip_prefix('{')
+        .is_some_and(|inner| inner.trim_start().starts_with('{'))
 }
 
 pub(super) fn eval(
@@ -93,11 +119,17 @@ pub(super) fn eval(
             return Err(SqlError::Type);
         };
         let element = array_constructor::element_type(&args[0].ty).ok_or(SqlError::Type)?;
+        let json = args[0].result_oid() == json_aggregate::ARRAY_OID;
         for item in logical_types::array_values(array)? {
-            let value = item.map_or(Ok(Value::Null), |text| {
-                coerce_clocked(Value::Text(text), &element, None)
-            })?;
-            append(json_aggregate::element(&value, &element, zone)?)?;
+            let entry = match item {
+                None => "null".into(),
+                Some(text) if json => text,
+                Some(text) => {
+                    let value = coerce_clocked(Value::Text(text), &element, None)?;
+                    json_aggregate::element(&value, &element, zone)?
+                }
+            };
+            append(entry)?;
         }
     } else {
         for (arg, value) in args.iter().zip(values) {

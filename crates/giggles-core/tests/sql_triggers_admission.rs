@@ -457,3 +457,34 @@ fn trigger_admission_with_generated_text_search_column() {
     drop(admin);
     std::fs::remove_dir_all(path).unwrap();
 }
+
+#[test]
+fn insert_select_uses_the_same_trigger_guard_as_values() {
+    let path = common::fresh("trigger-insert-select");
+    let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+    let mut session = admin.sql_session();
+    for sql in [
+        "CREATE TABLE dst (id int PRIMARY KEY)",
+        "INSERT INTO dst VALUES (3)",
+        FUNCTION,
+        "CREATE TRIGGER on_insert BEFORE INSERT ON dst FOR EACH ROW EXECUTE FUNCTION f()",
+        "CREATE TABLE source AS SELECT id FROM dst",
+    ] {
+        run(&mut session, sql);
+    }
+    for sql in [
+        "INSERT INTO dst VALUES (4)",
+        "INSERT INTO dst SELECT id + 1 FROM source",
+    ] {
+        refuse(&mut session, sql, "INSERT");
+    }
+    assert_eq!(rows(&mut session, "SELECT id FROM dst"), [vec![Value::Int(3)]]);
+    run(&mut session, "ALTER TABLE dst DISABLE TRIGGER on_insert");
+    assert_eq!(
+        run(&mut session, "INSERT INTO dst SELECT id + 1 FROM source").affected,
+        1,
+    );
+    drop(session);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}

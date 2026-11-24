@@ -190,6 +190,42 @@ fn insert_materializes_standalone_select_shapes() {
 }
 
 #[test]
+fn select_list_srf_refuses_distinct_on_and_unsupported_shapes() {
+    with_session(|db| {
+        source(db);
+        run(db, "CREATE TABLE dst (id int, tag text)");
+        let select = "SELECT DISTINCT ON (id) id, unnest(tags) FROM src ORDER BY id";
+        for sql in [
+            select.to_owned(),
+            format!("INSERT INTO dst {select}"),
+            format!("CREATE TABLE ctas AS {select}"),
+            "SELECT ARRAY(SELECT unnest(ARRAY[3,1,2]) ORDER BY 1)".into(),
+            "SELECT ARRAY(SELECT unnest(ARRAY[3,1,2]))".into(),
+            "SELECT generate_series('2026-01-01'::date,'2026-01-02','1 day')".into(),
+        ] {
+            assert_eq!(
+                db.execute(&sql, &[], None),
+                Err(CoreError::Sql(SqlError::Unsupported)),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            db.execute("SELECT unnest(tags) FROM src HAVING true", &[], None),
+            Err(CoreError::Sql(SqlError::GroupingError))
+        );
+        assert_eq!(
+            rows(run(db, "SELECT DISTINCT id, unnest(tags) FROM src ORDER BY 1, 2")),
+            pairs(&[(1, "a"), (1, "b"), (2, "c")])
+        );
+        assert!(rows(run(db, "SELECT * FROM dst")).is_empty());
+        assert_eq!(
+            db.execute("SELECT * FROM ctas", &[], None),
+            Err(CoreError::Sql(SqlError::UnknownTable))
+        );
+    });
+}
+
+#[test]
 fn ctas_keeps_select_names_types_and_no_data() {
     with_session(|db| {
         source(db);
@@ -388,5 +424,36 @@ fn coercion_conflicts_and_late_constraint_errors_use_insert_semantics() {
             Some("null value in column \"ids\" of relation \"nn\" violates not-null constraint")
         );
         assert!(rows(run(db, "SELECT * FROM nn")).is_empty());
+    });
+}
+
+#[test]
+fn regex_sets_materialize_in_insert_and_ctas() {
+    with_session(|db| {
+        let a = "b0000000-0000-0000-0000-000000000001";
+        let b = "b0000000-0000-0000-0000-000000000002";
+        run(db, "CREATE TABLE src (id int PRIMARY KEY, note text)");
+        run(db, &format!("INSERT INTO src VALUES (1,'hi ({a}) and ({b})'), (2,'none')"));
+        run(db, "CREATE TABLE dst (id int, mention uuid, PRIMARY KEY (id, mention))");
+        assert_eq!(
+            run(
+                db,
+                r"INSERT INTO dst SELECT DISTINCT id, (regexp_matches(note, '\(([0-9a-f-]{36})\)', 'g'))[1]::uuid FROM src ON CONFLICT DO NOTHING",
+            ).affected,
+            2,
+        );
+        assert_eq!(
+            run(
+                db,
+                r"INSERT INTO dst SELECT DISTINCT id, m[1]::uuid FROM src CROSS JOIN LATERAL regexp_matches(note, '\(([0-9a-f-]{36})\)', 'g') AS m ON CONFLICT DO NOTHING",
+            ).affected,
+            0,
+        );
+        assert_eq!(rows(run(db, "SELECT id, mention::text FROM dst ORDER BY mention")), pairs(&[(1, a), (1, b)]));
+        assert_eq!(
+            run(db, "CREATE TABLE pieces AS SELECT src.id, piece FROM src CROSS JOIN LATERAL regexp_split_to_table(note, ' ') AS piece WHERE src.id = 2").affected,
+            1,
+        );
+        assert_eq!(rows(run(db, "SELECT id, piece FROM pieces")), pairs(&[(2, "none")]));
     });
 }

@@ -676,7 +676,7 @@ pub(super) fn select_base(
     grouping_sets: Option<&group_sets::GroupingSets>,
     distinct_on: &mut [Scalar],
 ) -> ParseResult<Plan> {
-    let rewritten_projection = project_set::rewrite(tokens)?;
+    let rewritten_projection = project_set::rewrite(tokens, !distinct_on.is_empty())?;
     if rewritten_projection.is_some() && grouping_sets.is_some() {
         return Err(SqlError::Unsupported.into());
     }

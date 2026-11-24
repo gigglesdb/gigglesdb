@@ -81,7 +81,7 @@ impl CreateAs {
     pub(super) fn describe(&self, state: &Relational, prepared: &Prepared) -> R<Description> {
         let mut description = match &self.source {
             SelectSource::Query(query) => query
-                .bind_description(state, prepared.params, &prepared.parameter_types)?
+                .bind_create_as(state, prepared.params, &prepared.parameter_types)?
                 .description(state),
             SelectSource::Plan(plan, _) => {
                 plan.describe(state, prepared.params, &prepared.parameter_types)?
@@ -127,7 +127,7 @@ impl CreateAs {
         match &self.source {
             SelectSource::Query(query) => {
                 let bound = query
-                    .bind(state, prepared.params, declared)?
+                    .bind_create_as(state, prepared.params, declared)?
                     .with_clock(clock);
                 let mut definition =
                     self.definition(state, bound.description(state), bound.output_collations()?)?;

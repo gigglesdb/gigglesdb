@@ -106,6 +106,11 @@ async fn linear_outbox_backfill_over_pgwire() {
             "22021",
             r#"invalid byte sequence for encoding "UTF8": 0xff"#,
         ),
+        (
+            r"SELECT convert_from('\x00', 'SQL_ASCII')",
+            "22021",
+            r#"invalid byte sequence for encoding "SQL_ASCII": 0x00"#,
+        ),
     ] {
         for error in [
             client.simple_query(sql).await.unwrap_err(),

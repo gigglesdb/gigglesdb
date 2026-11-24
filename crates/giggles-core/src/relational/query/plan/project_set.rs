@@ -1,7 +1,7 @@
 //! Lower a scalar set-returning projection to a lateral FROM function.
 use super::*;
 
-fn call(tokens: &[Token], at: usize) -> Option<(&str, usize)> {
+fn function_call(tokens: &[Token], at: usize) -> Option<(&str, usize)> {
     let name = |at| match tokens.get(at) {
         Some(Token::Word(word) | Token::QuotedIdent(word)) => Some(word.as_str()),
         _ => None,
@@ -13,7 +13,23 @@ fn call(tokens: &[Token], at: usize) -> Option<(&str, usize)> {
             (at, at + 1)
         };
     let name = name(name_at)?;
-    (tokens.get(open) == Some(&Token::Symbol('(')) && srf::projection_function(name))
+    (tokens.get(open) == Some(&Token::Symbol('('))).then_some((name, open))
+}
+
+fn call(tokens: &[Token], at: usize) -> Option<(&str, usize)> {
+    function_call(tokens, at).filter(|(name, _)| srf::projection_function(name))
+}
+
+fn subscripted_regex(tokens: &[Token], at: usize) -> Option<(&str, usize)> {
+    if tokens.get(at) != Some(&Token::Symbol('(')) {
+        return None;
+    }
+    let (name, open) = function_call(tokens, at + 1)?;
+    if name != "regexp_matches" {
+        return None;
+    }
+    let close = subquery_end(tokens, open).ok()?;
+    matches!(tokens.get(close + 1..), Some([Token::Symbol(')'), Token::Symbol('['), ..]))
         .then_some((name, open))
 }
 
@@ -38,11 +54,26 @@ struct Projection {
 }
 
 impl Projection {
-    fn calls<'a>(&self, tokens: &'a [Token]) -> impl Iterator<Item = (usize, &'a str, usize)> {
-        self.items
-            .iter()
-            .copied()
-            .filter_map(|i| call(tokens, i).map(|(name, open)| (i, name, open)))
+    fn ungrouped_having(&self, tokens: &[Token]) -> bool {
+        let mut clauses = self.positions.iter().copied().filter(|&i| i >= self.tail);
+        clauses
+            .clone()
+            .any(|i| parse::unqualified(tokens, i) && parse::word(&tokens[i], "having"))
+            && !clauses.any(|i| parse::group_clause(tokens, i))
+    }
+
+    fn calls<'a>(
+        &self,
+        tokens: &'a [Token],
+        regex_source: bool,
+    ) -> impl Iterator<Item = (usize, usize, &'a str, usize)> {
+        self.items.iter().copied().filter_map(move |item| {
+            if regex_source {
+                subscripted_regex(tokens, item).map(|(name, open)| (item, item + 1, name, open))
+            } else {
+                call(tokens, item).map(|(name, open)| (item, item, name, open))
+            }
+        })
     }
 }
 
@@ -57,17 +88,19 @@ fn clause(tokens: &[Token], i: usize) -> bool {
 }
 
 pub(super) fn requires_plan(tokens: &[Token]) -> bool {
-    projection(tokens)
+    projection(tokens, claims(tokens))
         .ok()
         .flatten()
-        .is_some_and(|projection| projection.calls(tokens).next().is_some())
+        .is_some_and(|projection| {
+            !projection.ungrouped_having(tokens) && projection.calls(tokens, false).next().is_some()
+        })
 }
 
-fn projection(tokens: &[Token]) -> R<Option<Projection>> {
+fn projection(tokens: &[Token], claimed: bool) -> R<Option<Projection>> {
     if !tokens
         .first()
         .is_some_and(|token| parse::word(token, "select"))
-        || !claims(tokens)
+        || !claimed
     {
         return Ok(None);
     }
@@ -111,8 +144,26 @@ fn projection(tokens: &[Token]) -> R<Option<Projection>> {
     }))
 }
 
-pub(super) fn rewrite(tokens: &[Token]) -> R<Option<Vec<Token>>> {
-    let Some(projection) = projection(tokens)? else {
+pub(super) fn rewrite(tokens: &[Token], distinct_on: bool) -> R<Option<Vec<Token>>> {
+    rewrite_projection(tokens, distinct_on, false, claims(tokens))
+}
+
+pub(in crate::relational) fn rewrite_regex_source(tokens: &[Token]) -> R<Option<Vec<Token>>> {
+    // Plain regex projections have their own executor. Lower the parenthesized
+    // regexp_matches subscript used in a SELECT source through the FROM planner.
+    let claimed = tokens.iter().any(
+        |token| matches!(token, Token::Word(name) | Token::QuotedIdent(name) if name == "regexp_matches"),
+    );
+    rewrite_projection(tokens, false, true, claimed)
+}
+
+fn rewrite_projection(
+    tokens: &[Token],
+    distinct_on: bool,
+    regex_source: bool,
+    claimed: bool,
+) -> R<Option<Vec<Token>>> {
+    let Some(projection) = projection(tokens, claimed)? else {
         return Ok(None);
     };
     let Projection {
@@ -121,10 +172,18 @@ pub(super) fn rewrite(tokens: &[Token]) -> R<Option<Vec<Token>>> {
         tail,
     } = projection;
     let start = items[0];
-    let mut calls = projection.calls(tokens);
-    let Some((at, name, open)) = calls.next() else {
+    let mut calls = projection.calls(tokens, regex_source);
+    let Some((item, at, name, open)) = calls.next() else {
         return Ok(None);
     };
+    if distinct_on {
+        // DISTINCT ON can select its rows before expanding the projection.
+        return Err(SqlError::Unsupported);
+    }
+    if projection.ungrouped_having(tokens) {
+        // The ordinary grouping binder diagnoses ungrouped column references.
+        return Ok(None);
+    }
     // A lateral join can lower one direct scalar SRF. Filters, grouping, and
     // windows need an expansion operator after those stages. A bare star
     // would also expose the synthetic lateral column.
@@ -142,7 +201,8 @@ pub(super) fn rewrite(tokens: &[Token]) -> R<Option<Vec<Token>>> {
                 && (parse::group_clause(tokens, i)
                     || ["where", "having", "window", "over"]
                         .iter()
-                        .any(|name| parse::word(&tokens[i], name)))
+                        .any(|name| parse::word(&tokens[i], name))
+                    || regex_source && parse::word(&tokens[i], "for"))
         })
     {
         return Err(SqlError::Unsupported);
@@ -151,18 +211,8 @@ pub(super) fn rewrite(tokens: &[Token]) -> R<Option<Vec<Token>>> {
     let end = items
         .iter()
         .copied()
-        .find(|&i| i > at)
+        .find(|&i| i > item)
         .map_or(tail, |i| i - 1);
-    let mut alias = None;
-    if close + 1 < end {
-        let mut parser = parse::parser(&tokens[close + 1..end]);
-        parser.word("as");
-        alias = Some(parser.column_name()?);
-        if parser.at != parser.tokens.len() {
-            return Err(SqlError::Unsupported);
-        }
-    }
-    let alias = alias.as_deref().unwrap_or(name);
     let fresh = |prefix: &str| {
         (0..)
             .map(|i| format!("{prefix}_{i}"))
@@ -176,13 +226,27 @@ pub(super) fn rewrite(tokens: &[Token]) -> R<Option<Vec<Token>>> {
     let relation = fresh("project_set");
     let value = fresh("project_value");
     let mut rewritten = tokens[..at].to_vec();
-    rewritten.extend([
-        ident(&relation),
-        Token::Symbol('.'),
-        ident(&value),
-        word("as"),
-        ident(alias),
-    ]);
+    rewritten.extend([ident(&relation), Token::Symbol('.'), ident(&value)]);
+    if regex_source {
+        rewritten.extend_from_slice(&tokens[close + 1..end]);
+        let mut parser = parse::parser(&rewritten[item..]);
+        Scalar::parse_expr(&mut parser, 0, false)?;
+        if parser.at == parser.tokens.len() {
+            rewritten.extend([word("as"), ident(name)]);
+        }
+    } else {
+        let mut parser = parse::parser(&tokens[close + 1..end]);
+        parser.word("as");
+        let alias = if close + 1 < end {
+            parser.column_name()?
+        } else {
+            name.to_owned()
+        };
+        if parser.at != parser.tokens.len() {
+            return Err(SqlError::Unsupported);
+        }
+        rewritten.extend([word("as"), ident(&alias)]);
+    }
     rewritten.extend_from_slice(&tokens[end..tail]);
 
     let has_from = tokens.get(tail).is_some_and(|t| parse::word(t, "from"));

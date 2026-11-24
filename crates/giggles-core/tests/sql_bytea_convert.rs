@@ -142,6 +142,16 @@ fn utf8_and_sql_ascii_conversions() {
             r#"invalid byte sequence for encoding "UTF8": 0xe2 0x00 0x62"#,
         ),
         (
+            r"convert_from('\x00', 'SQL_ASCII')",
+            "22021",
+            r#"invalid byte sequence for encoding "SQL_ASCII": 0x00"#,
+        ),
+        (
+            r"convert_from('\xff00', 'sql-ascii')",
+            "22021",
+            r#"invalid byte sequence for encoding "SQL_ASCII": 0x00"#,
+        ),
+        (
             r"convert_from('\xff', 'SQL_ASCII')",
             "22021",
             r#"invalid byte sequence for encoding "UTF8": 0xff"#,
@@ -293,6 +303,22 @@ fn json_array_values_variadic_and_result_types() {
         ),
         ("json_build_array(VARIADIC '{}'::int[])::text", "[]"),
         (
+            r#"json_build_array(VARIADIC ARRAY['{"a":1}'::json, '[1,  2]'::json, NULL::json])::text"#,
+            r#"[{"a":1}, [1,  2], null]"#,
+        ),
+        (
+            "json_build_array(VARIADIC ARRAY[json_build_array(1,'x')])::text",
+            r#"[[1, "x"]]"#,
+        ),
+        (
+            r#"jsonb_build_array(VARIADIC ARRAY['{"a":1}'::json])::text"#,
+            r#"[{"a": 1}]"#,
+        ),
+        (
+            "json_build_array(VARIADIC ARRAY['{}'::json, '[]', NULL])::text",
+            "[{}, [], null]",
+        ),
+        (
             "json_build_array(VARIADIC ARRAY['a',NULL,'b'])",
             r#"["a", null, "b"]"#,
         ),
@@ -326,6 +352,16 @@ fn json_array_values_variadic_and_result_types() {
         select(&mut session, r#"jsonb_build_array('a') = '["a"]'::jsonb"#),
         vec![Value::Bool(true)]
     );
+    for sql in [
+        "SELECT json_build_array(VARIADIC '{{1,2},{3,4}}'::int[])",
+        "SELECT json_build_array(VARIADIC NULL::json[])",
+    ] {
+        assert_eq!(
+            session.execute(sql, &[], None),
+            Err(giggles_core::CoreError::Sql(SqlError::Unsupported)),
+            "{sql}"
+        );
+    }
     assert_eq!(
         session.execute("SELECT jsonb_build_array(ROW(1,'a'))", &[], None),
         Err(giggles_core::CoreError::Sql(SqlError::Unsupported))

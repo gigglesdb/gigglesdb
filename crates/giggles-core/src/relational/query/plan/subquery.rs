@@ -206,6 +206,13 @@ pub(super) fn rewrite(
             i = close + 1;
             continue;
         }
+        if parse::word(&tokens[i], "array") && is_subquery_open(tokens, i + 1) {
+            let close = subquery_end(tokens, i + 1)?;
+            if project_set::requires_plan(&tokens[i + 2..close]) {
+                // ARRAY needs to collect every row from the subquery.
+                return Err(SqlError::Unsupported.into());
+            }
+        }
         let exists = parse::word(&tokens[i], "exists") && is_subquery_open(tokens, i + 1);
         let open = if exists { i + 1 } else { i };
         if is_subquery_open(tokens, open) {

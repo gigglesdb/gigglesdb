@@ -297,7 +297,7 @@ mod tests {
         let root = query("SELECT id FROM a o");
         let middle = query("SELECT id FROM b m");
         let child = query("SELECT abs(id) FROM c WHERE o.id = $1");
-        let bound = child.bind_seeded_inner(&state, vec![None], false,
+        let bound = child.bind_seeded_inner(&state, vec![None], ProjectionBinding::Execute,
             &[&middle.sources, &root.sources]).unwrap();
         assert_eq!(bound.columns[0].data_type, DataType::BigInt);
         assert_eq!(bound.parameters, vec![DataType::Integer]);
@@ -311,7 +311,7 @@ mod tests {
         assert_eq!(deps.routines, ["abs".into()].into());
         let declared = query("SELECT $2 FROM c WHERE o.id = $1");
         let bound = declared.bind_seeded_inner(&state,
-            vec![Some(DataType::Integer), Some(DataType::Text)], false, &[&root.sources]).unwrap();
+            vec![Some(DataType::Integer), Some(DataType::Text)], ProjectionBinding::Execute, &[&root.sources]).unwrap();
         assert_eq!(bound.parameters, vec![DataType::Integer, DataType::Text]);
         assert_eq!(bound.columns[0].data_type, DataType::Text);
         for (sql, error) in [
@@ -324,23 +324,23 @@ mod tests {
             let q = query(sql);
             let ambiguous = query("SELECT x.id FROM a x JOIN b y ON x.id=y.id");
             let scopes = if sql == "SELECT id FROM c" { &ambiguous.sources } else { &root.sources };
-            assert!(matches!(q.bind_seeded_inner(&state, vec![], false, &[scopes]),
+            assert!(matches!(q.bind_seeded_inner(&state, vec![], ProjectionBinding::Execute, &[scopes]),
                 Err(actual) if actual == error), "{sql}");
         }
         for sql in ["SELECT o.id, count(*) FROM c", "SELECT o.id FROM c GROUP BY o.id"] {
             let q = query(sql);
-            let bound = q.bind_seeded_inner(&state, vec![], false, &[&root.sources]).unwrap();
+            let bound = q.bind_seeded_inner(&state, vec![], ProjectionBinding::Execute, &[&root.sources]).unwrap();
             assert_eq!(bound.outer_slots.len(), 1);
             assert_eq!(bound.columns[0].data_type, DataType::Integer);
         }
         let shadow = query("SELECT o.id FROM b o");
-        let bound = shadow.bind_seeded_inner(&state, vec![], false, &[&root.sources]).unwrap();
+        let bound = shadow.bind_seeded_inner(&state, vec![], ProjectionBinding::Execute, &[&root.sources]).unwrap();
         assert!(bound.outer_slots.is_empty());
         assert_eq!(bound.columns[0].data_type, DataType::BigInt);
         let q = query("SELECT o.id");
-        assert!(q.bind_seeded_inner(&state, vec![], false,
+        assert!(q.bind_seeded_inner(&state, vec![], ProjectionBinding::Execute,
             &vec![root.sources.as_slice(); MAX_DEPTH]).is_ok());
-        assert!(matches!(q.bind_seeded_inner(&state, vec![], false,
+        assert!(matches!(q.bind_seeded_inner(&state, vec![], ProjectionBinding::Execute,
             &vec![root.sources.as_slice(); MAX_DEPTH + 1]), Err(SqlError::Limit)));
         for sql in ["SELECT id FROM a WHERE id IN (SELECT 1)",
             "SELECT id FROM a WHERE id IN (SELECT count(*))"] {

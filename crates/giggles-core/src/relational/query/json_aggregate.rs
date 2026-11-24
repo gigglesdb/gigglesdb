@@ -3,6 +3,7 @@ use super::*;
 use giggles_pg_types::temporal::SessionZone;
 
 pub(super) const OID: u32 = 114;
+pub(super) const ARRAY_OID: u32 = 199;
 pub(super) const TEXT_RESULT: &str = "\0json_aggregate_text_result";
 pub(super) const INPUT: &str = "\0json_input";
 

@@ -234,10 +234,23 @@ impl Function {
             };
             s.infer(hint, parameters, &|_, _| Err(SqlError::UnknownColumn), &[])?;
             let ty = bind::scalar_type(s, parameters)?;
-            if !integer_type(&ty) {
-                return Err(SqlError::UndefinedFunction);
-            }
             types.push(ty);
+        }
+        if let [start, stop, step] = types.as_slice() {
+            let temporal = |ty: &DataType| {
+                matches!(ty, DataType::Date | DataType::Timestamp | DataType::TimestampTz)
+            };
+            let unknown = |i: usize| self.args[i].aggregate_unknown(parameters);
+            if (temporal(start) || temporal(stop))
+                && (temporal(start) || unknown(0))
+                && (temporal(stop) || unknown(1))
+                && (*step == DataType::Interval || unknown(2))
+            {
+                return Err(SqlError::Unsupported);
+            }
+        }
+        if types.iter().any(|ty| !integer_type(ty)) {
+            return Err(SqlError::UndefinedFunction);
         }
         Ok(if types.contains(&DataType::BigInt) {
             DataType::BigInt

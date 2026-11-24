@@ -45,6 +45,10 @@ impl SelectSource {
             inner = &inner[1..inner.len() - 1];
         }
 
+        let rewritten = query::plan::project_set::rewrite_regex_source(inner)?;
+        let (tokens, inner) = rewritten
+            .as_deref()
+            .map_or((tokens, inner), |rewritten| (rewritten, rewritten));
         let mut p = parser(inner);
         let source = match query::Query::parse(&mut p) {
             Ok(query) if !query.explain => Self::Query(Box::new(query)),

@@ -342,6 +342,7 @@ impl Diagnostic {
             (Err(CoreError::Sql(_)), Some(_)) if self.exact_sql_detail => true,
             (Err(CoreError::Sql(SqlError::CharacterNotInRepertoire)), Some(m)) => {
                 m.starts_with("invalid byte sequence for encoding \"UTF8\": ")
+                    || m == "invalid byte sequence for encoding \"SQL_ASCII\": 0x00"
             }
             (Err(CoreError::Sql(SqlError::InvalidIndexPredicate)), Some(m)) => {
                 m == "functions in index predicate must be marked IMMUTABLE"

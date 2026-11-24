@@ -235,6 +235,13 @@ impl Join {
         out
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProjectionBinding {
+    Execute,
+    Describe,
+    CreateAs,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct Query {
     pub(super) explain: bool,
@@ -2450,7 +2457,7 @@ impl Query {
             let used = q.used_parameters();
             let seed = parameters.iter().enumerate().map(|(i, p)|
                 p.clone().or_else(|| (!used.contains(&(i + 1))).then_some(DataType::Text))).collect();
-            let bound = q.bind_seeded_inner(state, seed, false, &[])?;
+            let bound = q.bind_seeded_inner(state, seed, ProjectionBinding::Execute, &[])?;
             for n in used { parameters[n - 1] = Some(bound.parameters[n - 1].clone()); }
             out.register(q as *const Query as usize, SubplanMode::Scalar, bound)?;
         }
@@ -2478,7 +2485,7 @@ impl Query {
                     })
                     .collect();
                 let scopes: Vec<_> = std::iter::once(&self.sources[..visible]).chain(outer.iter().copied()).collect();
-                let bound = q.bind_seeded_inner(state, seed, false, &scopes)?;
+                let bound = q.bind_seeded_inner(state, seed, ProjectionBinding::Execute, &scopes)?;
                 if value.is_some() && bound.columns.len() != 1 {
                     return Err(SqlError::Syntax);
                 }
@@ -3872,7 +3879,16 @@ impl Query {
         count: usize,
         declared: &[Option<DataType>],
     ) -> R<BoundQuery<'a>> {
-        self.bind_declared(state, count, declared, false)
+        self.bind_declared(state, count, declared, ProjectionBinding::Execute)
+    }
+
+    pub(super) fn bind_create_as<'a>(
+        &'a self,
+        state: &'a Relational,
+        count: usize,
+        declared: &[Option<DataType>],
+    ) -> R<BoundQuery<'a>> {
+        self.bind_declared(state, count, declared, ProjectionBinding::CreateAs)
     }
     pub(super) fn bind_description<'a>(
         &'a self,
@@ -3880,14 +3896,14 @@ impl Query {
         count: usize,
         declared: &[Option<DataType>],
     ) -> R<BoundQuery<'a>> {
-        self.bind_declared(state, count, declared, true)
+        self.bind_declared(state, count, declared, ProjectionBinding::Describe)
     }
     fn bind_declared<'a>(
         &'a self,
         state: &'a Relational,
         count: usize,
         declared: &[Option<DataType>],
-        classify_plain_columns: bool,
+        projection: ProjectionBinding,
     ) -> R<BoundQuery<'a>> {
         if count > MAX_PARAMS {
             return Err(SqlError::Limit);
@@ -3897,7 +3913,7 @@ impl Query {
         }
         let mut parameters = vec![None; count];
         parameters[..declared.len()].clone_from_slice(declared);
-        let mut bound = self.bind_seeded_inner(state, parameters, classify_plain_columns, &[])?;
+        let mut bound = self.bind_seeded_inner(state, parameters, projection, &[])?;
         bound.declared = declared.to_vec();
         Ok(bound)
     }
@@ -3906,14 +3922,14 @@ impl Query {
         state: &'a Relational,
         parameters: Vec<Option<DataType>>,
     ) -> R<BoundQuery<'a>> {
-        self.bind_seeded_inner(state, parameters, false, &[])
+        self.bind_seeded_inner(state, parameters, ProjectionBinding::Execute, &[])
     }
     pub(super) fn bind_projection_seeded<'a>(
         &'a self,
         state: &'a Relational,
         parameters: Vec<Option<DataType>>,
     ) -> R<BoundQuery<'a>> {
-        self.bind_seeded_inner(state, parameters, true, &[])
+        self.bind_seeded_inner(state, parameters, ProjectionBinding::Describe, &[])
     }
     /// Preserve unknown INSERT output literals without treating expanded columns as unknown.
     pub(super) fn insert_outputs(&self, state: &Relational) -> R<Vec<Option<Value>>> {
@@ -4009,7 +4025,7 @@ impl Query {
                 slot.get_or_insert(DataType::Text);
             }
         }
-        let mut bound = self.bind_seeded_inner(state, seed, false, &[])?;
+        let mut bound = self.bind_seeded_inner(state, seed, ProjectionBinding::Execute, &[])?;
         // INSERT source ordinals name expanded output positions, including stars.
         // Grouped queries already resolve ordinals in their grouping plan.
         if bound.grouping.is_none() {
@@ -4126,7 +4142,7 @@ impl Query {
         &'a self,
         state: &'a Relational,
         mut parameters: Vec<Option<DataType>>,
-        classify_plain_columns: bool,
+        projection: ProjectionBinding,
         outer: &[&[Source]],
     ) -> R<BoundQuery<'a>> {
         let _enum_scope = functions::enum_order::Scope::enter(state);
@@ -4421,9 +4437,9 @@ impl Query {
         {
             return Err(SqlError::AmbiguousParameter);
         }
-        // Only a plain projection seeded with bytea needs the catalog fallback's
-        // text default. Inferred bytea and other query shapes keep their errors.
-        if declared_bytea_projection {
+        // CTAS resolves bare output parameters to text when no clause supplies
+        // a type. Plain bytea-seeded projections also use the catalog fallback.
+        if declared_bytea_projection || projection == ProjectionBinding::CreateAs {
             for (item, _) in &self.items {
                 if let Item::Scalar(Scalar::Param(n)) = item {
                     parameters[*n - 1].get_or_insert(DataType::Text);
@@ -4475,7 +4491,7 @@ impl Query {
                         (None, d)
                     };
                     let item = match source_column {
-                        Some(column) if classify_plain_columns && !functions::collation::has_column_metadata(d.id)
+                        Some(column) if projection == ProjectionBinding::Describe && !functions::collation::has_column_metadata(d.id)
                             && !generated::is_virtual(d.id) => BoundItem::Column(column),
                         _ => BoundItem::Scalar(e),
                     };

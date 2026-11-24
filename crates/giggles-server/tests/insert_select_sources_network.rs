@@ -150,6 +150,19 @@ async fn migration_and_ctas_report_postgres_command_tags() {
             .unwrap(),
         2
     );
+    let inferred = client
+        .prepare("CREATE TABLE extended_text AS SELECT $1 AS a")
+        .await
+        .unwrap();
+    assert_eq!(inferred.params(), &[tokio_postgres::types::Type::TEXT]);
+    assert_eq!(client.execute(&inferred, &[&"5"]).await.unwrap(), 1);
+    let row = client
+        .query_one("SELECT a FROM extended_text", &[])
+        .await
+        .unwrap();
+    assert_eq!(*row.columns()[0].type_(), tokio_postgres::types::Type::TEXT);
+    assert_eq!(row.get::<_, &str>(0), "5");
+
     let recent: Vec<i32> = client
         .query("SELECT thread FROM recent ORDER BY thread", &[])
         .await

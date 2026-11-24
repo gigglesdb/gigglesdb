@@ -12,7 +12,7 @@ mod exec;
 pub(super) mod join;
 mod parse;
 mod paging;
-mod project_set;
+pub(in crate::relational) mod project_set;
 mod group_sets;
 mod insert_source;
 mod setops;
