@@ -1326,10 +1326,12 @@ impl<'de> Deserialize<'de> for Relational {
                     for table in std::sync::Arc::make_mut(&mut value.tables).values_mut() {
                         for column in &mut table.columns {
                             if let Some(kind) = value.ext.logical_kinds.get(&column.id) {
-                                if column.data_type != DataType::Text {
-                                    return Err(A::Error::custom(
-                                        "logical kind on non-text column",
-                                    ));
+                                let physical = match kind {
+                                    catalog_ext::LogicalKind::TsVector | catalog_ext::LogicalKind::TsQuery => DataType::Bytes,
+                                    _ => DataType::Text,
+                                };
+                                if column.data_type != physical {
+                                    return Err(A::Error::custom("logical kind on wrong physical column type"));
                                 }
                                 column.data_type = match kind {
                                     catalog_ext::LogicalKind::Uuid => DataType::Uuid,
@@ -1338,6 +1340,8 @@ impl<'de> Deserialize<'de> for Relational {
                                     catalog_ext::LogicalKind::BigIntArray => DataType::BigIntArray,
                                     catalog_ext::LogicalKind::TextArray => DataType::TextArray,
                                     catalog_ext::LogicalKind::UuidArray => DataType::UuidArray,
+                                    catalog_ext::LogicalKind::TsVector => DataType::TsVector,
+                                    catalog_ext::LogicalKind::TsQuery => DataType::TsQuery,
                                 };
                             }
                         }

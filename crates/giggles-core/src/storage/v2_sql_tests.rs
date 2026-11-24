@@ -2102,6 +2102,32 @@ fn uuid_array_feature_bit_tracks_persisted_types() {
 }
 
 #[test]
+fn text_search_v2_feature_bit_and_ordinary_catalog_bytes() {
+    let mut f = Fixture::new();
+    let bit = engine::meta::TEXT_SEARCH_TYPES;
+    let features = |f: &Fixture| engine::meta::validate_meta(f.db().kv.as_ref()).unwrap().features;
+    f.execute("CREATE TABLE t (id bigint PRIMARY KEY, v text[])");
+    f.execute("INSERT INTO t VALUES (1,'{old}')");
+    let bytes = f.catalog_bytes();
+    let old_bits = features(&f);
+    assert_eq!(old_bits & bit, 0);
+    f.execute("SELECT to_tsvector('a'), to_tsquery('a')");
+    f.reopen();
+    assert_eq!(f.catalog_bytes(), bytes);
+    assert_eq!(features(&f), old_bits);
+
+    f.execute("ALTER TABLE t ADD COLUMN q tsquery");
+    f.execute("UPDATE t SET q = ''");
+    assert_ne!(features(&f) & bit, 0);
+    assert!(engine::content_check::check(f.db().kv.as_ref(), features(&f) & !bit).is_err());
+    f.reopen();
+    assert_eq!(
+        values(&mut f.admin().sql_session(), "SELECT q::text FROM t"),
+        vec![vec![relational::Value::Text(String::new())]],
+    );
+}
+
+#[test]
 fn catalog_scale_feature_is_committed_with_the_first_wide_catalog() {
     let f = Fixture::new();
     let db = f.db();

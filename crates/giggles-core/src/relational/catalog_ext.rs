@@ -106,6 +106,9 @@ pub(crate) enum LogicalKind {
     BigIntArray,
     TextArray,
     UuidArray,
+    // Appended logical kinds require Legacy format-53 feature bit 37.
+    TsVector,
+    TsQuery,
 }
 // Frozen version-three column tuple; version six appends type_id.
 #[derive(Serialize, Deserialize)]
@@ -470,6 +473,9 @@ impl CatalogExt {
     pub(crate) fn has_uuid_arrays(&self) -> bool {
         self.logical_kinds.values().any(|kind| *kind == LogicalKind::UuidArray)
             || self.types.values().any(TypeDef::has_uuid_arrays)
+    }
+    pub(crate) fn has_text_search_types(&self) -> bool {
+        self.logical_kinds.values().any(|kind| matches!(kind, LogicalKind::TsVector | LogicalKind::TsQuery))
     }
     pub(crate) fn wire_version(&self) -> u32 {
         if !self.added_enum_labels.is_empty() {
@@ -1383,7 +1389,8 @@ impl Relational {
         }
         for (id, (_, column)) in &columns {
             let expected = match column.data_type {
-                DataType::RegType => return Err(SqlError::Unsupported),
+                DataType::RegType | DataType::RegConfig | DataType::RegDictionary | DataType::Oid
+                | DataType::PgChar | DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray => return Err(SqlError::Unsupported),
                 DataType::Varchar => Some(TextKind::Varchar),
                 DataType::Bpchar => Some(TextKind::Bpchar),
 
@@ -1393,6 +1400,8 @@ impl Relational {
                 | DataType::BigIntArray
                 | DataType::TextArray
                 | DataType::UuidArray
+                | DataType::TsVector
+                | DataType::TsQuery
                 | DataType::Boolean
                 | DataType::SmallInt
                 | DataType::Integer
@@ -1416,6 +1425,8 @@ impl Relational {
                 DataType::BigIntArray => Some(LogicalKind::BigIntArray),
                 DataType::TextArray => Some(LogicalKind::TextArray),
                 DataType::UuidArray => Some(LogicalKind::UuidArray),
+                DataType::TsVector => Some(LogicalKind::TsVector),
+                DataType::TsQuery => Some(LogicalKind::TsQuery),
                 _ => None,
             };
             if ext.logical_kinds.get(id).copied() != logical {

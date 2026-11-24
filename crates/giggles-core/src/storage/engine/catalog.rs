@@ -127,6 +127,12 @@ impl CatalogView {
         }) || self.types.values().any(TypeDef::has_uuid_arrays)
     }
 
+    fn has_text_search_types(&self) -> bool {
+        self.by_id.values().any(|entry| {
+            entry.def.columns.iter().any(|c| c.data_type.is_text_search())
+        })
+    }
+
     fn needs_wide_catalog(&self) -> bool {
         relational::catalog_scale::Counts {
             tables: self.by_id.len(),
@@ -173,6 +179,8 @@ impl CatalogView {
                     relational::DataType::BigIntArray => LogicalKind::BigIntArray,
                     relational::DataType::TextArray => LogicalKind::TextArray,
                     relational::DataType::UuidArray => LogicalKind::UuidArray,
+                    relational::DataType::TsVector => LogicalKind::TsVector,
+                    relational::DataType::TsQuery => LogicalKind::TsQuery,
                     _ => continue,
                 };
                 parts.ext.logical_kinds.insert(column.id, kind);
@@ -1062,8 +1070,8 @@ impl Catalog {
             if old_records.get(key) != Some(value) || txn.catalog_own(key).is_some() {
                 let bits = super::content_check::required_bits_for_catalog_value(key, value)
                     .map_err(|e| corrupt(&e.to_string()))?;
-                // Publish UUID arrays and partial indexes from the final catalog.
-                txn.require_features(bits & !(super::meta::UUID_ARRAY_COLUMNS | super::meta::PARTIAL_INDEXES));
+                // Publish UUID arrays, partial indexes and text-search types from the final catalog.
+                txn.require_features(bits & !(super::meta::UUID_ARRAY_COLUMNS | super::meta::PARTIAL_INDEXES | super::meta::TEXT_SEARCH_TYPES));
             }
         }
         self.lock_and_write(txn, &old_records, &new_records, deadline, cancel)?;
@@ -1555,6 +1563,9 @@ impl Catalog {
                 index.has_temporal_key(&final_view.by_id[&index.table].def)
             }),
         );
+        if final_view.has_text_search_types() {
+            txn.require_features(super::meta::TEXT_SEARCH_TYPES);
+        }
         // A gateway's catalog commit also replaces the generation record, so other gateways
         // see that their cached catalog is stale (GD-0075 P7-1).
         let token = match self.services {

@@ -1,0 +1,18 @@
+1	20	
+2	13	':1'
+15	24	'1':1 '10':3 '2':2
+18	2	'a' 'and' 'ate' 'cat' 'fat' 'mat' 'on' 'rat' 'sat'
+16	5	'a b':1 'c''d':2 'e f':3
+11	7	'a' 'b' 'x' 'y' 'z'
+17	3	'brown':3 'fox':4 'jump':5 'quick':2
+13	22	'café':1 'naïve':2
+10	1	'cat':1 'dog':2
+6	6	'cat' 'dog'
+14	4	'dog':5 'fox':1A,2B,3C,4
+7	11	'fox':1,2,3
+3	9	'fox':16383
+4	10	'fox':16383
+5	12	'fox':3A
+12	21	'Mixed' 'UPPER' 'lower'
+8	19	'out' 'spaced'
+9	23	'with:colon':1

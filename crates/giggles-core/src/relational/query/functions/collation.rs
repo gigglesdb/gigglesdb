@@ -223,6 +223,9 @@ impl BoundScalar {
         {
             return enum_order::compare_arrays(labels, a, b);
         }
+        if self.ty.is_text_search() && *a != Value::Null && *b != Value::Null {
+            return text_search_types::compare(&self.ty, a, b);
+        }
         if self.ty.is_array() {
             return array_order::compare(&self.ty, self.explicit_collation()?, a, b);
         }
@@ -399,6 +402,10 @@ pub(in crate::relational::query) fn compare(
     b: &Value,
     ty: &DataType,
 ) -> Ordering {
+    if ty.is_text_search() && *a != Value::Null && *b != Value::Null {
+        return user_types::probe_preserving_error_message(|| text_search_types::compare(ty, a, b))
+            .unwrap_or_else(|_| cmp(a, b));
+    }
     if ty.is_array() {
         // Scalar inputs are validated before sort/map callbacks. Preserve the
         // diagnostic if an internal value nevertheless needs the fallback.
@@ -442,6 +449,9 @@ pub(in crate::relational::query) fn compare_pair(
         && let Some(TypeDef::Enum { labels, .. }) = a.attached_enum().or_else(|| b.attached_enum())
     {
         return enum_order::compare_arrays(labels, av, bv);
+    }
+    if a.ty.is_text_search() {
+        return text_search_types::compare(&a.ty, av, bv);
     }
     if a.ty == DataType::TextArray {
         logical_types::validate_text_array(av)?;

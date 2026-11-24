@@ -273,7 +273,7 @@ fn cow_sink_dml_forks_keep_catalog_shared() {
             Ok(())
         }
         fn streams_index_builds(&self) -> bool { true }
-        fn ddl_pages(&mut self, _: &TableDef, _: &TableDef, _: bool,
+        fn ddl_pages(&mut self, _: &TableDef, _: &TableDef, _: row_sink::PageMode,
             page: &mut dyn FnMut(row_sink::DdlRows) -> Result<row_sink::DdlRows, CoreError>) -> Result<(), CoreError> {
             self.0 = page(self.0.clone())?;
             Ok(())

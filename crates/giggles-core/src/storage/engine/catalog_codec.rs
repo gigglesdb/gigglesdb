@@ -70,12 +70,22 @@ enum DataTypeDto {
     UserTypeArray(u64),
     // Appended tag 24 requires meta feature bit 32.
     UuidArray,
+    #[allow(dead_code)]
+    #[serde(skip_serializing, deserialize_with = "reject_reserved_data_type")]
+    Reserved25,
+    // Appended tags 26 and 27 require meta feature bit 37.
+    TsVector,
+    TsQuery,
+}
+fn reject_reserved_data_type<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+    Err(serde::de::Error::custom("reserved catalog data type tag"))
 }
 impl TryFrom<DataType> for DataTypeDto {
     type Error = CoreError;
     fn try_from(v: DataType) -> Result<Self, CoreError> {
         Ok(match v {
-            DataType::RegType => return Err(CoreError::Sql(crate::relational::SqlError::Unsupported)),
+            DataType::RegType | DataType::RegConfig | DataType::RegDictionary | DataType::Oid
+            | DataType::PgChar | DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray => return Err(CoreError::Sql(crate::relational::SqlError::Unsupported)),
             DataType::Boolean => Self::Boolean,
             DataType::SmallInt => Self::SmallInt,
             DataType::Integer => Self::Integer,
@@ -99,6 +109,8 @@ impl TryFrom<DataType> for DataTypeDto {
             DataType::BigIntArray => Self::BigIntArray,
             DataType::TextArray => Self::TextArray,
             DataType::UuidArray => Self::UuidArray,
+            DataType::TsVector => Self::TsVector,
+            DataType::TsQuery => Self::TsQuery,
         })
     }
 }
@@ -128,6 +140,9 @@ impl From<DataTypeDto> for DataType {
             DataTypeDto::BigIntArray => Self::BigIntArray,
             DataTypeDto::TextArray | DataTypeDto::UserTypeArray(_) => Self::TextArray,
             DataTypeDto::UuidArray => Self::UuidArray,
+            DataTypeDto::TsVector => Self::TsVector,
+            DataTypeDto::TsQuery => Self::TsQuery,
+            DataTypeDto::Reserved25 => unreachable!("reserved catalog tag cannot deserialize"),
             // Resolved against the type catalog before a view is published.
             DataTypeDto::UserType(_) => Self::Text,
         }

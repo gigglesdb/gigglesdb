@@ -1,0 +1,7 @@
+[package]
+name = "giggles-pg-tsearch"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0 AND PostgreSQL AND BSD-3-Clause"
+
+[workspace]

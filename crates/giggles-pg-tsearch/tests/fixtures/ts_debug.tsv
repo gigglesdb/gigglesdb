@@ -1,0 +1,588 @@
+1	asciiword	The	{english_stem}	english_stem	{}
+1	blank	 	{}	\N	\N
+1	asciiword	quick	{english_stem}	english_stem	{quick}
+1	blank	 	{}	\N	\N
+1	asciiword	brown	{english_stem}	english_stem	{brown}
+1	blank	 	{}	\N	\N
+1	asciiword	fox	{english_stem}	english_stem	{fox}
+1	blank	 	{}	\N	\N
+1	asciiword	jumps	{english_stem}	english_stem	{jump}
+2	asciiword	A	{english_stem}	english_stem	{}
+2	blank	 	{}	\N	\N
+2	asciiword	slow	{english_stem}	english_stem	{slow}
+2	blank	 	{}	\N	\N
+2	asciiword	dog	{english_stem}	english_stem	{dog}
+3	asciiword	a	{english_stem}	english_stem	{}
+3	blank	 	{}	\N	\N
+3	asciiword	fat	{english_stem}	english_stem	{fat}
+3	blank	 	{}	\N	\N
+3	asciiword	cat	{english_stem}	english_stem	{cat}
+3	blank	 	{}	\N	\N
+3	asciiword	sat	{english_stem}	english_stem	{sat}
+3	blank	 	{}	\N	\N
+3	asciiword	on	{english_stem}	english_stem	{}
+3	blank	 	{}	\N	\N
+3	asciiword	a	{english_stem}	english_stem	{}
+3	blank	 	{}	\N	\N
+3	asciiword	mat	{english_stem}	english_stem	{mat}
+3	blank	 	{}	\N	\N
+3	asciiword	and	{english_stem}	english_stem	{}
+3	blank	 	{}	\N	\N
+3	asciiword	ate	{english_stem}	english_stem	{ate}
+3	blank	 	{}	\N	\N
+3	asciiword	a	{english_stem}	english_stem	{}
+3	blank	 	{}	\N	\N
+3	asciiword	fat	{english_stem}	english_stem	{fat}
+3	blank	 	{}	\N	\N
+3	asciiword	rat	{english_stem}	english_stem	{rat}
+4	asciiword	Running	{english_stem}	english_stem	{run}
+4	blank	 	{}	\N	\N
+4	asciiword	runners	{english_stem}	english_stem	{runner}
+4	blank	 	{}	\N	\N
+4	asciiword	ran	{english_stem}	english_stem	{ran}
+4	blank	 	{}	\N	\N
+4	asciiword	quickly	{english_stem}	english_stem	{quick}
+4	blank	; 	{}	\N	\N
+4	asciiword	the	{english_stem}	english_stem	{}
+4	blank	 	{}	\N	\N
+4	asciiword	runner	{english_stem}	english_stem	{runner}
+4	blank	'	{}	\N	\N
+4	asciiword	s	{english_stem}	english_stem	{}
+4	blank	 	{}	\N	\N
+4	asciiword	runs	{english_stem}	english_stem	{run}
+4	blank	 	{}	\N	\N
+4	asciiword	were	{english_stem}	english_stem	{}
+4	blank	 	{}	\N	\N
+4	asciiword	running	{english_stem}	english_stem	{run}
+4	blank	.	{}	\N	\N
+5	asciiword	Visit	{english_stem}	english_stem	{visit}
+5	blank	 	{}	\N	\N
+5	protocol	https://	{}	\N	\N
+5	url	www.example.com/path/to/page.html?x=1&y=2#frag	{simple}	simple	{www.example.com/path/to/page.html?x=1&y=2#frag}
+5	host	www.example.com	{simple}	simple	{www.example.com}
+5	url_path	/path/to/page.html?x=1&y=2#frag	{simple}	simple	{/path/to/page.html?x=1&y=2#frag}
+5	blank	 	{}	\N	\N
+5	asciiword	for	{english_stem}	english_stem	{}
+5	blank	 	{}	\N	\N
+5	asciiword	details	{english_stem}	english_stem	{detail}
+6	protocol	http://	{}	\N	\N
+6	asciiword	localhost	{english_stem}	english_stem	{localhost}
+6	blank	:	{}	\N	\N
+6	file	3000/api/v1/search	{simple}	simple	{3000/api/v1/search}
+6	blank	?	{}	\N	\N
+6	asciiword	q	{english_stem}	english_stem	{q}
+6	blank	=	{}	\N	\N
+6	asciiword	hello	{english_stem}	english_stem	{hello}
+6	blank	%	{}	\N	\N
+6	numword	20world	{simple}	simple	{20world}
+7	protocol	ftp://	{}	\N	\N
+7	url	ftp.postgresql.org/pub/source	{simple}	simple	{ftp.postgresql.org/pub/source}
+7	host	ftp.postgresql.org	{simple}	simple	{ftp.postgresql.org}
+7	url_path	/pub/source	{simple}	simple	{/pub/source}
+8	asciiword	Email	{english_stem}	english_stem	{email}
+8	blank	 	{}	\N	\N
+8	host	aylon.test	{simple}	simple	{aylon.test}
+8	blank	+	{}	\N	\N
+8	email	tag@example.co.uk	{simple}	simple	{tag@example.co.uk}
+8	blank	 	{}	\N	\N
+8	asciiword	or	{english_stem}	english_stem	{}
+8	blank	 	{}	\N	\N
+8	asciiword	bob	{english_stem}	english_stem	{bob}
+8	blank	@	{}	\N	\N
+8	asciiword	localhost	{english_stem}	english_stem	{localhost}
+8	blank	 	{}	\N	\N
+8	asciiword	now	{english_stem}	english_stem	{}
+9	asciiword	version	{english_stem}	english_stem	{version}
+9	blank	 	{}	\N	\N
+9	version	1.2.3	{simple}	simple	{1.2.3}
+9	blank	 	{}	\N	\N
+9	asciiword	and	{english_stem}	english_stem	{}
+9	blank	 	{}	\N	\N
+9	float	18.6	{simple}	simple	{18.6}
+9	blank	 	{}	\N	\N
+9	asciiword	and	{english_stem}	english_stem	{}
+9	blank	 	{}	\N	\N
+9	numword	v2	{simple}	simple	{v2}
+9	blank	 	{}	\N	\N
+9	asciiword	and	{english_stem}	english_stem	{}
+9	blank	 	{}	\N	\N
+9	version	10.0.0	{simple}	simple	{10.0.0}
+9	blank	-	{}	\N	\N
+9	file	beta.1	{simple}	simple	{beta.1}
+10	asciiword	numbers	{english_stem}	english_stem	{number}
+10	blank	 	{}	\N	\N
+10	uint	42	{simple}	simple	{42}
+10	blank	 	{}	\N	\N
+10	int	-17	{simple}	simple	{-17}
+10	blank	 	{}	\N	\N
+10	int	+3	{simple}	simple	{+3}
+10	blank	 	{}	\N	\N
+10	float	3.14159	{simple}	simple	{3.14159}
+10	blank	 	{}	\N	\N
+10	float	-0.5	{simple}	simple	{-0.5}
+10	blank	 	{}	\N	\N
+10	sfloat	1e10	{simple}	simple	{1e10}
+10	blank	 	{}	\N	\N
+10	sfloat	6.02e23	{simple}	simple	{6.02e23}
+10	blank	 	{}	\N	\N
+10	numword	0x1F	{simple}	simple	{0x1f}
+10	blank	 	{}	\N	\N
+10	uint	007	{simple}	simple	{007}
+11	uint	2026	{simple}	simple	{2026}
+11	int	-11	{simple}	simple	{-11}
+11	int	-22	{simple}	simple	{-22}
+11	blank	 	{}	\N	\N
+11	uint	12	{simple}	simple	{12}
+11	blank	:	{}	\N	\N
+11	uint	34	{simple}	simple	{34}
+11	blank	:	{}	\N	\N
+11	uint	56	{simple}	simple	{56}
+11	blank	 	{}	\N	\N
+11	asciiword	dates	{english_stem}	english_stem	{date}
+11	blank	 	{}	\N	\N
+11	asciiword	and	{english_stem}	english_stem	{}
+11	blank	 	{}	\N	\N
+11	asciiword	times	{english_stem}	english_stem	{time}
+11	blank	 	{}	\N	\N
+11	uint	12	{simple}	simple	{12}
+11	blank	:	{}	\N	\N
+11	uint	00	{simple}	simple	{00}
+12	asciihword	hyphenated-word	{english_stem}	english_stem	{hyphenated-word}
+12	hword_asciipart	hyphenated	{english_stem}	english_stem	{hyphen}
+12	blank	-	{}	\N	\N
+12	hword_asciipart	word	{english_stem}	english_stem	{word}
+12	blank	 	{}	\N	\N
+12	asciihword	self-contained	{english_stem}	english_stem	{self-contain}
+12	hword_asciipart	self	{english_stem}	english_stem	{self}
+12	blank	-	{}	\N	\N
+12	hword_asciipart	contained	{english_stem}	english_stem	{contain}
+12	blank	 	{}	\N	\N
+12	asciihword	state-of-the-art	{english_stem}	english_stem	{state-of-the-art}
+12	hword_asciipart	state	{english_stem}	english_stem	{state}
+12	blank	-	{}	\N	\N
+12	hword_asciipart	of	{english_stem}	english_stem	{}
+12	blank	-	{}	\N	\N
+12	hword_asciipart	the	{english_stem}	english_stem	{}
+12	blank	-	{}	\N	\N
+12	hword_asciipart	art	{english_stem}	english_stem	{art}
+12	blank	 	{}	\N	\N
+12	asciihword	e-mail	{english_stem}	english_stem	{e-mail}
+12	hword_asciipart	e	{english_stem}	english_stem	{e}
+12	blank	-	{}	\N	\N
+12	hword_asciipart	mail	{english_stem}	english_stem	{mail}
+12	blank	 	{}	\N	\N
+12	asciihword	co-operate	{english_stem}	english_stem	{co-oper}
+12	hword_asciipart	co	{english_stem}	english_stem	{co}
+12	blank	-	{}	\N	\N
+12	hword_asciipart	operate	{english_stem}	english_stem	{oper}
+13	asciihword	multi-word-hyphen-chain-test	{english_stem}	english_stem	{multi-word-hyphen-chain-test}
+13	hword_asciipart	multi	{english_stem}	english_stem	{multi}
+13	blank	-	{}	\N	\N
+13	hword_asciipart	word	{english_stem}	english_stem	{word}
+13	blank	-	{}	\N	\N
+13	hword_asciipart	hyphen	{english_stem}	english_stem	{hyphen}
+13	blank	-	{}	\N	\N
+13	hword_asciipart	chain	{english_stem}	english_stem	{chain}
+13	blank	-	{}	\N	\N
+13	hword_asciipart	test	{english_stem}	english_stem	{test}
+13	blank	 	{}	\N	\N
+13	asciihword	x-ray	{english_stem}	english_stem	{x-ray}
+13	hword_asciipart	x	{english_stem}	english_stem	{x}
+13	blank	-	{}	\N	\N
+13	hword_asciipart	ray	{english_stem}	english_stem	{ray}
+14	asciiword	snake	{english_stem}	english_stem	{snake}
+14	blank	_	{}	\N	\N
+14	asciiword	case	{english_stem}	english_stem	{case}
+14	blank	_	{}	\N	\N
+14	asciiword	identifier	{english_stem}	english_stem	{identifi}
+14	blank	 	{}	\N	\N
+14	asciiword	and	{english_stem}	english_stem	{}
+14	blank	 	{}	\N	\N
+14	asciiword	camelCaseIdentifier	{english_stem}	english_stem	{camelcaseidentifi}
+14	blank	 	{}	\N	\N
+14	asciiword	and	{english_stem}	english_stem	{}
+14	blank	 	{}	\N	\N
+14	asciiword	PascalCase	{english_stem}	english_stem	{pascalcas}
+15	asciiword	file	{english_stem}	english_stem	{file}
+15	blank	 	{}	\N	\N
+15	asciiword	paths	{english_stem}	english_stem	{path}
+15	blank	 	{}	\N	\N
+15	file	/usr/local/bin/psql	{simple}	simple	{/usr/local/bin/psql}
+15	blank	 	{}	\N	\N
+15	asciiword	C	{english_stem}	english_stem	{c}
+15	blank	:\\	{}	\N	\N
+15	asciiword	Program	{english_stem}	english_stem	{program}
+15	blank	 	{}	\N	\N
+15	asciiword	Files	{english_stem}	english_stem	{file}
+15	blank	\\	{}	\N	\N
+15	host	app.exe	{simple}	simple	{app.exe}
+15	blank	 .	{}	\N	\N
+15	file	/relative/path.txt	{simple}	simple	{/relative/path.txt}
+15	blank	 ..	{}	\N	\N
+15	file	/up.md	{simple}	simple	{/up.md}
+16	tag	<p class="x">	{}	\N	\N
+16	asciiword	HTML	{english_stem}	english_stem	{html}
+16	blank	 	{}	\N	\N
+16	tag	<b>	{}	\N	\N
+16	asciiword	bold	{english_stem}	english_stem	{bold}
+16	tag	</b>	{}	\N	\N
+16	blank	 	{}	\N	\N
+16	entity	&amp;	{}	\N	\N
+16	blank	 	{}	\N	\N
+16	asciiword	entities	{english_stem}	english_stem	{entiti}
+16	blank	 	{}	\N	\N
+16	entity	&lt;	{}	\N	\N
+16	asciiword	tag	{english_stem}	english_stem	{tag}
+16	entity	&gt;	{}	\N	\N
+16	blank	 	{}	\N	\N
+16	entity	&#169;	{}	\N	\N
+16	blank	 	{}	\N	\N
+16	entity	&nbsp;	{}	\N	\N
+16	tag	</p>	{}	\N	\N
+17	tag	<?xml version="1.0"?>	{}	\N	\N
+17	tag	<root attr='v'>	{}	\N	\N
+17	asciiword	text	{english_stem}	english_stem	{text}
+17	tag	</root>	{}	\N	\N
+18	word	Café	{english_stem}	english_stem	{café}
+18	blank	 	{}	\N	\N
+18	word	naïve	{english_stem}	english_stem	{naïv}
+18	blank	 	{}	\N	\N
+18	word	résumé	{english_stem}	english_stem	{résumé}
+18	blank	 	{}	\N	\N
+18	word	façade	{english_stem}	english_stem	{façad}
+18	blank	 	{}	\N	\N
+18	word	Zürich	{english_stem}	english_stem	{zürich}
+18	blank	 	{}	\N	\N
+18	word	Ångström	{english_stem}	english_stem	{ångström}
+18	blank	 	{}	\N	\N
+18	word	œuvre	{english_stem}	english_stem	{œuvr}
+19	word	Привет	{english_stem}	english_stem	{привет}
+19	blank	 	{}	\N	\N
+19	word	мир	{english_stem}	english_stem	{мир}
+19	blank	, 	{}	\N	\N
+19	word	как	{english_stem}	english_stem	{как}
+19	blank	 	{}	\N	\N
+19	word	дела	{english_stem}	english_stem	{дела}
+19	blank	?	{}	\N	\N
+20	word	中文文本测试	{english_stem}	english_stem	{中文文本测试}
+20	blank	 	{}	\N	\N
+20	word	日本語のテキスト	{english_stem}	english_stem	{日本語のテキスト}
+20	blank	 	{}	\N	\N
+20	word	한국어	{english_stem}	english_stem	{한국어}
+21	asciiword	emoji	{english_stem}	english_stem	{emoji}
+21	blank	 🚀 	{}	\N	\N
+21	asciiword	rocket	{english_stem}	english_stem	{rocket}
+21	blank	 👍🏽 	{}	\N	\N
+21	asciiword	thumbs	{english_stem}	english_stem	{thumb}
+21	blank	 ✨ 	{}	\N	\N
+21	asciiword	sparkle	{english_stem}	english_stem	{sparkl}
+22	asciiword	don	{english_stem}	english_stem	{}
+22	blank	'	{}	\N	\N
+22	asciiword	t	{english_stem}	english_stem	{}
+22	blank	 	{}	\N	\N
+22	asciiword	won	{english_stem}	english_stem	{won}
+22	blank	'	{}	\N	\N
+22	asciiword	t	{english_stem}	english_stem	{}
+22	blank	 	{}	\N	\N
+22	asciiword	can	{english_stem}	english_stem	{}
+22	blank	'	{}	\N	\N
+22	asciiword	t	{english_stem}	english_stem	{}
+22	blank	 	{}	\N	\N
+22	asciiword	it	{english_stem}	english_stem	{}
+22	blank	'	{}	\N	\N
+22	asciiword	s	{english_stem}	english_stem	{}
+22	blank	 	{}	\N	\N
+22	asciiword	O	{english_stem}	english_stem	{o}
+22	blank	'	{}	\N	\N
+22	asciiword	Reilly	{english_stem}	english_stem	{reilli}
+22	blank	 	{}	\N	\N
+22	asciiword	rock	{english_stem}	english_stem	{rock}
+22	blank	'	{}	\N	\N
+22	asciiword	n	{english_stem}	english_stem	{n}
+22	blank	'	{}	\N	\N
+22	asciiword	roll	{english_stem}	english_stem	{roll}
+23	file	U.S.A	{simple}	simple	{u.s.a}
+23	blank	. 	{}	\N	\N
+23	file	e.g	{simple}	simple	{e.g}
+23	blank	. 	{}	\N	\N
+23	file	i.e	{simple}	simple	{i.e}
+23	blank	. 	{}	\N	\N
+23	asciiword	etc	{english_stem}	english_stem	{etc}
+23	blank	. 	{}	\N	\N
+23	file	Ph.D	{simple}	simple	{ph.d}
+23	blank	.	{}	\N	\N
+24	asciiword	SELECT	{english_stem}	english_stem	{select}
+24	blank	 * 	{}	\N	\N
+24	asciiword	FROM	{english_stem}	english_stem	{}
+24	blank	 "	{}	\N	\N
+24	asciiword	SearchDocument	{english_stem}	english_stem	{searchdocu}
+24	blank	" 	{}	\N	\N
+24	asciiword	WHERE	{english_stem}	english_stem	{}
+24	blank	 	{}	\N	\N
+24	asciiword	tsv	{english_stem}	english_stem	{tsv}
+24	blank	 @@ 	{}	\N	\N
+24	asciiword	q	{english_stem}	english_stem	{q}
+24	blank	;	{}	\N	\N
+25	blank	`	{}	\N	\N
+25	asciiword	inline	{english_stem}	english_stem	{inlin}
+25	blank	 	{}	\N	\N
+25	asciiword	code	{english_stem}	english_stem	{code}
+25	blank	` 	{}	\N	\N
+25	asciiword	and	{english_stem}	english_stem	{}
+25	blank	 ```	{}	\N	\N
+25	asciiword	fenced	{english_stem}	english_stem	{fenc}
+25	blank	``` 	{}	\N	\N
+25	asciiword	and	{english_stem}	english_stem	{}
+25	blank	 **	{}	\N	\N
+25	asciiword	bold	{english_stem}	english_stem	{bold}
+25	blank	** _	{}	\N	\N
+25	asciiword	italic	{english_stem}	english_stem	{ital}
+25	blank	_ ~~	{}	\N	\N
+25	asciiword	strike	{english_stem}	english_stem	{strike}
+25	blank	~~	{}	\N	\N
+26	blank	# 	{}	\N	\N
+26	asciiword	Heading	{english_stem}	english_stem	{head}
+27	blank	- [ ] 	{}	\N	\N
+27	asciiword	task	{english_stem}	english_stem	{task}
+27	blank	 	{}	\N	\N
+27	asciiword	item	{english_stem}	english_stem	{item}
+28	blank	| 	{}	\N	\N
+28	asciiword	col	{english_stem}	english_stem	{col}
+28	blank	 | 	{}	\N	\N
+28	numword	col2	{simple}	simple	{col2}
+28	blank	 |	{}	\N	\N
+29	asciiword	foo	{english_stem}	english_stem	{foo}
+29	blank	@	{}	\N	\N
+29	asciiword	bar	{english_stem}	english_stem	{bar}
+29	blank	 	{}	\N	\N
+29	email	baz@qux.com	{simple}	simple	{baz@qux.com}
+29	blank	 @	{}	\N	\N
+29	asciiword	mention	{english_stem}	english_stem	{mention}
+29	blank	 #	{}	\N	\N
+29	asciiword	hashtag	{english_stem}	english_stem	{hashtag}
+29	blank	 $	{}	\N	\N
+29	asciiword	dollar	{english_stem}	english_stem	{dollar}
+29	blank	 	{}	\N	\N
+29	uint	100	{simple}	simple	{100}
+29	blank	% 	{}	\N	\N
+29	file	50/50	{simple}	simple	{50/50}
+30	asciiword	C	{english_stem}	english_stem	{c}
+30	blank	+	{}	\N	\N
+30	blank	+ 	{}	\N	\N
+30	asciiword	C	{english_stem}	english_stem	{c}
+30	blank	# 	{}	\N	\N
+30	asciiword	F	{english_stem}	english_stem	{f}
+30	blank	# .	{}	\N	\N
+30	asciiword	NET	{english_stem}	english_stem	{net}
+30	blank	 	{}	\N	\N
+30	host	node.js	{simple}	simple	{node.js}
+30	blank	 	{}	\N	\N
+30	host	Vue.js	{simple}	simple	{vue.js}
+30	blank	 	{}	\N	\N
+30	host	ASP.NET	{simple}	simple	{asp.net}
+31	numword	IPv4	{simple}	simple	{ipv4}
+31	blank	 	{}	\N	\N
+31	version	192.168.1.1	{simple}	simple	{192.168.1.1}
+31	blank	 	{}	\N	\N
+31	asciiword	and	{english_stem}	english_stem	{}
+31	blank	 	{}	\N	\N
+31	version	10.0.0.255	{simple}	simple	{10.0.0.255}
+31	blank	:	{}	\N	\N
+31	uint	8080	{simple}	simple	{8080}
+31	blank	 	{}	\N	\N
+31	asciiword	and	{english_stem}	english_stem	{}
+31	blank	 ::	{}	\N	\N
+31	uint	1	{simple}	simple	{1}
+32	asciiword	the	{english_stem}	english_stem	{}
+32	blank	 	{}	\N	\N
+32	asciiword	and	{english_stem}	english_stem	{}
+32	blank	 	{}	\N	\N
+32	asciiword	or	{english_stem}	english_stem	{}
+32	blank	 	{}	\N	\N
+32	asciiword	not	{english_stem}	english_stem	{}
+32	blank	 	{}	\N	\N
+32	asciiword	a	{english_stem}	english_stem	{}
+32	blank	 	{}	\N	\N
+32	asciiword	an	{english_stem}	english_stem	{}
+32	blank	 	{}	\N	\N
+32	asciiword	of	{english_stem}	english_stem	{}
+32	blank	 	{}	\N	\N
+32	asciiword	to	{english_stem}	english_stem	{}
+32	blank	 	{}	\N	\N
+32	asciiword	in	{english_stem}	english_stem	{}
+32	blank	 	{}	\N	\N
+32	asciiword	is	{english_stem}	english_stem	{}
+32	blank	 	{}	\N	\N
+32	asciiword	it	{english_stem}	english_stem	{}
+32	blank	 	{}	\N	\N
+32	asciiword	be	{english_stem}	english_stem	{}
+33	asciiword	THE	{english_stem}	english_stem	{}
+33	blank	 	{}	\N	\N
+33	asciiword	QUICK	{english_stem}	english_stem	{quick}
+33	blank	 	{}	\N	\N
+33	asciiword	BROWN	{english_stem}	english_stem	{brown}
+33	blank	 	{}	\N	\N
+33	asciiword	FOX	{english_stem}	english_stem	{fox}
+34	blank	   	{}	\N	\N
+34	asciiword	leading	{english_stem}	english_stem	{lead}
+34	blank	 	{}	\N	\N
+34	asciiword	and	{english_stem}	english_stem	{}
+34	blank	 	{}	\N	\N
+34	asciiword	trailing	{english_stem}	english_stem	{trail}
+34	blank	 	{}	\N	\N
+34	asciiword	spaces	{english_stem}	english_stem	{space}
+35	asciiword	tab	{english_stem}	english_stem	{tab}
+35	blank	\t	{}	\N	\N
+35	asciiword	separated	{english_stem}	english_stem	{separ}
+35	blank	\t	{}	\N	\N
+35	asciiword	words	{english_stem}	english_stem	{word}
+36	asciiword	weird	{english_stem}	english_stem	{weird}
+36	blank	-	{}	\N	\N
+36	blank	-	{}	\N	\N
+36	blank	-	{}	\N	\N
+36	asciiword	dashes	{english_stem}	english_stem	{dash}
+36	blank	___	{}	\N	\N
+36	asciiword	underscores	{english_stem}	english_stem	{underscor}
+36	blank	...	{}	\N	\N
+36	asciiword	dots	{english_stem}	english_stem	{dot}
+36	blank	,,,	{}	\N	\N
+36	asciiword	commas	{english_stem}	english_stem	{comma}
+37	numword	a1b2c3	{simple}	simple	{a1b2c3}
+37	blank	 	{}	\N	\N
+37	numword	abc123	{simple}	simple	{abc123}
+37	blank	 	{}	\N	\N
+37	numword	123abc	{simple}	simple	{123abc}
+37	blank	 	{}	\N	\N
+37	numword	1st	{simple}	simple	{1st}
+37	blank	 	{}	\N	\N
+37	numword	2nd	{simple}	simple	{2nd}
+37	blank	 	{}	\N	\N
+37	numword	3rd	{simple}	simple	{3rd}
+37	blank	 	{}	\N	\N
+37	numword	4th	{simple}	simple	{4th}
+38	word	ÀÉÎÕÜ	{english_stem}	english_stem	{àéîõü}
+38	blank	 	{}	\N	\N
+38	word	ß	{english_stem}	english_stem	{ß}
+38	blank	 	{}	\N	\N
+38	word	ﬁ	{english_stem}	english_stem	{ﬁ}
+38	blank	 	{}	\N	\N
+38	asciiword	ligature	{english_stem}	english_stem	{ligatur}
+39	asciiword	generously	{english_stem}	english_stem	{generous}
+39	blank	 	{}	\N	\N
+39	asciiword	generalizations	{english_stem}	english_stem	{general}
+39	blank	 	{}	\N	\N
+39	asciiword	organizational	{english_stem}	english_stem	{organiz}
+39	blank	 	{}	\N	\N
+39	asciiword	nationalization	{english_stem}	english_stem	{nation}
+40	asciiword	caresses	{english_stem}	english_stem	{caress}
+40	blank	 	{}	\N	\N
+40	asciiword	ponies	{english_stem}	english_stem	{poni}
+40	blank	 	{}	\N	\N
+40	asciiword	ties	{english_stem}	english_stem	{tie}
+40	blank	 	{}	\N	\N
+40	asciiword	caress	{english_stem}	english_stem	{caress}
+40	blank	 	{}	\N	\N
+40	asciiword	cats	{english_stem}	english_stem	{cat}
+40	blank	 	{}	\N	\N
+40	asciiword	feed	{english_stem}	english_stem	{feed}
+40	blank	 	{}	\N	\N
+40	asciiword	agreed	{english_stem}	english_stem	{agre}
+40	blank	 	{}	\N	\N
+40	asciiword	disabled	{english_stem}	english_stem	{disabl}
+40	blank	 	{}	\N	\N
+40	asciiword	matting	{english_stem}	english_stem	{mat}
+40	blank	 	{}	\N	\N
+40	asciiword	mating	{english_stem}	english_stem	{mate}
+40	blank	 	{}	\N	\N
+40	asciiword	meeting	{english_stem}	english_stem	{meet}
+40	blank	 	{}	\N	\N
+40	asciiword	milling	{english_stem}	english_stem	{mill}
+40	blank	 	{}	\N	\N
+40	asciiword	messing	{english_stem}	english_stem	{mess}
+40	blank	 	{}	\N	\N
+40	asciiword	meetings	{english_stem}	english_stem	{meet}
+41	asciiword	happy	{english_stem}	english_stem	{happi}
+41	blank	 	{}	\N	\N
+41	asciiword	happiness	{english_stem}	english_stem	{happi}
+41	blank	 	{}	\N	\N
+41	asciiword	happily	{english_stem}	english_stem	{happili}
+41	blank	 	{}	\N	\N
+41	asciiword	sky	{english_stem}	english_stem	{sky}
+41	blank	 	{}	\N	\N
+41	asciiword	skies	{english_stem}	english_stem	{sky}
+41	blank	 	{}	\N	\N
+41	asciiword	dying	{english_stem}	english_stem	{die}
+41	blank	 	{}	\N	\N
+41	asciiword	lying	{english_stem}	english_stem	{lie}
+41	blank	 	{}	\N	\N
+41	asciiword	tying	{english_stem}	english_stem	{tie}
+42	asciiword	news	{english_stem}	english_stem	{news}
+42	blank	 	{}	\N	\N
+42	asciiword	andes	{english_stem}	english_stem	{andes}
+42	blank	 	{}	\N	\N
+42	asciiword	atlas	{english_stem}	english_stem	{atlas}
+42	blank	 	{}	\N	\N
+42	asciiword	cosmos	{english_stem}	english_stem	{cosmos}
+42	blank	 	{}	\N	\N
+42	asciiword	bias	{english_stem}	english_stem	{bias}
+43	blank	-	{}	\N	\N
+43	blank	- 	{}	\N	\N
+43	asciiword	comment	{english_stem}	english_stem	{comment}
+43	blank	 	{}	\N	\N
+43	blank	-	{}	\N	\N
+43	blank	- 	{}	\N	\N
+43	asciiword	and	{english_stem}	english_stem	{}
+43	blank	 	{}	\N	\N
+43	blank	/* 	{}	\N	\N
+43	asciiword	block	{english_stem}	english_stem	{block}
+43	blank	 	{}	\N	\N
+43	asciiword	comment	{english_stem}	english_stem	{comment}
+43	blank	 *	{}	\N	\N
+43	blank	/	{}	\N	\N
+44	uint	1	{simple}	simple	{1}
+44	int	-2	{simple}	simple	{-2}
+44	blank	 	{}	\N	\N
+44	uint	3	{simple}	simple	{3}
+44	blank	-	{}	\N	\N
+44	int	-4	{simple}	simple	{-4}
+44	blank	 	{}	\N	\N
+44	int	-5	{simple}	simple	{-5}
+44	blank	-	{}	\N	\N
+45	asciiword	xn	{english_stem}	english_stem	{xn}
+45	blank	-	{}	\N	\N
+45	int	-80	{simple}	simple	{-80}
+45	host	ak6aa92e.com	{simple}	simple	{ak6aa92e.com}
+45	blank	 	{}	\N	\N
+45	host	sub.domain.example.org	{simple}	simple	{sub.domain.example.org}
+46	asciiword	mailto	{english_stem}	english_stem	{mailto}
+46	blank	:	{}	\N	\N
+46	email	someone@example.com	{simple}	simple	{someone@example.com}
+47	protocol	https://	{}	\N	\N
+47	asciiword	user	{english_stem}	english_stem	{user}
+47	blank	:	{}	\N	\N
+47	email	pass@host.example.com:8443	{simple}	simple	{pass@host.example.com:8443}
+47	file	/a/b	{simple}	simple	{/a/b}
+48	host	www.example.com	{simple}	simple	{www.example.com}
+48	blank	 	{}	\N	\N
+48	host	example.com	{simple}	simple	{example.com}
+49	file	a.b.c.d.e	{simple}	simple	{a.b.c.d.e}
+50	float	50.5	{simple}	simple	{50.5}
+50	blank	% $	{}	\N	\N
+50	uint	1	{simple}	simple	{1}
+50	blank	,	{}	\N	\N
+50	uint	000	{simple}	simple	{000}
+50	blank	,	{}	\N	\N
+50	uint	000	{simple}	simple	{000}
+50	blank	 €	{}	\N	\N
+50	uint	20	{simple}	simple	{20}
+50	blank	 £	{}	\N	\N
+50	uint	30	{simple}	simple	{30}
+51	asciiword	aaa	{english_stem}	english_stem	{aaa}
+51	blank	'	{}	\N	\N
+51	asciiword	bbb	{english_stem}	english_stem	{bbb}
+51	blank	 '	{}	\N	\N
+51	asciiword	quoted	{english_stem}	english_stem	{quot}
+51	blank	' "	{}	\N	\N
+51	asciiword	double	{english_stem}	english_stem	{doubl}
+51	blank	"	{}	\N	\N
+52	asciiword	x	{english_stem}	english_stem	{x}

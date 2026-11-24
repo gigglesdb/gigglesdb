@@ -26,6 +26,9 @@ pub(super) fn element_type(array: &DataType) -> Option<DataType> {
         DataType::BigIntArray => DataType::BigInt,
         DataType::TextArray => DataType::Text,
         DataType::UuidArray => DataType::Uuid,
+        DataType::RealArray => DataType::Real,
+        DataType::PgCharArray => DataType::PgChar,
+        DataType::SmallIntArray => DataType::SmallInt,
         _ => return None,
     })
 }
@@ -80,6 +83,9 @@ pub(super) fn bind(
         DataType::BigInt => DataType::BigIntArray,
         DataType::Text => DataType::TextArray,
         DataType::Uuid => DataType::UuidArray,
+        DataType::Real => DataType::RealArray,
+        DataType::PgChar => DataType::PgCharArray,
+        DataType::SmallInt => DataType::SmallIntArray,
         _ => return Err(SqlError::Unsupported),
     };
     if target.is_none() && element == DataType::Text {
@@ -139,7 +145,9 @@ pub(super) fn eval(args: &[BoundScalar], values: &[Value], budget: &mut usize) -
         parts.push(if *value == Value::Null {
             "NULL".into()
         } else {
-            let Value::Text(text) = cast_value(value.clone(), &DataType::Text, budget)? else {
+            let text = text_search_types::cast_typed(value, &arg.ty, &DataType::Text)
+                .unwrap_or_else(|| cast_value(value.clone(), &DataType::Text, budget))?;
+            let Value::Text(text) = text else {
                 return Err(SqlError::Type);
             };
             let text = if array { text } else { logical_types::array_quote(&text) };

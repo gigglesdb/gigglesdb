@@ -149,8 +149,8 @@ pub(crate) fn schema(tables: &[Table], bounds: Bounds) -> Result<()> {
         let mut names = BTreeSet::new();
         for c in &t.columns {
             identifier(&c.name)?;
-            // Core serializes these logical kinds as Text. The current archive
-            // cannot preserve their identity, even for empty/all-NULL tables.
+            // The archive must preserve logical type identity, including for
+            // empty and all-NULL tables.
             if matches!(
                 c.data_type,
                 DataType::Uuid
@@ -160,7 +160,7 @@ pub(crate) fn schema(tables: &[Table], bounds: Bounds) -> Result<()> {
                     | DataType::TextArray
                     | DataType::UuidArray
                     | DataType::RegType
-            ) {
+            ) || c.data_type.text_search_oid().is_some() {
                 return Err(invalid(
                     "logical type is unsupported by the archive profile",
                 ));
@@ -522,6 +522,15 @@ pub(crate) fn create_sql(t: &Table) -> String {
                     DataType::TextArray => "TEXT[]",
                     DataType::UuidArray => "UUID[]",
                     DataType::RegType => "REGTYPE",
+                    DataType::TsVector => "TSVECTOR",
+                    DataType::TsQuery => "TSQUERY",
+                    DataType::RegConfig => "REGCONFIG",
+                    DataType::RegDictionary => "REGDICTIONARY",
+                    DataType::Oid => "OID",
+                    DataType::PgChar => "\"char\"",
+                    DataType::RealArray => "REAL[]",
+                    DataType::PgCharArray => "\"char\"[]",
+                    DataType::SmallIntArray => "SMALLINT[]",
                 },
                 if c.not_null { " NOT NULL" } else { "" }
             )
@@ -568,6 +577,8 @@ mod tests {
             ),
             (DataType::TextArray, "TEXT[]", r#"{"a,b","NULL",NULL,""}"#),
             (DataType::UuidArray, "UUID[]", "{NULL,12345678-1234-5678-1234-567812345678}"),
+            (DataType::TsVector, "TSVECTOR", "cat:1 dog:2"),
+            (DataType::TsQuery, "TSQUERY", "cat & dog"),
         ] {
             let table = Table {
                 name: "restored".into(),

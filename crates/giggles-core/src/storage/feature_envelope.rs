@@ -6,12 +6,13 @@ pub(crate) const KEY_DEPENDENCY_IDENTITY: u64 = 1 << 17;
 pub(crate) const COLUMN_COLLATIONS: u64 = 1 << 23;
 pub(crate) const USER_COLLATIONS: u64 = 1 << 22;
 pub(crate) const UUID_ARRAY_COLUMNS: u64 = crate::storage::engine::meta::UUID_ARRAY_COLUMNS;
+pub(crate) const TEXT_SEARCH_TYPES: u64 = super::engine::meta::TEXT_SEARCH_TYPES;
 const WIDE_CATALOG: u64 = super::engine::meta::WIDE_CATALOG;
 pub(crate) const PARTIAL_INDEXES: u64 = 1 << 33;
 pub(crate) const TEMPORAL_INDEXES: u64 = 1 << 34;
 pub(super) const NEW_BITS: u64 =
     0x3c0 | KEY_DEPENDENCY_IDENTITY | USER_COLLATIONS | COLUMN_COLLATIONS | UUID_ARRAY_COLUMNS | WIDE_CATALOG
-        | PARTIAL_INDEXES | TEMPORAL_INDEXES;
+        | PARTIAL_INDEXES | TEMPORAL_INDEXES | TEXT_SEARCH_TYPES;
 pub(super) const ROLE_BOOTSTRAP: u64 = 1 << 9;
 
 /// E1 B0b: true when CatalogExt is nonempty.
@@ -55,6 +56,10 @@ pub(super) fn uuid_array_columns_present(s: &State) -> bool {
     s.uuid_array_columns || s.sql.catalog_ext().has_uuid_arrays()
 }
 
+pub(super) fn text_search_types_present(s: &State) -> bool {
+    s.text_search_types || s.sql.catalog_ext().has_text_search_types()
+}
+
 pub(super) fn feature_bits_present(s: &State) -> Result<u64, CoreError> {
     let typed = s.sql.contains_typed()
         || s.native_outcomes
@@ -77,6 +82,7 @@ pub(super) fn feature_bits_present(s: &State) -> Result<u64, CoreError> {
         | if temporal_indexes { TEMPORAL_INDEXES } else { 0 }
         | if !s.sql.catalog_ext().column_collations.is_empty() { COLUMN_COLLATIONS } else { 0 }
         | if !s.sql.catalog_ext().collations.is_empty() { USER_COLLATIONS } else { 0 }
+        | if text_search_types_present(s) { TEXT_SEARCH_TYPES } else { 0 }
         | if uuid_array_columns_present(s) { UUID_ARRAY_COLUMNS } else { 0 }
         | if s.sql.catalog_ext().has_key_dependency_identity() { KEY_DEPENDENCY_IDENTITY } else { 0 })
 }

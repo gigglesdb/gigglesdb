@@ -4,7 +4,7 @@ use engine::{catalog::{CatalogParts, CatalogSnapshot}, txn::Isolation};
 use engine::{catalog::TableEntry, codec, kv::Keyspace, locks::LockMode, txn::Transaction};
 use relational::{
     SqlError, SqlRow, TableDef,
-    row_sink::{DdlRows, RowSink},
+    row_sink::{DdlRows, PageMode, RowSink},
 };
 use std::{collections::BTreeSet, ops::Bound};
 /// Encoded primary-key bounds of a read (GD-0075 P8-0).
@@ -1839,7 +1839,7 @@ impl RowSink for SqlRows<'_> {
     ) -> Result<(), CoreError> {
         #[cfg(test)]
         let keys = if DISABLE_MUTATION_POINTS.get() { None } else { keys };
-        let Some(keys) = keys else { return self.ddl_pages(table, table, true, page); };
+        let Some(keys) = keys else { return self.ddl_pages(table, table, PageMode::Mutation, page); };
         let entry = TableEntry { primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(), def: table.clone(), heap: self.parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new() };
         let mut rows = DdlRows::new();
@@ -1865,7 +1865,7 @@ impl RowSink for SqlRows<'_> {
                 // Leave room for the eight UNIQUE sidecars and their work meters;
                 // fall back before invoking the callback or publishing a write.
                 if !charge_mutation_point(table, &row, &mut retention)? {
-                    return self.ddl_pages(table, table, true, page);
+                    return self.ddl_pages(table, table, PageMode::Mutation, page);
                 }
                 rows.insert(key, row);
             }
@@ -1882,7 +1882,7 @@ impl RowSink for SqlRows<'_> {
         &mut self,
         table: &TableDef,
         after: &TableDef,
-        mutating: bool,
+        mode: PageMode,
         page: &mut dyn FnMut(DdlRows) -> Result<DdlRows, CoreError>,
     ) -> Result<(), CoreError> {
         let entry = TableEntry {
@@ -1934,14 +1934,14 @@ impl RowSink for SqlRows<'_> {
                 if let Some(hook) = AFTER_MUTATION_PAGE.with_borrow_mut(Option::take) { hook(); }
             }
             // R3-306: a task statement's mutation page holds only visible rows.
-            if mutating && self.scope_of(table).is_some() {
+            if mode == PageMode::Mutation && self.scope_of(table).is_some() {
                 self.retain_scope(table, &mut rows)?;
                 if rows.is_empty() {
                     continue;
                 }
             }
             let rewritten = page(rows.clone())?;
-            if mutating {
+            if mode == PageMode::Mutation {
                 self.apply_indexes(table, Some(after), &rows, &rewritten, &self.indexes())?;
                 self.apply(table, &rows, &rewritten)?;
             } else if table.columns.len() != after.columns.len() {
@@ -1952,6 +1952,11 @@ impl RowSink for SqlRows<'_> {
                 // Existing index tuples and primary-key bytes are unchanged.
                 self.apply(table, &rows, &BTreeMap::new())?;
                 self.apply(after, &BTreeMap::new(), &rewritten)?;
+            } else if mode == PageMode::TypeRewrite {
+                // A text-search cast can replace the physical value with the
+                // same column count. Publish the converted rows with the DDL.
+                self.apply_indexes(table, Some(after), &rows, &rewritten, &self.indexes())?;
+                self.apply(after, &rows, &rewritten)?;
             }
         }
         Ok(())

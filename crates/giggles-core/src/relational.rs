@@ -32,6 +32,7 @@ pub(crate) mod volatile;
 mod constraint_lookup;
 mod constraint_primary_key;
 mod ddl_type;
+pub mod text_search_types;
 pub use ddl_type::take_sql_warnings;
 mod user_types;
 
@@ -377,6 +378,47 @@ pub enum SqlError {
     InvalidName,
     #[serde(skip)]
     UnsafeNewEnumValue,
+    // Transient diagnostics from PostgreSQL text-search input and evaluation.
+    #[serde(skip)]
+    TextSearchInternal,
+    #[serde(skip)]
+    TextSearchProtocolViolation,
+    #[serde(skip)]
+    TextSearchUnsupported,
+    #[serde(skip)]
+    TextSearchNumericOutOfRange,
+    #[serde(skip)]
+    TextSearchNullValue,
+    #[serde(skip)]
+    TextSearchZeroLength,
+    #[serde(skip)]
+    TextSearchInvalidEncoding,
+    #[serde(skip)]
+    TextSearchInvalidParameter,
+    #[serde(skip)]
+    TextSearchInvalidSubscript,
+    #[serde(skip)]
+    TextSearchInvalidText,
+    #[serde(skip)]
+    TextSearchInvalidBinary,
+    #[serde(skip)]
+    TextSearchInvalidSchema,
+    #[serde(skip)]
+    TextSearchSyntax,
+    #[serde(skip)]
+    TextSearchInvalidName,
+    #[serde(skip)]
+    TextSearchUndefinedObject,
+    #[serde(skip)]
+    TextSearchAmbiguousFunction,
+    #[serde(skip)]
+    TextSearchDatatypeMismatch,
+    #[serde(skip)]
+    TextSearchUndefinedFunction,
+    #[serde(skip)]
+    TextSearchProgramLimit,
+    #[serde(skip)]
+    TextSearchStatementTooComplex,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,6 +465,16 @@ pub enum DataType {
     /// Expression-only regtype; never admitted by the column type grammar.
     RegType,
     UuidArray,
+    TsVector,
+    TsQuery,
+    // Expression-only PostgreSQL types.
+    RegConfig,
+    RegDictionary,
+    Oid,
+    PgChar,
+    RealArray,
+    PgCharArray,
+    SmallIntArray,
 }
 impl Serialize for DataType {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -433,6 +485,13 @@ impl Serialize for DataType {
             Self::BigInt => (3, "BigInt"),
             Self::Text
             | Self::RegType
+            | Self::RegConfig
+            | Self::RegDictionary
+            | Self::Oid
+            | Self::PgChar
+            | Self::RealArray
+            | Self::PgCharArray
+            | Self::SmallIntArray
             | Self::Varchar
             | Self::Bpchar
             | Self::Uuid
@@ -441,7 +500,7 @@ impl Serialize for DataType {
             | Self::BigIntArray
             | Self::TextArray
             | Self::UuidArray => (4, "Text"),
-            Self::Bytes => (5, "Bytes"),
+            Self::Bytes | Self::TsVector | Self::TsQuery => (5, "Bytes"),
             Self::Numeric => (6, "Numeric"),
             Self::Real => (7, "Real"),
             Self::DoublePrecision => (8, "DoublePrecision"),
@@ -712,6 +771,7 @@ pub(crate) fn check(v: &Value, c: &ColumnDef) -> R<()> {
             Value::Text(_),
         )
         | (DataType::Bytes, Value::Bytes(_)) => true,
+        (ty, v @ Value::Bytes(_)) if ty.is_text_search() => text_search_types::valid(ty, v),
         (DataType::SmallInt, Value::Int(n)) => i16::try_from(*n).is_ok(),
         (DataType::Integer, Value::Int(n)) => i32::try_from(*n).is_ok(),
         _ => false,
@@ -768,6 +828,9 @@ fn coerce_base_to_column(rel: &Relational, column: &ColumnDef, value: Value) -> 
         DataType::Time | DataType::TimeTz | DataType::Timestamp | DataType::TimestampTz
     ) {
         return defaults::apply_typmod(value, rel.column_typmod(column.id));
+    }
+    if column.data_type.is_text_search() && let Value::Text(text) = &value {
+        return text_search_types::input(&column.data_type, text);
     }
     if column.data_type.is_extended_text() {
         return logical_types::coerce(value, &column.data_type);
@@ -2011,7 +2074,7 @@ fn validate_create_columns(
         column_names.validate(key)?;
         if columns.iter().any(|column| {
             column.name == *key
-                && (column.data_type.is_temporal() || column.data_type == DataType::Bpchar)
+                && (column.data_type.is_temporal() || column.data_type == DataType::Bpchar || column.data_type.is_text_search())
         }) {
             return Err(SqlError::Unsupported);
         }

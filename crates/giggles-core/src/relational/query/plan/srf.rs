@@ -101,6 +101,7 @@ pub(in crate::relational::query) fn element(ty: &DataType) -> R<DataType> {
         DataType::BigIntArray => Ok(DataType::BigInt),
         DataType::TextArray => Ok(DataType::Text),
         DataType::UuidArray => Ok(DataType::Uuid),
+        DataType::TsVector => Ok(DataType::TsVector),
         _ => Err(SqlError::Type),
     }
 }
@@ -196,7 +197,10 @@ impl Function {
         parameters: &mut [Option<DataType>],
     ) -> R<(Vec<ColumnDef>, Vec<i32>)> {
         let ty = self.ty(state, parameters)?;
-        let mut columns = if json_srf::record(&self.name) {
+        let mut columns = if ty == DataType::TsVector {
+            [("lexeme", DataType::Text), ("positions", DataType::SmallIntArray), ("weights", DataType::PgCharArray)]
+                .into_iter().map(|(name, data_type)| ColumnDef { id: 0, name: name.into(), data_type, not_null: false }).collect()
+        } else if json_srf::record(&self.name) {
             vec![
                 ColumnDef { id: 0, name: "key".into(), data_type: DataType::Text, not_null: false },
                 ColumnDef { id: 0, name: "value".into(), data_type: ty, not_null: false },
@@ -267,8 +271,25 @@ impl Function {
         };
         if self.name == "unnest" {
             let ty = self.ty(state, &mut parameters.to_vec())?;
-            for value in array_values(values.remove(0), &ty)? {
-                emit(vec![value])?;
+            let value = values.remove(0);
+            if ty == DataType::TsVector {
+                let vector = text_search_types::vector(&value)?;
+                for lexeme in vector.unnest() {
+                    let array = |parts: Vec<String>| if parts.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::Text(format!("{{{}}}", parts.join(",")))
+                    };
+                    emit(vec![
+                        Value::Text(lexeme.word.clone()),
+                        array(lexeme.positions.iter().map(|p| p.index.to_string()).collect()),
+                        array(lexeme.positions.iter().map(|p| p.weight.letter().to_string()).collect()),
+                    ])?;
+                }
+            } else {
+                for value in array_values(value, &ty)? {
+                    emit(vec![value])?;
+                }
             }
         } else if json_srf::known(&self.name) {
             json_srf::emit(&self.name, &values[0], &mut emit)?;
@@ -340,9 +361,10 @@ impl Function {
         } else {
             Some(self.args[0].bind(&|_, _| Err(SqlError::UnknownColumn), &[], parameters)?)
         };
-        Ok(vec![Some(functions::collation::materialized(
-            original.as_ref(),
-            self.ty(state, parameters)?,
-        )?)])
+        let ty = self.ty(state, parameters)?;
+        if ty == DataType::TsVector {
+            return Ok(vec![None, None, None]);
+        }
+        Ok(vec![Some(functions::collation::materialized(original.as_ref(), ty)?)])
     }
 }

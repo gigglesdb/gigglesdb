@@ -130,6 +130,9 @@ pub(in crate::relational) fn convert(
     } else {
         target
     };
+    if let Some(value) = text_search_types::cast_typed(&value, source, target) {
+        return value;
+    }
     if source == target
         || value == Value::Null
         || matches!(

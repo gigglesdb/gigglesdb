@@ -31,6 +31,9 @@ pub(super) fn sequence_volatility(name: &str) -> Option<Volatility> {
 }
 fn signature(name: &str, args: &[DataType], result: &DataType) -> Option<(bool, bool)> {
     use DataType::*;
+    if let Some(metadata) = text_search::metadata(name, args, result) {
+        return Some(metadata);
+    }
     if let Some(immutable) = uuid_ossp::immutable(name) { return Some((immutable, true)); }
     if random_uuid::known(name) {
         return Some((!random_uuid::volatile(name), true));
@@ -379,6 +382,8 @@ fn normalized_signature_types(name: &str, args: &[BoundScalar]) -> Vec<DataType>
 
 fn immutable_cast(from: &DataType, to: &DataType) -> bool {
     from == to
+        || text_search_types::cast_supported(from, to) == Some(true)
+            && !matches!(to, DataType::RegConfig | DataType::RegDictionary)
         || number(from) && number(to)
         || integer(from) && *to == DataType::Bytes
         || *from == DataType::Bytes && integer(to)
@@ -481,6 +486,7 @@ impl BoundScalar {
             }
             Node::Call(name, args) => {
                 if collation::internal(name) { return args[0].plan_constant(budget); }
+                if text_search::known(name) { return Ok(None); }
                 if collation::derive(args.iter())?.is_some() { return Ok(None); }
                 let mut values = Vec::with_capacity(args.len());
                 let mut dependent = false;

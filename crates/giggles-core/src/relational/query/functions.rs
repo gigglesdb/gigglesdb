@@ -36,6 +36,7 @@ mod cross_binding_tests;
 mod pg18_types;
 pub(super) mod typeof_expr;
 pub(super) use typeof_expr::name as type_display;
+pub(super) mod text_search;
 pub(super) use comparison::{comparable, compare_cross, cross_compare};
 mod datetime_input;
 mod degree_math;
@@ -260,7 +261,10 @@ fn json_literal(value: &Value) -> R<BoundScalar> {
 }
 
 fn attach_text_cast(argument: &mut BoundScalar) {
-    if session_sensitive(&argument.ty, &DataType::Text) {
+    if matches!(argument.ty, DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary | DataType::PgChar) {
+        let old = std::mem::replace(argument, BoundScalar { ty: DataType::Text, node: Node::Literal(Value::Null) });
+        argument.node = Node::Cast(Box::new(old));
+    } else if session_sensitive(&argument.ty, &DataType::Text) {
         let old = std::mem::replace(argument, BoundScalar {
             ty: DataType::Text,
             node: Node::Literal(Value::Null),
@@ -700,6 +704,8 @@ impl Scalar {
                 let name = match op.as_str() {
                     "->" => "\0json_get".into(),
                     "->>" => "\0json_text".into(),
+                    "@@" => "\0ts_match".into(),
+                    "<->" => "\0ts_phrase".into(),
                     _ => arithmetic::unknown_operator(op),
                 };
                 (Err(name), 1)
@@ -764,7 +770,7 @@ impl Scalar {
         } else if let Some(Token::Op(op)) = p.tokens.get(p.at)
             && !matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "=>")
         {
-            let name = arithmetic::unknown_operator(op);
+            let name = if op == "!!" { "\0ts_negate".into() } else { arithmetic::unknown_operator(op) };
             p.at += 1;
             let right = Self::parse_binary(p, depth + 1, aggregate_argument, 2)?;
             Self::Call(name, vec![right])
@@ -1460,6 +1466,12 @@ impl Scalar {
             });
         }
         let a = a.bind(resolve, tables, parameters)?;
+        if let Some(supported) = text_search_types::cast_supported(&a.ty, ty) {
+            if !supported {
+                return Err(SqlError::CannotCoerce);
+            }
+            return Ok(BoundScalar { ty: ty.clone(), node: cast_node(a, ty) });
+        }
         if a.ty.is_array() && ty.is_array() {
             uuid_array_operators::check_cast(&a.ty, ty)?;
         }
@@ -1596,6 +1608,12 @@ impl Scalar {
                 Err(error)
             }
             "overlay" => Self::bind_overlay(args, resolve, tables, parameters),
+            name if text_search::known(name) => text_search::bind(name, args, resolve, tables, parameters),
+            "length" if args.len() == 1
+                && arithmetic::known(&args[0], resolve, tables, parameters)? == Some(DataType::TsVector) =>
+            {
+                text_search::bind("\0ts_length", args, resolve, tables, parameters)
+            }
             typeof_expr::NAME => typeof_expr::bind(args, resolve, tables, parameters),
             name if arithmetic::is_unknown_operator(name) => {
                 arithmetic::bind_unknown_operator(name, args, resolve, tables, parameters)
@@ -2534,7 +2552,8 @@ impl BoundScalar {
             Node::Case(..) => Some("case"),
             Node::Call(name, _) if name == array_constructor::NAME => Some("array"),
             Node::Call(name, args) if collation::internal(name) || aggregate_order::internal(name) || name == "\0array_subscript" => args[0].strong_name(),
-            Node::Call(name, _) if name.starts_with("\0json_") => None,
+            Node::Call(name, _) if name == "\0ts_length" => Some("length"),
+            Node::Call(name, _) if name.starts_with("\0json_") || name.starts_with("\0ts_") => None,
             Node::Call(name, _) if arithmetic::internal_name(name) || name.starts_with(ROW_ORDER_PREFIX) => None,
             Node::Column(_, name)
             | Node::Call(name, _)
@@ -2579,7 +2598,8 @@ impl BoundScalar {
             Node::Call(n, _) if n.starts_with("\0json_") || n.starts_with(ROW_ORDER_PREFIX) => "?column?",
             Node::Call(n, _) if n == conditional::NULLS_VARIADIC => "num_nulls",
             Node::Call(n, _) if n == conditional::NONNULLS_VARIADIC => "num_nonnulls",
-            Node::Call(n, _) if arithmetic::internal_name(n) => "?column?",
+            Node::Call(n, _) if n == "\0ts_length" => "length",
+            Node::Call(n, _) if arithmetic::internal_name(n) || n.starts_with("\0ts_") => "?column?",
             Node::Call(n, _) | Node::Clock(n, ..) | Node::Sequence(n, ..) | Node::Xact(n, ..) | Node::Privilege(n, ..) => n,
         }
     }
@@ -2760,6 +2780,11 @@ impl BoundScalar {
             ),
             Node::Cast(a) => {
                 let mut v = a.eval(row, params, budget)?;
+                if let Some(value) = text_search_types::cast_typed(&v, &a.ty, &self.ty) {
+                    let value = value?;
+                    charge(budget, &value)?;
+                    return Ok(value);
+                }
                 if a.ty != self.ty && a.ty.is_temporal() && self.ty.is_temporal() {
                     let value = assignment::convert(v, &a.ty, &self.ty, None)?;
                     charge(budget, &value)?;
@@ -2870,6 +2895,11 @@ impl BoundScalar {
                     && values.contains(&Value::Null)
                 {
                     return Ok(Value::Null);
+                }
+                if text_search::known(n) {
+                    let value = text_search::eval(n, args, &values)?;
+                    charge(budget, &value)?;
+                    return Ok(value);
                 }
                 if n == "jsonb_typeof" {
                     let value = jsonb_mutation::json_type(&values[0])?;
@@ -3137,6 +3167,11 @@ pub(super) fn cast_type_name(ty: &DataType) -> &'static str {
         DataType::BigIntArray => "int8",
         DataType::TextArray => "text",
         DataType::UuidArray => "uuid",
+        DataType::RealArray => "float4",
+        DataType::SmallIntArray => "int2",
+        DataType::PgChar | DataType::PgCharArray => "char",
+        DataType::TsQuery | DataType::TsVector | DataType::RegConfig | DataType::RegDictionary | DataType::Oid =>
+            ty.text_search_name().unwrap(),
         DataType::Boolean => "bool",
         DataType::Bytes => "bytea",
         DataType::Numeric => "numeric",
@@ -3184,6 +3219,9 @@ fn cast_type_with_diagnostics(p: &mut Parser, diagnose: bool) -> R<(DataType, Op
             DataType::BigInt => DataType::BigIntArray,
             DataType::Text => DataType::TextArray,
             DataType::Uuid => DataType::UuidArray,
+            DataType::Real => DataType::RealArray,
+            DataType::PgChar => DataType::PgCharArray,
+            DataType::SmallInt => DataType::SmallIntArray,
             _ => return Err(SqlError::Unsupported),
         };
     }
@@ -3223,6 +3261,20 @@ fn cast_with_date_order(
 ) -> R<Value> {
     if v == Value::Null {
         return Ok(v);
+    }
+    if ty.text_search_oid().is_some() {
+        let out = match (ty, v) {
+            (DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray, Value::Text(text)) => {
+                logical_types::array_values(&text)?;
+                Value::Text(text)
+            }
+            (_, Value::Text(text)) => text_search_types::input(ty, &text)?,
+            (DataType::TsVector | DataType::TsQuery, value @ Value::Bytes(_)) => value,
+            (DataType::RegConfig | DataType::RegDictionary | DataType::Oid | DataType::PgChar, value @ Value::Int(_)) => value,
+            _ => return Err(SqlError::Type),
+        };
+        charge(budget, &out)?;
+        return Ok(out);
     }
     if *ty == DataType::RegType {
         return typeof_expr::regtype(v);
@@ -3561,6 +3613,9 @@ impl Scalar {
                     None
                 };
                 args[1].infer(hint, parameters, resolve, tables)?;
+            }
+            Self::Call(n, args) if text_search::known(n) => {
+                text_search::infer(n, args, parameters, resolve, tables)?;
             }
             Self::Call(n, args) if arithmetic::is_unknown_operator(n) => {
                 for arg in args {

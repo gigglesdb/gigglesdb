@@ -279,6 +279,21 @@ fn signature(
     }
     let a = a.map(|ty| if ty == Varchar { Text } else { ty });
     let b = b.map(|ty| if ty == Varchar { Text } else { ty });
+    let types = [a.as_ref(), b.as_ref()];
+    if types.iter().flatten().any(|ty| ty.is_text_search()) {
+        match op {
+            BinaryOp::Concat if types.into_iter().flatten().all(|ty| ty == &TsVector) =>
+                return Ok((TsVector, TsVector, TsVector)),
+            BinaryOp::Concat | BinaryOp::Contains | BinaryOp::ContainedBy | BinaryOp::Overlap
+                if types.into_iter().flatten().all(|ty| ty == &TsQuery) =>
+            {
+                let result = if matches!(op, BinaryOp::Concat | BinaryOp::Overlap) { TsQuery } else { Boolean };
+                return Ok((TsQuery, TsQuery, result));
+            }
+            BinaryOp::Concat if types.contains(&Some(&Text)) => {}
+            _ => return Err(undefined_operator(op, types)),
+        }
+    }
     if op == BinaryOp::Concat {
         if let Some(signature) = concat::signature(a.as_ref(), b.as_ref()) {
             return signature;
@@ -603,7 +618,15 @@ pub(super) fn bind(
                     Node::ZonedOperator(name(*op).into(), args, None)
                 } else {
                     Node::Call(
-                        if *op == BinaryOp::Concat { concat::name(&at, &bt, &ty).unwrap_or(name(*op)) } else { name(*op) }.into(),
+                        match (*op, &at, &bt) {
+                            (BinaryOp::Concat, DataType::TsVector, DataType::TsVector) => "\0ts_concat",
+                            (BinaryOp::Concat, DataType::TsQuery, DataType::TsQuery) => "\0ts_or",
+                            (BinaryOp::Overlap, DataType::TsQuery, DataType::TsQuery) => "\0ts_and",
+                            (BinaryOp::Contains, DataType::TsQuery, DataType::TsQuery) => "\0ts_contains",
+                            (BinaryOp::ContainedBy, DataType::TsQuery, DataType::TsQuery) => "\0ts_contained_by",
+                            (BinaryOp::Concat, _, _) => concat::name(&at, &bt, &ty).unwrap_or(name(*op)),
+                            _ => name(*op),
+                        }.into(),
                         args,
                     )
                 },

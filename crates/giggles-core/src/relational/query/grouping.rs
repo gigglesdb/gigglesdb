@@ -780,6 +780,9 @@ pub(super) fn bind<'a>(
                 }
             },
             Aggregate::Min | Aggregate::Max => {
+                if b.ty.is_text_search() {
+                    return Err(functions::text_search::aggregate_error(a.name(), &b.ty));
+                }
                 if !legacy_column && matches!(b.ty, DataType::Boolean | DataType::Bytes) {
                     return Err(SqlError::UndefinedFunction);
                 }
@@ -1046,7 +1049,7 @@ impl KeyOrder {
     fn of(scalar: &BoundScalar) -> Option<Self> {
         let collation = scalar.explicit_collation().expect("bound collation");
         let enum_type = scalar.enum_definition();
-        (collation.is_some() || scalar.ty.is_array() || enum_type.is_some()).then(|| Self {
+        (collation.is_some() || scalar.ty.is_array() || enum_type.is_some() || scalar.ty.is_text_search()).then(|| Self {
             collation: collation.map(str::to_owned),
             ty: scalar.ty.clone(),
             enum_type: enum_type.cloned(),

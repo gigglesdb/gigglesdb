@@ -1,0 +1,24 @@
+1	cat:1 dog:2	'cat':1 'dog':2	2	'cat' 'dog'
+2	a fat cat sat on a mat and ate a fat rat	'a' 'and' 'ate' 'cat' 'fat' 'mat' 'on' 'rat' 'sat'	9	'a' 'and' 'ate' 'cat' 'fat' 'mat' 'on' 'rat' 'sat'
+3	'brown':3 'fox':4 'jump':5 'quick':2	'brown':3 'fox':4 'jump':5 'quick':2	4	'brown' 'fox' 'jump' 'quick'
+4	fox:1A,2B,3C,4D dog:5,5,5	'dog':5 'fox':1A,2B,3C,4	2	'dog' 'fox'
+5	'a b':1 'c''d':2 e\\ f:3	'a b':1 'c''d':2 'e f':3	3	'a b' 'c''d' 'e f'
+6	cat dog cat	'cat' 'dog'	2	'cat' 'dog'
+7	z y x b a	'a' 'b' 'x' 'y' 'z'	5	'a' 'b' 'x' 'y' 'z'
+8	fox:0	ERROR 42601 wrong position info in tsvector: "fox:0"	ERROR 42601 wrong position info in tsvector: "fox:0"	ERROR 42601 wrong position info in tsvector: "fox:0"
+9	fox:16383	'fox':16383	1	'fox'
+10	fox:16384	'fox':16383	1	'fox'
+11	fox:1,2,3,1	'fox':1,2,3	1	'fox'
+12	fox:3D,3A	'fox':3A	1	'fox'
+13	:1	':1'	1	':1'
+14	fox:	ERROR 42601 syntax error in tsvector: "fox:"	ERROR 42601 syntax error in tsvector: "fox:"	ERROR 42601 syntax error in tsvector: "fox:"
+15	fox:A	ERROR 42601 syntax error in tsvector: "fox:A"	ERROR 42601 syntax error in tsvector: "fox:A"	ERROR 42601 syntax error in tsvector: "fox:A"
+16	'	ERROR 42601 syntax error in tsvector: "'"	ERROR 42601 syntax error in tsvector: "'"	ERROR 42601 syntax error in tsvector: "'"
+17	''	ERROR 42601 syntax error in tsvector: "''"	ERROR 42601 syntax error in tsvector: "''"	ERROR 42601 syntax error in tsvector: "''"
+18	fox:1Z	ERROR 42601 syntax error in tsvector: "fox:1Z"	ERROR 42601 syntax error in tsvector: "fox:1Z"	ERROR 42601 syntax error in tsvector: "fox:1Z"
+19	   spaced    out   	'out' 'spaced'	2	'out' 'spaced'
+20			0	
+21	UPPER lower Mixed	'Mixed' 'UPPER' 'lower'	3	'Mixed' 'UPPER' 'lower'
+22	café:1 naïve:2	'café':1 'naïve':2	2	'café' 'naïve'
+23	'with:colon':1	'with:colon':1	1	'with:colon'
+24	1:1 2:2 10:3	'1':1 '10':3 '2':2	3	'1' '10' '2'

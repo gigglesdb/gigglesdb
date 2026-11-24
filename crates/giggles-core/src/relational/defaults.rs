@@ -720,6 +720,8 @@ pub(super) fn install_create(
             DataType::BigIntArray => Some(catalog_ext::LogicalKind::BigIntArray),
             DataType::TextArray => Some(catalog_ext::LogicalKind::TextArray),
             DataType::UuidArray => Some(catalog_ext::LogicalKind::UuidArray),
+            DataType::TsVector => Some(catalog_ext::LogicalKind::TsVector),
+            DataType::TsQuery => Some(catalog_ext::LogicalKind::TsQuery),
             _ => None,
         };
         if let Some(kind) = logical {
@@ -934,6 +936,9 @@ pub(super) fn type_name(ty: &DataType) -> &'static str {
         DataType::BigIntArray => "bigint[]",
         DataType::TextArray => "text[]",
         DataType::UuidArray => "uuid[]",
+        DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
+        | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray
+        | DataType::SmallIntArray => ty.text_search_name().unwrap(),
 
         DataType::Bytes => "bytea",
         DataType::Date => "date",
@@ -1173,6 +1178,10 @@ fn constant_text(sql: &str, ty: &DataType) -> R<String> {
         ),
         Value::Float4(v) => format!("{}::real", quoted(&v.to_text())),
         Value::Float8(v) => format!("{}::double precision", quoted(&v.to_text())),
+        value @ Value::Bytes(_) if ty.is_text_search() => {
+            let text = text_search_types::output(ty, &value)?;
+            format!("{}::{}", quoted(&text), type_name(ty))
+        }
         Value::Bytes(bytes) => {
             const HEX: &[u8; 16] = b"0123456789abcdef";
             let mut text = String::with_capacity(2 + bytes.len() * 2);
@@ -1215,6 +1224,8 @@ pub(super) fn cast_type(p: &mut Parser) -> R<DataType> {
         "uuid" => DataType::Uuid,
         "jsonb" => DataType::Jsonb,
         "bytea" => DataType::Bytes,
+        "tsvector" => DataType::TsVector,
+        "tsquery" => DataType::TsQuery,
         "date" => DataType::Date,
         "time" | "timestamp" => {
             let with = p.word("with");

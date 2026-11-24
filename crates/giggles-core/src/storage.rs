@@ -278,6 +278,7 @@ pub(crate) struct State {
     #[serde(skip)]
     wide_catalog: bool,
     uuid_array_columns: bool,
+    text_search_types: bool,
     #[serde(skip)]
     pub(crate) seq: BTreeMap<u64, sequences::SeqCounter>,
     // Legacy SQL stages these with its catalog, including across savepoints.
@@ -399,6 +400,7 @@ pub(crate) fn empty(domain: u128) -> State {
     State {
         wide_catalog: false,
         uuid_array_columns: false,
+        text_search_types: false,
         seq: BTreeMap::new(),
         sequence_owner_updates: BTreeMap::new(),
         accounting: BTreeMap::new(),
@@ -553,6 +555,7 @@ fn from_records_mode(
     secondary_index::gate(&records, indexed)?;
     let mut s = empty(m.domain);
     s.wide_catalog = bits.is_some_and(|bits| bits & engine::meta::WIDE_CATALOG != 0);
+    s.text_search_types = bits.is_some_and(|bits| bits & feature_envelope::TEXT_SEARCH_TYPES != 0);
     s.uuid_array_columns = bits.is_some_and(|bits| bits & feature_envelope::UUID_ARRAY_COLUMNS != 0);
     if records.contains_key(&vec![9]) {
         return Err(CoreError::Corrupt(
@@ -1179,6 +1182,7 @@ impl Inner {
             tx.commit().map_err(|error| self.legacy_io(site, error))?;
             s.wide_catalog = feature_envelope::wide_catalog_present(s);
             s.uuid_array_columns = feature_envelope::uuid_array_columns_present(s);
+            s.text_search_types = feature_envelope::text_search_types_present(s);
             s.sequence_owner_updates.clear();
             self.accept_sequences(s)?;
             if decision {

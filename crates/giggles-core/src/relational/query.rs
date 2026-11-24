@@ -2695,6 +2695,20 @@ impl Query {
         p.at = end;
         Ok(Some(Item::QualifiedStar { schema, relation }))
     }
+    pub(super) fn parse_text_search_conversion(p: &mut Parser, table: &str, target: DataType) -> R<Self> {
+        let expression = Scalar::parse_expr(p, 0, false)?;
+        Ok(Self {
+            explain: false,
+            sources: vec![Source { name: table.into(), alias: split_key(table).1.into() }],
+            joins: vec![],
+            items: vec![(Item::Scalar(Scalar::Cast(Box::new(expression), target)), None)],
+            predicates: vec![],
+            filter: None,
+            order: vec![],
+            limit: None,
+        })
+    }
+
     pub(super) fn mutation_target(p: &mut Parser, table: &str) -> R<Self> {
         admit_subquery_depth(&p.tokens[p.at..])?;
         admit_subquery_forms(&p.tokens[p.at..], true)?;
@@ -3190,7 +3204,7 @@ impl Query {
                     args.iter().all(scalar)
                 }
                 Scalar::Call(name, args) => {
-                    (random_uuid::known(name) || matches!(
+                    (random_uuid::known(name) || functions::text_search::known(name) || matches!(
                         name.as_str(),
                         "abs"
                             | "pg_collation_for"
@@ -4461,6 +4475,11 @@ impl Query {
                         && let Some(n)=c.explicit_collation()? { functions::collation::ready(n)?;
                     }
                     let ty = c.as_ref().map(|e| e.ty.clone());
+                    if matches!(a.base(), Aggregate::Min | Aggregate::Max)
+                        && let Some(ty) = ty.as_ref().filter(|ty| ty.is_text_search())
+                    {
+                        return Err(functions::text_search::aggregate_error(a.name(), ty));
+                    }
                     if matches!(a.base(), Aggregate::Min | Aggregate::Max) && ty == Some(DataType::Uuid) {
                         user_types::view_replace_error(format!("function {}(uuid) does not exist", a.name()));
                         return Err(SqlError::UndefinedFunction);
@@ -6784,6 +6803,9 @@ fn update_filtered_aggregates(
                     | DataType::BigIntArray
                     | DataType::TextArray
                     | DataType::UuidArray
+                    | DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
+                    | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray
+                    | DataType::SmallIntArray
                     | DataType::Varchar
                     | DataType::Bpchar
                     | DataType::Bytes

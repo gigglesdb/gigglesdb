@@ -574,7 +574,11 @@ impl State {
         session.set_max_value_bytes(self.settings.current.max_value_bytes);
         session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
         super::statement_deadline(&self.settings.current);
-        let result = self.simple_statement_inner(sql, source, session, out, received, implicit);
+        giggles_core::relational::take_sql_notices();
+        let config = self.settings.current.default_text_search_config.clone();
+        let result = text_search_types::with_default_config(&config, || {
+            self.simple_statement_inner(sql, source, session, out, received, implicit)
+        });
         if !self.copy_receiving() && let Some(admission) = self.execution_admission.as_mut() {
             admission.permits().role_permit = None;
         }
@@ -912,6 +916,7 @@ impl State {
                 self.settings.queried = session.in_transaction();
                 if p.command() == "SELECT" && writes.is_empty() {
                     let mut cursor = self.diagnostic.core(session.open_uncached_cursor(&p, &[]))?;
+                    sql_notice_frames(out, ReplyLimit::Checked)?;
                     row_description(&d, &[], out)?;
                     let mut count = 0;
                     while !cursor.is_exhausted() {
@@ -928,6 +933,7 @@ impl State {
                                 rows,
                                 ..SqlResult::default()
                             });
+                        sql_notice_frames(out, ReplyLimit::Checked)?;
                         let n = result.get().rows.len();
                         rows(
                             &self.settings.current,

@@ -344,6 +344,7 @@ impl Diagnostic {
             (Err(CoreError::Sql(SqlError::UndefinedObject)), Some(m)) => {
                 m.starts_with("constraint \"") && m.contains(" for table \"") && m.ends_with(" does not exist")
             }
+            (Err(CoreError::Sql(error)), Some(_)) if text_search_types::is_error(error) => true,
             (Err(CoreError::Sql(SqlError::Duplicate)), Some(m)) if self.duplicate_key.is_some() => {
                 m.starts_with("duplicate key value violates unique constraint ")
                     || m.starts_with("could not create unique index ")
@@ -560,6 +561,10 @@ impl Diagnostic {
                 self.wire_message = Some(format!("invalid value for parameter \"bytea_output\": \"{value}\""));
                 self.wire_hint = Some("Available values: escape, hex.".into());
             }),
+            Show::DefaultTextSearchConfig => text_search_types::config_setting(value).map(|_| ()).ok_or_else(|| {
+                self.wire_message = Some(format!("invalid value for parameter \"default_text_search_config\": \"{value}\""));
+                "22023"
+            }),
             _ => Ok(()),
         }
     }
@@ -668,6 +673,8 @@ fn diagnostic_error(
     b.push(0);
     let _ = ReplyLimit::Control.frame(b'E', &b, out);
 }
+use giggles_core::relational::text_search_types;
+
 pub fn oid(t: &DataType) -> u32 {
     match t {
         DataType::Boolean => 16,
@@ -684,6 +691,9 @@ pub fn oid(t: &DataType) -> u32 {
         DataType::TextArray => 1009,
         DataType::UuidArray => 2951,
         DataType::RegType => 2206,
+        DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
+        | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray
+        | DataType::SmallIntArray => t.text_search_oid().unwrap(),
 
         DataType::Bytes => 17,
         DataType::Numeric => 1700,
@@ -705,7 +715,10 @@ pub(crate) fn result_type_oids(d: &Description) -> Vec<u32> {
 }
 fn size(t: &DataType) -> i16 {
     match t {
-        DataType::RegType => 4,
+        DataType::RegType | DataType::RegConfig | DataType::RegDictionary | DataType::Oid => 4,
+        DataType::PgChar => 1,
+        DataType::TsVector | DataType::TsQuery | DataType::RealArray | DataType::PgCharArray
+        | DataType::SmallIntArray => -1,
         DataType::Uuid => 16,
         DataType::Jsonb | DataType::IntArray | DataType::BigIntArray | DataType::TextArray
         | DataType::UuidArray => -1,
@@ -806,6 +819,13 @@ fn decode_with_order(
         let s = std::str::from_utf8(b).map_err(|_| "22021")?;
         return match ty {
             DataType::RegType => Err("0A000"),
+            DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
+            | DataType::Oid | DataType::PgChar => text_search_types::input(ty, s)
+                .map_err(|error| giggles_core::sqlstate(&CoreError::Sql(error))),
+            DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray => {
+                giggles_core::relational::logical_types::array_values(s).map_err(|_| "22P02")?;
+                Ok(Value::Text(s.into()))
+            }
             DataType::Boolean => {
                 let s = s.trim_ascii();
                 let prefix = |word: &str| {
@@ -914,8 +934,12 @@ fn decode_with_order(
             }
         };
     }
-    if ty.is_extended_text() {
+    if ty.is_extended_text() || text_search_array(ty) {
         return logical_binary_input(ty, b, None);
+    }
+    if ty.text_search_oid().is_some() {
+        return text_search_types::binary_input(ty, b)
+            .map_err(|error| giggles_core::sqlstate(&CoreError::Sql(error)));
     }
     let temporal_size = match ty {
         DataType::Date => Some(4),
@@ -1019,6 +1043,14 @@ fn encode(
     if *v == Value::Null {
         return Ok(None);
     }
+    if ty.text_search_oid().is_some() && !text_search_array(ty) {
+        let result = if format == 0 {
+            text_search_types::output(ty, v).map(String::into_bytes)
+        } else {
+            text_search_types::binary_output(ty, v)
+        };
+        return result.map(Some).map_err(|error| giggles_core::sqlstate(&CoreError::Sql(error)));
+    }
     if format == 0 {
         return Ok(Some(match v {
             Value::Null => unreachable!(),
@@ -1065,7 +1097,7 @@ fn encode(
         }));
     }
     Ok(Some(match (v, ty) {
-        (Value::Text(s), ty) if ty.is_extended_text() => logical_binary_output(ty, s, 0)?,
+        (Value::Text(s), ty) if ty.is_extended_text() || text_search_array(ty) => logical_binary_output(ty, s, 0)?,
         (Value::Bool(v), DataType::Boolean) => vec![u8::from(*v)],
         (Value::Int(v), DataType::SmallInt) => i16::try_from(*v)
             .map_err(|_| "22003")?
@@ -1169,6 +1201,19 @@ fn completion_frames(
         body.push(0);
         limit.frame(b'N', &body, out)?;
     }
+    sql_notice_frames(out, limit)?;
+    let tag = match command {
+        "SELECT" => format!("SELECT {}", r.rows.len()),
+        "INSERT" => format!("INSERT 0 {}", r.affected),
+        "UPDATE" | "DELETE" | "MERGE" => format!("{command} {}", r.affected),
+        _ => command.into(),
+    };
+    let mut b = vec![];
+    z(&tag, &mut b);
+    limit.frame(b'C', &b, out)
+}
+
+fn sql_notice_frames(out: &mut Vec<u8>, limit: ReplyLimit) -> R<()> {
     for (message, detail, code) in giggles_core::relational::take_sql_notices() {
         let severity = if matches!(code, Some("22023" | "01000")) { "WARNING" } else { "NOTICE" };
         let mut body = vec![];
@@ -1188,15 +1233,7 @@ fn completion_frames(
         body.push(0);
         limit.frame(b'N', &body, out)?;
     }
-    let tag = match command {
-        "SELECT" => format!("SELECT {}", r.rows.len()),
-        "INSERT" => format!("INSERT 0 {}", r.affected),
-        "UPDATE" | "DELETE" | "MERGE" => format!("{command} {}", r.affected),
-        _ => command.into(),
-    };
-    let mut b = vec![];
-    z(&tag, &mut b);
-    limit.frame(b'C', &b, out)
+    Ok(())
 }
 fn core<T>(r: Result<T, CoreError>) -> R<T> {
     r.map_err(|e| crate::service::sqlstate(&e))
@@ -1302,6 +1339,15 @@ fn core_declared_type(oid: u32) -> Option<DataType> {
         1016 => Some(DataType::BigIntArray),
         1009 => Some(DataType::TextArray),
         2951 => Some(DataType::UuidArray),
+        3614 => Some(DataType::TsVector),
+        3615 => Some(DataType::TsQuery),
+        3734 => Some(DataType::RegConfig),
+        3769 => Some(DataType::RegDictionary),
+        26 => Some(DataType::Oid),
+        18 => Some(DataType::PgChar),
+        1021 => Some(DataType::RealArray),
+        1002 => Some(DataType::PgCharArray),
+        1005 => Some(DataType::SmallIntArray),
 
         1700 => Some(DataType::Numeric),
         700 => Some(DataType::Real),
@@ -2067,7 +2113,11 @@ impl State {
         session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
         session.set_default_isolation(&self.settings.current);
         if tag == b'E' { statement_deadline(&self.settings.current); }
-        let result = self.handle_inner(tag, b, session, out, received);
+        giggles_core::relational::take_sql_notices();
+        let config = self.settings.current.default_text_search_config.clone();
+        let result = text_search_types::with_default_config(&config, || {
+            self.handle_inner(tag, b, session, out, received)
+        });
         if !session.in_transaction() {
             if !self.implicit { session.service.advisory.release(session.backend_pid, true); }
             self.cursors
@@ -2774,6 +2824,7 @@ impl State {
                     session.open_uncached_cursor(prepared, &p.params)
                 };
                 p.cursor = Some(self.diagnostic.core(cursor)?);
+                sql_notice_frames(out, ReplyLimit::Checked)?;
             }
             let cursor = p.cursor.as_mut().expect("opened cursor");
             let mut remaining = if max == 0 { usize::MAX } else { max as usize };
@@ -2785,6 +2836,7 @@ impl State {
                     CURSOR_BYTES,
                 ))?;
                 let chunk = self.diagnostic.core(session.release_page(chunk))?;
+                sql_notice_frames(out, ReplyLimit::Checked)?;
                 let result = chunk.map(|rows| SqlResult {
                     rows,
                     ..SqlResult::default()
@@ -3118,7 +3170,12 @@ impl State {
                                     0
                                 },
                                 self.settings.current.datestyle.order,
-                            )?
+                            ).inspect_err(|_| {
+                            if ty.text_search_oid().is_some() {
+                                self.diagnostic.wire_message = giggles_core::relational::take_sql_error_message();
+                                self.diagnostic.sql_detail = giggles_core::relational::take_sql_error_detail();
+                            }
+                        })?
                         }
                     };
                     if let Some(parameter) = input {
@@ -3177,6 +3234,7 @@ impl State {
                 let mut portal = Portal::new(s, params, catalog_params, output, parameter_bytes);
                 portal.statement_name = Some(stmt);
                 self.portals.insert(name, portal);
+                sql_notice_frames(out, ReplyLimit::Checked)?;
                 frame(b'2', &[], out)?;
             }
             b'D' => {
@@ -4601,6 +4659,10 @@ mod task_release_tests;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "pgwire_task_catalog_tests.rs"]
 mod task_catalog_tests;
+fn text_search_array(ty: &DataType) -> bool {
+    matches!(ty, DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray)
+}
+
 fn logical_binary_output(ty: &DataType, s: &str, type_oid: u32) -> R<Vec<u8>> {
     use giggles_core::relational::logical_types::array_values;
     if *ty == DataType::Uuid {
@@ -4617,6 +4679,9 @@ fn logical_binary_output(ty: &DataType, s: &str, type_oid: u32) -> R<Vec<u8>> {
         DataType::BigIntArray => 20,
         DataType::UuidArray => 2950,
         DataType::TextArray if type_oid >= 65536 => type_oid - 1,
+        DataType::RealArray => 700,
+        DataType::PgCharArray => 18,
+        DataType::SmallIntArray => 21,
         _ => 25,
     };
     let mut b = Vec::new();
@@ -4641,6 +4706,9 @@ fn logical_binary_output(ty: &DataType, s: &str, type_oid: u32) -> R<Vec<u8>> {
                     .to_be_bytes()
                     .to_vec(),
                 DataType::UuidArray => logical_binary_output(&DataType::Uuid, &s, elem)?,
+                DataType::RealArray => giggles_pg_types::Float4::parse(&s).map_err(numeric_error)?.to_binary().to_vec(),
+                DataType::PgCharArray => vec![s.bytes().next().unwrap_or(0)],
+                DataType::SmallIntArray => s.parse::<i16>().map_err(|_| "22P02")?.to_be_bytes().to_vec(),
                 _ => s.into_bytes(),
             };
             b.extend_from_slice(&(v.len() as i32).to_be_bytes());
@@ -4704,6 +4772,9 @@ fn logical_binary_input(
         DataType::IntArray => 23,
         DataType::BigIntArray => 20,
         DataType::UuidArray => 2950,
+        DataType::RealArray => 700,
+        DataType::PgCharArray => 18,
+        DataType::SmallIntArray => 21,
         _ => 25,
     };
     // The parameter's enum type determines how to decode the labels, independent of the header OID.
@@ -4740,6 +4811,9 @@ fn logical_binary_input(
                 i64::from_be_bytes(v.try_into().unwrap()).to_string()
             }
             DataType::UuidArray if len == 16 => hex::encode(v),
+            DataType::RealArray if len == 4 => giggles_pg_types::Float4::from_binary(v).map_err(numeric_error)?.to_text_with_extra_float_digits(1).map_err(numeric_error)?,
+            DataType::PgCharArray if len == 1 => array_quote(&if v[0] == 0 { String::new() } else { char::from(v[0]).to_string() }),
+            DataType::SmallIntArray if len == 2 => i16::from_be_bytes(v.try_into().unwrap()).to_string(),
             DataType::TextArray => {
                 let text = if let Some(diagnostic) = enum_array_diagnostic.as_deref_mut() {
                     enum_array_label(v, diagnostic)?
@@ -4754,7 +4828,8 @@ fn logical_binary_input(
     if at != b.len() {
         return Err("22P03");
     }
-    coerce(Value::Text(format!("{{{}}}", vals.join(","))), ty).map_err(|_| "22P02")
+    let value = Value::Text(format!("{{{}}}", vals.join(",")));
+    if text_search_array(ty) { Ok(value) } else { coerce(value, ty).map_err(|_| "22P02") }
 }
 
 #[cfg(test)]

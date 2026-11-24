@@ -207,6 +207,12 @@ fn generic(
         "varchar" => DataType::Varchar,
         "uuid" => DataType::Uuid,
         "regtype" => DataType::RegType,
+        "tsvector" => DataType::TsVector,
+        "tsquery" => DataType::TsQuery,
+        "regconfig" => DataType::RegConfig,
+        "regdictionary" => DataType::RegDictionary,
+        "oid" => DataType::Oid,
+        "char" => DataType::PgChar,
         "jsonb" => DataType::Jsonb,
         "bpchar" => DataType::Bpchar,
         _ => {

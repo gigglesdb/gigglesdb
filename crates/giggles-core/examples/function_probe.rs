@@ -102,6 +102,15 @@ fn type_name(t: &DataType) -> &'static str {
         DataType::TextArray => "text[]",
         DataType::UuidArray => "uuid[]",
         DataType::RegType => "regtype",
+        DataType::TsVector => "tsvector",
+        DataType::TsQuery => "tsquery",
+        DataType::RegConfig => "regconfig",
+        DataType::RegDictionary => "regdictionary",
+        DataType::Oid => "oid",
+        DataType::PgChar => "\"char\"",
+        DataType::RealArray => "real[]",
+        DataType::PgCharArray => "\"char\"[]",
+        DataType::SmallIntArray => "smallint[]",
     }
 }
 

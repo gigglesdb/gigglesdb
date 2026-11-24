@@ -97,6 +97,8 @@ fn parse_inner(p: &mut Parser, site: Site, unknown_type: SqlError) -> R<Parsed> 
         "text" => DataType::Text,
         "uuid" => DataType::Uuid,
         "jsonb" => DataType::Jsonb,
+        "tsvector" => DataType::TsVector,
+        "tsquery" => DataType::TsQuery,
         "bytea" => DataType::Bytes,
         "bytes" if matches!(site, Site::Create) => DataType::Bytes,
         "date" => DataType::Date,

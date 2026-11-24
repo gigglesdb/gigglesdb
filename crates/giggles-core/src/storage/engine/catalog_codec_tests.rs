@@ -582,6 +582,8 @@ fn appended_column_type_tags_and_existing_typmod_round_trip() {
         (DataType::BigIntArray, 20, None, None),
         (DataType::TextArray, 21, None, None),
         (DataType::UuidArray, 24, None, None),
+        (DataType::TsVector, 26, None, None),
+        (DataType::TsQuery, 27, None, None),
     ] {
         assert_eq!(
             super::super::super::encode(&DataTypeDto::try_from(data_type.clone()).unwrap())

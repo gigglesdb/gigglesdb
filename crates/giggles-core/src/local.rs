@@ -157,7 +157,27 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::InvalidArgumentForLogarithm => 67,
                 relational::SqlError::InvalidArgumentForPowerFunction => 68,
                 relational::SqlError::InvalidArgumentForWidthBucket => 70,
-                relational::SqlError::InternalError => 69,
+                relational::SqlError::InternalError
+                | relational::SqlError::TextSearchInternal
+                | relational::SqlError::TextSearchProtocolViolation
+                | relational::SqlError::TextSearchUnsupported
+                | relational::SqlError::TextSearchNumericOutOfRange
+                | relational::SqlError::TextSearchNullValue
+                | relational::SqlError::TextSearchZeroLength
+                | relational::SqlError::TextSearchInvalidEncoding
+                | relational::SqlError::TextSearchInvalidParameter
+                | relational::SqlError::TextSearchInvalidSubscript
+                | relational::SqlError::TextSearchInvalidText
+                | relational::SqlError::TextSearchInvalidBinary
+                | relational::SqlError::TextSearchInvalidSchema
+                | relational::SqlError::TextSearchSyntax
+                | relational::SqlError::TextSearchInvalidName
+                | relational::SqlError::TextSearchUndefinedObject
+                | relational::SqlError::TextSearchAmbiguousFunction
+                | relational::SqlError::TextSearchDatatypeMismatch
+                | relational::SqlError::TextSearchUndefinedFunction
+                | relational::SqlError::TextSearchProgramLimit
+                | relational::SqlError::TextSearchStatementTooComplex => 69,
                 relational::SqlError::InvalidIndexPredicate => 71,
                 relational::SqlError::UndefinedParameter => 72,
                 relational::SqlError::InvalidName => 73,

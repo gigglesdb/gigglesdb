@@ -1126,6 +1126,8 @@ pub(crate) fn scalar(t: ScalarType) -> (u32, &'static str, i64, u32) {
         ScalarType::BigIntArray => (1016, "_int8", -1, 0),
         ScalarType::TextArray => (1009, "_text", -1, 0),
         ScalarType::UuidArray => (2951, "_uuid", -1, 0),
+        ScalarType::TsVector => (3614, "tsvector", -1, 3643),
+        ScalarType::TsQuery => (3615, "tsquery", -1, 3645),
         ScalarType::Bytes => (17, "bytea", -1, 1001),
         ScalarType::Numeric => (1700, "numeric", -1, 1231),
         ScalarType::Real => (700, "float4", 4, 1021),
@@ -1746,6 +1748,8 @@ fn build_with_budget(
         ScalarType::Varchar,
         ScalarType::Bpchar,
         ScalarType::Uuid,
+        ScalarType::TsVector,
+        ScalarType::TsQuery,
         ScalarType::Jsonb,
         ScalarType::Bytes,
         ScalarType::Numeric,
@@ -1776,6 +1780,7 @@ fn build_with_budget(
         (29, "cid", 4, 1012),
         (28, "xid", 4, 1011),
         (1033, "aclitem", 16, 1034),
+        (3642, "gtsvector", -1, 3644),
     ] {
         add!("pg_type", type_row(oid, name, len, 0, arr, false));
         add!(
@@ -1783,6 +1788,13 @@ fn build_with_budget(
             type_row(arr, &format!("_{name}"), -1, oid, 0, true),
         );
     }
+    add!("pg_ts_config", vec![I(3748), s("simple"), I(11), I(10), I(3722)]);
+    add!("pg_ts_config", vec![I(13248), s("english"), I(11), I(10), I(3722)]);
+    add!("pg_ts_dict", vec![I(3765), s("simple"), I(11), I(10), I(3727), N]);
+    add!("pg_ts_dict", vec![I(13247), s("english_stem"), I(11), I(10), I(13234), s("language = 'english', stopwords = 'english'")]);
+    add!("pg_ts_parser", vec![I(3722), s("default"), I(11), I(3717), I(3718), I(3719), I(3720), I(3721)]);
+    add!("pg_ts_template", vec![I(3727), s("simple"), I(11), I(3725), I(3726)]);
+    add!("pg_ts_template", vec![I(13234), s("snowball"), I(11), I(13232), I(13233)]);
     add!("pg_type", type_row(22, "int2vector", -1, 21, 1006, false));
     add!("pg_type", type_row(1006, "_int2vector", -1, 22, 0, true));
     add!("pg_type", type_row(30, "oidvector", -1, 26, 1013, false));
@@ -2492,6 +2504,7 @@ fn build_with_budget(
                         ScalarType::Bytes => 1955, ScalarType::Numeric => 1752, ScalarType::Real => 620,
                         ScalarType::DoublePrecision => 670, ScalarType::Date => 1093, ScalarType::Time => 1108,
                         ScalarType::TimeTz => 1550, ScalarType::Timestamp => 2060, ScalarType::TimestampTz => 1320,
+                        ScalarType::TsVector => 3629, ScalarType::TsQuery => 3676,
                         ScalarType::Interval => 1330, ScalarType::IntArray | ScalarType::BigIntArray | ScalarType::TextArray | ScalarType::UuidArray => 1070,
                     })
                 }).collect::<Vec<_>>();
@@ -2606,6 +2619,7 @@ fn type_layout(oid: i64) -> (&'static str, &'static str) {
         | 1231
         | 1270
         | 2951
+        | 3614 | 3643..=3645 | 3735 | 3770
         | 3221 => "x",
         n if n >= 32768 => "x",
         _ => "p",
@@ -2669,7 +2683,7 @@ fn type_row(oid: u32, name: &str, len: i64, elem: u32, array: u32, is_array: boo
             "D"
         } else if oid == 1186 {
             "T"
-        } else if matches!(oid, 17 | 27 | 28 | 29 | 1033 | 2950 | 3802) {
+        } else if matches!(oid, 17 | 27 | 28 | 29 | 1033 | 2950 | 3614 | 3615 | 3642 | 3802) {
             "U"
         } else if oid == 18 {
             "Z"
@@ -2690,6 +2704,9 @@ fn type_row(oid: u32, name: &str, len: i64, elem: u32, array: u32, is_array: boo
             match oid {
                 27 => 48,
                 29 => 52,
+                3614 => 3610,
+                3615 => 3612,
+                3642 => 3646,
                 _ => 0,
             }
         }),
@@ -2706,6 +2723,8 @@ fn type_row(oid: u32, name: &str, len: i64, elem: u32, array: u32, is_array: boo
 }
 
 fn type_receive(oid: u32, is_array: bool) -> i64 {
+    if oid == 3614 { return 3639; }
+    if oid == 3615 { return 3641; }
     if is_array {
         return 2400;
     }

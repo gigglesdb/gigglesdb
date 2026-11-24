@@ -9,6 +9,13 @@ use crate::CoreError;
 
 pub(crate) type DdlRows = BTreeMap<Vec<u8>, SqlRow>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageMode {
+    Catalog,
+    TypeRewrite,
+    Mutation,
+}
+
 impl Prepared {
     // Insert pages replace input rows after schema binding. Preserve
     // their target identity when the page is bound again: a bare storage key
@@ -189,13 +196,13 @@ pub(crate) trait RowSink {
         _keys: Option<&[Vec<Value>]>,
         page: &mut dyn FnMut(DdlRows) -> Result<DdlRows, CoreError>,
     ) -> Result<(), CoreError> {
-        self.ddl_pages(table, table, true, page)
+        self.ddl_pages(table, table, PageMode::Mutation, page)
     }
     fn ddl_pages(
         &mut self,
         _table: &TableDef,
         _after: &TableDef,
-        _mutating: bool,
+        _mode: PageMode,
         _page: &mut dyn FnMut(DdlRows) -> Result<DdlRows, CoreError>,
     ) -> Result<(), CoreError> {
         Err(CoreError::Sql(SqlError::Unsupported))
@@ -355,7 +362,7 @@ impl Relational {
             let names = prepared.truncate_tables(self).map_err(CoreError::Sql)?;
             for name in &names {
                 let table = self.tables[name].clone();
-                sink.ddl_pages(&table, &table, true, &mut |_| Ok(BTreeMap::new()))?;
+                sink.ddl_pages(&table, &table, PageMode::Mutation, &mut |_| Ok(BTreeMap::new()))?;
             }
             if *restart {
                 prepared
@@ -441,7 +448,13 @@ impl Relational {
                 .map_err(CoreError::Sql)?;
             if let Statement::AlterTable(alter) = prepared.statement.get() {
                 let table = &original.tables[&alter.table];
-                sink.ddl_pages(table, &self.tables[&alter.table], false, &mut |rows| {
+                let rewrites_text_search = alter.actions.iter().any(|action| {
+                    matches!(action, alter_table::Action::Type(column, ty, ..)
+                        if ty.is_text_search() || table.columns.iter().any(|old|
+                            old.name == *column && old.data_type.is_text_search()))
+                });
+                let mode = if rewrites_text_search { PageMode::TypeRewrite } else { PageMode::Catalog };
+                sink.ddl_pages(table, &self.tables[&alter.table], mode, &mut |rows| {
                     let mut page = original.clone();
                     page.rows.insert(table.id, rows);
                     page.execute_statement_inner(

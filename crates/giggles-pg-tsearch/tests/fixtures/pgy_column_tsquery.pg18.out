@@ -1,0 +1,13 @@
+Output format is csv.
+Pager usage is off.
+@@R0 BEGIN 1
+CREATE TABLE
+@@R0 END 1 00000 0
+@@R0 BEGIN 2
+INSERT 0 2
+@@R0 END 2 00000 2
+@@R0 BEGIN 3
+id,v,?column?,?column?
+1,'cat' & 'dog',t,t
+2,'cat' & 'dog',t,t
+@@R0 END 3 00000 2

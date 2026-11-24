@@ -156,6 +156,8 @@ impl BoundLocal {
             | DataType::BigIntArray
             | DataType::TextArray
             | DataType::UuidArray
+            | DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
+            | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray
             | DataType::Text
             | DataType::Varchar => Ty::Text,
             DataType::Bpchar => Ty::Bpchar,

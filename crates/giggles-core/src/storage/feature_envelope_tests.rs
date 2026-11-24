@@ -616,6 +616,34 @@ fn uuid_array_legacy_feature_envelope_preserves_old_bytes() {
 }
 
 #[test]
+fn text_search_legacy_feature_bit_and_ordinary_catalog_bytes() {
+    let mut state = empty(17);
+    let exec = |state: &mut State, sql: &str| {
+        let prepared = crate::relational::Prepared::parse(sql, 17, state.sql.epoch).unwrap();
+        state.sql.execute(&prepared, &[], None).unwrap();
+    };
+    exec(&mut state, "CREATE TABLE t (id bigint PRIMARY KEY, v text[])");
+    exec(&mut state, "INSERT INTO t VALUES (1, '{old}')");
+    let old = records(&state).unwrap();
+    let mut reopened = normal(old.clone()).unwrap();
+    exec(&mut reopened, "SELECT to_tsvector('a'), to_tsquery('a')");
+    assert_eq!(records(&reopened).unwrap(), old);
+    assert_eq!(feature_bits_present(&reopened).unwrap() & TEXT_SEARCH_TYPES, 0);
+
+    exec(&mut reopened, "ALTER TABLE t ADD COLUMN q tsquery");
+    exec(&mut reopened, "UPDATE t SET q = ''");
+    let new = records(&reopened).unwrap();
+    let bits = feature_bits_present(&reopened).unwrap();
+    assert_ne!(bits & TEXT_SEARCH_TYPES, 0);
+    assert_eq!(reopened.sql.catalog_ext().wire_version(), 4);
+    assert_eq!(records(&normal(new.clone()).unwrap()).unwrap(), new);
+
+    let mut missing_bit = new;
+    missing_bit.insert(vec![10], (bits & !TEXT_SEARCH_TYPES).to_be_bytes().to_vec());
+    assert!(matches!(normal(missing_bit), Err(CoreError::Corrupt(_))));
+}
+
+#[test]
 fn catalog_scale_main_shaped_sequences_preserve_feature_word() {
     use crate::relational::Prepared;
     let mut state = empty(17);

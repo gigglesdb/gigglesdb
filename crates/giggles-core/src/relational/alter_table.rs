@@ -186,8 +186,10 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
                 let (parsed,user_type)=ddl_type::parse_column_type(p, ddl_type::Site::Alter)?;
                 let collation=if p.word("collate") {Some(column_collations::parse_name(p)?)} else {None};
                 if let Some(error)=parsed.semantic_error {return Err(error);}
-                unsupported_type |= collation.is_none() && user_type.is_none() && !matches!(parsed.data_type,DataType::Text|DataType::Varchar|DataType::Bpchar);
-                let conversion = if user_type.is_some() && p.word("using") {
+                unsupported_type |= collation.is_none() && user_type.is_none() && !parsed.data_type.is_text_search() && !matches!(parsed.data_type,DataType::Text|DataType::Varchar|DataType::Bpchar);
+                let conversion = if parsed.data_type.is_text_search() && p.word("using") {
+                    Some(Box::new(query::Query::parse_text_search_conversion(p, &table, parsed.data_type.clone())?))
+                } else if user_type.is_some() && p.word("using") {
                     Some(Box::new(query::Query::alter_type_assignment(p, &table)?))
                 } else {
                     None
@@ -487,6 +489,8 @@ pub(super) fn execute(
                     DataType::BigIntArray => Some(catalog_ext::LogicalKind::BigIntArray),
                     DataType::TextArray => Some(catalog_ext::LogicalKind::TextArray),
                     DataType::UuidArray => Some(catalog_ext::LogicalKind::UuidArray),
+                    DataType::TsVector => Some(catalog_ext::LogicalKind::TsVector),
+                    DataType::TsQuery => Some(catalog_ext::LogicalKind::TsQuery),
                     _ => None,
                 };
                 if let Some(kind) = logical {
@@ -573,15 +577,32 @@ pub(super) fn execute(
                 let reference = column_collations::resolve_column(
                     &candidate, &new, type_id, collation.as_deref(), path
                 )?;
+                if new.data_type.is_text_search() && conversion.is_none() && old.data_type != new.data_type {
+                    return Err(text_search_types::error_message("42804", format!(
+                        "column \"{column}\" cannot be cast automatically to type {}",
+                        new.data_type.text_search_name().unwrap()
+                    )));
+                }
+                if new.data_type.is_text_search() && (table.primary_key.contains(&at)
+                    || candidate.secondary_descriptors_engine().iter().any(|index|
+                        index.table == table.id && index.columns.contains(&old.id))) {
+                    return Err(SqlError::Unsupported);
+                }
                 let previous = candidate.clone();
                 let rows = previous.rows.get(&table.id).ok_or(SqlError::Type)?;
                 let conversion = conversion.as_ref().map(|query| {
                     let mut query = query.as_ref().clone();
+                    if new.data_type.is_text_search() {
+                        return Ok(query);
+                    }
                     query.bind_schema_names(&|name| *name = previous.resolve_relation_key(name, path), &previous, path);
                     query.admit_assignment_literals(&mut 0)?;
                     Ok::<_, SqlError>(query)
                 }).transpose()?;
                 let conversion = conversion.as_ref().map(|query| {
+                    if new.data_type.is_text_search() {
+                        return query.bind(&previous, 0, &[]).map(|query| query.with_clock(clock));
+                    }
                     let query = query.bind_assignment(&previous, vec![], &new.data_type)?.with_clock(clock);
                     query.validate_immutable_constants()?;
                     Ok::<_, SqlError>(query)
@@ -609,6 +630,8 @@ pub(super) fn execute(
                     DataType::IntArray => Some(catalog_ext::LogicalKind::IntArray),
                     DataType::BigIntArray => Some(catalog_ext::LogicalKind::BigIntArray),
                     DataType::TextArray => Some(catalog_ext::LogicalKind::TextArray),
+                    DataType::TsVector => Some(catalog_ext::LogicalKind::TsVector),
+                    DataType::TsQuery => Some(catalog_ext::LogicalKind::TsQuery),
                     _ => None,
                 };
                 if let Some(logical) = logical {

@@ -104,6 +104,7 @@ pub(crate) struct Settings {
     pub datestyle: DateStyleSettings,
     pub bytea_output: ByteaOutput,
     pub intervalstyle: String,
+    pub default_text_search_config: String,
     pub session_replication_role: String,
     pub selected_role: String,
     pub selected_role_oid: Option<u32>,
@@ -149,6 +150,7 @@ impl Default for Settings {
             datestyle: DateStyleSettings::default(),
             bytea_output: ByteaOutput::default(),
             intervalstyle: "postgres".into(),
+            default_text_search_config: "pg_catalog.english".into(),
             session_replication_role: "origin".into(),
             selected_role: "none".into(),
             selected_role_oid: None,
@@ -403,6 +405,10 @@ impl Settings {
                 self.bytea_output = database::bytea_output(&value).expect("validated GUC");
             }
             Show::IntervalStyle => self.intervalstyle = value,
+            Show::DefaultTextSearchConfig => {
+                self.default_text_search_config =
+                    giggles_core::relational::text_search_types::config_setting(&value).expect("validated GUC");
+            }
             Show::SessionReplicationRole => self.session_replication_role = value,
             Show::Role => self.selected_role = value,
             Show::SessionAuthorization => self.session_authorization = value,
@@ -436,6 +442,7 @@ pub(crate) const RESETTABLE: &[Show] = &[
     Show::IntervalStyle,
     Show::SessionReplicationRole,
     Show::ByteaOutput,
+    Show::DefaultTextSearchConfig,
     Show::StatementTimeout,
     Show::LockTimeout,
     Show::IdleInTransactionSessionTimeout,
@@ -492,6 +499,7 @@ pub(crate) enum Show {
     Role,
     SessionAuthorization,
     ByteaOutput,
+    DefaultTextSearchConfig,
     StatementTimeout,
     LockTimeout,
     IdleInTransactionSessionTimeout,
@@ -574,6 +582,7 @@ impl Show {
             Self::SessionAuthorization => ("session_authorization", settings.session_authorization.clone()),
             Self::SessionReplicationRole => ("session_replication_role", settings.session_replication_role.clone()),
             Self::ByteaOutput => ("bytea_output", settings.bytea_output.name().into()),
+            Self::DefaultTextSearchConfig => ("default_text_search_config", settings.default_text_search_config.clone()),
             Self::TransactionTimeout => ("transaction_timeout", "0".into()),
             Self::ClientMinMessages => {
                 ("client_min_messages", settings.client_min_messages.clone())

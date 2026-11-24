@@ -48,7 +48,7 @@ pub(in crate::relational::query) fn join_key_supported(outer: &DataType, inner: 
     {
         return true;
     }
-    if temporal_type(outer) || temporal_type(inner) {
+    if temporal_type(outer) || temporal_type(inner) || outer.is_text_search() || inner.is_text_search() {
         return false;
     }
     if outer == inner {
@@ -136,6 +136,9 @@ pub(in crate::relational::query) fn join_equal(
         return Ok(equal(a, b));
     }
     if outer_ty == inner_ty {
+        if outer_ty.is_text_search() {
+            return Ok(text_search_types::compare(outer_ty, a, b)?.is_eq());
+        }
         return Ok(equal(a, b));
     }
     Ok(compare_cross(a, b, clock)? == Ordering::Equal)

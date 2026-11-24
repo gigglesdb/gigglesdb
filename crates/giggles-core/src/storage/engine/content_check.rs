@@ -89,6 +89,9 @@ pub(crate) fn required_bits_for_catalog_value(
             if entry.def.columns.iter().any(|column| column.data_type == DataType::UuidArray) {
                 required |= super::meta::UUID_ARRAY_COLUMNS;
             }
+            if entry.def.columns.iter().any(|column| column.data_type.is_text_search()) {
+                required |= super::meta::TEXT_SEARCH_TYPES;
+            }
             if ext.values().any(|column| column.type_id.is_some()) || entry.def.name.contains('\0')
             {
                 required |= super::meta::SCHEMAS_AND_USER_TYPES;

@@ -321,6 +321,7 @@ pub(crate) fn lookup_native(name: &str) -> Result<Show> {
         "intervalstyle" => Ok(Show::IntervalStyle),
         "session_replication_role" => Ok(Show::SessionReplicationRole),
         "bytea_output" => Ok(Show::ByteaOutput),
+        "default_text_search_config" => Ok(Show::DefaultTextSearchConfig),
         "statement_timeout" => Ok(Show::StatementTimeout),
         "lock_timeout" => Ok(Show::LockTimeout),
         "idle_in_transaction_session_timeout" => Ok(Show::IdleInTransactionSessionTimeout),
@@ -710,7 +711,7 @@ fn validate(name: Show, values: Vec<Token>) -> Result<String> {
             .map(|(_, label)| label).map_err(|_| "22023"),
         // These accept raw input here. The execution-time check has the
         // current DateStyle and can attach the PostgreSQL diagnostic fields.
-        Show::DateStyle | Show::ByteaOutput => Ok(value),
+        Show::DateStyle | Show::ByteaOutput | Show::DefaultTextSearchConfig => Ok(value),
         Show::ClientEncoding if matches!(lower.as_str(), "utf8" | "utf-8" | "unicode") => {
             Ok("UTF8".into())
         }

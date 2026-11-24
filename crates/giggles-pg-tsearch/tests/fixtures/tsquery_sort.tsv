@@ -1,0 +1,18 @@
+1	25	
+13	12	'a b' & 'c''d'
+6	17	!!'cat'
+5	3	!'cat'
+2	9	'cat':*
+10	8	'cat' <0> 'dog'
+7	23	'cat' <16384> 'dog'
+8	7	'cat' <3> 'dog'
+4	11	'cat':*AB
+3	10	'cat':AB
+14	22	!( 'cat' & 'dog' )
+12	1	'cat' & 'dog'
+9	6	'cat' <-> 'dog'
+11	2	'cat' | 'dog'
+17	4	'cat' & !'dog' | 'bird'
+15	18	'cat' <-> ( 'dog' | 'bird' )
+16	5	( 'cat' | 'dog' ) & 'bird'
+18	21	'cat' & 'dog' & 'bird' & 'fish'

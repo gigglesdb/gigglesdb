@@ -22,6 +22,7 @@ test-cursor-bindings = []
 [dependencies]
 giggles-glibm-loader = { path = "../giggles-glibm-loader" }
 giggles-icu = { path = "../giggles-icu" }
+giggles-pg-tsearch = { path = "../giggles-pg-tsearch" }
 giggles-pg-types = { path = "../giggles-pg-types" }
 giggles-transactions = { path = "../giggles-transactions" }
 redb = "3.1"

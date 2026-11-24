@@ -1,0 +1,25 @@
+1	cat & dog	'cat' & 'dog'	3	'cat' & 'dog'
+2	cat|dog	'cat' | 'dog'	3	'cat' | 'dog'
+3	!cat	!'cat'	2	T
+4	cat & !dog | bird	'cat' & !'dog' | 'bird'	6	'cat' | 'bird'
+5	(cat | dog) & bird	( 'cat' | 'dog' ) & 'bird'	5	( 'cat' | 'dog' ) & 'bird'
+6	cat <-> dog	'cat' <-> 'dog'	3	'cat' <-> 'dog'
+7	cat <3> dog	'cat' <3> 'dog'	3	'cat' <3> 'dog'
+8	cat <0> dog	'cat' <0> 'dog'	3	'cat' <0> 'dog'
+9	cat:*	'cat':*	1	'cat':*
+10	cat:AB	'cat':AB	1	'cat':AB
+11	cat:*AB	'cat':*AB	1	'cat':*AB
+12	'a b' & 'c''d'	'a b' & 'c''d'	3	'a b' & 'c''d'
+13	cat &	ERROR 42601 no operand in tsquery: "cat &"	ERROR 42601 no operand in tsquery: "cat &"	ERROR 42601 no operand in tsquery: "cat &"
+14	& cat	ERROR 42601 syntax error in tsquery: "& cat"	ERROR 42601 syntax error in tsquery: "& cat"	ERROR 42601 syntax error in tsquery: "& cat"
+15	(cat	ERROR 42601 syntax error in tsquery: "(cat"	ERROR 42601 syntax error in tsquery: "(cat"	ERROR 42601 syntax error in tsquery: "(cat"
+16	cat)	ERROR 42601 syntax error in tsquery: "cat)"	ERROR 42601 syntax error in tsquery: "cat)"	ERROR 42601 syntax error in tsquery: "cat)"
+17	!!cat	!!'cat'	3	T
+18	cat <-> (dog | bird)	'cat' <-> ( 'dog' | 'bird' )	5	'cat' <-> ( 'dog' | 'bird' )
+19	''	ERROR 42601 syntax error in tsquery: "''"	ERROR 42601 syntax error in tsquery: "''"	ERROR 42601 syntax error in tsquery: "''"
+20	cat dog	ERROR 42601 syntax error in tsquery: "cat dog"	ERROR 42601 syntax error in tsquery: "cat dog"	ERROR 42601 syntax error in tsquery: "cat dog"
+21	cat & dog & bird & fish	'cat' & 'dog' & 'bird' & 'fish'	7	'cat' & 'dog' & 'bird' & 'fish'
+22	!(cat & dog)	!( 'cat' & 'dog' )	4	T
+23	cat <16384> dog	'cat' <16384> 'dog'	3	'cat' <16384> 'dog'
+24	cat <-1> dog	ERROR 42601 syntax error in tsquery: "cat <-1> dog"	ERROR 42601 syntax error in tsquery: "cat <-1> dog"	ERROR 42601 syntax error in tsquery: "cat <-1> dog"
+25			0	

@@ -2470,6 +2470,7 @@ include!("filter_planning_network.inc");
 include!("aggregate_scalar_network.inc");
 include!("array_ordering_network.inc");
 include!("uuid_array_network.inc");
+include!("text_search_network.inc");
 include!("count_parameter_network.inc");
 include!("character_network.inc");
 include!("pgparity_scalars_w06_network.inc");

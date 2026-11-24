@@ -1,0 +1,4438 @@
+1	1	The
+1	12	 
+1	1	quick
+1	12	 
+1	1	brown
+1	12	 
+1	1	fox
+1	12	 
+1	1	jumps
+2	1	A
+2	12	 
+2	1	slow
+2	12	 
+2	1	dog
+3	1	a
+3	12	 
+3	1	fat
+3	12	 
+3	1	cat
+3	12	 
+3	1	sat
+3	12	 
+3	1	on
+3	12	 
+3	1	a
+3	12	 
+3	1	mat
+3	12	 
+3	1	and
+3	12	 
+3	1	ate
+3	12	 
+3	1	a
+3	12	 
+3	1	fat
+3	12	 
+3	1	rat
+4	1	Running
+4	12	 
+4	1	runners
+4	12	 
+4	1	ran
+4	12	 
+4	1	quickly
+4	12	; 
+4	1	the
+4	12	 
+4	1	runner
+4	12	'
+4	1	s
+4	12	 
+4	1	runs
+4	12	 
+4	1	were
+4	12	 
+4	1	running
+4	12	.
+5	1	Visit
+5	12	 
+5	14	https://
+5	5	www.example.com/path/to/page.html?x=1&y=2#frag
+5	6	www.example.com
+5	18	/path/to/page.html?x=1&y=2#frag
+5	12	 
+5	1	for
+5	12	 
+5	1	details
+6	14	http://
+6	1	localhost
+6	12	:
+6	19	3000/api/v1/search
+6	12	?
+6	1	q
+6	12	=
+6	1	hello
+6	12	%
+6	3	20world
+7	14	ftp://
+7	5	ftp.postgresql.org/pub/source
+7	6	ftp.postgresql.org
+7	18	/pub/source
+8	1	Email
+8	12	 
+8	6	aylon.test
+8	12	+
+8	4	tag@example.co.uk
+8	12	 
+8	1	or
+8	12	 
+8	1	bob
+8	12	@
+8	1	localhost
+8	12	 
+8	1	now
+9	1	version
+9	12	 
+9	8	1.2.3
+9	12	 
+9	1	and
+9	12	 
+9	20	18.6
+9	12	 
+9	1	and
+9	12	 
+9	3	v2
+9	12	 
+9	1	and
+9	12	 
+9	8	10.0.0
+9	12	-
+9	19	beta.1
+10	1	numbers
+10	12	 
+10	22	42
+10	12	 
+10	21	-17
+10	12	 
+10	21	+3
+10	12	 
+10	20	3.14159
+10	12	 
+10	20	-0.5
+10	12	 
+10	7	1e10
+10	12	 
+10	7	6.02e23
+10	12	 
+10	3	0x1F
+10	12	 
+10	22	007
+11	22	2026
+11	21	-11
+11	21	-22
+11	12	 
+11	22	12
+11	12	:
+11	22	34
+11	12	:
+11	22	56
+11	12	 
+11	1	dates
+11	12	 
+11	1	and
+11	12	 
+11	1	times
+11	12	 
+11	22	12
+11	12	:
+11	22	00
+12	16	hyphenated-word
+12	11	hyphenated
+12	12	-
+12	11	word
+12	12	 
+12	16	self-contained
+12	11	self
+12	12	-
+12	11	contained
+12	12	 
+12	16	state-of-the-art
+12	11	state
+12	12	-
+12	11	of
+12	12	-
+12	11	the
+12	12	-
+12	11	art
+12	12	 
+12	16	e-mail
+12	11	e
+12	12	-
+12	11	mail
+12	12	 
+12	16	co-operate
+12	11	co
+12	12	-
+12	11	operate
+13	16	multi-word-hyphen-chain-test
+13	11	multi
+13	12	-
+13	11	word
+13	12	-
+13	11	hyphen
+13	12	-
+13	11	chain
+13	12	-
+13	11	test
+13	12	 
+13	16	x-ray
+13	11	x
+13	12	-
+13	11	ray
+14	1	snake
+14	12	_
+14	1	case
+14	12	_
+14	1	identifier
+14	12	 
+14	1	and
+14	12	 
+14	1	camelCaseIdentifier
+14	12	 
+14	1	and
+14	12	 
+14	1	PascalCase
+15	1	file
+15	12	 
+15	1	paths
+15	12	 
+15	19	/usr/local/bin/psql
+15	12	 
+15	1	C
+15	12	:\\
+15	1	Program
+15	12	 
+15	1	Files
+15	12	\\
+15	6	app.exe
+15	12	 .
+15	19	/relative/path.txt
+15	12	 ..
+15	19	/up.md
+16	13	<p class="x">
+16	1	HTML
+16	12	 
+16	13	<b>
+16	1	bold
+16	13	</b>
+16	12	 
+16	23	&amp;
+16	12	 
+16	1	entities
+16	12	 
+16	23	&lt;
+16	1	tag
+16	23	&gt;
+16	12	 
+16	23	&#169;
+16	12	 
+16	23	&nbsp;
+16	13	</p>
+17	13	<?xml version="1.0"?>
+17	13	<root attr='v'>
+17	1	text
+17	13	</root>
+18	2	Café
+18	12	 
+18	2	naïve
+18	12	 
+18	2	résumé
+18	12	 
+18	2	façade
+18	12	 
+18	2	Zürich
+18	12	 
+18	2	Ångström
+18	12	 
+18	2	œuvre
+19	2	Привет
+19	12	 
+19	2	мир
+19	12	, 
+19	2	как
+19	12	 
+19	2	дела
+19	12	?
+20	2	中文文本测试
+20	12	 
+20	2	日本語のテキスト
+20	12	 
+20	2	한국어
+21	1	emoji
+21	12	 🚀 
+21	1	rocket
+21	12	 👍🏽 
+21	1	thumbs
+21	12	 ✨ 
+21	1	sparkle
+22	1	don
+22	12	'
+22	1	t
+22	12	 
+22	1	won
+22	12	'
+22	1	t
+22	12	 
+22	1	can
+22	12	'
+22	1	t
+22	12	 
+22	1	it
+22	12	'
+22	1	s
+22	12	 
+22	1	O
+22	12	'
+22	1	Reilly
+22	12	 
+22	1	rock
+22	12	'
+22	1	n
+22	12	'
+22	1	roll
+23	19	U.S.A
+23	12	. 
+23	19	e.g
+23	12	. 
+23	19	i.e
+23	12	. 
+23	1	etc
+23	12	. 
+23	19	Ph.D
+23	12	.
+24	1	SELECT
+24	12	 * 
+24	1	FROM
+24	12	 "
+24	1	SearchDocument
+24	12	" 
+24	1	WHERE
+24	12	 
+24	1	tsv
+24	12	 @@ 
+24	1	q
+24	12	;
+25	12	`
+25	1	inline
+25	12	 
+25	1	code
+25	12	` 
+25	1	and
+25	12	 ```
+25	1	fenced
+25	12	``` 
+25	1	and
+25	12	 **
+25	1	bold
+25	12	** _
+25	1	italic
+25	12	_ ~~
+25	1	strike
+25	12	~~
+26	12	# 
+26	1	Heading
+27	12	- [ ] 
+27	1	task
+27	12	 
+27	1	item
+28	12	| 
+28	1	col
+28	12	 | 
+28	3	col2
+28	12	 |
+29	1	foo
+29	12	@
+29	1	bar
+29	12	 
+29	4	baz@qux.com
+29	12	 @
+29	1	mention
+29	12	 #
+29	1	hashtag
+29	12	 $
+29	1	dollar
+29	12	 
+29	22	100
+29	12	% 
+29	19	50/50
+30	1	C
+30	12	+
+30	12	+ 
+30	1	C
+30	12	# 
+30	1	F
+30	12	# .
+30	1	NET
+30	12	 
+30	6	node.js
+30	12	 
+30	6	Vue.js
+30	12	 
+30	6	ASP.NET
+31	3	IPv4
+31	12	 
+31	8	192.168.1.1
+31	12	 
+31	1	and
+31	12	 
+31	8	10.0.0.255
+31	12	:
+31	22	8080
+31	12	 
+31	1	and
+31	12	 ::
+31	22	1
+32	1	the
+32	12	 
+32	1	and
+32	12	 
+32	1	or
+32	12	 
+32	1	not
+32	12	 
+32	1	a
+32	12	 
+32	1	an
+32	12	 
+32	1	of
+32	12	 
+32	1	to
+32	12	 
+32	1	in
+32	12	 
+32	1	is
+32	12	 
+32	1	it
+32	12	 
+32	1	be
+33	1	THE
+33	12	 
+33	1	QUICK
+33	12	 
+33	1	BROWN
+33	12	 
+33	1	FOX
+34	12	   
+34	1	leading
+34	12	 
+34	1	and
+34	12	 
+34	1	trailing
+34	12	 
+34	1	spaces
+35	1	tab
+35	12	\t
+35	1	separated
+35	12	\t
+35	1	words
+36	1	weird
+36	12	-
+36	12	-
+36	12	-
+36	1	dashes
+36	12	___
+36	1	underscores
+36	12	...
+36	1	dots
+36	12	,,,
+36	1	commas
+37	3	a1b2c3
+37	12	 
+37	3	abc123
+37	12	 
+37	3	123abc
+37	12	 
+37	3	1st
+37	12	 
+37	3	2nd
+37	12	 
+37	3	3rd
+37	12	 
+37	3	4th
+38	2	ÀÉÎÕÜ
+38	12	 
+38	2	ß
+38	12	 
+38	2	ﬁ
+38	12	 
+38	1	ligature
+39	1	generously
+39	12	 
+39	1	generalizations
+39	12	 
+39	1	organizational
+39	12	 
+39	1	nationalization
+40	1	caresses
+40	12	 
+40	1	ponies
+40	12	 
+40	1	ties
+40	12	 
+40	1	caress
+40	12	 
+40	1	cats
+40	12	 
+40	1	feed
+40	12	 
+40	1	agreed
+40	12	 
+40	1	disabled
+40	12	 
+40	1	matting
+40	12	 
+40	1	mating
+40	12	 
+40	1	meeting
+40	12	 
+40	1	milling
+40	12	 
+40	1	messing
+40	12	 
+40	1	meetings
+41	1	happy
+41	12	 
+41	1	happiness
+41	12	 
+41	1	happily
+41	12	 
+41	1	sky
+41	12	 
+41	1	skies
+41	12	 
+41	1	dying
+41	12	 
+41	1	lying
+41	12	 
+41	1	tying
+42	1	news
+42	12	 
+42	1	andes
+42	12	 
+42	1	atlas
+42	12	 
+42	1	cosmos
+42	12	 
+42	1	bias
+43	12	-
+43	12	- 
+43	1	comment
+43	12	 
+43	12	-
+43	12	- 
+43	1	and
+43	12	 
+43	12	/* 
+43	1	block
+43	12	 
+43	1	comment
+43	12	 *
+43	12	/
+44	22	1
+44	21	-2
+44	12	 
+44	22	3
+44	12	-
+44	21	-4
+44	12	 
+44	21	-5
+44	12	-
+45	1	xn
+45	12	-
+45	21	-80
+45	6	ak6aa92e.com
+45	12	 
+45	6	sub.domain.example.org
+46	1	mailto
+46	12	:
+46	4	someone@example.com
+47	14	https://
+47	1	user
+47	12	:
+47	4	pass@host.example.com:8443
+47	19	/a/b
+48	6	www.example.com
+48	12	 
+48	6	example.com
+49	19	a.b.c.d.e
+50	20	50.5
+50	12	% $
+50	22	1
+50	12	,
+50	22	000
+50	12	,
+50	22	000
+50	12	 €
+50	22	20
+50	12	 £
+50	22	30
+51	1	aaa
+51	12	'
+51	1	bbb
+51	12	 '
+51	1	quoted
+51	12	' "
+51	1	double
+51	12	"
+52	1	x
+53	12	# 
+53	1	Activity
+53	12	 
+53	1	feed
+54	1	The
+54	12	 
+54	1	activity
+54	12	 
+54	1	feed
+54	12	 
+54	1	shows
+54	12	 
+54	1	who
+54	12	 
+54	1	changed
+54	12	 
+54	1	what
+54	12	 
+54	1	recently
+54	12	 
+54	1	across
+54	12	 
+54	1	a
+54	12	 
+54	1	space
+54	12	 
+54	1	and
+54	12	 
+54	1	across
+54	12	 
+54	1	your
+55	1	whole
+55	12	 
+55	1	organization
+55	12	. 
+55	1	It
+55	12	 
+55	1	surfaces
+55	12	 
+55	1	document
+55	12	 
+55	1	edits
+55	12	, 
+55	1	comments
+55	12	, 
+55	1	object
+55	12	 
+55	1	changes
+55	12	, 
+55	1	and
+56	1	member
+56	12	 
+56	1	events
+56	12	 
+56	1	so
+56	12	 
+56	1	collaboration
+56	12	 
+56	1	stays
+56	12	 
+56	1	visible
+56	12	.
+57	12	## 
+57	1	Where
+57	12	 
+57	1	it
+57	12	 
+57	1	appears
+58	12	- **
+58	1	Organization
+58	12	 
+58	1	dashboard
+58	12	** 
+58	1	shows
+58	12	 
+58	1	a
+58	12	 "
+58	1	Recent
+58	12	 
+58	1	activity
+58	12	" 
+58	1	panel
+58	12	 
+58	1	covering
+58	12	 
+58	1	every
+58	12	 
+58	1	space
+59	12	  
+59	1	and
+59	12	 
+59	1	doc
+59	12	 
+59	1	you
+59	12	 
+59	1	can
+59	12	 
+59	1	see
+59	12	 
+59	1	in
+59	12	 
+59	1	the
+59	12	 
+59	1	active
+59	12	 
+59	1	organization
+59	12	.
+60	12	- **
+60	1	Space
+60	12	 
+60	1	view
+60	12	** 
+60	1	shows
+60	12	 
+60	1	an
+60	12	 "
+60	1	Activity
+60	12	" 
+60	1	panel
+60	12	 
+60	1	scoped
+60	12	 
+60	1	to
+60	12	 
+60	1	that
+60	12	 
+60	1	space
+60	12	.
+61	1	Both
+61	12	 
+61	1	panels
+61	12	 
+61	1	load
+61	12	 
+61	1	newest
+61	12	 
+61	1	first
+61	12	 
+61	1	and
+61	12	 
+61	1	page
+61	12	 
+61	1	back
+61	12	 
+61	1	through
+61	12	 
+61	1	history
+61	12	 
+61	1	as
+61	12	 
+61	1	you
+61	12	 
+61	1	click
+61	12	 "
+61	1	Load
+62	1	more
+62	12	".
+63	12	## 
+63	1	What
+63	12	 
+63	1	gets
+63	12	 
+63	1	recorded
+64	12	| 
+64	1	Verb
+64	12	                       | 
+64	1	Meaning
+64	12	                                  |
+65	12	| 
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	- | 
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	-
+65	12	- |
+66	12	| `
+66	6	doc.created
+66	12	`              | 
+66	1	A
+66	12	 
+66	1	document
+66	12	 
+66	1	was
+66	12	 
+66	1	created
+66	12	                   |
+67	12	| `
+67	6	doc.updated
+67	12	`              | 
+67	1	A
+67	12	 
+67	1	document
+67	12	 
+67	1	was
+67	12	 
+67	1	edited
+67	12	                    |
+68	12	| `
+68	6	doc.deleted
+68	12	`              | 
+68	1	A
+68	12	 
+68	1	document
+68	12	 
+68	1	was
+68	12	 
+68	1	deleted
+68	12	                   |
+69	12	| `
+69	6	doc.restored
+69	12	`             | 
+69	1	A
+69	12	 
+69	16	soft-deleted
+69	11	soft
+69	12	-
+69	11	deleted
+69	12	 
+69	1	document
+69	12	 
+69	1	was
+69	12	 
+69	1	restored
+69	12	     |
+70	12	| `
+70	6	comment.added
+70	12	`            | 
+70	1	A
+70	12	 
+70	1	comment
+70	12	 
+70	1	or
+70	12	 
+70	1	thread
+70	12	 
+70	1	was
+70	12	 
+70	1	added
+70	12	            |
+71	12	| `
+71	6	object.created
+71	12	`           | 
+71	1	An
+71	12	 
+71	1	object
+71	12	 
+71	1	was
+71	12	 
+71	1	created
+71	12	                    |
+72	12	| `
+72	6	object.updated
+72	12	`           | 
+72	1	An
+72	12	 
+72	1	object
+72	12	 
+72	1	was
+72	12	 
+72	1	changed
+72	12	                    |
+73	12	| `
+73	6	member.invited
+73	12	`           | 
+73	1	A
+73	12	 
+73	1	member
+73	12	 
+73	1	was
+73	12	 
+73	1	invited
+73	12	 
+73	1	to
+73	12	 
+73	1	the
+73	12	 
+73	1	organization
+73	12	 |
+74	12	| `
+74	6	member.joined
+74	12	`            | 
+74	1	An
+74	12	 
+74	1	invited
+74	12	 
+74	1	member
+74	12	 
+74	1	accepted
+74	12	 
+74	1	and
+74	12	 
+74	1	joined
+74	12	    |
+75	12	| `
+75	6	review.requested
+75	12	`         | 
+75	1	A
+75	12	 
+75	1	review
+75	12	 
+75	1	was
+75	12	 
+75	1	requested
+75	12	 
+75	1	on
+75	12	 
+75	1	a
+75	12	 
+75	1	document
+75	12	     |
+76	12	| `
+76	6	review.approved
+76	12	`          | 
+76	1	A
+76	12	 
+76	1	review
+76	12	 
+76	1	was
+76	12	 
+76	1	approved
+76	12	                    |
+77	12	| `
+77	6	review.changes
+77	12	_
+77	1	requested
+77	12	` | 
+77	1	A
+77	12	 
+77	1	reviewer
+77	12	 
+77	1	asked
+77	12	 
+77	1	for
+77	12	 
+77	1	changes
+77	12	             |
+78	1	Each
+78	12	 
+78	1	entry
+78	12	 
+78	1	shows
+78	12	 
+78	1	the
+78	12	 
+78	1	actor
+78	12	, 
+78	1	a
+78	12	 
+78	16	verb-templated
+78	11	verb
+78	12	-
+78	11	templated
+78	12	 
+78	1	sentence
+78	12	, 
+78	1	the
+78	12	 
+78	1	target
+78	12	 (
+78	1	with
+78	12	 
+78	1	a
+78	12	 
+78	1	deep
+79	1	link
+79	12	 
+79	1	where
+79	12	 
+79	1	one
+79	12	 
+79	1	exists
+79	12	), 
+79	1	and
+79	12	 
+79	1	a
+79	12	 
+79	1	relative
+79	12	 
+79	1	timestamp
+79	12	.
+80	12	## 
+80	1	Visibility
+81	1	The
+81	12	 
+81	1	feed
+81	12	 
+81	1	honors
+81	12	 
+81	1	the
+81	12	 
+81	1	same
+81	12	 
+81	1	visibility
+81	12	 
+81	1	rules
+81	12	 
+81	1	as
+81	12	 
+81	1	the
+81	12	 
+81	1	documents
+81	12	 
+81	1	overview
+81	12	. 
+81	1	Events
+81	12	 
+81	1	about
+82	1	PRIVATE
+82	12	 
+82	1	documents
+82	12	 
+82	1	are
+82	12	 
+82	1	only
+82	12	 
+82	1	shown
+82	12	 
+82	1	to
+82	12	 
+82	1	people
+82	12	 
+82	1	who
+82	12	 
+82	1	can
+82	12	 
+82	1	already
+82	12	 
+82	1	see
+82	12	 
+82	1	those
+82	12	 
+82	1	documents
+83	12	(
+83	1	the
+83	12	 
+83	1	creator
+83	12	 
+83	1	and
+83	12	 
+83	1	organization
+83	12	 
+83	1	admins
+83	12	). 
+83	1	Events
+83	12	 
+83	1	about
+83	12	 
+83	16	non-document
+83	11	non
+83	12	-
+83	11	document
+83	12	 
+83	1	targets
+83	12	 
+83	1	follow
+84	1	your
+84	12	 
+84	1	organization
+84	12	 
+84	1	role
+84	12	.
+85	12	## 
+85	1	Limitations
+85	12	 (
+85	3	v1
+85	12	)
+86	12	- 
+86	1	The
+86	12	 
+86	1	feed
+86	12	 
+86	1	is
+86	12	 
+86	1	a
+86	12	 
+86	1	product
+86	12	 
+86	1	activity
+86	12	 
+86	1	stream
+86	12	, 
+86	1	not
+86	12	 
+86	1	a
+86	12	 
+86	1	compliance
+86	12	 
+86	1	audit
+86	12	 
+86	1	log
+86	12	. 
+86	1	There
+86	12	 
+86	1	is
+86	12	 
+86	1	no
+87	12	  
+87	1	immutable
+87	12	 
+87	1	retention
+87	12	 
+87	1	guarantee
+87	12	 
+87	1	or
+87	12	 
+87	1	export
+87	12	.
+88	12	- 
+88	1	New
+88	12	 
+88	1	activity
+88	12	 
+88	1	appears
+88	12	 
+88	1	on
+88	12	 
+88	1	refetch
+88	12	 (
+88	1	open
+88	12	 
+88	1	or
+88	12	 
+88	1	reload
+88	12	 
+88	1	the
+88	12	 
+88	1	panel
+88	12	). 
+88	1	Live
+88	12	 
+88	1	push
+88	12	 
+88	1	over
+88	12	 
+88	1	the
+89	12	  
+89	1	websocket
+89	12	 
+89	1	is
+89	12	 
+89	1	a
+89	12	 
+89	1	later
+89	12	 
+89	1	addition
+89	12	.
+90	12	- 
+90	1	Notification
+90	12	 
+90	1	preferences
+90	12	 
+90	1	do
+90	12	 
+90	1	not
+90	12	 
+90	1	apply
+90	12	 
+90	1	here
+90	12	; 
+90	16	per-user
+90	11	per
+90	12	-
+90	11	user
+90	12	 
+90	1	delivery
+90	12	 
+90	1	preferences
+90	12	 
+90	1	belong
+91	12	  
+91	1	to
+91	12	 
+91	1	the
+91	12	 
+91	1	separate
+91	12	 
+91	1	notification
+91	12	 
+91	1	system
+91	12	.
+92	12	# 
+92	1	Changing
+92	12	 
+92	1	seats
+92	12	 
+92	1	on
+92	12	 
+92	1	an
+92	12	 
+92	1	existing
+92	12	 
+92	1	paid
+92	12	 
+92	1	subscription
+93	12	## 
+93	16	In-app
+93	11	In
+93	12	-
+93	11	app
+93	12	 
+93	1	API
+93	12	 
+93	1	path
+94	12	`
+94	6	billing.updateSeats
+94	12	` 
+94	1	exposes
+94	12	 `
+94	1	POST
+94	12	 
+94	19	/billing
+94	12	/:
+94	19	organizationId/seats
+94	12	` 
+94	1	with
+94	12	 
+94	1	a
+94	12	 
+94	1	JSON
+95	1	body
+95	12	 
+95	1	such
+95	12	 
+95	1	as
+95	12	 `{ "
+95	1	seatCount
+95	12	": 
+95	22	5
+95	12	 }`. 
+95	1	Send
+95	12	 
+95	1	the
+95	12	 
+95	1	bearer
+95	12	 `
+95	1	authorization
+95	12	` 
+95	1	header
+95	12	 
+95	1	and
+96	12	`
+96	16	x-organization-id
+96	11	x
+96	12	-
+96	11	organization
+96	12	-
+96	11	id
+96	12	` 
+96	1	for
+96	12	 
+96	1	the
+96	12	 
+96	1	same
+96	12	 
+96	1	organization
+96	12	 
+96	1	as
+96	12	 
+96	1	the
+96	12	 
+96	1	path
+96	12	 
+96	1	parameter
+96	12	. 
+96	1	The
+96	12	 
+96	1	caller
+97	1	must
+97	12	 
+97	1	have
+97	12	 `
+97	1	billing
+97	12	:
+97	1	manage
+97	12	` 
+97	1	permission
+97	12	.
+98	1	This
+98	12	 
+98	1	is
+98	12	 
+98	1	the
+98	12	 
+98	1	reliable
+98	12	 
+98	16	seat-management
+98	11	seat
+98	12	-
+98	11	management
+98	12	 
+98	1	path
+98	12	 
+98	1	implemented
+98	12	 
+98	1	by
+98	12	 
+98	1	the
+98	12	 
+98	1	app
+98	12	. 
+98	1	It
+98	12	 
+98	1	requires
+98	12	 
+98	1	a
+99	1	paid
+99	12	 
+99	1	subscription
+99	12	 
+99	1	with
+99	12	 
+99	1	a
+99	12	 
+99	1	Stripe
+99	12	 
+99	1	subscription
+99	12	 
+99	1	ID
+99	12	. 
+99	1	The
+99	12	 
+99	1	seat
+99	12	 
+99	1	count
+99	12	 
+99	1	must
+99	12	 
+99	1	be
+99	12	 
+99	1	a
+99	12	 
+99	1	positive
+100	1	integer
+100	12	 
+100	1	and
+100	12	 
+100	1	cannot
+100	12	 
+100	1	fall
+100	12	 
+100	1	below
+100	12	 
+100	1	either
+100	12	 
+100	1	the
+100	12	 
+100	1	plan
+100	12	'
+100	1	s
+100	12	 
+100	1	minimum
+100	12	 
+100	1	seats
+100	12	 
+100	1	or
+100	12	 
+100	1	the
+100	12	 
+100	1	current
+101	1	number
+101	12	 
+101	1	of
+101	12	 
+101	1	organization
+101	12	 
+101	1	members
+101	12	.
+102	12	`
+102	6	BillingService.updateSeats
+102	12	` 
+102	1	validates
+102	12	 
+102	1	that
+102	12	 
+102	1	floor
+102	12	, 
+102	1	calls
+103	12	`
+103	6	StripeService.updateSubscriptionQuantity
+103	12	`, 
+103	1	and
+103	12	 
+103	1	persists
+103	12	 
+103	1	the
+103	12	 
+103	1	new
+103	12	 
+103	1	seat
+103	12	 
+103	1	count
+104	1	immediately
+104	12	. 
+104	1	Stripe
+104	12	 
+104	1	updates
+104	12	 
+104	1	the
+104	12	 
+104	1	plan
+104	12	 
+104	1	subscription
+104	12	 
+104	1	item
+104	12	'
+104	1	s
+104	12	 
+104	1	quantity
+104	12	 
+104	1	with
+105	12	`
+105	1	proration
+105	12	_
+105	1	behavior
+105	12	: '
+105	1	create
+105	12	_
+105	1	prorations
+105	12	'`. 
+105	1	The
+106	12	`
+106	6	customer.subscription.updated
+106	12	` 
+106	1	webhook
+106	12	 
+106	1	remains
+106	12	 
+106	1	the
+106	12	 
+106	1	source
+106	12	 
+106	1	of
+106	12	 
+106	1	truth
+106	12	 
+106	1	and
+107	1	reconfirms
+107	12	 
+107	1	subscription
+107	12	 
+107	1	state
+107	12	. 
+107	1	This
+107	12	 
+107	1	path
+107	12	 
+107	1	is
+107	12	 
+107	1	independent
+107	12	 
+107	1	of
+107	12	 
+107	16	billing-portal
+107	11	billing
+107	12	-
+107	11	portal
+108	1	configuration
+108	12	.
+109	12	## 
+109	1	Stripe
+109	12	 
+109	1	customer
+109	12	 
+109	1	portal
+109	12	 
+109	1	path
+110	12	`
+110	6	billing.createPortalSession
+110	12	` 
+110	1	exposes
+110	12	 `
+110	1	POST
+110	12	 
+110	19	/billing
+110	12	/:
+110	19	organizationId/portal
+110	12	`
+111	1	with
+111	12	 
+111	1	an
+111	12	 
+111	1	empty
+111	12	 
+111	1	JSON
+111	12	 
+111	1	body
+111	12	 
+111	1	and
+111	12	 
+111	1	the
+111	12	 
+111	1	same
+111	12	 
+111	19	organization/authentication
+111	12	 
+111	1	headers
+111	12	 
+111	1	and
+112	12	`
+112	1	billing
+112	12	:
+112	1	manage
+112	12	` 
+112	1	permission
+112	12	. 
+112	1	It
+112	12	 
+112	1	returns
+112	12	 
+112	1	a
+112	12	 
+112	1	portal
+112	12	 
+112	1	URL
+112	12	; 
+112	1	the
+112	12	 
+112	1	return
+112	12	 
+112	1	location
+112	12	 
+112	1	is
+113	12	`
+113	19	/organizations/settings/billing
+113	12	`.
+114	12	**
+114	1	Portal
+114	12	 
+114	1	seat
+114	12	 
+114	1	changes
+114	12	 
+114	1	are
+114	12	 
+114	1	not
+114	12	 
+114	1	configured
+114	12	 
+114	1	in
+114	12	 
+114	1	code
+114	12	 
+114	1	today
+114	12	.**
+115	12	`
+115	6	StripeService.createBillingPortalSession
+115	12	` 
+115	1	passes
+115	12	 
+115	1	only
+115	12	 `
+115	1	customer
+115	12	` 
+115	1	and
+116	12	`
+116	1	return
+116	12	_
+116	1	url
+116	12	` 
+116	1	to
+116	12	 
+116	1	Stripe
+116	12	. 
+116	1	It
+116	12	 
+116	1	supplies
+116	12	 
+116	1	no
+116	12	 
+116	1	explicit
+116	12	 `
+116	1	configuration
+116	12	` 
+116	1	ID
+116	12	 
+116	1	and
+116	12	 
+116	1	does
+116	12	 
+116	1	not
+117	1	create
+117	12	 
+117	1	a
+117	12	 
+117	1	portal
+117	12	 
+117	1	configuration
+117	12	 
+117	1	with
+117	12	 `
+117	6	features.subscription
+117	12	_
+117	1	update
+117	12	` 
+117	1	quantity
+118	1	updates
+118	12	 
+118	1	enabled
+118	12	. 
+118	1	The
+118	12	 
+118	1	session
+118	12	 
+118	1	therefore
+118	12	 
+118	1	relies
+118	12	 
+118	1	on
+118	12	 
+118	1	the
+118	12	 
+118	1	Stripe
+118	12	 
+118	1	account
+118	12	'
+118	1	s
+118	12	 
+118	1	default
+119	16	billing-portal
+119	11	billing
+119	12	-
+119	11	portal
+119	12	 
+119	1	configuration
+119	12	 
+119	1	in
+119	12	 
+119	1	the
+119	12	 
+119	1	Dashboard
+119	12	. 
+119	1	Code
+119	12	 
+119	1	alone
+119	12	 
+119	1	neither
+119	12	 
+119	1	enables
+119	12	 
+119	1	nor
+120	1	disables
+120	12	 
+120	1	quantity
+120	12	 
+120	1	changes
+120	12	, 
+120	1	so
+120	12	 
+120	1	opening
+120	12	 
+120	1	the
+120	12	 
+120	1	portal
+120	12	 
+120	1	does
+120	12	 
+120	1	not
+120	12	 
+120	1	guarantee
+120	12	 
+120	1	that
+120	12	 
+120	1	a
+121	1	customer
+121	12	 
+121	1	can
+121	12	 
+121	1	change
+121	12	 
+121	1	seats
+121	12	.
+122	1	If
+122	12	 
+122	16	self-service
+122	11	self
+122	12	-
+122	11	service
+122	12	 
+122	1	seat
+122	12	 
+122	1	changes
+122	12	 
+122	1	through
+122	12	 
+122	1	the
+122	12	 
+122	1	portal
+122	12	 
+122	1	are
+122	12	 
+122	1	required
+122	12	, 
+122	1	a
+122	12	 
+122	16	follow-up
+122	11	follow
+122	12	-
+122	11	up
+122	12	 
+122	1	must
+123	1	either
+123	12	 
+123	1	enable
+123	12	 
+123	1	subscription
+123	12	 
+123	1	quantity
+123	12	 
+123	1	updates
+123	12	 
+123	1	in
+123	12	 
+123	1	the
+123	12	 
+123	1	Dashboard
+123	12	'
+123	1	s
+123	12	 
+123	1	default
+123	12	 
+123	1	portal
+124	1	configuration
+124	12	, 
+124	1	or
+124	12	 
+124	1	create
+124	12	 
+124	1	an
+124	12	 
+124	1	explicit
+124	12	 
+124	1	portal
+124	12	 
+124	1	configuration
+124	12	 
+124	1	enabling
+124	12	 
+124	1	quantity
+125	1	updates
+125	12	 
+125	1	through
+125	12	 `
+125	6	features.subscription
+125	12	_
+125	1	update
+125	12	` 
+125	1	and
+125	12	 
+125	1	pass
+125	12	 
+125	1	its
+125	12	 
+125	1	ID
+125	12	 
+125	1	as
+125	12	 
+125	1	the
+125	12	 
+125	1	session
+125	12	'
+125	1	s
+126	12	`
+126	1	configuration
+126	12	`. 
+126	1	The
+126	12	 
+126	1	live
+126	12	 
+126	1	Dashboard
+126	12	 
+126	1	configuration
+126	12	 
+126	1	was
+126	12	 
+126	1	not
+126	12	 
+126	1	inspected
+126	12	 
+126	1	as
+126	12	 
+126	1	part
+126	12	 
+126	1	of
+127	1	ARC
+127	21	-14
+127	12	. 
+127	1	This
+127	12	 
+127	1	change
+127	12	 
+127	1	documents
+127	12	 
+127	1	the
+127	12	 
+127	1	caveat
+127	12	 
+127	1	and
+127	12	 
+127	1	adds
+127	12	 
+127	1	no
+127	12	 
+127	16	seat-management
+127	11	seat
+127	12	-
+127	11	management
+127	12	 
+127	1	UI
+127	12	.
+128	12	## 
+128	1	Code
+128	12	 
+128	1	references
+129	12	- [
+129	1	Billing
+129	12	 
+129	1	controller
+129	12	](..
+129	19	/apps/api/src/billing/billing.controller.ts
+129	12	)
+130	12	- [
+130	1	Seat
+130	12	 
+130	1	validation
+130	12	 
+130	1	and
+130	12	 
+130	1	update
+130	12	 
+130	1	flow
+130	12	](..
+130	19	/apps/api/src/billing/billing.service.ts
+130	12	)
+131	12	- [
+131	1	Stripe
+131	12	 
+131	1	portal
+131	12	 
+131	1	session
+131	12	 
+131	1	and
+131	12	 
+131	1	quantity
+131	12	 
+131	1	update
+131	12	](..
+131	19	/apps/api/src/billing/stripe.service.ts
+131	12	)
+132	12	# 
+132	1	Doc
+132	12	 
+132	1	descriptions
+133	1	Every
+133	12	 
+133	1	architecture
+133	12	 
+133	1	doc
+133	12	 
+133	1	can
+133	12	 
+133	1	carry
+133	12	 
+133	1	an
+133	12	 
+133	1	optional
+133	12	 **
+133	1	description
+133	12	**: 
+133	1	a
+133	12	 
+133	1	short
+133	12	 
+133	1	piece
+133	12	 
+133	1	of
+134	1	markdown
+134	12	 
+134	1	that
+134	12	 
+134	1	captures
+134	12	 
+134	1	the
+134	12	 "
+134	1	why
+134	12	" 
+134	1	behind
+134	12	 
+134	1	the
+134	12	 
+134	1	diagram
+134	12	. 
+134	1	Use
+134	12	 
+134	1	it
+134	12	 
+134	1	to
+134	12	 
+134	1	record
+134	12	 
+134	1	the
+135	1	decision
+135	12	, 
+135	1	the
+135	12	 
+135	1	constraints
+135	12	, 
+135	1	or
+135	12	 
+135	1	the
+135	12	 
+135	1	context
+135	12	 
+135	1	that
+135	12	 
+135	1	the
+135	12	 
+135	1	boxes
+135	12	 
+135	1	and
+135	12	 
+135	1	arrows
+135	12	 
+135	1	cannot
+135	12	 
+135	1	show
+135	12	.
+136	12	## 
+136	1	Where
+136	12	 
+136	1	descriptions
+136	12	 
+136	1	appear
+137	12	- **
+137	1	Doc
+137	12	 
+137	1	page
+137	12	.** 
+137	1	The
+137	12	 
+137	1	rendered
+137	12	 
+137	1	description
+137	12	 
+137	1	sits
+137	12	 
+137	1	in
+137	12	 
+137	1	a
+137	12	 
+137	1	collapsible
+137	12	 "
+137	1	About
+137	12	 
+137	1	this
+138	12	  
+138	1	diagram
+138	12	" 
+138	1	panel
+138	12	 
+138	1	near
+138	12	 
+138	1	the
+138	12	 
+138	1	title
+138	12	.
+139	12	- **
+139	1	Overview
+139	12	 
+139	1	cards
+139	12	 
+139	1	and
+139	12	 
+139	1	lists
+139	12	.** 
+139	1	A
+139	12	 
+139	1	short
+139	12	, 
+139	16	plain-text
+139	11	plain
+139	12	-
+139	11	text
+139	12	 
+139	1	preview
+139	12	 (
+139	1	about
+139	12	 
+139	1	the
+139	12	 
+139	1	first
+139	12	 
+139	22	280
+140	12	  
+140	1	characters
+140	12	, 
+140	1	with
+140	12	 
+140	1	markdown
+140	12	 
+140	1	removed
+140	12	) 
+140	1	shows
+140	12	 
+140	1	under
+140	12	 
+140	1	the
+140	12	 
+140	1	doc
+140	12	 
+140	1	name
+140	12	 
+140	1	so
+140	12	 
+140	1	people
+140	12	 
+140	1	can
+140	12	 
+140	1	scan
+141	12	  
+141	1	a
+141	12	 
+141	1	space
+141	12	 
+141	1	and
+141	12	 
+141	1	find
+141	12	 
+141	1	the
+141	12	 
+141	1	right
+141	12	 
+141	1	diagram
+141	12	.
+142	12	- **
+142	1	Search
+142	12	.** 
+142	1	The
+142	12	 
+142	1	description
+142	12	 
+142	1	is
+142	12	 
+142	1	indexed
+142	12	, 
+142	1	so
+142	12	 
+142	1	a
+142	12	 
+142	1	doc
+142	12	 
+142	1	surfaces
+142	12	 
+142	1	when
+142	12	 
+142	1	you
+142	12	 
+142	1	search
+142	12	 
+142	1	for
+142	12	 
+142	1	a
+143	12	  
+143	1	term
+143	12	 
+143	1	that
+143	12	 
+143	1	appears
+143	12	 
+143	1	only
+143	12	 
+143	1	in
+143	12	 
+143	1	its
+143	12	 
+143	1	rationale
+143	12	.
+144	12	- **
+144	1	Ask
+144	12	 
+144	1	your
+144	12	 
+144	1	architecture
+144	12	.** 
+144	1	The
+144	12	 
+144	1	AI
+144	12	 
+144	1	assistant
+144	12	 
+144	1	can
+144	12	 
+144	1	read
+144	12	 
+144	1	a
+144	12	 
+144	1	doc
+144	12	'
+144	1	s
+144	12	 
+144	1	description
+144	12	 
+144	1	with
+145	12	  
+145	1	the
+145	12	 `
+145	1	getDoc
+145	12	` 
+145	1	tool
+145	12	, 
+145	1	so
+145	12	 
+145	1	it
+145	12	 
+145	1	can
+145	12	 
+145	1	cite
+145	12	 
+145	1	the
+145	12	 
+145	1	documented
+145	12	 
+145	1	reasoning
+145	12	 
+145	1	in
+145	12	 
+145	1	its
+145	12	 
+145	1	answers
+145	12	.
+146	12	## 
+146	1	Markdown
+146	12	 
+146	1	support
+147	1	Descriptions
+147	12	 
+147	1	are
+147	12	 
+147	1	rendered
+147	12	 
+147	1	with
+147	12	 
+147	1	GitHub
+147	12	 
+147	1	Flavored
+147	12	 
+147	1	Markdown
+147	12	. 
+147	1	You
+147	12	 
+147	1	can
+147	12	 
+147	1	use
+147	12	:
+148	12	- 
+148	1	Headings
+148	12	, **
+148	1	bold
+148	12	**, _
+148	1	italic
+148	12	_, 
+148	1	and
+148	12	 `
+148	1	inline
+148	12	 
+148	1	code
+148	12	`
+149	12	- 
+149	1	Bullet
+149	12	 
+149	1	and
+149	12	 
+149	1	numbered
+149	12	 
+149	1	lists
+150	12	- 
+150	1	Links
+150	12	, 
+150	1	like
+150	12	 [
+150	1	the
+150	12	 
+150	1	architecture
+150	12	 
+150	1	overview
+150	12	](
+150	14	https://
+150	6	example.com
+150	12	)
+151	12	- 
+151	1	Tables
+151	12	 
+151	1	and
+151	12	 
+151	1	task
+151	12	 
+151	1	lists
+151	12	 (
+151	1	GFM
+151	12	)
+152	12	## 
+152	1	Editing
+152	12	 
+152	1	a
+152	12	 
+152	1	description
+153	1	Open
+153	12	 
+153	1	a
+153	12	 
+153	1	doc
+153	12	, 
+153	1	open
+153	12	 
+153	1	the
+153	12	 
+153	19	share/info
+153	12	 
+153	1	dialog
+153	12	, 
+153	1	and
+153	12	 
+153	1	use
+153	12	 
+153	1	the
+153	12	 **
+153	1	Description
+153	12	** 
+153	1	section
+153	12	. 
+153	1	Type
+154	1	markdown
+154	12	 
+154	1	in
+154	12	 
+154	1	the
+154	12	 **
+154	1	Edit
+154	12	** 
+154	1	tab
+154	12	 
+154	1	and
+154	12	 
+154	1	switch
+154	12	 
+154	1	to
+154	12	 **
+154	1	Preview
+154	12	** 
+154	1	to
+154	12	 
+154	1	see
+154	12	 
+154	1	it
+154	12	 
+154	1	rendered
+154	12	. 
+154	1	Click
+155	12	**
+155	1	Save
+155	12	 
+155	1	description
+155	12	** 
+155	1	to
+155	12	 
+155	1	persist
+155	12	 
+155	1	it
+155	12	. 
+155	1	Editing
+155	12	 
+155	1	a
+155	12	 
+155	1	description
+155	12	 
+155	1	follows
+155	12	 
+155	1	the
+155	12	 
+155	1	same
+156	1	permission
+156	12	 
+156	1	as
+156	12	 
+156	1	editing
+156	12	 
+156	1	the
+156	12	 
+156	1	doc
+156	12	.
+157	12	## 
+157	1	Example
+158	12	```
+158	1	markdown
+159	12	# 
+159	1	Payments
+159	12	 
+159	1	service
+159	12	 
+159	1	split
+160	1	We
+160	12	 
+160	1	extracted
+160	12	 **
+160	1	payments
+160	12	** 
+160	1	from
+160	12	 
+160	1	the
+160	12	 
+160	1	monolith
+160	12	 
+160	1	to
+160	12	 
+160	1	isolate
+160	12	 
+160	1	PCI
+160	12	 
+160	1	scope
+160	12	 
+160	1	and
+160	12	 
+160	1	to
+160	12	 
+160	1	let
+160	12	 
+160	1	the
+161	1	payments
+161	12	 
+161	1	team
+161	12	 
+161	1	deploy
+161	12	 
+161	1	independently
+161	12	.
+162	12	- 
+162	1	Owner
+162	12	: 
+162	1	Payments
+162	12	 
+162	1	squad
+163	12	- 
+163	1	Constraint
+163	12	: 
+163	1	must
+163	12	 
+163	1	stay
+163	12	 
+163	16	PCI-DSS
+163	11	PCI
+163	12	-
+163	11	DSS
+163	12	 
+163	16	in-scope
+163	11	in
+163	12	-
+163	11	scope
+163	12	 
+163	1	only
+163	12	 
+163	1	here
+164	12	- 
+164	1	See
+164	12	 [
+164	1	the
+164	12	 
+164	1	migration
+164	12	 
+164	1	RFC
+164	12	](
+164	14	https://
+164	5	example.com/rfc-payments)
+164	6	example.com
+164	18	/rfc-payments)
+165	12	```
+166	12	# 
+166	1	Archdocs
+166	12	 
+166	1	Feature
+166	12	 
+166	1	Backlog
+167	1	A
+167	12	 
+167	1	living
+167	12	 
+167	1	catalog
+167	12	 
+167	1	of
+167	12	 
+167	1	candidate
+167	12	 
+167	1	features
+167	12	, 
+167	1	grouped
+167	12	 
+167	1	by
+167	12	 
+167	1	theme
+167	12	 
+167	1	and
+167	12	 
+167	1	ordered
+167	12	 
+167	1	roughly
+167	12	 
+167	1	by
+167	12	 
+167	1	how
+167	12	 
+167	1	much
+168	1	each
+168	12	 
+168	1	reinforces
+168	12	 
+168	1	the
+168	12	 
+168	1	product
+168	12	'
+168	1	s
+168	12	 
+168	1	differentiator
+168	12	: 
+168	1	the
+168	12	 
+168	1	reference
+168	12	 
+168	1	graph
+168	12	 
+168	1	plus
+168	12	 
+168	1	living
+168	12	 
+168	1	infrastructure
+168	12	.
+169	12	**
+169	1	Effort
+169	12	:** 
+169	1	S
+169	12	 = 
+169	1	days
+169	12	, 
+169	1	M
+169	12	 = 
+169	16	sprint-ish
+169	11	sprint
+169	12	-
+169	11	ish
+169	12	, 
+169	1	L
+169	12	 = 
+169	16	multi-sprint
+169	11	multi
+169	12	-
+169	11	sprint
+169	12	.
+170	12	**
+170	1	Moat
+170	12	 (⭐):** 
+170	1	leans
+170	12	 
+170	1	on
+170	12	 
+170	1	the
+170	12	 
+170	19	reference/object
+170	12	 
+170	1	graph
+170	12	, 
+170	1	hard
+170	12	 
+170	1	for
+170	12	 
+170	1	general
+170	12	 
+170	1	diagram
+170	12	 
+170	1	tools
+170	12	 
+170	1	to
+170	12	 
+170	1	copy
+170	12	.
+171	12	> 
+171	1	Note
+171	12	: 
+171	1	the
+171	12	 
+171	16	gap-closers
+171	11	gap
+171	12	-
+171	11	closers
+171	12	 
+171	1	identified
+171	12	 
+171	1	in
+171	12	 
+171	1	the
+171	12	 
+171	1	initial
+171	12	 
+171	1	eval
+171	12	 
+171	1	are
+171	12	 
+171	1	tracked
+171	12	 
+171	1	separately
+171	12	 
+171	1	and
+171	12	 
+171	1	not
+172	12	> 
+172	1	repeated
+172	12	 
+172	1	here
+172	12	: 
+172	1	comments
+172	12	 
+172	1	API
+172	12	, 
+172	16	cloud-import
+172	11	cloud
+172	12	-
+172	11	import
+172	12	 
+172	1	orchestration
+172	12	, 
+172	1	RBAC
+172	12	 
+172	1	enforcement
+172	12	, 
+172	1	org
+172	12	 
+172	1	member
+173	12	> 
+173	1	invitations
+173	12	, 
+173	16	real-time
+173	11	real
+173	12	-
+173	11	time
+173	12	 
+173	1	persistence
+173	12	, 
+173	1	billing
+173	12	 
+173	1	tests
+173	12	, 
+173	1	audit
+173	12	 
+173	1	log
+173	12	 
+173	1	viewer
+173	12	.
+174	12	-
+174	12	-
+174	12	-
+175	12	## 
+175	1	A
+175	12	. 
+175	1	The
+175	12	 
+175	1	dependency
+175	12	 
+175	1	graph
+175	12	 (
+175	1	most
+175	12	 
+175	1	defensible
+175	12	 
+175	1	territory
+175	12	)
+176	22	1
+176	12	. **⭐ 
+176	1	Impact
+176	12	 
+176	1	analysis
+176	12	 
+176	12	/ 
+176	1	blast
+176	12	 
+176	1	radius
+176	12	 (
+176	1	L
+176	12	)** — 
+176	1	select
+176	12	 
+176	1	any
+176	12	 
+176	1	object
+176	12	 
+176	1	or
+176	12	 
+176	1	doc
+176	12	, 
+176	1	see
+176	12	 
+176	1	everything
+176	12	 
+176	1	downstream
+176	12	 
+176	1	that
+176	12	 
+176	1	depends
+176	12	 
+176	1	on
+176	12	 
+176	1	it
+176	12	. "
+176	1	If
+176	12	 
+176	1	I
+176	12	 
+176	1	change
+176	12	 
+176	1	this
+176	12	 
+176	1	queue
+176	12	, 
+176	1	here
+176	12	 
+176	1	are
+176	12	 
+176	1	the
+176	12	 
+176	22	9
+176	12	 
+176	1	services
+176	12	 
+176	1	and
+176	12	 
+176	22	4
+176	12	 
+176	1	docs
+176	12	 
+176	1	affected
+176	12	."
+177	22	2
+177	12	. **⭐ 
+177	1	Dependency
+177	12	 
+177	1	graph
+177	12	 
+177	1	view
+177	12	 (
+177	1	M
+177	12	)** — 
+177	1	a
+177	12	 
+177	1	navigable
+177	12	 
+177	1	graph
+177	12	 
+177	1	of
+177	12	 
+177	1	all
+177	12	 
+177	19	doc/object
+177	12	 
+177	1	references
+177	12	. 
+177	1	The
+177	12	 
+177	1	edges
+177	12	 
+177	1	are
+177	12	 
+177	1	already
+177	12	 
+177	1	captured
+177	12	; 
+177	1	this
+177	12	 
+177	1	visualizes
+177	12	 
+177	1	them
+177	12	.
+178	22	3
+178	12	. **⭐ "
+178	1	Where
+178	12	 
+178	1	used
+178	12	" 
+178	1	panel
+178	12	 (
+178	1	S
+178	12	)** — 
+178	1	for
+178	12	 
+178	1	any
+178	12	 
+178	1	object
+178	12	, 
+178	1	a
+178	12	 
+178	1	live
+178	12	 
+178	1	list
+178	12	 
+178	1	of
+178	12	 
+178	1	every
+178	12	 
+178	1	doc
+178	12	 
+178	1	referencing
+178	12	 
+178	1	it
+178	12	, 
+178	1	surfaced
+178	12	 
+178	1	in
+178	12	 
+178	1	the
+178	12	 
+178	1	editor
+178	12	.
+179	22	4
+179	12	. **⭐ 
+179	19	Broken/dangling
+179	12	 
+179	1	reference
+179	12	 
+179	1	detection
+179	12	 (
+179	1	M
+179	12	)** — 
+179	1	flag
+179	12	 
+179	1	references
+179	12	 
+179	1	whose
+179	12	 
+179	1	target
+179	12	 
+179	1	was
+179	12	 
+179	1	deleted
+179	12	 
+179	1	or
+179	12	 
+179	1	structurally
+179	12	 
+179	1	changed
+179	12	. 
+179	1	A
+179	12	 
+179	1	health
+179	12	 
+179	1	view
+179	12	 
+179	1	per
+179	12	 
+179	1	space
+179	12	.
+180	22	5
+180	12	. **⭐ 
+180	1	Reference
+180	12	 
+180	1	change
+180	12	 
+180	1	alerts
+180	12	 (
+180	1	M
+180	12	)** — 
+180	1	notify
+180	12	 
+180	1	owners
+180	12	 
+180	1	of
+180	12	 
+180	1	doc
+180	12	 
+180	1	B
+180	12	 
+180	1	when
+180	12	 
+180	1	an
+180	12	 
+180	1	object
+180	12	 
+180	1	embedded
+180	12	 
+180	1	from
+180	12	 
+180	1	doc
+180	12	 
+180	1	A
+180	12	 
+180	1	changes
+180	12	.
+181	12	## 
+181	1	B
+181	12	. 
+181	1	Living
+181	12	 
+181	1	infrastructure
+181	12	 (
+181	1	objects
+181	12	 
+181	12	+ 
+181	1	cloud
+181	12	)
+182	22	6
+182	12	. **⭐ 
+182	1	Infra
+182	12	 
+182	1	drift
+182	12	 
+182	1	detection
+182	12	 (
+182	1	L
+182	12	)** — 
+182	1	diff
+182	12	 
+182	1	last
+182	12	 
+182	1	cloud
+182	12	 
+182	1	import
+182	12	 
+182	1	against
+182	12	 
+182	1	current
+182	12	 
+182	1	reality
+182	12	, 
+182	1	flag
+182	12	 
+182	1	stale
+182	12	 
+182	1	diagrams
+182	12	.
+183	22	7
+183	12	. **
+183	16	Auto-layout
+183	11	Auto
+183	12	-
+183	11	layout
+183	12	 
+183	1	from
+183	12	 
+183	1	import
+183	12	 (
+183	1	M
+183	12	)** — 
+183	1	generate
+183	12	 
+183	1	a
+183	12	 
+183	1	starter
+183	12	 
+183	1	diagram
+183	12	 
+183	1	from
+183	12	 
+183	1	imported
+183	12	 
+183	1	resources
+183	12	, 
+183	1	grouped
+183	12	 
+183	1	by
+183	12	 
+183	19	VPC/region/account
+183	12	.
+184	22	8
+184	12	. **
+184	1	Terraform
+184	12	 
+184	12	/ 
+184	1	IaC
+184	12	 
+184	1	import
+184	12	 (
+184	1	L
+184	12	)** — 
+184	1	build
+184	12	 
+184	1	objects
+184	12	 
+184	1	from
+184	12	 
+184	1	Terraform
+184	12	 
+184	1	state
+184	12	 
+184	1	or
+184	12	 
+184	1	HCL
+184	12	, 
+184	1	not
+184	12	 
+184	1	just
+184	12	 
+184	1	live
+184	12	 
+184	1	cloud
+184	12	.
+185	22	9
+185	12	. **
+185	1	Typed
+185	12	 
+185	1	object
+185	12	 
+185	1	metadata
+185	12	 (
+185	1	M
+185	12	)** — 
+185	1	structured
+185	12	 
+185	1	properties
+185	12	 (
+185	1	owner
+185	12	, 
+185	1	environment
+185	12	, 
+185	1	repo
+185	12	, 
+185	1	tier
+185	12	, 
+185	1	cost
+185	12	) 
+185	1	with
+185	12	 
+185	19	filter/search
+185	12	.
+186	22	10
+186	12	. **
+186	1	Cost
+186	12	 
+186	1	overlay
+186	12	 (
+186	1	M
+186	12	)** — 
+186	1	pull
+186	12	 
+186	1	spend
+186	12	 
+186	1	per
+186	12	 
+186	1	resource
+186	12	, 
+186	1	render
+186	12	 
+186	1	as
+186	12	 
+186	1	a
+186	12	 
+186	1	heatmap
+186	12	 
+186	1	on
+186	12	 
+186	1	the
+186	12	 
+186	1	canvas
+186	12	.
+187	22	11
+187	12	. **
+187	1	Object
+187	12	 
+187	1	template
+187	12	 
+187	1	library
+187	12	 (
+187	1	S
+187	12	)** — 
+187	1	curated
+187	12	 
+187	1	reusable
+187	12	 
+187	1	objects
+187	12	 
+187	1	for
+187	12	 
+187	1	common
+187	12	 
+187	1	cloud
+187	12	 
+187	1	patterns
+187	12	.
+188	12	## 
+188	1	C
+188	12	. 
+188	1	Canvas
+188	12	 
+188	12	& 
+188	1	editor
+189	22	12
+189	12	. **
+189	1	Export
+189	12	 (
+189	19	PNG/SVG/PDF
+189	12	) 
+189	12	+ 
+189	16	read-only
+189	11	read
+189	12	-
+189	11	only
+189	12	 
+189	1	embed
+189	12	 
+189	1	links
+189	12	 (
+189	1	S
+189	12	)** — 
+189	1	table
+189	12	 
+189	1	stakes
+189	12	 
+189	1	for
+189	12	 
+189	1	sharing
+189	12	 
+189	1	into
+189	12	 
+189	19	Confluence/Notion/READMEs
+189	12	.
+190	22	13
+190	12	. **
+190	1	Diagram
+190	12	 
+190	1	templates
+190	12	 (
+190	1	S
+190	12	)** — 
+190	3	C4
+190	12	 (
+190	19	context/container/component
+190	12	), 
+190	1	sequence
+190	12	, 
+190	1	microservice
+190	12	 
+190	1	starters
+190	12	.
+191	22	14
+191	12	. **
+191	1	Link
+191	12	 
+191	1	shapes
+191	12	 
+191	1	to
+191	12	 
+191	1	real
+191	12	 
+191	1	artifacts
+191	12	 (
+191	1	S
+191	12	)** — 
+191	1	attach
+191	12	 
+191	1	repo
+191	12	 
+191	1	URL
+191	12	, 
+191	1	runbook
+191	12	, 
+191	1	dashboard
+191	12	, 
+191	1	or
+191	12	 
+191	1	ticket
+191	12	 
+191	1	to
+191	12	 
+191	1	any
+191	12	 
+191	1	element
+191	12	.
+192	22	15
+192	12	. **
+192	1	Layers
+192	12	 
+192	12	/ 
+192	1	view
+192	12	 
+192	1	toggles
+192	12	 (
+192	1	M
+192	12	)** — 
+192	19	show/hide
+192	12	 
+192	1	categories
+192	12	 (
+192	1	network
+192	12	, 
+192	1	data
+192	12	, 
+192	1	security
+192	12	) 
+192	1	on
+192	12	 
+192	1	one
+192	12	 
+192	1	diagram
+192	12	.
+193	22	16
+193	12	. **
+193	1	Presentation
+193	12	 
+193	12	/ 
+193	1	walkthrough
+193	12	 
+193	1	mode
+193	12	 (
+193	1	M
+193	12	)** — 
+193	1	ordered
+193	12	 
+193	1	frames
+193	12	 
+193	1	through
+193	12	 
+193	1	a
+193	12	 
+193	1	diagram
+193	12	 
+193	1	for
+193	12	 
+193	1	design
+193	12	 
+193	1	reviews
+193	12	 
+193	1	and
+193	12	 
+193	1	onboarding
+193	12	.
+194	22	17
+194	12	. **
+194	16	Auto-tidy
+194	11	Auto
+194	12	-
+194	11	tidy
+194	12	 
+194	1	layout
+194	12	 (
+194	1	M
+194	12	)** — 
+194	1	algorithmic
+194	12	 
+194	1	arrange
+194	12	 
+194	1	of
+194	12	 
+194	1	selected
+194	12	 
+194	1	elements
+194	12	.
+195	22	18
+195	12	. **
+195	16	Mini-map
+195	11	Mini
+195	12	-
+195	11	map
+195	12	 
+195	1	for
+195	12	 
+195	1	large
+195	12	 
+195	1	diagrams
+195	12	 (
+195	1	S
+195	12	)** — 
+195	1	navigation
+195	12	 
+195	1	aid
+195	12	.
+196	12	## 
+196	1	D
+196	12	. 
+196	1	Collaboration
+196	12	 (
+196	1	beyond
+196	12	 
+196	1	the
+196	12	 
+196	1	comments
+196	12	 
+196	1	API
+196	12	 
+196	1	itself
+196	12	)
+197	22	19
+197	12	. **@
+197	1	mentions
+197	12	 
+197	12	+ 
+197	1	notifications
+197	12	 (
+197	1	M
+197	12	)** — 
+197	1	depends
+197	12	 
+197	1	on
+197	12	 
+197	1	comments
+197	12	, 
+197	1	drives
+197	12	 
+197	1	engagement
+197	12	.
+198	22	20
+198	12	. **
+198	1	Suggestions
+198	12	 
+198	12	/ 
+198	1	review
+198	12	 
+198	1	mode
+198	12	 (
+198	1	L
+198	12	)** — 
+198	1	propose
+198	12	 
+198	1	edits
+198	12	 
+198	1	an
+198	12	 
+198	1	owner
+198	12	 
+198	1	approves
+198	12	. 
+198	1	Already
+198	12	 
+198	1	promised
+198	12	 
+198	1	in
+198	12	 
+198	1	marketing
+198	12	.
+199	22	21
+199	12	. **
+199	1	Async
+199	12	 
+199	16	design-review
+199	11	design
+199	12	-
+199	11	review
+199	12	 
+199	1	workflow
+199	12	 (
+199	1	M
+199	12	)** — 
+199	1	request
+199	12	 
+199	1	review
+199	12	, 
+199	1	track
+199	12	 
+199	19	approvals/status
+199	12	 
+199	1	on
+199	12	 
+199	1	a
+199	12	 
+199	1	doc
+199	12	.
+200	22	22
+200	12	. **
+200	1	Activity
+200	12	 
+200	1	feed
+200	12	 (
+200	1	S
+200	12	)** — 
+200	1	per
+200	12	 
+200	19	space/org
+200	12	, 
+200	1	who
+200	12	 
+200	1	changed
+200	12	 
+200	1	what
+200	12	 
+200	1	recently
+200	12	.
+201	22	23
+201	12	. **
+201	16	Follow-user
+201	11	Follow
+201	12	-
+201	11	user
+201	12	 
+201	1	mode
+201	12	 (
+201	1	S
+201	12	)** — 
+201	1	follow
+201	12	 
+201	1	a
+201	12	 
+201	1	collaborator
+201	12	'
+201	1	s
+201	12	 
+201	1	viewport
+201	12	 
+201	1	live
+201	12	 
+201	1	during
+201	12	 
+201	1	a
+201	12	 
+201	1	session
+201	12	.
+202	12	## 
+202	1	E
+202	12	. 
+202	1	Knowledge
+202	12	 
+202	12	& 
+202	1	discoverability
+203	22	24
+203	12	. **
+203	1	Deep
+203	12	 
+203	1	search
+203	12	 (
+203	1	M
+203	12	)** — 
+203	1	search
+203	12	 
+203	1	inside
+203	12	 
+203	1	diagram
+203	12	 
+203	1	text
+203	12	, 
+203	1	object
+203	12	 
+203	1	metadata
+203	12	, 
+203	1	and
+203	12	 
+203	1	comments
+203	12	, 
+203	1	not
+203	12	 
+203	1	just
+203	12	 
+203	19	doc/icon
+203	12	 
+203	1	names
+203	12	.
+204	22	25
+204	12	. **
+204	1	Doc
+204	12	 
+204	1	descriptions
+204	12	 
+204	12	/ 
+204	1	README
+204	12	 
+204	1	per
+204	12	 
+204	1	diagram
+204	12	 (
+204	1	S
+204	12	)** — 
+204	1	markdown
+204	12	 
+204	1	context
+204	12	 
+204	1	capturing
+204	12	 
+204	1	the
+204	12	 "
+204	1	why
+204	12	."
+205	22	26
+205	12	. **
+205	1	Tags
+205	12	 
+205	12	& 
+205	16	cross-space
+205	11	cross
+205	12	-
+205	11	space
+205	12	 
+205	1	collections
+205	12	 (
+205	1	S
+205	12	)** — 
+205	1	organize
+205	12	 
+205	1	docs
+205	12	 
+205	1	beyond
+205	12	 
+205	1	the
+205	12	 
+205	1	space
+205	12	 
+205	1	hierarchy
+205	12	.
+206	22	27
+206	12	. **
+206	1	Architecture
+206	12	 
+206	1	catalog
+206	12	 
+206	12	/ 
+206	1	portal
+206	12	 (
+206	1	M
+206	12	)** — 
+206	1	a
+206	12	 
+206	1	browseable
+206	12	 
+206	16	read-only
+206	11	read
+206	12	-
+206	11	only
+206	12	 
+206	1	index
+206	12	 
+206	1	of
+206	12	 
+206	1	all
+206	12	 
+206	1	systems
+206	12	, 
+206	16	Backstage-style
+206	11	Backstage
+206	12	-
+206	11	style
+206	12	.
+207	12	## 
+207	1	F
+207	12	. 
+207	1	Governance
+207	12	 
+207	12	& 
+207	1	lifecycle
+208	22	28
+208	12	. **
+208	1	Ownership
+208	12	 
+208	12	+ 
+208	16	stale-doc
+208	11	stale
+208	12	-
+208	11	doc
+208	12	 
+208	1	policies
+208	12	 (
+208	1	M
+208	12	)** — 
+208	1	assign
+208	12	 
+208	1	owners
+208	12	, 
+208	1	flag
+208	12	 
+208	1	docs
+208	12	 
+208	1	untouched
+208	12	 
+208	1	for
+208	12	 
+208	1	N
+208	12	 
+208	1	days
+208	12	, "
+208	1	review
+208	12	 
+208	1	needed
+208	12	" 
+208	1	badges
+208	12	.
+209	22	29
+209	12	. **
+209	1	Canonical
+209	12	 
+209	12	/ 
+209	1	locked
+209	12	 
+209	1	docs
+209	12	 (
+209	1	S
+209	12	)** — 
+209	1	mark
+209	12	 
+209	1	a
+209	12	 
+209	1	doc
+209	12	 
+209	1	approved
+209	12	 
+209	1	so
+209	12	 
+209	1	it
+209	12	 
+209	1	can
+209	12	'
+209	1	t
+209	12	 
+209	1	be
+209	12	 
+209	1	casually
+209	12	 
+209	1	edited
+209	12	.
+210	22	30
+210	12	. **
+210	1	External
+210	12	 
+210	1	share
+210	12	 
+210	1	links
+210	12	 
+210	1	with
+210	12	 
+210	1	expiry
+210	12	 (
+210	1	M
+210	12	)** — 
+210	16	read-only
+210	11	read
+210	12	-
+210	11	only
+210	12	 
+210	1	public
+210	12	 
+210	1	sharing
+210	12	, 
+210	1	controlled
+210	12	.
+211	12	## 
+211	1	G
+211	12	. 
+211	1	Integrations
+211	12	 
+211	12	& 
+211	1	AI
+212	22	31
+212	12	. **
+212	1	GitHub
+212	12	 
+212	1	integration
+212	12	 (
+212	1	L
+212	12	)** — 
+212	1	link
+212	12	 
+212	1	diagrams
+212	12	 
+212	1	to
+212	12	 
+212	1	repos
+212	12	; 
+212	1	comment
+212	12	 
+212	1	on
+212	12	 
+212	1	PRs
+212	12	 
+212	1	that
+212	12	 
+212	1	touch
+212	12	 
+212	1	architecture
+212	12	; 
+212	16	docs-as-code
+212	11	docs
+212	12	-
+212	11	as
+212	12	-
+212	11	code
+212	12	 
+212	1	sync
+212	12	.
+213	22	32
+213	12	. **
+213	1	Slack
+213	12	 
+213	1	notifications
+213	12	 
+213	12	+ 
+213	1	doc
+213	12	 
+213	1	previews
+213	12	 (
+213	1	M
+213	12	)** — 
+213	1	comments
+213	12	, 
+213	1	mentions
+213	12	, 
+213	1	drift
+213	12	 
+213	1	alerts
+213	12	 
+213	1	pushed
+213	12	 
+213	1	where
+213	12	 
+213	1	teams
+213	12	 
+213	1	live
+213	12	.
+214	22	33
+214	12	. **⭐ "
+214	1	Ask
+214	12	 
+214	1	your
+214	12	 
+214	1	architecture
+214	12	" 
+214	1	AI
+214	12	 (
+214	1	L
+214	12	)** — 
+214	1	natural
+214	12	 
+214	1	language
+214	12	 
+214	1	over
+214	12	 
+214	1	the
+214	12	 
+214	1	reference
+214	12	 
+214	1	graph
+214	12	 
+214	1	and
+214	12	 
+214	1	objects
+214	12	: "
+214	1	what
+214	12	 
+214	1	depends
+214	12	 
+214	1	on
+214	12	 
+214	1	the
+214	12	 
+214	1	payments
+214	12	 
+214	1	database
+214	12	?"
+215	12	-
+215	12	-
+215	12	-
+216	12	## 
+216	1	Strategic
+216	12	 
+216	1	notes
+217	12	- **
+217	1	The
+217	12	 
+217	1	compounding
+217	12	 
+217	1	cluster
+217	12	 
+217	1	is
+217	12	 
+217	1	A
+217	12	 
+217	12	+ 
+217	1	B
+217	12	 
+217	12	+ 
+217	22	33
+217	12	.** 
+217	1	Impact
+217	12	 
+217	1	analysis
+217	12	, 
+217	1	drift
+217	12	 
+217	1	detection
+217	12	, 
+217	1	and
+217	12	 
+217	16	AI-over-the-graph
+217	11	AI
+217	12	-
+217	11	over
+217	12	-
+217	11	the
+217	12	-
+217	11	graph
+218	12	  
+218	1	are
+218	12	 
+218	1	the
+218	12	 
+218	1	same
+218	12	 
+218	1	underlying
+218	12	 
+218	1	asset
+218	12	 (
+218	1	the
+218	12	 
+218	19	reference/object
+218	12	 
+218	1	graph
+218	12	) 
+218	1	expressed
+218	12	 
+218	1	three
+218	12	 
+218	1	ways
+218	12	. 
+218	1	No
+218	12	 
+218	1	general
+219	12	  
+219	1	diagram
+219	12	 
+219	1	tool
+219	12	 (
+219	1	Lucid
+219	12	, 
+219	1	Excalidraw
+219	12	, 
+219	1	Miro
+219	12	) 
+219	1	can
+219	12	 
+219	1	follow
+219	12	 
+219	1	there
+219	12	.
+220	12	- **
+220	1	Cheap
+220	12	 
+220	1	adoption
+220	12	 
+220	1	wins
+220	12	:** 
+220	22	12
+220	12	, 
+220	22	13
+220	12	, 
+220	22	14
+220	12	, 
+220	22	18
+220	12	, 
+220	22	22
+220	12	, 
+220	22	25
+220	12	 — 
+220	1	all
+220	12	 
+220	1	small
+220	12	, 
+220	1	all
+220	12	 
+220	16	day-one
+220	11	day
+220	12	-
+220	11	one
+220	12	 
+220	1	expectations
+220	12	, 
+220	1	none
+220	12	 
+220	1	built
+220	12	 
+220	1	yet
+220	12	.
+221	12	- **
+221	16	Category-defining
+221	11	Category
+221	12	-
+221	11	defining
+221	12	 
+221	1	bets
+221	12	:** 
+221	22	20
+221	12	 
+221	1	and
+221	12	 
+221	22	31
+221	12	 
+221	1	turn
+221	12	 
+221	1	this
+221	12	 
+221	1	from
+221	12	 "
+221	1	a
+221	12	 
+221	1	diagram
+221	12	 
+221	1	tool
+221	12	" 
+221	1	into
+221	12	 "
+221	1	where
+221	12	 
+221	1	architecture
+222	12	  
+222	1	decisions
+222	12	 
+222	1	happen
+222	12	."
+223	12	## 
+223	1	Prerequisite
+224	1	Before
+224	12	 
+224	1	pursuing
+224	12	 
+224	1	most
+224	12	 
+224	1	of
+224	12	 
+224	1	the
+224	12	 
+224	1	above
+224	12	, 
+224	1	the
+224	12	 **
+224	1	objects
+224	12	 
+224	1	system
+224	12	 
+224	1	needs
+224	12	 
+224	1	a
+224	12	 
+224	1	serious
+224	12	 
+224	1	redesign
+224	12	**. 
+224	1	It
+224	12	 
+224	1	is
+224	12	 
+224	1	currently
+225	1	not
+225	12	 
+225	1	intuitive
+225	12	 
+225	1	and
+225	12	 
+225	1	not
+225	12	 
+225	1	finished
+225	12	. 
+225	1	Objects
+225	12	 
+225	1	are
+225	12	 
+225	1	the
+225	12	 
+225	1	substrate
+225	12	 
+225	1	that
+225	12	 
+225	19	A/B/33
+225	12	 
+225	1	depend
+225	12	 
+225	1	on
+225	12	, 
+225	1	so
+225	12	 
+225	1	this
+225	12	 
+225	1	is
+225	12	 
+225	1	the
+226	1	foundation
+226	12	 
+226	1	work
+226	12	 
+226	1	that
+226	12	 
+226	1	unblocks
+226	12	 
+226	1	the
+226	12	 
+226	1	rest
+226	12	. (
+226	1	Design
+226	12	 
+226	1	in
+226	12	 
+226	1	progress
+226	12	.)
+227	12	# 
+227	1	Review
+227	12	 
+227	1	and
+227	12	 
+227	1	Suggestions
+228	1	Archdocs
+228	12	 
+228	1	lets
+228	12	 
+228	1	a
+228	12	 
+228	1	document
+228	12	 
+228	1	owner
+228	12	 
+228	1	gate
+228	12	 
+228	1	changes
+228	12	 
+228	1	through
+228	12	 
+228	1	review
+228	12	 
+228	1	and
+228	12	 
+228	1	lets
+228	12	 
+228	1	collaborators
+228	12	 
+228	1	propose
+228	12	 
+228	1	specific
+229	1	edits
+229	12	. 
+229	1	There
+229	12	 
+229	1	are
+229	12	 
+229	1	two
+229	12	 
+229	1	layers
+229	12	:
+230	22	1
+230	12	. **
+230	16	Doc-level
+230	11	Doc
+230	12	-
+230	11	level
+230	12	 
+230	1	review
+230	12	** 
+230	12	- 
+230	1	request
+230	12	 
+230	1	review
+230	12	 
+230	1	from
+230	12	 
+230	1	named
+230	12	 
+230	1	reviewers
+230	12	, 
+230	1	who
+230	12	 
+230	1	approve
+230	12	 
+230	1	or
+230	12	 
+230	1	request
+230	12	 
+230	1	changes
+230	12	 
+230	1	with
+230	12	 
+230	1	a
+231	12	   
+231	1	comment
+231	12	. 
+231	1	The
+231	12	 
+231	1	document
+231	12	 
+231	1	carries
+231	12	 
+231	1	an
+231	12	 
+231	1	aggregate
+231	12	 
+231	1	review
+231	12	 
+231	1	status
+231	12	.
+232	22	2
+232	12	. **
+232	16	Element-level
+232	11	Element
+232	12	-
+232	11	level
+232	12	 
+232	1	suggestions
+232	12	** 
+232	12	- 
+232	1	a
+232	12	 
+232	1	collaborator
+232	12	 
+232	1	proposes
+232	12	 
+232	1	specific
+232	12	 
+232	1	canvas
+232	12	 
+232	1	edits
+232	12	 
+232	1	as
+232	12	 
+232	1	a
+232	12	 
+232	1	delta
+232	12	; 
+232	1	the
+232	12	 
+232	1	owner
+233	12	   
+233	1	accepts
+233	12	 
+233	1	or
+233	12	 
+233	1	rejects
+233	12	 
+233	1	them
+233	12	 
+233	1	per
+233	12	 
+233	1	element
+233	12	. (
+233	1	See
+233	12	 
+233	1	the
+233	12	 
+233	1	Suggestions
+233	12	 
+233	1	section
+233	12	 
+233	1	below
+233	12	.)
+234	12	## 
+234	16	Doc-level
+234	11	Doc
+234	12	-
+234	11	level
+234	12	 
+234	1	review
+235	12	### 
+235	1	Requesting
+235	12	 
+235	1	a
+235	12	 
+235	1	review
+236	1	Anyone
+236	12	 
+236	1	with
+236	12	 
+236	1	the
+236	12	 `
+236	1	review
+236	12	:
+236	1	request
+236	12	` 
+236	1	permission
+236	12	 (
+236	1	editors
+236	12	, 
+236	1	admins
+236	12	, 
+236	1	and
+236	12	 
+236	1	owners
+236	12	) 
+236	1	can
+236	12	 
+236	1	request
+236	12	 
+236	1	a
+236	12	 
+236	1	review
+236	12	 
+236	1	on
+236	12	 
+236	1	a
+237	1	document
+237	12	. 
+237	1	Pick
+237	12	 
+237	1	one
+237	12	 
+237	1	or
+237	12	 
+237	1	more
+237	12	 
+237	1	reviewers
+237	12	 
+237	1	from
+237	12	 
+237	1	your
+237	12	 
+237	1	organization
+237	12	'
+237	1	s
+237	12	 
+237	1	members
+237	12	; 
+237	1	you
+237	12	 
+237	1	cannot
+237	12	 
+237	1	add
+237	12	 
+237	1	yourself
+237	12	. 
+237	1	Each
+238	1	reviewer
+238	12	 
+238	1	is
+238	12	 
+238	1	notified
+238	12	 
+238	16	in-app
+238	11	in
+238	12	-
+238	11	app
+238	12	 
+238	1	and
+238	12	 
+238	1	by
+238	12	 
+238	1	email
+238	12	.
+239	12	### 
+239	1	Deciding
+240	1	A
+240	12	 
+240	1	named
+240	12	 
+240	1	reviewer
+240	12	 
+240	1	with
+240	12	 
+240	1	the
+240	12	 `
+240	1	review
+240	12	:
+240	1	decide
+240	12	` 
+240	1	permission
+240	12	 
+240	1	opens
+240	12	 
+240	1	the
+240	12	 
+240	1	document
+240	12	 
+240	1	and
+240	12	 
+240	1	either
+240	12	 **
+240	1	approves
+240	12	** 
+240	1	or
+241	12	**
+241	1	requests
+241	12	 
+241	1	changes
+241	12	**, 
+241	1	optionally
+241	12	 
+241	1	leaving
+241	12	 
+241	1	a
+241	12	 
+241	1	comment
+241	12	. 
+241	1	Only
+241	12	 
+241	1	a
+241	12	 
+241	1	named
+241	12	 
+241	1	reviewer
+241	12	 
+241	1	of
+241	12	 
+241	1	that
+241	12	 
+241	1	request
+241	12	 
+241	1	can
+241	12	 
+241	1	decide
+241	12	;
+242	1	anyone
+242	12	 
+242	1	else
+242	12	 
+242	1	is
+242	12	 
+242	1	refused
+242	12	 
+242	1	even
+242	12	 
+242	1	if
+242	12	 
+242	1	they
+242	12	 
+242	1	hold
+242	12	 
+242	1	the
+242	12	 
+242	1	permission
+242	12	. 
+242	1	The
+242	12	 
+242	1	requester
+242	12	 
+242	1	is
+242	12	 
+242	1	notified
+242	12	 
+242	16	in-app
+242	11	in
+242	12	-
+242	11	app
+242	12	 
+242	1	and
+242	12	 
+242	1	by
+243	1	email
+243	12	 
+243	1	of
+243	12	 
+243	1	each
+243	12	 
+243	1	decision
+243	12	.
+244	12	### 
+244	1	Statuses
+245	1	A
+245	12	 
+245	1	review
+245	12	 
+245	1	request
+245	12	 
+245	1	has
+245	12	 
+245	1	one
+245	12	 
+245	1	of
+245	12	 
+245	1	four
+245	12	 
+245	1	statuses
+245	12	:
+246	12	- **
+246	1	open
+246	12	** 
+246	12	- 
+246	1	the
+246	12	 
+246	1	request
+246	12	 
+246	1	is
+246	12	 
+246	1	active
+246	12	 
+246	1	and
+246	12	 
+246	1	not
+246	12	 
+246	1	every
+246	12	 
+246	1	reviewer
+246	12	 
+246	1	has
+246	12	 
+246	1	approved
+246	12	.
+247	12	- **
+247	1	approved
+247	12	** 
+247	12	- 
+247	1	every
+247	12	 
+247	1	reviewer
+247	12	 
+247	1	has
+247	12	 
+247	1	approved
+247	12	.
+248	12	- **
+248	1	changes
+248	12	_
+248	1	requested
+248	12	** 
+248	12	- 
+248	1	at
+248	12	 
+248	1	least
+248	12	 
+248	1	one
+248	12	 
+248	1	reviewer
+248	12	 
+248	1	requested
+248	12	 
+248	1	changes
+248	12	.
+249	12	- **
+249	1	cancelled
+249	12	** 
+249	12	- 
+249	1	the
+249	12	 
+249	1	requester
+249	12	 
+249	1	cancelled
+249	12	 
+249	1	the
+249	12	 
+249	1	request
+249	12	.
+250	1	The
+250	12	 
+250	1	derived
+250	12	 
+250	1	status
+250	12	 
+250	1	follows
+250	12	 
+250	1	a
+250	12	 
+250	1	simple
+250	12	 
+250	1	rule
+250	12	:
+251	12	- 
+251	1	If
+251	12	 
+251	1	any
+251	12	 
+251	1	reviewer
+251	12	 
+251	1	requested
+251	12	 
+251	1	changes
+251	12	, 
+251	1	the
+251	12	 
+251	1	status
+251	12	 
+251	1	is
+251	12	 **
+251	1	changes
+251	12	_
+251	1	requested
+251	12	** (
+251	1	this
+251	12	 
+251	1	wins
+251	12	 
+251	1	over
+251	12	 
+251	1	approvals
+251	12	).
+252	12	- 
+252	1	Otherwise
+252	12	, 
+252	1	if
+252	12	 
+252	1	there
+252	12	 
+252	1	is
+252	12	 
+252	1	at
+252	12	 
+252	1	least
+252	12	 
+252	1	one
+252	12	 
+252	1	reviewer
+252	12	 
+252	1	and
+252	12	 
+252	1	every
+252	12	 
+252	1	reviewer
+252	12	 
+252	1	approved
+252	12	, 
+252	1	the
+252	12	 
+252	1	status
+252	12	 
+252	1	is

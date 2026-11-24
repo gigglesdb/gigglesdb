@@ -54,6 +54,8 @@ pub enum ScalarType {
     BigIntArray,
     TextArray,
     UuidArray,
+    TsVector,
+    TsQuery,
 
     Boolean,
     SmallInt,

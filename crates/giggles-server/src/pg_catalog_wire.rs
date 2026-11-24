@@ -531,6 +531,10 @@ fn snapshot_owned(
                             C::BigIntArray => P::BigIntArray,
                             C::TextArray => P::TextArray,
                             C::UuidArray => P::UuidArray,
+                            C::TsVector => P::TsVector,
+                            C::TsQuery => P::TsQuery,
+                            C::RegConfig | C::RegDictionary | C::Oid | C::PgChar
+                            | C::RealArray | C::PgCharArray | C::SmallIntArray => P::Text,
 
                             C::Bytes => P::Bytes,
                             C::Numeric => P::Numeric,
@@ -1249,16 +1253,23 @@ fn encode_with_settings(
                 v.to_be_bytes().to_vec()
             }
         }
-        (Value::Int(v), PgType::Oid | PgType::Xid | PgType::Regproc)
-            if ty != PgType::Regproc || matches!(*v, 3 | 330) =>
-        {
+        (Value::Int(v), PgType::Oid | PgType::Xid | PgType::Regproc) => {
             let v = u32::try_from(*v).map_err(|_| "22003")?;
             if format == 0 {
                 if ty == PgType::Regproc {
-                    if v == 3 {
-                        b"heap_tableam_handler".to_vec()
-                    } else {
-                        b"bthandler".to_vec()
+                    match v {
+                        3 => b"heap_tableam_handler".to_vec(),
+                        330 => b"bthandler".to_vec(),
+                        3717 => b"prsd_start".to_vec(),
+                        3718 => b"prsd_nexttoken".to_vec(),
+                        3719 => b"prsd_end".to_vec(),
+                        3720 => b"prsd_headline".to_vec(),
+                        3721 => b"prsd_lextype".to_vec(),
+                        3725 => b"dsimple_init".to_vec(),
+                        3726 => b"dsimple_lexize".to_vec(),
+                        13232 => b"dsnowball_init".to_vec(),
+                        13233 => b"dsnowball_lexize".to_vec(),
+                        _ => return Err("0A000"),
                     }
                 } else {
                     v.to_string().into_bytes()

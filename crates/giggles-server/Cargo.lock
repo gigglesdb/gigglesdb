@@ -551,6 +551,7 @@ dependencies = [
  "getrandom 0.3.4",
  "giggles-glibm-loader",
  "giggles-icu",
+ "giggles-pg-tsearch",
  "giggles-pg-types",
  "giggles-transactions",
  "librocksdb-sys",
@@ -612,6 +613,10 @@ dependencies = [
  "regex",
  "sqlparser",
 ]
+
+[[package]]
+name = "giggles-pg-tsearch"
+version = "0.1.0"
 
 [[package]]
 name = "giggles-pg-types"

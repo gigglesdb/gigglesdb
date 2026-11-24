@@ -1,0 +1,77 @@
+Output format is csv.
+Pager usage is off.
+@@R0 BEGIN 1
+CREATE TABLE
+@@R0 END 1 00000 0
+@@R0 BEGIN 2
+INSERT 0 3
+@@R0 END 2 00000 3
+@@R0 BEGIN 3
+id,to_tsvector
+1,'brown':3 'fox':4 'jump':5 'quick':2
+2,'dog':3 'slow':2
+3,
+@@R0 END 3 00000 3
+@@R0 BEGIN 4
+id,?column?
+1,t
+2,f
+3,
+@@R0 END 4 00000 3
+@@R0 BEGIN 5
+id,?column?
+1,t
+2,f
+3,
+@@R0 END 5 00000 3
+@@R0 BEGIN 6
+id,?column?
+1,t
+2,t
+3,
+@@R0 END 6 00000 3
+@@R0 BEGIN 7
+id,ts_rank
+1,0.06079271
+2,0
+3,
+@@R0 END 7 00000 3
+@@R0 BEGIN 8
+id,ts_headline
+1,The quick brown <b>fox</b> jumps
+2,A slow dog
+3,
+@@R0 END 8 00000 3
+@@R0 BEGIN 9
+to_tsquery
+'fox' & !'dog'
+@@R0 END 9 00000 1
+@@R0 BEGIN 10
+plainto_tsquery
+'brown' & 'fox'
+@@R0 END 10 00000 1
+@@R0 BEGIN 11
+websearch_to_tsquery
+'fox' & !'dog'
+@@R0 END 11 00000 1
+@@R0 BEGIN 12
+id,to_tsquery
+1,'quick' & 'fox'
+2,'quick' & 'fox'
+3,'quick' & 'fox'
+@@R0 END 12 00000 3
+@@R0 BEGIN 13
+id,plainto_tsquery
+1,'quick' & 'fox'
+2,'quick' & 'fox'
+3,'quick' & 'fox'
+@@R0 END 13 00000 3
+@@R0 BEGIN 14
+id,websearch_to_tsquery
+1,'quick' <-> 'brown' | 'dog'
+2,'quick' <-> 'brown' | 'dog'
+3,'quick' <-> 'brown' | 'dog'
+@@R0 END 14 00000 3
+@@R0 BEGIN 15
+DROP TABLE
+@@R0 END 15 00000 0

@@ -616,3 +616,6 @@ mod enum_array_defaults;
 
 #[path = "enum_dml_overlap.rs"]
 mod enum_dml_overlap;
+
+#[path = "text_search.rs"]
+mod text_search;
