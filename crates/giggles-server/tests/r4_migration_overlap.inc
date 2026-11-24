@@ -180,10 +180,9 @@ async fn r4_run_ddl_and_reuse_plans(client: &tokio_postgres::Client) {
     client.batch_execute("COMMIT").await.unwrap();
 }
 
-async fn r4_migration_overlap(engine: R4Engine) {
+fn r4_migration_overlap(engine: R4Engine) {
     use giggles_core::roles::NewRole;
-    use giggles_server::auth::{PostgresqlConfig, TlsMode, scram::Verifier, serve_postgresql};
-    use tokio_postgres::{binary_copy::BinaryCopyInWriter, types::Type};
+    use giggles_server::auth::scram::Verifier;
 
     let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "r4-migration-overlap-{}-{}",
@@ -201,6 +200,24 @@ async fn r4_migration_overlap(engine: R4Engine) {
             ..NewRole::default()
         })
         .unwrap();
+
+    for (admin, reopened) in std::iter::once((admin, false)).chain(std::iter::once_with(|| {
+        (Admin::open(&path, Limits::default()).unwrap(), true)
+    })) {
+        // Dropping the runtime joins detached pgwire blocking work before the database reopens.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(r4_migration_overlap_phase(admin, reopened));
+    }
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+async fn r4_migration_overlap_phase(admin: Admin, reopened: bool) {
+    use giggles_server::auth::{PostgresqlConfig, TlsMode, serve_postgresql};
+    use tokio_postgres::{binary_copy::BinaryCopyInWriter, types::Type};
+
     let config = PostgresqlConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         tls: TlsMode::Disabled,
@@ -213,70 +230,64 @@ async fn r4_migration_overlap(engine: R4Engine) {
         connections: 8,
     };
     let listener = Arc::new(config.build().unwrap());
-
-    for (admin, reopened) in std::iter::once((admin, false)).chain(std::iter::once_with(|| {
-        (Admin::open(&path, Limits::default()).unwrap(), true)
-    })) {
-        let service = Service::new(admin, vec![], Clock::new(0, 3600).unwrap()).unwrap();
-        let running = serve_postgresql(config.listen, service, listener.clone())
+    let service = Service::new(admin, vec![], Clock::new(0, 3600).unwrap()).unwrap();
+    let running = serve_postgresql(config.listen, service, listener)
+        .await
+        .unwrap();
+    let (client, connection) = tokio_postgres::Config::new()
+        .host("127.0.0.1")
+        .port(running.address.port())
+        .dbname("postgres")
+        .user("r4_owner")
+        .password("fixture-password")
+        .ssl_mode(tokio_postgres::config::SslMode::Disable)
+        .connect(tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(connection);
+    if reopened {
+        r4_initial_rows_and_catalog(&client).await;
+        r4_run_ddl_and_reuse_plans(&client).await;
+    } else {
+        client.batch_execute("
+            CREATE TYPE r4_state AS ENUM ('draft','live');
+            CREATE TABLE r4_docs (
+                id int PRIMARY KEY, state r4_state, title text,
+                tags text[] DEFAULT ARRAY[]::text[],
+                search tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(title,''))) STORED
+            );
+            CREATE INDEX r4_docs_search ON r4_docs USING gin(search);
+            INSERT INTO r4_docs(id,state,title) VALUES (1,'draft','Running fast'),(2,'live','Testing');
+            UPDATE r4_docs SET state='live',title='Updated runners' WHERE id=1;
+        ").await.unwrap();
+        let copy = client
+            .copy_in("COPY r4_docs(id,state,title) FROM STDIN (FORMAT BINARY)")
             .await
             .unwrap();
-        let (client, connection) = tokio_postgres::Config::new()
-            .host("127.0.0.1")
-            .port(running.address.port())
-            .dbname("postgres")
-            .user("r4_owner")
-            .password("fixture-password")
-            .ssl_mode(tokio_postgres::config::SslMode::Disable)
-            .connect(tokio_postgres::NoTls)
+        // PostgreSQL represents a binary enum value by its label bytes.
+        let mut copy = std::pin::pin!(BinaryCopyInWriter::new(
+            copy,
+            &[Type::INT4, Type::TEXT, Type::TEXT]
+        ));
+        copy.as_mut()
+            .write(&[&3i32, &"draft", &"Copy words"])
             .await
             .unwrap();
-        let connection = tokio::spawn(connection);
-        if reopened {
-            r4_initial_rows_and_catalog(&client).await;
-            r4_run_ddl_and_reuse_plans(&client).await;
-        } else {
-            client.batch_execute("
-                CREATE TYPE r4_state AS ENUM ('draft','live');
-                CREATE TABLE r4_docs (
-                    id int PRIMARY KEY, state r4_state, title text,
-                    tags text[] DEFAULT ARRAY[]::text[],
-                    search tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(title,''))) STORED
-                );
-                CREATE INDEX r4_docs_search ON r4_docs USING gin(search);
-                INSERT INTO r4_docs(id,state,title) VALUES (1,'draft','Running fast'),(2,'live','Testing');
-                UPDATE r4_docs SET state='live',title='Updated runners' WHERE id=1;
-            ").await.unwrap();
-            let copy = client
-                .copy_in("COPY r4_docs(id,state,title) FROM STDIN (FORMAT BINARY)")
-                .await
-                .unwrap();
-            // PostgreSQL represents a binary enum value by its label bytes.
-            let mut copy = std::pin::pin!(BinaryCopyInWriter::new(
-                copy,
-                &[Type::INT4, Type::TEXT, Type::TEXT]
-            ));
-            copy.as_mut()
-                .write(&[&3i32, &"draft", &"Copy words"])
-                .await
-                .unwrap();
-            assert_eq!(copy.as_mut().finish().await.unwrap(), 1);
-            r4_initial_rows_and_catalog(&client).await;
-        }
-        drop(client);
-        connection.await.unwrap().unwrap();
-        running.shutdown().await.unwrap();
+        assert_eq!(copy.as_mut().finish().await.unwrap(), 1);
+        r4_initial_rows_and_catalog(&client).await;
     }
-    std::fs::remove_dir_all(path).unwrap();
+    drop(client);
+    connection.await.unwrap().unwrap();
+    running.shutdown().await.unwrap();
 }
 
-#[tokio::test]
-async fn r4_migration_overlap_legacy() {
-    r4_migration_overlap(R4Engine::Legacy).await;
+#[test]
+fn r4_migration_overlap_legacy() {
+    r4_migration_overlap(R4Engine::Legacy);
 }
 
 #[cfg(feature = "engine-rocksdb")]
-#[tokio::test]
-async fn r4_migration_overlap_v2() {
-    r4_migration_overlap(R4Engine::V2).await;
+#[test]
+fn r4_migration_overlap_v2() {
+    r4_migration_overlap(R4Engine::V2);
 }
