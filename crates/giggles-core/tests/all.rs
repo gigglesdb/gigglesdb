@@ -610,3 +610,6 @@ mod sql_dml_sources;
 mod window_grouping_sets;
 #[path = "unbounded_kv_reads.rs"]
 mod unbounded_kv_reads;
+
+#[path = "enum_array_defaults.rs"]
+mod enum_array_defaults;

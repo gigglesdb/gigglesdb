@@ -200,6 +200,73 @@ pub(super) fn parse_name(p: &mut Parser) -> R<String> {
         Ok(first)
     }
 }
+fn parse_catalog_name(p: &mut Parser) -> R<String> {
+    let first = p.name()?;
+    if p.sym('.') {
+        Ok(format!("{first}\0{}", p.name()?))
+    } else {
+        Ok(first)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct TypeReference {
+    pub name: String,
+    pub array: bool,
+}
+
+impl TypeReference {
+    pub(super) fn parse(p: &mut Parser) -> R<Self> {
+        let name = parse_catalog_name(p)?;
+        let mut array = false;
+        while p.sym('[') {
+            p.punct(']')?;
+            array = true;
+        }
+        Ok(Self { name, array })
+    }
+
+    pub(super) fn sql(&self) -> String {
+        let name = self.name.split('\0').map(quote_type_ident).collect::<Vec<_>>().join(".");
+        if self.array { format!("{name}[]") } else { name }
+    }
+
+    pub(super) fn resolve<'a>(
+        &self,
+        state: &'a Relational,
+        path: &[String],
+    ) -> R<(u64, &'a TypeDef)> {
+        state.resolve_type(&self.name, path)?.ok_or_else(|| {
+            view_replace_error(format!("type \"{}\" does not exist", self.name.replace('\0', ".")));
+            SqlError::UndefinedObject
+        })
+    }
+}
+
+pub(super) fn quote_type_ident(name: &str) -> String {
+    query::quote_identifier(name)
+}
+
+pub(super) fn storage_type(ty: &TypeDef, array: bool) -> R<DataType> {
+    if array {
+        if matches!(ty, TypeDef::Enum { .. }) {
+            Ok(DataType::TextArray)
+        } else {
+            Err(SqlError::Unsupported)
+        }
+    } else {
+        ty.storage_type()
+    }
+}
+
+pub(super) fn enum_input_error(name: &str, label: &str) -> SqlError {
+    view_replace_error(format!(
+        "invalid input value for enum {}: \"{label}\"",
+        quote_type_ident(name)
+    ));
+    SqlError::InvalidTextRepresentation
+}
+
 pub(super) fn claims(p: &Parser) -> bool {
     matches!(p.tokens.first(), Some(Token::Word(w)) if w == "create" || w == "drop")
         && matches!(p.tokens.get(1), Some(Token::Word(w)) if w == "type" || w == "domain")
@@ -217,16 +284,16 @@ pub(super) fn parse(p: &mut Parser) -> R<Ddl> {
     if optional {
         p.need("exists")?;
     }
-    let spelling = parse_name(p)?;
+    let spelling = parse_catalog_name(p)?;
     let (schema, name) = spelling
-        .split_once('.')
+        .split_once('\0')
         .map_or((String::new(), spelling.clone()), |(s, n)| {
             (s.into(), n.into())
         });
     if !create {
         let mut names = vec![spelling];
         while p.sym(',') {
-            names.push(parse_name(p)?);
+            names.push(parse_catalog_name(p)?);
         }
         let cascade = p.word("cascade");
         if !cascade {
@@ -595,7 +662,7 @@ impl Relational {
     }
     pub(super) fn resolve_type(&self, name: &str, path: &[String]) -> R<Option<(u64, &TypeDef)>> {
         let (schema, name) = name
-            .split_once('.')
+            .split_once('\0')
             .map_or((None, name), |(s, n)| (Some(s), n));
         if let Some(schema) = schema
             && schema != "public"
@@ -619,19 +686,31 @@ impl Relational {
     }
 }
 pub(super) fn coerce(state: &Relational, column: &ColumnDef, value: &Value) -> R<()> {
-    coerce_domain_opt(state.column_type(column.id), value)
+    match state.column_type(column.id) {
+        Some(ty) => coerce_user_type(ty, &column.data_type, value),
+        None => Ok(()),
+    }
 }
-pub(super) fn coerce_domain(ty: &TypeDef, value: &Value) -> R<()> {
-    coerce_domain_opt(Some(ty), value)
-}
-fn coerce_domain_opt(ty: Option<&TypeDef>, value: &Value) -> R<()> {
+pub(super) fn coerce_user_type(ty: &TypeDef, storage: &DataType, value: &Value) -> R<()> {
     match ty {
-        Some(TypeDef::Enum { labels, .. }) if *value != Value::Null => {
-            if !matches!(value, Value::Text(v) if labels.contains(v)) {
-                return Err(SqlError::InvalidTextRepresentation);
+        TypeDef::Enum { name, labels, .. } if *value != Value::Null => {
+            let Value::Text(text) = value else { return Err(SqlError::Type); };
+            let validate = |label: &str| {
+                if labels.iter().any(|allowed| allowed == label) {
+                    Ok(())
+                } else {
+                    Err(enum_input_error(name, label))
+                }
+            };
+            if *storage == DataType::TextArray {
+                for label in logical_types::array_values(text)?.iter().flatten() {
+                    validate(label)?;
+                }
+            } else {
+                validate(text)?;
             }
         }
-        Some(TypeDef::Domain {
+        TypeDef::Domain {
             name,
             base,
             typmod,
@@ -639,7 +718,7 @@ fn coerce_domain_opt(ty: Option<&TypeDef>, value: &Value) -> R<()> {
             check,
             constraint,
             ..
-        }) => {
+        } => {
             if *not_null && *value == Value::Null {
                 view_replace_error(format!("domain {name} does not allow null values"));
                 return Err(SqlError::Null);
@@ -701,7 +780,7 @@ impl CompositeSelect {
                 return Err(SqlError::Unsupported);
             }
             p.punct(':')?;
-            let ty = parse_name(p)?;
+            let ty = parse_catalog_name(p)?;
             let alias = if p.word("as") {
                 p.name()?
             } else {
@@ -810,6 +889,7 @@ pub struct UserTypeCatalog {
     pub epoch: u64,
     pub types: BTreeMap<u64, TypeDef>,
     pub column_types: BTreeMap<u64, u64>,
+    pub enum_array_columns: BTreeSet<u64>,
 }
 impl Relational {
     pub(crate) fn user_type_catalog(&self) -> UserTypeCatalog {
@@ -817,6 +897,10 @@ impl Relational {
             extensions: self.ext.extensions.clone(),
             epoch: self.epoch,
             types: self.ext.types.clone(),
+            enum_array_columns: self.ext.logical_kinds.iter().filter_map(|(&id, kind)| {
+                (*kind == catalog_ext::LogicalKind::TextArray
+                    && matches!(self.column_type(id), Some(TypeDef::Enum { .. }))).then_some(id)
+            }).collect(),
             column_types: self
                 .ext
                 .columns
@@ -831,6 +915,41 @@ impl Relational {
 mod tests {
     use super::*;
     use bincode::Options;
+    #[test]
+    fn enum_array_round_trip_preserves_legacy_catalog_bytes() {
+        fn run(state: &mut Relational, sql: &str) -> R<SqlResult> {
+            state.execute(&Prepared::parse(sql, 1, state.epoch)?, &[], None)
+        }
+
+        let mut state = Relational::default();
+        run(&mut state, r#"CREATE TYPE "Size" AS ENUM ('SMALL','LARGE')"#).unwrap();
+        run(&mut state, r#"CREATE TABLE sizes (id int PRIMARY KEY, size "Size", tags text[])"#).unwrap();
+        let existing_id = state.tables["sizes"].columns[2].id;
+        // Old text-backed array defaults were serialized with a text cast.
+        state.set_column_default(existing_id, Some("'{}'::text".into())).unwrap();
+        let legacy = bincode::serialize(&state).unwrap();
+        let mut reopened: Relational = bincode::deserialize(&legacy).unwrap();
+        assert_eq!(bincode::serialize(&reopened).unwrap(), legacy);
+        assert_eq!(reopened.ext.ext_version, 6);
+        assert!(reopened.user_type_catalog().enum_array_columns.is_empty());
+        run(&mut reopened, r#"INSERT INTO sizes (id, size) VALUES (1,'SMALL')"#).unwrap();
+
+        run(&mut reopened, r#"ALTER TABLE sizes ADD COLUMN sizes "Size"[] DEFAULT ARRAY['LARGE']::"Size"[]"#).unwrap();
+        let column_id = reopened.tables["sizes"].columns[3].id;
+        let type_id = reopened.type_by_name("Size").unwrap().0;
+        assert_eq!(reopened.ext.columns[&column_id].type_id, Some(type_id));
+        assert_eq!(reopened.ext.logical_kinds[&column_id], catalog_ext::LogicalKind::TextArray);
+        assert_eq!(reopened.ext.ext_version, 6);
+        let new = bincode::serialize(&reopened).unwrap();
+        let mut reopen_array: Relational = bincode::deserialize(&new).unwrap();
+        assert_eq!(bincode::serialize(&reopen_array).unwrap(), new);
+        assert_eq!(reopen_array.user_type_catalog().enum_array_columns, BTreeSet::from([column_id]));
+        let rows = run(&mut reopen_array, "SELECT tags, sizes FROM sizes").unwrap().rows;
+        assert_eq!(rows[0].values, vec![Value::Text("{}".into()), Value::Text("{LARGE}".into())]);
+        run(&mut reopen_array, "ALTER TABLE sizes DROP COLUMN sizes").unwrap();
+        assert!(reopen_array.user_type_catalog().enum_array_columns.is_empty());
+    }
+
     #[test]
     fn swallowed_probe_restores_prior_message() {
         for saved in [None, Some("division by zero")] {

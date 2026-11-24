@@ -83,6 +83,8 @@ pub(crate) struct CatalogView {
     pub(crate) column_labels: BTreeMap<(u64, u64), u8>,
     pub(crate) by_name: Arc<BTreeMap<String, Arc<TableEntry>>>,
     pub(crate) by_id: BTreeMap<u64, Arc<TableEntry>>,
+    // The V2 codec's array marker stays available on transaction overlays.
+    pub(crate) enum_array_columns: BTreeSet<u64>,
     pub(crate) names: Arc<BTreeMap<String, u64>>,
     pub(crate) constraints: BTreeMap<u64, BTreeMap<u64, Constraint>>,
     pub(crate) sequences: BTreeMap<u64, SequenceDef>,
@@ -1425,11 +1427,15 @@ impl Catalog {
         column.id = self.seq.next(0, 0)?;
         let mut entry = (*current).clone();
         entry.def.columns.push(column);
-        txn.put(
-            Keyspace::Catalog,
-            table_key(entry.def.id),
-            encode_entry(&entry)?,
-        )?;
+        let bytes = if catalog_codec::decoded_enum_array_columns(&entry.def, &entry.columns_ext)
+            .next().is_some()
+        {
+            let parts = self.parts(txn)?;
+            catalog_codec::encode_table_with_types(&entry, &entry.columns_ext, &parts.ext.types)?
+        } else {
+            encode_entry(&entry)?
+        };
+        txn.put(Keyspace::Catalog, table_key(entry.def.id), bytes)?;
         Ok(Arc::new(entry))
     }
 
@@ -1953,11 +1959,19 @@ fn apply_record(
         }
         CatalogKind::Table => {
             let id = decode_id(&key[1..])?;
+            if let Some(previous) = view.by_id.get(&id) {
+                for column in &previous.def.columns {
+                    view.enum_array_columns.remove(&column.id);
+                }
+            }
             if let Some(value) = value {
                 let entry = decode_entry(value)?;
                 if entry.def.id != id {
                     return Err(corrupt("catalog table key/id mismatch"));
                 }
+                view.enum_array_columns.extend(catalog_codec::decoded_enum_array_columns(
+                    &entry.def, &entry.columns_ext,
+                ));
                 view.by_id.insert(id, Arc::new(entry));
             } else {
                 view.by_id.remove(&id);
@@ -2111,12 +2125,16 @@ fn finish_view(
             let entry = Arc::make_mut(entry);
             for column in &mut entry.def.columns {
                 if let Some(id) = entry.columns_ext.get(&column.id).and_then(|ext| ext.type_id) {
-                    column.data_type = view
-                        .types
-                        .get(&id)
-                        .ok_or_else(|| corrupt("column user type absent"))?
-                        .storage_type()
-                        .map_err(|_| corrupt("unsupported user type column"))?;
+                    let ty = view.types.get(&id)
+                        .ok_or_else(|| corrupt("column user type absent"))?;
+                    column.data_type = if view.enum_array_columns.contains(&column.id) {
+                        if !matches!(ty, TypeDef::Enum { .. }) {
+                            return Err(corrupt("enum array column references a non-enum"));
+                        }
+                        relational::DataType::TextArray
+                    } else {
+                        ty.storage_type().map_err(|_| corrupt("unsupported user type column"))?
+                    };
                     let ext = entry.columns_ext.get_mut(&column.id).unwrap();
                     ext.text_kind = match column.data_type {
                         relational::DataType::Varchar => Some(relational::catalog_ext::TextKind::Varchar),
@@ -2435,7 +2453,7 @@ fn encode_parts(
             heap: parts.heap.contains(&def.id),
             columns_ext: ext,
         };
-        let value = encode_entry(&entry)?;
+        let value = catalog_codec::encode_table_with_types(&entry, &entry.columns_ext, &parts.ext.types)?;
         decode_entry(&value)?;
         records.insert(table_key(def.id), value);
     }

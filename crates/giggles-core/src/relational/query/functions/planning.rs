@@ -420,6 +420,13 @@ impl BoundScalar {
                     .as_ref()
                     .map_or(Ok(Some(Value::Null)), |result| result.plan_constant(budget))
             }
+            Node::Domain(inner, ty @ TypeDef::Enum { .. }) => {
+                let value = inner.plan_constant(budget)?;
+                if let Some(value) = &value {
+                    user_types::coerce_user_type(ty, &self.ty, value)?;
+                }
+                Ok(value)
+            }
             Node::Domain(..)
             | Node::EnumSort(..)
             | Node::Param(_)
@@ -485,7 +492,7 @@ impl BoundScalar {
                 }
                 let types = normalized_signature_types(name, args);
                 let Some((true, _strict)) = (arithmetic::internal_name(name)
-                    || greatest::known_name(name))
+                    || greatest::known_name(name) || name == array_constructor::NAME)
                 .then_some((true, true))
                 .or_else(|| signature(name, &types, &self.ty)) else {
                     return Ok(None);
@@ -576,7 +583,8 @@ impl BoundScalar {
                         || self.ty == DataType::Text
                             && (number(&value.ty) || value.ty == DataType::Boolean))
             }
-            Node::Call(name, args) if random_uuid::known(name) || uuid_ossp::known(name) || name == "coalesce" || greatest::known_name(name) => {
+            Node::Call(name, args) if random_uuid::known(name) || uuid_ossp::known(name) || name == "coalesce"
+                || greatest::known_name(name) || name == array_constructor::NAME => {
                 args.iter().all(Self::insert_input_only)
             }
             Node::Call(name, args) => {

@@ -5077,7 +5077,10 @@ impl BoundQuery<'_> {
     pub(super) fn description(&self, state: &Relational) -> Description {
         let oid = |item: &BoundItem| match item {
             BoundItem::Ctid(_) => 27,
-            BoundItem::Scalar(value) => value.result_oid(),
+            BoundItem::Scalar(value) => {
+                let oid = value.result_oid();
+                if oid == 0 { value.cast_enum_oid(state) } else { oid }
+            }
             BoundItem::Aggregate(kind, _) if json_aggregate::json_result(*kind) => json_aggregate::OID,
             _ => 0,
         };

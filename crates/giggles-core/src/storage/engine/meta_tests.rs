@@ -154,25 +154,31 @@ fn feature_positions_and_validation() {
     assert_eq!(
         FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit),
         0x1FFFF | KEY_DEPENDENCY_IDENTITY | RANGES | WIDE_ONCE_RECEIPTS | TASK_CATALOG | PROTECTED_RECORDS | WRITE_FENCE | USER_COLLATIONS | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS | ROLE_MEMBERSHIP | WIDE_ROWS
-            | UUID_ARRAY_COLUMNS | WIDE_CATALOG | PARTIAL_INDEXES | TEMPORAL_INDEXES
+            | ENUM_ARRAY_COLUMNS | UUID_ARRAY_COLUMNS | WIDE_CATALOG | PARTIAL_INDEXES | TEMPORAL_INDEXES
     );
-    assert_eq!(FEATURE_TABLE.len(), 32);
-    assert_eq!(FEATURE_TABLE[28], (UUID_ARRAY_COLUMNS, "uuid_array_columns"));
+    assert_eq!(FEATURE_TABLE.len(), 33);
+    assert_eq!(FEATURE_TABLE[29], (UUID_ARRAY_COLUMNS, "uuid_array_columns"));
     assert_eq!(UUID_ARRAY_COLUMNS, 1 << 32);
     assert!(check_features(UUID_ARRAY_COLUMNS).is_ok());
     assert!(matches!(
         check_features_allowed(UUID_ARRAY_COLUMNS, (1 << 29) - 1),
         Err(FormatError::Unsupported(_)),
     ));
-    assert_eq!(FEATURE_TABLE[29], (WIDE_CATALOG, "wide_catalog"));
+    assert_eq!(FEATURE_TABLE[30], (WIDE_CATALOG, "wide_catalog"));
     assert_eq!(WIDE_CATALOG, 1 << 31);
     assert!(check_features_allowed(WIDE_CATALOG, u64::from(u32::MAX >> 1)).is_err());
     check_features(WIDE_CATALOG).unwrap();
-    assert_eq!(FEATURE_TABLE[30], (PARTIAL_INDEXES, "partial_indexes"));
-    assert_eq!(FEATURE_TABLE[31], (TEMPORAL_INDEXES, "temporal_indexes"));
+    assert_eq!(FEATURE_TABLE[28], (ENUM_ARRAY_COLUMNS, "enum_array_columns"));
+    assert_eq!(ENUM_ARRAY_COLUMNS, 1 << 29);
+    let enum_array_features = 64 | TEXT_BACKED_COLUMN_TYPES | SCHEMAS_AND_USER_TYPES | ENUM_ARRAY_COLUMNS;
+    assert!(check_features(enum_array_features).is_ok());
+    assert!(check_features_allowed(enum_array_features, enum_array_features & !ENUM_ARRAY_COLUMNS).is_err());
+    assert!(check_features(ENUM_ARRAY_COLUMNS).is_err());
+    assert_eq!(FEATURE_TABLE[31], (PARTIAL_INDEXES, "partial_indexes"));
+    assert_eq!(FEATURE_TABLE[32], (TEMPORAL_INDEXES, "temporal_indexes"));
     assert_eq!(PARTIAL_INDEXES, 1 << 33);
     assert_eq!(TEMPORAL_INDEXES, 1 << 34);
-    let old_mask = FEATURE_TABLE.iter().take(30).fold(0, |bits, (bit, _)| bits | bit);
+    let old_mask = FEATURE_TABLE.iter().take(31).fold(0, |bits, (bit, _)| bits | bit);
     for bits in [PARTIAL_INDEXES, TEMPORAL_INDEXES, PARTIAL_INDEXES | TEMPORAL_INDEXES] {
         assert!(matches!(check_features_allowed(SECONDARY_INDEXES | bits, old_mask),
             Err(FormatError::Unsupported(_))));

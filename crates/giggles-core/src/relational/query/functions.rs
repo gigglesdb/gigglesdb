@@ -165,7 +165,7 @@ pub(super) enum Scalar {
     Param(usize),
     Cast(Box<Scalar>, DataType),
     // Resolved domain definitions are cold metadata, not recursive parser locals.
-    Domain(Box<Scalar>, String, Box<R<TypeDef>>),
+    Domain(Box<Scalar>, user_types::TypeReference, Box<R<TypeDef>>),
     Column(ColumnRef),
     Literal(Value),
     Call(String, Vec<Scalar>),
@@ -1252,7 +1252,7 @@ impl Scalar {
                     .ok_or(SqlError::Parameters)?,
                 node: Node::Param(*n),
             }),
-            Self::Domain(a, _, target) => Self::bind_domain(a, target, resolve, tables, parameters),
+            Self::Domain(a, name, target) => Self::bind_domain(a, (name, target), resolve, tables, parameters),
             Self::Cast(a, ty) => Self::bind_cast(a, ty, resolve, tables, parameters),
             Self::Column(c) => Self::bind_column(c, resolve, tables),
             Self::Literal(v) => Ok(Self::bind_literal(v)),
@@ -1371,19 +1371,21 @@ impl Scalar {
     #[inline(never)]
     fn bind_domain(
         a: &Self,
-        target: &R<TypeDef>,
+        (name, target): (&user_types::TypeReference, &R<TypeDef>),
         resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
         tables: &[&TableDef],
         parameters: &[Option<DataType>],
     ) -> R<BoundScalar> {
         let ty = target.as_ref().map_err(Clone::clone)?;
-        let TypeDef::Domain { base, typmod, .. } = ty else {
-            return Err(SqlError::Unsupported);
+        let base = user_types::storage_type(ty, name.array)?;
+        let typmod = match ty {
+            TypeDef::Domain { typmod, .. } => *typmod,
+            _ => None,
         };
-        let inner = cast::expression(a.clone(), (base.clone(), *typmod))
+        let inner = cast::expression(a.clone(), (base.clone(), typmod))
             .bind(resolve, tables, parameters)?;
         Ok(BoundScalar {
-            ty: base.clone(),
+            ty: base,
             node: Node::Domain(Box::new(inner), ty.clone()),
         })
     }
@@ -2471,6 +2473,7 @@ impl BoundScalar {
     }
     pub(super) fn enum_sort(self, state: &Relational, tables: &[&TableDef]) -> Self {
         if let Node::Column(c, _) = &self.node
+            && self.ty == DataType::Text
             && let Some(TypeDef::Enum { labels, .. }) =
                 state.column_type(tables[c.source].columns[c.column].id)
         {
@@ -2508,6 +2511,7 @@ impl BoundScalar {
             Node::ZonedOperator(name, ..) if matches!(name.as_str(), "date_trunc" | "uuidv7") => name,
             Node::CrossCompare(..) | Node::ZonedOperator(..) => "?column?",
             Node::Param(_) => "?column?",
+            Node::Domain(inner, TypeDef::Enum { .. }) if inner.strong_name() == Some("array") => "array",
             Node::Domain(_, ty) => ty.name(),
             Node::TypmodCast(inner, _) => inner.name(),
             Node::Cast(a) | Node::SessionCast(a, _) => {
@@ -2674,7 +2678,7 @@ impl BoundScalar {
             }
             Node::Domain(a, ty) => {
                 let value = a.eval(row, params, budget)?;
-                user_types::coerce_domain(ty, &value)?;
+                user_types::coerce_user_type(ty, &self.ty, &value)?;
                 Ok(value)
             }
             Node::SessionCast(a, cast) => {
@@ -2928,6 +2932,23 @@ impl Query {
             order: vec![],
             limit: None,
         })
+    }
+
+    pub(in super::super) fn alter_type_assignment(p: &mut Parser, table: &str) -> R<Self> {
+        let query = Self::assignment(p, table)?.normalize_assignment_alias();
+        if !matches!(&query.items[0].0, Item::Scalar(Scalar::Domain(inner, ..))
+            if matches!(inner.as_ref(), Scalar::Column(_)
+                | Scalar::Cast(..) | Scalar::Literal(Value::Text(_) | Value::Null)))
+        {
+            return Err(SqlError::Unsupported);
+        }
+        if let Item::Scalar(value) = &query.items[0].0 {
+            reject_scalar_subquery(value)?;
+        }
+        if !p.params.is_empty() {
+            return Err(SqlError::Parameters);
+        }
+        Ok(query)
     }
 
     pub(in super::super) fn infer_assignment(
@@ -3423,11 +3444,10 @@ impl Scalar {
                     slot.get_or_insert_with(|| ty.clone());
                 }
             }
-            Self::Domain(a, _, target) => {
-                let TypeDef::Domain { base, .. } = target.as_ref().as_ref().map_err(Clone::clone)? else {
-                    return Err(SqlError::Unsupported);
-                };
-                Self::Cast(a.clone(), base.clone()).infer(expected, parameters, resolve, tables)?;
+            Self::Domain(a, name, target) => {
+                let ty = target.as_ref().as_ref().map_err(Clone::clone)?;
+                let base = user_types::storage_type(ty, name.array)?;
+                Self::Cast(a.clone(), base).infer(expected, parameters, resolve, tables)?;
             }
             Self::Cast(a, ty) => {
                 // An explicit cast converts the already chosen input type; it

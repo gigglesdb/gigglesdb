@@ -693,7 +693,7 @@ pub(super) fn install_create(
     table: TableDef,
     defaults: &[Option<String>],
     sequences: &[Option<SequenceSpec>],
-    typmods: &[Option<i32>],
+    (typmods, type_ids): (&[Option<i32>], &[Option<u64>]),
     version: (u64, u64),
     context: (&str, &[String]),
 ) -> R<()> {
@@ -709,7 +709,10 @@ pub(super) fn install_create(
     }
     std::sync::Arc::make_mut(&mut candidate.tables).insert(relation_key(schema, &table.name), table.clone());
     // Sequence mutators validate the complete catalog, including later columns.
-    for (column, typmod) in table.columns.iter().zip(typmods) {
+    for ((column, typmod), type_id) in table.columns.iter().zip(typmods).zip(type_ids) {
+        if let Some(id) = type_id {
+            std::sync::Arc::make_mut(&mut candidate.ext).columns.entry(column.id).or_default().type_id = Some(*id);
+        }
         let logical = match column.data_type {
             DataType::Uuid => Some(catalog_ext::LogicalKind::Uuid),
             DataType::Jsonb => Some(catalog_ext::LogicalKind::Jsonb),
@@ -741,6 +744,7 @@ pub(super) fn install_create(
             std::sync::Arc::make_mut(&mut candidate.ext).columns.entry(column.id).or_default().typmod = Some(*typmod);
         }
     }
+    Relational::normalize_ext(std::sync::Arc::make_mut(&mut candidate.ext));
     for (column, spec) in table.columns.iter().zip(sequences) {
         if let Some(spec) = spec {
             let name = candidate.choose_sequence_name(&candidate.table_key(&table), &column.name);
@@ -782,8 +786,8 @@ pub(super) fn install_create(
                 relations: Vec::new(),
             };
             let mut value = expression(&mut parser, 0)?;
-            value.resolve(&candidate, path)?;
-            candidate.set_column_default(column.id, Some(value.canonical(&column.data_type)?))?;
+            let sql = column_default(&candidate, column, &mut value, path)?;
+            candidate.set_column_default(column.id, Some(sql))?;
         }
     }
     candidate.validate_ext()?;
@@ -975,6 +979,8 @@ enum Expression {
     Builtin(String, DataType),
     Negative(Box<Expression>),
     Cast(Box<Expression>, DataType),
+    NamedCast(Box<Expression>, user_types::TypeReference),
+    Array(Vec<Expression>),
 }
 impl Expression {
     fn qualify_stored_sequences(&mut self) -> R<()> {
@@ -1036,7 +1042,12 @@ impl Expression {
                     .ok_or(SqlError::UnknownTable)?;
                 *name = sequence_reference(&sequence.name);
             }
-            Self::Cast(value, _) | Self::Negative(value) => value.resolve(state, path)?,
+            Self::Cast(value, _) | Self::NamedCast(value, _) | Self::Negative(value) => value.resolve(state, path)?,
+            Self::Array(values) => {
+                for value in values {
+                    value.resolve(state, path)?;
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -1051,9 +1062,15 @@ impl Expression {
             Self::Boolean(_) => DataType::Boolean,
             Self::Clock(_, ty) | Self::Builtin(_, ty) | Self::Cast(_, ty) => ty.clone(),
             Self::Negative(value) => value.ty(),
+            Self::NamedCast(_, name) if name.array => DataType::TextArray,
+            Self::NamedCast(..) => DataType::Text,
+            Self::Array(_) => DataType::TextArray,
         }
     }
     fn sql(&self) -> String {
+        self.render(false)
+    }
+    fn render(&self, physical: bool) -> String {
         match self {
             Self::Extension(name,args) => format!("{}({})",name.split('\0').map(|n|format!("\"{}\"",n.replace('"',"\"\""))).collect::<Vec<_>>().join("."),args.iter().map(Self::sql).collect::<Vec<_>>().join(",")),
             Self::Sequence(name) => format!("nextval({}::regclass)", quoted(name)),
@@ -1063,10 +1080,15 @@ impl Expression {
             Self::Null => "NULL".into(),
             Self::Clock(s, _) => s.clone(),
             Self::Builtin(sql, _) => sql.clone(),
-            Self::Negative(value) => format!("-({})", value.sql()),
-            Self::Cast(value, ty) => format!("({})::{}", value.sql(), type_name(ty)),
+            Self::Negative(value) => format!("-({})", value.render(physical)),
+            Self::Cast(value, ty) => format!("({})::{}", value.render(physical), type_name(ty)),
+            Self::NamedCast(value, name) => format!("({})::{}", value.render(physical),
+                if physical { type_name(&self.ty()).into() } else { name.sql() }),
+            Self::Array(values) => format!("ARRAY[{}]",
+                values.iter().map(|v| v.render(physical)).collect::<Vec<_>>().join(", ")),
         }
     }
+
     fn canonical(&self, target: &DataType) -> R<String> {
         match self {
             Self::Extension(..) => Ok(self.sql()),
@@ -1084,7 +1106,12 @@ impl Expression {
                     Ok(format!("(- {})", value.canonical(&value.ty())?))
                 }
             }
+            Self::Array(values) => array_text(values, target, None),
+            Self::NamedCast(..) => Err(SqlError::Unsupported),
             Self::Cast(value, ty) => {
+                if let Self::Array(values) = value.as_ref() {
+                    return array_text(values, ty, None);
+                }
                 if matches!(value.as_ref(), Self::String(_) | Self::Null) {
                     constant_text(&self.sql(), ty)
                 } else if value.ty() == *ty {
@@ -1131,7 +1158,8 @@ fn constant_text(sql: &str, ty: &DataType) -> R<String> {
         Value::Int(n) => format!("{}::{}", quoted(&n.to_string()), type_name(ty)),
         Value::Numeric(n) => format!("{}::numeric", quoted(&n.to_string())),
         Value::Bool(b) => b.to_string(),
-        Value::Text(s) => format!("{}::text", quoted(&s)),
+        Value::Text(s) => format!("{}::{}", quoted(&s),
+            if ty.is_extended_text() { type_name(ty) } else { "text" }),
         Value::Float4(v) => format!("{}::real", quoted(&v.to_text())),
         Value::Float8(v) => format!("{}::double precision", quoted(&v.to_text())),
         Value::Bytes(bytes) => {
@@ -1158,7 +1186,7 @@ pub(super) fn cast_type(p: &mut Parser) -> R<DataType> {
         return Err(SqlError::Unsupported);
     };
     p.at += 1;
-    Ok(match word.as_str() {
+    let mut ty = match word.as_str() {
         "int" | "int4" | "integer" => DataType::Integer,
         "int2" | "smallint" => DataType::SmallInt,
         "int8" | "bigint" => DataType::BigInt,
@@ -1172,6 +1200,7 @@ pub(super) fn cast_type(p: &mut Parser) -> R<DataType> {
         }
         "text" => DataType::Text,
         "uuid" => DataType::Uuid,
+        "jsonb" => DataType::Jsonb,
         "bytea" => DataType::Bytes,
         "date" => DataType::Date,
         "time" | "timestamp" => {
@@ -1191,7 +1220,17 @@ pub(super) fn cast_type(p: &mut Parser) -> R<DataType> {
         "timestamptz" => DataType::TimestampTz,
         "interval" => DataType::Interval,
         _ => return Err(SqlError::Unsupported),
-    })
+    };
+    if p.sym('[') {
+        p.punct(']')?;
+        ty = match ty {
+            DataType::Text => DataType::TextArray,
+            DataType::Integer => DataType::IntArray,
+            DataType::BigInt => DataType::BigIntArray,
+            _ => return Err(SqlError::Unsupported),
+        };
+    }
+    Ok(ty)
 }
 fn expression(p: &mut Parser, depth: usize) -> R<Expression> {
     if depth > 16 {
@@ -1245,6 +1284,28 @@ fn expression(p: &mut Parser, depth: usize) -> R<Expression> {
                     p.punct(')')?;
                     Expression::Sequence(name)
                 }
+                "array" => {
+                    p.punct('[')?;
+                    let mut values = vec![];
+                    if !p.sym(']') {
+                        loop {
+                            let value = expression(p, depth + 1)?;
+                            if !matches!(&value,
+                                Expression::String(_) | Expression::Number(_) | Expression::Null
+                                | Expression::Boolean(_) | Expression::Cast(..) | Expression::NamedCast(..))
+                                || values.len() >= MAX_COLUMNS
+                            {
+                                return Err(SqlError::Unsupported);
+                            }
+                            values.push(value);
+                            if p.sym(']') {
+                                break;
+                            }
+                            p.punct(',')?;
+                        }
+                    }
+                    Expression::Array(values)
+                }
                 "null" => Expression::Null,
                 "true" | "false" => Expression::Boolean(w == "true"),
                 "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
@@ -1285,7 +1346,16 @@ fn expression(p: &mut Parser, depth: usize) -> R<Expression> {
         && p.tokens.get(p.at + 1) == Some(&Token::Symbol(':'))
     {
         p.at += 2;
-        value = Expression::Cast(Box::new(value), cast_type(p)?);
+        let start = p.at;
+        value = match cast_type(p) {
+            Ok(ty) if p.tokens.get(p.at) != Some(&Token::Symbol('.')) => Expression::Cast(Box::new(value), ty),
+            Err(SqlError::Unsupported) | Ok(_) if p.at <= start + 1 => {
+                p.at = start;
+                Expression::NamedCast(Box::new(value), user_types::TypeReference::parse(p)?)
+            }
+            Err(error) => return Err(error),
+            Ok(_) => return Err(SqlError::Unsupported),
+        };
     }
     Ok(value)
 }
@@ -1344,15 +1414,109 @@ pub(crate) fn native_default(default: &crate::operations::ColumnDefault, target:
     value.canonical(target)
 }
 
-pub(super) fn parse(p: &mut Parser, target: &DataType) -> R<String> {
+pub(super) fn parse(p: &mut Parser, target: &DataType, named_type: bool) -> R<String> {
     let value = expression(p, 0)?;
     if !matches!(p.tokens.get(p.at), Some(Token::Symbol(',' | ')')))
         && !matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "not" || w == "null" || w == "primary" || w == "references" || w == "check" || w == "constraint" || w == "unique")
     {
         return Err(SqlError::Unsupported);
     }
+    if named_type {
+        return Ok(value.sql());
+    }
     query::InsertExpressions::default_value(&value.sql(), target, None, false)?;
     value.canonical(target)
+}
+
+fn array_text(
+    values: &[Expression],
+    target: &DataType,
+    enum_name: Option<&str>,
+) -> R<String> {
+    let element = match target {
+        DataType::TextArray => DataType::Text,
+        DataType::IntArray => DataType::Integer,
+        DataType::BigIntArray => DataType::BigInt,
+        _ => return Err(SqlError::Type),
+    };
+    let name = enum_name.unwrap_or(type_name(&element));
+    if values.is_empty() {
+        return Ok(format!("ARRAY[]::{name}[]"));
+    }
+    let items = values.iter().map(|v| {
+        let value = query::InsertExpressions::default_value(&v.render(true), &element, None, false)?
+            .ok_or(SqlError::Unsupported)?;
+        Ok(match value {
+            Value::Text(text) => format!("{}::{name}", quoted(&text)),
+            Value::Null => format!("NULL::{name}"),
+            Value::Int(n) if element == DataType::Integer => n.to_string(),
+            Value::Int(n) => format!("{}::{name}", quoted(&n.to_string())),
+            _ => return Err(SqlError::Type),
+        })
+    }).collect::<R<Vec<_>>>()?;
+    Ok(format!("ARRAY[{}]", items.join(", ")))
+}
+
+fn column_default(
+    state: &Relational,
+    column: &ColumnDef,
+    expression: &mut Expression,
+    path: &[String],
+) -> R<String> {
+    expression.resolve(state, path)?;
+    let target = &column.data_type;
+    if let Some(ty @ TypeDef::Enum { .. }) = state.column_type(column.id) {
+        let is_array = *target == DataType::TextArray;
+        enum_default_casts(expression, state, path, ty, is_array)?;
+        let value = query::InsertExpressions::default_value(
+            &expression.render(true), target, None, false,
+        )?.ok_or(SqlError::Unsupported)?;
+        user_types::coerce_user_type(ty, target, &value)?;
+        let name = user_types::quote_type_ident(ty.name());
+        let name = if ty.schema() == "public" { name } else {
+            format!("{}.{name}", user_types::quote_type_ident(ty.schema()))
+        };
+        let input = match &*expression {
+            Expression::NamedCast(inner, _) => inner.as_ref(),
+            other => other,
+        };
+        if let Expression::Array(values) = input {
+            return array_text(values, target, Some(&name));
+        }
+        return match value {
+            Value::Text(text) => Ok(format!("{}::{name}{}", quoted(&text), if is_array { "[]" } else { "" })),
+            Value::Null => Ok("NULL".into()),
+            _ => Err(SqlError::Type),
+        };
+    }
+    query::InsertExpressions::default_value(&expression.sql(), target, None, false)?;
+    expression.canonical(target)
+}
+
+fn enum_default_casts(
+    value: &Expression,
+    state: &Relational,
+    path: &[String],
+    ty: &TypeDef,
+    array: bool,
+) -> R<()> {
+    match value {
+        Expression::NamedCast(inner, name) => {
+            let (_, cast_type) = name.resolve(state, path)?;
+            if cast_type != ty || name.array != array {
+                return Err(SqlError::Type);
+            }
+            enum_default_casts(inner, state, path, ty, array)
+        }
+        Expression::Array(values) if array => {
+            for value in values {
+                enum_default_casts(value, state, path, ty, false)?;
+            }
+            Ok(())
+        }
+        Expression::String(_) | Expression::Null => Ok(()),
+        _ => Err(SqlError::Type),
+    }
 }
 
 pub(super) fn evaluate_sql(
@@ -1361,6 +1525,12 @@ pub(super) fn evaluate_sql(
     clock: Option<&clock::ExecutionClock>,
 ) -> R<Value> {
     let qualified = cached_syntax(&QUALIFIED_DEFAULTS, sql, || qualify_default(sql))?;
+    let legacy_text = target.is_extended_text() && qualified.ends_with("::text");
+    let qualified = if legacy_text {
+        qualified.strip_suffix("::text").expect("text suffix")
+    } else {
+        &qualified
+    };
     // Character defaults are stored as text constants. Evaluate that physical
     // value before the caller applies the destination column's character rules;
     // relabeling a text cast as varchar/bpchar would change its scalar cast type.
@@ -1369,7 +1539,7 @@ pub(super) fn evaluate_sql(
         other => other,
     };
     let clock = clock.map(clock::ExecutionClock::for_column_default);
-    query::InsertExpressions::default_value(&qualified, evaluation_target, clock.as_ref(), true)?
+    query::InsertExpressions::default_value(qualified, evaluation_target, clock.as_ref(), true)?
         .ok_or(SqlError::Type)
 }
 fn qualify_default(sql: &str) -> R<Rc<str>> {
@@ -1386,7 +1556,7 @@ fn qualify_default(sql: &str) -> R<Rc<str>> {
     {
         return Err(SqlError::Unsupported);
     }
-    Ok(Rc::from(value.sql()))
+    Ok(Rc::from(value.render(true)))
 }
 
 pub(super) fn evaluate(
@@ -1481,10 +1651,7 @@ pub(super) fn install_alter(
             relations: Vec::new(),
         };
         let mut value = expression(&mut parser, 0)?;
-        value.resolve(state, path)?;
-        let sql = value.canonical(&column.data_type)?;
-        query::InsertExpressions::default_value(&value.sql(), &column.data_type, None, false)?;
-        Some(sql)
+        Some(column_default(state, column, &mut value, path)?)
     } else {
         None
     };
@@ -1603,7 +1770,7 @@ mod tests {
                 params: BTreeSet::new(),
                 relations: Vec::new(),
             };
-            assert_eq!(parse(&mut p, &target).unwrap(), expected, "{input}");
+            assert_eq!(parse(&mut p, &target, false).unwrap(), expected, "{input}");
             let mut p = Parser { privilege_seen: false, privilege_casts: false,
                 tokens: lex(&format!("{expected},")).unwrap(),
                 at: 0,
@@ -1611,7 +1778,7 @@ mod tests {
                 relations: Vec::new(),
             };
             assert_eq!(
-                parse(&mut p, &target).unwrap(),
+                parse(&mut p, &target, false).unwrap(),
                 expected,
                 "stored {expected}"
             );

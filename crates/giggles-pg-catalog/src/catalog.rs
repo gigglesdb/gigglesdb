@@ -2220,6 +2220,17 @@ fn build_with_budget(
             ]);
         })?;
     }
+    let enum_array_oids: BTreeSet<_> = if needs("pg_type") || needs("pg_attribute") {
+        snapshot.user_types.iter().filter(|ty| ty.kind == 'e')
+            .map(|ty| i64::from(ty.oid) + 1).collect()
+    } else {
+        BTreeSet::new()
+    };
+    let mut user_type_names: BTreeSet<_> = if needs("pg_type") {
+        snapshot.user_types.iter().map(|ty| (ty.schema.as_str(), ty.name.clone())).collect()
+    } else {
+        BTreeSet::new()
+    };
     for ty in &snapshot.user_types {
         if needs("pg_type") {
             let len = match (ty.kind, ty.base) {
@@ -2248,6 +2259,30 @@ fn build_with_budget(
             row[6] = B(ty.not_null);
             row[7] = I(ty.base as i64);
             row[8] = I(ty.typmod as i64);
+            // Enum IDs occupy the aligned slot, so the following OID is free
+            // for the array type. Label IDs are allocated in separate slots.
+            if ty.kind == 'e' {
+                let array_oid = ty.oid + 1;
+                let mut prefix = "_".to_owned();
+                let name = loop {
+                    let mut end = ty.name.len().min(63 - prefix.len());
+                    while !ty.name.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let candidate = format!("{prefix}{}", &ty.name[..end]);
+                    if user_type_names.insert((ty.schema.as_str(), candidate.clone())) {
+                        break candidate;
+                    }
+                    if prefix.len() == 63 {
+                        return Err(Error::Limit);
+                    }
+                    prefix.push('_');
+                };
+                let mut array = type_row(array_oid, &name, -1, ty.oid, 0, true);
+                array[2] = row[2].clone();
+                row[11] = I(i64::from(array_oid));
+                add!("pg_type", array);
+            }
             add!("pg_type", row);
         }
         if !needs("pg_enum") { continue; }
@@ -2300,7 +2335,7 @@ fn build_with_budget(
         };
         budget.rewrite(row, |row| {
             row.push(I(type_collation(&lookup, oid)));
-            row.push(s(type_layout(oid).0));
+            row.push(s(if enum_array_oids.contains(&oid) { "x" } else { type_layout(oid).0 }));
         })?;
     }
     for row in rows_mut(&mut all, "pg_attribute") {
@@ -2332,7 +2367,8 @@ fn build_with_budget(
                     collation = i64::from(column_collation(snapshot, &lookup, column));
                 }
             }
-            let (storage, align) = type_layout(oid);
+            let enum_array = enum_array_oids.contains(&oid);
+            let (storage, align) = if enum_array { ("x", "i") } else { type_layout(oid) };
             // Project the structural row into PG18's physical order.
             let column_acl = acl_value(&lookup, column_acl);
             let old = std::mem::take(row);
@@ -2366,7 +2402,7 @@ fn build_with_budget(
                 s(storage),
                 s(""),
                 old[4].clone(),
-                old[10].clone(),
+                if enum_array { I(1) } else { old[10].clone() },
                 B(false),
                 old[8].clone(),
                 old[9].clone(),

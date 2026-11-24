@@ -21,7 +21,48 @@ pub(super) struct Parsed {
     pub typmod: Option<i32>,
     pub semantic_error: Option<SqlError>,
 }
+pub(super) fn parse_column_type(
+    p: &mut Parser,
+    site: Site,
+) -> R<(Parsed, Option<user_types::TypeReference>)> {
+    let start = p.at;
+    match parse_inner(p, site, SqlError::UndefinedObject) {
+        Ok(parsed) => Ok((parsed, None)),
+        Err(error) if user_type_fallback(p, start, &error) => {
+            p.at = start;
+            let name = user_types::TypeReference::parse(p)?;
+            Ok((Parsed {
+                data_type: if name.array { DataType::TextArray } else { DataType::Text },
+                typmod: None,
+                semantic_error: None,
+            }, Some(name)))
+        }
+        Err(SqlError::UndefinedObject) => Err(SqlError::Unsupported),
+        Err(error) => Err(error),
+    }
+}
+
+// Keep diagnostics from built-in type grammar, including unsupported arrays.
+fn user_type_fallback(p: &Parser, start: usize, error: &SqlError) -> bool {
+    if matches!(p.tokens.get(start), Some(Token::QuotedIdent(_))) {
+        return matches!(error, SqlError::Syntax | SqlError::Unsupported);
+    }
+    *error == SqlError::UndefinedObject && p.at == start + 1 && match p.tokens.get(p.at) {
+        None | Some(Token::Symbol(',' | ')' | ';' | '.' | '[')) => true,
+        Some(Token::Word(word)) => matches!(
+            word.as_str(),
+            "not" | "null" | "default" | "constraint" | "check" | "unique"
+                | "references" | "primary" | "generated" | "collate" | "using"
+        ),
+        _ => false,
+    }
+}
+
 pub(super) fn parse(p: &mut Parser, site: Site) -> R<Parsed> {
+    parse_inner(p, site, SqlError::Unsupported)
+}
+
+fn parse_inner(p: &mut Parser, site: Site, unknown_type: SqlError) -> R<Parsed> {
     let Some(Token::Word(word)) = p.tokens.get(p.at).cloned() else {
         return Err(match site {
             Site::Create => SqlError::Unsupported,
@@ -64,7 +105,10 @@ pub(super) fn parse(p: &mut Parser, site: Site) -> R<Parsed> {
         "timestamp" => DataType::Timestamp,
         "timestamptz" => DataType::TimestampTz,
         "interval" => DataType::Interval,
-        _ => return Err(SqlError::Unsupported),
+        "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial" => {
+            return Err(SqlError::Unsupported);
+        }
+        _ => return Err(unknown_type),
     };
     // Keep unsupported array families rejected before CREATE precision policy.
     // The lexer now admits brackets for the supported integer, text and UUID arrays.

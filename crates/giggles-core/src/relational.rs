@@ -1162,7 +1162,7 @@ enum Statement {
         optional: bool,
         columns: Vec<ColumnDef>,
         typmods: Vec<Option<i32>>,
-        user_types: Vec<Option<String>>,
+        user_types: Vec<Option<user_types::TypeReference>>,
         collations: Vec<Option<String>>,
         defaults: Vec<Option<String>>,
         sequences: Vec<Option<defaults::SequenceSpec>>,
@@ -1574,55 +1574,21 @@ impl Parser {
                     } else {
                         None
                     };
-                    let mut user_type = None;
-                    let parsed = if let Some(ty) = &serial {
-                        ddl_type::Parsed {
+                    let (parsed, user_type) = if let Some(ty) = &serial {
+                        (ddl_type::Parsed {
                             data_type: ty.clone(),
                             typmod: None,
                             semantic_error: None,
-                        }
+                        }, None)
                     } else {
-                        let start = self.at;
-                        match ddl_type::parse(self, ddl_type::Site::Create) {
-                            Ok(parsed) => parsed,
-                            Err(SqlError::Unsupported)
-                                if self.at == start + 1
-                                    && self.tokens.get(self.at).is_some_and(
-                                        |token| match token {
-                                            Token::Symbol(',' | ')' | '.') => true,
-                                            Token::Word(w) => matches!(
-                                                w.as_str(),
-                                                "not"
-                                                    | "null"
-                                                    | "default"
-                                                    | "constraint"
-                                                    | "check"
-                                                    | "unique"
-                                                    | "references"
-                                                    | "primary"
-                                                    | "generated"
-                                                    | "collate"
-                                            ),
-                                            _ => false,
-                                        },
-                                    ) =>
-                            {
-                                self.at = start;
-                                user_type = Some(user_types::parse_name(self)?);
-                                ddl_type::Parsed {
-                                    data_type: DataType::Text,
-                                    typmod: None,
-                                    semantic_error: None,
-                                }
-                            }
-                            Err(e) => return Err(e),
-                        }
+                        ddl_type::parse_column_type(self, ddl_type::Site::Create)?
                     };
                     if let Some(error) = parsed.semantic_error {
                         return Err(error);
                     }
                     let data_type = parsed.data_type;
                     typmods.push(parsed.typmod);
+                    let named_type = user_type.is_some();
                     user_types.push(user_type);
                     let mut not_null = serial.is_some();
                     let mut default = None;
@@ -1646,7 +1612,7 @@ impl Parser {
                             if default.is_some() || sequence.is_some() {
                                 return Err(SqlError::Syntax);
                             }
-                            default = Some(defaults::parse(self, &data_type)?);
+                            default = Some(defaults::parse(self, &data_type, named_type)?);
                         } else if self.word("check") {
                             constraints.push(constraints::parse_check(self, column_constraint)?);
                         } else if self.word("unique") {
@@ -2731,11 +2697,8 @@ impl Prepared {
         }
         if let Statement::Create { user_types, .. } = this.statement.get() {
             for name in user_types.iter().flatten() {
-                state
-                    .resolve_type(name, &this.search_path)?
-                    .ok_or(SqlError::UndefinedObject)?
-                    .1
-                    .storage_type()?;
+                let (_, ty) = name.resolve(state, &this.search_path)?;
+                user_types::storage_type(ty, name.array)?;
             }
         }
         let mut description = this.describe_inner(state)?;
@@ -2748,7 +2711,7 @@ impl Prepared {
                 && let Some(id) = state.ext.columns.get(&column.id).and_then(|c| c.type_id)
                 && matches!(state.ext.types.get(&id), Some(TypeDef::Enum { .. }))
             {
-                *oid = type_oid(id)?;
+                *oid = type_oid(id)? + u32::from(column.data_type == DataType::TextArray);
             }
         }
         Ok(description)
@@ -4697,10 +4660,8 @@ impl Relational {
                 let mut type_ids = vec![None; columns.len()];
                 for (i, name) in user_types.iter().enumerate() {
                     if let Some(name) = name {
-                        let (id, ty) = self
-                            .resolve_type(name, &prepared.search_path)?
-                            .ok_or(SqlError::UndefinedObject)?;
-                        columns[i].data_type = ty.storage_type()?;
+                        let (id, ty) = name.resolve(self, &prepared.search_path)?;
+                        columns[i].data_type = user_types::storage_type(ty, name.array)?;
                         if let TypeDef::Domain { typmod, .. } = ty {
                             typmods[i] = *typmod;
                         }
@@ -4784,7 +4745,7 @@ impl Relational {
                     t,
                     defaults,
                     sequences,
-                    typmods,
+                    (typmods, &type_ids),
                     (next_id, epoch),
                     (&schema, &prepared.search_path),
                 )?;
@@ -4792,11 +4753,6 @@ impl Relational {
                 self.mutate_ext(|ext, _| {
                     for (column, reference) in table.columns.iter().zip(&collation_refs) {
                         if let Some(reference) = reference { ext.column_collations.insert(column.id, column_collations::Binding::Column(reference.clone())); }
-                    }
-                    for (column, type_id) in table.columns.iter().zip(&type_ids) {
-                        if let Some(id) = type_id {
-                            ext.columns.entry(column.id).or_default().type_id = Some(*id);
-                        }
                     }
                     Ok(())
                 })?;

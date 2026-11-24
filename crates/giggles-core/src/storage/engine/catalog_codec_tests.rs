@@ -89,7 +89,8 @@ fn frozen_table_goldens() {
     assert_corrupt(decode_table(&bad));
 }
 #[test]
-fn uuid_array_reserved_tag_is_corrupt() {
+fn enum_array_tag_with_out_of_range_type_id_is_corrupt() {
+    // Changing only the tag reads the following bytes as a type ID outside the OID space.
     let mut bytes = hex(TABLE);
     let tag = bytes.windows(5).position(|chunk| chunk == [b'c', 0, 0, 0, 2]).unwrap() + 1;
     bytes[tag..tag + 4].copy_from_slice(&23u32.to_be_bytes());
@@ -379,7 +380,7 @@ fn primary_key_without_persisted_name_is_corrupt() {
 }
 
 fn table_dto() -> TableEntryV2Dto {
-    TableEntryV2Dto::try_from((table(), BTreeMap::new())).unwrap()
+    TableEntryV2Dto::from_entry(&table(), &BTreeMap::new(), &BTreeMap::new()).unwrap()
 }
 
 fn assert_bad_table(dto: &TableEntryV2Dto) {
@@ -708,7 +709,7 @@ fn table_v3_birth_roundtrip_frozen_payload_and_canonicality() {
     for (heap, pk) in [(true, vec![0]), (false, vec![])] {
         entry.heap = heap; entry.def.primary_key = pk;
         assert_corrupt(encode_table(&entry, &BTreeMap::new()));
-        let dto = TableEntryV2Dto::try_from((entry.clone(), BTreeMap::new())).unwrap();
+        let dto = TableEntryV2Dto::from_entry(&entry, &BTreeMap::new(), &BTreeMap::new()).unwrap();
         assert_corrupt(decode_table(&encode_version(3, &(dto, 10u64)).unwrap()));
     }
 }
@@ -752,4 +753,59 @@ fn extension_record_roundtrip_and_absence_preserves_bytes() {
     for (key,value) in &original { assert_eq!(records.get(key),Some(value)); }
     parts.ext.extensions.clear();
     assert_eq!(super::super::catalog::parts_records(&parts).unwrap(),original);
+}
+
+#[test]
+fn enum_array_columns_use_a_new_tag_only_with_enum_elements() {
+    use super::super::{content_check, meta};
+
+    let enum_type = TypeDef::Enum {
+        name: "size".into(),
+        schema: "public".into(),
+        labels: vec!["small".into(), "large".into()],
+    };
+    let domain = TypeDef::Domain {
+        name: "tag_list".into(),
+        schema: "public".into(),
+        base: DataType::TextArray,
+        typmod: None,
+        not_null: false,
+        check: None,
+        constraint: "tag_list_check".into(),
+    };
+    let old = table();
+    assert_eq!(
+        encode_table_with_types(&old, &BTreeMap::new(), &BTreeMap::from([(42, enum_type.clone())])).unwrap(),
+        hex(TABLE),
+    );
+    assert_eq!(decode_table(&hex(TABLE)).unwrap().0, old);
+
+    let mut entry = table();
+    entry.def.columns.push(ColumnDef {
+        id: 3,
+        name: "values".into(),
+        data_type: DataType::TextArray,
+        not_null: false,
+    });
+    let ext = BTreeMap::from([(3, ColumnExt { type_id: Some(42), ..ColumnExt::default() })]);
+    let domain_bytes = encode_table_with_types(&entry, &ext, &BTreeMap::from([(42, domain)])).unwrap();
+    assert_eq!(domain_bytes, encode_table(&entry, &ext).unwrap());
+    let key = super::super::catalog::table_key(entry.def.id);
+    let domain_bits = content_check::required_bits_for_catalog_value(&key, &domain_bytes).unwrap();
+    assert_eq!(domain_bits & meta::ENUM_ARRAY_COLUMNS, 0);
+
+    let arrays = encode_table_with_types(&entry, &ext, &BTreeMap::from([(42, enum_type)])).unwrap();
+    let mut expected = domain_bytes;
+    let marker = hex("00000016000000000000002a");
+    let at = expected.windows(marker.len()).position(|bytes| bytes == marker).unwrap();
+    expected[at + 3] = 23;
+    assert_eq!(arrays, expected);
+    let (decoded, metadata) = decode_table(&arrays).unwrap();
+    assert_eq!(decoded.def, entry.def);
+    assert_eq!(metadata, ext);
+    assert_eq!(decoded_enum_array_columns(&decoded.def, &metadata).collect::<Vec<_>>(), [3]);
+    assert_eq!(
+        content_check::required_bits_for_catalog_value(&key, &arrays).unwrap(),
+        domain_bits | meta::TEXT_BACKED_COLUMN_TYPES | meta::ENUM_ARRAY_COLUMNS,
+    );
 }

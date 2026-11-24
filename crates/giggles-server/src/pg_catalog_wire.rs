@@ -339,7 +339,8 @@ fn snapshot_owned(
         .map(|(id, ty)| {
             (
                 *id,
-                giggles_core::relational::type_oid(*ty).expect("validated type ID"),
+                giggles_core::relational::type_oid(*ty).expect("validated type ID")
+                    + u32::from(types.enum_array_columns.contains(id)),
             )
         })
         .collect();

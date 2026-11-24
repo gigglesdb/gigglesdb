@@ -22,9 +22,17 @@ fn user_type_and_enum_rows() {
     assert_eq!(
         query("SELECT typname,typtype FROM pg_type WHERE typnamespace=2200 ORDER BY typname").rows,
         vec![
+            vec![Value::Text("_mood".into()), Value::Text("b".into())],
             vec![Value::Text("mood".into()), Value::Text("e".into())],
             vec![Value::Text("pair".into()), Value::Text("c".into())],
             vec![Value::Text("positive".into()), Value::Text("d".into())]
+        ]
+    );
+    assert_eq!(
+        query("SELECT oid,typelem,typarray FROM pg_type WHERE oid IN (65540,65541) ORDER BY oid").rows,
+        vec![
+            vec![Value::Int(65540), Value::Int(0), Value::Int(65541)],
+            vec![Value::Int(65541), Value::Int(65540), Value::Int(0)],
         ]
     );
     assert_eq!(

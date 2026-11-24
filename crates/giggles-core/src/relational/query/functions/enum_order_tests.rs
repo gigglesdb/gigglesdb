@@ -102,16 +102,12 @@ fn scope_matches_full_column_scan_after_private_ddl() {
             .columns
             .insert(dropped_id, metadata);
         assert_scope(&after_drop, 0);
-        run(session, "COMMIT");
 
-        assert_eq!(
-            session.execute(
-                "CREATE TABLE arrays (id int PRIMARY KEY, v mood[])",
-                &[],
-                None
-            ),
-            Err(CoreError::Sql(SqlError::Unsupported))
-        );
+        run(session, "CREATE TABLE arrays (id int PRIMARY KEY, v mood[])");
+        assert_scope(&snapshot(session), 1);
+        run(session, "DROP TABLE arrays");
+        assert_scope(&snapshot(session), 0);
+        run(session, "COMMIT");
     });
 }
 

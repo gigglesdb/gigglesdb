@@ -90,6 +90,9 @@ pub(crate) fn required_bits_for_catalog_value(
             {
                 required |= super::meta::SCHEMAS_AND_USER_TYPES;
             }
+            if catalog_codec::decoded_enum_array_columns(&entry.def, &ext).next().is_some() {
+                required |= super::meta::ENUM_ARRAY_COLUMNS;
+            }
             Ok(required)
         }
         CatalogKind::Constraint => {

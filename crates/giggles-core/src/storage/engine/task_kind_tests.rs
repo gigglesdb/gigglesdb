@@ -345,7 +345,7 @@ fn bit_20_without_role_catalog_is_corrupt() {
 
 #[test]
 fn unassigned_bits_are_unsupported() {
-    for bit in [26, 29, 30] {
+    for bit in [26, 35, 63] {
         let unknown = 1 << bit;
         for bits in [unknown, unknown | TASK_CATALOG | ROLES, unknown | TASK_CATALOG] {
             assert_eq!(

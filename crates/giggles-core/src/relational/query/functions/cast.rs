@@ -415,12 +415,11 @@ pub(super) fn parse_expression(p: &mut Parser, value: Scalar) -> R<Scalar> {
         Ok(target) => Ok(expression(value, target)),
         Err(error @ (SqlError::UndefinedObject | SqlError::Unsupported)) => {
             p.at = start;
-            let name = user_types::parse_name(p)?;
+            let name = user_types::TypeReference::parse(p)?;
             if p.tokens.get(p.at) == Some(&Token::Symbol('(')) {
                 return Err(SqlError::Unsupported);
             }
-            if matches!(name.as_str(), "json" | "pg_catalog.json")
-                && p.tokens.get(p.at) != Some(&Token::Symbol('['))
+            if matches!(name.name.as_str(), "json" | "pg_catalog\0json") && !name.array
             {
                 return Ok(Scalar::Call(json_aggregate::INPUT.into(), vec![value]));
             }

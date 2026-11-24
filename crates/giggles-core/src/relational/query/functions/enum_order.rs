@@ -42,8 +42,12 @@ impl Drop for Scope {
 }
 impl BoundScalar {
     pub(in crate::relational::query) fn enum_type(&self, tables: &[&TableDef]) -> Option<TypeDef> {
+        if self.ty == DataType::Text { self.user_enum_type(tables) } else { None }
+    }
+
+    pub(super) fn user_enum_type(&self, tables: &[&TableDef]) -> Option<TypeDef> {
         match &self.node {
-            Node::Call(name, args) if aggregate_order::internal(name) => args[0].enum_type(tables),
+            Node::Call(name, args) if aggregate_order::internal(name) => args[0].user_enum_type(tables),
             Node::Column(c, _) => TYPES.with(|slot| {
                 slot.borrow()
                     .get(&tables[c.source].columns[c.column].id)
@@ -53,6 +57,17 @@ impl BoundScalar {
             _ => None,
         }
     }
+    pub(in crate::relational::query) fn cast_enum_oid(&self, state: &Relational) -> u32 {
+        if let Node::Domain(_, TypeDef::Enum { name, .. }) = &self.node
+            && let Some((id, _)) = state.type_by_name(name)
+            && let Ok(oid) = type_oid(id)
+        {
+            oid + u32::from(self.ty == DataType::TextArray)
+        } else {
+            0
+        }
+    }
+
     pub(in crate::relational::query) fn with_enum(self, ty: &TypeDef) -> Self {
         Self {
             ty: self.ty.clone(),
@@ -66,10 +81,7 @@ impl BoundScalar {
         if let Node::Literal(Value::Text(label)) = &self.node
             && !labels.contains(label)
         {
-            user_types::view_replace_error(format!(
-                "invalid input value for enum {name}: \"{label}\""
-            ));
-            return Err(SqlError::InvalidTextRepresentation);
+            return Err(user_types::enum_input_error(name, label));
         }
         Ok(Self {
             ty: DataType::BigInt,
@@ -82,7 +94,8 @@ impl BoundScalar {
                 && args.first().is_some_and(|a| matches!(a.node, Node::Domain(_, TypeDef::Enum { .. })))) {
             return args[0].compare_values(a,b);
         }
-        if let Node::Domain(_, TypeDef::Enum { labels, .. }) = &self.node
+        if self.ty == DataType::Text
+            && let Node::Domain(_, TypeDef::Enum { labels, .. }) = &self.node
             && let (Value::Text(a), Value::Text(b)) = (a, b)
         {
             return labels

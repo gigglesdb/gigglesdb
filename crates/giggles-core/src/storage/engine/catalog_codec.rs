@@ -66,15 +66,10 @@ enum DataTypeDto {
     TextArray,
     // Appended tag 22 requires meta feature bit 12.
     UserType(u64),
-    // reserved for UserTypeArray (AM-2)
-    #[allow(dead_code)]
-    #[serde(skip_serializing, deserialize_with = "reject_reserved_data_type")]
-    ReservedUserTypeArray,
-    // Appended tag 24 requires meta feature bit 30.
+    // Appended tag 23 requires meta feature bit 29.
+    UserTypeArray(u64),
+    // Appended tag 24 requires meta feature bit 32.
     UuidArray,
-}
-fn reject_reserved_data_type<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
-    Err(serde::de::Error::custom("reserved catalog data type tag 23"))
 }
 impl TryFrom<DataType> for DataTypeDto {
     type Error = CoreError;
@@ -131,9 +126,8 @@ impl From<DataTypeDto> for DataType {
             DataTypeDto::Jsonb => Self::Jsonb,
             DataTypeDto::IntArray => Self::IntArray,
             DataTypeDto::BigIntArray => Self::BigIntArray,
-            DataTypeDto::TextArray => Self::TextArray,
+            DataTypeDto::TextArray | DataTypeDto::UserTypeArray(_) => Self::TextArray,
             DataTypeDto::UuidArray => Self::UuidArray,
-            DataTypeDto::ReservedUserTypeArray => unreachable!("reserved catalog tag cannot deserialize"),
             // Resolved against the type catalog before a view is published.
             DataTypeDto::UserType(_) => Self::Text,
         }
@@ -527,22 +521,30 @@ fn decode_version<T: DeserializeOwned>(version: u8, v: &[u8]) -> Result<T, CoreE
     }
     super::super::decode(&v[1..])
 }
-impl TryFrom<(TableEntry, BTreeMap<u64, ColumnExt>)> for TableEntryV2Dto {
-    type Error = CoreError;
-    fn try_from((entry, ext): (TableEntry, BTreeMap<u64, ColumnExt>)) -> Result<Self, CoreError> {
-        let TableEntry { def, heap, .. } = entry;
-        let mut def: TableDefDto = def.try_into()?;
+impl TableEntryV2Dto {
+    fn from_entry(
+        entry: &TableEntry,
+        ext: &BTreeMap<u64, ColumnExt>,
+        types: &BTreeMap<u64, TypeDef>,
+    ) -> Result<Self, CoreError> {
+        let mut def: TableDefDto = entry.def.clone().try_into()?;
         for column in &mut def.columns {
             if let Some(id) = ext.get(&column.id).and_then(|ext| ext.type_id) {
-                column.data_type = DataTypeDto::UserType(id);
+                column.data_type = if column.data_type == DataTypeDto::TextArray
+                    && matches!(types.get(&id), Some(TypeDef::Enum { .. }))
+                {
+                    DataTypeDto::UserTypeArray(id)
+                } else {
+                    DataTypeDto::UserType(id)
+                };
             }
         }
         Ok(Self {
             def,
-            heap,
+            heap: entry.heap,
             columns_ext: ext
-                .into_iter()
-                .map(|(k, v)| Ok((k, v.try_into()?)))
+                .iter()
+                .map(|(&id, ext)| Ok((id, ext.clone().try_into()?)))
                 .collect::<Result<_, CoreError>>()?,
         })
     }
@@ -559,13 +561,15 @@ impl TryFrom<TableEntryV2Dto> for (TableEntry, BTreeMap<u64, ColumnExt>) {
             .columns
             .iter()
             .filter_map(|column| {
-                if let DataTypeDto::UserType(id) = column.data_type {
-                    Some((column.id, id))
-                } else {
-                    None
+                match column.data_type {
+                    DataTypeDto::UserTypeArray(id) if crate::relational::type_oid(id).is_err() => {
+                        Some(Err(corrupt("invalid enum array element type id")))
+                    }
+                    DataTypeDto::UserType(id) | DataTypeDto::UserTypeArray(id) => Some(Ok((column.id, id))),
+                    _ => None,
                 }
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         let def: TableDef = def.try_into()?;
         let mut columns_ext: BTreeMap<u64, ColumnExt> = columns_ext
             .into_iter()
@@ -597,6 +601,14 @@ pub(crate) fn encode_table(
     entry: &TableEntry,
     ext: &BTreeMap<u64, ColumnExt>,
 ) -> Result<Vec<u8>, CoreError> {
+    encode_table_with_types(entry, ext, &BTreeMap::new())
+}
+
+pub(crate) fn encode_table_with_types(
+    entry: &TableEntry,
+    ext: &BTreeMap<u64, ColumnExt>,
+    types: &BTreeMap<u64, TypeDef>,
+) -> Result<Vec<u8>, CoreError> {
     for (id, column_ext) in ext {
         let column = entry
             .def
@@ -608,7 +620,7 @@ pub(crate) fn encode_table(
             return Err(corrupt("column text kind/type mismatch"));
         }
     }
-    let dto = TableEntryV2Dto::try_from((entry.clone(), ext.clone()))?;
+    let dto = TableEntryV2Dto::from_entry(entry, ext, types)?;
     if let Some(birth) = entry.primary_index_birth {
         validate_primary_birth(entry, birth)?;
         encode_version(3, &(dto, birth))
@@ -647,6 +659,20 @@ pub(crate) fn decode_table(
     }
     Ok((entry, ext))
 }
+// On a freshly decoded entry only UserTypeArray has both a textual
+// array storage type and a user-type binding. Ordinary UserType is
+// decoded as Text until the catalog resolves it, including array domains.
+pub(crate) fn decoded_enum_array_columns<'a>(
+    def: &'a TableDef,
+    ext: &'a BTreeMap<u64, ColumnExt>,
+) -> impl Iterator<Item = u64> + 'a {
+    def.columns.iter().filter_map(|column| {
+        (column.data_type == DataType::TextArray
+            && ext.get(&column.id).is_some_and(|c| c.type_id.is_some()))
+            .then_some(column.id)
+    })
+}
+
 fn validate_primary_birth(entry: &TableEntry, birth: u64) -> Result<(), CoreError> {
     if birth == 0 || entry.heap || entry.def.hidden_rowid().is_some() || entry.def.primary_key.is_empty() {
         return Err(corrupt("noncanonical primary index birth"));

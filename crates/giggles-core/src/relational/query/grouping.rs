@@ -76,7 +76,7 @@ pub(super) fn canonical(
         }
         Scalar::Unary(op, a) => format!("unary:{op:?}:{}", canonical(a, resolve, scope, tables)?),
         Scalar::Domain(a, name, _) => {
-            format!("domain:{name}:{}", canonical(a, resolve, scope, tables)?)
+            format!("domain:{}:{}", name.sql(), canonical(a, resolve, scope, tables)?)
         }
         Scalar::Cast(a, ty) => {
             // PostgreSQL grouping identity drops casts that keep the input type.

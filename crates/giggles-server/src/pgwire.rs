@@ -393,7 +393,25 @@ impl Diagnostic {
             self.wire_message = message.clone();
         }
         if result.is_err() && message.as_deref().is_some_and(|m| m.starts_with("collation ") || m.starts_with("cannot drop collation ") || m.starts_with("cannot drop schema ") || m.starts_with("invalid locale name ") || m.starts_with("deterministic requires ") || m.starts_with("permission denied for schema ") || m.starts_with("must be owner of collation ")) {
-            self.wire_message = message;
+            self.wire_message = message.clone();
+        }
+        if let Err(CoreError::Sql(error)) = &result
+            && let Some(message) = message
+        {
+            use giggles_core::relational::SqlError;
+            let column_message = message.starts_with("column \"") && message.contains(" of relation \"");
+            let allowed = match error {
+                SqlError::InvalidTextRepresentation => message.starts_with("invalid input value for enum "),
+                SqlError::UnknownColumn => column_message && message.ends_with(" does not exist"),
+                SqlError::DuplicateColumn => column_message && message.ends_with(" already exists"),
+                SqlError::UndefinedObject => message.starts_with("type \"") && message.ends_with(" does not exist"),
+                SqlError::Type => (message.starts_with("column \"") || message.starts_with("default for column \""))
+                    && message.contains(" cannot be cast automatically to type "),
+                _ => false,
+            };
+            if allowed {
+                self.wire_message = Some(message);
+            }
         }
         if let Err(error @ CoreError::WriteFenced { .. }) = &result {
             self.wire_message = Some(error.to_string());
@@ -1023,7 +1041,7 @@ fn encode(
         }));
     }
     Ok(Some(match (v, ty) {
-        (Value::Text(s), ty) if ty.is_extended_text() => logical_binary_output(ty, s)?,
+        (Value::Text(s), ty) if ty.is_extended_text() => logical_binary_output(ty, s, 0)?,
         (Value::Bool(v), DataType::Boolean) => vec![u8::from(*v)],
         (Value::Int(v), DataType::SmallInt) => i16::try_from(*v)
             .map_err(|_| "22003")?
@@ -1081,13 +1099,17 @@ fn data_row_frames(
         let mut b = vec![];
         b.extend((row.values.len() as u16).to_be_bytes());
         for (i, v) in row.values.iter().enumerate() {
-            match encode(
-                v,
-                &d.columns.get(i).ok_or("XX000")?.data_type,
-                format_at(formats, i),
-                settings,
-                zone,
-            )? {
+            let ty = &d.columns.get(i).ok_or("XX000")?.data_type;
+            let format = format_at(formats, i);
+            let type_oid = d.type_oids.get(i).copied().unwrap_or(0);
+            let bytes = if format == 1 && *ty == DataType::TextArray
+                && type_oid >= 65536 && let Value::Text(text) = v
+            {
+                Some(logical_binary_output(ty, text, type_oid)?)
+            } else {
+                encode(v, ty, format, settings, zone)?
+            };
+            match bytes {
                 None => b.extend((-1i32).to_be_bytes()),
                 Some(v) => {
                     b.extend((v.len() as i32).to_be_bytes());
@@ -4454,7 +4476,7 @@ mod task_release_tests;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "pgwire_task_catalog_tests.rs"]
 mod task_catalog_tests;
-fn logical_binary_output(ty: &DataType, s: &str) -> R<Vec<u8>> {
+fn logical_binary_output(ty: &DataType, s: &str, type_oid: u32) -> R<Vec<u8>> {
     use giggles_core::relational::logical_types::array_values;
     if *ty == DataType::Uuid {
         return hex::decode(s.replace('-', "")).map_err(|_| "22P02");
@@ -4469,6 +4491,7 @@ fn logical_binary_output(ty: &DataType, s: &str) -> R<Vec<u8>> {
         DataType::IntArray => 23u32,
         DataType::BigIntArray => 20,
         DataType::UuidArray => 2950,
+        DataType::TextArray if type_oid >= 65536 => type_oid - 1,
         _ => 25,
     };
     let mut b = Vec::new();
@@ -4492,7 +4515,7 @@ fn logical_binary_output(ty: &DataType, s: &str) -> R<Vec<u8>> {
                     .map_err(|_| "22P02")?
                     .to_be_bytes()
                     .to_vec(),
-                DataType::UuidArray => logical_binary_output(&DataType::Uuid, &s)?,
+                DataType::UuidArray => logical_binary_output(&DataType::Uuid, &s, elem)?,
                 _ => s.into_bytes(),
             };
             b.extend_from_slice(&(v.len() as i32).to_be_bytes());
@@ -4615,7 +4638,7 @@ mod logical_wire_tests {
             (DataType::TextArray, "{\"a,b\",NULL,\"NULL\"}"),
             (DataType::UuidArray, "{NULL,12345678-1234-5678-1234-567812345678}"),
         ] {
-            let binary = logical_binary_output(&ty, text).unwrap();
+            let binary = logical_binary_output(&ty, text, 0).unwrap();
             assert_eq!(
                 logical_binary_input(&ty, &binary),
                 Ok(Value::Text(text.into()))
@@ -4627,7 +4650,7 @@ mod logical_wire_tests {
                 assert_eq!(binary[0], 1);
             }
         }
-        let binary = logical_binary_output(&DataType::IntArray, "{1,NULL,-3}").unwrap();
+        let binary = logical_binary_output(&DataType::IntArray, "{1,NULL,-3}", 0).unwrap();
         assert_eq!(
             &binary[..20],
             &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 23, 0, 0, 0, 3, 0, 0, 0, 1]

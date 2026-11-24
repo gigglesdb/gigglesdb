@@ -133,7 +133,7 @@ fn new_columns_and_plain_add_keep_validation_errors() {
             error(
                 s,
                 &format!("ALTER TABLE t ADD {optional}fresh missing_type"),
-                SqlError::Unsupported,
+                SqlError::UndefinedObject,
             );
             error(
                 s,

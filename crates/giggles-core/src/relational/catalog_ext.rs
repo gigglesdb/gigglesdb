@@ -1344,7 +1344,11 @@ impl Relational {
             let (_, c) = columns.get(id).ok_or(SqlError::Type)?;
             if let Some(id) = e.type_id {
                 let ty = ext.types.get(&id).ok_or(SqlError::Type)?;
-                if ty.storage_type()? != c.data_type {
+                // An enum binding paired with the existing TextArray logical kind
+                // denotes a flat array of that enum. Scalar bindings retain their layout.
+                if ty.storage_type()? != c.data_type
+                    && !matches!((ty, &c.data_type), (TypeDef::Enum { .. }, DataType::TextArray))
+                {
                     return Err(SqlError::Type);
                 }
             }

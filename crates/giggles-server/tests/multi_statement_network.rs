@@ -1,4 +1,4 @@
-use giggles_core::{Admin, Limits, roles::NewRole};
+use giggles_core::{Admin, Engine, Limits, roles::NewRole};
 use giggles_server::{
     Binding, Role, Running, Service,
     auth::{PostgresqlConfig, TlsMode, serve_postgresql},
@@ -33,6 +33,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_engine(Engine::Legacy).await
+    }
+    async fn with_engine(engine: Engine) -> Self {
         let path = std::env::temp_dir().join(format!(
             "multi-statement-{}-{}-{}",
             std::process::id(),
@@ -43,7 +46,7 @@ impl Fixture {
             SERIAL.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&path).unwrap();
-        let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+        let admin = Admin::create_engine(path.join("db.redb"), Limits::default(), engine).unwrap();
         admin
             .roles()
             .create(NewRole {
@@ -527,3 +530,6 @@ async fn aggregate_response_limit_rolls_back_before_publishing() {
     drop(c);
     f.stop().await;
 }
+
+#[path = "enum_array_defaults_network.inc"]
+mod enum_array_defaults_network;

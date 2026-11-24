@@ -17,9 +17,16 @@ pub(super) enum Action {
         Option<SqlError>,
         bool,
         Option<String>,
-        Option<String>,
+        Option<user_types::TypeReference>,
     ),
-    Type(String, DataType, Option<i32>, Option<String>, Option<String>),
+    Type(
+        String,
+        DataType,
+        Option<i32>,
+        Option<String>,
+        Option<user_types::TypeReference>,
+        Option<Box<query::Query>>,
+    ),
     Drop(String, bool, bool),
     RenameColumn(String, String),
     RenameTable(String),
@@ -106,7 +113,7 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
                     p.need("exists")?;
                 }
                 let name = raw_name(p)?;
-                if !matches!(p.tokens.get(p.at), Some(Token::Word(_))) {
+                if !matches!(p.tokens.get(p.at), Some(Token::Word(_) | Token::QuotedIdent(_))) {
                     return Err(SqlError::Syntax);
                 }
                 let (
@@ -176,11 +183,16 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
                 !set && p.word("type")
             };
             if type_change {
-                let (parsed,user_type)=parse_type(p)?;
+                let (parsed,user_type)=ddl_type::parse_column_type(p, ddl_type::Site::Alter)?;
                 let collation=if p.word("collate") {Some(column_collations::parse_name(p)?)} else {None};
                 if let Some(error)=parsed.semantic_error {return Err(error);}
                 unsupported_type |= collation.is_none() && user_type.is_none() && !matches!(parsed.data_type,DataType::Text|DataType::Varchar|DataType::Bpchar);
-                actions.push(Action::Type(name,parsed.data_type,parsed.typmod,collation,user_type));
+                let conversion = if user_type.is_some() && p.word("using") {
+                    Some(Box::new(query::Query::alter_type_assignment(p, &table)?))
+                } else {
+                    None
+                };
+                actions.push(Action::Type(name, parsed.data_type, parsed.typmod, collation, user_type, conversion));
                 if p.sym(',') {continue;}
                 break;
             }
@@ -231,35 +243,13 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
         column_names: ColumnNamePolicy::Sql,
     })
 }
-fn parse_type(p:&mut Parser)->R<(ddl_type::Parsed,Option<String>)> {
-    let start=p.at;
-    match ddl_type::parse(p,ddl_type::Site::Alter) {
-        Ok(parsed)=>Ok((parsed,None)),
-        Err(e) if user_type_fallback(p, start, &e) => { p.at=start; let n=user_types::parse_name(p)?; Ok((ddl_type::Parsed {data_type:DataType::Text,typmod:None,semantic_error:None},Some(n))) },
-        Err(e)=>Err(e),
-    }
-}
-// Retry only an unknown or quoted type name. Built-in type errors (including
-// unsupported arrays) must retain the error returned by the DDL type parser.
-fn user_type_fallback(p: &Parser, start: usize, error: &SqlError) -> bool {
-    match error {
-        SqlError::Syntax => matches!(p.tokens.get(start), Some(Token::QuotedIdent(_))),
-        SqlError::Unsupported if p.at == start + 1 => match p.tokens.get(p.at) {
-            None | Some(Token::Symbol(',' | ';' | '.')) => true,
-            Some(Token::Word(w)) => matches!(w.as_str(), "collate" | "not" | "null" | "default"),
-            _ => false,
-        },
-        _ => false,
-    }
-}
 #[allow(clippy::type_complexity)]
 fn parse_add_definition(
     p: &mut Parser,
     if_not_exists: bool,
-) -> R<(ddl_type::Parsed, bool, Option<String>, Option<String>, Option<String>)> {
+) -> R<(ddl_type::Parsed, bool, Option<String>, Option<String>, Option<user_types::TypeReference>)> {
     let type_start = p.at;
-    let mut user_type = None;
-    let mut parsed = match ddl_type::parse(p, ddl_type::Site::Alter) {
+    let (mut parsed, user_type) = match ddl_type::parse_column_type(p, ddl_type::Site::Alter) {
         Ok(parsed) => parsed,
         // An unknown type name is semantic, but its modifiers must still have
         // valid syntax. Defer the existing Unsupported error until execution.
@@ -277,16 +267,11 @@ fn parse_add_definition(
             while p.sym('[') {
                 p.punct(']')?;
             }
-            ddl_type::Parsed {
+            (ddl_type::Parsed {
                 data_type: DataType::Text,
                 typmod: None,
                 semantic_error: Some(SqlError::Unsupported),
-            }
-        }
-        Err(error) if user_type_fallback(p, type_start, &error) => {
-            p.at=type_start;
-            user_type=Some(user_types::parse_name(p)?);
-            ddl_type::Parsed {data_type:DataType::Text,typmod:None,semantic_error:None}
+            }, None)
         }
         Err(error) => return Err(error),
     };
@@ -384,8 +369,22 @@ fn position(table: &TableDef, name: &str) -> R<usize> {
     if name == HIDDEN_ROWID {
         return Err(SqlError::Reserved);
     }
-    col(table, name)
+    col(table, name).inspect_err(|error| {
+        if *error == SqlError::UnknownColumn {
+            user_types::view_replace_error(format!(
+                "column \"{name}\" of relation \"{}\" does not exist", table.name
+            ));
+        }
+    })
 }
+
+fn null_column_error(table: &TableDef, name: &str) -> SqlError {
+    user_types::view_replace_error(format!(
+        "column \"{name}\" of relation \"{}\" contains null values", table.name
+    ));
+    SqlError::Null
+}
+
 pub(super) fn execute(
     state: &mut Relational,
     alter: &AlterTable,
@@ -446,6 +445,9 @@ pub(super) fn execute(
                     return Err(SqlError::DuplicateColumn);
                 }
                 if table.columns.iter().any(|c| c.name == column.name) {
+                    user_types::view_replace_error(format!(
+                        "column \"{}\" of relation \"{}\" already exists", column.name, table.name
+                    ));
                     return Err(SqlError::DuplicateColumn);
                 }
                 if table.columns.len() >= MAX_COLUMNS {
@@ -454,8 +456,8 @@ pub(super) fn execute(
                 let mut column = column.clone();
                 let mut typmod=*typmod;
                 let type_id=if let Some(n)=user_type {
-                    let (id,ty)=candidate.resolve_type(n,path)?.ok_or(SqlError::Unsupported)?;
-                    column.data_type=ty.storage_type()?;
+                    let (id,ty)=n.resolve(&candidate, path)?;
+                    column.data_type=user_types::storage_type(ty, n.array)?;
                     if let TypeDef::Domain{typmod:t,..}=ty {typmod = *t;}
                     Some(id)
                 } else {None};
@@ -515,22 +517,52 @@ pub(super) fn execute(
                         return Err(SqlError::Aborted);
                     }
                     let value = defaults::evaluate(&candidate, &column, clock)?;
+                    if column.not_null && value == Value::Null {
+                        return Err(null_column_error(&table, &column.name));
+                    }
                     row.values.insert(at, value);
                     row_check(&table, &row.values)?;
                 }
                 candidate.rows.insert(table.id, rows);
             }
-            Action::Type(column,ty,typmod,collation,user_type)=>{
-                let at=position(&table,column)?;
-                let old=table.columns[at].clone();
-                let mut new=old.clone(); new.data_type=ty.clone();
-                let type_id=if let Some(n)=user_type {let (id,ty)=candidate.resolve_type(n,path)?.ok_or(SqlError::UndefinedObject)?;new.data_type=ty.storage_type()?;Some(id)} else {None};
+            Action::Type(column, ty, typmod, collation, user_type, conversion) => {
+                let at = position(&table, column)?;
+                let old = &table.columns[at];
+                let mut new = old.clone();
+                new.data_type = ty.clone();
+                let mut typmod = *typmod;
+                let mut type_id = None;
+                if let Some(target) = user_type {
+                    let (id, ty) = target.resolve(&candidate, path)?;
+                    new.data_type = user_types::storage_type(ty, target.array)?;
+                    type_id = Some(id);
+                    if let TypeDef::Domain { typmod: domain_typmod, .. } = ty {
+                        typmod = *domain_typmod;
+                    }
+                    if matches!(ty, TypeDef::Enum { .. })
+                        && !(candidate.ext.columns.get(&old.id).and_then(|c| c.type_id) == type_id
+                            && old.data_type == new.data_type)
+                    {
+                        if conversion.is_none() {
+                            user_types::view_replace_error(format!(
+                                "column \"{column}\" cannot be cast automatically to type {}", target.sql()
+                            ));
+                            return Err(SqlError::Type);
+                        }
+                        if defaults::default_sql(&candidate, old).is_some() {
+                            user_types::view_replace_error(format!(
+                                "default for column \"{column}\" cannot be cast automatically to type {}", target.sql()
+                            ));
+                            return Err(SqlError::Type);
+                        }
+                    }
+                }
                 // The v2 layout rewrite leaves same-width rows and existing
                 // index tuples in place. Admit only a byte-preserving text change.
                 let representation_unchanged = matches!(
                     (&old.data_type, &new.data_type),
                     (DataType::Text, DataType::Varchar) | (DataType::Varchar, DataType::Text)
-                ) && typmod.is_none() && type_id.is_none() && collation.is_none()
+                ) && typmod.is_none() && type_id.is_none() && collation.is_none() && conversion.is_none()
                     && candidate.column_collation(old.id).is_none()
                     && candidate.ext.columns.get(&old.id).is_none_or(|c| c.type_id.is_none());
                 if !representation_unchanged && candidate.secondary_descriptors_engine().iter().any(|d| {
@@ -538,25 +570,75 @@ pub(super) fn execute(
                 }) {
                     return Err(SqlError::Unsupported);
                 }
-                let reference=column_collations::resolve_column(&candidate,&new,type_id,collation.as_deref(),path)?;
-                let rows=candidate.rows.get(&table.id).ok_or(SqlError::Type)?.clone();
-                table.columns[at]=new.clone();
-                std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(),table.clone());
-                let metadata=std::sync::Arc::make_mut(&mut candidate.ext).columns.entry(new.id).or_default();
-                metadata.type_id=type_id;metadata.typmod = *typmod;
-                metadata.text_kind=match new.data_type {DataType::Varchar=>Some(catalog_ext::TextKind::Varchar),DataType::Bpchar=>Some(catalog_ext::TextKind::Bpchar),_=>None};
-                std::sync::Arc::make_mut(&mut candidate.ext).column_collations.remove(&new.id);
-                if let Some(r)=reference {std::sync::Arc::make_mut(&mut candidate.ext).column_collations.insert(new.id,column_collations::Binding::Column(r));}
-                Relational::normalize_ext(std::sync::Arc::make_mut(&mut candidate.ext));
+                let reference = column_collations::resolve_column(
+                    &candidate, &new, type_id, collation.as_deref(), path
+                )?;
+                let previous = candidate.clone();
+                let rows = previous.rows.get(&table.id).ok_or(SqlError::Type)?;
+                let conversion = conversion.as_ref().map(|query| {
+                    let mut query = query.as_ref().clone();
+                    query.bind_schema_names(&|name| *name = previous.resolve_relation_key(name, path), &previous, path);
+                    query.admit_assignment_literals(&mut 0)?;
+                    Ok::<_, SqlError>(query)
+                }).transpose()?;
+                let conversion = conversion.as_ref().map(|query| {
+                    let query = query.bind_assignment(&previous, vec![], &new.data_type)?.with_clock(clock);
+                    query.validate_immutable_constants()?;
+                    Ok::<_, SqlError>(query)
+                }).transpose()?;
 
-                let mut converted=BTreeMap::new();
-                for (_,mut row) in rows {
-                    row.values[at]=coerce_to_column(&candidate,&new,query::assignment::convert(row.values[at].clone(),&old.data_type,&new.data_type,clock)?)?;
-                    if converted.insert(pk(&table,&row.values)?,row).is_some() {return Err(SqlError::Duplicate);}
+                let old_type = old.data_type.clone();
+                table.columns[at] = new.clone();
+                std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(), table.clone());
+                let ext = std::sync::Arc::make_mut(&mut candidate.ext);
+                let metadata = ext.columns.entry(new.id).or_default();
+                metadata.type_id = type_id;
+                metadata.typmod = typmod;
+                metadata.text_kind = match new.data_type {
+                    DataType::Varchar => Some(catalog_ext::TextKind::Varchar),
+                    DataType::Bpchar => Some(catalog_ext::TextKind::Bpchar),
+                    _ => None,
+                };
+                ext.column_collations.remove(&new.id);
+                if let Some(reference) = reference {
+                    ext.column_collations.insert(new.id, column_collations::Binding::Column(reference));
                 }
-                candidate.rows.insert(table.id,converted);
-                let descriptors=candidate.secondary_descriptors_engine().to_vec();
-                candidate.secondary=candidate.secondary_build_complete_engine(&descriptors,&mut *cancel)?;
+                let logical = match new.data_type {
+                    DataType::Uuid => Some(catalog_ext::LogicalKind::Uuid),
+                    DataType::Jsonb => Some(catalog_ext::LogicalKind::Jsonb),
+                    DataType::IntArray => Some(catalog_ext::LogicalKind::IntArray),
+                    DataType::BigIntArray => Some(catalog_ext::LogicalKind::BigIntArray),
+                    DataType::TextArray => Some(catalog_ext::LogicalKind::TextArray),
+                    _ => None,
+                };
+                if let Some(logical) = logical {
+                    ext.logical_kinds.insert(new.id, logical);
+                } else {
+                    ext.logical_kinds.remove(&new.id);
+                }
+                Relational::normalize_ext(ext);
+
+                let mut converted = BTreeMap::new();
+                let (mut work, mut bytes) = (0, 0);
+                for row in rows.values() {
+                    if cancel() {
+                        return Err(SqlError::Aborted);
+                    }
+                    let mut row = row.clone();
+                    let value = if let Some(query) = &conversion {
+                        query.project_row(&row.values, row.version, &[], &mut work, &mut bytes)?
+                            .pop().ok_or(SqlError::Type)?
+                    } else {
+                        query::assignment::convert(row.values[at].clone(), &old_type, &new.data_type, clock)?
+                    };
+                    row.values[at] = coerce_to_column(&candidate, &new, value)?;
+                    if converted.insert(pk(&table, &row.values)?, row).is_some() {
+                        return Err(SqlError::Duplicate);
+                    }
+                }
+                candidate.rows.insert(table.id, converted);
+                let descriptors = candidate.secondary_descriptors_engine().to_vec();
+                candidate.secondary = candidate.secondary_build_complete_engine(&descriptors, &mut *cancel)?;
             }
             Action::Drop(column, optional, cascade) => {
                 let at = match position(&table, column) {
@@ -635,6 +717,11 @@ pub(super) fn execute(
             }
             Action::Default(column, default) => {
                 let at = position(&table, column)?;
+                if default.is_none() && alter.actions.iter().any(|action| {
+                    matches!(action, Action::Default(name, Some(_)) if name == column)
+                }) {
+                    continue;
+                }
                 defaults::install_alter(
                     &mut candidate,
                     &table.columns[at],
@@ -645,6 +732,7 @@ pub(super) fn execute(
             Action::NotNull(column, set) => {
                 let at = position(&table, column)?;
                 if !set && table.primary_key.contains(&at) {
+                    user_types::view_replace_error(format!("column \"{column}\" is in a primary key"));
                     return Err(SqlError::InvalidTableDefinition);
                 }
                 if *set
@@ -655,7 +743,7 @@ pub(super) fn execute(
                         .values()
                         .any(|row| row.values[at] == Value::Null)
                 {
-                    return Err(SqlError::Null);
+                    return Err(null_column_error(&table, column));
                 }
                 table.columns[at].not_null = *set;
                 std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(), table.clone());
