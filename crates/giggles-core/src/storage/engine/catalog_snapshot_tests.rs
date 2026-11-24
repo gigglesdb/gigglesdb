@@ -124,21 +124,22 @@ fn gateway_token_reads_leave_the_catalog_cache_unlocked() {
 #[test]
 fn token_recheck_uses_the_version_published_during_the_unlocked_read() {
     let (_, _, catalog) = setup();
+    let mut retired = Vec::new();
     let mut cache = catalog.cache.lock().unwrap();
     let old = Ts(10);
     let published = Ts(20);
     let statement = Ts(30);
-    cache.publish(old, CatalogView::default());
+    cache.publish(old, CatalogView::default(), &mut retired);
     cache.tokens.insert(old, (1, old));
     // Another statement publishes between the cheap check and the locked recheck.
-    cache.publish(published, CatalogView::default());
+    cache.publish(published, CatalogView::default(), &mut retired);
     cache.tokens.insert(published, (2, published));
     catalog
-        .refresh_locked(&mut cache, statement, Some(2))
+        .refresh_locked(&mut cache, statement, Some(2), &mut retired)
         .unwrap();
     assert_eq!(cache.tokens[&published], (2, statement));
     assert_eq!(cache.tokens[&old], (1, old));
-    catalog.refresh_locked(&mut cache, Ts(25), Some(2)).unwrap();
+    catalog.refresh_locked(&mut cache, Ts(25), Some(2), &mut retired).unwrap();
     assert_eq!(cache.tokens[&published], (2, statement));
 }
 

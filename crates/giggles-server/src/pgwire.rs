@@ -1421,11 +1421,12 @@ impl Statement {
     }
 
     fn forget_cursor_plan(&self, session: &Session) {
-        if let Plan::Sql(prepared)
-            | Plan::Cursor(cursor::Command::Declare { prepared: Some(prepared), .. }) = &*self.p
-        {
-            session.sql.forget_cursor_plan(prepared);
-        }
+        let prepared = match &*self.p {
+            Plan::Sql(prepared) if prepared.command() == "SELECT" => prepared,
+            Plan::Cursor(cursor::Command::Declare { prepared: Some(prepared), .. }) => prepared,
+            _ => return,
+        };
+        session.sql.forget_cursor_plan(prepared);
     }
 
     // Binding reads the immutable Prepared (including its captured search_path,

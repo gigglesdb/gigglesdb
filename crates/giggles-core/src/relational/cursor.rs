@@ -3,7 +3,10 @@ use super::query::BoundQuery;
 use super::*;
 use std::{
     collections::HashMap,
-    sync::{Mutex, Weak},
+    sync::{
+        Mutex, Weak,
+        atomic::{AtomicPtr, Ordering},
+    },
 };
 
 #[derive(Default)]
@@ -140,42 +143,74 @@ impl Drop for PlanCacheEntry {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static SLOT_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// One last successful, clock-independent streaming binding per SQL session.
 /// Weak handles let pruning drop the plan and its owners, even while idle.
-/// The mutex lets read-only session metadata calls invalidate the slot.
 #[derive(Default)]
-pub(crate) struct PlanCache(Mutex<Option<PlanCacheEntry>>);
+pub(crate) struct PlanCache {
+    // Identity only, never dereferenced. The entry's Weak prevents address
+    // reuse while it is installed. Only exclusive access installs an entry,
+    // publishing its identity first. Shared callers can only remove an entry
+    // and publish null after taking it under the guard.
+    owners: AtomicPtr<PlanOwners>,
+    entry: Mutex<Option<PlanCacheEntry>>,
+}
 
 impl PlanCache {
     #[cfg(feature = "test-cursor-bindings")]
     pub(crate) fn binding_liveness(&self) -> Option<impl Fn() -> bool + use<>> {
-        let entry = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = self.entry.lock().unwrap_or_else(|e| e.into_inner());
         let binding = entry.as_ref()?.binding.clone();
         Some(move || binding.strong_count() != 0)
     }
 
     pub(crate) fn clear(&self) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if !self.owners.load(Ordering::Acquire).is_null() {
+            self.evict_if(|_| true);
+        }
     }
 
     pub(crate) fn observe(&self, owners: Option<&Arc<PlanOwners>>) {
-        let mut entry = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if entry.as_ref().is_some_and(|entry| {
-            owners.is_none_or(|owners| entry.owners.as_ptr() != Arc::as_ptr(owners))
-        }) {
-            entry.take();
+        let current = self.owners.load(Ordering::Acquire);
+        let observed = owners.map_or(std::ptr::null(), Arc::as_ptr);
+        if !current.is_null() && !std::ptr::eq(current, observed) {
+            self.evict_if(|entry| !std::ptr::eq(entry.owners.as_ptr(), observed));
         }
     }
 
     pub(crate) fn forget_statement(&self, source: &Prepared) {
-        let mut entry = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if entry.as_ref().is_some_and(|entry| {
-            entry.binding.upgrade().is_none_or(|binding| {
+        if self.owners.load(Ordering::Acquire).is_null() {
+            return;
+        }
+        // Keep the upgraded reference until eviction releases the slot guard.
+        // Catalog pruning can otherwise make this the last strong reference.
+        let mut binding = None;
+        self.evict_if(|entry| {
+            binding = entry.binding.upgrade();
+            binding.as_ref().is_none_or(|binding| {
                 Self::same_statement(&binding.query.prepared, source)
             })
-        }) {
-            entry.take();
-        }
+        });
+    }
+
+    fn evict_if(&self, should_evict: impl FnOnce(&PlanCacheEntry) -> bool) {
+        let removed = {
+            #[cfg(test)]
+            SLOT_LOCKS.set(SLOT_LOCKS.get() + 1);
+            let mut entry = self.entry.lock().unwrap_or_else(|e| e.into_inner());
+            if entry.as_ref().is_some_and(should_evict) {
+                let removed = entry.take();
+                self.owners.store(std::ptr::null_mut(), Ordering::Release);
+                removed
+            } else {
+                None
+            }
+        };
+        drop(removed);
     }
 
     fn same_statement(bound: &Prepared, source: &Prepared) -> bool {
@@ -193,7 +228,8 @@ impl PlanCache {
         };
         owners.0.lock().unwrap_or_else(|e| e.into_inner())
             .insert(Arc::as_ptr(&binding) as usize, binding);
-        *self.0.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(entry);
+        self.owners.store(Arc::as_ptr(owners).cast_mut(), Ordering::Release);
+        *self.entry.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(entry);
     }
 
     fn reuse(
@@ -202,7 +238,7 @@ impl PlanCache {
         source: &Prepared,
         context: Option<BindingContext>,
     ) -> Option<Arc<CursorQuery>> {
-        let entry = self.0.get_mut().unwrap_or_else(|e| e.into_inner());
+        let entry = self.entry.get_mut().unwrap_or_else(|e| e.into_inner());
         if let Some(binding) = entry.as_ref().and_then(|entry| entry.binding.upgrade()) {
             let query = &binding.query;
             let p = &query.prepared;
@@ -223,7 +259,9 @@ impl PlanCache {
             }
         }
         // Release the old image even if binding the new key fails.
-        entry.take();
+        let removed = entry.take();
+        self.owners.store(std::ptr::null_mut(), Ordering::Release);
+        drop(removed);
         None
     }
 }
@@ -404,7 +442,7 @@ mod tests {
         let mut first = open(1);
         let mut second = open(2);
         assert_eq!(QUERY_BINDS.get(), 2);
-        assert!(cache.0.into_inner().unwrap().is_none());
+        assert!(cache.entry.into_inner().unwrap().is_none());
         for (plan, micros) in [(&mut second, 2), (&mut first, 1)] {
             let rows = plan.fetch(&image, &scan::LegacyRows(&image), 1, 1024).unwrap();
             assert_eq!(rows[0].values, [Value::TimestampTz(
@@ -440,11 +478,69 @@ mod tests {
         let mut first = open(0);
         let mut second = open(86_400_000_000);
         assert_eq!(QUERY_BINDS.get(), 2);
-        assert!(cache.0.into_inner().unwrap().is_none());
+        assert!(cache.entry.into_inner().unwrap().is_none());
         for (plan, id) in [(&mut second, 2), (&mut first, 1)] {
             let rows = plan.fetch(&image, &scan::LegacyRows(&image), 10, 1024).unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].values, [Value::Int(id)]);
+        }
+    }
+
+    #[test]
+    fn empty_slot_and_same_catalog_observation_skip_the_slot_lock() {
+        let image = fixture();
+        let prepared = Prepared::parse("SELECT id FROM t", DOMAIN, image.epoch)
+            .unwrap().bind_schemas(&image).unwrap();
+        let mut cache = PlanCache::default();
+        let owners = Arc::default();
+        let before = SLOT_LOCKS.get();
+
+        cache.observe(Some(&owners));
+        cache.observe(None);
+        cache.clear();
+        cache.forget_statement(&prepared);
+        Plan::new(&image, &prepared, &[], None, Some((&mut cache, &owners))).unwrap().unwrap();
+        cache.observe(Some(&owners));
+
+        assert_eq!(SLOT_LOCKS.get(), before);
+        assert!(cache.entry.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn eviction_releases_the_slot_guard_before_the_binding() {
+        let image = fixture();
+        let prepared = Prepared::parse("SELECT id FROM t", DOMAIN, image.epoch)
+            .unwrap().bind_schemas(&image).unwrap();
+        let evictions: [fn(&PlanCache, &Prepared); 3] = [
+            |cache, _| cache.observe(None),
+            |cache, _| cache.clear(),
+            PlanCache::forget_statement,
+        ];
+        for evict in evictions {
+            let owners = Arc::default();
+            let mut cache = PlanCache::default();
+            Plan::new(&image, &prepared, &[], None, Some((&mut cache, &owners))).unwrap().unwrap();
+            let binding = cache.entry.lock().unwrap().as_ref().unwrap().binding.clone();
+
+            std::thread::scope(|scope| {
+                let registry = owners.0.lock().unwrap();
+                let eviction = scope.spawn(|| evict(&cache, &prepared));
+                let start = std::time::Instant::now();
+                let slot_released = loop {
+                    if cache.entry.try_lock().is_ok_and(|entry| entry.is_none()) {
+                        break true;
+                    }
+                    if start.elapsed() >= std::time::Duration::from_secs(5) {
+                        break false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                };
+                assert!(binding.upgrade().is_some());
+                drop(registry);
+                eviction.join().unwrap();
+                assert!(slot_released, "eviction held the slot guard while waiting for the registry");
+            });
+            assert!(binding.upgrade().is_none());
         }
     }
 

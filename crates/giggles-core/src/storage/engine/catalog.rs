@@ -377,7 +377,7 @@ impl CatalogCache {
             poison_cause: None,
             poison_reported: std::sync::atomic::AtomicBool::new(false),
         };
-        cache.publish(visible, load_view_until(kv, visible, end)?);
+        cache.publish(visible, load_view_until(kv, visible, end)?, &mut Vec::new());
         Ok(cache)
     }
     pub(crate) fn view_at(&self, snapshot: Ts) -> Option<Arc<CatalogView>> {
@@ -388,11 +388,13 @@ impl CatalogCache {
         end.checked_sub(1)
             .map(|index| self.versions[index].1.clone())
     }
-    pub(crate) fn publish(&mut self, ts: Ts, view: CatalogView) {
+    pub(crate) fn publish(&mut self, ts: Ts, view: CatalogView, retired: &mut Vec<Arc<CatalogSnapshot>>) {
         if self.poisoned {
             return;
         }
-        self.snapshots.remove(&ts);
+        if let Some(snapshot) = self.snapshots.remove(&ts) {
+            retired.push(snapshot);
+        }
         self.tokens.remove(&ts);
         match self.versions.binary_search_by_key(&ts, |(ts, _)| *ts) {
             Ok(index) => self.versions[index].1 = Arc::new(view),
@@ -782,7 +784,7 @@ impl Catalog {
         cache.ensure_live()?;
         if let Some((oldest, visible, token)) = cluster {
             cache.prune(oldest, visible, &mut retired);
-            self.refresh_locked(&mut cache, ts, token)?;
+            self.refresh_locked(&mut cache, ts, token, &mut retired)?;
         } else {
             self.prune_locked(&mut cache, &mut retired)?;
         }
@@ -894,6 +896,7 @@ impl Catalog {
         cache: &mut CatalogCache,
         ts: Ts,
         token: Option<u128>,
+        retired: &mut Vec<Arc<CatalogSnapshot>>,
     ) -> Result<(), CoreError> {
         let Some(token) = token else {
             return Ok(());
@@ -910,7 +913,7 @@ impl Catalog {
         }
         match cache.tokens.get_mut(&version) {
             Some((known, checked)) if *known == token => *checked = (*checked).max(ts),
-            _ => self.publish_loaded(cache, ts)?,
+            _ => self.publish_loaded(cache, ts, retired)?,
         }
         Ok(())
     }
@@ -920,9 +923,10 @@ impl Catalog {
     pub(crate) fn refresh_latest(&self) -> Result<(), CoreError> {
         let now = self.services.visible_ts()?;
         let token = self.refresh_token(now)?;
+        let mut retired = Vec::new();
         let mut cache = self.cache.lock().map_err(|_| corrupt("catalog cache mutex poisoned"))?;
         cache.ensure_live()?;
-        self.refresh_locked(&mut cache, now, token)
+        self.refresh_locked(&mut cache, now, token, &mut retired)
     }
 
     /// The committed catalog at `ts` (bounded below the cluster records on a gateway).
@@ -935,14 +939,14 @@ impl Catalog {
     }
 
     /// Loads the catalog at `ts` and publishes it, with its generation token on a gateway.
-    fn publish_loaded(&self, cache: &mut CatalogCache, ts: Ts) -> Result<(), CoreError> {
+    fn publish_loaded(&self, cache: &mut CatalogCache, ts: Ts, retired: &mut Vec<Arc<CatalogSnapshot>>) -> Result<(), CoreError> {
         let kv = self.services.read_view(ts);
         let view = load_view_until(&*kv, ts, catalog_end(&self.services))?;
         if matches!(self.services, TxnServices::Local { .. }) {
             self.current_version.store(0, std::sync::atomic::Ordering::Release);
             *self.current.write().map_err(|_| corrupt("catalog current lock poisoned"))? = None;
         }
-        cache.publish(ts, view);
+        cache.publish(ts, view, retired);
         if matches!(self.services, TxnServices::Local { .. }) && !cache.poisoned {
             self.current_version.store(ts.0, std::sync::atomic::Ordering::Release);
         }
@@ -1288,13 +1292,14 @@ impl Catalog {
             let snapshot = txn.snapshot_ts();
             let token = self.refresh_token(snapshot)?;
             let view = {
+                let mut retired = Vec::new();
                 let mut cache = self.cache.lock().map_err(|_| TxnError::Misuse)?;
                 cache.ensure_live()?;
-                self.refresh_locked(&mut cache, snapshot, token)?;
+                self.refresh_locked(&mut cache, snapshot, token, &mut retired)?;
                 match cache.view_at(snapshot) {
                     Some(view) => view,
                     None => {
-                        self.publish_loaded(&mut cache, snapshot)?;
+                        self.publish_loaded(&mut cache, snapshot, &mut retired)?;
                         cache.view_at(snapshot).unwrap()
                     }
                 }
@@ -1340,10 +1345,11 @@ impl Catalog {
                 None
             };
             let token = now.map(|now| self.refresh_token(now)).transpose()?.flatten();
+            let mut retired = Vec::new();
             let mut cache = self.cache.lock().map_err(|_| TxnError::Misuse)?;
             cache.ensure_live()?;
             if let Some(now) = now {
-                self.refresh_locked(&mut cache, now, token)?;
+                self.refresh_locked(&mut cache, now, token, &mut retired)?;
             }
             let latest = cache.versions.last().unwrap().1.by_name.get(name);
             if latest == base.as_ref() {
@@ -1571,7 +1577,7 @@ impl Catalog {
             && latest.sql_views.is_empty() && final_view.sql_views.is_empty()
         {
             return finish(txn, guard, |ts| {
-                cache.publish(ts, final_view);
+                cache.publish(ts, final_view, &mut retired);
                 self.current_version.store(ts.0, std::sync::atomic::Ordering::Release);
                 cache.prune(self.services.oldest_active(), ts, &mut retired);
                 Ok(())
@@ -1617,7 +1623,7 @@ impl Catalog {
                     return Err(TxnError::CommitAmbiguous);
                 }
             };
-            cache.publish(ts, view);
+            cache.publish(ts, view, &mut retired);
             if matches!(self.services, TxnServices::Local { .. }) {
                 self.current_version.store(ts.0, std::sync::atomic::Ordering::Release);
             }
