@@ -190,6 +190,10 @@ slot_reclaim_one() { # <slot dir> <lease text>; called under the lock
   fi
   if [[ "$dref" =~ ^refs/(gate|bench)-remote/[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]]; then
     g update-ref -d "$dref" 2>/dev/null && note="$note, removed $dref"
+    if [[ "$dref" == refs/bench-remote/* ]] &&
+       g show-ref --verify --quiet "$dref-base" && g update-ref -d "$dref-base" 2>/dev/null; then
+      note="$note, removed $dref-base"
+    fi
   fi
   # Release only the slot that was reclaimed, never one a new run took since.
   if [ "$(cat "$d/lease" 2>/dev/null || true)" != "$lease" ]; then

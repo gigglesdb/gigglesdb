@@ -10,7 +10,10 @@
 #   scripts/bench-remote.sh --tip <commit> --who <name> [matrix options]
 #   scripts/bench-remote.sh --build-snapshot --tip <commit> --who <name>
 # Matrix options (comma lists; defaults are the proper baseline):
+#   --base <commit>         compare against an ancestor of --tip in the same box
+#                           requires giggles-sql-base and giggles-sql in --targets
 #   --targets pg,giggles-sql[,giggles-native]   (default pg,giggles-sql)
+#                           add giggles-sql-base with --base and giggles-sql
 #   --clients 8,32          app-loadtest --clients values (default 8,32)
 #   --opset common          common = ops that pass on all three targets;
 #                           sql-full = every op GigglesDB SQL passes (pg and
@@ -47,13 +50,15 @@
 # (summary.md, results.jsonl, meta.json, logs.tar.gz).
 #
 # Start it only as a harness background task, never with a trailing `&` inside
-# a foreground call: a killed process group skips the cleanup trap. A run
-# killed that way is finished by the next gate or bench that takes a slot
-# (scripts/remote-slots.sh).
+# a foreground call: a killed process group skips the cleanup trap.
+# The next gate or bench that takes a slot cleans up the run (remote-slots.sh).
+#
+# Set BENCH_DRY_RUN=1 to verify the estimate, paths and bundle without a box.
 set -euo pipefail
 
-script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo=${GIGGLES_REPO:-$(dirname "$(git -C "$script_dir" rev-parse --path-format=absolute --git-common-dir)")}
+repo=$(cd "$repo" && pwd -P)
 boatdir=${GATE_TEST_BOATDIR:-J:/gigglesdb-work/boat}   # override for scripts/tests only
 B=${BOAT:-$HOME/.ascii/bin/boat.exe}
 snapshot=gigglesdb-bench-base
@@ -62,7 +67,7 @@ max_starts=200   # plan-included starts per day, all agents
 max_boxes=${GATE_MAX_BOXES:-10}   # concurrent boxes, account-wide, shared with gates
 type=large       # benches run on large only
 suite=matrix results_root=J:/gigglesdb-work/boat/bench
-tip='' who='' ttl=7200 slot_wait=1800 build_snapshot=0 profile=0
+tip='' base='' who='' ttl=7200 slot_wait=1800 build_snapshot=0 profile=0
 targets=pg,giggles-sql clients=8,32 mixes=read,write,tx protocols=all opset=common data_root=''
 warmup=30 duration=300 repeats=3 rows=1000 server_cpus='' client_cpus=''
 while [ $# -gt 0 ]; do
@@ -70,6 +75,7 @@ while [ $# -gt 0 ]; do
     --suite) suite=$2; shift 2 ;;
     --results-root) results_root=$2; shift 2 ;;
     --tip) tip=$2; shift 2 ;;
+    --base) base=$2; shift 2 ;;
     --who) who=$2; shift 2 ;;
     --ttl) ttl=$2; shift 2 ;;
     --slot-wait) slot_wait=$2; shift 2 ;;
@@ -99,25 +105,41 @@ case "$suite" in matrix|agent-load) ;; *) echo "bad --suite (matrix|agent-load)"
 if [ "$suite" = agent-load ] && { [ "$profile" = 1 ] || [ "$build_snapshot" = 1 ]; }; then
   echo "agent-load refuses --profile and --build-snapshot" >&2; exit 2
 fi
+if [ -n "$base" ] && { [ "$suite" != matrix ] || [ "$build_snapshot" = 1 ]; }; then
+  echo "--base requires a matrix benchmark" >&2; exit 2
+fi
+if [ -n "$base" ] && [[ ",$targets," != *",giggles-sql-base,"* ]]; then
+  echo "--base requires giggles-sql-base in --targets" >&2; exit 2
+fi
+if [[ ",$targets," == *",giggles-sql-base,"* ]] &&
+   { [ -z "$base" ] || [[ ",$targets," != *",giggles-sql,"* ]]; }; then
+  echo "giggles-sql-base requires --base and giggles-sql" >&2; exit 2
+fi
 if [ "$suite" = agent-load ]; then
   [[ -z "$data_root" || "$data_root" =~ ^/[A-Za-z0-9_./-]+$ ]] || { echo "bad --data-root (absolute box path)" >&2; exit 2; }
 fi
 if [ "$suite" = matrix ]; then
-[[ "$targets" =~ ^(pg|giggles-sql|giggles-native)(,(pg|giggles-sql|giggles-native))*$ ]] || { echo "bad --targets" >&2; exit 2; }
+[[ "$targets" =~ ^(pg|giggles-sql|giggles-sql-base|giggles-native)(,(pg|giggles-sql|giggles-sql-base|giggles-native))*$ ]] || { echo "bad --targets" >&2; exit 2; }
+IFS=, read -r -a target_list <<< "$targets"
+seen_targets=,
+for target in "${target_list[@]}"; do
+  if [[ "$seen_targets" == *",$target,"* ]]; then
+    echo "duplicate target '$target' in --targets" >&2; exit 2
+  fi
+  seen_targets+="$target,"
+done
 [[ "$clients" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "bad --clients" >&2; exit 2; }
 [[ "$mixes" =~ ^[a-z0-9=+]+(,[a-z0-9=+]+)*$ ]] || { echo "bad --mixes" >&2; exit 2; }
 [[ "$protocols" =~ ^(all|simple|extended|prepared)([+,](all|simple|extended|prepared))*$ ]] || { echo "bad --protocols" >&2; exit 2; }
 [[ "$opset" =~ ^(common|sql-full)$ ]] || { echo "bad --opset (common|sql-full)" >&2; exit 2; }
 if [ "$opset" = sql-full ] && [[ ",$targets," == *",giggles-native,"* ]]; then
-  echo "--opset sql-full is valid only for --targets pg,giggles-sql (giggles-native cannot run it)" >&2; exit 2
+  echo "--opset sql-full requires SQL targets (giggles-native cannot run it)" >&2; exit 2
 fi
 [[ -z "$data_root" || "$data_root" =~ ^/[A-Za-z0-9_./-]+$ ]] || { echo "bad --data-root (absolute box path)" >&2; exit 2; }
 for v in "$warmup" "$duration" "$repeats" "$rows"; do [[ "$v" =~ ^[0-9]+$ ]] || { echo "bad number $v" >&2; exit 2; }; done
 [ "$duration" -gt 0 ] && [ "$repeats" -gt 0 ] && [ "$rows" -ge 10 ] || { echo "duration/repeats must be > 0, rows >= 10" >&2; exit 2; }
 for v in "$server_cpus" "$client_cpus"; do [[ -z "$v" || "$v" =~ ^[0-9,-]+$ ]] || { echo "bad cpu list $v" >&2; exit 2; }; done
 fi
-[ -x "$B" ] || { echo "boat CLI not found at $B (set BOAT)" >&2; exit 5; }
-
 # Time estimate: each measured run costs warmup + duration + ~30s for server
 # restart, schema setup, seeding and teardown. Build and setup get a fixed 20
 # minutes. giggles-native runs once per (clients, mix), not per protocol.
@@ -155,13 +177,90 @@ if [ $build_snapshot = 0 ] && [ "$est" -gt "$budget" ]; then
   exit 2
 fi
 
-g() { git -C "$repo" "$@"; }
-tip=$(g rev-parse --verify "$tip^{commit}")
+bundle_repo=$repo
+g() { git -C "$bundle_repo" "$@"; }
+tip=$(g rev-parse --verify --end-of-options "$tip^{commit}")
+if [ -n "$base" ]; then
+  base=$(g rev-parse --verify --end-of-options "$base^{commit}")
+  g merge-base --is-ancestor "$base" "$tip" || { echo "--base must be an ancestor of --tip" >&2; exit 2; }
+fi
 short=${tip:0:12}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
+ref="refs/bench-remote/$stamp-$$"
+base_ref=$ref-base
+log() { echo "[bench-remote $(date -u +%T)] $*" >&2; }
+
+script_path() {
+  if [ -f "$script_dir/$1" ]; then
+    printf '%s\n' "$script_dir/$1"
+  elif [ -f "$repo/scripts/$1" ]; then
+    printf '%s\n' "$repo/scripts/$1"
+  else
+    log "cannot find $1 in $script_dir or $repo/scripts"
+    return 5
+  fi
+}
+runner=$script_dir/bench-remote-runner.sh
+[ -f "$runner" ] && [ -f "$script_dir/remote-slots.sh" ] || { log "missing runner or slot script in $script_dir"; exit 5; }
+setup_script=$(script_path bench-snapshot-setup.sh)
+if [ "$suite" = agent-load ]; then agent_runner=$(script_path bench-agent-load-runner.sh); fi
+
+if [ "$build_snapshot" = 1 ]; then
+  from=$gate_snapshot
+  snapshot_base=$(cat "$boatdir/base-commit.txt")
+else
+  from=$snapshot
+  snapshot_base=$(cat "$boatdir/bench-base-commit.txt" 2>/dev/null || cat "$boatdir/base-commit.txt")
+fi
+
+create_bundle() {
+  local bundle=$1 refs=("$ref") exclude=()
+  g update-ref "$ref" "$tip"
+  if [ -n "$base" ]; then
+    g update-ref "$base_ref" "$base"
+    refs+=("$base_ref")
+  fi
+  if g merge-base --is-ancestor "$snapshot_base" "$tip" &&
+     { [ -z "$base" ] || g merge-base --is-ancestor "$snapshot_base" "$base"; }; then
+    if [ "$snapshot_base" = "$tip" ] || [ "$snapshot_base" = "$base" ]; then
+      # Git omits an excluded ref from the bundle. Include the snapshot
+      # commit itself when it is a requested ref, excluding its parents.
+      exclude=(--not "$snapshot_base^@")
+    else
+      exclude=("^$snapshot_base")
+    fi
+  else
+    log "benchmark commits do not all descend from snapshot base $snapshot_base; sending full history"
+  fi
+  g bundle create "$bundle" "${refs[@]}" "${exclude[@]}"
+}
+
+if [ "${BENCH_DRY_RUN:-0}" = 1 ]; then
+  objects=$(g rev-parse --path-format=absolute --git-path objects)
+  dry_root=$(cd "${TEMP:-${TMPDIR:-/tmp}}" && pwd -P)
+  dry_dir=$(mktemp -d "$dry_root/bench-dry-run.XXXXXX")
+  cleanup_dry() {
+    if [ -d "$bundle_repo/objects" ]; then
+      g update-ref -d "$ref" || true
+      g update-ref -d "$base_ref" || true
+    fi
+    rm -rf -- "$dry_dir"
+  }
+  bundle_repo=$dry_dir/repo.git
+  trap cleanup_dry EXIT
+  git init --bare -q "$bundle_repo"
+  printf '%s\n' "$objects" > "$bundle_repo/objects/info/alternates"
+  create_bundle "$dry_dir/stack.bundle"
+  g bundle verify "$dry_dir/stack.bundle" >/dev/null 2>&1
+  printf 'runs=%s estimated_seconds=%s ttl_seconds=%s run_budget_seconds=%s\n' "$runs" "$est" "$ttl" "$budget"
+  printf 'repo=%s script_dir=%s runner=%s setup=%s\n' "$repo" "$script_dir" "$runner" "$setup_script"
+  g bundle list-heads "$dry_dir/stack.bundle"
+  exit 0
+fi
+
+[ -x "$B" ] || { echo "boat CLI not found at $B (set BOAT)" >&2; exit 5; }
 if [ $build_snapshot = 1 ]; then run="$results_root/snapshot-$stamp-$short-$who-$$"; else run="$results_root/$stamp-$short-$who-$$"; fi
 mkdir -p "$run" "$boatdir/slots"
-log() { echo "[bench-remote $(date -u +%T)] $*" >&2; }
 bj() { "$B" --no-update "$@"; }
 # BEGIN adopt_box (also exercised by the external dry-run driver)
 adopt_box() {
@@ -247,7 +346,7 @@ if [ "$used" -ge "$max_starts" ]; then
 fi
 
 # 2. Slot (atomic mkdir), released on exit; box deleted on every exit path.
-slot='' box='' boxname='' new_tried=0 ref="refs/bench-remote/$stamp-$$" started=$(date +%s)
+slot='' box='' boxname='' new_tried=0 started=$(date +%s)
 cleanup() {
   rc=$?
   if [ -z "$box" ] && [ "$new_tried" = 1 ] && [ -n "$boxname" ]; then
@@ -265,6 +364,7 @@ cleanup() {
   fi
   slot_release
   g update-ref -d "$ref" 2>/dev/null || true
+  [ -z "$base" ] || g update-ref -d "$base_ref" 2>/dev/null || true
   rm -f "$run/stack.bundle"
   exit $rc
 }
@@ -275,16 +375,8 @@ slot_acquire "$slot_wait" || { log "no free slot within ${slot_wait}s"; exit 4; 
 echo "pending $who $short $(date -u +%FT%TZ)" > "$boatdir/slots/$slot/owner"
 log "took $slot"
 
-# 3. Bundle the tip (commits after the snapshot's base when possible).
-if [ $build_snapshot = 1 ]; then from=$gate_snapshot; base=$(cat "$boatdir/base-commit.txt")
-else from=$snapshot; base=$(cat "$boatdir/bench-base-commit.txt" 2>/dev/null || cat "$boatdir/base-commit.txt"); fi
-g update-ref "$ref" "$tip"
-if g merge-base --is-ancestor "$base" "$tip"; then
-  g bundle create "$run/stack.bundle" "$ref" "^$base" 2>/dev/null
-else
-  log "tip does not descend from snapshot base $base; sending full history"
-  g bundle create "$run/stack.bundle" "$ref" 2>/dev/null
-fi
+# 3. Bundle the tip and, if requested, its comparison base.
+create_bundle "$run/stack.bundle"
 
 # 4. Box from the snapshot.
 log "starting $type box from $from"
@@ -305,15 +397,17 @@ slot_lease_write "$boatdir/slots/$slot"
 log "box $box ready"
 
 # 5. Ship the bundle and box-side scripts; check out the tip.
-here=$(cd "$(dirname "$0")" && pwd)
-[ "$suite" != agent-load ] || cp "$here/bench-agent-load-runner.sh" "$run/"
-cp "$here/bench-remote-runner.sh" "$here/bench-snapshot-setup.sh" "$run/"
+[ "$suite" != agent-load ] || cp "$agent_runner" "$run/bench-agent-load-runner.sh"
+cp "$runner" "$run/bench-remote-runner.sh"
+cp "$setup_script" "$run/bench-snapshot-setup.sh"
 extra_runner=''
 [ "$suite" != agent-load ] || extra_runner=bench-agent-load-runner.sh
 ( cd "$run" && for f in stack.bundle bench-remote-runner.sh bench-snapshot-setup.sh $extra_runner; do
     bj scp "$f" "$box:/home/user/$f" >/dev/null 2>&1 || exit 1
   done ) || { log "upload failed"; exit 5; }
-head=$(bexec "$box" "cd /home/user/gigglesdb && git fetch -q /home/user/stack.bundle '$ref:refs/bench/tip' && git checkout -q --detach $tip && git rev-parse HEAD")
+fetch_refs="'$ref:refs/bench/tip'"
+[ -z "$base" ] || fetch_refs+=" '$base_ref:refs/bench/base'"
+head=$(bexec "$box" "cd /home/user/gigglesdb && git fetch -q /home/user/stack.bundle $fetch_refs && git checkout -q --detach $tip && git rev-parse HEAD")
 [ "$(echo "$head" | tr -d '[:space:]')" = "$tip" ] || { log "checkout of $tip on box failed: $head"; exit 5; }
 
 wait_for() { # wait_for <done-file> <progress-file>
@@ -358,6 +452,7 @@ if [ "$suite" = agent-load ]; then
 else
 # 6. Run the bench in the background on the box and wait for it.
 envs="PROFILE=$profile TARGETS=$targets CLIENTS=$clients MIXES=$mixes PROTOCOLS=$protocols OPSET=$opset WARMUP=$warmup DURATION=$duration REPEATS=$repeats ROWS=$rows"
+[ -z "$base" ] || envs+=" BASE_COMMIT=$base"
 [ -n "$data_root" ] && envs+=" DATA_ROOT=$data_root"
 [ -n "$server_cpus" ] && envs+=" SERVER_CPUS=$server_cpus"
 [ -n "$client_cpus" ] && envs+=" CLIENT_CPUS=$client_cpus"

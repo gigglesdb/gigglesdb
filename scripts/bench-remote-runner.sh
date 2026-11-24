@@ -10,13 +10,14 @@
 # and the invariants), rc=1 otherwise, rc=2 when setup failed.
 #
 # Environment (set by bench-remote.sh): TARGETS CLIENTS MIXES PROTOCOLS WARMUP
-# DURATION REPEATS ROWS OPSET [SERVER_CPUS CLIENT_CPUS DATA_ROOT].
+# DURATION REPEATS ROWS OPSET [SERVER_CPUS CLIENT_CPUS DATA_ROOT BASE_COMMIT].
 set -uo pipefail
 source "$HOME/bench.env"
 repo=/home/user/gigglesdb
 out=/home/user/bench
 OPSET=${OPSET:-common}
 PROFILE=${PROFILE:-0}
+BASE_COMMIT=${BASE_COMMIT:-}
 profile_ran=0
 perf_version=""
 PROFILE_PHASE_BUDGET=1800
@@ -42,7 +43,7 @@ OPS_SQL_FULL=pk,email,pagination,keyset,search,range_in,join_sum,large_in,insert
 case "$OPSET" in
   common) OPS=$OPS_COMMON ;;
   sql-full) OPS=$OPS_SQL_FULL
-    [[ ",$TARGETS," == *",giggles-native,"* ]] && fail_setup "opset sql-full is valid only for pg,giggles-sql" ;;
+    [[ ",$TARGETS," == *",giggles-native,"* ]] && fail_setup "opset sql-full requires SQL targets" ;;
   *) fail_setup "unknown OPSET $OPSET" ;;
 esac
 
@@ -108,6 +109,21 @@ s=$(date +%s)
 build_s=$(( $(date +%s) - s ))
 gs=$CARGO_TARGET_DIR/release/giggles-server
 progress "build done in ${build_s}s"
+base_build_s=0
+gs_base=''
+if [ -n "$BASE_COMMIT" ]; then
+  base_repo=/home/user/gigglesdb-base
+  git -C "$repo" worktree add --detach "$base_repo" "$BASE_COMMIT" > "$out/logs/base-worktree.log" 2>&1 \
+    || fail_setup "base checkout (see logs/base-worktree.log)"
+  progress "cargo build --release giggles-server (base $BASE_COMMIT)"
+  s=$(date +%s)
+  ( cd "$base_repo/crates/giggles-server" &&
+    CARGO_TARGET_DIR=$CARGO_TARGET_DIR-base cargo build --release --bin giggles-server
+  ) > "$out/logs/build-base.log" 2>&1 || fail_setup "base release build (see logs/build-base.log)"
+  base_build_s=$(( $(date +%s) - s ))
+  gs_base=$CARGO_TARGET_DIR-base/release/giggles-server
+  progress "base build done in ${base_build_s}s"
+fi
 gs_profile=$gs
 profile_callgraph=dwarf
 profile_build_seconds=0
@@ -184,16 +200,16 @@ stop_proc() { # stop_proc <pid> <fd>: shutdown command, then INT, TERM, KILL
     for i in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return 0; }; sleep 0.5; done
   done
 }
-start_gg_proc() { # start_gg_proc <log-prefix> <args...>: sets gg_pid, gg_fd
-  local p=$1; shift
+start_gg_proc() { # start_gg_proc <binary> <log-prefix> <args...>: sets gg_pid, gg_fd
+  local binary=$1 p=$2; shift 2
   rm -f "$data/gg.ctl"; mkfifo "$data/gg.ctl"
-  env GIGGLES_OWNER_PASSWORD="$gg_pw" taskset -c "$SERVER_CPUS" "$gs" "$@" \
+  env GIGGLES_OWNER_PASSWORD="$gg_pw" taskset -c "$SERVER_CPUS" "$binary" "$@" \
     < "$data/gg.ctl" > "$p.out" 2> "$p.err" &
   gg_pid=$!
   exec {gg_fd}> "$data/gg.ctl"
 }
 start_server() { # start_server <target> <tag>
-  local t=$1 tag=$2
+  local t=$1 tag=$2 binary=$gs
   case "$t" in
     pg)
       rm -rf "$data/pg"; echo "$pg_pw" > "$data/pgpw"
@@ -211,13 +227,14 @@ full_page_writes = on
 CONF
       pin_server pg_ctl -D "$data/pg" -l "$out/logs/$tag.postgres.log" -w -t 60 start > /dev/null 2>&1 || return 1
       pg_up=1 ;;
-    giggles-sql|giggles-native)
+    giggles-sql|giggles-sql-base|giggles-native)
+      [ "$t" != giggles-sql-base ] || binary=$gs_base
       rm -rf "$data/gg"; mkdir -p "$data/gg"
-      start_gg_proc "$out/logs/$tag.create" --dev --data "$data/gg" --port $gg_pg --engine v2
+      start_gg_proc "$binary" "$out/logs/$tag.create" --dev --data "$data/gg" --port $gg_pg --engine v2
       wait_line "$out/logs/$tag.create.out" 'preview=single-host' 60 || { stop_proc "$gg_pid" "$gg_fd"; gg_pid='' gg_fd=''; return 1; }
       stop_proc "$gg_pid" "$gg_fd"; gg_pid='' gg_fd=''
       gg_config_json > "$data/gg/server.json"
-      start_gg_proc "$out/logs/$tag.server" "$data/gg/server.json"
+      start_gg_proc "$binary" "$out/logs/$tag.server" "$data/gg/server.json"
       wait_line "$out/logs/$tag.server.out" 'preview=single-host' 60 || return 1 ;;
   esac
 }
@@ -242,11 +259,14 @@ if has giggles-sql || has giggles-native; then
   stop_server
 fi
 gg_cfg_meta=$(fp=app-cert-sha256 gg_config_json)
+target_order="listed on every repeat"
+[ -z "$BASE_COMMIT" ] || target_order="listed on odd repeats, reversed on even repeats"
 python3 - "$out/meta.json" <<PY
 import json, sys, subprocess
 def sh(c): return subprocess.run(c, shell=True, capture_output=True, text=True).stdout.strip()
 meta = {
   "commit": sh("git -C $repo rev-parse HEAD"),
+  "base_commit": "$BASE_COMMIT" or None,
   "utc": sh("date -u +%FT%TZ"),
   "nproc": int(sh("nproc")),
   "cpu_model": sh("lscpu | sed -n 's/^Model name:[[:space:]]*//p'"),
@@ -264,14 +284,17 @@ meta = {
   "opset": "$OPSET", "ops": "$OPS",
   "node": sh("node --version"),
   "release_build_seconds": $build_s,
+  "base_release_build_seconds": $base_build_s if "$BASE_COMMIT" else None,
+  "target_order": "$target_order",
   "matrix": {"targets": "$TARGETS", "clients": "$CLIENTS", "mixes": "$MIXES", "protocols": "$PROTOCOLS",
              "warmup_s": $WARMUP, "duration_s": $DURATION, "repeats": $REPEATS, "rows": $ROWS},
 }
 json.dump(meta, open(sys.argv[1], "w"), indent=1)
 PY
 
-# 6. Matrix. Order: repeat > clients > mix > protocol > target, so targets
-# alternate and drift over the run hits all alike. giggles-native has no
+# 6. Matrix. Order: repeat > clients > mix > protocol > target.
+# With a comparison base, reverse the target order on even repeats.
+# giggles-native has no
 # protocol choice; it runs once per (clients, mix), labelled protocol=native.
 mixarg() {
   case "$1" in
@@ -286,7 +309,7 @@ loadtest() { # loadtest <target> <report> <log> <seconds> <clients> <mix> <proto
   [ -n "${LOAD_TIMEOUT:-}" ] && prefix=(timeout --kill-after=10 "$LOAD_TIMEOUT")
   case "$target" in
     pg) url=$pg_url; extra=(--protocols "$proto") ;;
-    giggles-sql) url=$gg_url; extra=(--protocols "$proto") ;;
+    giggles-sql|giggles-sql-base) url=$gg_url; extra=(--protocols "$proto") ;;
     giggles-native)
       # --url is the plaintext pgwire listener of the same server, used for
       # schema setup and seeding; operations go over HTTPS with mTLS.
@@ -299,10 +322,42 @@ loadtest() { # loadtest <target> <report> <log> <seconds> <clients> <mix> <proto
       --clients "$c" --duration "${secs}s" --rows "$ROWS" --mix "$mix" --ops "$OPS" \
       --max-error-rate 0 --report "$report" "${extra[@]}" ) > "$log" 2>&1
 }
+sample_prezero_tmpfiles() { # <server pid> <data dir>; run in the background
+  exec python3 - "$1" "$2" <<'PY'
+import os
+import sys
+import time
+
+fd_dir = f"/proc/{sys.argv[1]}/fd"
+data_prefix = os.path.realpath(sys.argv[2]) + "/"
+while True:
+    try:
+        entries = os.listdir(fd_dir)
+    except OSError:
+        break
+    count = 0
+    for entry in entries:
+        try:
+            target = os.readlink(os.path.join(fd_dir, entry))
+        except OSError:
+            continue
+        if target.startswith(data_prefix) and target.endswith(" (deleted)"):
+            count += 1
+    print(count, flush=True)
+    time.sleep(10)
+PY
+}
+
 overall=0
 IFS=, read -ra T <<< "$TARGETS"; IFS=, read -ra C <<< "$CLIENTS"
 IFS=, read -ra M <<< "$MIXES"; IFS=, read -ra P <<< "$PROTOCOLS"
-for r in $(seq 1 "$REPEATS"); do for c in "${C[@]}"; do for m in "${M[@]}"; do for p in "${P[@]}"; do for t in "${T[@]}"; do
+for r in $(seq 1 "$REPEATS"); do
+  ordered_targets=("${T[@]}")
+  if [ -n "$BASE_COMMIT" ] && (( r % 2 == 0 )); then
+    ordered_targets=()
+    for (( i=${#T[@]}-1; i>=0; i-- )); do ordered_targets+=("${T[i]}"); done
+  fi
+  for c in "${C[@]}"; do for m in "${M[@]}"; do for p in "${P[@]}"; do for t in "${ordered_targets[@]}"; do
   pl=$p
   if [ "$t" = giggles-native ]; then
     [ "$p" = "${P[0]}" ] || continue
@@ -322,19 +377,45 @@ for r in $(seq 1 "$REPEATS"); do for c in "${C[@]}"; do for m in "${M[@]}"; do f
       loadtest "$t" "$out/logs/$tag.warmup.json" "$out/logs/$tag.warmup.log" "$WARMUP" "$c" "$(mixarg "$m")" "$(protoarg "$p")"
     fi
     progress "run $tag"
+    sample_pid=''
+    if [[ "$t" == giggles-sql || "$t" == giggles-sql-base ]]; then
+      sample_prezero_tmpfiles "$gg_pid" "$data/gg" > "$out/logs/$tag.prezero-fds" &
+      sample_pid=$!
+    fi
     loadtest "$t" "$rep" "$out/logs/$tag.log" "$DURATION" "$c" "$(mixarg "$m")" "$(protoarg "$p")"; rc=$?
+    if [ -n "$sample_pid" ]; then
+      kill "$sample_pid" 2>/dev/null || true
+      wait "$sample_pid" 2>/dev/null || true
+    fi
     [ $rc = 0 ] || overall=1
     stop_server
   fi
   python3 - "$rep" "$out/results.jsonl" "$t" "$c" "$m" "$pl" "$r" "$rc" "$skip" <<'PY'
 import json, sys, os
+from pathlib import Path
 rep, res, t, c, m, p, r, rc, skip = sys.argv[1:]
 meta = json.load(open(os.path.join(os.path.dirname(res), "meta.json")))
 line = {"target": t, "clients": int(c), "mix": m, "protocol": p, "repeat": int(r), "exit": int(rc),
         "opset": meta["opset"], "duration_s": meta["matrix"]["duration_s"], "warmup_s": meta["matrix"]["warmup_s"],
         "rows": meta["matrix"]["rows"], "nproc": meta["nproc"], "cpu_model": meta["cpu_model"],
-        "server_cpus": meta["server_cpus"], "client_cpus": meta["client_cpus"], "commit": meta["commit"],
+        "server_cpus": meta["server_cpus"], "client_cpus": meta["client_cpus"],
+        "commit": {"giggles-sql-base": meta["base_commit"], "pg": None}.get(t, meta["commit"]),
         "data_fstype": meta["data_fstype"], "ops": {}, "protocols": {}}
+if t in ("giggles-sql", "giggles-sql-base"):
+    samples = []
+    warnings = []
+    try:
+        samples = Path(rep).with_suffix(".prezero-fds").read_text().splitlines()
+    except OSError:
+        pass
+    try:
+        with Path(rep).with_suffix(".server.err").open(errors="replace") as stderr:
+            warnings = [msg.rstrip("\n") for msg in stderr if "WAL prezero pool disabled" in msg]
+    except OSError:
+        pass
+    line.update(prezero_tmpfile_max=max((int(s) for s in samples if s.isdecimal()), default=None),
+                prezero_disabled_lines=len(warnings),
+                prezero_disabled_first_line=warnings[0] if warnings else None)
 if skip:
     line["skipped"] = skip
 else:
@@ -355,7 +436,8 @@ else:
         line["failed"] = True; line["blocker"] = "no report: %s" % e
 open(res, "a").write(json.dumps(line) + "\n")
 PY
-done; done; done; done; done
+  done; done; done; done
+done
 
 # Capture and processing run separately so every capture overlaps diagnostic load.
 # Redirects intentionally create user-owned artifacts; only collectors need root.
@@ -545,6 +627,8 @@ if [ "$PROFILE" = 1 ] && { has giggles-sql || has giggles-native; }; then
       [ "$t" = pg ] && continue
       [ "$t" = giggles-native ] && [ "$native_support" = 0 ] && continue
       tag="profile-$t-c$c"
+      callgraph=$profile_callgraph
+      [ "$t" != giggles-sql-base ] || callgraph=dwarf
       elapsed=$(( $(date +%s) - phase_start ))
       if [ $(( elapsed + PROFILE_TARGET_WORST )) -gt "$PROFILE_PHASE_BUDGET" ]; then
         progress "profile budget: skipping $tag and later targets (elapsed ${elapsed}s)"
@@ -558,7 +642,7 @@ if [ "$PROFILE" = 1 ] && { has giggles-sql || has giggles-native; }; then
           load_pid=$!
           # First progress line is after schema setup and seeding.
           if wait_line "$out/logs/$tag.log" 'completed=' 60; then
-            bench_profile "$gg_pid" "$out/profiles" "$t-c$c" "$tdl" "$profile_callgraph" "$out/progress" > "$out/logs/$tag.capture.txt" 2>&1 || progress "$tag capture failed (nonfatal)"
+            bench_profile "$gg_pid" "$out/profiles" "$t-c$c" "$tdl" "$callgraph" "$out/progress" > "$out/logs/$tag.capture.txt" 2>&1 || progress "$tag capture failed (nonfatal)"
           else progress "$tag load not ready; skipping captures"
           fi
           wait "$load_pid" || progress "$tag diagnostic load failed (nonfatal)"
@@ -589,8 +673,12 @@ out, build_s = sys.argv[1], sys.argv[2]
 meta = json.load(open(out + "/meta.json"))
 rows = [json.loads(l) for l in open(out + "/results.jsonl")]
 groups = {}
+comparisons = {}
 for r in rows:
-    groups.setdefault((r["target"], r["clients"], r["mix"], r["protocol"]), []).append(r)
+    config = r["clients"], r["mix"], r["protocol"]
+    groups.setdefault((r["target"], *config), []).append(r)
+    if r["target"] in ("giggles-sql", "giggles-sql-base"):
+        comparisons.setdefault(config, []).append(r)
 def med(v):
     v = [x for x in v if x is not None]
     return st.median(v) if v else None
@@ -615,17 +703,62 @@ L = ["# GigglesDB bench summary", "",
      f"GigglesDB: {meta['giggles']}; pgwire connections {meta['giggles_config']['postgresql']['connections']}, api sessions {meta['giggles_config']['api_limits']['sessions']}, service_limits {meta['giggles_config']['service_limits']}, role_statements {meta['giggles_config'].get('role_statements', 'default (16)')}",
      "",
      f"**{len(rows) - len(failed)} of {len(rows)} runs passed" + (f"; {len(failed)} FAILED (see notes)**" if failed else "**"), "",
-     "| target | clients | mix | protocol | ops/s | p50 ms | p99 ms | errors | repeats | ops/s per repeat | notes |",
-     "|---|---|---|---|---|---|---|---|---|---|---|"]
+     "| target | clients | mix | protocol | ops/s | p50 ms | p99 ms | errors | repeats | ops/s per repeat | prezero_tmpfile_max | prezero_disabled_lines | notes |",
+     "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+if meta["base_commit"]:
+    L[3:3] = [f"base `{meta['base_commit']}`, release build {meta['base_release_build_seconds']}s. Targets are {meta['target_order']}."]
 for (t, c, m, p), g in groups.items():
     ok = [r for r in g if "skipped" not in r]
     notes = sorted({why(r) for r in g} - {""})
     errs = sum(r.get("errors") or 0 for r in ok)
+    tmpfiles = max((r["prezero_tmpfile_max"] for r in g if r.get("prezero_tmpfile_max") is not None), default=None)
+    disabled = sum(r["prezero_disabled_lines"] for r in g) if "prezero_disabled_lines" in g[0] else None
     L.append(f"| {t} | {c} | {m} | {p} | {f(med([r.get('ops_per_s') for r in ok]))} | {f(med([r.get('p50_ms') for r in ok]),2)} | "
              f"{f(med([r.get('p99_ms') for r in ok]),2)} | {errs} | {len(ok)} | "
-             f"{' / '.join(f(r.get('ops_per_s')) for r in ok)} | {'; '.join(notes)} |")
+             f"{' / '.join(f(r.get('ops_per_s')) for r in ok)} | {f(tmpfiles, 0)} | {f(disabled, 0)} | {'; '.join(notes)} |")
 L += ["", "Medians across repeats. Latency is per app operation (all statements, retries, commit), in ms.",
+      "Pool columns show the maximum FD count and the total disabled warnings across repeats.",
       "Compare ratios between targets within one box; absolute numbers vary between cloud boxes."]
+
+metrics = "ops_per_s", "p50_ms", "p99_ms"
+def ratio(tip, base):
+    return f(tip / base if tip is not None and base else None, 3)
+
+if meta["base_commit"]:
+    for (c, m, p), runs in comparisons.items():
+        if not any(r["target"] == "giggles-sql-base" for r in runs):
+            continue
+        L += ["", f"## Base and tip, {c} clients, {m}, {p}", "",
+              "| repeat | binary | ops/s | p50 ms | p99 ms | prezero_tmpfile_max | prezero_disabled_lines |",
+              "|---|---|---|---|---|---|---|"]
+        repeats = {}
+        for r in runs:
+            binary = "base" if r["target"] == "giggles-sql-base" else "tip"
+            L.append(f"| {r['repeat']} | {binary} | {f(r.get('ops_per_s'))} | {f(r.get('p50_ms'), 2)} | "
+                     f"{f(r.get('p99_ms'), 2)} | {f(r.get('prezero_tmpfile_max'), 0)} | {f(r.get('prezero_disabled_lines'), 0)} |")
+            repeat = repeats.setdefault(r["repeat"], {})
+            if not (r.get("failed") or r.get("exit") or r.get("skipped")):
+                repeat[binary] = r
+        L += ["", "| tip/base | ops/s | p50 | p99 |", "|---|---|---|---|"]
+        matched = {metric: [] for metric in metrics}
+        for repeat, pair in repeats.items():
+            cells = []
+            for metric in metrics:
+                tip = pair.get("tip", {}).get(metric)
+                base = pair.get("base", {}).get(metric)
+                cells.append(ratio(tip, base))
+                if tip is not None and base is not None:
+                    matched[metric].append((tip, base))
+            L.append(f"| Repeat {repeat} | " + " | ".join(cells) + " |")
+        means = []
+        for pairs in matched.values():
+            if pairs:
+                tips, bases = zip(*pairs)
+                means.append(ratio(st.mean(tips), st.mean(bases)))
+            else:
+                means.append("-")
+        L.append("| Mean tip / mean base (matched runs) | " + " | ".join(means) + " |")
+
 for r in rows:
     L += ["", f"## Operations: {r['target']}, {r['clients']} clients, {r['mix']}, {r['protocol']}, repeat {r['repeat']}", "",
           "| target | clients | mix | op | count | p50 ms | p99 ms |",
