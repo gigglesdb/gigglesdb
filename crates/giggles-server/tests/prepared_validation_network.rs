@@ -350,3 +350,62 @@ async fn named_parameter_filter_rebinds_values() {
     drop(stream);
     f.stop().await;
 }
+
+#[tokio::test]
+async fn sql_prepared_cursor_checks_session_authorization_and_reset_role() {
+    let f = Fixture::new().await;
+    let mut stream = f.connect().await;
+    // The legacy role catalog only supports inheritable memberships.
+    // SUPERUSER applies only when reader is the active role.
+    let (reader, restricted) = if cfg!(feature = "engine-rocksdb") {
+        (
+            "CREATE ROLE reader",
+            "CREATE ROLE restricted NOINHERIT IN ROLE reader",
+        )
+    } else {
+        (
+            "CREATE ROLE reader SUPERUSER",
+            "CREATE ROLE restricted IN ROLE reader",
+        )
+    };
+    for sql in [
+        reader,
+        restricted,
+        "CREATE TABLE t(id int PRIMARY KEY)",
+        "INSERT INTO t VALUES (7)",
+    ] {
+        simple(&mut stream, sql).await;
+    }
+    if cfg!(feature = "engine-rocksdb") {
+        simple(&mut stream, "GRANT SELECT ON t TO reader").await;
+    }
+
+    for (sql, allowed) in [
+        ("PREPARE s AS SELECT id FROM public.t WHERE id = 7", true),
+        ("SET SESSION AUTHORIZATION restricted", false),
+        ("SET ROLE reader", true),
+        ("RESET ROLE", false),
+        ("RESET SESSION AUTHORIZATION", true),
+    ] {
+        simple(&mut stream, sql).await;
+        let frames = outcome(&mut stream, "s").await;
+        let rows: Vec<_> = frames
+            .iter()
+            .filter(|(tag, _)| *tag == b'D')
+            .map(|(_, body)| body.as_slice())
+            .collect();
+        let error = frames.iter().find(|(tag, _)| *tag == b'E');
+        if allowed {
+            assert!(error.is_none(), "{sql}: {frames:?}");
+            assert_eq!(rows, [b"\0\x01\0\0\0\x017".as_slice()], "{sql}");
+        } else {
+            assert!(rows.is_empty(), "{sql}: {frames:?}");
+            assert!(
+                error.is_some_and(|(_, body)| body.windows(7).any(|field| field == b"C42501\0")),
+                "{sql}: {frames:?}"
+            );
+        }
+    }
+    drop(stream);
+    f.stop().await;
+}

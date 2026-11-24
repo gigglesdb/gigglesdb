@@ -3412,10 +3412,7 @@ impl State {
                 r.end()?;
                 match kind {
                     b'S' => {
-                        if let Some(statement) = self.statements.get(&name) {
-                            statement.forget_cursor_plan(session);
-                        }
-                        self.remove_statement(&name);
+                        self.remove_statement(&name, session);
                     }
                     b'P' => {
                         self.portals.remove(&name);
@@ -4767,9 +4764,11 @@ mod prepared_validation_tests {
     use super::*;
 
     fn fixture() -> Session {
+        static NEXT_FIXTURE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = crate::test_support::fixture_root().join(format!(
-            "validation-memo-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            "validation-memo-{}-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         let admin = giggles_core::Admin::create_engine(path, giggles_core::Limits::default(), giggles_core::Engine::V2).unwrap();
         admin.roles().create(giggles_core::roles::NewRole {
             name: "owner".into(), login: true, superuser: true, ..Default::default()
@@ -4949,6 +4948,181 @@ mod prepared_validation_tests {
         assert!(session.sql.test_cursor_binding_liveness().is_none());
         let reply = message(&mut state, &mut session, b'Q', b"FETCH 1 FROM c\0").unwrap();
         assert!(reply.windows(SEVEN_ROW.len()).any(|frame| frame == SEVEN_ROW));
+    }
+
+    fn simple_sql(state: &mut State, session: &mut Session, sql: &str) -> Vec<u8> {
+        let mut query = Vec::new();
+        z(sql, &mut query);
+        message(state, session, b'Q', &query).unwrap_or_else(|code| panic!("{sql}: {code}"))
+    }
+
+    const BIND_SQL_PREPARED: &[u8] = b"p\0s\0\0\0\0\0\0\0";
+    const EXECUTE_PREPARED_PORTAL: &[u8] = b"p\0\0\0\0\0";
+
+    fn sql_prepared_cursor_fixture() -> (State, Session) {
+        let mut state = wire_state();
+        let mut session = fixture();
+        simple_sql(&mut state, &mut session, "CREATE TABLE t(id int PRIMARY KEY)");
+        simple_sql(&mut state, &mut session, "INSERT INTO t VALUES (7), (8)");
+        simple_sql(&mut state, &mut session, "PREPARE s AS SELECT id FROM public.t WHERE id = 7");
+        (state, session)
+    }
+
+    fn bind_and_execute_prepared_cursor(state: &mut State, session: &mut Session, row: &[u8]) {
+        assert_eq!(message(state, session, b'B', BIND_SQL_PREPARED).unwrap()[0], b'2');
+        let reply = message(state, session, b'E', EXECUTE_PREPARED_PORTAL).unwrap();
+        assert!(reply.starts_with(row), "{reply:?}");
+        assert_eq!(message(state, session, b'S', &[]).unwrap()[0], b'Z');
+    }
+
+    fn assert_sql_removal_releases_cursor_binding(sql: &str) {
+        let (mut state, mut session) = sql_prepared_cursor_fixture();
+        bind_and_execute_prepared_cursor(&mut state, &mut session, SEVEN_ROW);
+        let binding_is_live = session.sql.test_cursor_binding_liveness().unwrap();
+        assert!(binding_is_live());
+
+        simple_sql(&mut state, &mut session, sql);
+        assert!(!state.statements.contains_key("s"), "{sql}");
+        assert!(session.sql.test_cursor_binding_liveness().is_none(), "{sql} left a binding in the slot");
+        assert!(!binding_is_live(), "{sql} retained the bound query");
+    }
+
+    #[test]
+    fn sql_prepared_binding_released_by_deallocate() {
+        assert_sql_removal_releases_cursor_binding("DEALLOCATE s");
+    }
+
+    #[test]
+    fn sql_prepared_binding_released_by_deallocate_all() {
+        assert_sql_removal_releases_cursor_binding("DEALLOCATE ALL");
+    }
+
+    #[test]
+    fn sql_prepared_binding_released_by_discard_all() {
+        assert_sql_removal_releases_cursor_binding("DISCARD ALL");
+    }
+
+    const EIGHT_ROW: &[u8] = b"D\0\0\0\x0b\0\x01\0\0\0\x018";
+
+    #[test]
+    fn sql_prepared_replacement_binds_same_and_different_sql_afresh() {
+        let (mut state, mut session) = sql_prepared_cursor_fixture();
+        bind_and_execute_prepared_cursor(&mut state, &mut session, SEVEN_ROW);
+
+        for (id, row) in [(7, SEVEN_ROW), (8, EIGHT_ROW)] {
+            simple_sql(&mut state, &mut session, "DEALLOCATE s");
+            simple_sql(
+                &mut state,
+                &mut session,
+                &format!("PREPARE s AS SELECT id FROM public.t WHERE id = {id}"),
+            );
+            let before = giggles_core::SqlSession::test_cursor_query_binds();
+            bind_and_execute_prepared_cursor(&mut state, &mut session, row);
+            let binding_is_live = session.sql.test_cursor_binding_liveness().unwrap();
+            assert!(binding_is_live());
+            assert_eq!(giggles_core::SqlSession::test_cursor_query_binds(), before + 1);
+
+            bind_and_execute_prepared_cursor(&mut state, &mut session, row);
+            assert!(binding_is_live());
+            assert_eq!(giggles_core::SqlSession::test_cursor_query_binds(), before + 1);
+        }
+    }
+
+    #[test]
+    fn sql_prepared_bound_portal_executes_uncached_after_statement_removal_or_refresh() {
+        for sql in ["DEALLOCATE s", "DISCARD PLANS"] {
+            let (mut state, mut session) = sql_prepared_cursor_fixture();
+            bind_and_execute_prepared_cursor(&mut state, &mut session, SEVEN_ROW);
+            let binding_is_live = session.sql.test_cursor_binding_liveness().unwrap();
+            assert!(binding_is_live());
+
+            // A named portal survives Sync and a simple query in this transaction.
+            simple_sql(&mut state, &mut session, "BEGIN");
+            assert_eq!(message(&mut state, &mut session, b'B', BIND_SQL_PREPARED).unwrap()[0], b'2');
+            assert_eq!(message(&mut state, &mut session, b'S', &[]).unwrap()[0], b'Z');
+            simple_sql(&mut state, &mut session, sql);
+            if sql == "DISCARD PLANS" {
+                // Describing the statement refreshes the discarded plan while
+                // the already-bound portal keeps the previous plan.
+                assert_eq!(message(&mut state, &mut session, b'D', b"Ss\0").unwrap()[0], b't');
+            }
+            assert!(!binding_is_live(), "{sql}");
+            assert!(session.sql.test_cursor_binding_liveness().is_none(), "{sql}");
+            execute_bound_seven_and_sync(&mut state, &mut session);
+            simple_sql(&mut state, &mut session, "ROLLBACK");
+        }
+    }
+
+    #[test]
+    fn sql_prepared_discard_plans_releases_old_binding_on_rebind() {
+        let (mut state, mut session) = sql_prepared_cursor_fixture();
+        bind_and_execute_prepared_cursor(&mut state, &mut session, SEVEN_ROW);
+        let old_binding_is_live = session.sql.test_cursor_binding_liveness().unwrap();
+        assert!(old_binding_is_live());
+
+        simple_sql(&mut state, &mut session, "DISCARD PLANS");
+        assert_eq!(message(&mut state, &mut session, b'B', BIND_SQL_PREPARED).unwrap()[0], b'2');
+        assert!(!old_binding_is_live());
+        assert!(session.sql.test_cursor_binding_liveness().is_none());
+
+        let before = giggles_core::SqlSession::test_cursor_query_binds();
+        let reply = message(&mut state, &mut session, b'E', EXECUTE_PREPARED_PORTAL).unwrap();
+        assert!(reply.starts_with(SEVEN_ROW), "{reply:?}");
+        assert_eq!(message(&mut state, &mut session, b'S', &[]).unwrap()[0], b'Z');
+        assert!(session.sql.test_cursor_binding_liveness().unwrap()());
+        assert_eq!(giggles_core::SqlSession::test_cursor_query_binds(), before + 1);
+    }
+
+    #[test]
+    fn sql_prepared_cursor_tracks_search_path_settings_and_rollback() {
+        let mut state = wire_state();
+        let mut session = fixture();
+        for sql in [
+            "CREATE SCHEMA alternate",
+            "CREATE TABLE public.t(id int PRIMARY KEY)",
+            "CREATE TABLE alternate.t(id int PRIMARY KEY)",
+            "INSERT INTO public.t VALUES (7)",
+            "INSERT INTO alternate.t VALUES (8)",
+            "PREPARE s AS SELECT id FROM t",
+        ] {
+            simple_sql(&mut state, &mut session, sql);
+        }
+        bind_and_execute_prepared_cursor(&mut state, &mut session, SEVEN_ROW);
+
+        for (commands, row) in [
+            (&["SELECT set_config('search_path', 'alternate, public', false)"][..], EIGHT_ROW),
+            (&["RESET search_path"][..], SEVEN_ROW),
+            (&["BEGIN", "SET LOCAL search_path TO alternate, public"][..], EIGHT_ROW),
+            (&["ROLLBACK"][..], SEVEN_ROW),
+        ] {
+            for sql in commands {
+                simple_sql(&mut state, &mut session, sql);
+            }
+            let before = giggles_core::SqlSession::test_cursor_query_binds();
+            bind_and_execute_prepared_cursor(&mut state, &mut session, row);
+            let binding_is_live = session.sql.test_cursor_binding_liveness().unwrap();
+            assert!(binding_is_live(), "{commands:?}");
+            assert_eq!(giggles_core::SqlSession::test_cursor_query_binds(), before + 1, "{commands:?}");
+            if session.in_transaction() {
+                assert_eq!(message(&mut state, &mut session, b'C', b"Pp\0").unwrap()[0], b'3');
+            }
+            bind_and_execute_prepared_cursor(&mut state, &mut session, row);
+            assert!(binding_is_live(), "{commands:?}");
+            assert_eq!(giggles_core::SqlSession::test_cursor_query_binds(), before + 1, "{commands:?}");
+        }
+    }
+
+    #[test]
+    fn sql_prepared_execute_utility_leaves_cursor_binding_slot_empty() {
+        let (mut state, mut session) = sql_prepared_cursor_fixture();
+        let reply = simple_sql(&mut state, &mut session, "EXECUTE s");
+        assert!(reply.windows(SEVEN_ROW.len()).any(|frame| frame == SEVEN_ROW));
+        assert!(session.sql.test_cursor_binding_liveness().is_none());
+
+        parse_unnamed(&mut state, &mut session, "EXECUTE s", &[]);
+        let bind = b"p\0\0\0\0\0\0\0\0";
+        assert_eq!(message(&mut state, &mut session, b'B', bind).unwrap()[0], b'2');
+        execute_bound_seven_and_sync(&mut state, &mut session);
     }
 
     #[test]

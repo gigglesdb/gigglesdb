@@ -444,10 +444,11 @@ impl State {
         self.statements.insert(name, statement);
     }
 
-    pub(super) fn remove_statement(&mut self, name: &str) -> bool {
+    pub(super) fn remove_statement(&mut self, name: &str, session: &Session) -> bool {
         let Some(statement) = self.statements.remove(name) else {
             return false;
         };
+        statement.forget_cursor_plan(session);
         if !name.is_empty() {
             self.named_statement_bytes -= statement.sql_bytes;
         }
@@ -466,8 +467,14 @@ impl State {
         }
     }
 
-    fn deallocate_all(&mut self) {
-        self.statements.retain(|name, _| name.is_empty());
+    fn deallocate_all(&mut self, session: &Session) {
+        self.statements.retain(|name, statement| {
+            if name.is_empty() {
+                return true;
+            }
+            statement.forget_cursor_plan(session);
+            false
+        });
         self.named_statement_bytes = 0;
     }
 
@@ -903,13 +910,13 @@ impl State {
                 "PREPARE"
             }
             Command::Deallocate(Some(name)) => {
-                if !self.remove_statement(&name) {
+                if !self.remove_statement(&name, session) {
                     return Err(self.missing_statement(&name));
                 }
                 "DEALLOCATE"
             }
             Command::Deallocate(None) => {
-                self.deallocate_all();
+                self.deallocate_all(session);
                 "DEALLOCATE ALL"
             }
             Command::Discard(Discard::Plans) => {
@@ -949,7 +956,7 @@ impl State {
                     .reset_all(replication_role_allowed(session)?, false);
                 session.sync_role_settings(&mut self.settings.current)?;
                 settings_status(&before, &self.settings, session, out)?;
-                self.deallocate_all();
+                self.deallocate_all(session);
                 session
                     .service
                     .advisory
