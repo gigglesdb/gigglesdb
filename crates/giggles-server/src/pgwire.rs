@@ -1341,7 +1341,23 @@ fn catalog_input_override(
                 || (matches!(declared, 19 | 25 | 1043) && matches!(inferred, 19 | 25 | 1043)))
 }
 
+fn catalog_only_parameter_declaration(oid: u32) -> bool {
+    matches!(oid, 18 | 26 | 1002)
+}
+
+fn application_declared_type(oid: u32) -> Option<DataType> {
+    // Let application binding determine its own types and diagnostics before
+    // validating these catalog-only declarations, as it does for name.
+    if catalog_only_parameter_declaration(oid) {
+        return None;
+    }
+    core_declared_type(oid)
+}
+
 fn sql_declared_type(ty: &DataType, declared: u32) -> Option<DataType> {
+    if catalog_only_parameter_declaration(declared) {
+        return None;
+    }
     if declared == 0 || declared == oid(ty) {
         return Some(ty.clone());
     }
@@ -1409,7 +1425,7 @@ fn prepare_declared_sql_diagnostic(
 ) -> R<(Plan, Description, giggles_core::relational::EnumParameters)> {
     let declared = oids
         .iter()
-        .map(|&o| core_declared_type(o))
+        .map(|&o| application_declared_type(o))
         .collect::<Vec<_>>();
     let prepared = diagnostic.core(if unnamed { session.prepare_unnamed(sql, &declared) } else { session.prepare_with_parameter_types(sql, &declared) })?;
     let prepared = if oids.len() <= prepared.parameter_count() {
@@ -1439,7 +1455,7 @@ fn prepare_protected_sql(
 ) -> R<(Prepared, Description)> {
     let declared = oids
         .iter()
-        .map(|&o| core_declared_type(o))
+        .map(|&o| application_declared_type(o))
         .collect::<Vec<_>>();
     // A task refusal (the column rules) keeps its own message.
     let prepared = diagnostic.core(session.prepare_protected(class, sql, &declared))?;
@@ -2506,7 +2522,7 @@ impl State {
                 }
                 continue;
             }
-            if o != 0 && o != parameter_oids[i] {
+            if o != 0 && (o != parameter_oids[i] || catalog_only_parameter_declaration(o)) {
                 // Application integer parameters share Value::Int, but
                 // decode using the client's declared wire width. Core
                 // still enforces the destination range at execution.

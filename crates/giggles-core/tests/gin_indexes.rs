@@ -113,3 +113,42 @@ fn gin_indexes_legacy_lifecycle() {
 fn gin_indexes_v2_lifecycle() {
     lifecycle(Engine::V2);
 }
+
+
+fn non_gin_rename_refusals(engine: Engine) {
+    let path = common::fresh("non-gin-rename-refusals");
+    let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
+    let mut sql = admin.sql_session();
+    run(&mut sql, "CREATE TABLE t(a int PRIMARY KEY, s text UNIQUE)");
+    run(&mut sql, "CREATE INDEX t_s ON t(s)");
+    for statement in [
+        "ALTER INDEX missing_idx RENAME TO x",
+        "ALTER INDEX IF EXISTS missing_idx RENAME TO x",
+        "ALTER INDEX t RENAME TO x",
+        "ALTER INDEX t_pkey RENAME TO x",
+        "ALTER INDEX t_s_key RENAME TO x",
+        "ALTER INDEX t_s RENAME TO x",
+        "ALTER INDEX missing_schema.missing_idx RENAME TO x",
+        "ALTER INDEX t_s SET (fillfactor = 50)",
+        "ALTER INDEX t_s RENAME x",
+        "ALTER INDEX CONCURRENTLY t_s RENAME TO x",
+        "ALTER INDEX pg_catalog.pg_class RENAME TO x",
+        "ALTER INDEX t_s RENAME TO pg_reserved",
+    ] {
+        let error = sql.prepare(statement).unwrap_err();
+        assert_eq!(sqlstate(&error), "42601", "prepare: {statement}");
+        let error = sql.execute(statement, &[], None).unwrap_err();
+        assert_eq!(sqlstate(&error), "42601", "execute: {statement}");
+    }
+}
+
+#[test]
+fn non_gin_rename_refusals_legacy() {
+    non_gin_rename_refusals(Engine::Legacy);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn non_gin_rename_refusals_v2() {
+    non_gin_rename_refusals(Engine::V2);
+}

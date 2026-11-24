@@ -203,7 +203,7 @@ fn parse_drop_impl(p: &mut Parser, authority_only: bool) -> R<DropIndex> {
     }
     p.need("index")?;
     if p.word("concurrently") {
-        return Err(SqlError::Unsupported);
+        return Err(if alter { SqlError::Syntax } else { SqlError::Unsupported });
     }
     let optional = p.word("if");
     if optional {
@@ -212,13 +212,24 @@ fn parse_drop_impl(p: &mut Parser, authority_only: bool) -> R<DropIndex> {
     let name = if authority_only {
         let first = p.raw_name()?;
         if p.sym('.') { relation_key(&first, &p.raw_name()?) } else { first }
+    } else if alter {
+        // Resolve the index before applying name policy: every non-GIN
+        // rename retains the syntax error from before GIN renames existed.
+        let first = p.raw_name()?;
+        let (schema, name) = if p.sym('.') {
+            (Some(first), p.raw_name()?)
+        } else {
+            (None, first)
+        };
+        p.relations.push(schemas::Reference::read(name.clone(), schema.clone()));
+        schema.map_or(name.clone(), |schema| format!("{schema}\0{name}"))
     } else {
         p.table_name()?
     };
     let rename = if alter {
         p.need("rename")?;
         p.need("to")?;
-        Some(p.name()?)
+        Some(p.raw_name()?)
     } else { None };
     let cascade = !alter && p.word("cascade");
     if !alter && !cascade {

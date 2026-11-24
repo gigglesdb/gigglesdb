@@ -500,6 +500,7 @@ async fn application_inquiry_contextual_casts_on(engine: giggles_core::Engine) {
             }
         }
     }
+    application_parameter_refusals_wire(&owner).await;
     drop(owner);
     f.finish().await;
 }
@@ -558,4 +559,106 @@ async fn w1e_execution_search_path() {
     assert_eq!(e.code().unwrap().code(), "42703");
     Protocol::Simple.ok(&owner, "ROLLBACK").await;
     drop(owner); f.finish().await;
+}
+
+async fn application_parameter_refusals_wire(client: &tokio_postgres::Client) {
+    use tokio_postgres::types::Type;
+
+    for sql in [
+        "CREATE TABLE t(a int PRIMARY KEY, s text UNIQUE)",
+        "INSERT INTO t VALUES (1, 'x')",
+        "CREATE INDEX t_s ON t(s)",
+    ] {
+        Protocol::Simple.ok(client, sql).await;
+    }
+
+    // Main rejects the application declaration after binding. Preserve the
+    // binding error where the query cannot infer the parameter on its own.
+    for (sql, code) in [
+        (r#"PREPARE p6("char") AS SELECT $1"#, "0A000"),
+        ("EXECUTE p6('a')", "26000"),
+        (r#"EXECUTE p6('\303')"#, "26000"),
+        ("EXECUTE p6('ab')", "26000"),
+        (r#"PREPARE pchar_array("char"[]) AS SELECT $1"#, "0A000"),
+        ("EXECUTE pchar_array('{a}')", "26000"),
+        ("PREPARE p2(oid) AS SELECT $1", "0A000"),
+        ("EXECUTE p2('0x10')", "26000"),
+        ("EXECUTE p2('-1')", "26000"),
+        ("PREPARE p9(oid) AS SELECT $1 FROM t ORDER BY $1", "42804"),
+        ("EXECUTE p9('0x10')", "26000"),
+        ("PREPARE p5(oid) AS SELECT a FROM t WHERE $1 IS NOT NULL", "42804"),
+        ("EXECUTE p5(3)", "26000"),
+        ("PREPARE p10(name) AS SELECT $1", "0A000"),
+        ("PREPARE p1 AS SELECT $1::oid", "0A000"),
+        ("EXECUTE p1('1')", "26000"),
+        ("EXECUTE p1('0x10')", "26000"),
+        ("EXECUTE p1('4294967296')", "26000"),
+        ("PREPARE p3(text) AS SELECT $1::oid", "0A000"),
+        ("EXECUTE p3('5')", "26000"),
+        ("PREPARE p4(int) AS SELECT $1::oid", "0A000"),
+        ("EXECUTE p4(5)", "26000"),
+        ("PREPARE p8(oid) AS SELECT $1::regconfig", "0A000"),
+        ("EXECUTE p8(3748)", "26000"),
+        ("ALTER INDEX missing_idx RENAME TO x", "42601"),
+        ("ALTER INDEX IF EXISTS missing_idx RENAME TO x", "42601"),
+        ("ALTER INDEX t RENAME TO x", "42601"),
+        ("ALTER INDEX t_pkey RENAME TO x", "42601"),
+        ("ALTER INDEX t_s_key RENAME TO x", "42601"),
+        ("ALTER INDEX t_s RENAME TO x", "42601"),
+        ("ALTER INDEX missing_schema.missing_idx RENAME TO x", "42601"),
+        ("ALTER INDEX t_s SET (fillfactor = 50)", "42601"),
+        ("ALTER INDEX t_s RENAME x", "42601"),
+    ] {
+        let error = client.simple_query(sql).await.unwrap_err();
+        assert_eq!(error.code().unwrap().code(), code, "{sql}");
+    }
+    for (sql, value, code) in [
+        ("SELECT $1::oid", "1", "0A000"),
+        ("SELECT $1::oid", "0x10", "0A000"),
+        ("SELECT $1::oid", "-1", "0A000"),
+        ("SELECT $1::oid", "4294967296", "0A000"),
+        ("SELECT $1::oid", "abc", "0A000"),
+        ("SELECT $1::oid, a FROM t", "7", "0A000"),
+        ("SELECT CAST($1 AS oid)", "7", "0A000"),
+        ("SELECT a FROM t WHERE a = $1::oid", "1", "0A000"),
+        ("SELECT a FROM t WHERE $1::oid IS NOT NULL", "7", "0A000"),
+        ("SELECT $1::oid::text", "7", "0A000"),
+        (r#"SELECT $1::"char""#, "a", "0A000"),
+        (r#"SELECT $1::"char"[]"#, "{a}", "0A000"),
+        ("SELECT $1::name", "x", "0A000"),
+        ("SELECT pg_has_role($1::oid, 'owner', 'MEMBER') FROM t", "10", "42804"),
+    ] {
+        let error = client.query(sql, &[&value]).await.unwrap_err();
+        assert_eq!(error.code().unwrap().code(), code, "{sql} [{value}]");
+    }
+    for ty in [Type::OID, Type::CHAR, Type::CHAR_ARRAY, Type::NAME] {
+        for (sql, code) in [
+            ("SELECT $1", "0A000"),
+            ("SELECT $1 FROM t ORDER BY $1", "42804"),
+            ("SELECT a FROM t WHERE $1 IS NOT NULL", "42804"),
+        ] {
+            let error = client.prepare_typed(sql, std::slice::from_ref(&ty)).await.unwrap_err();
+            assert_eq!(error.code().unwrap().code(), code, "{sql}: {ty}");
+        }
+    }
+    let error = client.prepare_typed("SELECT $1::oid::regconfig", &[Type::OID]).await.unwrap_err();
+    assert_eq!(error.code().unwrap().code(), "0A000");
+    for (sql, ty) in [
+        ("SELECT oid FROM pg_catalog.pg_class WHERE oid=$1", Type::OID),
+        ("SELECT relkind FROM pg_catalog.pg_class WHERE relkind=$1", Type::CHAR),
+        ("SELECT relkind FROM pg_catalog.pg_class WHERE relkind=ANY($1)", Type::CHAR_ARRAY),
+    ] {
+        let statement = client.prepare_typed(sql, std::slice::from_ref(&ty)).await.unwrap();
+        assert_eq!(statement.params(), &[ty], "{sql}");
+    }
+    for sql in [
+        "PREPARE unused_oid(oid) AS SELECT 1",
+        r#"PREPARE unused_char("char") AS SELECT 1"#,
+        "PREPARE p7(regconfig) AS SELECT to_tsvector($1, 'cats')",
+    ] {
+        client.simple_query(sql).await.unwrap();
+    }
+    let rows = client.simple_query("EXECUTE p7('english')").await.unwrap();
+    assert!(rows.iter().any(|message| matches!(message,
+        tokio_postgres::SimpleQueryMessage::Row(row) if row.get(0) == Some("'cat':1"))));
 }

@@ -4517,6 +4517,11 @@ impl SqlSession {
 
     pub(crate) fn prepare_leased(&mut self, sql: &str, db: Option<&EngineLease>) -> Result<relational::Prepared, CoreError> {
         let p = self.prepare_unruled(sql, db)?;
+        // GIN lookup decides whether ALTER INDEX is supported syntax.
+        if p.command() == "ALTER INDEX" {
+            self.inspect_metadata_leased(db, |s| p.bind_schemas(&s.sql).map(|_| ()).map_err(CoreError::Sql))
+                .inspect_err(|_| self.abort())?;
+        }
         if self.task.is_none() {
             return Ok(p);
         }

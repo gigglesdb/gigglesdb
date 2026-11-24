@@ -243,7 +243,7 @@ impl State {
                 {
                     return Err("0A000");
                 }
-            } else if o != oid(t) {
+            } else if o != oid(t) || catalog_only_parameter_declaration(o) {
                 if !matches!(p, Plan::Sql(_) | Plan::Protected(_)) {
                     return Err("0A000");
                 }
@@ -435,7 +435,7 @@ impl State {
                 .core(Err(CoreError::Task(TaskError::OperationIdRequired)));
         }
         admit(&mut self.diagnostic, session, class)?;
-        let declared = oids.iter().map(|&oid| core_declared_type(oid)).collect::<Vec<_>>();
+        let declared = oids.iter().map(|&oid| application_declared_type(oid)).collect::<Vec<_>>();
         let prepared = session.prepare_with_parameter_types(sql, &declared);
         if let Err(error @ CoreError::Task(_)) = &prepared {
             self.diagnostic.task_refusal = Some((class, error.clone()));

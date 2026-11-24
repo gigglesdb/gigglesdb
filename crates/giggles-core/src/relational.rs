@@ -3434,6 +3434,11 @@ impl Prepared {
         if types.len() > self.params {
             return Err(SqlError::Parameters);
         }
+        if types.iter().flatten().any(|ty| matches!(ty,
+            DataType::Oid | DataType::PgChar | DataType::PgCharArray))
+        {
+            return Err(SqlError::Unsupported);
+        }
         if matches!(
             self.statement.get(),
             Statement::Query(_)
@@ -4742,13 +4747,6 @@ impl Relational {
                     .iter()
                     .find(|d| d.name == index.name)
                     .cloned();
-                if index.rename.is_some()
-                    && (descriptor.is_some() || sql_index::primary_table(self, &index.name).is_some())
-                {
-                    // Only GIN indexes support renames. Keep the existing
-                    // syntax refusal for regular indexes.
-                    return Err(SqlError::Syntax);
-                }
                 if let Some(descriptor) = descriptor {
                     if self.ext.constraints.values().flatten().any(|c|
                         matches!(c.kind, ConstraintKind::Unique { index, .. } if index == descriptor.id)) {

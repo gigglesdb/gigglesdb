@@ -1494,7 +1494,7 @@ impl Scalar {
             a.bind(resolve, tables, parameters)?
         };
         if *ty == DataType::Oid && !text_search_argument
-            && !matches!(a.ty, DataType::Oid | DataType::RegConfig | DataType::RegDictionary)
+            && !matches!(a.ty, DataType::RegConfig | DataType::RegDictionary)
         {
             return Err(SqlError::Unsupported);
         }

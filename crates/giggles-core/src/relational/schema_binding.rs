@@ -236,6 +236,12 @@ impl Prepared {
             Statement::CreateIndex(index) => read(&mut index.table),
             Statement::DropIndex(index) => {
                 index.name = state.resolve_index_key(&index.name, &self.search_path);
+                if let Some(rename) = &index.rename {
+                    if state.gin_index(&index.name).is_none() {
+                        return Err(SqlError::Syntax);
+                    }
+                    ident::ident(rename)?;
+                }
                 index.table = state.index_table_key(&index.name);
             }
             Statement::Sequence(ddl) => ddl.bind_schema_names(&read, &create)?,

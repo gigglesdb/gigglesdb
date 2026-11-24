@@ -793,3 +793,60 @@ fn text_search_review_legacy() {
 fn text_search_review_v2() {
     review_fixes(Engine::V2);
 }
+
+
+fn application_parameter_refusals(engine: Engine) {
+    let path = common::fresh("text-search-application-parameters");
+    let limits = Limits::default();
+    {
+        let admin = Admin::create_engine(&path, limits, engine).unwrap();
+        let mut sql = admin.sql_session();
+        run(&mut sql, "CREATE TABLE t(a int PRIMARY KEY, s text UNIQUE)");
+        run(&mut sql, "INSERT INTO t VALUES (1, 'x')");
+    }
+    let admin = Admin::open(&path, limits).unwrap();
+    let mut session = admin.sql_session();
+    for (query, input, code) in [
+        ("SELECT $1::oid", "1", "0A000"),
+        ("SELECT $1::oid", "0x10", "0A000"),
+        ("SELECT $1::oid", "-1", "0A000"),
+        ("SELECT $1::oid", "4294967296", "0A000"),
+        ("SELECT $1::oid", "abc", "0A000"),
+        ("SELECT $1::oid, a FROM t", "7", "0A000"),
+        ("SELECT CAST($1 AS oid)", "7", "0A000"),
+        ("SELECT a FROM t WHERE a = $1::oid", "1", "0A000"),
+        ("SELECT a FROM t WHERE $1::oid IS NOT NULL", "7", "0A000"),
+        ("SELECT $1::oid::text", "7", "0A000"),
+        (r#"SELECT $1::"char""#, "a", "0A000"),
+        (r#"SELECT $1::"char"[]"#, "{a}", "0A000"),
+        ("SELECT $1::name", "x", "0A000"),
+        ("SELECT pg_has_role($1::oid, 'owner', 'MEMBER') FROM t", "10", "42804"),
+    ] {
+        let error = session.prepare(query).and_then(|p| session.describe(&p)).unwrap_err();
+        assert_eq!(sqlstate(&error), code, "describe: {query}");
+        let error = session.execute(query, &[text(input)], None).unwrap_err();
+        assert_eq!(sqlstate(&error), code, "execute: {query} [{input}]");
+    }
+    for query in [
+        "SELECT $1",
+        "SELECT $1 FROM t ORDER BY $1",
+        "SELECT a FROM t WHERE $1 IS NOT NULL",
+    ] {
+        let prepared = session.prepare(query).unwrap();
+        for ty in [DataType::Oid, DataType::PgChar, DataType::PgCharArray] {
+            let error = prepared.clone().with_parameter_types(&[Some(ty.clone())]).unwrap_err();
+            assert_eq!(sqlstate(&giggles_core::CoreError::Sql(error)), "0A000", "{query}: {ty:?}");
+        }
+    }
+}
+
+#[test]
+fn application_parameter_refusals_legacy() {
+    application_parameter_refusals(Engine::Legacy);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn application_parameter_refusals_v2() {
+    application_parameter_refusals(Engine::V2);
+}
