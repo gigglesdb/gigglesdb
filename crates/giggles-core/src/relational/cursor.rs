@@ -143,9 +143,14 @@ impl Drop for PlanCacheEntry {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-cursor-bindings"))]
 thread_local! {
     static SLOT_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "test-cursor-bindings")]
+pub(crate) fn slot_locks() -> usize {
+    SLOT_LOCKS.get()
 }
 
 /// One last successful, clock-independent streaming binding per SQL session.
@@ -191,6 +196,10 @@ impl PlanCache {
         let mut binding = None;
         self.evict_if(|entry| {
             binding = entry.binding.upgrade();
+            #[cfg(test)]
+            if let Some(pause) = tests::AFTER_BINDING_UPGRADE.take() {
+                pause();
+            }
             binding.as_ref().is_none_or(|binding| {
                 Self::same_statement(&binding.query.prepared, source)
             })
@@ -199,7 +208,7 @@ impl PlanCache {
 
     fn evict_if(&self, should_evict: impl FnOnce(&PlanCacheEntry) -> bool) {
         let removed = {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-cursor-bindings"))]
             SLOT_LOCKS.set(SLOT_LOCKS.get() + 1);
             let mut entry = self.entry.lock().unwrap_or_else(|e| e.into_inner());
             if entry.as_ref().is_some_and(should_evict) {
@@ -357,6 +366,23 @@ impl Plan {
 mod tests {
     use super::*;
 
+    use std::{cell::Cell, sync::mpsc, time::Duration};
+
+    thread_local! {
+        pub(super) static AFTER_BINDING_UPGRADE: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+        static BINDING_DROP_PROBE: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+    }
+
+    impl Drop for CachedBinding {
+        fn drop(&mut self) {
+            let _ = BINDING_DROP_PROBE.try_with(|probe| {
+                if let Some(probe) = probe.take() {
+                    probe();
+                }
+            });
+        }
+    }
+
     const DOMAIN: u128 = 1;
 
     fn fixture() -> Arc<Relational> {
@@ -504,6 +530,69 @@ mod tests {
 
         assert_eq!(SLOT_LOCKS.get(), before);
         assert!(cache.entry.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn different_catalog_observation_evicts_with_one_slot_lock() {
+        let image = fixture();
+        let prepared = Prepared::parse("SELECT id FROM t", DOMAIN, image.epoch)
+            .unwrap().bind_schemas(&image).unwrap();
+        let mut cache = PlanCache::default();
+        let owners = Arc::default();
+        Plan::new(&image, &prepared, &[], None, Some((&mut cache, &owners))).unwrap().unwrap();
+        assert!(cache.entry.lock().unwrap().is_some());
+        let before = SLOT_LOCKS.get();
+
+        cache.observe(Some(&Arc::default()));
+
+        assert_eq!(SLOT_LOCKS.get() - before, 1);
+        assert!(cache.entry.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn forget_mismatched_statement_drops_last_binding_after_unlocking() {
+        let image = fixture();
+        let prepared = Prepared::parse("SELECT id FROM t", DOMAIN, image.epoch)
+            .unwrap().bind_schemas(&image).unwrap();
+        let other = Prepared::parse("SELECT id FROM t WHERE id = 1", DOMAIN, image.epoch).unwrap();
+        let mut cache = PlanCache::default();
+        let owners = Arc::default();
+        Plan::new(&image, &prepared, &[], None, Some((&mut cache, &owners))).unwrap().unwrap();
+        let binding = cache.entry.lock().unwrap().as_ref().unwrap().binding.clone();
+        let cache = Arc::new(cache);
+        let (upgraded, wait_for_upgrade) = mpsc::channel();
+        let (resume, wait_for_resume) = mpsc::channel();
+        let (dropped, wait_for_drop) = mpsc::channel();
+        let timeout = Duration::from_secs(5);
+
+        std::thread::scope(|scope| {
+            let cache = Arc::clone(&cache);
+            let forget = scope.spawn(move || {
+                let probe_cache = Arc::clone(&cache);
+                BINDING_DROP_PROBE.set(Some(Box::new(move || {
+                    dropped.send(probe_cache.entry.try_lock().is_ok()).unwrap();
+                })));
+                AFTER_BINDING_UPGRADE.set(Some(Box::new(move || {
+                    upgraded.send(()).unwrap();
+                    wait_for_resume.recv_timeout(timeout).unwrap();
+                })));
+                cache.forget_statement(&other);
+            });
+
+            wait_for_upgrade.recv_timeout(timeout).unwrap();
+            drop(owners);
+            // Catalog pruning leaves the in-flight forget as the sole strong owner.
+            assert_eq!(binding.strong_count(), 1);
+            resume.send(()).unwrap();
+            forget.join().unwrap();
+            assert!(
+                wait_for_drop.try_recv().unwrap(),
+                "forget destroyed the last binding while holding the slot mutex"
+            );
+        });
+
+        assert_eq!(binding.strong_count(), 0);
+        assert!(cache.entry.lock().unwrap().is_some(), "the statement did not match");
     }
 
     #[test]

@@ -291,6 +291,12 @@ impl SqlSession {
         relational::cursor::query_binds()
     }
 
+    #[cfg(feature = "test-cursor-bindings")]
+    #[doc(hidden)]
+    pub fn test_cursor_slot_locks() -> usize {
+        relational::cursor::slot_locks()
+    }
+
     /// A weak probe of the binding's lifetime, including after it leaves the slot.
     #[cfg(feature = "test-cursor-bindings")]
     #[doc(hidden)]

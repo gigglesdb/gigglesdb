@@ -4899,6 +4899,41 @@ mod prepared_validation_tests {
     }
 
     #[test]
+    fn close_and_unnamed_parse_forget_only_cursor_statements() {
+        let mut session = fixture();
+        let mut state = wire_state();
+        warm_named_cursor(&mut state, &mut session);
+        let select_is_live = session.sql.test_cursor_binding_liveness().unwrap();
+        assert!(select_is_live());
+
+        let insert = b"dml\0INSERT INTO public.t VALUES (8)\0\0\0";
+        assert_eq!(message(&mut state, &mut session, b'P', insert).unwrap()[0], b'1');
+        let before = giggles_core::SqlSession::test_cursor_slot_locks();
+        assert_eq!(message(&mut state, &mut session, b'C', b"Sdml\0").unwrap()[0], b'3');
+        assert!(select_is_live());
+        assert_eq!(giggles_core::SqlSession::test_cursor_slot_locks(), before, "DML Close");
+
+        parse_unnamed(&mut state, &mut session, "INSERT INTO public.t VALUES (8)", &[]);
+        let before = giggles_core::SqlSession::test_cursor_slot_locks();
+        parse_unnamed(&mut state, &mut session, "DELETE FROM public.t WHERE id = 8", &[]);
+        assert!(select_is_live());
+        assert_eq!(giggles_core::SqlSession::test_cursor_slot_locks(), before, "DML replacement");
+
+        assert_eq!(message(&mut state, &mut session, b'C', b"Ss\0").unwrap()[0], b'3');
+        assert!(!select_is_live());
+
+        let declare = b"d\0DECLARE c CURSOR WITH HOLD FOR SELECT id FROM public.t WHERE id = 7\0\0\0";
+        assert_eq!(message(&mut state, &mut session, b'P', declare).unwrap()[0], b'1');
+        assert_eq!(message(&mut state, &mut session, b'B', b"p\0d\0\0\0\0\0\0\0").unwrap()[0], b'2');
+        assert_eq!(message(&mut state, &mut session, b'E', b"p\0\0\0\0\0").unwrap()[0], b'C');
+        assert_eq!(message(&mut state, &mut session, b'S', &[]).unwrap()[0], b'Z');
+        let declare_is_live = session.sql.test_cursor_binding_liveness().unwrap();
+        assert!(declare_is_live());
+        assert_eq!(message(&mut state, &mut session, b'C', b"Sd\0").unwrap()[0], b'3');
+        assert!(!declare_is_live());
+    }
+
+    #[test]
     fn closed_statement_can_declare_a_cursor_without_retaining_a_binding() {
         let mut session = fixture();
         let mut state = wire_state();
