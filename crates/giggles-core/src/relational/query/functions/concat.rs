@@ -58,6 +58,25 @@ pub(super) fn name(a: &DataType, b: &DataType, result: &DataType) -> Option<&'st
         None
     }
 }
+pub(super) fn array_operator(name: &str) -> bool {
+    matches!(name, "\u{1}operator:array_cat" | "\u{1}operator:array_append" | "\u{1}operator:array_prepend")
+}
+
+pub(super) fn bind_enum_operands(sources: [&Scalar; 2], args: &mut [BoundScalar]) -> R<()> {
+    let Some(enum_type) = args.iter().find_map(BoundScalar::attached_enum).cloned() else {
+        return Ok(());
+    };
+    for (source, bound) in sources.into_iter().zip(args.iter_mut()) {
+        if let Scalar::Literal(value @ (Value::Text(_) | Value::Null)) = source {
+            *bound = BoundScalar::enum_literal(value, &bound.ty, &enum_type)?;
+        }
+    }
+    if !args.iter().all(|arg| arg.attached_enum() == Some(&enum_type)) {
+        return Err(enum_order::missing_operator("||", &args[0], &args[1]));
+    }
+    Ok(())
+}
+
 pub(super) fn eval(name: &str, values: &[Value], budget: &mut usize) -> Option<R<Value>> {
     let op = name.strip_prefix("\u{1}operator:")?;
     if !matches!(

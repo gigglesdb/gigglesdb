@@ -1033,15 +1033,25 @@ pub(super) fn bind<'a>(
 struct KeyOrder {
     collation: Option<String>,
     ty: DataType,
+    enum_type: Option<std::sync::Arc<TypeDef>>,
 }
 
 impl KeyOrder {
     fn of(scalar: &BoundScalar) -> Option<Self> {
         let collation = scalar.explicit_collation().expect("bound collation");
-        (collation.is_some() || scalar.ty.is_array()).then(|| Self {
+        let enum_type = scalar.enum_definition();
+        (collation.is_some() || scalar.ty.is_array() || enum_type.is_some()).then(|| Self {
             collation: collation.map(str::to_owned),
             ty: scalar.ty.clone(),
+            enum_type: enum_type.cloned(),
         })
+    }
+
+    fn compare(&self, a: &Value, b: &Value) -> Ordering {
+        if let Some(ty) = &self.enum_type {
+            return functions::enum_order::compare_stored(ty, &self.ty, a, b);
+        }
+        functions::collation::compare(self.collation.as_deref(), a, b, &self.ty)
     }
 }
 
@@ -1069,7 +1079,7 @@ fn cmp_collated(a: &[Value], b: &[Value], keys: &[Option<KeyOrder>]) -> Ordering
     a.iter().zip(b).enumerate().map(|(i, (a, b))| {
         keys.get(i).and_then(Option::as_ref).map_or_else(
             || cmp(a, b),
-            |key| functions::collation::compare(key.collation.as_deref(), a, b, &key.ty),
+            |key| key.compare(a, b),
         )
     }).find(|c| *c != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len()))
 }
@@ -1620,6 +1630,20 @@ impl Grouping {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn grouping_key_uses_enum_array_label_order() {
+        let ty = TypeDef::Enum {
+            schema: "public".into(),
+            name: "key_order".into(),
+            labels: vec!["z".into(), "a".into()],
+        };
+        let order = BoundScalar::enum_metadata(DataType::TextArray, &ty);
+        let keys = |value: &str| Key::collated(vec![Value::Text(value.into())], std::slice::from_ref(&order));
+        assert!(keys("{z}") < keys("{z,NULL}"));
+        assert!(keys("{z,NULL}") < keys("{a}"));
+        assert!(keys("{a,NULL}") == keys("{a,NULL}"));
+    }
     use super::*;
     fn state(rows: usize) -> Relational {
         let mut state = Relational::default();

@@ -173,6 +173,11 @@ pub(super) fn bind(
     tables: &[&TableDef],
     parameters: &[Option<DataType>],
 ) -> R<BoundScalar> {
+    if name == "nullif"
+        && let Some(result) = bind_enum_nullif(args, resolve, tables, parameters)?
+    {
+        return Ok(result);
+    }
     let (args, ty) = if count_nulls(name) {
         if args.is_empty() {
             user_types::view_replace_error(format!("function {name}() does not exist"));
@@ -197,7 +202,7 @@ pub(super) fn bind(
         (args, DataType::Integer)
     } else {
         let (targets, ty) = types(name, args, resolve, tables, parameters)?;
-        let args = args
+        let mut bound = args
             .iter()
             .zip(&targets)
             .map(|(arg, target)| {
@@ -226,14 +231,51 @@ pub(super) fn bind(
             })
             .collect::<R<Vec<_>>>()?;
         if name == "nullif" {
-            collation::pair(&args[0], &args[1])?;
+            collation::pair(&bound[0], &bound[1])?;
+        } else if let [operand, thresholds] = bound.as_mut_slice()
+            && let Some(enum_type) = thresholds.attached_enum()
+        {
+            if let Scalar::Literal(value @ (Value::Text(_) | Value::Null)) = &args[0] {
+                *operand = BoundScalar::enum_literal(value, &DataType::Text, enum_type)?;
+            } else if operand.attached_enum() != Some(enum_type) {
+                user_types::view_replace_error(format!(
+                    "function width_bucket({}, {}) does not exist",
+                    operand.type_name(), thresholds.type_name(),
+                ));
+                user_types::sql_error_hint("No function matches the given name and argument types. You might need to add explicit type casts.");
+                return Err(SqlError::UndefinedFunction);
+            }
         }
-        (args, ty)
+        (bound, ty)
     };
     Ok(BoundScalar {
         ty,
         node: Node::Call(name.into(), args),
     })
+}
+
+fn bind_enum_nullif(
+    args: &[Scalar],
+    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+    tables: &[&TableDef],
+    parameters: &[Option<DataType>],
+) -> R<Option<BoundScalar>> {
+    let [left, right] = args else { return Ok(None) };
+    let mut a = left.bind(resolve, tables, parameters)?;
+    let mut b = right.bind(resolve, tables, parameters)?;
+    let Some(enum_type) = a.attached_enum().or_else(|| b.attached_enum()).cloned() else {
+        return Ok(None);
+    };
+    if let Scalar::Literal(value @ (Value::Text(_) | Value::Null)) = left {
+        a = BoundScalar::enum_literal(value, &b.ty, &enum_type)?;
+    }
+    if let Scalar::Literal(value @ (Value::Text(_) | Value::Null)) = right {
+        b = BoundScalar::enum_literal(value, &a.ty, &enum_type)?;
+    }
+    if a.type_identity() != b.type_identity() {
+        return Err(enum_order::missing_operator("=", &a, &b));
+    }
+    Ok(Some(BoundScalar { ty: a.ty.clone(), node: Node::Call("nullif".into(), vec![a, b]) }))
 }
 
 pub(super) fn infer(
@@ -416,6 +458,10 @@ fn array_bucket(
         user_types::view_replace_error("thresholds array must not contain NULLs".into());
         return Err(SqlError::NullValueNotAllowed);
     }
+    let enum_labels = match thresholds.attached_enum() {
+        Some(TypeDef::Enum { labels, .. }) => Some(labels.as_slice()),
+        _ => None,
+    };
     let mut low = 0;
     let mut high = values.len();
     let collation = if input.ty == DataType::Text {
@@ -439,17 +485,13 @@ fn array_bucket(
             Value::Float8(operand) => operand.cmp(&Float8::from_bits(
                 value.parse::<f64>().map_err(|_| SqlError::InternalError)?.to_bits(),
             )),
-            Value::Text(operand) => collation.map_or_else(
-                || operand.cmp(value),
-                |name| {
-                    collation::compare(
-                        Some(name),
-                        &Value::Text(operand.clone()),
-                        &Value::Text(value.clone()),
-                        &DataType::Text,
-                    )
-                },
-            ),
+            Value::Text(operand) => {
+                if let Some(labels) = enum_labels {
+                    enum_order::compare_labels(labels, operand, value)
+                } else {
+                    collation::compare_text(collation, operand, value)
+                }
+            }
             _ => return Err(SqlError::InternalError),
         };
         if order.is_lt() {

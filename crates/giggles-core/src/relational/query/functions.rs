@@ -183,7 +183,7 @@ pub(in crate::relational) struct BoundScalar {
 }
 enum Node {
     EnumSort(Box<BoundScalar>, Vec<String>),
-    Domain(Box<BoundScalar>, TypeDef),
+    Domain(Box<BoundScalar>, std::sync::Arc<TypeDef>),
     Predicate(Box<super::BoundFilter>),
     Case(
         Vec<(super::BoundFilter, BoundScalar)>,
@@ -304,6 +304,19 @@ fn common_result_type(types: impl IntoIterator<Item = DataType>) -> R<DataType> 
         });
     }
     Ok(common.unwrap_or(DataType::Text))
+}
+fn case_result_enum(types: &[(usize, BoundScalar)], else_index: usize) -> R<Option<&TypeDef>> {
+    // PostgreSQL chooses the ELSE arm first when resolving enum identities.
+    let (otherwise_types, arm_types) = if types.last().is_some_and(|(i, _)| *i == else_index) {
+        let (otherwise, arms) = types.split_last().expect("typed ELSE arm");
+        (std::slice::from_ref(otherwise), arms)
+    } else {
+        (&[][..], types)
+    };
+    enum_order::common_enum(
+        "CASE/WHEN",
+        otherwise_types.iter().chain(arm_types).map(|(_, bound)| bound.type_identity()),
+    )
 }
 fn coalesce_hint(
     args: &[Scalar],
@@ -1302,26 +1315,29 @@ impl Scalar {
             .map(|(_, result)| result)
             .chain(case.otherwise.iter())
             .collect();
-        let bind_known = |result: &&Scalar| {
-            if matches!(result, Self::Literal(Value::Null | Value::Text(_))) {
-                Ok(None)
-            } else {
+        let types = originals
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| !matches!(result, Self::Literal(Value::Null | Value::Text(_))))
+            .map(|(i, result)| {
                 result
                     .bind(resolve, tables, parameters)
+                    .map(|bound| (i, bound))
                     .map_err(|error| Self::expression_parameter_error(error, parameters))
-                    .map(Some)
-            }
-        };
-        let known = originals.iter().map(bind_known).collect::<R<Vec<_>>>()?;
-        // PostgreSQL considers ELSE before the THEN branches for type selection.
-        let otherwise_first = known.get(case.arms.len()).into_iter()
-            .chain(known.iter().take(case.arms.len()));
-        let json = json_aggregate::common_branches("CASE", otherwise_first.flatten())?;
-        let ty = common_result_type(known.into_iter().flatten().map(|bound| bound.ty))?;
+            })
+            .collect::<R<Vec<_>>>()?;
+        let otherwise_first = types.iter().filter(|(i, _)| *i == case.arms.len())
+            .chain(types.iter().filter(|(i, _)| *i < case.arms.len()));
+        let json = json_aggregate::common_branches("CASE", otherwise_first.map(|(_, bound)| bound))?;
+        let enum_type = case_result_enum(&types, case.arms.len())?;
+        let ty = common_result_type(types.iter().map(|(_, bound)| bound.ty.clone()))?;
         let result = |value: &Scalar| -> R<BoundScalar> {
             if let Self::Literal(value @ (Value::Text(_) | Value::Null)) = value {
                 if json {
                     return json_literal(value);
+                }
+                if let Some(enum_type) = enum_type {
+                    return BoundScalar::enum_literal(value, &ty, enum_type);
                 }
                 return Ok(BoundScalar {
                     ty: ty.clone(),
@@ -1387,7 +1403,7 @@ impl Scalar {
             .bind(resolve, tables, parameters)?;
         Ok(BoundScalar {
             ty: base,
-            node: Node::Domain(Box::new(inner), ty.clone()),
+            node: Node::Domain(Box::new(inner), std::sync::Arc::new(ty.clone())),
         })
     }
 
@@ -2362,17 +2378,23 @@ impl Scalar {
                         })
                         .map(|(a, _)| a);
                     let json = json_aggregate::common_branches("COALESCE", known.clone())?;
+                    let enum_type = enum_order::common_enum(
+                        "COALESCE", known.clone().map(BoundScalar::type_identity),
+                    )?.cloned();
                     let ty = common_result_type(known.map(|a| a.ty.clone()))?;
                     for (a, original) in args.iter_mut().zip(original) {
                         if json {
                             if let Self::Literal(value @ (Value::Text(_) | Value::Null)) = original {
                                 *a = json_literal(value)?;
                             }
+                        } else if let Self::Literal(value @ (Value::Text(_) | Value::Null)) = original
+                            && let Some(enum_type) = &enum_type
+                        {
+                            *a = BoundScalar::enum_literal(value, &ty, enum_type)?;
                         } else if let Self::Literal(Value::Text(s)) = original {
                             a.node = literal_cast_node(Value::Text(s.clone()), &ty)?;
                             a.ty = ty.clone();
-                        }
-                        if null(a) {
+                        } else if null(a) {
                             a.ty = ty.clone();
                         }
                     }
@@ -2501,7 +2523,7 @@ impl BoundScalar {
             | Node::Sequence(name, ..)
             | Node::Privilege(name, ..)
             | Node::Xact(name, ..) => Some(name),
-            Node::Domain(inner, TypeDef::Enum { .. }) if matches!(inner.node, Node::Column(..)) => inner.strong_name(),
+            Node::Domain(inner, ty) if matches!(ty.as_ref(), TypeDef::Enum { .. }) && matches!(inner.node, Node::Column(..)) => inner.strong_name(),
             Node::Cast(a) | Node::SessionCast(a, _) | Node::TypmodCast(a, _) => a.strong_name(),
             _ => None,
         }
@@ -2513,8 +2535,15 @@ impl BoundScalar {
             Node::ZonedOperator(name, ..) if matches!(name.as_str(), "date_trunc" | "uuidv7") => name,
             Node::CrossCompare(..) | Node::ZonedOperator(..) => "?column?",
             Node::Param(_) => "?column?",
-            Node::Domain(inner, TypeDef::Enum { .. }) if matches!(inner.node, Node::Column(..)) => inner.name(),
-            Node::Domain(inner, TypeDef::Enum { .. }) if inner.strong_name() == Some("array") => "array",
+            Node::Domain(inner, ty) if matches!(ty.as_ref(), TypeDef::Enum { .. }) => {
+                if matches!(inner.node, Node::Column(..)) {
+                    inner.name()
+                } else if inner.strong_name() == Some("array") {
+                    "array"
+                } else {
+                    ty.name()
+                }
+            }
             Node::Domain(_, ty) => ty.name(),
             Node::TypmodCast(inner, _) => inner.name(),
             Node::Cast(a) | Node::SessionCast(a, _) => {
@@ -3428,6 +3457,7 @@ impl Scalar {
                 let otherwise_first = known.iter().filter(|(i, _)| *i == case.arms.len())
                     .chain(known.iter().filter(|(i, _)| *i < case.arms.len()));
                 json_aggregate::common_branches("CASE", otherwise_first.map(|(_, bound)| bound))?;
+                case_result_enum(&known, case.arms.len())?;
                 let ty = common_result_type(known.into_iter().map(|(_, bound)| bound.ty))?;
                 for result in results {
                     if result.aggregate_unknown(parameters) {

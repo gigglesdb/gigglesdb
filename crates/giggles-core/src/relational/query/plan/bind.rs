@@ -374,27 +374,41 @@ impl Plan {
                 let mut columns = vec![];
                 let mut collations = vec![];
                 for i in 0..width {
-                    let mut types = vec![];
+                    let mut typed = vec![];
                     for row in rows.iter() {
                         if row.len() != width {
                             return Err(SqlError::Syntax);
                         }
                         if !unknown(&row[i], parameters) {
-                            types.push(scalar_type(&row[i], parameters)?);
+                            row[i].infer(None, parameters, &no_column, &[])?;
+                            typed.push(row[i].bind(&no_column, &[], parameters)?);
                         }
                     }
-                    let ty = common(types.into_iter())?;
-                    let mut metadata = None;
-                    for row in rows.iter_mut() {
-                        row[i].infer(Some(&ty), parameters, &no_column, &[])?;
-                        let value = values_cell(&mut row[i], &ty, parameters)?;
-                        metadata = Some(functions::collation::combined(
-                            metadata.as_ref(),
-                            Some(&value),
-                            ty.clone(),
-                        )?);
+                    let enum_type = functions::enum_order::common_enum(
+                        "VALUES", typed.iter().map(BoundScalar::type_identity),
+                    )?;
+                    let ty = common(typed.iter().map(|value| value.ty.clone()))?;
+                    if let Some(enum_type) = enum_type {
+                        for row in rows.iter_mut() {
+                            if unknown(&row[i], parameters) {
+                                retarget_enum(&mut row[i], &ty, enum_type)?;
+                                row[i].infer(Some(&ty), parameters, &no_column, &[])?;
+                            }
+                        }
+                        collations.push(Some(BoundScalar::enum_metadata(ty.clone(), enum_type)));
+                    } else {
+                        let mut metadata = None;
+                        for row in rows.iter_mut() {
+                            row[i].infer(Some(&ty), parameters, &no_column, &[])?;
+                            let value = values_cell(&mut row[i], &ty, parameters)?;
+                            metadata = Some(functions::collation::combined(
+                                metadata.as_ref(),
+                                Some(&value),
+                                ty.clone(),
+                            )?);
+                        }
+                        collations.push(metadata);
                     }
-                    collations.push(metadata);
                     columns.push(ColumnDef {
                         id: 0,
                         name: format!("column{}", i + 1),
@@ -402,10 +416,13 @@ impl Plan {
                         not_null: false,
                     });
                 }
+                let type_oids: Vec<_> = collations.iter().map(|value| {
+                    value.as_ref().map_or(0, |value| value.cast_enum_oid(state))
+                }).collect();
                 Meta {
                     columns,
                     typmods: vec![-1; width],
-                    type_oids: vec![],
+                    type_oids: if type_oids.iter().any(|oid| *oid != 0) { type_oids } else { vec![] },
                     unknown: vec![false; width],
                     collations,
                 }
@@ -418,19 +435,6 @@ impl Plan {
             } => {
                 let mut a = left.resolve(state, parameters)?;
                 let b = right.resolve(state, parameters)?;
-                a.collations = (0..a.columns.len())
-                    .map(|i| {
-                        let value = functions::collation::combined(
-                            a.collations.get(i).and_then(Option::as_ref),
-                            b.collations.get(i).and_then(Option::as_ref),
-                            a.columns[i].data_type.clone(),
-                        )?;
-                        if !matches!(op, SetOp::Union) || !*all {
-                            value.require_collation()?;
-                        }
-                        Ok(Some(value))
-                    })
-                    .collect::<R<_>>()?;
                 // bpchar consumers remain closed until DD-0068 comparison semantics land.
                 if a.columns
                     .iter()
@@ -442,40 +446,55 @@ impl Plan {
                 if a.columns.len() != b.columns.len() {
                     return Err(SqlError::Syntax);
                 }
-                let mut oids = vec![0; a.columns.len()];
-                for (i, oid) in oids.iter_mut().enumerate() {
-                    let a_json = a.type_oids.get(i) == Some(&json_aggregate::OID);
+                let construct = match op {
+                    SetOp::Union => "UNION",
+                    SetOp::Intersect => "INTERSECT",
+                    SetOp::Except => "EXCEPT",
+                };
+                let a_oids = std::mem::replace(&mut a.type_oids, vec![0; a.columns.len()]);
+                a.collations.resize_with(a.columns.len(), || None);
+                for i in 0..a.columns.len() {
+                    let a_json = a_oids.get(i) == Some(&json_aggregate::OID);
                     let b_json = b.type_oids.get(i) == Some(&json_aggregate::OID);
                     if a_json || b_json {
                         if a_json != b_json && !(if a_json { b.unknown[i] } else { a.unknown[i] }) {
-                            let name = match op {
-                                SetOp::Union => "UNION",
-                                SetOp::Intersect => "INTERSECT",
-                                SetOp::Except => "EXCEPT",
-                            };
-                            let types = [&a, &b].into_iter().map(|m| {
-                                if m.type_oids.get(i) == Some(&json_aggregate::OID) {
+                            let types = [(&a, a_json), (&b, b_json)].map(|(m, json)| {
+                                if json {
                                     "json"
                                 } else {
                                     defaults::type_name(&m.columns[i].data_type)
                                 }
-                            }).collect::<Vec<_>>();
-                            user_types::view_replace_error(format!("{name} types {} and {} cannot be matched", types[0], types[1]));
+                            });
+                            user_types::view_replace_error(format!("{construct} types {} and {} cannot be matched", types[0], types[1]));
                             return Err(SqlError::Type);
                         }
                         if !matches!(op, SetOp::Union) || !*all {
                             user_types::view_replace_error("could not identify an equality operator for type json".into());
                             return Err(SqlError::UndefinedFunction);
                         }
-                        *oid = json_aggregate::OID;
                     }
-                    let types = [&a, &b]
-                        .into_iter()
-                        .filter(|m| !m.unknown[i])
-                        .map(|m| m.columns[i].data_type.clone());
-                    let ty = common(types)?;
-                    left.retarget(i, &ty, parameters)?;
-                    right.retarget(i, &ty, parameters)?;
+                    let typed = [&a, &b].into_iter().filter(|m| !m.unknown[i]);
+                    let enum_type = functions::enum_order::common_enum(
+                        construct,
+                        typed.clone().map(|m| {
+                            (&m.columns[i].data_type, m.collations.get(i).and_then(Option::as_ref)
+                                .and_then(BoundScalar::attached_enum))
+                        }),
+                    )?;
+                    let ty = common(typed.map(|m| m.columns[i].data_type.clone()))?;
+                    left.retarget(i, &ty, enum_type, parameters)?;
+                    right.retarget(i, &ty, enum_type, parameters)?;
+                    let value = functions::collation::combined(
+                        a.collations[i].as_ref().filter(|_| !a.unknown[i] || enum_type.is_none()),
+                        b.collations.get(i).and_then(Option::as_ref)
+                            .filter(|_| !b.unknown[i] || enum_type.is_none()),
+                        ty.clone(),
+                    )?;
+                    if !matches!(op, SetOp::Union) || !*all {
+                        value.require_collation()?;
+                    }
+                    a.type_oids[i] = if a_json || b_json { json_aggregate::OID } else { value.cast_enum_oid(state) };
+                    a.collations[i] = Some(value);
                     let same = a.columns[i].data_type == b.columns[i].data_type
                         && a.typmods[i] == b.typmods[i];
                     a.columns[i].data_type = ty;
@@ -486,7 +505,9 @@ impl Plan {
                     }
                     a.unknown[i] = false;
                 }
-                a.type_oids = if oids.contains(&json_aggregate::OID) { oids } else { vec![] };
+                if a.type_oids.iter().all(|oid| *oid == 0) {
+                    a.type_oids.clear();
+                }
                 a
             }
         };
@@ -530,7 +551,13 @@ impl Plan {
             _ => false,
         }
     }
-    fn retarget(&mut self, i: usize, ty: &DataType, parameters: &mut [Option<DataType>]) -> R<()> {
+    fn retarget(
+        &mut self,
+        i: usize,
+        ty: &DataType,
+        enum_type: Option<&TypeDef>,
+        parameters: &mut [Option<DataType>],
+    ) -> R<()> {
         if let Body::Select(select) = &mut self.body
             && select.query.items.len() > i
             && let (Item::Scalar(s), alias) = &mut select.query.items[i]
@@ -541,12 +568,30 @@ impl Plan {
             if alias.is_none() {
                 *alias = Some(name);
             }
-            *s = Scalar::Cast(Box::new(s.clone()), ty.clone());
-            s.bind(&no_column, &[], parameters)?;
+            if let Some(enum_type) = enum_type {
+                retarget_enum(s, ty, enum_type)?;
+            } else {
+                *s = Scalar::Cast(Box::new(s.clone()), ty.clone());
+                s.bind(&no_column, &[], parameters)?;
+            }
         }
         Ok(())
     }
 }
+fn retarget_enum(scalar: &mut Scalar, storage: &DataType, enum_type: &TypeDef) -> R<()> {
+    if let Scalar::Literal(value) = scalar {
+        BoundScalar::enum_literal(value, storage, enum_type)?;
+    }
+    let name = user_types::TypeReference {
+        name: enum_type.name().to_owned(),
+        array: *storage == DataType::TextArray,
+    };
+    *scalar = Scalar::Domain(
+        Box::new(scalar.clone()), name, Box::new(Ok(enum_type.clone())),
+    );
+    Ok(())
+}
+
 pub(super) fn output_column(c: &ColumnRef, table: &TableDef) -> R<BoundColumn> {
     if c.qualifier.is_some() {
         return Err(SqlError::UnknownTable);

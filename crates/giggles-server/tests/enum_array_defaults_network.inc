@@ -110,6 +110,21 @@ ALTER TABLE "OAuthClient" ADD COLUMN "linkDismissals" TEXT[] NOT NULL DEFAULT AR
             &[Some("later"), Some("{LARGE,SMALL}"), Some("{}"), Some(r#"{"LARGE": 0, "SMALL": 0, "STANDARD": 0}"#), Some("t")],
         ]).await;
 
+
+    expect_rows(
+        &pg,
+        r#"SELECT pg_typeof(sizes), sizes FROM (
+            SELECT greatest(coalesce("requiredFor", '{SMALL}'), '{STANDARD}') AS sizes
+            FROM "DesignDocVariationType"
+            UNION ALL SELECT '{SMALL}'
+        ) s ORDER BY sizes"#,
+        &[
+            &[Some(r#""DesignDocSize"[]"#), Some("{SMALL}")],
+            &[Some(r#""DesignDocSize"[]"#), Some("{STANDARD}")],
+            &[Some(r#""DesignDocSize"[]"#), Some("{LARGE,SMALL}")],
+        ],
+    ).await;
+
     for (sql, code, message) in [
         (
             r#"ALTER TABLE "Object" ADD COLUMN staged TEXT, ADD COLUMN bad "ObjectSource" DEFAULT 'NOPE'"#,
@@ -120,6 +135,26 @@ ALTER TABLE "OAuthClient" ADD COLUMN "linkDismissals" TEXT[] NOT NULL DEFAULT AR
             r#"UPDATE "DesignDocVariationType" SET "requiredFor" = ARRAY['NOPE']::"DesignDocSize"[] WHERE "presetKey" = 'later'"#,
             "22P02",
             r#"invalid input value for enum "DesignDocSize": "NOPE""#,
+        ),
+        (
+            r#"SELECT '{NOPE}' = "requiredFor" FROM "DesignDocVariationType" WHERE false"#,
+            "22P02",
+            r#"invalid input value for enum "DesignDocSize": "NOPE""#,
+        ),
+        (
+            r#"SELECT "requiredFor" FROM "DesignDocVariationType" UNION ALL SELECT ARRAY['MANUAL']::"ObjectSource"[]"#,
+            "42846",
+            r#"UNION could not convert type "ObjectSource"[] to "DesignDocSize"[]"#,
+        ),
+        (
+            r#"SELECT CASE WHEN false THEN "requiredFor" ELSE 'SMALL'::text END FROM "DesignDocVariationType""#,
+            "42804",
+            r#"CASE types text and "DesignDocSize"[] cannot be matched"#,
+        ),
+        (
+            r#"SELECT lag("requiredFor",1,NULL::"ObjectSource"[]) OVER (ORDER BY id) FROM "DesignDocVariationType""#,
+            "42883",
+            r#"function lag("DesignDocSize"[], integer, "ObjectSource"[]) does not exist"#,
         ),
         (
             r#"ALTER TABLE "Object" ADD COLUMN staged TEXT, ADD COLUMN nn INTEGER NOT NULL"#,

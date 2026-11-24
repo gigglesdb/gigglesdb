@@ -1495,10 +1495,14 @@ impl Filter {
                     {
                         a_ty
                     } else if let Some(ty) = &a_enum && av.ty == DataType::TextArray && unknown(b) {
-                        bv = bind(&Scalar::Cast(Box::new(b.clone()), DataType::TextArray))?;
+                        if let Scalar::Literal(value) = b {
+                            bv = BoundScalar::enum_literal(value, &DataType::TextArray, ty)?;
+                        }
                         ty
                     } else if let Some(ty) = &b_enum && bv.ty == DataType::TextArray && unknown(a) {
-                        av = bind(&Scalar::Cast(Box::new(a.clone()), DataType::TextArray))?;
+                        if let Scalar::Literal(value) = a {
+                            av = BoundScalar::enum_literal(value, &DataType::TextArray, ty)?;
+                        }
                         ty
                     } else {
                         let display = |value: &BoundScalar, ty: Option<&TypeDef>| ty.map_or_else(

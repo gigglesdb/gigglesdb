@@ -407,13 +407,26 @@ impl Diagnostic {
         {
             use giggles_core::relational::SqlError;
             let column_message = message.starts_with("column \"") && message.contains(" of relation \"");
+            let common_type_context = |separator| {
+                message.split_once(separator).is_some_and(|(context, _)| matches!(
+                    context,
+                    "UNION" | "INTERSECT" | "EXCEPT" | "VALUES" | "COALESCE"
+                        | "CASE" | "CASE/WHEN" | "GREATEST" | "LEAST" | "ARRAY"
+                ))
+            };
             let allowed = match error {
+                SqlError::CannotCoerce => common_type_context(" could not convert type "),
+                SqlError::UndefinedFunction => message.ends_with(") does not exist")
+                    && ["function lag(", "function lead(", "function width_bucket("]
+                        .iter()
+                        .any(|prefix| message.starts_with(prefix)),
                 SqlError::InvalidTextRepresentation => message.starts_with("invalid input value for enum "),
                 SqlError::UnknownColumn => column_message && message.ends_with(" does not exist"),
                 SqlError::DuplicateColumn => column_message && message.ends_with(" already exists"),
                 SqlError::UndefinedObject => message.starts_with("type \"") && message.ends_with(" does not exist"),
                 SqlError::Type => (message.starts_with("column \"") || message.starts_with("default for column \""))
-                    && message.contains(" cannot be cast automatically to type "),
+                    && message.contains(" cannot be cast automatically to type ")
+                    || message.ends_with(" cannot be matched") && common_type_context(" types "),
                 _ => false,
             };
             if allowed {

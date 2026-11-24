@@ -94,52 +94,47 @@ pub(super) fn bind(
     tables: &[&TableDef],
     parameters: &[Option<DataType>],
 ) -> R<BoundScalar> {
-    let ty = hint(args, resolve, tables, parameters)?;
-    let enum_ty = args
+    if args.is_empty() {
+        return Err(SqlError::Syntax);
+    }
+    let bound = args
         .iter()
         .map(|arg| arg.bind(resolve, tables, parameters))
-        .collect::<R<Vec<_>>>()?
-        .iter()
-        .find_map(|arg| arg.enum_type(tables));
+        .collect::<R<Vec<_>>>()?;
+    let typed = bound.iter().zip(args).filter_map(|(bound, source)| {
+        (!source.aggregate_unknown(parameters)).then_some(bound)
+    });
+    let enum_type = enum_order::common_enum(
+        if name == "greatest" { "GREATEST" } else { "LEAST" },
+        typed.clone().map(BoundScalar::type_identity),
+    )?.cloned();
+    let ty = result_type(
+        &typed.map(|bound| {
+            if bound.ty == DataType::Varchar { DataType::Text } else { bound.ty.clone() }
+        }).collect::<Vec<_>>(),
+    )?;
     let args = args
         .iter()
-        .map(|arg| {
+        .zip(bound)
+        .map(|(arg, bound)| {
             let node = match arg {
-                Scalar::Literal(Value::Text(text)) => {
-                    literal_cast_node(Value::Text(text.clone()), &ty)?
-                }
-                Scalar::Literal(Value::Null) => Node::Literal(Value::Null),
-                _ => {
-                    let bound = arg.bind(resolve, tables, parameters)?;
-                    if bound.ty == ty {
-                        return Ok(bound);
+                Scalar::Literal(value @ (Value::Text(_) | Value::Null)) => {
+                    if let Some(enum_type) = &enum_type {
+                        return BoundScalar::enum_literal(value, &ty, enum_type);
                     }
-                    cast_node(bound, &ty)
+                    literal_cast_node(value.clone(), &ty)?
                 }
+                _ if bound.ty == ty => return Ok(bound),
+                _ => cast_node(bound, &ty),
             };
-            Ok(BoundScalar {
-                ty: ty.clone(),
-                node,
-            })
+            Ok(BoundScalar { ty: ty.clone(), node })
         })
         .collect::<R<Vec<_>>>()?;
-    let args = args
-        .into_iter()
-        .map(|arg| {
-            if let Some(ty) = &enum_ty {
-                arg.with_enum(ty)
-            } else {
-                arg
-            }
-        })
-        .collect();
-    let args: Vec<BoundScalar> = args;
     if let Some(n) = collation::derive(args.iter())? { collation::ready(n)?; }
-    let result = BoundScalar {
+    Ok(BoundScalar {
         ty,
         node: Node::Call(name.into(), args),
-    };
-    Ok(if let Some(ty) = enum_ty {result.with_enum(&ty)} else {result})
+    })
 }
 
 pub(super) fn eval(name: &str, values: Vec<Value>, input: &BoundScalar) -> R<Value> {

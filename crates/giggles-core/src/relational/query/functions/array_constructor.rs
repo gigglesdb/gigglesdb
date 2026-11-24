@@ -82,6 +82,26 @@ pub(super) fn bind(
         DataType::Uuid => DataType::UuidArray,
         _ => return Err(SqlError::Unsupported),
     };
+    if target.is_none() && element == DataType::Text {
+        let bound = args
+            .iter()
+            .map(|arg| arg.bind(resolve, tables, parameters))
+            .collect::<R<Vec<_>>>()?;
+        let typed = bound.iter().zip(args).filter_map(|(bound, source)| {
+            (!source.aggregate_unknown(parameters)).then_some(bound)
+        });
+        if let Some(enum_type) = enum_order::common_enum("ARRAY", typed.map(BoundScalar::type_identity))? {
+            let enum_type = enum_type.clone();
+            let args = args.iter().zip(bound).map(|(source, bound)| {
+                if let Scalar::Literal(value @ (Value::Text(_) | Value::Null)) = source {
+                    BoundScalar::enum_literal(value, &element, &enum_type)
+                } else {
+                    Ok(bound)
+                }
+            }).collect::<R<Vec<_>>>()?;
+            return Ok(BoundScalar { ty, node: Node::Call(NAME.into(), args) });
+        }
+    }
     let args = args
         .iter()
         .map(|a| {

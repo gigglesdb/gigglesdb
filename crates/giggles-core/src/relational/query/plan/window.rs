@@ -939,6 +939,7 @@ fn bind_call(
         columns,
         primary_key: vec![],
     };
+    let value_default = matches!(call.name.as_str(), "lag" | "lead") && call.args.len() == 3;
     for (i, s) in call.args.iter().enumerate() {
         let expected = if (call.name == "ntile" && i == 0)
             || (matches!(call.name.as_str(), "lag" | "lead" | "nth_value") && i == 1)
@@ -954,21 +955,32 @@ fn bind_call(
             &[&table],
         )?;
     }
-    if matches!(call.name.as_str(), "lag" | "lead") && call.args.len() == 3 {
+    let default_type = if value_default {
         let candidates = [0, 2]
             .into_iter()
             .filter(|i| !call.args[*i].aggregate_unknown(parameters))
             .map(|i| {
-                call.args[i]
-                    .bind(
-                        &|c, _| bind::output_column(c, &table),
-                        &[&table],
-                        parameters,
-                    )
-                    .map(|b| b.ty)
+                call.args[i].bind(
+                    &|c, _| bind::output_column(c, &table),
+                    &[&table],
+                    parameters,
+                )
             })
             .collect::<R<Vec<_>>>()?;
-        let ty = bind::common(candidates.into_iter())?;
+        if let [first, default] = candidates.as_slice()
+            && (first.attached_enum().is_some() || default.attached_enum().is_some())
+            && first.type_identity() != default.type_identity()
+        {
+            user_types::view_replace_error(format!(
+                "function {}({}, integer, {}) does not exist",
+                call.name, first.type_name(), default.type_name(),
+            ));
+            user_types::sql_error_hint(
+                "No function matches the given name and argument types. You might need to add explicit type casts.",
+            );
+            return Err(SqlError::UndefinedFunction);
+        }
+        let ty = bind::common(candidates.iter().map(|bound| bound.ty.clone()))?;
         for i in [0, 2] {
             call.args[i].infer(
                 Some(&ty),
@@ -977,7 +989,10 @@ fn bind_call(
                 &[&table],
             )?;
         }
-    }
+        Some(ty)
+    } else {
+        None
+    };
     let (partition, order, mut args, filter) = {
         let mut bind_scalar = |s: &Scalar| bind_expression(s, &table, parameters, clock);
         let partition = call
@@ -1051,18 +1066,21 @@ fn bind_call(
     } else if matches!(call.name.as_str(), "percent_rank" | "cume_dist") {
         (DataType::DoublePrecision, None)
     } else {
-        let ty = if matches!(call.name.as_str(), "lag" | "lead") && args.len() == 3 {
-            bind::common(
-                [0, 2]
-                    .into_iter()
-                    .filter(|i| !call.args[*i].aggregate_unknown(parameters))
-                    .map(|i| args[i].ty.clone()),
-            )?
-        } else {
-            args[0].ty.clone()
-        };
+        let ty = default_type.unwrap_or_else(|| args[0].ty.clone());
+        let enum_type = args[0].attached_enum()
+            .or_else(|| args.get(2).and_then(BoundScalar::attached_enum))
+            .cloned();
         for i in [0, 2] {
             if let Some(s) = call.args.get(i) {
+                if let Some(enum_type) = &enum_type {
+                    if let Scalar::Literal(value @ (Value::Text(_) | Value::Null)) = s {
+                        args[i] = BoundScalar::enum_literal(value, &ty, enum_type)?;
+                        continue;
+                    }
+                    if args[i].attached_enum() == Some(enum_type) && args[i].ty == ty {
+                        continue;
+                    }
+                }
                 args[i] = bind_expression(
                     &Scalar::Cast(Box::new(s.clone()), ty.clone()),
                     &table,
@@ -1073,9 +1091,19 @@ fn bind_call(
         }
         (ty, None)
     };
-    let collation = if functions::collation::is_collatable(&ty) {
+    let enum_output = match &aggregate {
+        Some(BoundItem::Aggregate(kind, Some(input))) => kind.enum_result(input),
+        _ if matches!(ty, DataType::Text | DataType::TextArray) => args
+            .first()
+            .and_then(BoundScalar::attached_enum)
+            .map(|enum_type| BoundScalar::enum_metadata(ty.clone(), enum_type)),
+        _ => None,
+    };
+    let collation = if enum_output.is_some() {
+        enum_output
+    } else if functions::collation::is_collatable(&ty) {
         // Value windows inherit their value arguments (including lag/lead's default).
-        let values = if matches!(call.name.as_str(), "lag" | "lead") && call.args.len() == 3 {
+        let values = if value_default {
             vec![call.args[0].clone(), call.args[2].clone()]
         } else {
             call.args.first().cloned().into_iter().collect()

@@ -420,7 +420,7 @@ impl BoundScalar {
                     .as_ref()
                     .map_or(Ok(Some(Value::Null)), |result| result.plan_constant(budget))
             }
-            Node::Domain(inner, ty @ TypeDef::Enum { .. }) => {
+            Node::Domain(inner, ty) if matches!(ty.as_ref(), TypeDef::Enum { .. }) => {
                 let value = inner.plan_constant(budget)?;
                 if let Some(value) = &value {
                     user_types::coerce_user_type(ty, &self.ty, value)?;

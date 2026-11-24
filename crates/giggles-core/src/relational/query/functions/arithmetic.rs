@@ -521,10 +521,14 @@ pub(super) fn bind(
                 operand(a, &at, resolve, tables, parameters)?,
                 operand(b, &bt, resolve, tables, parameters)?,
             ];
-            collation::derive(args.iter())?;
-            if *op == BinaryOp::Concat && ty == DataType::Text {
-                args.iter_mut().for_each(attach_text_cast);
+            if *op == BinaryOp::Concat {
+                if ty == DataType::TextArray {
+                    concat::bind_enum_operands([a, b], &mut args)?;
+                } else if ty == DataType::Text {
+                    args.iter_mut().for_each(attach_text_cast);
+                }
             }
+            collation::derive(args.iter())?;
             Ok(BoundScalar {
                 ty: ty.clone(),
                 node: if matches!(
