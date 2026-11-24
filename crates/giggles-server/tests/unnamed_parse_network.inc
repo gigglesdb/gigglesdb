@@ -1,5 +1,5 @@
 use crate as giggles_server;
-use giggles_core::{Admin, Limits, roles::NewRole};
+use giggles_core::{Admin, Engine, Limits, roles::NewRole};
 use giggles_server::{
     Running, Service,
     auth::{PostgresqlConfig, TlsMode, serve_postgresql},
@@ -22,7 +22,9 @@ static SERIAL: AtomicU64 = AtomicU64::new(0);
 // Both scenarios use the same pgwire test counters and cache-disable switch.
 static SCENARIO: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[cfg(feature = "engine-rocksdb")]
 struct ResetReuse;
+#[cfg(feature = "engine-rocksdb")]
 impl Drop for ResetReuse {
     fn drop(&mut self) {
         super::UNNAMED_REUSE_DISABLED.store(false, Ordering::SeqCst);
@@ -35,7 +37,7 @@ struct Fixture {
     path: std::path::PathBuf,
 }
 impl Fixture {
-    async fn new() -> Self {
+    async fn new(engine: Engine) -> Self {
         let path = std::env::temp_dir().join(format!(
             "sql-clock-{}-{}-{}",
             std::process::id(),
@@ -46,7 +48,7 @@ impl Fixture {
             SERIAL.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&path).unwrap();
-        let admin = Admin::create_engine(path.join("db"), Limits::default(), giggles_core::Engine::V2).unwrap();
+        let admin = Admin::create_engine(path.join("db"), Limits::default(), engine).unwrap();
         admin
             .roles()
             .create(NewRole {
@@ -117,9 +119,11 @@ async fn connect(f: &Fixture) -> TcpStream {
     wire_cycle(&mut stream).await;
     stream
 }
+#[cfg(feature = "engine-rocksdb")]
 async fn extended(stream: &mut TcpStream, sql: &str, named: bool) -> Vec<(u8, Vec<u8>)> {
     extended_oids(stream, sql, named, &[]).await
 }
+#[cfg(feature = "engine-rocksdb")]
 async fn extended_oids(stream: &mut TcpStream, sql: &str, named: bool, oids: &[u32]) -> Vec<(u8, Vec<u8>)> {
     let name = if named { "control" } else { "" };
     let params = vec!["9"; oids.len()];
@@ -167,6 +171,7 @@ async fn extended_values(
     }
     result
 }
+#[cfg(feature = "engine-rocksdb")]
 fn error_field(messages: &[(u8, Vec<u8>)], field: u8) -> Option<&[u8]> {
     messages.iter().filter(|(tag, _)| *tag == b'E')
         .flat_map(|(_, body)| body.split(|b| *b == 0))
@@ -179,6 +184,7 @@ fn code(messages: &[(u8, Vec<u8>)]) -> Option<String> {
             .map(|s| String::from_utf8(s[1..].to_vec()).unwrap())
     })
 }
+#[cfg(feature = "engine-rocksdb")]
 async fn command(stream: &mut TcpStream, sql: &str) {
     let result = extended(stream, sql, true).await;
     assert_eq!(code(&result), None, "{sql}: {result:?}");
@@ -186,7 +192,9 @@ async fn command(stream: &mut TcpStream, sql: &str) {
 // Preserve complete ErrorResponse and NoticeResponse fields and message boundaries.
 // This scenario emits no nondeterministic wire values.
 type Outcome = Vec<(u8, Vec<u8>)>;
+#[cfg(feature = "engine-rocksdb")]
 fn outcome(messages: Outcome) -> Outcome { messages }
+#[cfg(feature = "engine-rocksdb")]
 async fn checked(stream: &mut TcpStream, sql: &str, hit: bool) -> Outcome {
     check_reuse(sql, hit, extended(stream, sql, false)).await
 }
@@ -199,9 +207,10 @@ async fn check_reuse(sql: &str, hit: bool, response: impl Future<Output = Outcom
     assert_eq!(super::UNNAMED_REUSE_MISSES.load(Ordering::SeqCst) - misses, usize::from(!hit), "miss: {sql}");
     result
 }
+#[cfg(feature = "engine-rocksdb")]
 async fn scenario(disabled: bool) -> Vec<Outcome> {
     super::UNNAMED_REUSE_DISABLED.store(disabled, Ordering::SeqCst);
-    let f = Fixture::new().await;
+    let f = Fixture::new(Engine::V2).await;
     let mut a = connect(&f).await;
     let mut b = connect(&f).await;
     for setup in ["CREATE TABLE r3_parse_source(id INT)", "INSERT INTO r3_parse_source VALUES(7)", "CREATE ROLE r", "GRANT SELECT ON r3_parse_source TO r"] {
@@ -481,6 +490,7 @@ async fn scenario(disabled: bool) -> Vec<Outcome> {
     drop(a); drop(b); drop(c); f.stop().await;
     results
 }
+#[cfg(feature = "engine-rocksdb")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repeated_unnamed_parse_matches_full_path() {
     let _scenario = SCENARIO.lock().await;
@@ -518,9 +528,10 @@ fn row_description_counts(reply: &Outcome) -> Vec<u16> {
         .collect()
 }
 
+#[cfg(feature = "engine-rocksdb")]
 async fn dml_scenario(disabled: bool) -> Vec<Outcome> {
     super::UNNAMED_REUSE_DISABLED.store(disabled, Ordering::SeqCst);
-    let f = Fixture::new().await;
+    let f = Fixture::new(Engine::V2).await;
     let mut a = connect(&f).await;
     let mut b = connect(&f).await;
     let mut results = Vec::new();
@@ -697,6 +708,7 @@ async fn dml_scenario(disabled: bool) -> Vec<Outcome> {
     results
 }
 
+#[cfg(feature = "engine-rocksdb")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repeated_unnamed_dml_parse_matches_full_path() {
     let _scenario = SCENARIO.lock().await;
@@ -704,4 +716,140 @@ async fn repeated_unnamed_dml_parse_matches_full_path() {
     let cached = dml_scenario(false).await;
     let full = dml_scenario(true).await;
     assert_eq!(cached, full);
+}
+
+
+// The checks use the same unnamed SQL before and after cross-connection DDL.
+// PostgreSQL 18.6 rows and tsvectors are captured in F5-oracle.pg18.out.
+async fn archdocs_unnamed_dml_after_search_ddl(engine: Engine) {
+    let _scenario = SCENARIO.lock().await;
+    let f = Fixture::new(engine).await;
+    let mut writer = connect(&f).await;
+    let mut ddl = connect(&f).await;
+    simple_ok(&mut ddl, r#"CREATE TABLE "SearchDocument" (
+        "entityType" text, "entityId" uuid, "organizationId" uuid, "architectureDocId" uuid,
+        "spaceId" uuid, "title" text, "body" text, "matchOnlyBody" text, "updatedAt" timestamptz,
+        PRIMARY KEY ("entityType", "entityId")
+    )"#).await;
+    let insert = r#"INSERT INTO "SearchDocument" ("entityType", "entityId", "title")
+        VALUES ($1, $2::uuid, $3) RETURNING * /* r3_parse_source */"#;
+    let upsert = concat!(
+        include_str!("../../giggles-core/tests/fixtures/text_search_archdocs_upsert.sql"),
+        " /* r3_parse_source */",
+    );
+    let update = r#"UPDATE "SearchDocument" SET "title"=$1
+        WHERE "entityType"=$2 AND "entityId"=$3::uuid RETURNING * /* r3_parse_source */"#;
+    let entity = "00000000-0000-0000-0000-000000000004";
+    let organization = "00000000-0000-0000-0000-000000000010";
+    let read = r#"SELECT "title", "body", "matchOnlyBody" FROM "SearchDocument"
+        WHERE "entityId"='00000000-0000-0000-0000-000000000004'"#;
+    let read_vector = r#"SELECT tsv FROM "SearchDocument"
+        WHERE "entityId"='00000000-0000-0000-0000-000000000004'"#;
+
+    for (stage, (inserts, upserts, updates)) in [
+        ([(1, "Running dogs"), (2, "Hopping rabbits")],
+         ["Searching dogs", "Searching cats"], ["Purring kittens", "Chasing mice"]),
+        ([(3, "Barking dogs"), (7, "Sending refunds")],
+         ["Purring kittens", "Running dogs"], ["Hopping rabbits", "Searching cats"]),
+        ([(5, "Billing invoices"), (8, "Looking up receipts")],
+         ["Hopping rabbits", "Running mice"], ["Chasing kittens", "Searching dogs"]),
+        ([(6, "Closing invoices"), (9, "Sending receipts")],
+         ["Garden rabbits", "Billing cats"], ["Running kittens", "Searching mice"]),
+    ].into_iter().enumerate() {
+        match stage {
+            1 => {
+                simple_ok(&mut ddl, r#"ALTER TABLE "SearchDocument"
+                    ADD COLUMN tsv tsvector GENERATED ALWAYS AS (
+                        setweight(to_tsvector('english', coalesce("title",'')), 'A'::"char") ||
+                        setweight(to_tsvector('english', coalesce("body",'')), 'B') ||
+                        setweight(to_tsvector('english', coalesce("matchOnlyBody",'')), 'C')
+                    ) STORED"#).await;
+                assert_wire_row(&simple_ok(&mut ddl, read_vector).await,
+                    &["'cat':4B 'chase':1A 'garden':3B 'mice':2A 'refund':5C"]);
+            }
+            2 => {
+                simple_ok(&mut ddl, r#"CREATE INDEX search_gin ON "SearchDocument" USING gin (tsv)"#).await;
+            }
+            3 => {
+                simple_ok(&mut ddl, r#"ALTER TABLE "SearchDocument" DROP COLUMN tsv"#).await;
+            }
+            _ => {}
+        }
+
+        let has_vector = matches!(stage, 1 | 2);
+        let columns = if has_vector { 10 } else { 9 };
+        for (execution, (id, title)) in inserts.into_iter().enumerate() {
+            let id = format!("00000000-0000-0000-0000-{id:012}");
+            let hit = engine == Engine::V2 && execution == 1;
+            let reply = checked_dml(&mut writer, insert, &["doc", &id, title], hit, None).await;
+            assert_eq!(row_description_counts(&reply), [columns; 2]);
+            assert!(reply.contains(&(b'C', b"INSERT 0 1\0".to_vec())));
+        }
+        for (execution, title) in upserts.into_iter().enumerate() {
+            let hit = engine == Engine::V2 && execution == 1;
+            let reply = checked_dml(&mut writer, upsert,
+                &["doc", entity, organization, "", "", title, "Garden cats", "Refunds"],
+                hit, None).await;
+            assert!(reply.contains(&(b'C', b"INSERT 0 1\0".to_vec())));
+            let vector = match (stage, execution) {
+                (1, 0) => Some("'cat':4B 'garden':3B 'kitten':2A 'pur':1A 'refund':5C"),
+                (1, 1) => Some("'cat':4B 'dog':2A 'garden':3B 'refund':5C 'run':1A"),
+                (2, 0) => Some("'cat':4B 'garden':3B 'hop':1A 'rabbit':2A 'refund':5C"),
+                (2, 1) => Some("'cat':4B 'garden':3B 'mice':2A 'refund':5C 'run':1A"),
+                _ => None,
+            };
+            if let Some(vector) = vector {
+                assert_wire_row(&simple_ok(&mut ddl, read_vector).await, &[vector]);
+            }
+        }
+        for (execution, title) in updates.into_iter().enumerate() {
+            let hit = engine == Engine::V2 && execution == 1;
+            let reply = checked_dml(&mut writer, update, &[title, "doc", entity], hit, None).await;
+            assert_eq!(row_description_counts(&reply), [columns; 2]);
+            assert!(reply.contains(&(b'C', b"UPDATE 1\0".to_vec())));
+            assert_wire_row(&simple_ok(&mut ddl, read).await, &[title, "Garden cats", "Refunds"]);
+            let vector = match (stage, execution) {
+                (1, 0) => Some("'cat':4B 'garden':3B 'hop':1A 'rabbit':2A 'refund':5C"),
+                (1, 1) => Some("'cat':2A,4B 'garden':3B 'refund':5C 'search':1A"),
+                (2, 0) => Some("'cat':4B 'chase':1A 'garden':3B 'kitten':2A 'refund':5C"),
+                (2, 1) => Some("'cat':4B 'dog':2A 'garden':3B 'refund':5C 'search':1A"),
+                _ => None,
+            };
+            if let Some(vector) = vector {
+                assert_wire_row(&simple_ok(&mut ddl, read_vector).await, &[vector]);
+                for (_, description) in reply.iter().filter(|(tag, _)| *tag == b'T') {
+                    let oid = &description[description.len() - 12..description.len() - 8];
+                    assert_eq!(oid, 3614u32.to_be_bytes());
+                }
+            }
+        }
+    }
+    assert_eq!(code(&wire_query(&mut ddl, read_vector).await).as_deref(), Some("42703"));
+
+    drop(writer);
+    drop(ddl);
+    f.stop().await;
+}
+
+fn assert_wire_row(reply: &Outcome, expected: &[&str]) {
+    let mut body = (expected.len() as u16).to_be_bytes().to_vec();
+    for field in expected {
+        body.extend((field.len() as u32).to_be_bytes());
+        body.extend(field.as_bytes());
+    }
+    assert_eq!(
+        reply.iter().filter(|(tag, _)| *tag == b'D').map(|(_, row)| row).collect::<Vec<_>>(),
+        [&body],
+    );
+}
+
+#[tokio::test]
+async fn unnamed_archdocs_dml_after_search_ddl_legacy() {
+    archdocs_unnamed_dml_after_search_ddl(Engine::Legacy).await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn unnamed_archdocs_dml_after_search_ddl_v2() {
+    archdocs_unnamed_dml_after_search_ddl(Engine::V2).await;
 }

@@ -1284,7 +1284,7 @@ impl Scalar {
                 })
             }
             Self::Domain(a, name, target) => Self::bind_domain(a, (name, target), resolve, tables, parameters),
-            Self::Cast(a, ty) => Self::bind_cast(a, ty, resolve, tables, parameters),
+            Self::Cast(a, ty) => Self::bind_cast(a, ty, false, resolve, tables, parameters),
             Self::Column(c) => Self::bind_column(c, resolve, tables),
             Self::Literal(v) => Ok(Self::bind_literal(v)),
             Self::SubstringOrder(args) => {
@@ -1428,10 +1428,16 @@ impl Scalar {
     fn bind_cast(
         a: &Self,
         ty: &DataType,
+        text_search_argument: bool,
         resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
         tables: &[&TableDef],
         parameters: &[Option<DataType>],
     ) -> R<BoundScalar> {
+        // The internal char family has a text-search use, but no general
+        // scalar cast contract on application rows.
+        if !text_search_argument && matches!(ty, DataType::PgChar | DataType::PgCharArray) {
+            return Err(SqlError::Unsupported);
+        }
         if let Self::Call(name, args) = a
             && name == array_constructor::NAME
             && array_constructor::element_type(ty).is_some()
@@ -1467,6 +1473,9 @@ impl Scalar {
         if let Self::Literal(Value::Text(_) | Value::Null) = a
             && *ty != DataType::TimestampTz
         {
+            if *ty == DataType::Oid && !text_search_argument {
+                return Err(SqlError::Unsupported);
+            }
             let Self::Literal(v) = a else { unreachable!() };
             let v = cast_value(v.clone(), ty, &mut 0)?;
             return Ok(BoundScalar {
@@ -1477,7 +1486,18 @@ impl Scalar {
                 })),
             });
         }
-        let a = a.bind(resolve, tables, parameters)?;
+        let a = if let Self::Cast(input, DataType::Oid) = a
+            && matches!(ty, DataType::RegConfig | DataType::RegDictionary)
+        {
+            Self::bind_cast(input, &DataType::Oid, true, resolve, tables, parameters)?
+        } else {
+            a.bind(resolve, tables, parameters)?
+        };
+        if *ty == DataType::Oid && !text_search_argument
+            && !matches!(a.ty, DataType::Oid | DataType::RegConfig | DataType::RegDictionary)
+        {
+            return Err(SqlError::Unsupported);
+        }
         if let Some(supported) = text_search_types::cast_supported(&a.ty, ty) {
             if !supported {
                 return Err(SqlError::CannotCoerce);

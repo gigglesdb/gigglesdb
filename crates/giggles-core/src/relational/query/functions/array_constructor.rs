@@ -111,6 +111,13 @@ pub(super) fn bind(
     let args = args
         .iter()
         .map(|a| {
+            if element == DataType::PgChar {
+                let input = match a {
+                    Scalar::Cast(input, DataType::PgChar) => input.as_ref(),
+                    _ => a,
+                };
+                return Scalar::bind_cast(input, &element, true, resolve, tables, parameters);
+            }
             if target.is_some()
                 && let Some(source) = arithmetic::known(a, resolve, tables, parameters)?
             {

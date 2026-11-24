@@ -4742,10 +4742,14 @@ impl Relational {
                     .iter()
                     .find(|d| d.name == index.name)
                     .cloned();
+                if index.rename.is_some()
+                    && (descriptor.is_some() || sql_index::primary_table(self, &index.name).is_some())
+                {
+                    // Only GIN indexes support renames. Keep the existing
+                    // syntax refusal for regular indexes.
+                    return Err(SqlError::Syntax);
+                }
                 if let Some(descriptor) = descriptor {
-                    if index.rename.is_some() {
-                        return Err(SqlError::Unsupported);
-                    }
                     if self.ext.constraints.values().flatten().any(|c|
                         matches!(c.kind, ConstraintKind::Unique { index, .. } if index == descriptor.id)) {
                         return Err(SqlError::DependentObjects);

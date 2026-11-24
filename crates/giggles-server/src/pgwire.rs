@@ -5070,7 +5070,7 @@ pub(crate) static UNNAMED_REAUTHORIZE_FAIL: std::sync::atomic::AtomicBool = std:
 static UNNAMED_REUSE_MISSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 static UNNAMED_REUSE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-#[cfg(all(test, feature = "engine-rocksdb"))]
+#[cfg(test)]
 #[path = "../tests/unnamed_parse_network.inc"]
 mod unnamed_parse_network;
 

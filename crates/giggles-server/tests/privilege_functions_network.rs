@@ -456,7 +456,17 @@ async fn application_rows_privilege_task_only_refused() {
 
 #[tokio::test]
 async fn application_inquiry_contextual_casts() {
-    let f = Fixture::new().await;
+    application_inquiry_contextual_casts_on(giggles_core::Engine::Legacy).await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn application_inquiry_contextual_casts_v2() {
+    application_inquiry_contextual_casts_on(giggles_core::Engine::V2).await;
+}
+
+async fn application_inquiry_contextual_casts_on(engine: giggles_core::Engine) {
+    let f = Fixture::new_engine(engine).await;
     let owner = f.connect("owner", "owner-pw").await;
     for sql in ["CREATE TABLE w1d_cast(id INTEGER PRIMARY KEY)", "INSERT INTO w1d_cast VALUES (1)"] {
         Protocol::Simple.ok(&owner, sql).await;
@@ -472,10 +482,23 @@ async fn application_inquiry_contextual_casts() {
         let e = owner.query(&format!("SELECT pg_has_role({input}::oid,'owner','MEMBER') FROM w1d_cast"), &[]).await.unwrap_err();
         assert_eq!(e.code().unwrap().code(), state);
     }
-    // Main rejects these PG-only types on core application rows (0A000).
-    for ty in ["oid", "name"] {
-        let e = owner.query(&format!("SELECT '1'::{ty} FROM w1d_cast"), &[]).await.unwrap_err();
-        assert_eq!(e.code().unwrap().code(), "0A000", "{ty}");
+    // These casts are available in their supported contexts. An ordinary
+    // application projection, predicate, or sort key still refuses them.
+    for ty in ["oid", "name", r#""char""#] {
+        for (sql, state) in [
+            (format!("SELECT '1'::{ty} FROM w1d_cast"), "0A000"),
+            (format!("SELECT id FROM w1d_cast WHERE '1'::{ty} = '1'::{ty}"), "0A000"),
+            (format!("SELECT id FROM w1d_cast ORDER BY '1'::{ty}"), "0A000"),
+            (format!("CREATE TABLE cast_col (id int PRIMARY KEY, val {ty})"), "42704"),
+        ] {
+            for protocol in [Protocol::Simple, Protocol::Extended] {
+                let err = match protocol {
+                    Protocol::Simple => owner.simple_query(&sql).await.unwrap_err(),
+                    Protocol::Extended => owner.query(&sql, &[]).await.unwrap_err(),
+                };
+                assert_eq!(err.code().unwrap().code(), state, "{protocol:?}: {sql}");
+            }
+        }
     }
     drop(owner);
     f.finish().await;

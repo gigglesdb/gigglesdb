@@ -163,6 +163,8 @@ fn choose(
         .iter()
         .map(|arg| match arg {
             Scalar::Call(n, _) if n == array_constructor::NAME => Ok(None),
+            // Check restricted casts against the selected argument slot in bind.
+            Scalar::Cast(_, ty @ (Oid | PgChar | PgCharArray)) => Ok(Some(ty.clone())),
             _ => arithmetic::known(arg, resolve, tables, parameters),
         })
         .collect::<R<Vec<_>>>()?;
@@ -230,6 +232,12 @@ pub(super) fn bind(
                 && n == array_constructor::NAME
             {
                 return array_constructor::bind(args, Some(target), resolve, tables, parameters);
+            }
+            if let Scalar::Cast(input, cast_type) = arg
+                && cast_type == target
+                && matches!(target, Oid | PgChar | PgCharArray)
+            {
+                return Scalar::bind_cast(input, target, true, resolve, tables, parameters);
             }
             arithmetic::operand(arg, target, resolve, tables, parameters)
         })
