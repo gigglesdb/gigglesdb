@@ -4766,8 +4766,10 @@ impl Relational {
                         }))
                     };
                 let schema = prepared.creation_schema(self)?;
-                for (type_id, default) in type_ids.iter().zip(defaults) {
-                    enum_alter::validate_default(type_id.and_then(|id| self.ext.types.get(&id)), default.as_deref())?;
+                for ((column, type_id), default) in t.columns.iter().zip(&type_ids).zip(defaults) {
+                    if column.data_type != DataType::TextArray {
+                        enum_alter::validate_default(type_id.and_then(|id| self.ext.types.get(&id)), default.as_deref())?;
+                    }
                 }
                 defaults::install_create(
                     self,

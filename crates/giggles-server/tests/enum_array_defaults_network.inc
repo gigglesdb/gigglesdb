@@ -51,7 +51,7 @@ DROP COLUMN "type",
 ADD COLUMN     "kindId" UUID,
 ADD COLUMN     "source" "ObjectSource" NOT NULL DEFAULT 'MANUAL';
 CREATE TABLE "PersonalAccessToken" ("id" UUID NOT NULL, "scopes" TEXT[] DEFAULT ARRAY[]::TEXT[], CONSTRAINT "PersonalAccessToken_pkey" PRIMARY KEY ("id"));
-CREATE TABLE "OAuthClient" ("id" UUID NOT NULL, "redirectUris" TEXT[], "grantTypes" TEXT[] DEFAULT ARRAY['authorization_code', 'refresh_token']::TEXT[], CONSTRAINT "OAuthClient_pkey" PRIMARY KEY ("id"));
+CREATE TABLE "OAuthClient" ("id" UUID NOT NULL, "redirectUris" TEXT[], "grantTypes" TEXT[] DEFAULT ARRAY['authorization_code', 'refresh_token']::TEXT[], "label" VARCHAR(5) DEFAULT 'web', CONSTRAINT "OAuthClient_pkey" PRIMARY KEY ("id"));
 INSERT INTO "OAuthClient" ("id", "redirectUris") VALUES ('00000000-0000-0000-0000-000000000001', '{https://example.org}');
 CREATE TABLE "DesignDocVariationType" ("id" UUID NOT NULL, "presetKey" TEXT, "requiredFor" "DesignDocSize"[], "approvalFor" "DesignDocSize"[] DEFAULT ARRAY['LARGE']::"DesignDocSize"[], CONSTRAINT "DesignDocVariationType_pkey" PRIMARY KEY ("id"));
 INSERT INTO "DesignDocVariationType" ("id", "presetKey", "requiredFor") VALUES ('00000000-0000-0000-0000-000000000001', 'evidence', '{STANDARD,SMALL}');
@@ -107,8 +107,8 @@ CREATE TYPE "DesignAuthorKind" AS ENUM ('HUMAN', 'AGENT', 'ARCHDOCS_AI');
         &[&[Some("{}")]],
     )
     .await;
-    expect_rows(&pg, r#"SELECT "redirectUris", "grantTypes", "excludedAccountIds", "linkDismissals", "orgExternalId" FROM "OAuthClient""#,
-        &[&[Some("{https://example.org}"), Some("{authorization_code,refresh_token}"), Some("{}"), Some("{}"), None]]).await;
+    expect_rows(&pg, r#"SELECT "redirectUris", "grantTypes", "excludedAccountIds", "linkDismissals", "orgExternalId", label FROM "OAuthClient""#,
+        &[&[Some("{https://example.org}"), Some("{authorization_code,refresh_token}"), Some("{}"), Some("{}"), None, Some("web")]]).await;
     expect_rows(&pg, r#"SELECT "presetKey", "requiredFor", "approvalFor", "approvalCounts", "selfApproveAgentWork" FROM "DesignDocVariationType" ORDER BY "presetKey""#,
         &[
             &[Some("evidence"), Some("{}"), Some("{LARGE}"), Some(r#"{"LARGE": 0, "SMALL": 0, "STANDARD": 0}"#), Some("t")],
@@ -245,6 +245,7 @@ CREATE TYPE "DesignAuthorKind" AS ENUM ('HUMAN', 'AGENT', 'ARCHDOCS_AI');
         &[
             &[Some("excludedAccountIds"), Some("ARRAY[]::text[]")],
             &[Some("grantTypes"), Some("ARRAY['authorization_code'::text, 'refresh_token'::text]")],
+            &[Some("label"), Some("'web'::text")],
             &[Some("linkDismissals"), Some("ARRAY[]::text[]")],
         ]).await;
     expect_rows(&pg, r#"SELECT a.attname, pg_get_expr(d.adbin,d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid=d.adrelid AND a.attnum=d.adnum WHERE d.adrelid='"Object"'::regclass ORDER BY 1"#,

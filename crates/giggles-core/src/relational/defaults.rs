@@ -786,8 +786,8 @@ pub(super) fn install_create(
                 relations: Vec::new(),
             };
             let mut value = expression(&mut parser, 0)?;
-            let sql = column_default(&candidate, column, &mut value, path)?;
-            candidate.set_column_default(column.id, Some(sql))?;
+            let sql = column_default(&candidate, column, &mut value, path, false)?;
+            candidate.set_column_default(column.id, sql)?;
         }
     }
     candidate.validate_ext()?;
@@ -1081,7 +1081,11 @@ impl Expression {
             Self::Clock(s, _) => s.clone(),
             Self::Builtin(sql, _) => sql.clone(),
             Self::Negative(value) => format!("-({})", value.render(physical)),
-            Self::Cast(value, ty) => format!("({})::{}", value.render(physical), type_name(ty)),
+            Self::Cast(value, ty) => {
+                // Character typmods apply to the destination column after evaluation.
+                let ty = if physical && *ty == DataType::Varchar { &DataType::Text } else { ty };
+                format!("({})::{}", value.render(physical), type_name(ty))
+            }
             Self::NamedCast(value, name) => format!("({})::{}", value.render(physical),
                 if physical { type_name(&self.ty()).into() } else { name.sql() }),
             Self::Array(values) => format!("ARRAY[{}]",
@@ -1113,7 +1117,11 @@ impl Expression {
                     return array_text(values, ty, None);
                 }
                 if matches!(value.as_ref(), Self::String(_) | Self::Null) {
-                    constant_text(&self.sql(), ty)
+                    let sql = constant_text(&self.sql(), ty)?;
+                    if *ty == DataType::Varchar && let Some(text) = sql.strip_suffix("::text") {
+                        return Ok(format!("{text}::character varying"));
+                    }
+                    Ok(sql)
                 } else if value.ty() == *ty {
                     value.canonical(ty)
                 } else {
@@ -1158,8 +1166,11 @@ fn constant_text(sql: &str, ty: &DataType) -> R<String> {
         Value::Int(n) => format!("{}::{}", quoted(&n.to_string()), type_name(ty)),
         Value::Numeric(n) => format!("{}::numeric", quoted(&n.to_string())),
         Value::Bool(b) => b.to_string(),
-        Value::Text(s) => format!("{}::{}", quoted(&s),
-            if ty.is_extended_text() { type_name(ty) } else { "text" }),
+        Value::Text(s) => format!(
+            "{}::{}",
+            quoted(&s),
+            if ty.is_extended_text() && *ty != DataType::Uuid { type_name(ty) } else { "text" },
+        ),
         Value::Float4(v) => format!("{}::real", quoted(&v.to_text())),
         Value::Float8(v) => format!("{}::double precision", quoted(&v.to_text())),
         Value::Bytes(bytes) => {
@@ -1199,6 +1210,8 @@ pub(super) fn cast_type(p: &mut Parser) -> R<DataType> {
             DataType::DoublePrecision
         }
         "text" => DataType::Text,
+        "varchar" => DataType::Varchar,
+        "character" if p.word("varying") => DataType::Varchar,
         "uuid" => DataType::Uuid,
         "jsonb" => DataType::Jsonb,
         "bytea" => DataType::Bytes,
@@ -1465,10 +1478,12 @@ fn column_default(
     column: &ColumnDef,
     expression: &mut Expression,
     path: &[String],
-) -> R<String> {
+    validate_assignment: bool,
+) -> R<Option<String>> {
     expression.resolve(state, path)?;
     let target = &column.data_type;
-    if let Some(ty @ TypeDef::Enum { .. }) = state.column_type(column.id) {
+    let user_type = state.column_type(column.id);
+    if let Some(ty @ TypeDef::Enum { .. }) = user_type {
         let is_array = *target == DataType::TextArray;
         enum_default_casts(expression, state, path, ty, is_array)?;
         let value = query::InsertExpressions::default_value(
@@ -1484,21 +1499,28 @@ fn column_default(
             other => other,
         };
         if let Expression::Array(values) = input {
-            return array_text(values, target, Some(&name));
+            return array_text(values, target, Some(&name)).map(Some);
         }
         return match value {
-            Value::Text(text) => Ok(format!("{}::{name}{}", quoted(&text), if is_array { "[]" } else { "" })),
-            Value::Null => Ok("NULL".into()),
+            Value::Text(text) => Ok(Some(format!("{}::{name}{}", quoted(&text), if is_array { "[]" } else { "" }))),
+            Value::Null => Ok(Some("NULL".into())),
             _ => Err(SqlError::Type),
         };
     }
-    let sql = expression.sql();
     if *target == DataType::UuidArray {
-        query::InsertExpressions::validate_uuid_array_default(&sql, &column.name)?;
-    } else {
-        query::InsertExpressions::default_value(&sql, target, None, false)?;
+        let constant = query::InsertExpressions::validate_uuid_array_default(&expression.sql(), &column.name)?;
+        if constant == Some(Value::Null) {
+            return Ok(None);
+        }
+        return expression.canonical(target).map(Some);
     }
-    expression.canonical(target)
+    let sql = expression.canonical(target)?;
+    // CREATE already validated the original expression for a built-in type.
+    // Defaults for named types and ALTER are validated with the resolved type here.
+    if validate_assignment || user_type.is_some() {
+        query::InsertExpressions::default_value(&expression.sql(), target, None, false)?;
+    }
+    Ok(Some(sql))
 }
 
 fn enum_default_casts(
@@ -1651,7 +1673,9 @@ pub(super) fn install_alter(
     sql: Option<&str>,
     path: &[String],
 ) -> R<()> {
-    enum_alter::validate_default(state.column_type(column.id), sql)?;
+    if column.data_type != DataType::TextArray {
+        enum_alter::validate_default(state.column_type(column.id), sql)?;
+    }
     let value = if let Some(sql) = sql {
         let mut parser = Parser { privilege_seen: false, privilege_casts: false,
             tokens: lex(&format!("{sql},"))?,
@@ -1660,7 +1684,7 @@ pub(super) fn install_alter(
             relations: Vec::new(),
         };
         let mut value = expression(&mut parser, 0)?;
-        Some(column_default(state, column, &mut value, path)?)
+        column_default(state, column, &mut value, path, true)?
     } else {
         None
     };

@@ -263,7 +263,7 @@ impl InsertExpressions {
         value.bind(&no_columns, &[], &parameters)
     }
 
-    pub(in super::super) fn validate_uuid_array_default(sql: &str, column: &str) -> R<()> {
+    pub(in super::super) fn validate_uuid_array_default(sql: &str, column: &str) -> R<Option<Value>> {
         let value = Self::bind_default(sql, &DataType::UuidArray)?;
         if value.ty != DataType::UuidArray {
             user_types::view_replace_error(format!(
@@ -273,7 +273,7 @@ impl InsertExpressions {
             user_types::sql_error_hint("You will need to rewrite or cast the expression.");
             return Err(SqlError::Type);
         }
-        Self::validate_default_value(&value).map(|_| ())
+        Self::validate_default_value(&value)
     }
 
     fn validate_default_value(value: &BoundScalar) -> R<Option<Value>> {

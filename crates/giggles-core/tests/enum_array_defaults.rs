@@ -172,6 +172,154 @@ fn defaults(db: &Admin, table: &str, expected: &[(&str, &str)]) {
 }
 
 #[test]
+#[cfg_attr(not(feature = "engine-rocksdb"), allow(clippy::single_element_loop))]
+fn builtin_defaults_keep_catalog_text_and_backfill() {
+    for engine in [
+        Engine::Legacy,
+        #[cfg(feature = "engine-rocksdb")]
+        Engine::V2,
+    ] {
+        let db = Admin::create_engine(common::fresh("builtin-defaults"), Limits::default(), engine)
+            .unwrap();
+        let mut sql = db.sql_session();
+        let clock = StatementClock {
+            unavailable: None,
+            transaction_us: 1_000_000,
+            statement_us: 1_000_000,
+            zone: Some(SessionZone::Fixed(0)),
+            wall: None,
+        };
+        run(&mut sql, "CREATE SEQUENCE default_ids");
+        for (ty, create, add, set, stored, checks) in [
+            ("int", "7", "'8'::integer", "9", ["7", "8", "9"], ["7", "8", "9", "8"]),
+            ("bigint", "2147483648", "'2147483649'::bigint", "2147483650",
+                ["'2147483648'::bigint", "'2147483649'::bigint", "'2147483650'::bigint"],
+                ["2147483648", "2147483649", "2147483650", "2147483649"]),
+            ("numeric(7,2)", "1.234", "'2.345'::numeric", "3.456",
+                ["1.234", "'2.345'::numeric", "3.456"], ["1.23", "2.35", "3.46", "2.35"]),
+            ("boolean", "true", "'false'::boolean", "false",
+                ["true", "false", "false"], ["true", "false", "false", "false"]),
+            ("text", "'old'", "'add'::text", "'new'",
+                ["'old'::text", "'add'::text", "'new'::text"], ["'old'", "'add'", "'new'", "'add'"]),
+            ("varchar(5)", "'old'", "'add'", "'new'",
+                ["'old'::text", "'add'::text", "'new'::text"], ["'old'", "'add'", "'new'", "'add'"]),
+            ("varchar", "'old'", "'add'", "'new'",
+                ["'old'::text", "'add'::text", "'new'::text"], ["'old'", "'add'", "'new'", "'add'"]),
+            ("character varying(5)", "'old'::character varying", "'add'::varchar", "'new'::character varying",
+                ["'old'::character varying", "'add'::character varying", "'new'::character varying"],
+                ["'old'", "'add'", "'new'", "'add'"]),
+            ("char(3)", "'x'", "'y'", "'z'",
+                ["'x'::text", "'y'::text", "'z'::text"], ["'x  '", "'y  '", "'z  '", "'y  '"]),
+            ("date", "'2024-01-02'", "'2024-02-03'::date", "'2024-03-04'",
+                ["'2024-01-02'::date", "'2024-02-03'::date", "'2024-03-04'::date"],
+                ["'2024-01-02'::date", "'2024-02-03'::date", "'2024-03-04'::date", "'2024-02-03'::date"]),
+            ("timestamp(3)", "'2024-01-02 03:04:05.1234'", "'2024-02-03 04:05:06.5678'::timestamp", "CURRENT_TIMESTAMP",
+                ["'2024-01-02 03:04:05.1234'::timestamp without time zone",
+                 "'2024-02-03 04:05:06.5678'::timestamp without time zone", "CURRENT_TIMESTAMP"],
+                ["'2024-01-02 03:04:05.123'::timestamp", "'2024-02-03 04:05:06.568'::timestamp",
+                 "", "'2024-02-03 04:05:06.568'::timestamp"]),
+            ("timestamptz", "now()", "'2024-02-03 04:05:06+00'::timestamptz", "CURRENT_TIMESTAMP",
+                ["now()", "'2024-02-03 04:05:06+00'::timestamp with time zone", "CURRENT_TIMESTAMP"],
+                ["", "'2024-02-03 04:05:06+00'::timestamptz", "", "'2024-02-03 04:05:06+00'::timestamptz"]),
+            ("uuid", "'00000000-0000-0000-0000-000000000001'", "'00000000-0000-0000-0000-000000000002'::uuid", "gen_random_uuid()",
+                ["'00000000-0000-0000-0000-000000000001'::text",
+                 "'00000000-0000-0000-0000-000000000002'::text", "gen_random_uuid()"],
+                ["'00000000-0000-0000-0000-000000000001'",
+                 "'00000000-0000-0000-0000-000000000002'", "", "'00000000-0000-0000-0000-000000000002'"]),
+            ("jsonb", r#"'{"a":1}'"#, r#"'{"b":2}'::jsonb"#, r#"'{"c":3}'"#,
+                [r#"'{"a": 1}'::jsonb"#, r#"'{"b": 2}'::jsonb"#, r#"'{"c": 3}'::jsonb"#],
+                [r#"'{"a": 1}'"#, r#"'{"b": 2}'"#, r#"'{"c": 3}'"#, r#"'{"b": 2}'"#]),
+            ("bytea", r"'\x61'", r"'\x62'::bytea", r"'\x63'",
+                [r"'\x61'::bytea", r"'\x62'::bytea", r"'\x63'::bytea"],
+                [r"'\x61'::bytea", r"'\x62'::bytea", r"'\x63'::bytea", r"'\x62'::bytea"]),
+            ("bigint", "nextval('default_ids'::regclass)", "nextval('default_ids')", "nextval('default_ids'::regclass)",
+                ["nextval('default_ids'::regclass)"; 3], ["1", "2", "3", "4"]),
+        ] {
+            let [initial, added, updated] = stored;
+            let mut execute = |statement: &str| {
+                sql.execute_at(statement, &[], None, &clock)
+                    .unwrap_or_else(|error| panic!("{engine:?} {ty} {create} / {statement}: {error:?} ({:?})", take_sql_error_message()));
+            };
+            execute(&format!("CREATE TABLE default_sweep (id int PRIMARY KEY, c {ty} DEFAULT {create})"));
+            defaults(&db, "default_sweep", &[("c", initial)]);
+            execute("INSERT INTO default_sweep(id) VALUES (1)");
+            execute(&format!("ALTER TABLE default_sweep ADD COLUMN a {ty} DEFAULT {add}"));
+            defaults(&db, "default_sweep", &[("c", initial), ("a", added)]);
+            execute(&format!("ALTER TABLE default_sweep ALTER COLUMN c SET DEFAULT {set}"));
+            defaults(&db, "default_sweep", &[("c", updated), ("a", added)]);
+            execute("INSERT INTO default_sweep(id) VALUES (2)");
+            let rows = run(&mut sql, "SELECT id,c,a FROM default_sweep ORDER BY id");
+            assert_eq!(rows.len(), 2);
+            assert_eq!((&rows[0][0], &rows[1][0]), (&Value::Int(1), &Value::Int(2)));
+            let values = [&rows[0][1], &rows[0][2], &rows[1][1], &rows[1][2]];
+            for (value, expected_sql) in values.into_iter().zip(checks) {
+                if expected_sql.is_empty() {
+                    // The generated value depends on the clock or random source.
+                    assert_ne!(*value, Value::Null, "{engine:?} {ty} {create}");
+                } else {
+                    let expected = run(&mut sql, &format!("SELECT {expected_sql}"));
+                    assert_eq!(value, &expected[0][0], "{engine:?} {ty} {create}");
+                }
+            }
+            run(&mut sql, "DROP TABLE default_sweep");
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(not(feature = "engine-rocksdb"), allow(clippy::single_element_loop))]
+fn enum_array_literals_and_uuid_array_null_defaults() {
+    for engine in [
+        Engine::Legacy,
+        #[cfg(feature = "engine-rocksdb")]
+        Engine::V2,
+    ] {
+        let db =
+            Admin::create_engine(common::fresh("array-literal-defaults"), Limits::default(), engine)
+                .unwrap();
+        let mut sql = db.sql_session();
+        for statement in [
+            r#"CREATE TYPE "Role Kind" AS ENUM ('admin','owner','two words','a,b','NULL')"#,
+            r#"CREATE TABLE array_literals (id int PRIMARY KEY, r "Role Kind"[] DEFAULT '{owner}',
+                bare uuid[] DEFAULT NULL, typed uuid[] DEFAULT NULL::uuid[], prior uuid[] DEFAULT '{}')"#,
+            "INSERT INTO array_literals(id) VALUES (1)",
+            r#"ALTER TABLE array_literals ADD COLUMN roles "Role Kind"[] DEFAULT '{"two words","a,b",NULL,"NULL"}'"#,
+            "ALTER TABLE array_literals ADD COLUMN added uuid[] DEFAULT NULL::uuid[]",
+            "ALTER TABLE array_literals ALTER COLUMN prior SET DEFAULT NULL::uuid[]",
+            "ALTER TABLE array_literals ALTER COLUMN r SET DEFAULT '{admin,owner}'",
+        ] {
+            run(&mut sql, statement);
+        }
+        for statement in [
+            r#"CREATE TABLE bad_enum_literal (id int PRIMARY KEY, r "Role Kind"[] DEFAULT '{owner,missing}')"#,
+            "ALTER TABLE array_literals ALTER COLUMN r SET DEFAULT '{admin,missing}'",
+            r#"ALTER TABLE array_literals ADD COLUMN bad "Role Kind"[] DEFAULT '{missing}'"#,
+        ] {
+            error(
+                &mut sql,
+                statement,
+                SqlError::InvalidTextRepresentation,
+                r#"invalid input value for enum "Role Kind": "missing""#,
+            );
+        }
+        run(&mut sql, "INSERT INTO array_literals(id) VALUES (2)");
+        let roles = text(r#"{"two words","a,b",NULL,"NULL"}"#);
+        assert_eq!(
+            run(&mut sql, "SELECT id,r,roles,bare,typed,prior,added FROM array_literals ORDER BY id"),
+            [
+                vec![Value::Int(1), text("{owner}"), roles.clone(), Value::Null, Value::Null, text("{}"), Value::Null],
+                vec![Value::Int(2), text("{admin,owner}"), roles, Value::Null, Value::Null, Value::Null, Value::Null],
+            ]
+        );
+        defaults(&db, "array_literals", &[
+            ("r", r#"'{admin,owner}'::"Role Kind"[]"#),
+            ("roles", r#"'{"two words","a,b",NULL,"NULL"}'::"Role Kind"[]"#),
+        ]);
+        assert_eq!(db.catalog_presentation().unwrap().defaults.len(), 2);
+    }
+}
+
+#[test]
 fn enum_array_and_jsonb_defaults_preserve_existing_rows() {
     let db = Admin::create(common::fresh("enum-array-defaults"), Limits::default()).unwrap();
     let mut sql = db.sql_session();
