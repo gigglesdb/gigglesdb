@@ -78,6 +78,9 @@ pub(crate) mod row_sink;
 pub(crate) mod scan;
 pub mod spill;
 mod searched;
+mod statement_description;
+pub(crate) use statement_description::StatementDescription;
+use statement_description::StatementDescriptionInput;
 #[cfg(test)]
 mod source_plumbing_tests;
 use returning::Returning;
@@ -1955,107 +1958,6 @@ pub struct Description {
     pub parameters: Vec<DataType>,
     pub columns: Vec<ColumnDef>,
     pub typmods: Vec<i32>,
-}
-
-/// A lazy description for one immutable statement input and binding catalog.
-/// Paged callers may share it only across equivalent binding catalogs. Each
-/// execution still binds and validates its own statement before using it.
-pub(crate) struct StatementDescription<'a> {
-    prepared: &'a Prepared,
-    full: std::cell::OnceCell<(Description, EnumParameters)>,
-    searched: [std::cell::OnceCell<Description>; 3],
-}
-
-impl<'a> StatementDescription<'a> {
-    fn new(prepared: &'a Prepared) -> Self {
-        Self {
-            prepared,
-            full: std::cell::OnceCell::new(),
-            searched: Default::default(),
-        }
-    }
-
-    pub(crate) fn prepared(&self) -> &'a Prepared {
-        self.prepared
-    }
-
-    fn input(&self) -> StatementDescriptionInput<'_> {
-        StatementDescriptionInput {
-            memo: self,
-            prepared: std::borrow::Cow::Borrowed(self.prepared),
-        }
-    }
-
-    fn bind_schemas(&self, state: &Relational) -> R<StatementDescriptionInput<'_>> {
-        Ok(StatementDescriptionInput {
-            memo: self,
-            prepared: std::borrow::Cow::Owned(self.prepared.bind_schemas(state)?),
-        })
-    }
-
-    fn searched_slot(
-        &self,
-        order: giggles_pg_types::temporal::DateOrder,
-    ) -> &std::cell::OnceCell<Description> {
-        use giggles_pg_types::temporal::DateOrder::*;
-        &self.searched[match order {
-            Ymd => 0,
-            Mdy => 1,
-            Dmy => 2,
-        }]
-    }
-}
-
-/// Pairs the memo with its original input or a schema binding of that input.
-struct StatementDescriptionInput<'a> {
-    memo: &'a StatementDescription<'a>,
-    prepared: std::borrow::Cow<'a, Prepared>,
-}
-
-impl StatementDescriptionInput<'_> {
-    fn prepared(&self) -> &Prepared {
-        &self.prepared
-    }
-
-    // The full description binds at the prepared date order and adds result
-    // OIDs. The searched caller uses the ambient order and only needs types.
-    fn describe(&self, state: &Relational) -> R<&Description> {
-        if let Some((description, _)) = self.memo.full.get() {
-            return Ok(description);
-        }
-        let searched_description = self.memo.searched_slot(self.prepared.literal_date_order)
-            .get()
-            .filter(|_| self.can_share_searched(state));
-        let description = self.prepared.describe_with_searched(state, searched_description)?;
-        Ok(&self.memo.full.get_or_init(|| description).0)
-    }
-
-    fn searched_parameters(&self, state: &Relational) -> R<Vec<Option<DataType>>> {
-        if !self.can_share_searched(state) {
-            let description = searched::describe(&self.prepared, state)?;
-            return Ok(description.parameters.into_iter().map(Some).collect());
-        }
-        let order = clock::LiteralDateOrder::current();
-        let slot = self.memo.searched_slot(order);
-        let description = if order == self.prepared.literal_date_order
-            && let Some((description, _)) = self.memo.full.get()
-        {
-            description
-        } else if let Some(description) = slot.get() {
-            description
-        } else {
-            let description = searched::describe(&self.prepared, state)?;
-            slot.get_or_init(|| description)
-        };
-        Ok(description.parameters.iter().cloned().map(Some).collect())
-    }
-
-    fn can_share_searched(&self, state: &Relational) -> bool {
-        // Full describe uses its own enum and type-display scopes. Searched
-        // binding uses the caller's scopes and can record enum inference there.
-        state.ext.types.is_empty()
-            && self.prepared.declared_enum_parameters.as_deref().is_none_or(BTreeMap::is_empty)
-    }
 }
 
 /// Native ordered access compiled through the same binder and transaction path.

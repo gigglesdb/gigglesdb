@@ -387,18 +387,23 @@ mod tests {
         let expected = describe(input.prepared(), &state).unwrap_err();
         assert_eq!(expected, SqlError::DatetimeFieldOverflow);
         let params = [Value::Int(2)];
+        DESCRIBE_CALLS.set(0);
         assert_eq!(
             state.execute(&prepared, &params, None).unwrap_err(),
             expected
         );
+        assert_eq!(DESCRIBE_CALLS.get(), 2, "describe in both date orders");
+
         let bound_memo = StatementDescription::new(input.prepared());
         bound_memo.input().describe(&state).unwrap();
+        DESCRIBE_CALLS.set(0);
         assert_eq!(
             state
                 .mutation_keys(&bound_memo, &params, None, &scan::LegacyRows(&state))
                 .unwrap_err(),
             expected
         );
+        assert_eq!(DESCRIBE_CALLS.get(), 1, "describe in the ambient date order");
     }
 
     #[test]
