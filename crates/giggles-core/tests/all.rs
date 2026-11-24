@@ -1,7 +1,5 @@
 // Each file keeps its own `mod common;`, exactly as when it was its own binary.
 #![allow(clippy::duplicate_mod)]
-#[path = "check_column_ddl.rs"]
-mod check_column_ddl;
 #[path = "datetime_input_grammar.rs"]
 mod datetime_input_grammar;
 #[path = "write_fence_embedded.rs"]
@@ -10,6 +8,8 @@ mod write_fence_embedded;
 mod native_paging;
 #[path = "alter_add_column_if_not_exists.rs"]
 mod alter_add_column_if_not_exists;
+#[path = "check_column_ddl.rs"]
+mod check_column_ddl;
 #[path = "generated_columns.rs"]
 mod generated_columns;
 #[path = "gin_indexes.rs"]

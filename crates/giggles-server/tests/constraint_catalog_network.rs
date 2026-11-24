@@ -12,8 +12,12 @@ async fn stored_constraint_metadata_reaches_simple_and_extended_wire() {
         certificate: None, private_key: None, client_ca: None, certificates: BTreeMap::new(),
         databases: vec!["postgres".into()], loopback_trust: true, connections: 8 };
     let running = serve_postgresql(config.listen, service.clone(), Arc::new(config.build().unwrap())).await.unwrap();
-    let (client, connection) = tokio_postgres::Config::new().hostaddr(running.address.ip()).port(running.address.port())
-        .user("owner").dbname("postgres").connect(tokio_postgres::NoTls).await.unwrap();
+    let connect = |port| {
+        let mut config = tokio_postgres::Config::new();
+        config.host("127.0.0.1").port(port).user("owner").dbname("postgres");
+        config
+    };
+    let (client, connection) = connect(running.address.port()).connect(tokio_postgres::NoTls).await.unwrap();
     let connection = tokio::spawn(connection);
     for sql in include_str!("../../../compat/gui/sample.sql").split(';').map(str::trim).filter(|s| s.starts_with("CREATE SCHEMA") || s.starts_with("CREATE TABLE") || s.starts_with("CREATE INDEX")) {
         client.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
@@ -43,6 +47,46 @@ async fn stored_constraint_metadata_reaches_simple_and_extended_wire() {
     assert_eq!(identity.get::<_,i8>(0),b'd' as i8); assert!(!identity.get::<_,bool>(1));
     client.simple_query("CREATE TABLE gui_sales.check_names (id integer PRIMARY KEY, lower text, text text, \"true\" boolean, CHECK (lower('x') = 'x' AND 'a' = 'a' AND true))").await.unwrap();
     assert!(client.query_one("SELECT conkey IS NULL FROM pg_constraint WHERE conname='check_names_check'",&[]).await.unwrap().get::<_,bool>(0));
+    for (table, extended) in [("migration_simple", false), ("migration_extended", true)] {
+        for sql in [
+            "BEGIN".into(),
+            format!("CREATE TABLE {table} (id int PRIMARY KEY, n int CHECK (n > 0), m int, CHECK (n < m))"),
+            format!("ALTER TABLE {table} RENAME COLUMN n TO n2"),
+            "COMMIT".into(),
+        ] {
+            migration_statement(&client, &sql, extended).await.unwrap();
+        }
+    }
     drop(client); connection.await.unwrap().unwrap(); running.shutdown().await.unwrap(); drop(service);
+
+    let admin = Admin::open(&path, Limits::default()).unwrap();
+    let service = Service::new(admin, vec![], Clock::new(0, 3600).unwrap()).unwrap();
+    let running = serve_postgresql(config.listen, service, Arc::new(config.build().unwrap())).await.unwrap();
+    let (client, connection) = connect(running.address.port()).connect(tokio_postgres::NoTls).await.unwrap();
+    let connection = tokio::spawn(connection);
+    for (table, extended) in [("migration_simple", false), ("migration_extended", true)] {
+        migration_statement(&client, &format!("INSERT INTO {table} VALUES (1, 2, 3)"), extended).await.unwrap();
+        let error = migration_statement(&client, &format!("INSERT INTO {table} VALUES (2, 0, 3)"), extended)
+            .await.unwrap_err();
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), "23514");
+        assert_eq!(error.constraint(), Some(format!("{table}_n_check").as_str()));
+        assert_eq!(error.detail(), Some("Failing row contains (2, 0, 3)."));
+        migration_statement(&client, &format!("ALTER TABLE {table} DROP COLUMN m"), extended).await.unwrap();
+        migration_statement(&client, &format!("INSERT INTO {table} VALUES (2, 4)"), extended).await.unwrap();
+        let sql = format!("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='{table}'::regclass AND contype='c'");
+        let row = client.query_one(&sql, &[]).await.unwrap();
+        assert_eq!(row.get::<_, &str>(0), "CHECK ((n2 > 0))");
+    }
+    drop(client); connection.await.unwrap().unwrap(); running.shutdown().await.unwrap();
     std::fs::remove_dir_all(path).unwrap();
+}
+
+async fn migration_statement(client: &tokio_postgres::Client, sql: &str, extended: bool) -> Result<(), tokio_postgres::Error> {
+    if extended {
+        client.execute(sql, &[]).await?;
+    } else {
+        client.simple_query(sql).await?;
+    }
+    Ok(())
 }

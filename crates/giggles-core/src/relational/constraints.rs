@@ -377,20 +377,11 @@ pub(super) fn install(
             expression,
             not_valid,
         } => {
-            let expr = query::table_constraint_deparse(state, table, expression)?;
+            let (expr, referenced) =
+                query::constraint_table_deparse(state, table, expression)?;
             query::constraint_validate(state, table, &expr)?;
-            let referenced = table
-                .columns
-                .iter()
-                .filter(|c| {
-                    expression
-                        .iter()
-                        .any(|t| matches!(t,Token::Word(w)|Token::QuotedIdent(w) if *w==c.name))
-                })
-                .map(|c| c.name.clone())
-                .collect::<Vec<_>>();
             let names = if referenced.len() == 1 {
-                referenced
+                referenced.into_iter().collect()
             } else {
                 vec![]
             };
@@ -547,6 +538,51 @@ pub(super) fn install(
     Relational::normalize_ext(std::sync::Arc::make_mut(&mut state.ext));
     Ok(())
 }
+pub(super) fn rename_check_column(
+    state: &mut Relational,
+    table: &TableDef,
+    old: &str,
+    new: &str,
+) -> R<()> {
+    let mut replacements = BTreeMap::new();
+    for constraint in state.table_constraints(table.id) {
+        if let ConstraintKind::Check { expr, .. } = &constraint.kind
+            && let Some(renamed) = query::constraint_rename(state, table, expr, old, new)?
+        {
+            replacements.insert(constraint.id, renamed);
+        }
+    }
+    if !replacements.is_empty()
+        && let Some(constraints) = Arc::make_mut(&mut state.ext).constraints.get_mut(&table.id)
+    {
+        for constraint in constraints {
+            if let ConstraintKind::Check { expr, .. } = &mut constraint.kind
+                && let Some(renamed) = replacements.remove(&constraint.id)
+            {
+                *expr = renamed;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn drop_check_column(state: &mut Relational, table: &TableDef, column: &str) -> R<()> {
+    let mut removed = BTreeSet::new();
+    for constraint in state.table_constraints(table.id) {
+        if let ConstraintKind::Check { expr, .. } = &constraint.kind
+            && query::constraint_references(state, table, expr, column)?
+        {
+            removed.insert(constraint.id);
+        }
+    }
+    if !removed.is_empty()
+        && let Some(constraints) = Arc::make_mut(&mut state.ext).constraints.get_mut(&table.id)
+    {
+        constraints.retain(|constraint| !removed.contains(&constraint.id));
+    }
+    Ok(())
+}
+
 fn validate_kind(
     state: &Relational,
     table: &TableDef,
@@ -564,18 +600,8 @@ fn validate_kind(
             return Err(SqlError::Aborted);
         }
         match kind {
-            ConstraintKind::Check { expr, .. } if keys.is_none() => {
-                query::constraint_check(state, table, expr, row).inspect_err(|error| {
-                    if *error == SqlError::CheckViolation {
-                        user_types::view_replace_error(format!(
-                            "check constraint \"{name}\" of relation \"{}\" is violated by some row", table.name,
-                        ));
-                        user_types::sql_error_names(state, table, None, Some(name));
-                    }
-                })?;
-            }
             ConstraintKind::Check { expr, .. } => {
-                let written = diagnostic.map_or(&[][..], |(_, written)| written);
+                let written = keys.map(|_| diagnostic.map_or(&[][..], |(_, written)| written));
                 check_row(state, table, name, expr, row, written)?;
             }
             ConstraintKind::ForeignKey { .. } => {
@@ -587,20 +613,41 @@ fn validate_kind(
     }
     Ok(())
 }
-fn check_row(state: &Relational, table: &TableDef, name: &str, expr: &str, row: &SqlRow, written: &[usize]) -> R<()> {
+fn check_row(
+    state: &Relational,
+    table: &TableDef,
+    name: &str,
+    expr: &str,
+    row: &SqlRow,
+    written: Option<&[usize]>,
+) -> R<()> {
     query::constraint_check(state, table, expr, row).inspect_err(|error| {
-        if *error == SqlError::CheckViolation {
-            user_types::view_replace_error(format!("new row for relation \"{}\" violates check constraint \"{name}\"", table.name));
-            let is_virtual = |id| state.generated_column(id).is_some_and(|generation| !generation.stored);
-            user_types::sql_failing_check_detail(DuplicateKeyDetail {
+        if *error != SqlError::CheckViolation {
+            return;
+        }
+        user_types::sql_error_names(state, table, None, Some(name));
+        let Some(written) = written else {
+            user_types::view_replace_error(format!(
+                "check constraint \"{name}\" of relation \"{}\" is violated by some row",
+                table.name,
+            ));
+            return;
+        };
+        user_types::view_replace_error(format!(
+            "new row for relation \"{}\" violates check constraint \"{name}\"",
+            table.name,
+        ));
+        let is_virtual = |id| state.generated_column(id).is_some_and(|generation| !generation.stored);
+        user_types::sql_failing_check_detail(
+            DuplicateKeyDetail {
                 table_id: table.id,
                 schema: state.table_schema(table.id).into(),
                 table: table.name.clone(),
                 constraint: name.into(),
                 values: logical_types::failing_row_detail_with(table, &row.values, is_virtual),
-            }, logical_types::failing_row_written_detail(table, &row.values, written, is_virtual));
-            user_types::sql_error_names(state, table, None, Some(name));
-        }
+            },
+            logical_types::failing_row_written_detail(table, &row.values, written, is_virtual),
+        );
     })
 }
 pub(super) fn validate_named(
@@ -1167,7 +1214,7 @@ impl Relational {
             };
             for constraint in constraints {
                 if let ConstraintKind::Check { expr, .. } = &constraint.kind {
-                    check_row(self, table, &constraint.name, expr, &row, written)?;
+                    check_row(self, table, &constraint.name, expr, &row, Some(written))?;
                 }
             }
         }

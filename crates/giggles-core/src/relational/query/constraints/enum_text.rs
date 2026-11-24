@@ -8,6 +8,7 @@ pub(super) const MEMBERSHIP: &str = "\0check_enum_text_membership";
 struct Context {
     columns: BTreeSet<String>,
     expand_membership: bool,
+    table: String,
 }
 
 thread_local! {
@@ -45,7 +46,16 @@ impl Scope {
         Self(CONTEXT.replace(Context {
             columns,
             expand_membership,
+            table: table.name.clone(),
         }))
+    }
+
+    pub(super) fn rename_column(&mut self, old: &str, new: &str) {
+        CONTEXT.with_borrow_mut(|context| {
+            if context.columns.remove(old) {
+                context.columns.insert(new.into());
+            }
+        });
     }
 }
 
@@ -76,8 +86,10 @@ pub(super) fn varchar_cast(scalar: &Scalar) -> Option<(&ColumnRef, Option<i64>)>
 }
 
 pub(super) fn is_character_column(column: &ColumnRef) -> bool {
-    column.qualifier.is_none()
-        && CONTEXT.with_borrow(|context| context.columns.contains(&column.name))
+    CONTEXT.with_borrow(|context| {
+        column.qualifier.as_ref().is_none_or(|name| *name == context.table)
+            && context.columns.contains(&column.name)
+    })
 }
 
 pub(super) fn text_operand(value: &Scalar) -> bool {

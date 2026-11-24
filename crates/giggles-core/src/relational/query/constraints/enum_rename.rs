@@ -10,12 +10,7 @@ pub(in crate::relational) fn rename_enum_check(
     new: &str,
 ) -> R<Option<String>> {
     let _scope = enum_text::Scope::stored(state, table, false);
-    let body = expr.strip_suffix(" NOT VALID").unwrap_or(expr);
-    let body = body
-        .strip_prefix("CHECK (")
-        .and_then(|body| body.strip_suffix(')'))
-        .ok_or(SqlError::Unsupported)?;
-    let mut filter = expression(lex(body)?)?;
+    let mut filter = stored_filter(expr)?;
     let mut rename = Rename {
         columns,
         old,
@@ -26,12 +21,7 @@ pub(in crate::relational) fn rename_enum_check(
     if !rename.changed {
         return Ok(None);
     }
-    let suffix = if expr.ends_with(" NOT VALID") {
-        " NOT VALID"
-    } else {
-        ""
-    };
-    Ok(Some(format!("CHECK ({}){suffix}", deparse(&filter)?)))
+    Ok(Some(render_stored_filter(expr, &filter)?))
 }
 
 struct Rename<'a> {

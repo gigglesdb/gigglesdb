@@ -65,6 +65,12 @@ fn without_case(s: &Scalar) -> R<()> {
     Ok(())
 }
 pub(super) fn scalar(s: &Scalar) -> R<String> {
+    render_scalar(s, false)
+}
+
+fn render_scalar(s: &Scalar, stored: bool) -> R<String> {
+    let scalar = |s| render_scalar(s, stored);
+    let deparse = |f| render_filter(f, stored);
     Ok(match s {
         Scalar::Predicate(f) => deparse(f)?,
         Scalar::Case(case) => {
@@ -150,6 +156,17 @@ pub(super) fn scalar(s: &Scalar) -> R<String> {
             args.iter().map(scalar).collect::<R<Vec<_>>>()?.join(", ")
         ),
         Scalar::Cast(a, ty) => {
+            if stored {
+                // The stored form already includes the casts emitted by this deparser.
+                match (a.as_ref(), ty) {
+                    (Scalar::Literal(Value::Null), DataType::Boolean) => return Ok("NULL::boolean".into()),
+                    (Scalar::Literal(Value::Text(text)), DataType::Text | DataType::Integer) => {
+                        let ty = if *ty == DataType::Text { "text" } else { "integer" };
+                        return Ok(format!("'{}'::{ty}", text.replace('\'', "''")));
+                    }
+                    _ => {}
+                }
+            }
             // Literal casts can fold or change constant type during PG analysis.
             // Keep the admitted deparse subset independent of that machinery.
             if !matches!(a.as_ref(), Scalar::Column(_))
@@ -175,7 +192,7 @@ pub(super) fn scalar(s: &Scalar) -> R<String> {
         _ => return Err(SqlError::Unsupported),
     })
 }
-fn comparison_operand(value: &Scalar, enum_text_comparison: bool) -> R<String> {
+fn comparison_operand(value: &Scalar, enum_text_comparison: bool, stored: bool) -> R<String> {
     if enum_text_comparison {
         if let Some(text) = enum_text::text_literal(value) {
             return scalar(&Scalar::Literal(Value::Text(text.into())));
@@ -184,10 +201,16 @@ fn comparison_operand(value: &Scalar, enum_text_comparison: bool) -> R<String> {
             return Ok(format!("({})::text", scalar(value)?));
         }
     }
-    scalar(value)
+    render_scalar(value, stored)
 }
 
 fn deparse(f: &Filter) -> R<String> {
+    render_filter(f, false)
+}
+
+fn render_filter(f: &Filter, stored: bool) -> R<String> {
+    let scalar = |s| render_scalar(s, stored);
+    let deparse = |f| render_filter(f, stored);
     Ok(match f {
         Filter::InSubquery { .. } => return Err(SqlError::Unsupported),
         Filter::Is(f, Some(target), negated) => {
@@ -211,9 +234,9 @@ fn deparse(f: &Filter) -> R<String> {
             });
             format!(
                 "({} {} {})",
-                comparison_operand(a, enum_text_comparison)?,
+                comparison_operand(a, enum_text_comparison, stored)?,
                 if op == "!=" { "<>" } else { op },
-                comparison_operand(b, enum_text_comparison)?,
+                comparison_operand(b, enum_text_comparison, stored)?,
             )
         }
         Filter::Null(s, not) => {
@@ -239,6 +262,10 @@ fn deparse(f: &Filter) -> R<String> {
     })
 }
 fn expression(tokens: Vec<Token>) -> R<Filter> {
+    parse_expression(tokens).map(|(filter, _)| filter)
+}
+
+fn parse_expression(tokens: Vec<Token>) -> R<(Filter, Vec<schemas::Reference>)> {
     if tokens.iter().any(|token|matches!(token,Token::Word(word) if word == "select" || word == "distinct"))
         || tokens.iter().enumerate().any(|(at, token)| {
             matches!(token, Token::Word(word) if word == "case")
@@ -258,7 +285,7 @@ fn expression(tokens: Vec<Token>) -> R<Filter> {
     if p.at != p.tokens.len() || !p.params.is_empty() {
         return Err(SqlError::Unsupported);
     }
-    Ok(filter)
+    Ok((filter, p.relations))
 }
 pub(in crate::relational) fn validate_trigger_condition(tokens: &[Token]) -> R<()> {
     expression(tokens.to_vec()).map(drop)
@@ -266,13 +293,82 @@ pub(in crate::relational) fn validate_trigger_condition(tokens: &[Token]) -> R<(
 pub(in crate::relational) fn constraint_deparse(tokens: &[Token]) -> R<String> {
     deparse(&expression(tokens.to_vec())?)
 }
-pub(in crate::relational) fn table_constraint_deparse(
-    state: &Relational, table: &TableDef, tokens: &[Token],
-) -> R<String> {
+pub(in crate::relational) fn constraint_table_deparse(
+    state: &Relational,
+    table: &TableDef,
+    tokens: &[Token],
+) -> R<(String, BTreeSet<String>)> {
     let _enums = enum_text::Scope::enter(state, table, false);
-    constraint_deparse(tokens)
+    let schema = state.table_schema(table.id);
+    let (mut filter, relations) = parse_expression(tokens.to_vec())?;
+    if relations.iter().any(|reference| reference.schema.as_deref() != Some(schema)) {
+        return Err(SqlError::UnknownTable);
+    }
+    let mut columns = BTreeSet::new();
+    plan::subquery::map_filter(&mut filter, &mut |scalar| {
+        if let Scalar::Column(column) = scalar {
+            if column.qualifier.take().is_some_and(|name| name != table.name) {
+                return Err(SqlError::UnknownTable);
+            }
+            columns.insert(column.name.clone());
+        }
+        Ok(())
+    })?;
+    Ok((deparse(&filter)?, columns))
 }
-fn query(table: &TableDef, key: &str, expr: &str) -> R<Query> {
+
+pub(in crate::relational) fn constraint_references(
+    state: &Relational,
+    table: &TableDef,
+    expr: &str,
+    name: &str,
+) -> R<bool> {
+    let _scope = enum_text::Scope::stored(state, table, false);
+    let mut referenced = false;
+    stored_filter(expr)?.walk_scalars(&mut |scalar| {
+        referenced |= matches!(scalar, Scalar::Column(column) if column.name == name);
+        Ok(())
+    })?;
+    Ok(referenced)
+}
+
+pub(in crate::relational) fn constraint_rename(
+    state: &Relational,
+    table: &TableDef,
+    expr: &str,
+    old: &str,
+    new: &str,
+) -> R<Option<String>> {
+    let mut scope = enum_text::Scope::stored(state, table, false);
+    let mut filter = stored_filter(expr)?;
+    let mut changed = false;
+    plan::subquery::map_filter(&mut filter, &mut |scalar| {
+        if let Scalar::Column(column) = scalar
+            && column.name == old
+        {
+            column.name = new.into();
+            changed = true;
+        }
+        Ok(())
+    })?;
+    if !changed {
+        return Ok(None);
+    }
+    scope.rename_column(old, new);
+    Ok(Some(render_stored_filter(expr, &filter)?))
+}
+
+fn render_stored_filter(expr: &str, filter: &Filter) -> R<String> {
+    let result = render_filter(filter, true)?;
+    let suffix = if expr.ends_with(" NOT VALID") { " NOT VALID" } else { "" };
+    Ok(if expr.starts_with("CHECK (") {
+        format!("CHECK ({result}){suffix}")
+    } else {
+        format!("{result}{suffix}")
+    })
+}
+
+fn stored_filter(expr: &str) -> R<Filter> {
     let expr = expr.strip_suffix(" NOT VALID").unwrap_or(expr);
     let expr = expr
         .strip_prefix("CHECK (")
@@ -299,8 +395,13 @@ fn query(table: &TableDef, key: &str, expr: &str) -> R<Query> {
     if p.at != p.tokens.len() || !p.params.is_empty() {
         return Err(SqlError::Unsupported);
     }
-    Ok(table_query(table, key, filter))
+    Ok(filter)
 }
+
+fn query(table: &TableDef, key: &str, expr: &str) -> R<Query> {
+    Ok(table_query(table, key, stored_filter(expr)?))
+}
+
 pub(super) fn table_query(table: &TableDef, key: &str, filter: Filter) -> Query {
     Query {
         explain: false,

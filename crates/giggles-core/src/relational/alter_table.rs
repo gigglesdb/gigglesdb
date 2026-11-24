@@ -779,7 +779,6 @@ pub(super) fn execute(
                         cs.retain(|c|match &c.kind {
                             ConstraintKind::ForeignKey {columns,ref_table,ref_columns,..}=>!columns.contains(&id) && !(*ref_table==table.id && ref_columns.contains(&id)),
                             ConstraintKind::PrimaryKey=>*owner!=table.id || !replace_primary,
-                            ConstraintKind::Check {expr,..} if *owner==table.id=>!lex(expr).unwrap_or_default().iter().any(|t|matches!(t,Token::Word(n)|Token::QuotedIdent(n) if n==column)),
                             _=>true
                         });
                     }
@@ -789,6 +788,7 @@ pub(super) fn execute(
                 if let Some(cs) = std::sync::Arc::make_mut(&mut candidate.ext).constraints.get_mut(&table.id) {
                     cs.retain(|c| !matches!(&c.kind, ConstraintKind::Unique { columns, .. } if columns.contains(&id)));
                 }
+                constraints::drop_check_column(&mut candidate, &table, column)?;
                 let descriptors = candidate
                     .secondary_descriptors_engine()
                     .iter()
@@ -824,6 +824,7 @@ pub(super) fn execute(
                 }
                 generated_columns::rename_reference(&mut candidate, &table, &table.columns[at], new)?;
                 triggers::rename_when_column(&mut candidate, table.id, &table.columns[at], new)?;
+                constraints::rename_check_column(&mut candidate, &table, old, new)?;
                 table.columns[at].name = new.clone();
                 std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(), table.clone());
             }

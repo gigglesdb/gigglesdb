@@ -7275,7 +7275,8 @@ pub(super) use generated::{
 pub(super) use constraints::{
     constraint_check, constraint_columns, constraint_deparse, constraint_eval, constraint_key,
     constraint_key_supported, constraint_quote, constraint_shape, constraint_types_compatible,
-    constraint_validate, table_constraint_deparse, validate_trigger_condition,
+    constraint_references, constraint_rename, constraint_table_deparse, constraint_validate,
+    validate_trigger_condition,
 };
 
 #[cfg(test)]
