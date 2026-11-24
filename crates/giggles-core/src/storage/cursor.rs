@@ -916,6 +916,44 @@ mod tests {
     }
 
     #[test]
+    fn changing_schema_user_rebinds_cursor_on_the_same_catalog_image() {
+        let path = crate::test_artifact_root().join("cursor-cache-schema-user");
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut session = admin.sql_session();
+        for sql in [
+            "CREATE SCHEMA alice",
+            "CREATE SCHEMA bob",
+            "CREATE TABLE alice.t(id int PRIMARY KEY)",
+            "CREATE TABLE bob.t(id int PRIMARY KEY)",
+            "INSERT INTO alice.t VALUES (1)",
+            "INSERT INTO bob.t VALUES (2)",
+        ] {
+            session.execute(sql, &[], None).unwrap();
+        }
+        let search_path = r#""$user", public"#;
+        session.set_search_path(search_path, "alice");
+        let prepared = session.prepare("SELECT id FROM t").unwrap();
+
+        let before = relational::cursor::query_binds();
+        let mut first = session.open_cursor(&prepared, &[]).unwrap();
+        assert_eq!(first.fetch(1, 1024).unwrap()[0].values, [Value::Int(1)]);
+        let Data::Scan { image, .. } = &first.data else { panic!("streaming cursor") };
+        let first_image = Arc::clone(image);
+        drop(first);
+        drop(session.open_cursor(&prepared, &[]).unwrap());
+        assert_eq!(relational::cursor::query_binds() - before, 1);
+
+        session.set_search_path(search_path, "bob");
+        let mut second = session.open_cursor(&prepared, &[]).unwrap();
+        let Data::Scan { image, .. } = &second.data else { panic!("streaming cursor") };
+        assert!(Arc::ptr_eq(&first_image, image));
+        assert_eq!(relational::cursor::query_binds() - before, 2);
+        assert_eq!(second.fetch(1, 1024).unwrap()[0].values, [Value::Int(2)]);
+        drop((second, session, admin));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn idle_session_does_not_retain_pruned_cursor_image() {
         let path = crate::test_artifact_root().join("cursor-cache-prune");
         let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();

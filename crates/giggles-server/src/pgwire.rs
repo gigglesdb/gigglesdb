@@ -1531,6 +1531,7 @@ struct Portal {
     // EXECUTE can run a replacement statement while retaining the result
     // description promised when the portal was bound.
     bound_execute_target: Option<Box<Statement>>,
+    statement_name: Option<String>,
     params: Vec<Value>,
     formats: Vec<u16>,
     /// GD-0061 R3-310: a retained result is released (masked and charged)
@@ -1549,8 +1550,15 @@ impl Portal {
         s: Statement, params: Vec<Value>, catalog_params: Vec<giggles_pg_catalog::Value>,
         formats: Vec<u16>, parameter_bytes: usize,
     ) -> Self {
-        Self { s, bound_execute_target: None, params, formats, result: None, spilled: None, cursor: None,
+        Self { s, bound_execute_target: None, statement_name: None, params, formats, result: None, spilled: None, cursor: None,
             catalog_params, catalog_result: None, parameter_bytes, at: 0 }
+    }
+
+    fn has_live_statement(&self, statements: &BTreeMap<String, Statement>) -> bool {
+        // A bound portal can outlive its statement, but only the live entry
+        // can release the binding on statement close or replacement.
+        self.statement_name.as_ref().and_then(|name| statements.get(name))
+            .is_some_and(|statement| Arc::ptr_eq(&statement.p, &self.s.p))
     }
 
     fn retained_bytes(&self) -> R<usize> {
@@ -2619,10 +2627,12 @@ impl State {
                 read_only_check(prepared.row_lock_command().filter(|_| !prepared.row_lock_tables().is_empty()).unwrap_or("SELECT"), &self.settings, session, &mut self.diagnostic)?;
                 begin_implicit(session, implicit, &mut self.settings)?;
                 self.settings.queried = true;
-                p.cursor = Some(
-                    self.diagnostic
-                        .core(session.open_cursor(prepared, &p.params))?,
-                );
+                let cursor = if p.has_live_statement(&self.statements) {
+                    session.open_cursor(prepared, &p.params)
+                } else {
+                    session.open_uncached_cursor(prepared, &p.params)
+                };
+                p.cursor = Some(self.diagnostic.core(cursor)?);
             }
             let cursor = p.cursor.as_mut().expect("opened cursor");
             let mut remaining = if max == 0 { usize::MAX } else { max as usize };
@@ -3016,7 +3026,9 @@ impl State {
                 }
                 self.validate_statement_binding(&stmt, &mut s, session)?;
                 self.note_plan_use(&stmt);
-                self.portals.insert(name, Portal::new(s, params, catalog_params, output, parameter_bytes));
+                let mut portal = Portal::new(s, params, catalog_params, output, parameter_bytes);
+                portal.statement_name = Some(stmt);
+                self.portals.insert(name, portal);
                 frame(b'2', &[], out)?;
             }
             b'D' => {
@@ -3123,7 +3135,7 @@ impl State {
                         &p.formats,
                         &mut self.settings,
                         &mut self.diagnostic,
-                        false,
+                        cursor::Execution::Extended { live_statement: p.has_live_statement(&self.statements) },
                         &self.output,
                         out,
                     )?;
@@ -4840,11 +4852,15 @@ mod prepared_validation_tests {
         }
         let original_is_live = session.sql.test_cursor_binding_liveness().unwrap();
         assert!(original_is_live());
+        assert_eq!(message(&mut state, &mut session, b'B', b"p\0\0\0\0\0\0\0\0").unwrap()[0], b'2');
         parse_unnamed(&mut state, &mut session, "SELECT id FROM public.t WHERE id = 8", &[]);
         assert!(!original_is_live());
+        execute_bound_seven_and_sync(&mut state, &mut session);
         assert_eq!(session.sql.committed_catalog_version(), Some(version));
-        run_cursor_cycle(&mut state, &mut session, b"\0\0\0\0\0\0\0\0", b"P\0", b"\0\0\0\0\0");
         assert_eq!(giggles_core::SqlSession::test_cursor_query_binds(), before + 2);
+        run_cursor_cycle(&mut state, &mut session, b"\0\0\0\0\0\0\0\0", b"P\0", b"\0\0\0\0\0");
+        assert_eq!(giggles_core::SqlSession::test_cursor_query_binds(), before + 3);
+        assert!(session.sql.test_cursor_binding_liveness().unwrap()());
     }
 
     fn warm_named_cursor(state: &mut State, session: &mut Session) {
@@ -4855,6 +4871,16 @@ mod prepared_validation_tests {
         run_cursor_cycle(state, session, b"p\0s\0\0\0\0\0\0\0", b"Pp\0", b"p\0\0\0\0\0");
     }
 
+    // Text DataRow with one column containing the byte '7'.
+    const SEVEN_ROW: &[u8] = b"D\0\0\0\x0b\0\x01\0\0\0\x017";
+
+    fn execute_bound_seven_and_sync(state: &mut State, session: &mut Session) {
+        let reply = message(state, session, b'E', b"p\0\0\0\0\0").unwrap();
+        assert!(reply.starts_with(SEVEN_ROW));
+        assert_eq!(message(state, session, b'S', &[]).unwrap()[0], b'Z');
+        assert!(session.sql.test_cursor_binding_liveness().is_none());
+    }
+
     #[test]
     fn close_statement_releases_cursor_binding_on_current_snapshot() {
         let mut session = fixture();
@@ -4863,9 +4889,30 @@ mod prepared_validation_tests {
         let version = session.sql.committed_catalog_version().unwrap();
         let binding_is_live = session.sql.test_cursor_binding_liveness().unwrap();
         assert!(binding_is_live());
+        let bind = b"p\0s\0\0\0\0\0\0\0";
+        assert_eq!(message(&mut state, &mut session, b'B', bind).unwrap()[0], b'2');
         assert_eq!(message(&mut state, &mut session, b'C', b"Ss\0").unwrap()[0], b'3');
         assert!(!binding_is_live());
+        execute_bound_seven_and_sync(&mut state, &mut session);
         assert_eq!(session.sql.committed_catalog_version(), Some(version));
+    }
+
+    #[test]
+    fn closed_statement_can_declare_a_cursor_without_retaining_a_binding() {
+        let mut session = fixture();
+        let mut state = wire_state();
+        session.execute_sql("CREATE TABLE t(id int PRIMARY KEY)", &[]).unwrap();
+        session.execute_sql("INSERT INTO t VALUES (7)", &[]).unwrap();
+        let parse = b"s\0DECLARE c CURSOR WITH HOLD FOR SELECT id FROM public.t WHERE id = 7\0\0\0";
+        assert_eq!(message(&mut state, &mut session, b'P', parse).unwrap()[0], b'1');
+        let bind = b"p\0s\0\0\0\0\0\0\0";
+        assert_eq!(message(&mut state, &mut session, b'B', bind).unwrap()[0], b'2');
+        assert_eq!(message(&mut state, &mut session, b'C', b"Ss\0").unwrap()[0], b'3');
+        assert_eq!(message(&mut state, &mut session, b'E', b"p\0\0\0\0\0").unwrap()[0], b'C');
+        assert_eq!(message(&mut state, &mut session, b'S', &[]).unwrap()[0], b'Z');
+        assert!(session.sql.test_cursor_binding_liveness().is_none());
+        let reply = message(&mut state, &mut session, b'Q', b"FETCH 1 FROM c\0").unwrap();
+        assert!(reply.windows(SEVEN_ROW.len()).any(|frame| frame == SEVEN_ROW));
     }
 
     #[test]

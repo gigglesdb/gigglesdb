@@ -702,7 +702,7 @@ impl State {
                 &[],
                 &mut self.settings,
                 &mut self.diagnostic,
-                true,
+                cursor::Execution::Simple,
                 &self.output,
                 out,
             )?;

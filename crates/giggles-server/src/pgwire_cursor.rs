@@ -16,6 +16,11 @@ pub(super) enum Command {
     },
     Close(Option<String>),
 }
+pub(super) enum Execution {
+    Simple,
+    Extended { live_statement: bool },
+}
+
 struct Cursor {
     description: Description,
     result: giggles_core::Cursor,
@@ -250,7 +255,7 @@ impl Cursors {
         formats: &[u16],
         settings: &mut crate::pg_settings::SessionSettings,
         diagnostic: &mut Diagnostic,
-        simple: bool,
+        execution: Execution,
         output: &Output,
         out: &mut Vec<u8>,
     ) -> R<()> {
@@ -286,7 +291,9 @@ impl Cursors {
                 reject_row_locks(&p, *hold, diagnostic)?;
                 let mut description = core(session.describe(&p))?;
                 description.parameters.clear();
-                let result = core(if prepared.is_some() {
+                let result = core(if prepared.is_some()
+                    && matches!(execution, Execution::Extended { live_statement: true })
+                {
                     session.open_cursor(&p, params)
                 } else {
                     session.open_uncached_cursor(&p, params)
@@ -315,7 +322,7 @@ impl Cursors {
                 if *count == 0 && !moving && current {
                     return Err("55000");
                 }
-                if !moving && simple {
+                if !moving && matches!(execution, Execution::Simple) {
                     row_description(&c.description, formats, out)?;
                 }
                 let mut fetched = 0usize;

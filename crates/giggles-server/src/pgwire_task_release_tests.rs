@@ -422,7 +422,7 @@ fn cursor_command(
         &[],
         &mut state.settings,
         &mut state.diagnostic,
-        true,
+        cursor::Execution::Simple,
         &state.output,
         out,
     )
