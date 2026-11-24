@@ -455,13 +455,18 @@ fn captured_datagrip_discovery_and_absent_features() {
         run(include_str!("fixtures/datagrip_superuser.sql")).rows,
         vec![vec![Value::Bool(true)]]
     );
+    // A fresh PostgreSQL 18.6 database has four languages and no event triggers.
     for sql in [
         include_str!("fixtures/datagrip_existent_languages.sql"),
         include_str!("fixtures/datagrip_languages.sql"),
-        include_str!("fixtures/datagrip_event_triggers.sql"),
     ] {
-        assert!(run(sql).rows.is_empty());
+        assert_eq!(run(sql).rows.len(), 4);
     }
+    assert!(
+        run(include_str!("fixtures/datagrip_event_triggers.sql"))
+            .rows
+            .is_empty()
+    );
     assert!(matches!(
         execute(&plan(
             "select round(extract(epoch from pg_postmaster_start_time() at time zone 'UTC')) as startup_time"

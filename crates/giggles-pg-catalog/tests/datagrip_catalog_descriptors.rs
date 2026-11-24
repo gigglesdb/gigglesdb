@@ -149,12 +149,12 @@ fn null_descriptors_do_not_add_casts_or_routine_resolution() {
         plan("select * from pg_catalog.pg_unknown"),
         Err(Error::Unsupported)
     ));
-    // Existing regproc cast still returns the existing Oid descriptor and
-    // rejects missing routine resolution at execution. No binder change here.
+    // PostgreSQL 18.6 describes this cast as regproc and reports SQLSTATE 42883
+    // when the routine is missing at execution.
     let p = plan("select 'missing_routine'::regproc").unwrap().unwrap();
-    assert_eq!(describe(&p).unwrap()[0].data_type, PgType::Oid);
+    assert_eq!(describe(&p).unwrap()[0].data_type, PgType::Regproc);
     assert_eq!(
         execute(&p, &CatalogSnapshot::default(), &[]),
-        Err(Error::Unsupported)
+        Err(Error::Inquiry("42883"))
     );
 }

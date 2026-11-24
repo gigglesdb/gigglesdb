@@ -15,7 +15,7 @@ A task credential grants only its task's bounded authority. This table is genera
 | 09 | Join, subquery, or view outside task | join another table; subquery; view | pg_simple, pg_extended | NotAllowedInTaskSession(Other)\|Denied | 0A000 / 42501 | ds_09_other_relations |
 | 10 | Split statements and instruction text | SELECT 1; UPDATE shipments SET status = queued | pg_simple | NotAllowedInTaskSession(TransactionControl) | 0A000 | ds_10_split_and_instruction |
 | 11 | COPY and file reads | COPY shipments TO STDOUT; COPY FROM; pg_read_file | pg_simple, pg_extended | NotAllowedInTaskSession(Copy)\|Denied | 0A000 / 42501 | ds_11_copy_and_files |
-| 12 | DDL, functions, triggers, security definer | DROP TABLE; CREATE FUNCTION; CREATE TRIGGER | pg_simple, pg_extended | NotAllowedInTaskSession(Ddl)\|SyntaxUnsupported | 0A000 / 42601 | ds_12_ddl |
+| 12 | DDL, functions, triggers, security definer | DROP TABLE; CREATE FUNCTION; CREATE TRIGGER | pg_simple, pg_extended | NotAllowedInTaskSession(Ddl) | 0A000 | ds_12_ddl |
 | 13 | Sequence and non-allowlisted functions | nextval; setval; pg_read_file | pg_simple, pg_extended, http, grpc | Denied | 42501 | ds_13_functions |
 | 14 | Transaction control and native blocks | BEGIN; COMMIT; SAVEPOINT; native transaction | pg_simple, pg_extended, http, grpc | NotAllowedInTaskSession(TransactionControl)\|NotAllowedInTaskSession(Savepoint) | 0A000 / 0A000 | ds_14_transactions |
 | 15 | INSERT, DELETE, EXPLAIN, cursors, LOCK | INSERT; DELETE; EXPLAIN; DECLARE; LOCK | pg_simple, pg_extended | NotAllowedInTaskSession(Insert)\|NotAllowedInTaskSession(Delete)\|NotAllowedInTaskSession(Explain)\|NotAllowedInTaskSession(Cursor)\|NotAllowedInTaskSession(Lock) | 0A000 / 0A000 / 0A000 / 0A000 / 0A000 | ds_15_refused_classes |

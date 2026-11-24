@@ -56,7 +56,9 @@ fn captured_expanded_global_discovery() {
             4 => 2, // Built-in pg_default and pg_global tablespaces.
             5 => 3, // Two tablespaces plus the snapshot database.
             10 => 1, // Fresh PostgreSQL installs plpgsql.
-            11 => 3,
+            // PostgreSQL 18.6 returns 8 rows: 4 languages and 4 namespaces.
+            // GigglesDB omits pg_toast, a pre-existing difference tracked separately.
+            11 => 7,
             12 => 26, // PG18.6 casts from the reflected integer/text GUI inventory.
             _ => 0,
         };

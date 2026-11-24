@@ -72,7 +72,6 @@ fn sqlstate(code: &str) -> String {
                 "PrimaryKeyTaskRefused" => "0A000",
                 "ApproverTaskRefused" => "22023",
                 "ConstraintViolation" => "23505",
-                "SyntaxUnsupported" => "42601",
                 "ExportRefused" => "0A000",
                 "ZeroRows" | "NotApplicable" => "—",
                 other => panic!("unknown code {other}"),
@@ -232,23 +231,6 @@ fn sql_rpc(sql: &str) -> Case {
     let mut case = Case::new(sql, "");
     case.native = Native::Request(json!({"sql":{"sql":sql}}));
     case
-}
-async fn check_plain(f: &ParityFixture, id: usize, case: Case, code: &str) {
-    for surface in surfaces(id) {
-        let before = durable(f);
-        let accounting = charged(f);
-        let o = f.run(surface, &case).await;
-        assert_eq!(
-            o.sqlstate.as_deref(),
-            Some(sqlstate(code).as_str()),
-            "row {id} {surface:?}: {o:?}"
-        );
-        assert!(o.task_error.is_none(), "{o:?}");
-        assert!(o.rows.is_empty(), "{o:?}");
-        assert_eq!(durable(f), before);
-        assert_eq!(charged(f), accounting);
-        no_receipt(f);
-    }
 }
 fn denied(rule: DenyRule) -> TaskError {
     TaskError::Denied(rule)
@@ -515,15 +497,14 @@ async fn ds_11_copy_and_files() {
 #[tokio::test]
 async fn ds_12_ddl() {
     let f = ParityFixture::start_with_credential().await;
-    for sql in ["DROP TABLE shipments", "CREATE TABLE ds_table (id bigint)"] {
-        check(&f, 12, Case::new(sql, ""), refused(Class::Ddl)).await;
-    }
     for sql in [
+        "DROP TABLE shipments",
+        "CREATE TABLE ds_table (id bigint)",
         "CREATE FUNCTION ds_fn() RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
         "CREATE FUNCTION ds_definer() RETURNS integer LANGUAGE SQL SECURITY DEFINER AS 'SELECT 1'",
         "CREATE TRIGGER ds_trigger BEFORE UPDATE ON shipments FOR EACH ROW EXECUTE FUNCTION ds_fn()",
     ] {
-        check_plain(&f, 12, Case::new(sql, ""), "SyntaxUnsupported").await;
+        check(&f, 12, Case::new(sql, ""), refused(Class::Ddl)).await;
     }
     f.stop().await;
 }
