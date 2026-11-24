@@ -660,7 +660,150 @@ pub(super) fn drop_column(
     Ok(())
 }
 
+impl Trigger {
+    fn enabled_for_role(&self, replica: bool) -> bool {
+        matches!(
+            (self.enabled, replica),
+            (b'A', _) | (b'O', false) | (b'R', true)
+        )
+    }
+}
+
+impl Prepared {
+    /// The SET list is sufficient to exclude UPDATE OF triggers and FK
+    /// actions for simple updates. Plans can have several distinct SET lists.
+    fn plain_update_columns(&self, table: &TableDef) -> Option<BTreeSet<u64>> {
+        let names = match self.statement.get() {
+            Statement::Update { sets, .. } => {
+                sets.iter().map(|(name, _)| name).collect::<BTreeSet<_>>()
+            }
+            Statement::UpdateExpressions { sets, .. } => {
+                sets.iter().map(|(name, _)| name).collect()
+            }
+            _ => return None,
+        };
+        Some(
+            table
+                .columns
+                .iter()
+                .filter(|c| names.contains(&c.name))
+                .map(|c| c.id)
+                .collect(),
+        )
+    }
+}
+
 impl Relational {
+    /// Refuse a write before publication when it could invoke a trigger on
+    /// the target or on a table reached by a referential action.
+    pub(crate) fn check_unimplemented_trigger_firing(
+        &self,
+        prepared: &Prepared,
+        replica: bool,
+        copy: bool,
+    ) -> R<()> {
+        use catalog_ext::{Action, ConstraintKind};
+
+        if self.ext.triggers.is_empty() {
+            return Ok(());
+        }
+        for (name, command) in prepared.write_tables() {
+            let Some(table) = self.tables.get(&name) else {
+                continue;
+            };
+            let event = match command {
+                "INSERT" => INSERT,
+                "UPDATE" => UPDATE,
+                "DELETE" => DELETE,
+                // A DO NOTHING-only MERGE still must not take a path that
+                // is unimplemented for targets with active trigger definitions.
+                "MERGE" => INSERT | UPDATE | DELETE,
+                _ => continue,
+            };
+            let updated = if event == UPDATE {
+                prepared.plain_update_columns(table)
+            } else {
+                None
+            };
+            let mut pending = vec![(table.id, event, updated)];
+            let mut seen = BTreeSet::new();
+            while let Some((id, event, updated)) = pending.pop() {
+                if !seen.insert((id, event, updated.clone())) {
+                    continue;
+                }
+                let fires = self
+                    .ext
+                    .triggers
+                    .get(&id)
+                    .into_iter()
+                    .flat_map(BTreeMap::values)
+                    .any(|trigger| {
+                        trigger.enabled_for_role(replica)
+                            && trigger.events & event != 0
+                            && (event != UPDATE
+                                || trigger.update_columns.is_empty()
+                                || updated.as_ref().is_none_or(|columns| {
+                                    trigger
+                                        .update_columns
+                                        .iter()
+                                        .any(|column| columns.contains(column))
+                                }))
+                    });
+                if fires {
+                    let command = if copy {
+                        "COPY FROM"
+                    } else if prepared.command() == "MERGE" {
+                        "MERGE"
+                    } else {
+                        command
+                    };
+                    return Err(error(
+                        "0A000",
+                        format!("{command} on a table with triggers is not supported"),
+                    ));
+                }
+                if replica || !matches!(event, UPDATE | DELETE) {
+                    continue;
+                }
+                for (&child, constraints) in &self.ext.constraints {
+                    for constraint in constraints {
+                        let ConstraintKind::ForeignKey {
+                            ref_table,
+                            columns,
+                            ref_columns,
+                            on_delete,
+                            on_update,
+                            ..
+                        } = &constraint.kind
+                        else {
+                            continue;
+                        };
+                        if *ref_table != id
+                            || updated.as_ref().is_some_and(|updated| {
+                                !ref_columns.iter().any(|column| updated.contains(column))
+                            })
+                        {
+                            continue;
+                        }
+                        match if event == DELETE {
+                            on_delete
+                        } else {
+                            on_update
+                        } {
+                            Action::Cascade if event == DELETE => {
+                                pending.push((child, DELETE, None))
+                            }
+                            Action::Cascade | Action::SetNull | Action::SetDefault => pending
+                                .push((child, UPDATE, Some(columns.iter().copied().collect()))),
+                            Action::NoAction | Action::Restrict => (),
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Match adopted PostgreSQL event bits, timing/level and replication role.
     /// UPDATE OF and WHEN are evaluated by the firing caller.
     #[allow(dead_code, reason = "consumed by the trigger firing worker")]
@@ -681,10 +824,7 @@ impl Relational {
                 t.events & event != 0
                     && t.before == before
                     && t.row == row
-                    && matches!(
-                        (t.enabled, replica),
-                        (b'A', _) | (b'O', false) | (b'R', true)
-                    )
+                    && t.enabled_for_role(replica)
             })
     }
 }

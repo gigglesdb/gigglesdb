@@ -1,7 +1,8 @@
 //! User routine definitions and V2-only SQL DDL.
 use super::*;
-use crate::plpgsql::{self, FunctionSignature};
+use crate::plpgsql::{self, FunctionArgument, FunctionKind, FunctionSignature};
 use std::ops::Range;
+use std::sync::OnceLock;
 
 pub(crate) const TRIGGER_TYPE: u32 = 2279;
 pub(crate) const DEPENDENCY_HINT: &str = "Use DROP ... CASCADE to drop the dependent objects too.";
@@ -82,6 +83,53 @@ pub struct Routine {
     /// Positive finite PostgreSQL float4 cost, stored as IEEE-754 bits.
     pub cost_bits: u32,
     pub owner: u32,
+    /// Derived from this definition's body and signature. Each replacement
+    /// gets a fresh program, and decoding a catalog record starts cold.
+    #[serde(skip)]
+    pub(crate) program: RoutineProgram,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RoutineProgram(Arc<OnceLock<plpgsql::CompiledFunction>>);
+
+impl PartialEq for RoutineProgram {
+    fn eq(&self, _: &Self) -> bool {
+        // Compiling a routine does not change its catalog identity or contents.
+        true
+    }
+}
+impl Eq for RoutineProgram {}
+
+impl Routine {
+    pub(crate) fn compiled_function(
+        &self,
+    ) -> Result<plpgsql::CompiledFunction, plpgsql::PlCompileError> {
+        if let Some(compiled) = self.program.0.get() {
+            return Ok(compiled.clone());
+        }
+        let compiled = self.compile(&[])?;
+        Ok(self.program.0.get_or_init(|| compiled).clone())
+    }
+
+    fn compile(
+        &self,
+        args: &[RoutineArgument],
+    ) -> Result<plpgsql::CompiledFunction, plpgsql::PlCompileError> {
+        let signature = FunctionSignature {
+            name: self.name.clone(),
+            kind: FunctionKind::Trigger,
+            arguments: args
+                .iter()
+                .map(|arg| FunctionArgument {
+                    name: arg.name.clone(),
+                    // The trigger compiler rejects declared arguments before
+                    // using their types.
+                    data_type: DataType::Text,
+                })
+                .collect(),
+        };
+        plpgsql::compile(&self.body, &signature)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -303,6 +351,7 @@ pub(super) fn parse(p: &mut Parser, source: &str) -> R<Ddl> {
         parallel: b'u',
         cost_bits: 100f32.to_bits(),
         owner: 0,
+        program: RoutineProgram::default(),
     };
     let mut body_source = None;
     let mut seen = BTreeSet::new();
@@ -485,22 +534,13 @@ pub(super) fn execute(state: &mut Relational, prepared: &Prepared, ddl: &Ddl) ->
                     format!("RETURNS {} is not supported", create.returns),
                 ));
             }
-            if !create.args.is_empty() {
-                let mut diagnostic = RoutineDiagnostic::new(
-                    "42P13",
-                    "trigger functions cannot have declared arguments",
-                );
-                diagnostic.hint = Some("The arguments of the trigger can be accessed through TG_NARGS and TG_ARGV instead.".into());
-                diagnostic.context = Some(compile_context(&create.name.name));
-                return Err(diagnostic.error());
-            }
             let schema = state.routine_creation_schema(prepared)?;
             let existing = state
                 .ext
                 .routines
                 .iter()
                 .find(|(_, def)| def.schema == schema && def.name == create.name.name);
-            if existing.is_some() && !create.replace {
+            if existing.is_some() && !create.replace && create.args.is_empty() {
                 return Err(error(
                     "42723",
                     format!(
@@ -509,23 +549,20 @@ pub(super) fn execute(state: &mut Relational, prepared: &Prepared, ddl: &Ddl) ->
                     ),
                 ));
             }
-            let signature = FunctionSignature {
-                returns_trigger: true,
-                arg_names: vec![],
-                function_name: create.name.name.clone(),
+            let compiled = if create.args.is_empty() {
+                create.def.compiled_function()
+            } else {
+                create.def.compile(&create.args)
             };
-            // The temporary compiler stub has no consumers of these fields.
-            let _ = (
-                &signature.returns_trigger,
-                &signature.arg_names,
-                &signature.function_name,
-            );
-            plpgsql::compile(&create.def.body, &signature).map_err(|err| {
+            compiled.map_err(|err| {
                 let mut diagnostic = RoutineDiagnostic::new(err.sqlstate, err.message);
                 diagnostic.hint = err.hint;
                 diagnostic.position = err
                     .position
                     .and_then(|at| create.body_source.position(&create.def.body, at));
+                if err.sqlstate == "42P13" {
+                    diagnostic.context = Some(compile_context(&create.name.name));
+                }
                 diagnostic.error()
             })?;
             let mut def = create.def.clone();

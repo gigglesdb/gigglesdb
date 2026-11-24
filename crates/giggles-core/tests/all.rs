@@ -629,3 +629,6 @@ mod sql_regex;
 
 #[path = "sql_triggers_ddl.rs"]
 mod sql_triggers_ddl;
+#[cfg(feature = "engine-rocksdb")]
+#[path = "sql_triggers_fire.rs"]
+mod sql_triggers_fire;

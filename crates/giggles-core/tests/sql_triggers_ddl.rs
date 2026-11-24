@@ -475,30 +475,33 @@ fn refused_variants_and_when_references() {
 
 #[cfg(feature = "engine-rocksdb")]
 #[test]
-#[ignore = "requires the merged W2 PL/pgSQL compiler"]
 fn postgres_oracle_function_body_compile_errors() {
     let path = common::fresh("triggers-compile");
     let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
     let mut s = admin.sql_session();
-    for (name, body, message) in [
+    for (name, body, token, message) in [
         (
             "bad1",
             " BEGIN RETURN NEW END ",
+            "",
             "syntax error at end of input",
         ),
         (
             "bad2",
             " BEGIN IF TG_OP = 'X' THEN RETURN NEW; END ",
+            "",
             "syntax error at end of input",
         ),
         (
             "bad3",
-            " BEGIN DELETE FRM t; RETURN NEW; END ",
+            " BEGIN /* caf\u{e9} */ DELETE FRM t; RETURN NEW; END ",
+            "FRM",
             "syntax error at or near \"FRM\"",
         ),
         (
             "bad4",
             " RETURN NEW; ",
+            "RETURN",
             "syntax error at or near \"RETURN\"",
         ),
     ] {
@@ -506,11 +509,14 @@ fn postgres_oracle_function_body_compile_errors() {
             "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $body${body}$body$"
         );
         let diagnostic = failure(&mut s, &sql, "42601", message);
-        assert!(
-            diagnostic
-                .position
-                .is_some_and(|at| at > sql.find("$body$").unwrap())
-        );
+        let offset = if token.is_empty() {
+            sql.rfind("$body$").unwrap()
+        } else {
+            sql.find("$body$").unwrap() + "$body$".len() + body.find(token).unwrap()
+        };
+        assert_eq!(diagnostic.position, Some(sql[..offset].chars().count() + 1));
+        assert_eq!(diagnostic.context, None);
+        assert_eq!(diagnostic.hint, None);
     }
     drop(s);
     drop(admin);

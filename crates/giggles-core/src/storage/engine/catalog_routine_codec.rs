@@ -167,6 +167,7 @@ mod tests {
             parallel: b'u',
             cost_bits: 100f32.to_bits(),
             owner: 10,
+            program: Default::default(),
         };
         let trigger = Trigger {
             id: 48,
@@ -183,6 +184,8 @@ mod tests {
             when_columns: vec![],
         };
         let mut r = encode_routine(&routine).unwrap();
+        routine.compiled_function().unwrap();
+        assert_eq!(encode_routine(&routine).unwrap(), r);
         let mut t = encode_trigger(&trigger).unwrap();
         assert_eq!(r[0], 1);
         assert_eq!(t[0], 1);

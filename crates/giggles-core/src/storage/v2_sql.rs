@@ -395,6 +395,11 @@ impl SqlSession {
             }
             let mut state = db.metadata_state(self.v2_transaction.as_ref())?;
             state.sql.epoch = 0;
+            if !state.sql.catalog_ext().triggers.is_empty() {
+                let bound = prepared.bind_schemas(&state.sql).map_err(CoreError::Sql)?;
+                state.sql.check_unimplemented_trigger_firing(&bound, self.deferral.replica, true)
+                    .map_err(relational::routines::into_core)?;
+            }
             let image = Arc::new(state.sql.clone());
             let guard = sql_sequences::Guard::new(&self.sequence_authority, self.admin.roles(),
                 self.v2_transaction.as_ref(), &image);
@@ -675,6 +680,11 @@ impl SqlSession {
                             }
                         })?;
                         let bound = p.bind_schemas(&binding).map_err(CoreError::Sql)?;
+                        if matches!(class, V2Class::Dml) {
+                            binding.check_unimplemented_trigger_firing(
+                                &bound, self.deferral.replica, self.copy_input.is_some(),
+                            ).map_err(relational::routines::into_core)?;
+                        }
                         let target_name = bound.storage_table().map(str::to_owned);
                         if writing && !ddl && target_name.as_ref().is_some_and(|n| binding.view_names.contains_key(n)) { return Err(CoreError::Sql(E::Unsupported)); }
                         let mut names = bound.read_tables().into_iter().collect::<BTreeSet<_>>();
