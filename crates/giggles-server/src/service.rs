@@ -3460,7 +3460,7 @@ impl Session {
         self.sql.still_valid()
     }
     /// Recheck fresh application-Parse authority without parsing or describing.
-    /// Caller proves this is an unchanged non-DDL SELECT outside a transaction.
+    /// Caller proves this is an unchanged SELECT, INSERT, UPDATE, or DELETE eligible for unnamed Parse reuse.
     pub(crate) fn reauthorize_unnamed_parse(&mut self, _sql: &str, dependencies: &[relational::SequenceDependency], p: &Prepared) -> Result<(), CoreError> {
         #[cfg(test)]
         if _sql.contains("r3_parse_source") && crate::pgwire::UNNAMED_REAUTHORIZE_FAIL.swap(false, std::sync::atomic::Ordering::SeqCst) {

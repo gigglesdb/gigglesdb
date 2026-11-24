@@ -1922,6 +1922,7 @@ fn unnamed_dml_can_skip_probes(
     // The service's lexical FK probe scans every bare REFERENCES word.
     // A nonempty result needs the full path's ownership check.
     let keyword = b"references";
+    // Only the scans shared with the service path use its statement budgets.
     let _budgets = session.sql.statement_budgets();
     if sql.as_bytes().windows(keyword.len()).any(|word| word.eq_ignore_ascii_case(keyword))
         && !Prepared::constraint_references(sql).is_ok_and(|tables| tables.is_empty())

@@ -660,28 +660,36 @@ async fn dml_scenario(disabled: bool) -> Vec<Outcome> {
     simple_ok(&mut b, "DROP TABLE r3_parse_source").await;
     results.push(checked_dml(&mut a, insert, &["15", "10"], false, Some("42P01")).await);
 
-    // This profile grants serial sequence USAGE through the sequence owner's role.
-    // Keep the table INSERT grant while revoking that role from the writer.
+    // This profile grants sequence USAGE through the sequence owner's role.
+    // Keep the table grants while revoking that role from the writer.
     for sql in [
         "CREATE ROLE dml_sequence_owner",
         "GRANT CREATE ON SCHEMA public TO dml_sequence_owner",
         "SET ROLE dml_sequence_owner",
         "CREATE TABLE r3_parse_source_serial (id SERIAL PRIMARY KEY, payload INT)",
+        "CREATE SEQUENCE r3_parse_source_explicit_seq",
         "RESET ROLE",
+        "CREATE TABLE r3_parse_source_explicit (id BIGINT PRIMARY KEY, payload INT)",
         "GRANT INSERT ON r3_parse_source_serial TO dml_writer",
+        "GRANT INSERT, SELECT ON r3_parse_source_explicit TO dml_writer",
         "GRANT dml_sequence_owner TO dml_writer",
     ] {
         simple_ok(&mut b, sql).await;
     }
     simple_ok(&mut a, "SET ROLE dml_writer").await;
-    let serial = "INSERT INTO r3_parse_source_serial (payload) VALUES ($1)";
-    results.push(checked_dml(&mut a, serial, &["1"], false, None).await);
-    results.push(checked_dml(&mut a, serial, &["2"], true, None).await);
-    simple_ok(&mut b, "REVOKE dml_sequence_owner FROM dml_writer").await;
-    results.push(checked_dml(&mut a, serial, &["3"], false, Some("42501")).await);
-    simple_ok(&mut b, "GRANT dml_sequence_owner TO dml_writer").await;
-    results.push(checked_dml(&mut a, serial, &["3"], false, None).await);
-    results.push(checked_dml(&mut a, serial, &["4"], true, None).await);
+    for sql in [
+        "INSERT INTO r3_parse_source_serial (payload) VALUES ($1)",
+        "INSERT INTO r3_parse_source_explicit (id, payload) \
+         VALUES (nextval('r3_parse_source_explicit_seq'), $1) RETURNING id",
+    ] {
+        results.push(checked_dml(&mut a, sql, &["1"], false, None).await);
+        results.push(checked_dml(&mut a, sql, &["2"], true, None).await);
+        simple_ok(&mut b, "REVOKE dml_sequence_owner FROM dml_writer").await;
+        results.push(checked_dml(&mut a, sql, &["3"], false, Some("42501")).await);
+        simple_ok(&mut b, "GRANT dml_sequence_owner TO dml_writer").await;
+        results.push(checked_dml(&mut a, sql, &["3"], false, None).await);
+        results.push(checked_dml(&mut a, sql, &["4"], true, None).await);
+    }
 
     drop(a);
     drop(b);
