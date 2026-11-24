@@ -6,6 +6,117 @@ use std::{
 };
 
 #[tokio::test]
+async fn enum_column_oids_agree_across_protocols() {
+    use super::wire_sql_types::{
+        api_support::{rpc, sql},
+        fixture, http_result, setup,
+    };
+    use giggles_server::{
+        api::proto,
+        auth::{PostgresqlConfig, TlsMode, serve_postgresql},
+    };
+
+    let (f, wire, mut native, _) = fixture().await;
+    setup(&f, "CREATE TYPE migration_stage AS ENUM ('DRAFT', 'READY')");
+    setup(
+        &f,
+        "CREATE TABLE migration_oids (stage migration_stage, stages migration_stage[])",
+    );
+    setup(
+        &f,
+        "INSERT INTO migration_oids VALUES ('READY', '{DRAFT,READY}')",
+    );
+
+    let config = PostgresqlConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        tls: TlsMode::Disabled,
+        certificate: None,
+        private_key: None,
+        client_ca: None,
+        certificates: Default::default(),
+        databases: vec!["postgres".into()],
+        loopback_trust: true,
+        connections: 8,
+    };
+    let postgres = serve_postgresql(
+        config.listen,
+        f.service.clone(),
+        Arc::new(config.build().unwrap()),
+    )
+    .await
+    .unwrap();
+    let (pg, connection) = tokio_postgres::Config::new()
+        .hostaddr(postgres.address.ip())
+        .port(postgres.address.port())
+        .user("oid_owner")
+        .dbname("postgres")
+        .connect(tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(connection);
+
+    let catalog = pg
+        .query_one(
+            "SELECT oid, typarray FROM pg_type WHERE typname = 'migration_stage'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let expected: [u32; 2] = [catalog.get(0), catalog.get(1)];
+    assert!(expected.iter().all(|&oid| oid >= 65536));
+    assert_ne!(expected[0], expected[1]);
+    let query = "SELECT stage, stages FROM migration_oids";
+    let description = pg.prepare(query).await.unwrap();
+    let pg_oids: Vec<_> = description
+        .columns()
+        .iter()
+        .map(|column| column.type_().oid())
+        .collect();
+    assert_eq!(pg_oids, expected);
+
+    let http = http_result(&f, query).await;
+    assert_eq!(http.column_types, pg_oids);
+    assert_eq!(http.rows.len(), 1);
+
+    let mut grpc = f.grpc_client(&f.app).await;
+    let session = grpc
+        .open_session(proto::OpenSessionRequest {
+            role: Some("oid_owner".into()),
+            database: Some("postgres".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let reply = grpc
+        .execute(rpc(&session.session_id, sql(query)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.code, "ok", "{reply:?}");
+    assert_eq!(reply.sql.unwrap().column_types, pg_oids);
+    grpc.close_session(rpc(&session.session_id, proto::CloseSessionRequest {}))
+        .await
+        .unwrap();
+
+    // The first reply defines the shape, and the second reuses it.
+    for _ in 0..2 {
+        let reply = native.execute(sql(query)).await.unwrap();
+        assert_eq!(reply.code, "ok", "{reply:?}");
+        let result = reply.sql.unwrap();
+        assert_eq!(result.columns, http.columns);
+        assert_eq!(result.column_types, pg_oids);
+    }
+
+    native.goodbye().await.unwrap();
+    wire.shutdown().await.unwrap();
+    drop(pg);
+    connection.await.unwrap().unwrap();
+    postgres.shutdown().await.unwrap();
+    f.stop().await;
+}
+
+#[tokio::test]
 async fn am2_enum_and_primary_key_archdocs_migration() {
     use giggles_core::{Engine, roles::NewRole};
     use giggles_server::auth::{PostgresqlConfig, TlsMode, scram::Verifier, serve_postgresql};

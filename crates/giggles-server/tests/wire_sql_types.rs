@@ -1,23 +1,24 @@
-#![cfg(feature = "engine-rocksdb")]
-mod api_support;
-use api_support::{Fixture, sql};
+pub(super) mod api_support;
+use api_support::Fixture;
+#[cfg(feature = "engine-rocksdb")]
+use api_support::sql;
 use giggles_core::roles::NewRole;
 use giggles_server::{
     api::{ApiLimits, ApiRuntime, json::decode_sql_result, net::serve_role_bound, proto},
     auth::RoleApiConfig,
-    wire::{
-        client::{Client, ClientTls, Credential},
-        listen::serve_role_wire_bound,
-        messages::WireReply,
-    },
+    wire::{client::{Client, ClientTls, Credential}, listen::serve_role_wire_bound},
 };
-use prost::Message;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::{net::TcpListener, sync::watch};
 
-async fn fixture() -> (Fixture, giggles_server::Running, Client, u32) {
-    let mut f = Fixture::catalog_empty_engine(giggles_core::Engine::V2).await;
+pub(super) async fn fixture() -> (Fixture, giggles_server::Running, Client, u32) {
+    let engine = if cfg!(feature = "engine-rocksdb") {
+        giggles_core::Engine::V2
+    } else {
+        giggles_core::Engine::Legacy
+    };
+    let mut f = Fixture::catalog_empty_engine(engine).await;
     f.admin
         .roles()
         .create(NewRole {
@@ -96,7 +97,7 @@ async fn fixture() -> (Fixture, giggles_server::Running, Client, u32) {
     (f, wire, client, ready.max_shapes)
 }
 
-fn setup(f: &Fixture, query: &str) {
+pub(super) fn setup(f: &Fixture, query: &str) {
     f.service
         .role_session("oid_owner")
         .unwrap()
@@ -104,7 +105,7 @@ fn setup(f: &Fixture, query: &str) {
         .unwrap_or_else(|error| panic!("{query}: {error:?}"));
 }
 
-async fn http_result(f: &Fixture, query: &str) -> proto::SqlResult {
+pub(super) async fn http_result(f: &Fixture, query: &str) -> proto::SqlResult {
     let (status, bytes) = f
         .http(
             &f.app,
@@ -138,6 +139,7 @@ async fn http_result(f: &Fixture, query: &str) -> proto::SqlResult {
     http
 }
 
+#[cfg(feature = "engine-rocksdb")]
 #[tokio::test]
 async fn wire_types_equal_http_types() {
     let (f, wire, mut client, _) = fixture().await;
@@ -170,6 +172,7 @@ async fn wire_types_equal_http_types() {
     f.stop().await;
 }
 
+#[cfg(feature = "engine-rocksdb")]
 #[tokio::test]
 async fn wire_empty_result_typed() {
     let (f, wire, mut client, _) = fixture().await;
@@ -187,8 +190,12 @@ async fn wire_empty_result_typed() {
     f.stop().await;
 }
 
+#[cfg(feature = "engine-rocksdb")]
 #[tokio::test]
 async fn shape_cap_with_types() {
+    use giggles_server::wire::messages::WireReply;
+    use prost::Message;
+
     let (f, wire, mut client, cap) = fixture().await;
     assert_eq!(cap, 256);
     for i in 0..=cap {
