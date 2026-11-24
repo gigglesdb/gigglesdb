@@ -32,10 +32,6 @@ impl KvRead for Recording {
 }
 
 impl KvBackend for Recording {
-    fn pipelined_sync(&self) -> bool {
-        self.inner.pipelined_sync()
-    }
-
     fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError> {
         self.log.lock().unwrap().push(batch.clone());
         self.inner.write(batch, durability)

@@ -70,10 +70,6 @@ impl KvRead for ObservedKv {
     }
 }
 impl KvBackend for ObservedKv {
-    fn pipelined_sync(&self) -> bool {
-        self.mem.pipelined_sync()
-    }
-
     fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError> {
         if durability == Durability::Sync
             && let Some((entered, release)) = self.pause.lock().unwrap().take()

@@ -299,7 +299,7 @@ fn single(key: &[u8]) -> WriteBatch {
 }
 
 #[test]
-fn local_commit_append_is_the_only_no_sync_entry_point_for_commit_batches() {
+fn local_no_sync_write_rejects_commit_batches() {
     let backend = Arc::new(MemKv::new());
     let kv = Kv::new_single_writer(backend.clone());
     assert!(!backend.pipelined_sync());
@@ -307,17 +307,11 @@ fn local_commit_append_is_the_only_no_sync_entry_point_for_commit_batches() {
 
     let mut batch = single(b"row");
     batch.put(Keyspace::Meta, b"last_commit_ts".to_vec(), 42u64.to_be_bytes().to_vec());
-    kv.append_commit(batch.clone()).unwrap();
-    assert_eq!(kv.get(KS, b"row").unwrap(), Some(b"row".to_vec()));
-    assert!(keys(&backend.crash(), KS).is_empty());
-
     let plain = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         kv.write(batch, Durability::NoSync)
     }));
     assert!(plain.is_err());
-
-    kv.sync_commits().unwrap();
-    assert_eq!(keys(&backend.crash(), KS), [b"row".to_vec()]);
+    assert_eq!(kv.get(KS, b"row").unwrap(), None);
 }
 
 #[test]
@@ -477,6 +471,10 @@ impl KvRead for FaultBackend {
     }
 }
 impl KvBackend for FaultBackend {
+    fn pipelined_sync(&self) -> bool {
+        true
+    }
+
     fn write(&self, _: WriteBatch, _: Durability) -> Result<(), KvError> {
         self.touch();
         Err(self.error.clone())
@@ -565,7 +563,12 @@ fn commit_io_class_comes_from_the_call_site() {
                 error: error.clone(),
                 fail_reads: false,
             });
-            let kv = Kv::new(backend.clone());
+            let kv = Kv::new_single_writer(backend.clone());
+            let class = if matches!(error, KvError::Corrupt(_)) {
+                FenceClass::Data
+            } else {
+                FenceClass::NotRecoverable
+            };
             let result = match operation {
                 FenceSite::CommitAppend => kv.append_commit(single(b"x")),
                 FenceSite::CommitSync => kv.sync_commits(),
@@ -573,7 +576,7 @@ fn commit_io_class_comes_from_the_call_site() {
             };
             assert_eq!(result, Err(error));
             let cause = kv.causes.cause().unwrap();
-            assert_eq!((cause.site, cause.class), (operation, FenceClass::NotRecoverable));
+            assert_eq!((cause.site, cause.class), (operation, class));
             assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
             assert_fenced(&kv, &backend);
         }

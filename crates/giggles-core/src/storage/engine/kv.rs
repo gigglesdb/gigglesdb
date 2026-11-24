@@ -366,10 +366,7 @@ impl FenceCause {
             }
             _ => (site, None, false),
         };
-        let class = if matches!(site, FenceSite::CommitAppend | FenceSite::CommitSync) {
-            // Pipeline recovery requires an amendment to fence note 6d6de0bd.
-            FenceClass::NotRecoverable
-        } else if matches!(error, KvError::Corrupt(_)) || site == FenceSite::NativeOnceLedger {
+        let class = if matches!(error, KvError::Corrupt(_)) || site == FenceSite::NativeOnceLedger {
             FenceClass::Data
         } else if io_error && matches!(
             site,
@@ -642,6 +639,8 @@ pub(crate) trait KvBackend: KvRead {
     /// Makes every preceding successful write durable. Errors are ambiguous too.
     fn flush_barrier(&self) -> Result<(), KvError>;
     /// Whether WAL sync can overlap a write on this backend.
+    /// Wrappers use the false default. An opt-in must explicitly implement
+    /// both commit operations and preserve their ordering and failure semantics.
     fn pipelined_sync(&self) -> bool {
         false
     }
@@ -748,6 +747,8 @@ impl Kv {
     #[allow(dead_code, reason = "The commit sequencer will use this in P3")]
     pub(crate) fn append_commit(&self, batch: WriteBatch) -> Result<(), KvError> {
         self.check()?;
+        debug_assert!(self.is_single_writer());
+        debug_assert!(self.pipelined_sync());
         // This entry point admits the sequencer's commit batch to local NoSync.
         let result = self.backend.append_commit(batch);
         self.fence_on_error(FenceSite::CommitAppend, result)

@@ -786,10 +786,6 @@ impl super::super::kv::KvRead for CountWrites {
     }
 }
 impl KvBackend for CountWrites {
-    fn pipelined_sync(&self) -> bool {
-        self.mem.pipelined_sync()
-    }
-
     fn write(&self, batch: WriteBatch, d: Durability) -> Result<(), KvError> {
         assert_eq!(d, Durability::Sync);
         if let Some((entered, release)) = &self.gate {

@@ -162,10 +162,6 @@ impl KvRead for ObservedSync {
 }
 
 impl KvBackend for ObservedSync {
-    fn pipelined_sync(&self) -> bool {
-        self.backend.pipelined_sync()
-    }
-
     fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError> {
         assert_eq!(durability, Durability::Sync);
         // Each request writes one row; the group adds one last_commit_ts.
@@ -198,6 +194,7 @@ fn concurrent_groups(backend: Arc<dyn KvBackend>) {
         first_sync: Mutex::new(Some((entered, released))),
         groups: Mutex::new(Vec::new()),
     });
+    assert!(!observed.pipelined_sync());
     let seq = Sequencer::open(
         Arc::new(Kv::new(observed.clone())),
         Arc::new(ManualClock::new(10)),

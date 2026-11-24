@@ -16,6 +16,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+unsafe extern "C" {
+    fn giggles_rocksdb_install_autorecovery_veto(options: *mut librocksdb_sys::rocksdb_options_t);
+    fn giggles_rocksdb_uses_default_env(options: *const librocksdb_sys::rocksdb_options_t) -> bool;
+}
+
 pub(crate) const WRITER_LOCK_FILE: &str = "giggles.lock";
 
 pub(in crate::storage) const WRITER_LOCK_HELD: &str = "database already open by another writer";
@@ -256,10 +261,17 @@ impl RocksKv {
         mode: DBRecoveryMode,
         directory_pin: Option<File>,
     ) -> Result<Self, KvError> {
+        let options = Self::open_options(cache_bytes, mode)?;
+        Self::open_with_options(path, writer_lock, directory_pin, options)
+    }
+
+    fn open_options(cache_bytes: usize, mode: DBRecoveryMode) -> Result<Options, KvError> {
         let cache = Cache::new_lru_cache(cache_bytes);
         let mut table = BlockBasedOptions::default();
         table.set_block_cache(&cache);
         // DESIGN.md section 3 and fence note 6d6de0bd section 6.2a.
+        // The retry pin blocks RocksDB's retryable-error worker. The native
+        // listener separately vetoes SstFileManager's NoSpace recovery.
         let mut options = Options::default()
             .get_options_from_string("max_bgerror_resume_count=0")
             .map_err(|error| map_error_at(error, FenceSite::Open))?;
@@ -272,13 +284,45 @@ impl RocksKv {
         options.set_recycle_log_file_num(0);
         options.set_wal_recovery_mode(mode);
         options.set_manual_wal_flush(false);
+        options.set_unordered_write(false);
+        options.set_enable_pipelined_write(false);
         // SAFETY: the options handle is live and uniquely borrowed here.
-        unsafe { librocksdb_sys::rocksdb_options_set_avoid_flush_during_recovery(options.as_raw_ptr(), 0) };
+        unsafe {
+            let options = options.as_raw_ptr();
+            librocksdb_sys::rocksdb_options_set_two_write_queues(options, 0);
+            librocksdb_sys::rocksdb_options_set_avoid_flush_during_recovery(options, 0);
+            giggles_rocksdb_install_autorecovery_veto(options);
+        }
         #[cfg(test)]
         if WAL_ONLY_SHUTDOWN.get() {
             // SAFETY: the options handle is live and uniquely borrowed here.
             unsafe { librocksdb_sys::rocksdb_options_set_avoid_flush_during_shutdown(options.as_raw_ptr(), 1) };
         }
+        Ok(options)
+    }
+
+    fn open_with_options(
+        path: &Path,
+        writer_lock: WriterLock,
+        directory_pin: Option<File>,
+        options: Options,
+    ) -> Result<Self, KvError> {
+        // R-WALB requires one RocksDB write queue and recovery flushes.
+        // SAFETY: the native getters and capability check only read live options.
+        let pipelined_sync = unsafe {
+            let options = options.as_raw_ptr();
+            assert!(
+                librocksdb_sys::rocksdb_options_get_unordered_write(options) == 0
+                    && librocksdb_sys::rocksdb_options_get_enable_pipelined_write(options) == 0
+                    && librocksdb_sys::rocksdb_options_get_two_write_queues(options) == 0
+                    && librocksdb_sys::rocksdb_options_get_avoid_flush_during_recovery(options) == 0,
+                "local RocksDB requires a single write queue and recovery flushes"
+            );
+            // Stock WAL files support concurrent sync (env/io_posix.cc:1854,
+            // port/win/io_win.cc:993). R-WALB excludes every custom Env or FS,
+            // including a future pre-zeroed WAL FileSystem.
+            giggles_rocksdb_uses_default_env(options)
+        };
         #[cfg(test)]
         if RECOVERY_OPEN_CRASH.get() == Some(RecoveryOpenCrash::BeforeNativeOpen) {
             crate::storage::crash_now();
@@ -303,12 +347,6 @@ impl RocksKv {
         if RECOVERY_OPEN_CRASH.get() == Some(RecoveryOpenCrash::AfterNativeOpen) {
             crate::storage::crash_now();
         }
-        // FlushWAL(true) calls SyncWAL with manual WAL flushing disabled.
-        let pipelined_sync = match db.flush_wal(true) {
-            Ok(()) => true,
-            Err(error) if error.kind() == rocksdb::ErrorKind::NotSupported => false,
-            Err(error) => return Err(map_error_at(error, FenceSite::Open)),
-        };
         Ok(Self {
             pipelined_sync,
             db: Arc::new(LockedDb {
@@ -817,8 +855,8 @@ impl RocksKv {
             })
         };
 
-        // Record pre-call evidence for the fence. Commit sites stay
-        // NotRecoverable until fence note 6d6de0bd is amended.
+        // Record pre-call evidence for the fence. Pipeline failures require
+        // operator recovery, with corruption classified as Data.
         op().map_err(|mut error| {
             if let KvError::RocksIo { message, .. } | KvError::Corrupt(message) = &mut error {
                 let before = background_errors
@@ -1043,6 +1081,10 @@ impl KvBackend for RocksKv {
     }
 
     fn append_commit(&self, batch: WriteBatch) -> Result<(), KvError> {
+        debug_assert!(
+            self.pipelined_sync,
+            "commit pipelining requires the default RocksDB Env and FS"
+        );
         self.commit_io(FenceSite::CommitAppend, || self.write_batch(batch, Durability::NoSync))
     }
 
@@ -1492,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn open_probes_wal_sync_and_pins_fence_options() {
+    fn local_open_advertises_pipelined_sync_and_pins_fence_options() {
         let dir = TestDir::new();
         for mode in [DBRecoveryMode::PointInTime, DBRecoveryMode::TolerateCorruptedTailRecords] {
             let cache_bytes = 8 * 1024 * 1024;
@@ -1508,7 +1550,14 @@ mod tests {
                 .max()
                 .unwrap();
             let options = std::fs::read_to_string(path).unwrap();
-            for expected in ["max_bgerror_resume_count=0", "paranoid_checks=true"] {
+            for expected in [
+                "max_bgerror_resume_count=0",
+                "paranoid_checks=true",
+                "unordered_write=false",
+                "enable_pipelined_write=false",
+                "two_write_queues=false",
+                "avoid_flush_during_recovery=false",
+            ] {
                 assert!(options.lines().any(|line| line.trim() == expected), "{expected}");
             }
         }
@@ -1526,17 +1575,11 @@ mod tests {
     }
 
     #[test]
-    fn failed_commit_sync_leaves_no_sst_before_close() {
+    fn simulated_seam_sync_failure_leaves_no_sst_before_close() {
         let dir = TestDir::new();
         let db = Arc::new(RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap());
         let kv = Kv::new_single_writer(db.clone());
-        let ssts = || -> std::collections::BTreeSet<PathBuf> {
-            dir.0.read_dir().unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| path.extension().is_some_and(|ext| ext == "sst"))
-                .collect()
-        };
-        let before = ssts();
+        let before = sst_paths(&dir.0);
 
         for group in 1..=2u64 {
             let mut batch = WriteBatch::default();
@@ -1554,7 +1597,163 @@ mod tests {
         let mut wait = rocksdb::WaitForCompactOptions::default();
         wait.set_timeout(5_000_000);
         db.db.wait_for_compact(&wait).unwrap();
-        assert_eq!(ssts(), before);
+        assert_eq!(sst_paths(&dir.0), before);
+    }
+
+    fn sst_paths(path: &Path) -> std::collections::BTreeSet<PathBuf> {
+        path.read_dir()
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sst"))
+            .collect()
+    }
+
+    mod autorecovery {
+        use super::*;
+        use std::{ffi::c_void, ptr::NonNull};
+
+        #[derive(Debug, Default)]
+        #[repr(C)]
+        struct WalFaultCounts {
+            sync_failures: u64,
+            full_space_checks: u64,
+            flushes: u64,
+            recoveries: u64,
+        }
+
+        #[link(name = "giggles_autorecovery_veto_test", kind = "static")]
+        unsafe extern "C" {
+            fn giggles_rocksdb_install_wal_fault(
+                options: *mut librocksdb_sys::rocksdb_options_t,
+                keep_veto: bool,
+            ) -> *mut c_void;
+            fn giggles_rocksdb_drop_wal_fault(handle: *mut c_void);
+            fn giggles_rocksdb_arm_wal_fault(handle: *mut c_void, armed: bool);
+            fn giggles_rocksdb_wal_fault_counts(handle: *const c_void, counts: *mut WalFaultCounts);
+        }
+
+        struct WalFault(NonNull<c_void>);
+
+        impl WalFault {
+            /// The caller must keep this handle alive until options, the DB and
+            /// any objects retaining the DB are dropped.
+            unsafe fn install(options: &mut Options, keep_veto: bool) -> Self {
+                // SAFETY: the options are live and exclusively borrowed.
+                let handle =
+                    unsafe { giggles_rocksdb_install_wal_fault(options.as_raw_ptr(), keep_veto) };
+                Self(NonNull::new(handle).expect("install native WAL fault Env"))
+            }
+
+            fn arm(&self, armed: bool) {
+                // SAFETY: this handle owns the live fault Env.
+                unsafe { giggles_rocksdb_arm_wal_fault(self.0.as_ptr(), armed) };
+            }
+
+            fn counts(&self) -> WalFaultCounts {
+                let mut counts = WalFaultCounts::default();
+                // SAFETY: both pointers are live, and the native counters are atomic.
+                unsafe { giggles_rocksdb_wal_fault_counts(self.0.as_ptr(), &mut counts) };
+                counts
+            }
+        }
+
+        impl Drop for WalFault {
+            fn drop(&mut self) {
+                // SAFETY: the test drops the DB before releasing its Env.
+                unsafe { giggles_rocksdb_drop_wal_fault(self.0.as_ptr()) };
+            }
+        }
+
+        #[test]
+        fn native_wal_no_space_veto_blocks_flush_and_resume() {
+            check_native_wal_no_space(true);
+        }
+
+        #[test]
+        fn native_wal_no_space_control_flushes_and_resumes() {
+            check_native_wal_no_space(false);
+        }
+
+        fn check_native_wal_no_space(keep_veto: bool) {
+            let dir = TestDir::new();
+            let (fault, options) = {
+                let mut options =
+                    RocksKv::open_options(8 * 1024 * 1024, DBRecoveryMode::PointInTime).unwrap();
+                // SAFETY: options and every DB handle are dropped before fault.
+                let fault = unsafe { WalFault::install(&mut options, keep_veto) };
+                (fault, options)
+            };
+            let lock = WriterLock::acquire(&dir.0).unwrap();
+            let db = Arc::new(RocksKv::open_with_options(&dir.0, lock, None, options).unwrap());
+            let kv = Kv::new_single_writer(db.clone());
+            assert!(!db.pipelined_sync());
+            assert!(!kv.pipelined_sync());
+            let before = sst_paths(&dir.0);
+
+            for group in 1..=2u64 {
+                let key = group.to_be_bytes().to_vec();
+                let mut batch = WriteBatch::default();
+                batch.put(Keyspace::Rows, key.clone(), b"row".to_vec());
+                batch.put(Keyspace::Meta, b"last_commit_ts".to_vec(), key.clone());
+                // Stage real commit-shaped NoSync batches directly on the backend.
+                // The fault Env is deliberately ineligible for Kv::append_commit.
+                db.write(batch, Durability::NoSync).unwrap();
+                assert_eq!(kv.get(Keyspace::Rows, &key).unwrap(), Some(b"row".to_vec()));
+            }
+
+            fault.arm(true);
+            let error = kv.sync_commits().unwrap_err();
+            assert!(error.to_string().contains("injected WAL Sync"), "{error}");
+            assert_commit_fence(&kv, error, FenceSite::CommitSync);
+            let armed = fault.counts();
+            assert!(armed.sync_failures > 0 && armed.full_space_checks > 0, "{armed:?}");
+            let native_write = || {
+                db.db.put_cf(
+                    db.db.cf_handle(Keyspace::Rows.name()).unwrap(),
+                    b"native-write",
+                    b"after-sync",
+                )
+            };
+            assert_native_no_space(native_write());
+
+            if !keep_veto {
+                // The first check is OverrideNoSpaceError. Wait for the SstFileManager
+                // to see a full disk as well, so recovery needs its next poll.
+                wait_for(|| fault.counts().full_space_checks >= 2);
+            }
+            fault.arm(false);
+
+            if keep_veto {
+                // SstFileManager retries every five seconds (file/sst_file_manager_impl.cc:347-350).
+                thread::sleep(Duration::from_millis(5_250));
+                let after = fault.counts();
+                assert_eq!((after.flushes, after.recoveries), (0, 0), "{after:?}");
+                assert_eq!(sst_paths(&dir.0), before);
+                assert_native_no_space(native_write());
+            } else {
+                wait_for(|| fault.counts().recoveries > 0);
+                let after = fault.counts();
+                assert!(after.flushes > 0, "{after:?}");
+                assert!(sst_paths(&dir.0).difference(&before).next().is_some());
+                native_write().unwrap();
+            }
+            assert!(kv.is_fenced());
+            assert_eq!(kv.write(single(), Durability::Sync), Err(KvError::Fenced));
+        }
+
+        fn wait_for(condition: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !condition() {
+                assert!(Instant::now() < deadline, "timed out waiting for native recovery");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn assert_native_no_space(result: Result<(), rocksdb::Error>) {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), rocksdb::ErrorKind::IOError);
+            assert!(error.to_string().contains("injected WAL Sync"), "{error}");
+        }
     }
 
     fn assert_commit_fence(kv: &Kv, error: KvError, expected: FenceSite) {

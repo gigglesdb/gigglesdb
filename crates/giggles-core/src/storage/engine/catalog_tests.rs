@@ -831,10 +831,6 @@ impl KvRead for FailCatalogRebuild {
     }
 }
 impl KvBackend for FailCatalogRebuild {
-    fn pipelined_sync(&self) -> bool {
-        self.mem.pipelined_sync()
-    }
-
     fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError> {
         let ops = batch.into_ops();
         let catalog_write = ops.iter().any(|op| {
