@@ -346,9 +346,14 @@ impl Colormap {
                     // All members moved to the subcolor. Keep the parent
                     // ID and retag only this bracket's new arcs. Otherwise
                     // another [ab] retags every earlier [ab] on the NFA.
+                    let mut remaining = self.desc[sub as usize].nschrs;
                     for color in &mut self.low {
                         if *color == sub {
                             *color = parent;
+                            remaining -= 1;
+                            if remaining == 0 {
+                                break;
+                            }
                         }
                     }
                     self.desc[parent as usize] = std::mem::take(&mut self.desc[sub as usize]);

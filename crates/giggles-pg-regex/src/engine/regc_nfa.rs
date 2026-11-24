@@ -40,11 +40,11 @@ pub(super) enum Arc {
     Empty,
     CantMatch,
     Plain(Color),
-    Bol(usize),
-    Eol(usize),
+    Bol(u8),
+    Eol(u8),
     Behind(Color),
     Ahead(Color),
-    Lacon(usize),
+    Lacon(u32),
 }
 
 impl Arc {
@@ -69,11 +69,164 @@ impl Arc {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reachability {
+    Unreached,
+    FromPre,
+    ToPost,
+}
+
+type StateEdge = (Arc, StateId);
+
+/// Sorted adjacency. Most states need only a few transitions. Large sets
+/// use a tree to keep insertion and removal logarithmic.
+enum StateArcs {
+    Inline {
+        len: usize,
+        arcs: [StateEdge; Self::INLINE_LIMIT],
+    },
+    Large(BTreeSet<StateEdge>),
+}
+
+impl Default for StateArcs {
+    fn default() -> Self {
+        Self::Inline {
+            len: 0,
+            arcs: [(Arc::Empty, 0); Self::INLINE_LIMIT],
+        }
+    }
+}
+
+impl StateArcs {
+    const INLINE_LIMIT: usize = 6;
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len,
+            Self::Large(arcs) => arcs.len(),
+        }
+    }
+
+    fn last(&self) -> Option<&StateEdge> {
+        match self {
+            Self::Large(arcs) => arcs.last(),
+            _ => self.as_slice().last(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn first(&self) -> Option<&StateEdge> {
+        match self {
+            Self::Large(arcs) => arcs.first(),
+            _ => self.as_slice().first(),
+        }
+    }
+
+    fn contains(&self, arc: &StateEdge) -> bool {
+        match self {
+            Self::Large(arcs) => arcs.contains(arc),
+            _ => self.as_slice().binary_search(arc).is_ok(),
+        }
+    }
+
+    fn insert(&mut self, arc: StateEdge) -> bool {
+        match self {
+            Self::Inline { len, arcs } => {
+                let Err(index) = arcs[..*len].binary_search(&arc) else {
+                    return false;
+                };
+                if *len < Self::INLINE_LIMIT {
+                    if index != *len {
+                        arcs.copy_within(index..*len, index + 1);
+                    }
+                    arcs[index] = arc;
+                    *len += 1;
+                } else {
+                    let mut spilled: BTreeSet<_> = arcs.iter().copied().collect();
+                    spilled.insert(arc);
+                    *self = Self::Large(spilled);
+                }
+            }
+            Self::Large(arcs) => return arcs.insert(arc),
+        }
+        true
+    }
+
+    fn remove(&mut self, arc: &StateEdge) -> bool {
+        match self {
+            Self::Inline { len, arcs } => {
+                let Ok(index) = arcs[..*len].binary_search(arc) else {
+                    return false;
+                };
+                *len -= 1;
+                if index != *len {
+                    arcs.copy_within(index + 1..=*len, index);
+                }
+            }
+            Self::Large(arcs) => return arcs.remove(arc),
+        }
+        true
+    }
+
+    fn as_slice(&self) -> &[StateEdge] {
+        match self {
+            Self::Inline { len, arcs } => &arcs[..*len],
+            Self::Large(_) => unreachable!(),
+        }
+    }
+
+    fn snapshot(&self) -> Vec<StateEdge> {
+        match self {
+            Self::Large(arcs) => arcs.iter().copied().collect(),
+            _ => self.as_slice().to_vec(),
+        }
+    }
+
+    fn iter(&self) -> StateArcsIter<'_> {
+        match self {
+            Self::Large(arcs) => StateArcsIter::Tree(arcs.range(..)),
+            _ => StateArcsIter::Slice(self.as_slice().iter()),
+        }
+    }
+
+    fn range(&self, start: StateEdge, end: Option<StateEdge>) -> StateArcsIter<'_> {
+        if let Self::Large(arcs) = self {
+            use std::ops::Bound::{Excluded, Included, Unbounded};
+            return StateArcsIter::Tree(
+                arcs.range((Included(start), end.map_or(Unbounded, Excluded))),
+            );
+        }
+        let arcs = self.as_slice();
+        let first = arcs.partition_point(|arc| *arc < start);
+        let last = end.map_or(arcs.len(), |end| arcs.partition_point(|arc| *arc < end));
+        StateArcsIter::Slice(arcs[first..last].iter())
+    }
+}
+
+enum StateArcsIter<'a> {
+    Slice(std::slice::Iter<'a, StateEdge>),
+    Tree(std::collections::btree_set::Range<'a, StateEdge>),
+}
+
+impl<'a> Iterator for StateArcsIter<'a> {
+    type Item = &'a StateEdge;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Slice(arcs) => arcs.next(),
+            Self::Tree(arcs) => arcs.next(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     ordinal: usize,
-    ins: BTreeSet<(Arc, StateId)>,
-    outs: BTreeSet<(Arc, StateId)>,
+    ins: StateArcs,
+    outs: StateArcs,
 }
 
 type Edges = Vec<(Arc, StateId, StateId)>;
@@ -84,6 +237,8 @@ pub(super) const POST: StateId = 0;
 pub(super) const PRE: StateId = 1;
 pub(super) const INIT: StateId = 2;
 pub(super) const FINAL: StateId = 3;
+
+const DROPPED_ORDINAL: usize = usize::MAX;
 
 // PostgreSQL's state and arc allocator budget, measured with its 64-bit
 // structure sizes. The wrapper and prefix each add graph states per parse level.
@@ -264,6 +419,10 @@ impl<'a> Nfa<'a> {
         while let Some(&(arc, from)) = self.states[state].ins.first() {
             self.remove(arc, from, state);
         }
+        self.states[state] = State {
+            ordinal: DROPPED_ORDINAL,
+            ..State::default()
+        };
         self.live.remove(&state);
         self.free.push(state);
     }
@@ -378,7 +537,7 @@ impl<'a> Nfa<'a> {
             };
             self.fragment_ids[state] = id;
             let outs = &self.states[state].outs;
-            for &(arc, to) in outs {
+            for &(arc, to) in outs.iter() {
                 edges.push((arc, id, to));
                 stack.push((to, depth + 1));
             }
@@ -494,17 +653,20 @@ impl<'a> Nfa<'a> {
     // The latter considers only states marked reachable by the former.
     fn mark_states(
         &self,
-        marks: &mut [Option<StateId>],
+        marks: &mut [Reachability],
         start: StateId,
-        previous: Option<StateId>,
         backwards: bool,
     ) -> Result<(), RegErrorCode> {
-        let limit = if backwards {
-            MARKCANREACH
+        let (limit, previous, mark) = if backwards {
+            (MARKCANREACH, Reachability::FromPre, Reachability::ToPost)
         } else {
-            MARKREACHABLE
-        }
-        .remaining(self.stack_used);
+            (
+                MARKREACHABLE,
+                Reachability::Unreached,
+                Reachability::FromPre,
+            )
+        };
+        let limit = limit.remaining(self.stack_used);
         let mut stack = vec![(start, 1)];
         while let Some((state, depth)) = stack.pop() {
             if depth > limit {
@@ -513,7 +675,7 @@ impl<'a> Nfa<'a> {
             if marks[state] != previous {
                 continue;
             }
-            marks[state] = Some(start);
+            marks[state] = mark;
             let edges = if backwards {
                 &self.states[state].ins
             } else {
@@ -525,11 +687,11 @@ impl<'a> Nfa<'a> {
     }
 
     fn cleanup(&mut self) -> Result<(), RegErrorCode> {
-        let mut marks = vec![None; self.states.len()];
-        self.mark_states(&mut marks, PRE, None, false)?;
-        self.mark_states(&mut marks, POST, Some(PRE), true)?;
+        let mut marks = vec![Reachability::Unreached; self.states.len()];
+        self.mark_states(&mut marks, PRE, false)?;
+        self.mark_states(&mut marks, POST, true)?;
         for state in self.state_order() {
-            if state > PRE && marks[state] != Some(POST) {
+            if state > PRE && marks[state] != Reachability::ToPost {
                 self.dropstate(state);
             }
         }
@@ -539,12 +701,13 @@ impl<'a> Nfa<'a> {
     fn hasnonemptyout(&self, state: StateId) -> bool {
         self.states[state]
             .outs
-            .iter()
-            .any(|&(arc, _)| arc != Arc::Empty)
+            .last()
+            .is_some_and(|&(arc, _)| arc != Arc::Empty)
     }
 
     fn fixempties(&mut self) -> Result<(), RegErrorCode> {
-        for state in self.state_order().into_iter().filter(|&state| state > PRE) {
+        let mut states = self.state_order();
+        for &state in states.iter().filter(|&&state| state > PRE) {
             let outs = &self.states[state].outs;
             if outs.len() == 1
                 && let Some(&(Arc::Empty, to)) = outs.first()
@@ -555,7 +718,8 @@ impl<'a> Nfa<'a> {
                 self.dropstate(state);
             }
         }
-        for state in self.state_order().into_iter().filter(|&state| state > PRE) {
+        states.retain(|&state| self.states[state].ordinal != DROPPED_ORDINAL);
+        for &state in states.iter().filter(|&&state| state > PRE) {
             let ins = &self.states[state].ins;
             if ins.len() == 1
                 && let Some(&(Arc::Empty, from)) = ins.first()
@@ -569,13 +733,13 @@ impl<'a> Nfa<'a> {
 
         // Only original inarcs can be copied forward. Keep epsilon
         // predecessors separately so traversal never scans the new inarcs.
-        let states = self.state_order();
+        states.retain(|&state| self.states[state].ordinal != DROPPED_ORDINAL);
         let mut old_ins = Vec::new();
         let mut empty_ins = Vec::new();
         let mut offsets = Vec::with_capacity(self.states.len() + 1);
         for state in &self.states {
             offsets.push([old_ins.len(), empty_ins.len()]);
-            for &(arc, from) in &state.ins {
+            for &(arc, from) in state.ins.iter() {
                 if arc == Arc::Empty {
                     empty_ins.push(from);
                 } else {
@@ -587,23 +751,23 @@ impl<'a> Nfa<'a> {
         let empty_predecessors =
             |state: StateId| &empty_ins[offsets[state][1]..offsets[state + 1][1]];
         let limit = EMPTYREACHABLE.remaining(self.stack_used);
-        let mut seen = vec![None; self.states.len()];
+        let mut seen = vec![usize::MAX; self.states.len()];
         let mut pending = Vec::new();
         let mut arcs = Vec::new();
         for &state in &states {
             if state > PRE && !self.hasnonemptyout(state) {
                 continue;
             }
-            seen[state] = Some(state);
+            seen[state] = state;
             pending.extend(empty_predecessors(state).iter().map(|&from| (from, 2)));
             while let Some((from, depth)) = pending.pop() {
-                if seen[from] == Some(state) {
+                if seen[from] == state {
                     continue;
                 }
                 if depth > limit {
                     return Err(RegErrorCode::ETooBig);
                 }
-                seen[from] = Some(state);
+                seen[from] = state;
                 pending.extend(
                     empty_predecessors(from)
                         .iter()
@@ -647,7 +811,7 @@ impl<'a> Nfa<'a> {
                 return Err(RegErrorCode::ETooBig);
             }
             marks[state] = 1;
-            stack.push((state, self.states[state].outs.range((Arc::Bol(0), 0)..)));
+            stack.push((state, self.states[state].outs.range((Arc::Bol(0), 0), None)));
             while let Some((from, outs)) = stack.last_mut() {
                 if let Some(&(_, to)) = outs.next() {
                     if stack.len() == limit {
@@ -657,7 +821,7 @@ impl<'a> Nfa<'a> {
                         DONE => {}
                         0 => {
                             marks[to] = stack.len() + 1;
-                            stack.push((to, self.states[to].outs.range((Arc::Bol(0), 0)..)));
+                            stack.push((to, self.states[to].outs.range((Arc::Bol(0), 0), None)));
                         }
                         depth => {
                             return Ok(Some(ConstraintLoop {
@@ -775,7 +939,7 @@ impl<'a> Nfa<'a> {
                     continue;
                 }
                 children.remove(&state);
-                for (arc, to) in self.states[state].outs.clone() {
+                for (arc, to) in self.states[state].outs.snapshot() {
                     if !arc.constraint()
                         || !self.states[to]
                             .outs
@@ -817,7 +981,7 @@ impl<'a> Nfa<'a> {
                 let mut intermediates = HashMap::new();
                 let constraints: Vec<_> = self.states[state]
                     .outs
-                    .range((Arc::Bol(0), 0)..(Arc::Lacon(0), 0))
+                    .range((Arc::Bol(0), 0), Some((Arc::Lacon(0), 0)))
                     .copied()
                     .collect();
                 for (con, to) in constraints {
@@ -833,12 +997,12 @@ impl<'a> Nfa<'a> {
         }
         let initial: Vec<_> = self.states[PRE]
             .outs
-            .range((Arc::Bol(0), 0)..(Arc::Eol(0), 0))
+            .range((Arc::Bol(0), 0), Some((Arc::Eol(0), 0)))
             .copied()
             .collect();
         for (arc, to) in initial {
             if let Arc::Bol(marker) = arc {
-                self.add(Arc::Plain(bos[marker]), PRE, to)?;
+                self.add(Arc::Plain(bos[usize::from(marker)]), PRE, to)?;
                 self.remove(arc, PRE, to);
             }
         }
@@ -863,14 +1027,14 @@ impl<'a> Nfa<'a> {
         // Isolate the constraint before changing the incoming transitions.
         if self.states[from].outs.len() > 1 {
             let clone = self.newstate()?;
-            for (arc, source) in self.states[from].ins.clone() {
+            for (arc, source) in self.states[from].ins.snapshot() {
                 self.add(arc, source, clone)?;
             }
             self.add(con, clone, to)?;
             self.remove(con, from, to);
             from = clone;
         }
-        for (arc, source) in self.states[from].ins.clone() {
+        for (arc, source) in self.states[from].ins.snapshot() {
             match combine_constraint(cmap, con, arc) {
                 Combined::Reject => {}
                 Combined::Keep => continue,
@@ -895,7 +1059,7 @@ impl<'a> Nfa<'a> {
                 let mut intermediates = HashMap::new();
                 let constraints: Vec<_> = self.states[state]
                     .ins
-                    .range((Arc::Bol(0), 0)..(Arc::Lacon(0), 0))
+                    .range((Arc::Bol(0), 0), Some((Arc::Lacon(0), 0)))
                     .copied()
                     .collect();
                 for (con, from) in constraints {
@@ -911,12 +1075,12 @@ impl<'a> Nfa<'a> {
         }
         let terminal: Vec<_> = self.states[POST]
             .ins
-            .range((Arc::Eol(0), 0)..(Arc::Behind(0), 0))
+            .range((Arc::Eol(0), 0), Some((Arc::Behind(0), 0)))
             .copied()
             .collect();
         for (arc, from) in terminal {
             if let Arc::Eol(marker) = arc {
-                self.add(Arc::Plain(eos[marker]), from, POST)?;
+                self.add(Arc::Plain(eos[usize::from(marker)]), from, POST)?;
                 self.remove(arc, from, POST);
             }
         }
@@ -940,14 +1104,14 @@ impl<'a> Nfa<'a> {
         }
         if self.states[to].ins.len() > 1 {
             let clone = self.newstate()?;
-            for (arc, dest) in self.states[to].outs.clone() {
+            for (arc, dest) in self.states[to].outs.snapshot() {
                 self.add(arc, clone, dest)?;
             }
             self.add(con, from, clone)?;
             self.remove(con, from, to);
             to = clone;
         }
-        for (arc, dest) in self.states[to].outs.clone() {
+        for (arc, dest) in self.states[to].outs.snapshot() {
             match combine_constraint(cmap, con, arc) {
                 Combined::Reject => {}
                 Combined::Keep => continue,
@@ -1067,10 +1231,10 @@ impl<'a> Nfa<'a> {
         for state in split {
             let progress = self.newstate()?;
             self.interrupt()?;
-            for (arc, to) in self.states[state].outs.clone() {
+            for (arc, to) in self.states[state].outs.snapshot() {
                 self.add(arc, progress, to)?;
             }
-            for (arc, from) in self.states[state].ins.clone() {
+            for (arc, from) in self.states[state].ins.snapshot() {
                 if from != PRE {
                     self.add(arc, from, progress)?;
                     self.remove(arc, from, state);
@@ -1145,7 +1309,7 @@ impl<'a> Nfa<'a> {
             let (state, _) = stack.pop().unwrap();
             let mut lengths = [false; DUPINF + 2];
             let mut self_loop = false;
-            for &(arc, to) in &self.states[state].outs {
+            for &(arc, to) in self.states[state].outs.iter() {
                 if arc != Arc::Plain(RAINBOW) {
                     continue;
                 }
@@ -1188,6 +1352,8 @@ impl<'a> Nfa<'a> {
             ids[state] = id;
         }
         let mut cnfa = Cnfa {
+            arcs: Vec::with_capacity(self.arc_count),
+            offsets: Vec::with_capacity(self.live.len() + 1),
             ncolors,
             bos,
             eos,
@@ -1195,16 +1361,17 @@ impl<'a> Nfa<'a> {
             pre: ids[PRE],
             post: ids[POST],
             no_progress: vec![false; self.live.len()],
-            ..Cnfa::default()
+            has_lacons: false,
         };
         for &state in &self.live {
-            let offset = cnfa.arcs.len();
-            cnfa.offsets.push(offset);
-            for &(arc, to) in &self.states[state].outs {
+            cnfa.offsets.push(cnfa.arcs.len());
+            // Plain colors sort before the larger lookaround colors, and the
+            // dense state IDs are assigned in ascending original ID order.
+            for &(arc, to) in self.states[state].outs.iter() {
                 let co = match arc {
                     Arc::Plain(color) => color,
                     Arc::Lacon(i) => {
-                        let color = ncolors + i;
+                        let color = ncolors + i as usize;
                         if color > MAX_COLOR {
                             return Err(RegErrorCode::EColors);
                         }
@@ -1218,7 +1385,6 @@ impl<'a> Nfa<'a> {
                     cnfa.no_progress[ids[to]] = true;
                 }
             }
-            cnfa.arcs[offset..].sort_unstable();
         }
         cnfa.offsets.push(cnfa.arcs.len());
         cnfa.no_progress[cnfa.pre] = true;

@@ -299,11 +299,18 @@ impl<'r> Dfa<'r> {
 
     // Without lookarounds, the scan cannot suspend. Backreference dissection
     // in particular can run many of these scans over overlapping spans.
-    fn scan_longest(&mut self, text: &Text<'_>, start: usize, stop: usize) -> ExecResult<Match> {
+    fn scan_longest<const ONE_COLOR: bool>(
+        &mut self,
+        text: &Text<'_>,
+        start: usize,
+        stop: usize,
+    ) -> ExecResult<Match> {
         let len = text.chars.len();
         let starter = self.initialize(start)?;
         let color = if start == 0 {
             self.cnfa.bos[usize::from(text.flags & REG_NOTBOL == 0)]
+        } else if ONE_COLOR {
+            0
         } else {
             text.cmap.get(text.chars[start - 1])
         };
@@ -322,7 +329,7 @@ impl<'r> Dfa<'r> {
             let cp = start + i + 1;
             let input = Input {
                 state,
-                color: text.cmap.get(chr),
+                color: if ONE_COLOR { 0 } else { text.cmap.get(chr) },
                 cp,
             };
             let Some(next) = self.consume(text, input, start)? else {
@@ -331,10 +338,17 @@ impl<'r> Dfa<'r> {
                     ..Match::default()
                 });
             };
+            // All remaining characters take this cached self-transition.
+            // Record the same final position without rescanning the suffix.
+            let self_loop = ONE_COLOR && next == state;
+            let cp = if self_loop { limit } else { cp };
             state = next;
             self.sets[state].lastseen = Some(cp);
             if self.ispost(state) {
                 last_post = Some(cp);
+            }
+            if self_loop {
+                break;
             }
         }
         let hitstop = stop == len;
@@ -758,10 +772,14 @@ impl Executor<'_, '_> {
             if let Some(result) = self.fast_scan(dfa, scan) {
                 return Ok(result);
             }
-            return self.dfas[dfa]
-                .as_mut()
-                .unwrap()
-                .scan_longest(&text, start, stop);
+            let dfa = self.dfas[dfa].as_mut().unwrap();
+            // Color zero is the only character color when the remaining
+            // four colors all belong to the start/end markers.
+            return if dfa.cnfa.ncolors == 1 + dfa.cnfa.bos.len() + dfa.cnfa.eos.len() {
+                dfa.scan_longest::<true>(&text, start, stop)
+            } else {
+                dfa.scan_longest::<false>(&text, start, stop)
+            };
         }
         // lacon is inlined in miss on the oracle. Lookahead reenters
         // through shortest, whereas lookbehind's matchuntil is inlined.

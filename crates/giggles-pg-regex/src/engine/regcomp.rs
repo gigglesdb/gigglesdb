@@ -963,7 +963,10 @@ impl<'a> Compiler<'a> {
             }
         } else {
             self.lacons.push((kind, begin, end));
-            self.nfa.add(Arc::Lacon(self.lacons.len()), left, right)?;
+            // Each lookaround keeps its own NFA states. The compile-space
+            // budget bounds their count well below u32::MAX.
+            let number = u32::try_from(self.lacons.len()).map_err(|_| RegErrorCode::ETooBig)?;
+            self.nfa.add(Arc::Lacon(number), left, right)?;
         }
         Ok(())
     }
