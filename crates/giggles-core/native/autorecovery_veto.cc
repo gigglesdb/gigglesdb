@@ -310,6 +310,7 @@ extern "C" void giggles_rocksdb_drop_commit_group_filter(
 #else
 
 #include <charconv>
+#include <condition_variable>
 #include <mutex>
 #include <utility>
 
@@ -455,6 +456,11 @@ class FaultWalFileSystem final : public FileSystemWrapper {
   IOStatus NewWritableFile(const std::string& path, const FileOptions& options,
                            std::unique_ptr<FSWritableFile>* file,
                            IODebugContext* debug) override {
+    if (path.ends_with(".sst") && ShouldFailSstCreation()) {
+      auto status = IOStatus::IOError("injected SST creation failure", path);
+      status.SetScope(IOStatus::IOErrorScope::kIOErrorScopeFile);
+      return status;
+    }
     auto status = target()->NewWritableFile(path, options, file, debug);
     if (status.ok() && path.ends_with(".log")) {
       *file = std::make_unique<FaultWalFile>(std::move(*file), state_, path);
@@ -484,9 +490,40 @@ class FaultWalFileSystem final : public FileSystemWrapper {
     return IOStatus::OK();
   }
 
+  void ArmSstFault() {
+    std::lock_guard<std::mutex> lock(sst_mutex_);
+    sst_fault_ = SstFault::kArmed;
+  }
+
+  bool SstFaultPaused() {
+    std::lock_guard<std::mutex> lock(sst_mutex_);
+    return sst_fault_ == SstFault::kPaused;
+  }
+
+  void ReleaseSstFault() {
+    std::lock_guard<std::mutex> lock(sst_mutex_);
+    sst_fault_ = SstFault::kIdle;
+    sst_ready_.notify_one();
+  }
+
  private:
+  enum class SstFault { kIdle, kArmed, kPaused };
+
+  bool ShouldFailSstCreation() {
+    std::unique_lock<std::mutex> lock(sst_mutex_);
+    if (sst_fault_ != SstFault::kArmed) {
+      return false;
+    }
+    sst_fault_ = SstFault::kPaused;
+    sst_ready_.wait(lock, [this] { return sst_fault_ == SstFault::kIdle; });
+    return true;
+  }
+
   std::shared_ptr<WalFaultState> state_;
   const std::string wal_dir_;
+  std::mutex sst_mutex_;
+  std::condition_variable sst_ready_;
+  SstFault sst_fault_ = SstFault::kIdle;
 };
 
 class RecoveryObserver final : public EventListener {
@@ -519,8 +556,8 @@ class RecoveryObserver final : public EventListener {
 class FaultEnv final : public EnvWrapper {
  public:
   FaultEnv(std::shared_ptr<WalFaultState> state,
-           const std::shared_ptr<FileSystem>& fs)
-      : EnvWrapper(NewCompositeEnv(fs)), state(std::move(state)) {
+           const std::shared_ptr<FaultWalFileSystem>& fs)
+      : EnvWrapper(NewCompositeEnv(fs)), state(std::move(state)), fs(fs) {
     file_system_ = fs;
   }
 
@@ -559,6 +596,7 @@ class FaultEnv final : public EnvWrapper {
   }
 
   const std::shared_ptr<WalFaultState> state;
+  const std::shared_ptr<FaultWalFileSystem> fs;
 
  private:
   struct Flush {
@@ -618,6 +656,18 @@ extern "C" void giggles_rocksdb_disable_wal_thread_safe_sync(
 
 extern "C" void giggles_rocksdb_arm_wal_append_fault(FaultEnv* handle) noexcept {
   handle->state->fail_wal_append.store(true);
+}
+
+extern "C" void giggles_rocksdb_arm_sst_fault(FaultEnv* handle) noexcept {
+  handle->fs->ArmSstFault();
+}
+
+extern "C" bool giggles_rocksdb_sst_fault_paused(FaultEnv* handle) noexcept {
+  return handle->fs->SstFaultPaused();
+}
+
+extern "C" void giggles_rocksdb_release_sst_fault(FaultEnv* handle) noexcept {
+  handle->fs->ReleaseSstFault();
 }
 
 extern "C" void giggles_rocksdb_pause_fault_env_flushes(FaultEnv* handle) noexcept {

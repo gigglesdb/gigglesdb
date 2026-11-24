@@ -207,9 +207,8 @@ fn fence_classification_and_precedence() {
 
 #[test]
 #[cfg(feature = "engine-rocksdb")]
-fn sync_latch_preserves_independent_corruption_in_each_report_order() {
-    use super::{FenceCause, FenceClass, FenceSite, FenceSource, FenceState, RocksStatus};
-    use super::super::kv_rocksdb::WalSyncError;
+fn sync_latch_preserves_independent_corruption_precedence() {
+    use super::{FenceCause, FenceClass, FenceSite, FenceState, RocksStatus};
 
     let error = KvError::RocksIo {
         message: "IO error: While fsync: 000042.log: device failure".into(),
@@ -217,27 +216,21 @@ fn sync_latch_preserves_independent_corruption_in_each_report_order() {
         site: FenceSite::WalWrite,
     };
     let corrupt = FenceCause::for_kv(FenceSite::Read, &KvError::Corrupt("bad bytes".into()));
-    for corruption_at in 0..3 {
+    let sync = FenceCause::for_kv(FenceSite::Write, &error);
+    assert_eq!(sync.class, FenceClass::Recoverable);
+    let write = FenceCause::for_kv(FenceSite::CommitAppend, &error);
+    assert_eq!(write.class, FenceClass::NotRecoverable);
+    for (first, second) in [(&corrupt, &write), (&write, &corrupt)] {
         let state = FenceState::default();
-        if corruption_at == 0 {
-            state.record(corrupt.clone());
-        }
-        let copy = FenceCause::for_kv(FenceSite::CommitAppend, &error);
-        state.record_cause(
-            copy, false, Some(&state.fenced), FenceSource::NoSync(WalSyncError::from_error(&error).unwrap()),
-        );
-        if corruption_at == 1 {
-            state.record(corrupt.clone());
-        }
-        let sync = FenceCause::for_kv(FenceSite::Write, &error);
-        assert_eq!(sync.class, FenceClass::Recoverable);
-        assert!(state.latch_sync_failure(sync.clone(), WalSyncError::from_error(&error)));
-        if corruption_at == 2 {
-            assert_eq!(state.cause(), Some(sync));
-            state.record(corrupt.clone());
-        }
-        assert_eq!(state.cause(), Some(corrupt.clone()));
+        state.record(first.clone());
+        assert!(state.latch_sync_failure(sync.clone()));
+        state.record(second.clone());
+        assert_eq!(state.cause().as_ref(), Some(first));
     }
+    let state = FenceState::default();
+    assert!(state.latch_sync_failure(sync));
+    state.record(corrupt.clone());
+    assert_eq!(state.cause(), Some(corrupt));
 }
 
 #[test]
