@@ -159,7 +159,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Alter> {
     p.need("type")?;
     let first = p.raw_name()?;
     let name = if p.sym('.') {
-        format!("{first}.{}", p.raw_name()?)
+        format!("{first}\0{}", p.raw_name()?)
     } else {
         first
     };
@@ -228,7 +228,7 @@ fn check_length(label: &str) -> R<()> {
 }
 
 fn resolve<'a>(state: &'a Relational, name: &str, path: &[String]) -> R<(u64, &'a TypeDef)> {
-    let user = if name.starts_with("pg_catalog.") {
+    let user = if name.starts_with("pg_catalog\0") {
         None
     } else {
         state.resolve_type(name, path)?
@@ -240,7 +240,7 @@ fn resolve<'a>(state: &'a Relational, name: &str, path: &[String]) -> R<(u64, &'
         user_types::view_replace_error(format!("{} is not an enum", type_name(ty)));
         return Err(SqlError::WrongObjectType);
     }
-    let builtin = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    let builtin = name.strip_prefix("pg_catalog\0").unwrap_or(name);
     let mut parser = Parser {
         tokens: vec![Token::Word(builtin.into())],
         at: 0,
@@ -263,7 +263,7 @@ fn resolve<'a>(state: &'a Relational, name: &str, path: &[String]) -> R<(u64, &'
         ));
         return Err(SqlError::WrongObjectType);
     }
-    user_types::view_replace_error(format!("type \"{name}\" does not exist"));
+    user_types::view_replace_error(format!("type \"{}\" does not exist", name.replace('\0', ".")));
     Err(SqlError::UndefinedObject)
 }
 

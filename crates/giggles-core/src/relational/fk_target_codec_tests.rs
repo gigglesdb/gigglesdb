@@ -136,10 +136,15 @@ fn births_cannot_collide_with_types_enum_labels_or_schemas() {
     let (tables, mut ext, indexes) = fixture();
     ext.types.insert(12, TypeDef::Enum { name: "e".into(), schema: "public".into(), labels: vec!["a".into()] });
     ext.schemas.insert("s".into(), schemas::Schema { id: 14, owner: "giggles".into() });
-    for birth in [12, 13, 14] {
+    for birth in [12, 14] {
         ext.primary_index_birth.insert(1, birth);
         assert!(validate_key_targets(&ext, tables.iter(), indexes.iter(), 30).is_err());
     }
+    // pg_enum label rows are projections of the type definition (ALTER TYPE
+    // ADD VALUE grows them past the IDs reserved at CREATE TYPE), so label
+    // offsets no longer occupy catalog object IDs.
+    ext.primary_index_birth.insert(1, 13);
+    assert!(validate_key_targets(&ext, tables.iter(), indexes.iter(), 30).is_ok());
 }
 
 #[test]

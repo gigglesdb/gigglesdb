@@ -261,14 +261,6 @@ pub(super) fn storage_type(ty: &TypeDef, array: bool) -> R<DataType> {
     }
 }
 
-pub(super) fn enum_input_error(name: &str, label: &str) -> SqlError {
-    view_replace_error(format!(
-        "invalid input value for enum {}: \"{label}\"",
-        quote_type_ident(name)
-    ));
-    SqlError::InvalidTextRepresentation
-}
-
 pub(super) fn claims(p: &Parser) -> bool {
     matches!(p.tokens.first(), Some(Token::Word(w)) if w == "create" || w == "drop")
         && matches!(p.tokens.get(1), Some(Token::Word(w)) if w == "type" || w == "domain")

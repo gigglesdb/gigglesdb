@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Admin, CoreError, Limits, SqlSession};
+use crate::{Admin, Limits, SqlSession};
 use std::sync::Arc;
 
 fn with_session(test: impl FnOnce(&mut SqlSession)) {
