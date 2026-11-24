@@ -93,13 +93,15 @@ differ. The `cleartraverse` limit is masked by the stricter walks over the
 same fragment in the measured cases. The match-all optimization considers
 at most 512 states, below its standalone recursion limit.
 
-Speed on very large patterns is not yet at PostgreSQL's level. Results are
-the same, but at review time (release builds) compiling
-`repeat('[ab]', 40000)` took 16 s against PostgreSQL's 0.43 s,
-`((a{1,25}){1,25}){1,25}` 404 ms against 42 ms, and the backreference match
-`(.*)\1$` on a 2,001-character string 26.5 s against 6.5 s. Typical patterns
-are as fast as PostgreSQL or faster. The likely cause is NFA arc bookkeeping
-that is linear where the C code uses linked in/out chains.
+Speed on large patterns is at or better than PostgreSQL's. Measured through
+the SQL functions against PostgreSQL 18.6 on 2026-11-24 (release build,
+results identical): `repeat('[ab]', 40000)` compiles in 56 ms against
+PostgreSQL's 8.0 s, `((a{1,25}){1,25}){1,25}` in 126 ms against 105 ms, and
+the backreference match `(.*)$` on a 2,001-character `abab...` string
+takes 0.18 s against 7.0 s. Backreference patterns such as `(?:(a)|b)*`
+on 2,000-character strings run past 20 s in both engines. The ignored tests
+in `tests/compile_speed.rs` track the first three cases
+(`cargo test --release --test all compile_speed:: -- --ignored`).
 
 ## Licences
 
