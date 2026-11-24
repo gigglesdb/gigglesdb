@@ -1,5 +1,8 @@
 mod common;
-use giggles_core::{Admin, CoreError, Engine, Limits, relational::SqlError};
+use giggles_core::{
+    Admin, CoreError, Engine, Limits, sqlstate,
+    relational::{SqlError, Value, take_sql_error_message},
+};
 
 #[test]
 #[cfg_attr(not(feature = "engine-rocksdb"), allow(clippy::single_element_loop))]
@@ -112,6 +115,57 @@ fn enum_text_checks_survive_column_type_changes() {
                 "{engine:?} {sql}"
             );
         }
+        drop((session, admin));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[test]
+#[cfg_attr(not(feature = "engine-rocksdb"), allow(clippy::single_element_loop))]
+fn enum_text_checks_reject_unsupported_column_types() {
+    for engine in [
+        Engine::Legacy,
+        #[cfg(feature = "engine-rocksdb")]
+        Engine::V2,
+    ] {
+        let path = common::fresh("check-column-type-refusal");
+        let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
+        let mut session = admin.sql_session();
+        for sql in [
+            "CREATE TYPE t_e AS ENUM ('A', 'B', 'C')",
+            "CREATE DOMAIN d_txt AS text",
+            "CREATE TABLE d1 (id int PRIMARY KEY, k t_e, CONSTRAINT d1c CHECK (k::text IN ('A', 'B')))",
+            "CREATE TABLE d2 (id int PRIMARY KEY, k t_e, CONSTRAINT d2c CHECK (k::text = ANY(ARRAY['A', 'B'])))",
+            "INSERT INTO d1 VALUES (1, 'A')",
+            "INSERT INTO d2 VALUES (1, 'A')",
+            "ALTER TABLE d1 ALTER COLUMN k TYPE t_e",
+        ] {
+            session
+                .execute(sql, &[], None)
+                .unwrap_or_else(|error| panic!("{engine:?} {sql}: {error:?}"));
+        }
+        for (table, constraint, target) in [("d1", "d1c", "char(3)"), ("d2", "d2c", "d_txt")] {
+            let sql = format!("ALTER TABLE {table} ALTER COLUMN k TYPE {target}");
+            let error = session.execute(&sql, &[], None).unwrap_err();
+            assert_eq!(sqlstate(&error), "0A000", "{engine:?} {sql}");
+            let message = take_sql_error_message().unwrap();
+            assert!(message.contains(constraint), "{engine:?} {sql}: {message}");
+
+            let sql = format!("INSERT INTO {table} VALUES (2, 'A') RETURNING pg_typeof(k)::text");
+            let result = session
+                .execute(&sql, &[], None)
+                .unwrap_or_else(|error| panic!("{engine:?} {sql}: {error:?}"));
+            assert_eq!(result.rows[0].values, [Value::Text("t_e".into())], "{engine:?} {sql}");
+
+            let sql = format!("INSERT INTO {table} VALUES (3, 'C')");
+            let error = session.execute(&sql, &[], None).unwrap_err();
+            assert_eq!(sqlstate(&error), "23514", "{engine:?} {sql}");
+        }
+        session.execute("ALTER TABLE d1 ALTER COLUMN k TYPE text", &[], None).unwrap();
+        let error = session.execute("ALTER TABLE d1 ALTER COLUMN k TYPE char(3)", &[], None).unwrap_err();
+        assert_eq!(sqlstate(&error), "0A000", "{engine:?}");
+        let message = take_sql_error_message().unwrap();
+        assert!(message.contains("d1c"), "{engine:?}: {message}");
         drop((session, admin));
         std::fs::remove_dir_all(path).unwrap();
     }

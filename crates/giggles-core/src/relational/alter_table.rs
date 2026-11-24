@@ -608,13 +608,6 @@ pub(super) fn execute(
                 let at = position(&table, column)?;
                 let old = &table.columns[at];
                 generated_columns::check_referenced_type(&candidate, &table, old)?;
-                if collation.is_none() && user_type.is_none()
-                    && !ty.is_text_search()
-                    && !matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
-                    && candidate.generated_column(old.id).is_none()
-                {
-                    return Err(SqlError::Unsupported);
-                }
                 let mut new = old.clone();
                 new.data_type = ty.clone();
                 let mut typmod = *typmod;
@@ -626,10 +619,12 @@ pub(super) fn execute(
                     if let TypeDef::Domain { typmod: domain_typmod, .. } = ty {
                         typmod = *domain_typmod;
                     }
-                    if matches!(ty, TypeDef::Enum { .. })
-                        && !(candidate.ext.columns.get(&old.id).and_then(|c| c.type_id) == type_id
-                            && old.data_type == new.data_type)
-                    {
+                    let same_type = candidate.ext.columns.get(&old.id).and_then(|c| c.type_id) == type_id
+                        && old.data_type == new.data_type;
+                    if !matches!(ty, TypeDef::Enum { .. }) || !same_type {
+                        query::check_enum_text_retype(&candidate, &table, old)?;
+                    }
+                    if matches!(ty, TypeDef::Enum { .. }) && !same_type {
                         if conversion.is_none() {
                             user_types::view_replace_error(format!(
                                 "column \"{column}\" cannot be cast automatically to type {}", target.sql()
@@ -642,6 +637,17 @@ pub(super) fn execute(
                             ));
                             return Err(SqlError::Type);
                         }
+                    }
+                } else {
+                    if !matches!(ty, DataType::Text | DataType::Varchar) {
+                        query::check_enum_text_retype(&candidate, &table, old)?;
+                    }
+                    if collation.is_none()
+                        && !ty.is_text_search()
+                        && !matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
+                        && candidate.generated_column(old.id).is_none()
+                    {
+                        return Err(SqlError::Unsupported);
                     }
                 }
                 // The v2 layout rewrite leaves same-width rows and existing

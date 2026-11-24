@@ -317,6 +317,50 @@ pub(in crate::relational) fn constraint_table_deparse(
     Ok((deparse(&filter)?, columns))
 }
 
+pub(in crate::relational) fn check_enum_text_retype(
+    state: &Relational,
+    table: &TableDef,
+    column: &ColumnDef,
+) -> R<()> {
+    let enum_column = match (state.column_type(column.id), &column.data_type) {
+        (Some(TypeDef::Enum { .. }), DataType::Text) => true,
+        (None, DataType::Text | DataType::Varchar) => false,
+        _ => return Ok(()),
+    };
+    let _scope = enum_text::Scope::stored(state, table, false);
+    for constraint in state.table_constraints(table.id) {
+        let catalog_ext::ConstraintKind::Check { expr, .. } = &constraint.kind else {
+            continue;
+        };
+        let mut found = false;
+        let mut inspect_cast = |scalar: &Scalar| {
+            found |= matches!(scalar, Scalar::Cast(inner, DataType::Text | DataType::Varchar)
+                if matches!(inner.as_ref(), Scalar::Column(reference) if reference.name == column.name));
+            Ok(())
+        };
+        stored_filter(expr)?.walk_scalars(&mut |scalar| {
+            if enum_column {
+                inspect_cast(scalar)?;
+            } else if let Scalar::Call(name, args) = scalar
+                && name == enum_text::MEMBERSHIP
+                && let Some(operand) = args.first()
+            {
+                // The canonical membership expression survives a retype to text or varchar.
+                walk_scalar(operand, &mut inspect_cast)?;
+            }
+            Ok(())
+        })?;
+        if found {
+            user_types::view_replace_error(format!(
+                "cannot change type of column \"{}\" because of enum-text check constraint \"{}\"",
+                column.name, constraint.name,
+            ));
+            return Err(SqlError::Unsupported);
+        }
+    }
+    Ok(())
+}
+
 pub(in crate::relational) fn constraint_references(
     state: &Relational,
     table: &TableDef,
