@@ -607,7 +607,7 @@ pub(super) fn drop_named(
     name: &str,
     optional: bool,
 ) -> R<()> {
-    drop_named_cascade(state, table, name, optional, false)
+    drop_named_cascade(state, table, name, optional, false, &mut || false)
 }
 pub(super) fn drop_named_cascade(
     state: &mut Relational,
@@ -615,11 +615,10 @@ pub(super) fn drop_named_cascade(
     name: &str,
     optional: bool,
     cascade: bool,
+    cancel: &mut impl FnMut() -> bool,
 ) -> R<()> {
-    if table.hidden_rowid().is_none()
-        && constraint_primary_key::primary_key_name(state, table).as_deref() == Some(name)
-    {
-        return Err(SqlError::Unsupported);
+    if constraint_primary_key::primary_key_name(state, table).as_deref() == Some(name) {
+        return constraint_primary_key::drop(state, table, name, cascade, cancel);
     }
     if let Some(Constraint { kind: ConstraintKind::Unique { index, .. }, .. }) =
         state.table_constraints(table.id).iter().find(|c| c.name == name) {
@@ -644,15 +643,17 @@ pub(super) fn drop_named_cascade(
             .filter(|d| d.id != index).cloned().collect::<Vec<_>>();
         state.secondary = state.secondary_build_complete_engine(&descriptors, &mut || false)?;
     }
-    let cs = std::sync::Arc::make_mut(&mut state.ext).constraints.entry(table.id).or_default();
-    if let Some(at) = cs.iter().position(|c| c.name == name) {
-        if matches!(cs[at].kind, ConstraintKind::PrimaryKey) {
-            return Err(SqlError::Unsupported);
+    let Some(at) = state.table_constraints(table.id).iter().position(|c| c.name == name) else {
+        let message = format!("constraint \"{name}\" of relation \"{}\" does not exist", table.name);
+        if optional {
+            user_types::sql_notice(format!("{message}, skipping"), "42704");
+            return Ok(());
         }
-        cs.remove(at);
-    } else if !optional {
+        user_types::view_replace_error(message);
         return Err(SqlError::UndefinedObject);
-    }
+    };
+    let cs = std::sync::Arc::make_mut(&mut state.ext).constraints.entry(table.id).or_default();
+    cs.remove(at);
     if cs.is_empty() {
         std::sync::Arc::make_mut(&mut state.ext).constraints.remove(&table.id);
     }
@@ -727,12 +728,38 @@ pub(super) fn enforce_with_rows<'a>(
         let Some(after) = state.rows.get(id) else {
             continue;
         };
+        let rekey = if before.epoch != state.epoch {
+            let old = table_by_id(&before, *id)?;
+            let new = table_by_id(state, *id)?;
+            old.hidden_rowid().is_some() != new.hidden_rowid().is_some()
+        } else {
+            false
+        };
+        // A DDL rewrite preserves row versions. Match by version when a key
+        // moves, so a physical rekey does not look like a referential delete.
+        let by_version = if rekey || !Arc::ptr_eq(&before.ext, &state.ext) && before.ext.types != state.ext.types {
+            after.iter().map(|(key, row)| (row.version, (key, row))).collect::<BTreeMap<_, _>>()
+        } else {
+            BTreeMap::new()
+        };
+        if rekey {
+            for ((_, table), keys) in &mut deferred.pending {
+                if table == id {
+                    *keys = keys.iter().filter_map(|key| {
+                        let old = rows.get(key)?;
+                        by_version.get(&old.version).map(|(new, _)| (*new).clone())
+                    }).collect();
+                }
+            }
+            continue;
+        }
         for (key, old) in rows {
             if cancel() {
                 return Err(SqlError::Aborted);
             }
+            let new = by_version.get(&old.version).map(|(_, row)| *row).or_else(|| after.get(key));
             if captured_old.contains(&(*id, old.version))
-                || after.get(key).is_some_and(|r| r.values == old.values)
+                || new.is_some_and(|r| r.values == old.values)
             {
                 continue;
             }
@@ -742,7 +769,7 @@ pub(super) fn enforce_with_rows<'a>(
             events.push_back(Event {
                 table: *id,
                 old: old.clone(),
-                new: after.get(key).cloned(),
+                new: new.cloned(),
             });
         }
     }

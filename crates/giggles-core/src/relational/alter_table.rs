@@ -422,7 +422,7 @@ pub(super) fn execute(
                 constraints::validate_named(&mut candidate, &table, name, &mut *cancel)?
             }
             Action::DropConstraint(name, optional, cascade) => {
-                constraints::drop_named_cascade(&mut candidate, &table, name, *optional, *cascade)?
+                constraints::drop_named_cascade(&mut candidate, &table, name, *optional, *cascade, cancel)?
             }
             Action::Add(column, typmod, default, semantic_error, if_not_exists, collation, user_type) => {
                 if *if_not_exists

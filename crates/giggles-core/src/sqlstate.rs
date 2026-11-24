@@ -74,6 +74,8 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::InvalidTableDefinition) => "42P16",
         CoreError::Sql(S::RestrictViolation) => "23001",
         CoreError::Sql(S::WrongObjectType) => "42809",
+        CoreError::Sql(S::InvalidName) => "42602",
+        CoreError::Sql(S::UnsafeNewEnumValue) => "55P04",
         CoreError::Sql(S::NullValueNotAllowed) => "22004",
         CoreError::Sql(S::CannotCoerce) => "42846",
         CoreError::Sql(S::BadCopyFileFormat) => "22P04",

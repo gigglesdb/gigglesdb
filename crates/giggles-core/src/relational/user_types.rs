@@ -160,6 +160,7 @@ pub fn type_oid(id: u64) -> R<u32> {
 #[derive(Debug, Clone)]
 pub(super) enum Ddl {
     Create(TypeDef),
+    Alter(enum_alter::Alter),
     Drop {
         names: Vec<String>,
         cascade: bool,
@@ -172,6 +173,7 @@ impl Ddl {
         match self {
             Self::Create(TypeDef::Domain { .. }) => "CREATE DOMAIN",
             Self::Create(_) => "CREATE TYPE",
+            Self::Alter(_) => "ALTER TYPE",
             Self::Drop { domain: true, .. } => "DROP DOMAIN",
             Self::Drop { .. } => "DROP TYPE",
         }
@@ -480,8 +482,14 @@ pub(super) fn validate_type(ty: &TypeDef) -> R<()> {
     }
     Ok(())
 }
-pub(super) fn execute(state: &mut Relational, ddl: &Ddl, prepared: &Prepared) -> R<()> {
+pub(super) fn execute(
+    state: &mut Relational,
+    ddl: &Ddl,
+    prepared: &Prepared,
+    cancel: &mut impl FnMut() -> bool,
+) -> R<()> {
     match ddl {
+        Ddl::Alter(ddl) => return enum_alter::execute(state, ddl, &prepared.search_path, cancel),
         Ddl::Create(ty) => {
             let mut ty = ty.clone();
             let schema = if ty.schema().is_empty() {
@@ -512,6 +520,7 @@ pub(super) fn execute(state: &mut Relational, ddl: &Ddl, prepared: &Prepared) ->
                 ext.types.insert(id, ty.clone());
                 Ok(())
             })?;
+            enum_alter::created(ty);
         }
         Ddl::Drop {
             names,
@@ -693,15 +702,9 @@ pub(super) fn coerce(state: &Relational, column: &ColumnDef, value: &Value) -> R
 }
 pub(super) fn coerce_user_type(ty: &TypeDef, storage: &DataType, value: &Value) -> R<()> {
     match ty {
-        TypeDef::Enum { name, labels, .. } if *value != Value::Null => {
+        TypeDef::Enum { labels, .. } if *value != Value::Null => {
             let Value::Text(text) = value else { return Err(SqlError::Type); };
-            let validate = |label: &str| {
-                if labels.iter().any(|allowed| allowed == label) {
-                    Ok(())
-                } else {
-                    Err(enum_input_error(name, label))
-                }
-            };
+            let validate = |label: &str| super::enum_alter::check_value(ty, labels, label);
             if *storage == DataType::TextArray {
                 for label in logical_types::array_values(text)?.iter().flatten() {
                     validate(label)?;

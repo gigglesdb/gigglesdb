@@ -8,6 +8,8 @@ mod release_seal;
 mod explain_text_network;
 #[path = "view_select_network.rs"]
 mod view_select_network;
+#[path = "am2_migration_network.inc"]
+mod am2_migration_network;
 #[path = "comments_network.rs"]
 mod comments_network;
 #[path = "group_parser_network.rs"]

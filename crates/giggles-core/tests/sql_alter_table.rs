@@ -411,12 +411,11 @@ fn bounded_rejections_and_column_limits() {
     let mut s = db.admin().sql_session();
     run(&mut s, "CREATE TABLE t (id int PRIMARY KEY,v int)");
     run(&mut s, "CREATE TABLE heap (only_column int)");
-    // Deliberate bounded 0A000 rules: PG permits removing PK/FK/last user columns.
+    // Deliberate bounded 0A000 rules: PG permits dropping a key column or the last user column.
     for sql in [
         "ALTER TABLE t DROP COLUMN id",
         "ALTER TABLE heap DROP COLUMN only_column",
         "ALTER TABLE t ALTER COLUMN v TYPE bigint",
-        "ALTER TABLE t DROP CONSTRAINT t_pkey",
         "ALTER TABLE t ADD COLUMN serial_col serial",
     ] {
         error(&mut s, sql, SqlError::Unsupported);

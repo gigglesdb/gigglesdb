@@ -339,12 +339,7 @@ impl CatalogSnapshot {
                     .chain(self.parts.ext.constraints.values().flatten().map(|c| c.id))
                     .chain(self.parts.ext.sequences.keys().copied())
                     .chain(self.parts.ext.collations.keys().copied())
-                    .chain(self.parts.ext.types.iter().map(|(&id, ty)| match ty {
-                        relational::TypeDef::Enum { labels, .. } => {
-                            id.saturating_add(labels.len() as u64)
-                        }
-                        _ => id,
-                    }))
+                    .chain(self.parts.ext.types.keys().copied())
                     .chain(self.parts.ext.schemas.values().map(|schema| schema.id))
                     .max()
                     .unwrap_or(0)
@@ -2280,17 +2275,10 @@ fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreErro
         insert(*id, (5, 0))?;
     }
     for id in parts.ext.collations.keys() { insert(*id, (22, 0))?; }
-    for (id, ty) in &parts.ext.types {
+    // Type definitions own catalog records. Their pg_enum label rows
+    // are projected from the definition and do not allocate catalog objects.
+    for id in parts.ext.types.keys() {
         insert(*id, (15, 0))?;
-        if let TypeDef::Enum { labels, .. } = ty {
-            for offset in 1..=labels.len() as u64 {
-                insert(
-                    id.checked_add(offset)
-                        .ok_or_else(|| corrupt("enum label id overflow"))?,
-                    (15, *id),
-                )?;
-            }
-        }
     }
     for (table, birth) in &parts.ext.primary_index_birth { insert(*birth, (18, *table))?; }
     for schema in parts.ext.schemas.values() {

@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 mod alter_table;
+mod enum_alter;
+pub(crate) use enum_alter::{EnumScope, EnumTransaction};
 mod comments;
 mod security_label;
 mod extensions;
@@ -366,6 +368,10 @@ pub enum SqlError {
     /// 42P02: a parameter reference where no parameters are defined.
     #[serde(skip)]
     UndefinedParameter,
+    #[serde(skip)]
+    InvalidName,
+    #[serde(skip)]
+    UnsafeNewEnumValue,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1432,6 +1438,9 @@ impl Parser {
         }
         if schemas::claims(&self.tokens) {
             return schemas::parse(self).map(Statement::Schema);
+        }
+        if enum_alter::claims(self) {
+            return enum_alter::parse(self).map(|ddl| Statement::TypeDdl(user_types::Ddl::Alter(ddl)));
         }
         if user_types::claims(self) {
             return user_types::parse(self).map(Statement::TypeDdl);
@@ -3497,7 +3506,7 @@ impl Prepared {
         if !matches!(tokens.first(), Some(Token::Word(word)) if word == "alter") {
             return Ok(None);
         }
-        if matches!(tokens.get(1), Some(Token::Word(word)) if matches!(word.as_str(), "sequence" | "collation")) {
+        if matches!(tokens.get(1), Some(Token::Word(word)) if matches!(word.as_str(), "sequence" | "collation" | "type")) {
             return Ok(None);
         }
         let mut parser = Parser { privilege_seen: false, privilege_casts: false,
@@ -4393,7 +4402,7 @@ impl Relational {
             Statement::Extension(ddl) => { extensions::execute(self, ddl, prepared)?; }
             Statement::CollationDdl(ddl) => { collations::execute(self, ddl, prepared)?; }
             Statement::TypeDdl(ddl) => {
-                user_types::execute(self, ddl, prepared)?;
+                user_types::execute(self, ddl, prepared, &mut cancel)?;
             }
             Statement::CompositeSelect(select) => {
                 return select.execute(self, params, &prepared.search_path, clock);
@@ -4740,6 +4749,9 @@ impl Relational {
                         }))
                     };
                 let schema = prepared.creation_schema(self)?;
+                for (type_id, default) in type_ids.iter().zip(defaults) {
+                    enum_alter::validate_default(type_id.and_then(|id| self.ext.types.get(&id)), default.as_deref())?;
+                }
                 defaults::install_create(
                     self,
                     t,
@@ -4838,7 +4850,7 @@ impl Relational {
                 let legacy = scan::LegacyRows(&*self);
                 let source = injected_source.unwrap_or(&legacy);
                 if source.contains(t, &key)? {
-                    return Err(self.primary_duplicate(t, &row));
+                    return Err(self.primary_duplicate_values(t, &row));
                 }
                 let version = match heap_version {
                     Some(version) => version,

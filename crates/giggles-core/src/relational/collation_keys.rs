@@ -243,6 +243,19 @@ impl Relational {
             })
     }
 
+    pub(crate) fn primary_duplicate_values(&self, table: &TableDef, values: &[Value]) -> SqlError {
+        if primary_has_uuid(table) {
+            return self.primary_duplicate(table, values);
+        }
+        if let Some(name) = self.primary_key_constraint_name(table) {
+            if let Ok(detail) = super::constraint_primary_key::key_detail(table, values, "already exists") {
+                user_types::sql_error_detail(detail);
+            }
+            return duplicate(&name);
+        }
+        SqlError::Duplicate
+    }
+
     pub(super) fn primary_collision_name(&self, table: &TableDef) -> String {
         let name = self.primary_key_constraint_name(table).unwrap_or_default();
         if primary_has_uuid(table) {

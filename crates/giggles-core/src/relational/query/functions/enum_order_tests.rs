@@ -141,37 +141,21 @@ fn assert_label_order(mut select: impl FnMut(&str) -> SqlResult) {
 fn scope_reads_updated_labels_from_the_private_catalog() {
     with_session(|session| {
         run(session, "CREATE TYPE mood AS ENUM ('z','b')");
-        // This parser has no ALTER TYPE command. Exercise both label changes
-        // on a private catalog snapshot below.
-        for sql in [
-            "ALTER TYPE mood ADD VALUE 'm' BEFORE 'b'",
-            "ALTER TYPE mood ADD VALUE 'a' AFTER 'b'",
-        ] {
-            assert_eq!(
-                session.execute(sql, &[], None),
-                Err(CoreError::Sql(SqlError::Syntax))
-            );
-        }
-
         run(session, "BEGIN");
         run(session, "CREATE TABLE items (id int PRIMARY KEY, v mood)");
         run(session, "INSERT INTO items VALUES (1,'b'),(2,'z')");
         let mut state = snapshot(session);
         let original = legacy_types(&state);
         let _outer = Scope::enter(&state);
-        let ext = Arc::make_mut(&mut state.ext);
-        let TypeDef::Enum { labels, .. } = ext.types.values_mut().next().unwrap() else {
-            panic!("expected the mood enum");
-        };
-        labels.insert(1, "m".into());
-        labels.push("a".into());
-        assert_scope(&state, 1);
         let mut execute = |sql: &str| {
             let prepared = Prepared::parse(sql, 1, state.epoch).unwrap();
             state.execute(&prepared, &[], None).unwrap()
         };
+        execute("ALTER TYPE mood ADD VALUE 'm' BEFORE 'b'");
+        execute("ALTER TYPE mood ADD VALUE 'a' AFTER 'b'");
         execute("INSERT INTO items VALUES (3,'a'),(4,'m')");
         assert_label_order(execute);
+        assert_scope(&state, 1);
         TYPES.with(|slot| assert_eq!(*slot.borrow(), original));
         run(session, "ROLLBACK");
     });

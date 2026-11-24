@@ -49,7 +49,8 @@ impl Relational {
                 if let Some(identity) = self.column_identity(column.id) {
                     out.identities.insert(column.id, if identity.always { 'a' } else { 'd' });
                 } else if let Some(sql) = self.column_default(column.id) {
-                    out.defaults.insert(column.id, defaults::present_default(self, sql, path));
+                    let display = enum_alter::present_default(self.column_type(column.id), sql)?;
+                    out.defaults.insert(column.id, display.unwrap_or_else(|| defaults::present_default(self, sql, path)));
                 }
             }
             for c in self.table_constraints(table.id) {

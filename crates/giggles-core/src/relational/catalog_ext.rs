@@ -355,12 +355,7 @@ pub(crate) fn validate_key_targets<'a>(ext: &CatalogExt, tables: impl Iterator<I
     let mut used: BTreeSet<_> = tables.values().flat_map(|t| std::iter::once(t.id).chain(t.columns.iter().map(|c| c.id)))
         .chain(indexes.keys().copied()).chain(ext.constraints.values().flatten().map(|c| c.id))
         .chain(ext.sequences.keys().copied()).chain(ext.schemas.values().map(|s| s.id)).collect();
-    for (id, ty) in &ext.types {
-        used.insert(*id);
-        if let TypeDef::Enum { labels, .. } = ty {
-            for offset in 1..=labels.len() as u64 { used.insert(id.checked_add(offset).ok_or(SqlError::Type)?); }
-        }
-    }
+    used.extend(ext.types.keys().copied());
     validate_births(ext, &tables, next_id, &mut used)?;
     for c in ext.constraints.values().flatten() {
         let ConstraintKind::ForeignKey { ref_table, ref_columns, target, .. } = &c.kind else { continue };
@@ -1279,13 +1274,10 @@ impl Relational {
                 return Err(SqlError::Type);
             }
             if let TypeDef::Enum { labels, .. } = ty {
-                for offset in 1..=labels.len() as u64 {
-                    let label_id = id.checked_add(offset).ok_or(SqlError::Limit)?;
-                    if label_id >= next_id || !used.insert(label_id) {
-                        return Err(SqlError::Type);
-                    }
-                    super::user_types::type_oid(label_id)?;
-                }
+                // pg_enum labels are virtual rows. ADD VALUE can grow the
+                // projection beyond the IDs reserved when the type was created.
+                let last_label = id.checked_add(labels.len() as u64).ok_or(SqlError::Limit)?;
+                super::user_types::type_oid(last_label)?;
             }
             super::user_types::type_oid(*id)?;
             super::user_types::validate_type(ty)?;

@@ -2231,6 +2231,12 @@ fn build_with_budget(
     } else {
         BTreeSet::new()
     };
+    let type_oids = if needs("pg_enum") {
+        snapshot.user_types.iter().map(|ty| ty.oid).collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let mut overflow_label_oid = u32::MAX;
     for ty in &snapshot.user_types {
         if needs("pg_type") {
             let len = match (ty.kind, ty.base) {
@@ -2287,10 +2293,21 @@ fn build_with_budget(
         }
         if !needs("pg_enum") { continue; }
         for (i, label) in ty.labels.iter().enumerate() {
-            // Label OIDs are stable within this immutable enumeration.
-            let oid = i64::from(ty.oid) + 4 * (i as i64 + 1);
+            // Keep the original positional OIDs while they fit in the
+            // range preceding the next type. Growing an enum can cross
+            // that boundary; use a disjoint residue for those labels.
+            let position_oid = ty.oid + 4 * (i as u32 + 1);
+            let oid = if type_oids.range((std::ops::Bound::Excluded(ty.oid), std::ops::Bound::Included(position_oid)))
+                .next().is_some()
+            {
+                let oid = overflow_label_oid;
+                overflow_label_oid -= 4;
+                oid
+            } else {
+                position_oid
+            };
             add!("pg_enum", vec![
-                I(oid),
+                I(i64::from(oid)),
                 I(ty.oid as i64),
                 Value::Float4(giggles_pg_types::Float4::from_bits(
                     ((i + 1) as f32).to_bits(),

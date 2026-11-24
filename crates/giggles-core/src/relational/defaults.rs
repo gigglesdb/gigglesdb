@@ -1643,6 +1643,7 @@ pub(super) fn install_alter(
     sql: Option<&str>,
     path: &[String],
 ) -> R<()> {
+    enum_alter::validate_default(state.column_type(column.id), sql)?;
     let value = if let Some(sql) = sql {
         let mut parser = Parser { privilege_seen: false, privilege_casts: false,
             tokens: lex(&format!("{sql},"))?,

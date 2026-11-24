@@ -287,6 +287,11 @@ impl Diagnostic {
                 || m.starts_with("function pg_catalog.normalize(") || m.starts_with("function num_nulls(")
                 || m.starts_with("function num_nonnulls(") || m.starts_with("invalid input syntax for type ") || m.starts_with("could not obtain lock on row ")
                 || m.starts_with("currval of sequence ") || m == "lastval is not yet defined in this session"
+                || m.starts_with("enum label \"") || m.starts_with("invalid input value for enum ")
+                || m.ends_with(" is not an enum") || m.starts_with("type \"") && m.ends_with(" does not exist")
+                || m.starts_with("constraint \"") && m.ends_with(" does not exist")
+                || m.starts_with("cannot drop constraint ") || m.starts_with("could not create unique index ")
+                || m.starts_with("duplicate key value violates unique constraint ")
                 || m == "canceling statement due to lock timeout"
                 || m.starts_with("type modifier is not allowed for type ")
                 || m.starts_with("permission denied for table ") || m.starts_with("view ") || m.starts_with("sequence ") || m.starts_with("index ")
@@ -379,6 +384,8 @@ impl Diagnostic {
                     | giggles_core::relational::SqlError::InvalidArgumentForPowerFunction
                     | giggles_core::relational::SqlError::InvalidArgumentForWidthBucket
                     | giggles_core::relational::SqlError::NullValueNotAllowed
+                    | giggles_core::relational::SqlError::InvalidName
+                    | giggles_core::relational::SqlError::UnsafeNewEnumValue
             ))
         ) || matches!(
             &result,

@@ -568,12 +568,13 @@ impl SqlSession {
                                     name.to_owned(),
                                     txn.savepoint(),
                                     self.deferral.clone(),
+                                    self.enum_transaction.clone(),
                                 ));
                             } else {
                                 let index = self
                                     .v2_savepoints
                                     .iter()
-                                    .rposition(|(saved, _, _)| saved == name)
+                                    .rposition(|(saved, ..)| saved == name)
                                     .ok_or(CoreError::Sql(E::InvalidSavepoint))?;
                                 let mark = self.v2_savepoints[index].1.clone();
                                 if control == "release" {
@@ -583,6 +584,7 @@ impl SqlSession {
                                 } else {
                                     txn.rollback_to_releasing_locks(&mark)?;
                                     self.deferral = self.v2_savepoints[index].2.clone();
+                                    self.enum_transaction = self.v2_savepoints[index].3.clone();
                                     self.rollback_copy_freeze(index);
                                     self.v2_savepoints.truncate(index + 1);
                                     self.aborted = false;
@@ -612,6 +614,7 @@ impl SqlSession {
                     let mut implicit = None;
                     let protected = self.protected.is_some();
                     let explicit = self.v2_transaction.is_some() && !protected;
+                    let enum_scope = relational::EnumScope::enter(explicit.then_some(&self.enum_transaction));
                     let (txn, mut protected_effects) = match (&mut self.protected, &mut self.v2_transaction) {
                         (Some(run), _) => (&mut run.txn, Some(&mut run.effects)),
                         (None, Some(txn)) => (txn, None),
@@ -1201,6 +1204,7 @@ impl SqlSession {
                         if !ddl {
                             return Ok(result);
                         }
+                        bound.check_enum_rename_views(&image, old.sql_views.values().map(|v| v.select.as_str())).map_err(CoreError::Sql)?;
                         // RESTART WITH does not change the recorded START. Carry its
                         // seed separately, using the bound name and post-DDL START.
                         let restart_seed = bound.sequence_restart_seed(&image);
@@ -1320,6 +1324,7 @@ impl SqlSession {
                         }
                     }
                     if explicit && result.is_ok() {
+                        self.enum_transaction = enum_scope.changes();
                         self.copy_freeze.last_mut().unwrap().extend(freeze_marks);
                     }
                     result
@@ -2313,7 +2318,7 @@ impl RowSink for SqlRows<'_> {
                 .current
                 .is_some()
             {
-                return Err(CoreError::Sql(image.primary_duplicate(table, &row.values)));
+                return Err(CoreError::Sql(image.primary_duplicate_values(table, &row.values)));
             }
         }
         if image.has_nondeterministic_keys(table) {
@@ -2393,12 +2398,13 @@ impl RowSink for SqlRows<'_> {
             }).map_err(crate::task::limits::lock_error)?;
             match (old, target.current) {
                 (None, Some(_)) => {
-                    if !relational::collation_keys::primary_has_uuid(table) {
-                        return Err(CoreError::Sql(SqlError::Duplicate));
-                    }
-                    let row = new.expect("appended row");
-                    let image = self.catalog.image().map_err(CoreError::Sql)?;
-                    return Err(CoreError::Sql(image.primary_duplicate(table, &row.values)));
+                    let error = if let Some(row) = new.filter(|_| !self.prepared.is_ddl() || relational::collation_keys::primary_has_uuid(table)) {
+                        self.catalog.image().map_err(CoreError::Sql)?
+                            .primary_duplicate_values(table, &row.values)
+                    } else {
+                        SqlError::Duplicate
+                    };
+                    return Err(CoreError::Sql(error));
                 }
                 (Some(old), Some(bytes)) => {
                     let record = codec::decode_row(key, &bytes)?;

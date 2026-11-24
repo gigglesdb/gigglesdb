@@ -160,6 +160,8 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::InternalError => 69,
                 relational::SqlError::InvalidIndexPredicate => 71,
                 relational::SqlError::UndefinedParameter => 72,
+                relational::SqlError::InvalidName => 73,
+                relational::SqlError::UnsafeNewEnumValue => 74,
             }
         }
     };

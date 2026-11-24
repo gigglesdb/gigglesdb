@@ -2252,6 +2252,7 @@ impl Executor {
 struct SqlSavepointState {
     staged: State,
     deferral: relational::DeferralState,
+    enum_transaction: relational::EnumTransaction,
 }
 struct SqlSavepoint {
     name: String,
@@ -2306,7 +2307,7 @@ pub struct SqlSession {
     protected: Option<ProtectedRun>,
     copy_input: Option<CopyInput>,
     savepoints: Vec<SqlSavepoint>,
-    v2_savepoints: Vec<(String, engine::txn::Savepoint, relational::DeferralState)>,
+    v2_savepoints: Vec<(String, engine::txn::Savepoint, relational::DeferralState, relational::EnumTransaction)>,
     copy_freeze: Vec<std::collections::BTreeSet<u64>>,
     savepoint_budget: u64,
     aborted: bool,
@@ -2338,6 +2339,7 @@ pub struct SqlSession {
     sequence_authority: SequenceAuthority,
     sequence_default_execution: Option<v2_sql::sql_sequences::DefaultExecution>,
     deferral: relational::DeferralState,
+    enum_transaction: relational::EnumTransaction,
     isolation: SqlIsolation,
     /// The task this session is bound to (GD-0061 R3-202); set once by `bind_task`.
     pub(crate) task: Option<crate::task::context::TaskContext>,
@@ -2407,6 +2409,7 @@ impl Admin {
             sequence_authority: SequenceAuthority::Unrestricted,
             sequence_default_execution: None,
             deferral: Default::default(),
+            enum_transaction: Default::default(),
             isolation: SqlIsolation::ReadCommitted,
             task: None,
             task_generation: None,
@@ -5422,6 +5425,7 @@ impl SqlSession {
                             state: SqlSavepointState {
                                 staged: staged.clone(),
                                 deferral: self.deferral.clone(),
+                                enum_transaction: self.enum_transaction.clone(),
                             },
                             bytes,
                         });
@@ -5438,6 +5442,7 @@ impl SqlSession {
                             let SqlSavepointState {
                                 staged: mut restored,
                                 deferral,
+                                enum_transaction,
                             } = self.savepoints[index].state.clone();
                             // Allocation and currval are nontransactional. Merge by
                             // incarnation/stamp, rather than restoring older counters.
@@ -5456,6 +5461,7 @@ impl SqlSession {
                                 .ok_or(CoreError::Sql(E::Overflow))?;
                             self.staged = Some(restored);
                             self.deferral = deferral;
+                            self.enum_transaction = enum_transaction;
                             self.staged_revision = revision;
                             self.rollback_copy_freeze(index);
                             self.savepoints.truncate(index + 1);
@@ -5564,6 +5570,7 @@ impl SqlSession {
         };
         let freeze_before = p.copy_freeze_created(&s.sql);
         let mut deferral = self.deferral.clone();
+        let enum_scope = relational::EnumScope::enter(self.staged.as_ref().map(|_| &self.enum_transaction));
         let result = if let Some((names, deferred)) = p.set_constraints() {
             // Outside a block PostgreSQL still resolves named constraints;
             // ALL succeeds while the ephemeral mode change is discarded.
@@ -5724,6 +5731,7 @@ impl SqlSession {
             self.copy_freeze.last_mut().unwrap().extend(p.copy_freeze_marks(&s.sql, freeze_before));
             self.staged = Some(s);
             self.deferral = deferral;
+            self.enum_transaction = enum_scope.changes();
         } else if !p.is_read() {
             check_autocommit_reply(check_reply, &result)?;
             self.publish(s)?;
@@ -5892,6 +5900,7 @@ impl SqlSession {
         self.sequence_baseline.clear();
         self.legacy_catalog_id_at_begin = 0;
         self.deferral = Default::default();
+        self.enum_transaction = Default::default();
         self.copy_freeze = vec![Default::default()];
         self.savepoints.clear();
         self.v2_savepoints.clear();

@@ -67,3 +67,46 @@ fn user_type_namespace_matches_pg_namespace() {
         ]]
     );
 }
+
+#[test]
+fn growing_an_enum_keeps_catalog_label_oids_distinct() {
+    let mut snapshot = CatalogSnapshot::default();
+    for (oid, name, labels) in [
+        (
+            65540,
+            "first",
+            vec!["start".into(), "inserted".into(), "end".into()],
+        ),
+        (65548, "second", vec!["kept".into()]),
+    ] {
+        snapshot.user_types.push(UserType {
+            schema: "public".into(),
+            oid,
+            name: name.into(),
+            kind: 'e',
+            base: 0,
+            typmod: -1,
+            not_null: false,
+            labels,
+        });
+    }
+    let sql = "SELECT oid,enumlabel FROM pg_enum ORDER BY enumtypid,enumsortorder";
+    let rows = execute(&plan(sql).unwrap().unwrap(), &snapshot, &[])
+        .unwrap()
+        .rows;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Int(65544), Value::Text("start".into())],
+            vec![
+                Value::Int(i64::from(u32::MAX)),
+                Value::Text("inserted".into())
+            ],
+            vec![
+                Value::Int(i64::from(u32::MAX - 4)),
+                Value::Text("end".into())
+            ],
+            vec![Value::Int(65552), Value::Text("kept".into())],
+        ]
+    );
+}

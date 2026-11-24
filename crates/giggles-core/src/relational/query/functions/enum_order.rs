@@ -75,13 +75,11 @@ impl BoundScalar {
         }
     }
     pub(in crate::relational::query) fn enum_rank(self, ty: &TypeDef) -> R<Self> {
-        let TypeDef::Enum { labels, name, .. } = ty else {
+        let TypeDef::Enum { labels, .. } = ty else {
             return Err(SqlError::Type);
         };
-        if let Node::Literal(Value::Text(label)) = &self.node
-            && !labels.contains(label)
-        {
-            return Err(user_types::enum_input_error(name, label));
+        if let Node::Literal(Value::Text(label)) = &self.node {
+            enum_alter::check_value(ty, labels, label)?;
         }
         Ok(Self {
             ty: DataType::BigInt,

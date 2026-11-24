@@ -530,7 +530,9 @@ impl Relational {
                 insert.conflict_arbiter_columns(self, &sink.indexes()),
             _ => None,
         };
-        let mut names = if let Some(names)=prepared.collation_drop_tables(self) {names} else if let Statement::TypeDdl(user_types::Ddl::Drop {
+        let mut names = if let Statement::TypeDdl(user_types::Ddl::Alter(alter)) = prepared.statement.get() {
+            alter.rewrite_tables(self, &prepared.search_path)
+        } else if let Some(names)=prepared.collation_drop_tables(self) {names} else if let Statement::TypeDdl(user_types::Ddl::Drop {
             names,
             cascade: true,
             ..
