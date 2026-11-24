@@ -415,7 +415,7 @@ impl EngineLease {
         error: &CoreError,
         flag: &AtomicBool,
     ) {
-        self.kv.causes.record_fence(FenceCause::for_core(site, error), flag, false);
+        self.kv.causes.record_fence(FenceCause::for_core(site, error), flag, false, *error == CoreError::Fenced);
     }
 
     pub(super) fn fence_native_commit(&self, flag: &AtomicBool) {
@@ -428,6 +428,7 @@ impl EngineLease {
             ),
             flag,
             true,
+            false,
         );
     }
 

@@ -331,6 +331,7 @@ struct WalFaultState {
   std::atomic<bool> sync_thread_safe{true};
   std::atomic<bool> shutdown_started{false};
   std::atomic<uint64_t> fail_wal_number{0};
+  std::atomic<bool> fail_wal_append{false};
   std::atomic<uint64_t> sync_failures{0};
   std::atomic<uint64_t> dir_sync_failures{0};
   std::atomic<uint64_t> full_space_checks{0};
@@ -348,6 +349,23 @@ class FaultWalFile final : public FSWritableFileOwnerWrapper {
 
   bool IsSyncThreadSafe() const override {
     return state_->sync_thread_safe.load() && target()->IsSyncThreadSafe();
+  }
+
+  IOStatus Append(const Slice& data, const IOOptions& options,
+                  IODebugContext* debug) override {
+    if (state_->fail_wal_append.exchange(false)) {
+      return AppendError();
+    }
+    return target()->Append(data, options, debug);
+  }
+
+  IOStatus Append(const Slice& data, const IOOptions& options,
+                  const DataVerificationInfo& verification,
+                  IODebugContext* debug) override {
+    if (state_->fail_wal_append.exchange(false)) {
+      return AppendError();
+    }
+    return target()->Append(data, options, verification, debug);
   }
 
   IOStatus Sync(const IOOptions& options, IODebugContext* debug) override {
@@ -373,6 +391,13 @@ class FaultWalFile final : public FSWritableFileOwnerWrapper {
   }
 
  private:
+  IOStatus AppendError() const {
+    auto status = IOStatus::IOError("While appending to file: " + path_,
+                                    "injected WAL append");
+    status.SetScope(IOStatus::IOErrorScope::kIOErrorScopeFile);
+    return status;
+  }
+
   static uint64_t WalNumber(const std::string& path) {
     const auto* start = path.data() + (path.find_last_of("/\\") + 1);
     const auto* end = path.data() + path.size() - 4;  // .log
@@ -589,6 +614,10 @@ extern "C" void giggles_rocksdb_arm_wal_file_fault(FaultEnv* handle,
 extern "C" void giggles_rocksdb_disable_wal_thread_safe_sync(
     FaultEnv* handle) noexcept {
   handle->state->sync_thread_safe.store(false);
+}
+
+extern "C" void giggles_rocksdb_arm_wal_append_fault(FaultEnv* handle) noexcept {
+  handle->state->fail_wal_append.store(true);
 }
 
 extern "C" void giggles_rocksdb_pause_fault_env_flushes(FaultEnv* handle) noexcept {

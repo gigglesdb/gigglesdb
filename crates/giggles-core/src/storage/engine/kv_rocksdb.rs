@@ -338,6 +338,10 @@ pub(crate) struct RocksKv {
     #[cfg(test)]
     no_sync_write_pause: Mutex<Option<NoSyncWritePause>>,
     #[cfg(test)]
+    sync_error_pause: TestPause,
+    #[cfg(test)]
+    no_sync_error_pause: TestPause,
+    #[cfg(test)]
     wal_stop: Option<WalStop>,
 }
 
@@ -346,6 +350,28 @@ struct NoSyncWritePause {
     entered: mpsc::Sender<()>,
     resume: mpsc::Receiver<()>,
     error: mpsc::Sender<Option<String>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct TestPause(Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>);
+
+#[cfg(test)]
+impl TestPause {
+    pub(super) fn arm(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, entered_rx) = mpsc::channel();
+        let (resume_tx, resume) = mpsc::channel();
+        assert!(self.0.lock().unwrap().replace((entered, resume)).is_none());
+        (entered_rx, resume_tx)
+    }
+
+    pub(super) fn wait(&self) {
+        let pause = self.0.lock().unwrap().take();
+        if let Some((entered, resume)) = pause {
+            let _ = entered.send(());
+            let _ = resume.recv();
+        }
+    }
 }
 
 impl Drop for RocksKv {
@@ -647,6 +673,10 @@ impl RocksKv {
             fence: Arc::default(),
             #[cfg(test)]
             no_sync_write_pause: Mutex::default(),
+            #[cfg(test)]
+            sync_error_pause: TestPause::default(),
+            #[cfg(test)]
+            no_sync_error_pause: TestPause::default(),
             #[cfg(test)]
             wal_stop: (stop.reason != 0).then_some(stop),
             db: Arc::new(LockedDb {
@@ -1122,19 +1152,58 @@ fn wal_number(file: &str) -> Option<u64> {
 fn wal_io(detail: &str) -> Option<(&str, u64)> {
     // A write can return SST, MANIFEST or background errors as well. Require a
     // known append/sync diagnostic and a numeric RocksDB WAL filename.
-    const OPERATIONS: [&str; 6] = [
+    const APPEND: [&str; 3] = [
         "While appending to file: ",
-        "While fdatasync: ",
-        "While fsync: ",
         "Failed to WriteFile: ",
         "Failed to write all bytes: ",
-        "FlushFileBuffers failed at Sync() for: ",
     ];
-    let diagnostic = OPERATIONS.iter().find_map(|op| detail.strip_prefix(op))?;
+    let diagnostic = APPEND.iter().find_map(|op| detail.strip_prefix(op))
+        .or_else(|| wal_sync_diagnostic(detail))?;
+    wal_path(diagnostic)
+}
+
+fn wal_sync_diagnostic(detail: &str) -> Option<&str> {
+    ["While fdatasync: ", "While fsync: ", "FlushFileBuffers failed at Sync() for: "]
+        .iter().find_map(|op| detail.strip_prefix(op))
+}
+
+fn wal_path(diagnostic: &str) -> Option<(&str, u64)> {
     let path = diagnostic
         .split_once(": ")
         .map_or(diagnostic, |(path, _)| path);
     Some((path, wal_number(path.rsplit(['/', '\\']).next()?)?))
+}
+
+#[derive(PartialEq, Eq)]
+pub(super) struct WalSyncError {
+    status: RocksStatus,
+    message: String,
+}
+
+impl WalSyncError {
+    pub(super) fn from_error(error: &KvError) -> Option<Self> {
+        let KvError::RocksIo { status, message, site } = error else { return None };
+        if status.code != RocksStatus::IO_ERROR {
+            return None;
+        }
+        // Pipeline diagnostics carry extra pre-call context. Compare the
+        // native status itself with the status returned by the NoSync call.
+        let message = if *site == FenceSite::CommitAppend {
+            message.split_once(" before commit I/O: ").map_or(message.as_str(), |(_, native)| native)
+        } else {
+            message
+        };
+        wal_path(wal_sync_diagnostic(status_detail(message).1)?)?;
+        Some(Self { status: *status, message: message.into() })
+    }
+
+    fn names_newest_wal(&self, wal_dir: &Path) -> bool {
+        wal_sync_diagnostic(status_detail(&self.message).1).and_then(wal_path)
+            .is_some_and(|(file, number)| {
+                Path::new(file).parent() == Some(wal_dir)
+                    && newest_wal(wal_dir).is_ok_and(|newest| newest == Some(number))
+            })
+    }
 }
 
 fn newest_wal(path: &Path) -> std::io::Result<Option<u64>> {
@@ -1187,6 +1256,7 @@ impl RocksKv {
         &self,
         site: FenceSite,
         error: KvError,
+        propagated: Option<WalSyncError>,
         classify: impl FnOnce(KvError) -> KvError,
     ) -> KvError {
         // A SyncWAL probe may be refused before doing I/O. Leave that handle
@@ -1197,15 +1267,26 @@ impl RocksKv {
                 status: RocksStatus { code: RocksStatus::IO_ERROR, .. }, ..
             }
         );
-        let stop = durability_failure && self.fence.latch_sync_failure();
         let error = classify(error);
-        if stop {
+        #[cfg(test)]
+        if durability_failure {
+            self.sync_error_pause.wait();
+        }
+        if durability_failure {
+            // Only a Sync operation can fail an explicit sync of the newest
+            // WAL. An append diagnostic can originate in either write group,
+            // so leave matching append reports to ordinary cause precedence.
+            let propagated = propagated.filter(|sync| {
+                matches!(error, KvError::RocksIo { site: FenceSite::WalWrite | FenceSite::WalFlush, .. })
+                    || (site == FenceSite::CommitSync && sync.names_newest_wal(self.db.path()))
+            });
             let cause = FenceCause::for_kv(site, &error);
-            // 11.8.1's SyncWalImpl checks for a background error before the
-            // WAL directory fsync. Cancel and drain native work even if it
-            // did not put the DB into an error state. All our writes use WAL.
-            self.db.cancel_all_background_work(true);
-            self.fence.record(cause);
+            if self.fence.latch_sync_failure(cause, propagated) {
+                // 11.8.1's SyncWalImpl checks for a background error before the
+                // WAL directory fsync. Cancel and drain even if RocksDB did
+                // not put the DB into an error state. All our writes use WAL.
+                self.db.cancel_all_background_work(true);
+            }
         }
         error
     }
@@ -1238,8 +1319,11 @@ impl RocksKv {
             error
         };
         if sync {
-            self.finish_sync_error(site, error, classify)
+            let propagated = WalSyncError::from_error(&error);
+            self.finish_sync_error(site, error, propagated, classify)
         } else {
+            #[cfg(test)]
+            self.no_sync_error_pause.wait();
             classify(error)
         }
     }
@@ -1281,7 +1365,9 @@ impl RocksKv {
         };
         op().map_err(|error| {
             if site == FenceSite::CommitSync {
-                self.finish_sync_error(site, error, classify)
+                let propagated = (background_errors == Some(0))
+                    .then(|| WalSyncError::from_error(&error)).flatten();
+                self.finish_sync_error(site, error, propagated, classify)
             } else {
                 classify(error)
             }
@@ -2126,6 +2212,7 @@ mod tests {
             fn giggles_rocksdb_arm_wal_fault(handle: *mut c_void, armed: bool);
             fn giggles_rocksdb_arm_wal_dir_fault(handle: *mut c_void);
             fn giggles_rocksdb_arm_wal_file_fault(handle: *mut c_void, number: u64);
+            fn giggles_rocksdb_arm_wal_append_fault(handle: *mut c_void);
             fn giggles_rocksdb_disable_wal_thread_safe_sync(handle: *mut c_void);
             fn giggles_rocksdb_pause_fault_env_flushes(handle: *mut c_void);
             fn giggles_rocksdb_has_paused_fault_env_flush(handle: *mut c_void) -> bool;
@@ -2159,6 +2246,11 @@ mod tests {
             fn arm_file(&self, number: u64) {
                 // SAFETY: this handle owns the live fault Env.
                 unsafe { giggles_rocksdb_arm_wal_file_fault(self.0.as_ptr(), number) };
+            }
+
+            fn arm_append(&self) {
+                // SAFETY: this handle owns the live fault Env.
+                unsafe { giggles_rocksdb_arm_wal_append_fault(self.0.as_ptr()) };
             }
 
             fn disable_thread_safe_sync(&self) {
@@ -2273,6 +2365,25 @@ mod tests {
 
         #[test]
         fn serial_wal_sync_fence_recovers_after_racing_no_sync_write() {
+            serial_wal_sync_fence(false);
+        }
+
+        #[test]
+        fn serial_wal_sync_fence_recovers_after_pre_latch_no_sync_report() {
+            serial_wal_sync_fence(true);
+        }
+
+        fn maintenance_batch() -> WriteBatch {
+            let mut batch = WriteBatch::default();
+            batch.delete_range(
+                Keyspace::Rows,
+                1u64.to_be_bytes().to_vec(),
+                2u64.to_be_bytes().to_vec(),
+            );
+            batch
+        }
+
+        fn serial_wal_sync_fence(report_first: bool) {
             let dir = TestDir::new();
             let (fault, db) = open_faulted(&dir.0, false);
             meta::write_initial_meta(db.as_ref(), [1; 16], 0).unwrap();
@@ -2296,26 +2407,17 @@ mod tests {
                 // Release the writer and flush before joining on unwind.
                 let flush = flush;
                 let (entered, resume, native_error) = pause_no_sync_write(&db);
-                let maintenance = scope.spawn(|| {
-                    let mut batch = WriteBatch::default();
-                    batch.delete_range(
-                        Keyspace::Rows,
-                        1u64.to_be_bytes().to_vec(),
-                        2u64.to_be_bytes().to_vec(),
-                    );
-                    kv.write(batch, Durability::NoSync)
-                });
+                let maintenance = scope.spawn(|| kv.write(maintenance_batch(), Durability::NoSync));
                 entered.recv_timeout(WAIT).unwrap();
                 fault.arm_file(newest);
+                let before_latch = report_first.then(|| db.sync_error_pause.arm());
                 let failed = highwater(&seq, 988).unwrap();
-                assert!(wait_until(|| fault.take_shutdown_started()), "native shutdown did not start");
-                assert_eq!(fault.counts().sync_failures, 1);
-                assert_eq!(background_errors(&db), 0);
-                assert!(matches!(failed.try_recv(), Err(mpsc::TryRecvError::Empty)));
-                assert!(fence_flag.load(Ordering::Acquire));
-                assert!(matches!(highwater(&seq, 989), Err(TxnError::Fenced)));
-                assert!(matches!(seq.durable_snapshot(), Err(TxnError::Kv(KvError::Fenced))));
-
+                if let Some((entered, _)) = &before_latch {
+                    entered.recv_timeout(WAIT).unwrap();
+                } else {
+                    assert!(wait_until(|| fault.take_shutdown_started()), "native shutdown did not start");
+                    assert_wal_write_cause(&kv);
+                }
                 drop(resume);
                 let native_error = native_error.recv_timeout(WAIT).unwrap().unwrap();
                 assert!(native_error.contains("injected WAL file sync"), "{native_error}");
@@ -2323,16 +2425,25 @@ mod tests {
                 assert!(matches!(&error, KvError::RocksIo {
                     site: FenceSite::Write | FenceSite::BackgroundError, ..
                 }), "{error}");
-                assert!(kv.causes.cause().is_none(), "the originating error is still draining");
+                if let Some((_, resume_sync)) = before_latch {
+                    assert!(!db.fence.sync_failure_latched());
+                    assert_eq!(kv.causes.cause().unwrap().class, FenceClass::NotRecoverable);
+                    drop(resume_sync);
+                    assert!(wait_until(|| fault.take_shutdown_started()), "native shutdown did not start");
+                }
+                assert_eq!(fault.counts().sync_failures, 1);
+                assert_eq!(background_errors(&db), 0);
+                assert!(matches!(failed.try_recv(), Err(mpsc::TryRecvError::Empty)));
+                assert!(fence_flag.load(Ordering::Acquire));
+                assert!(matches!(highwater(&seq, 989), Err(TxnError::Fenced)));
+                assert!(matches!(seq.durable_snapshot(), Err(TxnError::Kv(KvError::Fenced))));
 
+                assert_wal_write_cause(&kv);
                 drop(flush);
                 assert_eq!(failed.recv_timeout(WAIT).unwrap(), Err(TxnError::CommitAmbiguous));
             });
             assert!(background_errors(&db) > 0, "the scheduled flush must change the counter");
-            let cause = kv.causes.cause().unwrap();
-            assert_eq!((cause.site, cause.class), (FenceSite::WalWrite, FenceClass::Recoverable));
-            assert!(cause.error_text.contains("injected WAL file sync"), "{cause:?}");
-            assert_eq!(cause.status.unwrap().code, RocksStatus::IO_ERROR);
+            assert_wal_write_cause(&kv);
 
             let closed = db.close_latch();
             drop(seq);
@@ -2354,8 +2465,24 @@ mod tests {
             assert_eq!(admin.test_v2().kv.get(Keyspace::Seq, &key).unwrap(), Some(value));
         }
 
+        fn assert_wal_write_cause(kv: &Kv) {
+            let cause = kv.causes.cause().unwrap();
+            assert_eq!((cause.site, cause.class), (FenceSite::WalWrite, FenceClass::Recoverable));
+            assert!(cause.error_text.contains("injected WAL file sync"), "{cause:?}");
+            assert_eq!(cause.status.unwrap().code, RocksStatus::IO_ERROR);
+        }
+
         #[test]
         fn pipeline_commit_sync_fence_wins_over_racing_append() {
+            pipeline_commit_sync_fence(false);
+        }
+
+        #[test]
+        fn pipeline_commit_sync_fence_wins_over_pre_latch_append_report() {
+            pipeline_commit_sync_fence(true);
+        }
+
+        fn pipeline_commit_sync_fence(report_first: bool) {
             let dir = TestDir::new();
             wal_group_tests::initialize_marked(&dir.0);
             let (fault, db) = open_faulted(&dir.0, true);
@@ -2378,21 +2505,36 @@ mod tests {
             let appending = highwater(&seq, 989);
             let entered = entered.recv_timeout(WAIT);
             fault.arm_file(newest);
+            let before_latch = report_first.then(|| db.sync_error_pause.arm());
             hook.release(false);
             let appending = appending.unwrap();
             entered.expect("Stage A did not pass append admission");
-            assert!(wait_until(|| fault.take_shutdown_started()), "native shutdown did not start");
+            if let Some((entered, _)) = &before_latch {
+                entered.recv_timeout(WAIT).unwrap();
+            } else {
+                assert!(wait_until(|| fault.take_shutdown_started()), "native shutdown did not start");
+                assert_eq!(kv.causes.cause().unwrap().site, FenceSite::CommitSync);
+                assert!(!seq.is_fenced(), "Stage A has not yet reported its error");
+                assert!(fence_flag.load(Ordering::Acquire));
+                assert!(matches!(highwater(&seq, 990), Err(TxnError::Fenced)));
+                assert!(matches!(seq.durable_snapshot(), Err(TxnError::Fenced)));
+            }
             assert_eq!(fault.counts().sync_failures, 1);
-            assert!(fence_flag.load(Ordering::Acquire));
-            assert!(!seq.is_fenced(), "Stage A has not yet reported its error");
-            assert!(matches!(highwater(&seq, 990), Err(TxnError::Fenced)));
-            assert!(matches!(seq.durable_snapshot(), Err(TxnError::Fenced)));
 
             drop(resume);
             let native_error = native_error.recv_timeout(WAIT).unwrap().unwrap();
             assert!(native_error.contains("injected WAL file sync"), "{native_error}");
             assert!(wait_until(|| seq.is_fenced()), "Stage A did not report its error");
-            assert!(kv.causes.cause().is_none(), "the originating error is still draining");
+            if let Some((_, resume_sync)) = before_latch {
+                assert!(!db.fence.sync_failure_latched());
+                assert_eq!(kv.causes.cause().unwrap().site, FenceSite::CommitAppend);
+                drop(resume_sync);
+                assert!(wait_until(|| fault.take_shutdown_started()), "native shutdown did not start");
+            }
+            assert!(fence_flag.load(Ordering::Acquire));
+            assert!(matches!(highwater(&seq, 990), Err(TxnError::Fenced)));
+            assert!(matches!(seq.durable_snapshot(), Err(TxnError::Fenced)));
+            assert_eq!(kv.causes.cause().unwrap().site, FenceSite::CommitSync);
             assert!(matches!(syncing.try_recv(), Err(mpsc::TryRecvError::Empty)));
             assert!(matches!(appending.try_recv(), Err(mpsc::TryRecvError::Empty)));
 
@@ -2428,6 +2570,152 @@ mod tests {
         }
 
         #[test]
+        fn no_sync_wal_append_failure_keeps_write_cause_when_reported_first() {
+            no_sync_wal_append_failure(true);
+        }
+
+        #[test]
+        fn no_sync_wal_append_failure_keeps_write_cause_when_reported_during_drain() {
+            no_sync_wal_append_failure(false);
+        }
+
+        fn no_sync_wal_append_failure(report_first: bool) {
+            let dir = TestDir::new();
+            let (fault, db) = open_faulted(&dir.0, false);
+            let kv = Kv::new_single_writer(db.clone());
+            kv.write(single(), Durability::Sync).unwrap();
+            let flush = fault.pause_scheduled_flush(&db, Keyspace::Seq);
+            thread::scope(|scope| {
+                let flush = flush;
+                let (append_entered, append_resume) = db.no_sync_error_pause.arm();
+                let (sync_entered, sync_resume) = db.sync_error_pause.arm();
+                fault.arm_append();
+                let append = scope.spawn(|| kv.write(maintenance_batch(), Durability::NoSync));
+                // The appending writer stopped RocksDB but has not yet fenced
+                // the Kv. Sync enters RocksDB and sees that same native error.
+                append_entered.recv_timeout(WAIT).unwrap();
+                let sync = scope.spawn(|| kv.write(single(), Durability::Sync));
+                sync_entered.recv_timeout(WAIT).unwrap();
+                let sync_resume = if report_first {
+                    Some(sync_resume)
+                } else {
+                    drop(sync_resume);
+                    assert!(wait_until(|| fault.take_shutdown_started()));
+                    assert_eq!(kv.causes.cause().unwrap().site, FenceSite::WalWrite);
+                    None
+                };
+                drop(append_resume);
+                let append_error = append.join().unwrap().unwrap_err();
+                let cause = kv.causes.cause().unwrap();
+                assert_eq!((cause.site, cause.class), (FenceSite::Write, FenceClass::NotRecoverable));
+                assert!(cause.error_text.contains("injected WAL append"), "{cause:?}");
+                if let Some(sync_resume) = sync_resume {
+                    drop(sync_resume);
+                    assert!(wait_until(|| fault.take_shutdown_started()));
+                }
+                assert_eq!(kv.causes.cause().unwrap(), cause);
+                drop(flush);
+                let sync_error = sync.join().unwrap().unwrap_err();
+                assert_eq!(append_error.to_string(), sync_error.to_string());
+                assert_eq!(kv.causes.cause().unwrap(), cause);
+            });
+        }
+
+        #[test]
+        fn catalog_reload_refusal_during_sync_drain_preserves_recovery() {
+            catalog_reload_during_sync_drain(false);
+        }
+
+        #[test]
+        fn serial_sync_latch_wakes_supervisor_with_existing_read_cause() {
+            catalog_reload_during_sync_drain(true);
+        }
+
+        fn catalog_reload_during_sync_drain(prior_read: bool) {
+            use crate::relational::{ColumnDef, DataType, TableDef};
+            use crate::storage::engine::txn::Isolation;
+
+            let dir = TestDir::new();
+            let (fault, db) = open_faulted(&dir.0, false);
+            meta::write_initial_meta(db.as_ref(), [1; 16], 0).unwrap();
+            meta::write_marker(&dir.0).unwrap();
+            let kv = Arc::new(Kv::new_single_writer(db.clone()));
+            let v2 = V2Db::test_from_local_kv(kv.clone(), &dir.0);
+            let seq = v2.sequencer.clone();
+            let admin = Admin::attach_backend(
+                Backend::V2(EngineSlot::for_directory(v2, &dir.0, None)), Limits::default(),
+            ).unwrap().with_data_directory(&dir.0);
+            admin.set_fence_recovery(FenceRecovery { enabled: true, ..FenceRecovery::default() }).unwrap();
+            let ddl_engine = admin.test_v2();
+            let native_engine = admin.test_v2();
+            let mut txn = ddl_engine.begin(Isolation::ReadCommitted);
+            ddl_engine.catalog().create_table(&mut txn, TableDef {
+                id: 0,
+                name: "reload_during_sync_drain".into(),
+                columns: vec![ColumnDef {
+                    id: 0,
+                    name: "id".into(),
+                    data_type: DataType::BigInt,
+                    not_null: true,
+                }],
+                primary_key: vec![0],
+            }, false, None, &|| false).unwrap();
+            highwater(&seq, 987).unwrap().recv_timeout(WAIT).unwrap().unwrap();
+            let (reload_entered, reload_resume) = ddl_engine.catalog().reload_pause.arm();
+            let site = if prior_read { FenceSite::Read } else { FenceSite::WalWrite };
+            thread::scope(|scope| {
+                let reload_resume = reload_resume;
+                let ddl = scope.spawn(move || ddl_engine.catalog().commit_ddl(txn));
+                reload_entered.recv_timeout(WAIT).unwrap();
+                if prior_read {
+                    kv.test_report_read_error(&KvError::RocksIo {
+                        message: "earlier read I/O failure".into(),
+                        status: RocksStatus { code: RocksStatus::IO_ERROR, subcode: 0, severity: None },
+                        site: FenceSite::Read,
+                    });
+                    assert!(matches!(admin.storage_status(), StorageStatus::Serving {
+                        generation: 1, fenced: false, cause: Some(ref cause), ..
+                    } if cause.site == FenceSite::Read));
+                }
+                let flush = fault.pause_scheduled_flush(&db, Keyspace::Seq);
+                fault.arm_file(newest_wal(db.db.path()).unwrap().unwrap());
+                let failed = scope.spawn(|| {
+                    let mut batch = WriteBatch::default();
+                    let (key, value) = reservation(988);
+                    batch.put(Keyspace::Seq, key, value);
+                    kv.write(batch, Durability::Sync)
+                });
+                assert!(wait_until(|| fault.take_shutdown_started()));
+                assert!(wait_until(|| matches!(admin.storage_status(), StorageStatus::Recovering {
+                    generation: 1, cause: Some(ref cause), ..
+                } if cause.site == site && cause.class == FenceClass::Recoverable)));
+
+                drop(reload_resume);
+                assert_eq!(ddl.join().unwrap(), Err(TxnError::CommitAmbiguous));
+                let refusal = kv.get(Keyspace::Kernel, &[7]).unwrap_err().into();
+                let native_flag = std::sync::atomic::AtomicBool::default();
+                native_engine.fence_engine_error(FenceSite::NativeOnceLedger, &refusal, &native_flag);
+                assert!(native_flag.load(Ordering::Acquire));
+                assert_eq!(kv.causes.cause().unwrap().site, site);
+                assert_eq!(kv.causes.cause().unwrap().class, FenceClass::Recoverable);
+                assert!(db.close_latch().wait(Duration::ZERO).is_err());
+
+                drop(flush);
+                let error = failed.join().unwrap().unwrap_err();
+                assert!(error.to_string().contains("injected WAL file sync"), "{error}");
+            });
+            drop(native_engine);
+            drop(seq);
+            drop(kv);
+            drop(db);
+            assert!(wait_until(|| matches!(admin.storage_status(), StorageStatus::Serving {
+                generation: 2, fenced: false, ..
+            })), "{:?}", admin.storage_status());
+            let (key, value) = reservation(987);
+            assert_eq!(admin.test_v2().kv.get(Keyspace::Seq, &key).unwrap(), Some(value));
+        }
+
+        #[test]
         fn maintenance_wal_error_is_recorded_after_stage_b_fences_during_drain() {
             let dir = TestDir::new();
             wal_group_tests::initialize_marked(&dir.0);
@@ -2457,11 +2745,11 @@ mod tests {
                 assert!(draining, "maintenance Sync did not start native shutdown");
                 assert!(fenced_before_stage_b);
                 assert!(db.fence.sync_failure_latched());
-                assert!(kv.causes.cause().is_none());
+                assert_eq!(kv.causes.cause().unwrap().site, FenceSite::WalWrite);
                 assert_eq!(pending.recv_timeout(WAIT).unwrap(), Err(TxnError::CommitAmbiguous));
                 assert!(kv.is_fenced());
                 assert!(matches!(highwater(&seq, 989), Err(TxnError::Fenced)));
-                assert!(kv.causes.cause().is_none(), "the originating error is still draining");
+                assert_eq!(kv.causes.cause().unwrap().site, FenceSite::WalWrite);
 
                 drop(flush);
                 let error = failed.join().unwrap().unwrap_err();

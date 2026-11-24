@@ -407,17 +407,38 @@ pub(crate) struct FenceState {
 #[derive(Default)]
 struct RecordedFence {
     cause: Option<FenceCause>,
-    source: FenceSource,
+    #[cfg(feature = "engine-rocksdb")]
+    possible_sync_report: Option<PendingSyncReport>,
+    #[cfg(feature = "engine-rocksdb")]
+    propagated_sync_error: Option<super::kv_rocksdb::WalSyncError>,
     commit_pipeline: bool,
     #[cfg(feature = "engine-rocksdb")]
     notifier: Option<(u64, std::sync::Weak<super::super::fence_supervisor::Wake>)>,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum FenceSource {
-    #[default]
     Other,
-    Kv,
+    Refusal,
+    #[cfg(feature = "engine-rocksdb")]
+    NoSync(super::kv_rocksdb::WalSyncError),
+    #[cfg(feature = "engine-rocksdb")]
+    SyncFailure(Option<super::kv_rocksdb::WalSyncError>),
+}
+
+#[cfg(feature = "engine-rocksdb")]
+struct PendingSyncReport {
+    error: super::kv_rocksdb::WalSyncError,
+    independent: Option<FenceCause>,
+}
+
+fn keeps_cause(previous: Option<&FenceCause>, cause: &FenceCause, only_if_empty: bool) -> bool {
+    previous.is_some_and(|previous| {
+        only_if_empty
+            || cause.generation < previous.generation
+            || (cause.generation == previous.generation
+                && (previous.class != FenceClass::Recoverable
+                    || cause.class == FenceClass::Recoverable))
+    })
 }
 
 thread_local! {
@@ -435,19 +456,12 @@ impl FenceState {
     }
 
     #[cfg(feature = "engine-rocksdb")]
-    pub(super) fn latch_sync_failure(&self) -> bool {
-        let mut recorded = self.recorded.lock().unwrap_or_else(|p| p.into_inner());
-        if self.sync_failure_latched() {
-            return false;
-        }
-        // Close admission before publishing the backend latch. A write may
-        // already have reported the native error propagated from this Sync.
-        self.fenced.store(true, Ordering::Release);
-        self.sync_failed.store(true, Ordering::Release);
-        if recorded.source == FenceSource::Kv {
-            recorded.cause = None;
-        }
-        true
+    pub(super) fn latch_sync_failure(
+        &self,
+        cause: FenceCause,
+        propagated: Option<super::kv_rocksdb::WalSyncError>,
+    ) -> bool {
+        self.record_cause(cause, false, Some(&self.fenced), FenceSource::SyncFailure(propagated))
     }
 
     fn enable_commit_pipeline(&self) {
@@ -456,13 +470,15 @@ impl FenceState {
         if let Some(cause) = &mut recorded.cause {
             cause.class = FenceClass::NotRecoverable;
         }
+        #[cfg(feature = "engine-rocksdb")]
+        if let Some(cause) = recorded.possible_sync_report.as_mut().and_then(|report| report.independent.as_mut()) {
+            cause.class = FenceClass::NotRecoverable;
+        }
     }
 
     fn record_explicit_pipeline_fence(&self) {
         let mut recorded = self.recorded.lock().unwrap_or_else(|p| p.into_inner());
-        // A durability failure can already be draining background work. Its
-        // caller will report the cause when the drain completes.
-        if recorded.commit_pipeline && recorded.cause.is_none() && !self.sync_failure_latched() {
+        if recorded.commit_pipeline && recorded.cause.is_none() {
             #[cfg_attr(not(feature = "engine-rocksdb"), allow(unused_mut))]
             let mut cause = FenceCause::new(FenceSite::Other, FenceClass::NotRecoverable, &KvError::Fenced);
             #[cfg(feature = "engine-rocksdb")]
@@ -470,7 +486,6 @@ impl FenceState {
                 cause.generation = *generation;
             }
             recorded.cause = Some(cause);
-            recorded.source = FenceSource::Kv;
         }
     }
 
@@ -492,6 +507,9 @@ impl FenceState {
     ) {
         let mut recorded = self.recorded.lock().unwrap_or_else(|p| p.into_inner());
         recorded.notifier = Some((generation, Arc::downgrade(wake)));
+        if let Some(cause) = recorded.possible_sync_report.as_mut().and_then(|report| report.independent.as_mut()) {
+            cause.generation = generation;
+        }
         if let Some(cause) = &mut recorded.cause {
             cause.generation = generation;
             wake.fenced(generation);
@@ -512,8 +530,10 @@ impl FenceState {
         cause: FenceCause,
         flag: &AtomicBool,
         only_if_empty: bool,
+        refusal: bool,
     ) -> bool {
-        self.record_cause(cause, only_if_empty, Some(flag), FenceSource::Other)
+        let source = if refusal { FenceSource::Refusal } else { FenceSource::Other };
+        self.record_cause(cause, only_if_empty, Some(flag), source)
     }
 
     #[cfg(feature = "engine-rocksdb")]
@@ -535,7 +555,17 @@ impl FenceState {
         source: FenceSource,
     ) -> bool {
         let mut recorded = self.recorded.lock().unwrap_or_else(|p| p.into_inner());
-        if source == FenceSource::Kv && self.sync_failure_latched() {
+        if matches!(source, FenceSource::Refusal) && self.sync_failure_latched() {
+            if let Some(flag) = fence {
+                flag.store(true, Ordering::Release);
+            }
+            return false;
+        }
+        #[cfg(feature = "engine-rocksdb")]
+        let latch = matches!(source, FenceSource::SyncFailure(_));
+        #[cfg(not(feature = "engine-rocksdb"))]
+        let latch = false;
+        if latch && self.sync_failure_latched() {
             return false;
         }
         let mut cause = cause;
@@ -552,19 +582,43 @@ impl FenceState {
         } else {
             None
         };
-        // Admission reads both under this mutex. A new fence must wake the
-        // supervisor even if an earlier read error retains cause precedence.
-        let newly_fenced = fence.is_some_and(|flag| !flag.swap(true, Ordering::AcqRel));
-        let keep_previous = recorded.cause.as_ref().is_some_and(|previous| {
-            only_if_empty
-                || cause.generation < previous.generation
-                || (cause.generation == previous.generation
-                    && (previous.class != FenceClass::Recoverable
-                        || cause.class == FenceClass::Recoverable))
-        });
-        if keep_previous && !newly_fenced {
-            return false;
+        #[cfg(feature = "engine-rocksdb")]
+        match source {
+            FenceSource::SyncFailure(propagated) => {
+                if let Some(pending) = recorded.possible_sync_report.take()
+                    && propagated.as_ref() == Some(&pending.error)
+                {
+                    recorded.cause = pending.independent;
+                }
+                recorded.propagated_sync_error = propagated;
+            }
+            FenceSource::NoSync(ref error)
+                if recorded.propagated_sync_error.as_ref() == Some(error) =>
+            {
+                return false;
+            }
+            _ => {
+                // Keep main's precedence among independent reports in case
+                // the current cause turns out to be a copy of the Sync error.
+                if let Some(pending) = &mut recorded.possible_sync_report
+                    && !matches!(&source, FenceSource::NoSync(error) if *error == pending.error)
+                    && !matches!(source, FenceSource::Refusal)
+                    && !keeps_cause(pending.independent.as_ref(), &cause, only_if_empty)
+                {
+                    pending.independent = Some(cause.clone());
+                }
+                if let FenceSource::NoSync(error) = source
+                    && !self.sync_failure_latched()
+                    && !keeps_cause(recorded.cause.as_ref(), &cause, only_if_empty)
+                {
+                    recorded.possible_sync_report = Some(PendingSyncReport {
+                        error,
+                        independent: recorded.cause.clone(),
+                    });
+                }
+            }
         }
+        let keep_previous = keeps_cause(recorded.cause.as_ref(), &cause, only_if_empty);
         #[cfg(feature = "engine-rocksdb")]
         let generation = cause.generation;
         let text = (!keep_previous).then(|| {
@@ -577,18 +631,24 @@ impl FenceState {
                 cause.site, cause.class, cause.status, cause.generation, cause.error_text
             );
             recorded.cause = Some(cause);
-            recorded.source = source;
             text
         });
+        // Commit the cause and latch under the same mutex used by recovery.
+        // Wake on the latch even if an earlier Read cause retains precedence
+        // or a propagated report already set the outer flag.
+        if latch {
+            self.sync_failed.store(true, Ordering::Release);
+        }
+        let newly_fenced = fence.is_some_and(|flag| !flag.swap(true, Ordering::AcqRel));
         drop(recorded);
         #[cfg(feature = "engine-rocksdb")]
-        if let Some(wake) = notifier {
+        if (latch || newly_fenced || !keep_previous) && let Some(wake) = notifier {
             wake.fenced(generation);
         }
         if let Some(text) = text {
             super::diagnostics::error(text);
         }
-        newly_fenced
+        latch || newly_fenced
     }
 
     /// Catalog reload runs on the caller thread. Carry the backend error across
@@ -838,7 +898,7 @@ impl Kv {
             assert_local_no_sync(&batch);
         }
         let result = self.backend.write(batch, durability);
-        self.fence_on_error(FenceSite::Write, result)
+        self.fence_on_error(FenceSite::Write, result, durability == Durability::NoSync)
     }
     /// Appends a commit batch to the WAL without waiting for durability.
     pub(crate) fn append_commit(&self, batch: WriteBatch) -> Result<(), KvError> {
@@ -848,13 +908,13 @@ impl Kv {
         }
         // This entry point admits the sequencer's commit batch to local NoSync.
         let result = self.backend.append_commit(batch);
-        self.fence_on_error(FenceSite::CommitAppend, result)
+        self.fence_on_error(FenceSite::CommitAppend, result, true)
     }
     /// Makes preceding successful commit appends durable.
     pub(crate) fn sync_commits(&self) -> Result<(), KvError> {
         self.check()?;
         let result = self.backend.sync_commits();
-        self.fence_on_error(FenceSite::CommitSync, result)
+        self.fence_on_error(FenceSite::CommitSync, result, false)
     }
 
     #[cfg(all(test, feature = "engine-rocksdb"))]
@@ -863,7 +923,7 @@ impl Kv {
             message: "injected commit WAL error".into(),
             status: RocksStatus { code: RocksStatus::IO_ERROR, subcode: 0, severity: None },
             site,
-        }))
+        }), false)
     }
 
     #[cfg(all(test, feature = "engine-rocksdb"))]
@@ -882,12 +942,12 @@ impl Kv {
             message: "injected commit WAL error".into(),
             status: RocksStatus { code: RocksStatus::IO_ERROR, subcode: 0, severity: None },
             site: FenceSite::WalWrite,
-        }))
+        }), false)
     }
 
     #[cfg(all(test, feature = "engine-rocksdb"))]
     pub(in crate::storage) fn test_report_write_error(&self, error: KvError) {
-        let _ = self.fence_on_error(FenceSite::Write, Err(error));
+        let _ = self.fence_on_error(FenceSite::Write, Err(error), false);
     }
 
     #[cfg(all(test, feature = "engine-rocksdb"))]
@@ -898,21 +958,28 @@ impl Kv {
     pub(crate) fn flush_barrier(&self) -> Result<(), KvError> {
         self.check()?;
         let result = self.backend.flush_barrier();
-        self.fence_on_error(FenceSite::FlushBarrier, result)
+        self.fence_on_error(FenceSite::FlushBarrier, result, false)
     }
-    fn fence_on_error(&self, site: FenceSite, result: Result<(), KvError>) -> Result<(), KvError> {
-        if let Err(error) = &result
-            && self.causes.record_cause(
-                FenceCause::for_kv(site, error),
-                false,
-                Some(&self.causes.fenced),
-                FenceSource::Kv,
-            )
-        {
-            super::diagnostics::error(format!(
-                "KV fenced after backend write/flush failure: {}",
-                super::diagnostics::error_text(error),
-            ));
+    fn fence_on_error(
+        &self,
+        site: FenceSite,
+        result: Result<(), KvError>,
+        #[cfg_attr(not(feature = "engine-rocksdb"), allow(unused_variables))] no_sync: bool,
+    ) -> Result<(), KvError> {
+        if let Err(error) = &result {
+            let source = if *error == KvError::Fenced { FenceSource::Refusal } else { FenceSource::Other };
+            #[cfg(feature = "engine-rocksdb")]
+            let source = if no_sync && let Some(error) = super::kv_rocksdb::WalSyncError::from_error(error) {
+                FenceSource::NoSync(error)
+            } else {
+                source
+            };
+            if self.causes.record_cause(FenceCause::for_kv(site, error), false, Some(&self.causes.fenced), source) {
+                super::diagnostics::error(format!(
+                    "KV fenced after backend write/flush failure: {}",
+                    super::diagnostics::error_text(error),
+                ));
+            }
         }
         result
     }

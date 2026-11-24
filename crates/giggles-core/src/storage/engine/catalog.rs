@@ -494,6 +494,8 @@ pub(crate) struct Catalog {
     token_read_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     load_at_error: Mutex<Option<CoreError>>,
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(super) reload_pause: super::kv_rocksdb::TestPause,
     services: TxnServices,
     seq: Arc<SequenceAllocator>,
 }
@@ -534,6 +536,8 @@ impl Catalog {
             token_read_hook: Mutex::new(None),
             #[cfg(test)]
             load_at_error: Mutex::new(None),
+            #[cfg(all(test, feature = "engine-rocksdb"))]
+            reload_pause: Default::default(),
             services,
             seq,
         })
@@ -1619,6 +1623,8 @@ impl Catalog {
             });
         }
         finish(txn, guard, |ts| {
+            #[cfg(all(test, feature = "engine-rocksdb"))]
+            self.reload_pause.wait();
             let state = match &self.services {
                 TxnServices::Local { seq, .. } => Some(&*seq.kv().causes),
                 TxnServices::Cluster(_) => None,
@@ -1649,7 +1655,7 @@ impl Catalog {
                             None => FenceCause::for_core(FenceSite::CatalogReload, &error),
                         };
                         recorded.error_text = cause.clone();
-                        state.record_fence(recorded, &self.poisoned, follow_kv_fence);
+                        state.record_fence(recorded, &self.poisoned, follow_kv_fence, follow_kv_fence);
                     }
                     cache.poison_cause = Some(cause);
                     // Durability already succeeded. Never expose the previous

@@ -206,6 +206,41 @@ fn fence_classification_and_precedence() {
 }
 
 #[test]
+#[cfg(feature = "engine-rocksdb")]
+fn sync_latch_preserves_independent_corruption_in_each_report_order() {
+    use super::{FenceCause, FenceClass, FenceSite, FenceSource, FenceState, RocksStatus};
+    use super::super::kv_rocksdb::WalSyncError;
+
+    let error = KvError::RocksIo {
+        message: "IO error: While fsync: 000042.log: device failure".into(),
+        status: RocksStatus { code: RocksStatus::IO_ERROR, subcode: 0, severity: None },
+        site: FenceSite::WalWrite,
+    };
+    let corrupt = FenceCause::for_kv(FenceSite::Read, &KvError::Corrupt("bad bytes".into()));
+    for corruption_at in 0..3 {
+        let state = FenceState::default();
+        if corruption_at == 0 {
+            state.record(corrupt.clone());
+        }
+        let copy = FenceCause::for_kv(FenceSite::CommitAppend, &error);
+        state.record_cause(
+            copy, false, Some(&state.fenced), FenceSource::NoSync(WalSyncError::from_error(&error).unwrap()),
+        );
+        if corruption_at == 1 {
+            state.record(corrupt.clone());
+        }
+        let sync = FenceCause::for_kv(FenceSite::Write, &error);
+        assert_eq!(sync.class, FenceClass::Recoverable);
+        assert!(state.latch_sync_failure(sync.clone(), WalSyncError::from_error(&error)));
+        if corruption_at == 2 {
+            assert_eq!(state.cause(), Some(sync));
+            state.record(corrupt.clone());
+        }
+        assert_eq!(state.cause(), Some(corrupt.clone()));
+    }
+}
+
+#[test]
 fn failed_write_fences_and_preserves_cause() {
     use super::{Durability, FenceClass, FenceSite, Kv, RocksStatus};
     use super::super::kv_mem::MemKv;
