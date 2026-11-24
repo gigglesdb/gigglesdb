@@ -61,6 +61,16 @@ fn create_wal_only(path: &Path) -> V2Db {
     db.unwrap()
 }
 
+#[test]
+fn create_reports_future_format_as_unsupported() {
+    let dir = TestDir::new();
+    fs::create_dir(&dir.0).unwrap();
+    let marker = dir.0.join(engine::meta::MARKER);
+    fs::write(&marker, b"giggles-v3\n").unwrap();
+    assert!(matches!(V2Db::create(&dir.0), Err(CoreError::Unsupported)));
+    assert_eq!(fs::read(marker).unwrap(), b"giggles-v3\n");
+}
+
 fn wal(path: &Path) -> PathBuf {
     fs::read_dir(path)
         .unwrap()

@@ -8,6 +8,9 @@
 
 #include <algorithm>
 #include <atomic>
+#ifndef _WIN32
+#include <fcntl.h>
+#endif
 #if defined(__linux__)
 #include <cerrno>
 #include <linux/magic.h>
@@ -23,6 +26,8 @@ using namespace ROCKSDB_NAMESPACE;
 
 // The build checks these definitions against the vendored db/c.cc.
 struct rocksdb_options_t { Options rep; };
+
+#ifndef GIGGLES_ROCKSDB_AUTORECOVERY_TEST
 
 namespace {
 class AutoRecoveryVeto final : public EventListener {
@@ -51,12 +56,24 @@ class AutoRecoveryVeto final : public EventListener {
 };
 }  // namespace
 
-#ifndef GIGGLES_ROCKSDB_AUTORECOVERY_TEST
-
 extern "C" void giggles_rocksdb_install_autorecovery_veto(
     rocksdb_options_t* options) noexcept {
   options->rep.listeners.push_back(std::make_shared<AutoRecoveryVeto>());
 }
+
+extern "C" uint64_t giggles_rocksdb_autorecovery_veto_count(
+    const rocksdb_options_t* options) noexcept {
+  for (const auto& listener : options->rep.listeners) {
+    if (auto* veto = dynamic_cast<const AutoRecoveryVeto*>(listener.get())) {
+      return veto->Vetoes();
+    }
+  }
+  return 0;
+}
+
+#ifndef _WIN32
+extern "C" int giggles_marker_no_follow_flag() noexcept { return O_NOFOLLOW; }
+#endif
 
 extern "C" bool giggles_rocksdb_uses_default_env(
     const rocksdb_options_t* options) noexcept {
@@ -124,7 +141,7 @@ class GroupReader final : public WriteBatch::Handler {
   std::vector<std::optional<uint64_t>>& groups_;
 };
 
-enum class FilterMode { Refuse, Seed, Chain };
+enum class FilterMode { Refuse, Chain };
 enum class StopReason : uint64_t { None, Gap, OutOfOrder, InvalidValue, Unmarked };
 
 struct WalStop {
@@ -137,10 +154,8 @@ struct WalStop {
 
 class CommitGroupFilter final : public WalFilter {
  public:
-  CommitGroupFilter(const char* meta_name, const char* key, size_t key_len,
-                    bool ignore_records)
-      : meta_name_(meta_name), key_(key, key_len),
-        mode_(ignore_records ? FilterMode::Seed : FilterMode::Refuse) {}
+  CommitGroupFilter(const char* meta_name, const char* key, size_t key_len)
+      : meta_name_(meta_name), key_(key, key_len) {}
 
   const char* Name() const override { return "GigglesCommitGroup"; }
 
@@ -152,9 +167,6 @@ class CommitGroupFilter final : public WalFilter {
       const std::map<uint32_t, uint64_t>& log_numbers,
       const std::map<std::string, uint32_t>& cf_ids) noexcept override {
     meta_cf_.reset();
-    if (mode_ == FilterMode::Seed) {
-      return;
-    }
     last_ = seed_;
     stop_ = {};
     if (auto meta = cf_ids.find(meta_name_); meta != cf_ids.end()) {
@@ -176,11 +188,14 @@ class CommitGroupFilter final : public WalFilter {
                                       const std::string&, const WriteBatch& batch,
                                       WriteBatch* replacement,
                                       bool* batch_changed) noexcept override {
-    if (mode_ == FilterMode::Seed) {
-      return WalProcessingOption::kIgnoreCurrentRecord;
-    }
     if (!meta_cf_) {
       return WalProcessingOption::kContinueProcessing;
+    }
+    if (mode_ == FilterMode::Refuse) {
+      const auto& data = batch.Data();
+      if (data.find(key_.data(), 0, key_.size()) == std::string::npos) {
+        return WalProcessingOption::kContinueProcessing;
+      }
     }
     record_groups_.clear();
     GroupReader reader(*meta_cf_, key_, record_groups_);
@@ -250,7 +265,7 @@ class CommitGroupFilter final : public WalFilter {
 
   const std::string meta_name_;
   const Slice key_;
-  FilterMode mode_;
+  FilterMode mode_ = FilterMode::Refuse;
   uint64_t seed_ = 0;
   uint64_t last_ = 0;
   std::optional<uint32_t> meta_cf_;
@@ -262,10 +277,9 @@ class CommitGroupFilter final : public WalFilter {
 }  // namespace
 
 extern "C" CommitGroupFilter* giggles_rocksdb_new_commit_group_filter(
-    const char* meta_name, const char* key, size_t key_len,
-    bool ignore_records) noexcept {
+    const char* meta_name, const char* key, size_t key_len) noexcept {
   // key points to immutable Rust static storage.
-  return new CommitGroupFilter(meta_name, key, key_len, ignore_records);
+  return new CommitGroupFilter(meta_name, key, key_len);
 }
 
 extern "C" void giggles_rocksdb_set_commit_group_filter(
@@ -305,7 +319,7 @@ struct WalFaultCounts {
   uint64_t full_space_checks;
   uint64_t flushes;
   uint64_t recoveries;
-  uint64_t vetoes;
+  uint64_t recovery_begins_enabled;
 };
 
 struct WalFaultState {
@@ -314,6 +328,7 @@ struct WalFaultState {
   std::atomic<uint64_t> full_space_checks{0};
   std::atomic<uint64_t> flushes{0};
   std::atomic<uint64_t> recoveries{0};
+  std::atomic<uint64_t> recovery_begins_enabled{0};
 };
 
 class FaultWalFile final : public FSWritableFileOwnerWrapper {
@@ -381,6 +396,14 @@ class RecoveryObserver final : public EventListener {
 
   void OnFlushCompleted(DB*, const FlushJobInfo&) override { ++state_->flushes; }
 
+  void OnErrorRecoveryBegin(BackgroundErrorReason, Status error,
+                            bool* auto_recovery) override {
+    error.PermitUncheckedError();
+    if (*auto_recovery) {
+      ++state_->recovery_begins_enabled;
+    }
+  }
+
   void OnErrorRecoveryEnd(const BackgroundErrorRecoveryInfo& info) override {
     if (info.new_bg_error.ok()) {
       ++state_->recoveries;
@@ -394,7 +417,6 @@ class RecoveryObserver final : public EventListener {
 struct FaultEnv {
   std::shared_ptr<WalFaultState> state;
   std::unique_ptr<Env> env;
-  std::shared_ptr<AutoRecoveryVeto> veto;
 };
 }  // namespace
 
@@ -403,12 +425,8 @@ extern "C" FaultEnv* giggles_rocksdb_install_wal_fault(
   try {
     auto state = std::make_shared<WalFaultState>();
     auto handle = std::make_unique<FaultEnv>(
-        FaultEnv{state, NewCompositeEnv(std::make_shared<FaultWalFileSystem>(state)),
-                 nullptr});
-    if (keep_veto) {
-      handle->veto = std::static_pointer_cast<AutoRecoveryVeto>(
-          options->rep.listeners.front());
-    } else {
+        FaultEnv{state, NewCompositeEnv(std::make_shared<FaultWalFileSystem>(state))});
+    if (!keep_veto) {
       // The production options builder installs only the veto listener.
       options->rep.listeners.clear();
     }
@@ -435,7 +453,7 @@ extern "C" void giggles_rocksdb_wal_fault_counts(const FaultEnv* handle,
   const auto& state = *handle->state;
   *counts = {state.sync_failures.load(), state.full_space_checks.load(),
              state.flushes.load(), state.recoveries.load(),
-             handle->veto ? handle->veto->Vetoes() : 0};
+             state.recovery_begins_enabled.load()};
 }
 
 #endif

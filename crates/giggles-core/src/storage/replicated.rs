@@ -4,7 +4,7 @@ use super::engine::kv::{
 };
 use super::{
     engine::{
-        kv::Op,
+        kv::{COMMIT_GROUP_KEY, Op},
         kv_rocksdb::{RocksKv, WriterLock},
         meta,
     },
@@ -135,7 +135,7 @@ impl ReplicaStore {
         let lock = WriterLock::acquire(path)?;
         let mut concrete = None;
         meta::create_with_features(path, domain, meta::REPLICATED, |p| {
-            let kv = Arc::new(RocksKv::open_replicated_locked(p, 64 << 20, lock)?);
+            let kv = Arc::new(RocksKv::open_unmarked_locked(p, 64 << 20, lock)?);
             concrete = Some(kv.clone());
             Ok(kv)
         })
@@ -229,20 +229,24 @@ impl ReplicaStore {
             }
             None => WriteBatch::default(),
         };
-        let protected = b"raft_applied".as_slice();
-        if batch.ops().iter().any(|op| match op {
-            Op::Put { ks, key, .. } | Op::Delete { ks, key } => {
-                *ks == Keyspace::Meta && key == protected
+        const APPLIED_KEY: &[u8] = b"raft_applied";
+        for protected in [APPLIED_KEY, COMMIT_GROUP_KEY] {
+            if batch.ops().iter().any(|op| match op {
+                Op::Put { ks, key, .. } | Op::Delete { ks, key } => {
+                    *ks == Keyspace::Meta && key == protected
+                }
+                Op::DeleteRange { ks, start, end } => {
+                    *ks == Keyspace::Meta && start.as_slice() <= protected && protected < end.as_slice()
+                }
+            }) {
+                return Err(CoreError::Corrupt(format!(
+                    "batch touches {}", String::from_utf8_lossy(protected)
+                )));
             }
-            Op::DeleteRange { ks, start, end } => {
-                *ks == Keyspace::Meta && start.as_slice() <= protected && protected < end.as_slice()
-            }
-        }) {
-            return Err(CoreError::Corrupt("batch touches raft_applied".into()));
         }
         let mut bytes = at.index.to_be_bytes().to_vec();
         bytes.extend_from_slice(&at.term.to_be_bytes());
-        batch.put(Keyspace::Meta, protected.to_vec(), bytes);
+        batch.put(Keyspace::Meta, APPLIED_KEY.to_vec(), bytes);
         self.kv.write(batch, Durability::NoSync)?;
         Ok(ApplyOutcome::Applied)
     }

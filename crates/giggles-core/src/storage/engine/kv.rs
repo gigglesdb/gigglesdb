@@ -218,6 +218,8 @@ pub(crate) enum Direction {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum KvError {
     Io(String),
+    #[cfg(feature = "engine-rocksdb")]
+    OpenRefused(String),
     #[cfg_attr(not(any(test, feature = "engine-rocksdb")), allow(dead_code))]
     RocksIo { message: String, status: RocksStatus, site: FenceSite },
     Corrupt(String),
@@ -229,6 +231,8 @@ impl std::fmt::Debug for KvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(message) | Self::RocksIo { message, .. } => f.debug_tuple("Io").field(message).finish(),
+            #[cfg(feature = "engine-rocksdb")]
+            Self::OpenRefused(message) => f.debug_tuple("OpenRefused").field(message).finish(),
             Self::Corrupt(message) => f.debug_tuple("Corrupt").field(message).finish(),
             Self::Fenced => f.write_str("Fenced"),
             Self::Closed => f.write_str("Closed"),
@@ -240,6 +244,8 @@ impl std::fmt::Display for KvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(message) | Self::RocksIo { message, .. } => write!(f, "KV I/O: {message}"),
+            #[cfg(feature = "engine-rocksdb")]
+            Self::OpenRefused(message) => write!(f, "KV open refused: {message}"),
             Self::Corrupt(message) => write!(f, "KV corruption: {message}"),
             Self::Fenced => f.write_str("KV fenced"),
             Self::Closed => f.write_str("KV closed"),
@@ -251,6 +257,8 @@ impl From<KvError> for crate::CoreError {
     fn from(error: KvError) -> Self {
         match error {
             KvError::Io(message) | KvError::RocksIo { message, .. } => Self::Storage(message),
+            #[cfg(feature = "engine-rocksdb")]
+            KvError::OpenRefused(message) => Self::Storage(message),
             KvError::Corrupt(message) => Self::Corrupt(message),
             KvError::Fenced | KvError::Closed => Self::Fenced,
         }

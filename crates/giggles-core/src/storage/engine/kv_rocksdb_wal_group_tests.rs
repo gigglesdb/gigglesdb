@@ -118,12 +118,7 @@ fn copy_with_interior_hole(copy: &Path, flushed_seed: bool, flush_later_cf: bool
     assert_eq!(db.has_sst(Keyspace::Index), flush_later_cf);
     drop(db);
 
-    for file in source.0.read_dir().unwrap() {
-        let file = file.unwrap();
-        if file.file_type().unwrap().is_file() {
-            fs::copy(file.path(), copy.join(file.file_name())).unwrap();
-        }
-    }
+    copy_store_files(&source.0, copy);
     let wal = copy.join(wal.file_name().unwrap());
     let mut bytes = fs::read(&wal).unwrap();
     let mut markers = bytes
@@ -142,6 +137,15 @@ fn copy_with_interior_hole(copy: &Path, flushed_seed: bool, flush_later_cf: bool
     bytes[start..start + WAL_BLOCK].fill(0);
     fs::write(&wal, bytes).unwrap();
     wal_number(wal.file_name().unwrap().to_str().unwrap()).unwrap()
+}
+
+fn copy_store_files(source: &Path, copy: &Path) {
+    for file in source.read_dir().unwrap() {
+        let file = file.unwrap();
+        if file.file_type().unwrap().is_file() {
+            fs::copy(file.path(), copy.join(file.file_name())).unwrap();
+        }
+    }
 }
 
 fn assert_gap(db: &RocksKv, wal: u64, expected: u64, found: u64) {
@@ -389,6 +393,61 @@ fn marked_format_is_persistent_and_replicated_open_refuses_it() {
     assert_eq!(file_contents(&dir.0), before);
 }
 
+fn assert_pin_refused(path: &Path) {
+    let Err(error) = RocksKv::open(path, CACHE_BYTES) else {
+        panic!("opened marked store without a usable directory pin");
+    };
+    assert!(matches!(error, KvError::OpenRefused(_)), "{error}");
+    let failure = crate::storage::v2::OpenFailure::from(error);
+    assert_eq!(failure.cause.class, FenceClass::NotRecoverable);
+}
+
+#[cfg(windows)]
+#[test]
+fn marked_store_without_a_directory_pin_is_not_recoverable() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = TestDir::new();
+    initialize_marked(&dir.0);
+    let _deny_pin = OpenOptions::new()
+        .access_mode(1) // FILE_LIST_DIRECTORY
+        .share_mode(0)
+        .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
+        .open(&dir.0)
+        .unwrap();
+    assert_pin_refused(&dir.0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn marked_store_on_9p_is_not_recoverable() {
+    let Some(parent) = std::env::var_os("GIGGLES_TEST_9P_DIR") else {
+        return; // Set to a writable directory on a 9p mount.
+    };
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce).unwrap();
+    let path = PathBuf::from(parent).join(format!("kv-9p-{:032x}", u128::from_be_bytes(nonce)));
+    fs::create_dir(&path).unwrap();
+    let dir = TestDir(path);
+    let source = TestDir::new();
+    initialize_marked(&source.0);
+    copy_store_files(&source.0, &dir.0);
+    let pin = DirectoryIdentity::read(&dir.0).unwrap().pin(&dir.0).unwrap();
+    let c_path = CString::new(pin.path().as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: the NUL-terminated path is live through the statfs check.
+    assert_eq!(unsafe { giggles_rocksdb_check_directory_pin(c_path.as_ptr()) }, libc::EOPNOTSUPP);
+    assert_pin_refused(&dir.0);
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+#[test]
+fn marked_store_on_unsupported_target_is_not_recoverable() {
+    let dir = TestDir::new();
+    drop(open(&dir.0));
+    meta::write_commit_groups_marker(&dir.0).unwrap();
+    assert_pin_refused(&dir.0);
+}
+
 #[test]
 fn recovery_seed_ignores_bad_checksum_after_the_chain_stop() {
     let copy = TestDir::new();
@@ -403,15 +462,84 @@ fn recovery_seed_ignores_bad_checksum_after_the_chain_stop() {
 
     let options = RocksKv::open_options(CACHE_BYTES, DBRecoveryMode::TolerateCorruptedTailRecords).unwrap();
     let families = DB::list_cf(&options, native_path(&copy.0)).unwrap();
-    let mut ignore = WalFilter::new(true);
-    let mut strict_seed = options;
-    ignore.install(&mut strict_seed);
-    assert!(RocksKv::open_read_only(&copy.0, &strict_seed, &families).is_err());
+    assert!(RocksKv::open_read_only(&copy.0, &options, &families).is_err());
 
     let pin = DirectoryIdentity::read(&copy.0).unwrap().pin(&copy.0).unwrap();
     let db = RocksKv::open_recovery(pin, CACHE_BYTES).unwrap();
     assert_gap(&db, wal, 3, 4);
     assert_rows(&db, 1..=2, &[3, 4, 5]);
+}
+
+#[test]
+fn recovery_seed_ignores_checksum_valid_malformed_count_after_the_chain_stop() {
+    let copy = TestDir::new();
+    let wal = copy_with_interior_hole(&copy.0, true, false);
+    let path = current_wal(&copy.0);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.resize(bytes.len().next_multiple_of(WAL_BLOCK), 0);
+
+    let mut batch = rocksdb::WriteBatch::default();
+    batch.put(b"unaltered key", b"one operation");
+    let mut payload = batch.data().to_vec();
+    payload[..8].copy_from_slice(&100u64.to_le_bytes()); // Sequence number.
+    payload[8..12].copy_from_slice(&2u32.to_le_bytes()); // Invalid count.
+    let mut record = vec![1]; // Full physical record type, covered by the checksum.
+    record.extend_from_slice(&payload);
+    // RocksDB's log format uses masked CRC32C over the type byte and payload.
+    let mut crc = !0u32;
+    for byte in &record {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0x82f6_3b78 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    let masked = (!crc).rotate_right(15).wrapping_add(0xa282_ead8);
+    bytes.extend_from_slice(&masked.to_le_bytes());
+    bytes.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(&record);
+    fs::write(&path, bytes).unwrap();
+
+    let options = RocksKv::open_options(CACHE_BYTES, DBRecoveryMode::SkipAnyCorruptedRecord).unwrap();
+    let families = DB::list_cf(&options, native_path(&copy.0)).unwrap();
+    let Err(error) = RocksKv::open_read_only(&copy.0, &options, &families) else {
+        panic!("the unrestricted scan accepted a malformed count");
+    };
+    assert!(error.to_string().contains("wrong count"), "{error}");
+
+    let db = open(&copy.0);
+    assert_gap(&db, wal, 3, 4);
+    assert_rows(&db, 1..=2, &[3, 4, 5]);
+    assert_eq!(commit_group(&db), Some(2));
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn recovery_seed_skips_an_unopenable_wal_after_the_chain_stop() {
+    let copy = TestDir::new();
+    let wal = copy_with_interior_hole(&copy.0, true, false);
+    let later_wal = copy.0.join(format!("{:06}.log", wal + 1000));
+    #[cfg(target_os = "linux")]
+    std::os::unix::fs::symlink("missing-wal-target", &later_wal).unwrap();
+    #[cfg(windows)]
+    fs::write(&later_wal, b"unreadable WAL").unwrap();
+    #[cfg(windows)]
+    let _deny_read = {
+        use std::os::windows::fs::OpenOptionsExt;
+        OpenOptions::new().read(true).share_mode(4).open(&later_wal).unwrap()
+    };
+    assert!(File::open(&later_wal).is_err());
+
+    let options = RocksKv::open_options(CACHE_BYTES, DBRecoveryMode::SkipAnyCorruptedRecord).unwrap();
+    let families = DB::list_cf(&options, native_path(&copy.0)).unwrap();
+    let Err(error) = RocksKv::open_read_only(&copy.0, &options, &families) else {
+        panic!("the unrestricted scan accepted an unopenable WAL");
+    };
+    assert!(error.to_string().contains(&format!("{:06}.log", wal + 1000)), "{error}");
+
+    let db = open(&copy.0);
+    assert_gap(&db, wal, 3, 4);
+    assert_rows(&db, 1..=2, &[3, 4, 5]);
+    assert_eq!(commit_group(&db), Some(2));
 }
 
 #[test]
@@ -469,4 +597,55 @@ fn unreadable_current_is_not_more_recoverable_in_the_seed() {
     use crate::storage::v2::OpenFailure;
     assert_eq!(OpenFailure::from(seed_error).cause.class, FenceClass::NotRecoverable);
     assert_eq!(OpenFailure::from(native_error).cause.class, FenceClass::NotRecoverable);
+}
+
+#[test]
+#[ignore = "measures repeated opens with a 250 MiB pending WAL"]
+fn measure_unmarked_pending_wal_open() {
+    const PAYLOAD_BYTES: usize = 250 << 20;
+    const VALUE_BYTES: usize = 4 << 10;
+    const ROWS_PER_BATCH: usize = 16;
+    const SAMPLES: usize = 12;
+
+    let source = TestDir::new();
+    let (path, lock) = RocksKv::lock_local(&source.0).unwrap();
+    WAL_ONLY_SHUTDOWN.set(true);
+    let mut options = RocksKv::open_options(CACHE_BYTES, DBRecoveryMode::PointInTime).unwrap();
+    WAL_ONLY_SHUTDOWN.set(false);
+    options.set_write_buffer_size(512 << 20);
+    let db = RocksKv::open_with_options(&path, lock.writer_lock, lock.directory_pin, options, false).unwrap();
+    meta::write_marker(&source.0).unwrap();
+    let mut value = vec![0; VALUE_BYTES];
+    getrandom::fill(&mut value).unwrap();
+    for first in (0..PAYLOAD_BYTES / VALUE_BYTES).step_by(ROWS_PER_BATCH) {
+        let mut batch = WriteBatch::default();
+        for row in first..first + ROWS_PER_BATCH {
+            batch.put(Keyspace::Rows, (row as u64).to_be_bytes().to_vec(), value.clone());
+        }
+        db.write(batch, Durability::NoSync).unwrap();
+    }
+    db.flush_barrier().unwrap();
+    assert!(!db.has_sst(Keyspace::Rows));
+    drop(db);
+    let wal_bytes = wal_len(&current_wal(&source.0));
+    assert!(wal_bytes >= PAYLOAD_BYTES);
+    assert!(!source.0.read_dir().unwrap().any(|entry| entry.unwrap().path().extension().is_some_and(|ext| ext == "sst")));
+    eprintln!("wal_bytes={wal_bytes}");
+
+    for round in 0..=SAMPLES {
+        for baseline in [round % 2 == 0, round % 2 != 0] {
+            let copy = TestDir::new();
+            copy_store_files(&source.0, &copy.0);
+            MEASURE_WITHOUT_REFUSE_FILTER.set(baseline);
+            let start = Instant::now();
+            let db = RocksKv::open(&copy.0, CACHE_BYTES).unwrap();
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            MEASURE_WITHOUT_REFUSE_FILTER.set(false);
+            assert_eq!(db.get(Keyspace::Rows, &0u64.to_be_bytes()).unwrap().as_deref(), Some(value.as_slice()));
+            if round > 0 {
+                let mode = if baseline { "baseline" } else { "refuse" };
+                eprintln!("sample={round} mode={mode} ms={ms:.3}");
+            }
+        }
+    }
 }

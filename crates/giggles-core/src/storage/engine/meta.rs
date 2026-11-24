@@ -137,7 +137,38 @@ pub(super) fn write_commit_groups_marker(dir: &Path) -> Result<(), FormatError> 
     // Replace the marker atomically. Re-publish even on a retry, so success
     // includes the directory sync if a previous attempt failed there.
     let temp = dir.join(TMP);
-    let mut file = fs::File::create(&temp).map_err(FormatError::io)?;
+    let removed = fs::symlink_metadata(&temp).and_then(|metadata| {
+        let directory = metadata.is_dir();
+        #[cfg(windows)]
+        let directory = {
+            use std::os::windows::fs::FileTypeExt;
+
+            directory || metadata.file_type().is_symlink_dir()
+        };
+        if directory {
+            fs::remove_dir(&temp)
+        } else {
+            fs::remove_file(&temp)
+        }
+    });
+    match removed {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(FormatError::io(error)),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        unsafe extern "C" {
+            fn giggles_marker_no_follow_flag() -> std::ffi::c_int;
+        }
+        // SAFETY: the shim returns the platform's O_NOFOLLOW constant.
+        options.custom_flags(unsafe { giggles_marker_no_follow_flag() });
+    }
+    let mut file = options.open(&temp).map_err(FormatError::io)?;
     file.write_all(V2_COMMIT_GROUPS).map_err(FormatError::io)?;
     file.sync_all().map_err(FormatError::io)?;
     drop(file);

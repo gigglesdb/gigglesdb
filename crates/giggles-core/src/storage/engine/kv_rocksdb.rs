@@ -31,7 +31,6 @@ unsafe extern "C" {
         meta_name: *const c_char,
         key: *const u8,
         key_len: usize,
-        ignore_records: bool,
     ) -> *mut NativeWalFilter;
     fn giggles_rocksdb_set_commit_group_filter(
         options: *mut librocksdb_sys::rocksdb_options_t,
@@ -91,7 +90,7 @@ unsafe impl Send for WalFilter {}
 unsafe impl Sync for WalFilter {}
 
 impl WalFilter {
-    fn new(ignore_records: bool) -> Self {
+    fn new() -> Self {
         let meta = CString::new(Keyspace::Meta.name()).unwrap();
         // SAFETY: the shim copies the name and borrows only the static key.
         let filter = unsafe {
@@ -99,7 +98,6 @@ impl WalFilter {
                 meta.as_ptr(),
                 COMMIT_GROUP_KEY.as_ptr(),
                 COMMIT_GROUP_KEY.len(),
-                ignore_records,
             )
         };
         Self(NonNull::new(filter).expect("native WAL filter allocation"))
@@ -268,12 +266,40 @@ pub(crate) const RECOVERY_FLUSH_MISSED: i32 = 88;
 thread_local! {
     pub(crate) static RECOVERY_OPEN_CRASH: std::cell::Cell<Option<RecoveryOpenCrash>> = const { std::cell::Cell::new(None) };
     pub(crate) static WAL_ONLY_SHUTDOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MEASURE_WITHOUT_REFUSE_FILTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static COMMIT_IO_FAULT: std::cell::Cell<Option<FenceSite>> = const { std::cell::Cell::new(None) };
 }
 
-pub(crate) struct LocalWriterLock {
+struct LocalWriterLock {
     writer_lock: WriterLock,
     directory_pin: Option<File>,
+}
+
+struct SeedWalDir(PathBuf);
+
+impl SeedWalDir {
+    fn create(path: &Path) -> Result<Self, KvError> {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(|error| KvError::Io(error.to_string()))?;
+        let path = path.join(format!(".giggles-seed-wal-{:032x}", u128::from_be_bytes(nonce)));
+        #[cfg(unix)]
+        let result = {
+            use std::os::unix::fs::DirBuilderExt;
+
+            std::fs::DirBuilder::new().mode(0o700).create(&path)
+        };
+        #[cfg(not(unix))]
+        let result = std::fs::create_dir(&path);
+        result.map_err(|error| KvError::Io(error.to_string()))?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for SeedWalDir {
+    fn drop(&mut self) {
+        // Remove only this empty directory after releasing its pin.
+        let _ = std::fs::remove_dir(&self.0);
+    }
 }
 
 struct LockedDb {
@@ -323,7 +349,7 @@ impl RocksKv {
         Self::open_locked(&path, cache_bytes, lock)
     }
 
-    pub(crate) fn lock_local(path: &Path) -> Result<(Cow<'_, Path>, LocalWriterLock), KvError> {
+    fn lock_local(path: &Path) -> Result<(Cow<'_, Path>, LocalWriterLock), KvError> {
         if !has_commit_groups(path)? {
             let writer_lock = WriterLock::acquire(path)?;
             // A marker may have been published while we were acquiring the lock.
@@ -386,7 +412,7 @@ impl RocksKv {
         Ok(files)
     }
 
-    pub(crate) fn open_locked(
+    fn open_locked(
         path: &Path,
         cache_bytes: usize,
         lock: LocalWriterLock,
@@ -399,10 +425,10 @@ impl RocksKv {
 
     pub(crate) fn open_replicated(path: &Path, cache_bytes: usize) -> Result<Self, KvError> {
         std::fs::create_dir_all(path).map_err(|error| KvError::Io(error.to_string()))?;
-        Self::open_replicated_locked(path, cache_bytes, WriterLock::acquire(path)?)
+        Self::open_unmarked_locked(path, cache_bytes, WriterLock::acquire(path)?)
     }
 
-    pub(crate) fn open_replicated_locked(
+    pub(crate) fn open_unmarked_locked(
         path: &Path,
         cache_bytes: usize,
         writer_lock: WriterLock,
@@ -473,11 +499,23 @@ impl RocksKv {
         families: &[String],
         chain_filter: &mut WalFilter,
     ) -> Result<u64, KvError> {
-        let mut seed_filter = WalFilter::new(true);
+        // Recover enumerates WALs only in wal_dir. Pin a fresh empty directory
+        // inside the pinned store so the seed sees only MANIFEST and SST state.
+        let wal_dir = SeedWalDir::create(path)?;
+        let wal_pin = pin_commit_group_directory(&wal_dir.0)?;
         let mut options = options.clone();
-        options.set_wal_recovery_mode(DBRecoveryMode::SkipAnyCorruptedRecord);
+        options.set_wal_dir(native_path(wal_pin.path()));
         options.set_max_open_files(64);
-        seed_filter.install(&mut options);
+        // RocksDB 11.8.1 Recover rejects an empty directory when predecessor
+        // WAL tracking is on. The separate MANIFEST check passes an empty
+        // WalSet (Giggles never writes tracked-WAL edits) and safely rejects
+        // tracked synced WALs. Disabling that check with a nonempty WalSet
+        // would dereference the absent read-only recovery context.
+        // SAFETY: this handle is live and exclusively borrowed.
+        unsafe {
+            librocksdb_sys::rocksdb_options_set_track_and_verify_wals(options.as_raw_ptr(), 0);
+        }
+        options.set_track_and_verify_wals_in_manifest(true);
         let db = Self::open_read_only(path, &options, families).map_err(map_read_only_error)?;
         for name in families {
             let cf = db.cf_handle(name).unwrap();
@@ -556,12 +594,17 @@ impl RocksKv {
         if RECOVERY_OPEN_CRASH.get() == Some(RecoveryOpenCrash::BeforeNativeOpen) {
             crate::storage::crash_now();
         }
-        let mut filter = WalFilter::new(false);
+        let mut filter = WalFilter::new();
         let mut options = options;
         if chain {
             Self::validate_commit_groups(path, &options, &mut filter)?;
         }
+        #[cfg(not(test))]
         filter.install(&mut options);
+        #[cfg(test)]
+        if chain || !MEASURE_WITHOUT_REFUSE_FILTER.get() {
+            filter.install(&mut options);
+        }
 
         let open_native = || {
             DB::open_cf_with_opts(
@@ -614,29 +657,32 @@ fn has_commit_groups(path: &Path) -> Result<bool, KvError> {
 }
 
 fn lock_pinned_local(path: &Path) -> Result<(PathBuf, LocalWriterLock), KvError> {
-    let pin_error = |error: &dyn std::fmt::Display| {
-        KvError::Io(format!("commit group store requires a pinned directory: {error}"))
-    };
-    let identity = DirectoryIdentity::read(path).map_err(|error| pin_error(&error))?;
-    let pin = identity.pin(path).map_err(|error| pin_error(&error))?;
-    check_commit_group_pin(pin.path())?;
+    let pin = pin_commit_group_directory(path)?;
     let (directory, path) = pin.into_parts();
     let writer_lock = WriterLock::acquire(&path)?;
     Ok((path, LocalWriterLock { writer_lock, directory_pin: Some(directory) }))
+}
+
+fn commit_group_pin_error(error: impl std::fmt::Display) -> KvError {
+    KvError::OpenRefused(format!("commit group store requires a pinned directory: {error}"))
+}
+
+fn pin_commit_group_directory(path: &Path) -> Result<PinnedDirectory, KvError> {
+    let identity = DirectoryIdentity::read(path).map_err(commit_group_pin_error)?;
+    let pin = identity.pin(path).map_err(commit_group_pin_error)?;
+    check_commit_group_pin(pin.path())?;
+    Ok(pin)
 }
 
 fn check_commit_group_pin(_path: &Path) -> Result<(), KvError> {
     #[cfg(target_os = "linux")]
     {
         let path = CString::new(_path.as_os_str().as_encoded_bytes())
-            .map_err(|error| KvError::Io(error.to_string()))?;
+            .map_err(commit_group_pin_error)?;
         // SAFETY: the path is NUL-terminated and lives through the statfs check.
         let errno = unsafe { giggles_rocksdb_check_directory_pin(path.as_ptr()) };
         if errno != 0 {
-            return Err(KvError::Io(format!(
-                "commit group store requires a pinned directory: {}",
-                std::io::Error::from_raw_os_error(errno)
-            )));
+            return Err(commit_group_pin_error(std::io::Error::from_raw_os_error(errno)));
         }
     }
     Ok(())
@@ -1962,7 +2008,13 @@ mod tests {
             full_space_checks: u64,
             flushes: u64,
             recoveries: u64,
-            vetoes: u64,
+            recovery_begins_enabled: u64,
+        }
+
+        unsafe extern "C" {
+            fn giggles_rocksdb_autorecovery_veto_count(
+                options: *const librocksdb_sys::rocksdb_options_t,
+            ) -> u64;
         }
 
         #[link(name = "giggles_autorecovery_veto_test", kind = "static")]
@@ -2027,6 +2079,12 @@ mod tests {
                 let fault = unsafe { WalFault::install(&mut options, keep_veto) };
                 (fault, options)
             };
+            // Options clones share the production listener with the open DB.
+            let observed_options = options.clone();
+            let veto_count = || {
+                // SAFETY: the cloned options keep the listener live.
+                unsafe { giggles_rocksdb_autorecovery_veto_count(observed_options.as_raw_ptr()) }
+            };
             wal_group_tests::initialize_marked(&dir.0);
             let (path, lock) = RocksKv::lock_local(&dir.0).unwrap();
             let db = Arc::new(RocksKv::open_with_options(
@@ -2054,6 +2112,12 @@ mod tests {
             assert_commit_fence(&kv, error, FenceSite::CommitSync);
             let armed = fault.counts();
             assert!(armed.sync_failures > 0 && armed.full_space_checks > 0, "{armed:?}");
+            if keep_veto {
+                assert!(veto_count() > 0);
+                assert_eq!(armed.recovery_begins_enabled, 0, "{armed:?}");
+            } else {
+                assert!(armed.recovery_begins_enabled > 0, "{armed:?}");
+            }
             let native_write = || {
                 db.db.put_cf(
                     db.db.cf_handle(Keyspace::Rows.name()).unwrap(),
@@ -2066,7 +2130,8 @@ mod tests {
             if keep_veto {
                 thread::sleep(Duration::from_millis(100));
                 let after = fault.counts();
-                assert!(after.vetoes > 0, "{after:?}");
+                assert!(veto_count() > 0);
+                assert_eq!(after.recovery_begins_enabled, 0, "{after:?}");
                 assert_eq!(after.full_space_checks, 1, "{after:?}");
             } else {
                 // The first check is OverrideNoSpaceError. Wait for the SstFileManager
@@ -2080,13 +2145,14 @@ mod tests {
                 thread::sleep(Duration::from_millis(5_250));
                 let after = fault.counts();
                 assert_eq!(after.full_space_checks, 1, "{after:?}");
+                assert_eq!(after.recovery_begins_enabled, 0, "{after:?}");
                 assert_eq!((after.flushes, after.recoveries), (0, 0), "{after:?}");
                 assert_eq!(sst_paths(&dir.0), before);
                 assert_native_no_space(native_write());
             } else {
                 wait_for(|| fault.counts().recoveries > 0);
                 let after = fault.counts();
-                assert_eq!(after.vetoes, 0, "{after:?}");
+                assert_eq!(veto_count(), 0);
                 assert!(after.flushes > 0, "{after:?}");
                 assert!(sst_paths(&dir.0).difference(&before).next().is_some());
                 native_write().unwrap();

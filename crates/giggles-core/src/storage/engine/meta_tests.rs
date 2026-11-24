@@ -61,6 +61,31 @@ fn role(kv: &MemKv, id: u64, ts: u64, live: bool) {
     );
     kv.write(b, Durability::Sync).unwrap();
 }
+#[cfg(all(feature = "engine-rocksdb", any(unix, windows)))]
+#[test]
+fn marker_publication_replaces_leftover_temp_without_writing_through_it() {
+    let dir = TestDir::new();
+    dir.put(MARKER, V2);
+    dir.put("existing", b"original contents");
+    let existing = dir.0.join("existing");
+    let temp = dir.0.join(TMP);
+    // A hard link checks that a leftover regular entry is never truncated.
+    fs::hard_link(&existing, &temp).unwrap();
+    write_commit_groups_marker(&dir.0).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&existing, &temp).unwrap();
+        write_commit_groups_marker(&dir.0).unwrap();
+    }
+    fs::create_dir(&temp).unwrap();
+    write_commit_groups_marker(&dir.0).unwrap();
+    let marker = dir.0.join(MARKER);
+    assert!(marker.symlink_metadata().unwrap().is_file());
+    assert_eq!(fs::read(marker).unwrap(), V2_COMMIT_GROUPS);
+    assert_eq!(fs::read(existing).unwrap(), b"original contents");
+    assert!(!temp.exists());
+}
+
 #[test]
 fn directory_matrix() {
     let d = TestDir::new();

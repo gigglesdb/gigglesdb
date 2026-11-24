@@ -317,9 +317,9 @@ impl V2Db {
         getrandom::fill(&mut domain).map_err(io)?;
         fs::create_dir_all(path).map_err(io)?;
         let identity = DirectoryIdentity::read(path).ok();
-        let (open_path, writer_lock) = engine::kv_rocksdb::RocksKv::lock_local(path)?;
-        let backend = engine::meta::create(&open_path, domain, |path| {
-            Ok(Arc::new(engine::kv_rocksdb::RocksKv::open_locked(
+        let writer_lock = engine::kv_rocksdb::WriterLock::acquire(path)?;
+        let backend = engine::meta::create(path, domain, |path| {
+            Ok(Arc::new(engine::kv_rocksdb::RocksKv::open_unmarked_locked(
                 path,
                 64 * 1024 * 1024,
                 writer_lock,

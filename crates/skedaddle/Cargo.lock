@@ -847,8 +847,8 @@ dependencies = [
 name = "giggles-core"
 version = "0.1.0"
 dependencies = [
- "cc",
  "bincode",
+ "cc",
  "getrandom 0.3.4",
  "giggles-glibm-loader",
  "giggles-icu",

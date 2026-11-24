@@ -122,6 +122,38 @@ fn ordered_atomic_apply_and_reopen() {
     assert!(matches!(store.applied(), Err(CoreError::Corrupt(_))));
 }
 
+#[test]
+fn replica_apply_rejects_commit_group_mutations() {
+    let dir = Dir::new();
+    let store = ReplicaStore::create(&dir.0, [9; 16]).unwrap();
+    let at = pos(1, 1);
+    let before = contents(&store);
+    let mut put_then_delete = WriteBatch::default();
+    put_then_delete.put(Keyspace::Rows, b"row".to_vec(), b"value".to_vec());
+    put_then_delete.put(
+        Keyspace::Meta,
+        COMMIT_GROUP_KEY.to_vec(),
+        1u64.to_be_bytes().to_vec(),
+    );
+    put_then_delete.delete(Keyspace::Meta, COMMIT_GROUP_KEY.to_vec());
+
+    let mut delete = WriteBatch::default();
+    delete.delete(Keyspace::Meta, COMMIT_GROUP_KEY.to_vec());
+    let mut range = WriteBatch::default();
+    range.delete_range(Keyspace::Meta, b"commit_".to_vec(), b"commit_z".to_vec());
+
+    for invalid in [put_then_delete, delete, range] {
+        assert_eq!(
+            store.apply(&invalid.encode(), at),
+            Err(CoreError::Corrupt("batch touches commit_group".into()))
+        );
+        assert_eq!(store.applied().unwrap(), None);
+        assert_eq!(contents(&store), before);
+    }
+    assert_eq!(store.apply(&batch(COMMIT_GROUP_KEY), at), Ok(ApplyOutcome::Applied));
+    assert_eq!(store.applied().unwrap(), Some(at));
+}
+
 struct Fanout {
     stores: [Arc<ReplicaStore>; 3],
     next: Mutex<u64>,

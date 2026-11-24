@@ -68,7 +68,7 @@ impl RangeStore {
         let lock = WriterLock::acquire(path)?;
         let mut concrete = None;
         meta::create_with_features(path, domain, meta::REPLICATED | meta::RANGES, |p| {
-            let kv = Arc::new(RocksKv::open_replicated_locked(p, 64 << 20, lock)?);
+            let kv = Arc::new(RocksKv::open_unmarked_locked(p, 64 << 20, lock)?);
             concrete = Some(kv.clone());
             Ok(kv)
         })
