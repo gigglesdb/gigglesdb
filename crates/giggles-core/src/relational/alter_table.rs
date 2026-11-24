@@ -33,7 +33,7 @@ pub(super) enum Action {
     RenameColumn(String, String),
     RenameTable(String),
     Default(String, Option<String>),
-    Expression(String, Option<generated_columns::Definition>),
+    Expression(String, Option<generated_columns::Definition>, bool),
     NotNull(String, bool),
     Unique(Option<String>, Vec<String>),
     PrimaryKey(Option<String>, Vec<String>),
@@ -235,7 +235,9 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
                     let (tokens, locations) = generated_columns::expression_tokens(p)?;
                     Some(generated_columns::Definition { tokens, locations, stored: false })
                 } else { None };
-                Action::Expression(name, expression)
+                let if_exists = !set && p.word("if");
+                if if_exists { p.need("exists")?; }
+                Action::Expression(name, expression, if_exists)
             } else if p.word("not") {
                 p.need("null")?;
                 Action::NotNull(name, set)
@@ -746,7 +748,7 @@ pub(super) fn execute(
                     Err(SqlError::UnknownColumn) if *optional => continue,
                     Err(error) => return Err(error),
                 };
-                views::drop_column_views(&mut candidate, table.columns[at].id, *cascade)?;
+                views::drop_column_views(&mut candidate, &table, &table.columns[at], *cascade, path)?;
                 let id = table.columns[at].id;
                 let dependents: Vec<_> = generated_columns::dependent_columns(&candidate, &table, id)
                     .into_iter().map(|column| column.name.clone()).collect();
@@ -763,6 +765,7 @@ pub(super) fn execute(
                         table: name.clone(),
                         actions: dependents.into_iter().map(|column| Action::Drop(column, false, true)).collect(),
                         resolution_error: None,
+                        column_names: alter.column_names,
                     };
                     execute(&mut candidate, &dependent_drops, path, clock, cancel)?;
                     table = candidate.tables[&name].clone();
@@ -857,9 +860,9 @@ pub(super) fn execute(
                     path,
                 )?;
             }
-            Action::Expression(column, expression) => {
+            Action::Expression(column, expression, if_exists) => {
                 let target = &table.columns[position(&table, column)?];
-                generated_columns::alter(&mut candidate, &table, target, expression.as_ref(), cancel)?;
+                generated_columns::alter(&mut candidate, &table, target, expression.as_ref(), *if_exists, cancel)?;
             }
             Action::NotNull(column, set) => {
                 let at = position(&table, column)?;

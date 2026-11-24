@@ -2,6 +2,9 @@
 use super::*;
 use exec::Relation;
 
+#[path = "text_search_srf.rs"]
+mod text_search_srf;
+
 #[derive(Debug, Clone)]
 pub(super) struct Function {
     name: String,
@@ -22,6 +25,7 @@ pub(super) fn parse(
         .to_string();
     if !["generate_series", "unnest"].contains(&name.as_str())
         && !json_srf::known(&name)
+        && !text_search_srf::known(&name)
     {
         return Err(SqlError::UndefinedFunction);
     }
@@ -43,10 +47,12 @@ pub(super) fn parse(
     p.at = close + 1;
     let mut arguments = parse::parser(&tokens);
     let mut args = vec![];
-    loop {
-        args.push(Scalar::parse_expr(&mut arguments, 0, false)?);
-        if !arguments.sym(',') {
-            break;
+    if !tokens.is_empty() || !text_search_srf::known(&name) {
+        loop {
+            args.push(Scalar::parse_expr(&mut arguments, 0, false)?);
+            if !arguments.sym(',') {
+                break;
+            }
         }
     }
     if arguments.at != arguments.tokens.len() {
@@ -120,6 +126,8 @@ pub(super) fn array_values(value: Value, ty: &DataType) -> R<Vec<Value>> {
     }
 }
 impl Function {
+    pub(super) fn ordinality(&self) -> bool { self.ordinality }
+
     fn ty(&self, state: &Relational, parameters: &mut [Option<DataType>]) -> R<DataType> {
         if json_srf::known(&self.name) {
             if self.args.len() != 1 {
@@ -196,17 +204,18 @@ impl Function {
         state: &Relational,
         parameters: &mut [Option<DataType>],
     ) -> R<(Vec<ColumnDef>, Vec<i32>)> {
-        let ty = self.ty(state, parameters)?;
-        let mut columns = if ty == DataType::TsVector {
-            [("lexeme", DataType::Text), ("positions", DataType::SmallIntArray), ("weights", DataType::PgCharArray)]
-                .into_iter().map(|(name, data_type)| ColumnDef { id: 0, name: name.into(), data_type, not_null: false }).collect()
-        } else if json_srf::record(&self.name) {
-            vec![
-                ColumnDef { id: 0, name: "key".into(), data_type: DataType::Text, not_null: false },
-                ColumnDef { id: 0, name: "value".into(), data_type: ty, not_null: false },
-            ]
+        let mut columns = if text_search_srf::known(&self.name) {
+            if let Some(input) = &self.input {
+                let meta = input.clone().resolve(state, parameters)?;
+                let types = meta.columns.into_iter().zip(meta.unknown)
+                    .map(|(column, unknown)| (!unknown).then_some(column.data_type)).collect::<Vec<_>>();
+                functions::text_search::row_arg_types(&self.name, &types)?;
+            } else {
+                functions::text_search::bind_row_args(&self.name, &self.args, parameters)?;
+            }
+            text_search_srf::columns(&self.name)
         } else {
-            vec![ColumnDef { id: 0, name: self.column_names(&self.name, &[]).remove(0), data_type: ty, not_null: false }]
+            self.scalar_columns(state, parameters)?
         };
         if self.ordinality {
             columns.push(ColumnDef {
@@ -218,6 +227,22 @@ impl Function {
         }
         let typmods = vec![-1; columns.len()];
         Ok((columns, typmods))
+    }
+
+    fn scalar_columns(&self, state: &Relational, parameters: &mut [Option<DataType>]) -> R<Vec<ColumnDef>> {
+        let ty = self.ty(state, parameters)?;
+        Ok(if ty == DataType::TsVector {
+            [("lexeme", DataType::Text), ("positions", DataType::SmallIntArray), ("weights", DataType::PgCharArray)]
+                .into_iter().map(|(name, data_type)| ColumnDef { id: 0, name: name.into(), data_type, not_null: false }).collect()
+        } else if json_srf::record(&self.name) {
+            vec![
+                ColumnDef { id: 0, name: "key".into(), data_type: DataType::Text, not_null: false },
+                ColumnDef { id: 0, name: "value".into(), data_type: ty, not_null: false },
+            ]
+        } else {
+            let name = if json_srf::element_column(&self.name) { "value" } else { &self.name };
+            vec![ColumnDef { id: 0, name: name.into(), data_type: ty, not_null: false }]
+        })
     }
     pub fn run<'a>(
         &self,
@@ -238,14 +263,20 @@ impl Function {
         let mut values = if let Some(rows) = &mut evaluated {
             rows.rows.pop().ok_or(SqlError::Syntax)?.values
         } else {
-            let mut values = vec![];
-            for s in &self.args {
-                let scalar = if json_srf::known(&self.name) && s.aggregate_unknown(parameters) {
-                    Scalar::Cast(Box::new(s.clone()), DataType::Jsonb)
-                } else {
-                    s.clone()
-                };
-                let mut b = scalar.bind(&|_, _| Err(SqlError::UnknownColumn), &[], parameters)?;
+            let mut bound = if text_search_srf::known(&self.name) {
+                functions::text_search::bind_row_args(&self.name, &self.args, &mut parameters.to_vec())?
+            } else {
+                self.args.iter().map(|scalar| {
+                    if json_srf::known(&self.name) && scalar.aggregate_unknown(parameters) {
+                        Scalar::Cast(Box::new(scalar.clone()), DataType::Jsonb)
+                            .bind(&|_, _| Err(SqlError::UnknownColumn), &[], parameters)
+                    } else {
+                        scalar.bind(&|_, _| Err(SqlError::UnknownColumn), &[], parameters)
+                    }
+                }).collect::<R<Vec<_>>>()?
+            };
+            let mut values = Vec::with_capacity(bound.len());
+            for b in &mut bound {
                 b.attach_clock(clock);
                 values.push(b.eval(
                     &Tuple {
@@ -269,7 +300,9 @@ impl Function {
             }
             out.push(SqlRow { values, version: 0 })
         };
-        if self.name == "unnest" {
+        if text_search_srf::known(&self.name) {
+            text_search_srf::run(&self.name, &values, &mut emit)?;
+        } else if self.name == "unnest" {
             let ty = self.ty(state, &mut parameters.to_vec())?;
             let value = values.remove(0);
             if ty == DataType::TsVector {
@@ -325,8 +358,20 @@ impl Function {
         json_srf::element_column(&self.name) && !self.ordinality
     }
 
-    pub(super) fn column_names(&self, alias: &str, aliases: &[String]) -> Vec<String> {
-        let mut names = if json_srf::record(&self.name) {
+    pub(super) fn uses_relation_alias(&self) -> bool {
+        !json_srf::element_column(&self.name)
+    }
+
+    pub(super) fn local_column_names(
+        &self, state: &Relational, parameters: &[Option<DataType>], alias: &str, aliases: &[String],
+    ) -> Vec<String> {
+        let mut names = if self.name == "unnest"
+            && self.ty(state, &mut parameters.to_vec()) == Ok(DataType::TsVector)
+        {
+            vec!["lexeme".into(), "positions".into(), "weights".into()]
+        } else if text_search_srf::known(&self.name) {
+            text_search_srf::columns(&self.name).into_iter().map(|column| column.name).collect()
+        } else if json_srf::record(&self.name) {
             vec!["key".into(), "value".into()]
         } else if json_srf::element_column(&self.name) {
             vec!["value".into()]

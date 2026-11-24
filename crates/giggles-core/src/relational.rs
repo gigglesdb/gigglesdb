@@ -108,6 +108,7 @@ pub use giggles_pg_types::temporal::{
     Date, Interval, Time as PgTime, TimeTz, Timestamp, TimestampTz,
 };
 pub use giggles_pg_types::{Float4, Float8, Numeric};
+pub(crate) use sql_copy::copy_table_columns;
 pub use sql_copy::{Copy, CopyFormat, CopySource, CopyOptions, CopyHeader, CopyColumns, CopyLogVerbosity, CopyInput};
 
 pub const MAX_SQL: usize = 64 * 1024;
@@ -480,6 +481,7 @@ pub enum DataType {
     RealArray,
     PgCharArray,
     SmallIntArray,
+    RegDictionaryArray,
 }
 impl Serialize for DataType {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -497,6 +499,7 @@ impl Serialize for DataType {
             | Self::RealArray
             | Self::PgCharArray
             | Self::SmallIntArray
+            | Self::RegDictionaryArray
             | Self::Varchar
             | Self::Bpchar
             | Self::Uuid
@@ -772,10 +775,14 @@ pub(crate) fn check(v: &Value, c: &ColumnDef) -> R<()> {
             | DataType::IntArray
             | DataType::BigIntArray
             | DataType::TextArray
-            | DataType::UuidArray,
+            | DataType::UuidArray
+            | DataType::RegDictionaryArray,
             Value::Text(_),
         )
         | (DataType::Bytes, Value::Bytes(_)) => true,
+        (DataType::RegConfig | DataType::RegDictionary | DataType::Oid, Value::Int(oid)) =>
+            u32::try_from(*oid).is_ok(),
+        (DataType::PgChar, Value::Int(byte)) => i8::try_from(*byte).is_ok(),
         (ty, v @ Value::Bytes(_)) if ty.is_text_search() => text_search_types::valid(ty, v),
         (DataType::SmallInt, Value::Int(n)) => i16::try_from(*n).is_ok(),
         (DataType::Integer, Value::Int(n)) => i32::try_from(*n).is_ok(),
@@ -879,7 +886,7 @@ pub(crate) fn row_check(t: &TableDef, values: &[Value]) -> R<()> {
     for (v, c) in values.iter().zip(&t.columns) {
         check(v, c).inspect_err(|error| {
             if *error == SqlError::Null && c.data_type == DataType::UuidArray {
-                logical_types::not_null_violation(t, c, values);
+                logical_types::not_null_violation(t, c, logical_types::failing_row_detail(t, values));
             }
         })?;
         size = size.checked_add(value_bytes(v)).ok_or(SqlError::Limit)?;
@@ -4541,6 +4548,7 @@ impl Relational {
         let mut returned_rows = vec![];
         // Normalize expression outputs after mutation input admission.
         let normalized;
+        let expression_values = matches!(prepared.statement.get(), Statement::InsertExpressions(_));
         let prepared = if let Statement::InsertExpressions(values) = prepared.statement.get() {
             values.check_identity(self)?;
             if expected.is_some() {
@@ -5029,7 +5037,11 @@ impl Relational {
                 }
                 let mut row = defaults::row(self, t, &indexes, clock)?;
                 for (i, v) in indexes.iter().zip(values) {
-                    row[*i] = if matches!(v, Expr::Literal(_)) {
+                    row[*i] = if expression_values && t.columns[*i].data_type.is_text_search() {
+                        // The expression binder already assigned the destination type.
+                        // Byte-backed search values would look like bytea to literal().
+                        v.value(params)?
+                    } else if matches!(v, Expr::Literal(_)) {
                         query::assignment::literal(
                             v.value(params)?,
                             &t.columns[*i].data_type,
@@ -5156,14 +5168,20 @@ impl Relational {
                 for row in iter.take(limit) {
                     let row = row?;
                     let r = &row.row;
-                    bytes += indexes
-                        .iter()
-                        .map(|i| value_bytes(&r.values[*i]))
-                        .sum::<usize>();
-                    if bytes > MAX_RESULT_BYTES {
-                        return Err(SqlError::Limit);
+                    let mut values = Vec::with_capacity(indexes.len());
+                    for &i in &indexes {
+                        let column = &t.columns[i];
+                        let value = match self.generated_column(column.id) {
+                            Some(generation) if !generation.stored =>
+                                query::generated_expression_value(t, generation, column, &r.values)?,
+                            _ => r.values[i].clone(),
+                        };
+                        bytes = bytes.checked_add(value_bytes(&value)).ok_or(SqlError::Limit)?;
+                        if bytes > MAX_RESULT_BYTES {
+                            return Err(SqlError::Limit);
+                        }
+                        values.push(value);
                     }
-                    let values: Vec<Value> = indexes.iter().map(|i| r.values[*i].clone()).collect();
                     result.rows.push(SqlRow {
                         values,
                         version: r.version,

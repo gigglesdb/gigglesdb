@@ -1175,7 +1175,7 @@ fn finish_row(
             if index != hidden {
                 check(value, column).inspect_err(|error| {
                     if *error == SqlError::Null && column.data_type == DataType::UuidArray {
-                        logical_types::not_null_violation(table, column, &row);
+                        logical_types::not_null_violation(table, column, logical_types::failing_row_detail(table, &row));
                     }
                 })?;
             }

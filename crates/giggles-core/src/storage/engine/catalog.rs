@@ -1095,7 +1095,7 @@ impl Catalog {
             // Labels (and their tombstones) need TASK_CATALOG, which needs role_catalog.
             txn.require_features(super::meta::TASK_CATALOG | super::super::roles::engine::FEATURE);
         }
-        if !new.ext.is_empty() {
+        if !new.ext.namespace5_ext_is_empty() {
             txn.require_features(1 << 6);
         }
         if new.ext.columns.values().any(|c| c.typmod.is_some()) {

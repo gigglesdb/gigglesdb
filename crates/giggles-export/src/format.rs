@@ -531,6 +531,7 @@ pub(crate) fn create_sql(t: &Table) -> String {
                     DataType::RealArray => "REAL[]",
                     DataType::PgCharArray => "\"char\"[]",
                     DataType::SmallIntArray => "SMALLINT[]",
+                    DataType::RegDictionaryArray => "REGDICTIONARY[]",
                 },
                 if c.not_null { " NOT NULL" } else { "" }
             )

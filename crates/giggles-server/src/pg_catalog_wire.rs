@@ -554,7 +554,7 @@ fn snapshot_owned(
                             C::TsVector => P::TsVector,
                             C::TsQuery => P::TsQuery,
                             C::RegConfig | C::RegDictionary | C::Oid | C::PgChar
-                            | C::RealArray | C::PgCharArray | C::SmallIntArray => P::Text,
+                            | C::RealArray | C::PgCharArray | C::SmallIntArray | C::RegDictionaryArray => P::Text,
 
                             C::Bytes => P::Bytes,
                             C::Numeric => P::Numeric,
@@ -1189,6 +1189,69 @@ pub(crate) fn description(fields: &[Field], formats: &[u16], out: &mut Vec<u8>) 
 pub(crate) fn encode(value: &Value, ty: PgType, format: u16) -> Result<Option<Vec<u8>>> {
     encode_with_settings(value, ty, format, 0, Default::default())
 }
+// PostgreSQL 18.6 names of the regproc values exposed by the catalog profile.
+fn regproc_name(oid: u32) -> Option<&'static str> {
+    Some(match oid {
+        0 => "-",
+        3 => "heap_tableam_handler",
+        330 => "bthandler",
+        331 => "hashhandler",
+        332 => "gisthandler",
+        333 => "ginhandler",
+        334 => "spghandler",
+        335 => "brinhandler",
+        101 => "eqsel",
+        102 => "neqsel",
+        103 => "scalarltsel",
+        104 => "scalargtsel",
+        105 => "eqjoinsel",
+        106 => "neqjoinsel",
+        107 => "scalarltjoinsel",
+        108 => "scalargtjoinsel",
+        336 => "scalarlesel",
+        337 => "scalargesel",
+        386 => "scalarlejoinsel",
+        398 => "scalargejoinsel",
+        3616 => "tsvector_lt",
+        3617 => "tsvector_le",
+        3618 => "tsvector_eq",
+        3619 => "tsvector_ne",
+        3620 => "tsvector_ge",
+        3621 => "tsvector_gt",
+        3625 => "tsvector_concat",
+        3634 => "ts_match_vq",
+        3635 => "ts_match_qv",
+        3662 => "tsquery_lt",
+        3663 => "tsquery_le",
+        3664 => "tsquery_eq",
+        3665 => "tsquery_ne",
+        3666 => "tsquery_ge",
+        3667 => "tsquery_gt",
+        3669 => "tsquery_and",
+        3670 => "tsquery_or",
+        3671 => "tsquery_not",
+        3686 => "tsmatchsel",
+        3687 => "tsmatchjoinsel",
+        3691 => "tsq_mcontains",
+        3692 => "tsq_mcontained",
+        3760 => "ts_match_tt",
+        3761 => "ts_match_tq",
+        5003 => "pg_catalog.tsquery_phrase",
+        5040 => "matchingsel",
+        5041 => "matchingjoinsel",
+        3717 => "prsd_start",
+        3718 => "prsd_nexttoken",
+        3719 => "prsd_end",
+        3720 => "prsd_headline",
+        3721 => "prsd_lextype",
+        3725 => "dsimple_init",
+        3726 => "dsimple_lexize",
+        13232 => "dsnowball_init",
+        13233 => "dsnowball_lexize",
+        _ => return None,
+    })
+}
+
 fn encode_with_settings(
     value: &Value,
     ty: PgType,
@@ -1275,35 +1338,17 @@ fn encode_with_settings(
         }
         (Value::Int(v), PgType::Oid | PgType::Xid | PgType::Regproc) => {
             let v = u32::try_from(*v).map_err(|_| "22003")?;
-            if format == 0 {
-                if ty == PgType::Regproc {
-                    match v {
-                        3 => b"heap_tableam_handler".to_vec(),
-                        330 => b"bthandler".to_vec(),
-                        331 => b"hashhandler".to_vec(),
-                        332 => b"gisthandler".to_vec(),
-                        333 => b"ginhandler".to_vec(),
-                        334 => b"spghandler".to_vec(),
-                        335 => b"brinhandler".to_vec(),
-                        3717 => b"prsd_start".to_vec(),
-                        3718 => b"prsd_nexttoken".to_vec(),
-                        3719 => b"prsd_end".to_vec(),
-                        3720 => b"prsd_headline".to_vec(),
-                        3721 => b"prsd_lextype".to_vec(),
-                        3725 => b"dsimple_init".to_vec(),
-                        3726 => b"dsimple_lexize".to_vec(),
-                        13232 => b"dsnowball_init".to_vec(),
-                        13233 => b"dsnowball_lexize".to_vec(),
-                        _ => return Err("0A000"),
-                    }
-                } else {
-                    v.to_string().into_bytes()
-                }
+            let regproc = if ty == PgType::Regproc {
+                Some(regproc_name(v).ok_or("0A000")?)
             } else {
-                if ty == PgType::Regproc && !matches!(v, 3 | 330..=335 | 3717..=3721 | 3725 | 3726 | 13232 | 13233) {
-                    return Err("0A000");
-                }
+                None
+            };
+            if format == 1 {
                 v.to_be_bytes().to_vec()
+            } else if let Some(name) = regproc {
+                name.as_bytes().to_vec()
+            } else {
+                v.to_string().into_bytes()
             }
         }
         (Value::Int(v), PgType::Int8) => {
@@ -2123,11 +2168,13 @@ mod tests {
             assert_eq!(parameter_type(ty.oid()), Err("0A000"));
             for format in [0, 1] {
                 assert_eq!(encode(&Value::Null, ty, format), Ok(None));
-                for v in [
-                    Value::Int(0),
-                    Value::Bytes(vec![]),
-                ] {
-                    assert_eq!(encode(&v, ty, format), Err("42804"));
+                assert_eq!(encode(&Value::Bytes(vec![]), ty, format), Err("42804"));
+                if ty == PgType::Regproc {
+                    assert_eq!(encode(&Value::Int(0), ty, format),
+                        Ok(Some(if format == 0 { b"-".to_vec() } else { vec![0; 4] })));
+                    assert_eq!(encode(&Value::Int(u32::MAX.into()), ty, format), Err("0A000"));
+                } else {
+                    assert_eq!(encode(&Value::Int(0), ty, format), Err("42804"));
                 }
                 assert_eq!(encode(&Value::Text(String::new()), ty, format),
                     if ty == PgType::PgNodeTree { Ok(Some(vec![])) } else { Err("42804") });

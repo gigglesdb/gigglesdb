@@ -6809,7 +6809,7 @@ fn update_filtered_aggregates(
                     | DataType::UuidArray
                     | DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
                     | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray
-                    | DataType::SmallIntArray
+                    | DataType::SmallIntArray | DataType::RegDictionaryArray
                     | DataType::Varchar
                     | DataType::Bpchar
                     | DataType::Bytes

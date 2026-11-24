@@ -88,6 +88,12 @@ impl Default for CatalogExt {
 }
 impl CatalogExt {
     pub(crate) fn is_empty(&self) -> bool {
+        self.namespace5_ext_is_empty() && self.generated_columns.is_empty() && self.gin_indexes.is_empty()
+    }
+
+    // Generated columns and GIN indexes have their own format-53 envelope maps
+    // and V2 table trailers. They never contribute to the base extension.
+    pub(crate) fn namespace5_ext_is_empty(&self) -> bool {
         self.extensions.is_empty() && self.column_collations.is_empty() && self.collations.is_empty()
             && self.columns.is_empty()
             && self.constraints.is_empty()
@@ -1409,7 +1415,7 @@ impl Relational {
         for (id, (_, column)) in &columns {
             let expected = match column.data_type {
                 DataType::RegType | DataType::RegConfig | DataType::RegDictionary | DataType::Oid
-                | DataType::PgChar | DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray => return Err(SqlError::Unsupported),
+                | DataType::PgChar | DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray | DataType::RegDictionaryArray => return Err(SqlError::Unsupported),
                 DataType::Varchar => Some(TextKind::Varchar),
                 DataType::Bpchar => Some(TextKind::Bpchar),
 

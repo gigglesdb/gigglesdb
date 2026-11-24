@@ -82,18 +82,27 @@ fn uuid_input(input: &str) -> R<String> {
     })
 }
 
-pub(super) fn not_null_violation(table: &TableDef, column: &ColumnDef, values: &[Value]) {
+pub(super) fn not_null_violation(table: &TableDef, column: &ColumnDef, detail: String) {
     let table_name = split_key(&table.name).1;
     user_types::view_replace_error(format!(
         "null value in column \"{}\" of relation \"{table_name}\" violates not-null constraint",
         column.name,
     ));
-    user_types::sql_error_detail(failing_row_detail(table, values));
+    user_types::sql_error_detail(detail);
 }
 
 pub(super) fn failing_row_detail(table: &TableDef, values: &[Value]) -> String {
+    failing_row_detail_with(table, values, |_| false)
+}
+
+pub(super) fn failing_row_detail_with(
+    table: &TableDef, values: &[Value], is_virtual: impl Fn(u64) -> bool,
+) -> String {
     use std::borrow::Cow;
     let fields = table.logical_offsets().into_iter().map(|offset| {
+        if is_virtual(table.columns[offset].id) {
+            return "virtual".into();
+        }
         let text = match &values[offset] {
             Value::Null => Cow::Borrowed("null"),
             Value::Text(text) => Cow::Borrowed(text.as_str()),

@@ -1,6 +1,6 @@
 // Based on PostgreSQL 18.6 dict_simple.c, dict_snowball.c, ts_parse.c,
 // snowball.sql.in and the built-in pg_ts_config_map data.
-// Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group.
+// Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group.
 use std::{collections::HashSet, sync::LazyLock};
 
 use crate::{Parser, Token, TsError, english, locale, vector::MAX_POS};
@@ -129,18 +129,37 @@ impl Config {
         CONFIGS[self as usize].name
     }
 
+    /// Whether a canonical name refers to a built-in PostgreSQL 18.6 configuration.
+    pub fn is_builtin(name: &str) -> bool {
+        CONFIGS.iter().any(|spec| spec.name == name)
+            || matches!(
+                name,
+                "arabic" | "armenian" | "basque" | "catalan" | "danish" | "dutch"
+                    | "estonian" | "finnish" | "french" | "german" | "greek" | "hindi"
+                    | "hungarian" | "indonesian" | "irish" | "italian" | "lithuanian"
+                    | "nepali" | "norwegian" | "portuguese" | "romanian" | "russian"
+                    | "serbian" | "spanish" | "swedish" | "tamil" | "turkish" | "yiddish"
+            )
+    }
+
     pub fn lookup(name: &str) -> Result<Self, TsError> {
         if let Some(oid) = numeric_oid(name)
-            && let Some(spec) = CONFIGS.iter().find(|spec| spec.oid == oid)
+            && let Some(config) = Self::from_oid(oid)
         {
-            return Ok(spec.id);
+            return Ok(config);
         }
         resolve(name, "configuration", |word| {
-            CONFIGS
-                .iter()
-                .find(|spec| spec.name == word)
-                .map(|spec| spec.id)
-        })
+            if let Some(spec) = CONFIGS.iter().find(|spec| spec.name == word) {
+                Some(Ok(spec.id))
+            } else if Self::is_builtin(word) {
+                Some(Err(TsError::new(
+                    "0A000",
+                    format!("text search configuration \"{word}\" is not supported"),
+                )))
+            } else {
+                None
+            }
+        })?
     }
 
     pub(crate) fn dictionary(self, token_id: u8) -> Option<Dictionary> {

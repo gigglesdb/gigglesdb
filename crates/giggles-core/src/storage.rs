@@ -4684,6 +4684,26 @@ impl SqlSession {
         }
         result
     }
+    /// Resolve a table COPY TO projection against the active catalog snapshot.
+    /// Other relation kinds retain their SQL SELECT path.
+    pub fn copy_output_columns(
+        &mut self, relation: &str, columns: &[String],
+    ) -> Result<Option<Vec<relational::ColumnDef>>, CoreError> {
+        let inner = self.admin.inner.clone();
+        let _ticket = inner.enter_sql()?;
+        let read = |s: &MetadataState<'_>| {
+            let key = s.sql.resolve_relation_key(relation, &self.search_path);
+            s.sql.tables.get(&key)
+                .map(|table| relational::copy_table_columns(&s.sql, table, columns))
+                .transpose()
+                .map_err(CoreError::Sql)
+        };
+        match &self.staged {
+            Some(s) => read(&MetadataState::borrow(s)),
+            None => self.inspect_metadata(read),
+        }
+    }
+
     /// Resolve each COPY row once, including defaults, and check row-local constraints.
     /// The returned descriptor supplies every logical column so final ingestion
     /// neither reevaluates defaults nor reserves a sequence a second time.

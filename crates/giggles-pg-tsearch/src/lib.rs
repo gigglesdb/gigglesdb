@@ -1,3 +1,6 @@
+// Based on PostgreSQL 18.6 tsearch and full-text utility routines.
+// Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group.
+
 //! PostgreSQL 18.6 full-text search for UTF-8 with the en_US locale.
 //!
 //! `TsVector` and `TsQuery` implement text input via `FromStr`, canonical text

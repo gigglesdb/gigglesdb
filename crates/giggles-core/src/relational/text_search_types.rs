@@ -19,6 +19,7 @@ impl DataType {
             Self::RealArray => 1021,
             Self::PgCharArray => 1002,
             Self::SmallIntArray => 1005,
+            Self::RegDictionaryArray => 3770,
             _ => return None,
         })
     }
@@ -34,6 +35,7 @@ impl DataType {
             Self::RealArray => "real[]",
             Self::PgCharArray => "\"char\"[]",
             Self::SmallIntArray => "smallint[]",
+            Self::RegDictionaryArray => "regdictionary[]",
             _ => return None,
         })
     }
@@ -250,40 +252,43 @@ pub(super) fn compare(ty: &DataType, a: &Value, b: &Value) -> R<Ordering> {
     }
 }
 
+enum DefaultConfig {
+    Name(String),
+    Resolved(Result<Config, TsError>),
+}
+
 thread_local! {
-    static DEFAULT_CONFIG: std::cell::Cell<Config> = const { std::cell::Cell::new(Config::English) };
+    static DEFAULT_CONFIG: std::cell::RefCell<DefaultConfig> =
+        const { std::cell::RefCell::new(DefaultConfig::Resolved(Ok(Config::English))) };
 }
 
-pub(super) fn default_config() -> Config {
-    DEFAULT_CONFIG.get()
+pub(super) fn default_config() -> R<Config> {
+    DEFAULT_CONFIG.with_borrow_mut(|setting| {
+        if let DefaultConfig::Name(name) = setting {
+            *setting = DefaultConfig::Resolved(Config::lookup(name));
+        }
+        let DefaultConfig::Resolved(result) = setting else { unreachable!() };
+        result.clone().map_err(diagnostic)
+    })
 }
 
-/// Validate a default_text_search_config setting and return its qualified name.
-pub fn config_setting(name: &str) -> Option<String> {
-    if name
-        .trim_ascii()
-        .as_bytes()
-        .first()
-        .is_some_and(u8::is_ascii_digit)
-    {
-        return None;
-    }
-    Config::lookup(name)
-        .ok()
-        .map(|config| format!("pg_catalog.{}", config.name()))
-}
-
-/// Use a connection's config during synchronous statement evaluation.
-pub fn with_default_config<T>(name: &str, execute: impl FnOnce() -> T) -> T {
-    struct Restore(Config);
+/// Resolve a connection's setting only if a function needs its configuration.
+pub fn with_default_config<T>(name: String, execute: impl FnOnce() -> T) -> T {
+    struct Restore(Option<DefaultConfig>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            DEFAULT_CONFIG.set(self.0);
+            if let Some(previous) = self.0.take() {
+                DEFAULT_CONFIG.replace(previous);
+            }
         }
     }
-    let config = Config::lookup(name).expect("validated text search config");
-    let _restore = Restore(DEFAULT_CONFIG.replace(config));
+    let _restore = Restore(Some(DEFAULT_CONFIG.replace(DefaultConfig::Name(name))));
     execute()
+}
+
+/// Test a canonical name during GUC validation, independent of engine support.
+pub fn is_builtin_config(name: &str) -> bool {
+    Config::is_builtin(name)
 }
 
 pub(super) fn cast_supported(source: &DataType, target: &DataType) -> Option<bool> {
@@ -306,6 +311,7 @@ pub(super) fn cast_supported(source: &DataType, target: &DataType) -> Option<boo
                         | RealArray
                         | PgCharArray
                         | SmallIntArray
+                        | RegDictionaryArray
                 ) | (
                     TsVector
                         | TsQuery
@@ -315,7 +321,8 @@ pub(super) fn cast_supported(source: &DataType, target: &DataType) -> Option<boo
                         | PgChar
                         | RealArray
                         | PgCharArray
-                        | SmallIntArray,
+                        | SmallIntArray
+                        | RegDictionaryArray,
                     Text | Varchar | Bpchar
                 ) | (RegConfig | RegDictionary, Oid)
                     | (Oid, RegConfig | RegDictionary)

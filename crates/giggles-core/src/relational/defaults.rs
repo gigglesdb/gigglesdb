@@ -943,7 +943,7 @@ pub(super) fn type_name(ty: &DataType) -> &'static str {
         DataType::UuidArray => "uuid[]",
         DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
         | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray
-        | DataType::SmallIntArray => ty.text_search_name().unwrap(),
+        | DataType::SmallIntArray | DataType::RegDictionaryArray => ty.text_search_name().unwrap(),
 
         DataType::Bytes => "bytea",
         DataType::Date => "date",
@@ -1446,6 +1446,10 @@ pub(crate) fn native_default(default: &crate::operations::ColumnDefault, target:
 
 pub(super) fn parse(p: &mut Parser, target: &DataType, named_type: bool) -> R<String> {
     let value = expression(p, 0)?;
+    if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "generated") {
+        // The column parser reports the conflicting clauses before coercing the default.
+        return Ok(value.sql());
+    }
     if !matches!(p.tokens.get(p.at), Some(Token::Symbol(',' | ')')))
         && !matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "not" || w == "null" || w == "primary" || w == "references" || w == "check" || w == "constraint" || w == "unique")
     {

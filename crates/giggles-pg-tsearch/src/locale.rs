@@ -1,4 +1,5 @@
-// Character classes for the PostgreSQL UTF-8 parser and dictionaries.
+// Character classes based on PostgreSQL 18.6 tsearch/ts_locale.c.
+// Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group.
 #[path = "locale_ranges.rs"]
 mod ranges;
 

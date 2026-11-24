@@ -1,5 +1,5 @@
 // Port of PostgreSQL 18.6 tsrank.c.
-// Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group.
+// Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group.
 use std::collections::HashMap;
 
 use crate::{

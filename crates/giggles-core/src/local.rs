@@ -87,39 +87,56 @@ pub fn failure(e: CoreError) -> Reply {
         CoreError::TempFile { .. } => 21,
         CoreError::Sql(e) => {
             200 + match e {
-                relational::SqlError::Unsupported => 0,
-                relational::SqlError::Syntax => 1,
+                relational::SqlError::Unsupported
+                | relational::SqlError::TextSearchUnsupported => 0,
+                relational::SqlError::Syntax
+                | relational::SqlError::TextSearchSyntax
+                | relational::SqlError::TextSearchInvalidName => 1,
                 relational::SqlError::Reserved => 2,
                 relational::SqlError::UnknownTable => 3,
                 relational::SqlError::UnknownColumn => 4,
                 relational::SqlError::Duplicate => 5,
-                relational::SqlError::Type => 6,
+                relational::SqlError::Type
+                | relational::SqlError::TextSearchDatatypeMismatch => 6,
                 relational::SqlError::Null => 7,
-                relational::SqlError::Parameters => 8,
-                relational::SqlError::Limit => 9,
+                relational::SqlError::Parameters
+                | relational::SqlError::TextSearchProtocolViolation => 8,
+                relational::SqlError::Limit
+                | relational::SqlError::TextSearchProgramLimit
+                | relational::SqlError::TextSearchStatementTooComplex => 9,
                 relational::SqlError::Unbounded => 10,
                 relational::SqlError::Version => 11,
                 relational::SqlError::Conflict => 12,
                 relational::SqlError::StaleSchema => 13,
                 relational::SqlError::Transaction => 14,
                 relational::SqlError::Aborted => 15,
-                relational::SqlError::Overflow => 16,
-                relational::SqlError::UndefinedFunction => 17,
-                relational::SqlError::InvalidParameterValue => 18,
+                relational::SqlError::Overflow
+                | relational::SqlError::TextSearchNumericOutOfRange => 16,
+                relational::SqlError::UndefinedFunction
+                | relational::SqlError::TextSearchUndefinedFunction => 17,
+                relational::SqlError::InvalidParameterValue
+                | relational::SqlError::TextSearchInvalidParameter
+                | relational::SqlError::TextSearchZeroLength
+                | relational::SqlError::TextSearchInvalidSubscript => 18,
                 relational::SqlError::InvalidDatetimeFormat => 19,
                 relational::SqlError::DatetimeFieldOverflow => 20,
                 relational::SqlError::IntervalFieldOverflow => 21,
-                relational::SqlError::AmbiguousFunction => 22,
+                relational::SqlError::AmbiguousFunction
+                | relational::SqlError::TextSearchAmbiguousFunction => 22,
                 relational::SqlError::GroupingError => 23,
                 relational::SqlError::IndeterminateDatatype => 24,
                 relational::SqlError::AmbiguousParameter => 25,
-                relational::SqlError::InvalidTextRepresentation => 26,
+                relational::SqlError::InvalidTextRepresentation
+                | relational::SqlError::TextSearchInvalidText
+                | relational::SqlError::TextSearchInvalidBinary => 26,
                 relational::SqlError::SubstringError => 27,
-                relational::SqlError::CharacterNotInRepertoire => 28,
+                relational::SqlError::CharacterNotInRepertoire
+                | relational::SqlError::TextSearchInvalidEncoding => 28,
                 relational::SqlError::DuplicateTable => 29,
                 relational::SqlError::DuplicateColumn => 30,
                 relational::SqlError::DuplicateObject => 31,
-                relational::SqlError::UndefinedObject => 32,
+                relational::SqlError::UndefinedObject
+                | relational::SqlError::TextSearchUndefinedObject => 32,
                 relational::SqlError::CheckViolation => 33,
                 relational::SqlError::ForeignKeyViolation => 34,
                 relational::SqlError::DependentObjects => 35,
@@ -129,13 +146,15 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::NoActiveTransaction => 39,
                 relational::SqlError::InvalidSavepoint => 40,
                 relational::SqlError::InvalidForeignKey => 41,
-                relational::SqlError::InvalidSchema => 42,
+                relational::SqlError::InvalidSchema
+                | relational::SqlError::TextSearchInvalidSchema => 42,
                 relational::SqlError::DivisionByZero => 43,
                 relational::SqlError::InvalidEscapeSequence => 44,
                 relational::SqlError::InvalidTableDefinition => 45,
                 relational::SqlError::RestrictViolation => 46,
                 relational::SqlError::WrongObjectType => 47,
-                relational::SqlError::NullValueNotAllowed => 48,
+                relational::SqlError::NullValueNotAllowed
+                | relational::SqlError::TextSearchNullValue => 48,
                 relational::SqlError::CannotCoerce => 49,
                 relational::SqlError::BadCopyFileFormat => 50,
                 relational::SqlError::StringDataRightTruncation => 51,
@@ -157,27 +176,7 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::InvalidArgumentForLogarithm => 67,
                 relational::SqlError::InvalidArgumentForPowerFunction => 68,
                 relational::SqlError::InvalidArgumentForWidthBucket => 70,
-                relational::SqlError::InternalError
-                | relational::SqlError::TextSearchInternal
-                | relational::SqlError::TextSearchProtocolViolation
-                | relational::SqlError::TextSearchUnsupported
-                | relational::SqlError::TextSearchNumericOutOfRange
-                | relational::SqlError::TextSearchNullValue
-                | relational::SqlError::TextSearchZeroLength
-                | relational::SqlError::TextSearchInvalidEncoding
-                | relational::SqlError::TextSearchInvalidParameter
-                | relational::SqlError::TextSearchInvalidSubscript
-                | relational::SqlError::TextSearchInvalidText
-                | relational::SqlError::TextSearchInvalidBinary
-                | relational::SqlError::TextSearchInvalidSchema
-                | relational::SqlError::TextSearchSyntax
-                | relational::SqlError::TextSearchInvalidName
-                | relational::SqlError::TextSearchUndefinedObject
-                | relational::SqlError::TextSearchAmbiguousFunction
-                | relational::SqlError::TextSearchDatatypeMismatch
-                | relational::SqlError::TextSearchUndefinedFunction
-                | relational::SqlError::TextSearchProgramLimit
-                | relational::SqlError::TextSearchStatementTooComplex => 69,
+                relational::SqlError::InternalError | relational::SqlError::TextSearchInternal => 69,
                 relational::SqlError::InvalidIndexPredicate => 71,
                 relational::SqlError::UndefinedParameter => 72,
                 relational::SqlError::InvalidName => 73,

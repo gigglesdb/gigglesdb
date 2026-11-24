@@ -44,6 +44,54 @@ fn search_wire_field(body: &[u8], target: u8) -> Option<&str> {
     None
 }
 
+async fn text_search_configuration_wire(f: &Fixture) {
+    let mut stream = raw_pg(f).await;
+    let frames = uuid_array_query_frames(&mut stream, "SET default_text_search_config = 'hindi'").await;
+    assert_eq!(frames.iter().map(|frame| frame.0).collect::<Vec<_>>(), b"CZ");
+    let frames = uuid_array_query_frames(&mut stream, "SHOW default_text_search_config").await;
+    assert_eq!(search_data_row(&frames[1].1), [Some(b"pg_catalog.hindi".as_slice())]);
+
+    let frames = uuid_array_query_frames(&mut stream, "SELECT 1").await;
+    assert_eq!(search_data_row(&frames[1].1), [Some(b"1".as_slice())]);
+    let frames = uuid_array_query_frames(&mut stream, "SELECT to_tsvector('english','cats')").await;
+    assert_eq!(search_data_row(&frames[1].1), [Some(b"'cat':1".as_slice())]);
+
+    for sql in [
+        "SELECT to_tsvector('x')",
+        "SELECT to_tsvector('hindi','x')",
+        "SELECT 'hindi'::regconfig",
+    ] {
+        let frames = uuid_array_query_frames(&mut stream, sql).await;
+        let error = &frames.iter().find(|frame| frame.0 == b'E').expect(sql).1;
+        assert_eq!(search_wire_field(error, b'C'), Some("0A000"), "{sql}");
+        assert_eq!(
+            search_wire_field(error, b'M'),
+            Some("text search configuration \"hindi\" is not supported"),
+            "{sql}"
+        );
+    }
+
+    pg_send(&mut stream, b'P', &parse("default_config", "SELECT to_tsvector($1)")).await;
+    pg_send(&mut stream, b'B', &bind("", "default_config", &[Some("cats")], false)).await;
+    pg_send(&mut stream, b'E', &execute("", 0)).await;
+    let frames = pg_sync(&mut stream).await;
+    let error = &frames.iter().find(|frame| frame.0 == b'E').expect("extended error").1;
+    assert_eq!(search_wire_field(error, b'C'), Some("0A000"));
+    assert_eq!(search_wire_field(error, b'M'), Some("text search configuration \"hindi\" is not supported"));
+    assert_eq!(frames.last().map(|frame| frame.0), Some(b'Z'));
+
+    let frames = uuid_array_query_frames(&mut stream, "SET default_text_search_config = 'english'").await;
+    assert_eq!(frames.iter().map(|frame| frame.0).collect::<Vec<_>>(), b"CZ");
+    let frames = uuid_array_query_frames(&mut stream, "SELECT to_tsvector('cats')").await;
+    assert_eq!(search_data_row(&frames[1].1), [Some(b"'cat':1".as_slice())]);
+
+    pg_send(&mut stream, b'B', &bind("", "default_config", &[Some("cats")], false)).await;
+    pg_send(&mut stream, b'E', &execute("", 0)).await;
+    let frames = pg_sync(&mut stream).await;
+    assert_eq!(frames.iter().map(|frame| frame.0).collect::<Vec<_>>(), b"2DCZ", "{frames:?}");
+    assert_eq!(search_data_row(&frames[1].1), [Some(b"'cat':1".as_slice())]);
+}
+
 async fn text_search_wire(engine: giggles_core::Engine) {
     let f = Fixture::with_app_table_engine(
         "terms",
@@ -51,6 +99,7 @@ async fn text_search_wire(engine: giggles_core::Engine) {
         engine,
     )
     .await;
+    text_search_configuration_wire(&f).await;
     let mut stream = raw_pg(&f).await;
     let vector = hex::decode("000000026361740000010001646f670000010002").unwrap();
     let query = hex::decode("0000000101000063617400").unwrap();
@@ -114,6 +163,61 @@ async fn text_search_wire(engine: giggles_core::Engine) {
         ]
     );
 
+    let sql = "INSERT INTO terms VALUES (2, to_tsvector('english','fat cats'), 'cat'::tsquery)
+        RETURNING v::text, q::text";
+    let frames = uuid_array_query_frames(&mut stream, sql).await;
+    assert_eq!(search_data_row(&frames[1].1), [Some(b"'cat':2 'fat':1".as_slice()), Some(b"'cat'".as_slice())]);
+
+    pg_send(&mut stream, b'P', &parse("fts_insert", "INSERT INTO terms (id,v) VALUES ($1,to_tsvector($2))")).await;
+    pg_send(&mut stream, b'B', &bind("", "fts_insert", &[Some("3"), Some("Running dogs")], false)).await;
+    pg_send(&mut stream, b'E', &execute("", 0)).await;
+    let frames = pg_sync(&mut stream).await;
+    assert_eq!(frames.iter().map(|frame| frame.0).collect::<Vec<_>>(), b"12CZ", "{frames:?}");
+
+    pg_send(&mut stream, b'P', &parse("config_fts", "SELECT to_tsvector($1,$2), to_tsquery($1,$3),
+        plainto_tsquery($1,$2), phraseto_tsquery($1,$2), websearch_to_tsquery($1,$2), ts_headline($1,$2,$3::tsquery)")).await;
+    pg_send(&mut stream, b'D', b"Sconfig_fts\0").await;
+    pg_send(&mut stream, b'B', &bind("", "config_fts", &[Some("english"), Some("Running dogs"), Some("dog")], false)).await;
+    pg_send(&mut stream, b'E', &execute("", 0)).await;
+    let frames = pg_sync(&mut stream).await;
+    assert_eq!(frames.iter().map(|frame| frame.0).collect::<Vec<_>>(), b"1tT2DCZ", "{frames:?}");
+    assert_eq!(&frames[1].1, &[0, 3, 0, 0, 14, 150, 0, 0, 0, 25, 0, 0, 0, 25]);
+    assert_eq!(search_data_row(&frames[4].1).into_iter().flatten().collect::<Vec<_>>(), [
+        b"'dog':2 'run':1".as_slice(), b"'dog'", b"'run' & 'dog'", b"'run' <-> 'dog'", b"'run' & 'dog'", b"Running <b>dogs</b>"
+    ]);
+
+    let frames = uuid_array_query_frames(&mut stream, "SELECT * FROM unnest('a:1'::tsvector)").await;
+    assert!(frames[0].1[2..].starts_with(b"lexeme\0"));
+    assert_eq!(search_type_oids(&frames[0].1), [25, 1005, 1002]);
+
+    let frames = uuid_array_query_frames(&mut stream, "SELECT * FROM ts_debug('english','Running the')").await;
+    assert_eq!(search_type_oids(&frames[0].1), [25, 25, 25, 3770, 3769, 1009]);
+    let row = search_data_row(&frames[1].1);
+    assert_eq!(row[3], Some(b"{english_stem}".as_slice()));
+    assert_eq!(row[4], Some(b"english_stem".as_slice()));
+    assert_eq!(row[5], Some(b"{run}".as_slice()));
+
+    pg_send(&mut stream, b'P', &parse("fts_dict", "SELECT dictionaries, dictionary FROM ts_debug('english','Running')")).await;
+    pg_send(&mut stream, b'B', &bind("", "fts_dict", &[], true)).await;
+    pg_send(&mut stream, b'E', &execute("", 0)).await;
+    let frames = pg_sync(&mut stream).await;
+    let row = search_data_row(&frames.iter().find(|frame| frame.0 == b'D').expect("DataRow").1);
+    let dictionary_oid = giggles_core::relational::text_search_types::input(&giggles_core::relational::DataType::RegDictionary, "english_stem").unwrap();
+    let giggles_core::relational::Value::Int(dictionary_oid) = dictionary_oid else { unreachable!() };
+    let dictionary_oid = u32::try_from(dictionary_oid).unwrap();
+    let array = [1u32, 0, 3769, 1, 1, 4, dictionary_oid].into_iter()
+        .flat_map(u32::to_be_bytes).collect::<Vec<_>>();
+    assert_eq!(row, [Some(array.as_slice()), Some(dictionary_oid.to_be_bytes().as_slice())]);
+
+    for (sql, types, first) in [
+        ("SELECT * FROM ts_parse('default','Running')", &[23, 25][..], &b"Running"[..]),
+        ("SELECT * FROM ts_token_type(3722::oid) LIMIT 1", &[23, 25, 25][..], &b"asciiword"[..]),
+    ] {
+        let frames = uuid_array_query_frames(&mut stream, sql).await;
+        assert_eq!(search_type_oids(&frames[0].1), types);
+        assert_eq!(search_data_row(&frames[1].1)[1], Some(first));
+    }
+
     let notice_sql = "SELECT to_tsquery('english','the')";
     let simple = uuid_array_query_frames(&mut stream, notice_sql).await;
     pg_send(&mut stream, b'P', &parse("fts_notice", notice_sql)).await;
@@ -154,6 +258,12 @@ async fn text_search_wire(engine: giggles_core::Engine) {
         assert_eq!(search_wire_field(error, b'M'), Some(message), "{sql}");
     }
 
+    let frames = uuid_array_query_frames(&mut stream,
+        "SELECT oprcode FROM pg_operator WHERE oprname = '@@' ORDER BY oid").await;
+    let names = frames.iter().filter(|frame| frame.0 == b'D')
+        .map(|frame| search_data_row(&frame.1)[0].unwrap()).collect::<Vec<_>>();
+    assert_eq!(names, [b"ts_match_vq", b"ts_match_qv", b"ts_match_tt", b"ts_match_tq"]);
+
     let (pg, connection) = f.pg(f.app.clone()).await;
     let row = pg.query_one(
         "SELECT data_type, udt_name FROM information_schema.columns WHERE table_name='terms' AND column_name='v'", &[],
@@ -167,6 +277,15 @@ async fn text_search_wire(engine: giggles_core::Engine) {
     assert_eq!(row.get::<_, i16>(1), -1);
     assert_eq!(row.get::<_, &str>(2), "U");
     assert_eq!(row.get::<_, u32>(3), 3645);
+    let operators = pg.query(
+        "SELECT oid, oprleft::oid, oprright::oid, oprresult::oid, oprcode::oid
+         FROM pg_operator WHERE oprname = '@@' ORDER BY oid", &[],
+    ).await.unwrap();
+    assert_eq!(
+        operators.iter().map(|row| std::array::from_fn(|i| row.get::<_, u32>(i))).collect::<Vec<_>>(),
+        [[3636, 3614, 3615, 16, 3634], [3637, 3615, 3614, 16, 3635],
+         [3762, 25, 25, 16, 3760], [3763, 25, 3615, 16, 3761]]
+    );
     drop(pg);
     connection.abort();
 }

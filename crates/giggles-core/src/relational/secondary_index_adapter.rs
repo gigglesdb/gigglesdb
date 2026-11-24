@@ -503,7 +503,7 @@ impl Serialize for StatementRows<'_> {
 }
 impl Serialize for StatementNamespace5<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let extended = !self.source.ext.is_empty();
+        let extended = !self.source.ext.namespace5_ext_is_empty();
         let format = if extended { 2u32 } else { 1u32 };
         let mut s = serializer.serialize_struct("Relational", if extended { 8 } else { 7 })?;
         s.serialize_field("format", &format)?;
@@ -1252,7 +1252,7 @@ impl Serialize for Relational {
 struct LegacyNamespace5<'a>(&'a Relational);
 impl Serialize for LegacyNamespace5<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let extended = !self.0.ext.is_empty();
+        let extended = !self.0.ext.namespace5_ext_is_empty();
         let format = if extended { 2u32 } else { 1u32 };
         let mut s = serializer.serialize_struct("Relational", if extended { 8 } else { 7 })?;
         s.serialize_field("format", &format)?;
@@ -1311,7 +1311,7 @@ impl<'de> Deserialize<'de> for Relational {
                 };
                 if format == 2 {
                     value.ext = Arc::new(field!("ext"));
-                    if value.ext.is_empty() {
+                    if value.ext.namespace5_ext_is_empty() {
                         return Err(A::Error::custom("empty format-2 catalog extension"));
                     }
                     for table in std::sync::Arc::make_mut(&mut value.tables).values_mut() {

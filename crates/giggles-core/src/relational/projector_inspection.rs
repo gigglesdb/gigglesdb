@@ -148,6 +148,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generated_columns_and_gin_are_not_plain_catalog_content() {
+        let mut state = Relational::default();
+        for text in [
+            "CREATE TABLE projected (id int PRIMARY KEY, doubled int GENERATED ALWAYS AS (id * 2) STORED)",
+            "INSERT INTO projected VALUES (3)",
+        ] {
+            let statement = Prepared::parse(text, 1, state.epoch).unwrap();
+            state.execute(&statement, &[], None).unwrap();
+        }
+        let table_id = state.tables["projected"].id;
+        assert!(state.ext.namespace5_ext_is_empty());
+        assert_eq!(
+            state.with_complete_table_engine(table_id, || false, |_, _| Ok(())),
+            Err(SqlError::Unsupported),
+        );
+        assert_eq!(
+            state.canonical_pk_engine(table_id, &[Value::Int(3)], || false),
+            Err(SqlError::Unsupported),
+        );
+        assert!(matches!(
+            state.projector_counters_engine(state.epoch, state.generation, &mut || false),
+            Err(SqlError::Unsupported),
+        ));
+
+        let mut state = Relational::default();
+        for text in [
+            "CREATE TABLE indexed (id int PRIMARY KEY, terms text[])",
+            "CREATE INDEX terms_gin ON indexed USING gin (terms)",
+        ] {
+            let statement = Prepared::parse(text, 1, state.epoch).unwrap();
+            state.execute(&statement, &[], None).unwrap();
+        }
+        let extension = CatalogExt { gin_indexes: state.ext.gin_indexes.clone(), ..CatalogExt::default() };
+        assert!(extension.namespace5_ext_is_empty());
+        assert!(!extension.is_empty());
+    }
+
     fn fixture(data_type: DataType) -> Relational {
         let table = TableDef {
             id: 1,

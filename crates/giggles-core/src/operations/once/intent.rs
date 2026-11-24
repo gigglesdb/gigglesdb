@@ -191,7 +191,7 @@ impl Writer {
             | DataType::TextArray
             | DataType::UuidArray
             | DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
-            | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray
+            | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray | DataType::RegDictionaryArray
             | DataType::Text
             | DataType::Varchar
             | DataType::Bpchar => 4,

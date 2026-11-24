@@ -85,6 +85,9 @@ fn signatures(name: &str) -> &'static [Signature] {
             (&[RegConfig, Text, TsQuery, Text], Text, true),
         ],
         "ts_rewrite" => &[(&[TsQuery, TsQuery, TsQuery], TsQuery, true)],
+        "ts_debug" => &[(&[Text], Text, false), (&[RegConfig, Text], Text, false)],
+        "ts_parse" => &[(&[Text, Text], Text, true), (&[Oid, Text], Text, true)],
+        "ts_token_type" => &[(&[Text], Text, true), (&[Oid], Text, true)],
         "ts_lexize" => &[(&[RegDictionary, Text], TextArray, true)],
         "get_current_ts_config" => &[(&[], RegConfig, false)],
         "\0ts_length" => &[(&[TsVector], Integer, true)],
@@ -113,7 +116,7 @@ fn compatible(source: &DataType, target: &DataType) -> bool {
     source == target
         || matches!(
             (source, target),
-            (Varchar | Bpchar, Text) | (SmallInt, Integer)
+            (Varchar | Bpchar, Text) | (SmallInt, Integer) | (SmallInt | Integer | BigInt, Oid)
         )
 }
 
@@ -259,7 +262,31 @@ pub(super) fn infer(
     Ok(())
 }
 
-fn text(value: &Value) -> R<&str> {
+pub(in crate::relational::query) fn bind_row_args(
+    name: &str, args: &[Scalar], parameters: &mut [Option<DataType>],
+) -> R<Vec<BoundScalar>> {
+    let no_columns = |_: &ColumnRef, _: usize| Err(SqlError::UnknownColumn);
+    infer(name, args, parameters, &no_columns, &[])?;
+    let bound = bind(name, args, &no_columns, &[], parameters)?;
+    let Node::Call(_, args) = bound.node else { unreachable!() };
+    Ok(args)
+}
+
+pub(in crate::relational::query) fn row_arg_types(
+    name: &str, types: &[Option<DataType>],
+) -> R<()> {
+    if signatures(name).iter().any(|(sig, _, _)| {
+        sig.len() == types.len() && sig.iter().zip(types).all(|(target, source)| {
+            source.as_ref().is_none_or(|source| compatible(source, target))
+        })
+    }) {
+        Ok(())
+    } else {
+        Err(function_error(name, types, false))
+    }
+}
+
+pub(in crate::relational::query) fn text(value: &Value) -> R<&str> {
     match value {
         Value::Text(text) => Ok(text),
         _ => Err(SqlError::Type),
@@ -273,7 +300,7 @@ fn int(value: &Value) -> R<i64> {
     }
 }
 
-fn config(value: &Value) -> R<Config> {
+pub(in crate::relational::query) fn config(value: &Value) -> R<Config> {
     let oid = int(value)? as u32;
     Config::from_oid(oid).ok_or_else(|| {
         types::error_message(
@@ -287,7 +314,7 @@ fn config_arg<'a>(args: &[BoundScalar], values: &'a [Value]) -> R<(Config, &'a [
     if args[0].ty == RegConfig {
         Ok((config(&values[0])?, &values[1..]))
     } else {
-        Ok((types::default_config(), values))
+        Ok((types::default_config()?, values))
     }
 }
 
@@ -441,11 +468,11 @@ pub(super) fn eval(name: &str, args: &[BoundScalar], values: &[Value]) -> R<Valu
             (TsVector, TsQuery) => ts::ts_match(&vector(first())?, &query(second())?),
             (TsQuery, TsVector) => ts::ts_match(&vector(second())?, &query(first())?),
             (Text, TsQuery) => with_notices(
-                ts::ts_match_text(types::default_config(), text(first())?, &query(second())?)
+                ts::ts_match_text(types::default_config()?, text(first())?, &query(second())?)
                     .map_err(diagnostic)?,
             ),
             (Text, Text) => with_notices(
-                ts::ts_match_text_text(types::default_config(), text(first())?, text(second())?)
+                ts::ts_match_text_text(types::default_config()?, text(first())?, text(second())?)
                     .map_err(diagnostic)?,
             ),
             _ => return Err(SqlError::Type),
@@ -479,7 +506,7 @@ pub(super) fn eval(name: &str, args: &[BoundScalar], values: &[Value]) -> R<Valu
                     .map(String::as_str),
             )
         }
-        "get_current_ts_config" => Value::Int(types::default_config().oid().into()),
+        "get_current_ts_config" => Value::Int(types::default_config()?.oid().into()),
         _ => return Err(SqlError::UndefinedFunction),
     })
 }

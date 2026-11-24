@@ -227,13 +227,19 @@ pub(super) fn alter(
     table: &TableDef,
     column: &ColumnDef,
     expression: Option<&Definition>,
+    if_exists: bool,
     cancel: &mut impl FnMut() -> bool,
 ) -> R<()> {
     let Some(generation) = state.generated_column(column.id) else {
-        user_types::view_replace_error(format!(
+        let message = format!(
             "column \"{}\" of relation \"{}\" is not a generated column",
             column.name, table.name
-        ));
+        );
+        if if_exists {
+            user_types::sql_notice(format!("{message}, skipping"), "00000");
+            return Ok(());
+        }
+        user_types::view_replace_error(message);
         return Err(SqlError::ObjectNotInPrerequisiteState);
     };
     let Some(expression) = expression else {
@@ -336,7 +342,10 @@ impl Relational {
                     column.name != HIDDEN_ROWID && column.not_null && *value == Value::Null
                 };
                 if null {
-                    logical_types::not_null_violation(table, column, values);
+                    let detail = logical_types::failing_row_detail_with(table, values, |id| {
+                        self.generated_column(id).is_some_and(|generation| !generation.stored)
+                    });
+                    logical_types::not_null_violation(table, column, detail);
                     user_types::sql_error_names(self, table, Some(&column.name), None);
                     return Err(SqlError::Null);
                 }

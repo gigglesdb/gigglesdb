@@ -1,5 +1,5 @@
 // Port of PostgreSQL 18.6 tsvector_op.c matching and phrase execution.
-// Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group.
+// Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group.
 use crate::{
     Config, SearchResult, TsError, TsQuery, TsVector, plainto_tsquery,
     query::{Node, Operand, Operator},

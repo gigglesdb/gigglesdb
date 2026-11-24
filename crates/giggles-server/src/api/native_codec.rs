@@ -696,7 +696,7 @@ fn column(v: ColumnDef) -> p::NativeColumn {
             DataType::BigInt => 4,
             DataType::RegType
             | DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
-            | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray
+            | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray | DataType::RegDictionaryArray
             | DataType::Uuid
             | DataType::Jsonb
             | DataType::IntArray
@@ -960,6 +960,7 @@ fn catalog_type_name(v: &DataType) -> &'static str {
         DataType::RealArray => "RealArray",
         DataType::PgCharArray => "PgCharArray",
         DataType::SmallIntArray => "SmallIntArray",
+        DataType::RegDictionaryArray => "RegDictionaryArray",
     }
 }
 pub(crate) fn encode_catalog_outcome(v: o::CatalogOutcome, canonical_table: String) -> p::NativeCatalogOutcome {

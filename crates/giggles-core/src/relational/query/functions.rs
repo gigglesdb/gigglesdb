@@ -3183,6 +3183,7 @@ pub(super) fn cast_type_name(ty: &DataType) -> &'static str {
         DataType::UuidArray => "uuid",
         DataType::RealArray => "float4",
         DataType::SmallIntArray => "int2",
+        DataType::RegDictionaryArray => "regdictionary",
         DataType::PgChar | DataType::PgCharArray => "char",
         DataType::TsQuery | DataType::TsVector | DataType::RegConfig | DataType::RegDictionary | DataType::Oid =>
             ty.text_search_name().unwrap(),

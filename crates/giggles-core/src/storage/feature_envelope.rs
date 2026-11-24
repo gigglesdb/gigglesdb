@@ -17,9 +17,9 @@ pub(super) const NEW_BITS: u64 =
         | PARTIAL_INDEXES | TEMPORAL_INDEXES | GENERATED_COLUMNS | TEXT_SEARCH_TYPES | GIN_INDEXES;
 pub(super) const ROLE_BOOTSTRAP: u64 = 1 << 9;
 
-/// E1 B0b: true when CatalogExt is nonempty.
+/// E1 B0b: true when the base namespace-5 extension is nonempty.
 fn catalog_ext_present(s: &State) -> bool {
-    !s.sql.catalog_ext().is_empty()
+    !s.sql.catalog_ext().namespace5_ext_is_empty()
 }
 /// Extended scalar metadata requires feature bit seven.
 fn extended_types_present(s: &State) -> bool {

@@ -1,6 +1,6 @@
 // Port of PostgreSQL 18.6 wparser_def.c headline selection, ts_parse.c
 // headline parsing and formatting, and tsearchcmds.c option parsing.
-// Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group.
+// Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group.
 use crate::{
     Config, Parser, SearchResult, TsError, TsQuery, locale,
     matching::{Hit, Phrase, execute, locations},

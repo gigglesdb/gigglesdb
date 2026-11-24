@@ -582,10 +582,6 @@ impl Diagnostic {
                 self.wire_message = Some(format!("invalid value for parameter \"bytea_output\": \"{value}\""));
                 self.wire_hint = Some("Available values: escape, hex.".into());
             }),
-            Show::DefaultTextSearchConfig => text_search_types::config_setting(value).map(|_| ()).ok_or_else(|| {
-                self.wire_message = Some(format!("invalid value for parameter \"default_text_search_config\": \"{value}\""));
-                "22023"
-            }),
             _ => Ok(()),
         }
     }
@@ -729,7 +725,7 @@ pub fn oid(t: &DataType) -> u32 {
         DataType::RegType => 2206,
         DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
         | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray
-        | DataType::SmallIntArray => t.text_search_oid().unwrap(),
+        | DataType::SmallIntArray | DataType::RegDictionaryArray => t.text_search_oid().unwrap(),
 
         DataType::Bytes => 17,
         DataType::Numeric => 1700,
@@ -754,7 +750,7 @@ fn size(t: &DataType) -> i16 {
         DataType::RegType | DataType::RegConfig | DataType::RegDictionary | DataType::Oid => 4,
         DataType::PgChar => 1,
         DataType::TsVector | DataType::TsQuery | DataType::RealArray | DataType::PgCharArray
-        | DataType::SmallIntArray => -1,
+        | DataType::SmallIntArray | DataType::RegDictionaryArray => -1,
         DataType::Uuid => 16,
         DataType::Jsonb | DataType::IntArray | DataType::BigIntArray | DataType::TextArray
         | DataType::UuidArray => -1,
@@ -858,7 +854,7 @@ fn decode_with_order(
             DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
             | DataType::Oid | DataType::PgChar => text_search_types::input(ty, s)
                 .map_err(|error| giggles_core::sqlstate(&CoreError::Sql(error))),
-            DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray => {
+            DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray | DataType::RegDictionaryArray => {
                 giggles_core::relational::logical_types::array_values(s).map_err(|_| "22P02")?;
                 Ok(Value::Text(s.into()))
             }
@@ -1384,6 +1380,7 @@ fn core_declared_type(oid: u32) -> Option<DataType> {
         1021 => Some(DataType::RealArray),
         1002 => Some(DataType::PgCharArray),
         1005 => Some(DataType::SmallIntArray),
+        3770 => Some(DataType::RegDictionaryArray),
 
         1700 => Some(DataType::Numeric),
         700 => Some(DataType::Real),
@@ -2150,8 +2147,8 @@ impl State {
         session.set_default_isolation(&self.settings.current);
         if tag == b'E' { statement_deadline(&self.settings.current); }
         giggles_core::relational::take_sql_notices();
-        let config = self.settings.current.default_text_search_config.clone();
-        let result = text_search_types::with_default_config(&config, || {
+        let config = self.settings.default_text_search_config().to_owned();
+        let result = text_search_types::with_default_config(config, || {
             self.handle_inner(tag, b, session, out, received)
         });
         if !session.in_transaction() {
@@ -4685,7 +4682,7 @@ mod task_release_tests;
 #[path = "pgwire_task_catalog_tests.rs"]
 mod task_catalog_tests;
 fn text_search_array(ty: &DataType) -> bool {
-    matches!(ty, DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray)
+    matches!(ty, DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray | DataType::RegDictionaryArray)
 }
 
 fn logical_binary_output(ty: &DataType, s: &str, type_oid: u32) -> R<Vec<u8>> {
@@ -4707,6 +4704,7 @@ fn logical_binary_output(ty: &DataType, s: &str, type_oid: u32) -> R<Vec<u8>> {
         DataType::RealArray => 700,
         DataType::PgCharArray => 18,
         DataType::SmallIntArray => 21,
+        DataType::RegDictionaryArray => 3769,
         _ => 25,
     };
     let mut b = Vec::new();
@@ -4734,6 +4732,12 @@ fn logical_binary_output(ty: &DataType, s: &str, type_oid: u32) -> R<Vec<u8>> {
                 DataType::RealArray => giggles_pg_types::Float4::parse(&s).map_err(numeric_error)?.to_binary().to_vec(),
                 DataType::PgCharArray => vec![s.bytes().next().unwrap_or(0)],
                 DataType::SmallIntArray => s.parse::<i16>().map_err(|_| "22P02")?.to_be_bytes().to_vec(),
+                DataType::RegDictionaryArray => {
+                    let value = text_search_types::input(&DataType::RegDictionary, &s)
+                        .map_err(|error| giggles_core::sqlstate(&CoreError::Sql(error)))?;
+                    text_search_types::binary_output(&DataType::RegDictionary, &value)
+                        .map_err(|error| giggles_core::sqlstate(&CoreError::Sql(error)))?
+                }
                 _ => s.into_bytes(),
             };
             b.extend_from_slice(&(v.len() as i32).to_be_bytes());
@@ -4800,6 +4804,7 @@ fn logical_binary_input(
         DataType::RealArray => 700,
         DataType::PgCharArray => 18,
         DataType::SmallIntArray => 21,
+        DataType::RegDictionaryArray => 3769,
         _ => 25,
     };
     // The parameter's enum type determines how to decode the labels, independent of the header OID.
@@ -4839,6 +4844,12 @@ fn logical_binary_input(
             DataType::RealArray if len == 4 => giggles_pg_types::Float4::from_binary(v).map_err(numeric_error)?.to_text_with_extra_float_digits(1).map_err(numeric_error)?,
             DataType::PgCharArray if len == 1 => array_quote(&if v[0] == 0 { String::new() } else { char::from(v[0]).to_string() }),
             DataType::SmallIntArray if len == 2 => i16::from_be_bytes(v.try_into().unwrap()).to_string(),
+            DataType::RegDictionaryArray if len == 4 => {
+                let value = text_search_types::binary_input(&DataType::RegDictionary, v)
+                    .map_err(|error| giggles_core::sqlstate(&CoreError::Sql(error)))?;
+                text_search_types::output(&DataType::RegDictionary, &value)
+                    .map_err(|error| giggles_core::sqlstate(&CoreError::Sql(error)))?
+            }
             DataType::TextArray => {
                 let text = if let Some(diagnostic) = enum_array_diagnostic.as_deref_mut() {
                     enum_array_label(v, diagnostic)?

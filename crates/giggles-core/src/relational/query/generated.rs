@@ -241,6 +241,15 @@ pub(in crate::relational) fn bind_definition(
     generated: &BTreeSet<u64>,
 ) -> R<GeneratedColumn> {
     if let Some(at) = definition.tokens.windows(2).position(|tokens| matches!(tokens,
+        [Token::Symbol('('), Token::Word(word)] if matches!(word.as_str(), "select" | "with" | "values" | "table")))
+    {
+        if let Some(position) = definition.locations.get(at) {
+            user_types::sql_error_position(*position);
+        }
+        user_types::view_replace_error("cannot use subquery in column generation expression".into());
+        return Err(SqlError::Unsupported);
+    }
+    if let Some(at) = definition.tokens.windows(2).position(|tokens| matches!(tokens,
         [Token::Word(name) | Token::QuotedIdent(name), Token::Symbol('(')] if Aggregate::from_name(name).is_some()))
     {
         if let Some(position) = definition.locations.get(at) {

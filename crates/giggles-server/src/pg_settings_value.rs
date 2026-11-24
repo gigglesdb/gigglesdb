@@ -201,14 +201,6 @@ impl Entry {
         input: &str,
         database: Option<&str>,
     ) -> Result<String, Error> {
-        // SELECT cfgnamespace::regnamespace, cfgname FROM pg_ts_config on PG 18.6.
-        const CONFIGS: &[&str] = &[
-            "arabic", "armenian", "basque", "catalan", "danish", "dutch", "english",
-            "estonian", "finnish", "french", "german", "greek", "hindi", "hungarian",
-            "indonesian", "irish", "italian", "lithuanian", "nepali", "norwegian",
-            "portuguese", "romanian", "russian", "serbian", "simple", "spanish",
-            "swedish", "tamil", "turkish", "yiddish",
-        ];
         let parts = text_search_name(input).ok_or_else(|| self.invalid(input))?;
         let (schema, name) = match parts.as_slice() {
             [name] => ("pg_catalog", name),
@@ -227,7 +219,7 @@ impl Entry {
                 ));
             }
         };
-        if schema != "pg_catalog" || !CONFIGS.contains(&name.as_str()) {
+        if schema != "pg_catalog" || !giggles_core::relational::text_search_types::is_builtin_config(name) {
             return Err(self.invalid(input));
         }
         Ok(format!("pg_catalog.{name}"))

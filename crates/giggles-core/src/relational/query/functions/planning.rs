@@ -598,8 +598,10 @@ impl BoundScalar {
                         || self.ty == DataType::Text
                             && (number(&value.ty) || value.ty == DataType::Boolean))
             }
-            Node::Call(name, args) if random_uuid::known(name) || uuid_ossp::known(name) || name == "coalesce"
-                || greatest::known_name(name) || name == array_constructor::NAME => {
+            Node::Call(name, args)
+                if text_search::known(name) || random_uuid::known(name) || uuid_ossp::known(name)
+                    || name == "coalesce" || greatest::known_name(name) || name == array_constructor::NAME =>
+            {
                 args.iter().all(Self::insert_input_only)
             }
             Node::Call(name, args) => {

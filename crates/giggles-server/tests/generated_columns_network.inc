@@ -1,6 +1,8 @@
 async fn generated_columns_over_pgwire(engine: giggles_core::Engine) {
     use giggles_core::roles::NewRole;
     use giggles_server::auth::{PostgresqlConfig, TlsMode, scram::Verifier, serve_postgresql};
+    use futures_core::Stream;
+    use tokio_postgres::{binary_copy::BinaryCopyInWriter, types::Type};
     use tokio_postgres::SimpleQueryMessage;
 
     let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
@@ -45,7 +47,16 @@ async fn generated_columns_over_pgwire(engine: giggles_core::Engine) {
         .connect(tokio_postgres::NoTls)
         .await
         .unwrap();
-    let connection = tokio::spawn(connection);
+    let (send_notice, mut notices) = tokio::sync::mpsc::unbounded_channel();
+    let mut connection = connection;
+    let connection = tokio::spawn(async move {
+        while let Some(message) = std::future::poll_fn(|cx| connection.poll_message(cx)).await {
+            if let tokio_postgres::AsyncMessage::Notice(notice) = message? {
+                let _ = send_notice.send(notice);
+            }
+        }
+        Ok::<_, tokio_postgres::Error>(())
+    });
     client.batch_execute("
         CREATE TABLE articles (
             id integer PRIMARY KEY,
@@ -174,6 +185,78 @@ async fn generated_columns_over_pgwire(engine: giggles_core::Engine) {
         error.detail(),
         Some("Key (summary)=(Grace Hopper) already exists.")
     );
+    client.batch_execute("
+        CREATE TABLE f1 (id int PRIMARY KEY, a int,
+            s int GENERATED ALWAYS AS (a * 2) STORED,
+            v int GENERATED ALWAYS AS (nullif(a, -10)) VIRTUAL NOT NULL);
+        INSERT INTO f1 VALUES (1,5);
+        CREATE TABLE only_gen (v int GENERATED ALWAYS AS (5) STORED);
+        INSERT INTO only_gen DEFAULT VALUES;
+    ").await.unwrap();
+    {
+        let copy = client.copy_in("COPY f1 FROM STDIN WITH (FORMAT binary)").await.unwrap();
+        let mut copy = std::pin::pin!(BinaryCopyInWriter::new(copy, &[Type::INT4, Type::INT4]));
+        copy.as_mut().write(&[&2i32, &6i32]).await.unwrap();
+        assert_eq!(copy.as_mut().finish().await.unwrap(), 1);
+    }
+    for (sql, expected) in [
+        ("COPY f1 TO STDOUT WITH (FORMAT csv, HEADER)", "id,a\n1,5\n2,6\n"),
+        ("COPY f1 (a,id) TO STDOUT WITH (FORMAT csv, HEADER)", "a,id\n5,1\n6,2\n"),
+        ("COPY only_gen TO STDOUT", "\n"),
+        ("COPY (SELECT * FROM f1 ORDER BY id) TO STDOUT", "1\t5\t10\t5\n2\t6\t12\t6\n"),
+    ] {
+        let copy = client.copy_out(sql).await.unwrap();
+        let mut copy = std::pin::pin!(copy);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = std::future::poll_fn(|cx| copy.as_mut().poll_next(cx)).await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(bytes, expected.as_bytes(), "{sql}");
+    }
+    let errors = [
+        (client.copy_out("COPY f1 (v) TO STDOUT").await.err().unwrap(), "v"),
+        (client.copy_out("COPY f1 TO STDOUT WITH (FORMAT csv, FORCE_QUOTE(s))").await.err().unwrap(), "s"),
+        (client.copy_in::<_, bytes::Bytes>("COPY f1 (s) FROM STDIN").await.err().unwrap(), "s"),
+    ];
+    for (error, column) in errors {
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), "42P10");
+        assert_eq!(error.message(), format!("column \"{column}\" is a generated column"));
+        assert_eq!(error.detail(), Some("Generated columns cannot be used in COPY."));
+    }
+
+    for (sql, state, message) in [
+        ("CREATE TABLE both_default (a int DEFAULT 1 GENERATED ALWAYS AS (2) STORED)",
+         "42601", "both default and generation expression specified for column \"a\" of table \"both_default\""),
+        ("CREATE TABLE sub (a int GENERATED ALWAYS AS ((SELECT 1)) STORED)",
+         "0A000", "cannot use subquery in column generation expression"),
+    ] {
+        let error = client.simple_query(sql).await.unwrap_err();
+        let error = error.as_db_error().unwrap();
+        assert_eq!((error.code().code(), error.message()), (state, message));
+    }
+    let error = client.simple_query("INSERT INTO f1 VALUES (5,-10)").await.unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "23502");
+    assert_eq!(error.detail(), Some("Failing row contains (5, -10, -20, virtual)."));
+    client.batch_execute("ALTER TABLE f1 ALTER COLUMN a DROP EXPRESSION IF EXISTS").await.unwrap();
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(5), notices.recv()).await.unwrap().unwrap();
+    assert_eq!(notice.code().code(), "00000");
+    assert_eq!(notice.message(), "column \"a\" of relation \"f1\" is not a generated column, skipping");
+
+    if engine == giggles_core::Engine::V2 {
+        client.batch_execute("CREATE VIEW fv AS SELECT s FROM f1; CREATE VIEW fv2 AS SELECT * FROM fv").await.unwrap();
+        let error = client.simple_query("ALTER TABLE f1 DROP COLUMN s RESTRICT").await.unwrap_err();
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), "2BP01");
+        assert_eq!(error.detail(), Some("view fv depends on column s of table f1\nview fv2 depends on view fv"));
+        client.batch_execute("ALTER TABLE f1 DROP COLUMN s CASCADE").await.unwrap();
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(5), notices.recv()).await.unwrap().unwrap();
+        assert_eq!(notice.code().code(), "00000");
+        assert_eq!(notice.message(), "drop cascades to 2 other objects");
+        assert_eq!(notice.detail(), Some("drop cascades to view fv\ndrop cascades to view fv2"));
+    }
+
     drop(client);
     connection.await.unwrap().unwrap();
     running.shutdown().await.unwrap();

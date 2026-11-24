@@ -301,3 +301,111 @@ fn generated_columns_v2_lifecycle() {
 fn generated_columns_v2_diagnostics() {
     diagnostics(Engine::V2);
 }
+
+
+fn review_fixes(engine: Engine) {
+    use giggles_core::{
+        CoreError,
+        relational::{Scan, take_sql_error_message, take_sql_notices},
+    };
+    let path = common::fresh("generated-column-review");
+    let limits = Limits::default();
+    let admin = Admin::create_engine(&path, limits, engine).unwrap();
+    let mut sql = admin.sql_session();
+    run(&mut sql, "CREATE TABLE f1 (
+        id int PRIMARY KEY, a int,
+        s int GENERATED ALWAYS AS (a * 2) STORED,
+        v int GENERATED ALWAYS AS (nullif(a, -10)) VIRTUAL NOT NULL
+    )");
+    run(&mut sql, "INSERT INTO f1 VALUES (1,5)");
+    let columns = sql.copy_output_columns("f1", &[]).unwrap().unwrap();
+    assert_eq!(columns.into_iter().map(|col| col.name).collect::<Vec<_>>(), ["id", "a"]);
+
+    let (copy, _) = sql.prepare_copy("COPY f1 FROM STDIN").unwrap();
+    let columns = sql.copy_columns(&copy).unwrap();
+    assert_eq!(columns.into_iter().map(|col| col.name).collect::<Vec<_>>(), ["id", "a"]);
+    let error = sql.copy_output_columns("f1", &["v".into()]).unwrap_err();
+    assert_eq!(sqlstate(&error), "42P10");
+    assert_eq!(take_sql_error_message().as_deref(), Some("column \"v\" is a generated column"));
+    assert_eq!(take_sql_error_detail().as_deref(), Some("Generated columns cannot be used in COPY."));
+    let err = sql.prepare_copy("COPY f1 (s) FROM STDIN").unwrap_err();
+    assert_eq!(sqlstate(&err), "42P10");
+    assert_eq!(take_sql_error_message().as_deref(), Some("column \"s\" is a generated column"));
+    assert_eq!(take_sql_error_detail().as_deref(), Some("Generated columns cannot be used in COPY."));
+
+    rejects(&mut sql, "CREATE TABLE both_default (a int DEFAULT 1 GENERATED ALWAYS AS (2) STORED)", "42601");
+    assert_eq!(take_sql_error_message().as_deref(),
+        Some("both default and generation expression specified for column \"a\" of table \"both_default\""));
+    rejects(&mut sql, "CREATE TABLE bad_default (a int DEFAULT 'foo' GENERATED ALWAYS AS (2) STORED)", "42601");
+    assert_eq!(take_sql_error_message().as_deref(),
+        Some("both default and generation expression specified for column \"a\" of table \"bad_default\""));
+    rejects(&mut sql, "CREATE TABLE sub (a int GENERATED ALWAYS AS ((SELECT 1)) STORED)", "0A000");
+    assert_eq!(take_sql_error_message().as_deref(), Some("cannot use subquery in column generation expression"));
+    run(&mut sql, "ALTER TABLE f1 ALTER COLUMN a DROP EXPRESSION IF EXISTS");
+    let notices = take_sql_notices();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].0, "column \"a\" of relation \"f1\" is not a generated column, skipping");
+
+    rejects(&mut sql, "INSERT INTO f1 VALUES (5,-10)", "23502");
+    assert_eq!(take_sql_error_detail().as_deref(), Some("Failing row contains (5, -10, -20, virtual)."));
+    drop(sql);
+    drop(admin);
+
+    let admin = Admin::open(&path, limits).unwrap();
+    if engine == Engine::Legacy {
+        assert_eq!(admin.logical_export_catalog(), Err(CoreError::Unsupported));
+    }
+    let mut sql = admin.sql_session();
+    run(&mut sql, "BEGIN");
+    for prefix in [vec![Value::Int(1)], vec![]] {
+        let result = sql.scan(Scan {
+            table: "f1".into(), projection: vec!["v".into(), "s".into()], prefix,
+            lower: None, upper: None, reverse: false, limit: 2,
+        }).unwrap();
+        assert_eq!(result.rows[0].values, vec![Value::Int(5), Value::Int(10)]);
+    }
+
+    run(&mut sql, "COMMIT");
+    if engine == Engine::V2 {
+        run(&mut sql, "CREATE VIEW fv AS SELECT s FROM f1");
+        run(&mut sql, "CREATE VIEW fv2 AS SELECT * FROM fv");
+        rejects(&mut sql, "ALTER TABLE f1 DROP COLUMN s RESTRICT", "2BP01");
+        assert_eq!(take_sql_error_detail().as_deref(),
+            Some("view fv depends on column s of table f1\nview fv2 depends on view fv"));
+        run(&mut sql, "ALTER TABLE f1 DROP COLUMN s CASCADE");
+        let notices = take_sql_notices();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].0, "drop cascades to 2 other objects");
+        assert_eq!(notices[0].1.as_deref(), Some("drop cascades to view fv\ndrop cascades to view fv2"));
+        rejects(&mut sql, "SELECT * FROM fv2", "42P01");
+        for statement in [
+            "CREATE SCHEMA s",
+            r#"CREATE TABLE s."Mixed Table" (id int PRIMARY KEY, "With Space" int)"#,
+            r#"CREATE VIEW s."z First" AS SELECT "With Space" FROM s."Mixed Table""#,
+            r#"CREATE VIEW s."a Second" AS SELECT "With Space" FROM s."Mixed Table""#,
+            r#"CREATE VIEW s."y Child" AS SELECT * FROM s."z First""#,
+        ] {
+            run(&mut sql, statement);
+        }
+        rejects(&mut sql, r#"ALTER TABLE s."Mixed Table" DROP COLUMN "With Space""#, "2BP01");
+        assert_eq!(take_sql_error_detail().as_deref(), Some(concat!(
+            "view s.\"z First\" depends on column With Space of table s.\"Mixed Table\"\n",
+            "view s.\"y Child\" depends on view s.\"z First\"\n",
+            "view s.\"a Second\" depends on column With Space of table s.\"Mixed Table\"",
+        )));
+    }
+    drop(sql);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn generated_columns_review_legacy() {
+    review_fixes(Engine::Legacy);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn generated_columns_review_v2() {
+    review_fixes(Engine::V2);
+}

@@ -935,6 +935,8 @@ pub(crate) struct CopyOutput {
     pub encoding: Option<giggles_core::relational::CopyEncoding>,
     pub destination: CopyDestination,
     pub table_name: Option<String>,
+    pub relation_key: String,
+    pub columns: Vec<String>,
     pub all_select: Option<String>,
     pub select: String,
     // 0 = text, 1 = csv, 2 = binary.
@@ -993,16 +995,20 @@ pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<CopyOutput>, &'stat
         p.tokens = lex(&sql[i..])?;
         p.pos = 0;
     }
-    let mut table = if query.is_some() {
-        String::new()
-    } else {
-        p.ident()?
-    };
-    table = if p.tokens.get(p.pos) == Some(&Token::Dot) {
+    let name = if query.is_some() { String::new() } else { p.ident()? };
+    let (schema, name) = if p.tokens.get(p.pos) == Some(&Token::Dot) {
         p.pos += 1;
-        format!("{}.{}", quote_relation(&table), quote_relation(&p.ident()?))
+        (Some(name), p.ident()?)
     } else {
-        quote_relation(&table)
+        (None, name)
+    };
+    let table = match &schema {
+        Some(schema) => format!("{}.{}", quote_relation(schema), quote_relation(&name)),
+        None => quote_relation(&name),
+    };
+    let relation_key = match schema {
+        Some(schema) => format!("{schema}\0{name}"),
+        None => name.clone(),
     };
     let mut columns = Vec::new();
     if p.tokens.get(p.pos) == Some(&Token::LParen) {
@@ -1025,7 +1031,9 @@ pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<CopyOutput>, &'stat
     let mut options = CopyOutput {
         encoding: None,
         destination,
-        table_name: if query.is_some() { None } else { Some(table.rsplit('.').next().unwrap_or(&table).trim_matches('"').replace("\"\"", "\"")) },
+        table_name: query.is_none().then_some(name),
+        relation_key,
+        columns: columns.clone(),
         all_select: query.is_none().then(|| format!("SELECT * FROM {table}")),
         select: String::new(),
         format: 0,

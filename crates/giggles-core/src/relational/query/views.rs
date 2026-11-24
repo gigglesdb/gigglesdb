@@ -5,6 +5,7 @@ use crate::storage::SqlViewDef;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Projection {
     pub base: String,
+    pub direct_source: Option<u64>,
     pub columns: Vec<(ColumnDef, usize)>,
     pub reads: Vec<String>,
     filters: Vec<ViewPredicate>,
@@ -36,9 +37,18 @@ fn expand(state: &Relational, definitions: &BTreeMap<u64, SqlViewDef>, id: u64, 
     if let Some(projection) = cache.get(&key) { return Ok(projection.clone()); }
     visited.insert(id);
     let view = definitions.get(&id).ok_or(SqlError::UnknownTable)?;
-    let mut result = Projection { base: String::new(), columns: vec![], reads: vec![], filters: vec![], dependencies: vec![] };
+    let mut result = Projection {
+        base: String::new(),
+        direct_source: view.dependencies.first().map(|d| d.relation),
+        columns: vec![],
+        reads: vec![],
+        filters: vec![],
+        dependencies: vec![],
+    };
     for output in &view.columns {
         let (relation, column) = output.source.ok_or(SqlError::Unsupported)?;
+        result.direct_source.get_or_insert(relation);
+        result.dependencies.push(column);
         let (base, offset, reads, source_id) = if let Some((name, table)) = state.tables.iter().find(|(_, t)| t.id == relation) {
             (name.clone(), table.columns.iter().position(|c| c.id == column).ok_or(SqlError::UnknownColumn)?, vec![name.clone()], column)
         } else {
@@ -60,7 +70,6 @@ fn expand(state: &Relational, definitions: &BTreeMap<u64, SqlViewDef>, id: u64, 
         let mapping = if definitions.contains_key(&relation) {
             let inner = expand(state, definitions, relation, visited, cache)?;
             result.filters = inner.filters;
-            result.dependencies.extend(inner.dependencies);
             inner.columns.iter().map(|(c, offset)| (c.name.clone(), *offset)).collect()
         } else {
             let table = state.tables.values().find(|t| t.id == relation).ok_or(SqlError::UnknownTable)?;

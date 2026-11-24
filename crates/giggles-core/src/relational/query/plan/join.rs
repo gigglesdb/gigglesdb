@@ -661,8 +661,10 @@ impl From {
                 aliases,
             } => {
                 let (mut columns, typmods) = function.resolve(state, parameters)?;
-                for (column, name) in columns.iter_mut().zip(function.column_names(alias, aliases)) {
-                    column.name = name;
+                if aliases.is_empty() && function.uses_relation_alias()
+                    && columns.len() == 1 + usize::from(function.ordinality())
+                {
+                    columns[0].name = alias.clone();
                 }
                 let mut shape = leaf_shape(columns, typmods, alias, aliases)?;
                 if function.scalar_element_row() {
@@ -1347,7 +1349,8 @@ impl From {
             }
             Self::Lateral(input) => input.locals(state, parameters, out),
             Self::Function { function, alias, aliases } => {
-                out.push((alias.clone(), function.column_names(alias, aliases)));
+                let names = function.local_column_names(state, parameters, alias, aliases);
+                out.push((alias.clone(), names));
             }
             Self::Leaf { alias, .. } | Self::Alias { alias, .. } => {
                 let columns = self

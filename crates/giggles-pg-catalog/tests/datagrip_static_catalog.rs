@@ -186,7 +186,14 @@ fn static_catalog_descriptors_and_empty_rows() {
         vec![vec![Value::Int(2616)]]
     );
     let result = run("select * from pg_catalog.pg_operator", &[]);
-    assert!(result.rows.is_empty(), "pg_operator");
+    assert_eq!(result.rows.len(), 23, "pg_operator");
+    assert_eq!(
+        run("SELECT oid, oprleft::oid, oprright::oid, oprresult::oid, oprcode::oid
+             FROM pg_operator WHERE oprname = '@@' ORDER BY oid", &[]).rows,
+        [[3636, 3614, 3615, 16, 3634], [3637, 3615, 3614, 16, 3635],
+         [3762, 25, 25, 16, 3760], [3763, 25, 3615, 16, 3761]]
+            .map(|row| row.into_iter().map(Value::Int).collect::<Vec<_>>())
+    );
     assert_eq!(
         result
             .fields

@@ -53,20 +53,61 @@ pub(super) fn parse(p: &mut Parser) -> R<Ddl> {
 // Runtime projections retain stable base-column IDs, including through aliases.
 // Retire their bindings between ALTER actions so a later RESTRICT sees CASCADE's
 // earlier removals. Persisted definitions/comments are removed at publication.
-pub(super) fn drop_column_views(state: &mut Relational, column: u64, cascade: bool) -> R<()> {
-    let mut dropped = state.view_names.iter().filter(|(_, (_, p))|
-        p.as_ref().is_ok_and(|p| p.columns.iter().any(|(c, _)| c.id == column) || p.dependencies.contains(&column)))
-        .map(|(name, _)| name.clone()).collect::<BTreeSet<_>>();
-    loop {
-        let before = dropped.len();
-        for (name, (_, projection)) in &state.view_names {
-            if projection.as_ref().is_ok_and(|p| p.reads.iter().any(|n| dropped.contains(n))) {
-                dropped.insert(name.clone());
-            }
+pub(super) fn drop_column_views(
+    state: &mut Relational, table: &TableDef, column: &ColumnDef, cascade: bool, path: &[String],
+) -> R<()> {
+    let display = |key: &str| {
+        let (schema, name) = split_key(key);
+        let visible = state.resolve_relation_key(name, path) == key;
+        let name = query::quote_identifier(name);
+        if visible { name } else { format!("{}.{name}", query::quote_identifier(schema)) }
+    };
+    let target = format!("column {} of table {}", column.name, display(&state.table_key(table)));
+    let mut children: BTreeMap<u64, Vec<(u64, &str)>> = BTreeMap::new();
+    for (name, (id, projection)) in &state.view_names {
+        if let Ok(projection) = projection
+            && let Some(source) = projection.direct_source
+            && (source != table.id || projection.dependencies.contains(&column.id))
+        {
+            children.entry(source).or_default().push((*id, name));
         }
-        if before == dropped.len() { break; }
     }
-    if !cascade && !dropped.is_empty() { return Err(SqlError::DependentObjects); }
+    for branch in children.values_mut() {
+        branch.sort_unstable_by_key(|(id, _)| *id);
+    }
+    let branch = |id| children.get(&id).map_or(&[][..], Vec::as_slice);
+    let mut pending = branch(table.id).iter().rev()
+        .map(|&(id, name)| (id, name, None)).collect::<Vec<_>>();
+    let mut dropped = BTreeSet::new();
+    let mut dependencies = Vec::new();
+    while let Some((id, name, parent)) = pending.pop() {
+        if dropped.insert(name.to_owned()) {
+            let parent = parent.map_or_else(|| target.clone(), |key| format!("view {}", display(key)));
+            dependencies.push((display(name), parent));
+            pending.extend(branch(id).iter().rev().map(|&(child, key)| (child, key, Some(name))));
+        }
+    }
+    if dependencies.is_empty() {
+        return Ok(());
+    }
+    if !cascade {
+        user_types::view_replace_error(format!("cannot drop {target} because other objects depend on it"));
+        user_types::sql_error_detail(dependencies.iter().map(|(name, parent)| {
+            format!("view {name} depends on {parent}")
+        }).collect::<Vec<_>>().join("\n"));
+        user_types::sql_error_hint("Use DROP ... CASCADE to drop the dependent objects too.");
+        return Err(SqlError::DependentObjects);
+    }
+    let notices: Vec<_> = dependencies.iter().map(|(name, _)| {
+        format!("drop cascades to view {name}")
+    }).collect();
+    if notices.len() == 1 {
+        user_types::sql_notice(notices[0].clone(), "00000");
+    } else {
+        user_types::sql_notice_detail(
+            format!("drop cascades to {} other objects", notices.len()), notices.join("\n"), "00000",
+        );
+    }
     state.view_names.retain(|name, _| !dropped.contains(name));
     Ok(())
 }
@@ -83,7 +124,7 @@ fn oid(ty: &DataType) -> u32 {
         DataType::RegType => 2206,
         DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
         | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray
-        | DataType::SmallIntArray => ty.text_search_oid().unwrap(),
+        | DataType::SmallIntArray | DataType::RegDictionaryArray => ty.text_search_oid().unwrap(),
     }
 }
 fn quote(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }

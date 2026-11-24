@@ -1,5 +1,5 @@
 // Generated from PostgreSQL 18.6 wparser_def.c by tools/generate_tables.py.
-// Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+// Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
 use super::*;
 
 #[derive(Clone, Copy, Debug)]

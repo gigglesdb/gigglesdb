@@ -657,30 +657,7 @@ impl Copy {
     }
     pub(crate) fn columns_in(&self, state: &Relational) -> R<Vec<ColumnDef>> {
         let table = state.tables.get(&self.table).ok_or(SqlError::UnknownTable)?;
-        if self.columns.is_empty() {
-            return Ok(table.logical_columns().filter(|column| state.generated_column(column.id).is_none()).cloned().collect());
-        }
-        if self.columns.len() > MAX_COLUMNS {
-            return Err(SqlError::Limit);
-        }
-        let indexes = self
-            .columns
-            .iter()
-            .map(|name| col(table, name))
-            .collect::<R<Vec<_>>>()?;
-        unique(&indexes)?;
-        for &offset in &indexes {
-            let column = &table.columns[offset];
-            if state.generated_column(column.id).is_some() {
-                user_types::view_replace_error(format!("column \"{}\" is a generated column", column.name));
-                user_types::sql_error_detail("Generated columns cannot be used in COPY.".into());
-                return Err(SqlError::InvalidColumnReference);
-            }
-        }
-        Ok(indexes
-            .into_iter()
-            .map(|i| table.columns[i].clone())
-            .collect())
+        copy_table_columns(state, table, &self.columns)
     }
     pub(crate) fn schema_key(&self, state: &Relational, path: &[String]) -> String {
         let name = self.relation.schema.as_ref().map_or_else(
@@ -750,6 +727,34 @@ impl Prepared {
         insert.replace_copy_rows(rows, clock)?;
         Ok(prepared)
     }
+}
+
+pub(crate) fn copy_table_columns(
+    state: &Relational, table: &TableDef, columns: &[String],
+) -> R<Vec<ColumnDef>> {
+    if columns.is_empty() {
+        return Ok(table.logical_columns().filter(|column| state.generated_column(column.id).is_none()).cloned().collect());
+    }
+    if columns.len() > MAX_COLUMNS {
+        return Err(SqlError::Limit);
+    }
+    let indexes = columns
+        .iter()
+        .map(|name| col(table, name))
+        .collect::<R<Vec<_>>>()?;
+    unique(&indexes)?;
+    for &offset in &indexes {
+        let column = &table.columns[offset];
+        if state.generated_column(column.id).is_some() {
+            user_types::view_replace_error(format!("column \"{}\" is a generated column", column.name));
+            user_types::sql_error_detail("Generated columns cannot be used in COPY.".into());
+            return Err(SqlError::InvalidColumnReference);
+        }
+    }
+    Ok(indexes
+        .into_iter()
+        .map(|i| table.columns[i].clone())
+        .collect())
 }
 
 /// Runtime COPY cells: `None` denotes DEFAULT; SQL NULL is `Some(Value::Null)`.

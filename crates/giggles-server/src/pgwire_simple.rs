@@ -393,8 +393,11 @@ impl State {
     ) -> R<()> {
         self.retain_durability_permits = true;
         self.copy_destination_privilege(session, &options.destination)?;
-        let prepared = self.prepare_copy_output(options, session)?;
-        let description = core(session.describe(&prepared))?;
+        let (prepared, empty_projection) = self.prepare_copy_output(options, session)?;
+        let mut description = core(session.describe(&prepared))?;
+        if empty_projection {
+            description.columns.clear();
+        }
         let writes = prepared.write_tables();
         let writing = !writes.is_empty();
         if writing {
@@ -575,8 +578,8 @@ impl State {
         session.set_max_statement_tokens(self.settings.current.max_statement_tokens);
         super::statement_deadline(&self.settings.current);
         giggles_core::relational::take_sql_notices();
-        let config = self.settings.current.default_text_search_config.clone();
-        let result = text_search_types::with_default_config(&config, || {
+        let config = self.settings.default_text_search_config().to_owned();
+        let result = text_search_types::with_default_config(config, || {
             self.simple_statement_inner(sql, source, session, out, received, implicit)
         });
         if !self.copy_receiving() && let Some(admission) = self.execution_admission.as_mut() {

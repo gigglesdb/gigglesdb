@@ -1,6 +1,6 @@
 // Port of PostgreSQL 18.6 tsvector.c, tsvector_parser.c, tsvector_op.c and
 // the vector construction in to_tsany.c.
-// Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group.
+// Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group.
 use std::{cmp::Ordering, collections::BTreeMap, fmt, str::FromStr};
 
 use crate::{Config, Corrupt, SearchResult, TsError, Wire, config, locale, quote};

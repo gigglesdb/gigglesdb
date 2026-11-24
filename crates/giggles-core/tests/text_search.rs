@@ -477,3 +477,84 @@ fn text_search_archdocs_legacy() {
 fn text_search_archdocs_v2() {
     archdocs_search(Engine::V2);
 }
+
+
+fn review_fixes(engine: Engine) {
+    let path = common::fresh("text-search-review");
+    let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
+    let mut s = admin.sql_session();
+    run(&mut s, "CREATE TABLE terms(id int PRIMARY KEY, v tsvector, q tsquery)");
+    for sql in [
+        "INSERT INTO terms VALUES (1, to_tsvector('english','fat cats'), to_tsquery('english','cats'))",
+        "INSERT INTO terms VALUES (2, 'a:1'::tsvector, 'a'::tsquery)",
+        "INSERT INTO terms VALUES (3, to_tsvector($1), to_tsquery($2))",
+    ] {
+        let params = if sql.contains("$1") { vec![text("Running dogs"), text("dog")] } else { vec![] };
+        s.execute(sql, &params, None).unwrap();
+    }
+    assert_eq!(run(&mut s, "SELECT v::text, q::text FROM terms ORDER BY id"), vec![
+        vec![text("'cat':2 'fat':1"), text("'cat'")],
+        vec![text("'a':1"), text("'a'")],
+        vec![text("'dog':2 'run':1"), text("'dog'")],
+    ]);
+    let sql = "SELECT to_tsvector($1,$2)::text, to_tsquery($1,$3)::text,
+        plainto_tsquery($1,$2)::text, phraseto_tsquery($1,$2)::text,
+        websearch_to_tsquery($1,$2)::text, ts_headline($1,$2,$3::tsquery)";
+    let prepared = s.prepare(sql).unwrap();
+    assert_eq!(s.describe(&prepared).unwrap().parameters, [DataType::RegConfig, DataType::Text, DataType::Text]);
+    let config = giggles_core::relational::text_search_types::input(&DataType::RegConfig, "english").unwrap();
+    assert_eq!(rows(s.execute_prepared(&prepared, &[config, text("Running dogs"), text("dog")], None), sql), vec![
+        vec![text("'dog':2 'run':1"), text("'dog'"), text("'run' & 'dog'"), text("'run' <-> 'dog'"),
+            text("'run' & 'dog'"), text("Running <b>dogs</b>")],
+    ]);
+    for (sql, names) in [
+        ("SELECT * FROM unnest('a:1'::tsvector) AS xyz", &["lexeme", "positions", "weights"][..]),
+        ("SELECT * FROM ts_debug('english','Running the 34.') WITH ORDINALITY", &["alias", "description", "token", "dictionaries", "dictionary", "lexemes", "ordinality"][..]),
+        ("SELECT * FROM ts_parse('default','Running the 34.')", &["tokid", "token"][..]),
+        ("SELECT * FROM ts_token_type('default')", &["tokid", "alias", "description"][..]),
+    ] {
+        let prepared = s.prepare(sql).unwrap();
+        assert_eq!(s.describe(&prepared).unwrap().columns.iter().map(|col| col.name.as_str()).collect::<Vec<_>>(), names);
+    }
+    assert_eq!(run(&mut s, "SELECT token, dictionaries::text, dictionary::text, lexemes FROM ts_debug('english','Running the 34.')"), vec![
+        vec![text("Running"), text("{english_stem}"), text("english_stem"), text("{run}")],
+        vec![text(" "), text("{}"), Value::Null, Value::Null],
+        vec![text("the"), text("{english_stem}"), text("english_stem"), text("{}")],
+        vec![text(" "), text("{}"), Value::Null, Value::Null],
+        vec![text("34"), text("{simple}"), text("simple"), text("{34}")],
+        vec![text("."), text("{}"), Value::Null, Value::Null],
+    ]);
+    assert_eq!(run(&mut s, "SELECT * FROM ts_parse(3722::oid, 'Running the 34.')"), vec![
+        vec![Value::Int(1), text("Running")], vec![Value::Int(12), text(" ")],
+        vec![Value::Int(1), text("the")], vec![Value::Int(12), text(" ")],
+        vec![Value::Int(22), text("34")], vec![Value::Int(12), text(".")],
+    ]);
+    assert_eq!(run(&mut s, "SELECT * FROM ts_token_type('default') LIMIT 3"), vec![
+        vec![Value::Int(1), text("asciiword"), text("Word, all ASCII")],
+        vec![Value::Int(2), text("word"), text("Word, all letters")],
+        vec![Value::Int(3), text("numword"), text("Word, letters and digits")],
+    ]);
+    assert!(run(&mut s, "SELECT * FROM ts_debug(NULL::text)").is_empty());
+    expect_error(&mut s, "SELECT * FROM ts_debug()", "42883");
+    expect_error(&mut s, "SELECT * FROM ts_parse('nosuch', 'x')", "42704");
+    expect_error(&mut s, "SELECT * FROM ts_token_type(0)", "XX000");
+
+    for (sql, code) in [("SELECT 'a & '::tsquery", 201), ("SELECT 'nosuch'::regconfig", 232)] {
+        let input = serde_json::json!({"sql": sql}).to_string();
+        assert_eq!(giggles_core::local::sql_session(&mut s, input.as_bytes()).code, code);
+    }
+    drop(s);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn text_search_review_legacy() {
+    review_fixes(Engine::Legacy);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn text_search_review_v2() {
+    review_fixes(Engine::V2);
+}

@@ -111,6 +111,7 @@ fn type_name(t: &DataType) -> &'static str {
         DataType::RealArray => "real[]",
         DataType::PgCharArray => "\"char\"[]",
         DataType::SmallIntArray => "smallint[]",
+        DataType::RegDictionaryArray => "regdictionary[]",
     }
 }
 

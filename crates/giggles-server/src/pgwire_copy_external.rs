@@ -37,14 +37,34 @@ impl State {
         &mut self,
         options: &crate::auth::statements::CopyOutput,
         session: &mut Session,
-    ) -> R<Prepared> {
-        let prepared = core(session.prepare(&options.select)).inspect_err(|code| {
+    ) -> R<(Prepared, bool)> {
+        let default_columns = if options.all_select.is_some() && options.columns.is_empty() {
+            self.diagnostic.core(session.sql.copy_output_columns(&options.relation_key, &[]))?
+        } else {
+            None
+        };
+        let empty_projection = default_columns.as_ref().is_some_and(Vec::is_empty);
+        let projected = default_columns.map(|columns| {
+            let columns = if empty_projection {
+                // Preserve the row count when the table has only generated columns.
+                "NULL".into()
+            } else {
+                columns.iter().map(|c| format!("\"{}\"", c.name.replace('"', "\"\"")))
+                    .collect::<Vec<_>>().join(",")
+            };
+            options.select.replacen("SELECT *", &format!("SELECT {columns}"), 1)
+        });
+        let sql = projected.as_deref().unwrap_or(&options.select);
+        let prepared = core(session.prepare(sql)).inspect_err(|code| {
             if *code == "42501"
                 && let Some(table) = &options.table_name
             {
                 self.diagnostic.wire_message = Some(format!("permission denied for table {table}"));
             }
         })?;
+        if options.all_select.is_some() && !options.columns.is_empty() {
+            self.diagnostic.core(session.sql.copy_output_columns(&options.relation_key, &options.columns))?;
+        }
         if !options.force_columns.is_empty() {
             let description = core(session.describe(&prepared))?;
             let all = if let Some(sql) = &options.all_select {
@@ -56,13 +76,18 @@ impl State {
                     self.diagnostic.wire_message = Some(options.table_name.as_ref().map_or_else(|| format!("column \"{name}\" does not exist"), |table| format!("column \"{name}\" of relation \"{table}\" does not exist")));
                     return Err("42703");
                 }
+                if options.all_select.is_some() {
+                    self.diagnostic.core(session.sql.copy_output_columns(
+                        &options.relation_key, std::slice::from_ref(name),
+                    ))?;
+                }
                 if !description.columns.iter().any(|c| c.name == *name) {
                     self.diagnostic.wire_message = Some(format!("FORCE_QUOTE column \"{name}\" not referenced by COPY"));
                     return Err("42P10");
                 }
             }
         }
-        Ok(prepared)
+        Ok((prepared, empty_projection))
     }
 
     pub(super) fn copy_privilege(&mut self, session: &Session, program: bool, from: bool) -> R<()> {
