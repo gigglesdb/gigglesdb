@@ -434,7 +434,7 @@ impl State {
                 begin_implicit(session, implicit, &mut self.settings)?;
             }
             self.diagnostic
-                .core(session.sync_replication_role(&self.settings))?;
+                .core(session.sync_execution_settings(&self.settings))?;
         }
         self.settings.queried = session.in_transaction();
         let encoder = CopyRows {
@@ -624,49 +624,6 @@ impl State {
     ) -> R<()> {
         if session.task().is_some() {
             return self.task_statement(sql, session, out);
-        }
-        let mut prefix = cursor::Prefix(sql);
-        let prepare = prefix.kw("PREPARE");
-        if prepare || prefix.kw("EXECUTE") {
-            if !session.role.is_sql() {
-                return Err("42501");
-            }
-            if session.is_aborted() {
-                return Err("25P02");
-            }
-            let name = prefix.name()?;
-            if name.is_empty() {
-                return Err("42601");
-            }
-            if prepare {
-                prefix.need("AS")?;
-                let sql = prefix.0.trim();
-                if !cursor::Prefix(sql).kw("SELECT") {
-                    return Err("0A000");
-                }
-                self.check_named_statement_slot(&name, sql.len())?;
-                let statement = self.prepare_statement(sql, vec![], session, false)?;
-                if !matches!(&*statement.p, Plan::Sql(p) if p.command() == "SELECT" && p.write_tables().is_empty())
-                    || !statement.parameter_oids.is_empty()
-                {
-                    return Err("0A000");
-                }
-                self.named_statement_bytes += statement.sql_bytes;
-                self.statements.insert(name, statement);
-                return complete("PREPARE", &empty(), out);
-            }
-            prefix.end()?;
-            self.refresh_statement(&name, session)?;
-            let statement = self.statements.get(&name).ok_or("26000")?.clone();
-            let Plan::Sql(prepared) = &*statement.p else { return Err("0A000") };
-            if prepared.command() != "SELECT" || !prepared.write_tables().is_empty()
-                || !statement.parameter_oids.is_empty()
-            {
-                return Err("0A000");
-            }
-            read_only_check(prepared.row_lock_command().unwrap_or("SELECT"), &self.settings, session, &mut self.diagnostic)?;
-            self.settings.queried = session.in_transaction();
-            return self.simple_select(prepared, &statement.d, session, out);
         }
         // GD-0061 R3-707: an approver form, before any other grammar reads it.
         if let Some(change) = crate::agent::preview::approver_statement(sql)? {
@@ -974,7 +931,7 @@ impl State {
                 if self.settings.replication_role_replica() && !matches!(p.command(), "BEGIN" | "COMMIT" | "ROLLBACK") {
                     begin_implicit(session, implicit, &mut self.settings)?;
                 }
-                self.diagnostic.core(session.sync_replication_role(&self.settings))?;
+                self.diagnostic.core(session.sync_execution_settings(&self.settings))?;
                 let autocommit_write = !session.in_transaction() && (!writes.is_empty() || p.is_ddl());
                 self.simple_prepared_reply(&p, &d, session, out, was_transaction, autocommit_write)?;
             }

@@ -2082,6 +2082,7 @@ pub struct Prepared {
     search_path: Vec<String>,
     schema_user: String,
     extension_owner: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    pub(crate) skip_routine_body_check: bool,
     warnings: Vec<String>,
     authorization_has_views: bool,
     authorization_binding: Option<AuthorizationBinding>,
@@ -2309,12 +2310,6 @@ impl Prepared {
     pub fn has_trigger_call(&self) -> bool {
         matches!(self.statement.get(), Statement::Query(query) if query.has_trigger_call())
     }
-    pub fn missing_zero_arg_projection(&self) -> Option<&str> {
-        match self.statement.get() {
-            Statement::Query(query) => query.missing_zero_arg_projection(),
-            _ => None,
-        }
-    }
     fn engine(statement: Statement, domain: u128, epoch: u64) -> Self {
         Self {
             domain,
@@ -2329,6 +2324,7 @@ impl Prepared {
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
             extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
+            skip_routine_body_check: false,
             native_delete: None,
             native_insert_many: false,
             unbound_statement: None,
@@ -3449,6 +3445,7 @@ impl Prepared {
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
             extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
+            skip_routine_body_check: false,
             native_delete: None,
             native_insert_many: false,
             unbound_statement: None,
@@ -3972,6 +3969,7 @@ impl Prepared {
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
             extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
+            skip_routine_body_check: false,
             native_delete: None,
             native_insert_many: false,
             unbound_statement: None,
@@ -4679,6 +4677,7 @@ impl Relational {
                 search_path: vec!["public".into()],
                 schema_user: "giggles".into(),
             extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
+            skip_routine_body_check: false,
                 native_delete: None,
             native_insert_many: false,
             unbound_statement: None,

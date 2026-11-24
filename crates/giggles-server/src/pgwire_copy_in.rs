@@ -48,8 +48,14 @@ impl CopyIn {
         let input = giggles_core::relational::CopyInput { rows, options, first_line: self.next_line, skipped: self.skipped };
         let result = session.normalize_copy_cells(&self.prepared, input, &self.clock);
         self.next_line += count;
-        if matches!(result, Err(CoreError::Sql(giggles_core::relational::SqlError::InvalidTextRepresentation))) {
-            self.input_error_message = message;
+        match &result {
+            Err(CoreError::Sql(giggles_core::relational::SqlError::InvalidTextRepresentation)) => {
+                self.input_error_message = message;
+            }
+            Err(CoreError::RoutineDdl(diagnostic)) => {
+                self.input_error_message = Some(diagnostic.message.clone());
+            }
+            _ => {}
         }
         let (prepared, rows, skipped) = core(result)?;
         self.skipped += skipped;
@@ -290,7 +296,10 @@ impl State {
         for _ in &columns {
             response.extend(u16::from(binary).to_be_bytes());
         }
-        core(session.sync_replication_role(&self.settings))?;
+        core(session.sync_execution_settings(&self.settings))?;
+        if !descriptor.target_is_view {
+            self.diagnostic.core(session.sql.check_copy_input_triggers(&prepared))?;
+        }
         let clock = session.copy_clock();
         let streaming = !binary && core(session.sql.begin_copy_input())?;
         if streaming { decoder.stream(); }

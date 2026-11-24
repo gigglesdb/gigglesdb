@@ -366,6 +366,22 @@ impl SqlSession {
         result
     }
 
+    pub(super) fn check_copy_triggers_v2(
+        &self,
+        db: &EngineLease,
+        txn: &engine::txn::Transaction,
+        binding: &relational::Relational,
+        prepared: &relational::Prepared,
+    ) -> Result<(), CoreError> {
+        let live = db.catalog().latest_snapshot(txn)?;
+        if live.parts.ext.triggers.is_empty() {
+            return Ok(());
+        }
+        let bound = prepared.bind_schemas(binding).map_err(CoreError::Sql)?;
+        binding.check_unimplemented_trigger_firing(&bound, &live.parts.ext, self.deferral.replica, true)
+            .map_err(relational::routines::into_core)
+    }
+
     pub(super) fn normalize_copy_v2(
         &mut self,
         db: &EngineLease,
@@ -393,13 +409,23 @@ impl SqlSession {
             {
                 return Err(CoreError::Sql(SqlError::StaleSchema));
             }
+            // Hold the same barrier as the publisher before evaluating COPY
+            // defaults, which can have effects of their own.
+            let implicit;
+            let txn = match self.v2_transaction.as_ref() {
+                Some(txn) => txn,
+                None => {
+                    implicit = db.begin(self.isolation.engine());
+                    &implicit
+                }
+            };
+            txn.acquire_lock(engine::locks::LockKey::Table(0), LockMode::RowExclusive,
+                crate::task::limits::lock_deadline(),
+                &|| crate::cancellation::check().is_err() || db.check().is_err(),
+            ).map_err(crate::task::limits::lock_error)?;
             let mut state = db.metadata_state(self.v2_transaction.as_ref())?;
             state.sql.epoch = 0;
-            if !state.sql.catalog_ext().triggers.is_empty() {
-                let bound = prepared.bind_schemas(&state.sql).map_err(CoreError::Sql)?;
-                state.sql.check_unimplemented_trigger_firing(&bound, self.deferral.replica, true)
-                    .map_err(relational::routines::into_core)?;
-            }
+            self.check_copy_triggers_v2(db, txn, &state.sql, prepared)?;
             let image = Arc::new(state.sql.clone());
             let guard = sql_sequences::Guard::new(&self.sequence_authority, self.admin.roles(),
                 self.v2_transaction.as_ref(), &image);
@@ -680,11 +706,6 @@ impl SqlSession {
                             }
                         })?;
                         let bound = p.bind_schemas(&binding).map_err(CoreError::Sql)?;
-                        if matches!(class, V2Class::Dml) {
-                            binding.check_unimplemented_trigger_firing(
-                                &bound, self.deferral.replica, self.copy_input.is_some(),
-                            ).map_err(relational::routines::into_core)?;
-                        }
                         let target_name = bound.storage_table().map(str::to_owned);
                         if writing && !ddl && target_name.as_ref().is_some_and(|n| binding.view_names.contains_key(n)) { return Err(CoreError::Sql(E::Unsupported)); }
                         let mut names = bound.read_tables().into_iter().collect::<BTreeSet<_>>();
@@ -807,6 +828,21 @@ impl SqlSession {
                                     engine::catalog::CatalogError::Core(e) => e,
                                     engine::catalog::CatalogError::Txn(e) => crate::task::limits::lock_error(e),
                                 })?;
+                        }
+                        if matches!(class, V2Class::Dml) && !write_ids.is_empty() {
+                            // The catalog barrier excludes trigger DDL even on
+                            // other gateways. A fixed row snapshot must not
+                            // hide any trigger that is enabled now.
+                            let latest;
+                            let live = if txn.isolation() == Isolation::ReadCommitted {
+                                &parts.ext
+                            } else {
+                                latest = db.catalog().latest_snapshot(txn)?;
+                                &latest.parts.ext
+                            };
+                            binding.check_unimplemented_trigger_firing(
+                                &bound, live, self.deferral.replica, self.copy_input.is_some(),
+                            ).map_err(relational::routines::into_core)?;
                         }
                         // A WITH statement can own several mutation targets.
                         if writing && !ddl {
@@ -1007,7 +1043,24 @@ impl SqlSession {
                         } else if !self.copy_input.as_ref().is_some_and(|input| input.started) {
                             txn.begin_statement();
                         }
-                        let catalog = db.catalog().snapshot(txn)?;
+                        let catalog = if p.is_drop_trigger() && txn.isolation() != Isolation::ReadCommitted {
+                            // DROP looks up the trigger after locking its table.
+                            // Reject relation drift when the live binding no
+                            // longer names the same table the statement locked.
+                            let live = db.catalog().latest_snapshot(txn)?;
+                            let live_image = live.image().map_err(CoreError::Sql)?;
+                            let live_bound = p.bind_schemas(&live_image).map_err(CoreError::Sql)?;
+                            if live_bound.storage_table() != target_name.as_deref()
+                                || target_name.as_ref().is_some_and(|name| parts.tables.get(name) != live.parts.tables.get(name))
+                            {
+                                return Err(engine::txn::TxnError::Serialization(
+                                    engine::txn::SerializationReason::WriteConflict,
+                                ).into());
+                            }
+                            live
+                        } else {
+                            db.catalog().snapshot(txn)?
+                        };
                         self.cursor_plan_cache.observe(catalog.cursor_plan_owners.as_ref());
                         let old = &catalog.parts;
                         if p.schema_ddl().is_some_and(|(name, _, create)| !create && old.sql_views.values().any(|v|
@@ -1175,6 +1228,15 @@ impl SqlSession {
                         }
                         bound.check_view_drop(&image).map_err(CoreError::Sql)?;
                         let freeze_before = bound.copy_freeze_created(&image);
+                        let configured;
+                        let p = if !self.check_function_bodies && p.command() == "CREATE FUNCTION" {
+                            let mut routine = p.clone();
+                            routine.skip_routine_body_check = true;
+                            configured = routine;
+                            &configured
+                        } else {
+                            p
+                        };
                         let result = if !bound.is_collation_ddl() && matches!(bound.command(), "COMMENT" | "SECURITY LABEL" | "CREATE VIEW" | "DROP VIEW") { Ok(Default::default()) } else { image.execute_with_sink(
                             p,
                             params,

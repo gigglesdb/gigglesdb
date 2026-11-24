@@ -2288,16 +2288,6 @@ impl Query {
         });
         found
     }
-    pub(super) fn missing_zero_arg_projection(&self) -> Option<&str> {
-        let Self { explain: false, sources, joins, items, predicates, filter: None, order, limit: None } = self else {
-            return None;
-        };
-        let [(Item::Scalar(call), _)] = items.as_slice() else { return None };
-        if sources.len() != 1 || !joins.is_empty() || !predicates.is_empty() || !order.is_empty() {
-            return None;
-        }
-        call.missing_unqualified_zero_arg_call()
-    }
     fn has_volatile_call(&self) -> bool {
         let mut found = false;
         let _ = self.walk_scalars(&mut |s| {

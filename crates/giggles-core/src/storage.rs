@@ -2304,6 +2304,7 @@ pub type SequenceOwners = [(String, Option<String>)];
 /// Trusted session only. Dropping a session discards its staged transaction.
 /// No lock or admission ticket lives across client calls.
 pub struct SqlSession {
+    check_function_bodies: bool,
     privilege_callback: Option<PrivilegeCallback>,
     admin: Admin,
     staged: Option<State>,
@@ -2419,6 +2420,7 @@ impl Admin {
             sequence_default_execution: None,
             deferral: Default::default(),
             enum_transaction: Default::default(),
+            check_function_bodies: true,
             isolation: SqlIsolation::ReadCommitted,
             task: None,
             task_generation: None,
@@ -4350,6 +4352,11 @@ impl SqlSession {
             Some(expected_version),
         )
     }
+    /// Set whether CREATE FUNCTION validates PL/pgSQL bodies during execution.
+    pub fn set_check_function_bodies(&mut self, check: bool) {
+        self.check_function_bodies = check;
+    }
+
     /// Set FK trigger suppression for the active transaction. Call before each
     /// statement after BEGIN (including an implicit server transaction).
     /// Existing deferred checks still run at commit; commit/rollback resets it.

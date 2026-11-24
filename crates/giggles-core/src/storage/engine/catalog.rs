@@ -719,6 +719,21 @@ impl Catalog {
         self.with_snapshot_cache(ts, |cache| self.snapshot_locked(cache, writes, ts))
     }
 
+    /// Read the latest catalog with this transaction's private DDL overlaid.
+    /// The caller holds the catalog lock when the result must remain stable.
+    pub(crate) fn latest_snapshot(
+        &self,
+        txn: &Transaction,
+    ) -> Result<Arc<CatalogSnapshot>, CoreError> {
+        let pin = self.services.pin()?;
+        let ts = pin.ts();
+        if let Some((_, snapshot)) = self.current_for(txn, ts) {
+            return Ok(snapshot);
+        }
+        self.check().map_err(CoreError::from)?;
+        self.with_snapshot_cache(ts, |cache| self.snapshot_locked(cache, txn, ts))
+    }
+
     /// Does not refresh or assign a transaction snapshot; metadata preserves the
     /// existing fallback to visible_ts when no snapshot has been chosen yet.
     pub(crate) fn metadata_snapshot(

@@ -333,7 +333,6 @@ pub(crate) fn lookup_native(name: &str) -> Result<Show> {
         "transaction_timeout" => Ok(Show::TransactionTimeout),
         "client_min_messages" => Ok(Show::ClientMinMessages),
         "row_security" => Ok(Show::RowSecurity),
-        "check_function_bodies" => Ok(Show::CheckFunctionBodies),
         "synchronize_seqscans" => Ok(Show::SynchronizeSeqscans),
         "restrict_nonsystem_relation_kind" => Ok(Show::RestrictNonsystemRelationKind),
         "xmloption" => Ok(Show::XmlOption),
@@ -733,7 +732,7 @@ fn validate(name: Show, values: Vec<Token>) -> Result<String> {
         {
             Ok(lower)
         }
-        Show::CheckFunctionBodies | Show::SynchronizeSeqscans => {
+        Show::SynchronizeSeqscans => {
             boolean(&lower).map(|v| if v { "on" } else { "off" }.into())
         }
         Show::RowSecurity => {

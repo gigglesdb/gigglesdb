@@ -30,7 +30,7 @@ pub(super) enum Ddl {
         table: String,
         name: String,
         optional: bool,
-        skip_notice: Option<String>,
+        authority: DropAuthority,
     },
     Rename {
         table: String,
@@ -42,6 +42,12 @@ pub(super) enum Ddl {
         table: String,
     },
 }
+#[derive(Clone, Debug)]
+pub(super) enum DropAuthority {
+    Unchecked,
+    Table(Option<u64>),
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Create {
     table: String,
@@ -113,7 +119,7 @@ pub(super) fn parse(p: &mut Parser, source: &str) -> R<Ddl> {
             table,
             name,
             optional,
-            skip_notice: None,
+            authority: DropAuthority::Unchecked,
         });
     }
     if p.word("alter") {
@@ -355,10 +361,6 @@ fn relation_name(key: &str) -> String {
     }
 }
 pub(super) fn execute(state: &mut Relational, prepared: &Prepared, ddl: &Ddl) -> R<()> {
-    if let Ddl::Drop { skip_notice: Some(notice), .. } = ddl {
-        user_types::sql_notice(notice.clone(), "00000");
-        return Ok(());
-    }
     if let Ddl::Unsupported { what, .. } = ddl {
         return Err(error("0A000", format!("{what} are not supported")));
     }
@@ -457,7 +459,7 @@ pub(super) fn execute(state: &mut Relational, prepared: &Prepared, ddl: &Ddl) ->
                 .or_default()
                 .insert(trigger.name.clone(), trigger);
         }
-        Ddl::Drop { name, optional, .. } => {
+        Ddl::Drop { name, optional, authority, .. } => {
             if triggers.is_none_or(|entries| !entries.contains_key(name)) {
                 if *optional {
                     user_types::sql_notice(
@@ -469,6 +471,11 @@ pub(super) fn execute(state: &mut Relational, prepared: &Prepared, ddl: &Ddl) ->
                     return Ok(());
                 }
                 return Err(missing_trigger(name, table_name));
+            }
+            if let DropAuthority::Table(allowed) = authority
+                && *allowed != Some(table_id)
+            {
+                return Err(error("42501", format!("must be owner of relation {table_name}")));
             }
             let ext = Arc::make_mut(&mut state.ext);
             let entries = ext.triggers.get_mut(&table_id).unwrap();
@@ -498,18 +505,16 @@ pub(super) fn execute(state: &mut Relational, prepared: &Prepared, ddl: &Ddl) ->
 }
 
 impl Prepared {
-    pub fn drop_trigger_target(&self) -> Option<(&str, bool)> {
-        match self.statement.get() {
-            Statement::Trigger(Ddl::Drop { name, optional, .. }) => Some((name, *optional)),
-            _ => None,
-        }
+    pub fn is_drop_trigger(&self) -> bool {
+        matches!(self.statement.get(), Statement::Trigger(Ddl::Drop { .. }))
     }
 
-    /// Preserve an authorized IF EXISTS no-op across execution's catalog rebind.
-    pub fn skip_missing_drop_trigger(&mut self, notice: String) {
+    /// Carry the authorized table identity across the catalog rebind. Core
+    /// checks ownership only if the trigger exists once the DDL locks are held.
+    pub fn restrict_drop_trigger_to_table(&mut self, table: Option<u64>) {
         let mark = |statement: &mut Statement| {
-            if let Statement::Trigger(Ddl::Drop { optional: true, skip_notice, .. }) = statement {
-                *skip_notice = Some(notice.clone());
+            if let Statement::Trigger(Ddl::Drop { authority, .. }) = statement {
+                *authority = DropAuthority::Table(table);
             }
         };
         mark(self.statement.get_mut());
@@ -728,14 +733,19 @@ impl Relational {
     pub(crate) fn check_unimplemented_trigger_firing(
         &self,
         prepared: &Prepared,
+        live: &catalog_ext::CatalogExt,
         replica: bool,
         copy: bool,
     ) -> R<()> {
         use catalog_ext::{Action, ConstraintKind};
 
-        if self.ext.triggers.is_empty() {
+        if live.triggers.is_empty() {
             return Ok(());
         }
+        // Execution can still follow the fixed snapshot's FK edges. Include
+        // those as well as the current edges, but use live trigger states.
+        let live_edges = (!std::ptr::eq(live, self.ext.as_ref()) && live.constraints != self.ext.constraints)
+            .then_some(&live.constraints);
         for (name, command) in prepared.write_tables() {
             let Some(table) = self.tables.get(&name) else {
                 continue;
@@ -760,8 +770,7 @@ impl Relational {
                 if !seen.insert((id, event, updated.clone())) {
                     continue;
                 }
-                let fires = self
-                    .ext
+                let fires = live
                     .triggers
                     .get(&id)
                     .into_iter()
@@ -794,7 +803,7 @@ impl Relational {
                 if replica || !matches!(event, UPDATE | DELETE) {
                     continue;
                 }
-                for (&child, constraints) in &self.ext.constraints {
+                for (&child, constraints) in self.ext.constraints.iter().chain(live_edges.into_iter().flatten()) {
                     for constraint in constraints {
                         let ConstraintKind::ForeignKey {
                             ref_table,

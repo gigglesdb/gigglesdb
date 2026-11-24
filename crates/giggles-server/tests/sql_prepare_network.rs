@@ -407,6 +407,29 @@ async fn prepare_execute_and_transaction_lifetime() {
     fixture.shutdown().await;
 }
 
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn execute_rechecks_triggers_created_after_prepare() {
+    let fixture = Fixture::new("trigger-recheck").await;
+    let mut writer = fixture.connect().await;
+    let mut owner = fixture.connect().await;
+    simple(&mut owner, "CREATE TABLE trigger_target (id int PRIMARY KEY); CREATE FUNCTION trigger_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$").await.success();
+    simple(&mut writer, "PREPARE insert_target (int) AS INSERT INTO trigger_target VALUES ($1); EXECUTE insert_target(1)").await.tags(&["PREPARE", "INSERT 0 1"]);
+    parse(&mut writer, "insert_protocol", "INSERT INTO trigger_target VALUES ($1)").await;
+    sync(&mut writer).await.success();
+
+    simple(&mut owner, "CREATE TRIGGER guard BEFORE INSERT ON trigger_target FOR EACH ROW EXECUTE FUNCTION trigger_fn()").await.tags(&["CREATE TRIGGER"]);
+    let message = "INSERT on a table with triggers is not supported";
+    bind_execute(&mut writer, "insert_protocol", &["2"], false).await.assert_error("0A000", message);
+    simple(&mut writer, "EXECUTE insert_target(2)").await.assert_error("0A000", message);
+
+    simple(&mut owner, "DROP TRIGGER guard ON trigger_target").await.tags(&["DROP TRIGGER"]);
+    simple(&mut writer, "EXECUTE insert_target(2)").await.tags(&["INSERT 0 1"]);
+    drop(writer);
+    drop(owner);
+    fixture.shutdown().await;
+}
+
 #[tokio::test]
 async fn discard_resets_session_and_preserves_sequence_storage() {
     let fixture = Fixture::new("discard").await;

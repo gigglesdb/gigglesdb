@@ -36,7 +36,7 @@ impl Cursors {
 }
 
 // Read only the cursor-command prefix; the SELECT is parsed by the SQL engine.
-pub(super) struct Prefix<'a>(pub(super) &'a str);
+struct Prefix<'a>(&'a str);
 impl Prefix<'_> {
     fn word(&mut self) -> R<(String, bool)> {
         self.0 = self.0.trim_start();
@@ -69,7 +69,7 @@ impl Prefix<'_> {
         self.0 = &self.0[end..];
         Ok((value, false))
     }
-    pub(super) fn kw(&mut self, kw: &str) -> bool {
+    fn kw(&mut self, kw: &str) -> bool {
         let saved = self.0;
         if self
             .word()
@@ -81,10 +81,10 @@ impl Prefix<'_> {
             false
         }
     }
-    pub(super) fn need(&mut self, kw: &str) -> R<()> {
+    fn need(&mut self, kw: &str) -> R<()> {
         if self.kw(kw) { Ok(()) } else { Err("42601") }
     }
-    pub(super) fn name(&mut self) -> R<String> {
+    fn name(&mut self) -> R<String> {
         let (mut name, quoted) = self.word()?;
         if !quoted {
             if !name.chars().enumerate().all(|(i, c)| {
@@ -99,7 +99,7 @@ impl Prefix<'_> {
         }
         Ok(name)
     }
-    pub(super) fn end(&self) -> R<()> {
+    fn end(&self) -> R<()> {
         if self.0.trim().trim_end_matches(';').trim().is_empty() {
             Ok(())
         } else {

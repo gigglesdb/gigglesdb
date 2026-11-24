@@ -558,22 +558,26 @@ pub(super) fn execute(state: &mut Relational, prepared: &Prepared, ddl: &Ddl) ->
                     ),
                 ));
             }
-            let compiled = if create.args.is_empty() {
-                create.def.compiled_function()
-            } else {
-                create.def.compile(&create.args)
-            };
-            compiled.map_err(|err| {
-                let mut diagnostic = RoutineDiagnostic::new(err.sqlstate, err.message);
-                diagnostic.hint = err.hint;
-                diagnostic.position = err
-                    .position
-                    .and_then(|at| create.body_source.position(&create.def.body, at));
-                if err.sqlstate == "42P13" {
-                    diagnostic.context = Some(compile_context(&create.name.name));
-                }
-                diagnostic.error()
-            })?;
+            // Declared arguments are outside the supported routine signature,
+            // independently of whether the PL/pgSQL body is validated now.
+            if !prepared.skip_routine_body_check || !create.args.is_empty() {
+                let compiled = if create.args.is_empty() {
+                    create.def.compiled_function()
+                } else {
+                    create.def.compile(&create.args)
+                };
+                compiled.map_err(|err| {
+                    let mut diagnostic = RoutineDiagnostic::new(err.sqlstate, err.message);
+                    diagnostic.hint = err.hint;
+                    diagnostic.position = err
+                        .position
+                        .and_then(|at| create.body_source.position(&create.def.body, at));
+                    if err.sqlstate == "42P13" {
+                        diagnostic.context = Some(compile_context(&create.name.name));
+                    }
+                    diagnostic.error()
+                })?;
+            }
             let mut def = create.def.clone();
             def.schema = schema;
             def.owner = prepared
@@ -774,6 +778,41 @@ mod tests {
                 panic!("expected outer routine diagnostic");
             };
             assert_eq!(*diagnostic, outer);
+        }
+    }
+
+    #[test]
+    fn unchecked_bodies_stay_cold_until_the_compiler_is_needed() {
+        let mut state = Relational::default();
+        for (name, body) in [
+            ("valid", "BEGIN RETURN NEW; END"),
+            ("invalid", "BEGIN RETURN NEW END"),
+        ] {
+            let sql = format!(
+                "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $body${body}$body$"
+            );
+            let mut prepared = Prepared::parse(&sql, 0, 0).unwrap();
+            prepared.skip_routine_body_check = true;
+            let Statement::Routine(ddl) = prepared.statement.get() else {
+                panic!("expected routine DDL");
+            };
+            execute(&mut state, &prepared, ddl).unwrap();
+            let (_, routine) = state
+                .find_routine(
+                    &Name {
+                        schema: None,
+                        name: name.into(),
+                    },
+                    &prepared.search_path,
+                )
+                .unwrap();
+            assert!(routine.program.0.get().is_none());
+            if name == "valid" {
+                routine.compiled_function().unwrap();
+                assert!(routine.program.0.get().is_some());
+            } else {
+                assert_eq!(routine.compiled_function().unwrap_err().sqlstate, "42601");
+            }
         }
     }
 }

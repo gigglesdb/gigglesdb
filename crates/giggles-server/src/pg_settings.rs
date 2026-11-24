@@ -115,8 +115,6 @@ pub(crate) struct Settings {
     pub search_path: String,
     /// No NOTICE/DEBUG messages are emitted today. WARNING is suppressed at error.
     pub client_min_messages: String,
-    /// Presentation only: there are no user-defined functions to validate.
-    pub check_function_bodies: String,
     /// Presentation only: the engine does not synchronize sequential scans.
     pub synchronize_seqscans: String,
     /// Presentation only: views and foreign tables are not supported.
@@ -156,7 +154,6 @@ impl Default for Settings {
             session_authorization: String::new(),
             search_path: r#""$user", public"#.into(),
             client_min_messages: "notice".into(),
-            check_function_bodies: "on".into(),
             synchronize_seqscans: "on".into(),
             restrict_nonsystem_relation_kind: String::new(),
             xmloption: "content".into(),
@@ -299,6 +296,11 @@ impl SessionSettings {
         self.registry_base(entry)
     }
 
+    pub(crate) fn check_function_bodies(&self) -> bool {
+        let entry = registry::find("check_function_bodies").expect("registered setting");
+        self.registry_base(entry) == "on"
+    }
+
     pub(crate) fn registry_base(&self, entry: &'static registry::Entry) -> &str {
         self.current.registered.get(entry.name).map_or(entry.default, String::as_str)
     }
@@ -413,7 +415,6 @@ impl Settings {
             Show::SessionAuthorization => self.session_authorization = value,
             Show::SearchPath => self.search_path = value,
             Show::ClientMinMessages => self.client_min_messages = value,
-            Show::CheckFunctionBodies => self.check_function_bodies = value,
             Show::SynchronizeSeqscans => self.synchronize_seqscans = value,
             Show::RestrictNonsystemRelationKind => self.restrict_nonsystem_relation_kind = value,
             Show::XmlOption => self.xmloption = value,
@@ -450,7 +451,6 @@ pub(crate) const RESETTABLE: &[Show] = &[
     Show::TransactionTimeout,
     Show::ClientMinMessages,
     Show::RowSecurity,
-    Show::CheckFunctionBodies,
     Show::SynchronizeSeqscans,
     Show::RestrictNonsystemRelationKind,
     Show::XmlOption,
@@ -504,7 +504,6 @@ pub(crate) enum Show {
     ClientMinMessages,
     /// No RLS exists: off is the only behavior; requests for on are rejected.
     RowSecurity,
-    CheckFunctionBodies,
     SynchronizeSeqscans,
     RestrictNonsystemRelationKind,
     XmlOption,
@@ -584,10 +583,6 @@ impl Show {
                 ("client_min_messages", settings.client_min_messages.clone())
             }
             Self::RowSecurity => ("row_security", "off".into()),
-            Self::CheckFunctionBodies => (
-                "check_function_bodies",
-                settings.check_function_bodies.clone(),
-            ),
             Self::SynchronizeSeqscans => (
                 "synchronize_seqscans",
                 settings.synchronize_seqscans.clone(),

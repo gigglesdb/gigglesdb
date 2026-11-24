@@ -132,6 +132,7 @@ impl Prepared {
             search_path: self.search_path.clone(),
             schema_user: self.schema_user.clone(),
             extension_owner: self.extension_owner.clone(),
+            skip_routine_body_check: self.skip_routine_body_check,
             warnings: self.warnings.clone(),
             authorization_has_views: false,
             // A caller must witness the catalog version of this binding anew.

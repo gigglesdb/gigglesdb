@@ -3170,23 +3170,14 @@ impl Session {
         if !allowed {
             let mut error = CoreError::Policy(Error::Scope);
             if self.surface == Surface::Postgres
-                && let Role::Database { name } = self.authority_role()
+                && matches!(self.authority_role(), Role::Database { .. })
                 && self.sql.task().is_none()
                 && !p.is_multi_source_read()
+                && p.has_trigger_call()
                 && let Some(table) = p.table()
             {
-                let (schema, relation) = table.split_once('\0').unwrap_or(("public", table));
-                if p.has_trigger_call() {
-                    error = routine_ddl_error("42501", format!("permission denied for table {relation}"));
-                } else if self.service.admin.engine() == giggles_core::Engine::V2
-                    && let Some(routine) = p.missing_zero_arg_projection()
-                    && self.schema_privilege_allowed(schema, name, roles::SchemaPrivilege::Usage)?
-                    && self.sql.relation_exists(table)?
-                {
-                    // PostgreSQL resolves a bare missing call before checking SELECT.
-                    // The query still stops here without binding or reading the source.
-                    error = routine_ddl_error("42883", format!("function {routine}() does not exist"));
-                }
+                let (_, relation) = table.split_once('\0').unwrap_or(("public", table));
+                error = routine_ddl_error("42501", format!("permission denied for table {relation}"));
             }
             for table in p.row_lock_tables() {
                 if !self.table_requirements_allowed(&[(table.clone(), roles::TablePrivilege::Select),
@@ -3227,7 +3218,7 @@ impl Session {
         self.authorize_sequences(&implicit)?;
         Ok(())
     }
-    fn authorize_routine_ddl(&mut self, p: &Prepared) -> Result<Option<String>, CoreError> {
+    fn authorize_routine_ddl(&mut self, p: &Prepared) -> Result<Option<Prepared>, CoreError> {
         let Role::Database { name } = self.authority_role() else { return Err(CoreError::Policy(Error::Scope)); };
         let name = name.clone();
         let roles = self.service.admin.roles();
@@ -3257,29 +3248,29 @@ impl Session {
                 let table = p.table().ok_or(CoreError::Policy(Error::Scope))?;
                 let table = self.sql.resolve_relation_reference(table)?;
                 self.authorize_drop_schema(&table)?;
-                if !self.sql.relation_exists(&table)? { return Ok(None); }
                 let (schema, relation) = table.split_once('\0').unwrap_or(("public", &table));
-                if let Some((trigger, optional)) = p.drop_trigger_target() {
+                if p.is_drop_trigger() {
                     let metadata = self.sql.catalog_metadata()?;
-                    if let Some(target) = metadata.tables.iter().find(|target| {
+                    let target = metadata.tables.iter().find(|target| {
                         target.name == relation
                             && metadata.schemas.tables.get(&target.id).map_or("public", String::as_str) == schema
                             && !metadata.presentation.views.contains_key(&target.id)
-                    }) && !metadata.presentation.triggers.iter().any(|entry| {
-                        entry.table == target.id && entry.name == trigger
-                    }) {
-                        if optional {
-                            return Ok(Some(format!("trigger \"{trigger}\" for relation \"{relation}\" does not exist, skipping")));
-                        }
-                        return Err(routine_ddl_error("42704", format!(
-                            "trigger \"{trigger}\" for table \"{relation}\" does not exist",
-                        )));
-                    }
+                    });
+                    let allowed = if let Some(target) = target
+                        && self.table_privilege_allowed(&table, &name, None)?
+                    {
+                        Some(target.id)
+                    } else {
+                        None
+                    };
+                    let mut restricted = p.clone();
+                    restricted.restrict_drop_trigger_to_table(allowed);
+                    return Ok(Some(restricted));
                 }
+                if !self.sql.relation_exists(&table)? { return Ok(None); }
                 let privilege = (command == "CREATE TRIGGER").then_some(roles::TablePrivilege::Trigger);
                 if !self.table_privilege_allowed(&table, &name, privilege)? {
                     let message = match command {
-                        "DROP TRIGGER" => format!("must be owner of relation {relation}"),
                         "ALTER TRIGGER" => format!("must be owner of table {relation}"),
                         _ => format!("permission denied for table {relation}"),
                     };
@@ -3667,11 +3658,12 @@ impl Session {
             result
         })
     }
-    /// Copy the effective pgwire setting after its transaction has started.
-    pub(crate) fn sync_replication_role(
+    /// Copy effective pgwire settings at statement execution.
+    pub(crate) fn sync_execution_settings(
         &mut self,
         settings: &crate::pg_settings::SessionSettings,
     ) -> Result<(), CoreError> {
+        self.sql.set_check_function_bodies(settings.check_function_bodies());
         if self.sql.in_transaction() && !self.sql.is_aborted() {
             self.sql.set_replication_role_replica(settings.replication_role_replica())?;
         }
@@ -3740,10 +3732,10 @@ impl Session {
         let result = self.authority_scope(|session| {
             let mut bound = session.sql.bind_relation_context(p)?;
             session.reconcile_sequence_owners()?;
-            let authorization = if bound.drop_trigger_target().is_some() {
+            let authorization = if bound.is_drop_trigger() {
                 session.admit_backstop(bound.task_class())?;
-                if let Some(notice) = session.authorize_routine_ddl(&bound).inspect_err(|_| session.sql.abort())? {
-                    bound.skip_missing_drop_trigger(notice);
+                if let Some(restricted) = session.authorize_routine_ddl(&bound).inspect_err(|_| session.sql.abort())? {
+                    bound = restricted;
                 }
                 None
             } else {

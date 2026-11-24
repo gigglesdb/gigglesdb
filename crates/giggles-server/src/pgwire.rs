@@ -2601,17 +2601,6 @@ impl State {
         self.next_statement_id = id.checked_add(1).expect("statement ID exhausted");
         id
     }
-    fn check_named_statement_slot(&self, name: &str, sql_bytes: usize) -> R<()> {
-        if self.statements.contains_key(name) {
-            return Err("42P05");
-        }
-        if self.statements.keys().filter(|name| !name.is_empty()).count() >= MAX_NAMED_STATEMENTS
-            || self.named_statement_bytes.checked_add(sql_bytes).ok_or("54000")? > MAX_NAMED_STATEMENT_BYTES
-        {
-            return Err("54000");
-        }
-        Ok(())
-    }
     fn reuse_unnamed(&mut self, sql: &str, oids: &[u32], session: &mut Session) -> R<Option<Statement>> {
         #[cfg(test)]
         if sql.contains("r3_parse_source") { UNNAMED_REUSE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
@@ -2961,7 +2950,7 @@ impl State {
                 *implicit = false;
                 (Released::synthetic(SqlResult::default()), None)
             } else {
-                self.diagnostic.core(session.sync_replication_role(&self.settings))?;
+                self.diagnostic.core(session.sync_execution_settings(&self.settings))?;
                 // GD-0061 R3-310: the whole result is released once,
                 // here. A task session's spill never reaches this
                 // handle: core materialises it behind the release tag.

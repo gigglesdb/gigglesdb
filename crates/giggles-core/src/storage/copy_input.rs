@@ -15,6 +15,23 @@ pub(super) struct CopyInput {
 }
 
 impl SqlSession {
+    /// Refuse an already-triggered COPY target before requesting any input.
+    /// Normalization and publication repeat the check under the catalog lock.
+    pub fn check_copy_input_triggers(&mut self, prepared: &relational::Prepared) -> Result<(), CoreError> {
+        self.refuse_task_session()?;
+        let Some(db) = self.statement_lease()? else { return Ok(()); };
+        let implicit;
+        let txn = match self.v2_transaction.as_ref() {
+            Some(txn) => txn,
+            None => {
+                implicit = db.begin(self.isolation.engine());
+                &implicit
+            }
+        };
+        let (_, binding) = db.native_metadata_image(self.v2_transaction.as_ref())?;
+        self.check_copy_triggers_v2(&db, txn, &binding, prepared)
+    }
+
     /// Start bounded COPY input on v2. Legacy callers retain buffered ingestion.
     /// Abort or dropping this session discards unfinished input.
     pub fn begin_copy_input(&mut self) -> Result<bool, CoreError> {

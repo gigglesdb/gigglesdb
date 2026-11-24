@@ -689,6 +689,7 @@ impl Copy {
             relations: vec![self.relation.clone()],
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
+            skip_routine_body_check: false,
             extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
             native_delete: None,
             native_insert_many: false,

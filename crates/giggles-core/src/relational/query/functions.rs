@@ -112,8 +112,11 @@ pub(super) fn resolve_trigger_call(name: &mut String, has_arguments: bool, state
     } else { return; };
     let target = crate::relational::routines::Name { schema, name: routine.into() };
     if let Some((_, def)) = state.find_routine(&target, path) {
-        let prefix = if has_arguments { UNDEFINED_TRIGGER_CALL_PREFIX } else { TRIGGER_CALL_PREFIX };
-        *name = format!("{prefix}{}", def.name);
+        *name = if has_arguments {
+            format!("{UNDEFINED_TRIGGER_CALL_PREFIX}{}", target.display())
+        } else {
+            format!("{TRIGGER_CALL_PREFIX}{}", def.name)
+        };
     }
 }
 fn privilege_name(name: &str) -> bool {
@@ -584,11 +587,6 @@ pub(super) fn sequence_name(name: &str) -> bool {
 impl Scalar {
     pub(super) fn is_trigger_call(&self) -> bool {
         matches!(self, Self::Call(name, args) if args.is_empty() && name.starts_with(TRIGGER_CALL_PREFIX))
-    }
-    pub(super) fn missing_unqualified_zero_arg_call(&self) -> Option<&str> {
-        let Self::Call(name, args) = self else { return None };
-        name.strip_prefix(UNDEFINED_ROUTINE_PREFIX)
-            .filter(|name| args.is_empty() && !name.contains('\0'))
     }
     /// Catalog dependencies are distinct from the positive table-free proof.
     pub(in crate::relational) fn sequence_dependencies(&self, out: &mut Vec<SequenceDependency>) {
