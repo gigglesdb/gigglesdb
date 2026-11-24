@@ -299,6 +299,28 @@ fn single(key: &[u8]) -> WriteBatch {
 }
 
 #[test]
+fn local_commit_append_is_the_only_no_sync_entry_point_for_commit_batches() {
+    let backend = Arc::new(MemKv::new());
+    let kv = Kv::new_single_writer(backend.clone());
+    assert!(!backend.pipelined_sync());
+    assert!(!kv.pipelined_sync());
+
+    let mut batch = single(b"row");
+    batch.put(Keyspace::Meta, b"last_commit_ts".to_vec(), 42u64.to_be_bytes().to_vec());
+    kv.append_commit(batch.clone()).unwrap();
+    assert_eq!(kv.get(KS, b"row").unwrap(), Some(b"row".to_vec()));
+    assert!(keys(&backend.crash(), KS).is_empty());
+
+    let plain = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        kv.write(batch, Durability::NoSync)
+    }));
+    assert!(plain.is_err());
+
+    kv.sync_commits().unwrap();
+    assert_eq!(keys(&backend.crash(), KS), [b"row".to_vec()]);
+}
+
+#[test]
 fn mem_crash_barriers_and_atomic_batches() {
     for flush in [false, true] {
         let db = MemKv::new();
@@ -499,6 +521,8 @@ fn assert_fenced(kv: &Kv, backend: &FaultBackend) {
         Err(KvError::Fenced)
     );
     assert_eq!(kv.flush_barrier(), Err(KvError::Fenced));
+    assert_eq!(kv.append_commit(single(b"x")), Err(KvError::Fenced));
+    assert_eq!(kv.sync_commits(), Err(KvError::Fenced));
     assert_eq!(backend.calls.load(Ordering::Relaxed), before);
 }
 #[test]
@@ -518,6 +542,38 @@ fn wrapper_write_and_flush_errors_fence_every_entry_point() {
                 kv.write(single(b"x"), Durability::Sync)
             };
             assert_eq!(result, Err(error.clone()));
+            assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
+            assert_fenced(&kv, &backend);
+        }
+    }
+}
+
+#[test]
+fn commit_io_class_comes_from_the_call_site() {
+    for (operation, legacy_site) in [
+        (FenceSite::CommitAppend, FenceSite::WalWrite),
+        (FenceSite::CommitSync, FenceSite::WalFlush),
+    ] {
+        let rocks_error = KvError::RocksIo {
+            message: "WAL error".into(),
+            status: RocksStatus { code: RocksStatus::IO_ERROR, subcode: 0, severity: None },
+            site: legacy_site,
+        };
+        for error in errors().into_iter().chain([rocks_error]) {
+            let backend = Arc::new(FaultBackend {
+                calls: AtomicUsize::new(0),
+                error: error.clone(),
+                fail_reads: false,
+            });
+            let kv = Kv::new(backend.clone());
+            let result = match operation {
+                FenceSite::CommitAppend => kv.append_commit(single(b"x")),
+                FenceSite::CommitSync => kv.sync_commits(),
+                _ => unreachable!(),
+            };
+            assert_eq!(result, Err(error));
+            let cause = kv.causes.cause().unwrap();
+            assert_eq!((cause.site, cause.class), (operation, FenceClass::NotRecoverable));
             assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
             assert_fenced(&kv, &backend);
         }

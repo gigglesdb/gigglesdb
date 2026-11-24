@@ -284,6 +284,8 @@ pub enum FenceSite {
     WalWrite,
     FlushBarrier,
     WalFlush,
+    CommitAppend,
+    CommitSync,
     BackgroundError,
     Read,
     Open,
@@ -364,7 +366,10 @@ impl FenceCause {
             }
             _ => (site, None, false),
         };
-        let class = if matches!(error, KvError::Corrupt(_)) || site == FenceSite::NativeOnceLedger {
+        let class = if matches!(site, FenceSite::CommitAppend | FenceSite::CommitSync) {
+            // Pipeline recovery requires an amendment to fence note 6d6de0bd.
+            FenceClass::NotRecoverable
+        } else if matches!(error, KvError::Corrupt(_)) || site == FenceSite::NativeOnceLedger {
             FenceClass::Data
         } else if io_error && matches!(
             site,
@@ -636,6 +641,16 @@ pub(crate) trait KvBackend: KvRead {
     fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError>;
     /// Makes every preceding successful write durable. Errors are ambiguous too.
     fn flush_barrier(&self) -> Result<(), KvError>;
+    /// Whether WAL sync can overlap a write on this backend.
+    fn pipelined_sync(&self) -> bool {
+        false
+    }
+    fn append_commit(&self, batch: WriteBatch) -> Result<(), KvError> {
+        self.write(batch, Durability::NoSync)
+    }
+    fn sync_commits(&self) -> Result<(), KvError> {
+        self.flush_barrier()
+    }
     fn snapshot(&self) -> Result<Arc<dyn KvRead>, KvError>;
     fn engine_name(&self) -> &'static str;
 }
@@ -675,6 +690,10 @@ impl Kv {
 
     pub(crate) fn is_single_writer(&self) -> bool {
         self.single_writer
+    }
+    #[allow(dead_code, reason = "The commit sequencer will use this in P3")]
+    pub(crate) fn pipelined_sync(&self) -> bool {
+        self.is_single_writer() && self.backend.pipelined_sync()
     }
     /// Fences the handle: every later call fails without reaching the backend.
     pub(crate) fn fence(&self) {
@@ -725,6 +744,22 @@ impl Kv {
         let result = self.backend.write(batch, durability);
         self.fence_on_error(FenceSite::Write, result)
     }
+    /// Appends a commit batch to the WAL without waiting for durability.
+    #[allow(dead_code, reason = "The commit sequencer will use this in P3")]
+    pub(crate) fn append_commit(&self, batch: WriteBatch) -> Result<(), KvError> {
+        self.check()?;
+        // This entry point admits the sequencer's commit batch to local NoSync.
+        let result = self.backend.append_commit(batch);
+        self.fence_on_error(FenceSite::CommitAppend, result)
+    }
+    /// Makes preceding successful commit appends durable.
+    #[allow(dead_code, reason = "The commit sequencer will use this in P3")]
+    pub(crate) fn sync_commits(&self) -> Result<(), KvError> {
+        self.check()?;
+        let result = self.backend.sync_commits();
+        self.fence_on_error(FenceSite::CommitSync, result)
+    }
+
     #[cfg(all(test, feature = "engine-rocksdb"))]
     pub(super) fn test_sync_wal_error(
         &self,
@@ -780,8 +815,9 @@ impl Kv {
     }
 }
 
-// Design note 6.2a(4). Check every local NoSync batch that reaches the test
-// seam, including GC delete chunks that leave the cursor unchanged.
+// Design note 6.2a(4). Check every local NoSync batch passed to write(),
+// including GC delete chunks that leave the cursor unchanged. Commit batches
+// enter through append_commit().
 #[cfg(test)]
 fn assert_local_no_sync(batch: &WriteBatch) {
     let safe = match batch.ops() {

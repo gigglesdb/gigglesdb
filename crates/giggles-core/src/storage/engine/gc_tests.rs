@@ -72,6 +72,10 @@ impl KvRead for RecordingKv {
 }
 
 impl KvBackend for RecordingKv {
+    fn pipelined_sync(&self) -> bool {
+        self.inner.pipelined_sync()
+    }
+
     fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError> {
         let ops = batch.into_ops();
         self.batches.lock().unwrap().push(ops.clone());
@@ -587,6 +591,10 @@ impl KvRead for ImagingKv {
 }
 
 impl KvBackend for ImagingKv {
+    fn pipelined_sync(&self) -> bool {
+        self.inner.pipelined_sync()
+    }
+
     fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError> {
         let deletes = batch.ops().iter().any(|op| matches!(op, Op::Delete { .. }));
         self.inner.write(batch, durability)?;

@@ -51,6 +51,8 @@ fn range_kv(dir: &Dir, which: usize) -> (Arc<RangeStore>, Arc<Sink>, RangeKv) {
 fn in_range_writes_reach_the_sink_and_out_of_range_writes_are_never_proposed() {
     let dir = Dir::new("range-kv");
     let (store, sink, kv) = range_kv(&dir, 1);
+    assert!(store.kv().pipelined_sync());
+    assert!(!kv.pipelined_sync());
     let mut batch = WriteBatch::default();
     batch.put(Keyspace::Rows, row(SPLIT_TABLE, 1, 1), b"v".to_vec());
     kv.write(batch, Durability::Sync).unwrap();

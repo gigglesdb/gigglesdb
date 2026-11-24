@@ -52,6 +52,7 @@ fn sql_loopback_and_ambiguous_write_fences() {
         fail: AtomicBool::new(false),
     });
     let rkv = ReplicatedKv::new(mem.clone(), sink.clone());
+    assert!(!rkv.pipelined_sync());
     let admin = Admin::attach_v2_backend(Arc::new(rkv), Limits::default(), DEFAULT_WRITE_SET_BYTES)
         .unwrap();
     let mut session = admin.sql_session();

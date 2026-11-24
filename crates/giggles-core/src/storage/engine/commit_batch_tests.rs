@@ -162,6 +162,10 @@ impl KvRead for ObservedSync {
 }
 
 impl KvBackend for ObservedSync {
+    fn pipelined_sync(&self) -> bool {
+        self.backend.pipelined_sync()
+    }
+
     fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError> {
         assert_eq!(durability, Durability::Sync);
         // Each request writes one row; the group adds one last_commit_ts.

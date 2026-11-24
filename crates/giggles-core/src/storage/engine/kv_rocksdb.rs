@@ -148,6 +148,7 @@ pub(crate) const RECOVERY_FLUSH_MISSED: i32 = 88;
 thread_local! {
     pub(crate) static RECOVERY_OPEN_CRASH: std::cell::Cell<Option<RecoveryOpenCrash>> = const { std::cell::Cell::new(None) };
     pub(crate) static WAL_ONLY_SHUTDOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static COMMIT_IO_FAULT: std::cell::Cell<Option<FenceSite>> = const { std::cell::Cell::new(None) };
 }
 
 struct LockedDb {
@@ -177,6 +178,7 @@ impl Deref for LockedDb {
 
 pub(crate) struct RocksKv {
     db: Arc<LockedDb>,
+    pipelined_sync: bool,
 }
 
 impl Drop for RocksKv {
@@ -257,7 +259,11 @@ impl RocksKv {
         let cache = Cache::new_lru_cache(cache_bytes);
         let mut table = BlockBasedOptions::default();
         table.set_block_cache(&cache);
-        let mut options = Options::default();
+        // DESIGN.md section 3 and fence note 6d6de0bd section 6.2a.
+        let mut options = Options::default()
+            .get_options_from_string("max_bgerror_resume_count=0")
+            .map_err(|error| map_error_at(error, FenceSite::Open))?;
+        options.set_paranoid_checks(true);
         options.create_if_missing(true);
         options.create_missing_column_families(true);
         options.set_compression_type(DBCompressionType::Lz4);
@@ -297,7 +303,14 @@ impl RocksKv {
         if RECOVERY_OPEN_CRASH.get() == Some(RecoveryOpenCrash::AfterNativeOpen) {
             crate::storage::crash_now();
         }
+        // FlushWAL(true) calls SyncWAL with manual WAL flushing disabled.
+        let pipelined_sync = match db.flush_wal(true) {
+            Ok(()) => true,
+            Err(error) if error.kind() == rocksdb::ErrorKind::NotSupported => false,
+            Err(error) => return Err(map_error_at(error, FenceSite::Open)),
+        };
         Ok(Self {
+            pipelined_sync,
             db: Arc::new(LockedDb {
                 points: Mutex::new(PointPool::default()),
                 db,
@@ -777,6 +790,44 @@ impl RocksKv {
         }
         error
     }
+
+    fn commit_io(
+        &self,
+        site: FenceSite,
+        op: impl FnOnce() -> Result<(), rocksdb::Error>,
+    ) -> Result<(), KvError> {
+        let background_errors = self
+            .db
+            .property_int_value(c"rocksdb.background-errors")
+            .ok()
+            .flatten();
+
+        let op = || op().map_err(|error| map_error_at(error, site));
+        // Match the fence tests' backend-result injection before reporting the fence.
+        #[cfg(test)]
+        let op = || {
+            if COMMIT_IO_FAULT.get() != Some(site) {
+                return op();
+            }
+            COMMIT_IO_FAULT.set(None);
+            Err(KvError::RocksIo {
+                message: "injected commit WAL error".into(),
+                status: RocksStatus { code: RocksStatus::IO_ERROR, subcode: 0, severity: None },
+                site,
+            })
+        };
+
+        // Record pre-call evidence for the fence. Commit sites stay
+        // NotRecoverable until fence note 6d6de0bd is amended.
+        op().map_err(|mut error| {
+            if let KvError::RocksIo { message, .. } | KvError::Corrupt(message) = &mut error {
+                let before = background_errors
+                    .map_or_else(|| "unknown".into(), |count| count.to_string());
+                *message = format!("rocksdb.background-errors={before} before commit I/O: {message}");
+            }
+            error
+        })
+    }
 }
 
 // RocksDB appends slash-separated filenames. Windows verbatim paths prohibit
@@ -958,13 +1009,8 @@ impl KvRead for RocksKv {
     }
 }
 
-impl KvBackend for RocksKv {
-    fn close_latch(&self) -> Option<CloseLatch> {
-        Some(self.close_latch())
-    }
-
-
-    fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError> {
+impl RocksKv {
+    fn write_batch(&self, batch: WriteBatch, durability: Durability) -> Result<(), rocksdb::Error> {
         let mut native = rocksdb::WriteBatch::default();
         for op in batch.into_ops() {
             match op {
@@ -984,6 +1030,28 @@ impl KvBackend for RocksKv {
         options.set_sync(durability == Durability::Sync);
         options.disable_wal(false);
         self.db.write_opt(native, &options)
+    }
+}
+
+impl KvBackend for RocksKv {
+    fn close_latch(&self) -> Option<CloseLatch> {
+        Some(self.close_latch())
+    }
+
+    fn pipelined_sync(&self) -> bool {
+        self.pipelined_sync
+    }
+
+    fn append_commit(&self, batch: WriteBatch) -> Result<(), KvError> {
+        self.commit_io(FenceSite::CommitAppend, || self.write_batch(batch, Durability::NoSync))
+    }
+
+    fn sync_commits(&self) -> Result<(), KvError> {
+        self.commit_io(FenceSite::CommitSync, || self.db.flush_wal(true))
+    }
+
+    fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError> {
+        self.write_batch(batch, durability)
             .map_err(|error| self.map_write_error(error, FenceSite::Write, durability == Durability::Sync))
     }
 
@@ -1385,10 +1453,13 @@ mod tests {
             classify(&current, true, Some(0), &dir.0),
             (Site::WalWrite, Class::Recoverable)
         );
-        assert_eq!(
-            write_error_site(Site::FlushBarrier, true, &current, Some(0), &dir.0),
-            Site::WalFlush
-        );
+        let flush_error = KvError::RocksIo {
+            site: write_error_site(Site::FlushBarrier, true, &current, Some(0), &dir.0),
+            message: current.clone(),
+            status: RocksStatus { code: RocksStatus::IO_ERROR, subcode: 0, severity: None },
+        };
+        let cause = FenceCause::for_kv(Site::FlushBarrier, &flush_error);
+        assert_eq!((cause.site, cause.class), (Site::WalFlush, Class::Recoverable));
         assert_eq!(
             classify(&current, true, Some(1), &dir.0),
             (Site::BackgroundError, Class::NotRecoverable)
@@ -1418,6 +1489,80 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn open_probes_wal_sync_and_pins_fence_options() {
+        let dir = TestDir::new();
+        for mode in [DBRecoveryMode::PointInTime, DBRecoveryMode::TolerateCorruptedTailRecords] {
+            let cache_bytes = 8 * 1024 * 1024;
+            let lock = WriterLock::acquire(&dir.0).unwrap();
+            let db = Arc::new(RocksKv::open_locked_in_mode(&dir.0, cache_bytes, lock, mode, None).unwrap());
+            assert!(db.pipelined_sync());
+            assert!(Kv::new_single_writer(db.clone()).pipelined_sync());
+            assert!(!Kv::new(db.clone()).pipelined_sync());
+
+            let path = dir.0.read_dir().unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with("OPTIONS-"))
+                .max()
+                .unwrap();
+            let options = std::fs::read_to_string(path).unwrap();
+            for expected in ["max_bgerror_resume_count=0", "paranoid_checks=true"] {
+                assert!(options.lines().any(|line| line.trim() == expected), "{expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn failed_commit_append_is_not_recoverable() {
+        let dir = TestDir::new();
+        let db = Arc::new(RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap());
+        let kv = Kv::new_single_writer(db);
+
+        COMMIT_IO_FAULT.set(Some(FenceSite::CommitAppend));
+        let error = kv.append_commit(single()).unwrap_err();
+        assert_commit_fence(&kv, error, FenceSite::CommitAppend);
+    }
+
+    #[test]
+    fn failed_commit_sync_leaves_no_sst_before_close() {
+        let dir = TestDir::new();
+        let db = Arc::new(RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap());
+        let kv = Kv::new_single_writer(db.clone());
+        let ssts = || -> std::collections::BTreeSet<PathBuf> {
+            dir.0.read_dir().unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "sst"))
+                .collect()
+        };
+        let before = ssts();
+
+        for group in 1..=2u64 {
+            let mut batch = WriteBatch::default();
+            batch.put(Keyspace::Rows, group.to_be_bytes().to_vec(), b"row".to_vec());
+            batch.put(Keyspace::Meta, b"last_commit_ts".to_vec(), group.to_be_bytes().to_vec());
+            kv.append_commit(batch).unwrap();
+            assert_eq!(kv.get(Keyspace::Rows, &group.to_be_bytes()).unwrap(), Some(b"row".to_vec()));
+        }
+
+        COMMIT_IO_FAULT.set(Some(FenceSite::CommitSync));
+        let error = kv.sync_commits().unwrap_err();
+        assert_commit_fence(&kv, error, FenceSite::CommitSync);
+        assert_eq!(kv.sync_commits(), Err(KvError::Fenced));
+        assert_eq!(kv.append_commit(single()), Err(KvError::Fenced));
+        let mut wait = rocksdb::WaitForCompactOptions::default();
+        wait.set_timeout(5_000_000);
+        db.db.wait_for_compact(&wait).unwrap();
+        assert_eq!(ssts(), before);
+    }
+
+    fn assert_commit_fence(kv: &Kv, error: KvError, expected: FenceSite) {
+        assert!(matches!(error, KvError::RocksIo { site, .. } if site == expected));
+        assert!(kv.is_fenced());
+        let cause = kv.causes.cause().unwrap();
+        assert_eq!((cause.site, cause.class), (expected, FenceClass::NotRecoverable));
+        assert!(cause.error_text.contains("rocksdb.background-errors=0 before commit I/O"));
     }
 
     #[test]
