@@ -240,6 +240,33 @@ fn primary_key_candidate_value(s: &Scalar, column: &ColumnDef, params: &[Value])
     Some(v)
 }
 
+pub(super) fn has_materialized_collations() -> bool {
+    functions::collation::has_materialized_columns()
+}
+
+impl Query {
+    // Admit only syntax whose binder uses the base table and simple scalar
+    // leaves. Keep view expansion and less common expression binders on the
+    // ordinary path.
+    pub(super) fn is_plain_cursor_candidate(&self) -> bool {
+        let leaf = |s: &Scalar| matches!(s, Scalar::Column(_) | Scalar::Param(_) | Scalar::Literal(_));
+        !self.explain
+            && self.sources.len() == 1
+            && self.joins.is_empty()
+            && self.clauses().is_none()
+            && self.order.is_empty()
+            && self.limit.is_none()
+            && self.items.iter().all(|(item, _)| match item {
+                Item::Star | Item::QualifiedStar { .. } => true,
+                Item::Scalar(s) => leaf(s),
+                _ => false,
+            })
+            && self.filter.as_ref().is_none_or(|filter| {
+                matches!(filter, Filter::Compare(lhs, _, rhs) if leaf(lhs) && leaf(rhs))
+            })
+    }
+}
+
 impl Query {
     pub(super) fn from_single_source_read(read: typed_read::SingleSourceRead) -> R<Self> {
         typed_read::lower(read)
@@ -5183,6 +5210,21 @@ impl BoundQuery<'_> {
         } else {
             None
         }
+    }
+    // A successful cursor_direction check rules out joins, grouping and
+    // subqueries. Only admit projections and predicates for which attaching
+    // an execution clock would do nothing.
+    pub(super) fn cursor_clock_independent(&self) -> bool {
+        self.order.is_empty()
+            && self.items.iter().all(|item| match item {
+                BoundItem::Column(_) => true,
+                BoundItem::Scalar(value) => value.cursor_clock_independent(),
+                _ => false,
+            })
+            && self.filter.as_ref().is_none_or(|filter| {
+                matches!(filter, BoundFilter::Compare(lhs, _, rhs)
+                    if lhs.cursor_clock_independent() && rhs.cursor_clock_independent())
+            })
     }
     pub(super) fn fetch_cursor(
         &self,

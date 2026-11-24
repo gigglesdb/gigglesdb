@@ -2419,6 +2419,10 @@ impl BoundScalar {
         }
     }
 
+    pub(super) fn cursor_clock_independent(&self) -> bool {
+        matches!(self.node, Node::Column(..) | Node::Param(_) | Node::Literal(_))
+    }
+
     pub(in crate::relational) fn attach_clock(
         &mut self,
         clock: Option<&crate::relational::clock::ExecutionClock>,

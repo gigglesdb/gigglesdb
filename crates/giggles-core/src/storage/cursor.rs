@@ -355,6 +355,7 @@ impl SqlSession {
                             || t.writes_keyspace(engine::kv::Keyspace::Index)
                             || t.isolation() == engine::txn::Isolation::Serializable
                     }) {
+                        self.cursor_plan_cache = Default::default();
                         discard(&tag);
                         return self.buffer_cursor(&p, params, clock, buffer_limit, lease);
                     }
@@ -404,6 +405,7 @@ impl SqlSession {
                     let image = catalog.cursor_image().map_err(CoreError::Sql)?;
                     // Sequence-bearing selects use the established execution path.
                     if !p.sequences().is_empty() {
+                        self.cursor_plan_cache = Default::default();
                         discard(&tag);
                         return self.buffer_cursor(&p, params, clock, buffer_limit, lease);
                     }
@@ -479,7 +481,13 @@ impl SqlSession {
                     PrivilegeImage::Catalog(image.clone()), self.search_path.clone(), self.v2_transaction.as_ref(), self.admin.roles(), db)),
                 None => clock,
             });
-            match Plan::new(&image, &p, params, context.clone()).map_err(CoreError::Sql)? {
+            let cache = if self.task.is_none() && self.is_v2_engine() {
+                Some(&mut self.cursor_plan_cache)
+            } else {
+                self.cursor_plan_cache = Default::default();
+                None
+            };
+            match Plan::new(&image, &p, params, context.clone(), cache).map_err(CoreError::Sql)? {
                 Some(plan) => Ok(Cursor {
                     engine: lease
                         .map(|pin| Ok::<_, CoreError>(CursorEngine::Streaming {
@@ -846,6 +854,31 @@ mod tests {
             assert_eq!(cursor.fetch(1, 9).unwrap()[0].values, vec![Value::Int(1)]);
         }
     }
+    #[test]
+    fn repeats_cursor_binding_on_the_same_catalog_image_and_rebinds_after_ddl() {
+        let path = crate::test_artifact_root().join("cursor-execute-binding-reuse");
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut session = admin.sql_session();
+        session.execute("CREATE TABLE t(id bigint PRIMARY KEY)", &[], None).unwrap();
+        session.execute("INSERT INTO t VALUES (1),(2)", &[], None).unwrap();
+        let prepared = session.prepare("SELECT * FROM t WHERE id = $1").unwrap();
+
+        let before = relational::cursor::query_binds();
+        let mut first = session.open_cursor(&prepared, &[Value::Int(1)]).unwrap();
+        let mut second = session.open_cursor(&prepared, &[Value::Int(2)]).unwrap();
+        assert_eq!(relational::cursor::query_binds() - before, 1);
+        assert_eq!(first.fetch(1, 1024).unwrap()[0].values, [Value::Int(1)]);
+        assert_eq!(second.fetch(1, 1024).unwrap()[0].values, [Value::Int(2)]);
+        drop((first, second));
+
+        session.execute("ALTER TABLE t ADD COLUMN payload text", &[], None).unwrap();
+        let mut after_ddl = session.open_cursor(&prepared, &[Value::Int(1)]).unwrap();
+        assert_eq!(relational::cursor::query_binds() - before, 2);
+        assert_eq!(after_ddl.fetch(1, 1024).unwrap()[0].values, [Value::Int(1), Value::Null]);
+        drop((after_ddl, session, admin));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     #[test]
     fn secondary_cursor_matches_scan_and_resumes() {
         let mut nonce = [0; 16];

@@ -261,6 +261,9 @@ struct Metadata {
     conflict: Option<(String, String)>,
 }
 std::thread_local! { static MATERIALIZED: std::cell::RefCell<BTreeMap<u64, Metadata>> = const { std::cell::RefCell::new(BTreeMap::new()) }; }
+pub(in crate::relational::query) fn has_materialized_columns() -> bool {
+    MATERIALIZED.with(|columns| !columns.borrow().is_empty())
+}
 pub(in crate::relational::query) struct ColumnScope(BTreeMap<u64, Metadata>);
 impl ColumnScope {
     pub(in crate::relational::query) fn enter(
