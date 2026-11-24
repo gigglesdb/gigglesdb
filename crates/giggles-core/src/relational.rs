@@ -4180,6 +4180,34 @@ fn bounds(t: &TableDef, preds: &[Predicate], params: &[Value]) -> R<Bounds> {
         point: false,
     })
 }
+/// Parse a PL/pgSQL variable's SQL type without binding to a catalog.
+pub(crate) fn plpgsql_data_type(sql: &str) -> R<DataType> {
+    let mut p = Parser {
+        privilege_casts: false,
+        privilege_seen: false,
+        tokens: lex(sql)?,
+        at: 0,
+        params: BTreeSet::new(),
+        relations: Vec::new(),
+    };
+    let parsed = ddl_type::parse(&mut p, ddl_type::Site::Alter)?;
+    if p.at != p.tokens.len() {
+        return Err(SqlError::Syntax);
+    }
+    if let Some(error) = parsed.semantic_error {
+        return Err(error);
+    }
+    Ok(parsed.data_type)
+}
+
+/// Decode a PL/pgSQL format string with the SQL literal rules.
+pub(crate) fn plpgsql_string(sql: &str) -> R<String> {
+    match lex(sql)?.as_slice() {
+        [Token::String(value)] => Ok(value.clone()),
+        _ => Err(SqlError::Syntax),
+    }
+}
+
 impl DataType {
     pub fn is_temporal(&self) -> bool {
         matches!(
