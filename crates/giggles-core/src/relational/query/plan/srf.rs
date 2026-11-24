@@ -208,7 +208,7 @@ impl Function {
             if let Some(input) = &self.input {
                 let meta = input.clone().resolve(state, parameters)?;
                 let types = meta.columns.into_iter().zip(meta.unknown)
-                    .map(|(column, unknown)| (!unknown).then_some(column.data_type)).collect::<Vec<_>>();
+                    .map(|(column, unknown)| unknown.is_none().then_some(column.data_type)).collect::<Vec<_>>();
                 functions::text_search::row_arg_types(&self.name, &types)?;
             } else {
                 functions::text_search::bind_row_args(&self.name, &self.args, parameters)?;

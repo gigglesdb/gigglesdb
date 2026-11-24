@@ -202,7 +202,6 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
                 let (parsed,user_type)=ddl_type::parse_column_type(p, ddl_type::Site::Alter)?;
                 let collation=if p.word("collate") {Some(column_collations::parse_name(p)?)} else {None};
                 if let Some(error)=parsed.semantic_error {return Err(error);}
-                unsupported_type |= collation.is_none() && user_type.is_none() && !parsed.data_type.is_text_search() && !matches!(parsed.data_type,DataType::Text|DataType::Varchar|DataType::Bpchar);
                 let conversion = if parsed.data_type.is_text_search() && p.word("using") {
                     Some(Box::new(query::Query::parse_text_search_conversion(p, &table, parsed.data_type.clone())?))
                 } else if user_type.is_some() && p.word("using") {
@@ -838,7 +837,11 @@ pub(super) fn execute(
                 let at = position(&table, column)?;
                 if candidate.generated_column(table.columns[at].id).is_some() {
                     user_types::view_replace_error(format!("column \"{column}\" of relation \"{}\" is a generated column", table.name));
-                    user_types::sql_error_hint("Use ALTER TABLE ... ALTER COLUMN ... SET EXPRESSION instead.");
+                    user_types::sql_error_hint(if default.is_some() {
+                        "Use ALTER TABLE ... ALTER COLUMN ... SET EXPRESSION instead."
+                    } else {
+                        "Use ALTER TABLE ... ALTER COLUMN ... DROP EXPRESSION instead."
+                    });
                     return Err(SqlError::Syntax);
                 }
                 if default.is_none() && alter.actions.iter().any(|action| {

@@ -2653,9 +2653,11 @@ impl State {
                         giggles_core::PreparedCatalogState::Version(version) =>
                             old.description_version.is_none() || old.description_version != version,
                         giggles_core::PreparedCatalogState::UnknownBackend =>
-                            // Enum Bind and EXECUTE validate labels against the prepared
-                            // definitions, which change even when the type OIDs stay fixed.
-                            ((old.origin.as_ref().is_some_and(|origin| origin.is_sql())
+                            // Legacy has a schema epoch but no catalog version. Refresh
+                            // reads after DDL and parameters whose enum labels can change
+                            // while their type OIDs stay fixed.
+                            ((p.command() == "SELECT"
+                                || old.origin.as_ref().is_some_and(|origin| origin.is_sql())
                                 || !old.enum_parameters.is_empty())
                                 && core(session.sql.legacy_prepared_schema_changed(p))?)
                             || old.description_version.is_some_and(|version| session.sql.committed_catalog_version()

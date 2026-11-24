@@ -3329,7 +3329,7 @@ impl Prepared {
             Statement::View(ddl) => if ddl.query.is_some() { "CREATE VIEW" } else { "DROP VIEW" },
             Statement::Create { .. } => "CREATE TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
-            Statement::DropIndex(ref index) => if index.rename.is_some() { "ALTER INDEX" } else { "DROP INDEX" },
+            Statement::DropIndex(index) => if index.rename.is_some() { "ALTER INDEX" } else { "DROP INDEX" },
             Statement::Insert { .. }
             | Statement::InsertExpressions(_)
             | Statement::InsertMulti(_) => "INSERT",

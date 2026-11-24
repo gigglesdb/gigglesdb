@@ -922,6 +922,49 @@ mod tests {
     }
 
     #[test]
+    fn cursor_rebinds_when_generated_columns_or_gin_indexes_change() {
+        let path = crate::test_artifact_root().join("cursor-am6-catalog-changes");
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut session = admin.sql_session();
+        for sql in [
+            "CREATE TABLE docs (id int PRIMARY KEY, title text,
+                search tsvector GENERATED ALWAYS AS (to_tsvector('english', title)) STORED)",
+            "INSERT INTO docs(id,title) VALUES (1,'Running dogs')",
+        ] {
+            session.execute(sql, &[], None).unwrap();
+        }
+        let prepared = session.prepare("SELECT id,search FROM docs WHERE id=$1").unwrap();
+
+        let before = relational::cursor::query_binds();
+        for (binds, ddl, expected) in [
+            (1, "", "'dog':2 'run':1"),
+            (1, "", "'dog':2 'run':1"),
+            (2, "CREATE INDEX docs_search ON docs USING gin(search)", "'dog':2 'run':1"),
+            (3, "ALTER TABLE docs ALTER COLUMN search SET EXPRESSION AS
+                (to_tsvector('simple', title))", "'dogs':2 'running':1"),
+            (4, "DROP INDEX docs_search", "'dogs':2 'running':1"),
+            (5, "ALTER TABLE docs ALTER COLUMN search DROP EXPRESSION", "'dogs':2 'running':1"),
+            (6, "ALTER TABLE docs ADD COLUMN fresh tsvector
+                GENERATED ALWAYS AS (to_tsvector('simple', title)) STORED", "'dogs':2 'running':1"),
+            (7, "ALTER TABLE docs DROP COLUMN fresh", "'dogs':2 'running':1"),
+        ] {
+            if !ddl.is_empty() {
+                session.execute(ddl, &[], None).unwrap();
+            }
+            let mut cursor = session.open_cursor(&prepared, &[Value::Int(1)]).unwrap();
+            assert_eq!(relational::cursor::query_binds() - before, binds, "{ddl}");
+            let rows = cursor.fetch(1, 1024).unwrap();
+            assert_eq!(rows[0].values[0], Value::Int(1));
+            assert_eq!(
+                relational::text_search_types::output(&relational::DataType::TsVector, &rows[0].values[1]).unwrap(),
+                expected,
+            );
+        }
+        drop((session, admin));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn changing_schema_user_rebinds_cursor_on_the_same_catalog_image() {
         let path = crate::test_artifact_root().join("cursor-cache-schema-user");
         let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
