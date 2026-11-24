@@ -34,19 +34,19 @@ async fn generated_columns_over_pgwire(engine: giggles_core::Engine) {
         loopback_trust: false,
         connections: 8,
     };
-    let running = serve_postgresql(config.listen, service, Arc::new(config.build().unwrap()))
-        .await
-        .unwrap();
-    let (client, connection) = tokio_postgres::Config::new()
-        .host("127.0.0.1")
-        .port(running.address.port())
-        .dbname("postgres")
-        .user("migration_owner")
-        .password("fixture-password")
-        .ssl_mode(tokio_postgres::config::SslMode::Disable)
-        .connect(tokio_postgres::NoTls)
-        .await
-        .unwrap();
+    let listener = Arc::new(config.build().unwrap());
+    let running = serve_postgresql(config.listen, service, listener.clone()).await.unwrap();
+    let client_config = |port| {
+        let mut config = tokio_postgres::Config::new();
+        config.host("127.0.0.1")
+            .port(port)
+            .dbname("postgres")
+            .user("migration_owner")
+            .password("fixture-password")
+            .ssl_mode(tokio_postgres::config::SslMode::Disable);
+        config
+    };
+    let (client, connection) = client_config(running.address.port()).connect(tokio_postgres::NoTls).await.unwrap();
     let (send_notice, mut notices) = tokio::sync::mpsc::unbounded_channel();
     let mut connection = connection;
     let connection = tokio::spawn(async move {
@@ -57,6 +57,7 @@ async fn generated_columns_over_pgwire(engine: giggles_core::Engine) {
         }
         Ok::<_, tokio_postgres::Error>(())
     });
+    text_search_configuration_wire(&client).await;
     client.batch_execute("
         CREATE TABLE articles (
             id integer PRIMARY KEY,
@@ -239,6 +240,28 @@ async fn generated_columns_over_pgwire(engine: giggles_core::Engine) {
     let error = error.as_db_error().unwrap();
     assert_eq!(error.code().code(), "23502");
     assert_eq!(error.detail(), Some("Failing row contains (5, -10, -20, virtual)."));
+    client.batch_execute("CREATE TABLE f2_check (id int PRIMARY KEY, a int CHECK (a > 0),
+        v int GENERATED ALWAYS AS (a * 2) VIRTUAL)").await.unwrap();
+    let error = client.simple_query("INSERT INTO f2_check VALUES (1, -5)").await.unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "23514");
+    assert_eq!(error.detail(), Some("Failing row contains (1, -5, virtual)."));
+
+    client.batch_execute("CREATE TABLE f2_search (id int PRIMARY KEY, body text,
+        doc tsvector GENERATED ALWAYS AS (to_tsvector('english', body)) STORED)").await.unwrap();
+    for (sql, input) in [
+        ("COPY f2_search FROM STDIN WITH (FORMAT binary)", (1i32, "Fat cats ran")),
+        ("COPY f2_search (id, body) FROM STDIN WITH (FORMAT binary)", (2i32, "Running dogs")),
+    ] {
+        let copy = client.copy_in(sql).await.unwrap();
+        let mut copy = std::pin::pin!(BinaryCopyInWriter::new(copy, &[Type::INT4, Type::TEXT]));
+        copy.as_mut().write(&[&input.0, &input.1]).await.unwrap();
+        assert_eq!(copy.as_mut().finish().await.unwrap(), 1);
+    }
+    let rows = client.query("SELECT doc::text FROM f2_search ORDER BY id", &[]).await.unwrap();
+    assert_eq!(rows.iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>(),
+        ["'cat':2 'fat':1 'ran':3", "'dog':2 'run':1"]);
+
     client.batch_execute("ALTER TABLE f1 ALTER COLUMN a DROP EXPRESSION IF EXISTS").await.unwrap();
     let notice = tokio::time::timeout(std::time::Duration::from_secs(5), notices.recv()).await.unwrap().unwrap();
     assert_eq!(notice.code().code(), "00000");
@@ -250,6 +273,15 @@ async fn generated_columns_over_pgwire(engine: giggles_core::Engine) {
         let error = error.as_db_error().unwrap();
         assert_eq!(error.code().code(), "2BP01");
         assert_eq!(error.detail(), Some("view fv depends on column s of table f1\nview fv2 depends on view fv"));
+        let error = client.simple_query("ALTER TABLE f1 DROP COLUMN a RESTRICT").await.unwrap_err();
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), "2BP01");
+        assert_eq!(error.detail(), Some(concat!(
+            "column s of table f1 depends on column a of table f1\n",
+            "view fv depends on column s of table f1\n",
+            "view fv2 depends on view fv\n",
+            "column v of table f1 depends on column a of table f1",
+        )));
         client.batch_execute("ALTER TABLE f1 DROP COLUMN s CASCADE").await.unwrap();
         let notice = tokio::time::timeout(std::time::Duration::from_secs(5), notices.recv()).await.unwrap().unwrap();
         assert_eq!(notice.code().code(), "00000");
@@ -257,9 +289,30 @@ async fn generated_columns_over_pgwire(engine: giggles_core::Engine) {
         assert_eq!(notice.detail(), Some("drop cascades to view fv\ndrop cascades to view fv2"));
     }
 
+    if engine == giggles_core::Engine::V2 {
+        client.batch_execute("CREATE TABLE f2_generation (
+            id int PRIMARY KEY, n int, s int GENERATED ALWAYS AS (n * 2) STORED);
+            ALTER TABLE f2_generation ALTER COLUMN s SET EXPRESSION AS (n * 3)").await.unwrap();
+    }
     drop(client);
     connection.await.unwrap().unwrap();
     running.shutdown().await.unwrap();
+
+    if engine == giggles_core::Engine::V2 {
+        let admin = Admin::open(&path, Limits::default()).unwrap();
+        let service = Service::new(admin, vec![], Clock::new(0, 3600).unwrap()).unwrap();
+        let running = serve_postgresql(config.listen, service, listener).await.unwrap();
+        let (client, connection) = client_config(running.address.port()).connect(tokio_postgres::NoTls).await.unwrap();
+        let connection = tokio::spawn(connection);
+        let row = client.query_one("SELECT generation_expression FROM information_schema.columns
+            WHERE table_name='f2_generation' AND column_name='s'", &[]).await.unwrap();
+        assert_eq!(row.get::<_, &str>(0), "(n * 3)");
+        let row = client.query_one("INSERT INTO f2_generation VALUES (2, 7) RETURNING s", &[]).await.unwrap();
+        assert_eq!(row.get::<_, i32>(0), 21);
+        drop(client);
+        connection.await.unwrap().unwrap();
+        running.shutdown().await.unwrap();
+    }
     std::fs::remove_dir_all(path).unwrap();
 }
 

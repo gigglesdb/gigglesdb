@@ -1096,6 +1096,8 @@ fn input_value(
             .into_iter().map(Some).collect::<Vec<_>>();
         let bound = expression.bind(table, None, &table.columns[index].data_type, &parameters, clock)?;
         bound.evaluate(&SqlRow { values: vec![], version: 0 }, &[], params, &mut 0)
+    } else if insert.copy_input.is_some() && let Expr::Literal(value) = expression {
+        sql_copy::copy_value(value.clone(), &table.columns[index].data_type, clock)
     } else if matches!(expression, Expr::Param(n) if declared.get(n - 1).is_some_and(Option::is_some)) {
         assign::plain_value(state, expression, &table.columns[index], declared, params, clock)
     } else {
@@ -1295,7 +1297,7 @@ pub(super) fn normalize_copy(
         // Preserve the assignment step previously performed by normalize_row
         // on literal expressions, including omitted and marker defaults.
         for index in &logical {
-            full[*index] = query::assignment::literal(
+            full[*index] = sql_copy::copy_value(
                 std::mem::replace(&mut full[*index], Value::Null),
                 &table.columns[*index].data_type, clock)?;
         }

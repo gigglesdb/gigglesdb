@@ -783,6 +783,21 @@ pub(super) fn copy_text_field(
     query::assignment::literal(Value::Text(text), ty, clock)
 }
 
+pub(super) fn copy_value(
+    value: Value,
+    ty: &DataType,
+    clock: Option<&clock::ExecutionClock>,
+) -> R<Value> {
+    // COPY carries typed values after decoding or computing a generated column.
+    // Text-search values use bytes internally; a SQL bytea literal still cannot
+    // be assigned to a text-search column.
+    if ty.is_text_search() && text_search_types::valid(ty, &value) {
+        Ok(value)
+    } else {
+        query::assignment::literal(value, ty, clock)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

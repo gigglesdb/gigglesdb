@@ -548,6 +548,58 @@ fn review_fixes(engine: Engine) {
     std::fs::remove_dir_all(path).unwrap();
 }
 
+fn copy_generated_tsvector(engine: Engine) {
+    let path = common::fresh("copy-generated-tsvector");
+    let limits = Limits::default();
+    let admin = Admin::create_engine(&path, limits, engine).unwrap();
+    let mut session = admin.sql_session();
+    run(
+        &mut session,
+        "CREATE TABLE tsd (id int PRIMARY KEY, body text, doc tsvector
+            GENERATED ALWAYS AS (to_tsvector('english', body)) STORED)",
+    );
+    let clock = StatementClock {
+        unavailable: None,
+        transaction_us: 0,
+        statement_us: 0,
+        zone: None,
+        wall: None,
+    };
+    for (statement, id, body) in [
+        ("COPY tsd FROM STDIN", 1, "Fat cats ran"),
+        ("COPY tsd (id, body) FROM STDIN", 2, "Running dogs"),
+    ] {
+        let (_, prepared) = session.prepare_copy(statement).unwrap();
+        let (prepared, data) = session.normalize_copy_rows_at(
+            &prepared, vec![vec![Value::Int(id), text(body)]], &clock,
+        ).unwrap();
+        session.ingest_copy_at(&prepared, data, &clock).unwrap();
+    }
+    drop(session);
+    drop(admin);
+
+    let admin = Admin::open(&path, limits).unwrap();
+    let mut session = admin.sql_session();
+    assert_eq!(run(&mut session, "SELECT id,doc::text FROM tsd ORDER BY id"), vec![
+        vec![Value::Int(1), text("'cat':2 'fat':1 'ran':3")],
+        vec![Value::Int(2), text("'dog':2 'run':1")],
+    ]);
+    drop(session);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn text_search_copy_generated_legacy() {
+    copy_generated_tsvector(Engine::Legacy);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn text_search_copy_generated_v2() {
+    copy_generated_tsvector(Engine::V2);
+}
+
 #[test]
 fn text_search_review_legacy() {
     review_fixes(Engine::Legacy);

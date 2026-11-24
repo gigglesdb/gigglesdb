@@ -54,7 +54,8 @@ pub(super) fn parse(p: &mut Parser) -> R<Ddl> {
 // Retire their bindings between ALTER actions so a later RESTRICT sees CASCADE's
 // earlier removals. Persisted definitions/comments are removed at publication.
 pub(super) fn drop_column_views(
-    state: &mut Relational, table: &TableDef, column: &ColumnDef, cascade: bool, path: &[String],
+    state: &mut Relational, table: &TableDef, column: &ColumnDef,
+    generated_dependents: &[&ColumnDef], cascade: bool, path: &[String],
 ) -> R<()> {
     let display = |key: &str| {
         let (schema, name) = split_key(key);
@@ -62,50 +63,68 @@ pub(super) fn drop_column_views(
         let name = query::quote_identifier(name);
         if visible { name } else { format!("{}.{name}", query::quote_identifier(schema)) }
     };
-    let target = format!("column {} of table {}", column.name, display(&state.table_key(table)));
+    let table_name = display(&state.table_key(table));
+    let describe_column = |column: &ColumnDef| format!("column {} of table {table_name}", column.name);
+    let target = describe_column(column);
+    // CASCADE drops generated columns through their own ALTER actions. RESTRICT
+    // needs the full graph now, including views reached through those columns.
+    let indirect = if cascade { &[][..] } else { generated_dependents };
+    let parents = || indirect.iter().copied().chain(std::iter::once(column));
+    let mut roots: BTreeMap<u64, Vec<(u64, &str)>> = BTreeMap::new();
     let mut children: BTreeMap<u64, Vec<(u64, &str)>> = BTreeMap::new();
     for (name, (id, projection)) in &state.view_names {
-        if let Ok(projection) = projection
-            && let Some(source) = projection.direct_source
-            && (source != table.id || projection.dependencies.contains(&column.id))
-        {
-            children.entry(source).or_default().push((*id, name));
+        if let Ok(projection) = projection && let Some(source) = projection.direct_source {
+            if source == table.id {
+                if let Some(parent) = parents().find(|column| projection.dependencies.contains(&column.id)) {
+                    roots.entry(parent.id).or_default().push((*id, name));
+                }
+            } else {
+                children.entry(source).or_default().push((*id, name));
+            }
         }
     }
-    for branch in children.values_mut() {
+    for branch in roots.values_mut().chain(children.values_mut()) {
         branch.sort_unstable_by_key(|(id, _)| *id);
     }
-    let branch = |id| children.get(&id).map_or(&[][..], Vec::as_slice);
-    let mut pending = branch(table.id).iter().rev()
-        .map(|&(id, name)| (id, name, None)).collect::<Vec<_>>();
     let mut dropped = BTreeSet::new();
-    let mut dependencies = Vec::new();
-    while let Some((id, name, parent)) = pending.pop() {
-        if dropped.insert(name.to_owned()) {
-            let parent = parent.map_or_else(|| target.clone(), |key| format!("view {}", display(key)));
-            dependencies.push((display(name), parent));
-            pending.extend(branch(id).iter().rev().map(|&(child, key)| (child, key, Some(name))));
+    let mut messages = Vec::new();
+    for parent in parents() {
+        let description = describe_column(parent);
+        if parent.id != column.id {
+            messages.push(format!("{description} depends on {target}"));
+        }
+        let Some(branch) = roots.get(&parent.id) else { continue; };
+        let mut pending = branch.iter().rev().map(|&(id, name)| (id, name, None)).collect::<Vec<_>>();
+        while let Some((id, name, parent)) = pending.pop() {
+            if dropped.insert(name.to_owned()) {
+                let view = display(name);
+                if cascade {
+                    messages.push(format!("drop cascades to view {view}"));
+                } else if let Some(parent) = parent {
+                    messages.push(format!("view {view} depends on view {}", display(parent)));
+                } else {
+                    messages.push(format!("view {view} depends on {description}"));
+                }
+                if let Some(branch) = children.get(&id) {
+                    pending.extend(branch.iter().rev().map(|&(child, key)| (child, key, Some(name))));
+                }
+            }
         }
     }
-    if dependencies.is_empty() {
+    if messages.is_empty() {
         return Ok(());
     }
     if !cascade {
         user_types::view_replace_error(format!("cannot drop {target} because other objects depend on it"));
-        user_types::sql_error_detail(dependencies.iter().map(|(name, parent)| {
-            format!("view {name} depends on {parent}")
-        }).collect::<Vec<_>>().join("\n"));
+        user_types::sql_error_detail(messages.join("\n"));
         user_types::sql_error_hint("Use DROP ... CASCADE to drop the dependent objects too.");
         return Err(SqlError::DependentObjects);
     }
-    let notices: Vec<_> = dependencies.iter().map(|(name, _)| {
-        format!("drop cascades to view {name}")
-    }).collect();
-    if notices.len() == 1 {
-        user_types::sql_notice(notices[0].clone(), "00000");
+    if messages.len() == 1 {
+        user_types::sql_notice(messages.pop().unwrap(), "00000");
     } else {
         user_types::sql_notice_detail(
-            format!("drop cascades to {} other objects", notices.len()), notices.join("\n"), "00000",
+            format!("drop cascades to {} other objects", messages.len()), messages.join("\n"), "00000",
         );
     }
     state.view_names.retain(|name, _| !dropped.contains(name));

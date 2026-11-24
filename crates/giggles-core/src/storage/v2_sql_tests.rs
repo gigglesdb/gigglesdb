@@ -2256,6 +2256,61 @@ fn ddl_rejects_a_post_image_with_a_dangling_column_collation() {
 }
 
 #[test]
+fn gin_indexes_catalog_publication_matches_durable_reload() {
+    let mut f = Fixture::new();
+    let features = |f: &Fixture| engine::meta::validate_meta(f.db().kv.as_ref()).unwrap().features;
+    f.execute("CREATE TABLE f2_gin (id int PRIMARY KEY, tags text[])");
+    assert_eq!(features(&f) & engine::meta::GIN_INDEXES, 0);
+    f.execute("CREATE INDEX f2_gin_idx ON f2_gin USING gin (tags)");
+    f.db().catalog().assert_current_matches_reload();
+    assert_ne!(features(&f) & engine::meta::GIN_INDEXES, 0);
+
+    f.reopen();
+    assert_eq!(f.parts().ext.gin_indexes.len(), 1);
+    assert_ne!(features(&f) & engine::meta::GIN_INDEXES, 0);
+    f.execute("CREATE TABLE f2_gin_seed (id int PRIMARY KEY)");
+    f.execute("DROP INDEX f2_gin_idx");
+    f.db().catalog().assert_current_matches_reload();
+
+    f.reopen();
+    assert!(f.parts().ext.gin_indexes.is_empty());
+    assert_ne!(features(&f) & engine::meta::GIN_INDEXES, 0);
+}
+
+#[test]
+fn generated_columns_catalog_publication_matches_durable_reload() {
+    let mut f = Fixture::new();
+    let features = |f: &Fixture| engine::meta::validate_meta(f.db().kv.as_ref()).unwrap().features;
+    f.execute("CREATE TABLE f2_generation (id int PRIMARY KEY, n int, s int GENERATED ALWAYS AS (n * 2) STORED)");
+    assert!(f.parts().ext.columns.is_empty());
+    assert_ne!(features(&f) & engine::meta::GENERATED_COLUMNS, 0);
+
+    f.execute("INSERT INTO f2_generation VALUES (1, 5)");
+    f.execute("ALTER TABLE f2_generation ALTER COLUMN s SET EXPRESSION AS (n * 3)");
+    f.db().catalog().assert_current_matches_reload();
+
+    f.reopen();
+    assert_ne!(features(&f) & engine::meta::GENERATED_COLUMNS, 0);
+    f.execute("INSERT INTO f2_generation VALUES (2, 7)");
+    assert_eq!(
+        values(&mut f.admin().sql_session(), "SELECT s FROM f2_generation ORDER BY id"),
+        vec![vec![relational::Value::Int(15)], vec![relational::Value::Int(21)]],
+    );
+    f.execute("CREATE TABLE f2_generation_seed (id int PRIMARY KEY)");
+    f.execute("ALTER TABLE f2_generation ALTER COLUMN s DROP EXPRESSION");
+    f.db().catalog().assert_current_matches_reload();
+
+    f.reopen();
+    assert!(f.parts().ext.generated_columns.is_empty());
+    assert_ne!(features(&f) & engine::meta::GENERATED_COLUMNS, 0);
+    f.execute("INSERT INTO f2_generation VALUES (3, 8, 100)");
+    assert_eq!(
+        values(&mut f.admin().sql_session(), "SELECT s FROM f2_generation WHERE id = 3"),
+        vec![vec![relational::Value::Int(100)]],
+    );
+}
+
+#[test]
 fn mixed_sql_ddl_catalog_publication_matches_durable_reload() {
     let f = Fixture::new();
     let mut session = f.admin().sql_session();

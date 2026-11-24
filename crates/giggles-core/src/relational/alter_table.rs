@@ -748,22 +748,15 @@ pub(super) fn execute(
                     Err(SqlError::UnknownColumn) if *optional => continue,
                     Err(error) => return Err(error),
                 };
-                views::drop_column_views(&mut candidate, &table, &table.columns[at], *cascade, path)?;
                 let id = table.columns[at].id;
-                let dependents: Vec<_> = generated_columns::dependent_columns(&candidate, &table, id)
-                    .into_iter().map(|column| column.name.clone()).collect();
+                let dependents = generated_columns::dependent_columns(&candidate, &table, id);
+                views::drop_column_views(
+                    &mut candidate, &table, &table.columns[at], &dependents, *cascade, path,
+                )?;
                 if !dependents.is_empty() {
-                    if !cascade {
-                        user_types::view_replace_error(format!("cannot drop column {column} of table {} because other objects depend on it", table.name));
-                        user_types::sql_error_detail(dependents.iter().map(|dependent|
-                            format!("column {dependent} of table {} depends on column {column} of table {}", table.name, table.name)
-                        ).collect::<Vec<_>>().join("\n"));
-                        user_types::sql_error_hint("Use DROP ... CASCADE to drop the dependent objects too.");
-                        return Err(SqlError::DependentObjects);
-                    }
                     let dependent_drops = AlterTable {
                         table: name.clone(),
-                        actions: dependents.into_iter().map(|column| Action::Drop(column, false, true)).collect(),
+                        actions: dependents.into_iter().map(|column| Action::Drop(column.name.clone(), false, true)).collect(),
                         resolution_error: None,
                         column_names: alter.column_names,
                     };

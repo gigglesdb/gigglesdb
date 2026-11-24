@@ -2375,6 +2375,15 @@ impl<'a> UnchangedRecords<'a> {
             .map(|key| &key[1..key.len() - 1])
             .collect();
         let mut unchanged_defs = BTreeSet::new();
+        // A changed GIN index can invalidate either its old or new owning table.
+        let mut changed_gin_tables = BTreeSet::new();
+        let old_gin = &old.ext.gin_indexes;
+        let new_gin = &new.ext.gin_indexes;
+        for (previous, next) in [(old_gin, new_gin), (new_gin, old_gin)] {
+            changed_gin_tables.extend(previous.iter().filter_map(|(id, index)| {
+                (next.get(id) != Some(index)).then_some(index.table)
+            }));
+        }
         let has_own = |kind, first: u64, second: Option<u64>| {
             let mut key = [0; 17];
             key[0] = kind;
@@ -2399,8 +2408,11 @@ impl<'a> UnchangedRecords<'a> {
             if !has_own(1, table.id, None)
                 && old.heap.contains(&table.id) == new.heap.contains(&table.id)
                 && old.ext.primary_index_birth.get(&table.id) == new.ext.primary_index_birth.get(&table.id)
+                && !changed_gin_tables.contains(&table.id)
                 && table.columns.iter().all(|column| {
                     old.ext.columns.get(&column.id) == new.ext.columns.get(&column.id)
+                        && old.ext.generated_columns.get(&column.id)
+                            == new.ext.generated_columns.get(&column.id)
                 })
             {
                 unchanged.tables.insert(table.id);
@@ -2477,6 +2489,7 @@ fn encode_parts(
         records.insert(catalog_codec::sql_views::view_key(*id), catalog_codec::sql_views::encode_view(view)?);
     }
     let mut columns = BTreeSet::new();
+    let track_column_owners = !parts.ext.columns.is_empty() || !parts.ext.generated_columns.is_empty();
     let mut table_ids = BTreeMap::new();
     for (name, def) in &parts.tables {
         let schema = parts
@@ -2491,7 +2504,7 @@ fn encode_parts(
             return Err(CoreError::Sql(SqlError::Duplicate));
         }
         table_ids.insert(def.id, def);
-        if !parts.ext.columns.is_empty() {
+        if track_column_owners {
             columns.extend(def.columns.iter().map(|c| c.id));
         }
         if !unchanged.names.contains(name.as_str()) {

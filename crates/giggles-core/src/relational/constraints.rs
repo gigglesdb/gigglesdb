@@ -578,7 +578,9 @@ fn check_row(state: &Relational, table: &TableDef, name: &str, expr: &str, row: 
     query::constraint_check(state, table, expr, row).inspect_err(|error| {
         if *error == SqlError::CheckViolation && state.has_generated_columns(table) {
             user_types::view_replace_error(format!("new row for relation \"{}\" violates check constraint \"{name}\"", table.name));
-            user_types::sql_error_detail(logical_types::failing_row_detail(table, &row.values));
+            user_types::sql_error_detail(logical_types::failing_row_detail_with(table, &row.values, |id| {
+                state.generated_column(id).is_some_and(|generation| !generation.stored)
+            }));
             user_types::sql_error_names(state, table, None, Some(name));
         }
     })

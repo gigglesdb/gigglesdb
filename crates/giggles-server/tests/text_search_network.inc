@@ -44,52 +44,46 @@ fn search_wire_field(body: &[u8], target: u8) -> Option<&str> {
     None
 }
 
-async fn text_search_configuration_wire(f: &Fixture) {
-    let mut stream = raw_pg(f).await;
-    let frames = uuid_array_query_frames(&mut stream, "SET default_text_search_config = 'hindi'").await;
-    assert_eq!(frames.iter().map(|frame| frame.0).collect::<Vec<_>>(), b"CZ");
-    let frames = uuid_array_query_frames(&mut stream, "SHOW default_text_search_config").await;
-    assert_eq!(search_data_row(&frames[1].1), [Some(b"pg_catalog.hindi".as_slice())]);
+async fn text_search_configuration_wire(client: &tokio_postgres::Client) {
+    use tokio_postgres::SimpleQueryMessage;
 
-    let frames = uuid_array_query_frames(&mut stream, "SELECT 1").await;
-    assert_eq!(search_data_row(&frames[1].1), [Some(b"1".as_slice())]);
-    let frames = uuid_array_query_frames(&mut stream, "SELECT to_tsvector('english','cats')").await;
-    assert_eq!(search_data_row(&frames[1].1), [Some(b"'cat':1".as_slice())]);
-
+    client.simple_query("SET default_text_search_config = 'hindi'").await.unwrap();
+    for (sql, expected) in [
+        ("SHOW default_text_search_config", "pg_catalog.hindi"),
+        ("SELECT 1", "1"),
+        ("SELECT to_tsvector('english','cats')", "'cat':1"),
+    ] {
+        let messages = client.simple_query(sql).await.unwrap();
+        assert!(messages.iter().any(|message| matches!(message,
+            SimpleQueryMessage::Row(row) if row.get(0) == Some(expected))), "{sql}");
+    }
     for sql in [
         "SELECT to_tsvector('x')",
         "SELECT to_tsvector('hindi','x')",
         "SELECT 'hindi'::regconfig",
     ] {
-        let frames = uuid_array_query_frames(&mut stream, sql).await;
-        let error = &frames.iter().find(|frame| frame.0 == b'E').expect(sql).1;
-        assert_eq!(search_wire_field(error, b'C'), Some("0A000"), "{sql}");
-        assert_eq!(
-            search_wire_field(error, b'M'),
-            Some("text search configuration \"hindi\" is not supported"),
-            "{sql}"
-        );
+        let error = client.simple_query(sql).await.unwrap_err();
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), "0A000", "{sql}");
+        assert_eq!(error.message(), "text search configuration \"hindi\" is not supported", "{sql}");
     }
+    client.simple_query("SET default_text_search_config = 'english'").await.unwrap();
+    let messages = client.simple_query("SELECT to_tsvector('cats')").await.unwrap();
+    assert!(messages.iter().any(|message| matches!(message,
+        SimpleQueryMessage::Row(row) if row.get(0) == Some("'cat':1"))));
 
-    pg_send(&mut stream, b'P', &parse("default_config", "SELECT to_tsvector($1)")).await;
-    pg_send(&mut stream, b'B', &bind("", "default_config", &[Some("cats")], false)).await;
-    pg_send(&mut stream, b'E', &execute("", 0)).await;
-    let frames = pg_sync(&mut stream).await;
-    let error = &frames.iter().find(|frame| frame.0 == b'E').expect("extended error").1;
-    assert_eq!(search_wire_field(error, b'C'), Some("0A000"));
-    assert_eq!(search_wire_field(error, b'M'), Some("text search configuration \"hindi\" is not supported"));
-    assert_eq!(frames.last().map(|frame| frame.0), Some(b'Z'));
+    client.execute("SET default_text_search_config = 'hindi'", &[]).await.unwrap();
+    let row = client.query_one("SELECT 1", &[]).await.unwrap();
+    assert_eq!(row.get::<_, i32>(0), 1);
+    let search = client.prepare("SELECT to_tsvector($1)::text").await.unwrap();
+    let error = client.query_one(&search, &[&"cats"]).await.unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "0A000");
+    assert_eq!(error.message(), "text search configuration \"hindi\" is not supported");
 
-    let frames = uuid_array_query_frames(&mut stream, "SET default_text_search_config = 'english'").await;
-    assert_eq!(frames.iter().map(|frame| frame.0).collect::<Vec<_>>(), b"CZ");
-    let frames = uuid_array_query_frames(&mut stream, "SELECT to_tsvector('cats')").await;
-    assert_eq!(search_data_row(&frames[1].1), [Some(b"'cat':1".as_slice())]);
-
-    pg_send(&mut stream, b'B', &bind("", "default_config", &[Some("cats")], false)).await;
-    pg_send(&mut stream, b'E', &execute("", 0)).await;
-    let frames = pg_sync(&mut stream).await;
-    assert_eq!(frames.iter().map(|frame| frame.0).collect::<Vec<_>>(), b"2DCZ", "{frames:?}");
-    assert_eq!(search_data_row(&frames[1].1), [Some(b"'cat':1".as_slice())]);
+    client.execute("SET default_text_search_config = 'english'", &[]).await.unwrap();
+    let row = client.query_one(&search, &[&"cats"]).await.unwrap();
+    assert_eq!(row.get::<_, &str>(0), "'cat':1");
 }
 
 async fn text_search_wire(engine: giggles_core::Engine) {
@@ -99,7 +93,6 @@ async fn text_search_wire(engine: giggles_core::Engine) {
         engine,
     )
     .await;
-    text_search_configuration_wire(&f).await;
     let mut stream = raw_pg(&f).await;
     let vector = hex::decode("000000026361740000010001646f670000010002").unwrap();
     let query = hex::decode("0000000101000063617400").unwrap();
