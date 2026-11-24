@@ -1378,11 +1378,6 @@ impl Transaction {
                 | (if temporal { TEMPORAL_INDEXES } else { 0 }),
         );
     }
-    pub(crate) fn set_table_metadata_features(&mut self, gin: bool, generated: bool) {
-        self.features_or &= !(super::meta::GIN_INDEXES | super::meta::GENERATED_COLUMNS);
-        if gin { self.require_features(super::meta::GIN_INDEXES); }
-        if generated { self.require_features(super::meta::GENERATED_COLUMNS); }
-    }
     pub(crate) fn require_subversion(&mut self, version: u32) {
         self.minimum_subversion = self.minimum_subversion.max(version);
     }

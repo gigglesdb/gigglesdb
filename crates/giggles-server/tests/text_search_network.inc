@@ -184,11 +184,24 @@ async fn text_search_network_v2() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn text_search_network_archdocs() {
-    let setup = include_str!("../../giggles-core/tests/fixtures/text_search_archdocs_setup.sql")
-        .split(';')
-        .map(str::trim)
-        .filter(|sql| !sql.is_empty())
-        .collect::<Vec<_>>();
+    let setup = [
+        r#"CREATE TABLE "Organization" ("id" UUID PRIMARY KEY)"#,
+        r#"INSERT INTO "Organization" VALUES ('00000000-0000-0000-0000-0000000000aa')"#,
+    ]
+    .into_iter()
+    .chain(
+        include_str!("../../giggles-core/tests/fixtures/text_search_archdocs_setup.sql")
+            .split_terminator(';')
+            .chain(
+                include_str!(
+                    "../../giggles-core/tests/fixtures/text_search_archdocs_match_body.sql"
+                )
+                .split_terminator(';'),
+            )
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty()),
+    )
+    .collect::<Vec<_>>();
     let engine = if cfg!(feature = "engine-rocksdb") {
         giggles_core::Engine::V2
     } else {
@@ -196,26 +209,145 @@ async fn text_search_network_archdocs() {
     };
     let f = Fixture::with_app_table_engine("SearchDocument", &setup, engine).await;
     let mut stream = raw_pg(&f).await;
-    let query = include_str!("../../giggles-core/tests/fixtures/text_search_archdocs_query.sql");
-    let sql_prepare = format!("PREPARE s(uuid, text, int, text[]) AS {query}");
-    let frames = uuid_array_query_frames(&mut stream, &sql_prepare).await;
-    if let Some((_, error)) = frames.iter().find(|(tag, _)| *tag == b'E') {
-        println!(
-            "Archdocs SQL PREPARE state={:?}",
-            search_wire_field(error, b'C')
+    let organization = "00000000-0000-0000-0000-0000000000aa";
+    let insert = r#"INSERT INTO "SearchDocument" ("entityType","entityId","organizationId",title,body,"updatedAt")
+        VALUES ($1,$2,$3,$4,$5,$6) RETURNING tsv"#;
+    pg_send(
+        &mut stream,
+        b'P',
+        &parse_oids("insert_document", insert, &[25, 2950, 2950, 25, 25, 1114]),
+    )
+    .await;
+    for (entity, id, title, body, vector) in [
+        (
+            "doc",
+            "00000000-0000-0000-0000-000000000001",
+            "Payment service architecture",
+            "The payment service talks to Stripe through the billing gateway. Retries are idempotent.",
+            "'architectur':3A 'bill':12B 'gateway':13B 'idempot':16B 'payment':1A,5B 'retri':14B 'servic':2A,6B 'stripe':9B 'talk':7B",
+        ),
+        (
+            "design-doc",
+            "00000000-0000-0000-0000-000000000002",
+            "Search indexing design",
+            "We index documents into a tsvector column and rank results with ts_rank.",
+            "'column':10B 'design':3A 'document':6B 'index':2A,5B 'rank':12B,16B 'result':13B 'search':1A 'ts':15B 'tsvector':9B",
+        ),
+        (
+            "object",
+            "00000000-0000-0000-0000-000000000003",
+            "Billing gateway",
+            "Gateway for payments; owns invoices.",
+            "'bill':1A 'gateway':2A,3B 'invoic':7B 'own':6B 'payment':5B",
+        ),
+    ] {
+        pg_send(
+            &mut stream,
+            b'B',
+            &bind(
+                "",
+                "insert_document",
+                &[entity, id, organization, title, body, "2026-01-01"].map(Some),
+                false,
+            ),
+        )
+        .await;
+        pg_send(&mut stream, b'E', &execute("", 0)).await;
+        let frames = pg_sync(&mut stream).await;
+        assert!(!frames.iter().any(|frame| frame.0 == b'E'), "{frames:?}");
+        let row = &frames.iter().find(|frame| frame.0 == b'D').unwrap().1;
+        assert_eq!(search_data_row(row), [Some(vector.as_bytes())]);
+    }
+    for (column, value, id, vector) in [
+        (
+            "body",
+            "Payments are retried by the gateway",
+            "00000000-0000-0000-0000-000000000003",
+            "'bill':1A 'gateway':2A,8B 'payment':3B 'retri':5B",
+        ),
+        (
+            "matchOnlyBody",
+            "journal entry about refunds",
+            "00000000-0000-0000-0000-000000000001",
+            "'architectur':3A 'bill':12B 'entri':18C 'gateway':13B 'idempot':16B 'journal':17C 'payment':1A,5B 'refund':20C 'retri':14B 'servic':2A,6B 'stripe':9B 'talk':7B",
+        ),
+    ] {
+        let sql = format!(
+            r#"UPDATE "SearchDocument" SET "{column}"=$1 WHERE "entityId"=$2 RETURNING tsv"#
         );
+        pg_send(&mut stream, b'P', &parse_oids("", &sql, &[25, 2950])).await;
+        pg_send(
+            &mut stream,
+            b'B',
+            &bind("", "", &[Some(value), Some(id)], false),
+        )
+        .await;
+        pg_send(&mut stream, b'E', &execute("", 0)).await;
+        let frames = pg_sync(&mut stream).await;
+        assert!(!frames.iter().any(|frame| frame.0 == b'E'), "{frames:?}");
+        let row = &frames.iter().find(|frame| frame.0 == b'D').unwrap().1;
+        assert_eq!(search_data_row(row), [Some(vector.as_bytes())]);
     }
-    let oids = [2950, 25, 23, 1009];
-    pg_send(&mut stream, b'P', &parse_oids("search", query, &oids)).await;
-    let frames = pg_sync(&mut stream).await;
-    if let Some((_, error)) = frames.iter().find(|(tag, _)| *tag == b'E') {
-        let code = search_wire_field(error, b'C');
-        assert_eq!(code, Some("42804"), "{frames:?}");
-        println!("Archdocs protocol Parse with LIMIT $3 state={code:?}");
-        // The same joined-query limit error occurs without FTS.
-        let query = query.replace("LIMIT $3", "LIMIT ($3::bigint)");
-        pg_send(&mut stream, b'P', &parse_oids("search", &query, &oids)).await;
-    }
+
+    let expected_expression = r#"((setweight(to_tsvector('english'::regconfig, COALESCE(title, ''::text)), 'A'::"char") || setweight(to_tsvector('english'::regconfig, COALESCE(body, ''::text)), 'B'::"char")) || setweight(to_tsvector('english'::regconfig, COALESCE("matchOnlyBody", ''::text)), 'C'::"char"))"#;
+    let (pg, connection) = f.pg(f.app.clone()).await;
+    let row = pg.query_one(
+        "SELECT data_type, udt_name, is_generated, generation_expression FROM information_schema.columns WHERE table_name='SearchDocument' AND column_name='tsv'",
+        &[],
+    ).await.unwrap();
+    assert_eq!(
+        (0..4).map(|i| row.get::<_, &str>(i)).collect::<Vec<_>>(),
+        ["tsvector", "tsvector", "ALWAYS", expected_expression]
+    );
+    let row = pg.query_one(
+        r#"SELECT pg_get_expr(d.adbin,d.adrelid), a.attnum, pg_get_expr(d.adbin,d.adrelid,true)
+        FROM pg_attribute a JOIN pg_attrdef d ON a.attrelid=d.adrelid AND a.attnum=d.adnum
+        WHERE a.attrelid='"SearchDocument"'::regclass AND a.attname='tsv'"#,
+        &[],
+    ).await.unwrap();
+    assert_eq!(row.get::<_, &str>(0), expected_expression);
+    let attnum = row.get::<_, i16>(1);
+    assert_eq!(
+        row.get::<_, &str>(2),
+        &expected_expression[1..expected_expression.len() - 1]
+    );
+    let row = pg
+        .query_one(
+            "SELECT indexdef FROM pg_indexes WHERE indexname='SearchDocument_tsv_idx'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        row.get::<_, &str>(0),
+        r#"CREATE INDEX "SearchDocument_tsv_idx" ON public."SearchDocument" USING gin (tsv)"#
+    );
+    let row = pg
+        .query_one(
+            "SELECT am.amname, opc.opcname, opc.oid, i.indisunique, i.indkey[0]
+         FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+         JOIN pg_am am ON am.oid=c.relam JOIN pg_opclass opc ON opc.oid=i.indclass[0]
+         WHERE c.relname='SearchDocument_tsv_idx'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, &str>(0), "gin");
+    assert_eq!(row.get::<_, &str>(1), "tsvector_ops");
+    assert_eq!(row.get::<_, u32>(2), 10073);
+    assert!(!row.get::<_, bool>(3));
+    assert_eq!(row.get::<_, i16>(4), attnum);
+    drop(pg);
+    connection.abort();
+
+    let query = include_str!("../../giggles-core/tests/fixtures/text_search_archdocs_query.sql")
+        .replace("LIMIT $3", "LIMIT ($3::bigint)");
+    pg_send(
+        &mut stream,
+        b'P',
+        &parse_oids("search", &query, &[2950, 25, 23, 1009]),
+    )
+    .await;
     let parameter_sets = [
         (
             "payment gateway",
@@ -275,7 +407,7 @@ async fn text_search_network_archdocs() {
                 "",
                 "search",
                 &[
-                    Some("00000000-0000-0000-0000-0000000000aa"),
+                    Some(organization),
                     Some(terms),
                     Some("10"),
                     Some("{doc,object,design-doc}"),

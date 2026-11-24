@@ -2,7 +2,7 @@ mod common;
 
 use giggles_core::{
     Admin, Engine, Limits, SqlSession,
-    relational::{DataType, Value, take_sql_error_message},
+    relational::{DataType, StatementClock, Value, take_sql_error_message},
     sqlstate,
 };
 
@@ -296,16 +296,113 @@ fn text_search_scalar_oracle() {
     std::fs::remove_dir_all(path).unwrap();
 }
 
-#[test]
-fn text_search_archdocs_query() {
+fn archdocs_search(engine: Engine) {
     let path = common::fresh("text-search-archdocs");
-    let admin = Admin::create_engine(&path, Limits::default(), default_engine()).unwrap();
+    let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
     let mut s = admin.sql_session();
+    run(
+        &mut s,
+        r#"CREATE TABLE "Organization" ("id" UUID PRIMARY KEY)"#,
+    );
+    run(
+        &mut s,
+        r#"INSERT INTO "Organization" VALUES ('00000000-0000-0000-0000-0000000000aa')"#,
+    );
     for statement in include_str!("fixtures/text_search_archdocs_setup.sql").split(';') {
         if !statement.trim().is_empty() {
             run(&mut s, statement);
         }
     }
+    let clock = StatementClock {
+        unavailable: None,
+        transaction_us: 0,
+        statement_us: 0,
+        zone: Some(giggles_pg_types::temporal::SessionZone::Fixed(0)),
+        wall: None,
+    };
+    let insert = r#"INSERT INTO "SearchDocument" ("entityType","entityId","organizationId","title","body","updatedAt") VALUES
+        ('doc','00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-0000000000aa','Payment service architecture','The payment service talks to Stripe through the billing gateway. Retries are idempotent.', '2026-01-01'),
+        ('design-doc','00000000-0000-0000-0000-000000000002','00000000-0000-0000-0000-0000000000aa','Search indexing design','We index documents into a tsvector column and rank results with ts_rank.', '2026-01-01'),
+        ('object','00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-0000000000aa','Billing gateway','Gateway for payments; owns invoices.', '2026-01-01')"#;
+    rows(s.execute_at(insert, &[], None, &clock), insert);
+
+    let vectors = r#"SELECT tsv::text FROM "SearchDocument" ORDER BY title"#;
+    let original = run(&mut s, vectors);
+    assert_eq!(
+        original,
+        vec![
+            vec![text(
+                "'bill':1A 'gateway':2A,3B 'invoic':7B 'own':6B 'payment':5B"
+            )],
+            vec![text(
+                "'architectur':3A 'bill':12B 'gateway':13B 'idempot':16B 'payment':1A,5B 'retri':14B 'servic':2A,6B 'stripe':9B 'talk':7B"
+            )],
+            vec![text(
+                "'column':10B 'design':3A 'document':6B 'index':2A,5B 'rank':12B,16B 'result':13B 'search':1A 'ts':15B 'tsvector':9B"
+            )],
+        ]
+    );
+    let updated = run(
+        &mut s,
+        r#"UPDATE "SearchDocument" SET body = 'Payments are retried by the gateway' WHERE "entityType" = 'object' RETURNING tsv::text"#,
+    );
+    assert_eq!(
+        updated,
+        vec![vec![text(
+            "'bill':1A 'gateway':2A,8B 'payment':3B 'retri':5B"
+        )]]
+    );
+    for statement in include_str!("fixtures/text_search_archdocs_match_body.sql").split(';') {
+        if !statement.trim().is_empty() {
+            run(&mut s, statement);
+        }
+    }
+    assert_eq!(
+        run(&mut s, vectors),
+        vec![updated[0].clone(), original[1].clone(), original[2].clone()]
+    );
+    run(
+        &mut s,
+        r#"UPDATE "SearchDocument" SET "matchOnlyBody" = 'journal entry about refunds' WHERE "entityType" = 'doc'"#,
+    );
+
+    let sql = "CREATE TABLE unstable (title text, tsv tsvector GENERATED ALWAYS AS (to_tsvector(title)) STORED)";
+    expect_error(&mut s, sql, "42P17");
+    assert_eq!(
+        take_sql_error_message().as_deref(),
+        Some("generation expression is not immutable")
+    );
+    expect_error(
+        &mut s,
+        r#"CREATE INDEX ordinary ON "SearchDocument" (tsv)"#,
+        "0A000",
+    );
+    expect_error(
+        &mut s,
+        r#"CREATE INDEX expression ON "SearchDocument" USING gin (to_tsvector('english', title))"#,
+        "0A000",
+    );
+
+    drop(s);
+    drop(admin);
+    let admin = Admin::open(&path, Limits::default()).unwrap();
+    let mut s = admin.sql_session();
+    let catalog = s.catalog_metadata().unwrap();
+    let gin = catalog.presentation.gin_indexes.values().next().unwrap();
+    assert!(gin.name.ends_with("SearchDocument_tsv_idx"));
+    assert_eq!(gin.opclasses, [10073]);
+    let actual = run(&mut s, vectors);
+    assert_eq!(
+        actual,
+        vec![
+            updated[0].clone(),
+            vec![text(
+                "'architectur':3A 'bill':12B 'entri':18C 'gateway':13B 'idempot':16B 'journal':17C 'payment':1A,5B 'refund':20C 'retri':14B 'servic':2A,6B 'stripe':9B 'talk':7B"
+            )],
+            original[2].clone(),
+        ]
+    );
+
     // The generic joined-query planner requires an explicit bigint limit.
     let sql = include_str!("fixtures/text_search_archdocs_query.sql")
         .replace("LIMIT $3", "LIMIT ($3::bigint)");
@@ -322,31 +419,61 @@ fn text_search_archdocs_query() {
             .map(Some),
         )
         .unwrap();
-    let actual = rows(
-        s.execute_prepared(
-            &prepared,
-            &[
-                text("00000000-0000-0000-0000-0000000000aa"),
-                text("refunds"),
-                Value::Int(10),
-                text("{doc,object,design-doc}"),
-            ],
-            None,
+    for (terms, expected) in [
+        (
+            "payment gateway",
+            vec![("object", false, "0.763366"), ("doc", false, "0.35984504")],
         ),
-        &sql,
-    );
-    assert_eq!(actual.len(), 1);
-    assert_eq!(actual[0][0], text("doc"));
-    assert_eq!(actual[0][2], Value::Bool(true));
-    assert_eq!(
-        actual[0][3],
-        Value::Float4(giggles_core::relational::Float4::parse("0.12158542").unwrap())
-    );
-    assert_eq!(
-        actual[0][4],
-        text("Payment service architecture \u{2014} The payment service talks to")
+        ("refunds", vec![("doc", true, "0.12158542")]),
+        (
+            r#""billing gateway" -invoices"#,
+            vec![("object", false, "0.9953511"), ("doc", false, "0.39641288")],
+        ),
+        ("the", vec![]),
+    ] {
+        let result = rows(
+            s.execute_prepared(
+                &prepared,
+                &[
+                    text("00000000-0000-0000-0000-0000000000aa"),
+                    text(terms),
+                    Value::Int(10),
+                    text("{doc,object,design-doc}"),
+                ],
+                None,
+            ),
+            &sql,
+        );
+        assert_eq!(result.len(), expected.len(), "{terms}");
+        for (row, (entity, journal, rank)) in result.iter().zip(expected) {
+            assert_eq!(row[0], text(entity));
+            assert_eq!(row[2], Value::Bool(journal));
+            assert_eq!(
+                row[3],
+                Value::Float4(giggles_core::relational::Float4::parse(rank).unwrap())
+            );
+        }
+    }
+    run(&mut s, r#"ALTER TABLE "SearchDocument" DROP COLUMN tsv"#);
+    assert!(
+        s.catalog_metadata()
+            .unwrap()
+            .presentation
+            .gin_indexes
+            .is_empty()
     );
     drop(s);
     drop(admin);
     std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn text_search_archdocs_legacy() {
+    archdocs_search(Engine::Legacy);
+}
+
+#[test]
+#[cfg(feature = "engine-rocksdb")]
+fn text_search_archdocs_v2() {
+    archdocs_search(Engine::V2);
 }

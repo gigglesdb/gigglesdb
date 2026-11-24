@@ -111,10 +111,31 @@ pub(in crate::relational) fn rename_reference(sql: &str, old: &str, new: &str) -
     deparse(&expression)
 }
 
+// PostgreSQL prints the resolved types of these formerly unknown arguments.
+fn deparse_argument(value: &Scalar, inferred: Option<&DataType>) -> R<String> {
+    match (value, inferred) {
+        (Scalar::Literal(Value::Text(text)), Some(ty)) => {
+            let text = if *ty == DataType::RegConfig {
+                text_search_types::output(ty, &text_search_types::input(ty, text)?)?
+            } else {
+                text.clone()
+            };
+            Ok(format!("'{}'::{}", text.replace('\'', "''"), defaults::type_name(ty)))
+        }
+        (Scalar::Literal(Value::Null), Some(ty)) => Ok(format!("NULL::{}", defaults::type_name(ty))),
+        _ => deparse(value),
+    }
+}
+
 fn deparse(value: &Scalar) -> R<String> {
     match value {
         Scalar::Cast(input, ty) if matches!(input.as_ref(), Scalar::Literal(Value::Null)) => {
             Ok(format!("NULL::{}", defaults::type_name(ty)))
+        }
+        Scalar::Cast(input, ty @ (DataType::Text | DataType::RegConfig | DataType::PgChar))
+            if matches!(input.as_ref(), Scalar::Literal(Value::Text(_))) =>
+        {
+            deparse_argument(input, Some(ty))
         }
         Scalar::Call(name, args) if name == "coalesce" => {
             let args = args.iter().map(deparse).collect::<R<Vec<_>>>()?.join(", ");
@@ -140,7 +161,19 @@ fn deparse(value: &Scalar) -> R<String> {
                     "nullif" | "width_bucket" | "normalize" | "is_normalized"
                 ) =>
         {
-            let args = args.iter().map(deparse).collect::<R<Vec<_>>>()?.join(", ");
+            let args = args
+                .iter()
+                .enumerate()
+                .map(|(index, argument)| {
+                    let inferred = match (name.as_str(), args.len(), index) {
+                        ("to_tsvector", 2, 0) => Some(&DataType::RegConfig),
+                        ("setweight", _, 1) => Some(&DataType::PgChar),
+                        _ => None,
+                    };
+                    deparse_argument(argument, inferred)
+                })
+                .collect::<R<Vec<_>>>()?
+                .join(", ");
             Ok(format!("{}({args})", constraints::constraint_quote(name)))
         }
         _ => constraints::scalar(value),
@@ -160,10 +193,12 @@ pub(in crate::relational) fn pretty(sql: &str) -> R<String> {
                     functions::BinaryOp::Concat => ("||", 4),
                     _ => return deparse(value),
                 };
+                // PostgreSQL preserves grouping for nested generic operators.
+                let left_precedence = precedence + u8::from(op == "||");
                 (
                     format!(
                         "{} {op} {}",
-                        render(left, precedence)?,
+                        render(left, left_precedence)?,
                         render(right, precedence + 1)?
                     ),
                     precedence,

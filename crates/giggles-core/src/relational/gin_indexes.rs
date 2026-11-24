@@ -80,6 +80,12 @@ const OPCLASSES: &[OperatorClass] = &[
         default: true,
     },
     OperatorClass {
+        name: "tsvector_ops",
+        oid: 10073,
+        matches_type: |ty| *ty == DataType::TsVector,
+        default: true,
+    },
+    OperatorClass {
         name: "jsonb_ops",
         oid: 10090,
         matches_type: |ty| *ty == DataType::Jsonb,

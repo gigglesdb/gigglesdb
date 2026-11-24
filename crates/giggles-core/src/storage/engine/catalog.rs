@@ -1088,7 +1088,6 @@ impl Catalog {
             &new.indexes, new.tables.values(),
         );
         txn.set_secondary_index_features(partial, temporal);
-        txn.set_table_metadata_features(!new.ext.gin_indexes.is_empty(), !new.ext.generated_columns.is_empty());
         if !new.indexes.is_empty() {
             txn.require_features(super::meta::SECONDARY_INDEXES);
         }
@@ -1576,6 +1575,12 @@ impl Catalog {
         );
         if final_view.has_text_search_types() {
             txn.require_features(super::meta::TEXT_SEARCH_TYPES);
+        }
+        if final_view.metadata.values().any(|table| !table.generated.is_empty()) {
+            txn.require_features(super::meta::GENERATED_COLUMNS);
+        }
+        if final_view.metadata.values().any(|table| !table.gin.is_empty()) {
+            txn.require_features(super::meta::GIN_INDEXES);
         }
         // A gateway's catalog commit also replaces the generation record, so other gateways
         // see that their cached catalog is stale (GD-0075 P7-1).
