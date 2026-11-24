@@ -34,7 +34,7 @@ fn fenced_group(seq: &Sequencer, group: Vec<Message>) {
     let mut log = RecentLog::new(1024);
     let mut features = load_features(seq.kv()).unwrap();
     let mut subversion = load_subversion(seq.kv()).unwrap();
-    assert!(!process_group(
+    assert!(!process_group::<false>(
         group,
         seq.kv(),
         &ManualClock::new(10),
@@ -46,6 +46,7 @@ fn fenced_group(seq: &Sequencer, group: Vec<Message>) {
         &TsSource::Hlc,
         &seq.served,
         &fence,
+        None,
     ));
 }
 
@@ -340,7 +341,7 @@ fn write_fence_limits_and_replicated_refusal() {
     let mut features = meta::REPLICATED;
     let mut hlc = HlcClock::new(Ts(0));
     assert_eq!(
-        process_fence(
+        process_fence::<false>(
             seq.kv(),
             FenceAction::Install {
                 digest: holder_digest(b"token"),
@@ -349,7 +350,8 @@ fn write_fence_limits_and_replicated_refusal() {
             &mut state,
             &mut features,
             &mut hlc,
-            &ManualClock::new(10)
+            &ManualClock::new(10),
+            None,
         ),
         Err(TxnError::Unsupported)
     );

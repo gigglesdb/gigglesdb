@@ -84,6 +84,19 @@ fn in_range_writes_reach_the_sink_and_out_of_range_writes_are_never_proposed() {
 }
 
 #[test]
+fn range_sequencer_stays_serial_with_pipeline_requested() {
+    use crate::storage::engine::{commit::{ManualClock, Sequencer, SequencerConfig}, kv::Kv};
+    let dir = Dir::new("range-kv-serial");
+    let (_, _, kv) = range_kv(&dir, 0);
+    let seq = Sequencer::open(
+        Arc::new(Kv::new(Arc::new(kv))),
+        Arc::new(ManualClock::new(10)),
+        SequencerConfig { commit_pipeline: true, ..SequencerConfig::default() },
+    ).unwrap();
+    assert!(!seq.uses_commit_pipeline());
+}
+
+#[test]
 fn sequencer_meta_keys_are_range_local() {
     let dir = Dir::new("range-kv");
     let (store, _sink, kv) = range_kv(&dir, 0);

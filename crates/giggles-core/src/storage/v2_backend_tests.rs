@@ -178,7 +178,7 @@ fn metadata_origin_cache_uses_exact_snapshot_and_never_caches_errors() {
     // This private backend has no external writers; exercise the native cache path.
     let db = super::V2Db::from_kv_with_limit(
         Arc::new(engine::kv::Kv::new_single_writer(initialized_backend())),
-        DEFAULT_WRITE_SET_BYTES, false, None, None,
+        DEFAULT_WRITE_SET_BYTES, false, None, None, super::EngineOptions::default(),
     ).unwrap();
     let old = db.begin(Isolation::ReadCommitted);
     let ts = old.current_snapshot_ts().unwrap();

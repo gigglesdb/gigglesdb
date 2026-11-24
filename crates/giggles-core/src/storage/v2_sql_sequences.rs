@@ -1149,9 +1149,14 @@ fn await_retirement(
 ) -> Result<i64, CoreError> {
     loop {
         crate::cancellation::check()?;
-        if !db.catalog().current_local_view()?.sequences.get(&id)
-            .is_some_and(|current| current.incarnation == incarnation)
-        {
+        if db.is_fenced() || db.sequencer.stopped() {
+            return Err(CoreError::Fenced);
+        }
+        let view = db.catalog().current_local_view();
+        if db.is_fenced() || db.sequencer.stopped() {
+            return Err(CoreError::Fenced);
+        }
+        if !view?.sequences.get(&id).is_some_and(|current| current.incarnation == incarnation) {
             return Ok(result);
         }
         std::thread::sleep(std::time::Duration::from_millis(5));

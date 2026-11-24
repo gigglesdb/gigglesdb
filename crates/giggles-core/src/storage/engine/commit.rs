@@ -2,7 +2,7 @@
 use super::{
     codec::CodecError,
     hlc::{HlcClock, Ts},
-    kv::{Durability, Keyspace, Kv, KvRead, WriteBatch},
+    kv::{Durability, Keyspace, Kv, KvError, KvRead, WriteBatch},
     once_guard::CommitGuard,
     txn::TxnError,
     write_fence::{FenceState, WriteFenceRecord, holder_digest},
@@ -18,6 +18,9 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[path = "commit_pipeline.rs"]
+mod pipeline;
 
 pub(crate) trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
@@ -197,6 +200,7 @@ pub(crate) struct SequencerConfig {
     pub(crate) recent_log_bytes: usize,
     pub(crate) write_set_bytes: usize,
     pub(crate) ts_source: TsSource,
+    pub(crate) commit_pipeline: bool,
 }
 impl Default for SequencerConfig {
     fn default() -> Self {
@@ -207,6 +211,7 @@ impl Default for SequencerConfig {
             recent_log_bytes: 256 * 1024 * 1024,
             write_set_bytes: 256 * 1024 * 1024,
             ts_source: TsSource::Hlc,
+            commit_pipeline: false,
         }
     }
 }
@@ -323,6 +328,8 @@ struct Shared {
     max_mixed_group: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     sync_writes: std::sync::atomic::AtomicUsize,
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pipeline_barriers: AtomicUsize,
     #[cfg(test)]
     highwater_puts: std::sync::atomic::AtomicUsize,
     visible: Arc<AtomicU64>,
@@ -367,15 +374,21 @@ fn oldest_active(shared: &Shared) -> Option<Ts> {
         .min()
 }
 
-/// Called only by the single sequencer publisher, with monotonic timestamps.
-fn publish_visible(shared: &Shared, max: Ts) -> Ts {
+/// Publish before scanning the active snapshots for a trim bound.
+fn publish_visible<const MONOTONE: bool>(shared: &Shared, max: Ts) -> Ts {
     // Store visible (Release) FIRST, then lock each shard to scan registrations.
     // snapshot() locks its shard BEFORE loading visible (Acquire). Any snapshot
     // missed by this scan registered after its shard was released and therefore
     // read visible >= max, so min(max, oldest) never passes a live snapshot.
-    shared.visible.store(max.0, Ordering::Release);
+    if MONOTONE {
+        shared.visible.fetch_max(max.0, Ordering::AcqRel);
+    } else {
+        shared.visible.store(max.0, Ordering::Release);
+    }
     max.min(oldest_active(shared).unwrap_or(max))
 }
+
+type PhysicalSnapshot = (SnapshotHandle, Arc<dyn KvRead>);
 
 struct Pending {
     request: CommitRequest,
@@ -399,6 +412,11 @@ enum Message {
         action: FenceAction,
         reply: mpsc::Sender<Result<Option<WriteFenceRecord>, TxnError>>,
     },
+    DurableSnapshot {
+        pin: SnapshotHandle,
+        reply: mpsc::Sender<Result<PhysicalSnapshot, TxnError>>,
+    },
+    Wake,
     Shutdown,
 }
 impl From<Pending> for Message {
@@ -409,14 +427,14 @@ impl Message {
         match self {
             Self::Commit(p) => request_bytes(&p.request),
             Self::Counter { key, value, .. } | Self::Highwater { key, value, .. } => key.len() + value.len(),
-            Self::Fence { .. } | Self::Shutdown => unreachable!("fence actions and shutdown are never grouped"),
+            _ => unreachable!("control messages are never grouped"),
         }
     }
     fn reject(self, error: TxnError) {
         match self {
             Self::Commit(p) => { let _ = p.reply.send(Err(error)); }
             Self::Counter { reply, .. } | Self::Highwater { reply, .. } => { let _ = reply.send(Err(error)); }
-            Self::Fence { .. } | Self::Shutdown => unreachable!("fence actions and shutdown are never grouped"),
+            _ => unreachable!("control messages are never grouped"),
         }
     }
 }
@@ -460,7 +478,12 @@ pub(crate) struct Sequencer {
     /// Served-read floor and in-flight reservations (O3/O4/O6); used in oracle mode.
     served: Arc<ServedGate>,
     sender: mpsc::Sender<Message>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Mutex<Option<Workers>>,
+    commit_pipeline: bool,
+}
+struct Workers {
+    sequencer: JoinHandle<()>,
+    syncer: Option<JoinHandle<()>>,
 }
 impl Sequencer {
     pub(crate) fn visible_clock(&self) -> VisibleClock {
@@ -474,7 +497,7 @@ impl Sequencer {
     #[cfg(feature = "engine-rocksdb")]
     pub(crate) fn is_accepting(&self) -> bool {
         !self.stopped() && !self.is_fenced() && self.worker.lock().unwrap_or_else(|p| p.into_inner())
-            .as_ref().is_some_and(|worker| !worker.is_finished())
+            .as_ref().is_some_and(|worker| !worker.sequencer.is_finished())
     }
 
     pub(in crate::storage) fn is_fenced(&self) -> bool {
@@ -490,8 +513,15 @@ impl Sequencer {
             let _ = self.sender.send(Message::Shutdown);
             // A pending guard can own the last reference under implicit drop.
             // Explicit engine shutdown always joins from the owner's thread.
-            if worker.thread().id() != thread::current().id() {
-                let _ = worker.join();
+            if worker.sequencer.thread().id() != thread::current().id() {
+                let result = worker.sequencer.join();
+                if let Some(syncer) = worker.syncer {
+                    // Pipeline workers abort before unwinding. Keep join
+                    // errors fatal if that contract ever changes.
+                    if result.is_err() || syncer.join().is_err() {
+                        std::process::abort();
+                    }
+                }
             }
         }
     }
@@ -502,6 +532,11 @@ impl Sequencer {
     #[cfg(any(test, feature = "test-commit-sync"))]
     pub(crate) fn set_sync_hook(&self, hook: Option<Arc<crate::CommitSyncHook>>) {
         *self.shared.sync_hook.lock().unwrap() = hook;
+    }
+
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn uses_commit_pipeline(&self) -> bool {
+        self.commit_pipeline
     }
 
     #[cfg(all(test, feature = "engine-rocksdb"))]
@@ -574,6 +609,13 @@ impl Sequencer {
         let features = load_features(kv.as_ref())?;
         let subversion = load_subversion(kv.as_ref())?;
         let seed = read_last_commit_ts(&kv)?;
+        // R-WALB: there is no pre-zero WAL wrapper. RocksDB's capability
+        // check excludes custom WAL environments, including such a wrapper.
+        let commit_pipeline = config.commit_pipeline
+            && matches!(config.ts_source, TsSource::Hlc)
+            && kv.pipelined_sync()
+            && kv.enable_commit_pipeline()?;
+        let group_number = if commit_pipeline { pipeline::read_group_number(&kv)? } else { 0 };
         let shared = Arc::new(Shared {
             stopped: AtomicBool::new(false),
             fenced: AtomicBool::new(false),
@@ -589,6 +631,8 @@ impl Sequencer {
             max_mixed_group: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             sync_writes: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(all(test, feature = "engine-rocksdb"))]
+            pipeline_barriers: AtomicUsize::new(0),
             #[cfg(test)]
             highwater_puts: std::sync::atomic::AtomicUsize::new(0),
             visible: Arc::new(AtomicU64::new(seed.0)),
@@ -600,7 +644,20 @@ impl Sequencer {
         let worker_shared = shared.clone();
         let worker_kv = kv.clone();
         let worker_config = config.clone();
-        let worker = thread::spawn(move || {
+        let (pipe, syncer) = if commit_pipeline {
+            let (pipe, syncer) = pipeline::start_syncer(kv.clone(), shared.clone(), sender.clone(), seed);
+            (Some(pipe), Some(syncer))
+        } else {
+            (None, None)
+        };
+        let sequencer = thread::spawn(move || {
+            if let Some(pipe) = pipe {
+                pipeline::run(
+                    receiver, worker_kv, clock, worker_config, worker_shared, worker_served,
+                    seed, features, subversion, fence, pipe, group_number,
+                );
+                return;
+            }
             run(
                 receiver,
                 worker_kv,
@@ -620,7 +677,8 @@ impl Sequencer {
             shared,
             served,
             sender,
-            worker: Mutex::new(Some(worker)),
+            worker: Mutex::new(Some(Workers { sequencer, syncer })),
+            commit_pipeline,
         }))
     }
     fn fence_action(&self, action: FenceAction) -> Result<Option<WriteFenceRecord>, TxnError> {
@@ -694,6 +752,21 @@ impl Sequencer {
             ts,
         }
     }
+    pub(crate) fn durable_snapshot(&self) -> Result<PhysicalSnapshot, TxnError> {
+        // Pin before asking for the physical snapshot so concurrent GC
+        // preserves all versions that the captured image might need.
+        let pin = self.snapshot();
+        if !self.commit_pipeline {
+            return Ok((pin, self.kv.snapshot()?));
+        }
+        if self.stopped() || self.kv.is_fenced() {
+            return Err(TxnError::Fenced);
+        }
+        let (reply, receive) = mpsc::channel();
+        self.sender.send(Message::DurableSnapshot { pin, reply }).map_err(|_| TxnError::Fenced)?;
+        receive.recv().unwrap_or(Err(TxnError::Fenced))
+    }
+
     pub(crate) fn submit(&self, request: CommitRequest) -> Result<Ts, TxnError> {
         self.submit_with_tail(request, None)
     }
@@ -869,8 +942,8 @@ fn gather(
                 }
                 group.push(item);
             }
-            fence @ Message::Fence { .. } => return (group, Some(fence), false),
             Message::Shutdown => return (group, None, true),
+            control => return (group, Some(control), false),
         }
     }
     (group, None, false)
@@ -899,13 +972,14 @@ fn run(
                 let result = if fenced || kv.is_fenced() || shared.stopped.load(Ordering::Acquire) {
                     Err(TxnError::Fenced)
                 } else {
-                    let result = process_fence(
+                    let result = process_fence::<false>(
                         &kv,
                         action,
                         &mut fence,
                         &mut features,
                         &mut hlc,
                         clock.as_ref(),
+                        None,
                     );
                     if matches!(result, Err(TxnError::CommitAmbiguous | TxnError::Fenced)) {
                         fenced = true;
@@ -917,6 +991,7 @@ fn run(
                 continue;
             }
             Message::Shutdown => break,
+            Message::Wake | Message::DurableSnapshot { .. } => unreachable!("pipeline control"),
             item => item,
         };
         let (group, next, shutdown) = gather(first, &receiver, &config);
@@ -930,7 +1005,7 @@ fn run(
             }
             continue;
         }
-        fenced = process_group(
+        fenced = process_group::<false>(
             group,
             &kv,
             clock.as_ref(),
@@ -942,6 +1017,7 @@ fn run(
             &config.ts_source,
             &served,
             &fence,
+            None,
         );
         if fenced && !shared.stopped.load(Ordering::Acquire) {
             publish_sequencer_fence(&shared, &kv);
@@ -959,6 +1035,7 @@ fn run(
                 let _ = reply.send(Err(TxnError::Fenced));
             }
             Message::Shutdown => {}
+            Message::Wake | Message::DurableSnapshot { .. } => unreachable!("pipeline control"),
         }
     }
 }
@@ -968,13 +1045,14 @@ fn publish_sequencer_fence(shared: &Shared, _kv: &Kv) {
     #[cfg(feature = "engine-rocksdb")]
     _kv.causes.signal_recovery();
 }
-fn process_fence(
+fn process_fence<const PIPELINED: bool>(
     kv: &Kv,
     action: FenceAction,
     fence: &mut FenceAccess,
     features: &mut u64,
     hlc: &mut HlcClock,
     clock: &dyn Clock,
+    numbering: Option<&mut pipeline::GroupNumber>,
 ) -> Result<Option<WriteFenceRecord>, TxnError> {
     if matches!(action, FenceAction::Status) {
         return Ok(fence.record.clone());
@@ -1031,6 +1109,9 @@ fn process_fence(
         b"last_commit_ts".to_vec(),
         record.changed_at.to_be_bytes().to_vec(),
     );
+    if PIPELINED {
+        numbering.expect("pipeline numbering").stamp(&mut batch)?;
+    }
     kv.write(batch, Durability::Sync)
         .map_err(|e| write_error(&e))?;
     // A failed Sync leaves all worker-owned fence state unchanged.
@@ -1119,7 +1200,7 @@ fn write_error(error: &super::kv::KvError) -> TxnError {
 
 // Returns whether an ambiguous backend result requires fencing subsequent groups.
 #[allow(clippy::too_many_arguments)]
-fn process_group(
+fn process_group<const PIPELINED: bool>(
     group: Vec<Message>,
     kv: &Kv,
     clock: &dyn Clock,
@@ -1131,7 +1212,26 @@ fn process_group(
     ts_source: &TsSource,
     served: &ServedGate,
     fence: &FenceAccess,
+    mut pipeline: Option<&mut pipeline::Group<'_>>,
 ) -> bool {
+    macro_rules! reject {
+        ($kind:ident, $reply:expr, $error:expr) => {{
+            if PIPELINED {
+                pipeline.as_deref_mut().expect("pipeline group").reject(pipeline::Reply::$kind($reply, Err($error)));
+            } else {
+                let _ = $reply.send(Err($error));
+            }
+        }};
+    }
+    macro_rules! reject_message {
+        ($item:expr, $error:expr) => {{
+            if PIPELINED {
+                pipeline.as_deref_mut().expect("pipeline group").reject(pipeline::Reply::rejected($item, $error));
+            } else {
+                $item.reject($error);
+            }
+        }};
+    }
     #[cfg(test)]
     shared.max_group.fetch_max(group.len(), std::sync::atomic::Ordering::Relaxed);
     // Reject each writer before timestamp reservation, validation or staging;
@@ -1149,7 +1249,7 @@ fn process_group(
                 _ => false,
             };
             if writes && let Err(error) = fence.check() {
-                item.reject(error);
+                reject_message!(item, error);
                 return None;
             }
             Some(item)
@@ -1182,7 +1282,7 @@ fn process_group(
                 }
                 Err(error) => {
                     for p in group {
-                        p.reject(error.clone());
+                        reject_message!(p, error.clone());
                     }
                     return false;
                 }
@@ -1191,7 +1291,7 @@ fn process_group(
         _ => None,
     };
     let visible = Ts(shared.visible.load(Ordering::Acquire));
-    let mut max = visible;
+    let mut max = if PIPELINED { pipeline.as_ref().expect("pipeline group").mvcc_max() } else { visible };
     let mut batch = WriteBatch::default();
     let mut accepted = Vec::new();
     let mut counters = Vec::new();
@@ -1203,7 +1303,7 @@ fn process_group(
         Ok(native) => native,
         Err(error) => {
             let fenced = error == TxnError::Fenced;
-            for pending in group { pending.reject(error.clone()); }
+            for pending in group { reject_message!(pending, error.clone()); }
             return fenced;
         }
     };
@@ -1221,7 +1321,7 @@ fn process_group(
                         #[cfg(test)]
                         shared.highwater_puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    Err(error) => { let _ = reply.send(Err(error)); }
+                    Err(error) => reject!(Unit, reply, error),
                 }
                 continue;
             }
@@ -1233,13 +1333,11 @@ fn process_group(
                         pending_features = next;
                         counters.push(reply);
                     }
-                    Err(error) => { let _ = reply.send(Err(error)); }
+                    Err(error) => reject!(Unit, reply, error),
                 }
                 continue;
             }
-            Message::Fence { .. } | Message::Shutdown => {
-                unreachable!("fence actions and shutdown are never grouped")
-            }
+            _ => unreachable!("control messages are never grouped"),
         };
         let request = &pending.request;
         let next_features = pending_features | request.features_or;
@@ -1300,13 +1398,13 @@ fn process_group(
                 }
             })
         {
-            let _ = pending.reply.send(Err(TxnError::Misuse));
+            reject!(Commit, pending.reply, TxnError::Misuse);
             continue;
         }
         if let Some(guard) = &pending.guard
             && let Err(error) = guard.check_fence(visible)
         {
-            let _ = pending.reply.send(Err(TxnError::Guard(error)));
+            reject!(Commit, pending.reply, TxnError::Guard(error));
             continue;
         }
         let ts = if request.writes.is_empty() {
@@ -1319,7 +1417,7 @@ fn process_group(
             match HlcClock::new(hlc.last).next(clock.now_ms()) {
                 Ok(ts) => ts,
                 Err(error) => {
-                    let _ = pending.reply.send(Err(TxnError::Codec(error)));
+                    reject!(Commit, pending.reply, TxnError::Codec(error));
                     continue;
                 }
             }
@@ -1327,7 +1425,7 @@ fn process_group(
         if let Some(validate) = &request.validation
             && let Err(error) = validate(log, kv, request.snapshot, ts)
         {
-            let _ = pending.reply.send(Err(error));
+            reject!(Commit, pending.reply, error);
             continue;
         }
         if !request.writes.is_empty() {
@@ -1380,26 +1478,39 @@ fn process_group(
     if pending_subversion != *subversion {
         batch.put(Keyspace::Meta, b"subversion".to_vec(), pending_subversion.to_be_bytes().to_vec());
     }
-    if max != visible {
+    let write_timestamp = if PIPELINED {
+        max > pipeline.as_ref().expect("pipeline group").physical_floor()
+    } else {
+        max != visible
+    };
+    if write_timestamp {
         batch.put(
             Keyspace::Meta,
             b"last_commit_ts".to_vec(),
             max.0.to_be_bytes().to_vec(),
         );
     }
+    if PIPELINED && !pipeline.as_deref_mut().expect("pipeline group").admit(&batch) {
+        for (reply, _) in accepted { reject!(Commit, reply, TxnError::Fenced); }
+        for reply in counters { reject!(Unit, reply, TxnError::Fenced); }
+        return true;
+    }
     // This load is the start of decision for this group. A shutdown fence
     // ordered before it wins; a group already deciding can finish its Sync.
     // Never wait for Sync (or a guard callback) in stop_submissions.
     if shared.stopped.load(Ordering::Acquire) {
-        for (reply, _) in accepted { let _ = reply.send(Err(TxnError::Fenced)); }
-        for reply in counters { let _ = reply.send(Err(TxnError::Fenced)); }
+        if PIPELINED {
+            pipeline.as_deref_mut().expect("pipeline group").refused();
+        }
+        for (reply, _) in accepted { reject!(Commit, reply, TxnError::Fenced); }
+        for reply in counters { reject!(Unit, reply, TxnError::Fenced); }
         return true;
     }
     if let Some(guard) = decision
         && let Err(error) = guard.decide()
     {
         for (reply, _) in accepted {
-            let _ = reply.send(Err(TxnError::Guard(error)));
+            reject!(Commit, reply, TxnError::Guard(error));
         }
         return false;
     }
@@ -1411,8 +1522,46 @@ fn process_group(
     if !batch.is_empty() {
         shared.sync_writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    if PIPELINED {
+        let failed = pipeline.expect("pipeline group").dispatch(batch, max, accepted, counters, kv, shared);
+        if !failed {
+            *features = pending_features;
+            *subversion = pending_subversion;
+        }
+        return failed;
+    }
+    if let Err(error) = sync_batch(kv, shared, batch) {
+        let error = write_error(&error);
+        for (reply, _) in accepted {
+            let _ = reply.send(Err(error.clone()));
+        }
+        for reply in counters { let _ = reply.send(Err(error.clone())); }
+        return true;
+    }
+    *features = pending_features;
+    *subversion = pending_subversion;
+    // Publish only after Sync succeeds, then trim and acknowledge.
+    let trim_bound = publish_visible::<false>(shared, max);
+    if !accepted.is_empty() {
+        log.trim(Some(trim_bound));
+    }
+    for reply in counters {
+        #[cfg(test)]
+        {
+            let mut gate = shared.counter_gate.lock().unwrap();
+            if let Some(replies) = gate.as_mut() { replies.push(reply); continue; }
+        }
+        let _ = reply.send(Ok(()));
+    }
+    for (reply, ts) in accepted {
+        let _ = reply.send(Ok(ts));
+    }
+    false
+}
+
+fn sync_batch(kv: &Kv, _shared: &Shared, batch: WriteBatch) -> Result<(), KvError> {
     #[cfg(any(test, feature = "test-commit-sync"))]
-    let sync_hook = shared.sync_hook.lock().unwrap().clone();
+    let sync_hook = _shared.sync_hook.lock().unwrap().clone();
     #[cfg(test)]
     let wrote_batch = !batch.is_empty();
     #[cfg(any(test, feature = "test-commit-sync"))]
@@ -1431,38 +1580,11 @@ fn process_group(
     };
     #[cfg(not(any(test, feature = "test-commit-sync")))]
     let sync_result = if !batch.is_empty() { kv.write(batch, Durability::Sync) } else { Ok(()) };
-    if let Err(error) = sync_result
-    {
-        let error = write_error(&error);
-        for (reply, _) in accepted {
-            let _ = reply.send(Err(error.clone()));
-        }
-        for reply in counters { let _ = reply.send(Err(error.clone())); }
-        return true;
-    }
     #[cfg(test)]
-    if wrote_batch && let Some(hook) = sync_hook {
+    if sync_result.is_ok() && wrote_batch && let Some(hook) = sync_hook {
         hook.after_sync();
     }
-    *features = pending_features;
-    *subversion = pending_subversion;
-    // Publish only after Sync succeeds, then trim and acknowledge.
-    let trim_bound = publish_visible(shared, max);
-    if !accepted.is_empty() {
-        log.trim(Some(trim_bound));
-    }
-    for reply in counters {
-        #[cfg(test)]
-        {
-            let mut gate = shared.counter_gate.lock().unwrap();
-            if let Some(replies) = gate.as_mut() { replies.push(reply); continue; }
-        }
-        let _ = reply.send(Ok(()));
-    }
-    for (reply, ts) in accepted {
-        let _ = reply.send(Ok(ts));
-    }
-    false
+    sync_result
 }
 
 #[cfg(test)]
@@ -1494,7 +1616,7 @@ impl Sequencer {
         }
         let mut features = load_features(self.kv.as_ref()).unwrap();
         let mut subversion = load_subversion(self.kv.as_ref()).unwrap();
-        process_group(
+        process_group::<false>(
             group,
             &self.kv,
             clock,
@@ -1506,6 +1628,7 @@ impl Sequencer {
             &self.config.ts_source,
             &self.served,
             &FenceAccess::default(),
+            None,
         );
         receives
             .into_iter()
@@ -1568,6 +1691,17 @@ mod shutdown_tests {
             assert!(seq.write_counter(key, vec![0; 8], 0).is_err());
         });
     }
+    #[test]
+    fn memory_backend_uses_serial_sync_with_pipeline_requested() {
+        let seq = Sequencer::open(
+            Arc::new(Kv::new_single_writer(Arc::new(super::super::kv_mem::MemKv::new()))),
+            Arc::new(ManualClock::new(10)),
+            SequencerConfig { commit_pipeline: true, ..SequencerConfig::default() },
+        ).unwrap();
+        assert!(!seq.commit_pipeline);
+        assert!(seq.submit(write()).is_ok());
+    }
+
     #[test]
     fn stop_is_idempotent_and_new_submissions_are_fenced() {
         let (_, seq) = fixture();

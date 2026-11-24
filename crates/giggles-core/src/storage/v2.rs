@@ -332,7 +332,7 @@ impl V2Db {
     }
     #[cfg(feature = "engine-rocksdb")]
     fn from_kv(kv: Arc<engine::kv::Kv>) -> Result<Self, CoreError> {
-        Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false, None, None)
+        Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false, None, None, EngineOptions::default())
             .map_err(|failure| failure.error)
     }
     #[cfg(feature = "engine-rocksdb")]
@@ -346,6 +346,7 @@ impl V2Db {
             true,
             None,
             None,
+            EngineOptions::default(),
         )
         .map_err(|failure| failure.error)
     }
@@ -356,6 +357,7 @@ impl V2Db {
         replicated_allowed: bool,
         token: Option<&[u8]>,
         recovery: Option<RecoveryOpen<'_>>,
+        options: EngineOptions,
     ) -> Result<Self, OpenFailure> {
         if let Some(recovery) = recovery {
             let on_disk = engine::commit::read_last_commit_ts(&kv)?;
@@ -388,6 +390,7 @@ impl V2Db {
             write_set_bytes,
             // Replicated groups must fit the same budget as individual writes.
             group_max_bytes: replicated_allowed.then_some(write_set_bytes),
+            commit_pipeline: options.commit_pipeline,
             ..Default::default()
         };
         #[cfg(test)]
@@ -846,7 +849,7 @@ impl V2Db {
     pub(crate) fn open_with_holder(path: &Path, token: Option<&[u8]>) -> Result<Self, CoreError> {
         #[cfg(feature = "engine-rocksdb")]
         {
-            Self::open_in_mode(path, token, None).map_err(|failure| failure.error)
+            Self::open_with_options(path, token, EngineOptions::default())
         }
         #[cfg(not(feature = "engine-rocksdb"))]
         {
@@ -862,12 +865,21 @@ impl V2Db {
     }
 
     #[cfg(feature = "engine-rocksdb")]
+    pub(crate) fn open_with_options(
+        path: &Path,
+        token: Option<&[u8]>,
+        options: EngineOptions,
+    ) -> Result<Self, CoreError> {
+        Self::open_in_mode(path, token, None, options).map_err(|failure| failure.error)
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
     pub(crate) fn open_recovery(
         path: &Path,
         token: Option<&[u8]>,
         recovery: RecoveryOpen<'_>,
     ) -> Result<Self, OpenFailure> {
-        Self::open_in_mode(path, token, Some(recovery))
+        Self::open_in_mode(path, token, Some(recovery), EngineOptions::default())
             .map_err(|failure| failure.at_recovery_path(path))
     }
 
@@ -876,6 +888,7 @@ impl V2Db {
         path: &Path,
         token: Option<&[u8]>,
         recovery: Option<RecoveryOpen<'_>>,
+        options: EngineOptions,
     ) -> Result<Self, OpenFailure> {
         use engine::kv_rocksdb::RocksKv;
         let check_format = |directory: &Path| -> Result<(), OpenFailure> {
@@ -908,12 +921,18 @@ impl V2Db {
             (RocksKv::open(path, CACHE_BYTES)?, identity)
         };
         let kv = Arc::new(engine::kv::Kv::new_single_writer(Arc::new(rocks)));
-        let mut db = Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false, token, recovery)?;
+        let mut db = Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false, token, recovery, options)?;
         db.directory_identity = identity.filter(|identity| identity.matches(path));
         Ok(db)
     }
 
 }
+#[cfg(feature = "engine-rocksdb")]
+#[derive(Default)]
+pub(crate) struct EngineOptions {
+    pub(crate) commit_pipeline: bool,
+}
+
 #[cfg(all(test, feature = "engine-rocksdb"))]
 type OpenReclaim = fn(&V2Db) -> Result<(), CoreError>;
 

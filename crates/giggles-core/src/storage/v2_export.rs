@@ -90,8 +90,7 @@ fn export_inner(
     // timestamp and all unversioned feature/counter records are one atomic view.
     // The earlier MVCC pin protects every version needed by that later view.
     db.require_local()?;
-    let _pin = db.sequencer.snapshot();
-    let read = db.kv.snapshot()?;
+    let (_pin, read) = db.sequencer.durable_snapshot()?;
     let features = read
         .get(Keyspace::Meta, b"features")?
         .ok_or_else(|| corrupt("features"))?;

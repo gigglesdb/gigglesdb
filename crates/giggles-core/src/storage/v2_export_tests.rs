@@ -58,6 +58,51 @@ fn restore_preserves_immediate_origin_across_reopen_and_generations() {
 }
 
 #[test]
+fn pipelined_export_waits_for_the_durable_counter_image() {
+    use engine::kv_rocksdb::mark_commit_groups;
+    let root = directory();
+    let path = root.join("db");
+    drop(v2::V2Db::create(&path).unwrap());
+    mark_commit_groups(&path).unwrap();
+    let db = v2::V2Db::open_with_options(&path, None, v2::EngineOptions { commit_pipeline: true }).unwrap();
+
+    let hook = crate::CommitSyncHook::new();
+    db.sequencer.set_sync_hook(Some(hook.clone()));
+    let mut key = vec![3];
+    key.extend_from_slice(&987u64.to_be_bytes());
+    let highwater = 8u64.to_be_bytes().to_vec();
+    let ack = db.sequencer.write_highwater_async(key.clone(), highwater.clone()).unwrap();
+    let entered = hook.wait_entered(std::time::Duration::from_secs(10));
+    let backup = root.join("backup");
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        let db = &db;
+        let backup = &backup;
+        scope.spawn(move || {
+            let result = export(db, backup, RecoveryPoint::None);
+            let _ = send.send(result);
+        });
+        let early = receive.recv_timeout(std::time::Duration::from_millis(100));
+        hook.release(false);
+        assert!(entered);
+        assert!(matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        ack.recv_timeout(std::time::Duration::from_secs(10)).unwrap().unwrap();
+        receive.recv_timeout(std::time::Duration::from_secs(10)).unwrap().unwrap();
+    });
+    let image = ExportRead::open(&backup).unwrap();
+    let mut offset = HEADER;
+    let mut actual = None;
+    while let Some(record) = image.record(&mut offset).unwrap() {
+        if record.tag == 4 && record.key == key {
+            actual = Some(record.value);
+        }
+    }
+    assert_eq!(actual, Some(highwater));
+    drop((image, db));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn pinned_export_allows_commits_and_restores_snapshot_roles_and_features() {
     let root = directory();
     fs::create_dir(&root).unwrap();

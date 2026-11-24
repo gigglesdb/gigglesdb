@@ -1,12 +1,20 @@
-//! Trusted test-only seam at the commit worker's Sync boundary.
+//! Trusted test-only seams at commit append and sync boundaries.
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 #[derive(Default)]
 pub struct CommitSyncHook {
     state: Mutex<State>,
     changed: Condvar,
+    point: Point,
+}
+#[derive(Default, PartialEq, Eq)]
+enum Point {
+    #[default]
+    BeforeSync,
+    BeforeAppend,
+    AfterAppend,
     #[cfg(test)]
-    pause_before_publish: bool,
+    BeforePublish,
 }
 #[derive(Default)]
 struct State {
@@ -19,6 +27,8 @@ pub(crate) enum SyncOutcome {
     Proceed,
     Fail,
     #[cfg(all(test, feature = "engine-rocksdb"))]
+    Panic,
+    #[cfg(all(test, feature = "engine-rocksdb"))]
     WalError {
         after_apply: bool,
     },
@@ -27,11 +37,19 @@ impl CommitSyncHook {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
+    pub fn before_append() -> Arc<Self> {
+        Arc::new(Self { point: Point::BeforeAppend, ..Self::default() })
+    }
+
+    pub fn after_append_before_enqueue() -> Arc<Self> {
+        Arc::new(Self { point: Point::AfterAppend, ..Self::default() })
+    }
+
     /// Pause a successful nonempty Sync batch before publication.
     #[cfg(test)]
     pub(crate) fn before_publish() -> Arc<Self> {
         Arc::new(Self {
-            pause_before_publish: true,
+            point: Point::BeforePublish,
             ..Self::default()
         })
     }
@@ -60,34 +78,50 @@ impl CommitSyncHook {
         self.release_with(SyncOutcome::WalError { after_apply });
     }
 
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn release_with_panic(&self) {
+        self.release_with(SyncOutcome::Panic);
+    }
+
     fn release_with(&self, outcome: SyncOutcome) {
         self.state.lock().unwrap().outcome = Some(outcome);
         self.changed.notify_all();
     }
 
     pub(crate) fn before_sync(&self) -> SyncOutcome {
-        #[cfg(test)]
-        if self.pause_before_publish {
-            return SyncOutcome::Proceed;
-        }
-        self.pause()
+        self.at(Point::BeforeSync)
+    }
+
+    pub(crate) fn on_before_append(&self) -> SyncOutcome {
+        self.at(Point::BeforeAppend)
+    }
+
+    pub(crate) fn on_after_append(&self) {
+        self.at(Point::AfterAppend);
+    }
+
+    fn at(&self, point: Point) -> SyncOutcome {
+        if self.point == point { self.pause() } else { SyncOutcome::Proceed }
     }
 
     #[cfg(test)]
     pub(crate) fn after_sync(&self) {
-        if self.pause_before_publish {
-            self.pause();
-        }
+        self.at(Point::BeforePublish);
     }
 
     fn pause(&self) -> SyncOutcome {
         let mut state = self.state.lock().unwrap();
         state.entered = true;
         self.changed.notify_all();
-        self.changed
+        let outcome = self.changed
             .wait_while(state, |state| state.outcome.is_none())
             .unwrap()
             .outcome
-            .unwrap()
+            .unwrap();
+        #[cfg(all(test, feature = "engine-rocksdb"))]
+        if let SyncOutcome::Panic = outcome {
+            panic!("injected commit worker panic");
+        }
+        outcome
     }
 }

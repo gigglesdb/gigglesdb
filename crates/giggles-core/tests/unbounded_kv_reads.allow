@@ -22,6 +22,7 @@ storage/engine/commit.rs open_with_holder get 1 | Recovers the fence before star
 storage/engine/commit.rs read_last_commit_ts get 1 | Reads the recovery timestamp before starting the sequencer.
 storage/engine/commit.rs validate_counter latest_version 1 | Sequencer validation includes every applied predecessor and the current group overlay.
 storage/engine/commit.rs validate_highwater get 1 | Sequencer validation compares against prior applied and staged highwaters.
+storage/engine/commit_pipeline.rs read_group_number get 1 | Reads the recovered WAL group number before starting the sequencer.
 storage/engine/content_check.rs check range 2 | Engine format validation reads a recovery or export image.
 storage/engine/content_check.rs check_protected_kernel range 2 | Engine format validation reads a recovery or export image.
 storage/engine/gc.rs open get 1 | Recovers GC's dedicated watermark, written by the GC state owner.
@@ -106,8 +107,8 @@ storage/replicated.rs range range 1 | The replicated KV adapter delegates the ra
 storage/replicated.rs seek_ge seek_ge 1 | The replicated KV adapter delegates the raw primitive for its caller to constrain.
 storage/roles_engine.rs reconcile_tables range 1 | Local writers and DDL take ROLE_LOCK AccessExclusive. Routed role DDL also takes the Exclusive sentinel.
 storage/upgrade.rs verify get 2 | Upgrade verifies its private destination before activation.
-storage/v2_export.rs export_inner get 2 | P1 defers the export fence. Local export reads metadata from its physical snapshot.
-storage/v2_export.rs export_inner range 2 | P1 defers the export fence. Local export reads counters and checks Kernel in its physical snapshot.
+storage/v2_export.rs export_inner get 2 | Local export reads metadata from a sequencer-certified durable snapshot.
+storage/v2_export.rs export_inner range 2 | Local export reads counters and checks Kernel in the same sequencer-certified durable snapshot.
 storage/v2_export.rs get range 1 | The import verifier reads staged export records through an in-memory adapter.
 storage/v2_sql.rs execute_v2_inner get 1 | Transaction::get reads the selected MVCC snapshot.
 storage/v2_sql.rs fk_key_changed_since range 1 | The raw witness check can only add a retryable FK conflict.

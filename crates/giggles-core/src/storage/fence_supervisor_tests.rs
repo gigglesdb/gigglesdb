@@ -645,6 +645,49 @@ fn read_io_error_keeps_serving_until_a_write_fences_the_same_generation() {
 }
 
 #[test]
+fn pipelined_maintenance_fence_never_reopens_the_generation() {
+    use crate::storage::{engine::kv_rocksdb::mark_commit_groups, v2::{EngineOptions, V2Db}};
+    let (dir, admin) = fixture();
+    drop(admin);
+    mark_commit_groups(&dir.0).unwrap();
+    let db = V2Db::open_with_options(&dir.0, None, EngineOptions { commit_pipeline: true }).unwrap();
+    let slot = EngineSlot::for_directory(db, &dir.0, None);
+    let admin = Admin::attach_backend(Backend::V2(slot), Limits::default())
+        .unwrap().with_data_directory(&dir.0);
+    let (idle, parked) = mpsc::channel();
+    let opens = Arc::new(AtomicUsize::new(0));
+    let observed = opens.clone();
+    let worker = Worker::start(&admin, settings(), TestRuntime {
+        idle: Some(idle),
+        open: Some(Box::new(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            Err(open_failure(FenceClass::Data))
+        })),
+        ..TestRuntime::default()
+    });
+    parked.recv_timeout(WAIT).unwrap();
+    let hook = crate::CommitSyncHook::new();
+    let db = admin.test_v2();
+    db.sequencer.set_sync_hook(Some(hook.clone()));
+    let mut key = vec![3];
+    key.extend_from_slice(&987u64.to_be_bytes());
+    let pending = db.sequencer.write_highwater_async(key, 8u64.to_be_bytes().to_vec()).unwrap();
+    let entered = hook.wait_entered(WAIT);
+    db.kv.test_report_write_error(wal_error());
+    hook.release(false);
+    assert!(entered);
+    assert_eq!(pending.recv_timeout(WAIT).unwrap(), Err(crate::storage::engine::txn::TxnError::CommitAmbiguous));
+    drop(db);
+    parked.recv_timeout(WAIT).unwrap();
+    assert!(matches!(admin.storage_status(), StorageStatus::Serving {
+        generation: 1, fenced: true, cause: Some(FenceCause { class: FenceClass::NotRecoverable, .. }), ..
+    }));
+    assert_fenced(&admin);
+    assert_eq!(opens.load(Ordering::Relaxed), 0);
+    drop(worker);
+}
+
+#[test]
 fn sequencer_fence_wakes_recovery_after_a_read_io_error() {
     read_io_error_keeps_serving_until_fenced(|admin| {
         let hook = crate::CommitSyncHook::new();

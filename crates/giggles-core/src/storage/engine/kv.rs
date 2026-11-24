@@ -168,7 +168,6 @@ impl WriteBatch {
     pub(crate) fn put(&mut self, ks: Keyspace, key: Vec<u8>, value: Vec<u8>) {
         self.ops.push(Op::Put { ks, key, value });
     }
-    #[allow(dead_code, reason = "Stage A will assign groups in GD-0084 P3")]
     pub(crate) fn put_commit_group(&mut self, group: u64) {
         self.put(Keyspace::Meta, COMMIT_GROUP_KEY.to_vec(), group.to_be_bytes().to_vec());
     }
@@ -323,6 +322,7 @@ pub struct RocksStatus {
 }
 
 impl RocksStatus {
+    const NOT_SUPPORTED: u8 = 3;
     pub(crate) const IO_ERROR: u8 = 5;
 }
 
@@ -403,6 +403,7 @@ pub(crate) struct FenceState(Mutex<RecordedFence>);
 #[derive(Default)]
 struct RecordedFence {
     cause: Option<FenceCause>,
+    commit_pipeline: bool,
     #[cfg(feature = "engine-rocksdb")]
     notifier: Option<(u64, std::sync::Weak<super::super::fence_supervisor::Wake>)>,
 }
@@ -417,6 +418,27 @@ struct ReadErrorCapture {
 }
 
 impl FenceState {
+    fn enable_commit_pipeline(&self) {
+        let mut recorded = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        recorded.commit_pipeline = true;
+        if let Some(cause) = &mut recorded.cause {
+            cause.class = FenceClass::NotRecoverable;
+        }
+    }
+
+    fn record_explicit_pipeline_fence(&self) {
+        let mut recorded = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if recorded.commit_pipeline && recorded.cause.is_none() {
+            #[cfg_attr(not(feature = "engine-rocksdb"), allow(unused_mut))]
+            let mut cause = FenceCause::new(FenceSite::Other, FenceClass::NotRecoverable, &KvError::Fenced);
+            #[cfg(feature = "engine-rocksdb")]
+            if let Some((generation, _)) = &recorded.notifier {
+                cause.generation = *generation;
+            }
+            recorded.cause = Some(cause);
+        }
+    }
+
     pub(crate) fn cause(&self) -> Option<FenceCause> {
         self.0.lock().unwrap_or_else(|p| p.into_inner()).cause.clone()
     }
@@ -477,8 +499,10 @@ impl FenceState {
         fence: Option<&AtomicBool>,
     ) -> bool {
         let mut recorded = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        #[cfg(feature = "engine-rocksdb")]
         let mut cause = cause;
+        if recorded.commit_pipeline {
+            cause.class = FenceClass::NotRecoverable;
+        }
         #[cfg(feature = "engine-rocksdb")]
         let notifier = if let Some((generation, wake)) = &recorded.notifier {
             if cause.generation != 0 && cause.generation != *generation {
@@ -706,13 +730,28 @@ impl Kv {
     pub(crate) fn is_single_writer(&self) -> bool {
         self.single_writer
     }
-    #[allow(dead_code, reason = "The commit sequencer will use this in P3")]
     pub(crate) fn pipelined_sync(&self) -> bool {
         self.is_single_writer() && self.backend.pipelined_sync()
     }
+    /// Probe SyncWAL before admitting any appends. Unsupported WAL files use
+    /// serial Sync writes. Other probe errors fail the open.
+    pub(super) fn enable_commit_pipeline(&self) -> Result<bool, KvError> {
+        self.check()?;
+        let result = self.backend.sync_commits();
+        if let Err(KvError::RocksIo { status, .. }) = &result
+            && status.code == RocksStatus::NOT_SUPPORTED
+        {
+            return Ok(false);
+        }
+        result?;
+        self.causes.enable_commit_pipeline();
+        Ok(true)
+    }
+
     /// Fences the handle: every later call fails without reaching the backend.
     pub(crate) fn fence(&self) {
         if !self.fenced.swap(true, Ordering::AcqRel) {
+            self.causes.record_explicit_pipeline_fence();
             #[cfg(feature = "engine-rocksdb")]
             self.causes.signal_recovery();
             super::diagnostics::error("KV fenced".into());
@@ -760,7 +799,6 @@ impl Kv {
         self.fence_on_error(FenceSite::Write, result)
     }
     /// Appends a commit batch to the WAL without waiting for durability.
-    #[allow(dead_code, reason = "The commit sequencer will use this in P3")]
     pub(crate) fn append_commit(&self, batch: WriteBatch) -> Result<(), KvError> {
         self.check()?;
         if !self.pipelined_sync() {
@@ -771,11 +809,19 @@ impl Kv {
         self.fence_on_error(FenceSite::CommitAppend, result)
     }
     /// Makes preceding successful commit appends durable.
-    #[allow(dead_code, reason = "The commit sequencer will use this in P3")]
     pub(crate) fn sync_commits(&self) -> Result<(), KvError> {
         self.check()?;
         let result = self.backend.sync_commits();
         self.fence_on_error(FenceSite::CommitSync, result)
+    }
+
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(super) fn test_commit_wal_error(&self, site: FenceSite) -> Result<(), KvError> {
+        self.fence_on_error(site, Err(KvError::RocksIo {
+            message: "injected commit WAL error".into(),
+            status: RocksStatus { code: RocksStatus::IO_ERROR, subcode: 0, severity: None },
+            site,
+        }))
     }
 
     #[cfg(all(test, feature = "engine-rocksdb"))]
