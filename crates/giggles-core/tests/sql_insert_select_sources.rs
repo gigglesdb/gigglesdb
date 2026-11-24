@@ -428,6 +428,34 @@ fn coercion_conflicts_and_late_constraint_errors_use_insert_semantics() {
 }
 
 #[test]
+fn mixed_select_list_srfs_are_refused_before_writing() {
+    with_session(|db| {
+        run(db, "CREATE TABLE m (id int, word text)");
+        for sql in [
+            "SELECT generate_series(1,2) AS g, regexp_split_to_table('a b',' ') AS w",
+            "SELECT unnest(ARRAY[1,2,3]), regexp_matches('ab','(.)','g')",
+            "CREATE TABLE c4 AS SELECT generate_series(1,2), regexp_split_to_table('a b',' ')",
+            "INSERT INTO m SELECT generate_series(1,2), regexp_split_to_table('a b',' ')",
+            "CREATE TABLE c5 AS SELECT (regexp_matches('ab','(.)','g'))[1] AS a, regexp_split_to_table('x y',' ') AS b",
+        ] {
+            assert_eq!(
+                db.execute(sql, &[], None),
+                Err(CoreError::Sql(SqlError::Unsupported)),
+                "{sql}"
+            );
+        }
+        for sql in ["SELECT * FROM c4", "SELECT * FROM c5"] {
+            assert_eq!(
+                db.execute(sql, &[], None),
+                Err(CoreError::Sql(SqlError::UnknownTable)),
+                "{sql}"
+            );
+        }
+        assert!(rows(run(db, "SELECT * FROM m")).is_empty());
+    });
+}
+
+#[test]
 fn regex_sets_materialize_in_insert_and_ctas() {
     with_session(|db| {
         let a = "b0000000-0000-0000-0000-000000000001";

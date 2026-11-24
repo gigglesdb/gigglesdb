@@ -208,6 +208,18 @@ fn rewrite_projection(
         return Err(SqlError::Unsupported);
     }
     let close = subquery_end(tokens, open)?;
+    // The remaining select-list SRFs would expand on every lateral row.
+    let has_other_set = |tokens: &[Token]| {
+        tokens.windows(2).any(|pair| {
+            matches!(pair, [Token::Word(name) | Token::QuotedIdent(name), Token::Symbol('(')]
+                if functions::regexp::set_type(name).is_some()
+                    || regex_source && srf::projection_function(name))
+        })
+    };
+    if has_other_set(&tokens[start..at]) || has_other_set(&tokens[close + 1..tail]) {
+        return Err(SqlError::Unsupported);
+    }
+
     let end = items
         .iter()
         .copied()
