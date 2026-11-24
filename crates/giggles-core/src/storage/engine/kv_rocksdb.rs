@@ -17,7 +17,11 @@ use std::{
     ops::{Bound, Deref},
     path::{Path, PathBuf},
     ptr::NonNull,
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -331,6 +335,7 @@ impl Deref for LockedDb {
 pub(crate) struct RocksKv {
     db: Arc<LockedDb>,
     pipelined_sync: bool,
+    sync_failed: AtomicBool,
     #[cfg(test)]
     wal_stop: Option<WalStop>,
 }
@@ -631,6 +636,7 @@ impl RocksKv {
         }
         Ok(Self {
             pipelined_sync,
+            sync_failed: AtomicBool::new(false),
             #[cfg(test)]
             wal_stop: (stop.reason != 0).then_some(stop),
             db: Arc::new(LockedDb {
@@ -1002,6 +1008,7 @@ impl RocksKv {
 
     /// Flush every column family's memtables to SST files.
     pub(crate) fn flush_memtables(&self) -> Result<(), KvError> {
+        self.check_sync_failure()?;
         self.db.clear_points();
         for ks in Keyspace::ALL {
             let cf = self.db.cf_handle(ks.name()).unwrap();
@@ -1159,6 +1166,24 @@ fn write_error_site(
 }
 
 impl RocksKv {
+    fn check_sync_failure(&self) -> Result<(), KvError> {
+        if self.sync_failure_latched() {
+            return Err(KvError::Fenced);
+        }
+        Ok(())
+    }
+
+    fn stop_after_sync_error(&self) {
+        // Refuse backend calls during the native stop, before the outer Kv
+        // has recorded the original error. Already-admitted calls may finish.
+        if !self.sync_failed.swap(true, Ordering::AcqRel) {
+            // 11.8.1's SyncWalImpl checks for a background error before the
+            // WAL directory fsync. Cancel and drain native work even if it
+            // did not put the DB into an error state. All our writes use WAL.
+            self.db.cancel_all_background_work(true);
+        }
+    }
+
     // In RocksDB 11.8.1, background SyncClosedWals only syncs older WALs.
     // Its error can be published before the cumulative background-error count
     // increments, so require the diagnostic to name the newest live WAL too.
@@ -1213,6 +1238,9 @@ impl RocksKv {
         // Record pre-call evidence for the fence. Pipeline failures require
         // operator recovery, with corruption classified as Data.
         op().map_err(|mut error| {
+            if site == FenceSite::CommitSync {
+                self.stop_after_sync_error();
+            }
             if let KvError::RocksIo { message, .. } | KvError::Corrupt(message) = &mut error {
                 let before = background_errors
                     .map_or_else(|| "unknown".into(), |count| count.to_string());
@@ -1435,7 +1463,12 @@ impl KvBackend for RocksKv {
         self.pipelined_sync
     }
 
+    fn sync_failure_latched(&self) -> bool {
+        self.sync_failed.load(Ordering::Acquire)
+    }
+
     fn append_commit(&self, batch: WriteBatch) -> Result<(), KvError> {
+        self.check_sync_failure()?;
         if !self.pipelined_sync {
             return Err(KvError::Io("commit append requires pipeline-capable RocksDB recovery".into()));
         }
@@ -1443,17 +1476,27 @@ impl KvBackend for RocksKv {
     }
 
     fn sync_commits(&self) -> Result<(), KvError> {
+        self.check_sync_failure()?;
         self.commit_io(FenceSite::CommitSync, || self.db.flush_wal(true))
     }
 
     fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError> {
-        self.write_batch(batch, durability)
-            .map_err(|error| self.map_write_error(error, FenceSite::Write, durability == Durability::Sync))
+        self.check_sync_failure()?;
+        let sync = durability == Durability::Sync;
+        self.write_batch(batch, durability).map_err(|error| {
+            if sync {
+                self.stop_after_sync_error();
+            }
+            self.map_write_error(error, FenceSite::Write, sync)
+        })
     }
 
     fn flush_barrier(&self) -> Result<(), KvError> {
-        self.db.flush_wal(true)
-            .map_err(|error| self.map_write_error(error, FenceSite::FlushBarrier, true))
+        self.check_sync_failure()?;
+        self.db.flush_wal(true).map_err(|error| {
+            self.stop_after_sync_error();
+            self.map_write_error(error, FenceSite::FlushBarrier, true)
+        })
     }
 
     fn snapshot(&self) -> Result<Arc<dyn KvRead>, KvError> {
@@ -1983,9 +2026,7 @@ mod tests {
         assert_commit_fence(&kv, error, FenceSite::CommitSync);
         assert_eq!(kv.sync_commits(), Err(KvError::Fenced));
         assert_eq!(kv.append_commit(single()), Err(KvError::Fenced));
-        let mut wait = rocksdb::WaitForCompactOptions::default();
-        wait.set_timeout(5_000_000);
-        db.db.wait_for_compact(&wait).unwrap();
+        assert_eq!(db.flush_memtables(), Err(KvError::Fenced));
         assert_eq!(sst_paths(&dir.0), before);
     }
 
@@ -2005,6 +2046,7 @@ mod tests {
         #[repr(C)]
         struct WalFaultCounts {
             sync_failures: u64,
+            dir_sync_failures: u64,
             full_space_checks: u64,
             flushes: u64,
             recoveries: u64,
@@ -2025,6 +2067,7 @@ mod tests {
             ) -> *mut c_void;
             fn giggles_rocksdb_drop_wal_fault(handle: *mut c_void);
             fn giggles_rocksdb_arm_wal_fault(handle: *mut c_void, armed: bool);
+            fn giggles_rocksdb_arm_wal_dir_fault(handle: *mut c_void);
             fn giggles_rocksdb_wal_fault_counts(handle: *const c_void, counts: *mut WalFaultCounts);
         }
 
@@ -2045,6 +2088,11 @@ mod tests {
                 unsafe { giggles_rocksdb_arm_wal_fault(self.0.as_ptr(), armed) };
             }
 
+            fn arm_directory(&self) {
+                // SAFETY: this handle owns the live fault Env.
+                unsafe { giggles_rocksdb_arm_wal_dir_fault(self.0.as_ptr()) };
+            }
+
             fn counts(&self) -> WalFaultCounts {
                 let mut counts = WalFaultCounts::default();
                 // SAFETY: both pointers are live, and the native counters are atomic.
@@ -2057,6 +2105,129 @@ mod tests {
             fn drop(&mut self) {
                 // SAFETY: the test drops the DB before releasing its Env.
                 unsafe { giggles_rocksdb_drop_wal_fault(self.0.as_ptr()) };
+            }
+        }
+
+        #[test]
+        fn native_wal_directory_sync_error_stops_commit_sync_handle() {
+            check_native_wal_directory_sync_error(false);
+        }
+
+        #[test]
+        fn native_wal_directory_sync_error_stops_sync_write_handle() {
+            check_native_wal_directory_sync_error(true);
+        }
+
+        fn check_native_wal_directory_sync_error(sync_write: bool) {
+            let dir = TestDir::new();
+            let wal_dir = native_path(&dir.0.join("test-wal"));
+            let mut options = RocksKv::open_options(8 << 20, DBRecoveryMode::PointInTime).unwrap();
+            options.set_wal_dir(&wal_dir);
+            options.set_write_buffer_size(64 << 10);
+            options.set_max_write_buffer_number(4);
+            let reopen_options = options.clone();
+            // SAFETY: the fault Env outlives this open and all its handles.
+            let fault = unsafe { WalFault::install(&mut options, true) };
+            let open = |options| {
+                let lock = WriterLock::acquire(&dir.0).unwrap();
+                Arc::new(RocksKv::open_with_options(&dir.0, lock, None, options, false).unwrap())
+            };
+            let db = open(options);
+            let kv = Kv::new_single_writer(db.clone());
+
+            // Pause flushes so the first directory fsync after rotation belongs to
+            // the tested caller. Resuming after the fault tests the native stop.
+            let background_work = |operate: unsafe extern "C" fn(
+                *mut librocksdb_sys::rocksdb_t,
+                *mut *mut c_char,
+            )| {
+                let mut error = std::ptr::null_mut();
+                // SAFETY: the DB and error out pointer are live for the call.
+                unsafe { operate(db.db.as_raw_ptr(), &mut error) };
+                if !error.is_null() {
+                    // SAFETY: RocksDB returned an owned, NUL-terminated error.
+                    let message = unsafe { std::ffi::CStr::from_ptr(error) }
+                        .to_string_lossy()
+                        .into_owned();
+                    // SAFETY: this is the owned error returned by the C API.
+                    unsafe { librocksdb_sys::rocksdb_free(error.cast()) };
+                    panic!("{message}");
+                }
+            };
+            background_work(librocksdb_sys::rocksdb_pause_background_work);
+            let before = sst_paths(&dir.0);
+            let payloads = [
+                b"acked".to_vec(),
+                vec![42; 128 << 10],
+                b"rotated".to_vec(),
+                b"failed-sync".to_vec(),
+            ];
+            let batch = |index: usize| {
+                let key = vec![index as u8];
+                let mut batch = WriteBatch::default();
+                batch.put(Keyspace::Rows, key.clone(), payloads[index].clone());
+                batch.put(Keyspace::Meta, key, vec![index as u8]);
+                batch
+            };
+            kv.write(batch(0), Durability::Sync).unwrap();
+            let first_wal = newest_wal(&wal_dir).unwrap().unwrap();
+            // Raw NoSync appends stage the unacknowledged suffix. The fault Env
+            // is intentionally ineligible to advertise pipeline capability.
+            db.write(batch(1), Durability::NoSync).unwrap();
+            db.write(batch(2), Durability::NoSync).unwrap();
+            assert!(newest_wal(&wal_dir).unwrap().unwrap() > first_wal);
+            assert_eq!(sst_paths(&dir.0), before);
+
+            fault.arm_directory();
+            let (error, site) = if sync_write {
+                (kv.write(batch(3), Durability::Sync).unwrap_err(), FenceSite::Write)
+            } else {
+                (kv.sync_commits().unwrap_err(), FenceSite::CommitSync)
+            };
+            assert!(error.to_string().contains("injected WAL directory fsync"), "{error}");
+            assert!(kv.is_fenced());
+            let cause = kv.causes.cause().unwrap();
+            assert_eq!((cause.site, cause.class), (site, FenceClass::NotRecoverable), "{cause:?}");
+            let counts = fault.counts();
+            assert_eq!((counts.dir_sync_failures, counts.sync_failures), (1, 0), "{counts:?}");
+            assert_eq!(kv.write(batch(3), Durability::Sync), Err(KvError::Fenced));
+            assert_eq!(kv.sync_commits(), Err(KvError::Fenced));
+            assert_eq!(kv.flush_barrier(), Err(KvError::Fenced));
+            assert_eq!(db.write(batch(3), Durability::NoSync), Err(KvError::Fenced));
+            assert_eq!(db.sync_commits(), Err(KvError::Fenced));
+
+            background_work(librocksdb_sys::rocksdb_continue_background_work);
+            // The one-shot fault has cleared. Bypass the Rust fence to ask the
+            // old DB to flush the queued immutable memtable anyway.
+            let mut flush = rocksdb::FlushOptions::default();
+            flush.set_wait(true);
+            let native_error = db.db
+                .flush_cf_opt(db.db.cf_handle(Keyspace::Rows.name()).unwrap(), &flush)
+                .unwrap_err();
+            if !sync_write {
+                assert_eq!(native_error.kind(), rocksdb::ErrorKind::ShutdownInProgress, "{native_error}");
+            }
+            assert_eq!(fault.counts().flushes, 0);
+            assert_eq!(sst_paths(&dir.0), before);
+            drop(kv);
+            drop(db);
+
+            let reopened = open(reopen_options);
+            let last = if sync_write { 3 } else { 2 };
+            let mut missing = false;
+            for (index, payload) in payloads.iter().enumerate() {
+                let key = [index as u8];
+                let row = reopened.get(Keyspace::Rows, &key).unwrap();
+                let meta = reopened.get(Keyspace::Meta, &key).unwrap();
+                assert_eq!(row.is_some(), meta.is_some(), "partial batch {index}");
+                if let Some(row) = row {
+                    assert!(!missing && index <= last, "non-prefix batch {index}");
+                    assert_eq!(&row, payload);
+                    assert_eq!(meta.as_deref(), Some(key.as_slice()));
+                } else {
+                    assert_ne!(index, 0, "acknowledged batch was lost");
+                    missing = true;
+                }
             }
         }
 
@@ -2107,9 +2278,11 @@ mod tests {
             }
 
             fault.arm(true);
-            let error = kv.sync_commits().unwrap_err();
+            // Exercise the native listener in isolation. Production commit
+            // sync also cancels background work before fencing the Kv.
+            let error = db.db.flush_wal(true).unwrap_err();
             assert!(error.to_string().contains("injected WAL Sync"), "{error}");
-            assert_commit_fence(&kv, error, FenceSite::CommitSync);
+            kv.fence();
             let armed = fault.counts();
             assert!(armed.sync_failures > 0 && armed.full_space_checks > 0, "{armed:?}");
             if keep_veto {

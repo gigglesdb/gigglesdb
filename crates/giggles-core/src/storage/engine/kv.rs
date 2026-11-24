@@ -690,6 +690,11 @@ pub(crate) trait KvBackend: KvRead {
     fn sync_commits(&self) -> Result<(), KvError> {
         self.flush_barrier()
     }
+    /// A backend with a latched sync failure rejects concurrent calls while
+    /// the call that failed is still reporting the original error.
+    fn sync_failure_latched(&self) -> bool {
+        false
+    }
     fn snapshot(&self) -> Result<Arc<dyn KvRead>, KvError>;
     fn engine_name(&self) -> &'static str;
 }
@@ -860,6 +865,9 @@ impl Kv {
     }
     fn fence_on_error(&self, site: FenceSite, result: Result<(), KvError>) -> Result<(), KvError> {
         if let Err(error) = &result
+            // A backend already stopping after an error can reject concurrent
+            // callers. Leave the fence cause to the call that failed.
+            && !(*error == KvError::Fenced && self.backend.sync_failure_latched())
             && self.causes.record_fence(FenceCause::for_kv(site, error), &self.fenced, false)
         {
             super::diagnostics::error(format!(

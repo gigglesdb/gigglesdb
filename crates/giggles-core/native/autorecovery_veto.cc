@@ -316,6 +316,7 @@ struct rocksdb_env_t { Env* rep; bool is_default; };
 namespace {
 struct WalFaultCounts {
   uint64_t sync_failures;
+  uint64_t dir_sync_failures;
   uint64_t full_space_checks;
   uint64_t flushes;
   uint64_t recoveries;
@@ -324,7 +325,9 @@ struct WalFaultCounts {
 
 struct WalFaultState {
   std::atomic<bool> armed{false};
+  std::atomic<bool> dir_armed{false};
   std::atomic<uint64_t> sync_failures{0};
+  std::atomic<uint64_t> dir_sync_failures{0};
   std::atomic<uint64_t> full_space_checks{0};
   std::atomic<uint64_t> flushes{0};
   std::atomic<uint64_t> recoveries{0};
@@ -357,10 +360,31 @@ class FaultWalFile final : public FSWritableFileOwnerWrapper {
   std::shared_ptr<WalFaultState> state_;
 };
 
+class FaultWalDirectory final : public FSDirectoryWrapper {
+ public:
+  FaultWalDirectory(std::unique_ptr<FSDirectory> directory,
+                    std::shared_ptr<WalFaultState> state)
+      : FSDirectoryWrapper(std::move(directory)), state_(std::move(state)) {}
+
+  IOStatus FsyncWithDirOptions(const IOOptions& options, IODebugContext* debug,
+                               const DirFsyncOptions& dir_options) override {
+    if (dir_options.reason == DirFsyncOptions::kNewFileSynced &&
+        state_->dir_armed.exchange(false)) {
+      ++state_->dir_sync_failures;
+      return IOStatus::IOError("injected WAL directory fsync");
+    }
+    return FSDirectoryWrapper::FsyncWithDirOptions(options, debug, dir_options);
+  }
+
+ private:
+  std::shared_ptr<WalFaultState> state_;
+};
+
 class FaultWalFileSystem final : public FileSystemWrapper {
  public:
-  explicit FaultWalFileSystem(std::shared_ptr<WalFaultState> state)
-      : FileSystemWrapper(FileSystem::Default()), state_(std::move(state)) {}
+  FaultWalFileSystem(std::shared_ptr<WalFaultState> state, std::string wal_dir)
+      : FileSystemWrapper(FileSystem::Default()), state_(std::move(state)),
+        wal_dir_(std::move(wal_dir)) {}
 
   const char* Name() const override { return "GigglesFaultWalFileSystem"; }
 
@@ -370,6 +394,17 @@ class FaultWalFileSystem final : public FileSystemWrapper {
     auto status = target()->NewWritableFile(path, options, file, debug);
     if (status.ok() && path.ends_with(".log")) {
       *file = std::make_unique<FaultWalFile>(std::move(*file), state_);
+    }
+    return status;
+  }
+
+  IOStatus NewDirectory(const std::string& path, const IOOptions& options,
+                         std::unique_ptr<FSDirectory>* directory,
+                         IODebugContext* debug) override {
+    auto status = target()->NewDirectory(path, options, directory, debug);
+    if (status.ok() && !wal_dir_.empty() && path == wal_dir_) {
+      *directory =
+          std::make_unique<FaultWalDirectory>(std::move(*directory), state_);
     }
     return status;
   }
@@ -387,6 +422,7 @@ class FaultWalFileSystem final : public FileSystemWrapper {
 
  private:
   std::shared_ptr<WalFaultState> state_;
+  const std::string wal_dir_;
 };
 
 class RecoveryObserver final : public EventListener {
@@ -424,8 +460,8 @@ extern "C" FaultEnv* giggles_rocksdb_install_wal_fault(
     rocksdb_options_t* options, bool keep_veto) noexcept {
   try {
     auto state = std::make_shared<WalFaultState>();
-    auto handle = std::make_unique<FaultEnv>(
-        FaultEnv{state, NewCompositeEnv(std::make_shared<FaultWalFileSystem>(state))});
+    auto fs = std::make_shared<FaultWalFileSystem>(state, options->rep.wal_dir);
+    auto handle = std::make_unique<FaultEnv>(FaultEnv{state, NewCompositeEnv(fs)});
     if (!keep_veto) {
       // The production options builder installs only the veto listener.
       options->rep.listeners.clear();
@@ -448,10 +484,15 @@ extern "C" void giggles_rocksdb_arm_wal_fault(FaultEnv* handle,
   handle->state->armed.store(armed);
 }
 
+extern "C" void giggles_rocksdb_arm_wal_dir_fault(FaultEnv* handle) noexcept {
+  handle->state->dir_armed.store(true);
+}
+
 extern "C" void giggles_rocksdb_wal_fault_counts(const FaultEnv* handle,
                                                 WalFaultCounts* counts) noexcept {
   const auto& state = *handle->state;
-  *counts = {state.sync_failures.load(), state.full_space_checks.load(),
+  *counts = {state.sync_failures.load(), state.dir_sync_failures.load(),
+             state.full_space_checks.load(),
              state.flushes.load(), state.recoveries.load(),
              state.recovery_begins_enabled.load()};
 }
