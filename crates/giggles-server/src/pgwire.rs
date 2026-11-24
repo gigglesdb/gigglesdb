@@ -1420,6 +1420,14 @@ impl Statement {
         ))
     }
 
+    fn forget_cursor_plan(&self, session: &Session) {
+        if let Plan::Sql(prepared)
+            | Plan::Cursor(cursor::Command::Declare { prepared: Some(prepared), .. }) = &*self.p
+        {
+            session.sql.forget_cursor_plan(prepared);
+        }
+    }
+
     // Binding reads the immutable Prepared (including its captured search_path,
     // types, schema user and literal DateOrder) and the catalog. Query binding installs catalog enum
     // and collation scopes; plan_constant excludes runtime/session nodes and only
@@ -2457,6 +2465,7 @@ impl State {
             self.diagnostic.message = Some("cached plan must not change result type");
             return Err("0A000");
         }
+        old.forget_cursor_plan(session);
         self.statements.insert(name.to_owned(), new);
         Ok(())
     }
@@ -2827,7 +2836,9 @@ impl State {
                 let sql = r.text()?;
                 self.diagnostic.query(&sql);
                 r.end()?;
-                self.statements.remove("");
+                if let Some(statement) = self.statements.remove("") {
+                    statement.forget_cursor_plan(session);
+                }
                 self.portals.remove("");
                 self.invalidate_unnamed_for_sql(&sql);
                 self.simple_query(&sql, session, out, received)?;
@@ -2863,7 +2874,9 @@ impl State {
                     self.cache_unnamed(&statement);
                 }
                 if name.is_empty() {
-                    self.statements.insert(name, statement);
+                    if let Some(previous) = self.statements.insert(name, statement) {
+                        previous.forget_cursor_plan(session);
+                    }
                 } else {
                     statement.origin = Some(Box::new(prepare::Origin::protocol(session)));
                     self.store_named_statement(name, statement);
@@ -3377,6 +3390,9 @@ impl State {
                 r.end()?;
                 match kind {
                     b'S' => {
+                        if let Some(statement) = self.statements.get(&name) {
+                            statement.forget_cursor_plan(session);
+                        }
                         self.remove_statement(&name);
                     }
                     b'P' => {

@@ -341,7 +341,7 @@ impl SqlSession {
                     .with_text_settings(self.date_style, self.bytea_output)
                     .with_extra_float_digits(self.extra_float_digits)
             });
-            let (image, source, context, scope) = match &self.admin.inner.backend {
+            let (image, source, context, scope, plan_catalog) = match &self.admin.inner.backend {
                 Backend::V2(_) => {
                     let db = db.expect("V2 cursor is leased");
                     // Stream through the local store or the gateway's paged range reader.
@@ -355,7 +355,7 @@ impl SqlSession {
                             || t.writes_keyspace(engine::kv::Keyspace::Index)
                             || t.isolation() == engine::txn::Isolation::Serializable
                     }) {
-                        self.cursor_plan_cache = Default::default();
+                        self.cursor_plan_cache.clear();
                         discard(&tag);
                         return self.buffer_cursor(&p, params, clock, buffer_limit, lease);
                     }
@@ -372,6 +372,7 @@ impl SqlSession {
                         implicit.insert(db.begin(engine::txn::Isolation::ReadCommitted))
                     });
                     let catalog = db.catalog().snapshot(txn)?;
+                    self.cursor_plan_cache.observe(catalog.cursor_plan_owners.as_ref());
                     let parts = &catalog.parts;
                     for name in p.read_tables() {
                         let name = parts.tables.keys().find(|key| **key == name).cloned();
@@ -399,13 +400,14 @@ impl SqlSession {
                         return Err(error.clone().into());
                     }
                     let catalog = db.catalog().snapshot(txn)?;
+                    self.cursor_plan_cache.observe(catalog.cursor_plan_owners.as_ref());
                     // Cursors allocate no catalog IDs. Match metadata snapshots:
                     // include every validated schema/type/enum-label ID without
                     // duplicating the catalog allocator's object inventory.
                     let image = catalog.cursor_image().map_err(CoreError::Sql)?;
                     // Sequence-bearing selects use the established execution path.
                     if !p.sequences().is_empty() {
-                        self.cursor_plan_cache = Default::default();
+                        self.cursor_plan_cache.clear();
                         discard(&tag);
                         return self.buffer_cursor(&p, params, clock, buffer_limit, lease);
                     }
@@ -437,6 +439,7 @@ impl SqlSession {
                         }),
                         context,
                         scope,
+                        Some(catalog),
                     )
                 }
                 Backend::Legacy(_) => {
@@ -473,7 +476,7 @@ impl SqlSession {
                             self.search_path.clone(),
                         ))
                     });
-                    (Arc::new(s.sql), None, context, None)
+                    (Arc::new(s.sql), None, context, None, None)
                 }
             };
             let context = context.map(|clock| match self.privilege_callback.as_ref().filter(|_| p.has_privilege_inquiry()) {
@@ -481,12 +484,10 @@ impl SqlSession {
                     PrivilegeImage::Catalog(image.clone()), self.search_path.clone(), self.v2_transaction.as_ref(), self.admin.roles(), db)),
                 None => clock,
             });
-            let cache = if self.task.is_none() && self.is_v2_engine() {
-                Some(&mut self.cursor_plan_cache)
-            } else {
-                self.cursor_plan_cache = Default::default();
-                None
-            };
+            let cache = plan_catalog.as_ref()
+                .and_then(|catalog| catalog.cursor_plan_owners.as_ref())
+                .filter(|_| self.task.is_none())
+                .map(|owners| (&mut self.cursor_plan_cache, owners));
             match Plan::new(&image, &p, params, context.clone(), cache).map_err(CoreError::Sql)? {
                 Some(plan) => Ok(Cursor {
                     engine: lease
@@ -865,17 +866,112 @@ mod tests {
 
         let before = relational::cursor::query_binds();
         let mut first = session.open_cursor(&prepared, &[Value::Int(1)]).unwrap();
+        assert_eq!(first.fetch(1, 1024).unwrap()[0].values, [Value::Int(1)]);
+        drop(first);
         let mut second = session.open_cursor(&prepared, &[Value::Int(2)]).unwrap();
         assert_eq!(relational::cursor::query_binds() - before, 1);
-        assert_eq!(first.fetch(1, 1024).unwrap()[0].values, [Value::Int(1)]);
         assert_eq!(second.fetch(1, 1024).unwrap()[0].values, [Value::Int(2)]);
-        drop((first, second));
+        drop(second);
 
         session.execute("ALTER TABLE t ADD COLUMN payload text", &[], None).unwrap();
         let mut after_ddl = session.open_cursor(&prepared, &[Value::Int(1)]).unwrap();
         assert_eq!(relational::cursor::query_binds() - before, 2);
         assert_eq!(after_ddl.fetch(1, 1024).unwrap()[0].values, [Value::Int(1), Value::Null]);
         drop((after_ddl, session, admin));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn idle_session_does_not_retain_pruned_cursor_image() {
+        let path = crate::test_artifact_root().join("cursor-cache-prune");
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut reader = admin.sql_session();
+        let mut writer = admin.sql_session();
+        writer.execute("CREATE TABLE t(id int PRIMARY KEY)", &[], None).unwrap();
+        let p = reader.prepare("SELECT id FROM t").unwrap();
+
+        let cursor = reader.open_cursor(&p, &[]).unwrap();
+        let Data::Scan { image, .. } = &cursor.data else { panic!("streaming cursor") };
+        let old_image = Arc::downgrade(image);
+        drop(cursor);
+        assert!(old_image.upgrade().is_some());
+
+        writer.execute("ALTER TABLE t ADD COLUMN payload text", &[], None).unwrap();
+        admin.test_v2().catalog().prune().unwrap();
+        assert!(old_image.upgrade().is_none());
+        // The reader has remained connected and made no observation of the DDL.
+        assert!(reader.open_cursor(&p, &[]).unwrap().fetch(1, 1024).unwrap().is_empty());
+        drop((reader, writer, admin));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn private_cursor_image_is_never_cached_and_rollback_rebinds() {
+        let path = crate::test_artifact_root().join("cursor-cache-rollback");
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut session = admin.sql_session();
+        session.execute("CREATE TABLE t(id int PRIMARY KEY)", &[], None).unwrap();
+        session.execute("INSERT INTO t VALUES (1)", &[], None).unwrap();
+        let p = session.prepare("SELECT * FROM t").unwrap();
+
+        let before = relational::cursor::query_binds();
+        drop(session.open_cursor(&p, &[]).unwrap());
+        session.execute("BEGIN", &[], None).unwrap();
+        session.execute("CREATE SCHEMA private_schema", &[], None).unwrap();
+        let mut private = session.open_cursor(&p, &[]).unwrap();
+        assert_eq!(private.fetch(1, 1024).unwrap()[0].values, [Value::Int(1)]);
+        let Data::Scan { image, .. } = &private.data else { panic!("streaming cursor") };
+        assert!(image.catalog_ext().schemas.contains_key("private_schema"));
+        let private_image = Arc::downgrade(image);
+        drop(private);
+        // The transaction's private catalog snapshot retains this image until
+        // rollback. Prove that the binding is not cached by opening again on
+        // that same image and requiring another bind.
+        let again = session.open_cursor(&p, &[]).unwrap();
+        let Data::Scan { image, .. } = &again.data else { panic!("streaming cursor") };
+        assert!(std::ptr::eq(private_image.as_ptr(), Arc::as_ptr(image)));
+        assert_eq!(relational::cursor::query_binds() - before, 3);
+        drop(again);
+
+        session.execute("ROLLBACK", &[], None).unwrap();
+        assert!(private_image.upgrade().is_none());
+        let mut restored = session.open_cursor(&p, &[]).unwrap();
+        assert_eq!(restored.fetch(1, 1024).unwrap()[0].values, [Value::Int(1)]);
+        assert_eq!(relational::cursor::query_binds() - before, 4);
+        drop(restored);
+
+        // A catalog-changing transaction must also clear the slot at its end
+        // if no cursor or metadata lookup observed its private image.
+        session.execute("BEGIN", &[], None).unwrap();
+        session.execute("CREATE SCHEMA temporary_schema", &[], None).unwrap();
+        session.rollback();
+        drop(session.open_cursor(&p, &[]).unwrap());
+        assert_eq!(relational::cursor::query_binds() - before, 5);
+        drop((session, admin));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn closing_a_statement_releases_only_its_cached_binding() {
+        let path = crate::test_artifact_root().join("cursor-cache-close");
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut session = admin.sql_session();
+        session.execute("CREATE TABLE t(id int PRIMARY KEY)", &[], None).unwrap();
+        session.execute("INSERT INTO t VALUES (1)", &[], None).unwrap();
+        let p = session.prepare("SELECT id FROM t").unwrap();
+        let other = session.prepare("SELECT id FROM t").unwrap();
+
+        let before = relational::cursor::query_binds();
+        let mut existing = session.open_cursor(&p, &[]).unwrap();
+        session.forget_cursor_plan(&other);
+        drop(session.open_cursor(&p, &[]).unwrap());
+        assert_eq!(relational::cursor::query_binds() - before, 1);
+        session.forget_cursor_plan(&p);
+        drop(session.open_cursor(&p, &[]).unwrap());
+        assert_eq!(relational::cursor::query_binds() - before, 2);
+        assert_eq!(existing.fetch(1, 1024).unwrap()[0].values, [Value::Int(1)]);
+
+        drop((existing, session, admin));
         std::fs::remove_dir_all(path).unwrap();
     }
 

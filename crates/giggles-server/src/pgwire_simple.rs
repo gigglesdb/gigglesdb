@@ -910,6 +910,7 @@ impl State {
                 self.settings.queried = session.in_transaction();
                 if p.command() == "SELECT" && writes.is_empty() {
                     let mut cursor = self.diagnostic.core(session.open_cursor(&p, &[]))?;
+                    session.sql.forget_cursor_plan(&p);
                     row_description(&d, &[], out)?;
                     let mut count = 0;
                     while !cursor.is_exhausted() {

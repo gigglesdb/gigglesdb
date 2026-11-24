@@ -51,7 +51,7 @@ async fn case(label: &str, setup: &str, sql: &str, change: &str, expected: Optio
     let mut tasks = Vec::new();
     for role in [
         "owner",
-        if matches!(label, "e" | "h" | "seq" | "implicit-seq") {
+        if matches!(label, "e" | "h" | "seq" | "implicit-seq" | "cursor-revoke") {
             "r"
         } else {
             "owner"
@@ -112,6 +112,9 @@ async fn case(label: &str, setup: &str, sql: &str, change: &str, expected: Optio
         None
     } else if label.starts_with("portal") {
         portal_probe(pg.address, &clients[0], &admin, label, change).await;
+        None
+    } else if label.starts_with("cursor-") {
+        cached_cursor_probe(&clients[0], &clients[1], label).await;
         None
     } else {
         let statement = clients[1].prepare(sql).await.unwrap();
@@ -237,6 +240,80 @@ async fn case(label: &str, setup: &str, sql: &str, change: &str, expected: Optio
         assert_eq!(rows[0].columns()[0].name(), "a");
         assert_eq!(rows[0].get::<_, i32>(0), 7);
     }
+}
+
+async fn cached_cursor_probe(
+    owner: &tokio_postgres::Client,
+    reader: &tokio_postgres::Client,
+    label: &str,
+) {
+    let statement = reader.prepare("SELECT a FROM t").await.unwrap();
+    let first = reader.query_one(&statement, &[]).await.unwrap();
+    assert_eq!(first.get::<_, i32>(0), 7);
+
+    match label {
+        "cursor-revoke" => {
+            owner.batch_execute("REVOKE SELECT ON t FROM r").await.unwrap();
+        }
+        "cursor-role" => reader.batch_execute("SET ROLE r").await.unwrap(),
+        "cursor-path" => reader.batch_execute("SET search_path TO alternate, public").await.unwrap(),
+        "cursor-rollback" => {
+            reader.batch_execute("BEGIN; ALTER TABLE t ADD COLUMN b int").await.unwrap();
+            let private = reader.query_one(&statement, &[]).await.unwrap();
+            assert_eq!(private.get::<_, i32>(0), 7);
+            reader.batch_execute("ROLLBACK").await.unwrap();
+        }
+        _ => unreachable!(),
+    }
+
+    let second = reader.query_one(&statement, &[]).await;
+    match label {
+        "cursor-revoke" | "cursor-role" => {
+            let error = second.unwrap_err();
+            assert_eq!(error.code().unwrap().code(), "42501");
+        }
+        "cursor-path" => assert_eq!(second.unwrap().get::<_, i32>(0), 11),
+        "cursor-rollback" => assert_eq!(second.unwrap().get::<_, i32>(0), 7),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn repeated_cursor_execute_checks_revoked_grants() {
+    case(
+        "cursor-revoke",
+        "CREATE TABLE t(a int PRIMARY KEY); INSERT INTO t VALUES(7); GRANT SELECT ON t TO r",
+        "", "", None,
+    ).await;
+}
+
+#[tokio::test]
+async fn repeated_cursor_execute_checks_effective_role() {
+    case(
+        "cursor-role",
+        "CREATE TABLE t(a int PRIMARY KEY); INSERT INTO t VALUES(7)",
+        "", "", None,
+    ).await;
+}
+
+#[tokio::test]
+async fn repeated_cursor_execute_binds_current_search_path() {
+    case(
+        "cursor-path",
+        "CREATE TABLE t(a int PRIMARY KEY); INSERT INTO t VALUES(7);
+         CREATE SCHEMA alternate; CREATE TABLE alternate.t(a int PRIMARY KEY);
+         INSERT INTO alternate.t VALUES(11)",
+        "", "", None,
+    ).await;
+}
+
+#[tokio::test]
+async fn repeated_cursor_execute_after_ddl_rollback() {
+    case(
+        "cursor-rollback",
+        "CREATE TABLE t(a int PRIMARY KEY); INSERT INTO t VALUES(7)",
+        "", "", None,
+    ).await;
 }
 
 #[tokio::test]

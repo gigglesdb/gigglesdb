@@ -1,6 +1,10 @@
 //! Owned cursor syntax and resumable scan position; no persisted state.
 use super::query::BoundQuery;
 use super::*;
+use std::{
+    collections::HashMap,
+    sync::{Mutex, Weak},
+};
 
 #[derive(Default)]
 pub(crate) struct Progress {
@@ -110,25 +114,93 @@ impl BindingContext {
     }
 }
 
-/// One last successful, clock-independent streaming binding per SQL session.
+struct CachedBinding {
+    context: BindingContext,
+    query: Arc<CursorQuery>,
+}
+
+/// Owned by a published catalog snapshot. A binding owns its image and
+/// prepared syntax, and has no reference back to the snapshot.
 #[derive(Default)]
-pub(crate) struct PlanCache(Option<(BindingContext, Arc<CursorQuery>)>);
+pub(crate) struct PlanOwners(Mutex<HashMap<usize, Arc<CachedBinding>>>);
+
+struct PlanCacheEntry {
+    owners: Weak<PlanOwners>,
+    // Also keeps the map key's allocation address from being reused.
+    binding: Weak<CachedBinding>,
+}
+
+impl Drop for PlanCacheEntry {
+    fn drop(&mut self) {
+        if let Some(owners) = self.owners.upgrade() {
+            owners.0.lock().unwrap_or_else(|e| e.into_inner())
+                .remove(&(self.binding.as_ptr() as usize));
+        }
+    }
+}
+
+/// One last successful, clock-independent streaming binding per SQL session.
+/// Weak handles let pruning drop the plan and its owners, even while idle.
+/// The mutex lets read-only session metadata calls invalidate the slot.
+#[derive(Default)]
+pub(crate) struct PlanCache(Mutex<Option<PlanCacheEntry>>);
 
 impl PlanCache {
+    pub(crate) fn clear(&self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+
+    pub(crate) fn observe(&self, owners: Option<&Arc<PlanOwners>>) {
+        let mut entry = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if entry.as_ref().is_some_and(|entry| {
+            owners.is_none_or(|owners| entry.owners.as_ptr() != Arc::as_ptr(owners))
+        }) {
+            entry.take();
+        }
+    }
+
+    pub(crate) fn forget_statement(&self, source: &Prepared) {
+        let mut entry = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if entry.as_ref().is_some_and(|entry| {
+            entry.binding.upgrade().is_none_or(|binding| {
+                Self::same_statement(&binding.query.prepared, source)
+            })
+        }) {
+            entry.take();
+        }
+    }
+
+    fn same_statement(bound: &Prepared, source: &Prepared) -> bool {
+        // The bound Prepared retains the original Arc. Any copy-on-write
+        // edit of that syntax must acquire a different allocation.
+        bound.unbound_statement.as_ref().zip(source.unbound_statement.as_ref())
+            .is_some_and(|(bound, unbound)| Arc::ptr_eq(bound, unbound))
+    }
+
+    fn store(&mut self, owners: &Arc<PlanOwners>, context: BindingContext, query: Arc<CursorQuery>) {
+        let binding = Arc::new(CachedBinding { context, query });
+        let entry = PlanCacheEntry {
+            owners: Arc::downgrade(owners),
+            binding: Arc::downgrade(&binding),
+        };
+        owners.0.lock().unwrap_or_else(|e| e.into_inner())
+            .insert(Arc::as_ptr(&binding) as usize, binding);
+        *self.0.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(entry);
+    }
+
     fn reuse(
         &mut self,
         image: &Arc<Relational>,
         source: &Prepared,
         context: Option<BindingContext>,
     ) -> Option<Arc<CursorQuery>> {
-        if let Some((saved_context, query)) = &self.0 {
+        let entry = self.0.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some(binding) = entry.as_ref().and_then(|entry| entry.binding.upgrade()) {
+            let query = &binding.query;
             let p = &query.prepared;
-            // The bound Prepared retains the original Arc. Any copy-on-write
-            // edit of that syntax must acquire a different allocation.
             if Arc::ptr_eq(&query.image, image)
-                && Some(*saved_context) == context
-                && p.unbound_statement.as_ref().zip(source.unbound_statement.as_ref())
-                    .is_some_and(|(bound, unbound)| Arc::ptr_eq(bound, unbound))
+                && Some(binding.context) == context
+                && Self::same_statement(p, source)
                 && p.domain == source.domain
                 && p.epoch == source.epoch
                 && p.transaction == source.transaction
@@ -143,7 +215,7 @@ impl PlanCache {
             }
         }
         // Release the old image even if binding the new key fails.
-        self.0 = None;
+        entry.take();
         None
     }
 }
@@ -160,10 +232,10 @@ impl Plan {
         p: &Prepared,
         params: &[Value],
         clock: Option<clock::ExecutionClock>,
-        mut cache: Option<&mut PlanCache>,
+        mut cache: Option<(&mut PlanCache, &Arc<PlanOwners>)>,
     ) -> R<Option<Self>> {
         let context = cache.as_ref().and_then(|_| BindingContext::current(p));
-        let query = if let Some(query) = cache.as_mut().and_then(|c| c.reuse(state, p, context)) {
+        let query = if let Some(query) = cache.as_mut().and_then(|(cache, _)| cache.reuse(state, p, context)) {
             // This exact image and input already passed schema binding,
             // validation and the epoch check. Parameters are execution inputs.
             Self::check_params(p.params, params)?;
@@ -182,8 +254,8 @@ impl Plan {
                 return Ok(None);
             };
             let query = Arc::new(query);
-            if shareable && let Some((cache, context)) = cache.zip(context) {
-                cache.0 = Some((context, query.clone()));
+            if shareable && let Some(((cache, owners), context)) = cache.zip(context) {
+                cache.store(owners, context, query.clone());
             }
             query
         };
@@ -287,24 +359,25 @@ mod tests {
         let mut p = Prepared::parse("SELECT id FROM t WHERE id = $1", DOMAIN, image.epoch)
             .unwrap().bind_schemas(&image).unwrap();
         let mut cache = PlanCache::default();
+        let owners = Arc::default();
         let params = [Value::Int(1)];
         QUERY_BINDS.set(0);
 
-        Plan::new(&image, &p, &params, None, Some(&mut cache)).unwrap().unwrap();
-        assert!(matches!(Plan::new(&image, &p, &[], None, Some(&mut cache)), Err(SqlError::Parameters)));
+        Plan::new(&image, &p, &params, None, Some((&mut cache, &owners))).unwrap().unwrap();
+        assert!(matches!(Plan::new(&image, &p, &[], None, Some((&mut cache, &owners))), Err(SqlError::Parameters)));
         assert_eq!(QUERY_BINDS.get(), 1);
         {
             let _limit = ValueBudget::enter(128, true);
-            Plan::new(&image, &p, &params, None, Some(&mut cache)).unwrap().unwrap();
+            Plan::new(&image, &p, &params, None, Some((&mut cache, &owners))).unwrap().unwrap();
             assert_eq!(QUERY_BINDS.get(), 2);
         }
-        Plan::new(&image, &p, &params, None, Some(&mut cache)).unwrap().unwrap();
+        Plan::new(&image, &p, &params, None, Some((&mut cache, &owners))).unwrap().unwrap();
         let _tokens = StatementBudget::enter(128, true);
-        Plan::new(&image, &p, &params, None, Some(&mut cache)).unwrap().unwrap();
+        Plan::new(&image, &p, &params, None, Some((&mut cache, &owners))).unwrap().unwrap();
         assert_eq!(QUERY_BINDS.get(), 4);
 
         p.search_path.push("other".into());
-        Plan::new(&image, &p, &params, None, Some(&mut cache)).unwrap().unwrap();
+        Plan::new(&image, &p, &params, None, Some((&mut cache, &owners))).unwrap().unwrap();
         assert_eq!(QUERY_BINDS.get(), 5);
     }
 
@@ -314,20 +387,56 @@ mod tests {
         let p = Prepared::parse("SELECT statement_timestamp() FROM t", DOMAIN, image.epoch)
             .unwrap().bind_schemas(&image).unwrap();
         let mut cache = PlanCache::default();
+        let owners = Arc::default();
         let mut open = |micros| {
             let clock = clock::ExecutionClock::new(&clock::ExecutionClock::pinned(micros, None));
-            Plan::new(&image, &p, &[], Some(clock), Some(&mut cache)).unwrap().unwrap()
+            Plan::new(&image, &p, &[], Some(clock), Some((&mut cache, &owners))).unwrap().unwrap()
         };
         QUERY_BINDS.set(0);
         let mut first = open(1);
         let mut second = open(2);
         assert_eq!(QUERY_BINDS.get(), 2);
-        assert!(cache.0.is_none());
+        assert!(cache.0.into_inner().unwrap().is_none());
         for (plan, micros) in [(&mut second, 2), (&mut first, 1)] {
             let rows = plan.fetch(&image, &scan::LegacyRows(&image), 1, 1024).unwrap();
             assert_eq!(rows[0].values, [Value::TimestampTz(
                 giggles_pg_types::temporal::TimestampTz::from_microseconds(micros).unwrap(),
             )]);
+        }
+    }
+
+    #[test]
+    fn implicit_timestamptz_cast_keeps_each_execution_clock() {
+        let mut image = Relational::default();
+        for sql in [
+            "CREATE TABLE t(id int PRIMARY KEY, observed_at timestamptz)",
+            "INSERT INTO t VALUES (1,'2000-01-01 00:00:00+00'),(2,'2000-01-02 00:00:00+00')",
+        ] {
+            let p = Prepared::parse(sql, DOMAIN, image.epoch).unwrap();
+            image.execute_with_cancel(&p, &[], None, || false).unwrap();
+        }
+        let image = Arc::new(image);
+        let p = Prepared::parse("SELECT id FROM t WHERE observed_at = 'now'", DOMAIN, image.epoch)
+            .unwrap().bind_schemas(&image).unwrap();
+        assert!(matches!(p.unbound_statement.as_deref(), Some(Statement::Query(query))
+            if query.is_plain_cursor_candidate()));
+
+        let mut cache = PlanCache::default();
+        let owners = Arc::default();
+        let mut open = |micros| {
+            let utc = giggles_pg_types::temporal::SessionZone::fixed(0).unwrap();
+            let clock = clock::ExecutionClock::new(&clock::ExecutionClock::pinned(micros, Some(utc)));
+            Plan::new(&image, &p, &[], Some(clock), Some((&mut cache, &owners))).unwrap().unwrap()
+        };
+        QUERY_BINDS.set(0);
+        let mut first = open(0);
+        let mut second = open(86_400_000_000);
+        assert_eq!(QUERY_BINDS.get(), 2);
+        assert!(cache.0.into_inner().unwrap().is_none());
+        for (plan, id) in [(&mut second, 2), (&mut first, 1)] {
+            let rows = plan.fetch(&image, &scan::LegacyRows(&image), 10, 1024).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values, [Value::Int(id)]);
         }
     }
 

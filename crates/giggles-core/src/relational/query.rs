@@ -245,9 +245,8 @@ pub(super) fn has_materialized_collations() -> bool {
 }
 
 impl Query {
-    // Admit only syntax whose binder uses the base table and simple scalar
-    // leaves. Keep view expansion and less common expression binders on the
-    // ordinary path.
+    // Admit only a single relation and simple scalar leaves at the syntax
+    // stage. cursor_direction excludes expanded views after binding.
     pub(super) fn is_plain_cursor_candidate(&self) -> bool {
         let leaf = |s: &Scalar| matches!(s, Scalar::Column(_) | Scalar::Param(_) | Scalar::Literal(_));
         !self.explain

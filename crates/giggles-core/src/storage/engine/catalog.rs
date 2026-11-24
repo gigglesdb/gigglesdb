@@ -220,6 +220,8 @@ pub(crate) struct CatalogSnapshot {
     checked_base: Option<Arc<relational::Relational>>,
     image: OnceLock<Arc<relational::Relational>>,
     cursor_image: OnceLock<Arc<relational::Relational>>,
+    // Present only for snapshots published in the shared catalog cache.
+    pub(crate) cursor_plan_owners: Option<Arc<relational::cursor::PlanOwners>>,
     image_build: Mutex<()>,
     pub(crate) sequence_owners: OnceLock<Arc<crate::storage::SequenceOwners>>,
     allocation_floor: OnceLock<Result<u64, SqlError>>,
@@ -237,6 +239,7 @@ impl CatalogSnapshot {
             checked_base,
             image: OnceLock::new(),
             cursor_image: OnceLock::new(),
+            cursor_plan_owners: None,
             image_build: Mutex::new(()),
             sequence_owners: OnceLock::new(),
             allocation_floor: OnceLock::new(),
@@ -818,7 +821,14 @@ impl Catalog {
         }
         let version = *version;
         let snapshot = cache.snapshots.entry(version)
-            .or_insert_with(|| self.make_snapshot(view)).clone();
+            .or_insert_with(|| {
+                // Shared snapshots own the cursor binding registry; private overlays do not.
+                let checked = self.checked_parts.lock().ok().and_then(|proof| proof.clone());
+                Arc::new(CatalogSnapshot {
+                    cursor_plan_owners: Some(Arc::default()),
+                    ..CatalogSnapshot::new(view, checked.as_deref())
+                })
+            }).clone();
         if matches!(self.services, TxnServices::Local { .. })
             && cache.versions.last().is_some_and(|(latest, _)| *latest == version)
         {

@@ -137,6 +137,9 @@ impl SqlSession {
         // Statement autocommit historically samples the crash point before attaching.
         let point = if explicit { None } else { Some(*inner.crash.lock().map_err(|_| CoreError::Fenced)?) };
         let mut txn = txn;
+        if txn.catalog_generation() != 0 {
+            self.cursor_plan_cache.clear();
+        }
         let validation = (if explicit {
             validate_pending(db, &mut txn, &mut self.deferral)
         } else { Ok(()) })
@@ -654,6 +657,7 @@ impl SqlSession {
                         // Resolve and lock relations before choosing the final statement
                         // snapshot/image; readers retain MVCC snapshot visibility.
                         let catalog = db.catalog().snapshot(txn)?;
+                        self.cursor_plan_cache.observe(catalog.cursor_plan_owners.as_ref());
                         let parts = &catalog.parts;
                         // Bind from the original references, preserving explicit public
                         // qualification even when another schema shadows the bare name.
@@ -988,6 +992,7 @@ impl SqlSession {
                             txn.begin_statement();
                         }
                         let catalog = db.catalog().snapshot(txn)?;
+                        self.cursor_plan_cache.observe(catalog.cursor_plan_owners.as_ref());
                         let old = &catalog.parts;
                         if p.schema_ddl().is_some_and(|(name, _, create)| !create && old.sql_views.values().any(|v|
                             if v.schema == 0 { name == "public" } else { old.ext.schemas.get(name).is_some_and(|s| s.id == v.schema) })) {

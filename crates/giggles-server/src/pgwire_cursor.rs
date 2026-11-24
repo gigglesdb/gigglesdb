@@ -287,6 +287,9 @@ impl Cursors {
                 let mut description = core(session.describe(&p))?;
                 description.parameters.clear();
                 let result = core(session.open_cursor(&p, params))?;
+                if prepared.is_none() {
+                    session.sql.forget_cursor_plan(&p);
+                }
                 self.0.insert(
                     name.clone(),
                     Cursor {

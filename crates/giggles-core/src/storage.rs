@@ -2697,7 +2697,10 @@ impl SqlSession {
             },
             Backend::V2(_) => {
                 let _ticket = self.admin.inner.enter()?;
-                db.ok_or(CoreError::Fenced)?.inspect_metadata(self.v2_transaction.as_ref(), f)
+                db.ok_or(CoreError::Fenced)?.inspect_metadata(self.v2_transaction.as_ref(), |state| {
+                    self.cursor_plan_cache.observe(state.catalog.and_then(|catalog| catalog.cursor_plan_owners.as_ref()));
+                    f(state)
+                })
             }
         }
     }
@@ -2762,6 +2765,11 @@ impl SqlSession {
         }
         .ok()
         .flatten()
+    }
+
+    /// Release a cached cursor binding when the caller removes this statement.
+    pub fn forget_cursor_plan(&self, prepared: &relational::Prepared) {
+        self.cursor_plan_cache.forget_statement(prepared);
     }
 
     /// Retain exact binding identities for a gateway that memoizes SQL authorization.
@@ -3991,6 +3999,7 @@ impl SqlSession {
                 let txn = self.v2_transaction.as_mut()
                     .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
                 let catalog = db.catalog().snapshot(txn)?;
+                self.cursor_plan_cache.observe(catalog.cursor_plan_owners.as_ref());
                 let image = catalog.image().map_err(CoreError::Sql)?;
                 // Reuse the legacy definition/key admission before touching rows.
                 match image.row_version_engine(table, key) {
@@ -5806,6 +5815,7 @@ impl SqlSession {
             let mut read = db.begin(engine::txn::Isolation::ReadCommitted);
             let private = self.v2_transaction.as_ref();
             let snapshot = db.catalog().snapshot_with_catalog_writes(&mut read, private)?;
+            self.cursor_plan_cache.observe(snapshot.cursor_plan_owners.as_ref());
             let sql = snapshot.image().map_err(CoreError::Sql)?;
             if sql.tables.get(name).is_none_or(|table| table.id != id) {
                 return Ok(None);
@@ -5865,6 +5875,9 @@ impl SqlSession {
         self.copy_input = None;
         // A parked protected run is not an SQL transaction slot.
         self.protected = None;
+        if self.v2_transaction.as_ref().is_some_and(|txn| txn.catalog_generation() != 0) {
+            self.cursor_plan_cache.clear();
+        }
         let v2 = self.v2_transaction.take().is_some();
         if self.staged.take().is_some() || v2 {
             self.admin
