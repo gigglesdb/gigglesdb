@@ -424,6 +424,24 @@ fn unnamed_cache_hit_and_transaction_exclusion() {
 }
 
 #[test]
+fn unnamed_cache_dml_misses_with_a_live_transaction() {
+    let mut session = fixture();
+    session.execute_sql("CREATE TABLE t (id int PRIMARY KEY, v int)", &[]).unwrap();
+    let mut state = state();
+    let sql = "UPDATE t SET v = v + 1 WHERE id = $1";
+    parse_sql(&mut state, &mut session, sql).unwrap();
+    let cached = state.unnamed_cache[0].p.clone();
+
+    // Open the transaction without sending a wire BEGIN that clears the LRU.
+    session.execute_sql("BEGIN", &[]).unwrap();
+    parse_sql(&mut state, &mut session, sql).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&state.unnamed_cache[0].p, &cached));
+    assert!(!std::sync::Arc::ptr_eq(&state.statements[""].p, &cached));
+    assert!(state.statements[""].parse_context.is_none());
+    session.execute_sql("ROLLBACK", &[]).unwrap();
+}
+
+#[test]
 fn unnamed_parse_replays_authorization_on_postgres_surface() {
     let mut session = fixture();
     assert_eq!(session.service.admin.engine(), Engine::V2);
@@ -869,6 +887,8 @@ fn unnamed_cache_sequence_dependency_equivalence() {
         "SELECT coalesce(setval('s', 7), currval('s'))",
         "SELECT nextval('public.s')",
         "SELECT nextval('s'::regclass)",
+        "INSERT INTO t (id) VALUES (nextval('s')) RETURNING id",
+        "UPDATE t SET id = nextval('s') WHERE id = 7 RETURNING id",
     ] {
         parse_sql(&mut state, &mut session, sql).unwrap();
         let cached = state.unnamed_cache.iter().find(|entry| entry.sql == sql).unwrap();
@@ -878,15 +898,36 @@ fn unnamed_cache_sequence_dependency_equivalence() {
         let Plan::Sql(bound) = &*cached.p else { panic!("SQL plan expected") };
         println!("sequence equivalence: {sql}: bound_equal={} unbound={unbound:?} bound={:?}", bound.sequence_calls() == unbound, bound.sequence_calls());
     }
-    for sql in [
-        "CREATE TABLE defaults (id int DEFAULT nextval('s'))",
-        "INSERT INTO t DEFAULT VALUES",
-        "INSERT INTO t (id) VALUES (DEFAULT)",
-    ] {
+    let ddl = "CREATE TABLE defaults (id int DEFAULT nextval('s'))";
+    parse_sql(&mut state, &mut session, ddl).unwrap();
+    assert!(state.statements[""].parse_context.is_none());
+    assert!(state.unnamed_cache.iter().all(|entry| entry.sql != ddl));
+
+    for sql in ["INSERT INTO t DEFAULT VALUES", "INSERT INTO t (id) VALUES (DEFAULT)"] {
         parse_sql(&mut state, &mut session, sql).unwrap();
-        assert!(state.statements[""].parse_context.is_none(), "{sql}");
-        assert!(state.unnamed_cache.iter().all(|entry| entry.sql != sql));
+        let cached = state.unnamed_cache.iter().find(|entry| entry.sql == sql).unwrap();
+        assert!(cached.sequence_dependencies.is_empty(), "{sql}");
+        let Plan::Sql(bound) = &*cached.p else { panic!("SQL plan expected") };
+        assert!(!session.sql.implicit_sequence_dependencies(bound).unwrap().is_empty(), "{sql}");
     }
+}
+
+#[test]
+fn unnamed_cache_declines_dml_with_budget_dependent_sequence_scan() {
+    let mut session = fixture();
+    session.execute_sql("CREATE TABLE t (id int PRIMARY KEY)", &[]).unwrap();
+    session.execute_sql("CREATE SEQUENCE s", &[]).unwrap();
+    let mut state = state();
+    let predicates = vec!["1"; 2050].join(", ");
+    let sql = format!("UPDATE t SET id = nextval('s') WHERE id IN ({predicates})");
+    assert!(Prepared::sequence_calls_from_sql(&sql).is_empty());
+    {
+        let _budgets = session.sql.statement_budgets();
+        assert!(!Prepared::sequence_calls_from_sql(&sql).is_empty());
+    }
+    parse_sql(&mut state, &mut session, &sql).unwrap();
+    assert!(state.statements[""].parse_context.is_none());
+    assert!(state.unnamed_cache.is_empty());
 }
 
 #[test]

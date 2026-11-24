@@ -1422,7 +1422,7 @@ struct Statement {
     id: u64,
     // Syntax-only dependencies: binding may qualify names or add defaults.
     sequence_dependencies: std::sync::Arc<[giggles_core::relational::SequenceDependency]>,
-    // Only an unnamed application SELECT prepared outside a transaction gets a key.
+    // Only eligible unnamed application statements prepared outside a transaction get a key.
     parse_context: Option<std::sync::Arc<ParseContext>>,
     description_version: Option<u64>,
     validated: Option<(u64, usize, usize, u64)>,
@@ -1896,6 +1896,43 @@ fn control(sql: &str) -> Option<&'static str> {
         .into_iter()
         .find(|command| sql.eq_ignore_ascii_case(command))
 }
+const UNNAMED_CACHE_SQL_BYTES: usize = 64 * 1024;
+
+fn unnamed_cache_sql_head(sql: &str) -> Option<&'static str> {
+    let head = sql
+        .trim_start()
+        .split(|c: char| c.is_ascii() && !c.is_ascii_alphanumeric() && c != '_' && c != '$')
+        .next()?;
+    ["SELECT", "INSERT", "UPDATE", "DELETE"]
+        .into_iter()
+        .find(|command| head.eq_ignore_ascii_case(command))
+}
+
+fn unnamed_dml_can_skip_probes(
+    sql: &str,
+    session: &Session,
+    wire_dependencies: &[giggles_core::relational::SequenceDependency],
+) -> bool {
+    // Leave WITH in the full path, including inside INSERT sources.
+    if sql.as_bytes().windows(4).any(|word| word.eq_ignore_ascii_case(b"with"))
+        && !Prepared::application_dml(sql, |word| word.eq_ignore_ascii_case("with"))
+    {
+        return false;
+    }
+    // The service's lexical FK probe scans every bare REFERENCES word.
+    // A nonempty result needs the full path's ownership check.
+    let keyword = b"references";
+    let _budgets = session.sql.statement_budgets();
+    if sql.as_bytes().windows(keyword.len()).any(|word| word.eq_ignore_ascii_case(keyword))
+        && !Prepared::constraint_references(sql).is_ok_and(|tables| tables.is_empty())
+    {
+        return false;
+    }
+    // Both Parse authorization steps share one list on a hit. Session
+    // budgets can make the service scan succeed where the wire scan declines.
+    Prepared::sequence_calls_from_sql(sql) == wire_dependencies
+}
+
 fn inspect(
     show: &crate::pg_settings::SettingName,
     settings: &crate::pg_settings::SessionSettings,
@@ -2144,9 +2181,13 @@ impl State {
                 query_id: self.diagnostic.query_id.clone(),
             });
         }
-        if !is_copy_sql(sql) {
-            core(session.authorize_sequence_sql(sql))?;
-        }
+        let sequence_dependencies = if is_copy_sql(sql) {
+            Vec::new()
+        } else {
+            let dependencies = Prepared::sequence_calls_from_sql(sql);
+            core(session.authorize_sequence_dependencies(&dependencies))?;
+            dependencies
+        };
         let mut plain_application = false;
         let mut enum_parameters = giggles_core::relational::EnumParameters::new();
         let (mut p, mut d) = if let Some(tables) =
@@ -2399,13 +2440,22 @@ impl State {
                 && session.sql.statement_catalog_version() == Some(*version)
         });
         let parse_context = (unnamed && description_version.is_some()
-            && !session.in_transaction() && !session.agent && session.task().is_none()
+            && !session.in_transaction() && !session.is_aborted()
+            && !session.agent && session.task().is_none()
             && matches!(session.role, Role::Database { .. })
             && plain_application
-            && matches!(&p, Plan::Sql(p) if !p.is_ddl() && p.command() == "SELECT"))
+            && matches!(&p, Plan::Sql(p) if match p.command() {
+                "SELECT" => p.write_tables().is_empty(),
+                command @ ("INSERT" | "UPDATE" | "DELETE") => {
+                    unnamed_cache_sql_head(sql) == Some(command)
+                        && sql.len() <= UNNAMED_CACHE_SQL_BYTES
+                        && unnamed_dml_can_skip_probes(sql, session, &sequence_dependencies)
+                }
+                _ => false,
+            }))
             .then(|| std::sync::Arc::new(ParseContext::current(&self.settings.current, session)));
         let sequence_dependencies = if parse_context.is_some() {
-            Prepared::sequence_calls_from_sql(sql).into()
+            sequence_dependencies.into()
         } else {
             Default::default()
         };
@@ -2465,11 +2515,10 @@ impl State {
         }
         // Preserve the dispatch chain's first authorization, including sequence errors.
         if session.authorize_sequence_dependencies(&old.sequence_dependencies).is_err() { return Ok(None); }
-        // SELECT authorization proves visibility of every application dependency;
-        // catalog_plan returned None for this unchanged SQL, so skipping it cannot
-        // expose catalog relations or bypass their visibility checks.
-        // Re-run the application path's live authority checks. Any error or drift
-        // takes the full path, which owns error ordering and diagnostic fields.
+        // The application route is unchanged for this SQL and context. Recheck
+        // the bound plan's read, write and sequence privileges, including
+        // implicit sequence defaults. Any error or drift takes the full path,
+        // which owns error ordering and diagnostic fields.
         if session.reauthorize_unnamed_parse(sql, &old.sequence_dependencies, p).is_err() {
             self.unnamed_cache.clear();
             return Ok(None);
@@ -2495,16 +2544,15 @@ impl State {
     fn invalidate_unnamed_for_sql(&mut self, sql: &str) {
         // Conservative invalidation also covers SET/RESET ROLE, authorization,
         // DISCARD (including unsupported forms), and all transaction controls.
-        if !sql.trim_start().get(..6).is_some_and(|head| head.eq_ignore_ascii_case("SELECT")) {
+        if unnamed_cache_sql_head(sql).is_none() {
             self.unnamed_cache.clear();
         }
     }
     fn cache_unnamed(&mut self, statement: &Statement) {
-        const SQL_BYTES: usize = 64 * 1024;
-        if statement.parse_context.is_none() || statement.sql_bytes > SQL_BYTES { return; }
+        if statement.parse_context.is_none() || statement.sql_bytes > UNNAMED_CACHE_SQL_BYTES { return; }
         self.unnamed_cache.retain(|old| old.sql != statement.sql || old.declared_oids != statement.declared_oids);
         while self.unnamed_cache.len() >= 16
-            || self.unnamed_cache.iter().map(|old| old.sql_bytes).sum::<usize>() + statement.sql_bytes > SQL_BYTES {
+            || self.unnamed_cache.iter().map(|old| old.sql_bytes).sum::<usize>() + statement.sql_bytes > UNNAMED_CACHE_SQL_BYTES {
             self.unnamed_cache.remove(0);
         }
         self.unnamed_cache.push(statement.clone());
@@ -4872,6 +4920,33 @@ mod collation_diagnostic_tests {
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "pgwire_implicit_block_tests.rs"]
 mod implicit_block_tests;
+
+#[cfg(test)]
+mod unnamed_cache_tests {
+    use super::unnamed_cache_sql_head;
+
+    #[test]
+    fn unnamed_cache_invalidation_admits_only_known_heads() {
+        for (sql, command) in [
+            (" SeLeCt * FROM t", "SELECT"),
+            ("\tinsert INTO t VALUES (1)", "INSERT"),
+            ("UPDATE\nt SET n = 1", "UPDATE"),
+            ("DELETE/* comment */ FROM t", "DELETE"),
+        ] {
+            assert_eq!(unnamed_cache_sql_head(sql), Some(command), "{sql}");
+        }
+        for sql in [
+            "", "SELECTED", "INSERT_2", "UPDATE$1", "DELETE2", "INSERT\u{e9}",
+            "/* comment */ UPDATE t SET n = 1", "WITH x AS (SELECT 1) SELECT * FROM x",
+            "MERGE", "TRUNCATE", "SET ROLE r", "RESET SESSION AUTHORIZATION",
+            "SET search_path TO s", "BEGIN", "COMMIT", "ROLLBACK", "CREATE TABLE",
+            "ALTER TABLE", "DROP TABLE", "PREPARE s AS SELECT 1", "EXECUTE s",
+            "DEALLOCATE ALL", "DISCARD ALL", "DISCARD PLANS",
+        ] {
+            assert_eq!(unnamed_cache_sql_head(sql), None, "{sql}");
+        }
+    }
+}
 
 #[cfg(test)]
 static UNNAMED_REUSE_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

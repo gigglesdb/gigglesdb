@@ -19,6 +19,15 @@ use tokio::{
 };
 
 static SERIAL: AtomicU64 = AtomicU64::new(0);
+// Both scenarios use the same pgwire test counters and cache-disable switch.
+static SCENARIO: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct ResetReuse;
+impl Drop for ResetReuse {
+    fn drop(&mut self) {
+        super::UNNAMED_REUSE_DISABLED.store(false, Ordering::SeqCst);
+    }
+}
 
 struct Fixture {
     service: Arc<Service>,
@@ -113,6 +122,17 @@ async fn extended(stream: &mut TcpStream, sql: &str, named: bool) -> Vec<(u8, Ve
 }
 async fn extended_oids(stream: &mut TcpStream, sql: &str, named: bool, oids: &[u32]) -> Vec<(u8, Vec<u8>)> {
     let name = if named { "control" } else { "" };
+    let params = vec!["9"; oids.len()];
+    extended_values(stream, sql, name, oids, &params, false).await
+}
+async fn extended_values(
+    stream: &mut TcpStream,
+    sql: &str,
+    name: &str,
+    oids: &[u32],
+    params: &[&str],
+    describe_statement: bool,
+) -> Outcome {
     let mut parse = vec![];
     giggles_server::pgwire::z(name, &mut parse);
     giggles_server::pgwire::z(sql, &mut parse);
@@ -121,17 +141,24 @@ async fn extended_oids(stream: &mut TcpStream, sql: &str, named: bool, oids: &[u
     let mut bind = vec![0];
     giggles_server::pgwire::z(name, &mut bind);
     bind.extend(0u16.to_be_bytes());
-    bind.extend((oids.len() as u16).to_be_bytes());
-    for _ in oids { bind.extend(1u32.to_be_bytes()); bind.push(b'9'); }
+    bind.extend((params.len() as u16).to_be_bytes());
+    for param in params {
+        bind.extend((param.len() as u32).to_be_bytes());
+        bind.extend_from_slice(param.as_bytes());
+    }
     bind.extend(0u16.to_be_bytes());
     let mut packet = Vec::new();
-    for (tag, body) in [(b'P', parse.as_slice()), (b'B', &bind), (b'D', b"P\0"),
+    giggles_server::pgwire::frame(b'P', &parse, &mut packet).unwrap();
+    if describe_statement {
+        giggles_server::pgwire::frame(b'D', b"S\0", &mut packet).unwrap();
+    }
+    for (tag, body) in [(b'B', bind.as_slice()), (b'D', b"P\0"),
         (b'E', &[0; 5]), (b'S', &[])] {
         giggles_server::pgwire::frame(tag, body, &mut packet).unwrap();
     }
     stream.write_all(&packet).await.unwrap();
     let result = wire_cycle(stream).await;
-    if named {
+    if !name.is_empty() {
         let mut packet = vec![];
         giggles_server::pgwire::frame(b'C', b"Scontrol\0", &mut packet).unwrap();
         giggles_server::pgwire::frame(b'S', &[], &mut packet).unwrap();
@@ -161,9 +188,12 @@ async fn command(stream: &mut TcpStream, sql: &str) {
 type Outcome = Vec<(u8, Vec<u8>)>;
 fn outcome(messages: Outcome) -> Outcome { messages }
 async fn checked(stream: &mut TcpStream, sql: &str, hit: bool) -> Outcome {
+    check_reuse(sql, hit, extended(stream, sql, false)).await
+}
+async fn check_reuse(sql: &str, hit: bool, response: impl Future<Output = Outcome>) -> Outcome {
     let hits = super::UNNAMED_REUSE_HITS.load(Ordering::SeqCst);
     let misses = super::UNNAMED_REUSE_MISSES.load(Ordering::SeqCst);
-    let result = extended(stream, sql, false).await;
+    let result = response.await;
     let hit = hit && !super::UNNAMED_REUSE_DISABLED.load(Ordering::SeqCst);
     assert_eq!(super::UNNAMED_REUSE_HITS.load(Ordering::SeqCst) - hits, usize::from(hit), "hit: {sql}");
     assert_eq!(super::UNNAMED_REUSE_MISSES.load(Ordering::SeqCst) - misses, usize::from(!hit), "miss: {sql}");
@@ -453,10 +483,217 @@ async fn scenario(disabled: bool) -> Vec<Outcome> {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repeated_unnamed_parse_matches_full_path() {
-    struct Reset;
-    impl Drop for Reset { fn drop(&mut self) { super::UNNAMED_REUSE_DISABLED.store(false, Ordering::SeqCst); } }
-    let _reset = Reset;
+    let _scenario = SCENARIO.lock().await;
+    let _reset = ResetReuse;
     let cached = scenario(false).await;
     let full = scenario(true).await;
+    assert_eq!(cached, full);
+}
+
+async fn checked_dml(
+    stream: &mut TcpStream,
+    sql: &str,
+    params: &[&str],
+    hit: bool,
+    expected: Option<&str>,
+) -> Outcome {
+    let reply = check_reuse(sql, hit, extended_values(stream, sql, "", &[], params, true)).await;
+    assert_eq!(code(&reply).as_deref(), expected, "{sql}: {reply:?}");
+    if let Some(code) = expected {
+        // Read-only checks happen at Execute. The other refusals belong to Parse.
+        assert_eq!(reply.iter().any(|(tag, _)| *tag == b'1'), code == "25006", "{sql}");
+    }
+    reply
+}
+
+async fn simple_ok(stream: &mut TcpStream, sql: &str) -> Outcome {
+    let reply = wire_query(stream, sql).await;
+    assert_eq!(code(&reply), None, "{sql}: {reply:?}");
+    reply
+}
+
+fn row_description_counts(reply: &Outcome) -> Vec<u16> {
+    reply.iter().filter(|(tag, _)| *tag == b'T')
+        .map(|(_, body)| u16::from_be_bytes(body[..2].try_into().unwrap()))
+        .collect()
+}
+
+async fn dml_scenario(disabled: bool) -> Vec<Outcome> {
+    super::UNNAMED_REUSE_DISABLED.store(disabled, Ordering::SeqCst);
+    let f = Fixture::new().await;
+    let mut a = connect(&f).await;
+    let mut b = connect(&f).await;
+    let mut results = Vec::new();
+    for sql in [
+        "CREATE TABLE r3_parse_source (id INT, version INT)",
+        "CREATE ROLE dml_writer",
+        "CREATE ROLE dml_denied",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON r3_parse_source TO dml_writer",
+        "CREATE SCHEMA dml_other",
+        "CREATE TABLE dml_other.r3_parse_source (id INT, version INT)",
+    ] {
+        simple_ok(&mut b, sql).await;
+    }
+
+    let insert = "INSERT INTO r3_parse_source (id, version) VALUES ($1, $2) RETURNING *";
+    let update = "UPDATE r3_parse_source SET version = $2 WHERE id = $1 RETURNING version";
+    let optimistic = "UPDATE r3_parse_source SET version = version + 1 WHERE id = $1 AND version = 20";
+    let delete = "DELETE FROM r3_parse_source WHERE id = $1 RETURNING id, version";
+    // `version` makes the optimistic UPDATE go through the catalog fallback.
+    assert!(!giggles_core::relational::Prepared::application_dml(
+        optimistic, giggles_pg_catalog::catalog_identifier,
+    ));
+    let cycle = [
+        (insert, &["1", "10"][..], 2, 2),
+        (update, &["1", "20"][..], 2, 1),
+        (optimistic, &["1"][..], 1, 0),
+        (delete, &["1"][..], 1, 2),
+    ];
+    for hit in [false, true] {
+        for (sql, params, num_oids, columns) in cycle {
+            let reply = checked_dml(&mut a, sql, params, hit, None).await;
+            let mut parameter_description = vec![0, num_oids];
+            for _ in 0..num_oids {
+                parameter_description.extend(23u32.to_be_bytes());
+            }
+            assert!(reply.contains(&(b't', parameter_description)), "{sql}");
+            let descriptions = if columns == 0 { vec![] } else { vec![columns; 2] };
+            assert_eq!(row_description_counts(&reply), descriptions, "{sql}");
+            if sql == delete {
+                // DELETE returns the changed value from the preceding optimistic UPDATE.
+                assert!(reply.contains(&(b'D', b"\0\x02\0\0\0\x011\0\0\0\x0221".to_vec())));
+            }
+            results.push(reply);
+        }
+    }
+    assert_eq!(results[..cycle.len()], results[cycle.len()..]);
+
+    // Simple writes preserve the entries. Utility commands still invalidate them.
+    simple_ok(&mut a, "UPDATE r3_parse_source SET version = 0 WHERE id = 999").await;
+    results.push(checked_dml(&mut a, optimistic, &["1"], true, None).await);
+    for sql in [
+        "PREPARE dml_plan AS UPDATE r3_parse_source SET version = 0 WHERE id = 999",
+        "EXECUTE dml_plan",
+        "DEALLOCATE ALL",
+        "DISCARD PLANS",
+        "DISCARD ALL",
+        "UPDATE r3_parse_source SET version = 0 WHERE id = 999; SET search_path TO public",
+    ] {
+        results.push(simple_ok(&mut a, sql).await);
+        results.push(checked_dml(&mut a, optimistic, &["1"], false, None).await);
+        results.push(checked_dml(&mut a, optimistic, &["1"], true, None).await);
+    }
+
+    let bad = "UPDATE r3_parse_source SET absent = 0 WHERE id = $1";
+    for _ in 0..2 {
+        results.push(checked_dml(&mut a, bad, &["1"], false, Some("42703")).await);
+    }
+    let modifying_cte = "WITH gone AS (DELETE FROM r3_parse_source WHERE id = 999 RETURNING id) SELECT id FROM gone";
+    for _ in 0..2 {
+        results.push(checked_dml(&mut a, modifying_cte, &[], false, None).await);
+    }
+    simple_ok(&mut a, "SET default_transaction_read_only = on").await;
+    for hit in [false, true] {
+        results.push(checked_dml(&mut a, optimistic, &["1"], hit, Some("25006")).await);
+    }
+    simple_ok(&mut a, "RESET default_transaction_read_only").await;
+    results.push(checked_dml(&mut a, optimistic, &["1"], false, None).await);
+    results.push(checked_dml(&mut a, optimistic, &["1"], true, None).await);
+    simple_ok(&mut a, "BEGIN READ ONLY").await;
+    results.push(checked_dml(&mut a, optimistic, &["1"], false, Some("25006")).await);
+    simple_ok(&mut a, "ROLLBACK").await;
+    simple_ok(&mut a, "BEGIN").await;
+    for _ in 0..2 {
+        results.push(checked_dml(&mut a, optimistic, &["1"], false, None).await);
+    }
+    simple_ok(&mut a, "ROLLBACK").await;
+
+    for (set, reset) in [
+        ("SET ROLE dml_denied", "RESET ROLE"),
+        ("SET SESSION AUTHORIZATION dml_denied", "RESET SESSION AUTHORIZATION"),
+    ] {
+        results.push(checked_dml(&mut a, optimistic, &["1"], false, None).await);
+        results.push(checked_dml(&mut a, optimistic, &["1"], true, None).await);
+        simple_ok(&mut a, set).await;
+        results.push(checked_dml(&mut a, optimistic, &["1"], false, Some("42501")).await);
+        simple_ok(&mut a, reset).await;
+    }
+    simple_ok(&mut a, "SET ROLE dml_writer").await;
+    for (privilege, sql, params) in [
+        ("INSERT", insert, &["2", "10"][..]),
+        ("UPDATE", update, &["2", "20"][..]),
+        ("DELETE", delete, &["2"][..]),
+        ("SELECT", optimistic, &["2"][..]),
+        ("SELECT", insert, &["3", "10"][..]),
+    ] {
+        results.push(checked_dml(&mut a, sql, params, false, None).await);
+        results.push(checked_dml(&mut a, sql, params, true, None).await);
+        simple_ok(&mut b, &format!("REVOKE {privilege} ON r3_parse_source FROM dml_writer")).await;
+        results.push(checked_dml(&mut a, sql, params, false, Some("42501")).await);
+        simple_ok(&mut b, &format!("GRANT {privilege} ON r3_parse_source TO dml_writer")).await;
+        results.push(checked_dml(&mut a, sql, params, false, None).await);
+        results.push(checked_dml(&mut a, sql, params, true, None).await);
+    }
+    simple_ok(&mut a, "RESET ROLE").await;
+
+    // Exercise the context comparison without a standalone SET clearing the LRU.
+    results.push(checked_dml(&mut a, insert, &["8", "10"], false, None).await);
+    results.push(simple_ok(&mut a, "SELECT set_config('search_path', 'dml_other', false)").await);
+    results.push(checked_dml(&mut a, insert, &["9", "20"], false, None).await);
+    results.push(checked_dml(&mut a, insert, &["10", "30"], true, None).await);
+    for (sql, has_row) in [
+        ("SELECT version FROM public.r3_parse_source WHERE id = 9", false),
+        ("SELECT version FROM dml_other.r3_parse_source WHERE id = 9 AND version = 20", true),
+    ] {
+        let reply = simple_ok(&mut b, sql).await;
+        assert_eq!(reply.iter().any(|(tag, _)| *tag == b'D'), has_row, "{sql}");
+        results.push(reply);
+    }
+    simple_ok(&mut a, "SET search_path TO public").await;
+    results.push(checked_dml(&mut a, insert, &["11", "10"], false, None).await);
+    results.push(checked_dml(&mut a, insert, &["12", "10"], true, None).await);
+    simple_ok(&mut b, "ALTER TABLE r3_parse_source ADD COLUMN extra INT").await;
+    let after_alter = checked_dml(&mut a, insert, &["13", "10"], false, None).await;
+    assert_eq!(row_description_counts(&after_alter), [3, 3]);
+    results.push(after_alter);
+    results.push(checked_dml(&mut a, insert, &["14", "10"], true, None).await);
+    simple_ok(&mut b, "DROP TABLE r3_parse_source").await;
+    results.push(checked_dml(&mut a, insert, &["15", "10"], false, Some("42P01")).await);
+
+    // This profile grants serial sequence USAGE through the sequence owner's role.
+    // Keep the table INSERT grant while revoking that role from the writer.
+    for sql in [
+        "CREATE ROLE dml_sequence_owner",
+        "GRANT CREATE ON SCHEMA public TO dml_sequence_owner",
+        "SET ROLE dml_sequence_owner",
+        "CREATE TABLE r3_parse_source_serial (id SERIAL PRIMARY KEY, payload INT)",
+        "RESET ROLE",
+        "GRANT INSERT ON r3_parse_source_serial TO dml_writer",
+        "GRANT dml_sequence_owner TO dml_writer",
+    ] {
+        simple_ok(&mut b, sql).await;
+    }
+    simple_ok(&mut a, "SET ROLE dml_writer").await;
+    let serial = "INSERT INTO r3_parse_source_serial (payload) VALUES ($1)";
+    results.push(checked_dml(&mut a, serial, &["1"], false, None).await);
+    results.push(checked_dml(&mut a, serial, &["2"], true, None).await);
+    simple_ok(&mut b, "REVOKE dml_sequence_owner FROM dml_writer").await;
+    results.push(checked_dml(&mut a, serial, &["3"], false, Some("42501")).await);
+    simple_ok(&mut b, "GRANT dml_sequence_owner TO dml_writer").await;
+    results.push(checked_dml(&mut a, serial, &["3"], false, None).await);
+    results.push(checked_dml(&mut a, serial, &["4"], true, None).await);
+
+    drop(a);
+    drop(b);
+    f.stop().await;
+    results
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_unnamed_dml_parse_matches_full_path() {
+    let _scenario = SCENARIO.lock().await;
+    let _reset = ResetReuse;
+    let cached = dml_scenario(false).await;
+    let full = dml_scenario(true).await;
     assert_eq!(cached, full);
 }

@@ -267,6 +267,8 @@ impl State {
             }
             return Ok(());
         }
+        // The first statement's head cannot classify a whole Query batch.
+        self.unnamed_cache.clear();
         let output = self.output.take();
         let result = self.simple_batch(statements, sql, session, out, received, &output);
         self.output = output;

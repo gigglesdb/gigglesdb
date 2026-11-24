@@ -3466,6 +3466,8 @@ impl Session {
         if _sql.contains("r3_parse_source") && crate::pgwire::UNNAMED_REAUTHORIZE_FAIL.swap(false, std::sync::atomic::Ordering::SeqCst) {
             return Err(CoreError::Policy(Error::Scope));
         }
+        // Match fresh Parse's budget scope for authorization of stored defaults.
+        let _budgets = self.sql.statement_budgets();
         self.authority_scope(|session| {
             session.reconcile_sequence_owners()?;
             session.authorize_sequence_dependencies(dependencies)?;
