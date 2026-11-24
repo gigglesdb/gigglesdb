@@ -1,0 +1,14 @@
+[package]
+autotests = false
+exclude = ["upstream/"]
+name = "giggles-pg-regex"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0 AND PostgreSQL"
+description = "PostgreSQL 18.6 regular expressions (Henry Spencer's ARE/ERE/BRE engine and the regexp.c SQL layer) ported to Rust"
+[workspace]
+[dependencies]
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
