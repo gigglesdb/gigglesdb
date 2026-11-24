@@ -34,7 +34,7 @@ pub(super) fn duplicate_names<'a>(names: impl IntoIterator<Item = &'a String>) -
 }
 
 pub(super) fn has_duplicates(prepared: &Prepared) -> bool {
-    match &prepared.statement {
+    match prepared.statement.get() {
         Statement::Update { sets, .. } => duplicate_names(sets.iter().map(|(name, _)| name)),
         Statement::UpdateExpressions { sets, .. } => {
             duplicate_names(sets.iter().map(|(name, _)| name))
@@ -49,7 +49,7 @@ pub(super) fn check_duplicate_literals(prepared: &Prepared, state: &Relational) 
         .tables
         .get(prepared.table().ok_or(SqlError::UnknownTable)?)
         .ok_or(SqlError::UnknownTable)?;
-    let values: Vec<(&String, Option<&Expr>)> = match &prepared.statement {
+    let values: Vec<(&String, Option<&Expr>)> = match prepared.statement.get() {
         Statement::Update { sets, .. } => sets
             .iter()
             .map(|(name, value)| (name, Some(value)))
@@ -248,7 +248,7 @@ impl<'a> Plan<'a> {
         // Plain SQL type checks precede row lookup; NOT NULL checks apply to
         // matched postimages. Scalar inputs need a shared schema
         // for SET, WHERE and RETURNING before any parameter is evaluated.
-        if let Statement::Update { sets, .. } = &prepared.statement {
+        if let Statement::Update { sets, .. } = prepared.statement.get() {
             let values = sets
                 .iter()
                 .map(|(name, value)| {
@@ -274,7 +274,7 @@ impl<'a> Plan<'a> {
                 scalar: false,
             });
         }
-        let Statement::UpdateExpressions { sets, .. } = &prepared.statement else {
+        let Statement::UpdateExpressions { sets, .. } = prepared.statement.get() else {
             return Err(SqlError::Unsupported);
         };
         let indexes = indexes(sets, table, state)?;

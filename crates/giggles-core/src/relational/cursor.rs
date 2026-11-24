@@ -65,7 +65,7 @@ fn bind_query<'a>(
     state: &'a Relational,
     clock: Option<&clock::ExecutionClock>,
 ) -> R<Option<BoundQuery<'a>>> {
-    let Statement::Query(query) = &prepared.statement else {
+    let Statement::Query(query) = prepared.statement.get() else {
         return Ok(None);
     };
     #[cfg(test)]

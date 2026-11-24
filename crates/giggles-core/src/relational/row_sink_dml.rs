@@ -3,7 +3,7 @@ use super::*;
 
 fn moves_primary_key(state: &Relational, prepared: &Prepared) -> bool {
     let Some(table) = prepared.table().and_then(|name| state.tables.get(name)) else { return false; };
-    let names = match &prepared.statement {
+    let names = match prepared.statement.get() {
         Statement::Update { sets, .. } => sets.iter().map(|(name, _)| name).collect::<Vec<_>>(),
         Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
         _ => return false,
@@ -16,7 +16,7 @@ pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
         return false;
     };
     if state.tables.values().any(|t| state.has_nondeterministic_keys(t)) { return false; }
-    let sets = match &prepared.statement {
+    let sets = match prepared.statement.get() {
         Statement::Update { sets, .. } => sets.iter().map(|(name, _)| name).collect::<Vec<_>>(),
         Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
         Statement::Delete { .. } => vec![],
@@ -37,7 +37,7 @@ pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
             let ConstraintKind::ForeignKey { columns, ref_table, ref_columns, .. } = &constraint.kind else { return false; };
             let changed = |ids: &[u64]| ids.iter().any(|id| table.columns.iter()
                 .any(|column| column.id == *id && sets.contains(&&column.name)));
-            let deleting = matches!(prepared.statement, Statement::Delete { .. });
+            let deleting = matches!(prepared.statement.get(), Statement::Delete { .. });
             (*owner == table.id && !deleting && *ref_table == table.id && changed(columns))
                 || (*ref_table == table.id && (deleting || changed(ref_columns)))
         })
@@ -51,7 +51,7 @@ fn point_keys(state: &Relational, prepared: &Prepared, params: &[Value],
     let mut point_keys = if prepared.native_delete.is_some() { native_lock_key(state, prepared, table) } else { searched::target(prepared)
         .and_then(|q| q.mutation_primary_keys(state, table, params)) };
     // Preserve the page executor's RETURNING and UNIQUE error order.
-    let returning = match &prepared.statement {
+    let returning = match prepared.statement.get() {
         Statement::Update { returning, .. } | Statement::UpdateExpressions { returning, .. }
             => returning.is_some(),
         _ => false,
@@ -60,7 +60,7 @@ fn point_keys(state: &Relational, prepared: &Prepared, params: &[Value],
         point_keys = None;
     }
     if point_keys.as_ref().is_some_and(|keys| keys.len() > 1 || returning && !keys.is_empty()) {
-        let changed = match &prepared.statement {
+        let changed = match prepared.statement.get() {
             Statement::Update { sets, .. } => sets.iter().map(|(name, _)| name).collect::<Vec<_>>(),
             Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
             _ => Vec::new(),
@@ -88,7 +88,7 @@ fn native_lock_key(state: &Relational, prepared: &Prepared, table: &TableDef) ->
     }
     if searched::target(prepared).is_some() || table.primary_key.is_empty()
         || table.hidden_rowid().is_some() { return None; }
-    let predicates = match &prepared.statement {
+    let predicates = match prepared.statement.get() {
         Statement::Update { predicates, search: None, .. }
         | Statement::Delete { predicates, search: None, .. } => predicates,
         _ => return None,
@@ -121,7 +121,7 @@ impl Prepared {
     /// Conservative prelock decision before the new row image is available.
     pub(crate) fn mutation_changes_key(&self, table: &TableDef,
         indexes: &[secondary_index::Descriptor]) -> bool {
-        let names = match &self.statement {
+        let names = match self.statement.get() {
             Statement::Delete { .. } => return true,
             Statement::Update { sets, .. } => sets.iter().map(|(name, _)| name).collect::<Vec<_>>(),
             Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
@@ -137,7 +137,7 @@ impl Prepared {
         clock: Option<&clock::ExecutionClock>,
     ) -> Option<UpsertLockRows> {
         let plan = self.upsert_lock_plan(state, indexes)?;
-        let Statement::InsertMulti(insert) = &self.statement else { return None; };
+        let Statement::InsertMulti(insert) = self.statement.get() else { return None; };
         let table = state.tables.get(&insert.table)?;
         let descriptor = match plan.arbiter {
             Arbiter::PrimaryKey => None,
@@ -166,7 +166,7 @@ impl Prepared {
     /// Conservative static admission only; no isolation or storage decisions.
     pub(crate) fn upsert_lock_plan(&self, state: &Relational,
         indexes: &[secondary_index::Descriptor]) -> Option<UpsertLockPlan> {
-        let Statement::InsertMulti(insert) = &self.statement else { return None; };
+        let Statement::InsertMulti(insert) = self.statement.get() else { return None; };
         if insert.source.is_some() || insert.row_count() > paged_insert::SHARED_WRITE_ROWS { return None; }
         let sql_insert::LockConflict { columns, constraint, sets } = insert.lock_conflict()?;
         let table = state.tables.get(&insert.table)?;
@@ -222,7 +222,7 @@ impl Prepared {
         if !eligible(state, self) { return None; }
         let table = state.tables.get(self.table()?)?;
         let unique = indexes.iter().filter(|d| d.table == table.id && d.unique).cloned().collect::<Vec<_>>();
-        let changed = match &self.statement {
+        let changed = match self.statement.get() {
             Statement::Update { sets, .. } => sets.iter().map(|(name, _)| name).collect::<Vec<_>>(),
             Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
             _ => Vec::new(),
@@ -235,7 +235,7 @@ impl Prepared {
 
     /// Incoming-FK DELETE prelocks, independent of publisher eligibility.
     pub(crate) fn fk_delete_lock_keys(&self, state: &Relational, params: &[Value]) -> Option<Vec<Vec<Value>>> {
-        if !matches!(self.statement, Statement::Delete { .. }) { return None; }
+        if !matches!(self.statement.get(), Statement::Delete { .. }) { return None; }
         let table = state.tables.get(self.table()?)?;
         let mut component = BTreeSet::from([table.id]);
         loop {
@@ -291,8 +291,8 @@ impl Prepared {
             matches!(c.kind, ConstraintKind::ForeignKey { ref_table, .. } if ref_table == table.id)) {
             return false;
         }
-        matches!(&self.statement, Statement::Insert { .. } | Statement::InsertExpressions(_))
-            || matches!(&self.statement, Statement::InsertMulti(i) if i.append_only() && i.source.is_none() && (self.native_insert_many || i.row_count() <= paged_insert::SHARED_WRITE_ROWS))
+        matches!(self.statement.get(), Statement::Insert { .. } | Statement::InsertExpressions(_))
+            || matches!(self.statement.get(), Statement::InsertMulti(i) if i.append_only() && i.source.is_none() && (self.native_insert_many || i.row_count() <= paged_insert::SHARED_WRITE_ROWS))
     }
 }
 
@@ -400,7 +400,7 @@ fn selection(state: &Relational, prepared: &Prepared, params: &[Value],
         template.parameter_types = prepared.describe(state).map_err(CoreError::Sql)?
             .parameters.into_iter().map(Some).collect();
         template.unbound_statement = None;
-        match &mut template.statement {
+        match template.statement.get_mut() {
             Statement::Update { predicates, search, .. }
             | Statement::UpdateExpressions { predicates, search, .. }
             | Statement::Delete { predicates, search, .. } => {
@@ -416,13 +416,13 @@ fn selection(state: &Relational, prepared: &Prepared, params: &[Value],
 // PK moves use the same bounded publisher and referential-action queue.
 pub(super) fn cascade_eligible(state: &Relational, prepared: &Prepared) -> bool {
     if eligible(state, prepared)
-        || !matches!(prepared.statement, Statement::Delete { .. } | Statement::Update { .. } | Statement::UpdateExpressions { .. })
+        || !matches!(prepared.statement.get(), Statement::Delete { .. } | Statement::Update { .. } | Statement::UpdateExpressions { .. })
     {
         return false;
     }
     let Some(target) = prepared.table().and_then(|name| state.tables.get(name)) else { return false; };
     if state.tables.values().any(|t| state.has_nondeterministic_keys(t)) { return false; }
-    let mut connected = BTreeSet::from([(target.id, !matches!(prepared.statement, Statement::Delete { .. }))]);
+    let mut connected = BTreeSet::from([(target.id, !matches!(prepared.statement.get(), Statement::Delete { .. }))]);
     let pk_move = moves_primary_key(state, prepared);
     let mut cascade = pk_move;
     loop {
@@ -908,7 +908,7 @@ mod native_lock_tests {
                     else { Prepared::update_engine(&table, key.clone(), vec![(2, Value::Int(1))], 1, &state) }.unwrap();
                 let keys = p.mutation_lock_keys(&state, &[], &[]).unwrap();
                 assert_eq!(keys, vec![key.clone()], "{ty}");
-                let predicates = match &mut p.statement {
+                let predicates = match p.statement.get_mut() {
                     Statement::Update { predicates, .. } | Statement::Delete { predicates, .. } => predicates,
                     _ => unreachable!(),
                 };
@@ -918,7 +918,7 @@ mod native_lock_tests {
                 assert_eq!(crate::storage::engine::codec::pk_bytes(&keys[0]).unwrap(), bound.low);
                 predicates.push(predicates[0].clone());
                 assert!(p.mutation_lock_keys(&state, &[], &[]).is_none());
-                let predicates = match &mut p.statement {
+                let predicates = match p.statement.get_mut() {
                     Statement::Update { predicates, .. } | Statement::Delete { predicates, .. } => predicates,
                     _ => unreachable!(),
                 };

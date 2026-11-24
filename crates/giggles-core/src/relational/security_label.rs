@@ -79,7 +79,7 @@ impl Prepared {
         state: &Relational,
         parts: &mut crate::storage::CatalogParts,
     ) -> R<()> {
-        let Statement::SecurityLabel(label) = &self.statement else {
+        let Statement::SecurityLabel(label) = self.statement.get() else {
             return Ok(());
         };
         self.validate_schemas(state)?;

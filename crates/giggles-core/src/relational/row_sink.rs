@@ -14,7 +14,7 @@ impl Prepared {
     // their target identity when the page is bound again: a bare storage key
     // denotes public here, even when search_path prefers another schema.
     fn preserve_page_target(&mut self) {
-        let mut statement = self.statement.clone();
+        let mut statement = self.statement.get().clone();
         let name = match &mut statement {
             Statement::InsertMulti(insert) => &mut insert.table,
             _ => unreachable!("paged mutation target"),
@@ -237,7 +237,7 @@ pub(crate) trait RowSink {
 
 impl Relational {
     pub(crate) fn streaming_reduction(&self, p: &Prepared) -> bool {
-        matches!(&p.statement, Statement::Query(q) if q.streaming_reduction())
+        matches!(p.statement.get(), Statement::Query(q) if q.streaming_reduction())
     }
 
     pub(crate) fn execute_reduction(
@@ -347,7 +347,7 @@ impl Relational {
             })?;
         }
 
-        if let Statement::Truncate { restart, .. } = &prepared.statement {
+        if let Statement::Truncate { restart, .. } = prepared.statement.get() {
             if !params.is_empty() || expected.is_some() {
                 return Err(CoreError::Sql(SqlError::Parameters));
             }
@@ -374,7 +374,7 @@ impl Relational {
         }
         if expected.is_none()
             && sink.streams_index_builds()
-            && matches!(&prepared.statement, Statement::InsertMulti(_))
+            && matches!(prepared.statement.get(), Statement::InsertMulti(_))
             && paged_insert::eligible(self, prepared)
         {
             return paged_insert::execute(
@@ -388,13 +388,13 @@ impl Relational {
             );
         }
         if expected.is_none() && sink.streams_index_builds()
-            && let Statement::Plan(plan)=&prepared.statement
+            && let Statement::Plan(plan)=prepared.statement.get()
             && let Some(merge)=plan.paged_merge(self)
         {
             return merge.paged(self,prepared,params,clock,sink,version_end,deferred);
         }
         if expected.is_none() && sink.streams_index_builds()
-            && let Statement::Plan(plan)=&prepared.statement
+            && let Statement::Plan(plan)=prepared.statement.get()
             && let Some(mutation)=plan.paged_mutation()
         {
             return mutation.paged(self,prepared,params,clock,sink,version_end,deferred);
@@ -403,7 +403,7 @@ impl Relational {
             return paged_dml::cascade(self, prepared, params, clock, sink, deferred, version_end);
         }
         let append = sink.streams_index_builds()
-            && match &prepared.statement {
+            && match prepared.statement.get() {
                 Statement::Insert { .. } | Statement::InsertExpressions(_) => true,
                 Statement::InsertMulti(i) => i.append_only() && i.source.is_none(),
                 _ => false,
@@ -412,7 +412,7 @@ impl Relational {
         {
             return paged_dml::execute(self, prepared, params, clock, sink, version_end, deferred);
         }
-        let streamed_ddl = match &prepared.statement {
+        let streamed_ddl = match prepared.statement.get() {
             Statement::DropIndex(_) | Statement::DropTable { .. } => true,
             Statement::AlterTable(alter) => alter.actions.iter().all(|action| {
                 matches!(
@@ -438,7 +438,7 @@ impl Relational {
                     &mut Vec::new(),
                 )
                 .map_err(CoreError::Sql)?;
-            if let Statement::AlterTable(alter) = &prepared.statement {
+            if let Statement::AlterTable(alter) = prepared.statement.get() {
                 let table = &original.tables[&alter.table];
                 sink.ddl_pages(table, &self.tables[&alter.table], false, &mut |rows| {
                     let mut page = original.clone();
@@ -460,7 +460,7 @@ impl Relational {
             // transaction commits; physical reclamation is snapshot-safe GC work.
             return Ok(result);
         }
-        let index_build = match &prepared.statement {
+        let index_build = match prepared.statement.get() {
             Statement::CreateIndex(_) => true,
             Statement::AlterTable(alter) => alter.actions.iter().all(|action| {
                 matches!(
@@ -472,7 +472,7 @@ impl Relational {
             _ => false,
         };
         let collated = self.tables.values().any(|t| self.has_nondeterministic_keys(t))
-            || matches!(&prepared.statement, Statement::CreateIndex(i) if i.collations.iter().any(Option::is_some));
+            || matches!(prepared.statement.get(), Statement::CreateIndex(i) if i.collations.iter().any(Option::is_some));
         if index_build && sink.streams_index_builds() && !collated {
             let old: BTreeSet<_> = sink.indexes().iter().map(|index| index.id).collect();
             let result = self
@@ -511,7 +511,7 @@ impl Relational {
             .flatten();
         let mut normalized = prepared.clone();
         let conflict_rows = if sink.streams_index_builds() {
-            if let Statement::InsertMulti(insert) = &mut normalized.statement {
+            if let Statement::InsertMulti(insert) = normalized.statement.get_mut() {
                 insert
                     .witness_rows(self, params, &prepared.parameter_types, clock)
                     .map_err(CoreError::Sql)?
@@ -525,7 +525,7 @@ impl Relational {
             normalized.preserve_page_target();
         }
         let prepared = &normalized;
-        let arbiter = match &prepared.statement {
+        let arbiter = match prepared.statement.get() {
             Statement::InsertMulti(insert) if conflict_rows.is_some() =>
                 insert.conflict_arbiter_columns(self, &sink.indexes()),
             _ => None,
@@ -534,7 +534,7 @@ impl Relational {
             names,
             cascade: true,
             ..
-        }) = &prepared.statement
+        }) = prepared.statement.get()
         {
             let ids: BTreeSet<_> = names
                 .iter()
@@ -558,7 +558,7 @@ impl Relational {
                 })
                 .map(|(key, _)| key.clone())
                 .collect()
-        } else if matches!(prepared.v2_class(), V2Class::Ddl) && !matches!(prepared.statement,Statement::Create {as_query:Some(_),..}) {
+        } else if matches!(prepared.v2_class(), V2Class::Ddl) && !matches!(prepared.statement.get(),Statement::Create {as_query:Some(_),..}) {
             Vec::new()
         } else {
             prepared.read_tables()
@@ -601,7 +601,7 @@ impl Relational {
                 let columns = table.primary_key.iter().map(|i| table.columns[*i].id).collect::<Vec<_>>();
                 let primary = collation_keys::Key::new(self, table, &columns, None).map_err(CoreError::Sql)?;
                 keys.push((columns, primary, true));
-                let actual = match &prepared.statement {
+                let actual = match prepared.statement.get() {
                     Statement::InsertMulti(insert) => insert.arbiter_predicate(self, table).map_err(CoreError::Sql)?,
                     _ => None,
                 };
@@ -711,7 +711,7 @@ impl Relational {
         let mut before = self.clone();
         let mut edges = self.ext.constraints.clone();
         // Resolve a new ALTER FK before its existing-row validation executes.
-        if let Statement::AlterTable(alter) = &prepared.statement {
+        if let Statement::AlterTable(alter) = prepared.statement.get() {
             let mut empty = self.clone();
             empty.rows.values_mut().for_each(BTreeMap::clear);
             empty.secondary = empty
@@ -737,7 +737,7 @@ impl Relational {
         // This ALTER adds metadata without rewriting either row image. A
         // successful exact parent lookup can serve later passes over the same
         // FK edge while the sink holds the DDL and parent-key locks.
-        let stable_fk = matches!(&prepared.statement, Statement::AlterTable(alter)
+        let stable_fk = matches!(prepared.statement.get(), Statement::AlterTable(alter)
             if matches!(alter.actions.as_slice(), [alter_table::Action::Constraint(
                 constraints::Definition::ForeignKey { .. }
             )])) && sink.stable_fk_ddl_reads();
@@ -948,7 +948,7 @@ fn point_target(
     params: &[Value],
     _indexes: &[secondary_index::Descriptor],
 ) -> Option<(Vec<u64>, Vec<Value>)> {
-    let predicates = match &prepared.statement {
+    let predicates = match prepared.statement.get() {
         Statement::Update { predicates, .. }
         | Statement::UpdateExpressions { predicates, .. }
         | Statement::Delete { predicates, .. } => predicates,

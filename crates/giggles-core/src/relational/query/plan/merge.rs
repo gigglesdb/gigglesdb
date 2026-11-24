@@ -1156,7 +1156,7 @@ impl Plan {
             // Other DML keeps its existing dependency path; MERGE's literal
             // templates need no virtual CTE catalog to discover defaults.
             if let Some(p) = &cte.dml {
-                if let Statement::Plan(plan) = &p.statement {
+                if let Statement::Plan(plan) = p.statement.get() {
                     out.extend(plan.implicit_sequences(state, count, declared)?);
                 }
             } else {

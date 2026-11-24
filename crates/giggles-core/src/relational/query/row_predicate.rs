@@ -222,7 +222,7 @@ impl Prepared {
     /// A table read that runs through a `RowSource` (GD-0061 R3-305): task
     /// sessions route these through the scoped source on the buffered path.
     pub(crate) fn task_source_read(&self) -> bool {
-        matches!(self.statement, Statement::Query(_) | Statement::Select { .. })
+        matches!(self.statement.get(), Statement::Query(_) | Statement::Select { .. })
     }
 }
 

@@ -37,7 +37,7 @@ impl Prepared {
     /// subquery) is `Catalog`, because catalog queries are refused or filtered as a class
     /// (ruling D11), never released through the column rules.
     pub fn task_class(&self) -> StatementClass {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Select { name, .. } if is_catalog_relation(name) => StatementClass::Catalog,
             Statement::Select { .. } => StatementClass::Select,
             Statement::Query(q) if q.row_lock_command().is_some() => StatementClass::Other,
@@ -186,7 +186,7 @@ mod tests {
 
         // The legacy single-table `Select` has no SQL spelling of its own.
         let mut p = prepared("SELECT id FROM shipments");
-        p.statement = Statement::Select {
+        *p.statement.get_mut() = Statement::Select {
             name: "shipments".into(),
             projection: vec!["id".into()],
             predicates: Vec::new(),
@@ -194,7 +194,7 @@ mod tests {
             limit: None,
         };
         assert_eq!(p.task_class(), StatementClass::Select);
-        if let Statement::Select { name, .. } = &mut p.statement {
+        if let Statement::Select { name, .. } = p.statement.get_mut() {
             *name = "pg_catalog\0pg_class".into();
         }
         assert_eq!(p.task_class(), StatementClass::Catalog);

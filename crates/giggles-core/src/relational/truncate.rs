@@ -11,7 +11,7 @@ impl Prepared {
         self.truncate_targets(state, false)
     }
     fn truncate_targets(&self, state: &Relational, enforce_restrict: bool) -> R<Vec<String>> {
-        let Statement::Truncate { names, cascade, .. } = &self.statement else {
+        let Statement::Truncate { names, cascade, .. } = self.statement.get() else {
             return Ok(vec![]);
         };
         self.validate_schemas(state)?;
@@ -73,6 +73,6 @@ impl Prepared {
         Ok(())
     }
     pub(crate) fn truncate_restarts_identity(&self) -> bool {
-        matches!(self.statement, Statement::Truncate { restart: true, .. })
+        matches!(self.statement.get(), Statement::Truncate { restart: true, .. })
     }
 }

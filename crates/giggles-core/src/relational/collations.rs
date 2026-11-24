@@ -571,7 +571,7 @@ pub(super) fn execute(state: &mut Relational, ddl: &Ddl, prepared: &Prepared) ->
 
 impl Prepared {
     pub fn collation_permission_error(&self, schema: Option<&str>) {
-        if let Statement::CollationDdl(ddl) = &self.statement {
+        if let Statement::CollationDdl(ddl) = self.statement.get() {
             user_types::view_replace_error(schema.map_or_else(
                 || format!("must be owner of collation {}", ddl.name),
                 |s| format!("permission denied for schema {s}"),
@@ -579,15 +579,15 @@ impl Prepared {
         }
     }
     pub(crate) fn collation_drop_tables(&self,state:&Relational)->Option<Vec<String>> {
-        let Statement::CollationDdl(Ddl {action:Action::Drop {names,cascade:true,..},..})=&self.statement else {return None};
+        let Statement::CollationDdl(Ddl {action:Action::Drop {names,cascade:true,..},..})=self.statement.get() else {return None};
         let ids=names.iter().filter_map(|n|resolve(state,n,&self.search_path).map(|(id,_)|id)).collect::<BTreeSet<_>>();
         Some(state.tables.iter().filter(|(_,t)|t.columns.iter().any(|c|matches!(state.column_collation(c.id),Some(column_collations::Reference::User(id)) if ids.contains(id)))).map(|(n,_)|n.clone()).collect())
     }
     pub fn is_collation_ddl(&self) -> bool {
-        matches!(self.statement, Statement::CollationDdl(_))
+        matches!(self.statement.get(), Statement::CollationDdl(_))
     }
     pub fn collation_new_owner(&self) -> Option<&str> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::CollationDdl(Ddl {
                 action: Action::Owner(owner),
                 ..
@@ -599,7 +599,7 @@ impl Prepared {
         &self,
         state: &Relational,
     ) -> R<Vec<(String, Option<String>)>> {
-        let Statement::CollationDdl(ddl) = &self.statement else {
+        let Statement::CollationDdl(ddl) = self.statement.get() else {
             return Ok(Vec::new());
         };
         if matches!(ddl.action, Action::Create { .. }) {

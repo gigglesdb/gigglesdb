@@ -53,7 +53,7 @@ fn snapshot(s: &mut SqlSession) -> Relational {
 }
 fn parsed(text: &str) -> Prepared {
     let p = Prepared::parse(text, 1, 0).unwrap();
-    assert!(matches!(&p.statement, Statement::InsertMulti(_)), "{text}");
+    assert!(matches!(p.statement.get(), Statement::InsertMulti(_)), "{text}");
     assert_eq!(p.table(), Some("items"));
     assert_eq!(p.command(), "INSERT");
     assert!(!p.is_ddl());
@@ -102,7 +102,7 @@ fn implicit_sequences_keep_distinct_names_in_first_use_order() {
         state.epoch,
     )
     .unwrap();
-    assert!(matches!(single.statement, Statement::Insert { .. }));
+    assert!(matches!(single.statement.get(), Statement::Insert { .. }));
     assert_eq!(
         single.implicit_sequences(&state).unwrap(),
         [Some("shared_seq".into())],
@@ -157,14 +157,14 @@ fn sql_insert_claim_rule_preserves_single_row_paths() {
     ] {
         assert!(!claims(&lex(text).unwrap()));
         assert!(matches!(
-            Prepared::parse(text, 1, 0).unwrap().statement,
+            Prepared::parse(text, 1, 0).unwrap().statement.get(),
             Statement::Insert { .. }
         ));
     }
     let text = "INSERT INTO values (id) VALUES (1)";
     assert!(!claims(&lex(text).unwrap()));
     assert!(matches!(
-        Prepared::parse(text, 1, 0).unwrap().statement,
+        Prepared::parse(text, 1, 0).unwrap().statement.get(),
         Statement::Insert { .. }
     ));
     let text = "INSERT INTO items VALUES (1) garbage (2)";
@@ -176,7 +176,7 @@ fn sql_insert_claim_rule_preserves_single_row_paths() {
     let text = "INSERT INTO items (id,n) VALUES (1,abs(-10))";
     assert!(!claims(&lex(text).unwrap()));
     assert!(matches!(
-        Prepared::parse(text, 1, 0).unwrap().statement,
+        Prepared::parse(text, 1, 0).unwrap().statement.get(),
         Statement::InsertExpressions(_)
     ));
     for text in [
@@ -234,7 +234,7 @@ fn sql_insert_default_and_overriding_grammar_accept_matrix() {
 fn sql_insert_quoted_names_preserve_case() {
     let p = Prepared::parse(r#"INSERT INTO "Items" ("Id",n) VALUES (1,10),(2,20)"#, 1, 0).unwrap();
     assert_eq!(p.table(), Some("Items"));
-    assert!(matches!(p.statement, Statement::InsertMulti(_)));
+    assert!(matches!(p.statement.get(), Statement::InsertMulti(_)));
 }
 #[test]
 fn sql_insert_select_on_conflict_do_nothing() {

@@ -44,7 +44,7 @@ impl Prepared {
         Ok(Some(parse(&mut parser)?.table))
     }
     pub(crate) fn apply_comment(&self, state: &Relational, parts: &mut crate::storage::CatalogParts) -> R<()> {
-        let Statement::Comment(comment) = &self.statement else { return Ok(()); };
+        let Statement::Comment(comment) = self.statement.get() else { return Ok(()); };
         self.validate_schemas(state)?;
         let (id, columns) = if let Some(table) = parts.tables.get(&comment.table) {
             if comment.view { return Err(SqlError::WrongObjectType); }

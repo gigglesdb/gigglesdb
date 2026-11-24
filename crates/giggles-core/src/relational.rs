@@ -1882,6 +1882,61 @@ impl Relational {
         Ok(row)
     }
 }
+#[cfg(test)]
+thread_local! {
+    static AUTHORIZATION_DEPENDENCY_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+mod prepared_syntax {
+    use super::{R, Statement};
+    use std::{fmt, sync::OnceLock};
+
+    pub(super) struct Syntax {
+        statement: Statement,
+        authorization_tables: OnceLock<R<Vec<String>>>,
+    }
+
+    impl Syntax {
+        pub(super) fn new(statement: Statement) -> Self {
+            Self { statement, authorization_tables: OnceLock::new() }
+        }
+
+        pub(super) fn get(&self) -> &Statement {
+            &self.statement
+        }
+
+        pub(super) fn get_mut(&mut self) -> &mut Statement {
+            // The dependency list belongs to this exact AST. Every mutable
+            // borrow clears it before the syntax can change.
+            self.authorization_tables.take();
+            &mut self.statement
+        }
+
+        pub(super) fn into_inner(self) -> Statement {
+            self.statement
+        }
+
+        pub(super) fn authorization_tables(
+            &self,
+            collect: impl FnOnce() -> R<Vec<String>>,
+        ) -> R<&[String]> {
+            self.authorization_tables.get_or_init(collect).as_deref().map_err(Clone::clone)
+        }
+    }
+
+    impl Clone for Syntax {
+        fn clone(&self) -> Self {
+            Self::new(self.statement.clone())
+        }
+    }
+
+    impl fmt::Debug for Syntax {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.statement.fmt(f)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Prepared {
     pub(crate) domain: u128,
@@ -1890,7 +1945,7 @@ pub struct Prepared {
     // Process-local identity set when V2 binds this plan to an engine.
     pub(crate) engine_generation: Option<crate::storage::PreparedGeneration>,
     pub(crate) literal_date_order: giggles_pg_types::temporal::DateOrder,
-    statement: Statement,
+    statement: prepared_syntax::Syntax,
     // Request targets and version witnesses only; never cached relation rows.
     native_delete: Option<Vec<(Vec<Value>, u64)>>,
     native_insert_many: bool,
@@ -2064,7 +2119,7 @@ impl Prepared {
 
     #[allow(dead_code)] // Awaiting v2 dispatch integration.
     pub(crate) fn v2_class(&self) -> V2Class {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Begin => V2Class::Control("begin"),
             Statement::Commit => V2Class::Control("commit"),
             Statement::Rollback => V2Class::Control("rollback"),
@@ -2121,7 +2176,7 @@ impl Prepared {
 
     /// DD-0068 F9 (GD-0001 Q8): table-free SELECT whose only non-table-free parts are deferred undefined / unknown-schema routine calls. Classification only; grants nothing by itself.
     pub fn deferred_routine_only(&self) -> bool {
-        matches!(&self.statement, Statement::Query(query) if query.deferred_routine_only())
+        matches!(self.statement.get(), Statement::Query(query) if query.deferred_routine_only())
     }
     fn engine(statement: Statement, domain: u128, epoch: u64) -> Self {
         Self {
@@ -2129,7 +2184,7 @@ impl Prepared {
             epoch,
             transaction: None,
             engine_generation: None,
-            statement,
+            statement: prepared_syntax::Syntax::new(statement),
             params: 0,
             parameter_types: vec![],
             relations: Vec::new(),
@@ -2201,10 +2256,11 @@ impl Prepared {
             TypedRead::Single(read) => Self::from_single_source_read(domain, epoch, *read)?,
             TypedRead::Join(read) => Self::from_two_source_read(domain, epoch, *read)?,
         };
-        let Statement::Query(source) = prepared.statement else { unreachable!() };
+        let Statement::Query(source) = prepared.statement.into_inner() else { unreachable!() };
         prepared.relations.push(schemas::Reference::read(split_key(&table).1.into(), schema));
-        prepared.statement = Statement::InsertMulti(Box::new(sql_insert::Insert::from_query(
-            table, insert.columns, source)));
+        prepared.statement = prepared_syntax::Syntax::new(Statement::InsertMulti(Box::new(
+            sql_insert::Insert::from_query(table, insert.columns, source),
+        )));
         Ok(prepared)
     }
     /// Native view DDL lowers directly to the same statement as parsed SQL.
@@ -2513,19 +2569,19 @@ impl Prepared {
             defaults::check_explicit(state, table.columns.get(*index).ok_or(SqlError::UnknownColumn)?)?;
         }
         let mut prepared = Self::insert_engine(table, values, domain, state)?;
-        let Statement::Insert { values, .. } = prepared.statement else {
+        let Statement::Insert { values, .. } = prepared.statement.into_inner() else {
             return Err(SqlError::Unsupported);
         };
         let values = values.into_iter().map(|expr| match expr {
             Expr::Literal(value) => Ok(value),
             _ => Err(SqlError::Unsupported),
         }).collect::<R<Vec<_>>>()?;
-        prepared.statement = Statement::InsertMulti(Box::new(sql_insert::Insert::copy(
+        prepared.statement = prepared_syntax::Syntax::new(Statement::InsertMulti(Box::new(sql_insert::Insert::copy(
             state.table_key(table),
             table.columns.iter().map(|c| c.name.clone()).collect(),
             table.columns.iter().map(|c| c.data_type.clone()).collect(),
             vec![values],
-        )));
+        ))));
         Ok(prepared)
     }
     pub(crate) fn insert_many_normalized_engine(
@@ -2642,7 +2698,7 @@ impl Prepared {
         if epoch != state.epoch {
             return Err(SqlError::StaleSchema);
         }
-        if let Statement::InsertExpressions(values) = &this.statement {
+        if let Statement::InsertExpressions(values) = this.statement.get() {
             return returning::validate_insert_constants(
                 values,
                 state,
@@ -2650,10 +2706,10 @@ impl Prepared {
                 &this.parameter_types,
             );
         }
-        if let Statement::Plan(plan) = &this.statement {
+        if let Statement::Plan(plan) = this.statement.get() {
             return plan.validate_immutable_constants(state, this.params, &this.parameter_types);
         }
-        if let Statement::Query(q) = &this.statement {
+        if let Statement::Query(q) = this.statement.get() {
             return q
                 .bind(state, this.params, &this.parameter_types)?
                 .validate_immutable_constants();
@@ -2673,7 +2729,7 @@ impl Prepared {
             this.describe_inner(state)?;
             return Err(SqlError::Syntax);
         }
-        if let Statement::Create { user_types, .. } = &this.statement {
+        if let Statement::Create { user_types, .. } = this.statement.get() {
             for name in user_types.iter().flatten() {
                 state
                     .resolve_type(name, &this.search_path)?
@@ -2699,7 +2755,7 @@ impl Prepared {
     }
     fn describe_inner(&self, state: &Relational) -> R<Description> {
         if matches!(self.command(), "INSERT" | "UPDATE" | "DELETE") && self.table().is_some_and(|n| state.view_names.contains_key(n)) { return Err(SqlError::Unsupported); }
-        if matches!(self.statement, Statement::Truncate { .. }) {
+        if matches!(self.statement.get(), Statement::Truncate { .. }) {
             self.truncate_authority_tables(state)?;
             return Ok(Description {
                 parameters: vec![],
@@ -2711,10 +2767,10 @@ impl Prepared {
         if self.epoch != state.epoch {
             return Err(SqlError::StaleSchema);
         }
-        if let Statement::CompositeSelect(select) = &self.statement {
+        if let Statement::CompositeSelect(select) = self.statement.get() {
             return select.describe(state, self.params, &self.search_path);
         }
-        if let Statement::AlterTable(alter) = &self.statement {
+        if let Statement::AlterTable(alter) = self.statement.get() {
             if let Some(error) = &alter.resolution_error {
                 return Err(error.clone());
             }
@@ -2723,16 +2779,16 @@ impl Prepared {
                 .get(&alter.table)
                 .ok_or(SqlError::UnknownTable)?;
         }
-        if let Statement::InsertMulti(insert) = &self.statement {
+        if let Statement::InsertMulti(insert) = self.statement.get() {
             return insert.describe(state, self.params, &self.parameter_types);
         }
-        if let Statement::InsertExpressions(values) = &self.statement {
+        if let Statement::InsertExpressions(values) = self.statement.get() {
             return returning::describe_insert(values, state, self.params, &self.parameter_types);
         }
-        if let Statement::Plan(plan) = &self.statement {
+        if let Statement::Plan(plan) = self.statement.get() {
             return plan.describe(state, self.params, &self.parameter_types);
         }
-        if let Statement::Query(q) = &self.statement {
+        if let Statement::Query(q) = self.statement.get() {
             if !q.is_table_free() && state.sequence_by_name(q.target()).is_some() {
                 return Err(SqlError::Unsupported);
             }
@@ -2749,7 +2805,7 @@ impl Prepared {
             predicates,
             returning,
             ..
-        } = &self.statement
+        } = self.statement.get()
         {
             return assign::describe(
                 name,
@@ -2782,7 +2838,7 @@ impl Prepared {
                 }
                 Ok(())
             };
-            match &self.statement {
+            match self.statement.get() {
                 Statement::Insert {
                     columns: names,
                     values,
@@ -2882,14 +2938,14 @@ impl Prepared {
         })
     }
     pub(crate) fn v2_index_predicates(&self, params: &[Value]) -> Vec<(String, String, Value)> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Query(query) => query.v2_index_predicates(params),
             _ => Vec::new(),
         }
     }
     /// Parsed table target for gateway authorization. Controls have no target.
     pub fn table(&self) -> Option<&str> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::View(ddl) => ddl.names.first().map(String::as_str),
             Statement::Truncate { names, .. } | Statement::DropTable { names, .. } => names.first().map(String::as_str),
             // Planner operators are not scalar table-free proofs.
@@ -2919,7 +2975,7 @@ impl Prepared {
     }
     /// Whether this statement uses the relational planner.
     pub fn is_planner_statement(&self) -> bool {
-        matches!(self.statement, Statement::Plan(_))
+        matches!(self.statement.get(), Statement::Plan(_))
     }
     /// Whether authorization must use the individual sources of a query or plan.
     pub fn is_multi_source_read(&self) -> bool {
@@ -2929,7 +2985,7 @@ impl Prepared {
     /// Planner statements expose an authorization marker through `table()`;
     /// their actual relations come from `read_tables()` and `write_tables()`.
     pub(crate) fn storage_table(&self) -> Option<&str> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Plan(_) => None,
             _ => self.table(),
         }
@@ -2950,7 +3006,7 @@ impl Prepared {
     /// Tables whose rows are read by this statement, in first-seen order.
     /// Mutation targets are included only when an IN subquery reads them.
     pub fn read_tables(&self) -> Vec<String> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::View(ddl) => ddl.query.as_ref().map_or_else(Vec::new, query::Query::read_tables),
             Statement::Query(query) => query.read_tables(),
             Statement::Plan(plan) => plan.read_tables(),
@@ -2967,7 +3023,7 @@ impl Prepared {
     fn authorization_reads_target(&self) -> bool {
         self.returning().is_some_and(Returning::reads_columns)
             || searched::target(self).is_some_and(query::Query::mutation_filter_reads_columns)
-            || match &self.statement {
+            || match self.statement.get() {
                 Statement::UpdateExpressions { sets, predicates, .. } => {
                     !predicates.is_empty() || sets.iter().any(|(_, value)| {
                         matches!(value, assign::Value::Scalar(q) if q.projection_reads_columns())
@@ -2985,14 +3041,14 @@ impl Prepared {
 
     /// Relations whose rows this statement locks, including nested SELECTs.
     pub fn row_lock_tables(&self) -> Vec<String> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Query(q) => q.row_lock_tables(),
             Statement::Plan(p) => p.row_lock_tables(),
             _ => vec![],
         }
     }
     pub fn row_lock_command(&self) -> Option<&'static str> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Query(q) => q.row_lock_command(),
             Statement::Plan(p) => p.row_lock_command(),
             _ => None,
@@ -3000,7 +3056,7 @@ impl Prepared {
     }
     /// Mutation targets and required command privileges, including WITH substatements.
     pub fn write_tables(&self) -> Vec<(String, &'static str)> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Plan(plan) => plan.write_tables(),
             _ if matches!(self.command(), "INSERT" | "UPDATE" | "DELETE") => {
                 let mut out: Vec<_> = self.table().map(|t| (t.to_owned(), self.command())).into_iter().collect();
@@ -3012,7 +3068,7 @@ impl Prepared {
     }
     /// Additional command privilege for syntactic ON CONFLICT DO UPDATE.
     pub fn authorization_update_table(&self) -> Option<&str> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::InsertMulti(insert) if insert.updates_conflicts() => Some(&insert.table),
             _ => None,
         }
@@ -3023,15 +3079,24 @@ impl Prepared {
     pub fn authorization_has_views(&self) -> bool { self.authorization_has_views }
 
     pub fn authorization_tables(&self) -> R<Vec<String>> {
-        self.authorization_tables_for(false)
+        self.authorization_tables_ref().map(<[String]>::to_vec)
     }
+
+    fn authorization_tables_ref(&self) -> R<&[String]> {
+        self.statement.authorization_tables(|| {
+            #[cfg(test)]
+            AUTHORIZATION_DEPENDENCY_WALKS.with(|walks| walks.set(walks.get() + 1));
+            self.authorization_tables_for(false)
+        })
+    }
+
     /// Database view reads authorize generated dependencies as their owners.
     pub fn invoker_authorization_tables(&self) -> R<Vec<String>> {
         self.authorization_tables_for(true)
     }
     fn authorization_tables_for(&self, invoker: bool) -> R<Vec<String>> {
-        if let Statement::Plan(plan) = &self.statement { return plan.authorization_tables(); }
-        let query = match &self.statement {
+        if let Statement::Plan(plan) = self.statement.get() { return plan.authorization_tables(); }
+        let query = match self.statement.get() {
             Statement::View(ddl) => ddl.query.as_ref(),
             Statement::Query(query) => Some(query),
             Statement::Create {as_query:Some((query,_)),..} => Some(query.as_ref()),
@@ -3048,7 +3113,7 @@ impl Prepared {
                 }
                 tables
             }
-            None => match &self.statement {
+            None => match self.statement.get() {
                 Statement::InsertMulti(insert) => match &insert.source {
                     Some(sql_insert::Source::Plan(plan, _)) => plan.authorization_tables()?,
                     _ => self.read_tables(),
@@ -3064,10 +3129,10 @@ impl Prepared {
         Ok(tables)
     }
 
-    pub(crate) fn is_create_as(&self)->bool {matches!(self.statement,Statement::Create {as_query:Some(_),..})}
+    pub(crate) fn is_create_as(&self)->bool {matches!(self.statement.get(),Statement::Create {as_query:Some(_),..})}
     pub fn is_ddl(&self) -> bool {
         matches!(
-            self.statement,
+            self.statement.get(),
             Statement::Extension(_) | Statement::Schema(_)
                 | Statement::Sequence(_)
                 | Statement::TypeDdl(_) | Statement::CollationDdl(_)
@@ -3082,16 +3147,16 @@ impl Prepared {
         )
     }
     pub fn drop_tables(&self) -> &[String] {
-        match &self.statement { Statement::DropTable { names, .. } => names, Statement::View(ddl) if ddl.query.is_none() => &ddl.names, _ => &[] }
+        match self.statement.get() { Statement::DropTable { names, .. } => names, Statement::View(ddl) if ddl.query.is_none() => &ddl.names, _ => &[] }
     }
     pub fn is_drop_table(&self) -> bool {
-        matches!(self.statement, Statement::DropTable { .. }) || matches!(&self.statement, Statement::View(ddl) if ddl.query.is_none())
+        matches!(self.statement.get(), Statement::DropTable { .. }) || matches!(self.statement.get(), Statement::View(ddl) if ddl.query.is_none())
     }
     pub fn is_alter_table(&self) -> bool {
-        matches!(self.statement, Statement::AlterTable(_))
+        matches!(self.statement.get(), Statement::AlterTable(_))
     }
     pub fn table_rename(&self) -> Option<(&str, &str)> {
-        if let Statement::AlterTable(alter) = &self.statement {
+        if let Statement::AlterTable(alter) = self.statement.get() {
             alter.actions.iter().rev().find_map(|action| match action {
                 alter_table::Action::RenameTable(name) => {
                     Some((alter.table.as_str(), name.as_str()))
@@ -3103,8 +3168,8 @@ impl Prepared {
         }
     }
     pub fn command(&self) -> &'static str {
-        match self.statement {
-            Statement::Schema(ref ddl) => {
+        match self.statement.get() {
+            Statement::Schema(ddl) => {
                 if ddl.rename.is_some() {
                     "ALTER SCHEMA"
                 } else if ddl.create {
@@ -3113,17 +3178,17 @@ impl Prepared {
                     "DROP SCHEMA"
                 }
             }
-            Statement::TypeDdl(ref ddl) => ddl.command(),
-            Statement::Plan(ref plan) if plan.mutation_command().is_some() => plan.mutation_command().unwrap(),
-            Statement::CollationDdl(ref ddl) => ddl.command(),
-            Statement::Extension(ref ddl) => ddl.command(),
+            Statement::TypeDdl(ddl) => ddl.command(),
+            Statement::Plan(plan) if plan.mutation_command().is_some() => plan.mutation_command().unwrap(),
+            Statement::CollationDdl(ddl) => ddl.command(),
+            Statement::Extension(ddl) => ddl.command(),
             Statement::CompositeSelect(_) | Statement::Plan(_) => "SELECT",
-            Statement::Sequence(ref ddl) => match ddl {
+            Statement::Sequence(ddl) => match ddl {
                 defaults::SequenceDdl::Create { .. } => "CREATE SEQUENCE",
                 defaults::SequenceDdl::Alter { .. } => "ALTER SEQUENCE",
                 defaults::SequenceDdl::Drop { .. } => "DROP SEQUENCE",
             },
-            Statement::Query(ref q) => {
+            Statement::Query(q) => {
                 if q.explain {
                     "EXPLAIN"
                 } else {
@@ -3135,7 +3200,7 @@ impl Prepared {
             Statement::AlterTable(_) => "ALTER TABLE",
             Statement::Comment(_) => "COMMENT",
             Statement::SecurityLabel(_) => "SECURITY LABEL",
-            Statement::View(ref ddl) => if ddl.query.is_some() { "CREATE VIEW" } else { "DROP VIEW" },
+            Statement::View(ddl) => if ddl.query.is_some() { "CREATE VIEW" } else { "DROP VIEW" },
             Statement::Create { .. } => "CREATE TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
             Statement::DropIndex(_) => "DROP INDEX",
@@ -3218,7 +3283,7 @@ impl Prepared {
             authorization_has_views: false,
             authorization_binding: None,
             privilege_inquiry: false,
-            statement: Statement::Select {
+            statement: prepared_syntax::Syntax::new(Statement::Select {
                 name: scan.table,
                 projection: scan.projection,
                 predicates,
@@ -3228,7 +3293,7 @@ impl Prepared {
                     .map(|i| (t.columns[*i].name.clone(), scan.reverse))
                     .collect(),
                 limit: Some(Expr::Literal(Value::Int(scan.limit as i64))),
-            },
+            }),
         })
     }
     /// Declare input types for SELECT, INSERT VALUES, UPDATE and DELETE before type inference.
@@ -3243,7 +3308,7 @@ impl Prepared {
             return Err(SqlError::Parameters);
         }
         if matches!(
-            self.statement,
+            self.statement.get(),
             Statement::Query(_)
                 | Statement::Plan(_)
                 | Statement::Insert { .. }
@@ -3274,7 +3339,7 @@ impl Prepared {
             .unwrap_or_default()
     }
     pub fn has_privilege_inquiry(&self) -> bool {
-        self.privilege_inquiry || match &self.statement {
+        self.privilege_inquiry || match self.statement.get() {
             Statement::Query(q) => q.has_privilege_inquiry(),
             Statement::Plan(p) => p.has_privilege_inquiry(),
             Statement::InsertMulti(insert) => matches!(&insert.source,
@@ -3284,7 +3349,7 @@ impl Prepared {
     }
     /// Syntactic sequence calls, including session-local lastval().
     pub fn sequence_calls(&self) -> Vec<SequenceDependency> {
-        let mut dependencies = match &self.statement {
+        let mut dependencies = match self.statement.get() {
             Statement::Query(query) => query.sequence_dependencies(),
             Statement::Plan(plan) => plan.sequences(),
             Statement::InsertExpressions(values) => values.sequence_dependencies(),
@@ -3322,10 +3387,10 @@ impl Prepared {
     }
 
     pub(crate) fn implicit_sequences(&self, state: &Relational) -> R<Vec<Option<String>>> {
-        if let Statement::InsertMulti(insert) = &self.statement {
+        if let Statement::InsertMulti(insert) = self.statement.get() {
             return insert.implicit_sequences_declared(state, &self.parameter_types);
         }
-        if let Statement::Plan(plan) = &self.statement {
+        if let Statement::Plan(plan) = self.statement.get() {
             return plan.implicit_sequences(state, self.params, &self.parameter_types);
         }
         let mut dependencies: Vec<Option<String>> = vec![];
@@ -3339,7 +3404,7 @@ impl Prepared {
             }
             Ok(())
         };
-        match &self.statement {
+        match self.statement.get() {
             Statement::Insert { name, columns, values, .. } => {
                 let table = state.tables.get(name).ok_or(SqlError::UnknownTable)?;
                 let supplied = insert_value_indexes(table, columns, values.len())?;
@@ -3375,31 +3440,31 @@ impl Prepared {
     }
     pub fn sequence_only(&self) -> bool {
         self.is_sequence_ddl()
-            || matches!(&self.statement, Statement::Query(query) if query.sequence_only())
+            || matches!(self.statement.get(), Statement::Query(query) if query.sequence_only())
     }
     pub fn is_sequence_ddl(&self) -> bool {
-        matches!(self.statement, Statement::Sequence(_))
+        matches!(self.statement.get(), Statement::Sequence(_))
     }
     pub fn is_alter_sequence(&self) -> bool {
         matches!(
-            self.statement,
+            self.statement.get(),
             Statement::Sequence(defaults::SequenceDdl::Alter { .. })
         )
     }
     pub fn is_drop_sequence(&self) -> bool {
         matches!(
-            self.statement,
+            self.statement.get(),
             Statement::Sequence(defaults::SequenceDdl::Drop { .. })
         )
     }
     pub fn sequence_ddl_names(&self) -> Vec<&str> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Sequence(ddl) => ddl.names(),
             _ => vec![],
         }
     }
     pub fn sequence_owned_by_table(&self) -> Option<&str> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Sequence(ddl) => ddl.owned_by_table(),
             _ => None,
         }
@@ -3431,25 +3496,25 @@ impl Prepared {
             return Ok(false);
         }
         Ok(matches!(
-            Self::parse(sql, 0, 0)?.statement,
+            Self::parse(sql, 0, 0)?.statement.get(),
             Statement::Sequence(defaults::SequenceDdl::Create { .. })
         ))
     }
     pub(crate) fn sequence_restart_seed(&self, state: &Relational) -> Option<(u64, i64)> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Sequence(ddl) => ddl.restart_seed(state),
             _ => None,
         }
     }
     pub(crate) fn sequence_copies_counter(&self) -> bool {
-        matches!(&self.statement, Statement::Sequence(ddl) if ddl.copies_counter())
+        matches!(self.statement.get(), Statement::Sequence(ddl) if ddl.copies_counter())
     }
     pub(crate) fn validate_sequence_current(
         &self,
         state: &Relational,
         current: impl Fn(u64) -> Option<i64>,
     ) -> R<()> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Sequence(ddl) => ddl.validate_current(state, current),
             _ => Ok(()),
         }
@@ -3523,7 +3588,7 @@ impl Prepared {
     /// Parse failures and dependency-bearing queries keep their existing gateway path.
     pub fn rejects_unsupported_table_free_scalar(sql: &str) -> bool {
         Self::parse(sql, 0, 0).is_ok_and(|prepared| {
-            matches!(&prepared.statement,
+            matches!(prepared.statement.get(),
                 Statement::Query(query) if query.rejects_unsupported_table_free_scalar())
         })
     }
@@ -3579,7 +3644,7 @@ impl Prepared {
         Ok(references)
     }
     pub fn constraint_reference_tables(&self) -> Vec<String> {
-        let (definitions, own) = match &self.statement {
+        let (definitions, own) = match self.statement.get() {
             Statement::Create {
                 constraints, name, ..
             } => (constraints.iter().collect::<Vec<_>>(), Some(name)),
@@ -3688,7 +3753,7 @@ impl Prepared {
             epoch,
             transaction: None,
             engine_generation: None,
-            statement,
+            statement: prepared_syntax::Syntax::new(statement),
             params,
             parameter_types: vec![],
             relations: p.relations,
@@ -3707,18 +3772,18 @@ impl Prepared {
     }
     /// Transaction-local name, normalized using PostgreSQL identifier rules.
     pub(crate) fn set_constraints(&self) -> Option<(&[String], bool)> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::SetConstraints(names, deferred) => Some((names, *deferred)),
             _ => None,
         }
     }
     pub(crate) fn copy_freeze_created(&self, state: &Relational) -> Option<u64> {
-        if let Statement::Create { name, .. } = &self.statement {
+        if let Statement::Create { name, .. } = self.statement.get() {
             state.tables.get(name).map(|t| t.id)
         } else { None }
     }
     pub(crate) fn copy_freeze_marks(&self, state: &Relational, before: Option<u64>) -> Vec<u64> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Create { name, .. } => state.tables.get(name)
                 .filter(|t| Some(t.id) != before).map(|t| vec![t.id]).unwrap_or_default(),
             Statement::Truncate { .. } => self.truncate_tables(state).unwrap_or_default().iter()
@@ -3727,7 +3792,7 @@ impl Prepared {
         }
     }
     pub fn savepoint_name(&self) -> Option<&str> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Savepoint(name) | Statement::Release(name) | Statement::RollbackTo(name) => {
                 Some(name)
             }
@@ -3737,12 +3802,12 @@ impl Prepared {
     /// Recovery controls remain available in a failed transaction block.
     pub fn allows_aborted_transaction(&self) -> bool {
         matches!(
-            self.statement,
+            self.statement.get(),
             Statement::Rollback | Statement::RollbackTo(_)
         )
     }
     pub(crate) fn control(&self) -> Option<&'static str> {
-        match self.statement {
+        match self.statement.get() {
             Statement::Begin => Some("begin"),
             Statement::Commit => Some("commit"),
             Statement::Rollback => Some("rollback"),
@@ -3753,9 +3818,9 @@ impl Prepared {
         }
     }
     pub(crate) fn is_read(&self) -> bool {
-        if let Statement::Plan(plan) = &self.statement { return plan.write_tables().is_empty(); }
+        if let Statement::Plan(plan) = self.statement.get() { return plan.write_tables().is_empty(); }
         matches!(
-            self.statement,
+            self.statement.get(),
             Statement::Select { .. } | Statement::Query(_) | Statement::Plan(_) | Statement::CompositeSelect(_)
         )
     }
@@ -4140,8 +4205,8 @@ impl Relational {
         clock: Option<&clock::ExecutionClock>,
         injected_source: Option<&dyn scan::RowSource>,
     ) -> R<SqlResult> {
-        let adds_constraints = matches!(&prepared.statement,Statement::Create { constraints,.. } if !constraints.is_empty())
-            || matches!(&prepared.statement,Statement::AlterTable(alter) if alter.actions.iter().any(|a|matches!(a,alter_table::Action::Constraint(_))));
+        let adds_constraints = matches!(prepared.statement.get(),Statement::Create { constraints,.. } if !constraints.is_empty())
+            || matches!(prepared.statement.get(),Statement::AlterTable(alter) if alter.actions.iter().any(|a|matches!(a,alter_table::Action::Constraint(_))));
         if self.ext.constraints.is_empty() && !adds_constraints {
             return self.execute_statement_inner(
                 prepared,
@@ -4236,7 +4301,7 @@ impl Relational {
             return Err(SqlError::Parameters);
         }
         if matches!(
-            prepared.statement,
+            prepared.statement.get(),
             Statement::Insert { .. }
                 | Statement::InsertExpressions(_)
                 | Statement::InsertMulti(_)
@@ -4247,7 +4312,7 @@ impl Relational {
             self.secondary_admit_mutation(&mut cancel)?;
         }
         if matches!(
-            prepared.statement,
+            prepared.statement.get(),
             Statement::Insert { .. }
                 | Statement::InsertExpressions(_)
                 | Statement::Update { .. }
@@ -4255,7 +4320,7 @@ impl Relational {
                 | Statement::Delete { .. }
         ) {
             let mut source_values = Vec::new();
-            match &prepared.statement {
+            match prepared.statement.get() {
                 Statement::Insert { values, .. } => {
                     for e in values {
                         if let Expr::Literal(v) = e {
@@ -4282,10 +4347,10 @@ impl Relational {
             Self::secondary_admit_values(params.iter())?;
             Self::secondary_admit_values(source_values.iter().copied())?;
             payload_bound(source_values.into_iter())?;
-            if let Statement::InsertExpressions(values) = &prepared.statement {
+            if let Statement::InsertExpressions(values) = prepared.statement.get() {
                 values.admit_literals()?;
             }
-            if let Statement::UpdateExpressions { sets, .. } = &prepared.statement {
+            if let Statement::UpdateExpressions { sets, .. } = prepared.statement.get() {
                 assign::admit_literals(sets)?;
             }
         }
@@ -4293,7 +4358,7 @@ impl Relational {
         params_bound(params.iter())?;
         if prepared.parameter_types.iter().any(Option::is_some)
             && matches!(
-                prepared.statement,
+                prepared.statement.get(),
                 Statement::Insert { .. }
                     | Statement::InsertMulti(_)
                     | Statement::InsertExpressions(_)
@@ -4305,7 +4370,7 @@ impl Relational {
             prepared.describe(self)?;
         }
         if assign::has_duplicates(prepared)
-            || matches!(&prepared.statement, Statement::InsertMulti(insert) if insert.has_duplicate_assignments())
+            || matches!(prepared.statement.get(), Statement::InsertMulti(insert) if insert.has_duplicate_assignments())
         {
             prepared.describe(self)?;
         }
@@ -4313,7 +4378,7 @@ impl Relational {
         let mut returned_rows = vec![];
         // Normalize expression outputs after mutation input admission.
         let normalized;
-        let prepared = if let Statement::InsertExpressions(values) = &prepared.statement {
+        let prepared = if let Statement::InsertExpressions(values) = prepared.statement.get() {
             values.check_identity(self)?;
             if expected.is_some() {
                 return Err(SqlError::Unsupported);
@@ -4349,19 +4414,19 @@ impl Relational {
             authorization_has_views: false,
             authorization_binding: None,
             privilege_inquiry: false,
-                statement: Statement::Insert {
+                statement: prepared_syntax::Syntax::new(Statement::Insert {
                     name: values.name.clone(),
                     columns: values.columns.clone(),
                     values: output,
                     returning: values.returning.clone(),
-                },
+                }),
             };
             &normalized
         } else {
             prepared
         };
         let mut result = SqlResult::default();
-        match &prepared.statement {
+        match prepared.statement.get() {
             Statement::Extension(ddl) => { extensions::execute(self, ddl, prepared)?; }
             Statement::CollationDdl(ddl) => { collations::execute(self, ddl, prepared)?; }
             Statement::TypeDdl(ddl) => {

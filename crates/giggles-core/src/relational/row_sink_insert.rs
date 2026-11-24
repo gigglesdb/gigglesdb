@@ -8,12 +8,12 @@ pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
     if prepared.table().and_then(|name| state.tables.get(name)).is_none() {
         return false;
     }
-    if let Statement::InsertMulti(i) = &prepared.statement
+    if let Statement::InsertMulti(i) = prepared.statement.get()
         && !i.append_only()
         && !i.can_witness(state) {
         return false;
     }
-    matches!(&prepared.statement, Statement::InsertMulti(i) if i.needs_pages()
+    matches!(prepared.statement.get(), Statement::InsertMulti(i) if i.needs_pages()
         && i.source.as_ref().is_none_or(|source| source.query()
             .is_some_and(|q| paged_source(state, i, q) || stored_source(state, q))))
 }
@@ -43,12 +43,12 @@ pub(super) fn execute(
     version_end: u64,
     mut deferred: Option<&mut DeferralState>,
 ) -> Result<SqlResult, CoreError> {
-    let Statement::InsertMulti(insert) = &prepared.statement else {
+    let Statement::InsertMulti(insert) = prepared.statement.get() else {
         unreachable!()
     };
     let mut template = prepared.clone();
     template.parameter_types = prepared.describe(state).map_err(CoreError::Sql)?.parameters.into_iter().map(Some).collect();
-    template.statement = Statement::InsertMulti(Box::new(insert.batch(0, 0)));
+    *template.statement.get_mut() = Statement::InsertMulti(Box::new(insert.batch(0, 0)));
     let mut output = spill::RowBuffer::new(Vec::new())?;
     let mut result = SqlResult::default();
     let mut after = None;
@@ -119,7 +119,7 @@ pub(super) fn execute(
                 .retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
         }
         let mut batch = template.clone();
-        batch.statement = Statement::InsertMulti(Box::new(input));
+        *batch.statement.get_mut() = Statement::InsertMulti(Box::new(input));
         batch.preserve_page_target();
         let part = page.execute_with_sink_actions(
             &batch,

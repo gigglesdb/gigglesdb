@@ -1765,7 +1765,7 @@ mod tests {
         );
         let p = Prepared::parse("SELECT * FROM ja FULL JOIN jb USING(id)", 1, s.epoch).unwrap();
         assert_eq!(p.read_tables(), vec!["ja".to_string(), "jb".to_string()]);
-        let Statement::Plan(plan) = &p.statement else {
+        let Statement::Plan(plan) = p.statement.get() else {
             panic!("expected plan");
         };
         assert_eq!(

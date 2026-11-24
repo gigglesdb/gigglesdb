@@ -230,7 +230,7 @@ impl Execution<'_> {
 impl Prepared {
     pub(crate) fn exists_test_query(&mut self, sql: &str) {
         self.unbound_statement = None;
-        self.statement = Statement::Query(Query::parse(&mut Parser { privilege_seen: false, privilege_casts: false,
+        *self.statement.get_mut() = Statement::Query(Query::parse(&mut Parser { privilege_seen: false, privilege_casts: false,
             tokens: lex(sql).unwrap(), at: 0, params: BTreeSet::new(), relations: vec![],
         }).unwrap());
     }
@@ -252,7 +252,7 @@ mod tests {
     fn query(sql: &str) -> Query {
         let mut p = Prepared::parse("SELECT 1", 1, 0).unwrap();
         p.exists_test_query(sql);
-        let Statement::Query(q) = p.statement else { unreachable!() }; q
+        let Statement::Query(q) = p.statement.into_inner() else { unreachable!() }; q
     }
     #[test]
     fn oracle_filters_projection_elision_and_nested_scopes() {

@@ -712,7 +712,7 @@ impl Copy {
             authorization_has_views: false,
             authorization_binding: None,
             privilege_inquiry: false,
-            statement: Statement::InsertMulti(Box::new(sql_insert::Insert::copy(
+            statement: prepared_syntax::Syntax::new(Statement::InsertMulti(Box::new(sql_insert::Insert::copy(
                 format!(
                     "{}\0{}",
                     if copy.target_is_view { split_key(&copy.table).0 } else { state.table_schema(table.id) },
@@ -721,7 +721,7 @@ impl Copy {
                 self.columns.clone(),
                 types,
                 vec![vec![Value::Null; width]],
-            ))),
+            )))),
         })
     }
 }
@@ -735,7 +735,7 @@ impl Prepared {
         prepared.unbound_statement = None;
         // COPY rows belong to the target bound by the already accepted header.
         prepared.relations.clear();
-        let Statement::InsertMulti(insert) = &mut prepared.statement else {
+        let Statement::InsertMulti(insert) = prepared.statement.get_mut() else {
             return Err(SqlError::Unsupported);
         };
         insert.replace_copy_rows(rows, clock)?;

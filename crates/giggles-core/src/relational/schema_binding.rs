@@ -103,8 +103,8 @@ impl Prepared {
     pub(crate) fn bind_schemas(&self, state: &Relational) -> R<Self> {
         let _date_order = super::clock::LiteralDateOrder::enter(self.literal_date_order);
         if self.relations.is_empty()
-            && !matches!(&self.statement, Statement::Plan(_))
-            && !matches!(&self.statement, Statement::Query(q) if q.has_domain_expression())
+            && !matches!(self.statement.get(), Statement::Plan(_))
+            && !matches!(self.statement.get(), Statement::Query(q) if q.has_domain_expression())
         {
             return Ok(self.clone());
         }
@@ -112,14 +112,14 @@ impl Prepared {
             .unbound_statement
             .as_ref()
             .map(Arc::clone)
-            .unwrap_or_else(|| Arc::new(self.statement.clone()));
+            .unwrap_or_else(|| Arc::new(self.statement.get().clone()));
         let mut bound = Self {
             domain: self.domain,
             epoch: self.epoch,
             transaction: self.transaction,
             engine_generation: self.engine_generation,
             literal_date_order: self.literal_date_order,
-            statement: (*unbound).clone(),
+            statement: prepared_syntax::Syntax::new((*unbound).clone()),
             native_delete: self.native_delete.clone(),
             native_insert_many: self.native_insert_many,
             unbound_statement: Some(unbound),
@@ -146,7 +146,7 @@ impl Prepared {
         let read = |name: &mut String| {
             *name = state.resolve_relation_key(name, &self.search_path);
         };
-        let created = match &bound.statement {
+        let created = match bound.statement.get() {
             Statement::Create { name, .. } => Some(create(name)?),
             _ => None,
         };
@@ -174,7 +174,7 @@ impl Prepared {
                 }
             }
         };
-        match &mut bound.statement {
+        match bound.statement.get_mut() {
             Statement::View(ddl) => {
                 if let Some(query) = &mut ddl.query {
                     ddl.names[0] = create(&ddl.names[0])?;
@@ -244,15 +244,17 @@ impl Prepared {
         if let Some(returning) = bound.returning_mut() {
             returning.bind_schema_names(&read, state, &self.search_path);
         }
-        if let Statement::Query(query) = &bound.statement
+        if let Statement::Query(query) = bound.statement.get()
             && let Some(plan) = query::plan::Plan::correlated_in(query, state)
         {
-            bound.statement = Statement::Plan(plan);
+            *bound.statement.get_mut() = Statement::Plan(plan);
         }
-        bound.authorization_has_views = bound.authorization_tables()?.iter()
-            .any(|name| state.view_names.contains_key(name));
-        bound.privilege_inquiry |= bound.authorization_tables()?.iter().any(|name|
+        let tables = bound.authorization_tables_ref()?;
+        let has_views = tables.iter().any(|name| state.view_names.contains_key(name));
+        let privilege_inquiry = tables.iter().any(|name|
             state.view_names.get(name).is_some_and(|(_,p)| p.as_ref().is_ok_and(|p| p.has_privilege_inquiry())));
+        bound.authorization_has_views = has_views;
+        bound.privilege_inquiry |= privilege_inquiry;
         Ok(bound)
     }
 }
@@ -311,7 +313,7 @@ impl Prepared {
     pub(crate) fn enable_sql_authorization_binding(&mut self) {
         // The other statement variants (including DDL and TRUNCATE) always
         // take the original path. Constraint references occur only in DDL.
-        if matches!(&self.statement, Statement::Select { .. } | Statement::CompositeSelect(_)
+        if matches!(self.statement.get(), Statement::Select { .. } | Statement::CompositeSelect(_)
             | Statement::Query(_) | Statement::Plan(_) | Statement::Insert { .. }
             | Statement::InsertMulti(_) | Statement::InsertExpressions(_)
             | Statement::Update { .. } | Statement::UpdateExpressions { .. }
@@ -346,7 +348,7 @@ impl Prepared {
 
     pub(crate) fn set_authorization_binding_version(&mut self, version: u64) {
         // A table-free statement may have taken bind_schemas' no-op path.
-        self.unbound_statement.get_or_insert_with(|| Arc::new(self.statement.clone()));
+        self.unbound_statement.get_or_insert_with(|| Arc::new(self.statement.get().clone()));
         self.authorization_binding = Some(AuthorizationBinding::Sql(Some(version)));
     }
 
@@ -358,7 +360,7 @@ impl Prepared {
     }
 
     pub fn authorization_may_parse_defaults(&self) -> bool {
-        matches!(&self.statement, Statement::Plan(_) | Statement::Insert { .. }
+        matches!(self.statement.get(), Statement::Plan(_) | Statement::Insert { .. }
             | Statement::InsertMulti(_) | Statement::InsertExpressions(_)
             | Statement::UpdateExpressions { .. })
     }
@@ -420,6 +422,35 @@ mod tests {
             second.unbound_statement.as_ref().unwrap(),
         ));
         assert_eq!(prepared.storage_table(), Some("t"));
+    }
+
+    #[test]
+    fn authorization_dependencies_follow_the_bound_syntax() {
+        let mut state = Relational::default();
+        for sql in [
+            "CREATE SCHEMA a",
+            "CREATE SCHEMA b",
+            "CREATE TABLE a.t(id int PRIMARY KEY)",
+            "CREATE TABLE b.t(id int PRIMARY KEY)",
+        ] {
+            run(&mut state, sql);
+        }
+        let mut prepared = Prepared::parse("SELECT id FROM t", 1, state.epoch).unwrap();
+        prepared.search_path = vec!["a".into()];
+        AUTHORIZATION_DEPENDENCY_WALKS.set(0);
+        let mut first = prepared.bind_schemas(&state).unwrap();
+        assert_eq!(first.authorization_tables().unwrap(), ["a\0t"]);
+        assert_eq!(first.authorization_tables_ref().unwrap(), ["a\0t"]);
+        assert_eq!(AUTHORIZATION_DEPENDENCY_WALKS.get(), 1);
+
+        first.search_path = vec!["b".into()];
+        let mut second = first.bind_schemas(&state).unwrap();
+        assert_eq!(second.authorization_tables().unwrap(), ["b\0t"]);
+        assert_eq!(AUTHORIZATION_DEPENDENCY_WALKS.get(), 2);
+
+        *second.statement.get_mut() = first.statement.get().clone();
+        assert_eq!(second.authorization_tables().unwrap(), ["a\0t"]);
+        assert_eq!(AUTHORIZATION_DEPENDENCY_WALKS.get(), 3);
     }
 
     #[test]

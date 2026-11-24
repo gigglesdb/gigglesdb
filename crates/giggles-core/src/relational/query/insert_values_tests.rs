@@ -196,8 +196,8 @@ fn insert_values_admission_and_apply_callback_differential() {
         let mut new_state = base.clone();
         let old = Prepared::parse(literal, 1, base.epoch).unwrap();
         let new = Prepared::parse(expression, 1, base.epoch).unwrap();
-        assert!(matches!(old.statement, Statement::Insert { .. }));
-        assert!(matches!(new.statement, Statement::InsertExpressions(_)));
+        assert!(matches!(old.statement.get(), Statement::Insert { .. }));
+        assert!(matches!(new.statement.get(), Statement::InsertExpressions(_)));
         let mut old_calls = 0;
         let old_result = old_state.execute_with_cancel(&old, &[], None, || {
             old_calls += 1;

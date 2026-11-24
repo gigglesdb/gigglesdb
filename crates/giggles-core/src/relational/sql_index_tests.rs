@@ -45,7 +45,7 @@ fn parsed(text: &str) -> CreateIndex {
     assert!(p.is_ddl());
     assert_eq!(p.command(), "CREATE INDEX");
     assert!(!p.is_read());
-    match p.statement {
+    match p.statement.into_inner() {
         Statement::CreateIndex(index) => index,
         _ => panic!("not index"),
     }

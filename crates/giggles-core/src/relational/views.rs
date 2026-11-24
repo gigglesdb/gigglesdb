@@ -85,12 +85,12 @@ fn oid(ty: &DataType) -> u32 {
 }
 fn quote(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
 impl Prepared {
-    pub fn is_view_replacement(&self) -> bool { matches!(&self.statement, Statement::View(ddl) if ddl.replace) }
+    pub fn is_view_replacement(&self) -> bool { matches!(self.statement.get(), Statement::View(ddl) if ddl.replace) }
     pub(crate) fn clear_view_diagnostics(&self) {
-        if matches!(self.statement, Statement::View(_) | Statement::Comment(_) | Statement::SecurityLabel(_)) { user_types::clear_sql_error_message(); }
+        if matches!(self.statement.get(), Statement::View(_) | Statement::Comment(_) | Statement::SecurityLabel(_)) { user_types::clear_sql_error_message(); }
     }
     pub(crate) fn view_drop_locks(&self, state: &Relational, parts: &CatalogParts) -> BTreeSet<u64> {
-        let Statement::View(ddl) = &self.statement else { return BTreeSet::new(); };
+        let Statement::View(ddl) = self.statement.get() else { return BTreeSet::new(); };
         if ddl.query.is_some() { return BTreeSet::new(); }
         let mut ids = ddl.names.iter().filter_map(|n| state.view_names.get(n).map(|v| v.0)).collect::<BTreeSet<_>>();
         if ddl.cascade { loop {
@@ -109,7 +109,7 @@ impl Prepared {
         Ok(())
     }
     pub(crate) fn apply_view(&self, state: &Relational, parts: &mut CatalogParts, mut next: u64) -> R<()> {
-        let cascade = match &self.statement {
+        let cascade = match self.statement.get() {
             Statement::DropTable { cascade, .. } => Some(*cascade),
             Statement::AlterTable(alter) => Some(alter.actions.iter().any(|a|
                 matches!(a, alter_table::Action::Drop(_, _, true)))),
@@ -127,7 +127,7 @@ impl Prepared {
                 parts.comments.retain(|(id, _), _| !dropped.contains(id));
             }
         }
-        let Statement::View(ddl) = &self.statement else { return Ok(()); };
+        let Statement::View(ddl) = self.statement.get() else { return Ok(()); };
         self.validate_schemas(state)?;
         if let Some(query) = &ddl.query {
             let name = &ddl.names[0];

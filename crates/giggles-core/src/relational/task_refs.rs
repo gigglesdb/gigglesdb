@@ -11,7 +11,7 @@ impl Prepared {
     pub(crate) fn task_syntactic_shape(&self) -> R<StatementShape> {
         let Some(statement) = &self.unbound_statement else { return self.task_shape(); };
         let mut syntactic = self.clone();
-        syntactic.statement = (**statement).clone();
+        *syntactic.statement.get_mut() = (**statement).clone();
         syntactic.task_shape()
     }
 
@@ -22,7 +22,7 @@ impl Prepared {
     #[allow(dead_code, reason = "R3-303 wires the column rules to this collector")]
     pub(crate) fn task_shape(&self) -> R<StatementShape> {
         let mut out = StatementShape::new(self.task_class());
-        match &self.statement {
+        match self.statement.get() {
             Statement::Query(q) => q.task_refs(&mut out, true),
             Statement::CompositeSelect(_) => out.casts_user_type = true,
             Statement::Select {
@@ -100,7 +100,7 @@ impl Prepared {
             }
             _ => {}
         };
-        expand(&mut out.statement);
+        expand(out.statement.get_mut());
         if let Some(unbound) = out.unbound_statement.as_mut() {
             expand(std::sync::Arc::make_mut(unbound));
         }
@@ -109,7 +109,7 @@ impl Prepared {
 
     /// True when a select-list star survives in this statement.
     pub(crate) fn task_has_star(&self) -> bool {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Query(q) => q.task_has_star(),
             Statement::Select { projection, .. } => projection.is_empty(),
             _ => false,
@@ -119,7 +119,7 @@ impl Prepared {
     /// Test hook: whether a query statement calls a volatile routine.
     #[cfg(test)]
     pub(crate) fn task_has_volatile_call(&self) -> bool {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Query(q) => q.task_has_volatile_call(),
             _ => false,
         }
@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn legacy_select_and_update_arms() {
         let mut p = Prepared::parse("SELECT 1", 1, 0).unwrap();
-        p.statement = Statement::Select {
+        *p.statement.get_mut() = Statement::Select {
             name: "shipments".into(),
             projection: vec!["id".into(), "status".into()],
             predicates: vec![Predicate {
@@ -360,7 +360,7 @@ mod tests {
         assert_eq!(at(&s, "status"), [Position::Output]);
         assert_eq!(at(&s, "merchant_id"), [Position::Filter]);
         assert!(!s.star);
-        if let Statement::Select { projection, .. } = &mut p.statement {
+        if let Statement::Select { projection, .. } = p.statement.get_mut() {
             projection.clear();
         }
         assert!(p.task_shape().unwrap().star);

@@ -5,7 +5,7 @@ type Publisher<'a> = dyn FnMut(&Prepared) -> R<()> + 'a;
 type Point = (Vec<u8>, Vec<(String, Expr)>);
 
 fn collect_point(table: &TableDef, point: &Prepared) -> R<Point> {
-    let (predicates, sets) = match &point.statement {
+    let (predicates, sets) = match point.statement.get() {
         Statement::Update { predicates, sets, .. } => (predicates, sets.clone()),
         Statement::Delete { predicates, .. } => (predicates, vec![]),
         _ => return Err(SqlError::Unsupported),
@@ -977,7 +977,7 @@ impl Mutation {
                     value: Expr::Literal(old.values[*i].clone()),
                 })
                 .collect();
-            match &mut point.statement {
+            match point.statement.get_mut() {
                 Statement::Update { predicates: p, .. }
                 | Statement::Delete { predicates: p, .. } => *p = predicates,
                 _ => unreachable!(),

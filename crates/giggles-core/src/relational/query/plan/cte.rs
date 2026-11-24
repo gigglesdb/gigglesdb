@@ -248,7 +248,7 @@ fn finish(
         remap(&mut body, alias, &cte.name);
     }
     for (_, cte) in &definitions {
-        if cte.dml.as_ref().is_some_and(|p| p.returning().is_none() && !matches!(&p.statement, Statement::Plan(plan) if (plan.mutation.as_ref().is_some_and(|m| m.has_returning()) || plan.merge.as_ref().is_some_and(|m| m.has_returning())))) {
+        if cte.dml.as_ref().is_some_and(|p| p.returning().is_none() && !matches!(p.statement.get(), Statement::Plan(plan) if (plan.mutation.as_ref().is_some_and(|m| m.has_returning()) || plan.merge.as_ref().is_some_and(|m| m.has_returning())))) {
             let referenced = references(&body, &cte.name) > 0
                 || definitions.iter().any(|(_, other)| {
                     references(&other.query, &cte.name) > 0

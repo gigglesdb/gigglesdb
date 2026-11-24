@@ -151,7 +151,7 @@ fn legacy_point_select_reads_only_the_supplied_source() {
     assert_eq!(result.rows[0].values, vec![Value::Int(2), Value::Int(7)]);
 
     let mut zero_limit = prepared;
-    if let Statement::Select { limit, .. } = &mut zero_limit.statement {
+    if let Statement::Select { limit, .. } = zero_limit.statement.get_mut() {
         *limit = Some(Expr::Literal(Value::Int(0)));
     }
     let (result, _) = query_from_source(&state, &zero_limit, &[]);
@@ -194,7 +194,7 @@ fn legacy_range_select_preserves_reverse_limit_and_empty_bounds() {
         vec![vec![Value::Int(3)], vec![Value::Int(2)]]
     );
 
-    if let Statement::Select { predicates, .. } = &mut prepared.statement {
+    if let Statement::Select { predicates, .. } = prepared.statement.get_mut() {
         predicates[0].value = Expr::Literal(Value::Int(4));
     }
     let (result, _) = query_from_source(&state, &prepared, &[]);

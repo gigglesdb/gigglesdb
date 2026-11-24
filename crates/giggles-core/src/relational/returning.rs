@@ -191,7 +191,7 @@ impl Returning {
 
 impl Prepared {
     pub(super) fn returning_mut(&mut self) -> Option<&mut Returning> {
-        match &mut self.statement {
+        match self.statement.get_mut() {
             Statement::Insert { returning, .. }
             | Statement::Update { returning, .. }
             | Statement::UpdateExpressions { returning, .. }
@@ -203,7 +203,7 @@ impl Prepared {
     }
 
     pub(super) fn returning(&self) -> Option<&Returning> {
-        match &self.statement {
+        match self.statement.get() {
             Statement::Insert { returning, .. }
             | Statement::Update { returning, .. }
             | Statement::UpdateExpressions { returning, .. }

@@ -268,7 +268,7 @@ impl Relational {
 }
 impl Prepared {
     pub fn schema_ddl(&self) -> Option<(&str, Option<&str>, bool)> {
-        if let Statement::Schema(ddl) = &self.statement {
+        if let Statement::Schema(ddl) = self.statement.get() {
             Some((&ddl.name, ddl.owner.as_deref(), ddl.create))
         } else {
             None
@@ -307,11 +307,11 @@ impl Prepared {
     }
     pub(crate) fn validate_schemas(&self, state: &Relational) -> R<()> {
         // DROP SEQUENCE validates schemas in name order during execution.
-        if matches!(&self.statement, Statement::Sequence(defaults::SequenceDdl::Drop { .. })) {
+        if matches!(self.statement.get(), Statement::Sequence(defaults::SequenceDdl::Drop { .. })) {
             return Ok(());
         }
         // Typed index operations can carry their target without parser references.
-        if let Statement::DropIndex(index) = &self.statement && !index.optional {
+        if let Statement::DropIndex(index) = self.statement.get() && !index.optional {
             state.require_relation_schema(&index.name)?;
         }
         for r in &self.relations {
@@ -322,7 +322,7 @@ impl Prepared {
             let key = r.schema.as_ref().map_or_else(|| r.name.clone(), |s| relation_key(s, &r.name));
             if state.require_relation_schema(&key).is_err() {
                 // A view's SELECT still resolves relations with DML semantics.
-                let error = match &self.statement {
+                let error = match self.statement.get() {
                     Statement::DropTable { optional: true, .. } => continue,
                     Statement::DropIndex(index) if index.optional => continue,
                     Statement::View(ddl) if ddl.query.is_none() && ddl.optional => continue,

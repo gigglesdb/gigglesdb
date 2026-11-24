@@ -8,7 +8,7 @@ fn create(state: &mut Relational, name: &str, typmods: Vec<Option<i32>>) -> R<Sq
     )?;
     let Statement::Create {
         typmods: target, ..
-    } = &mut prepared.statement
+    } = prepared.statement.get_mut()
     else {
         unreachable!()
     };
@@ -34,7 +34,7 @@ fn create_typmods_validate_before_any_mutation() {
     }
     let mut timestamp =
         Prepared::parse("CREATE TABLE bad_time (v TIMESTAMP)", 1, state.epoch).unwrap();
-    let Statement::Create { typmods, .. } = &mut timestamp.statement else {
+    let Statement::Create { typmods, .. } = timestamp.statement.get_mut() else {
         unreachable!()
     };
     *typmods = vec![Some(7)];

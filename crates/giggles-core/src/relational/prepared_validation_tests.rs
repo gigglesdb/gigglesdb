@@ -8,7 +8,7 @@ fn reference(p: &Prepared, state: &Relational, epoch: u64) -> R<()> {
     if bound.epoch != state.epoch {
         return Err(SqlError::StaleSchema);
     }
-    match &bound.statement {
+    match bound.statement.get() {
         Statement::InsertExpressions(values) => returning::validate_insert_constants(
             values,
             state,

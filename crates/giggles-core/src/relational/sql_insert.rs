@@ -1152,7 +1152,7 @@ pub(super) fn normalize_copy(
 ) -> R<(Prepared, Vec<Vec<Value>>, u64)> {
     if prepared.epoch != state.epoch { return Err(SqlError::StaleSchema); }
     if input.rows.len() > MAX_ROWS { return Err(SqlError::Limit); }
-    let Statement::InsertMulti(template) = &prepared.statement else { return Err(SqlError::Unsupported); };
+    let Statement::InsertMulti(template) = prepared.statement.get() else { return Err(SqlError::Unsupported); };
     let table = state.tables.get(&template.table).ok_or(SqlError::UnknownTable)?;
     let target_indexes = indexes(template, table)?;
     let logical = table.logical_offsets();
@@ -1256,7 +1256,7 @@ pub(super) fn normalize_copy(
     let mut prepared = prepared.clone();
     prepared.unbound_statement = None;
     prepared.relations.clear();
-    prepared.statement = Statement::InsertMulti(Box::new(insert));
+    *prepared.statement.get_mut() = Statement::InsertMulti(Box::new(insert));
     Ok((prepared, output, skipped))
 }
 

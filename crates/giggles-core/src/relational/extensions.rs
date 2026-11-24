@@ -333,7 +333,7 @@ pub(super) fn extension_defaults(state: &Relational, path: &[String]) -> R<Vec<(
 
 impl Prepared {
     pub fn extension_ddl(&self) -> Option<(bool, &[String])> {
-        if let Statement::Extension(d) = &self.statement {
+        if let Statement::Extension(d) = self.statement.get() {
             Some((d.create, &d.names))
         } else {
             None
@@ -351,7 +351,7 @@ impl Prepared {
         state: &Relational,
         views: impl Iterator<Item = (&'a str, &'a str)>,
     ) -> R<()> {
-        let cascade = match &self.statement {
+        let cascade = match self.statement.get() {
             Statement::Extension(d) if !d.create && d.names.iter().any(|n| n == "uuid-ossp") => d.cascade,
             Statement::Schema(d) if !d.create && state.ext.extensions.get("uuid-ossp").is_some_and(|e| e.schema == d.name) => d.cascade,
             _ => return Ok(()),

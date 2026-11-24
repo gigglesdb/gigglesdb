@@ -39,7 +39,7 @@ pub(super) fn parse_target(
 }
 
 pub(super) fn target(prepared: &Prepared) -> Option<&query::Query> {
-    match &prepared.statement {
+    match prepared.statement.get() {
         Statement::Update { search, .. }
         | Statement::UpdateExpressions { search, .. }
         | Statement::Delete { search, .. } => search.as_deref(),
@@ -84,7 +84,7 @@ pub(super) fn route(
         .collect();
     let bound = target.bind_seeded(state, parameters)?.with_clock(clock);
     let updating = matches!(
-        prepared.statement,
+        prepared.statement.get(),
         Statement::Update { .. } | Statement::UpdateExpressions { .. }
     );
     let assignments = if updating {
@@ -235,7 +235,7 @@ pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description
     let infer = |value: &Expr, ty: &DataType, parameters: &mut [Option<DataType>]| -> R<()> {
         infer_mutation_parameter(value, ty, parameters, &prepared.parameter_types, true)
     };
-    match &prepared.statement {
+    match prepared.statement.get() {
         Statement::Update { sets, .. } => {
             for (name, value) in sets {
                 infer(

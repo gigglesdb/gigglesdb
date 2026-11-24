@@ -43,7 +43,7 @@ pub(super) fn parse(tokens: &[Token], owner: &mut Parser) -> R<Prepared> {
 }
 
 pub(super) fn references(prepared: &Prepared, name: &str) -> bool {
-    match &prepared.statement {
+    match prepared.statement.get() {
         Statement::Plan(plan) => cte::references(plan, name) > 0,
         Statement::InsertMulti(insert) if let Some(sql_insert::Source::Plan(plan, _)) = &insert.source => {
             cte::references(plan, name) > 0
@@ -53,8 +53,8 @@ pub(super) fn references(prepared: &Prepared, name: &str) -> bool {
 }
 
 pub(super) fn remap(p: &mut Prepared, alias: &str, name: &str) {
-    if let Statement::Plan(plan) = &mut p.statement { cte::remap(plan, alias, name); }
-    if let Statement::InsertMulti(insert) = &mut p.statement
+    if let Statement::Plan(plan) = p.statement.get_mut() { cte::remap(plan, alias, name); }
+    if let Statement::InsertMulti(insert) = p.statement.get_mut()
         && let Some(source) = &mut insert.source
     {
         match source {
@@ -64,7 +64,7 @@ pub(super) fn remap(p: &mut Prepared, alias: &str, name: &str) {
     }
     if let Statement::Update { search, .. }
     | Statement::UpdateExpressions { search, .. }
-    | Statement::Delete { search, .. } = &mut p.statement
+    | Statement::Delete { search, .. } = p.statement.get_mut()
         && let Some(query) = search
     {
         // The root scan is the real mutation target, even if a CTE shadows it.
@@ -153,7 +153,7 @@ pub(super) fn execute<'e>(
     prepared.parameter_types = parameters.to_vec();
     let description = prepared.describe(&candidate)?;
     let injected_source = if matches!(
-        prepared.statement,
+        prepared.statement.get(),
         Statement::Insert { .. } | Statement::InsertExpressions(_)
     ) {
         // Point INSERT uses its source for occupancy, not a query scan.

@@ -6899,7 +6899,7 @@ mod deferred_routine_only_tests {
 
     fn query(sql: &str) -> Query {
         let prepared = Prepared::parse(sql, 1, 0).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
-        let Statement::Query(query) = prepared.statement else {
+        let Statement::Query(query) = prepared.statement.into_inner() else {
             panic!("expected query: {sql}");
         };
         query
@@ -7197,7 +7197,7 @@ mod integer_bound_tests {
                         state.epoch,
                     )
                     .unwrap();
-                    let Statement::Query(q) = p.statement else {
+                    let Statement::Query(q) = p.statement.into_inner() else {
                         panic!("query")
                     };
                     let declared = vec![Some(ty.clone()); count];
