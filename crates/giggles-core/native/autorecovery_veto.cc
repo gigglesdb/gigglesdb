@@ -309,6 +309,8 @@ extern "C" void giggles_rocksdb_drop_commit_group_filter(
 
 #else
 
+#include <charconv>
+#include <mutex>
 #include <utility>
 
 struct rocksdb_env_t { Env* rep; bool is_default; };
@@ -326,6 +328,9 @@ struct WalFaultCounts {
 struct WalFaultState {
   std::atomic<bool> armed{false};
   std::atomic<bool> dir_armed{false};
+  std::atomic<bool> sync_thread_safe{true};
+  std::atomic<bool> shutdown_started{false};
+  std::atomic<uint64_t> fail_wal_number{0};
   std::atomic<uint64_t> sync_failures{0};
   std::atomic<uint64_t> dir_sync_failures{0};
   std::atomic<uint64_t> full_space_checks{0};
@@ -337,13 +342,21 @@ struct WalFaultState {
 class FaultWalFile final : public FSWritableFileOwnerWrapper {
  public:
   FaultWalFile(std::unique_ptr<FSWritableFile> file,
-               std::shared_ptr<WalFaultState> state)
-      : FSWritableFileOwnerWrapper(std::move(file)), state_(std::move(state)) {}
+               std::shared_ptr<WalFaultState> state, std::string path)
+      : FSWritableFileOwnerWrapper(std::move(file)), state_(std::move(state)),
+        path_(std::move(path)), number_(WalNumber(path_)) {}
+
+  bool IsSyncThreadSafe() const override {
+    return state_->sync_thread_safe.load() && target()->IsSyncThreadSafe();
+  }
 
   IOStatus Sync(const IOOptions& options, IODebugContext* debug) override {
     if (state_->armed.load()) {
       ++state_->sync_failures;
       return IOStatus::NoSpace("injected WAL Sync");
+    }
+    if (FailThisWal()) {
+      return InjectFileError("While fdatasync: ");
     }
     return target()->Sync(options, debug);
   }
@@ -353,11 +366,37 @@ class FaultWalFile final : public FSWritableFileOwnerWrapper {
       ++state_->sync_failures;
       return IOStatus::NoSpace("injected WAL Fsync");
     }
+    if (FailThisWal()) {
+      return InjectFileError("While fsync: ");
+    }
     return target()->Fsync(options, debug);
   }
 
  private:
+  static uint64_t WalNumber(const std::string& path) {
+    const auto* start = path.data() + (path.find_last_of("/\\") + 1);
+    const auto* end = path.data() + path.size() - 4;  // .log
+    uint64_t number = 0;
+    const auto parsed = std::from_chars(start, end, number);
+    return parsed.ec == std::errc{} && parsed.ptr == end ? number : 0;
+  }
+
+  bool FailThisWal() const {
+    uint64_t expected = number_;
+    return expected != 0 &&
+           state_->fail_wal_number.compare_exchange_strong(expected, 0);
+  }
+
+  IOStatus InjectFileError(const char* operation) const {
+    ++state_->sync_failures;
+    auto status = IOStatus::IOError(operation + path_, "injected WAL file sync");
+    status.SetScope(IOStatus::IOErrorScope::kIOErrorScopeFile);
+    return status;
+  }
+
   std::shared_ptr<WalFaultState> state_;
+  const std::string path_;
+  const uint64_t number_;
 };
 
 class FaultWalDirectory final : public FSDirectoryWrapper {
@@ -393,7 +432,7 @@ class FaultWalFileSystem final : public FileSystemWrapper {
                            IODebugContext* debug) override {
     auto status = target()->NewWritableFile(path, options, file, debug);
     if (status.ok() && path.ends_with(".log")) {
-      *file = std::make_unique<FaultWalFile>(std::move(*file), state_);
+      *file = std::make_unique<FaultWalFile>(std::move(*file), state_, path);
     }
     return status;
   }
@@ -432,6 +471,8 @@ class RecoveryObserver final : public EventListener {
 
   void OnFlushCompleted(DB*, const FlushJobInfo&) override { ++state_->flushes; }
 
+  void OnDBShutdownBegin(DB*) override { state_->shutdown_started.store(true); }
+
   void OnErrorRecoveryBegin(BackgroundErrorReason, Status error,
                             bool* auto_recovery) override {
     error.PermitUncheckedError();
@@ -450,9 +491,61 @@ class RecoveryObserver final : public EventListener {
   std::shared_ptr<WalFaultState> state_;
 };
 
-struct FaultEnv {
-  std::shared_ptr<WalFaultState> state;
-  std::unique_ptr<Env> env;
+class FaultEnv final : public EnvWrapper {
+ public:
+  FaultEnv(std::shared_ptr<WalFaultState> state,
+           const std::shared_ptr<FileSystem>& fs)
+      : EnvWrapper(NewCompositeEnv(fs)), state(std::move(state)) {
+    file_system_ = fs;
+  }
+
+  void Schedule(void (*run)(void*), void* arg, Priority priority, void* tag,
+                void (*unschedule)(void*)) override {
+    if (priority == HIGH) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (pause_flushes_) {
+        // RocksDB has already counted this flush as scheduled. Hold it out of
+        // the shared background pool so independent tests can keep running.
+        paused_flushes_.push_back({run, arg, tag, unschedule});
+        return;
+      }
+    }
+    EnvWrapper::Schedule(run, arg, priority, tag, unschedule);
+  }
+
+  void PauseFlushes() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pause_flushes_ = true;
+  }
+
+  bool HasPausedFlush() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !paused_flushes_.empty();
+  }
+
+  void ResumeFlushes() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pause_flushes_ = false;
+    for (const auto& flush : paused_flushes_) {
+      EnvWrapper::Schedule(flush.run, flush.arg, HIGH, flush.tag,
+                           flush.unschedule);
+    }
+    paused_flushes_.clear();
+  }
+
+  const std::shared_ptr<WalFaultState> state;
+
+ private:
+  struct Flush {
+    void (*run)(void*);
+    void* arg;
+    void* tag;
+    void (*unschedule)(void*);
+  };
+
+  std::mutex mutex_;
+  bool pause_flushes_ = false;
+  std::vector<Flush> paused_flushes_;
 };
 }  // namespace
 
@@ -461,13 +554,13 @@ extern "C" FaultEnv* giggles_rocksdb_install_wal_fault(
   try {
     auto state = std::make_shared<WalFaultState>();
     auto fs = std::make_shared<FaultWalFileSystem>(state, options->rep.wal_dir);
-    auto handle = std::make_unique<FaultEnv>(FaultEnv{state, NewCompositeEnv(fs)});
+    auto handle = std::make_unique<FaultEnv>(state, fs);
     if (!keep_veto) {
       // The production options builder installs only the veto listener.
       options->rep.listeners.clear();
     }
     options->rep.listeners.push_back(std::make_shared<RecoveryObserver>(state));
-    rocksdb_env_t env{handle->env.get(), false};
+    rocksdb_env_t env{handle.get(), false};
     rocksdb_options_set_env(options, &env);
     return handle.release();
   } catch (...) {
@@ -486,6 +579,34 @@ extern "C" void giggles_rocksdb_arm_wal_fault(FaultEnv* handle,
 
 extern "C" void giggles_rocksdb_arm_wal_dir_fault(FaultEnv* handle) noexcept {
   handle->state->dir_armed.store(true);
+}
+
+extern "C" void giggles_rocksdb_arm_wal_file_fault(FaultEnv* handle,
+                                                  uint64_t number) noexcept {
+  handle->state->fail_wal_number.store(number);
+}
+
+extern "C" void giggles_rocksdb_disable_wal_thread_safe_sync(
+    FaultEnv* handle) noexcept {
+  handle->state->sync_thread_safe.store(false);
+}
+
+extern "C" void giggles_rocksdb_pause_fault_env_flushes(FaultEnv* handle) noexcept {
+  handle->PauseFlushes();
+}
+
+extern "C" bool giggles_rocksdb_has_paused_fault_env_flush(
+    FaultEnv* handle) noexcept {
+  return handle->HasPausedFlush();
+}
+
+extern "C" void giggles_rocksdb_resume_fault_env_flushes(FaultEnv* handle) noexcept {
+  handle->ResumeFlushes();
+}
+
+extern "C" bool giggles_rocksdb_take_fault_env_shutdown_started(
+    FaultEnv* handle) noexcept {
+  return handle->state->shutdown_started.exchange(false);
 }
 
 extern "C" void giggles_rocksdb_wal_fault_counts(const FaultEnv* handle,

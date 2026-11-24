@@ -335,6 +335,13 @@ impl V2Db {
         Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false, None, None, EngineOptions::default())
             .map_err(|failure| failure.error)
     }
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(super) fn test_from_local_kv(kv: Arc<engine::kv::Kv>, path: &Path) -> Self {
+        let mut db = Self::from_kv(kv).unwrap();
+        db.directory_identity = Some(DirectoryIdentity::read(path).unwrap());
+        db
+    }
+
     #[cfg(feature = "engine-rocksdb")]
     pub(crate) fn from_backend(
         backend: Arc<dyn engine::kv::KvBackend>,

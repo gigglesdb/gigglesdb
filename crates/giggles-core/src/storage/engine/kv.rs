@@ -426,9 +426,11 @@ impl FenceState {
         }
     }
 
-    fn record_explicit_pipeline_fence(&self) {
+    fn record_explicit_pipeline_fence(&self, backend: &dyn KvBackend) {
         let mut recorded = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        if recorded.commit_pipeline && recorded.cause.is_none() {
+        // A durability failure can already be draining background work. Its
+        // caller will report the cause when the drain completes.
+        if recorded.commit_pipeline && recorded.cause.is_none() && !backend.sync_failure_latched() {
             #[cfg_attr(not(feature = "engine-rocksdb"), allow(unused_mut))]
             let mut cause = FenceCause::new(FenceSite::Other, FenceClass::NotRecoverable, &KvError::Fenced);
             #[cfg(feature = "engine-rocksdb")]
@@ -756,7 +758,7 @@ impl Kv {
     /// Fences the handle: every later call fails without reaching the backend.
     pub(crate) fn fence(&self) {
         if !self.fenced.swap(true, Ordering::AcqRel) {
-            self.causes.record_explicit_pipeline_fence();
+            self.causes.record_explicit_pipeline_fence(self.backend.as_ref());
             #[cfg(feature = "engine-rocksdb")]
             self.causes.signal_recovery();
             super::diagnostics::error("KV fenced".into());

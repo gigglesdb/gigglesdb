@@ -1173,15 +1173,30 @@ impl RocksKv {
         Ok(())
     }
 
-    fn stop_after_sync_error(&self) {
-        // Refuse backend calls during the native stop, before the outer Kv
-        // has recorded the original error. Already-admitted calls may finish.
-        if !self.sync_failed.swap(true, Ordering::AcqRel) {
+    fn finish_sync_error(
+        &self,
+        error: KvError,
+        classify: impl FnOnce(KvError) -> KvError,
+    ) -> KvError {
+        // A SyncWAL probe may be refused before doing I/O. Leave that handle
+        // available for serial Sync writes.
+        let durability_failure = matches!(
+            error,
+            KvError::Corrupt(_) | KvError::RocksIo {
+                status: RocksStatus { code: RocksStatus::IO_ERROR, .. }, ..
+            }
+        );
+        // Refuse new backend calls before classification and shutdown. The
+        // outer Kv records the original error after the drain.
+        let stop = durability_failure && !self.sync_failed.swap(true, Ordering::AcqRel);
+        let error = classify(error);
+        if stop {
             // 11.8.1's SyncWalImpl checks for a background error before the
             // WAL directory fsync. Cancel and drain native work even if it
             // did not put the DB into an error state. All our writes use WAL.
             self.db.cancel_all_background_work(true);
         }
+        error
     }
 
     // In RocksDB 11.8.1, background SyncClosedWals only syncs older WALs.
@@ -1195,18 +1210,27 @@ impl RocksKv {
         site: FenceSite,
         sync: bool,
     ) -> KvError {
-        let mut error = map_error_at(error, site);
-        if let KvError::RocksIo { status, site: error_site, message } = &mut error
-            && status.code == RocksStatus::IO_ERROR
-        {
-            let background_errors = self
-                .db
-                .property_int_value("rocksdb.background-errors")
-                .ok()
-                .flatten();
-            *error_site = write_error_site(site, sync, message, background_errors, self.db.path());
+        let error = map_error_at(error, site);
+        let classify = |mut error| {
+            if let KvError::RocksIo { status, site: error_site, message } = &mut error
+                && status.code == RocksStatus::IO_ERROR
+            {
+                // A scheduled flush can change the counter or the live WAL
+                // set while draining. Carry the pre-stop site to the Kv.
+                let background_errors = self
+                    .db
+                    .property_int_value("rocksdb.background-errors")
+                    .ok()
+                    .flatten();
+                *error_site = write_error_site(site, sync, message, background_errors, self.db.path());
+            }
+            error
+        };
+        if sync {
+            self.finish_sync_error(error, classify)
+        } else {
+            classify(error)
         }
-        error
     }
 
     fn commit_io(
@@ -1235,18 +1259,21 @@ impl RocksKv {
             })
         };
 
-        // Record pre-call evidence for the fence. Pipeline failures require
-        // operator recovery, with corruption classified as Data.
-        op().map_err(|mut error| {
-            if site == FenceSite::CommitSync {
-                self.stop_after_sync_error();
-            }
+        // Carry pre-call evidence through shutdown to the Kv fence.
+        let classify = |mut error| {
             if let KvError::RocksIo { message, .. } | KvError::Corrupt(message) = &mut error {
                 let before = background_errors
                     .map_or_else(|| "unknown".into(), |count| count.to_string());
                 *message = format!("rocksdb.background-errors={before} before commit I/O: {message}");
             }
             error
+        };
+        op().map_err(|error| {
+            if site == FenceSite::CommitSync {
+                self.finish_sync_error(error, classify)
+            } else {
+                classify(error)
+            }
         })
     }
 }
@@ -1483,20 +1510,14 @@ impl KvBackend for RocksKv {
     fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError> {
         self.check_sync_failure()?;
         let sync = durability == Durability::Sync;
-        self.write_batch(batch, durability).map_err(|error| {
-            if sync {
-                self.stop_after_sync_error();
-            }
-            self.map_write_error(error, FenceSite::Write, sync)
-        })
+        self.write_batch(batch, durability)
+            .map_err(|error| self.map_write_error(error, FenceSite::Write, sync))
     }
 
     fn flush_barrier(&self) -> Result<(), KvError> {
         self.check_sync_failure()?;
-        self.db.flush_wal(true).map_err(|error| {
-            self.stop_after_sync_error();
-            self.map_write_error(error, FenceSite::FlushBarrier, true)
-        })
+        self.db.flush_wal(true)
+            .map_err(|error| self.map_write_error(error, FenceSite::FlushBarrier, true))
     }
 
     fn snapshot(&self) -> Result<Arc<dyn KvRead>, KvError> {
@@ -2040,7 +2061,17 @@ mod tests {
 
     mod autorecovery {
         use super::*;
+        use crate::{
+            Admin, CommitSyncHook, FenceRecovery, Limits, StorageStatus,
+            storage::{
+                Backend, engine_slot::EngineSlot,
+                engine::{commit::{ManualClock, Sequencer, SequencerConfig}, txn::TxnError},
+                v2::V2Db,
+            },
+        };
         use std::{ffi::c_void, ptr::NonNull};
+
+        const WAIT: Duration = Duration::from_secs(15);
 
         #[derive(Debug, Default)]
         #[repr(C)]
@@ -2068,6 +2099,12 @@ mod tests {
             fn giggles_rocksdb_drop_wal_fault(handle: *mut c_void);
             fn giggles_rocksdb_arm_wal_fault(handle: *mut c_void, armed: bool);
             fn giggles_rocksdb_arm_wal_dir_fault(handle: *mut c_void);
+            fn giggles_rocksdb_arm_wal_file_fault(handle: *mut c_void, number: u64);
+            fn giggles_rocksdb_disable_wal_thread_safe_sync(handle: *mut c_void);
+            fn giggles_rocksdb_pause_fault_env_flushes(handle: *mut c_void);
+            fn giggles_rocksdb_has_paused_fault_env_flush(handle: *mut c_void) -> bool;
+            fn giggles_rocksdb_resume_fault_env_flushes(handle: *mut c_void);
+            fn giggles_rocksdb_take_fault_env_shutdown_started(handle: *mut c_void) -> bool;
             fn giggles_rocksdb_wal_fault_counts(handle: *const c_void, counts: *mut WalFaultCounts);
         }
 
@@ -2093,6 +2130,33 @@ mod tests {
                 unsafe { giggles_rocksdb_arm_wal_dir_fault(self.0.as_ptr()) };
             }
 
+            fn arm_file(&self, number: u64) {
+                // SAFETY: this handle owns the live fault Env.
+                unsafe { giggles_rocksdb_arm_wal_file_fault(self.0.as_ptr(), number) };
+            }
+
+            fn disable_thread_safe_sync(&self) {
+                // SAFETY: this handle owns the live fault Env.
+                unsafe { giggles_rocksdb_disable_wal_thread_safe_sync(self.0.as_ptr()) };
+            }
+
+            fn take_shutdown_started(&self) -> bool {
+                // SAFETY: this handle owns the live fault Env.
+                unsafe { giggles_rocksdb_take_fault_env_shutdown_started(self.0.as_ptr()) }
+            }
+
+            fn pause_scheduled_flush(&self, db: &RocksKv, ks: Keyspace) -> PausedFlush<'_> {
+                // SAFETY: this handle owns the live fault Env.
+                unsafe { giggles_rocksdb_pause_fault_env_flushes(self.0.as_ptr()) };
+                let pause = PausedFlush(self);
+                let mut options = rocksdb::FlushOptions::default();
+                options.set_wait(false);
+                db.db.flush_cf_opt(db.db.cf_handle(ks.name()).unwrap(), &options).unwrap();
+                // SAFETY: this handle owns the live fault Env.
+                assert!(unsafe { giggles_rocksdb_has_paused_fault_env_flush(self.0.as_ptr()) });
+                pause
+            }
+
             fn counts(&self) -> WalFaultCounts {
                 let mut counts = WalFaultCounts::default();
                 // SAFETY: both pointers are live, and the native counters are atomic.
@@ -2106,6 +2170,187 @@ mod tests {
                 // SAFETY: the test drops the DB before releasing its Env.
                 unsafe { giggles_rocksdb_drop_wal_fault(self.0.as_ptr()) };
             }
+        }
+
+        struct PausedFlush<'a>(&'a WalFault);
+
+        impl Drop for PausedFlush<'_> {
+            fn drop(&mut self) {
+                // SAFETY: the guard borrows the fault Env.
+                unsafe { giggles_rocksdb_resume_fault_env_flushes(self.0.0.as_ptr()) };
+            }
+        }
+
+        fn open_faulted(path: &Path, marked: bool) -> (WalFault, Arc<RocksKv>) {
+            let (path, lock) = RocksKv::lock_local(path).unwrap();
+            let mut options = RocksKv::open_options(8 << 20, DBRecoveryMode::PointInTime).unwrap();
+            // SAFETY: the tests keep the fault Env alive until all DB users are gone.
+            let fault = unsafe { WalFault::install(&mut options, true) };
+            let mut db =
+                RocksKv::open_with_options(&path, lock.writer_lock, lock.directory_pin, options, marked)
+                    .unwrap();
+            assert!(!db.pipelined_sync());
+            // Admit the test Env to the real startup probe and pipeline. The
+            // production capability check excludes all custom environments.
+            db.pipelined_sync = marked;
+            // Marked opens close a temporary read-only validation handle.
+            fault.take_shutdown_started();
+            (fault, Arc::new(db))
+        }
+
+        fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+            let start = Instant::now();
+            while !condition() {
+                if start.elapsed() >= WAIT {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            true
+        }
+
+        fn background_errors(db: &RocksKv) -> u64 {
+            db.db.property_int_value("rocksdb.background-errors").unwrap().unwrap()
+        }
+
+        fn reservation(id: u64) -> (Vec<u8>, Vec<u8>) {
+            let mut key = vec![3];
+            key.extend_from_slice(&id.to_be_bytes());
+            (key, 8u64.to_be_bytes().to_vec())
+        }
+
+        fn highwater(seq: &Sequencer, id: u64) -> Result<mpsc::Receiver<Result<(), TxnError>>, TxnError> {
+            let (key, value) = reservation(id);
+            seq.write_highwater_async(key, value)
+        }
+
+        fn open_with_pipeline_knob(kv: Arc<Kv>) -> Arc<Sequencer> {
+            Sequencer::open(
+                kv,
+                Arc::new(ManualClock::new(10)),
+                SequencerConfig { commit_pipeline: true, ..SequencerConfig::default() },
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn serial_wal_sync_fence_recovers_after_scheduled_flush_drain() {
+            let dir = TestDir::new();
+            let (fault, db) = open_faulted(&dir.0, false);
+            meta::write_initial_meta(db.as_ref(), [1; 16], 0).unwrap();
+            meta::write_marker(&dir.0).unwrap();
+            let kv = Arc::new(Kv::new_single_writer(db.clone()));
+            let v2 = V2Db::test_from_local_kv(kv.clone(), &dir.0);
+            let seq = v2.sequencer.clone();
+            assert!(!seq.uses_commit_pipeline());
+            let slot = EngineSlot::for_directory(v2, &dir.0, None);
+            let admin = Admin::attach_backend(Backend::V2(slot), Limits::default())
+                .unwrap()
+                .with_data_directory(&dir.0);
+            highwater(&seq, 987).unwrap().recv_timeout(WAIT).unwrap().unwrap();
+            let before = newest_wal(db.db.path()).unwrap().unwrap();
+            let flush = fault.pause_scheduled_flush(&db, Keyspace::Seq);
+            let newest = newest_wal(db.db.path()).unwrap().unwrap();
+            assert!(newest > before, "flush should rotate the WAL");
+            fault.arm_file(newest);
+            let failed = highwater(&seq, 988).unwrap();
+            assert!(wait_until(|| fault.take_shutdown_started()), "native shutdown did not start");
+            assert_eq!(fault.counts().sync_failures, 1);
+            assert_eq!(background_errors(&db), 0);
+            assert!(matches!(failed.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+            drop(flush);
+            assert_eq!(failed.recv_timeout(WAIT).unwrap(), Err(TxnError::CommitAmbiguous));
+            assert!(background_errors(&db) > 0, "the scheduled flush must change the counter");
+            let cause = kv.causes.cause().unwrap();
+            assert_eq!((cause.site, cause.class), (FenceSite::WalWrite, FenceClass::Recoverable));
+            assert!(cause.error_text.contains("injected WAL file sync"), "{cause:?}");
+            assert_eq!(cause.status.unwrap().code, RocksStatus::IO_ERROR);
+
+            let closed = db.close_latch();
+            drop(seq);
+            drop(kv);
+            drop(db);
+            admin.set_fence_recovery(FenceRecovery { enabled: true, ..FenceRecovery::default() }).unwrap();
+            if !wait_until(|| matches!(admin.storage_status(), StorageStatus::Serving {
+                generation: 2, fenced: false, ..
+            })) {
+                let status = admin.storage_status();
+                drop(admin);
+                if closed.wait(WAIT).is_err() {
+                    // A worker still owns the native handle and its Env.
+                    std::mem::forget(fault);
+                }
+                panic!("{status:?}");
+            }
+            let (key, value) = reservation(987);
+            assert_eq!(admin.test_v2().kv.get(Keyspace::Seq, &key).unwrap(), Some(value));
+        }
+
+        #[test]
+        fn unsupported_sync_wal_probe_leaves_serial_writes_enabled() {
+            let dir = TestDir::new();
+            wal_group_tests::initialize_marked(&dir.0);
+            let (fault, db) = open_faulted(&dir.0, true);
+            fault.disable_thread_safe_sync();
+            assert_eq!(
+                db.db.flush_wal(true).unwrap_err().kind(),
+                rocksdb::ErrorKind::NotSupported,
+            );
+            let kv = Arc::new(Kv::new_single_writer(db.clone()));
+            assert!(kv.pipelined_sync());
+            let seq = open_with_pipeline_knob(kv.clone());
+            assert!(!seq.uses_commit_pipeline());
+            assert!(!db.sync_failure_latched());
+            assert!(!fault.take_shutdown_started());
+            highwater(&seq, 987).unwrap().recv_timeout(WAIT).unwrap().unwrap();
+            let (key, value) = reservation(987);
+            assert_eq!(kv.get(Keyspace::Seq, &key).unwrap(), Some(value));
+            assert!(kv.causes.cause().is_none());
+        }
+
+        #[test]
+        fn maintenance_wal_error_is_recorded_after_stage_b_fences_during_drain() {
+            let dir = TestDir::new();
+            wal_group_tests::initialize_marked(&dir.0);
+            let (fault, db) = open_faulted(&dir.0, true);
+            let kv = Arc::new(Kv::new_single_writer(db.clone()));
+            let seq = open_with_pipeline_knob(kv.clone());
+            assert!(seq.uses_commit_pipeline());
+
+            highwater(&seq, 987).unwrap().recv_timeout(WAIT).unwrap().unwrap();
+            let flush = fault.pause_scheduled_flush(&db, Keyspace::Seq);
+            let hook = CommitSyncHook::new();
+            seq.set_sync_hook(Some(hook.clone()));
+            let newest = newest_wal(db.db.path()).unwrap().unwrap();
+            let pending = highwater(&seq, 988).unwrap();
+            if !hook.wait_entered(WAIT) {
+                hook.release(false);
+                panic!("Stage B did not reach its sync hook");
+            }
+            fault.arm_file(newest);
+            thread::scope(|scope| {
+                // Release the native flush before joining the writer on unwind.
+                let flush = flush;
+                let failed = scope.spawn(|| kv.write(single(), Durability::Sync));
+                let draining = wait_until(|| fault.take_shutdown_started());
+                hook.release(false);
+                assert!(draining, "maintenance Sync did not start native shutdown");
+                assert!(db.sync_failure_latched());
+                assert!(kv.causes.cause().is_none());
+                assert_eq!(pending.recv_timeout(WAIT).unwrap(), Err(TxnError::CommitAmbiguous));
+                assert!(kv.is_fenced());
+                assert!(matches!(highwater(&seq, 989), Err(TxnError::Fenced)));
+                assert!(kv.causes.cause().is_none(), "the originating error is still draining");
+
+                drop(flush);
+                let error = failed.join().unwrap().unwrap_err();
+                assert!(error.to_string().contains("injected WAL file sync"), "{error}");
+                let cause = kv.causes.cause().unwrap();
+                assert_eq!((cause.site, cause.class), (FenceSite::WalWrite, FenceClass::NotRecoverable));
+                assert_eq!(cause.status.unwrap().code, RocksStatus::IO_ERROR);
+                assert!(cause.error_text.contains("injected WAL file sync"), "{cause:?}");
+            });
         }
 
         #[test]
