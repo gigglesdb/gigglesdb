@@ -18,6 +18,8 @@ mod group_parser_network;
 mod constraint_catalog_network;
 #[path = "trigger_catalog_network.rs"]
 mod trigger_catalog_network;
+#[path = "bytea_convert_network.rs"]
+mod bytea_convert_network;
 
 
 // Single integration-test binary: every tests/*.rs file is a module here, so the

@@ -340,6 +340,9 @@ impl Diagnostic {
         }
         let postgres_diagnostic = match (&result, message.as_deref()) {
             (Err(CoreError::Sql(_)), Some(_)) if self.exact_sql_detail => true,
+            (Err(CoreError::Sql(SqlError::CharacterNotInRepertoire)), Some(m)) => {
+                m.starts_with("invalid byte sequence for encoding \"UTF8\": ")
+            }
             (Err(CoreError::Sql(SqlError::InvalidIndexPredicate)), Some(m)) => {
                 m == "functions in index predicate must be marked IMMUTABLE"
             }

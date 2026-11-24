@@ -227,6 +227,8 @@ fn signature(name: &str, args: &[DataType], result: &DataType) -> Option<(bool, 
         ("int2", &[Numeric], SmallInt) => Some((true, true)),               // pg_proc 1783
         ("bit_length", &[Bytes], Integer) => Some((true, true)),            // pg_proc 1810
         ("bit_length", &[Text], Integer) => Some((true, true)),             // pg_proc 1811
+        ("convert_from", &[Bytes, Text], Text) => Some((false, true)),      // pg_proc 1714
+        ("convert_to", &[Text, Text], Bytes) => Some((false, true)),        // pg_proc 1717
         ("encode", &[Bytes, Text], Text) => Some((true, true)),             // pg_proc 1946
         ("decode", &[Text, Text], Bytes) => Some((true, true)),             // pg_proc 1947
         ("timestamp", &[Timestamp, Integer], Timestamp) => Some((true, true)), // pg_proc 1961
@@ -600,10 +602,9 @@ impl BoundScalar {
                         || self.ty == DataType::Text
                             && (number(&value.ty) || value.ty == DataType::Boolean))
             }
-            Node::Call(name, args)
-                if text_search::known(name) || random_uuid::known(name) || uuid_ossp::known(name)
-                    || name == "coalesce" || greatest::known_name(name) || name == array_constructor::NAME =>
-            {
+            Node::Call(name, args) if text_search::known(name) || random_uuid::known(name) || uuid_ossp::known(name)
+                || matches!(name.as_str(), "coalesce" | "convert_from" | "convert_to")
+                || greatest::known_name(name) || name == array_constructor::NAME => {
                 args.iter().all(Self::insert_input_only)
             }
             Node::Call(name, args) => {

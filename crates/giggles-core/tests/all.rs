@@ -127,6 +127,8 @@ mod sql_aggregate_scalars;
 mod sql_alter_table;
 #[path = "sql_binary_functions.rs"]
 mod sql_binary_functions;
+#[path = "sql_bytea_convert.rs"]
+mod sql_bytea_convert;
 #[path = "sql_boolean_expressions.rs"]
 mod sql_boolean_expressions;
 #[path = "sql_bytea_input.rs"]

@@ -16,6 +16,8 @@ pub(super) fn signature(n: &str, count: usize, first: Option<&DataType>) -> Opti
             }
             (t, Bytes)
         }
+        "convert_to" => (vec![Text, Text], Bytes),
+        "convert_from" => (vec![Bytes, Text], Text),
         "encode" => (vec![Bytes, Text], Text),
         "decode" => (vec![Text, Text], Bytes),
         "get_byte" => (vec![Bytes, Integer], Integer),
@@ -50,6 +52,9 @@ fn evaluate(n: &str, v: &[Value], budget: &mut usize) -> R<Value> {
     }
     if n == "encode" || n == "decode" {
         return codec(n, v, budget);
+    }
+    if matches!(n, "convert_to" | "convert_from") {
+        return convert(n, v, budget);
     }
     let Value::Bytes(b) = &v[0] else {
         return Err(SqlError::Type);
@@ -155,6 +160,80 @@ fn evaluate(n: &str, v: &[Value], budget: &mut usize) -> R<Value> {
         _ => Err(SqlError::Type),
     }
 }
+fn invalid_parameter(message: String) -> SqlError {
+    user_types::view_replace_error(message);
+    SqlError::InvalidParameterValue
+}
+
+fn convert(name: &str, args: &[Value], budget: &mut usize) -> R<Value> {
+    let Value::Text(encoding) = &args[1] else {
+        return Err(SqlError::Type);
+    };
+    // The PostgreSQL encoding argument is a name, with a 63-byte payload.
+    let encoding = &encoding[..encoding.floor_char_boundary(63)];
+    let from = name == "convert_from";
+    let encoding = CopyEncoding::lookup(encoding).ok_or_else(|| {
+        let role = if from { "source" } else { "destination" };
+        invalid_parameter(format!("invalid {role} encoding name \"{encoding}\""))
+    })?;
+    if !matches!(encoding.name(), "UTF8" | "SQL_ASCII") {
+        let (source, destination) = if from {
+            (encoding.name(), "UTF8")
+        } else {
+            ("UTF8", encoding.name())
+        };
+        user_types::view_replace_error(format!(
+            "encoding conversion from \"{source}\" to \"{destination}\" is not supported"
+        ));
+        return Err(SqlError::Unsupported);
+    }
+    match (from, &args[0]) {
+        (false, Value::Text(text)) => {
+            checked_utf8(text.as_bytes())?;
+            reserve(budget, text.len())?;
+            Ok(Value::Bytes(text.as_bytes().to_vec()))
+        }
+        (true, Value::Bytes(bytes)) => {
+            // SQL_ASCII copies bytes, and the resulting UTF8 text must still be valid.
+            let text = checked_utf8(bytes)?;
+            reserve(budget, text.len())?;
+            Ok(Value::Text(text.into()))
+        }
+        _ => Err(SqlError::Type),
+    }
+}
+
+fn checked_utf8(bytes: &[u8]) -> R<&str> {
+    let decoded = std::str::from_utf8(bytes);
+    let valid_end = decoded
+        .as_ref()
+        .map_or_else(|error| error.valid_up_to(), |_| bytes.len());
+    let invalid_start = bytes[..valid_end]
+        .iter()
+        .position(|byte| *byte == 0)
+        .or_else(|| decoded.as_ref().err().map(|error| error.valid_up_to()));
+    if let Some(start) = invalid_start {
+        let width = match bytes[start] {
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => 1,
+        };
+        let invalid = bytes[start..][..width.min(bytes.len() - start)]
+            .iter()
+            .map(|byte| format!("0x{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        user_types::view_replace_error(format!(
+            "invalid byte sequence for encoding \"UTF8\": {invalid}"
+        ));
+    }
+    match (decoded, invalid_start) {
+        (Ok(text), None) => Ok(text),
+        _ => Err(SqlError::CharacterNotInRepertoire),
+    }
+}
+
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 fn codec(n: &str, v: &[Value], budget: &mut usize) -> R<Value> {
     let Value::Text(format) = &v[1] else {
@@ -167,7 +246,9 @@ fn codec(n: &str, v: &[Value], budget: &mut usize) -> R<Value> {
     } else if format.eq_ignore_ascii_case("escape") {
         2
     } else {
-        return Err(SqlError::Type);
+        return Err(invalid_parameter(format!(
+            "unrecognized encoding: \"{format}\""
+        )));
     };
     if n == "decode" {
         let Value::Text(s) = &v[0] else {
@@ -175,12 +256,12 @@ fn codec(n: &str, v: &[Value], budget: &mut usize) -> R<Value> {
         };
         // Validate and count before allocating any output, including expansion.
         let mut len = 0usize;
-        decode(s.as_bytes(), format, |_| {
+        decode(s, format, |_| {
             len += 1;
         })?;
         reserve(budget, len)?;
         let mut out = Vec::with_capacity(len);
-        decode(s.as_bytes(), format, |b| out.push(b))?;
+        decode(s, format, |b| out.push(b))?;
         return Ok(Value::Bytes(out));
     }
     let Value::Bytes(b) = &v[0] else {
@@ -192,7 +273,7 @@ fn codec(n: &str, v: &[Value], budget: &mut usize) -> R<Value> {
             .len()
             .checked_add(2)
             .and_then(|n| (n / 3).checked_mul(4))
-            .and_then(|n| n.checked_add(n / 76)),
+            .and_then(|n| n.checked_add(b.len() / 57)),
         _ => b.iter().try_fold(0usize, |n, b| {
             n.checked_add(if *b == b'\\' {
                 2
@@ -227,7 +308,7 @@ fn codec(n: &str, v: &[Value], budget: &mut usize) -> R<Value> {
                         B64[((word >> (18 - 6 * i)) & 63) as usize] as char
                     });
                     col += 1;
-                    if col == 76 {
+                    if col == 76 && chunk.len() == 3 {
                         out.push('\n');
                         col = 0;
                     }
@@ -251,12 +332,16 @@ fn codec(n: &str, v: &[Value], budget: &mut usize) -> R<Value> {
     }
     Ok(Value::Text(out))
 }
-fn decode(s: &[u8], format: u8, mut emit: impl FnMut(u8)) -> R<()> {
-    let hex = |b: u8| match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(SqlError::Type),
+fn decode(input: &str, format: u8, mut emit: impl FnMut(u8)) -> R<()> {
+    let s = input.as_bytes();
+    let hex = |i: usize| match s[i] {
+        b @ b'0'..=b'9' => Ok(b - b'0'),
+        b @ b'a'..=b'f' => Ok(b - b'a' + 10),
+        b @ b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(invalid_parameter(format!(
+            "invalid hexadecimal digit: \"{}\"",
+            input[i..].chars().next().expect("hex digit")
+        ))),
     };
     let ws = |b: u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n');
     let mut i = 0;
@@ -267,10 +352,14 @@ fn decode(s: &[u8], format: u8, mut emit: impl FnMut(u8)) -> R<()> {
                     i += 1;
                     continue;
                 }
-                let a = hex(s[i])?;
-                i += 1;
-                let b = hex(*s.get(i).ok_or(SqlError::Type)?)?;
-                i += 1;
+                let a = hex(i)?;
+                if i + 1 == s.len() {
+                    return Err(invalid_parameter(
+                        "invalid hexadecimal data: odd number of digits".into(),
+                    ));
+                }
+                let b = hex(i + 1)?;
+                i += 2;
                 emit((a << 4) | b);
             }
         }
@@ -279,7 +368,7 @@ fn decode(s: &[u8], format: u8, mut emit: impl FnMut(u8)) -> R<()> {
             let mut count = 0;
             // PG18 retains the first padding width across subsequent quartets.
             let mut width = 3;
-            for b in s {
+            for (index, b) in s.iter().enumerate() {
                 if ws(*b) {
                     continue;
                 }
@@ -288,12 +377,21 @@ fn decode(s: &[u8], format: u8, mut emit: impl FnMut(u8)) -> R<()> {
                         width = match count {
                             2 => 1,
                             3 => 2,
-                            _ => return Err(SqlError::Type),
+                            _ => {
+                                return Err(invalid_parameter(
+                                    "unexpected \"=\" while decoding base64 sequence".into(),
+                                ));
+                            }
                         };
                     }
                     0
                 } else {
-                    B64.iter().position(|v| v == b).ok_or(SqlError::Type)? as u32
+                    B64.iter().position(|v| v == b).ok_or_else(|| {
+                        invalid_parameter(format!(
+                            "invalid symbol \"{}\" found while decoding base64 sequence",
+                            input[index..].chars().next().expect("base64 digit")
+                        ))
+                    })? as u32
                 };
                 word = (word << 6) | digit;
                 count += 1;
@@ -306,10 +404,17 @@ fn decode(s: &[u8], format: u8, mut emit: impl FnMut(u8)) -> R<()> {
                 }
             }
             if count != 0 {
-                return Err(SqlError::Type);
+                user_types::sql_error_hint(
+                    "Input data is missing padding, is truncated, or is otherwise corrupted.",
+                );
+                return Err(invalid_parameter("invalid base64 end sequence".into()));
             }
         }
         _ => {
+            let invalid_escape = || {
+                user_types::view_replace_error("invalid input syntax for type bytea".into());
+                SqlError::InvalidTextRepresentation
+            };
             while i < s.len() {
                 let b = s[i];
                 i += 1;
@@ -322,12 +427,12 @@ fn decode(s: &[u8], format: u8, mut emit: impl FnMut(u8)) -> R<()> {
                     i += 1;
                     continue;
                 }
-                let q = s.get(i..i + 3).ok_or(SqlError::Type)?;
+                let q = s.get(i..i + 3).ok_or_else(invalid_escape)?;
                 if !(b'0'..=b'3').contains(&q[0])
                     || !(b'0'..=b'7').contains(&q[1])
                     || !(b'0'..=b'7').contains(&q[2])
                 {
-                    return Err(SqlError::Type);
+                    return Err(invalid_escape());
                 }
                 emit(((q[0] - b'0') << 6) | ((q[1] - b'0') << 3) | (q[2] - b'0'));
                 i += 3;

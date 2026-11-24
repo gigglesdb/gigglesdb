@@ -78,14 +78,16 @@ fn binary_values_metadata_nulls_and_errors() {
     ] {
         assert_eq!(
             s.execute(&format!("SELECT {q}"), &[], None),
-            Err(CoreError::Sql(if q == "sha256(1)"
-                || q == "get_byte('\\x00'::bytea,0::bigint)"
-                || q == "btrim(''::bytea)"
-                || q == "sha512()"
-            {
-                E::UndefinedFunction
-            } else {
-                E::Type
+            Err(CoreError::Sql(match q {
+                "sha256(1)"
+                | "get_byte('\\x00'::bytea,0::bigint)"
+                | "btrim(''::bytea)"
+                | "sha512()" => E::UndefinedFunction,
+                "decode('\\777','escape')" => E::InvalidTextRepresentation,
+                "decode('a b','hex')" | "decode('a','base64')" | "decode('','bad')" => {
+                    E::InvalidParameterValue
+                }
+                _ => E::Type,
             })),
             "{q}"
         );
@@ -177,7 +179,11 @@ fn binary_review_aliases_and_codec_audit() {
     ] {
         assert_eq!(
             s.execute(&format!("SELECT {expr}"), &[], None),
-            Err(CoreError::Sql(E::Type)),
+            Err(CoreError::Sql(if expr.starts_with("decode") {
+                E::InvalidParameterValue
+            } else {
+                E::Type
+            })),
             "{expr}"
         );
     }

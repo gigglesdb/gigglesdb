@@ -87,7 +87,7 @@ pub(super) fn object(kind: Aggregate) -> bool {
     matches!(kind.base(), Aggregate::JsonObject | Aggregate::JsonbObject)
 }
 
-fn element(value: &Value, ty: &DataType, zone: SessionZone) -> R<String> {
+pub(super) fn element(value: &Value, ty: &DataType, zone: SessionZone) -> R<String> {
     let quote = |text: &str| serde_json::to_string(text).map_err(|_| SqlError::Type);
     match value {
         Value::Null => Ok("null".into()),
@@ -128,7 +128,7 @@ fn element(value: &Value, ty: &DataType, zone: SessionZone) -> R<String> {
     }
 }
 
-fn bound_element(value: &Value, scalar: &BoundScalar, zone: SessionZone) -> R<String> {
+pub(super) fn bound_element(value: &Value, scalar: &BoundScalar, zone: SessionZone) -> R<String> {
     if scalar.result_oid() == OID
         && let Value::Text(text) = value
     {

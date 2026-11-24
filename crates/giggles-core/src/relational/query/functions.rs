@@ -6,6 +6,7 @@ pub(super) mod uuid_array_operators;
 mod array_order;
 pub(super) mod collation;
 mod concat;
+mod json_array;
 mod jsonb_mutation;
 pub(in crate::relational) mod assignment;
 mod binary;
@@ -1157,6 +1158,18 @@ impl Scalar {
                             };
                             return Ok(Self::Call(variadic.into(), args));
                         }
+                        if let Some(variadic) = json_array::variadic_name(&name) {
+                            if p.word("variadic") {
+                                args.push(Self::parse_expr(p, depth + 1, aggregate_argument)?);
+                                p.punct(')')?;
+                                return Ok(Self::Call(variadic.into(), args));
+                            }
+                            if matches!(p.tokens.get(p.at), Some(Token::Word(word)) if word == "row")
+                                && p.tokens.get(p.at + 1) == Some(&Token::Symbol('('))
+                            {
+                                return Err(SqlError::Unsupported);
+                            }
+                        }
                         let previous_casts = p.privilege_casts;
                         p.privilege_casts = privilege_name(&name);
                         // regclass is an object reference only in the first sequence
@@ -1701,6 +1714,9 @@ impl Scalar {
         }
         match name {
             array_constructor::NAME => array_constructor::bind(args, None, resolve, tables, parameters),
+            name if json_array::name(name).is_some() => {
+                json_array::bind(name, args, resolve, tables, parameters)
+            }
             name if uuid_array_operators::is_quantified(name) => uuid_array_operators::bind_quantified(name, args, resolve, tables, parameters),
             plan::subquery::lazy::NAME if args.len() == 3 => {
                 Self::bind_passthrough_inputs(name, args, resolve, tables, parameters)
@@ -2633,6 +2649,9 @@ impl BoundScalar {
         }
         match &self.node {
             Node::Call(name, _) if name == "setseed" => random_uuid::VOID_OID,
+            Node::ZonedOperator(name, ..) if json_array::name(name) == Some("json_build_array") => {
+                json_aggregate::OID
+            }
             Node::Call(name, _) if matches!(name.as_str(), json_aggregate::TEXT_RESULT | json_aggregate::INPUT) => json_aggregate::OID,
             Node::Case(arms, other) => json_in_branches(arms.iter().map(|(_, value)| value).chain(other.as_deref())),
             Node::Call(name, args) if name == "coalesce" => json_in_branches(args.iter()),
@@ -2723,7 +2742,8 @@ impl BoundScalar {
     fn strong_name(&self) -> Option<&str> {
         match &self.node {
             Node::ZonedOperator(name, ..) if matches!(name.as_str(), "date_trunc" | "uuidv7") => Some(name),
-            Node::EnumSort(..) | Node::Predicate(_) | Node::ZonedOperator(..) => None,
+            Node::ZonedOperator(name, ..) => json_array::name(name),
+            Node::EnumSort(..) | Node::Predicate(_) => None,
             Node::Case(..) => Some("case"),
             Node::Call(name, _) if name == array_constructor::NAME => Some("array"),
             Node::Call(name, args) if collation::internal(name) || aggregate_order::internal(name) || name == "\0array_subscript" => args[0].strong_name(),
@@ -2746,7 +2766,8 @@ impl BoundScalar {
             Node::EnumSort(..) | Node::Predicate(_) => "?column?",
             Node::Case(..) => "case",
             Node::ZonedOperator(name, ..) if matches!(name.as_str(), "date_trunc" | "uuidv7") => name,
-            Node::CrossCompare(..) | Node::ZonedOperator(..) => "?column?",
+            Node::ZonedOperator(name, ..) => json_array::name(name).unwrap_or("?column?"),
+            Node::CrossCompare(..) => "?column?",
             Node::Param(_) => "?column?",
             Node::Domain(inner, ty) if matches!(ty.as_ref(), TypeDef::Enum { .. }) => {
                 if matches!(inner.node, Node::Column(..) | Node::Param(_)) {
@@ -2844,6 +2865,10 @@ impl BoundScalar {
                     let value = random_uuid::v7_interval(&values, zone)?;
                     charge(budget, &value)?;
                     return Ok(value);
+                }
+                if json_array::name(name).is_some() {
+                    let zone = clock.as_ref().and_then(|clock| clock.zone());
+                    return json_array::eval(name, args, &values, zone, budget);
                 }
                 arithmetic::eval_zoned(name, &values, clock.as_ref(), budget)
             }

@@ -43,7 +43,7 @@ impl CopyEncoding {
             "latin8" => "LATIN8",
             "latin9" => "LATIN9",
             "latin10" => "LATIN10",
-            "mskanji" => "SJIS",
+            "mskanji" | "win932" | "windows932" => "SJIS",
             "muleinternal" => "MULE_INTERNAL",
             "shiftjis" => "SJIS",
             "shiftjis2004" => "SHIFT_JIS_2004",
@@ -78,9 +78,9 @@ impl CopyEncoding {
             "windows1258" => "WIN1258",
             "windows866" => "WIN866",
             "windows874" => "WIN874",
-            "windows936" => "GBK",
-            "windows949" => "UHC",
-            "windows950" => "BIG5",
+            "win936" | "windows936" => "GBK",
+            "win949" | "windows949" => "UHC",
+            "win950" | "windows950" => "BIG5",
             _ => return None,
         };
         Some(Self { name, table: match name {
