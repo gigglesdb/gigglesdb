@@ -199,6 +199,13 @@ pub enum StatementKind {
         /// Command completion tag.
         tag: &'static str,
     },
+    /// Deallocate a prepared statement or all named prepared statements.
+    Deallocate {
+        /// Prepared statement name, or `None` for ALL.
+        name: Option<String>,
+    },
+    /// Discard session-local state and deallocate all named prepared statements.
+    DiscardAll,
     /// Explicit tokenization in the named domain.
     Tokenize {
         /// Domain.
@@ -213,7 +220,7 @@ pub enum StatementKind {
 /// Resolved statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedStatement {
-    /// Fixed upstream SQL for an allowlisted metadata statement.
+    /// Fixed upstream SQL for an allowlisted statement.
     pub canonical_sql: Option<&'static str>,
     /// Kind.
     pub kind: StatementKind,

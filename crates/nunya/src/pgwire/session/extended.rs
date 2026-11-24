@@ -70,7 +70,7 @@ impl Prepared {
         }
         Ok(())
     }
-    fn local(&self) -> bool {
+    pub(super) fn local(&self) -> bool {
         self.empty_query || self.plan.tokenize.is_some() || matches!(self.kind, StatementKind::SessionNoop { .. })
     }
 }
@@ -173,7 +173,12 @@ impl Session {
             return Err(failure(NyCode::NotAnalysable));
         }
         let statement = &statements[0];
-        if self.aborted && !recovery(&statement.kind) {
+        if (self.aborted && !recovery(&statement.kind))
+            || matches!(
+                statement.kind,
+                StatementKind::Deallocate { .. } | StatementKind::DiscardAll
+            )
+        {
             return Err(failure(NyCode::StatementNotAllowed));
         }
         let plan = ir::check::check(statement, &policy, &snapshot)?;

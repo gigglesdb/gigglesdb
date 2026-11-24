@@ -69,3 +69,5 @@ mod policy_fencing_live;
 
 #[path = "result_refusal.rs"]
 mod result_refusal;
+#[path = "housekeeping_live.rs"]
+mod housekeeping_live;

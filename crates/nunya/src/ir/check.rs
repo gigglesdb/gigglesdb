@@ -92,7 +92,9 @@ pub fn check(
         | StatementKind::Savepoint
         | StatementKind::ReleaseSavepoint
         | StatementKind::RollbackToSavepoint
-        | StatementKind::SessionNoop { .. } => {
+        | StatementKind::SessionNoop { .. }
+        | StatementKind::Deallocate { .. }
+        | StatementKind::DiscardAll => {
             if !stmt.uses.is_empty() || !stmt.writes.is_empty() || !stmt.outputs.is_empty() {
                 return Err(refusal(NyCode::NotAnalysable));
             }
@@ -801,6 +803,11 @@ mod tests {
             StatementKind::ReleaseSavepoint,
             StatementKind::RollbackToSavepoint,
             StatementKind::SessionNoop { tag: "SET" },
+            StatementKind::Deallocate {
+                name: Some("s1".into()),
+            },
+            StatementKind::Deallocate { name: None },
+            StatementKind::DiscardAll,
         ] {
             let mut s = stmt();
             s.kind = kind;

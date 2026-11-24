@@ -469,6 +469,27 @@ impl Session {
             {
                 return Ok(None);
             }
+            if statements.len() != 1
+                && statements.iter().any(|s| {
+                    matches!(
+                        s.kind,
+                        StatementKind::Deallocate { .. } | StatementKind::DiscardAll
+                    )
+                })
+            {
+                return Err(failure(NyCode::StatementNotAllowed));
+            }
+            let local_deallocate = match statements.first().map(|s| &s.kind) {
+                Some(StatementKind::DiscardAll) if self.status != b'I' => {
+                    return Err(failure(NyCode::StatementNotAllowed));
+                }
+                Some(StatementKind::Deallocate { name: Some(name) })
+                    if self.prepared.get(name).is_some_and(Prepared::local) =>
+                {
+                    Some(name)
+                }
+                _ => None,
+            };
             let plans = statements
                 .iter()
                 .map(|s| ir::check::check(s, &policy, &snapshot))
@@ -483,7 +504,7 @@ impl Session {
             if noops != 0 && noops != statements.len() {
                 return Err(failure(NyCode::StatementNotAllowed));
             }
-            let rewritten = if noops != 0 {
+            let rewritten = if noops != 0 || local_deallocate.is_some() {
                 String::new()
             } else if self.aborted
                 && matches!(
@@ -530,6 +551,13 @@ impl Session {
                 client.push(self.ready());
                 return Ok(Some(Actions {
                     client,
+                    ..Actions::default()
+                }));
+            }
+            if let Some(name) = local_deallocate {
+                self.prepared.remove(name);
+                return Ok(Some(Actions {
+                    client: vec![Backend::CommandComplete("DEALLOCATE".into()), self.ready()],
                     ..Actions::default()
                 }));
             }
@@ -783,12 +811,26 @@ impl Session {
                 if recovery(kind) {
                     self.aborted = false;
                 }
-                self.active.pop_front();
-                Ok(vec![Backend::CommandComplete(if commit {
+                let discard_all = matches!(kind, StatementKind::DiscardAll);
+                match kind {
+                    StatementKind::Deallocate { name: Some(name) } => {
+                        self.prepared.remove(name);
+                    }
+                    StatementKind::Deallocate { name: None } | StatementKind::DiscardAll => {
+                        self.prepared.retain(|name, _| name.is_empty());
+                    }
+                    _ => {}
+                }
+                let tag = if discard_all {
+                    self.portals.clear();
+                    "DISCARD ALL".into()
+                } else if commit {
                     "ROLLBACK".into()
                 } else {
                     tag
-                })])
+                };
+                self.active.pop_front();
+                Ok(vec![Backend::CommandComplete(tag)])
             }
             Backend::EmptyQueryResponse => {
                 if !self.waiting || !self.empty_pending || !self.active.is_empty() {
@@ -860,6 +902,8 @@ fn writes(kind: &StatementKind) -> bool {
         | StatementKind::ReleaseSavepoint
         | StatementKind::RollbackToSavepoint
         | StatementKind::SessionNoop { .. }
+        | StatementKind::Deallocate { .. }
+        | StatementKind::DiscardAll
         | StatementKind::Tokenize { .. }
         | StatementKind::Refused(_) => false,
     }
@@ -1629,6 +1673,7 @@ pub(crate) mod tests {
     include!("session/sql_error_tests.rs");
     include!("session/segment_tests.rs");
     include!("session/result_refusal_tests.rs");
+    include!("session/housekeeping_tests.rs");
     use super::*;
     use crate::value::ColumnType;
     use crate::{

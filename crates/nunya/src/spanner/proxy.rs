@@ -1135,6 +1135,8 @@ impl NunyaSpanner {
             | StatementKind::ReleaseSavepoint
             | StatementKind::RollbackToSavepoint
             | StatementKind::SessionNoop { .. }
+            | StatementKind::Deallocate { .. }
+            | StatementKind::DiscardAll
             | StatementKind::Refused(_) => return Err(denied()),
         };
         Ok((plan, names, write))
@@ -1934,6 +1936,8 @@ impl SpannerService for NunyaSpanner {
                     | StatementKind::ReleaseSavepoint
                     | StatementKind::RollbackToSavepoint
                     | StatementKind::SessionNoop { .. }
+                    | StatementKind::Deallocate { .. }
+                    | StatementKind::DiscardAll
                     | StatementKind::Refused(_) => Err(denied()),
                 }
             })())?;

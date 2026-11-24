@@ -1321,7 +1321,6 @@ fn driver_session_settings_are_exact_and_fail_closed() {
         "SET extra_float_digits = 2",
         "SET search_path = x",
         "SET ROLE x",
-        "RESET ALL",
         "SET timezone = 'Europe/London'",
         "SET client_encoding = 'LATIN1'",
         "SET datestyle = SQL",
@@ -1350,6 +1349,101 @@ fn driver_session_settings_are_exact_and_fail_closed() {
             PgLowering.lower(sql, &snapshot, &policy, &[]).unwrap()[0].kind,
             StatementKind::Savepoint
         );
+    }
+}
+
+#[test]
+fn prepared_statement_housekeeping_classification() {
+    for (sql, name) in [
+        ("DEALLOCATE x", Some("x")),
+        ("DEALLOCATE PREPARE x", Some("x")),
+        (r#"DEALLOCATE "Case Sensitive""#, Some("Case Sensitive")),
+        (r#"DEALLOCATE "ALL""#, Some("ALL")),
+        ("DEALLOCATE ALL", None),
+        ("DEALLOCATE PREPARE ALL", None),
+    ] {
+        let statement = lower(sql);
+        assert_eq!(
+            statement.kind,
+            StatementKind::Deallocate {
+                name: name.map(str::to_owned),
+            },
+            "{sql}"
+        );
+        assert_eq!(statement.canonical_sql, None, "{sql}");
+    }
+    let discard = lower("DISCARD ALL");
+    assert_eq!(discard.kind, StatementKind::DiscardAll);
+    assert_eq!(discard.canonical_sql, Some("DEALLOCATE ALL"));
+    assert_eq!(
+        lower("DISCARD PLANS").kind,
+        StatementKind::SessionNoop {
+            tag: "DISCARD PLANS"
+        }
+    );
+    for sql in ["DISCARD SEQUENCES", "DISCARD TEMP", "DISCARD TEMPORARY"] {
+        assert_eq!(
+            lower(sql).kind,
+            StatementKind::Refused(NyCode::StatementNotAllowed),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn reset_housekeeping_classification() {
+    for sql in [
+        "RESET ALL",
+        "RESET extra_float_digits",
+        "RESET application_name",
+        "RESET client_encoding",
+        "RESET TIME ZONE",
+        "RESET DateStyle",
+        "RESET intervalstyle",
+        "RESET standard_conforming_strings",
+    ] {
+        assert_eq!(
+            lower(sql).kind,
+            StatementKind::SessionNoop { tag: "RESET" },
+            "{sql}"
+        );
+    }
+    for sql in [
+        "RESET statement_timeout",
+        "RESET search_path",
+        "RESET role",
+        "SET application_name TO DEFAULT",
+    ] {
+        assert_eq!(
+            lower(sql).kind,
+            StatementKind::Refused(NyCode::StatementNotAllowed),
+            "{sql}"
+        );
+    }
+
+    // Lowering classifies each statement. The simple-query route refuses
+    // messages that mix local housekeeping with a forwarded statement.
+    let (snapshot, policy) = fixture();
+    for (sql, expected) in [
+        (
+            "RESET search_path; SELECT 1",
+            StatementKind::Refused(NyCode::StatementNotAllowed),
+        ),
+        (
+            "RESET role; SELECT 1",
+            StatementKind::Refused(NyCode::StatementNotAllowed),
+        ),
+        (
+            "RESET ALL; SELECT 1",
+            StatementKind::SessionNoop { tag: "RESET" },
+        ),
+    ] {
+        let statements = PgLowering.lower(sql, &snapshot, &policy, &[]).unwrap();
+        let [reset, select] = statements.as_slice() else {
+            panic!("expected two statements: {sql}");
+        };
+        assert_eq!(reset.kind, expected, "{sql}");
+        assert_eq!(select.kind, StatementKind::Select, "{sql}");
     }
 }
 

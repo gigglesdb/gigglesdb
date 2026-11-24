@@ -113,9 +113,15 @@ fn setting_integer(n: &p::Node) -> Option<i32> {
     }
 }
 fn session_setting(s: &p::VariableSetStmt) -> StatementKind {
+    use p::VariableSetKind::{VarReset, VarResetAll, VarSetMulti, VarSetValue};
+
     let denied = StatementKind::Refused(NyCode::StatementNotAllowed);
+    let kind = s.kind();
+    if kind == VarResetAll {
+        return StatementKind::SessionNoop { tag: "RESET" };
+    }
     let name = s.name.to_ascii_lowercase();
-    if s.kind == p::VariableSetKind::VarSetMulti as i32 && name == "transaction" {
+    if kind == VarSetMulti && name == "transaction" {
         let valid = !s.args.is_empty()
             && s.args.iter().all(|n| match n.node.as_ref() {
                 Some(NodeEnum::DefElem(d)) => match (d.defname.as_str(), d.arg.as_deref()) {
@@ -142,7 +148,7 @@ fn session_setting(s: &p::VariableSetStmt) -> StatementKind {
             denied
         };
     }
-    if s.kind != p::VariableSetKind::VarSetValue as i32 {
+    if !matches!(kind, VarSetValue | VarReset) {
         return denied;
     }
     let values = s
@@ -175,12 +181,12 @@ fn session_setting(s: &p::VariableSetStmt) -> StatementKind {
         }
         "intervalstyle" => one == Some("postgres"),
         "standard_conforming_strings" => one == Some("on"),
-        _ => false,
+        _ => return denied,
     };
-    if allowed {
-        StatementKind::SessionNoop { tag: "SET" }
-    } else {
-        denied
+    match kind {
+        VarReset => StatementKind::SessionNoop { tag: "RESET" },
+        VarSetValue if allowed => StatementKind::SessionNoop { tag: "SET" },
+        _ => denied,
     }
 }
 
@@ -309,6 +315,23 @@ impl Lowering for PgLowering {
                     _ => state.statement.kind = StatementKind::Refused(NyCode::StatementNotAllowed),
                 },
                 NodeEnum::VariableSetStmt(s) => state.statement.kind = session_setting(s),
+                NodeEnum::DeallocateStmt(s) => {
+                    state.statement.kind = StatementKind::Deallocate {
+                        name: (!s.isall).then(|| s.name.clone()),
+                    };
+                }
+                NodeEnum::DiscardStmt(s) => {
+                    state.statement.kind = match s.target() {
+                        p::DiscardMode::DiscardAll => {
+                            state.statement.canonical_sql = Some("DEALLOCATE ALL");
+                            StatementKind::DiscardAll
+                        }
+                        p::DiscardMode::DiscardPlans => StatementKind::SessionNoop {
+                            tag: "DISCARD PLANS",
+                        },
+                        _ => StatementKind::Refused(NyCode::StatementNotAllowed),
+                    };
+                }
                 NodeEnum::TransactionStmt(t) => {
                     state.statement.kind = match p::TransactionStmtKind::try_from(t.kind)
                         .map_err(|_| refuse())?
