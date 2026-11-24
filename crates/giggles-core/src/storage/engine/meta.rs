@@ -51,7 +51,8 @@ pub(crate) const TEMPORAL_INDEXES: u64 = 1 << 34;
 pub(crate) const GENERATED_COLUMNS: u64 = 1 << 36;
 pub(crate) const TEXT_SEARCH_TYPES: u64 = 1 << 37;
 pub(crate) const GIN_INDEXES: u64 = 1 << 38;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 37] = [
+pub(crate) const USER_ROUTINES: u64 = 1 << 39;
+pub(crate) const FEATURE_TABLE: [(u64, &str); 38] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -89,6 +90,7 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 37] = [
     (GENERATED_COLUMNS, "generated_columns"),
     (TEXT_SEARCH_TYPES, "text_search_types"),
     (GIN_INDEXES, "gin_indexes"),
+    (USER_ROUTINES, "user_routines"),
 ];
 #[path = "meta_range.rs"]
 mod range_local;
@@ -506,6 +508,7 @@ pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
         bits,
         0x3FFF
             | SQL_VIEWS
+            | USER_ROUTINES
             | RELATION_COMMENTS
             | REPLICATED
             | KEY_DEPENDENCY_IDENTITY

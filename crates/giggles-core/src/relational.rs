@@ -11,6 +11,10 @@ mod enum_alter;
 pub(crate) mod enum_parameters;
 pub use enum_parameters::{EnumParameter, EnumParameters};
 pub(crate) use enum_alter::{EnumScope, EnumTransaction};
+pub(crate) mod routines;
+pub(crate) mod triggers;
+pub use routines::{Routine, RoutineArgument, RoutineDiagnostic};
+pub use triggers::Trigger;
 mod comments;
 mod security_label;
 mod extensions;
@@ -431,6 +435,8 @@ pub enum SqlError {
     InvalidUseOfEscapeCharacter,
     #[serde(skip)]
     QueryCanceled,
+    #[serde(skip)]
+    RoutineDdl,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1014,9 +1020,14 @@ fn lex(s: &str) -> R<Vec<Token>> {
 const SPECIAL_OPERATOR_BYTES: &[u8] = b"~!@#%^&|`?";
 const OPERATOR_BYTES: &[u8] = b"+-*/<>=~!@#%^&|`?";
 fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
-    lex_into_at(s, out, routing, None)
+    lex_with_spans(s, out, routing, None)
 }
-fn lex_into_at(s: &str, out: &mut Vec<Token>, routing: bool, mut locations: Option<&mut Vec<usize>>) -> R<()> {
+fn lex_with_spans(
+    s: &str,
+    out: &mut Vec<Token>,
+    routing: bool,
+    mut spans: Option<&mut Vec<std::ops::Range<usize>>>,
+) -> R<()> {
     if s.len() > MAX_STATEMENT_SQL {
         return Err(SqlError::Limit);
     }
@@ -1027,8 +1038,9 @@ fn lex_into_at(s: &str, out: &mut Vec<Token>, routing: bool, mut locations: Opti
             i += 1;
             continue;
         }
+        let start_token = i;
+        let first_token = out.len();
         let c = b[i];
-        let start_location = i;
         if c == b'-' && b.get(i + 1) == Some(&b'-') {
             i += 2;
             while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
@@ -1130,33 +1142,28 @@ fn lex_into_at(s: &str, out: &mut Vec<Token>, routing: bool, mut locations: Opti
             out.push(Token::Number(number));
             i = end;
         } else if c == b'$' {
-            if b.get(i + 1) == Some(&b'$') {
-                i += 2;
-                let start = i;
-                let end = s[start..].find("$$").ok_or(SqlError::Syntax)? + start;
+            if let Some(delimiter) = dollar_delimiter(&s[i..]) {
+                let start = i + delimiter.len();
+                let end = s[start..].find(delimiter).ok_or(SqlError::Syntax)? + start;
                 if end - start > max_value_bytes() {
                     return Err(SqlError::Limit);
                 }
                 out.push(Token::String(s[start..end].into()));
-                if let Some(locations) = &mut locations { locations.push(start_location); }
-                i = end + 2;
-                if out.len() > token_limit(out, routing) {
-                    return Err(SqlError::Limit);
-                }
-                continue;
-            }
-            i += 1;
-            let start = i;
-            while i < b.len() && b[i].is_ascii_digit() {
+                i = end + delimiter.len();
+            } else {
                 i += 1;
+                let start = i;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let n = s[start..i]
+                    .parse::<usize>()
+                    .map_err(|_| SqlError::Parameters)?;
+                if n == 0 || n > MAX_PARAMS {
+                    return Err(SqlError::Parameters);
+                }
+                out.push(Token::Param(n));
             }
-            let n = s[start..i]
-                .parse::<usize>()
-                .map_err(|_| SqlError::Parameters)?;
-            if n == 0 || n > MAX_PARAMS {
-                return Err(SqlError::Parameters);
-            }
-            out.push(Token::Param(n));
         } else if b"(),;.:[]".contains(&c) {
             out.push(Token::Symbol(c as char));
             i += 1;
@@ -1182,10 +1189,6 @@ fn lex_into_at(s: &str, out: &mut Vec<Token>, routing: bool, mut locations: Opti
                 out.push(Token::Op(op.into()));
             }
             // Emit the split suffix in one pass, even for long runs of signs.
-            if let Some(locations) = &mut locations {
-                locations.push(start_location);
-                locations.extend(i..end);
-            }
             while i < end {
                 if out.len() >= token_limit(out, routing) {
                     return Err(SqlError::Limit);
@@ -1193,19 +1196,34 @@ fn lex_into_at(s: &str, out: &mut Vec<Token>, routing: bool, mut locations: Opti
                 out.push(Token::Op(char::from(b[i]).to_string()));
                 i += 1;
             }
-            if out.len() > token_limit(out, routing) {
-                return Err(SqlError::Limit);
-            }
-            continue;
         } else {
             return Err(SqlError::Unsupported);
         }
-        if let Some(locations) = &mut locations { locations.push(start_location); }
+        if let Some(spans) = spans.as_deref_mut() {
+            let count = out.len() - first_token;
+            if count != 0 {
+                let first_end = i - (count - 1);
+                spans.push(start_token..first_end);
+                spans.extend((first_end..i).map(|at| at..at + 1));
+            }
+        }
         if out.len() > token_limit(out, routing) {
             return Err(SqlError::Limit);
         }
     }
     Ok(())
+}
+fn dollar_delimiter(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix('$')?;
+    let end = rest.find('$')?;
+    let tag = &rest[..end];
+    if tag.bytes().enumerate().all(|(i, b)| {
+        b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 || (i != 0 && b.is_ascii_digit())
+    }) {
+        Some(&s[..end + 2])
+    } else {
+        None
+    }
 }
 fn token_limit(tokens: &[Token], routing: bool) -> usize {
     if wide_values() { return max_statement_tokens(); }
@@ -1254,6 +1272,8 @@ enum Statement {
     },
     SetConstraints(Vec<String>, bool),
     AlterTable(alter_table::AlterTable),
+    Routine(routines::Ddl),
+    Trigger(triggers::Ddl),
     Comment(comments::Comment),
     SecurityLabel(security_label::Label),
     Extension(extensions::Ddl),
@@ -1525,7 +1545,9 @@ impl Parser {
         }
         Ok(out)
     }
-    fn parse(&mut self) -> R<Statement> {
+    fn parse(&mut self, source: &str) -> R<Statement> {
+        if !source.is_empty() && routines::claims(&self.tokens) { return routines::parse(self, source).map(Statement::Routine); }
+        if !source.is_empty() && triggers::claims(&self.tokens) { return triggers::parse(self, source).map(Statement::Trigger); }
         if collations::claims(&self.tokens) { return collations::parse(self).map(Statement::CollationDdl); }
         if views::claims(&self.tokens) {
             return views::parse(self).map(Statement::View);
@@ -2242,7 +2264,7 @@ impl Prepared {
             Statement::Truncate { .. } | Statement::Extension(_) | Statement::Schema(_) | Statement::TypeDdl(_) | Statement::CollationDdl(_) => {
                 V2Class::Ddl
             }
-            Statement::Sequence(_) | Statement::DropTable { .. } | Statement::Comment(_) | Statement::SecurityLabel(_) | Statement::View(_) => V2Class::Ddl,
+            Statement::Sequence(_) | Statement::DropTable { .. } | Statement::Comment(_) | Statement::SecurityLabel(_) | Statement::View(_) | Statement::Routine(_) | Statement::Trigger(_) => V2Class::Ddl,
             Statement::Create { .. } => V2Class::Ddl,
             Statement::CreateIndex(_) | Statement::DropIndex(_) => V2Class::Ddl,
             Statement::AlterTable(alter) => {
@@ -2269,7 +2291,8 @@ impl Prepared {
                             | constraints::Definition::ForeignKey { .. },
                         )
                         | alter_table::Action::Validate(_)
-                        | alter_table::Action::DropConstraint(..) => (),
+                        | alter_table::Action::DropConstraint(..)
+                        | alter_table::Action::TriggerState(..) => (),
                     }
                 }
                 V2Class::Ddl
@@ -2882,6 +2905,9 @@ impl Prepared {
         state: &Relational,
         searched_description: Option<&Description>,
     ) -> R<Description> {
+        if self.requires_routine_catalog() {
+            return Ok(Description { parameters: vec![], columns: vec![], type_oids: vec![], typmods: vec![] });
+        }
         if matches!(self.command(), "INSERT" | "UPDATE" | "DELETE") && self.table().is_some_and(|n| state.view_names.contains_key(n)) { return Err(SqlError::Unsupported); }
         if matches!(self.statement.get(), Statement::Truncate { .. }) {
             self.truncate_authority_tables(state)?;
@@ -3091,6 +3117,7 @@ impl Prepared {
             }
             Statement::InsertExpressions(values) => Some(&values.name),
             Statement::AlterTable(alter) => Some(&alter.table),
+            Statement::Trigger(ddl) => Some(ddl.table()),
             Statement::Comment(comment) => Some(&comment.table),
             Statement::SecurityLabel(label) => Some(&label.table),
             Statement::CreateIndex(index) => Some(&index.table),
@@ -3275,6 +3302,8 @@ impl Prepared {
                 | Statement::Comment(_)
                 | Statement::SecurityLabel(_)
                 | Statement::View(_)
+                | Statement::Routine(_)
+                | Statement::Trigger(_)
                 | Statement::DropTable { .. }
         )
     }
@@ -3330,6 +3359,8 @@ impl Prepared {
             Statement::DropTable { .. } => "DROP TABLE",
             Statement::SetConstraints(..) => "SET CONSTRAINTS",
             Statement::AlterTable(_) => "ALTER TABLE",
+            Statement::Routine(ddl) => ddl.command(),
+            Statement::Trigger(ddl) => ddl.command(),
             Statement::Comment(_) => "COMMENT",
             Statement::SecurityLabel(_) => "SECURITY LABEL",
             Statement::View(ddl) => if ddl.query.is_some() { "CREATE VIEW" } else { "DROP VIEW" },
@@ -3710,7 +3741,7 @@ impl Prepared {
             params: BTreeSet::new(),
             relations: Vec::new(),
         };
-        match parser.parse()? {
+        match parser.parse(sql)? {
             Statement::DropTable { names, .. } => Ok(names),
             Statement::View(ddl) if ddl.query.is_none() => Ok(ddl.names),
             _ => Ok(vec![]),
@@ -3828,12 +3859,25 @@ impl Prepared {
             .collect()
     }
     pub(crate) fn parse(sql: &str, domain: u128, epoch: u64) -> R<Self> {
+        Self::parse_with_routine_catalog(sql, domain, epoch, true)
+    }
+    pub(crate) fn parse_legacy(sql: &str, domain: u128, epoch: u64) -> R<Self> {
+        Self::parse_with_routine_catalog(sql, domain, epoch, false)
+    }
+    fn parse_with_routine_catalog(sql: &str, domain: u128, epoch: u64, enabled: bool) -> R<Self> {
         assert_sql_frontend_allowed();
         take_sql_warnings();
+        routines::clear_diagnostic();
         let tokens = lex(sql)?;
         let _generated_locations = generated_columns::Locations::enter(sql, &tokens)?;
+        let tokens = if routines::claims(&tokens) || triggers::claims(&tokens) {
+            if !enabled { return Err(SqlError::Unsupported); }
+            tokens
+        } else {
+            column_collations::rewrite_into(tokens)?
+        };
         let mut p = Parser { privilege_seen: false, privilege_casts: false,
-            tokens: column_collations::rewrite_into(tokens)?,
+            tokens,
             at: 0,
             params: BTreeSet::new(),
             relations: Vec::new(),
@@ -3850,7 +3894,7 @@ impl Prepared {
                 Statement::Query(query::Query::parse(&mut p)?)
             }
         } else {
-            match p.parse() {
+            match p.parse(sql) {
                 Ok(statement) => statement,
                 Err(_)
                     if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "insert")
@@ -4185,6 +4229,7 @@ impl Relational {
         for d in self.secondary_descriptors_engine().iter().filter(|d|d.table==table_id) {ext.column_collations.remove(&d.id);}
         ext.column_collations.remove(&table_id);
         ext.constraints.remove(&table_id);
+        ext.triggers.remove(&table_id);
         ext.table_schemas.remove(&table_id);
         ext.primary_index_birth.remove(&table_id);
         ext.gin_indexes.retain(|_, index| index.table != table_id);
@@ -4696,6 +4741,14 @@ impl Relational {
                     return Err(SqlError::Unsupported);
                 }
                 alter_table::execute(self, alter, &prepared.search_path, clock, &mut cancel)?;
+            }
+            Statement::Routine(ddl) => {
+                if expected.is_some() { return Err(SqlError::Unsupported); }
+                routines::execute(self, prepared, ddl)?;
+            }
+            Statement::Trigger(ddl) => {
+                if expected.is_some() { return Err(SqlError::Unsupported); }
+                triggers::execute(self, prepared, ddl)?;
             }
             Statement::Comment(_) | Statement::SecurityLabel(_) | Statement::View(_) => return Err(SqlError::Unsupported), // v2 bridge only
             Statement::DropTable {

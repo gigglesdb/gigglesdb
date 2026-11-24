@@ -19,6 +19,9 @@ impl TableMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatalogExt {
     pub(crate) ext_version: u32,
+    // V2-only records, deliberately absent from the namespace-5 serializer.
+    pub(crate) routines: BTreeMap<u64, Routine>,
+    pub(crate) triggers: BTreeMap<u64, BTreeMap<String, Trigger>>,
     pub(crate) columns: BTreeMap<u64, ColumnExt>,
     pub(crate) constraints: BTreeMap<u64, Vec<Constraint>>,
     pub(crate) sequences: BTreeMap<u64, SequenceDef>,
@@ -69,6 +72,8 @@ impl Default for CatalogExt {
     fn default() -> Self {
         Self {
             ext_version: 1,
+            routines: BTreeMap::new(),
+            triggers: BTreeMap::new(),
             columns: BTreeMap::new(),
             constraints: BTreeMap::new(),
             sequences: BTreeMap::new(),
@@ -813,6 +818,8 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     added_enum_labels: if ext_version >= 12 { next!(EnumLabels).0 } else { BTreeMap::new() },
                     gin_indexes: BTreeMap::new(),
                     generated_columns: BTreeMap::new(),
+                    routines: BTreeMap::new(),
+                    triggers: BTreeMap::new(),
                 };
                 if ext_version != out.wire_version() {
                     return Err(de::Error::custom("noncanonical catalog extension version"));

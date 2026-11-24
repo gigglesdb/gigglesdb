@@ -2938,6 +2938,11 @@ impl Session {
     }
 
     fn authorize_full(&mut self, p: &Prepared) -> Result<(), CoreError> {
+        if matches!(p.command(), "CREATE FUNCTION" | "DROP FUNCTION" | "CREATE TRIGGER" | "DROP TRIGGER" | "ALTER TRIGGER") {
+            let result = self.authorize_routine_ddl(p);
+            if result.is_err() { self.sql.abort(); }
+            return result;
+        }
         if p.is_collation_ddl() {
             let allowed = if let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) {
                 let roles = self.service.admin.roles();
@@ -3184,6 +3189,50 @@ impl Session {
             ))
             .collect::<Vec<_>>();
         self.authorize_sequences(&implicit)?;
+        Ok(())
+    }
+    fn authorize_routine_ddl(&mut self, p: &Prepared) -> Result<(), CoreError> {
+        use giggles_core::relational::RoutineDiagnostic;
+        let failure = |message: String| CoreError::RoutineDdl(Box::new(RoutineDiagnostic {
+            sqlstate: "42501", message, detail: None, hint: None, context: None, position: None,
+        }));
+        let Role::Database { name } = self.authority_role() else { return Err(CoreError::Policy(Error::Scope)); };
+        let name = name.clone();
+        let roles = self.service.admin.roles();
+        let role = roles.get(&name).map_err(role_lookup_error)?
+            .filter(|role| self.authority_role_live(role)).ok_or(CoreError::Policy(Error::Authentication))?;
+        match p.command() {
+            "CREATE FUNCTION" | "DROP FUNCTION" => {
+                p.set_extension_owner(role.oid);
+                if role.superuser { return Ok(()); }
+                let schema = if p.command() == "CREATE FUNCTION" {
+                    let schema = self.sql.creation_schema(p)?;
+                    if !self.schema_privilege_allowed(&schema, &name, roles::SchemaPrivilege::Create)? {
+                        return Err(failure(format!("permission denied for schema {schema}")));
+                    }
+                    if p.creates_leakproof_routine() { return Err(failure("only superuser can define a leakproof function".into())); }
+                    Some(schema)
+                } else { None };
+                let metadata = self.sql.catalog_metadata()?;
+                for oid in p.routine_owners(&metadata.presentation, schema.as_deref()) {
+                    let allowed = roles.privileges_of(&name).map_err(role_lookup_error)?.iter()
+                        .any(|owner| roles.get(owner).ok().flatten().is_some_and(|role| role.oid == oid));
+                    if !allowed { return Err(failure("must be owner of function".into())); }
+                }
+            }
+            command => {
+                if role.superuser { return Ok(()); }
+                let table = p.table().ok_or(CoreError::Policy(Error::Scope))?;
+                let table = self.sql.resolve_relation_reference(table)?;
+                self.authorize_drop_schema(&table)?;
+                if !self.sql.relation_exists(&table)? { return Ok(()); }
+                let privilege = (command == "CREATE TRIGGER").then_some(roles::TablePrivilege::Trigger);
+                if !self.table_privilege_allowed(&table, &name, privilege)? {
+                    let table = table.rsplit('\0').next().unwrap_or(&table);
+                    return Err(failure(format!("permission denied for table {table}")));
+                }
+            }
+        }
         Ok(())
     }
     fn authorize_copy_sql(&mut self, sql: &str) -> Result<(), CoreError> {

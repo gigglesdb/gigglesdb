@@ -248,7 +248,7 @@ pub(super) fn missing_diagnostic(
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     tables: &[&TableDef], parameters: &[Option<DataType>],
 ) -> R<()> {
-    if let Some(routine) = name.strip_prefix(UNDEFINED_ROUTINE_PREFIX)
+    if let Some(routine) = name.strip_prefix(UNDEFINED_ROUTINE_PREFIX).map(|n| n.rsplit('\0').next().unwrap_or(n))
         && known(routine)
     {
         let types = args.iter().map(|arg| {

@@ -228,6 +228,9 @@ fn expression(tokens: Vec<Token>) -> R<Filter> {
     }
     Ok(filter)
 }
+pub(in crate::relational) fn validate_trigger_condition(tokens: &[Token]) -> R<()> {
+    expression(tokens.to_vec()).map(drop)
+}
 pub(in crate::relational) fn constraint_deparse(tokens: &[Token]) -> R<String> {
     deparse(&expression(tokens.to_vec())?)
 }

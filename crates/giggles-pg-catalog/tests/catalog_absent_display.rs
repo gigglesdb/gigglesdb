@@ -17,6 +17,9 @@ fn strict_null_and_nonnull_refusal() {
         "pg_get_function_arguments(NULL)",
         "pg_get_function_result(NULL)",
         "pg_get_function_sqlbody(NULL)",
+        "pg_get_function_arguments(1)",
+        "pg_get_function_result(1)",
+        "pg_get_functiondef(NULL)",
         "NULL::regtype::text",
         "(NULL::regprocedure)::varchar",
         "CAST(CAST(NULL AS regoperator) AS text)",
@@ -28,10 +31,7 @@ fn strict_null_and_nonnull_refusal() {
     }
     for expression in [
         "pg_get_ruledef(1,false)",
-        "pg_get_function_arguments(1)",
-        "pg_get_function_result(1)",
         "pg_get_function_sqlbody(1)",
-        "1::regprocedure::varchar",
         "1::regoperator::text",
     ] {
         assert_eq!(
@@ -54,8 +54,6 @@ fn closed_signatures_and_cast_boundary() {
         "pg_get_ruledef(1,1)",
         "pg_get_function_result('bad')",
         "other.pg_get_function_result(NULL)",
-        "pg_get_functiondef(NULL)",
-        "NULL::regprocedure",
         "NULL::regoperator",
         "NULL::other.regtype::text",
         "true::regtype::text",
@@ -68,7 +66,7 @@ fn closed_signatures_and_cast_boundary() {
     assert!(
         plan_gateway("SELECT pg_get_function_result(NULL)")
             .unwrap()
-            .is_none()
+            .is_some()
     );
     assert!(
         plan_gateway("SELECT NULL::regtype::text")
@@ -307,7 +305,7 @@ fn schema_and_binder_legacy_guards() {
     )
     .unwrap();
     assert_eq!(out.rows, vec![vec![Value::Null; 3]]);
-    assert!(out.fields.iter().all(|f| f.data_type == PgType::Oid));
+    assert_eq!(out.fields.iter().map(|f| f.data_type).collect::<Vec<_>>(), [PgType::Oid, PgType::Regproc, PgType::Oid]);
     let p = plan("SELECT pg_get_viewdef($1,$2::boolean) FROM pg_namespace n WHERE n.oid=11")
         .unwrap()
         .unwrap();

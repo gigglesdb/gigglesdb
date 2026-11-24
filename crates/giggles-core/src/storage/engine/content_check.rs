@@ -49,6 +49,9 @@ pub(crate) fn required_bits_for_catalog_key(key: &[u8]) -> Result<u64, FormatErr
     } else if key.first() == Some(&17) {
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::meta::SQL_VIEWS)
+    } else if key.first().is_some_and(|kind| matches!(*kind, catalog_codec::routines::ROUTINE | catalog_codec::routines::TRIGGER)) {
+        catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
+        Ok(super::meta::USER_ROUTINES)
     } else if key.first() == Some(&18) {
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::meta::RELATION_COMMENTS)
@@ -146,6 +149,15 @@ pub(crate) fn required_bits_for_catalog_value(
             Ok(super::meta::SECONDARY_INDEXES | if descriptor.predicate.is_some() {
                 super::meta::PARTIAL_INDEXES
             } else { 0 })
+        }
+        CatalogKind::Routine => {
+            catalog_codec::routines::decode_routine(value).map_err(corrupt)?;
+            Ok(super::meta::USER_ROUTINES)
+        }
+        CatalogKind::Trigger => {
+            let id = u64::from_be_bytes(key[1..].try_into().unwrap());
+            catalog_codec::routines::decode_trigger(value, id).map_err(corrupt)?;
+            Ok(super::meta::USER_ROUTINES)
         }
         CatalogKind::SqlView => {
             let view = catalog_codec::sql_views::decode_view(value).map_err(corrupt)?;
@@ -337,6 +349,8 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
     let mut credentials = BTreeMap::new();
     let mut labels = BTreeMap::new();
     let mut required = 0;
+    let mut routines = BTreeMap::new();
+    let mut triggers = Vec::new();
     let mut stored_roles = std::collections::BTreeSet::new();
     let mut membership_endpoints = Vec::new();
     for item in kv
@@ -367,6 +381,14 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
             CatalogKind::Role => { stored_roles.insert(user[1..user.len()-1].to_vec()); }
             CatalogKind::RoleMembership => {
                 membership_endpoints.extend(user[1..user.len()-1].split(|b| *b == 0).take(2).map(Vec::from));
+            }
+            CatalogKind::Routine => {
+                let id = u64::from_be_bytes(user[1..].try_into().unwrap());
+                routines.insert(id, catalog_codec::routines::decode_routine(value).map_err(corrupt)?);
+            }
+            CatalogKind::Trigger => {
+                let id = u64::from_be_bytes(user[1..].try_into().unwrap());
+                triggers.push(catalog_codec::routines::decode_trigger(value, id).map_err(corrupt)?);
             }
             CatalogKind::SqlView => {
                 views.insert(u64::from_be_bytes(user[1..9].try_into().unwrap()), catalog_codec::sql_views::decode_view(value).map_err(corrupt)?);
@@ -497,6 +519,9 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
     let mut parts = super::catalog::CatalogParts { sql_views: views, ..Default::default() };
     parts.tables = tables.into_iter().map(|(id, t)| (id.to_string(), t)).collect();
     parts.ext.schemas = schemas;
+    parts.ext.routines = routines;
+    parts.ext.triggers = catalog_codec::routines::by_table(triggers).map_err(corrupt)?;
+    catalog_codec::routines::validate_catalog(&parts).map_err(corrupt)?;
     catalog_codec::sql_views::validate_catalog(&parts).map_err(corrupt)?;
     if !types.is_empty() || !added_enum_labels.is_empty() {
         parts.ext.types = types;

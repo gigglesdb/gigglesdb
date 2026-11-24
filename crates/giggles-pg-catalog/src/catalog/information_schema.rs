@@ -10,6 +10,8 @@ pub(super) fn identity(name: &str) -> Option<(u32, u32)> {
         "schemata" => (13467, 13469),
         "table_constraints" => (13496, 13498),
         "tables" => (13510, 13512),
+        "triggers" => (13525, 13527),
+        "routines" => (13462, 13464),
         _ => return None,
     })
 }
@@ -17,6 +19,7 @@ pub(super) fn identity(name: &str) -> Option<(u32, u32)> {
 /// RowDescription exposes the PG18 domain base types: name for sql_identifier,
 /// int4 for cardinal_number, and varchar for character_data/yes_or_no.
 pub(super) fn schema(name: &str) -> Option<Vec<Field>> {
+    if let Some(fields) = super::routines::information_schema(name) { return Some(fields); }
     Some(fields(match name {
         "views" => &[("table_catalog", T::Name), ("table_schema", T::Name), ("table_name", T::Name),
             ("view_definition", T::Varchar), ("check_option", T::Varchar), ("is_updatable", T::Varchar),

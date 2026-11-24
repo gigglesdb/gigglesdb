@@ -22,6 +22,8 @@ pub struct CatalogView {
 #[derive(Clone, Debug, Default)]
 pub struct CatalogPresentation {
     pub epoch: u64,
+    pub routines: BTreeMap<u64, (String, Routine)>,
+    pub triggers: Vec<Trigger>,
     pub views: BTreeMap<u64, CatalogView>,
     /// Stable (table ID, column ID), with zero identifying the table itself.
     pub comments: BTreeMap<(u64, u64), String>,
@@ -38,7 +40,15 @@ impl Relational {
         self.catalog_presentation_in_path(&["public".into()])
     }
     pub(crate) fn catalog_presentation_in_path(&self, path: &[String]) -> R<CatalogPresentation> {
-        let mut out = CatalogPresentation { epoch: self.epoch, ..Default::default() };
+        let mut out = CatalogPresentation {
+            epoch: self.epoch,
+            routines: self.ext.routines.iter().map(|(&id, routine)| {
+                let schema = self.routine_schema(routine.schema).ok_or(SqlError::InvalidSchema)?;
+                Ok((id, (schema.to_owned(), routine.clone())))
+            }).collect::<R<_>>()?,
+            triggers: self.ext.triggers.values().flat_map(BTreeMap::values).cloned().collect(),
+            ..Default::default()
+        };
         out.gin_indexes.clone_from(&self.ext.gin_indexes);
         out.generated_columns.clone_from(&self.ext.generated_columns);
         let action = |a: &Action| match a {

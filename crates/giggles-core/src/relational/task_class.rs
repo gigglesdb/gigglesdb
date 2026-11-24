@@ -28,7 +28,7 @@ impl Prepared {
         }
         Prepared::parse(sql, 0, 0)
             .map(|p| p.task_class())
-            .map_err(crate::CoreError::Sql)
+            .map_err(super::routines::into_core)
     }
 
     /// The class `task::admit::admit` sees for this statement.
@@ -87,6 +87,7 @@ impl Prepared {
             | Statement::Comment(_)
             | Statement::SecurityLabel(_)
             | Statement::View(_)
+            | Statement::Routine(_) | Statement::Trigger(_)
             | Statement::DropTable { .. } => StatementClass::Ddl,
         }
     }

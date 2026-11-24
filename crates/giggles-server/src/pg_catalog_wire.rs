@@ -265,6 +265,7 @@ fn snapshot_owned(
                         C::Update => acl.push(P::Update),
                         // The authorization store intentionally shares DELETE/TRUNCATE.
                         C::Delete => acl.extend([P::Delete, P::Truncate]),
+                        C::Trigger => acl.push(P::Trigger),
                     }
                 }
                 // SQL grants have no grant option; the store models the owner as
@@ -421,7 +422,26 @@ fn snapshot_owned(
             (id, giggles_pg_catalog::GinIndexMetadata { opclasses: index.opclasses, options: index.options }),
         ))
         .unzip();
+    let (routines, triggers) = if context.identity.task { Default::default() } else {
+        let oid = |id| giggles_core::relational::type_oid(id).map_err(|_| "54000");
+        let routines = presentation.routines.into_iter().map(|(id, (schema, r))| Ok((oid(id)?,
+            giggles_pg_catalog::RoutineDef {
+                schema, name: r.name, owner: r.owner, body: r.body,
+                volatility: char::from(r.volatility), strict: r.strict, security_definer: r.security_definer,
+                leakproof: r.leakproof, parallel: char::from(r.parallel), cost: giggles_core::relational::Float4::from_bits(r.cost_bits),
+            }))).collect::<Result<_>>()?;
+        let triggers = presentation.triggers.into_iter().filter(|t| visible.contains(&t.table)).map(|t| Ok(
+            giggles_pg_catalog::TriggerDef {
+                oid: oid(t.id)?, table: t.table, routine: oid(t.routine)?, name: t.name,
+                kind: t.events | u8::from(t.row) | (u8::from(t.before) << 1),
+                enabled: char::from(t.enabled), update_columns: t.update_columns, args: t.args,
+                condition: t.when, condition_columns: t.when_columns,
+            })).collect::<Result<_>>()?;
+        (routines, triggers)
+    };
     let snapshot = giggles_pg_catalog::CatalogSnapshot {
+        routines,
+        triggers,
         schema_privileges,
         sequences,
         extensions,
@@ -594,6 +614,8 @@ fn task_filtered(
         .iter()
         .any(|table| !table.primary_key.is_empty());
     snapshot.views.clear();
+    snapshot.routines.clear();
+    snapshot.triggers.clear();
     snapshot.sequences.clear();
     snapshot.comments.retain(|(table, column), text| {
         *table == view.table && (*column == 0 || shown(column)) && !view.mentions_hidden(text)
@@ -1189,69 +1211,6 @@ pub(crate) fn description(fields: &[Field], formats: &[u16], out: &mut Vec<u8>) 
 pub(crate) fn encode(value: &Value, ty: PgType, format: u16) -> Result<Option<Vec<u8>>> {
     encode_with_settings(value, ty, format, 0, Default::default())
 }
-// PostgreSQL 18.6 names of the regproc values exposed by the catalog profile.
-fn regproc_name(oid: u32) -> Option<&'static str> {
-    Some(match oid {
-        0 => "-",
-        3 => "heap_tableam_handler",
-        330 => "bthandler",
-        331 => "hashhandler",
-        332 => "gisthandler",
-        333 => "ginhandler",
-        334 => "spghandler",
-        335 => "brinhandler",
-        101 => "eqsel",
-        102 => "neqsel",
-        103 => "scalarltsel",
-        104 => "scalargtsel",
-        105 => "eqjoinsel",
-        106 => "neqjoinsel",
-        107 => "scalarltjoinsel",
-        108 => "scalargtjoinsel",
-        336 => "scalarlesel",
-        337 => "scalargesel",
-        386 => "scalarlejoinsel",
-        398 => "scalargejoinsel",
-        3616 => "tsvector_lt",
-        3617 => "tsvector_le",
-        3618 => "tsvector_eq",
-        3619 => "tsvector_ne",
-        3620 => "tsvector_ge",
-        3621 => "tsvector_gt",
-        3625 => "tsvector_concat",
-        3634 => "ts_match_vq",
-        3635 => "ts_match_qv",
-        3662 => "tsquery_lt",
-        3663 => "tsquery_le",
-        3664 => "tsquery_eq",
-        3665 => "tsquery_ne",
-        3666 => "tsquery_ge",
-        3667 => "tsquery_gt",
-        3669 => "tsquery_and",
-        3670 => "tsquery_or",
-        3671 => "tsquery_not",
-        3686 => "tsmatchsel",
-        3687 => "tsmatchjoinsel",
-        3691 => "tsq_mcontains",
-        3692 => "tsq_mcontained",
-        3760 => "ts_match_tt",
-        3761 => "ts_match_tq",
-        5003 => "pg_catalog.tsquery_phrase",
-        5040 => "matchingsel",
-        5041 => "matchingjoinsel",
-        3717 => "prsd_start",
-        3718 => "prsd_nexttoken",
-        3719 => "prsd_end",
-        3720 => "prsd_headline",
-        3721 => "prsd_lextype",
-        3725 => "dsimple_init",
-        3726 => "dsimple_lexize",
-        13232 => "dsnowball_init",
-        13233 => "dsnowball_lexize",
-        _ => return None,
-    })
-}
-
 fn encode_with_settings(
     value: &Value,
     ty: PgType,
@@ -1336,10 +1295,15 @@ fn encode_with_settings(
                 v.to_be_bytes().to_vec()
             }
         }
+        (Value::Record(fields), PgType::Regproc | PgType::Regprocedure) => {
+            let [Value::Int(oid), Value::Text(name)] = fields.as_slice() else { return Err("42804"); };
+            let oid = u32::try_from(*oid).map_err(|_| "22003")?;
+            if format == 0 { name.as_bytes().to_vec() } else { oid.to_be_bytes().to_vec() }
+        }
         (Value::Int(v), PgType::Oid | PgType::Xid | PgType::Regproc) => {
             let v = u32::try_from(*v).map_err(|_| "22003")?;
             let regproc = if ty == PgType::Regproc {
-                Some(regproc_name(v).ok_or("0A000")?)
+                Some(giggles_pg_catalog::builtin_regproc_name(v).ok_or("0A000")?)
             } else {
                 None
             };

@@ -36,8 +36,9 @@ impl Locations {
         {
             return Ok(None);
         }
-        let mut positions = Vec::new();
-        lex_into_at(sql, &mut Vec::new(), false, Some(&mut positions))?;
+        let mut spans = Vec::new();
+        lex_with_spans(sql, &mut Vec::new(), false, Some(&mut spans))?;
+        let mut positions: Vec<_> = spans.into_iter().map(|span| span.start).collect();
         let mut next = sql.char_indices().enumerate();
         for position in &mut positions {
             if let Some((index, _)) = next.find(|(_, (offset, _))| offset == position) {

@@ -37,7 +37,11 @@ pub(super) fn scalar(
     state: &Relational,
     path: &[String],
 ) {
-    if let Scalar::Call(name, _) = s { functions::collation::resolve_name(name, state, path); functions::uuid_ossp::resolve_name(name, state, path); }
+    if let Scalar::Call(name, args) = s {
+        if args.is_empty() { functions::resolve_trigger_call(name, state, path); }
+        functions::collation::resolve_name(name, state, path);
+        functions::uuid_ossp::resolve_name(name, state, path);
+    }
     if let Scalar::Domain(_, name, target) = s {
         **target = state.resolve_type(&name.name, path).and_then(|ty| {
             ty.map(|(_, ty)| ty.clone()).ok_or_else(|| {

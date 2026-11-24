@@ -342,7 +342,7 @@ impl SqlSession {
     ) -> Result<relational::Prepared, CoreError> {
         relational::assert_sql_frontend_allowed();
         let result = relational::Prepared::parse(sql, u128::from_be_bytes(db.meta.domain), 0)
-            .map_err(CoreError::Sql)
+            .map_err(relational::routines::into_core)
             .and_then(|mut p| {
                 if self.aborted && !p.allows_aborted_transaction() {
                     return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -1335,7 +1335,7 @@ impl SqlSession {
                 V2Class::Refused(feature) => Err(unsupported(feature)),
             }
         })();
-        let result = result.map_err(|error| {
+        let result = result.map_err(relational::routines::promote).map_err(|error| {
             if p.schema_ddl().is_some_and(|(_, _, create)| create)
                 && error == CoreError::Sql(E::DuplicateObject)
             {

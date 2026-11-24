@@ -81,6 +81,8 @@ pub(crate) struct CatalogView {
     pub(crate) comments: BTreeMap<(u64, u64), String>,
     /// Kind 21 column labels: (table id, column id) -> flags (GD-0061 R3-307).
     pub(crate) column_labels: BTreeMap<(u64, u64), u8>,
+    pub(crate) routines: BTreeMap<u64, relational::Routine>,
+    pub(crate) triggers: BTreeMap<u64, relational::Trigger>,
     pub(crate) by_name: Arc<BTreeMap<String, Arc<TableEntry>>>,
     pub(crate) by_id: BTreeMap<u64, Arc<TableEntry>>,
     // The V2 codec's array marker stays available on transaction overlays.
@@ -204,6 +206,10 @@ impl CatalogView {
         parts.ext.extensions = self.extensions.clone();
         parts.ext.column_collations = self.column_collations.clone();
         parts.ext.schemas = self.schemas.clone();
+        parts.ext.routines = self.routines.clone();
+        for trigger in self.triggers.values() {
+            parts.ext.triggers.entry(trigger.table).or_default().insert(trigger.name.clone(), trigger.clone());
+        }
         if parts.ext.constraints.values().flatten().any(|c| matches!(&c.kind, crate::relational::catalog_ext::ConstraintKind::ForeignKey { deferral, .. } if *deferral != crate::relational::catalog_ext::Deferral::NotDeferrable)) {
             parts.ext.ext_version = 2;
         }
@@ -349,6 +355,8 @@ impl CatalogSnapshot {
                             .chain(table.columns.iter().map(|column| column.id))
                     })
                     .chain(self.parts.sql_views.iter().flat_map(|(id, v)| std::iter::once(*id).chain(v.columns.iter().map(|c| c.id))))
+                    .chain(self.parts.ext.routines.keys().copied())
+                    .chain(self.parts.ext.triggers.values().flat_map(|entries| entries.values().map(|t| t.id)))
                     .chain(self.parts.indexes.iter().map(|index| index.id))
                     .chain(self.parts.ext.gin_indexes.keys().copied())
                     .chain(self.parts.ext.primary_index_birth.values().copied())
@@ -1166,6 +1174,13 @@ impl Catalog {
                 1 | 4 | 17 | 18 => {
                     tables.insert(decode_id(&key[1..9]).map_err(commit_error)?);
                 }
+                catalog_codec::routines::TRIGGER => {
+                    if let Some(value) = new_records.get(key).or_else(|| old_records.get(key)) {
+                        let id = decode_id(&key[1..]).map_err(commit_error)?;
+                        let trigger = catalog_codec::routines::decode_trigger(value, id).map_err(commit_error)?;
+                        tables.insert(trigger.table);
+                    }
+                }
                 16 => {
                     if let Some(value) = new_records.get(key).or_else(|| old_records.get(key)) {
                         let descriptor =
@@ -1417,6 +1432,7 @@ impl Catalog {
             new.ext.generated_columns.remove(&column.id);
         }
         new.ext.constraints.remove(&entry.def.id);
+        new.ext.triggers.remove(&entry.def.id);
         new.ext.primary_index_birth.remove(&entry.def.id);
         new.ext.sequences.retain(|_, sequence| {
             sequence
@@ -1965,6 +1981,18 @@ fn apply_record(
     value: Option<&[u8]>,
 ) -> Result<(), CoreError> {
     match catalog_codec::classify_catalog_key(key)? {
+        CatalogKind::Routine => {
+            let id = decode_id(&key[1..])?;
+            if let Some(value) = value {
+                view.routines.insert(id, catalog_codec::routines::decode_routine(value)?);
+            } else { view.routines.remove(&id); }
+        }
+        CatalogKind::Trigger => {
+            let id = decode_id(&key[1..])?;
+            if let Some(value) = value {
+                view.triggers.insert(id, catalog_codec::routines::decode_trigger(value, id)?);
+            } else { view.triggers.remove(&id); }
+        }
         CatalogKind::SqlView => {
             let id = decode_id(&key[1..])?;
             if let Some(value) = value {
@@ -2164,8 +2192,12 @@ fn finish_view(
     let mut by_name = BTreeMap::new();
     catalog_codec::validate_comments(&view.comments, view.by_id.values().map(|entry| &entry.def), &view.sql_views)?;
     super::catalog_label_codec::validate_labels(&view.column_labels, view.by_id.values().map(|entry| &entry.def))?;
-    if !view.sql_views.is_empty() {
+    if !view.sql_views.is_empty() || !view.routines.is_empty() || !view.triggers.is_empty() {
         let parts = view.parts();
+        if parts.ext.triggers.values().map(BTreeMap::len).sum::<usize>() != view.triggers.len() {
+            return Err(corrupt("duplicate trigger name for table"));
+        }
+        catalog_codec::routines::validate_catalog(&parts)?;
         catalog_codec::sql_views::validate_catalog(&parts)?;
         object_ids(&parts)?;
     }
@@ -2336,6 +2368,10 @@ pub(super) fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)
             insert(c.id, (4, *table))?;
         }
     }
+    for &id in parts.ext.routines.keys() { insert(id, (catalog_codec::routines::ROUTINE, 0))?; }
+    for trigger in parts.ext.triggers.values().flat_map(BTreeMap::values) {
+        insert(trigger.id, (catalog_codec::routines::TRIGGER, trigger.table))?;
+    }
     for descriptor in &parts.indexes {
         insert(descriptor.id, (16, descriptor.table))?;
     }
@@ -2370,6 +2406,8 @@ struct UnchangedRecords<'a> {
     tables: BTreeSet<u64>,
     constraints: BTreeSet<u64>,
     indexes: BTreeSet<u64>,
+    routines: BTreeSet<u64>,
+    triggers: BTreeSet<u64>,
 }
 
 impl<'a> UnchangedRecords<'a> {
@@ -2443,6 +2481,23 @@ impl<'a> UnchangedRecords<'a> {
                 unchanged.indexes.insert(index.id);
             }
         }
+        for (&id, routine) in &old.ext.routines {
+            if new.ext.routines.get(&id) == Some(routine)
+                && !has_own(catalog_codec::routines::ROUTINE, id, None)
+            {
+                unchanged.routines.insert(id);
+            }
+        }
+        for (table, triggers) in &old.ext.triggers {
+            let Some(next) = new.ext.triggers.get(table) else { continue; };
+            for (name, trigger) in triggers {
+                if next.get(name) == Some(trigger)
+                    && !has_own(catalog_codec::routines::TRIGGER, trigger.id, None)
+                {
+                    unchanged.triggers.insert(trigger.id);
+                }
+            }
+        }
         unchanged
     }
 }
@@ -2464,6 +2519,7 @@ fn encode_parts(
     if !checked_old {
         catalog_codec::validate_comments(&parts.comments, parts.tables.values(), &parts.sql_views)?;
         catalog_codec::sql_views::validate_catalog(parts)?;
+        catalog_codec::routines::validate_catalog(parts)?;
         relational::catalog_ext::validate_unique_indexes(parts.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))), parts.indexes.iter()).map_err(|_| corrupt("invalid UNIQUE backing index"))?;
         relational::column_collations::validate_index_bindings(&parts.ext,&parts.indexes).map_err(|_|corrupt("invalid index collation binding"))?;
     }
@@ -2473,6 +2529,16 @@ fn encode_parts(
         super::catalog_label_codec::validate_labels(&parts.column_labels, parts.tables.values())?;
     }
     let mut records = BTreeMap::new();
+    for (&id, routine) in &parts.ext.routines {
+        if !unchanged.routines.contains(&id) {
+            records.insert(catalog_codec::routines::routine_key(id), catalog_codec::routines::encode_routine(routine)?);
+        }
+    }
+    for trigger in parts.ext.triggers.values().flat_map(BTreeMap::values) {
+        if !unchanged.triggers.contains(&trigger.id) {
+            records.insert(catalog_codec::routines::trigger_key(trigger.id), catalog_codec::routines::encode_trigger(trigger)?);
+        }
+    }
     for (&(table, column), &flags) in &parts.column_labels {
         records.insert(
             super::catalog_label_codec::label_key(table, column),

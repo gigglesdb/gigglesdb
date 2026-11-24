@@ -173,6 +173,7 @@ pub(super) fn truncate_reference_error() {
     view_replace_error("cannot truncate a table referenced in a foreign key constraint".into());
 }
 pub(super) fn clear_sql_error_message() {
+    routines::clear_diagnostic();
     take_sql_notices();
     take_sql_diagnostic_hint();
     take_sql_diagnostic_detail();

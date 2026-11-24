@@ -106,7 +106,7 @@ impl Prepared {
         let _date_order = super::clock::LiteralDateOrder::enter(self.literal_date_order);
         if self.relations.is_empty()
             && !matches!(self.statement.get(), Statement::Plan(_))
-            && !matches!(self.statement.get(), Statement::Query(q) if q.has_domain_expression())
+            && !matches!(self.statement.get(), Statement::Query(q) if q.has_domain_expression() || !state.ext.routines.is_empty() || self.unbound_statement.is_some())
         {
             return Ok(self.clone());
         }
@@ -185,6 +185,7 @@ impl Prepared {
                 } else { ddl.names.iter_mut().for_each(read); }
             }
             Statement::Comment(comment) => read(&mut comment.table),
+            Statement::Trigger(ddl) => ddl.bind_table(read),
             Statement::SecurityLabel(label) => read(&mut label.table),
             Statement::Truncate { names, .. } | Statement::DropTable { names, .. } => names.iter_mut().for_each(read),
             Statement::Create {

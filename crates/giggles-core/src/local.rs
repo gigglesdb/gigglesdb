@@ -85,6 +85,7 @@ pub fn failure(e: CoreError) -> Reply {
         CoreError::DuplicateSchema => 18,
         CoreError::Task(_) => 20,
         CoreError::TempFile { .. } => 21,
+        CoreError::RoutineDdl(_) => 275,
         CoreError::Sql(e) => {
             200 + match e {
                 relational::SqlError::Unsupported
@@ -185,6 +186,7 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::InvalidRegularExpression => 78,
                 relational::SqlError::InvalidUseOfEscapeCharacter => 79,
                 relational::SqlError::QueryCanceled => 77,
+                relational::SqlError::RoutineDdl => 75,
             }
         }
     };
@@ -430,5 +432,28 @@ pub fn executor(e: &Executor, input: &[u8]) -> Reply {
             Ok(OperationStatus::Decided(d)) => decision(Ok(d)),
             Err(e) => failure(e),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routine_ddl_and_index_predicate_have_distinct_reply_codes() {
+        let diagnostic = relational::RoutineDiagnostic {
+            sqlstate: "42601",
+            message: "invalid routine definition".into(),
+            detail: None,
+            hint: None,
+            context: None,
+            position: None,
+        };
+        assert_eq!(failure(CoreError::RoutineDdl(Box::new(diagnostic))).code, 275);
+        assert_eq!(failure(CoreError::Sql(relational::SqlError::RoutineDdl)).code, 275);
+        assert_eq!(
+            failure(CoreError::Sql(relational::SqlError::InvalidIndexPredicate)).code,
+            271,
+        );
     }
 }

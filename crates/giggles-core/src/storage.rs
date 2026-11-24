@@ -145,6 +145,8 @@ pub enum CoreError {
     /// Execution-time refusal to use a sequence.
     SequencePrivilege,
     Sql(relational::SqlError),
+    /// Transient routine and trigger diagnostics with PostgreSQL wire fields.
+    RoutineDdl(Box<relational::RoutineDiagnostic>),
     /// Schema DDL error outside the frozen, persisted scalar-error enum.
     DuplicateSchema,
     /// Execution-only privilege inquiry error; never persisted.
@@ -3190,7 +3192,7 @@ impl SqlSession {
                 if matches!(self.admin.inner.backend, Backend::V2(_)) {
                     metadata_plan.epoch = s.sql.image.epoch;
                 }
-                metadata_plan.describe_with_enum_parameters(&s.sql).map_err(CoreError::Sql)
+                metadata_plan.describe_with_enum_parameters(&s.sql).map_err(relational::routines::into_core)
             };
             if let Some(s) = &self.staged {
                 describe(&MetadataState::borrow(s))
@@ -3291,7 +3293,7 @@ impl SqlSession {
                     p.epoch
                 };
                 p.validate_immutable_constants_at_epoch(&s.sql, epoch)
-                    .map_err(CoreError::Sql)
+                    .map_err(relational::routines::into_core)
             };
             if let Some(s) = &self.staged {
                 describe(&MetadataState::borrow(s))
@@ -4563,20 +4565,23 @@ impl SqlSession {
         relational::assert_sql_frontend_allowed();
         let mut result = if let Some(s) = &self.staged {
             if self.aborted {
-                let p = relational::Prepared::parse(sql, s.view.domain, s.sql.epoch)
+                let p = relational::Prepared::parse_legacy(sql, s.view.domain, s.sql.epoch)
                     .map_err(CoreError::Sql)?;
                 if !p.allows_aborted_transaction() {
                     return Err(CoreError::Sql(relational::SqlError::Aborted));
                 }
                 Ok(p)
             } else {
-                relational::Prepared::parse(sql, s.view.domain, s.sql.epoch).map_err(CoreError::Sql)
+                relational::Prepared::parse_legacy(sql, s.view.domain, s.sql.epoch).map_err(CoreError::Sql)
             }
         } else {
             self.admin.inner.inspect(|s| {
-                relational::Prepared::parse(sql, s.view.domain, s.sql.epoch).map_err(CoreError::Sql)
+                relational::Prepared::parse_legacy(sql, s.view.domain, s.sql.epoch).map_err(CoreError::Sql)
             })
         };
+        if result.as_ref().is_ok_and(relational::Prepared::requires_routine_catalog) {
+            result = Err(CoreError::Sql(relational::SqlError::Unsupported));
+        }
         if let Ok(p) = &mut result {
             p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
             p.transaction = self.transaction_id;

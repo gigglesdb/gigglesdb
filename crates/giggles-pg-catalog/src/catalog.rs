@@ -1,4 +1,5 @@
 mod information_schema;
+pub(crate) mod routines;
 mod pg_tables;
 mod constraints;
 mod materialize;
@@ -731,8 +732,6 @@ pub(crate) fn pg_schema_columns(name: &str) -> Option<&'static [(&'static str, P
             ("collversion", T::Text),
             ("xmin", T::Xid),
         ],
-        // No user routines are modeled. The callable SQL registry is not a snapshot
-        // of PostgreSQL builtins; this empty relation is not a complete pg_proc.
         "pg_proc" => &[
             ("oid", T::Oid),
             ("proname", T::Name),
@@ -1440,6 +1439,7 @@ fn build_with_budget(
             }
         };
     }
+    routines::populate(snapshot, &lookup, budget, &mut all)?;
     for ext in &snapshot.extensions {
         budget.visit(1 + ext.versions.len())?;
         if let Some((oid, owner, namespace, version)) = &ext.installed {
@@ -1887,6 +1887,7 @@ fn build_with_budget(
         // Nominal descriptors needed by NULL-only catalog fields, not new SQL types.
         for (oid, name, len, kind, category, elem, array, input, receive) in [
             (2277, "anyarray", -1, "p", "P", 0, 0, 2296, 2502),
+            (2279, "trigger", 4, "p", "P", 0, 0, 2300, 0),
             (3220, "pg_lsn", 8, "b", "U", 0, 3221, 3229, 3238),
             (3221, "_pg_lsn", -1, "b", "A", 3220, 0, 750, 2400),
         ] {
@@ -2651,12 +2652,18 @@ fn build_with_budget(
     for name in ["pg_class", "pg_index", "pg_constraint"] {
         let Some(relation) = all.get_mut(name) else { continue };
         let fields = schema(name).unwrap();
+        let has_triggers: BTreeSet<_> = if name == "pg_class" {
+            snapshot.triggers.iter().map(|t| table_oid(t.table).map(i64::from)).collect::<R<_>>()?
+        } else { BTreeSet::new() };
         let positions: Vec<_> = fields.iter().map(|f| {
             relation.fields.iter().position(|old| old.name == f.name)
         }).collect();
         for row in &mut relation.rows {
             budget.rewrite(row, |row| {
                 *row = fields.iter().zip(&positions).map(|(field, position)| {
+                    if field.name == "relhastriggers" {
+                        return B(matches!(row[0], I(oid) if has_triggers.contains(&oid)));
+                    }
                     position.map_or_else(|| if field.data_type == PgType::Bool { B(false) } else { I(0) }, |i| row[i].clone())
                 }).collect();
             })?;

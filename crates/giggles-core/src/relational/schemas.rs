@@ -197,6 +197,12 @@ impl Relational {
                 .filter(|(_, ty)| ty.schema() == ddl.name)
                 .map(|(id, _)| *id)
                 .collect();
+            let schema_id = self.ext.schemas.get(&ddl.name).map_or(0, |s| s.id);
+            let routine_ids: BTreeSet<_> = self.ext.routines.iter()
+                .filter_map(|(&id, r)| (r.schema == schema_id).then_some(id)).collect();
+            if !routine_ids.is_empty() && (!ddl.cascade || ddl.name == "public") {
+                return Err(SqlError::DependentObjects);
+            }
             let extensions: Vec<_> = self.ext.extensions.iter()
                 .filter(|(_, e)| e.schema == ddl.name).map(|(n, _)| n.clone()).collect();
             let defaults = if extensions.iter().any(|n| n == "uuid-ossp") {
@@ -216,6 +222,14 @@ impl Relational {
                     user_types::sql_error_detail(format!("collation {}.{} depends on schema {}",c.schema,c.name,c.schema));
                 }
                 return Err(SqlError::DependentObjects);
+            }
+            if !routine_ids.is_empty() {
+                let ext = Arc::make_mut(&mut self.ext);
+                ext.routines.retain(|id, _| !routine_ids.contains(id));
+                ext.triggers.retain(|_, triggers| {
+                    triggers.retain(|_, t| !routine_ids.contains(&t.routine));
+                    !triggers.is_empty()
+                });
             }
             if ddl.name == "public" {
                 return Err(SqlError::Unsupported);
@@ -308,6 +322,8 @@ impl Prepared {
         self.schema_user = user;
     }
     pub(crate) fn validate_schemas(&self, state: &Relational) -> R<()> {
+        // Trigger DDL builds relation and IF EXISTS diagnostics during execution.
+        if matches!(self.statement.get(), Statement::Trigger(_)) { return Ok(()); }
         // DROP SEQUENCE validates schemas in name order during execution.
         if matches!(self.statement.get(), Statement::Sequence(defaults::SequenceDdl::Drop { .. })) {
             return Ok(());

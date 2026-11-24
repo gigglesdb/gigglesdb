@@ -18,7 +18,7 @@ pub(super) fn parameters(tokens: &[Token]) -> BTreeSet<usize> {
 
 pub(super) fn parse(tokens: &[Token], owner: &mut Parser) -> R<Prepared> {
     let mut p = parse::parser(tokens);
-    let statement = match p.parse() {
+    let statement = match p.parse("") {
         Ok(statement) => statement,
         Err(_)
             if tokens.first().is_some_and(|t| parse::word(t, "insert"))

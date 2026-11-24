@@ -16,6 +16,8 @@ mod comments_network;
 mod group_parser_network;
 #[path = "constraint_catalog_network.rs"]
 mod constraint_catalog_network;
+#[path = "trigger_catalog_network.rs"]
+mod trigger_catalog_network;
 
 
 // Single integration-test binary: every tests/*.rs file is a module here, so the

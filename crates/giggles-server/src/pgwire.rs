@@ -186,6 +186,7 @@ struct Diagnostic {
     wire_position: Option<usize>,
     wire_names: Option<giggles_core::relational::SqlErrorNames>,
     wire_exact: bool,
+    routine_hint: Option<String>,
     sql_detail: Option<String>,
     exact_sql_detail: bool,
     duplicate_key: Option<DuplicateKeyDetail>,
@@ -330,6 +331,13 @@ impl Diagnostic {
         self.wire_position = giggles_core::relational::take_sql_error_position();
         self.wire_names = giggles_core::relational::take_sql_error_names();
         use giggles_core::relational::SqlError;
+        if let Err(CoreError::RoutineDdl(diagnostic)) = &result {
+            self.wire_message = Some(diagnostic.message.clone());
+            self.wire_detail.clone_from(&diagnostic.detail);
+            self.wire_context.clone_from(&diagnostic.context);
+            self.wire_position = diagnostic.position;
+            self.routine_hint.clone_from(&diagnostic.hint);
+        }
         let postgres_diagnostic = match (&result, message.as_deref()) {
             (Err(CoreError::Sql(_)), Some(_)) if self.exact_sql_detail => true,
             (Err(CoreError::Sql(SqlError::InvalidIndexPredicate)), Some(m)) => {
@@ -687,7 +695,7 @@ fn diagnostic_error(
     }
     if let Some(context) = diagnostic.and_then(|d| d.wire_context.as_deref()) { b.push(b'W'); z(context, &mut b); }
     if let Some(hint) = registry_error.and_then(|error| error.hint.as_deref())
-        .or_else(|| diagnostic.and_then(|d| d.wire_hint.as_deref())) {
+        .or_else(|| diagnostic.and_then(|d| d.routine_hint.as_deref().or(d.wire_hint.as_deref()))) {
         b.push(b'H');
         z(hint, &mut b);
     }

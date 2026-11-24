@@ -298,7 +298,7 @@ fn walk(expression: &mut E, visit: &mut dyn FnMut(&mut E)) {
         | K::Cast(e, _)
         | K::IntegerOid(e, _)
         | K::Regclass(e)
-        | K::Regproc(e)
+        | K::Regproc(e, _)
         | K::Regoper(e)
         | K::RegisteredDisplay(e)
         | K::Member(e, _)

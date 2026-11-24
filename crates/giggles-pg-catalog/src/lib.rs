@@ -27,6 +27,7 @@
 //! General transaction IDs, timestamp functions, procedural execution,
 //! arbitrary SQL/data access, and unmodeled DataGrip discovery remain unsupported.
 mod catalog;
+pub use catalog::routines::builtin_regproc_name;
 mod timezone_abbrevs;
 /// Git revision embedded at build time, or an explicit build identifier override.
 pub const BUILD_ID: &str = env!("GIGGLES_BUILD_ID");
@@ -208,6 +209,8 @@ pub struct PreparedStatementRow {
 /// the host remains responsible for authentication, membership, and authorization.
 #[derive(Debug, Clone)]
 pub struct CatalogSnapshot {
+    pub routines: std::collections::BTreeMap<u32, RoutineDef>,
+    pub triggers: Vec<TriggerDef>,
     pub sequences: Vec<SequenceDef>,
     /// Direct role/schema CREATE and USAGE grants, projected by the host.
     pub schema_privileges: std::collections::BTreeMap<(u32, String), [bool; 2]>,
@@ -281,6 +284,8 @@ impl CatalogSnapshot {
 impl Default for CatalogSnapshot {
     fn default() -> Self {
         Self {
+            routines: Default::default(),
+            triggers: Vec::new(),
             sequences: Vec::new(),
             schema_privileges: Default::default(),
             extensions: vec![ExtensionDef::plpgsql(), ExtensionDef::uuid_ossp()],
@@ -363,10 +368,10 @@ pub enum PgType {
     Numeric,
     Float4,
     Float8,
-    /// Metadata descriptor for finite catalog handler OIDs, not a routine registry.
     Regproc,
     Regtype,
     RegtypeArray,
+    Regprocedure,
     /// Metadata descriptor only; non-NULL wire I/O is unsupported.
     PgNodeTree,
     /// Metadata descriptor only; missing-value arrays are always NULL.
@@ -411,6 +416,7 @@ impl PgType {
             Self::Regproc => 24,
             Self::Regtype => 2206,
             Self::RegtypeArray => 2211,
+            Self::Regprocedure => 2202,
             Self::PgNodeTree => 194,
             Self::AnyArray => 2277,
             Self::PgLsn => 3220,
@@ -422,7 +428,7 @@ impl PgType {
         match self {
             Self::Bool | Self::Char => 1,
             Self::Int2 => 2,
-            Self::Int4 | Self::Oid | Self::Xid | Self::Float4 | Self::Regproc | Self::Regtype => 4,
+            Self::Int4 | Self::Oid | Self::Xid | Self::Float4 | Self::Regproc | Self::Regtype | Self::Regprocedure => 4,
             Self::Int8 | Self::Float8 | Self::PgLsn | Self::TimestampTz => 8,
             Self::Name => 64,
             Self::Interval => 16,
@@ -585,6 +591,35 @@ impl ExtensionDef {
             comment: "generate universally unique identifiers (UUIDs)".into(), relocatable: true, superuser: true, trusted: true,
             schema: None, requires: vec![], installed: None }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct RoutineDef {
+    pub schema: String,
+    pub name: String,
+    pub owner: u32,
+    pub body: String,
+    pub volatility: char,
+    pub strict: bool,
+    pub security_definer: bool,
+    pub leakproof: bool,
+    pub parallel: char,
+    pub cost: giggles_pg_types::Float4,
+}
+
+#[derive(Debug, Clone)]
+pub struct TriggerDef {
+    pub oid: u32,
+    pub table: u64,
+    pub routine: u32,
+    pub name: String,
+    /// PostgreSQL's tgtype bitmask, including timing and orientation.
+    pub kind: u8,
+    pub enabled: char,
+    pub update_columns: Vec<u64>,
+    pub args: Vec<String>,
+    pub condition: Option<String>,
+    pub condition_columns: Vec<u64>,
 }
 
 /// In-memory sequence identity and owning role; no storage encoding is implied.

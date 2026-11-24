@@ -275,6 +275,7 @@ pub enum TablePrivilege {
     Insert,
     Update,
     Delete,
+    Trigger,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -599,7 +600,9 @@ impl RoleCatalog {
             let mut after = before.clone();
             let result = change(&mut after)?;
             task_only_invariants(&after)?;
-            if after.0.iter().any(|(k, v)| extended_record(k, v) || synthesized_membership(&after, k)) {
+            if after.0.iter().any(|(k, v)| extended_record(k, v) || synthesized_membership(&after, k)
+                || k.starts_with(b"tgrant/") && decode::<BTreeSet<TablePrivilege>>(v)
+                    .is_ok_and(|privileges| privileges.contains(&TablePrivilege::Trigger))) {
                 return Err(CoreError::Unsupported.into());
             }
             for key in before.0.keys().filter(|key| !after.0.contains_key(*key)) {

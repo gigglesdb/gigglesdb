@@ -420,6 +420,11 @@ impl Relational {
         {
             return paged_dml::execute(self, prepared, params, clock, sink, version_end, deferred);
         }
+        if prepared.routine_catalog_only() {
+            return self.execute_statement_inner(prepared, params, expected,
+                || crate::cancellation::check().is_err(), clock, None, &mut Vec::new())
+                .map_err(CoreError::Sql);
+        }
         let streamed_ddl = match prepared.statement.get() {
             Statement::DropIndex(_) | Statement::DropTable { .. } => true,
             Statement::AlterTable(alter) => alter.actions.iter().all(|action| {

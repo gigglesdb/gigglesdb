@@ -134,7 +134,7 @@ enum K {
     Cast(Box<E>, PgType),
     IntegerOid(Box<E>, PgType),
     Regclass(Box<E>),
-    Regproc(Box<E>),
+    Regproc(Box<E>, bool),
     Regoper(Box<E>),
     RegisteredDisplay(Box<E>),
     Case(Option<Box<E>>, Vec<(E, E)>, Box<E>),
@@ -432,12 +432,21 @@ impl Visitor for Scan {
             A::Value(_) | A::Nested(_) | A::Identifier(_) | A::CompoundIdentifier(_)
             | A::Function(_) | A::Cast { .. } | A::UnaryOp { .. } | A::BinaryOp { .. }
             | A::IsNull(_) | A::IsNotNull(_));
+        if let A::Cast { data_type, .. } = e {
+            let name = data_type.to_string().to_ascii_lowercase();
+            self.introspection |= matches!(
+                name.strip_prefix("pg_catalog.").unwrap_or(&name),
+                "regproc" | "regprocedure"
+            );
+        }
         if let A::Function(f) = e {
             self.view_definitions |= function(&f.name).is_ok_and(|n| n == "pg_get_viewdef");
             let introspection = function(&f.name).is_ok_and(|n| matches!(n.as_str(),
                 "pg_get_indexdef" | "pg_get_constraintdef" | "pg_get_expr"
                 | "pg_get_userbyid" | "format_type" | "obj_description" | "pg_collation_actual_version"
                 | "col_description" | "shobj_description" | "pg_get_viewdef"
+                | "pg_get_triggerdef" | "pg_get_functiondef" | "pg_get_function_result"
+                | "pg_get_function_arguments" | "pg_get_function_identity_arguments"
                 | "pg_has_role" | "has_table_privilege" | "has_column_privilege"
                 | "has_any_column_privilege" | "has_sequence_privilege"
                 | "has_schema_privilege" | "has_database_privilege" | "has_type_privilege"));
@@ -975,7 +984,18 @@ pub fn execute_with_startup(
         recursive_rows: BTreeMap::new(),
         introspection: introspection::Lookups::default(),
     };
-    let rows = rt.query(&plan.query, &[])?;
+    let mut rows = rt.query(&plan.query, &[])?;
+    for row in &mut rows {
+        for (field, value) in plan.query.fields.iter().zip(row) {
+            if !matches!(field.data_type, PgType::Regproc | PgType::Regprocedure) { continue; }
+            let Value::Int(oid) = value else { continue; };
+            let oid = u32::try_from(*oid).map_err(|_| Error::Type)?;
+            if field.data_type == PgType::Regprocedure || crate::builtin_regproc_name(oid).is_none() {
+                let name = catalog::routines::registered_display(snapshot, oid, field.data_type == PgType::Regprocedure);
+                *value = Value::Record(vec![Value::Int(i64::from(oid)), Value::Text(name)]);
+            }
+        }
+    }
     Ok(ResultSet {
         fields: plan.query.fields.clone(),
         rows,
@@ -2471,7 +2491,7 @@ impl Compiler {
                                 .to_ascii_lowercase()
                                 .strip_prefix("pg_catalog.")
                                 .unwrap_or(&registered.to_string().to_ascii_lowercase()),
-                            "regtype" | "regclass" | "regprocedure" | "regoperator"
+                            "regtype" | "regclass" | "regprocedure" | "regproc" | "regoperator"
                         )
                     {
                         let registered = registered.to_string().to_ascii_lowercase();
@@ -2479,6 +2499,13 @@ impl Compiler {
                             let value = self.expr(inner, schema)?;
                             return Ok(E {
                                 kind: K::Call(if registered.ends_with("regclass") { "_regclass_display" } else { "_regtype_display" }.into(), vec![value]),
+                                ty: PgType::Text,
+                            });
+                        }
+                        if registered.ends_with("regproc") || registered.ends_with("regprocedure") {
+                            let arg = self.expr(inner, schema)?;
+                            return Ok(E {
+                                kind: K::Call(if registered.ends_with("regprocedure") { "_regprocedure_display" } else { "_regproc_display" }.into(), vec![arg]),
                                 ty: PgType::Text,
                             });
                         }
@@ -2526,7 +2553,13 @@ impl Compiler {
                         (K::Call("_regnamespace".into(), vec![*e]), PgType::Name)
                     }
                     "regproc" if e.ty == PgType::Regproc => return Ok(*e),
-                    "regproc" => (K::Regproc(e), PgType::Oid),
+                    "regproc" => (K::Regproc(e, false), PgType::Regproc),
+                    "regprocedure" if e.ty == PgType::Regprocedure => return Ok(*e),
+                    "regprocedure" => (K::Regproc(e, true), PgType::Regprocedure),
+                    "text" | "varchar" if matches!(e.ty, PgType::Regproc | PgType::Regprocedure) => {
+                        let f = if e.ty == PgType::Regprocedure { "_regprocedure_display" } else { "_regproc_display" };
+                        (K::Call(f.into(), vec![*e]), PgType::Text)
+                    },
                     "regoper" => (K::Regoper(e), PgType::Oid),
                     _ => {
                         let ty = cast_type(name)?;
@@ -3331,7 +3364,7 @@ fn check_expr(e: &mut E) -> R<()> {
             Op::Eq | Op::NotEq
                 if matches!(
                     (l.ty, r.ty),
-                    (PgType::Regproc, PgType::Oid) | (PgType::Oid, PgType::Regproc)
+                    (PgType::Regproc | PgType::Regprocedure, PgType::Oid) | (PgType::Oid, PgType::Regproc | PgType::Regprocedure)
                 ) => {}
             _ => compatible(l, r)?,
         },
@@ -3414,10 +3447,13 @@ fn check_expr(e: &mut E) -> R<()> {
             }
             "pg_get_ruledef" | "pg_get_triggerdef" => {
                 expect(&mut args[0], PgType::Oid)?;
-                expect(&mut args[1], PgType::Bool)?;
+                if let Some(pretty) = args.get_mut(1) { expect(pretty, PgType::Bool)?; }
             }
-            "pg_get_function_arguments" | "pg_get_function_result" | "pg_get_function_sqlbody" => {
-                expect(&mut args[0], PgType::Oid)?;
+            "pg_get_function_arguments" | "pg_get_function_identity_arguments" | "pg_get_functiondef"
+                | "pg_get_function_result" | "pg_get_function_sqlbody" => {
+                if !matches!(args[0].ty, PgType::Regproc | PgType::Regprocedure) {
+                    expect(&mut args[0], PgType::Oid)?;
+                }
             }
             "split_part" => {
                 expect(&mut args[0], PgType::Text)?;
@@ -3571,8 +3607,9 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         ("pg_get_statisticsobjdef_columns", 1) => PgType::Text,
         ("pg_get_indexdef", 1 | 3) => PgType::Text,
         ("pg_get_constraintdef", 1 | 2) => PgType::Text,
-        ("pg_get_viewdef", 1 | 2) | ("pg_get_ruledef" | "pg_get_triggerdef" | "encode", 2)
-        | ("pg_get_function_arguments" | "pg_get_function_result" | "pg_get_function_sqlbody", 1) => {
+        ("pg_get_viewdef" | "pg_get_triggerdef", 1 | 2) | ("pg_get_ruledef" | "encode", 2)
+        | ("pg_get_function_arguments" | "pg_get_function_identity_arguments" | "pg_get_functiondef"
+           | "pg_get_function_result" | "pg_get_function_sqlbody", 1) => {
             PgType::Text
         }
         ("pg_indexam_has_property", 2) | ("pg_relation_is_publishable", 1) => PgType::Bool,
@@ -3626,7 +3663,7 @@ fn children(e: &E) -> Vec<&E> {
         | K::Cast(a, _)
         | K::IntegerOid(a, _)
         | K::Regclass(a)
-        | K::Regproc(a)
+        | K::Regproc(a, _)
         | K::Regoper(a)
         | K::RegisteredDisplay(a)
         | K::Member(a, _)
@@ -4380,10 +4417,11 @@ impl Runtime<'_> {
                 I(i) => I(i),
                 _ => return Err(Error::Type),
             },
-            K::Regproc(e) => match ev(e)? {
+            K::Regproc(e, procedure) => match ev(e)? {
                 N => N,
-                S(s) if s == "pg_catalog.array_in" || s == "array_in" => I(750),
-                _ => return Err(Error::Unsupported),
+                S(s) => I(i64::from(catalog::routines::registered_oid(self.snapshot, &s, *procedure)?)),
+                I(oid) => I(i64::from(u32::try_from(oid).map_err(|_| Error::Type)?)),
+                _ => return Err(Error::Type),
             },
             K::RegisteredDisplay(e) => match ev(e)? {
                 N => N,
@@ -5353,11 +5391,26 @@ impl Runtime<'_> {
                     None => N,
                 }
             }
-            "pg_get_ruledef"
-            | "pg_get_triggerdef"
-            | "pg_get_function_arguments"
-            | "pg_get_function_result"
-            | "pg_get_function_sqlbody" => return Err(Error::Unsupported),
+            "pg_get_triggerdef" => {
+                let oid = u32::try_from(integer(v[0].clone())?).map_err(|_| Error::Type)?;
+                catalog::routines::trigger_definition(self.snapshot, oid, v.get(1) == Some(&B(true)))?.map_or(N, S)
+            }
+            "pg_get_functiondef" | "pg_get_function_arguments" | "pg_get_function_identity_arguments"
+            | "pg_get_function_result" | "pg_get_function_sqlbody" => {
+                let oid = u32::try_from(integer(v[0].clone())?).map_err(|_| Error::Type)?;
+                match self.snapshot.routines.get(&oid) {
+                    Some(r) if n == "pg_get_functiondef" => S(catalog::routines::function_definition(r)),
+                    Some(_) if n == "pg_get_function_result" => S("trigger".into()),
+                    Some(_) if n != "pg_get_function_sqlbody" => S(String::new()),
+                    None if n == "pg_get_function_sqlbody" => return Err(Error::Unsupported),
+                    _ => N,
+                }
+            }
+            "_regproc_display" | "_regprocedure_display" => {
+                let oid = u32::try_from(integer(v[0].clone())?).map_err(|_| Error::Type)?;
+                S(catalog::routines::registered_display(self.snapshot, oid, n == "_regprocedure_display"))
+            }
+            "pg_get_ruledef" => return Err(Error::Unsupported),
             "chr" => S(char::from_u32(
                 u32::try_from(integer(v[0].clone())?).map_err(|_| Error::Type)?,
             )

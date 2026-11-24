@@ -9,6 +9,8 @@ mod constraint_metadata;
 // by exact test name (current_exe) stay separate [[test]] targets in Cargo.toml.
 #[path = "catalog_absent_display.rs"]
 mod catalog_absent_display;
+#[path = "routine_trigger_catalog.rs"]
+mod routine_trigger_catalog;
 #[path = "catalog_array_expansion.rs"]
 mod catalog_array_expansion;
 #[path = "catalog_description_state.rs"]

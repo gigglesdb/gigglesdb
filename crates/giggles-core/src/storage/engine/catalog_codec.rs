@@ -1,6 +1,8 @@
 //! Frozen v2 catalog wire types. Field and variant order are persisted format.
 #[path = "catalog_view_codec.rs"]
 pub(crate) mod sql_views;
+#[path = "catalog_routine_codec.rs"]
+pub(crate) mod routines;
 use super::catalog::TableEntry;
 use crate::{
     CoreError,
@@ -941,6 +943,8 @@ pub(crate) enum CatalogKind {
     Extensions,
     Index,
     SqlView,
+    Routine,
+    Trigger,
     RelationComment,
     Task,
     /// Kind 24: task credential, key 24 | task | credential (GD-0061 R3-1301).
@@ -983,6 +987,8 @@ pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError>
             CatalogKind::TaskCredential
         }
         Some(16) if key.len() == 9 => CatalogKind::Index,
+        Some(&routines::ROUTINE) if key.len() == 9 && key[1..] != [0; 8] => CatalogKind::Routine,
+        Some(&routines::TRIGGER) if key.len() == 9 && key[1..] != [0; 8] => CatalogKind::Trigger,
         Some(17) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::SqlView,
         Some(18) if key.len() == 17 && key[1..9] != [0; 8] => CatalogKind::RelationComment,
         Some(19) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::Task,

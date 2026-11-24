@@ -351,7 +351,7 @@ impl Parser {
             } else {
                 !matches!(
                     p.as_str(),
-                    "select" | "insert" | "update" | "delete" | "truncate" | "all"
+                    "select" | "insert" | "update" | "delete" | "truncate" | "trigger" | "all"
                 )
             }
         }) {
@@ -817,9 +817,11 @@ pub(crate) fn execute(
                 ("update", TablePrivilege::Update),
                 ("delete", TablePrivilege::Delete),
                 ("truncate", TablePrivilege::Delete),
+                ("trigger", TablePrivilege::Trigger),
             ]
             .into_iter()
-            .filter(|(s, _)| all || privileges.iter().any(|p| p == s))
+            // Preserve the existing ALL expansion, including on Legacy.
+            .filter(|(s, _)| (all && *s != "trigger") || privileges.iter().any(|p| p == s))
             .map(|(_, p)| p)
             .collect();
             let sp: Vec<_> = [

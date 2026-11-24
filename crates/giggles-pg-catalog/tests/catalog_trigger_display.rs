@@ -78,6 +78,7 @@ fn strict_null_signatures_and_refusals() {
         "encode(NULL,NULL)",
         "pg_get_triggerdef(NULL,true)",
         "pg_get_triggerdef(1,NULL)",
+        "pg_get_triggerdef(1)",
     ] {
         assert_eq!(
             run(&format!("SELECT {expression}{SOURCE}"), &[])
@@ -110,7 +111,6 @@ fn strict_null_signatures_and_refusals() {
         "encode(NULL,NULL,NULL)",
         "encode(true,'escape')",
         "encode(NULL,true)",
-        "pg_get_triggerdef(1)",
         "pg_get_triggerdef(1,true,false)",
         "pg_get_triggerdef(true,true)",
         "pg_get_triggerdef(1,1)",
@@ -123,13 +123,8 @@ fn strict_null_signatures_and_refusals() {
             "{expression}"
         );
     }
-    for expression in ["encode(NULL,'escape')", "pg_get_triggerdef(NULL,true)"] {
-        assert!(
-            plan_gateway(&format!("SELECT {expression}"))
-                .unwrap()
-                .is_none()
-        );
-    }
+    assert!(plan_gateway("SELECT encode(NULL,'escape')").unwrap().is_none());
+    assert!(plan_gateway("SELECT pg_get_triggerdef(NULL,true)").unwrap().is_some());
     let p = plan(&format!("SELECT pg_get_triggerdef($1,$2){SOURCE}"))
         .unwrap()
         .unwrap();
@@ -151,8 +146,8 @@ fn strict_null_signatures_and_refusals() {
             &CatalogSnapshot::default(),
             &[Value::Int(1), Value::Bool(true)]
         )
-        .unwrap_err(),
-        Error::Unsupported
+        .unwrap().rows,
+        vec![vec![Value::Null]]
     );
     assert!(plan("DELETE FROM pg_trigger").is_err());
     assert!(

@@ -100,6 +100,26 @@ pub(super) const CAST_TYPMOD: &str = "\0cast:typmod";
 const UNDEFINED_ROUTINE_PREFIX: &str = "public.\0";
 const PG_TOAST_ROUTINE_PREFIX: &str = "pg_toast.\0";
 const INVALID_SCHEMA_ROUTINE_PREFIX: &str = "schema.\0";
+const TRIGGER_CALL_PREFIX: &str = "\0trigger-call:";
+
+pub(super) fn resolve_trigger_call(name: &mut String, state: &Relational, path: &[String]) {
+    if state.ext.routines.is_empty() { return; }
+    let (schema, routine) = if let Some(raw) = name.strip_prefix(UNDEFINED_ROUTINE_PREFIX)
+        .or_else(|| name.strip_prefix(INVALID_SCHEMA_ROUTINE_PREFIX))
+    {
+        raw.split_once('\0').map_or((None, raw), |(s, r)| (Some(s.to_owned()), r))
+    } else { return; };
+    let target = crate::relational::routines::Name { schema, name: routine.into() };
+    if let Some((_, def)) = state.find_routine(&target, path) {
+        *name = format!("{TRIGGER_CALL_PREFIX}{}", def.name);
+    }
+}
+fn trigger_call_error(name: &str) -> Option<SqlError> {
+    let name = name.strip_prefix(TRIGGER_CALL_PREFIX)?;
+    let mut diagnostic = crate::relational::RoutineDiagnostic::new("0A000", "trigger functions can only be called as triggers");
+    diagnostic.context = Some(crate::relational::routines::compile_context(name));
+    Some(diagnostic.error())
+}
 fn privilege_name(name: &str) -> bool {
     matches!(name, "pg_has_role" | "has_table_privilege" | "has_schema_privilege"
         | "has_column_privilege" | "has_any_column_privilege" | "has_database_privilege"
@@ -1001,7 +1021,8 @@ impl Scalar {
                     } else if name == "pg_catalog" && random_uuid::known(&routine) {
                         (format!("pg_catalog.{routine}"), quoted)
                     } else {
-                        (format!("{prefix}{routine}"), quoted)
+                        if prefix.is_empty() { (routine, quoted) }
+                        else { (format!("{prefix}{name}\0{routine}"), quoted) }
                     }
                 } else if uuid_ossp::known(&name) {
                     (format!("\0uuid-ossp:{name}"), quoted)
@@ -1641,6 +1662,9 @@ impl Scalar {
         tables: &[&TableDef],
         parameters: &[Option<DataType>],
     ) -> R<BoundScalar> {
+        if args.is_empty() && let Some(error) = trigger_call_error(name) {
+            return Err(error);
+        }
         match name {
             array_constructor::NAME => array_constructor::bind(args, None, resolve, tables, parameters),
             name if uuid_array_operators::is_quantified(name) => uuid_array_operators::bind_quantified(name, args, resolve, tables, parameters),
@@ -3636,6 +3660,12 @@ impl Scalar {
         resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
         tables: &[&TableDef],
     ) -> R<()> {
+        if let Self::Call(name, args) = self
+            && args.is_empty()
+            && let Some(error) = trigger_call_error(name)
+        {
+            return Err(error);
+        }
         match self {
             Self::Predicate(filter) => filter.infer(parameters, resolve, tables)?,
             Self::Case(case) => {

@@ -397,7 +397,26 @@ fn name_subscripts_use_zero_based_padded_bytes() {
 #[test]
 fn pg_dump_language_inventory() {
     let r=run("SELECT tableoid,oid,lanname,lanpltrusted,lanplcallfoid,laninline,lanvalidator,lanacl,acldefault('l',lanowner) AS acldefault,lanowner FROM pg_language WHERE lanispl ORDER BY oid").unwrap();
-    assert!(r.rows.is_empty());
+    // PostgreSQL 18.6 exposes plpgsql by default. The fixture's bootstrap
+    // role is named giggles and retains the PostgreSQL owner OID.
+    assert_eq!(
+        r.rows,
+        vec![vec![
+            Value::Int(2612),
+            Value::Int(13647),
+            Value::Text("plpgsql".into()),
+            Value::Bool(true),
+            Value::Int(13644),
+            Value::Int(13645),
+            Value::Int(13646),
+            Value::Null,
+            Value::Array(vec![
+                Value::Text("=U/giggles".into()),
+                Value::Text("giggles=U/giggles".into()),
+            ]),
+            Value::Int(10),
+        ]]
+    );
 }
 
 #[test]

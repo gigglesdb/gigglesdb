@@ -36,6 +36,7 @@ pub use storage::Executor;
 pub mod local;
 pub mod operations;
 pub mod relational;
+pub(crate) mod plpgsql;
 pub mod task;
 pub use task::release::{ReleaseTag, Released, Unreleased};
 

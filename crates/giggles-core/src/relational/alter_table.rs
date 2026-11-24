@@ -40,6 +40,7 @@ pub(super) enum Action {
     Constraint(constraints::Definition),
     Validate(String),
     DropConstraint(String, bool, bool),
+    TriggerState(triggers::Target, u8),
 }
 #[derive(Debug, Clone, Default)]
 pub(super) struct AddConstraints {
@@ -88,7 +89,10 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
         if p.at == p.tokens.len() || matches!(p.tokens.get(p.at), Some(Token::Symbol(';'))) {
             return Err(SqlError::Syntax);
         }
-        let action = if p.word("add") {
+        let action = if matches!(p.tokens.get(p.at), Some(Token::Word(word)) if matches!(word.as_str(), "enable" | "disable")) {
+            let (target, enabled) = triggers::parse_state(p)?;
+            Action::TriggerState(target, enabled)
+        } else if p.word("add") {
             let constraint = if p.word("constraint") {
                 Some(raw_name(p)?)
             } else {
@@ -463,6 +467,7 @@ pub(super) fn execute(
             .ok_or(SqlError::UnknownTable)?
             .clone();
         match action {
+            Action::TriggerState(target, enabled) => triggers::set_enabled(&mut candidate, &table, target, *enabled)?,
             Action::PrimaryKey(explicit, columns) => constraint_primary_key::add(
                 &mut candidate,
                 &table,
@@ -747,6 +752,7 @@ pub(super) fn execute(
                     Err(SqlError::UnknownColumn) if *optional => continue,
                     Err(error) => return Err(error),
                 };
+                triggers::drop_column(&mut candidate, &table, &table.columns[at], *cascade)?;
                 let id = table.columns[at].id;
                 let dependents = generated_columns::dependent_columns(&candidate, &table, id);
                 views::drop_column_views(
@@ -817,6 +823,7 @@ pub(super) fn execute(
                     return Err(SqlError::DuplicateColumn);
                 }
                 generated_columns::rename_reference(&mut candidate, &table, &table.columns[at], new)?;
+                triggers::rename_when_column(&mut candidate, table.id, &table.columns[at], new)?;
                 table.columns[at].name = new.clone();
                 std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(), table.clone());
             }

@@ -9,6 +9,12 @@ mod aggregate_filter;
 mod aggregate_order;
 mod functions;
 pub(super) use functions::{quoting::quote_identifier, random_uuid};
+
+pub(super) fn known_zero_argument_function(name: &str) -> bool {
+    user_types::probe_preserving_error_message(|| {
+        Scalar::Call(name.to_owned(), vec![]).bind(&|_, _| Err(SqlError::UnknownColumn), &[], &[])
+    }).is_ok()
+}
 pub(super) mod plan;
 pub(super) mod typed_read;
 pub(super) use functions::assignment;
@@ -7239,6 +7245,7 @@ pub(super) use generated::{
 pub(super) use constraints::{
     constraint_check, constraint_columns, constraint_deparse, constraint_eval, constraint_key,
     constraint_key_supported, constraint_quote, constraint_shape, constraint_types_compatible,
+    validate_trigger_condition,
     constraint_validate,
 };
 

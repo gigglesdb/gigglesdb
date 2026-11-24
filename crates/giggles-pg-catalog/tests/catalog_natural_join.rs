@@ -157,12 +157,7 @@ fn exact_full_routines_replay() {
             out.rows
         );
     }
-    for relation in ["pg_proc", "pg_language"] {
-        assert!(
-            run(&format!("SELECT * FROM {relation}"))
-                .unwrap()
-                .rows
-                .is_empty()
-        );
-    }
+    assert!(run("SELECT * FROM pg_proc").unwrap().rows.is_empty());
+    assert_eq!(run("SELECT lanname FROM pg_language ORDER BY oid").unwrap().rows,
+        ["internal", "c", "sql", "plpgsql"].map(|name| vec![Value::Text(name.into())]));
 }

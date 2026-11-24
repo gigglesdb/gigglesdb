@@ -179,9 +179,9 @@ fn feature_positions_and_validation() {
     assert_eq!(
         FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit),
         0x1FFFF | KEY_DEPENDENCY_IDENTITY | RANGES | WIDE_ONCE_RECEIPTS | TASK_CATALOG | PROTECTED_RECORDS | WRITE_FENCE | USER_COLLATIONS | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS | ROLE_MEMBERSHIP | WIDE_ROWS
-            | ENUM_ARRAY_COLUMNS | ENUM_LABEL_IDENTITIES | UUID_ARRAY_COLUMNS | WIDE_CATALOG | PARTIAL_INDEXES | TEMPORAL_INDEXES | GENERATED_COLUMNS | TEXT_SEARCH_TYPES | GIN_INDEXES
+            | ENUM_ARRAY_COLUMNS | ENUM_LABEL_IDENTITIES | UUID_ARRAY_COLUMNS | WIDE_CATALOG | PARTIAL_INDEXES | TEMPORAL_INDEXES | GENERATED_COLUMNS | TEXT_SEARCH_TYPES | GIN_INDEXES | USER_ROUTINES
     );
-    assert_eq!(FEATURE_TABLE.len(), 37);
+    assert_eq!(FEATURE_TABLE.len(), 38);
     assert_eq!(FEATURE_TABLE[30], (UUID_ARRAY_COLUMNS, "uuid_array_columns"));
     assert_eq!(TEXT_SEARCH_TYPES, 1 << 37);
     assert!(check_features(TEXT_SEARCH_TYPES).is_ok());
@@ -189,6 +189,9 @@ fn feature_positions_and_validation() {
         check_features_allowed(TEXT_SEARCH_TYPES, u64::from(u32::MAX) | UUID_ARRAY_COLUMNS),
         Err(FormatError::Unsupported(_)),
     ));
+    assert_eq!(FEATURE_TABLE[37], (USER_ROUTINES, "user_routines"));
+    assert_eq!(USER_ROUTINES, 1 << 39);
+    check_features(USER_ROUTINES).unwrap();
     assert_eq!(UUID_ARRAY_COLUMNS, 1 << 32);
     assert!(check_features(UUID_ARRAY_COLUMNS).is_ok());
     assert!(matches!(
