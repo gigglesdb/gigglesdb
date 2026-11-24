@@ -193,7 +193,7 @@ fn rename_rewrites_keys_indexes_defaults_and_reopens_the_existing_format() {
 }
 
 #[test]
-fn rename_rejects_a_dependent_check_atomically() {
+fn rename_updates_enum_literals_in_a_dependent_check() {
     let mut state = Relational::default();
     run(&mut state, "CREATE TYPE phase AS ENUM ('todo','done')").unwrap();
     run(
@@ -202,11 +202,12 @@ fn rename_rejects_a_dependent_check_atomically() {
     )
     .unwrap();
     run(&mut state, "INSERT INTO jobs VALUES ('todo')").unwrap();
+    run(&mut state, "ALTER TYPE phase RENAME VALUE 'done' TO 'closed'").unwrap();
     fail(
         &mut state,
-        "ALTER TYPE phase RENAME VALUE 'done' TO 'closed'",
-        SqlError::Unsupported,
-        "cannot rename enum value with a dependent CHECK constraint",
+        "INSERT INTO jobs VALUES ('closed')",
+        SqlError::CheckViolation,
+        "new row for relation \"jobs\" violates check constraint \"jobs_s_check\"",
     );
 }
 

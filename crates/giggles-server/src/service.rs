@@ -2767,6 +2767,20 @@ impl Session {
         }).unwrap_or(false)
     }
 
+    pub(crate) fn can_show_written_check_row(
+        &mut self,
+        detail: &giggles_core::relational::DuplicateKeyDetail,
+    ) -> bool {
+        let table = giggles_core::relational::relation_key(&detail.schema, &detail.table);
+        self.authority_scope(|session| {
+            let Role::Database { name } = session.authority_role() else { return Ok(false) };
+            let Some(authority) = session.sql.table_authority_snapshot(&table, detail.table_id)
+                .map_err(role_lookup_error)? else { return Ok(false) };
+            authority.roles.with_role(name, |role| role.is_some_and(|role| session.authority_role_live(role)))
+                .map_err(role_lookup_error)
+        }).unwrap_or(false)
+    }
+
     fn duplicate_key_select_allowed(
         &self,
         name: &str,
@@ -3793,8 +3807,9 @@ impl Session {
         });
         if self.surface == Surface::Native {
             relational::retain_sql_duplicate_key_detail(|detail|
-                matches!(result, Err(CoreError::Sql(relational::SqlError::Duplicate)))
-                    && self.can_read_duplicate_key(detail));
+                matches!(result, Err(CoreError::Sql(
+                    relational::SqlError::Duplicate | relational::SqlError::CheckViolation,
+                ))) && self.can_read_duplicate_key(detail));
         }
         result
     }

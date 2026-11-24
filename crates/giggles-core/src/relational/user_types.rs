@@ -2,7 +2,7 @@
 pub use super::catalog_ext::TypeDef;
 use super::*;
 
-/// Key values are supplied to a trusted consumer, which must authorize their disclosure.
+/// Row diagnostics are supplied to a trusted consumer, which must authorize disclosure.
 pub struct DuplicateKeyDetail {
     pub table_id: u64,
     pub schema: String,
@@ -16,6 +16,7 @@ pub enum SqlErrorDetail {
     /// Preserve the detail field exactly, including its absence.
     Exact(Option<String>),
     DuplicateKey(DuplicateKeyDetail),
+    FailingCheckRow { row: DuplicateKeyDetail, written: Option<String> },
     ForeignKey { key: DuplicateKeyDetail, redacted: String },
 }
 
@@ -57,7 +58,9 @@ pub fn take_sql_error_detail() -> Option<String> {
     take_sql_diagnostic_detail().and_then(|detail| match detail {
         SqlErrorDetail::Text(text) => Some(text),
         SqlErrorDetail::Exact(detail) => detail,
-        SqlErrorDetail::DuplicateKey(detail) | SqlErrorDetail::ForeignKey { key: detail, .. } => Some(detail.values),
+        SqlErrorDetail::DuplicateKey(detail)
+        | SqlErrorDetail::FailingCheckRow { row: detail, .. }
+        | SqlErrorDetail::ForeignKey { key: detail, .. } => Some(detail.values),
     })
 }
 pub fn take_sql_diagnostic_detail() -> Option<SqlErrorDetail> {
@@ -67,7 +70,8 @@ pub fn take_sql_diagnostic_detail() -> Option<SqlErrorDetail> {
 pub fn retain_sql_duplicate_key_detail(allowed: impl FnOnce(&DuplicateKeyDetail) -> bool) {
     let detail = take_sql_diagnostic_detail();
     let key = match &detail {
-        Some(SqlErrorDetail::DuplicateKey(key) | SqlErrorDetail::ForeignKey { key, .. }) => Some(key),
+        Some(SqlErrorDetail::DuplicateKey(key) | SqlErrorDetail::FailingCheckRow { row: key, .. }
+            | SqlErrorDetail::ForeignKey { key, .. }) => Some(key),
         _ => None,
     };
     let detail = if key.is_none_or(allowed) {
@@ -82,6 +86,9 @@ pub fn retain_sql_duplicate_key_detail(allowed: impl FnOnce(&DuplicateKeyDetail)
 
 pub(super) fn sql_duplicate_key_detail(detail: DuplicateKeyDetail) {
     SQL_ERROR_DETAIL.with(|v| *v.borrow_mut() = Some(SqlErrorDetail::DuplicateKey(detail)));
+}
+pub(super) fn sql_failing_check_detail(row: DuplicateKeyDetail, written: Option<String>) {
+    SQL_ERROR_DETAIL.with(|v| *v.borrow_mut() = Some(SqlErrorDetail::FailingCheckRow { row, written }));
 }
 pub(super) fn sql_foreign_key_detail(key: DuplicateKeyDetail, redacted: String) {
     SQL_ERROR_DETAIL.with(|v| *v.borrow_mut() = Some(SqlErrorDetail::ForeignKey { key, redacted }));

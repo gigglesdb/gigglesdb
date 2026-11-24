@@ -156,9 +156,12 @@ impl BoundScalar {
 }
 
 pub(super) fn missing_operator(op: &str, a: &BoundScalar, b: &BoundScalar) -> SqlError {
+    missing_operator_types(op, &a.type_name(), &b.type_name())
+}
+
+pub(super) fn missing_operator_types(op: &str, left: &str, right: &str) -> SqlError {
     user_types::view_replace_error(format!(
-        "operator does not exist: {} {op} {}",
-        a.type_name(), b.type_name(),
+        "operator does not exist: {left} {op} {right}",
     ));
     user_types::sql_error_hint("No operator matches the given name and argument types. You might need to add explicit type casts.");
     SqlError::UndefinedFunction

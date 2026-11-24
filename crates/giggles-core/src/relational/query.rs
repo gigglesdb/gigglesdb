@@ -1115,7 +1115,8 @@ impl Filter {
                 }
                 p.punct(')')?;
                 admit_expansion(&a, values.len())?;
-                Self::membership(&a, &values, not)
+                constraints::enum_text::membership(&a, &values, not)
+                    .unwrap_or_else(|| Self::membership(&a, &values, not))
             }
         } else if p.word("between") {
             let symmetric = p.word("symmetric");
@@ -1160,7 +1161,9 @@ impl Filter {
                 p.punct('(')?;
                 let array = parse_scalar(p, depth + 1)?;
                 p.punct(')')?;
-                Self::Scalar(Scalar::Call(name.into(), vec![a, array]))
+                let (op, all) = functions::uuid_array_operators::quantifier(name);
+                constraints::enum_text::rebind(&a, &array, op, all)?
+                    .unwrap_or_else(|| Self::Scalar(Scalar::Call(name.into(), vec![a, array])))
             } else {
                 Self::Compare(a, op, parse_scalar(p, depth + 1)?)
             }
@@ -2780,6 +2783,7 @@ impl Query {
         parameters: &mut [Option<DataType>],
         declared: &[Option<DataType>],
     ) -> R<()> {
+        let _enums = functions::enum_order::Scope::enter(state);
         if self.sources.len() != 1 || !self.joins.is_empty() {
             return Err(SqlError::Unsupported);
         }
@@ -7261,6 +7265,7 @@ mod deferred_routine_only_tests {
 }
 
 mod constraints;
+pub(super) use constraints::rename_enum_check;
 pub(super) mod index_predicate;
 mod generated;
 pub(super) use generated::{
@@ -7270,8 +7275,7 @@ pub(super) use generated::{
 pub(super) use constraints::{
     constraint_check, constraint_columns, constraint_deparse, constraint_eval, constraint_key,
     constraint_key_supported, constraint_quote, constraint_shape, constraint_types_compatible,
-    validate_trigger_condition,
-    constraint_validate,
+    constraint_validate, table_constraint_deparse, validate_trigger_condition,
 };
 
 #[cfg(test)]

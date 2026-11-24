@@ -976,8 +976,8 @@ fn pk(t: &TableDef, v: &[Value]) -> R<Vec<u8>> {
     encode_key(
         &t.primary_key
             .iter()
-            .map(|i| v[*i].clone())
-            .collect::<Vec<_>>(),
+            .map(|i| v.get(*i).cloned().ok_or(SqlError::InternalError))
+            .collect::<R<Vec<_>>>()?,
     )
 }
 
@@ -4488,13 +4488,15 @@ impl Relational {
             injected_source,
             &mut events,
         )?;
-        constraints::enforce(
+        constraints::enforce_with_rows(
             &mut candidate,
-            self,
+            std::borrow::Cow::Borrowed(self),
             events,
             &mut deferred,
             &mut cancel,
             clock,
+            constraints::insert_check_columns(self, prepared),
+            None,
         )?;
         candidate.validate_deferred(&mut deferred, &mut cancel)?;
         *self = candidate;
@@ -4521,13 +4523,15 @@ impl Relational {
             None,
             &mut events,
         )?;
-        constraints::enforce(
+        constraints::enforce_with_rows(
             &mut candidate,
-            self,
+            std::borrow::Cow::Borrowed(self),
             events,
             &mut pending,
             &mut cancel,
             clock,
+            constraints::insert_check_columns(self, prepared),
+            None,
         )?;
         *self = candidate;
         *deferred = pending;
@@ -5335,7 +5339,8 @@ impl Relational {
                     }
                     self.materialize_generated(t, &mut row.values)?;
                     row_check(t, &row.values)?;
-                    self.check_insert_candidate(t, &row.values)?;
+                    let written = assignments.written_offsets().collect::<Vec<_>>();
+                    self.check_written_candidate(t, &row.values, &written)?;
                     let new_key = pk(t, &row.values)?;
                     // One-row UPDATE: per-row and statement-end UNIQUE checking coincide, so the
                     // existing final-batch validation is exact here; no UpdateUnique occupancy needed.

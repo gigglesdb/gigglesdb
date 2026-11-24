@@ -854,6 +854,7 @@ impl Relational {
                 }
                 let descriptors = self.secondary_descriptors_engine().to_vec();
                 let mut source_error = None;
+                let insert_columns = constraints::insert_check_columns(&before, prepared);
                 let enforced = constraints::enforce_with_rows(
                     self,
                     std::borrow::Cow::Owned(before),
@@ -861,6 +862,7 @@ impl Relational {
                     &mut pending,
                     &mut || crate::cancellation::check().is_err(),
                     clock,
+                    insert_columns,
                     Some(&mut |state, old| {
                         let result = (|| {
                             loop {

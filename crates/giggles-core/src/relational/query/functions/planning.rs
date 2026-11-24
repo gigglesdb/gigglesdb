@@ -1,5 +1,6 @@
 //! Closed PG18 overload metadata and bounded, dependency-free constant planning.
 use super::*;
+use super::super::constraints::{self, ExpressionContext};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Volatility {
@@ -520,25 +521,27 @@ impl BoundScalar {
 }
 
 impl BoundScalar {
-    /// CHECK admits only routines and casts marked immutable by this binder's metadata.
+    #[cfg(test)]
     pub(in super::super) fn constraint_immutable(&self) -> bool {
-        self.immutable_for(false)
+        self.immutable_for(ExpressionContext::Check)
     }
     pub(in crate::relational::query) fn generation_immutable(&self) -> bool {
-        self.immutable_for(true)
+        self.immutable_for(ExpressionContext::GeneratedColumn)
     }
-    pub(in crate::relational::query) fn immutable_for(&self, generation: bool) -> bool {
-        let immutable = |value: &Self| value.immutable_for(generation);
+    pub(in crate::relational::query) fn immutable_for(&self, context: ExpressionContext) -> bool {
+        let immutable = |value: &Self| value.immutable_for(context);
         match &self.node {
-            Node::Predicate(filter) => super::super::constraints::immutable_for(filter, generation),
+            Node::Predicate(filter) => constraints::immutable_for(filter, context),
             Node::Case(arms, otherwise) => {
                 arms.iter().all(|(condition, result)| {
-                    super::super::constraints::immutable_for(condition, generation) && immutable(result)
+                    constraints::immutable_for(condition, context) && immutable(result)
                 }) && otherwise
                     .as_ref()
                     .is_none_or(|result| immutable(result))
             }
             Node::EnumSort(..) | Node::Literal(_) | Node::Column(..) => true,
+            Node::Domain(value, definition) if context == ExpressionContext::Check && matches!(definition.as_ref(), TypeDef::Enum { .. }) =>
+                immutable(value),
             Node::Domain(..)
             | Node::TriggerCall(_)
             | Node::Param(_)
@@ -561,7 +564,12 @@ impl BoundScalar {
             Node::Cast(value) => {
                 immutable(value)
                     && (immutable_cast(&value.ty, &self.ty)
-                        || generation && integer(&value.ty) && self.ty == DataType::Text)
+                        || context == ExpressionContext::Check
+                            && ((value.attached_enum().is_some()
+                                && matches!(self.ty, DataType::Text | DataType::Varchar))
+                                || value.ty == DataType::Varchar && self.ty == DataType::Text)
+                        || context == ExpressionContext::GeneratedColumn
+                            && integer(&value.ty) && self.ty == DataType::Text)
             }
             Node::Call(name, args) if uuid_ossp::known(name) || name == "coalesce" || greatest::known_name(name) => {
                 args.iter().all(immutable)

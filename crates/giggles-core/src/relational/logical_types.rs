@@ -98,25 +98,47 @@ pub(super) fn failing_row_detail(table: &TableDef, values: &[Value]) -> String {
 pub(super) fn failing_row_detail_with(
     table: &TableDef, values: &[Value], is_virtual: impl Fn(u64) -> bool,
 ) -> String {
-    use std::borrow::Cow;
     let fields = table.logical_offsets().into_iter().map(|offset| {
-        if is_virtual(table.columns[offset].id) {
-            return "virtual".into();
+        failing_row_value(&values[offset], is_virtual(table.columns[offset].id))
+    }).collect::<Vec<_>>();
+    format!("Failing row contains ({}).", fields.join(", "))
+}
+
+pub(super) fn failing_row_written_detail(
+    table: &TableDef, values: &[Value], written: &[usize], is_virtual: impl Fn(u64) -> bool,
+) -> Option<String> {
+    let mut names = Vec::new();
+    let mut fields = Vec::new();
+    for offset in table.logical_offsets() {
+        if written.contains(&offset) {
+            let column = &table.columns[offset];
+            names.push(column.name.as_str());
+            fields.push(failing_row_value(&values[offset], is_virtual(column.id)));
         }
-        let text = match &values[offset] {
+    }
+    (!names.is_empty()).then(|| format!(
+        "Failing row contains ({}) = ({}).", names.join(", "), fields.join(", "),
+    ))
+}
+
+fn failing_row_value(value: &Value, is_virtual: bool) -> String {
+    use std::borrow::Cow;
+    let text = if is_virtual {
+        Cow::Borrowed("virtual")
+    } else {
+        match value {
             Value::Null => Cow::Borrowed("null"),
             Value::Text(text) => Cow::Borrowed(text.as_str()),
             Value::Bool(true) => Cow::Borrowed("t"),
             Value::Bool(false) => Cow::Borrowed("f"),
             value => Cow::Owned(query::output_text(value).ok().flatten().unwrap_or_default()),
-        };
-        if text.len() > 64 {
-            format!("{}...", &text[..text.floor_char_boundary(64)])
-        } else {
-            text.into_owned()
         }
-    }).collect::<Vec<_>>();
-    format!("Failing row contains ({}).", fields.join(", "))
+    };
+    if text.len() > 64 {
+        format!("{}...", &text[..text.floor_char_boundary(64)])
+    } else {
+        text.into_owned()
+    }
 }
 
 pub fn json_output(v: &serde_json::Value) -> R<String> {

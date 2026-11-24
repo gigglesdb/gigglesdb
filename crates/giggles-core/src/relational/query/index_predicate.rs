@@ -141,7 +141,9 @@ fn bind_filter(
         }
         error
     })?;
-    if require_immutable && !constraints::immutable(&bound) {
+    if require_immutable
+        && !constraints::immutable_for(&bound, constraints::ExpressionContext::Predicate)
+    {
         return Err(failure(
             SqlError::InvalidIndexPredicate,
             "functions in index predicate must be marked IMMUTABLE".into(),

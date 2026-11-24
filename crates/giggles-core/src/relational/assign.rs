@@ -165,6 +165,7 @@ pub(super) fn describe(
                 infer_mutation_parameter(value, target, &mut parameters, declared, true)?
             }
             Value::Scalar(value) => value.infer_assignment(
+                state,
                 &{
                     let mut target = table.clone();
                     target.name = table.name.rsplit('\0').next().unwrap_or(&table.name).into();
@@ -240,6 +241,10 @@ pub(super) struct Plan<'a> {
     scalar: bool,
 }
 impl<'a> Plan<'a> {
+    pub(super) fn written_offsets(&self) -> impl Iterator<Item = usize> + '_ {
+        self.values.iter().map(|(offset, _)| *offset)
+    }
+
     pub(super) fn new(
         table: &TableDef,
         state: &'a Relational,

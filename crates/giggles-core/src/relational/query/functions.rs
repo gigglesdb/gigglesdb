@@ -97,6 +97,7 @@ mod unicode_data;
 #[cfg(test)]
 mod w06_tests;
 // Preserve failed routine lookup until argument and source analysis finishes.
+pub(super) use array_constructor::NAME as ARRAY_CONSTRUCTOR;
 pub(super) const CAST_TYPMOD: &str = "\0cast:typmod";
 const UNDEFINED_ROUTINE_PREFIX: &str = "public.\0";
 const PG_TOAST_ROUTINE_PREFIX: &str = "pg_toast.\0";
@@ -1190,6 +1191,14 @@ impl Scalar {
                             && let Some(literal) = conditional::parse_wide_bucket_literal(p)
                         {
                             args.push(literal);
+                        } else if name == json_aggregate::OBJECT
+                            && args.len().is_multiple_of(2)
+                            && super::Filter::starts_row(p)
+                        {
+                            args.push(Self::Call(
+                                json_aggregate::RECORD_KEY.into(),
+                                super::Filter::row(p, depth + 1, aggregate_argument)?,
+                            ));
                         } else {
                             args.push(
                                 if !qualified_call
@@ -1790,6 +1799,13 @@ impl Scalar {
             name if matches!(name, "nullif" | "width_bucket") || conditional::count_nulls(name) => {
                 conditional::bind(name, args, resolve, tables, parameters)
             }
+            json_aggregate::RECORD_KEY => Ok(BoundScalar {
+                ty: DataType::Boolean,
+                node: Node::Call(
+                    name.into(),
+                    args.iter().map(|arg| arg.bind(resolve, tables, parameters)).collect::<R<_>>()?,
+                ),
+            }),
             _ => Self::bind_regular_call(name, args, resolve, tables, parameters),
         }
     }
@@ -2124,7 +2140,16 @@ impl Scalar {
         let _placement = (name == "coalesce").then(|| regexp::SetPlacement::Coalesce.enter());
         let bound = args
             .iter()
-            .map(|a| a.bind(resolve, tables, parameters))
+            .map(|a| {
+                if name == json_aggregate::OBJECT
+                    && let Self::Param(n) = a
+                    && a.aggregate_unknown(parameters)
+                {
+                    user_types::view_replace_error(format!("could not determine data type of parameter ${n}"));
+                    return Err(SqlError::IndeterminateDatatype);
+                }
+                a.bind(resolve, tables, parameters)
+            })
             .collect::<R<Vec<_>>>()
             .map_err(|e| {
                 if name == "format" {
@@ -2152,6 +2177,16 @@ impl Scalar {
             return Ok(BoundScalar {
                 ty,
                 node: Node::Call(name.into(), args),
+            });
+        }
+        if name == json_aggregate::OBJECT {
+            return Ok(BoundScalar {
+                ty: DataType::Jsonb,
+                node: if args.iter().any(|arg| arg.ty == DataType::TimestampTz) {
+                    Node::ZonedOperator(name.into(), args, None)
+                } else {
+                    Node::Call(name.into(), args)
+                },
             });
         }
         if args
@@ -2604,6 +2639,9 @@ impl Scalar {
     }
 }
 impl BoundScalar {
+    pub(super) fn is_json_object_record_key(&self) -> bool {
+        matches!(&self.node, Node::Call(name, _) if name == json_aggregate::RECORD_KEY)
+    }
     pub(super) fn null_extend(self, column: BoundColumn, definition: &ColumnDef) -> Self {
         let key = Self {
             ty: definition.data_type.clone(),
@@ -2866,6 +2904,11 @@ impl BoundScalar {
                         budget,
                     );
                 }
+                if name == json_aggregate::OBJECT {
+                    let zone = clock.as_ref().and_then(|clock| clock.zone())
+                        .unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0));
+                    return json_aggregate::build_object(args, &values, zone, budget);
+                }
                 if name == "uuidv7" {
                     let zone = clock.as_ref().and_then(|clock| clock.zone());
                     let value = random_uuid::v7_interval(&values, zone)?;
@@ -3101,7 +3144,16 @@ impl BoundScalar {
                 }
                 if n == array_constructor::NAME { return array_constructor::eval(args, &values, budget); }
                 if uuid_array_operators::is_quantified(n) {
-                    return uuid_array_operators::eval_quantified(n, &values);
+                    return uuid_array_operators::eval_quantified(n, &values, args);
+                }
+                if n == json_aggregate::RECORD_KEY {
+                    // The fields have been evaluated. The object builder rejects the record key.
+                    return Ok(Value::Bool(true));
+                }
+                if n == json_aggregate::OBJECT {
+                    return json_aggregate::build_object(
+                        args, &values, giggles_pg_types::temporal::SessionZone::Fixed(0), budget,
+                    );
                 }
                 if let Some(result) = regexp::eval(n, args, &values, budget) {
                     return result;
@@ -3252,10 +3304,12 @@ impl Query {
 
     pub(in super::super) fn infer_assignment(
         &self,
+        state: &Relational,
         table: &TableDef,
         target: &DataType,
         parameters: &mut [Option<DataType>],
     ) -> R<()> {
+        let _enums = enum_order::Scope::enter(state);
         let resolve = |column: &ColumnRef, _: usize| {
             if column
                 .qualifier

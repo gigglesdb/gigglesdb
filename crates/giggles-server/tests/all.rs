@@ -440,3 +440,6 @@ mod window_grouping_sets_network;
 
 #[path = "regex_network.rs"]
 mod regex_network;
+
+#[path = "enum_array_check_network.rs"]
+mod enum_array_check_network;

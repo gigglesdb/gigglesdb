@@ -361,23 +361,28 @@ fn rewrite(
     new: &str,
     cancel: &mut impl FnMut() -> bool,
 ) -> R<()> {
+    let mut rewritten_checks = Vec::new();
     for (owner, constraints) in &state.ext.constraints {
         for constraint in constraints {
             match &constraint.kind {
                 ConstraintKind::Check { expr, .. } => {
-                    let columns = state
-                        .tables
-                        .values()
-                        .filter(|t| t.id == *owner)
-                        .flat_map(|t| &t.columns)
-                        .filter(|c| column_uses(state, c.id, id));
                     let tokens = lex(expr)?;
-                    if mentions_type(&tokens, ty)
-                        || columns
-                            .into_iter()
-                            .any(|c| tokens.iter().any(|token| identifier_token(token, &c.name)))
-                    {
+                    if mentions_type(&tokens, ty) {
                         return Err(unsupported_dependency("CHECK constraint"));
+                    }
+                    let table = state.tables.values().find(|table| table.id == *owner)
+                        .ok_or(SqlError::InternalError)?;
+                    let columns = table.columns.iter()
+                        .filter(|column| column_uses(state, column.id, id))
+                        .map(|column| column.name.as_str())
+                        .collect::<BTreeSet<_>>();
+                    if columns.iter().any(|name| tokens.iter().any(|token| identifier_token(token, name)))
+                        && let Some(expr) = query::rename_enum_check(state, table, expr, &columns, old, new)
+                            .map_err(|error| {
+                                if error == SqlError::Unsupported { unsupported_dependency("CHECK constraint") } else { error }
+                            })?
+                    {
+                        rewritten_checks.push((*owner, constraint.id, expr));
                     }
                 }
                 ConstraintKind::ForeignKey {
@@ -433,6 +438,14 @@ fn rewrite(
     }
     for (column, default) in rewrite_defaults {
         state.set_column_default(column, Some(default))?;
+    }
+    for (table, id, updated) in rewritten_checks {
+        let constraint = Arc::make_mut(&mut state.ext).constraints.get_mut(&table)
+            .and_then(|constraints| constraints.iter_mut().find(|constraint| constraint.id == id));
+        let Some(Constraint { kind: ConstraintKind::Check { expr, .. }, .. }) = constraint else {
+            return Err(SqlError::InternalError);
+        };
+        *expr = updated;
     }
     let tables = state.tables.clone();
     for table in tables.values() {

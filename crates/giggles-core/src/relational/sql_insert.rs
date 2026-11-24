@@ -161,6 +161,15 @@ fn unsupported_or_syntax(p: &Parser) -> SqlError {
     }
 }
 impl Insert {
+    pub(super) fn plain_insert_check_columns(
+        &self, state: &Relational, table: &TableDef, declared: &[Option<DataType>],
+    ) -> R<Vec<usize>> {
+        if self.conflict.is_some() || self.copy_input.is_some() || self.copy_precoerced {
+            return Ok(vec![]);
+        }
+        source_indexes(self, state, table, declared)
+    }
+
     pub(super) fn bind_schema_names(
         &mut self,
         bind: &impl Fn(&mut String),
@@ -831,6 +840,7 @@ impl Insert {
             for (slot, (expression, index)) in row.iter().zip(&indexes).enumerate() {
                 if let Some(expression) = self.casts.get(&(row_index, slot)) {
                     expression.infer(
+                        state,
                         table,
                         None,
                         &table.columns[*index].data_type,
@@ -862,6 +872,7 @@ impl Insert {
                     state.check_generated_explicit(&table.columns[index], true)?;
                     defaults::check_explicit_identity(state, &table.columns[index])?;
                     expression.infer(
+                        state,
                         table,
                         self.alias.as_deref(),
                         &table.columns[index].data_type,
@@ -871,6 +882,7 @@ impl Insert {
             }
             if let Some(guard) = &update.guard {
                 guard.infer(
+                    state,
                     table,
                     self.alias.as_deref(),
                     &DataType::Boolean,
@@ -1020,7 +1032,7 @@ fn input_value(
     if let Some(expression) = insert.casts.get(&(row_index, slot)) {
         let parameters = insert.describe(state, params.len(), declared)?.parameters
             .into_iter().map(Some).collect::<Vec<_>>();
-        let bound = expression.bind(table, None, &table.columns[index].data_type, &parameters, clock)?;
+        let bound = expression.bind(state, table, None, &table.columns[index].data_type, &parameters, clock)?;
         bound.evaluate(&SqlRow { values: vec![], version: 0 }, &[], params, &mut 0)
     } else if insert.copy_input.is_some() && let Expr::Literal(value) = expression {
         sql_copy::copy_value(value.clone(), &table.columns[index].data_type, clock)
@@ -1289,6 +1301,7 @@ impl<'a> ConflictPlan<'a> {
         for (name, operand) in &update.sets {
             if let Operand::Scalar(expression) = operand {
                 expression.infer(
+                    state,
                     table,
                     alias,
                     &table.columns[col(table, name)?].data_type,
@@ -1297,7 +1310,7 @@ impl<'a> ConflictPlan<'a> {
             }
         }
         if let Some(guard) = &update.guard {
-            guard.infer(table, alias, &DataType::Boolean, &mut parameters)?;
+            guard.infer(state, table, alias, &DataType::Boolean, &mut parameters)?;
         }
         let values = update
             .sets
@@ -1308,7 +1321,7 @@ impl<'a> ConflictPlan<'a> {
                 let value = match operand {
                     Operand::Default => BoundOperand::Default(defaults::default_sql(state, column)),
                     Operand::Scalar(expression) => BoundOperand::Scalar(Box::new(
-                        expression.bind(table, alias, &column.data_type, &parameters, clock)?,
+                        expression.bind(state, table, alias, &column.data_type, &parameters, clock)?,
                     )),
                 };
                 Ok((index, value))
@@ -1317,7 +1330,7 @@ impl<'a> ConflictPlan<'a> {
         let guard = update
             .guard
             .as_ref()
-            .map(|guard| guard.bind(table, alias, &DataType::Boolean, &parameters, clock))
+            .map(|guard| guard.bind(state, table, alias, &DataType::Boolean, &parameters, clock))
             .transpose()?;
         Ok(Self {
             values,

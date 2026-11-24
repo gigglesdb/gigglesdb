@@ -1,5 +1,7 @@
 // Each file keeps its own `mod common;`, exactly as when it was its own binary.
 #![allow(clippy::duplicate_mod)]
+#[path = "check_column_ddl.rs"]
+mod check_column_ddl;
 #[path = "datetime_input_grammar.rs"]
 mod datetime_input_grammar;
 #[path = "write_fence_embedded.rs"]
@@ -639,3 +641,6 @@ mod sql_triggers_admission;
 #[cfg(feature = "engine-rocksdb")]
 #[path = "sql_triggers_fire.rs"]
 mod sql_triggers_fire;
+
+#[path = "enum_array_check.rs"]
+mod enum_array_check;

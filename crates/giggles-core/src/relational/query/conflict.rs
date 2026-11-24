@@ -155,11 +155,13 @@ impl Expression {
     }
     pub(in crate::relational) fn infer(
         &self,
+        state: &Relational,
         table: &TableDef,
         alias: Option<&str>,
         target: &DataType,
         parameters: &mut [Option<DataType>],
     ) -> R<()> {
+        let _enums = functions::enum_order::Scope::enter(state);
         let resolve = Self::resolver(table, alias);
         self.0.infer(
             matches!(self.0, Scalar::Param(n) if parameters.get(n - 1).is_none_or(Option::is_none))
@@ -183,12 +185,14 @@ impl Expression {
     }
     pub(in crate::relational) fn bind(
         &self,
+        state: &Relational,
         table: &TableDef,
         alias: Option<&str>,
         target: &DataType,
         parameters: &[Option<DataType>],
         clock: Option<&clock::ExecutionClock>,
     ) -> R<BoundExpression> {
+        let _enums = functions::enum_order::Scope::enter(state);
         let literal = matches!(self.0, Scalar::Literal(_));
         let mut value = self
             .0

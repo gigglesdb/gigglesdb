@@ -89,6 +89,7 @@ pub(super) fn route(
     } else {
         None
     };
+    let written = assignments.iter().flat_map(assign::Plan::written_offsets).collect::<Vec<_>>();
     let mut retention = scan::Retention::new(scan::MAX_RETAINED_BYTES);
     let legacy = scan::LegacyRows(&*state);
     let source = injected_source.unwrap_or(&legacy);
@@ -120,7 +121,7 @@ pub(super) fn route(
             }
             state.materialize_generated(table, &mut row.values)?;
             row_check(table, &row.values)?;
-            state.check_insert_candidate(table, &row.values)?;
+            state.check_written_candidate(table, &row.values, &written)?;
             let new_key = pk(table, &row.values)?;
             // Immediate uniqueness is checked in logical evaluation order. A later
             // matched row still occupies its key until that row is evaluated.
@@ -264,6 +265,7 @@ pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description
                     assign::Value::Plain(value) => infer(value, &table.columns[index], &mut parameters)?,
                     assign::Value::Scalar(value) => {
                         value.infer_assignment(
+                            state,
                             &{
                                 let mut target = table.clone();
                                 target.name =

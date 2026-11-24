@@ -251,7 +251,12 @@ impl Plan {
         }
         // Pagination can determine an otherwise unknown projection parameter.
         for s in self.limit.iter().chain(&self.offset) {
-            s.infer(Some(&DataType::BigInt), parameters,
+            let expected = if matches!(s, Scalar::Param(n) if parameters.get(n - 1).is_some_and(Option::is_some)) {
+                None
+            } else {
+                Some(&DataType::BigInt)
+            };
+            s.infer(expected, parameters,
                 &|_, _| Err(SqlError::InvalidColumnReference), &[])?;
         }
         if let Some(sample) = &self.decorations.sample {
@@ -599,7 +604,12 @@ impl Plan {
         }
         for s in self.limit.iter().chain(&self.offset) {
             let no_page_column = |_: &ColumnRef, _: usize| Err(SqlError::InvalidColumnReference);
-            s.infer(Some(&DataType::BigInt), parameters, &no_page_column, &[])?;
+            let expected = if matches!(s, Scalar::Param(n) if parameters.get(n - 1).is_some_and(Option::is_some)) {
+                None
+            } else {
+                Some(&DataType::BigInt)
+            };
+            s.infer(expected, parameters, &no_page_column, &[])?;
             let ty = s.bind(&no_page_column, &[], parameters)?.ty;
             if !integer_type(&ty)
                 && !matches!(ty, DataType::Numeric | DataType::Real | DataType::DoublePrecision)

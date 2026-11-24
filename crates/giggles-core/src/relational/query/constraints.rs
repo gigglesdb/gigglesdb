@@ -1,5 +1,8 @@
 //! CHECK binding, deterministic deparse and evaluation through the query scalar layer.
 use super::*;
+pub(super) mod enum_text;
+mod enum_rename;
+pub(in crate::relational) use enum_rename::rename_enum_check;
 
 pub(in crate::relational) fn constraint_types_compatible(
     child: &DataType,
@@ -122,6 +125,15 @@ pub(super) fn scalar(s: &Scalar) -> R<String> {
             };
             format!("({} {op} {})", scalar(a)?, scalar(b)?)
         }
+        Scalar::Call(name, args) if name == enum_text::MEMBERSHIP => enum_text::deparse_membership(args)?,
+        _ if enum_text::varchar_cast(s).is_some() => {
+            let (column, length) = enum_text::varchar_cast(s).ok_or(SqlError::InternalError)?;
+            let column = quote(&column.name);
+            match length {
+                Some(length) => format!("({column})::character varying({length})"),
+                None => format!("({column})::character varying"),
+            }
+        }
         Scalar::Call(name, args) if name == "nullif" => {
             let [left, right] = args.as_slice() else {
                 return Err(SqlError::Unsupported);
@@ -140,7 +152,9 @@ pub(super) fn scalar(s: &Scalar) -> R<String> {
         Scalar::Cast(a, ty) => {
             // Literal casts can fold or change constant type during PG analysis.
             // Keep the admitted deparse subset independent of that machinery.
-            if !matches!(a.as_ref(), Scalar::Column(_)) {
+            if !matches!(a.as_ref(), Scalar::Column(_))
+                && !(*ty == DataType::Text && enum_text::varchar_cast(a).is_some())
+            {
                 return Err(SqlError::Unsupported);
             }
             let ty = match ty {
@@ -161,6 +175,18 @@ pub(super) fn scalar(s: &Scalar) -> R<String> {
         _ => return Err(SqlError::Unsupported),
     })
 }
+fn comparison_operand(value: &Scalar, enum_text_comparison: bool) -> R<String> {
+    if enum_text_comparison {
+        if let Some(text) = enum_text::text_literal(value) {
+            return scalar(&Scalar::Literal(Value::Text(text.into())));
+        }
+        if enum_text::varchar_cast(value).is_some() {
+            return Ok(format!("({})::text", scalar(value)?));
+        }
+    }
+    scalar(value)
+}
+
 fn deparse(f: &Filter) -> R<String> {
     Ok(match f {
         Filter::InSubquery { .. } => return Err(SqlError::Unsupported),
@@ -178,12 +204,18 @@ fn deparse(f: &Filter) -> R<String> {
         Filter::Is(_, None, _) => return Err(SqlError::Unsupported),
         Filter::Scalar(Scalar::Literal(Value::Null)) => "NULL::boolean".into(),
         Filter::Scalar(s) => scalar(s)?,
-        Filter::Compare(a, op, b) => format!(
-            "({} {} {})",
-            scalar(a)?,
-            if op == "!=" { "<>" } else { op },
-            scalar(b)?
-        ),
+        Filter::Compare(a, op, b) => {
+            let enum_text_comparison = [a, b].into_iter().any(|value| {
+                enum_text::text_operand(value)
+                    || enum_text::varchar_cast(value).is_some()
+            });
+            format!(
+                "({} {} {})",
+                comparison_operand(a, enum_text_comparison)?,
+                if op == "!=" { "<>" } else { op },
+                comparison_operand(b, enum_text_comparison)?,
+            )
+        }
         Filter::Null(s, not) => {
             format!("({} IS {}NULL)", scalar(s)?, if *not { "NOT " } else { "" })
         }
@@ -234,6 +266,12 @@ pub(in crate::relational) fn validate_trigger_condition(tokens: &[Token]) -> R<(
 pub(in crate::relational) fn constraint_deparse(tokens: &[Token]) -> R<String> {
     deparse(&expression(tokens.to_vec())?)
 }
+pub(in crate::relational) fn table_constraint_deparse(
+    state: &Relational, table: &TableDef, tokens: &[Token],
+) -> R<String> {
+    let _enums = enum_text::Scope::enter(state, table, false);
+    constraint_deparse(tokens)
+}
 fn query(table: &TableDef, key: &str, expr: &str) -> R<Query> {
     let expr = expr.strip_suffix(" NOT VALID").unwrap_or(expr);
     let expr = expr
@@ -278,15 +316,15 @@ pub(super) fn table_query(table: &TableDef, key: &str, filter: Filter) -> Query 
         limit: None,
     }
 }
-pub(super) fn immutable(filter: &BoundFilter) -> bool {
-    immutable_for(filter, false)
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExpressionContext {
+    Check,
+    Predicate,
+    GeneratedColumn,
 }
-pub(super) fn immutable_for(filter: &BoundFilter, generation: bool) -> bool {
-    let scalar = |value: &BoundScalar| if generation {
-        value.generation_immutable()
-    } else {
-        value.constraint_immutable()
-    };
+
+pub(super) fn immutable_for(filter: &BoundFilter, context: ExpressionContext) -> bool {
+    let scalar = |value: &BoundScalar| value.immutable_for(context);
     match filter {
         BoundFilter::InSubquery { .. } | BoundFilter::Exists { .. } => false,
         BoundFilter::Scalar(s) | BoundFilter::Null(s, _) => scalar(s),
@@ -303,8 +341,8 @@ pub(super) fn immutable_for(filter: &BoundFilter, generation: bool) -> bool {
                     .as_deref()
                     .is_none_or(scalar)
         }
-        BoundFilter::Not(a) | BoundFilter::Is(a, _, _) => immutable_for(a, generation),
-        BoundFilter::Logic(a, _, b) => immutable_for(a, generation) && immutable_for(b, generation),
+        BoundFilter::Not(a) | BoundFilter::Is(a, _, _) => immutable_for(a, context),
+        BoundFilter::Logic(a, _, b) => immutable_for(a, context) && immutable_for(b, context),
     }
 }
 fn cast_subset(filter: &Filter, table: &TableDef) -> R<()> {
@@ -323,10 +361,13 @@ fn cast_subset(filter: &Filter, table: &TableDef) -> R<()> {
             Scalar::Cast(value, target) => {
                 match value.as_ref() {
                     Scalar::Column(column) => {
-                        if table.columns[col(table, &column.name)?].data_type == *target {
+                        if table.columns[col(table, &column.name)?].data_type == *target
+                            && !(*target == DataType::Text && enum_text::is_character_column(column))
+                        {
                             return Err(SqlError::Unsupported);
                         }
                     }
+                    inner if *target == DataType::Text && enum_text::varchar_cast(inner).is_some() => (),
                     // Canonical PG spelling emitted for a boolean-context NULL.
                     Scalar::Literal(Value::Null) if *target == DataType::Boolean => (),
                     // Canonical PG spelling emitted for text literals.
@@ -378,6 +419,7 @@ pub(in crate::relational) fn constraint_validate(
     table: &TableDef,
     expr: &str,
 ) -> R<()> {
+    let _enums = enum_text::Scope::enter(state, table, true);
     let q = query(
         table,
         &relation_key(state.table_schema(table.id), &table.name),
@@ -385,7 +427,7 @@ pub(in crate::relational) fn constraint_validate(
     )?;
     cast_subset(q.filter.as_ref().ok_or(SqlError::Unsupported)?, table)?;
     let bound = q.bind(state, 0, &[])?;
-    if !bound.filter.as_ref().is_some_and(immutable) {
+    if !bound.filter.as_ref().is_some_and(|filter| immutable_for(filter, ExpressionContext::Check)) {
         return Err(SqlError::Unsupported);
     }
     Ok(())
@@ -396,6 +438,7 @@ pub(in crate::relational) fn constraint_eval(
     expr: &str,
     row: &SqlRow,
 ) -> R<Option<bool>> {
+    let _scope = enum_text::Scope::stored(state, table, true);
     let q = query(
         table,
         &relation_key(state.table_schema(table.id), &table.name),
@@ -485,7 +528,7 @@ pub(in crate::relational) fn constraint_columns(
         filter,
     );
     let bound = q.bind(state, 0, &[])?;
-    if !bound.filter.as_ref().is_some_and(immutable) {
+    if !bound.filter.as_ref().is_some_and(|filter| immutable_for(filter, ExpressionContext::Predicate)) {
         return Err(SqlError::Unsupported);
     }
     read.iter()

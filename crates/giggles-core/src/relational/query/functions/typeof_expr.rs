@@ -44,6 +44,12 @@ pub(super) fn bind(
     let [arg] = args else {
         return Err(SqlError::UndefinedFunction);
     };
+    if let Scalar::Param(n) = arg
+        && arg.aggregate_unknown(parameters)
+    {
+        user_types::view_replace_error(format!("could not determine data type of parameter ${n}"));
+        return Err(SqlError::IndeterminateDatatype);
+    }
     let bound = arg.bind(resolve, tables, parameters)?;
     let display = if bound.result_oid() == random_uuid::VOID_OID {
         "void".into()

@@ -377,7 +377,7 @@ pub(super) fn install(
             expression,
             not_valid,
         } => {
-            let expr = query::constraint_deparse(expression)?;
+            let expr = query::table_constraint_deparse(state, table, expression)?;
             query::constraint_validate(state, table, &expr)?;
             let referenced = table
                 .columns
@@ -553,7 +553,7 @@ fn validate_kind(
     name: &str,
     kind: &ConstraintKind,
     keys: Option<&BTreeSet<Vec<u8>>>,
-    diagnostic: Option<(&str, &BTreeSet<Vec<u8>>)>,
+    diagnostic: Option<(&BTreeSet<Vec<u8>>, &[usize])>,
     cancel: &mut impl FnMut() -> bool,
 ) -> R<()> {
     for (key, row) in state.rows.get(&table.id).ok_or(SqlError::Type)? {
@@ -564,9 +564,22 @@ fn validate_kind(
             return Err(SqlError::Aborted);
         }
         match kind {
-            ConstraintKind::Check { expr, .. } => check_row(state, table, name, expr, row)?,
+            ConstraintKind::Check { expr, .. } if keys.is_none() => {
+                query::constraint_check(state, table, expr, row).inspect_err(|error| {
+                    if *error == SqlError::CheckViolation {
+                        user_types::view_replace_error(format!(
+                            "check constraint \"{name}\" of relation \"{}\" is violated by some row", table.name,
+                        ));
+                        user_types::sql_error_names(state, table, None, Some(name));
+                    }
+                })?;
+            }
+            ConstraintKind::Check { expr, .. } => {
+                let written = diagnostic.map_or(&[][..], |(_, written)| written);
+                check_row(state, table, name, expr, row, written)?;
+            }
             ConstraintKind::ForeignKey { .. } => {
-                let name = diagnostic.filter(|(_, changed)| changed.contains(key)).map(|(name, _)| name);
+                let name = diagnostic.filter(|(changed, _)| changed.contains(key)).map(|_| name);
                 fk_row(state, table, row, kind, name)?;
             }
             ConstraintKind::PrimaryKey | ConstraintKind::Unique { .. } => (),
@@ -574,13 +587,18 @@ fn validate_kind(
     }
     Ok(())
 }
-fn check_row(state: &Relational, table: &TableDef, name: &str, expr: &str, row: &SqlRow) -> R<()> {
+fn check_row(state: &Relational, table: &TableDef, name: &str, expr: &str, row: &SqlRow, written: &[usize]) -> R<()> {
     query::constraint_check(state, table, expr, row).inspect_err(|error| {
-        if *error == SqlError::CheckViolation && state.has_generated_columns(table) {
+        if *error == SqlError::CheckViolation {
             user_types::view_replace_error(format!("new row for relation \"{}\" violates check constraint \"{name}\"", table.name));
-            user_types::sql_error_detail(logical_types::failing_row_detail_with(table, &row.values, |id| {
-                state.generated_column(id).is_some_and(|generation| !generation.stored)
-            }));
+            let is_virtual = |id| state.generated_column(id).is_some_and(|generation| !generation.stored);
+            user_types::sql_failing_check_detail(DuplicateKeyDetail {
+                table_id: table.id,
+                schema: state.table_schema(table.id).into(),
+                table: table.name.clone(),
+                constraint: name.into(),
+                values: logical_types::failing_row_detail_with(table, &row.values, is_virtual),
+            }, logical_types::failing_row_written_detail(table, &row.values, written, is_virtual));
             user_types::sql_error_names(state, table, None, Some(name));
         }
     })
@@ -716,10 +734,26 @@ pub(super) fn enforce(
         cancel,
         clock,
         None,
+        None,
     )
     .map(|_| ())
 }
 type LoadRows<'a> = dyn FnMut(&mut Relational, &mut Relational) -> R<()> + 'a;
+pub(super) fn insert_check_columns(state: &Relational, prepared: &Prepared) -> Option<(u64, Vec<usize>)> {
+    let table = state.tables.get(prepared.table()?)?;
+    if !state.table_constraints(table.id).iter().any(|constraint| matches!(constraint.kind, ConstraintKind::Check { .. })) {
+        return None;
+    }
+    let offsets = match prepared.statement.get() {
+        Statement::Insert { columns, values, .. } => insert_value_indexes(table, columns, values.len()),
+        Statement::InsertExpressions(values) => values.supplied_indexes(table),
+        Statement::InsertMulti(insert) => insert.plain_insert_check_columns(state, table, &prepared.parameter_types),
+        _ => return None,
+    };
+    offsets.ok().map(|offsets| (table.id, offsets))
+}
+
+#[expect(clippy::too_many_arguments, reason = "statement constraints with optional row loader and INSERT diagnostics")]
 pub(super) fn enforce_with_rows<'a>(
     state: &mut Relational,
     mut before: std::borrow::Cow<'a, Relational>,
@@ -727,6 +761,7 @@ pub(super) fn enforce_with_rows<'a>(
     deferred: &mut DeferralState,
     cancel: &mut impl FnMut() -> bool,
     clock: Option<&clock::ExecutionClock>,
+    insert_columns: Option<(u64, Vec<usize>)>,
     mut load: Option<&mut LoadRows<'_>>,
 ) -> R<std::borrow::Cow<'a, Relational>> {
     // DDL may have removed constraints with queued checks or explicit modes.
@@ -740,6 +775,7 @@ pub(super) fn enforce_with_rows<'a>(
     if let Some(load) = load.as_mut() {
         load(state, before.to_mut())?;
     }
+    let type_rewrite = !Arc::ptr_eq(&before.ext, &state.ext) && before.ext.types != state.ext.types;
     let mut touched_old = captured
         .iter()
         .filter_map(|event| {
@@ -761,16 +797,21 @@ pub(super) fn enforce_with_rows<'a>(
         let Some(after) = state.rows.get(id) else {
             continue;
         };
-        let rekey = if before.epoch != state.epoch {
-            let old = table_by_id(&before, *id)?;
-            let new = table_by_id(state, *id)?;
-            old.hidden_rowid().is_some() != new.hidden_rowid().is_some()
+        let (rekey, old_offsets) = if before.epoch != state.epoch {
+            let old_table = table_by_id(&before, *id)?;
+            let new_table = table_by_id(state, *id)?;
+            let same_layout = old_table.columns.iter().map(|column| column.id)
+                .eq(new_table.columns.iter().map(|column| column.id));
+            let old_offsets = (!same_layout).then(|| new_table.columns.iter()
+                .map(|column| old_table.columns.iter().position(|old| old.id == column.id))
+                .collect::<Vec<_>>());
+            (old_table.hidden_rowid().is_some() != new_table.hidden_rowid().is_some(), old_offsets)
         } else {
-            false
+            (false, None)
         };
         // A DDL rewrite preserves row versions. Match by version when a key
         // moves, so a physical rekey does not look like a referential delete.
-        let by_version = if rekey || !Arc::ptr_eq(&before.ext, &state.ext) && before.ext.types != state.ext.types {
+        let by_version = if rekey || type_rewrite {
             after.iter().map(|(key, row)| (row.version, (key, row))).collect::<BTreeMap<_, _>>()
         } else {
             BTreeMap::new()
@@ -790,10 +831,26 @@ pub(super) fn enforce_with_rows<'a>(
             if cancel() {
                 return Err(SqlError::Aborted);
             }
+            if captured_old.contains(&(*id, old.version)) {
+                continue;
+            }
             let new = by_version.get(&old.version).map(|(_, row)| *row).or_else(|| after.get(key));
-            if captured_old.contains(&(*id, old.version))
-                || new.is_some_and(|r| r.values == old.values)
-            {
+            // ADD/DROP COLUMN moves the heap key's physical offset. Compare
+            // the same attributes and carry postimage values for new columns,
+            // whose constraints were already validated by ALTER TABLE.
+            let old = if let Some(offsets) = &old_offsets {
+                std::borrow::Cow::Owned(SqlRow {
+                    version: old.version,
+                    values: offsets.iter().enumerate().map(|(index, offset)| {
+                        offset.and_then(|offset| old.values.get(offset))
+                            .or_else(|| new.and_then(|row| row.values.get(index)))
+                            .cloned().unwrap_or(Value::Null)
+                    }).collect(),
+                })
+            } else {
+                std::borrow::Cow::Borrowed(old)
+            };
+            if new.is_some_and(|r| r.values == old.values) {
                 continue;
             }
             if events.len() >= MAX_ROWS {
@@ -801,7 +858,7 @@ pub(super) fn enforce_with_rows<'a>(
             }
             events.push_back(Event {
                 table: *id,
-                old: old.clone(),
+                old: old.into_owned(),
                 new: new.cloned(),
             });
         }
@@ -1028,12 +1085,21 @@ pub(super) fn enforce_with_rows<'a>(
     for (table_id, cs) in &state.ext.constraints {
         let table = table_by_id(state, *table_id)?;
         let rows = state.rows.get(table_id).ok_or(SqlError::Type)?;
+        let written = insert_columns.as_ref().filter(|(id, _)| id == table_id)
+            .map_or(&[][..], |(_, offsets)| offsets.as_slice());
+        let before_rows = before.rows.get(table_id);
+        // A renamed enum label can change a physical key without changing
+        // the row's logical identity. Such rows are not CHECK postimages.
+        let prior_versions = if type_rewrite {
+            before_rows.into_iter().flat_map(|rows| rows.values().map(|row| row.version))
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
         let changed = rows
             .iter()
             .filter_map(|(key, row)| {
-                if before
-                    .rows
-                    .get(table_id)
+                if !prior_versions.contains(&row.version) && before_rows
                     .and_then(|rs| rs.get(key))
                     .is_none_or(|r| r.version != row.version)
                 {
@@ -1082,7 +1148,7 @@ pub(super) fn enforce_with_rows<'a>(
                     keys.extend(parent.iter().cloned());
                 }
                 validate_kind(state, table, &constraint.name, &constraint.kind, Some(&keys),
-                    Some((&constraint.name, &changed)), cancel)?;
+                    Some((&changed, written)), cancel)?;
             }
         }
     }
@@ -1090,6 +1156,10 @@ pub(super) fn enforce_with_rows<'a>(
 }
 impl Relational {
     pub(crate) fn check_insert_candidate(&self, table: &TableDef, values: &[Value]) -> R<()> {
+        self.check_written_candidate(table, values, &[])
+    }
+
+    pub(super) fn check_written_candidate(&self, table: &TableDef, values: &[Value], written: &[usize]) -> R<()> {
         if let Some(constraints) = self.ext.constraints.get(&table.id) {
             let row = SqlRow {
                 values: values.to_vec(),
@@ -1097,7 +1167,7 @@ impl Relational {
             };
             for constraint in constraints {
                 if let ConstraintKind::Check { expr, .. } = &constraint.kind {
-                    check_row(self, table, &constraint.name, expr, &row)?;
+                    check_row(self, table, &constraint.name, expr, &row, written)?;
                 }
             }
         }

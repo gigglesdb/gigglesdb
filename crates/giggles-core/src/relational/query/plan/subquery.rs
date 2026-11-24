@@ -600,6 +600,28 @@ fn bind_scalar(
     s.infer(None, parameters, &resolve, &[&table])?;
     s.bind(&resolve, &[&table], parameters)
 }
+fn enum_operands(
+    lhs: &Scalar,
+    rhs: &Scalar,
+    op: &str,
+    shape: &join::Shape,
+    parameters: &mut [Option<DataType>],
+    row_slot: Option<usize>,
+    array: BoundScalar,
+) -> R<(Option<BoundScalar>, BoundScalar)> {
+    if let Some(definition) = array.attached_enum() {
+        lhs.infer_enum_parameter(&DataType::Text, Some(definition), parameters)?;
+    } else if matches!(lhs, Scalar::Param(_)) && lhs.aggregate_unknown(parameters) {
+        return Ok((None, array));
+    }
+    let value = bind_scalar(lhs, shape, parameters, row_slot)?;
+    if value.attached_enum().is_none() && array.attached_enum().is_none() {
+        return Ok((None, array));
+    }
+    let (value, array) = functions::uuid_array_operators::bind_enum(op, lhs, rhs, value, array)?;
+    Ok((Some(value), array))
+}
+
 fn comparison(lhs: Scalar, op: &str, rhs: Scalar) -> Filter {
     match op {
         "like" | "~~" | "ilike" | "~~*" | "!~~" | "!~~*" => Filter::Like {
@@ -626,6 +648,7 @@ fn prepare(
     for a in &s.applies {
         let mut metadata;
         let mut json = false;
+        let mut enum_comparison = false;
         let (ty, name) = match &a.right {
             Right::Query(q) => {
                 let (mut q, correlated) = instantiate(q, &shape, None, state, parameters)?;
@@ -667,21 +690,30 @@ fn prepare(
                 (col.data_type.clone(), col.name.clone())
             }
             Right::Array(s) => {
-                if matches!(s, Scalar::Param(_)) && s.aggregate_unknown(parameters)
+                if let Scalar::Param(n) = s
+                    && s.aggregate_unknown(parameters)
                     && let Some((lhs, _, _)) = &a.comparison
                 {
                     let left = bind_scalar(lhs, &shape, parameters, None)?;
                     if left.ty == DataType::Text {
                         s.infer_enum_parameter(&DataType::TextArray, left.attached_enum(), parameters)?;
+                        parameters[*n - 1].get_or_insert(DataType::TextArray);
                     }
                 }
                 let bound = bind_scalar(s, &shape, parameters, None)?;
+                let bound = if let Some((lhs, op, _)) = &a.comparison {
+                    let (left, array) = enum_operands(lhs, s, op, &shape, parameters, None, bound)?;
+                    enum_comparison = left.is_some();
+                    array
+                } else {
+                    bound
+                };
                 let ty = srf::element(&bound.ty)?;
                 metadata = Some(functions::collation::combined(Some(&bound),None,ty.clone())?);
                 (ty, "?column?".into())
             },
         };
-        if let Some((lhs, op, _)) = &a.comparison {
+        if !enum_comparison && let Some((lhs, op, _)) = &a.comparison {
             let table = TableDef {
                 id: 0,
                 name: join::INPUT.into(),
@@ -1115,8 +1147,32 @@ fn evaluate_apply(
                 !a.exists && a.comparison.is_none(),
                 correlated,
             )?
-        } else if let Right::Array(array) = &a.right {
-            let mut array = bind_scalar(array, shape, &mut parameters.to_vec(), row_slot)?;
+        } else if let Right::Array(rhs) = &a.right {
+            let mut inferred = parameters.to_vec();
+            let array = bind_scalar(rhs, shape, &mut inferred, row_slot)?;
+            let mut array = if let Some((lhs, op, all)) = &a.comparison {
+                let (left, mut array) =
+                    enum_operands(lhs, rhs, op, shape, &mut inferred, row_slot, array)?;
+                if let Some(mut left) = left {
+                    left.attach_clock(clock);
+                    array.attach_clock(clock);
+                    let row = Tuple {
+                        source_versions: vec![],
+                        values: vec![values.to_vec()],
+                        version,
+                    };
+                    let left = left.eval(&row, params, &mut 0)?;
+                    let right = array.eval(&row, params, &mut 0)?;
+                    let definition = array.attached_enum().ok_or(SqlError::InternalError)?;
+                    let value = functions::uuid_array_operators::eval_enum(
+                        left, right, definition, op, *all, || execution.comparison(),
+                    )?;
+                    return Ok((value, false));
+                }
+                array
+            } else {
+                array
+            };
             let ty = srf::element(&array.ty)?;
             array.attach_clock(clock);
             let value = array.eval(

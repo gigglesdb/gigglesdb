@@ -1,6 +1,6 @@
 //! ARRAY constructors use the existing text-backed array codec and scalar casts.
 use super::*;
-pub(super) const NAME: &str = "\0array_constructor";
+pub(in crate::relational::query) const NAME: &str = "\0array_constructor";
 
 pub(super) enum Binding<'a> {
     Inferred,

@@ -6,6 +6,8 @@ pub(super) const OID: u32 = 114;
 pub(super) const ARRAY_OID: u32 = 199;
 pub(super) const TEXT_RESULT: &str = "\0json_aggregate_text_result";
 pub(super) const INPUT: &str = "\0json_input";
+pub(super) const OBJECT: &str = "jsonb_build_object";
+pub(super) const RECORD_KEY: &str = "\0jsonb_object_record_key";
 
 pub(super) fn type_name(scalar: &BoundScalar) -> &'static str {
     if scalar.result_oid() == OID {
@@ -178,6 +180,46 @@ pub(super) fn push(
     Ok(())
 }
 
+pub(super) fn build_object(
+    args: &[BoundScalar],
+    values: &[Value],
+    zone: SessionZone,
+    budget: &mut usize,
+) -> R<Value> {
+    if !values.len().is_multiple_of(2) {
+        user_types::view_replace_error("argument list must have even number of elements".into());
+        user_types::sql_error_hint(
+            "The arguments of jsonb_build_object() must consist of alternating keys and values.",
+        );
+        return Err(SqlError::InvalidParameterValue);
+    }
+    let kind = Aggregate::JsonbObject;
+    let mut object = Value::Text(String::new());
+    let mut retention = scan::Retention::new(crate::relational::max_value_bytes());
+    let (value_pairs, _) = values.as_chunks::<2>();
+    let (argument_pairs, _) = args.as_chunks::<2>();
+    for (index, (input, args)) in value_pairs.iter().zip(argument_pairs).enumerate() {
+        if input[0] == Value::Null {
+            user_types::view_replace_error(format!("argument {}: key must not be null", index * 2 + 1));
+            return Err(SqlError::InvalidParameterValue);
+        }
+        if args[0].result_oid() == OID || args[0].is_json_object_record_key() {
+            return Err(invalid_object_key());
+        }
+        push_object(&mut object, input, args, kind, zone, &mut retention)?;
+    }
+    if values.is_empty() {
+        object = Value::Text("{".into());
+    }
+    finish(&mut object, kind, budget)?;
+    Ok(object)
+}
+
+fn invalid_object_key() -> SqlError {
+    user_types::view_replace_error("key value must be scalar, not array, composite, or json".into());
+    SqlError::InvalidParameterValue
+}
+
 pub(super) fn compare_distinct(input: Option<&BoundScalar>, a: &Value, b: &Value) -> R<Ordering> {
     match (a, b) {
         (Value::Null, Value::Null) => Ok(Ordering::Equal),
@@ -214,10 +256,7 @@ pub(super) fn push_object(
     }
     let key_type = &args[0].ty;
     if key_type.is_array() || *key_type == DataType::Jsonb {
-        user_types::view_replace_error(
-            "key value must be scalar, not array, composite, or json".into(),
-        );
-        return Err(SqlError::InvalidParameterValue);
+        return Err(invalid_object_key());
     }
     let mut key = element(key, key_type, zone)?;
     if !key.starts_with('"') {

@@ -191,6 +191,7 @@ struct Diagnostic {
     exact_sql_detail: bool,
     duplicate_key: Option<DuplicateKeyDetail>,
     duplicate_key_visible: Option<bool>,
+    written_check_row: Option<String>,
     query_id: Option<String>,
     /// GD-0061 R3-310: a task-session refusal (class, error) not yet written
     /// to the read log; the task path logs it with the statement text.
@@ -231,10 +232,17 @@ impl Diagnostic {
     }
     fn read_core_detail(&mut self) -> Option<String> {
         self.exact_sql_detail = false;
+        self.written_check_row = None;
         match giggles_core::relational::take_sql_diagnostic_detail() {
             Some(SqlErrorDetail::DuplicateKey(detail)) => {
                 self.duplicate_key = Some(detail);
                 self.duplicate_key_visible = None;
+                None
+            }
+            Some(SqlErrorDetail::FailingCheckRow { row, written }) => {
+                self.duplicate_key = Some(row);
+                self.duplicate_key_visible = None;
+                self.written_check_row = written;
                 None
             }
             Some(SqlErrorDetail::ForeignKey { key, redacted }) => {
@@ -252,11 +260,18 @@ impl Diagnostic {
     }
 
     fn authorize_duplicate_key(&mut self, code: &str, session: &mut Session) {
-        if matches!(code, "23503" | "23505")
+        if matches!(code, "23503" | "23505" | "23514")
             && self.duplicate_key_visible.is_none()
             && let Some(detail) = &self.duplicate_key
         {
-            self.duplicate_key_visible = Some(session.can_read_duplicate_key(detail));
+            let full = session.can_read_duplicate_key(detail);
+            self.duplicate_key_visible = Some(full);
+            if !full && code == "23514"
+                && let Some(written) = self.written_check_row.take()
+                && session.can_show_written_check_row(detail)
+            {
+                self.sql_detail = Some(written);
+            }
         }
     }
 
@@ -349,6 +364,10 @@ impl Diagnostic {
             }
             (Err(CoreError::Sql(SqlError::UndefinedParameter)), Some(m)) => {
                 m.starts_with("there is no parameter $")
+            }
+            (Err(CoreError::Sql(SqlError::IndeterminateDatatype)), Some(m)) => {
+                self.wire_exact = m.starts_with("could not determine data type of parameter $");
+                self.wire_exact
             }
             (Err(CoreError::Sql(SqlError::GroupingError)), Some(m)) => {
                 m == "aggregate functions are not allowed in index predicates"
@@ -669,7 +688,7 @@ fn diagnostic_error(
         .or_else(|| diagnostic.and_then(|d| d.wire_message.as_deref()));
     z(wire_message.unwrap_or(message), &mut b);
     if let Some((diagnostic, key)) = diagnostic
-        .filter(|_| matches!(code, "23503" | "23505"))
+        .filter(|_| matches!(code, "23503" | "23505" | "23514"))
         .and_then(|d| d.duplicate_key.as_ref().map(|key| (d, key)))
     {
         let detail = if diagnostic.duplicate_key_visible == Some(true) {
@@ -3138,7 +3157,11 @@ impl State {
                 }
                 let mut oids = vec![];
                 for _ in 0..n {
-                    oids.push(r.u32()?);
+                    // PostgreSQL's UNKNOWN pseudo-type asks Parse to infer the type.
+                    oids.push(match r.u32()? {
+                        705 => 0,
+                        oid => oid,
+                    });
                 }
                 r.end()?;
                 if name.len() > 63 {
