@@ -218,6 +218,11 @@ impl BoundScalar {
         b: &Value,
     ) -> R<Ordering> {
         self.check_comparison_collation()?;
+        if self.ty == DataType::TextArray
+            && let Some(TypeDef::Enum { labels, .. }) = self.attached_enum()
+        {
+            return enum_order::compare_arrays(labels, a, b);
+        }
         if self.ty.is_array() {
             return array_order::compare(&self.ty, self.explicit_collation()?, a, b);
         }
