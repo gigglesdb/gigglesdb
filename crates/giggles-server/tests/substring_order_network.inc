@@ -62,15 +62,14 @@ async fn substring_order_numeric_parse0_binary_metadata_rows_and_authority() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, String>(0), "a");
-    // PG supports this regex overload; current bounded profile explicitly does not.
-    assert_eq!(
-        code(
-            pg.prepare("SELECT SUBSTRING($1 FOR $2 FROM $3)")
-                .await
-                .unwrap_err()
-        ),
-        "0A000"
-    );
+    // PG18.6: parameter_types = {text,text,text}, result_types = {text}.
+    let p = pg
+        .prepare("SELECT SUBSTRING($1 FOR $2 FROM $3)")
+        .await
+        .unwrap();
+    assert_eq!(p.params(), &[tokio_postgres::types::Type::TEXT; 3]);
+    assert_eq!(p.columns().len(), 1);
+    assert_eq!(p.columns()[0].type_(), &tokio_postgres::types::Type::TEXT);
     drop(pg);
     connection.await.unwrap();
     let (task, connection) = f.pg(f.task.clone()).await;

@@ -80,16 +80,20 @@ fn schema_and_signature_errors_on_empty_and_limit_zero() {
             "abs(txt)",
             "lower(i)",
             "coalesce(txt,i)",
-            "substring(txt,txt)",
         ] {
-            // PostgreSQL's substring(text,text) regex overload is not implemented.
-            let expected = if q.starts_with("coalesce(") || q == "substring(txt,txt)" {
+            let expected = if q.starts_with("coalesce(") {
                 E::Type
             } else {
                 E::UndefinedFunction
             };
             error(&mut s, &format!("SELECT {q} FROM f{suffix}"), expected);
         }
+        // PG18.6: substring(txt,txt) succeeds with 0 rows, with and without LIMIT 0.
+        assert!(
+            run(&mut s, &format!("SELECT substring(txt,txt) FROM f{suffix}"))
+                .rows
+                .is_empty()
+        );
         error(
             &mut s,
             &format!("SELECT coalesce(1,abs(missing)) FROM f{suffix}"),
@@ -325,13 +329,18 @@ fn cast_context_empty_input_limits_and_rollback() {
             ))
             .unwrap();
         let d = s.describe(&p).unwrap();
-        assert_eq!(d.parameters, vec![T::Integer, T::Text, T::Integer]);
+        // PG18.6: parameter_types = {integer,text,text}.
+        assert_eq!(d.parameters, vec![T::Integer, T::Text, T::Text]);
         assert_eq!(d.columns[0].data_type, T::SmallInt);
         assert!(
-            s.execute_prepared(&p, &[V::Int(1), V::Text("abc".into()), V::Int(1)], None)
-                .unwrap()
-                .rows
-                .is_empty()
+            s.execute_prepared(
+                &p,
+                &[V::Int(1), V::Text("abc".into()), V::Text("a".into())],
+                None
+            )
+            .unwrap()
+            .rows
+            .is_empty()
         );
     }
     assert_eq!(

@@ -231,6 +231,13 @@ fn substring_order_numeric_proposal_metadata_and_outputs() {
             "{q}"
         );
     }
+    // PG18.6: parameter_types = {text,text,text}, result_types = {text}.
+    let p = s.prepare("SELECT SUBSTRING($1 FOR $2 FROM $3)").unwrap();
+    let d = s.describe(&p).unwrap();
+    assert_eq!(d.parameters, vec![DataType::Text; 3]);
+    assert_eq!(d.columns.len(), 1);
+    assert_eq!(d.columns[0].data_type, DataType::Text);
+
     for (q, error) in [
         (
             "SELECT SUBSTRING('abcdef' FOR 2::bigint FROM 3)",
@@ -244,12 +251,10 @@ fn substring_order_numeric_proposal_metadata_and_outputs() {
             "SELECT SUBSTRING('abc' FOR missing_length FROM missing_start)",
             SqlError::UnknownColumn,
         ),
-        // PG resolves regex and succeeds; this candidate explicitly lacks that family.
-        ("SELECT SUBSTRING($1 FOR $2 FROM $3)", SqlError::Unsupported),
-        // PG42703 is retained in mixed.json; existing infer defers plain column lookup.
+        // PG18.6: ERROR 42703 column "missing" does not exist.
         (
             "SELECT SUBSTRING($1 FOR $2 FROM $3), missing",
-            SqlError::Unsupported,
+            SqlError::UnknownColumn,
         ),
     ] {
         let p = s.prepare(q).unwrap();
