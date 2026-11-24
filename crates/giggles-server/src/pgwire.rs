@@ -187,6 +187,7 @@ struct Diagnostic {
     wire_names: Option<giggles_core::relational::SqlErrorNames>,
     wire_exact: bool,
     sql_detail: Option<String>,
+    exact_sql_detail: bool,
     duplicate_key: Option<DuplicateKeyDetail>,
     duplicate_key_visible: Option<bool>,
     query_id: Option<String>,
@@ -228,6 +229,7 @@ impl Diagnostic {
         error.sqlstate
     }
     fn read_core_detail(&mut self) -> Option<String> {
+        self.exact_sql_detail = false;
         match giggles_core::relational::take_sql_diagnostic_detail() {
             Some(SqlErrorDetail::DuplicateKey(detail)) => {
                 self.duplicate_key = Some(detail);
@@ -240,6 +242,10 @@ impl Diagnostic {
                 Some(redacted)
             }
             Some(SqlErrorDetail::Text(detail)) => Some(detail),
+            Some(SqlErrorDetail::Exact(detail)) => {
+                self.exact_sql_detail = true;
+                detail
+            }
             None => None,
         }
     }
@@ -325,6 +331,7 @@ impl Diagnostic {
         self.wire_names = giggles_core::relational::take_sql_error_names();
         use giggles_core::relational::SqlError;
         let postgres_diagnostic = match (&result, message.as_deref()) {
+            (Err(CoreError::Sql(_)), Some(_)) if self.exact_sql_detail => true,
             (Err(CoreError::Sql(SqlError::InvalidIndexPredicate)), Some(m)) => {
                 m == "functions in index predicate must be marked IMMUTABLE"
             }
@@ -668,6 +675,9 @@ fn diagnostic_error(
         }
     } else if let Some(detail) = match registry_error {
         Some(error) => error.detail,
+        None if diagnostic.is_some_and(|d| d.exact_sql_detail) => {
+            diagnostic.and_then(|d| d.sql_detail.as_deref())
+        }
         None => diagnostic
             .and_then(|d| d.sql_detail.as_deref().or(d.wire_detail.as_deref()))
             .or(detail.as_deref().filter(|_| !diagnostic.is_some_and(|d| d.wire_exact))),

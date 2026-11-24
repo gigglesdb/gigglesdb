@@ -1018,6 +1018,7 @@ pub(super) fn bind<'a>(
         declared: vec![],
         distinct_order_slots: vec![],
         volatile_order: vec![],
+        set_order: None,
         aggregate_zone: giggles_pg_types::temporal::SessionZone::Fixed(0),
         grouping: Some(Grouping {
             mask: grouping_mask,

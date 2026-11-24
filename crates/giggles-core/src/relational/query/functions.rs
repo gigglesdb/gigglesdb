@@ -56,6 +56,7 @@ mod overlay_tests;
 mod pg18_routines;
 mod planning;
 mod position;
+pub(super) mod regexp;
 pub(in crate::relational) mod quoting;
 
 pub(super) fn keyword_requires_quotes(name: &str) -> bool {
@@ -681,6 +682,7 @@ impl Scalar {
     }
     fn parse_context(p: &mut Parser, depth: usize, aggregate_argument: bool) -> R<Self> {
         let value = Self::parse_binary(p, depth, aggregate_argument, 0)?;
+        let value = regexp::parse_similar(p, value, depth, aggregate_argument)?;
         arithmetic::admit_shape(&value, depth, &mut 0)?;
         Ok(value)
     }
@@ -1135,6 +1137,16 @@ impl Scalar {
                             break;
                         }
 
+                        if !qualified_call
+                            && !quoted
+                            && name == "substring"
+                            && args.len() == 1
+                            && p.word("similar")
+                        {
+                            return regexp::parse_similar_substring(
+                                p, args, depth + 1, aggregate_argument,
+                            );
+                        }
                         if !qualified_call
                             && !quoted
                             && name == "substring"
@@ -2028,6 +2040,13 @@ impl Scalar {
         if random_uuid::known(name) {
             return random_uuid::bind(name, original, args);
         }
+        if let Some(ty) = regexp::bind(name, original, &mut args, parameters)? {
+            collation::derive(args.iter())?;
+            return Ok(BoundScalar {
+                ty,
+                node: Node::Call(name.into(), args),
+            });
+        }
         if args
             .iter()
             .enumerate()
@@ -2405,15 +2424,6 @@ impl Scalar {
                     }
                 }
                 "substring" | "substr" if (2..=3).contains(&args.len()) => {
-                    if name == "substring"
-                        && args.iter().all(|a| a.ty == DataType::Text)
-                        && original[1..]
-                            .iter()
-                            .any(|a| !a.aggregate_unknown(parameters))
-                    {
-                        // PostgreSQL regex overloads exist but are not implemented here.
-                        return Err(SqlError::Type);
-                    }
                     for (i, a) in args.iter_mut().enumerate() {
                         let ty = if i == 0 {
                             DataType::Text
@@ -2496,6 +2506,26 @@ impl BoundScalar {
             ty: self.ty.clone(),
             node: Node::Case(vec![(super::BoundFilter::Null(key, true), self)], None),
         }
+    }
+
+    pub(super) fn is_regex_set(&self) -> bool {
+        matches!(&self.node, Node::Call(name, _) if regexp::set_type(name).is_some())
+    }
+
+    pub(super) fn regex_set(&self, row: &Tuple, params: &[Value]) -> R<Option<Vec<Value>>> {
+        let Node::Call(name, args) = &self.node else { return Ok(None) };
+        if regexp::set_type(name).is_none() {
+            return Ok(None);
+        }
+        let mut work = 0;
+        let values = args.iter().map(|arg| arg.eval(row, params, &mut work)).collect::<R<Vec<_>>>()?;
+        let mut values_out = Vec::new();
+        regexp::emit(name, args, &values, |value| {
+            charge(&mut work, &value)?;
+            values_out.push(value);
+            Ok(())
+        })?;
+        Ok(Some(values_out))
     }
 
     pub(super) fn result_oid(&self) -> u32 {
@@ -2640,6 +2670,8 @@ impl BoundScalar {
             Node::Column(_, name) => name,
             Node::Literal(_) => "?column?",
             Node::Call(n, _) if n == array_constructor::NAME => "array",
+            Node::Call(n, _) if n == regexp::SUBSTRING_SIMILAR => "substring",
+            Node::Call(n, _) if matches!(n.as_str(), regexp::SIMILAR_TO | regexp::NOT_SIMILAR_TO) => "?column?",
             Node::Call(n, args) if collation::internal(n) || aggregate_order::internal(n) || n == "\0array_subscript" => args[0].name(),
             Node::Call(n, _) if n.starts_with("\0json_") || n.starts_with(ROW_ORDER_PREFIX) => "?column?",
             Node::Call(n, _) if n == conditional::NULLS_VARIADIC => "num_nulls",
@@ -2933,6 +2965,9 @@ impl BoundScalar {
                 if n == array_constructor::NAME { return array_constructor::eval(args, &values, budget); }
                 if uuid_array_operators::is_quantified(n) {
                     return uuid_array_operators::eval_quantified(n, &values);
+                }
+                if let Some(result) = regexp::eval(n, args, &values, budget) {
+                    return result;
                 }
                 if n != "concat"
                     && n != "format"
@@ -3834,6 +3869,9 @@ impl Scalar {
                 integer_formats::argument_type(ty.as_ref())?;
             }
             Self::Call(n, args) => {
+                if regexp::infer(n, args, parameters, resolve, tables)? {
+                    return Ok(());
+                }
                 if matches!(n.as_str(), "mod" | "gcd" | "lcm")
                     && args.len() == 2
                     && args.iter().all(|a| a.aggregate_unknown(parameters))

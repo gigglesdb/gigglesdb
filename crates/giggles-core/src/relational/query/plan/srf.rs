@@ -1,6 +1,7 @@
 //! FROM functions share scalar argument binding, array codecs and row budgets.
 use super::*;
 use exec::Relation;
+use functions::regexp;
 
 #[path = "text_search_srf.rs"]
 mod text_search_srf;
@@ -26,6 +27,7 @@ pub(super) fn parse(
     if !["generate_series", "unnest"].contains(&name.as_str())
         && !json_srf::known(&name)
         && !text_search_srf::known(&name)
+        && regexp::set_type(&name).is_none()
     {
         return Err(SqlError::UndefinedFunction);
     }
@@ -128,7 +130,43 @@ pub(super) fn array_values(value: Value, ty: &DataType) -> R<Vec<Value>> {
 impl Function {
     pub(super) fn ordinality(&self) -> bool { self.ordinality }
 
+    fn regex_args(
+        &self,
+        state: &Relational,
+        parameters: &mut [Option<DataType>],
+    ) -> R<Vec<BoundScalar>> {
+        if !(2..=3).contains(&self.args.len()) {
+            return Err(SqlError::UndefinedFunction);
+        }
+        let no_column = |_: &ColumnRef, _| Err(SqlError::UnknownColumn);
+        let args = if let Some(input) = &self.input {
+            for arg in &self.args {
+                if arg.aggregate_unknown(parameters) {
+                    arg.infer(Some(&DataType::Text), parameters, &no_column, &[])?;
+                }
+            }
+            let meta = input.clone().resolve(state, parameters)?;
+            meta.columns.into_iter().zip(meta.collations).map(|(c, collation)| {
+                functions::collation::materialized(collation.as_ref(), c.data_type)
+            }).collect::<R<Vec<_>>>()?
+        } else {
+            self.args.iter().map(|arg| {
+                let hint = arg.aggregate_unknown(parameters).then_some(&DataType::Text);
+                arg.infer(hint, parameters, &no_column, &[])?;
+                arg.bind(&no_column, &[], parameters)
+            }).collect::<R<Vec<_>>>()?
+        };
+        if args.iter().any(|arg| !regexp::text_type(&arg.ty)) {
+            return Err(SqlError::UndefinedFunction);
+        }
+        Ok(args)
+    }
+
     fn ty(&self, state: &Relational, parameters: &mut [Option<DataType>]) -> R<DataType> {
+        if let Some(ty) = regexp::set_type(&self.name) {
+            self.regex_args(state, parameters)?;
+            return Ok(ty);
+        }
         if json_srf::known(&self.name) {
             if self.args.len() != 1 {
                 return Err(SqlError::UndefinedFunction);
@@ -260,8 +298,22 @@ impl Function {
             .as_ref()
             .map(|p| p.run(state, source, params, parameters, clock, execution))
             .transpose()?;
+        let mut regex_args = regexp::set_type(&self.name)
+            .map(|_| self.regex_args(state, &mut parameters.to_vec()))
+            .transpose()?;
+        let row = Tuple {
+            source_versions: vec![],
+            values: vec![],
+            version: 0,
+        };
+        let eval = |argument: &mut BoundScalar| {
+            argument.attach_clock(clock);
+            argument.eval(&row, params, &mut 0)
+        };
         let mut values = if let Some(rows) = &mut evaluated {
             rows.rows.pop().ok_or(SqlError::Syntax)?.values
+        } else if let Some(args) = &mut regex_args {
+            args.iter_mut().map(eval).collect::<R<Vec<_>>>()?
         } else {
             let mut bound = if text_search_srf::known(&self.name) {
                 functions::text_search::bind_row_args(&self.name, &self.args, &mut parameters.to_vec())?
@@ -275,20 +327,7 @@ impl Function {
                     }
                 }).collect::<R<Vec<_>>>()?
             };
-            let mut values = Vec::with_capacity(bound.len());
-            for b in &mut bound {
-                b.attach_clock(clock);
-                values.push(b.eval(
-                    &Tuple {
-                        source_versions: vec![],
-                        values: vec![],
-                        version: 0,
-                    },
-                    params,
-                    &mut 0,
-                )?);
-            }
-            values
+            bound.iter_mut().map(eval).collect::<R<Vec<_>>>()?
         };
         if values.contains(&Value::Null) {
             return Ok(out);
@@ -326,6 +365,8 @@ impl Function {
             }
         } else if json_srf::known(&self.name) {
             json_srf::emit(&self.name, &values[0], &mut emit)?;
+        } else if let Some(args) = &regex_args {
+            regexp::emit(&self.name, args, &values, |value| emit(vec![value]))?;
         } else {
             let Value::Int(mut n) = values[0] else {
                 return Err(SqlError::Type);

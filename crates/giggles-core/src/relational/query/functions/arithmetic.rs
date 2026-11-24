@@ -273,7 +273,16 @@ fn signature(
     a: Option<DataType>,
     b: Option<DataType>,
 ) -> R<(DataType, DataType, DataType)> {
+    use BinaryOp::*;
     use DataType::*;
+    if matches!(op, Regex | NotRegex | RegexInsensitive | NotRegexInsensitive) {
+        if [a.as_ref(), b.as_ref()].into_iter().flatten().all(regexp::text_type) {
+            // PostgreSQL has a character operator whose source retains padding.
+            let source = if a == Some(Bpchar) { Bpchar } else { Text };
+            return Ok((source, Text, Boolean));
+        }
+        return Err(undefined_operator(op, [a.as_ref(), b.as_ref()]));
+    }
     if a == Some(Bpchar) || b == Some(Bpchar) {
         return Err(SqlError::Unsupported);
     }
@@ -313,7 +322,6 @@ fn signature(
         }
         return Err(SqlError::UndefinedFunction);
     }
-    use BinaryOp::*;
     if matches!(op, JsonPath | JsonPathText) {
         return if matches!(a, None | Some(Jsonb)) && matches!(b, None | Some(TextArray)) {
             Ok((Jsonb, TextArray, if op == JsonPath { Jsonb } else { Text }))
@@ -343,8 +351,7 @@ fn signature(
             Err(SqlError::Unsupported)
         };
     }
-    if matches!(op, Like | NotLike | Ilike | NotIlike | StartsWith | Regex | NotRegex
-        | RegexInsensitive | NotRegexInsensitive) {
+    if matches!(op, Like | NotLike | Ilike | NotIlike | StartsWith) {
         return if [a, b].iter().flatten().all(|ty| *ty == Text) {
             Ok((Text, Text, Boolean))
         } else {

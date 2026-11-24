@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 mod returning_images;
 mod row_locks;
+mod regex_projection;
 mod aggregate_filter;
 mod aggregate_order;
 mod functions;
@@ -2583,7 +2584,7 @@ impl Query {
                 && (p.tokens.get(p.at) == Some(&Token::Symbol(':'))
                     || functions::binary_operator(p.tokens.get(p.at))
                     || matches!(p.tokens.get(p.at), Some(Token::Op(op)) if ["=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()))
-                    || matches!(p.tokens.get(p.at), Some(Token::Word(w)) if ["and", "or", "is", "not", "between", "in", "like", "ilike"].contains(&w.as_str())))
+                    || matches!(p.tokens.get(p.at), Some(Token::Word(w)) if ["and", "or", "is", "not", "between", "in", "like", "ilike", "similar"].contains(&w.as_str())))
             {
                 let mut skip_until = item_start;
                 for n in item_start..p.tokens.len().saturating_sub(3) {
@@ -4604,6 +4605,8 @@ impl Query {
         } else {
             (resolve_order(&grouping::projection(self, &tables)?)?, vec![])
         };
+        let set_order = items.iter().any(BoundItem::is_regex_set)
+            .then(|| order_syntax.iter().map(|(_, slot)| *slot).collect());
         let mut volatile_order = Vec::new();
         let order = self
             .order
@@ -4649,6 +4652,7 @@ impl Query {
             exists_keys,
             distinct_order_slots,
             volatile_order,
+            set_order,
             outer_slots: outer_slots.into_inner(),
             subqueries,
             declared: vec![],
@@ -4667,6 +4671,11 @@ enum BoundItem {
     Scalar(BoundScalar),
     Column(BoundColumn),
     Aggregate(Aggregate, Option<BoundScalar>),
+}
+impl BoundItem {
+    fn is_regex_set(&self) -> bool {
+        matches!(self, Self::Scalar(value) if value.is_regex_set())
+    }
 }
 struct BoundJoin {
     left: bool,
@@ -4691,6 +4700,7 @@ pub(super) struct BoundQuery<'a> {
     distinct_order_slots: Vec<usize>,
     // (Select-list slot, ORDER BY key), in select-list order.
     volatile_order: Vec<(usize, usize)>,
+    set_order: Option<Vec<Option<usize>>>,
     exists_keys: Vec<exists::ProbeKey>,
     outer_slots: Vec<outer::OuterSlot>,
     subqueries: Subplans<'a>,
@@ -5263,6 +5273,7 @@ impl BoundQuery<'_> {
             || self.grouping.is_some()
             || self.query.distinct()
             || self.query.explain
+            || self.set_order.is_some()
             || self.query.has_in_subquery()
             || self.query.derived().is_some()
             || self.query.clauses().is_some_and(|c| !c.view_reads.is_empty())
@@ -5776,7 +5787,7 @@ impl BoundQuery<'_> {
                 rows: vec![],
                 affected: 0,
             };
-            if limit != Some(0) && offset == 0 {
+            if limit != Some(0) && (offset == 0 || self.set_order.is_some()) {
                 let row = Tuple {
                     source_versions: vec![],
                     values: self.outer_values(execution),
@@ -5789,6 +5800,13 @@ impl BoundQuery<'_> {
                     )? != Some(true)
                 {
                     return Ok(result);
+                }
+                if self.set_order.is_some() {
+                    let output = Output::new(source.streams_reductions(), subquery, insert_source, capture)?;
+                    return self.execute_regex_projection(
+                        std::iter::once(Ok(row)), params, scan::Page { offset, limit },
+                        execution, output, result,
+                    );
                 }
                 // DISTINCT keys are all projected values, and there is at most one row.
                 if !self.query.distinct() {
@@ -5951,6 +5969,10 @@ impl BoundQuery<'_> {
             rows: vec![],
             affected: 0,
         };
+        if self.set_order.is_some() {
+            let output = Output::new(source.streams_reductions(), subquery, insert_source, capture)?;
+            return self.execute_regex_projection(filtered, params, page, execution, output, result);
+        }
         let mut result_bytes = 0usize;
         // Legacy computed aggregate inputs keep the statement-wide scalar work budget
         // (DD-0068 aggregate_scalar_work_budget_is_shared_over_full_input). On v2,

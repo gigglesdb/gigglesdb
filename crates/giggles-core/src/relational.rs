@@ -425,6 +425,12 @@ pub enum SqlError {
     /// 42P17 invalid_object_definition, transient DDL validation failure.
     #[serde(skip)]
     InvalidObjectDefinition,
+    #[serde(skip)]
+    InvalidRegularExpression,
+    #[serde(skip)]
+    InvalidUseOfEscapeCharacter,
+    #[serde(skip)]
+    QueryCanceled,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

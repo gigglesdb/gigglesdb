@@ -154,11 +154,16 @@ pub fn json_output(v: &serde_json::Value) -> R<String> {
         _ => v.to_string(),
     })
 }
+// PostgreSQL's array lexer and output agree on ASCII whitespace, including VT.
+fn array_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{b}' | '\u{c}')
+}
+
 pub fn array_quote(s: &str) -> String {
     if s.is_empty()
         || s.eq_ignore_ascii_case("null")
         || s.chars()
-            .any(|c| c.is_whitespace() || "{},\\\"".contains(c))
+            .any(|c| array_space(c) || "{},\\\"".contains(c))
     {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     } else {
@@ -173,17 +178,17 @@ pub(super) fn malformed_array_literal(s: &str) -> SqlError {
 pub fn array_values(s: &str) -> R<Vec<Option<String>>> {
     let bad = || malformed_array_literal(s);
     let inner = s
-        .trim()
+        .trim_matches(array_space)
         .strip_prefix('{')
         .and_then(|s| s.strip_suffix('}'))
         .ok_or_else(bad)?;
-    if inner.trim().is_empty() {
+    if inner.trim_matches(array_space).is_empty() {
         return Ok(Vec::new());
     }
     let mut chars = inner.chars().peekable();
     let mut out = Vec::new();
     loop {
-        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+        while chars.peek().is_some_and(|c| array_space(*c)) {
             chars.next();
         }
         let quoted = chars.peek() == Some(&'"');
@@ -212,14 +217,14 @@ pub fn array_values(s: &str) -> R<Vec<Option<String>>> {
             return Err(bad());
         }
         if quoted {
-            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            while chars.peek().is_some_and(|c| array_space(*c)) {
                 chars.next();
             }
             if chars.peek().is_some() && chars.next() != Some(',') {
                 return Err(bad());
             }
         }
-        let v = if quoted { v } else { v.trim().into() };
+        let v = if quoted { v } else { v.trim_matches(array_space).into() };
         if !quoted && v.is_empty() {
             return Err(bad());
         }
@@ -229,7 +234,7 @@ pub fn array_values(s: &str) -> R<Vec<Option<String>>> {
             Some(v)
         });
         if chars.peek().is_none() {
-            if inner.trim_end().ends_with(',') {
+            if inner.trim_end_matches(array_space).ends_with(',') {
                 return Err(bad());
             }
             break;

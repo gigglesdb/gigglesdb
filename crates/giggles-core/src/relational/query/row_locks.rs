@@ -104,6 +104,9 @@ pub(super) fn validate(query: &Query) -> R<()> {
             else if clauses.having.is_some() { Some("HAVING clause") }
             else if query.items.iter().any(|(item, _)| matches!(item, Item::Aggregate(..))
                 || matches!(item, Item::Scalar(s) if grouping::contains_aggregate(s))) { Some("aggregate functions") }
+            else if query.items.iter().any(|(item, _)| {
+                matches!(item, Item::Scalar(Scalar::Call(name, _)) if functions::regexp::set_type(name).is_some())
+            }) { Some("set-returning functions in the target list") }
             else { None };
         if let Some(reason) = reason { return Err(fail(format!("{} is not allowed with {reason}", label(clause.mode)), SqlError::Unsupported)); }
         for name in &clause.names {
@@ -178,8 +181,13 @@ pub(in crate::relational::query) fn reject_plan(tokens: &[Token]) -> R<()> {
         else {
             let end = top.iter().copied().find(|i| word(tokens.get(*i), "from")).unwrap_or(mark);
             top.iter().copied().filter(|i| *i < end).any(|i| {
-                ["generate_series", "unnest", "generate_subscripts", "jsonb_array_elements", "jsonb_array_elements_text", "jsonb_each", "jsonb_each_text"].iter()
-                    .any(|w| word(tokens.get(i), w)) && tokens.get(i + 1) == Some(&Token::Symbol('('))
+                let known = match &tokens[i] {
+                    Token::Word(name) => functions::regexp::set_type(name).is_some()
+                        || ["generate_series", "unnest", "generate_subscripts", "jsonb_array_elements",
+                            "jsonb_array_elements_text", "jsonb_each", "jsonb_each_text"].contains(&name.as_str()),
+                    _ => false,
+                };
+                known && tokens.get(i + 1) == Some(&Token::Symbol('('))
             }).then_some("set-returning functions in the target list")
         };
     if let Some(reason) = reason { return Err(fail(format!("{} is not allowed with {reason}", label(mode)), SqlError::Unsupported)); }

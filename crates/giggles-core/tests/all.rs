@@ -623,3 +623,6 @@ mod enum_dml_overlap;
 
 #[path = "text_search.rs"]
 mod text_search;
+
+#[path = "sql_regex.rs"]
+mod sql_regex;

@@ -431,3 +431,6 @@ mod wire_sql_handles;
 
 #[path = "window_grouping_sets_network.rs"]
 mod window_grouping_sets_network;
+
+#[path = "regex_network.rs"]
+mod regex_network;

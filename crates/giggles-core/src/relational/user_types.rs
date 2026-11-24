@@ -13,6 +13,8 @@ pub struct DuplicateKeyDetail {
 
 pub enum SqlErrorDetail {
     Text(String),
+    /// Preserve the detail field exactly, including its absence.
+    Exact(Option<String>),
     DuplicateKey(DuplicateKeyDetail),
     ForeignKey { key: DuplicateKeyDetail, redacted: String },
 }
@@ -52,9 +54,10 @@ pub(super) fn sql_error_hint_owned(hint: String) {
     SQL_ERROR_HINT.with(|v| *v.borrow_mut() = Some(hint.into()));
 }
 pub fn take_sql_error_detail() -> Option<String> {
-    take_sql_diagnostic_detail().map(|detail| match detail {
-        SqlErrorDetail::Text(text) => text,
-        SqlErrorDetail::DuplicateKey(detail) | SqlErrorDetail::ForeignKey { key: detail, .. } => detail.values,
+    take_sql_diagnostic_detail().and_then(|detail| match detail {
+        SqlErrorDetail::Text(text) => Some(text),
+        SqlErrorDetail::Exact(detail) => detail,
+        SqlErrorDetail::DuplicateKey(detail) | SqlErrorDetail::ForeignKey { key: detail, .. } => Some(detail.values),
     })
 }
 pub fn take_sql_diagnostic_detail() -> Option<SqlErrorDetail> {
@@ -85,6 +88,9 @@ pub(super) fn sql_foreign_key_detail(key: DuplicateKeyDetail, redacted: String) 
 }
 pub(super) fn sql_error_detail(detail: String) {
     SQL_ERROR_DETAIL.with(|v| *v.borrow_mut() = Some(SqlErrorDetail::Text(detail)));
+}
+pub(super) fn exact_sql_error_detail(detail: Option<&str>) {
+    SQL_ERROR_DETAIL.with(|v| *v.borrow_mut() = Some(SqlErrorDetail::Exact(detail.map(str::to_owned))));
 }
 pub(super) fn type_name_syntax_error(near: &str, input: &str) {
     let message = format!(r#"syntax error at or near "{near}""#);

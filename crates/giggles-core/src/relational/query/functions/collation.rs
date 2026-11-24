@@ -639,6 +639,24 @@ pub(in crate::relational::query) fn like(
     Ok(Some(crate::relational::like::like(value, pattern, escape, fold, work)? != negated))
 }
 
+pub(super) fn regex_context(args: &[BoundScalar]) -> R<giggles_pg_regex::api::RegexpContext<'static>> {
+    use giggles_pg_regex::api::RegexLocale;
+    let d = merge(args.iter())?;
+    if d.conflict.is_some() {
+        return indeterminate();
+    }
+    if d.name.is_some_and(nondeterministic) {
+        user_types::view_replace_error(
+            "nondeterministic collations are not supported for regular expressions".into(),
+        );
+        return Err(SqlError::Unsupported);
+    }
+    Ok(regexp::context(match d.name {
+        Some("C" | "POSIX") => RegexLocale::C,
+        _ => RegexLocale::CUtf8,
+    }))
+}
+
 pub(super) fn regex(
     op: &str,
     args: &[BoundScalar],
@@ -646,21 +664,15 @@ pub(super) fn regex(
     pattern: &str,
     budget: &mut usize,
 ) -> R<Value> {
-    let locale = comparison_locale(&args[0], &args[1])?;
-    if locale.is_some_and(nondeterministic) {
-        user_types::view_replace_error(
-            "nondeterministic collations are not supported for regular expressions".into(),
-        );
-        return Err(SqlError::Unsupported);
-    }
-    let expression = regex::RegexBuilder::new(pattern)
-        .case_insensitive(op.ends_with('*'))
-        .dot_matches_new_line(true)
-        .size_limit(1 << 20)
-        .dfa_size_limit(1 << 20)
-        .build()
-        .map_err(|_| SqlError::Unsupported)?;
-    let result = Value::Bool(expression.is_match(value) != op.starts_with('!'));
+    use giggles_pg_regex::api;
+    let match_op = match op {
+        "~" => api::textregexeq,
+        "!~" => api::textregexne,
+        "~*" => api::texticregexeq,
+        "!~*" => api::texticregexne,
+        _ => unreachable!("regex operator {op}"),
+    };
+    let result = Value::Bool(match_op(value, pattern, &regex_context(args)?).map_err(regexp::error)?);
     charge(budget, &result)?;
     Ok(result)
 }

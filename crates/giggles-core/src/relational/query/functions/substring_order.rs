@@ -1,4 +1,4 @@
-//! FOR-before-FROM numeric overload resolution.
+//! FOR-before-FROM overload resolution.
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9,20 +9,18 @@ enum Family {
 }
 
 fn family(types: [Option<&DataType>; 3]) -> R<Family> {
+    if regexp::substring(&types) {
+        return Ok(Family::TextRegex);
+    }
     if types.iter().flatten().any(|ty| **ty == DataType::Bpchar) {
         return Err(SqlError::Unsupported);
     }
     let source_text = types[0].is_none_or(|t| matches!(t, DataType::Text | DataType::Varchar));
     let source_bytes = types[0].is_none_or(|t| *t == DataType::Bytes);
-    let text = types[1..]
-        .iter()
-        .all(|t| t.is_none_or(|t| matches!(t, DataType::Text | DataType::Varchar)));
     let numeric = types[1..]
         .iter()
         .all(|t| t.is_none_or(|t| matches!(t, DataType::SmallInt | DataType::Integer)));
-    if source_text && text {
-        Ok(Family::TextRegex)
-    } else if source_text && numeric {
+    if source_text && numeric {
         Ok(Family::TextNumeric)
     } else if source_bytes && numeric {
         Ok(Family::BytesNumeric)
@@ -87,13 +85,12 @@ impl Scalar {
         let types = std::array::from_fn(|i| {
             (!args[i].aggregate_unknown(parameters)).then_some(&bound[i].ty)
         });
-        let source = match family(types)? {
-            Family::TextNumeric => DataType::Text,
-            Family::BytesNumeric => DataType::Bytes,
-            Family::TextRegex => return Err(SqlError::Unsupported),
+        let expected = match family(types)? {
+            Family::TextNumeric => [DataType::Text, DataType::Integer, DataType::Integer],
+            Family::BytesNumeric => [DataType::Bytes, DataType::Integer, DataType::Integer],
+            Family::TextRegex => [DataType::Text, DataType::Text, DataType::Text],
         };
-        let result = source.clone();
-        let expected = [source, DataType::Integer, DataType::Integer];
+        let result = expected[0].clone();
         let mut normalized = Vec::with_capacity(3);
         for ((i, arg), ty) in bound.into_iter().enumerate().zip(expected) {
             let arg = if args[i].aggregate_unknown(parameters) {
@@ -106,8 +103,8 @@ impl Scalar {
                 }
             } else if arg.ty != ty {
                 BoundScalar {
+                    node: cast_node(arg, &ty),
                     ty,
-                    node: Node::Cast(Box::new(arg)),
                 }
             } else {
                 arg
