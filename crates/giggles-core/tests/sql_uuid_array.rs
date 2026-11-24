@@ -400,3 +400,37 @@ fn review_array_errors_legacy() {
 fn review_array_errors_v2() {
     review_array_errors(Engine::V2);
 }
+
+#[test]
+fn uuid_array_containment_accepts_columns_literals_and_untyped_parameters() {
+    let path = common::fresh("uuid-array-containment");
+    let admin = Admin::create(&path, Limits::default()).unwrap();
+    let mut session = admin.sql_session();
+    run(&mut session, "CREATE TABLE uc (id int PRIMARY KEY, v uuid[])");
+    let literal = format!("{{{A}}}");
+    run(&mut session, &format!("INSERT INTO uc VALUES (1, '{literal}')"));
+
+    assert_eq!(
+        run(&mut session, "SELECT id, v = v, v @> v, v <@ v, v && v FROM uc ORDER BY v, id"),
+        [vec![Value::Int(1), Value::Bool(true), Value::Bool(true), Value::Bool(true), Value::Bool(true)]]
+    );
+    assert_eq!(
+        run(
+            &mut session,
+            &format!("SELECT v @> '{literal}', '{literal}' <@ v, v && '{{{B}}}' FROM uc"),
+        ),
+        [vec![Value::Bool(true), Value::Bool(true), Value::Bool(false)]]
+    );
+
+    for expression in ["v @> $1", "$1 <@ v", "v && $1"] {
+        let statement = format!("SELECT {expression} FROM uc");
+        let plan = session.prepare(&statement).unwrap();
+        assert_eq!(session.describe(&plan).unwrap().parameters, [DataType::UuidArray]);
+        let result = session.execute_prepared(&plan, &[text(&literal)], None).unwrap();
+        assert_eq!(result.rows[0].values, [Value::Bool(true)], "{statement}");
+    }
+
+    drop(session);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}

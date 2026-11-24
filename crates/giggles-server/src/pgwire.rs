@@ -3031,10 +3031,8 @@ impl State {
                     } else {
                         let raw = r.take(usize::try_from(n).map_err(|_| "54000")?)?;
                         let format = format_at(&fmts, i);
-                        if let Some(parameter) = input
-                            && *ty == DataType::TextArray && format == 1
-                        {
-                            logical_binary_input(ty, raw, Some(parameter.oid() - 1))?
+                        if input.is_some() && *ty == DataType::TextArray && format == 1 {
+                            logical_binary_input(ty, raw, Some(&mut self.diagnostic))?
                         } else {
                             decode_with_order(
                                 raw, ty, format,
@@ -4578,7 +4576,32 @@ fn logical_binary_output(ty: &DataType, s: &str, type_oid: u32) -> R<Vec<u8>> {
     }
     Ok(b)
 }
-fn logical_binary_input(ty: &DataType, b: &[u8], element_oid: Option<u32>) -> R<Value> {
+fn enum_array_label<'a>(bytes: &'a [u8], diagnostic: &mut Diagnostic) -> R<&'a str> {
+    let text = std::str::from_utf8(bytes);
+    let valid_len = text.as_ref().map_or_else(|error| error.valid_up_to(), |text| text.len());
+    let invalid = if let Some(nul) = bytes[..valid_len].iter().position(|&byte| byte == 0) {
+        &bytes[nul..=nul]
+    } else if let Ok(text) = text {
+        return Ok(text);
+    } else {
+        let width = match bytes[valid_len] {
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => 1,
+        };
+        &bytes[valid_len..bytes.len().min(valid_len + width)]
+    };
+    let hex = invalid.iter().map(|byte| format!("0x{byte:02x}")).collect::<Vec<_>>().join(" ");
+    diagnostic.wire_message = Some(format!("invalid byte sequence for encoding \"UTF8\": {hex}"));
+    Err("22021")
+}
+
+fn logical_binary_input(
+    ty: &DataType,
+    b: &[u8],
+    mut enum_array_diagnostic: Option<&mut Diagnostic>,
+) -> R<Value> {
     use giggles_core::relational::logical_types::{array_quote, coerce};
     if *ty == DataType::Uuid {
         if b.len() != 16 {
@@ -4602,14 +4625,14 @@ fn logical_binary_input(ty: &DataType, b: &[u8], element_oid: Option<u32>) -> R<
     let ndim = int(b, &mut at)?;
     let hasnull = int(b, &mut at)?;
     let elem = int(b, &mut at)? as u32;
-    let expected = element_oid.unwrap_or(match ty {
+    let expected = match ty {
         DataType::IntArray => 23,
         DataType::BigIntArray => 20,
         DataType::UuidArray => 2950,
         _ => 25,
-    });
-    // Binary enum elements carry label bytes, including text and varchar headers.
-    let element_matches = elem == expected || element_oid.is_some() && matches!(elem, 25 | 1043);
+    };
+    // The parameter's enum type determines how to decode the labels, independent of the header OID.
+    let element_matches = elem == expected || enum_array_diagnostic.is_some();
     if !(0..=1).contains(&ndim) || !(0..=1).contains(&hasnull) || !element_matches {
         return Err("22P03");
     }
@@ -4642,7 +4665,14 @@ fn logical_binary_input(ty: &DataType, b: &[u8], element_oid: Option<u32>) -> R<
                 i64::from_be_bytes(v.try_into().unwrap()).to_string()
             }
             DataType::UuidArray if len == 16 => hex::encode(v),
-            DataType::TextArray => array_quote(std::str::from_utf8(v).map_err(|_| "22021")?),
+            DataType::TextArray => {
+                let text = if let Some(diagnostic) = enum_array_diagnostic.as_deref_mut() {
+                    enum_array_label(v, diagnostic)?
+                } else {
+                    std::str::from_utf8(v).map_err(|_| "22021")?
+                };
+                array_quote(text)
+            }
             _ => return Err("22P03"),
         });
     }

@@ -447,7 +447,7 @@ async fn prisma_prepares_enum_parameters_without_oids() {
 #[derive(Debug)]
 struct BinaryEnumArray<'a> {
     element_oid: u32,
-    labels: &'a [&'a str],
+    labels: &'a [&'a [u8]],
 }
 
 impl ToSql for BinaryEnumArray<'_> {
@@ -463,7 +463,7 @@ impl ToSql for BinaryEnumArray<'_> {
         out.extend_from_slice(&1i32.to_be_bytes()); // lower bound
         for label in self.labels {
             out.extend_from_slice(&i32::try_from(label.len())?.to_be_bytes());
-            out.extend_from_slice(label.as_bytes());
+            out.extend_from_slice(label);
         }
         Ok(IsNull::No)
     }
@@ -476,7 +476,7 @@ impl ToSql for BinaryEnumArray<'_> {
 }
 
 #[tokio::test]
-async fn inferred_enum_array_binary_bind_accepts_text_and_varchar_headers() {
+async fn inferred_enum_array_binary_bind_ignores_header_element_oid() {
     let engine = if cfg!(feature = "engine-rocksdb") {
         Engine::V2
     } else {
@@ -497,23 +497,39 @@ async fn inferred_enum_array_binary_bind_accepts_text_and_varchar_headers() {
         panic!("expected inferred enum-array parameter, got {:?}", plan.params());
     };
     assert_eq!(element.name(), "qe");
-    for element_oid in [element.oid(), Type::TEXT.oid(), Type::VARCHAR.oid()] {
+    for element_oid in [element.oid(), Type::TEXT.oid(), Type::VARCHAR.oid(), Type::INT4.oid(), 0] {
         let valid = BinaryEnumArray {
             element_oid,
-            labels: &["a", "z"],
+            labels: &[b"a", b"z"],
         };
         let row = pg.query_one(&plan, &[&valid]).await.unwrap();
         assert_eq!(row.get::<_, i32>(0), 2, "element OID {element_oid}");
 
         let invalid = BinaryEnumArray {
             element_oid,
-            labels: &["BOGUS"],
+            labels: &[b"BOGUS"],
         };
         let error = pg.query(&plan, &[&invalid]).await.unwrap_err();
         let error = error.as_db_error().unwrap();
         assert_eq!(error.code().code(), "22P02", "element OID {element_oid}");
         assert_eq!(error.message(), r#"invalid input value for enum qe: "BOGUS""#);
     }
+    for (label, hex) in [(b"\0\0\0\x01".as_slice(), "0x00"), (b"\xff".as_slice(), "0xff")] {
+        let invalid = BinaryEnumArray {
+            element_oid: Type::INT4.oid(),
+            labels: &[label],
+        };
+        let error = pg.query(&plan, &[&invalid]).await.unwrap_err();
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), "22021");
+        assert_eq!(error.message(), format!(r#"invalid byte sequence for encoding "UTF8": {hex}"#));
+    }
+    expect_rows(
+        &pg,
+        "SELECT id, a FROM q ORDER BY id",
+        &[&[Some("1"), Some("{z}")], &[Some("2"), Some("{a,z}")]],
+    )
+    .await;
     drop(pg);
     fixture.stop().await;
 }

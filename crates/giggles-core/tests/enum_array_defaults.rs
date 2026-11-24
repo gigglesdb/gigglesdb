@@ -1112,15 +1112,52 @@ fn set_arm_distinct_on_resolves_referenced_unknown_outputs() {
 }
 
 #[test]
-fn ordinary_containment_with_untyped_parameters_stays_unsupported() {
+fn enum_array_containment_preserves_enum_types() {
+    let db = Admin::create(common::fresh("enum-containment"), Limits::default()).unwrap();
+    let mut sql = db.sql_session();
+    for statement in [
+        "CREATE TYPE ce AS ENUM ('z','a')",
+        "CREATE TABLE uc (id int PRIMARY KEY, e ce[])",
+        "INSERT INTO uc VALUES (1,'{z}')",
+    ] {
+        run(&mut sql, statement);
+    }
+    assert_eq!(
+        run(&mut sql, "SELECT e @> '{z}', e <@ '{z,a}', e && '{a}', e && e FROM uc"),
+        [vec![Value::Bool(true), Value::Bool(true), Value::Bool(false), Value::Bool(true)]]
+    );
+
+    for (expression, value) in [("e @> $1", "{z}"), ("e <@ $1", "{z,a}"), ("e && $1", "{z}")] {
+        let statement = format!("SELECT {expression} FROM uc");
+        let plan = sql.prepare(&statement).unwrap();
+        let (description, enums) = sql.describe_with_enum_parameters(&plan).unwrap();
+        assert_eq!(description.parameters, [giggles_core::relational::DataType::TextArray]);
+        assert!(enums.contains_key(&0), "{statement}");
+        let result = sql.execute_prepared(&plan, &[text(value)], None).unwrap();
+        assert_eq!(result.rows[0].values, [Value::Bool(true)], "{statement}");
+    }
+    error(
+        &mut sql,
+        "SELECT e @> '{BOGUS}' FROM uc",
+        SqlError::InvalidTextRepresentation,
+        r#"invalid input value for enum ce: "BOGUS""#,
+    );
+    assert_eq!(run(&mut sql, "SELECT e FROM uc"), [vec![text("{z}")]]);
+}
+
+#[test]
+fn ordinary_containment_stays_unsupported() {
     let db = Admin::create(common::fresh("ordinary-containment"), Limits::default()).unwrap();
     let mut sql = db.sql_session();
     run(
         &mut sql,
         "CREATE TABLE ordinary(id int PRIMARY KEY, xi int[], xt text[], j jsonb)",
     );
-    for expression in ["xi @> $1", "xt <@ $1", "j @> $1"] {
-        let statement = format!("SELECT id FROM ordinary WHERE {expression}");
+    for expression in [
+        "xi @> $1", "xt <@ $1", "j @> $1",
+        "xt @> xt", "xt @> '{a}'", "xi @> '{1}'", r#"j @> '{"a":1}'"#,
+    ] {
+        let statement = format!("SELECT {expression} FROM ordinary");
         let plan = sql.prepare(&statement).unwrap();
         assert!(
             matches!(

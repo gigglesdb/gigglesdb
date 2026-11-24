@@ -135,10 +135,19 @@ pub(super) fn known(
     tables: &[&TableDef],
     parameters: &[Option<DataType>],
 ) -> R<Option<DataType>> {
+    Ok(known_operand(a, resolve, tables, parameters)?.map(|operand| operand.ty))
+}
+
+fn known_operand(
+    a: &Scalar,
+    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+    tables: &[&TableDef],
+    parameters: &[Option<DataType>],
+) -> R<Option<BoundScalar>> {
     if a.aggregate_unknown(parameters) {
         Ok(None)
     } else {
-        Ok(Some(a.bind(resolve, tables, parameters)?.ty))
+        a.bind(resolve, tables, parameters).map(Some)
     }
 }
 // PostgreSQL's temporal overloads. Implicit conversions are deliberately closed.
@@ -433,26 +442,24 @@ pub(super) fn infer(
         Scalar::Binary(op, a, b) => {
             a.infer(None, parameters, resolve, tables)?;
             b.infer(None, parameters, resolve, tables)?;
-            if matches!(op, BinaryOp::Contains | BinaryOp::ContainedBy) {
-                for (target, source) in [(a, b), (b, a)] {
-                    if matches!(target.as_ref(), Scalar::Param(_)) && target.aggregate_unknown(parameters) {
-                        if !source.aggregate_unknown(parameters) {
-                            let bound = source.bind(resolve, tables, parameters)?;
-                            if bound.ty == DataType::TextArray && bound.attached_enum().is_some() {
-                                target.infer_enum_parameter(&bound.ty, bound.attached_enum(), parameters)?;
-                                return Ok(());
-                            }
-                        }
-                        return Err(SqlError::Unsupported);
+            let operands = [
+                known_operand(a, resolve, tables, parameters)?,
+                known_operand(b, resolve, tables, parameters)?,
+            ];
+            if let Some(definition) = enum_containment_type(*op, &operands) {
+                for (scalar, operand) in [a.as_ref(), b.as_ref()].into_iter().zip(&operands) {
+                    if matches!(scalar, Scalar::Param(_)) && operand.is_none() {
+                        return scalar.infer_enum_parameter(
+                            &DataType::TextArray,
+                            Some(&definition),
+                            parameters,
+                        );
                     }
                 }
-                return bind_enum_containment(*op, a, b, resolve, tables, parameters).map(|_| ());
+                return bind_enum_containment(*op, [a, b], operands, &definition).map(|_| ());
             }
-            let (at, bt, _) = signature(
-                *op,
-                known(a, resolve, tables, parameters)?,
-                known(b, resolve, tables, parameters)?,
-            )?;
+            let [left, right] = operands.map(|operand| operand.map(|operand| operand.ty));
+            let (at, bt, _) = signature(*op, left, right)?;
             // Overload coercions convert typed expressions; they only assign unknown parameters.
             if a.aggregate_unknown(parameters) {
                 a.infer(Some(&at), parameters, resolve, tables)?;
@@ -500,27 +507,35 @@ pub(super) fn operand(
         })
     }
 }
+fn enum_containment_type(
+    op: BinaryOp,
+    operands: &[Option<BoundScalar>; 2],
+) -> Option<std::sync::Arc<TypeDef>> {
+    if !matches!(op, BinaryOp::Contains | BinaryOp::ContainedBy | BinaryOp::Overlap) {
+        return None;
+    }
+    operands
+        .iter()
+        .flatten()
+        .filter(|operand| operand.ty == DataType::TextArray)
+        .find_map(BoundScalar::enum_definition)
+        .cloned()
+}
+
 fn bind_enum_containment(
     op: BinaryOp,
-    a: &Scalar,
-    b: &Scalar,
-    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
-    tables: &[&TableDef],
-    parameters: &[Option<DataType>],
+    [a, b]: [&Scalar; 2],
+    [left, right]: [Option<BoundScalar>; 2],
+    definition: &TypeDef,
 ) -> R<BoundScalar> {
-    let mut left = a.bind(resolve, tables, parameters)?;
-    let mut right = b.bind(resolve, tables, parameters)?;
-    let definition = [&left, &right].into_iter()
-        .find(|value| value.ty == DataType::TextArray && value.attached_enum().is_some())
-        .and_then(BoundScalar::enum_definition)
-        .cloned()
-        .ok_or(SqlError::Unsupported)?;
-    if let Scalar::Literal(value @ (Value::Null | Value::Text(_))) = a {
-        left = BoundScalar::enum_literal(value, &DataType::TextArray, &definition)?;
-    }
-    if let Scalar::Literal(value @ (Value::Null | Value::Text(_))) = b {
-        right = BoundScalar::enum_literal(value, &DataType::TextArray, &definition)?;
-    }
+    let bind = |scalar: &Scalar, operand: Option<BoundScalar>| match scalar {
+        Scalar::Literal(value @ (Value::Null | Value::Text(_))) => {
+            BoundScalar::enum_literal(value, &DataType::TextArray, definition)
+        }
+        _ => operand.ok_or(SqlError::Parameters),
+    };
+    let left = bind(a, left)?;
+    let right = bind(b, right)?;
     if left.type_identity() != right.type_identity() {
         return Err(enum_order::missing_operator(name(op).strip_prefix(PREFIX).unwrap(), &left, &right));
     }
@@ -553,15 +568,16 @@ pub(super) fn bind(
                 ),
             })
         }
-        Scalar::Binary(op @ (BinaryOp::Contains | BinaryOp::ContainedBy), a, b) => {
-            bind_enum_containment(*op, a, b, resolve, tables, parameters)
-        }
         Scalar::Binary(op, a, b) => {
-            let (at, bt, ty) = signature(
-                *op,
-                known(a, resolve, tables, parameters)?,
-                known(b, resolve, tables, parameters)?,
-            )?;
+            let operands = [
+                known_operand(a, resolve, tables, parameters)?,
+                known_operand(b, resolve, tables, parameters)?,
+            ];
+            if let Some(definition) = enum_containment_type(*op, &operands) {
+                return bind_enum_containment(*op, [a, b], operands, &definition);
+            }
+            let [left, right] = operands.map(|operand| operand.map(|operand| operand.ty));
+            let (at, bt, ty) = signature(*op, left, right)?;
             let mut args = vec![
                 operand(a, &at, resolve, tables, parameters)?,
                 operand(b, &bt, resolve, tables, parameters)?,
@@ -630,16 +646,6 @@ pub(super) fn eval(
             })?;
         charge(budget, &value)?;
         return Ok(value);
-    }
-    if matches!(op, "@>" | "<@")
-        && let [Value::Text(left), Value::Text(right)] = values
-    {
-        let (container, subset) = if op == "@>" { (left, right) } else { (right, left) };
-        let container: BTreeSet<_> = logical_types::array_values(container)?.into_iter().flatten().collect();
-        let subset = logical_types::array_values(subset)?;
-        return Ok(Value::Bool(subset.iter().all(|value| {
-            value.as_ref().is_some_and(|value| container.contains(value))
-        })));
     }
     if op == "@" {
         return eval_abs(ty, &values[0], budget);
