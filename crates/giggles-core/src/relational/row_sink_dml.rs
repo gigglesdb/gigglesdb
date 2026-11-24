@@ -401,7 +401,7 @@ fn selection<'a>(state: &Relational, description: &StatementDescription<'a>, par
         .map(|_| sink.mutation_keys(state, description, params, clock)).transpose()? };
     let template = if keys.is_some() {
         let mut template = prepared.clone();
-        template.parameter_types = description.describe(prepared, state).map_err(CoreError::Sql)?
+        template.parameter_types = description.input().describe(state).map_err(CoreError::Sql)?
             .parameters.iter().cloned().map(Some).collect();
         template.unbound_statement = None;
         match template.statement.get_mut() {
@@ -420,6 +420,8 @@ fn selection<'a>(state: &Relational, description: &StatementDescription<'a>, par
     Ok((template, keys))
 }
 
+// Only index names can change binding between preflight and a page. An index
+// on the search path can shadow an unqualified relation.
 fn page_memo<'a, 'p>(
     state: &Relational,
     page_indexes: &[secondary_index::Descriptor],
@@ -427,24 +429,31 @@ fn page_memo<'a, 'p>(
     preflight: &'a StatementDescription<'p>,
     page: &'a StatementDescription<'p>,
 ) -> &'a StatementDescription<'p> {
-    // The page stages rows, suppresses FK checks, and rebuilds index witnesses.
-    // Binding ignores those, sequence positions, and the row version allocator.
-    // But an index name on the search path can shadow an unqualified relation.
     if rewritten {
         return page;
     }
+    fn relevant_names<'d>(
+        indexes: &'d [secondary_index::Descriptor],
+        prepared: &Prepared,
+    ) -> BTreeSet<&'d str> {
+        indexes
+            .iter()
+            .filter(|index| {
+                let (schema, name) = split_key(&index.name);
+                prepared.search_path.iter().any(|s| s == schema)
+                    && prepared
+                        .relations
+                        .iter()
+                        .any(|r| r.schema.is_none() && r.name == name)
+            })
+            .map(|index| index.name.as_str())
+            .collect()
+    }
+
     let prepared = preflight.prepared();
-    let relevant = |index: &&secondary_index::Descriptor| {
-        let (schema, name) = split_key(&index.name);
-        prepared.search_path.iter().any(|s| s == schema)
-            && prepared
-                .relations
-                .iter()
-                .any(|r| r.schema.is_none() && r.name == name)
-    };
-    let original = state.secondary.descriptors().iter().filter(relevant);
-    let rebuilt = page_indexes.iter().filter(relevant);
-    if original.map(|index| &index.name).eq(rebuilt.map(|index| &index.name)) {
+    if relevant_names(state.secondary.descriptors(), prepared)
+        == relevant_names(page_indexes, prepared)
+    {
         preflight
     } else {
         page
@@ -798,6 +807,99 @@ impl ActionWork {
         sink.check_occupancy(table, &before, &after)?;
         sink.apply_indexes(table, Some(table), &before, &after, descriptors)?;
         sink.apply(table, &before, &after)
+    }
+}
+
+#[cfg(test)]
+mod page_memo_tests {
+    use super::*;
+
+    fn catalog() -> Relational {
+        let mut state = Relational::default();
+        for sql in [
+            "CREATE SCHEMA a",
+            "CREATE TABLE t(id bigint PRIMARY KEY, n bigint)",
+            "CREATE TABLE u(id bigint PRIMARY KEY)",
+            "CREATE TABLE v(id bigint PRIMARY KEY)",
+            "CREATE TABLE a.indexed(id bigint PRIMARY KEY, n bigint)",
+            "CREATE INDEX u ON a.indexed(n)",
+            "CREATE INDEX v ON a.indexed(n)",
+            "INSERT INTO t VALUES (1, 10), (2, 20)",
+            "INSERT INTO u VALUES (2)",
+        ] {
+            let prepared = Prepared::parse(sql, 1, state.epoch).unwrap();
+            state.execute(&prepared, &[], None).unwrap();
+        }
+        state
+    }
+
+    #[test]
+    fn page_memo_reuses_description_when_index_names_are_reordered() {
+        let state = catalog();
+        let mut prepared = Prepared::parse(
+            "UPDATE t SET n = 30 WHERE id IN (SELECT id FROM u) AND id IN (SELECT id FROM v) RETURNING id",
+            1,
+            state.epoch,
+        )
+        .unwrap();
+        prepared.set_schema_context(vec!["public".into(), "a".into()], "giggles".into());
+        let preflight = StatementDescription::new(&prepared);
+        let page = StatementDescription::new(&prepared);
+        let mut indexes = state.secondary_descriptors_engine().to_vec();
+        assert_eq!(indexes.len(), 2);
+        indexes.reverse();
+
+        let selected = page_memo(&state, &indexes, false, &preflight, &page);
+        assert!(std::ptr::eq(selected, &preflight));
+    }
+
+    #[test]
+    fn page_memo_rebinds_when_an_index_shadows_an_unqualified_relation() {
+        let shadowed = catalog();
+        let mut unshadowed = shadowed.clone();
+        rebuild(&mut unshadowed, &[]).unwrap();
+        let mut prepared = Prepared::parse(
+            "UPDATE t SET n = 30 WHERE id IN (SELECT id FROM u) RETURNING id",
+            1,
+            shadowed.epoch,
+        )
+        .unwrap();
+        prepared.set_schema_context(vec!["a".into(), "public".into()], "giggles".into());
+        assert_eq!(
+            shadowed.resolve_relation_key("u", &prepared.search_path),
+            relation_key("a", "u")
+        );
+        assert_eq!(unshadowed.resolve_relation_key("u", &prepared.search_path), "u");
+
+        let preflight = StatementDescription::new(&prepared);
+        let page = StatementDescription::new(&prepared);
+        let selected = page_memo(&shadowed, &[], false, &preflight, &page);
+        assert!(std::ptr::eq(selected, &page));
+        let mut fresh = unshadowed.clone();
+        let expected = fresh.execute(&prepared, &[], None).unwrap();
+        assert_eq!(expected.affected, 1);
+        assert_eq!(expected.rows[0].values, [Value::Int(2)]);
+        searched::DESCRIBE_CALLS.set(0);
+        let actual = unshadowed
+            .execute_statement_described(selected, &[], None, || false, None, None, &mut vec![])
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(searched::DESCRIBE_CALLS.get(), 1);
+
+        // A populated memo from the unshadowed image cannot describe the
+        // shadowed image. Its error must match an independent describe.
+        let fresh = StatementDescription::new(&prepared);
+        let selected = page_memo(
+            &unshadowed,
+            shadowed.secondary_descriptors_engine(),
+            false,
+            &page,
+            &fresh,
+        );
+        assert!(std::ptr::eq(selected, &fresh));
+        let expected = prepared.describe(&shadowed).unwrap_err();
+        assert_eq!(expected, SqlError::UnknownTable);
+        assert_eq!(selected.input().describe(&shadowed).unwrap_err(), expected);
     }
 }
 

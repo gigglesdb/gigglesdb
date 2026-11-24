@@ -242,11 +242,11 @@ impl<'a> Plan<'a> {
     pub(super) fn new(
         table: &TableDef,
         state: &'a Relational,
-        prepared: &'a Prepared,
         params: &[super::Value],
         clock: Option<&super::clock::ExecutionClock>,
-        description: &StatementDescription<'_>,
+        description: &'a StatementDescriptionInput<'_>,
     ) -> R<Self> {
+        let prepared = description.prepared();
         // Plain SQL type checks precede row lookup; NOT NULL checks apply to
         // matched postimages. Scalar inputs need a shared schema
         // for SET, WHERE and RETURNING before any parameter is evaluated.
@@ -281,7 +281,7 @@ impl<'a> Plan<'a> {
         };
         let indexes = indexes(sets, table, state)?;
         let parameters: Vec<Option<DataType>> = {
-            let description = description.describe(prepared, state)?;
+            let description = description.describe(state)?;
             for (value, ty) in params.iter().zip(&description.parameters) {
                 check(
                     value,

@@ -257,7 +257,7 @@ impl Relational {
         clock: Option<&clock::ExecutionClock>, source: &dyn scan::RowSource,
     ) -> R<BTreeSet<Vec<u8>>> {
         let prepared = description.prepared();
-        let parameters = description.searched_parameters(prepared, self)?;
+        let parameters = description.input().searched_parameters(self)?;
         searched::target(prepared).ok_or(SqlError::Unsupported)?
             .bind_seeded(self, parameters)?.with_clock(clock).matching_keys(self, source, params)
     }

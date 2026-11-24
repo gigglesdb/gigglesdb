@@ -53,8 +53,7 @@ pub(super) fn target(prepared: &Prepared) -> Option<&query::Query> {
 )]
 pub(super) fn route(
     state: &mut Relational,
-    prepared: &Prepared,
-    description: &StatementDescription<'_>,
+    description: &StatementDescriptionInput<'_>,
     params: &[Value],
     expected: Option<u64>,
     returning: &Option<returning::Plan<'_>>,
@@ -72,22 +71,21 @@ pub(super) fn route(
     {
         return Err(error);
     }
+    let prepared = description.prepared();
     let target = target(prepared).ok_or(SqlError::Unbounded)?;
     let table = state
         .tables
         .get(prepared.table().ok_or(SqlError::UnknownTable)?)
         .ok_or(SqlError::UnknownTable)?;
     let table_id = table.id;
-    let parameters = description.searched_parameters(prepared, state)?;
+    let parameters = description.searched_parameters(state)?;
     let bound = target.bind_seeded(state, parameters)?.with_clock(clock);
     let updating = matches!(
         prepared.statement.get(),
         Statement::Update { .. } | Statement::UpdateExpressions { .. }
     );
     let assignments = if updating {
-        Some(assign::Plan::new(
-            table, state, prepared, params, clock, description,
-        )?)
+        Some(assign::Plan::new(table, state, params, clock, description)?)
     } else {
         None
     };
@@ -338,6 +336,72 @@ mod tests {
     }
 
     #[test]
+    fn nonpaged_update_returning_shares_description_with_assignment_and_search() {
+        let mut state = fixture();
+        let prepared = Prepared::parse(
+            "UPDATE searched_cancel SET n = n + $1 WHERE n >= $2 RETURNING id, n",
+            1,
+            state.epoch,
+        )
+        .unwrap()
+        .with_parameter_types(&[Some(DataType::BigInt), None])
+        .unwrap();
+
+        DESCRIBE_CALLS.set(0);
+        let result = state
+            .execute(&prepared, &[Value::Int(2), Value::Int(20)], None)
+            .unwrap();
+        assert_eq!(DESCRIBE_CALLS.get(), 1);
+        assert_eq!(result.affected, 2);
+        assert_eq!(result.columns, ["id", "n"]);
+        assert_eq!(result.rows[0].values, [Value::Int(2), Value::Int(22)]);
+        assert_eq!(result.rows[1].values, [Value::Int(3), Value::Int(32)]);
+    }
+
+    #[test]
+    fn searched_route_and_mutation_keys_keep_the_ambient_date_order() {
+        use giggles_pg_types::temporal::DateOrder;
+
+        let mut state = Relational::default();
+        for sql in [
+            "CREATE TABLE t(id bigint PRIMARY KEY, d date, n bigint)",
+            "INSERT INTO t VALUES (1, '2020-01-13', 10), (2, '2020-01-14', 20)",
+        ] {
+            let prepared = Prepared::parse(sql, 1, state.epoch).unwrap();
+            state.execute(&prepared, &[], None).unwrap();
+        }
+        let prepared = {
+            let _order = clock::LiteralDateOrder::enter(DateOrder::Dmy);
+            Prepared::parse(
+                "UPDATE t SET n = n + $1 WHERE d = '13/01/2020' RETURNING id, n",
+                1,
+                state.epoch,
+            )
+            .unwrap()
+        };
+        let _order = clock::LiteralDateOrder::enter(DateOrder::Mdy);
+        let memo = StatementDescription::new(&prepared);
+        let input = memo.bind_schemas(&state).unwrap();
+        assert_eq!(input.describe(&state).unwrap().parameters, [DataType::BigInt]);
+
+        let expected = describe(input.prepared(), &state).unwrap_err();
+        assert_eq!(expected, SqlError::DatetimeFieldOverflow);
+        let params = [Value::Int(2)];
+        assert_eq!(
+            state.execute(&prepared, &params, None).unwrap_err(),
+            expected
+        );
+        let bound_memo = StatementDescription::new(input.prepared());
+        bound_memo.input().describe(&state).unwrap();
+        assert_eq!(
+            state
+                .mutation_keys(&bound_memo, &params, None, &scan::LegacyRows(&state))
+                .unwrap_err(),
+            expected
+        );
+    }
+
+    #[test]
     fn searched_heap_mutations_preserve_hidden_rowids_and_keys() {
         let mut state = Relational::default();
         for sql in [
@@ -416,8 +480,8 @@ mod tests {
         assert_eq!(matched.len(), 1);
         let (key, old) = &matched[0];
         let description = StatementDescription::new(&prepared);
-        let assignments = assign::Plan::new(table, &state, &prepared, &[], None, &description)
-            .unwrap();
+        let input = description.input();
+        let assignments = assign::Plan::new(table, &state, &[], None, &input).unwrap();
         let mut postimage = old.clone();
         for (index, value) in assignments
             .evaluate(table, old, &[], &mut || false)

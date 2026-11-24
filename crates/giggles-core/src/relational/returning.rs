@@ -299,16 +299,16 @@ pub(super) struct Plan<'a> {
 }
 impl<'a> Plan<'a> {
     pub(super) fn new(
-        prepared: &'a Prepared,
         state: &Relational,
         params: &[Value],
         clock: Option<&super::clock::ExecutionClock>,
-        description: &'a StatementDescription<'_>,
+        description: &'a StatementDescriptionInput<'_>,
     ) -> R<Option<Self>> {
+        let prepared = description.prepared();
         let Some(returning) = prepared.returning() else {
             return Ok(None);
         };
-        let description = description.describe(prepared, state)?;
+        let description = description.describe(state)?;
         for (value, data_type) in params.iter().zip(&description.parameters) {
             check(
                 value,

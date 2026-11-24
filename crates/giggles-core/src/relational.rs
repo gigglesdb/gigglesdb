@@ -1979,6 +1979,20 @@ impl<'a> StatementDescription<'a> {
         self.prepared
     }
 
+    fn input(&self) -> StatementDescriptionInput<'_> {
+        StatementDescriptionInput {
+            memo: self,
+            prepared: std::borrow::Cow::Borrowed(self.prepared),
+        }
+    }
+
+    fn bind_schemas(&self, state: &Relational) -> R<StatementDescriptionInput<'_>> {
+        Ok(StatementDescriptionInput {
+            memo: self,
+            prepared: std::borrow::Cow::Owned(self.prepared.bind_schemas(state)?),
+        })
+    }
+
     fn searched_slot(
         &self,
         order: giggles_pg_types::temporal::DateOrder,
@@ -1990,49 +2004,57 @@ impl<'a> StatementDescription<'a> {
             Dmy => 2,
         }]
     }
+}
+
+/// Pairs the memo with its original input or a schema binding of that input.
+struct StatementDescriptionInput<'a> {
+    memo: &'a StatementDescription<'a>,
+    prepared: std::borrow::Cow<'a, Prepared>,
+}
+
+impl StatementDescriptionInput<'_> {
+    fn prepared(&self) -> &Prepared {
+        &self.prepared
+    }
 
     // The full description binds at the prepared date order and adds result
     // OIDs. The searched caller uses the ambient order and only needs types.
-    fn describe(&self, prepared: &Prepared, state: &Relational) -> R<&Description> {
-        if let Some((description, _)) = self.full.get() {
+    fn describe(&self, state: &Relational) -> R<&Description> {
+        if let Some((description, _)) = self.memo.full.get() {
             return Ok(description);
         }
-        let searched_description = Self::can_share_searched(prepared, state)
-            .then(|| self.searched_slot(prepared.literal_date_order).get())
-            .flatten();
-        let description = prepared.describe_with_searched(state, searched_description)?;
-        Ok(&self.full.get_or_init(|| description).0)
+        let searched_description = self.memo.searched_slot(self.prepared.literal_date_order)
+            .get()
+            .filter(|_| self.can_share_searched(state));
+        let description = self.prepared.describe_with_searched(state, searched_description)?;
+        Ok(&self.memo.full.get_or_init(|| description).0)
     }
 
-    fn searched_parameters(
-        &self,
-        prepared: &Prepared,
-        state: &Relational,
-    ) -> R<Vec<Option<DataType>>> {
-        if !Self::can_share_searched(prepared, state) {
-            let description = searched::describe(prepared, state)?;
+    fn searched_parameters(&self, state: &Relational) -> R<Vec<Option<DataType>>> {
+        if !self.can_share_searched(state) {
+            let description = searched::describe(&self.prepared, state)?;
             return Ok(description.parameters.into_iter().map(Some).collect());
         }
         let order = clock::LiteralDateOrder::current();
-        let slot = self.searched_slot(order);
-        let description = if order == prepared.literal_date_order
-            && let Some((description, _)) = self.full.get()
+        let slot = self.memo.searched_slot(order);
+        let description = if order == self.prepared.literal_date_order
+            && let Some((description, _)) = self.memo.full.get()
         {
             description
         } else if let Some(description) = slot.get() {
             description
         } else {
-            let description = searched::describe(prepared, state)?;
+            let description = searched::describe(&self.prepared, state)?;
             slot.get_or_init(|| description)
         };
         Ok(description.parameters.iter().cloned().map(Some).collect())
     }
 
-    fn can_share_searched(prepared: &Prepared, state: &Relational) -> bool {
+    fn can_share_searched(&self, state: &Relational) -> bool {
         // Full describe uses its own enum and type-display scopes. Searched
         // binding uses the caller's scopes and can record enum inference there.
         state.ext.types.is_empty()
-            && prepared.declared_enum_parameters.as_deref().is_none_or(BTreeMap::is_empty)
+            && self.prepared.declared_enum_parameters.as_deref().is_none_or(BTreeMap::is_empty)
     }
 }
 
@@ -4410,10 +4432,11 @@ impl Relational {
         injected_source: Option<&dyn scan::RowSource>,
         events: &mut Vec<constraints::Event>,
     ) -> R<SqlResult> {
+        let _type_path = user_types::TypeDisplayScope::enter(
+            &description.prepared().search_path, Some(self),
+        );
+        let description = description.bind_schemas(self)?;
         let prepared = description.prepared();
-        let _type_path = user_types::TypeDisplayScope::enter(&prepared.search_path, Some(self));
-        let bound = prepared.bind_schemas(self)?;
-        let prepared = &bound;
         prepared.validate_schemas(self)?;
         user_types::clear_sql_error_message();
         ddl_type::publish(&prepared.warnings);
@@ -4490,14 +4513,14 @@ impl Relational {
                     | Statement::Delete { .. }
             )
         {
-            description.describe(prepared, self)?;
+            description.describe(self)?;
         }
         if assign::has_duplicates(prepared)
             || matches!(prepared.statement.get(), Statement::InsertMulti(insert) if insert.has_duplicate_assignments())
         {
-            description.describe(prepared, self)?;
+            description.describe(self)?;
         }
-        let returning = returning::Plan::new(prepared, self, params, clock, description)?;
+        let returning = returning::Plan::new(self, params, clock, &description)?;
         let mut returned_rows = vec![];
         // Normalize expression outputs after mutation input admission.
         let normalized;
@@ -5124,8 +5147,7 @@ impl Relational {
                     other => {
                         return searched::route(
                             self,
-                            prepared,
-                            description,
+                            &description,
                             params,
                             expected,
                             &returning,
@@ -5137,7 +5159,7 @@ impl Relational {
                         );
                     }
                 };
-                let assignments = assign::Plan::new(t, self, prepared, params, clock, description)?;
+                let assignments = assign::Plan::new(t, self, params, clock, &description)?;
                 let table_id = t.id;
                 let legacy = scan::LegacyRows(&*self);
                 let source = injected_source.unwrap_or(&legacy);
@@ -5224,8 +5246,7 @@ impl Relational {
                     other => {
                         return searched::route(
                             self,
-                            prepared,
-                            description,
+                            &description,
                             params,
                             expected,
                             &returning,

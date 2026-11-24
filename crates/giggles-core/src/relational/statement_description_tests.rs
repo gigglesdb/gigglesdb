@@ -152,6 +152,81 @@ fn rewritten_selection_has_its_own_description() {
 }
 
 #[test]
+fn cascade_delete_with_rewritten_selection_uses_two_descriptions() {
+    let admin = database();
+    let mut s = admin.sql_session();
+    for sql in [
+        "CREATE TABLE parent(id bigint PRIMARY KEY, n bigint)",
+        "CREATE TABLE child(id bigint PRIMARY KEY, pid bigint REFERENCES parent(id) ON DELETE CASCADE)",
+        "INSERT INTO parent VALUES (1, 10), (2, 20), (3, 20)",
+        "INSERT INTO child VALUES (1, 1), (2, 2), (3, 3)",
+    ] {
+        execute(&mut s, sql);
+    }
+
+    let delete = s
+        .prepare("DELETE FROM parent WHERE id IN (SELECT id FROM parent WHERE n = $1) RETURNING id")
+        .unwrap();
+    let result = execute_counted(&mut s, &delete, &[Value::Int(20)], 2);
+    assert_eq!(result.affected, 2);
+    assert_eq!(result.columns, ["id"]);
+    assert_eq!(result.rows[0].values, [Value::Int(2)]);
+    assert_eq!(result.rows[1].values, [Value::Int(3)]);
+    let child = execute(&mut s, "SELECT pid FROM child");
+    assert_eq!(child.rows.len(), 1);
+    assert_eq!(child.rows[0].values, [Value::Int(1)]);
+}
+
+#[test]
+fn prepared_returning_keeps_date_order_and_parameter_types_after_datestyle_change() {
+    use giggles_pg_types::{
+        bytea::ByteaOutput,
+        temporal::{DateOrder, DateStyle, DateStyleSettings},
+    };
+
+    let admin = database();
+    let mut s = admin.sql_session();
+    for sql in [
+        "CREATE TABLE t(id bigint PRIMARY KEY, d date, n bigint)",
+        "CREATE TABLE keys(id bigint PRIMARY KEY)",
+        "INSERT INTO t VALUES (1, '2020-01-13', 10), (2, '2020-01-14', 20)",
+        "INSERT INTO keys VALUES (1), (2)",
+    ] {
+        execute(&mut s, sql);
+    }
+    let style = |order| DateStyleSettings {
+        style: DateStyle::Iso,
+        order,
+    };
+    for (sql, descriptions, expected_n) in [
+        (
+            "UPDATE t SET n = n + $1 WHERE d = '13/01/2020' RETURNING id, n",
+            1,
+            12,
+        ),
+        (
+            "UPDATE t SET n = n + $1 WHERE d = '13/01/2020' AND id IN (SELECT id FROM keys) RETURNING id, n",
+            2,
+            14,
+        ),
+    ] {
+        s.set_text_settings(style(DateOrder::Dmy), ByteaOutput::default());
+        let prepared = s.prepare(sql).unwrap();
+        let types = s.describe(&prepared).unwrap().parameters;
+        assert_eq!(types, [DataType::BigInt]);
+
+        s.set_text_settings(style(DateOrder::Mdy), ByteaOutput::default());
+        assert_eq!(s.describe(&prepared).unwrap().parameters, types);
+        let params = [Value::Int(2)];
+        let error = s.execute(sql, &params, None).unwrap_err();
+        assert_eq!(sqlstate(&error), "22008");
+        let result = execute_counted(&mut s, &prepared, &params, descriptions);
+        assert_eq!(result.affected, 1);
+        assert_eq!(result.rows[0].values, [Value::Int(1), Value::Int(expected_n)]);
+    }
+}
+
+#[test]
 fn update_returning_preserves_constraint_sqlstates() {
     let admin = database();
     let mut s = admin.sql_session();
