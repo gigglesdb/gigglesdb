@@ -9,13 +9,20 @@ async fn prisma_enum_arrays_and_label_oids_through_a_migration() {
     };
     let f = Fixture::with_engine(engine).await;
     let pg = f.client().await;
-    pg.simple_query(r#"
-        CREATE SCHEMA design;
+    // Legacy table ownership checks require the schema to be committed.
+    pg.simple_query("CREATE SCHEMA design").await.unwrap();
+    // Keep two enum-array name collisions on both engines. SQL view DDL needs V2.
+    let second_collision = if engine == Engine::V2 {
+        r#"CREATE VIEW "_DesignDocSize_1" AS SELECT id FROM "_DesignDocSize""#
+    } else {
+        r#"CREATE TABLE "_DesignDocSize_1"(id int PRIMARY KEY)"#
+    };
+    pg.simple_query(&format!(r#"
         SET search_path=design,public;
         CREATE TABLE "_DesignDocSize"(id int PRIMARY KEY);
-        CREATE VIEW "_DesignDocSize_1" AS SELECT id FROM "_DesignDocSize";
+        {second_collision};
         CREATE TYPE "DesignDocSize" AS ENUM ('SMALL', 'STANDARD', 'LARGE');
-    "#).await.unwrap();
+    "#)).await.unwrap();
 
     let labels_sql = r#"SELECT enumlabel, oid FROM pg_enum WHERE enumtypid='"DesignDocSize"'::regtype ORDER BY enumsortorder"#;
     let initial_labels = rows(&pg, labels_sql).await;

@@ -27,9 +27,8 @@ fn exercise(engine: Engine) {
         ("ALTER TABLE p DROP CONSTRAINT u CASCADE RESTRICT", "42601"),
         ("ALTER TABLE p DROP CONSTRAINT u RESTRICT CASCADE", "42601"),
         ("ALTER TABLE p DROP CONSTRAINT u CASCADE, DROP CONSTRAINT missing", "42704"),
-        ("ALTER TABLE p DROP CONSTRAINT pk", "0A000"),
-        ("ALTER TABLE p DROP CONSTRAINT pk CASCADE", "0A000"),
-        ("ALTER TABLE p DROP CONSTRAINT pk RESTRICT", "0A000"),
+        ("ALTER TABLE p DROP CONSTRAINT pk", "2BP01"),
+        ("ALTER TABLE p DROP CONSTRAINT pk RESTRICT", "2BP01"),
     ] {
         assert_eq!(sqlstate(&s.execute(sql, &[], None).unwrap_err()), code, "{sql}");
         assert_eq!(s.foreign_key_targets().unwrap(), targets);
@@ -38,6 +37,13 @@ fn exercise(engine: Engine) {
         run(&mut s, &format!("ALTER TABLE p DROP CONSTRAINT IF EXISTS missing {suffix}"));
         assert_eq!(s.foreign_key_targets().unwrap(), targets);
     }
+    run(&mut s, "BEGIN");
+    run(&mut s, "ALTER TABLE p DROP CONSTRAINT pk CASCADE");
+    let mut expected = targets.clone();
+    expected.remove("kept_fk");
+    assert_eq!(s.foreign_key_targets().unwrap(), expected);
+    run(&mut s, "ROLLBACK");
+    assert_eq!(s.foreign_key_targets().unwrap(), targets);
     run(&mut s, "BEGIN");
     run(&mut s, "ALTER TABLE p DROP CONSTRAINT u CASCADE");
     assert_eq!(s.foreign_key_targets().unwrap().len(), 1);
