@@ -1452,6 +1452,18 @@ impl Scalar {
                 },
             });
         }
+        // Correlation can substitute a stored search value as an already typed literal.
+        if let Self::Literal(value @ Value::Bytes(_)) = a
+            && ty.is_text_search()
+        {
+            if !text_search_types::valid(ty, value) {
+                return Err(SqlError::Type);
+            }
+            return Ok(BoundScalar {
+                ty: ty.clone(),
+                node: Node::Literal(value.clone()),
+            });
+        }
         if let Self::Literal(Value::Text(_) | Value::Null) = a
             && *ty != DataType::TimestampTz
         {

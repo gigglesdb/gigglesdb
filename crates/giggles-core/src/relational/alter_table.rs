@@ -835,13 +835,17 @@ pub(super) fn execute(
             }
             Action::Default(column, default) => {
                 let at = position(&table, column)?;
-                if candidate.generated_column(table.columns[at].id).is_some() {
+                if let Some(generation) = candidate.generated_column(table.columns[at].id) {
                     user_types::view_replace_error(format!("column \"{column}\" of relation \"{}\" is a generated column", table.name));
-                    user_types::sql_error_hint(if default.is_some() {
-                        "Use ALTER TABLE ... ALTER COLUMN ... SET EXPRESSION instead."
-                    } else {
-                        "Use ALTER TABLE ... ALTER COLUMN ... DROP EXPRESSION instead."
-                    });
+                    if default.is_some() {
+                        user_types::sql_error_hint(
+                            "Use ALTER TABLE ... ALTER COLUMN ... SET EXPRESSION instead.",
+                        );
+                    } else if generation.stored {
+                        user_types::sql_error_hint(
+                            "Use ALTER TABLE ... ALTER COLUMN ... DROP EXPRESSION instead.",
+                        );
+                    }
                     return Err(SqlError::Syntax);
                 }
                 if default.is_none() && alter.actions.iter().any(|action| {

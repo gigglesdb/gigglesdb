@@ -479,6 +479,189 @@ fn text_search_archdocs_v2() {
 }
 
 
+fn non_key_text_search_dml(engine: Engine) {
+    use giggles_core::relational::text_search_types::output;
+
+    let path = common::fresh("text-search-dml");
+    let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
+    let mut s = admin.sql_session();
+    let search_values = |s: &mut SqlSession, sql| {
+        run(s, sql)
+            .iter()
+            .map(|row| {
+                [DataType::TsVector, DataType::TsQuery]
+                    .iter()
+                    .zip(row)
+                    .map(|(ty, value)| match value {
+                        Value::Null => Value::Null,
+                        value => text(&output(ty, value).unwrap()),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    run(&mut s, "CREATE TABLE terms (id int PRIMARY KEY, v tsvector, q tsquery)");
+    assert_eq!(
+        search_values(&mut s, "INSERT INTO terms VALUES (2,'b','b') ON CONFLICT (id) DO NOTHING RETURNING v,q"),
+        vec![vec![text("'b'"), text("'b'")]],
+    );
+    assert!(search_values(
+        &mut s,
+        "INSERT INTO terms VALUES (2,'ignored','ignored') ON CONFLICT (id) DO NOTHING RETURNING v,q"
+    ).is_empty());
+    assert_eq!(
+        search_values(&mut s, "INSERT INTO terms VALUES (3,NULL,NULL) ON CONFLICT DO NOTHING RETURNING v,q"),
+        vec![vec![Value::Null, Value::Null]],
+    );
+    assert_eq!(
+        search_values(&mut s, "INSERT INTO terms VALUES (2,'cats:2','cats & dogs')
+            ON CONFLICT (id) DO UPDATE SET v=EXCLUDED.v,q=EXCLUDED.q RETURNING v,q"),
+        vec![vec![text("'cats':2"), text("'cats' & 'dogs'")]],
+    );
+    run(&mut s, "CREATE TABLE generated_terms (id int PRIMARY KEY, title text,
+        v tsvector GENERATED ALWAYS AS (to_tsvector('english', title)) STORED)");
+    for (sql, expected) in [
+        ("INSERT INTO generated_terms VALUES (1,'Running dogs') ON CONFLICT DO NOTHING RETURNING v",
+            "'dog':2 'run':1"),
+        ("INSERT INTO generated_terms VALUES (1,'Searching cats') ON CONFLICT (id)
+            DO UPDATE SET title=EXCLUDED.title || ' purring' RETURNING v",
+            "'cat':2 'pur':3 'search':1"),
+    ] {
+        let rows = run(&mut s, sql);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(output(&DataType::TsVector, &rows[0][0]).unwrap(), expected);
+    }
+
+    run(&mut s, "CREATE TABLE source_terms (id int PRIMARY KEY, v tsvector, q tsquery)");
+    run(&mut s, "INSERT INTO source_terms VALUES (2,'running','running'),(4,'dogs:2','dogs & cats')");
+    for (sql, pair) in [
+        ("INSERT INTO terms SELECT * FROM source_terms WHERE id=4 RETURNING v,q",
+            ("'dogs':2", "'dogs' & 'cats'")),
+        ("INSERT INTO terms SELECT * FROM source_terms WHERE id=2
+            ON CONFLICT (id) DO UPDATE SET v=EXCLUDED.v,q=EXCLUDED.q RETURNING v,q",
+            ("'running'", "'running'")),
+        ("UPDATE terms t SET v=s.v,q=s.q FROM source_terms s
+            WHERE t.id=3 AND s.id=4 RETURNING t.v,t.q",
+            ("'dogs':2", "'dogs' & 'cats'")),
+    ] {
+        assert_eq!(search_values(&mut s, sql), vec![vec![text(pair.0), text(pair.1)]]);
+    }
+    let mut merged = run(&mut s, "MERGE INTO terms t USING source_terms s ON t.id=s.id+2
+        WHEN MATCHED THEN UPDATE SET v=s.v,q=s.q
+        WHEN NOT MATCHED THEN INSERT VALUES(s.id+2,s.v,s.q)
+        RETURNING t.id,t.v::text,t.q::text");
+    merged.sort_by_key(|row| match row[0] {
+        Value::Int(id) => id,
+        _ => panic!("expected integer id"),
+    });
+    assert_eq!(merged, vec![
+        vec![Value::Int(4), text("'running'"), text("'running'")],
+        vec![Value::Int(6), text("'dogs':2"), text("'dogs' & 'cats'")],
+    ]);
+    let clock = StatementClock {
+        unavailable: None,
+        transaction_us: 0,
+        statement_us: 0,
+        zone: None,
+        wall: None,
+    };
+    let (_, copy) = s.prepare_copy("COPY terms FROM STDIN").unwrap();
+    let (copy, cells) = s.normalize_copy_rows_at(
+        &copy, vec![vec![text("7"), text("fish:1"), text("fish")]], &clock,
+    ).unwrap();
+    assert_eq!(s.ingest_copy_at(&copy, cells, &clock).unwrap().affected, 1);
+
+    drop(s);
+    drop(admin);
+    let admin = Admin::open(&path, Limits::default()).unwrap();
+    let mut s = admin.sql_session();
+    assert_eq!(
+        run(&mut s, "SELECT id,v::text,q::text FROM terms ORDER BY id"),
+        vec![
+            vec![Value::Int(2), text("'running'"), text("'running'")],
+            vec![Value::Int(3), text("'dogs':2"), text("'dogs' & 'cats'")],
+            vec![Value::Int(4), text("'running'"), text("'running'")],
+            vec![Value::Int(6), text("'dogs':2"), text("'dogs' & 'cats'")],
+            vec![Value::Int(7), text("'fish':1"), text("'fish'")],
+        ],
+    );
+    assert_eq!(
+        run(&mut s, "SELECT v::text FROM generated_terms"),
+        vec![vec![text("'cat':2 'pur':3 'search':1")]],
+    );
+    drop(s);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+fn archdocs_upsert(engine: Engine) {
+    let path = common::fresh("text-search-archdocs-upsert");
+    let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
+    let mut s = admin.sql_session();
+    run(&mut s, r#"CREATE TABLE "Organization" ("id" UUID PRIMARY KEY)"#);
+    run(&mut s, r#"INSERT INTO "Organization" VALUES ('00000000-0000-0000-0000-0000000000aa')"#);
+    let setup = include_str!("fixtures/text_search_archdocs_setup.sql");
+    let match_body = include_str!("fixtures/text_search_archdocs_match_body.sql");
+    for statement in setup.split(';').chain(match_body.split(';')) {
+        if !statement.trim().is_empty() {
+            run(&mut s, statement);
+        }
+    }
+
+    let upsert = include_str!("fixtures/text_search_archdocs_upsert.sql");
+    let clock = StatementClock {
+        unavailable: None,
+        transaction_us: 0,
+        statement_us: 0,
+        zone: Some(giggles_pg_types::temporal::SessionZone::Fixed(0)),
+        wall: None,
+    };
+    for (title, body, match_only, vector) in [
+        ("Running dogs", "Searching cats", "", "'cat':4B 'dog':2A 'run':1A 'search':3B"),
+        ("Searching cats", "Purring kittens", "Refunds", "'cat':2A 'kitten':4B 'pur':3B 'refund':5C 'search':1A"),
+    ] {
+        let params = [
+            "doc", "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-0000000000aa", "", "",
+            title, body, match_only,
+        ].map(text);
+        assert_eq!(s.execute_at(upsert, &params, None, &clock).unwrap().affected, 1);
+        assert_eq!(
+            run(&mut s, r#"SELECT title,tsv::text FROM "SearchDocument""#),
+            vec![vec![text(title), text(vector)]],
+        );
+    }
+    let check = |s: &mut SqlSession| {
+        assert_eq!(
+            run(s, r#"SELECT title FROM "SearchDocument"
+                WHERE tsv @@ websearch_to_tsquery('english','kittens refunds')"#),
+            vec![vec![text("Searching cats")]],
+        );
+        assert!(run(s, r#"SELECT title FROM "SearchDocument"
+            WHERE tsv @@ websearch_to_tsquery('english','dogs')"#).is_empty());
+    };
+    check(&mut s);
+    drop(s);
+    drop(admin);
+    let admin = Admin::open(&path, Limits::default()).unwrap();
+    check(&mut admin.sql_session());
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn text_search_dml_legacy() {
+    non_key_text_search_dml(Engine::Legacy);
+    archdocs_upsert(Engine::Legacy);
+}
+
+#[test]
+#[cfg(feature = "engine-rocksdb")]
+fn text_search_dml_v2() {
+    non_key_text_search_dml(Engine::V2);
+    archdocs_upsert(Engine::V2);
+}
+
 fn review_fixes(engine: Engine) {
     let path = common::fresh("text-search-review");
     let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();

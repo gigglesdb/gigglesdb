@@ -546,4 +546,55 @@ async fn text_search_network_archdocs() {
             .collect::<Vec<_>>();
         assert_eq!(rows, expected, "{terms}");
     }
+
+    let upsert = include_str!("../../giggles-core/tests/fixtures/text_search_archdocs_upsert.sql");
+    let entity = "00000000-0000-0000-0000-000000000004";
+    // node-postgres leaves parameter OIDs unspecified unless supplied explicitly.
+    pg_send(&mut stream, b'P', &parse("write_document", upsert)).await;
+    let (pg, connection) = f.pg(f.app.clone()).await;
+    for (title, body, match_only, vector) in [
+        ("Running dogs", "Searching cats", "", "'cat':4B 'dog':2A 'run':1A 'search':3B"),
+        ("Searching cats", "Purring kittens", "Refunds", "'cat':2A 'kitten':4B 'pur':3B 'refund':5C 'search':1A"),
+    ] {
+        pg_send(
+            &mut stream,
+            b'B',
+            &bind(
+                "",
+                "write_document",
+                &["doc", entity, organization, "", "", title, body, match_only].map(Some),
+                false,
+            ),
+        )
+        .await;
+        pg_send(&mut stream, b'E', &execute("", 0)).await;
+        let frames = pg_sync(&mut stream).await;
+        assert!(!frames.iter().any(|frame| frame.0 == b'E'), "{frames:?}");
+        assert!(frames.iter().any(|frame| frame.0 == b'C' && frame.1 == b"INSERT 0 1\0"));
+        let row = pg.query_one(
+            r#"SELECT title,tsv::text FROM "SearchDocument" WHERE "entityId"=$1::text::uuid"#,
+            &[&entity],
+        ).await.unwrap();
+        assert_eq!(row.get::<_, &str>(0), title);
+        assert_eq!(row.get::<_, &str>(1), vector);
+    }
+    let simple_sql = [
+        "doc", entity, organization, "", "", "Hopping rabbits", "Garden carrots", "Invoices",
+    ].iter().enumerate().fold(upsert.to_owned(), |sql, (i, value)| {
+        sql.replace(&format!("{}{}", '$', i + 1), &format!("'{value}'"))
+    });
+    let messages = pg.simple_query(&simple_sql).await.unwrap();
+    assert!(matches!(
+        messages.as_slice(),
+        [tokio_postgres::SimpleQueryMessage::CommandComplete(1)]
+    ));
+    let row = pg.query_one(
+        r#"SELECT title,tsv::text FROM "SearchDocument"
+            WHERE tsv @@ websearch_to_tsquery('english','rabbits invoices')"#,
+        &[],
+    ).await.unwrap();
+    assert_eq!(row.get::<_, &str>(0), "Hopping rabbits");
+    assert_eq!(row.get::<_, &str>(1), "'carrot':4B 'garden':3B 'hop':1A 'invoic':5C 'rabbit':2A");
+    drop(pg);
+    connection.abort();
 }

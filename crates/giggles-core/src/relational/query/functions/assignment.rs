@@ -102,6 +102,10 @@ pub(in crate::relational) fn literal(
         Value::Int(_) => DataType::BigInt,
         Value::Numeric(_) => DataType::Numeric,
         Value::Bool(_) => DataType::Boolean,
+        // Point DML can receive a search value already converted by its SQL source.
+        Value::Bytes(_) if target.is_text_search() && text_search_types::valid(target, &value) => {
+            return Ok(value);
+        }
         Value::Bytes(_) => DataType::Bytes,
         Value::Float4(_) => DataType::Real,
         Value::Float8(_) => DataType::DoublePrecision,

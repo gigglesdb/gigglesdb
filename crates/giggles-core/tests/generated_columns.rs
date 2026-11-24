@@ -278,6 +278,22 @@ fn diagnostics(engine: Engine) {
         "42601",
     );
     run(&mut sql, "ALTER TABLE ok12 ALTER COLUMN b TYPE bigint");
+    use giggles_core::relational::{take_sql_error_hint, take_sql_error_message};
+    run(&mut sql, "CREATE TABLE h (id int PRIMARY KEY, a int,
+        g int GENERATED ALWAYS AS (a*2) STORED,
+        v int GENERATED ALWAYS AS (a*3) VIRTUAL)");
+    for (column, action, hint) in [
+        ("g", "DROP DEFAULT", Some("Use ALTER TABLE ... ALTER COLUMN ... DROP EXPRESSION instead.")),
+        ("v", "DROP DEFAULT", None),
+        ("v", "SET DEFAULT 2", Some("Use ALTER TABLE ... ALTER COLUMN ... SET EXPRESSION instead.")),
+    ] {
+        rejects(&mut sql, &format!("ALTER TABLE h ALTER COLUMN {column} {action}"), "42601");
+        assert_eq!(
+            take_sql_error_message().as_deref(),
+            Some(format!(r#"column "{column}" of relation "h" is a generated column"#).as_str()),
+        );
+        assert_eq!(take_sql_error_hint(), hint);
+    }
     drop(sql);
     drop(admin);
     std::fs::remove_dir_all(path).unwrap();

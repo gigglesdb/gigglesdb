@@ -118,6 +118,17 @@ fn supports_arbiter(column: &ColumnDef, semantics: Semantics) -> bool {
             | DataType::Bytes
     )
 }
+fn check_value(
+    value: &Value,
+    column: &ColumnDef,
+    semantics: Semantics,
+) -> std::result::Result<(), PlanError> {
+    if semantics == Semantics::Sql && column.data_type.is_text_search() {
+        return crate::relational::check(value, column).map_err(sql);
+    }
+    check(value, column).map_err(PlanError::from)
+}
+
 struct Resolved<'s> {
     key: Vec<u8>,
     rowid: Option<(usize, Value)>,
@@ -212,7 +223,7 @@ fn plan_unique_conflict_evaluated<'s>(
                 charge_value(&mut remaining_input, &Value::Int(0))?;
                 continue;
             }
-            check(value, column)?;
+            check_value(value, column, semantics)?;
             charge_value(&mut remaining_row, value)?;
             charge_value(&mut remaining_input, value)?;
         }
@@ -549,7 +560,7 @@ fn plan_unique_conflict_evaluated<'s>(
                 if semantics == Semantics::Sql && column.not_null && *final_value == Value::Null {
                     return Err(PlanError::Sql(SqlError::Null));
                 }
-                check(final_value, column)?;
+                check_value(final_value, column, semantics)?;
                 charge_value(&mut remaining_row, final_value)?;
                 charge_value(&mut remaining_mutation, final_value)?;
             }
