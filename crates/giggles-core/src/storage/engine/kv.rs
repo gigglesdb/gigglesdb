@@ -652,8 +652,8 @@ pub(crate) trait KvBackend: KvRead {
     fn pipelined_sync(&self) -> bool {
         false
     }
-    fn append_commit(&self, batch: WriteBatch) -> Result<(), KvError> {
-        self.write(batch, Durability::NoSync)
+    fn append_commit(&self, _batch: WriteBatch) -> Result<(), KvError> {
+        Err(KvError::Io("commit append requires a pipeline-capable backend".into()))
     }
     fn sync_commits(&self) -> Result<(), KvError> {
         self.flush_barrier()
@@ -755,8 +755,9 @@ impl Kv {
     #[allow(dead_code, reason = "The commit sequencer will use this in P3")]
     pub(crate) fn append_commit(&self, batch: WriteBatch) -> Result<(), KvError> {
         self.check()?;
-        debug_assert!(self.is_single_writer());
-        debug_assert!(self.pipelined_sync());
+        if !self.pipelined_sync() {
+            return Err(KvError::Io("commit append requires a pipeline-capable single writer".into()));
+        }
         // This entry point admits the sequencer's commit batch to local NoSync.
         let result = self.backend.append_commit(batch);
         self.fence_on_error(FenceSite::CommitAppend, result)

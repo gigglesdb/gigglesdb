@@ -7,6 +7,12 @@
 #include "rocksdb/write_batch.h"
 
 #include <algorithm>
+#include <atomic>
+#if defined(__linux__)
+#include <cerrno>
+#include <linux/magic.h>
+#include <sys/vfs.h>
+#endif
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -17,8 +23,6 @@ using namespace ROCKSDB_NAMESPACE;
 
 // The build checks these definitions against the vendored db/c.cc.
 struct rocksdb_options_t { Options rep; };
-
-#ifndef GIGGLES_ROCKSDB_AUTORECOVERY_TEST
 
 namespace {
 class AutoRecoveryVeto final : public EventListener {
@@ -34,10 +38,20 @@ class AutoRecoveryVeto final : public EventListener {
     // RecoverFromBGError (file/sst_file_manager_impl.cc:319), which enters
     // ResumeImpl (db/error_handler.cc:671). The retryable path ignores the
     // flag (:525-528) and is stopped by max_bgerror_resume_count=0 (:694).
+    if (*auto_recovery) {
+      ++vetoes_;
+    }
     *auto_recovery = false;
   }
+
+  uint64_t Vetoes() const { return vetoes_.load(); }
+
+ private:
+  std::atomic<uint64_t> vetoes_{0};
 };
 }  // namespace
+
+#ifndef GIGGLES_ROCKSDB_AUTORECOVERY_TEST
 
 extern "C" void giggles_rocksdb_install_autorecovery_veto(
     rocksdb_options_t* options) noexcept {
@@ -49,6 +63,18 @@ extern "C" bool giggles_rocksdb_uses_default_env(
   auto* env = options->rep.env;
   return env == Env::Default() && env->GetFileSystem() == FileSystem::Default();
 }
+
+#if defined(__linux__)
+extern "C" int giggles_rocksdb_check_directory_pin(const char* path) noexcept {
+  struct statfs info;
+  if (statfs(path, &info) != 0) {
+    return errno;
+  }
+  // WSL's 9p-mounted Windows drives can resolve children in the
+  // replacement directory even through an open /proc/self/fd handle.
+  return info.f_type == V9FS_MAGIC ? EOPNOTSUPP : 0;
+}
+#endif
 
 namespace {
 class GroupReader final : public WriteBatch::Handler {
@@ -98,7 +124,8 @@ class GroupReader final : public WriteBatch::Handler {
   std::vector<std::optional<uint64_t>>& groups_;
 };
 
-enum class StopReason : uint64_t { None, Gap, OutOfOrder, InvalidValue };
+enum class FilterMode { Refuse, Seed, Chain };
+enum class StopReason : uint64_t { None, Gap, OutOfOrder, InvalidValue, Unmarked };
 
 struct WalStop {
   StopReason reason = StopReason::None;
@@ -110,8 +137,10 @@ struct WalStop {
 
 class CommitGroupFilter final : public WalFilter {
  public:
-  CommitGroupFilter(const char* meta_name, const char* key, size_t key_len)
-      : meta_name_(meta_name), key_(key, key_len) {}
+  CommitGroupFilter(const char* meta_name, const char* key, size_t key_len,
+                    bool ignore_records)
+      : meta_name_(meta_name), key_(key, key_len),
+        mode_(ignore_records ? FilterMode::Seed : FilterMode::Refuse) {}
 
   const char* Name() const override { return "GigglesCommitGroup"; }
 
@@ -123,12 +152,11 @@ class CommitGroupFilter final : public WalFilter {
       const std::map<uint32_t, uint64_t>& log_numbers,
       const std::map<std::string, uint32_t>& cf_ids) noexcept override {
     meta_cf_.reset();
-    if (seed_open_) {
+    if (mode_ == FilterMode::Seed) {
       return;
     }
     last_ = seed_;
     stop_ = {};
-    meta_cf_.reset();
     if (auto meta = cf_ids.find(meta_name_); meta != cf_ids.end()) {
       meta_cf_ = meta->second;
     }
@@ -148,7 +176,7 @@ class CommitGroupFilter final : public WalFilter {
                                       const std::string&, const WriteBatch& batch,
                                       WriteBatch* replacement,
                                       bool* batch_changed) noexcept override {
-    if (seed_open_) {
+    if (mode_ == FilterMode::Seed) {
       return WalProcessingOption::kIgnoreCurrentRecord;
     }
     if (!meta_cf_) {
@@ -156,26 +184,23 @@ class CommitGroupFilter final : public WalFilter {
     }
     record_groups_.clear();
     GroupReader reader(*meta_cf_, key_, record_groups_);
-    // RocksDB handles a structurally invalid batch using its recovery mode.
-    if (!batch.Iterate(&reader).ok()) {
-      return WalProcessingOption::kContinueProcessing;
-    }
-    for (auto group : record_groups_) {
-      if (!CheckGroup(wal, group)) {
-        continue;
+    const bool valid = batch.Iterate(&reader).ok();
+    if (mode_ == FilterMode::Refuse && !record_groups_.empty()) {
+      stop_ = {StopReason::Unmarked, wal, 0, record_groups_.front().value_or(0), 0};
+      Refuse(batch, replacement, batch_changed);
+    } else if (valid) {
+      for (auto group : record_groups_) {
+        if (!CheckGroup(wal, group)) {
+          continue;
+        }
+        if (stop_.reason == StopReason::Gap && stop_.sst_log <= wal) {
+          return WalProcessingOption::kStopReplay;
+        }
+        Refuse(batch, replacement, batch_changed);
+        break;
       }
-      if (stop_.reason == StopReason::Gap && stop_.sst_log <= wal) {
-        return WalProcessingOption::kStopReplay;
-      }
-      // A filter stop would retire the WALs, and point-in-time recovery can
-      // proceed after kCorruptedRecord. WalFilter's replacement-count check
-      // fails recovery in either mode before committing any recovery edits
-      // (db_impl_open.cc:1136-1155,1727). The replacement is never applied.
-      *replacement = WriteBatch(batch.Data());
-      replacement->Put(Slice(), Slice()).PermitUncheckedError();
-      *batch_changed = true;
-      break;
     }
+    // RocksDB handles structurally invalid batches using its recovery mode.
     return WalProcessingOption::kContinueProcessing;
   }
 
@@ -184,13 +209,26 @@ class CommitGroupFilter final : public WalFilter {
   }
 
   void BeginReplay(uint64_t seed) noexcept {
-    seed_open_ = false;
+    mode_ = FilterMode::Chain;
     seed_ = last_ = seed;
+    stop_ = {};
   }
 
   WalStop stop() const { return stop_; }
 
  private:
+  static void Refuse(const WriteBatch& batch, WriteBatch* replacement,
+                     bool* batch_changed) {
+    // A filter stop retires WALs, and point-in-time recovery can proceed
+    // after kCorruptedRecord. The replacement-count check instead aborts
+    // both modes before committing any recovery edits. Marked stores run
+    // this filter read-only first so a refusal leaves live files untouched.
+    // See db_impl_open.cc:1136-1155,1727. The replacement is never applied.
+    *replacement = WriteBatch(batch.Data());
+    replacement->Put(Slice(), Slice()).PermitUncheckedError();
+    *batch_changed = true;
+  }
+
   bool CheckGroup(uint64_t wal, std::optional<uint64_t> group) {
     if (group && *group <= seed_) {
       return false;
@@ -212,7 +250,7 @@ class CommitGroupFilter final : public WalFilter {
 
   const std::string meta_name_;
   const Slice key_;
-  bool seed_open_ = true;
+  FilterMode mode_;
   uint64_t seed_ = 0;
   uint64_t last_ = 0;
   std::optional<uint32_t> meta_cf_;
@@ -224,9 +262,10 @@ class CommitGroupFilter final : public WalFilter {
 }  // namespace
 
 extern "C" CommitGroupFilter* giggles_rocksdb_new_commit_group_filter(
-    const char* meta_name, const char* key, size_t key_len) noexcept {
+    const char* meta_name, const char* key, size_t key_len,
+    bool ignore_records) noexcept {
   // key points to immutable Rust static storage.
-  return new CommitGroupFilter(meta_name, key, key_len);
+  return new CommitGroupFilter(meta_name, key, key_len, ignore_records);
 }
 
 extern "C" void giggles_rocksdb_set_commit_group_filter(
@@ -256,7 +295,6 @@ extern "C" void giggles_rocksdb_drop_commit_group_filter(
 
 #else
 
-#include <atomic>
 #include <utility>
 
 struct rocksdb_env_t { Env* rep; bool is_default; };
@@ -267,6 +305,7 @@ struct WalFaultCounts {
   uint64_t full_space_checks;
   uint64_t flushes;
   uint64_t recoveries;
+  uint64_t vetoes;
 };
 
 struct WalFaultState {
@@ -355,6 +394,7 @@ class RecoveryObserver final : public EventListener {
 struct FaultEnv {
   std::shared_ptr<WalFaultState> state;
   std::unique_ptr<Env> env;
+  std::shared_ptr<AutoRecoveryVeto> veto;
 };
 }  // namespace
 
@@ -363,8 +403,12 @@ extern "C" FaultEnv* giggles_rocksdb_install_wal_fault(
   try {
     auto state = std::make_shared<WalFaultState>();
     auto handle = std::make_unique<FaultEnv>(
-        FaultEnv{state, NewCompositeEnv(std::make_shared<FaultWalFileSystem>(state))});
-    if (!keep_veto) {
+        FaultEnv{state, NewCompositeEnv(std::make_shared<FaultWalFileSystem>(state)),
+                 nullptr});
+    if (keep_veto) {
+      handle->veto = std::static_pointer_cast<AutoRecoveryVeto>(
+          options->rep.listeners.front());
+    } else {
       // The production options builder installs only the veto listener.
       options->rep.listeners.clear();
     }
@@ -390,7 +434,8 @@ extern "C" void giggles_rocksdb_wal_fault_counts(const FaultEnv* handle,
                                                 WalFaultCounts* counts) noexcept {
   const auto& state = *handle->state;
   *counts = {state.sync_failures.load(), state.full_space_checks.load(),
-             state.flushes.load(), state.recoveries.load()};
+             state.flushes.load(), state.recoveries.load(),
+             handle->veto ? handle->veto->Vetoes() : 0};
 }
 
 #endif

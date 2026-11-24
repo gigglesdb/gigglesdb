@@ -93,6 +93,79 @@ pub(crate) use range_local::{
 pub(in crate::storage) const MARKER: &str = "GIGGLES_FORMAT";
 pub(in crate::storage) const TMP: &str = "GIGGLES_FORMAT.tmp";
 const V2: &[u8] = b"giggles-v2\n";
+#[cfg(feature = "engine-rocksdb")]
+const V2_COMMIT_GROUPS: &[u8] = b"giggles-v2\ncommit-groups\n";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StoreMarker {
+    V2,
+    #[cfg(feature = "engine-rocksdb")]
+    CommitGroups,
+}
+
+pub(super) fn read_store_marker(dir: &Path) -> Result<Option<StoreMarker>, FormatError> {
+    let file = match fs::File::open(dir.join(MARKER)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(FormatError::io(error)),
+    };
+    if file.metadata().map_err(FormatError::io)?.len() > 64 {
+        return Err(corrupt("oversized marker"));
+    }
+    let mut bytes = Vec::new();
+    file.take(65).read_to_end(&mut bytes).map_err(FormatError::io)?;
+    match bytes.as_slice() {
+        V2 => return Ok(Some(StoreMarker::V2)),
+        #[cfg(feature = "engine-rocksdb")]
+        V2_COMMIT_GROUPS => return Ok(Some(StoreMarker::CommitGroups)),
+        _ => {}
+    }
+    if let Some(n) = bytes
+        .strip_prefix(b"giggles-v")
+        .and_then(|s| s.strip_suffix(b"\n"))
+        && n.first().is_some_and(|b| matches!(*b, b'1'..=b'9'))
+        && n.iter().all(u8::is_ascii_digit)
+        && n != b"2"
+    {
+        return Err(FormatError::Unsupported("marker version".into()));
+    }
+    Err(corrupt("invalid marker"))
+}
+
+#[cfg(feature = "engine-rocksdb")]
+pub(super) fn write_commit_groups_marker(dir: &Path) -> Result<(), FormatError> {
+    // Replace the marker atomically. Re-publish even on a retry, so success
+    // includes the directory sync if a previous attempt failed there.
+    let temp = dir.join(TMP);
+    let mut file = fs::File::create(&temp).map_err(FormatError::io)?;
+    file.write_all(V2_COMMIT_GROUPS).map_err(FormatError::io)?;
+    file.sync_all().map_err(FormatError::io)?;
+    drop(file);
+    fs::rename(&temp, dir.join(MARKER)).map_err(FormatError::io)?;
+    sync_marker_directory(dir).map_err(FormatError::io)
+}
+
+#[cfg(all(feature = "engine-rocksdb", unix))]
+fn sync_marker_directory(dir: &Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(all(feature = "engine-rocksdb", windows))]
+fn sync_marker_directory(dir: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)?
+        .sync_all()
+}
+
+#[cfg(all(feature = "engine-rocksdb", not(any(unix, windows))))]
+fn sync_marker_directory(_dir: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DirClass {
     Empty,
@@ -193,23 +266,8 @@ pub(crate) fn classify_dir(dir: &Path) -> Result<DirClass, FormatError> {
         return Err(corrupt("marker and data.redb coexist"));
     }
     if marker {
-        let file = fs::File::open(dir.join(MARKER)).map_err(FormatError::io)?;
-        if file.metadata().map_err(FormatError::io)?.len() > 64 {
-            return Err(corrupt("oversized marker"));
-        }
-        let mut bytes = Vec::new();
-        file.take(64).read_to_end(&mut bytes).map_err(FormatError::io)?;
-        if bytes != V2 {
-            if let Some(n) = bytes
-                .strip_prefix(b"giggles-v")
-                .and_then(|s| s.strip_suffix(b"\n"))
-                && n.first().is_some_and(|b| matches!(*b, b'1'..=b'9'))
-                && n.iter().all(u8::is_ascii_digit)
-                && n != b"2"
-            {
-                return Err(FormatError::Unsupported("marker version".into()));
-            }
-            return Err(corrupt("invalid marker"));
+        if read_store_marker(dir)?.is_none() {
+            return Err(corrupt("format marker disappeared"));
         }
         return if current {
             Ok(DirClass::V2)

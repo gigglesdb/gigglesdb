@@ -13,6 +13,14 @@ fn open(path: &Path) -> RocksKv {
     result.unwrap()
 }
 
+pub(super) fn initialize_marked(path: &Path) {
+    if !path.join("CURRENT").exists() {
+        drop(open(path));
+    }
+    meta::write_marker(path).unwrap();
+    mark_commit_groups(path).unwrap();
+}
+
 fn group(db: &RocksKv, number: u64, value: Vec<u8>) {
     let mut batch = WriteBatch::default();
     batch.put(Keyspace::Rows, number.to_be_bytes().to_vec(), value);
@@ -88,6 +96,7 @@ fn zeroable_group_three(db: &RocksKv, wal: &Path) {
 
 fn copy_with_interior_hole(copy: &Path, flushed_seed: bool, flush_later_cf: bool) -> u64 {
     let source = TestDir::new();
+    initialize_marked(&source.0);
     let db = open(&source.0);
     small_group(&db, 1);
     if flushed_seed {
@@ -173,6 +182,7 @@ fn no_meta_group_keeps_replay_unchanged() {
 #[test]
 fn chain_crosses_reopens_and_partial_memtable_flushes() {
     let dir = TestDir::new();
+    initialize_marked(&dir.0);
     let mut db = open(&dir.0);
     for first in [1, 4, 7] {
         small_group(&db, first);
@@ -224,6 +234,7 @@ fn first_generation_hole_stops_and_recovery_retires_the_wal() {
 #[test]
 fn wal_start_gap_uses_sst_seed() {
     let dir = TestDir::new();
+    initialize_marked(&dir.0);
     let db = open(&dir.0);
     small_group(&db, 1);
     db.sync_commits().unwrap();
@@ -277,6 +288,7 @@ fn live_sst_beyond_stopping_wal_refuses_recovery() {
 fn repeated_and_backwards_groups_above_seed_refuse_recovery() {
     for unexpected in [2, 1] {
         let dir = TestDir::new();
+        initialize_marked(&dir.0);
         let db = open(&dir.0);
         small_group(&db, 1);
         small_group(&db, 2);
@@ -302,6 +314,7 @@ fn file_contents(path: &Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
 #[test]
 fn seed_open_failure_has_writable_open_class_and_leaves_files_intact() {
     let dir = TestDir::new();
+    initialize_marked(&dir.0);
     drop(open(&dir.0));
     fs::write(dir.0.join("CURRENT"), b"").unwrap();
     let before = file_contents(&dir.0);
@@ -335,6 +348,7 @@ fn seed_open_allows_a_partially_initialized_store() {
     raw.put(b"existing", b"value").unwrap();
     drop(raw);
 
+    initialize_marked(&dir.0);
     let db = open(&dir.0);
     assert_eq!(db.db.get(b"existing").unwrap(), Some(b"value".to_vec()));
     assert_eq!(commit_group(&db), None);
@@ -342,29 +356,117 @@ fn seed_open_allows_a_partially_initialized_store() {
 }
 
 #[test]
-fn measure_small_store_seed_open_time() {
-    let dir = TestDir::new();
-    let db = open(&dir.0);
-    for number in 1..=10 {
-        small_group(&db, number);
-    }
-    db.sync_commits().unwrap();
-    db.flush_memtables().unwrap();
-    drop(db);
-
-    let (_directory, path) = pin_local_directory(&dir.0).unwrap();
-    let _lock = WriterLock::acquire(&path).unwrap();
-    let options = RocksKv::open_options(CACHE_BYTES, DBRecoveryMode::PointInTime).unwrap();
-    let elapsed = Instant::now();
-    let samples = 32;
-    for _ in 0..samples {
-        assert_eq!(
-            RocksKv::read_commit_group_seed(&path, &options, &mut WalFilter::new()).unwrap(),
-            10
+fn unmarked_local_and_replicated_open_refuse_commit_group_records() {
+    for malformed in [false, true] {
+        let dir = TestDir::new();
+        let db = open(&dir.0);
+        let mut batch = WriteBatch::default();
+        batch.put(
+            Keyspace::Meta,
+            COMMIT_GROUP_KEY.to_vec(),
+            if malformed { vec![0] } else { 1u64.to_be_bytes().to_vec() },
         );
+        db.write(batch, Durability::Sync).unwrap();
+        drop(db);
+
+        assert!(data_error(&dir.0).contains("requires a marked local store"));
+        let Err(error) = RocksKv::open_replicated(&dir.0, CACHE_BYTES) else {
+            panic!("replicated open accepted a commit group");
+        };
+        assert_eq!(FenceCause::for_kv(FenceSite::Open, &error).class, FenceClass::Data);
     }
-    println!(
-        "mean added seed open time: {:.3} ms",
-        elapsed.elapsed().as_secs_f64() * 1000.0 / f64::from(samples)
-    );
+}
+
+#[test]
+fn marked_format_is_persistent_and_replicated_open_refuses_it() {
+    let dir = TestDir::new();
+    initialize_marked(&dir.0);
+    mark_commit_groups(&dir.0).unwrap();
+    assert_eq!(meta::classify_dir(&dir.0).unwrap(), meta::DirClass::V2);
+    assert!(open(&dir.0).pipelined_sync());
+    let before = file_contents(&dir.0);
+    assert!(matches!(RocksKv::open_replicated(&dir.0, CACHE_BYTES), Err(KvError::Corrupt(_))));
+    assert_eq!(file_contents(&dir.0), before);
+}
+
+#[test]
+fn recovery_seed_ignores_bad_checksum_after_the_chain_stop() {
+    let copy = TestDir::new();
+    let wal = copy_with_interior_hole(&copy.0, true, false);
+    let path = current_wal(&copy.0);
+    let mut bytes = fs::read(&path).unwrap();
+    let block = bytes.len().next_multiple_of(WAL_BLOCK);
+    bytes.resize(block + WAL_BLOCK, 0);
+    bytes[block + 4..block + 6].copy_from_slice(&((WAL_BLOCK - WAL_HEADER) as u16).to_le_bytes());
+    bytes[block + 6] = 1; // Full record with an invalid checksum.
+    fs::write(&path, bytes).unwrap();
+
+    let options = RocksKv::open_options(CACHE_BYTES, DBRecoveryMode::TolerateCorruptedTailRecords).unwrap();
+    let families = DB::list_cf(&options, native_path(&copy.0)).unwrap();
+    let mut ignore = WalFilter::new(true);
+    let mut strict_seed = options;
+    ignore.install(&mut strict_seed);
+    assert!(RocksKv::open_read_only(&copy.0, &strict_seed, &families).is_err());
+
+    let pin = DirectoryIdentity::read(&copy.0).unwrap().pin(&copy.0).unwrap();
+    let db = RocksKv::open_recovery(pin, CACHE_BYTES).unwrap();
+    assert_gap(&db, wal, 3, 4);
+    assert_rows(&db, 1..=2, &[3, 4, 5]);
+}
+
+#[test]
+fn validation_refusal_preserves_files_after_a_full_replay_buffer() {
+    const WRITE_BUFFER: usize = 64 << 10;
+    let dir = TestDir::new();
+    initialize_marked(&dir.0);
+    let db = open(&dir.0);
+    group(&db, 1, vec![1; 2 * WRITE_BUFFER]);
+    group(&db, 2, vec![2; 2 * WRITE_BUFFER]);
+    small_group(&db, 2);
+    db.sync_commits().unwrap();
+    drop(db);
+    let before = file_contents(&dir.0);
+    assert!(wal_len(&current_wal(&dir.0)) > 4 * WRITE_BUFFER);
+
+    let (path, lock) = RocksKv::lock_local(&dir.0).unwrap();
+    let mut options = RocksKv::open_options(CACHE_BYTES, DBRecoveryMode::PointInTime).unwrap();
+    options.set_write_buffer_size(WRITE_BUFFER);
+    let Err(error) = RocksKv::open_with_options(&path, lock.writer_lock, lock.directory_pin, options, true) else {
+        panic!("unsafe recovery opened successfully");
+    };
+    assert!(error.to_string().contains("expected 3, found 2"));
+    assert_eq!(FenceCause::for_kv(FenceSite::Open, &error).class, FenceClass::Data);
+    assert_eq!(file_contents(&dir.0), before);
+}
+
+#[cfg(windows)]
+#[test]
+fn unreadable_current_is_not_more_recoverable_in_the_seed() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = TestDir::new();
+    initialize_marked(&dir.0);
+    let before = file_contents(&dir.0);
+    let current = OpenOptions::new().read(true).share_mode(0)
+        .open(dir.0.join("CURRENT")).unwrap();
+    assert!(File::open(dir.0.join("CURRENT")).is_err());
+    let Err(seed_error) = RocksKv::open(&dir.0, CACHE_BYTES) else {
+        panic!("seed accepted an unreadable CURRENT");
+    };
+    drop(current);
+    assert_eq!(file_contents(&dir.0), before);
+
+    let _current = OpenOptions::new().read(true).share_mode(0)
+        .open(dir.0.join("CURRENT")).unwrap();
+    let options = RocksKv::open_options(CACHE_BYTES, DBRecoveryMode::PointInTime).unwrap();
+    let Err(native_error) = DB::open_cf_with_opts(
+        &options,
+        native_path(&dir.0),
+        Keyspace::ALL.map(|ks| (ks.name(), options.clone())),
+    ) else {
+        panic!("native open accepted an unreadable CURRENT");
+    };
+    let native_error = map_error_at(native_error, FenceSite::Open);
+    use crate::storage::v2::OpenFailure;
+    assert_eq!(OpenFailure::from(seed_error).cause.class, FenceClass::NotRecoverable);
+    assert_eq!(OpenFailure::from(native_error).cause.class, FenceClass::NotRecoverable);
 }

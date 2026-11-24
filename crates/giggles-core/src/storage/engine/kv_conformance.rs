@@ -474,6 +474,9 @@ impl KvBackend for FaultBackend {
     fn pipelined_sync(&self) -> bool {
         true
     }
+    fn append_commit(&self, batch: WriteBatch) -> Result<(), KvError> {
+        self.write(batch, Durability::NoSync)
+    }
 
     fn write(&self, _: WriteBatch, _: Durability) -> Result<(), KvError> {
         self.touch();

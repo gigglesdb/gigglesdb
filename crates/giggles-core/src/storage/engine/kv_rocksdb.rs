@@ -1,13 +1,15 @@
 //! Optional RocksDB implementation of the storage-engine KV seam.
-use super::kv::*;
-#[cfg(any(target_os = "linux", windows))]
-use crate::storage::directory_identity::DirectoryIdentity;
-use crate::storage::directory_identity::PinnedDirectory;
+use super::{
+    kv::*,
+    meta::{self, FormatError, StoreMarker},
+};
+use crate::storage::directory_identity::{DirectoryIdentity, PinnedDirectory};
 use rocksdb::{
     AsColumnFamilyRef, AsRawPtr, BlockBasedOptions, Cache, DB, DBCompressionType, DBRecoveryMode,
     IngestExternalFileOptions, IteratorMode, Options, SstFileWriter, WriteOptions,
 };
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     ffi::{CString, c_char},
     fs::{File, OpenOptions, TryLockError},
@@ -23,10 +25,13 @@ use std::{
 unsafe extern "C" {
     fn giggles_rocksdb_install_autorecovery_veto(options: *mut librocksdb_sys::rocksdb_options_t);
     fn giggles_rocksdb_uses_default_env(options: *const librocksdb_sys::rocksdb_options_t) -> bool;
+    #[cfg(target_os = "linux")]
+    fn giggles_rocksdb_check_directory_pin(path: *const c_char) -> std::ffi::c_int;
     fn giggles_rocksdb_new_commit_group_filter(
         meta_name: *const c_char,
         key: *const u8,
         key_len: usize,
+        ignore_records: bool,
     ) -> *mut NativeWalFilter;
     fn giggles_rocksdb_set_commit_group_filter(
         options: *mut librocksdb_sys::rocksdb_options_t,
@@ -54,22 +59,24 @@ struct WalStop {
 }
 
 impl WalStop {
-    fn validate(self) -> Result<(), KvError> {
-        let Self { reason, wal, expected, found, sst_log } = self;
-        if reason != 0 {
-            tracing::warn!(
-                wal_number = wal,
-                expected_group = expected,
-                found_group = found,
-                "RocksDB commit group WAL replay stopped"
+    fn report(self) {
+        if self.reason != 0 {
+            eprintln!(
+                "RocksDB commit group WAL replay stopped: reason {}, WAL {}, expected group {}, found group {}, live SST WAL {}",
+                self.reason, self.wal, self.expected, self.found, self.sst_log
             );
         }
+    }
+
+    fn validate(self) -> Result<(), KvError> {
+        let Self { reason, wal, expected, found, sst_log } = self;
         let problem = match reason {
             0 => return Ok(()),
             1 if sst_log <= wal => return Ok(()),
             1 => format!("live SST column family starts at WAL {sst_log}, beyond the commit group gap at WAL {wal} (expected {expected}, found {found})"),
             2 => format!("out-of-order commit group in WAL {wal}: expected {expected}, found {found}"),
             3 => format!("invalid commit_group value in WAL {wal}"),
+            4 => format!("commit_group record in WAL {wal} requires a marked local store"),
             _ => unreachable!("unknown native commit group stop reason"),
         };
         Err(KvError::Corrupt(problem))
@@ -84,12 +91,15 @@ unsafe impl Send for WalFilter {}
 unsafe impl Sync for WalFilter {}
 
 impl WalFilter {
-    fn new() -> Self {
+    fn new(ignore_records: bool) -> Self {
         let meta = CString::new(Keyspace::Meta.name()).unwrap();
         // SAFETY: the shim copies the name and borrows only the static key.
         let filter = unsafe {
             giggles_rocksdb_new_commit_group_filter(
-                meta.as_ptr(), COMMIT_GROUP_KEY.as_ptr(), COMMIT_GROUP_KEY.len(),
+                meta.as_ptr(),
+                COMMIT_GROUP_KEY.as_ptr(),
+                COMMIT_GROUP_KEY.len(),
+                ignore_records,
             )
         };
         Self(NonNull::new(filter).expect("native WAL filter allocation"))
@@ -107,7 +117,7 @@ impl WalFilter {
     }
 
     fn begin_replay(&mut self, seed: u64) {
-        // SAFETY: the seed DB and its options have already dropped.
+        // SAFETY: no DB is using the filter during this reset.
         unsafe { giggles_rocksdb_begin_commit_group_replay(self.0.as_ptr(), seed) };
     }
 
@@ -261,12 +271,17 @@ thread_local! {
     static COMMIT_IO_FAULT: std::cell::Cell<Option<FenceSite>> = const { std::cell::Cell::new(None) };
 }
 
+pub(crate) struct LocalWriterLock {
+    writer_lock: WriterLock,
+    directory_pin: Option<File>,
+}
+
 struct LockedDb {
     // Must precede db: all lifetime-extended iterators die before their DB.
     points: Mutex<PointPool>,
     // Field order matters: close RocksDB before releasing the explicit lock.
     db: DB,
-    _wal_filter: Option<WalFilter>,
+    _wal_filter: WalFilter,
     _writer_lock: WriterLock,
     _directory_pin: Option<File>,
     close: SignalClose,
@@ -304,11 +319,25 @@ impl Drop for RocksKv {
 impl RocksKv {
     pub(crate) fn open(path: &Path, cache_bytes: usize) -> Result<Self, KvError> {
         std::fs::create_dir_all(path).map_err(|error| KvError::Io(error.to_string()))?;
-        let (directory, path) = pin_local_directory(path)?;
-        let writer_lock = WriterLock::acquire(&path)?;
-        Self::open_locked_in_mode(
-            &path, cache_bytes, writer_lock, DBRecoveryMode::PointInTime, directory, true,
-        )
+        let (path, lock) = Self::lock_local(path)?;
+        Self::open_locked(&path, cache_bytes, lock)
+    }
+
+    pub(crate) fn lock_local(path: &Path) -> Result<(Cow<'_, Path>, LocalWriterLock), KvError> {
+        if !has_commit_groups(path)? {
+            let writer_lock = WriterLock::acquire(path)?;
+            // A marker may have been published while we were acquiring the lock.
+            if !has_commit_groups(path)? {
+                return Ok((Cow::Borrowed(path), LocalWriterLock { writer_lock, directory_pin: None }));
+            }
+            drop(writer_lock);
+        }
+
+        let (path, lock) = lock_pinned_local(path)?;
+        if !has_commit_groups(&path)? {
+            return Err(KvError::Io("commit group marker changed while opening the store".into()));
+        }
+        Ok((Cow::Owned(path), lock))
     }
 
     pub(in crate::storage) fn open_recovery(
@@ -317,14 +346,12 @@ impl RocksKv {
     ) -> Result<Self, KvError> {
         let (directory, path) = pin.into_parts();
         let writer_lock = WriterLock::acquire(&path)?;
-        Self::open_locked_in_mode(
-            &path,
-            cache_bytes,
-            writer_lock,
-            DBRecoveryMode::TolerateCorruptedTailRecords,
-            Some(directory),
-            true,
-        )
+        let chain = has_commit_groups(&path)?;
+        if chain {
+            check_commit_group_pin(&path)?;
+        }
+        let options = Self::open_options(cache_bytes, DBRecoveryMode::TolerateCorruptedTailRecords)?;
+        Self::open_with_options(&path, writer_lock, Some(directory), options, chain)
     }
 
     pub(crate) fn close_latch(&self) -> CloseLatch {
@@ -362,12 +389,12 @@ impl RocksKv {
     pub(crate) fn open_locked(
         path: &Path,
         cache_bytes: usize,
-        writer_lock: WriterLock,
+        lock: LocalWriterLock,
     ) -> Result<Self, KvError> {
-        let (directory, path) = pin_local_directory(path)?;
-        Self::open_locked_in_mode(
-            &path, cache_bytes, writer_lock, DBRecoveryMode::PointInTime, directory, true,
-        )
+        let LocalWriterLock { writer_lock, directory_pin } = lock;
+        let chain = directory_pin.is_some();
+        let options = Self::open_options(cache_bytes, DBRecoveryMode::PointInTime)?;
+        Self::open_with_options(path, writer_lock, directory_pin, options, chain)
     }
 
     pub(crate) fn open_replicated(path: &Path, cache_bytes: usize) -> Result<Self, KvError> {
@@ -380,21 +407,11 @@ impl RocksKv {
         cache_bytes: usize,
         writer_lock: WriterLock,
     ) -> Result<Self, KvError> {
-        Self::open_locked_in_mode(
-            path, cache_bytes, writer_lock, DBRecoveryMode::PointInTime, None, false,
-        )
-    }
-
-    fn open_locked_in_mode(
-        path: &Path,
-        cache_bytes: usize,
-        writer_lock: WriterLock,
-        mode: DBRecoveryMode,
-        directory_pin: Option<File>,
-        check_commit_groups: bool,
-    ) -> Result<Self, KvError> {
-        let options = Self::open_options(cache_bytes, mode)?;
-        Self::open_with_options(path, writer_lock, directory_pin, options, check_commit_groups)
+        if has_commit_groups(path)? {
+            return Err(KvError::Corrupt("a marked commit group store requires a local open".into()));
+        }
+        let options = Self::open_options(cache_bytes, DBRecoveryMode::PointInTime)?;
+        Self::open_with_options(path, writer_lock, None, options, false)
     }
 
     fn open_options(cache_bytes: usize, mode: DBRecoveryMode) -> Result<Options, KvError> {
@@ -433,55 +450,48 @@ impl RocksKv {
         Ok(options)
     }
 
-    fn read_commit_group_seed(
+    fn open_read_only(
         path: &Path,
         options: &Options,
-        filter: &mut WalFilter,
-    ) -> Result<u64, KvError> {
-        match path.join("CURRENT").symlink_metadata() {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => {
-                return Err(KvError::RocksIo {
-                    message: error.to_string(),
-                    status: RocksStatus { code: RocksStatus::IO_ERROR, subcode: 0, severity: None },
-                    site: FenceSite::Open,
-                });
-            }
-        }
-
-        let map_open_error = |error| map_error_at(error, FenceSite::Open);
-        let path = native_path(path);
-        let mut options = options.clone();
-        options.create_if_missing(false);
-        options.create_missing_column_families(false);
-        filter.install(&mut options);
-        // A partially initialized store may lack CFs that the writable open
-        // would create. Use the manifest's list for the read-only open.
-        let families = DB::list_cf(&options, &path).map_err(map_open_error)?;
-        let db = DB::open_cf_with_opts_for_read_only(
-            &options,
-            &path,
+        families: &[String],
+    ) -> Result<DB, rocksdb::Error> {
+        DB::open_cf_with_opts_for_read_only(
+            options,
+            native_path(path),
             families.iter().map(|name| {
+                // Match writable open: it gets implicit default CF options.
                 let cf_options = if name == "default" { Options::default() } else { options.clone() };
                 (name, cf_options)
             }),
             false,
         )
-        .map_err(map_open_error)?;
-        for name in &families {
+    }
+
+    fn read_commit_group_seed(
+        path: &Path,
+        options: &Options,
+        families: &[String],
+        chain_filter: &mut WalFilter,
+    ) -> Result<u64, KvError> {
+        let mut seed_filter = WalFilter::new(true);
+        let mut options = options.clone();
+        options.set_wal_recovery_mode(DBRecoveryMode::SkipAnyCorruptedRecord);
+        options.set_max_open_files(64);
+        seed_filter.install(&mut options);
+        let db = Self::open_read_only(path, &options, families).map_err(map_read_only_error)?;
+        for name in families {
             let cf = db.cf_handle(name).unwrap();
             if db.property_int_value_cf(cf, rocksdb::properties::LIVE_SST_FILES_SIZE)
-                .map_err(map_open_error)?
+                .map_err(map_read_only_error)?
                 .is_some_and(|size| size != 0)
             {
-                filter.note_live_sst(name);
+                chain_filter.note_live_sst(name);
             }
         }
         let Some(meta) = db.cf_handle(Keyspace::Meta.name()) else {
             return Ok(0);
         };
-        match db.get_cf(meta, COMMIT_GROUP_KEY).map_err(map_open_error)? {
+        match db.get_cf(meta, COMMIT_GROUP_KEY).map_err(map_read_only_error)? {
             None => Ok(0),
             Some(bytes) => bytes
                 .as_slice()
@@ -491,12 +501,38 @@ impl RocksKv {
         }
     }
 
+    fn validate_commit_groups(
+        path: &Path,
+        options: &Options,
+        filter: &mut WalFilter,
+    ) -> Result<(), KvError> {
+        let mut options = options.clone();
+        options.create_if_missing(false);
+        options.create_missing_column_families(false);
+        // A partially initialized DB may lack CFs the writable open creates.
+        let families = DB::list_cf(&options, native_path(path)).map_err(map_read_only_error)?;
+        let seed = Self::read_commit_group_seed(path, &options, &families, filter)?;
+        filter.begin_replay(seed);
+        filter.install(&mut options);
+        // A writable recovery can flush its replay prefix before a later
+        // record is refused. Validate read-only so refusal leaves live files untouched.
+        let result = Self::open_read_only(path, &options, &families);
+        let stop = filter.stop();
+        if let Err(error) = stop.validate() {
+            stop.report();
+            return Err(error);
+        }
+        drop(result.map_err(map_read_only_error)?);
+        filter.begin_replay(seed);
+        Ok(())
+    }
+
     fn open_with_options(
         path: &Path,
         writer_lock: WriterLock,
         directory_pin: Option<File>,
         options: Options,
-        check_commit_groups: bool,
+        chain: bool,
     ) -> Result<Self, KvError> {
         // R-WALB requires one RocksDB write queue and recovery flushes.
         // SAFETY: the native getters and capability check only read live options.
@@ -512,19 +548,20 @@ impl RocksKv {
             // Stock WAL files support concurrent sync (env/io_posix.cc:1854,
             // port/win/io_win.cc:993). R-WALB excludes every custom Env or FS,
             // including a future pre-zeroed WAL FileSystem.
-            giggles_rocksdb_uses_default_env(options)
+            chain
+                && librocksdb_sys::rocksdb_options_get_allow_mmap_writes(options) == 0
+                && giggles_rocksdb_uses_default_env(options)
         };
         #[cfg(test)]
         if RECOVERY_OPEN_CRASH.get() == Some(RecoveryOpenCrash::BeforeNativeOpen) {
             crate::storage::crash_now();
         }
-        let mut filter = check_commit_groups.then(WalFilter::new);
+        let mut filter = WalFilter::new(false);
         let mut options = options;
-        if let Some(filter) = &mut filter {
-            let seed = Self::read_commit_group_seed(path, &options, filter)?;
-            filter.begin_replay(seed);
-            filter.install(&mut options);
+        if chain {
+            Self::validate_commit_groups(path, &options, &mut filter)?;
         }
+        filter.install(&mut options);
 
         let open_native = || {
             DB::open_cf_with_opts(
@@ -541,7 +578,8 @@ impl RocksKv {
         };
         #[cfg(not(test))]
         let result = open_native();
-        let stop = filter.as_ref().map_or_else(WalStop::default, WalFilter::stop);
+        let stop = filter.stop();
+        stop.report();
         stop.validate()?;
         let db = result.map_err(|error| map_error_at(error, FenceSite::Open))?;
         #[cfg(test)]
@@ -564,18 +602,71 @@ impl RocksKv {
     }
 }
 
-fn pin_local_directory(path: &Path) -> Result<(Option<File>, PathBuf), KvError> {
-    #[cfg(any(target_os = "linux", windows))]
-    {
-        let (directory, path) = DirectoryIdentity::read(path)
-            .map_err(|error| KvError::Io(error.to_string()))?
-            .pin(path)
-            .map_err(|error| KvError::Io(error.to_string()))?
-            .into_parts();
-        Ok((Some(directory), path))
+fn marker_error(error: FormatError) -> KvError {
+    match error {
+        FormatError::WrappedIo { source, .. } => source,
+        error => KvError::Corrupt(error.to_string()),
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    Ok((None, path.to_path_buf()))
+}
+
+fn has_commit_groups(path: &Path) -> Result<bool, KvError> {
+    Ok(meta::read_store_marker(path).map_err(marker_error)? == Some(StoreMarker::CommitGroups))
+}
+
+fn lock_pinned_local(path: &Path) -> Result<(PathBuf, LocalWriterLock), KvError> {
+    let pin_error = |error: &dyn std::fmt::Display| {
+        KvError::Io(format!("commit group store requires a pinned directory: {error}"))
+    };
+    let identity = DirectoryIdentity::read(path).map_err(|error| pin_error(&error))?;
+    let pin = identity.pin(path).map_err(|error| pin_error(&error))?;
+    check_commit_group_pin(pin.path())?;
+    let (directory, path) = pin.into_parts();
+    let writer_lock = WriterLock::acquire(&path)?;
+    Ok((path, LocalWriterLock { writer_lock, directory_pin: Some(directory) }))
+}
+
+fn check_commit_group_pin(_path: &Path) -> Result<(), KvError> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = CString::new(_path.as_os_str().as_encoded_bytes())
+            .map_err(|error| KvError::Io(error.to_string()))?;
+        // SAFETY: the path is NUL-terminated and lives through the statfs check.
+        let errno = unsafe { giggles_rocksdb_check_directory_pin(path.as_ptr()) };
+        if errno != 0 {
+            return Err(KvError::Io(format!(
+                "commit group store requires a pinned directory: {}",
+                std::io::Error::from_raw_os_error(errno)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Enable commit group recovery before opening a store for pipelined writes.
+#[allow(dead_code, reason = "P3 will mark the store before its first commit group")]
+pub(crate) fn mark_commit_groups(path: &Path) -> Result<(), KvError> {
+    let (path, _lock) = lock_pinned_local(path)?;
+    if meta::classify_dir(&path).map_err(marker_error)? != meta::DirClass::V2 {
+        return Err(KvError::Corrupt("commit groups require an existing v2 store".into()));
+    }
+    meta::write_commit_groups_marker(&path).map_err(marker_error)
+}
+
+fn map_read_only_error(error: rocksdb::Error) -> KvError {
+    // Writable open probes CURRENT before reading its contents, and can
+    // classify an unreadable CURRENT as InvalidArgument. A read-only probe
+    // must not make the same store eligible for a recovery retry.
+    let mut error = map_error_at(error, FenceSite::Open);
+    if let KvError::RocksIo { status, .. } = &mut error
+        && status.code == RocksStatus::IO_ERROR
+    {
+        *status = RocksStatus {
+            code: 4, // InvalidArgument, as in the writable CURRENT probe.
+            subcode: 0,
+            severity: None,
+        };
+    }
+    error
 }
 
 #[cfg(test)]
@@ -1299,10 +1390,9 @@ impl KvBackend for RocksKv {
     }
 
     fn append_commit(&self, batch: WriteBatch) -> Result<(), KvError> {
-        debug_assert!(
-            self.pipelined_sync,
-            "commit pipelining requires the default RocksDB Env and FS"
-        );
+        if !self.pipelined_sync {
+            return Err(KvError::Io("commit append requires pipeline-capable RocksDB recovery".into()));
+        }
         self.commit_io(FenceSite::CommitAppend, || self.write_batch(batch, Durability::NoSync))
     }
 
@@ -1758,10 +1848,13 @@ mod tests {
     #[test]
     fn local_open_advertises_pipelined_sync_and_pins_fence_options() {
         let dir = TestDir::new();
+        wal_group_tests::initialize_marked(&dir.0);
         for mode in [DBRecoveryMode::PointInTime, DBRecoveryMode::TolerateCorruptedTailRecords] {
-            let cache_bytes = 8 * 1024 * 1024;
-            let lock = WriterLock::acquire(&dir.0).unwrap();
-            let db = Arc::new(RocksKv::open_locked_in_mode(&dir.0, cache_bytes, lock, mode, None, true).unwrap());
+            let (path, lock) = RocksKv::lock_local(&dir.0).unwrap();
+            let options = RocksKv::open_options(8 << 20, mode).unwrap();
+            let db = Arc::new(RocksKv::open_with_options(
+                &path, lock.writer_lock, lock.directory_pin, options, true,
+            ).unwrap());
             assert!(db.pipelined_sync());
             assert!(Kv::new_single_writer(db.clone()).pipelined_sync());
             assert!(!Kv::new(db.clone()).pipelined_sync());
@@ -1787,8 +1880,34 @@ mod tests {
     }
 
     #[test]
+    fn unmarked_commit_append_refuses_before_dispatch() {
+        let dir = TestDir::new();
+        let db = Arc::new(RocksKv::open(&dir.0, 8 << 20).unwrap());
+        let kv = Kv::new_single_writer(db.clone());
+        assert!(!db.pipelined_sync());
+        assert!(!kv.pipelined_sync());
+        assert!(matches!(db.append_commit(single()), Err(KvError::Io(_))));
+        assert!(matches!(kv.append_commit(single()), Err(KvError::Io(_))));
+        assert!(!kv.is_fenced());
+    }
+
+    #[test]
+    fn mmap_writes_disable_pipelined_sync_on_a_marked_store() {
+        let dir = TestDir::new();
+        wal_group_tests::initialize_marked(&dir.0);
+        let (path, lock) = RocksKv::lock_local(&dir.0).unwrap();
+        let mut options = RocksKv::open_options(8 << 20, DBRecoveryMode::PointInTime).unwrap();
+        options.set_allow_mmap_writes(true);
+        let db = RocksKv::open_with_options(&path, lock.writer_lock, lock.directory_pin, options, true)
+            .unwrap();
+        assert!(!db.pipelined_sync());
+        assert!(matches!(db.append_commit(single()), Err(KvError::Io(_))));
+    }
+
+    #[test]
     fn failed_commit_append_is_not_recoverable() {
         let dir = TestDir::new();
+        wal_group_tests::initialize_marked(&dir.0);
         let db = Arc::new(RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap());
         let kv = Kv::new_single_writer(db);
 
@@ -1800,6 +1919,7 @@ mod tests {
     #[test]
     fn simulated_seam_sync_failure_leaves_no_sst_before_close() {
         let dir = TestDir::new();
+        wal_group_tests::initialize_marked(&dir.0);
         let db = Arc::new(RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap());
         let kv = Kv::new_single_writer(db.clone());
         let before = sst_paths(&dir.0);
@@ -1842,6 +1962,7 @@ mod tests {
             full_space_checks: u64,
             flushes: u64,
             recoveries: u64,
+            vetoes: u64,
         }
 
         #[link(name = "giggles_autorecovery_veto_test", kind = "static")]
@@ -1906,8 +2027,11 @@ mod tests {
                 let fault = unsafe { WalFault::install(&mut options, keep_veto) };
                 (fault, options)
             };
-            let lock = WriterLock::acquire(&dir.0).unwrap();
-            let db = Arc::new(RocksKv::open_with_options(&dir.0, lock, None, options, true).unwrap());
+            wal_group_tests::initialize_marked(&dir.0);
+            let (path, lock) = RocksKv::lock_local(&dir.0).unwrap();
+            let db = Arc::new(RocksKv::open_with_options(
+                &path, lock.writer_lock, lock.directory_pin, options, true,
+            ).unwrap());
             let kv = Kv::new_single_writer(db.clone());
             assert!(!db.pipelined_sync());
             assert!(!kv.pipelined_sync());
@@ -1939,7 +2063,12 @@ mod tests {
             };
             assert_native_no_space(native_write());
 
-            if !keep_veto {
+            if keep_veto {
+                thread::sleep(Duration::from_millis(100));
+                let after = fault.counts();
+                assert!(after.vetoes > 0, "{after:?}");
+                assert_eq!(after.full_space_checks, 1, "{after:?}");
+            } else {
                 // The first check is OverrideNoSpaceError. Wait for the SstFileManager
                 // to see a full disk as well, so recovery needs its next poll.
                 wait_for(|| fault.counts().full_space_checks >= 2);
@@ -1950,12 +2079,14 @@ mod tests {
                 // SstFileManager retries every five seconds (file/sst_file_manager_impl.cc:347-350).
                 thread::sleep(Duration::from_millis(5_250));
                 let after = fault.counts();
+                assert_eq!(after.full_space_checks, 1, "{after:?}");
                 assert_eq!((after.flushes, after.recoveries), (0, 0), "{after:?}");
                 assert_eq!(sst_paths(&dir.0), before);
                 assert_native_no_space(native_write());
             } else {
                 wait_for(|| fault.counts().recoveries > 0);
                 let after = fault.counts();
+                assert_eq!(after.vetoes, 0, "{after:?}");
                 assert!(after.flushes > 0, "{after:?}");
                 assert!(sst_paths(&dir.0).difference(&before).next().is_some());
                 native_write().unwrap();
