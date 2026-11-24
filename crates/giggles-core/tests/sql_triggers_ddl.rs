@@ -104,7 +104,7 @@ fn postgres_oracle_ddl_and_dependencies() {
     );
     run(
         &mut s,
-        "CREATE FUNCTION options() RETURNS trigger AS 'BEGIN RETURN NEW; END' IMMUTABLE LEAKPROOF RETURNS NULL ON NULL INPUT SECURITY DEFINER PARALLEL SAFE COST 23 LANGUAGE plpgsql",
+        "CREATE FUNCTION options() RETURNS trigger AS 'BEGIN RETURN NEW; END' IMMUTABLE LEAKPROOF RETURNS NULL ON NULL INPUT SECURITY INVOKER PARALLEL SAFE COST 23 LANGUAGE plpgsql",
     );
     let snapshot = s.catalog_metadata().unwrap().presentation;
     let (_, options) = snapshot
@@ -113,9 +113,16 @@ fn postgres_oracle_ddl_and_dependencies() {
         .find(|(_, r)| r.name == "options")
         .unwrap();
     assert_eq!(options.volatility, b'i');
-    assert!(options.leakproof && options.strict && options.security_definer);
+    assert!(options.leakproof && options.strict && !options.security_definer);
     assert_eq!(options.parallel, b's');
     assert_eq!(f32::from_bits(options.cost_bits), 23.0);
+    for sql in [
+        "CREATE FUNCTION refused() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN RETURN NEW; END $$",
+        "CREATE OR REPLACE FUNCTION options() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN RETURN NEW; END $$",
+    ] {
+        failure(&mut s, sql, "0A000", "SECURITY DEFINER functions are not supported");
+        assert_eq!(s.catalog_metadata().unwrap().presentation.routines, snapshot.routines);
+    }
     run(&mut s, "DROP FUNCTION options() RESTRICT");
     let d = failure(
         &mut s,
@@ -141,6 +148,13 @@ fn postgres_oracle_ddl_and_dependencies() {
         d.context.as_deref(),
         Some("compilation of PL/pgSQL function \"f1\" near line 1")
     );
+    let no_rows = s.execute("SELECT f1() WHERE false", &[], None).unwrap();
+    assert!(no_rows.rows.is_empty());
+    let prepared = s.prepare("SELECT f1()").unwrap();
+    assert_eq!(s.describe(&prepared).unwrap().type_oids, vec![2279]);
+    let error = s.execute_prepared(&prepared, &[], None).unwrap_err();
+    assert_eq!(sqlstate(&error), "0A000");
+    failure(&mut s, "SELECT CASE WHEN false THEN f1() END", "0A000", "cannot accept a value of type trigger");
     for (sql, code, message) in [
         (
             "CREATE FUNCTION bad() RETURNS trigger LANGUAGE nosuchlang AS $$ BEGIN RETURN NEW; END $$",
@@ -312,6 +326,69 @@ fn features(path: &std::path::Path) -> u64 {
         .unwrap()
         .unwrap();
     u64::from_be_bytes(value.as_slice().try_into().unwrap())
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn trigger_grant_feature_tracks_only_the_new_record_bytes() {
+    use giggles_core::roles::{NewRole, TablePrivilege};
+    use redb::{ReadableDatabase, TableDefinition};
+    use rocksdb::{DB, Direction, IteratorMode, Options};
+
+    let base = common::fresh("trigger-grant-base");
+    let legacy = Admin::create_engine(&base, Limits::default(), Engine::Legacy).unwrap();
+    legacy.roles().create(NewRole { name: "reader".into(), ..Default::default() }).unwrap();
+    legacy.roles().grant_table("t", "reader", &[TablePrivilege::Select]).unwrap();
+    drop(legacy);
+    let baseline = {
+        let db = redb::Database::open(base.join("data.redb")).unwrap();
+        let txn = db.begin_read().unwrap();
+        let roles = txn.open_table(TableDefinition::<&[u8], &[u8]>::new("giggles_roles_v1")).unwrap();
+        let payload = roles.get(b"tgrant/t\0reader".as_slice()).unwrap().unwrap();
+        // V2's base writer adds the live MVCC tag and the role record version.
+        [b"\x00\x01", payload.value()].concat()
+    };
+    std::fs::remove_dir_all(base).unwrap();
+
+    let path = common::fresh("trigger-grant-feature");
+    let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+    run(&mut admin.sql_session(), "CREATE TABLE t (id int)");
+    admin.roles().create(NewRole { name: "reader".into(), ..Default::default() }).unwrap();
+    admin.roles().grant_table("t", "reader", &[TablePrivilege::Select]).unwrap();
+    drop(admin);
+
+    let grant_bytes = |path: &std::path::Path| {
+        let options = Options::default();
+        let names = DB::list_cf(&options, path).unwrap();
+        let db = DB::open_cf_for_read_only(&options, path, names, false).unwrap();
+        let catalog = db.cf_handle("catalog").unwrap();
+        let key = b"\x0bt\0reader\0";
+        let (stored_key, value) = db.iterator_cf(&catalog, IteratorMode::From(key, Direction::Forward))
+            .next().unwrap().unwrap();
+        assert_eq!(&stored_key[..stored_key.len() - 8], key);
+        value
+    };
+    assert_eq!(features(&path) & (1 << 39), 0);
+    assert_eq!(&*grant_bytes(&path), baseline.as_slice());
+
+    let admin = Admin::open(&path, Limits::default()).unwrap();
+    admin.roles().grant_table("t", "reader", &[TablePrivilege::Trigger]).unwrap();
+    drop(admin);
+    let bits = features(&path);
+    assert_ne!(bits & (1 << 39), 0);
+    assert_eq!(&*grant_bytes(&path), b"\x00\x01[\"Select\",\"Trigger\"]");
+    let reopened = Admin::open(&path, Limits::default()).unwrap();
+    assert!(reopened.roles().table_privileges("t", "reader").unwrap().contains(&TablePrivilege::Trigger));
+    drop(reopened);
+
+    let options = Options::default();
+    let names = DB::list_cf(&options, &path).unwrap();
+    let db = DB::open_cf(&options, &path, names).unwrap();
+    db.put_cf(&db.cf_handle("meta").unwrap(), b"features", (bits & !(1 << 39)).to_be_bytes()).unwrap();
+    drop(db);
+    assert!(matches!(Admin::open(&path, Limits::default()), Err(giggles_core::CoreError::Corrupt(message))
+        if message.contains("content requires unset format feature")));
+    std::fs::remove_dir_all(path).unwrap();
 }
 
 #[cfg(feature = "engine-rocksdb")]

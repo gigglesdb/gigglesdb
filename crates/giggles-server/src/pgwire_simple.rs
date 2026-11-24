@@ -625,6 +625,49 @@ impl State {
         if session.task().is_some() {
             return self.task_statement(sql, session, out);
         }
+        let mut prefix = cursor::Prefix(sql);
+        let prepare = prefix.kw("PREPARE");
+        if prepare || prefix.kw("EXECUTE") {
+            if !session.role.is_sql() {
+                return Err("42501");
+            }
+            if session.is_aborted() {
+                return Err("25P02");
+            }
+            let name = prefix.name()?;
+            if name.is_empty() {
+                return Err("42601");
+            }
+            if prepare {
+                prefix.need("AS")?;
+                let sql = prefix.0.trim();
+                if !cursor::Prefix(sql).kw("SELECT") {
+                    return Err("0A000");
+                }
+                self.check_named_statement_slot(&name, sql.len())?;
+                let statement = self.prepare_statement(sql, vec![], session, false)?;
+                if !matches!(&*statement.p, Plan::Sql(p) if p.command() == "SELECT" && p.write_tables().is_empty())
+                    || !statement.parameter_oids.is_empty()
+                {
+                    return Err("0A000");
+                }
+                self.named_statement_bytes += statement.sql_bytes;
+                self.statements.insert(name, statement);
+                return complete("PREPARE", &empty(), out);
+            }
+            prefix.end()?;
+            self.refresh_statement(&name, session)?;
+            let statement = self.statements.get(&name).ok_or("26000")?.clone();
+            let Plan::Sql(prepared) = &*statement.p else { return Err("0A000") };
+            if prepared.command() != "SELECT" || !prepared.write_tables().is_empty()
+                || !statement.parameter_oids.is_empty()
+            {
+                return Err("0A000");
+            }
+            read_only_check(prepared.row_lock_command().unwrap_or("SELECT"), &self.settings, session, &mut self.diagnostic)?;
+            self.settings.queried = session.in_transaction();
+            return self.simple_select(prepared, &statement.d, session, out);
+        }
         // GD-0061 R3-707: an approver form, before any other grammar reads it.
         if let Some(change) = crate::agent::preview::approver_statement(sql)? {
             crate::agent::preview::approver_guard(session)?;
@@ -918,41 +961,7 @@ impl State {
                 read_only_check(command, &self.settings, session, &mut self.diagnostic)?;
                 self.settings.queried = session.in_transaction();
                 if p.command() == "SELECT" && writes.is_empty() {
-                    let mut cursor = self.diagnostic.core(session.open_uncached_cursor(&p, &[]))?;
-                    sql_notice_frames(out, ReplyLimit::Checked)?;
-                    row_description(&d, &[], out)?;
-                    let mut count = 0;
-                    while !cursor.is_exhausted() {
-                        // GD-0061 R3-311: fetch unreleased, release, then encode.
-                        let chunk = self.diagnostic.core(session.fetch_cursor_unreleased(
-                            &mut cursor,
-                            CURSOR_ROWS,
-                            CURSOR_BYTES,
-                        ))?;
-                        let result = self
-                            .diagnostic
-                            .core(session.release_page(chunk))?
-                            .map(|rows| SqlResult {
-                                rows,
-                                ..SqlResult::default()
-                            });
-                        sql_notice_frames(out, ReplyLimit::Checked)?;
-                        let n = result.get().rows.len();
-                        rows(
-                            &self.settings.current,
-                            session.zone().unwrap_or(SessionZone::Fixed(0)),
-                            &result,
-                            &d,
-                            &[],
-                            0,
-                            n,
-                            out,
-                        )?;
-                        count += n;
-                        flush_output(&self.output, out)?;
-                    }
-                    catalog_complete(count, out)?;
-                    return Ok(());
+                    return self.simple_select(&p, &d, session, out);
                 }
                 // Keep the durability registration through the checked reply.
                 let _durability = if !was_transaction {
@@ -971,6 +980,29 @@ impl State {
             }
         }
         Ok(())
+    }
+    fn simple_select(&mut self, p: &Prepared, d: &Description, session: &mut Session, out: &mut Vec<u8>) -> R<()> {
+        let mut cursor = self.diagnostic.core(session.open_uncached_cursor(p, &[]))?;
+        sql_notice_frames(out, ReplyLimit::Checked)?;
+        row_description(d, &[], out)?;
+        let mut count = 0;
+        while !cursor.is_exhausted() {
+            // GD-0061 R3-311: fetch unreleased, release, then encode.
+            let chunk = self.diagnostic.core(session.fetch_cursor_unreleased(
+                &mut cursor, CURSOR_ROWS, CURSOR_BYTES,
+            ))?;
+            let result = self.diagnostic.core(session.release_page(chunk))?.map(|rows| SqlResult {
+                rows,
+                ..SqlResult::default()
+            });
+            sql_notice_frames(out, ReplyLimit::Checked)?;
+            let n = result.get().rows.len();
+            rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
+                &result, d, &[], 0, n, out)?;
+            count += n;
+            flush_output(&self.output, out)?;
+        }
+        catalog_complete(count, out)
     }
     fn simple_prepared_reply(
         &mut self,

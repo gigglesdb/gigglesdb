@@ -193,8 +193,8 @@ pub(crate) fn required_bits_for_catalog_value(
         | CatalogKind::TableGrant
         | CatalogKind::SchemaGrant
         | CatalogKind::RoleOid => {
-            super::super::roles::engine::validate_record(key, value).map_err(corrupt)?;
-            Ok(super::super::roles::engine::FEATURE
+            let grant_features = super::super::roles::engine::validate_record(key, value).map_err(corrupt)?;
+            Ok(super::super::roles::engine::FEATURE | grant_features
                 | super::super::roles::engine::membership_features(key, value)
                 | if super::super::roles::engine::is_task_only_record(key, value) {
                     super::meta::TASK_CATALOG

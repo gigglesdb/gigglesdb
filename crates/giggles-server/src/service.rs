@@ -256,6 +256,12 @@ pub(crate) fn role_lookup_error(error: roles::RoleError) -> CoreError {
     }
 }
 
+fn routine_ddl_error(sqlstate: &'static str, message: String) -> CoreError {
+    CoreError::RoutineDdl(Box::new(giggles_core::relational::RoutineDiagnostic {
+        sqlstate, message, detail: None, hint: None, context: None, position: None,
+    }))
+}
+
 pub type StatementGate = std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 #[derive(Default)]
@@ -2263,14 +2269,25 @@ impl Session {
             if let Some(table) = comment_target { session.authorize_alter_table(&table)?; }
             // Parse the complete ALTER before checking authority, but do not bind
             // its table, columns, or defaults until ownership has been checked.
-            let alter_target = Prepared::alter_table_target(sql).map_err(|error| {
+            let alter_target = Prepared::alter_table_authority_target(sql).map_err(|error| {
                 // Match SqlSession::prepare's failed-statement transaction
                 // semantics even though ALTER parsing precedes core binding.
                 session.sql.abort();
                 parse_error(session, CoreError::Sql(error))
             })?;
-            if let Some(table) = alter_target {
-                session.authorize_alter_table(&table)?;
+            if let Some((table, changes_trigger)) = alter_target {
+                if changes_trigger && matches!(session.authority_role(), Role::Database { .. })
+                    && session.service.admin.engine() == giggles_core::Engine::V2
+                {
+                    session.authorize_alter_table(&table).map_err(|error| match error {
+                        CoreError::Policy(Error::Scope) => routine_ddl_error("42501", format!(
+                            "must be owner of table {}", table.rsplit('\0').next().unwrap_or(&table),
+                        )),
+                        error => error,
+                    })?;
+                } else {
+                    session.authorize_alter_table(&table)?;
+                }
             }
             let drop_targets = Prepared::drop_table_targets(sql).map_err(|error| {
                 session.sql.abort();
@@ -2941,7 +2958,7 @@ impl Session {
         if matches!(p.command(), "CREATE FUNCTION" | "DROP FUNCTION" | "CREATE TRIGGER" | "DROP TRIGGER" | "ALTER TRIGGER") {
             let result = self.authorize_routine_ddl(p);
             if result.is_err() { self.sql.abort(); }
-            return result;
+            return result.map(drop);
         }
         if p.is_collation_ddl() {
             let allowed = if let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) {
@@ -3152,6 +3169,25 @@ impl Session {
         }
         if !allowed {
             let mut error = CoreError::Policy(Error::Scope);
+            if self.surface == Surface::Postgres
+                && let Role::Database { name } = self.authority_role()
+                && self.sql.task().is_none()
+                && !p.is_multi_source_read()
+                && let Some(table) = p.table()
+            {
+                let (schema, relation) = table.split_once('\0').unwrap_or(("public", table));
+                if p.has_trigger_call() {
+                    error = routine_ddl_error("42501", format!("permission denied for table {relation}"));
+                } else if self.service.admin.engine() == giggles_core::Engine::V2
+                    && let Some(routine) = p.missing_zero_arg_projection()
+                    && self.schema_privilege_allowed(schema, name, roles::SchemaPrivilege::Usage)?
+                    && self.sql.relation_exists(table)?
+                {
+                    // PostgreSQL resolves a bare missing call before checking SELECT.
+                    // The query still stops here without binding or reading the source.
+                    error = routine_ddl_error("42883", format!("function {routine}() does not exist"));
+                }
+            }
             for table in p.row_lock_tables() {
                 if !self.table_requirements_allowed(&[(table.clone(), roles::TablePrivilege::Select),
                     (table.clone(), roles::TablePrivilege::Update)], false, check_views)? {
@@ -3191,11 +3227,7 @@ impl Session {
         self.authorize_sequences(&implicit)?;
         Ok(())
     }
-    fn authorize_routine_ddl(&mut self, p: &Prepared) -> Result<(), CoreError> {
-        use giggles_core::relational::RoutineDiagnostic;
-        let failure = |message: String| CoreError::RoutineDdl(Box::new(RoutineDiagnostic {
-            sqlstate: "42501", message, detail: None, hint: None, context: None, position: None,
-        }));
+    fn authorize_routine_ddl(&mut self, p: &Prepared) -> Result<Option<String>, CoreError> {
         let Role::Database { name } = self.authority_role() else { return Err(CoreError::Policy(Error::Scope)); };
         let name = name.clone();
         let roles = self.service.admin.roles();
@@ -3204,36 +3236,58 @@ impl Session {
         match p.command() {
             "CREATE FUNCTION" | "DROP FUNCTION" => {
                 p.set_extension_owner(role.oid);
-                if role.superuser { return Ok(()); }
+                if role.superuser { return Ok(None); }
                 let schema = if p.command() == "CREATE FUNCTION" {
                     let schema = self.sql.creation_schema(p)?;
                     if !self.schema_privilege_allowed(&schema, &name, roles::SchemaPrivilege::Create)? {
-                        return Err(failure(format!("permission denied for schema {schema}")));
+                        return Err(routine_ddl_error("42501", format!("permission denied for schema {schema}")));
                     }
-                    if p.creates_leakproof_routine() { return Err(failure("only superuser can define a leakproof function".into())); }
+                    if p.creates_leakproof_routine() { return Err(routine_ddl_error("42501", "only superuser can define a leakproof function".into())); }
                     Some(schema)
                 } else { None };
                 let metadata = self.sql.catalog_metadata()?;
-                for oid in p.routine_owners(&metadata.presentation, schema.as_deref()) {
+                for (routine, oid) in p.routine_owners(&metadata.presentation, schema.as_deref()) {
                     let allowed = roles.privileges_of(&name).map_err(role_lookup_error)?.iter()
                         .any(|owner| roles.get(owner).ok().flatten().is_some_and(|role| role.oid == oid));
-                    if !allowed { return Err(failure("must be owner of function".into())); }
+                    if !allowed { return Err(routine_ddl_error("42501", format!("must be owner of function {routine}"))); }
                 }
             }
             command => {
-                if role.superuser { return Ok(()); }
+                if role.superuser { return Ok(None); }
                 let table = p.table().ok_or(CoreError::Policy(Error::Scope))?;
                 let table = self.sql.resolve_relation_reference(table)?;
                 self.authorize_drop_schema(&table)?;
-                if !self.sql.relation_exists(&table)? { return Ok(()); }
+                if !self.sql.relation_exists(&table)? { return Ok(None); }
+                let (schema, relation) = table.split_once('\0').unwrap_or(("public", &table));
+                if let Some((trigger, optional)) = p.drop_trigger_target() {
+                    let metadata = self.sql.catalog_metadata()?;
+                    if let Some(target) = metadata.tables.iter().find(|target| {
+                        target.name == relation
+                            && metadata.schemas.tables.get(&target.id).map_or("public", String::as_str) == schema
+                            && !metadata.presentation.views.contains_key(&target.id)
+                    }) && !metadata.presentation.triggers.iter().any(|entry| {
+                        entry.table == target.id && entry.name == trigger
+                    }) {
+                        if optional {
+                            return Ok(Some(format!("trigger \"{trigger}\" for relation \"{relation}\" does not exist, skipping")));
+                        }
+                        return Err(routine_ddl_error("42704", format!(
+                            "trigger \"{trigger}\" for table \"{relation}\" does not exist",
+                        )));
+                    }
+                }
                 let privilege = (command == "CREATE TRIGGER").then_some(roles::TablePrivilege::Trigger);
                 if !self.table_privilege_allowed(&table, &name, privilege)? {
-                    let table = table.rsplit('\0').next().unwrap_or(&table);
-                    return Err(failure(format!("permission denied for table {table}")));
+                    let message = match command {
+                        "DROP TRIGGER" => format!("must be owner of relation {relation}"),
+                        "ALTER TRIGGER" => format!("must be owner of table {relation}"),
+                        _ => format!("permission denied for table {relation}"),
+                    };
+                    return Err(routine_ddl_error("42501", message));
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
     fn authorize_copy_sql(&mut self, sql: &str) -> Result<(), CoreError> {
         self.admit_backstop(giggles_core::task::StatementClass::Copy)?;
@@ -3684,10 +3738,18 @@ impl Session {
     ) -> Result<Unreleased<SqlResult>, CoreError> {
         self.clear_native_duplicate_key_detail();
         let result = self.authority_scope(|session| {
-            let bound = session.sql.bind_relation_context(p)?;
-            let p = &bound;
+            let mut bound = session.sql.bind_relation_context(p)?;
             session.reconcile_sequence_owners()?;
-            let authorization = session.authorize_for_execution(p)?;
+            let authorization = if bound.drop_trigger_target().is_some() {
+                session.admit_backstop(bound.task_class())?;
+                if let Some(notice) = session.authorize_routine_ddl(&bound).inspect_err(|_| session.sql.abort())? {
+                    bound.skip_missing_drop_trigger(notice);
+                }
+                None
+            } else {
+                session.authorize_for_execution(&bound)?
+            };
+            let p = &bound;
             // Recovery must remain available even after the host clock latches.
             if session.sql.is_aborted() && p.command() == "ROLLBACK" {
                 if plain && session.sql.task().is_some() {

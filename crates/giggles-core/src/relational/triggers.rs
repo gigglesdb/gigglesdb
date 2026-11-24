@@ -30,6 +30,7 @@ pub(super) enum Ddl {
         table: String,
         name: String,
         optional: bool,
+        skip_notice: Option<String>,
     },
     Rename {
         table: String,
@@ -112,6 +113,7 @@ pub(super) fn parse(p: &mut Parser, source: &str) -> R<Ddl> {
             table,
             name,
             optional,
+            skip_notice: None,
         });
     }
     if p.word("alter") {
@@ -353,6 +355,10 @@ fn relation_name(key: &str) -> String {
     }
 }
 pub(super) fn execute(state: &mut Relational, prepared: &Prepared, ddl: &Ddl) -> R<()> {
+    if let Ddl::Drop { skip_notice: Some(notice), .. } = ddl {
+        user_types::sql_notice(notice.clone(), "00000");
+        return Ok(());
+    }
     if let Ddl::Unsupported { what, .. } = ddl {
         return Err(error("0A000", format!("{what} are not supported")));
     }
@@ -490,6 +496,29 @@ pub(super) fn execute(state: &mut Relational, prepared: &Prepared, ddl: &Ddl) ->
     }
     Ok(())
 }
+
+impl Prepared {
+    pub fn drop_trigger_target(&self) -> Option<(&str, bool)> {
+        match self.statement.get() {
+            Statement::Trigger(Ddl::Drop { name, optional, .. }) => Some((name, *optional)),
+            _ => None,
+        }
+    }
+
+    /// Preserve an authorized IF EXISTS no-op across execution's catalog rebind.
+    pub fn skip_missing_drop_trigger(&mut self, notice: String) {
+        let mark = |statement: &mut Statement| {
+            if let Statement::Trigger(Ddl::Drop { optional: true, skip_notice, .. }) = statement {
+                *skip_notice = Some(notice.clone());
+            }
+        };
+        mark(self.statement.get_mut());
+        if let Some(source) = &mut self.unbound_statement {
+            mark(Arc::make_mut(source));
+        }
+    }
+}
+
 fn column_id(table: &TableDef, name: &str) -> R<u64> {
     table
         .columns

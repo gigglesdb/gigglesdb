@@ -820,8 +820,11 @@ pub(crate) fn execute(
                 ("trigger", TablePrivilege::Trigger),
             ]
             .into_iter()
-            // Preserve the existing ALL expansion, including on Legacy.
-            .filter(|(s, _)| (all && *s != "trigger") || privileges.iter().any(|p| p == s))
+            // Legacy cannot write TRIGGER grants. REVOKE ALL can remove every privilege.
+            .filter(|(s, _)| {
+                (all && (*s != "trigger" || !*grant || admin.engine() == giggles_core::Engine::V2))
+                    || privileges.iter().any(|p| p == s)
+            })
             .map(|(_, p)| p)
             .collect();
             let sp: Vec<_> = [

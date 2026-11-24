@@ -830,7 +830,7 @@ pub fn row_description(d: &Description, formats: &[u16], out: &mut Vec<u8>) -> R
         b.extend(0u32.to_be_bytes());
         b.extend(0i16.to_be_bytes());
         b.extend(type_oids[i].to_be_bytes());
-        b.extend(if d.type_oids.get(i) == Some(&2278) { 4i16 } else { size(&c.data_type) }.to_be_bytes());
+        b.extend(if matches!(d.type_oids.get(i), Some(2278 | 2279)) { 4i16 } else { size(&c.data_type) }.to_be_bytes());
         b.extend(d.typmods.get(i).copied().unwrap_or(-1).to_be_bytes());
         b.extend(format_at(formats, i).to_be_bytes());
     }
@@ -2600,6 +2600,17 @@ impl State {
         let id = self.next_statement_id;
         self.next_statement_id = id.checked_add(1).expect("statement ID exhausted");
         id
+    }
+    fn check_named_statement_slot(&self, name: &str, sql_bytes: usize) -> R<()> {
+        if self.statements.contains_key(name) {
+            return Err("42P05");
+        }
+        if self.statements.keys().filter(|name| !name.is_empty()).count() >= MAX_NAMED_STATEMENTS
+            || self.named_statement_bytes.checked_add(sql_bytes).ok_or("54000")? > MAX_NAMED_STATEMENT_BYTES
+        {
+            return Err("54000");
+        }
+        Ok(())
     }
     fn reuse_unnamed(&mut self, sql: &str, oids: &[u32], session: &mut Session) -> R<Option<Statement>> {
         #[cfg(test)]

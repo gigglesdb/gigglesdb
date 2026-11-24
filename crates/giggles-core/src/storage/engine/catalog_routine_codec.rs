@@ -205,7 +205,7 @@ mod tests {
         assert!(classify_catalog_key(&trigger_key(0)).is_err());
         r[0] = 2;
         t[0] = 2;
-        assert!(decode_routine(&r).is_err());
-        assert!(decode_trigger(&t, 48).is_err());
+        assert!(matches!(decode_routine(&r), Err(CoreError::Corrupt(message)) if message == "unsupported catalog version"));
+        assert!(matches!(decode_trigger(&t, 48), Err(CoreError::Corrupt(message)) if message == "unsupported catalog version"));
     }
 }

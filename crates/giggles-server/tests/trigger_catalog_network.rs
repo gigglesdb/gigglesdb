@@ -184,8 +184,16 @@ async fn archdocs_trigger_ddl_and_pg_dump_catalog_queries() {
     let owner: bool = client.query_one("SELECT proowner=(SELECT oid FROM pg_roles WHERE rolname=current_user) FROM pg_proc WHERE proname='cleanup_semantic_vectors'", &[]).await.unwrap().get(0);
     assert!(owner);
 
-    let (reader, reader_connection) = config("reader").connect(NoTls).await.unwrap();
-    let reader_connection = tokio::spawn(reader_connection);
+    let (reader, mut reader_connection) = config("reader").connect(NoTls).await.unwrap();
+    let (notice_tx, mut notices) = tokio::sync::mpsc::unbounded_channel();
+    let reader_connection = tokio::spawn(async move {
+        while let Some(message) = std::future::poll_fn(|cx| reader_connection.poll_message(cx)).await {
+            if let tokio_postgres::AsyncMessage::Notice(notice) = message? {
+                let _ = notice_tx.send(notice);
+            }
+        }
+        Ok::<(), tokio_postgres::Error>(())
+    });
     let sql = "CREATE TRIGGER reader_trigger AFTER DELETE ON \"DesignDoc\" EXECUTE FUNCTION cleanup_semantic_vectors()";
     let error = reader.batch_execute(sql).await.unwrap_err();
     let error = error.as_db_error().unwrap();
@@ -196,6 +204,76 @@ async fn archdocs_trigger_ddl_and_pg_dump_catalog_queries() {
         .await
         .unwrap();
     reader.batch_execute(sql).await.unwrap();
+    client.batch_execute("REVOKE ALL ON \"DesignDoc\" FROM reader").await.unwrap();
+    assert_wire_error(&reader,
+        "CREATE TRIGGER revoked_trigger AFTER DELETE ON \"DesignDoc\" EXECUTE FUNCTION cleanup_semantic_vectors()",
+        "42501", "permission denied for table DesignDoc").await;
+    for (grant, name) in [("ALL", "all_trigger"), ("ALL PRIVILEGES", "all_privileges_trigger")] {
+        client.batch_execute(&format!("GRANT {grant} ON TABLE \"DesignDoc\" TO reader")).await.unwrap();
+        reader.batch_execute(&format!(
+            "CREATE TRIGGER {name} AFTER DELETE ON \"DesignDoc\" EXECUTE FUNCTION cleanup_semantic_vectors()",
+        )).await.unwrap();
+        client.batch_execute("REVOKE ALL ON \"DesignDoc\" FROM reader").await.unwrap();
+    }
+
+    client.batch_execute("CREATE TABLE t (id int); CREATE TABLE secret (id int); \
+        CREATE FUNCTION f1() RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER AS $$ BEGIN RETURN NEW; END $$; \
+        CREATE TRIGGER tr_owner BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f1()").await.unwrap();
+    for sql in [
+        "CREATE FUNCTION refused() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN RETURN NEW; END $$",
+        "CREATE OR REPLACE FUNCTION f1() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN RETURN OLD; END $$",
+    ] {
+        assert_wire_error(&client, sql, "0A000", "SECURITY DEFINER functions are not supported").await;
+    }
+    let row = client.query_one("SELECT prosrc, prosecdef FROM pg_proc WHERE proname = 'f1'", &[]).await.unwrap();
+    assert_eq!(row.get::<_, &str>(0), " BEGIN RETURN NEW; END ");
+    assert!(!row.get::<_, bool>(1));
+    assert!(client.query_opt("SELECT oid FROM pg_proc WHERE proname = 'refused'", &[]).await.unwrap().is_none());
+
+    for (sql, code, message) in [
+        ("DROP FUNCTION f1()", "42501", "must be owner of function f1"),
+        ("DROP TRIGGER tr_owner ON t", "42501", "must be owner of relation t"),
+        ("DROP TRIGGER nosuch ON t", "42704", "trigger \"nosuch\" for table \"t\" does not exist"),
+        ("ALTER TRIGGER tr_owner ON t RENAME TO tr_x", "42501", "must be owner of table t"),
+        ("ALTER TABLE t DISABLE TRIGGER tr_owner", "42501", "must be owner of table t"),
+        ("ALTER TABLE t ENABLE TRIGGER ALL", "42501", "must be owner of table t"),
+        ("SELECT f1() FROM secret", "42501", "permission denied for table secret"),
+        ("SELECT nosuch_fn() FROM secret", "42883", "function nosuch_fn() does not exist"),
+        ("SELECT nosuch_fn(id) FROM secret", "42501", "request rejected; consult documented code"),
+        ("SELECT CASE WHEN false THEN f1() END", "0A000", "cannot accept a value of type trigger"),
+    ] {
+        assert_wire_error(&reader, sql, code, message).await;
+    }
+    reader.batch_execute("DROP TRIGGER IF EXISTS nosuch ON t").await.unwrap();
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(5), notices.recv()).await.unwrap().unwrap();
+    assert_eq!(notice.message(), "trigger \"nosuch\" for relation \"t\" does not exist, skipping");
+    let replace = "CREATE OR REPLACE FUNCTION f1() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$";
+    assert_wire_error(&reader, replace, "42501", "permission denied for schema public").await;
+    client.batch_execute("GRANT CREATE ON SCHEMA public TO reader").await.unwrap();
+    assert_wire_error(&reader, replace, "42501", "must be owner of function f1").await;
+
+    let rows = reader.simple_query("SELECT f1() WHERE false").await.unwrap();
+    assert!(!rows.iter().any(|message| matches!(message, SimpleQueryMessage::Row(_))));
+    reader.batch_execute("PREPARE p AS SELECT f1()").await.unwrap();
+    for sql in ["EXECUTE p", "SELECT f1()", "SELECT public.f1()"] {
+        let error = reader.simple_query(sql).await.unwrap_err();
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), "0A000", "{sql}");
+        assert_eq!(error.message(), "trigger functions can only be called as triggers", "{sql}");
+        assert_eq!(error.where_(), Some("compilation of PL/pgSQL function \"f1\" near line 1"), "{sql}");
+    }
+    let prepared = reader.prepare("SELECT f1()").await.unwrap();
+    assert_eq!(prepared.columns()[0].type_().oid(), 2279);
+    let error = reader.query(&prepared, &[]).await.unwrap_err();
+    assert_eq!(error.as_db_error().unwrap().message(), "trigger functions can only be called as triggers");
+    let error = reader.batch_execute("SELECT f1(1)").await.unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "42883");
+    assert_eq!(error.message(), "function f1(integer) does not exist");
+    assert_eq!(error.hint(), Some("No function matches the given name and argument types. You might need to add explicit type casts."));
+    client.batch_execute("INSERT INTO secret VALUES (1)").await.unwrap();
+    client.batch_execute("GRANT SELECT ON secret TO reader").await.unwrap();
+    assert_wire_error(&reader, "SELECT f1() FROM secret", "0A000", "trigger functions can only be called as triggers").await;
 
     let error = client
         .batch_execute("DROP FUNCTION cleanup_semantic_vectors()")
@@ -221,4 +299,11 @@ async fn archdocs_trigger_ddl_and_pg_dump_catalog_queries() {
     running.shutdown().await.unwrap();
     drop(service);
     std::fs::remove_dir_all(path).unwrap();
+}
+
+async fn assert_wire_error(client: &tokio_postgres::Client, sql: &str, code: &str, message: &str) {
+    let error = client.batch_execute(sql).await.unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), code, "{sql}");
+    assert_eq!(error.message(), message, "{sql}");
 }

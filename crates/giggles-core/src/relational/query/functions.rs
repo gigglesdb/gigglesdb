@@ -101,8 +101,9 @@ const UNDEFINED_ROUTINE_PREFIX: &str = "public.\0";
 const PG_TOAST_ROUTINE_PREFIX: &str = "pg_toast.\0";
 const INVALID_SCHEMA_ROUTINE_PREFIX: &str = "schema.\0";
 const TRIGGER_CALL_PREFIX: &str = "\0trigger-call:";
+const UNDEFINED_TRIGGER_CALL_PREFIX: &str = "\0undefined-trigger-call:";
 
-pub(super) fn resolve_trigger_call(name: &mut String, state: &Relational, path: &[String]) {
+pub(super) fn resolve_trigger_call(name: &mut String, has_arguments: bool, state: &Relational, path: &[String]) {
     if state.ext.routines.is_empty() { return; }
     let (schema, routine) = if let Some(raw) = name.strip_prefix(UNDEFINED_ROUTINE_PREFIX)
         .or_else(|| name.strip_prefix(INVALID_SCHEMA_ROUTINE_PREFIX))
@@ -111,14 +112,9 @@ pub(super) fn resolve_trigger_call(name: &mut String, state: &Relational, path: 
     } else { return; };
     let target = crate::relational::routines::Name { schema, name: routine.into() };
     if let Some((_, def)) = state.find_routine(&target, path) {
-        *name = format!("{TRIGGER_CALL_PREFIX}{}", def.name);
+        let prefix = if has_arguments { UNDEFINED_TRIGGER_CALL_PREFIX } else { TRIGGER_CALL_PREFIX };
+        *name = format!("{prefix}{}", def.name);
     }
-}
-fn trigger_call_error(name: &str) -> Option<SqlError> {
-    let name = name.strip_prefix(TRIGGER_CALL_PREFIX)?;
-    let mut diagnostic = crate::relational::RoutineDiagnostic::new("0A000", "trigger functions can only be called as triggers");
-    diagnostic.context = Some(crate::relational::routines::compile_context(name));
-    Some(diagnostic.error())
 }
 fn privilege_name(name: &str) -> bool {
     matches!(name, "pg_has_role" | "has_table_privilege" | "has_schema_privilege"
@@ -126,13 +122,40 @@ fn privilege_name(name: &str) -> bool {
         | "has_sequence_privilege" | "has_type_privilege")
 }
 fn deferred_routine_error(name: &str) -> Option<SqlError> {
-    if name.starts_with(UNDEFINED_ROUTINE_PREFIX) || name.starts_with(PG_TOAST_ROUTINE_PREFIX) {
+    if name.starts_with(UNDEFINED_ROUTINE_PREFIX) || name.starts_with(PG_TOAST_ROUTINE_PREFIX)
+        || name.starts_with(UNDEFINED_TRIGGER_CALL_PREFIX)
+    {
         Some(SqlError::UndefinedFunction)
     } else if name.starts_with(INVALID_SCHEMA_ROUTINE_PREFIX) {
         Some(SqlError::InvalidSchema)
     } else {
         None
     }
+}
+fn deferred_call_error(
+    name: &str,
+    args: &[Scalar],
+    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+    tables: &[&TableDef],
+    parameters: &[Option<DataType>],
+    fallback: SqlError,
+) -> R<SqlError> {
+    let Some(routine) = name.strip_prefix(UNDEFINED_TRIGGER_CALL_PREFIX) else {
+        uuid_ossp::missing_diagnostic(name, args, resolve, tables, parameters)?;
+        return Ok(fallback);
+    };
+    let types = args.iter().map(|arg| {
+        if arg.aggregate_unknown(parameters) {
+            Ok("unknown")
+        } else {
+            arg.bind(resolve, tables, parameters).map(|bound| typeof_expr::name(&bound.ty))
+        }
+    }).collect::<R<Vec<_>>>()?;
+    let mut diagnostic = RoutineDiagnostic::new(
+        "42883", format!("function {routine}({}) does not exist", types.join(", ")),
+    );
+    diagnostic.hint = Some("No function matches the given name and argument types. You might need to add explicit type casts.".into());
+    Ok(diagnostic.error())
 }
 pub(super) fn is_deferred_routine_name(name: &str) -> bool {
     deferred_routine_error(name).is_some()
@@ -270,6 +293,7 @@ enum Node {
     Column(BoundColumn, String),
     Literal(Value),
     Call(String, Vec<BoundScalar>),
+    TriggerCall(String),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -558,6 +582,14 @@ pub(super) fn sequence_name(name: &str) -> bool {
     matches!(name, "nextval" | "currval" | "setval" | "lastval")
 }
 impl Scalar {
+    pub(super) fn is_trigger_call(&self) -> bool {
+        matches!(self, Self::Call(name, args) if args.is_empty() && name.starts_with(TRIGGER_CALL_PREFIX))
+    }
+    pub(super) fn missing_unqualified_zero_arg_call(&self) -> Option<&str> {
+        let Self::Call(name, args) = self else { return None };
+        name.strip_prefix(UNDEFINED_ROUTINE_PREFIX)
+            .filter(|name| args.is_empty() && !name.contains('\0'))
+    }
     /// Catalog dependencies are distinct from the positive table-free proof.
     pub(in crate::relational) fn sequence_dependencies(&self, out: &mut Vec<SequenceDependency>) {
         match self {
@@ -696,7 +728,7 @@ impl Scalar {
                 }) || case.otherwise.as_ref().is_some_and(Self::has_volatile_call)
             }
             Self::Call(name, args) => {
-                uuid_ossp::volatile_name(name) || random_uuid::volatile(name) || matches!(
+                self.is_trigger_call() || uuid_ossp::volatile_name(name) || random_uuid::volatile(name) || matches!(
                     name.as_str(),
                     "uuid_generate_v1" | "uuid_generate_v1mc" | "uuid_generate_v4" | "nextval"
                         | "setval"
@@ -1405,8 +1437,11 @@ impl Scalar {
             .map(|(i, result)| {
                 regexp::SetPlacement::Case
                     .scope(|| result.bind(resolve, tables, parameters))
-                    .map(|bound| (i, bound))
                     .map_err(|error| Self::expression_parameter_error(error, parameters))
+                    .and_then(|bound| {
+                        bound.check_case_result_type()?;
+                        Ok((i, bound))
+                    })
             })
             .collect::<R<Vec<_>>>()?;
         let otherwise_first = types.iter().filter(|(i, _)| *i == case.arms.len())
@@ -1662,8 +1697,9 @@ impl Scalar {
         tables: &[&TableDef],
         parameters: &[Option<DataType>],
     ) -> R<BoundScalar> {
-        if args.is_empty() && let Some(error) = trigger_call_error(name) {
-            return Err(error);
+        if args.is_empty() && let Some(name) = name.strip_prefix(TRIGGER_CALL_PREFIX) {
+            // The result OID carries the pseudo-type. There is no stored trigger value.
+            return Ok(BoundScalar { ty: DataType::Text, node: Node::TriggerCall(name.into()) });
         }
         match name {
             array_constructor::NAME => array_constructor::bind(args, None, resolve, tables, parameters),
@@ -1708,8 +1744,7 @@ impl Scalar {
                 Self::bind_privilege(name, args, resolve, tables, parameters)
             }
             name if let Some(error) = deferred_routine_error(name) => {
-                uuid_ossp::missing_diagnostic(name, args, resolve, tables, parameters)?;
-                Err(error)
+                Err(deferred_call_error(name, args, resolve, tables, parameters, error)?)
             }
             "overlay" => Self::bind_overlay(args, resolve, tables, parameters),
             name if text_search::known(name) => text_search::bind(name, args, resolve, tables, parameters),
@@ -2603,6 +2638,7 @@ impl BoundScalar {
             Node::Call(name, _) if matches!(name.as_str(), json_aggregate::TEXT_RESULT | json_aggregate::INPUT) => json_aggregate::OID,
             Node::Case(arms, other) => json_in_branches(arms.iter().map(|(_, value)| value).chain(other.as_deref())),
             Node::Call(name, args) if name == "coalesce" => json_in_branches(args.iter()),
+            Node::TriggerCall(_) => routines::TRIGGER_TYPE,
             _ => 0,
         }
     }
@@ -2617,6 +2653,13 @@ impl BoundScalar {
             }
             _ => false,
         }
+    }
+
+    fn check_case_result_type(&self) -> R<()> {
+        if self.result_oid() == routines::TRIGGER_TYPE {
+            return Err(routines::error("0A000", "cannot accept a value of type trigger"));
+        }
+        Ok(())
     }
 
     pub(in crate::relational) fn attach_clock(
@@ -2689,7 +2732,7 @@ impl BoundScalar {
             Node::Call(name, _) if name == "\0ts_length" => Some("length"),
             Node::Call(name, _) if name.starts_with("\0json_") || name.starts_with("\0ts_") => None,
             Node::Call(name, _) if arithmetic::internal_name(name) || name.starts_with(ROW_ORDER_PREFIX) => None,
-            Node::Column(_, name)
+            Node::Column(_, name) | Node::TriggerCall(name)
             | Node::Call(name, _)
             | Node::Clock(name, ..)
             | Node::Sequence(name, ..)
@@ -2725,7 +2768,7 @@ impl BoundScalar {
                     cast_type_name(&self.ty)
                 }
             }
-            Node::Column(_, name) => name,
+            Node::Column(_, name) | Node::TriggerCall(name) => name,
             Node::Literal(_) => "?column?",
             Node::Call(n, _) if n == array_constructor::NAME => "array",
             Node::Call(n, _) if n == regexp::SUBSTRING_SIMILAR => "substring",
@@ -2755,6 +2798,13 @@ impl BoundScalar {
     }
     fn eval_inner(&self, row: &Tuple, params: &[Value], budget: &mut usize) -> R<Value> {
         match &self.node {
+            Node::TriggerCall(name) => {
+                let mut diagnostic = RoutineDiagnostic::new(
+                    "0A000", "trigger functions can only be called as triggers",
+                );
+                diagnostic.context = Some(routines::compile_context(name));
+                Err(diagnostic.error())
+            }
             Node::EnumSort(inner, labels) => match inner.eval(row, params, budget)? {
                 Value::Null => Ok(Value::Null),
                 Value::Text(label) => labels
@@ -3660,12 +3710,6 @@ impl Scalar {
         resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
         tables: &[&TableDef],
     ) -> R<()> {
-        if let Self::Call(name, args) = self
-            && args.is_empty()
-            && let Some(error) = trigger_call_error(name)
-        {
-            return Err(error);
-        }
         match self {
             Self::Predicate(filter) => filter.infer(parameters, resolve, tables)?,
             Self::Case(case) => {
@@ -3693,7 +3737,11 @@ impl Scalar {
                     .iter()
                     .enumerate()
                     .filter(|(_, result)| !result.aggregate_unknown(parameters))
-                    .map(|(i, result)| result.bind(resolve, tables, parameters).map(|bound| (i, bound)))
+                    .map(|(i, result)| {
+                        let bound = result.bind(resolve, tables, parameters)?;
+                        bound.check_case_result_type()?;
+                        Ok((i, bound))
+                    })
                     .collect::<R<Vec<_>>>()?;
                 let otherwise_first = known.iter().filter(|(i, _)| *i == case.arms.len())
                     .chain(known.iter().filter(|(i, _)| *i < case.arms.len()));
@@ -3803,7 +3851,7 @@ impl Scalar {
                 };
                 inner.infer(expected, parameters, resolve, tables)?;
             }
-            Self::Call(n, args) if deferred_routine_error(n).is_some() => {
+            Self::Call(n, args) if let Some(error) = deferred_routine_error(n) => {
                 // Validate ordinary arguments without inventing a signature for
                 // unresolved parameters or binding aggregates as scalar calls.
                 fn validate(
@@ -3860,8 +3908,7 @@ impl Scalar {
                     arg.infer(None, parameters, resolve, tables)?;
                     validate(arg, parameters, resolve, tables)?;
                 }
-                uuid_ossp::missing_diagnostic(n, args, resolve, tables, parameters)?;
-                return Err(deferred_routine_error(n).unwrap());
+                return Err(deferred_call_error(n, args, resolve, tables, parameters, error)?);
             }
             Self::Call(n, args) if privilege_name(n) => {
                 for arg in args { arg.infer(Some(&DataType::Text), parameters, resolve, tables)?; }

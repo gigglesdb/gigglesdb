@@ -433,6 +433,7 @@ impl BoundScalar {
                 Ok(value)
             }
             Node::Domain(..)
+            | Node::TriggerCall(_)
             | Node::EnumSort(..)
             | Node::Param(_)
             | Node::Column(..)
@@ -537,6 +538,7 @@ impl BoundScalar {
             }
             Node::EnumSort(..) | Node::Literal(_) | Node::Column(..) => true,
             Node::Domain(..)
+            | Node::TriggerCall(_)
             | Node::Param(_)
             | Node::Clock(..)
             | Node::Sequence(..)
@@ -577,7 +579,7 @@ impl BoundScalar {
         match &self.node {
             Node::Predicate(_) | Node::Case(..) => false,
             Node::Literal(_) | Node::Param(_) => true,
-            Node::EnumSort(..) | Node::Column(..) => false,
+            Node::EnumSort(..) | Node::Column(..) | Node::TriggerCall(_) => false,
             Node::Clock(..) => true,
             Node::SessionCast(value, _) | Node::TypmodCast(value, _) | Node::Domain(value, _) => {
                 value.insert_input_only()

@@ -246,7 +246,7 @@ impl Cursor {
                 if let Some(error) = self.clock.as_ref().and_then(|clock| clock.take_error()) {
                     return Err(error);
                 }
-                result.map_err(CoreError::Sql)
+                result.map_err(relational::routines::into_core)
             }
         }
     }
@@ -528,7 +528,7 @@ impl SqlSession {
                 .and_then(|catalog| catalog.cursor_plan_owners.as_ref())
                 .filter(|_| use_plan_cache && self.task.is_none())
                 .map(|owners| (&mut self.cursor_plan_cache, owners));
-            match Plan::new(&image, &p, params, context.clone(), cache).map_err(CoreError::Sql)? {
+            match Plan::new(&image, &p, params, context.clone(), cache).map_err(relational::routines::into_core)? {
                 Some(plan) => Ok(Cursor {
                     engine: lease
                         .map(|pin| Ok::<_, CoreError>(CursorEngine::Streaming {

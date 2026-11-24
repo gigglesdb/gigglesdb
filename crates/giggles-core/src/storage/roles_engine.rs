@@ -90,7 +90,8 @@ pub(crate) fn classify_key(key: &[u8]) -> Result<CatalogKind, CoreError> {
     })
 }
 
-pub(crate) fn validate_record(key: &[u8], value: &[u8]) -> Result<(), CoreError> {
+/// Validate a role record and return feature bits required by its grant payload.
+pub(crate) fn validate_record(key: &[u8], value: &[u8]) -> Result<u64, CoreError> {
     let kind = classify_key(key)?;
     let payload = value
         .strip_prefix(&[1])
@@ -119,8 +120,11 @@ pub(crate) fn validate_record(key: &[u8], value: &[u8]) -> Result<(), CoreError>
             validate_name(name).map_err(|_| corrupt("invalid catalog owner"))?;
         }
         CatalogKind::TableGrant => {
-            let _: BTreeSet<TablePrivilege> =
+            let privileges: BTreeSet<TablePrivilege> =
                 serde_json::from_slice(payload).map_err(|e| CoreError::Corrupt(e.to_string()))?;
+            if privileges.contains(&TablePrivilege::Trigger) {
+                return Ok(crate::storage::engine::meta::USER_ROUTINES);
+            }
         }
         CatalogKind::SchemaGrant => {
             let _: BTreeSet<SchemaPrivilege> =
@@ -133,7 +137,7 @@ pub(crate) fn validate_record(key: &[u8], value: &[u8]) -> Result<(), CoreError>
         }
         _ => return Err(corrupt("invalid role catalog payload")),
     }
-    Ok(())
+    Ok(0)
 }
 
 /// Whether a validated role record carries the task-only attribute, which
@@ -314,9 +318,9 @@ fn stage(txn: &mut Transaction, before: &RoleTable, after: &RoleTable) -> Result
         }
         let key = encode_key(raw)?;
         let value = [vec![1], payload.clone()].concat();
-        validate_record(&key, &value)?;
+        let grant_features = validate_record(&key, &value)?;
         let synthesized = synthesized_membership(after, raw);
-        txn.require_features(FEATURE | membership_features(&key, &value)
+        txn.require_features(FEATURE | grant_features | membership_features(&key, &value)
             | if synthesized { crate::storage::engine::meta::ROLE_MEMBERSHIP } else { 0 });
         if is_task_only_record(&key, &value) {
             txn.require_features(crate::storage::engine::meta::TASK_CATALOG);

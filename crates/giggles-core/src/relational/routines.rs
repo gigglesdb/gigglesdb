@@ -528,6 +528,9 @@ pub(super) fn execute(state: &mut Relational, prepared: &Prepared, ddl: &Ddl) ->
             if lang != "plpgsql" {
                 return Err(error("0A000", format!("LANGUAGE {lang} is not supported")));
             }
+            if create.def.security_definer {
+                return Err(error("0A000", "SECURITY DEFINER functions are not supported"));
+            }
             if !matches!(create.returns.as_str(), "trigger" | "pg_catalog.trigger") {
                 return Err(error(
                     "0A000",
@@ -676,11 +679,11 @@ pub(super) fn cascade_notices(mut notices: Vec<String>) {
 
 impl Prepared {
     /// Existing owners involved in CREATE OR REPLACE or DROP FUNCTION.
-    pub fn routine_owners(
-        &self,
+    pub fn routine_owners<'a>(
+        &'a self,
         catalog: &CatalogPresentation,
         creation_schema: Option<&str>,
-    ) -> Vec<u32> {
+    ) -> Vec<(&'a str, u32)> {
         let find = |schema: &str, name: &str| {
             catalog
                 .routines
@@ -690,6 +693,7 @@ impl Prepared {
         match self.statement.get() {
             Statement::Routine(Ddl::Create(c)) if c.replace => creation_schema
                 .and_then(|s| find(s, &c.name.name))
+                .map(|owner| (c.name.name.as_str(), owner))
                 .into_iter()
                 .collect(),
             Statement::Routine(Ddl::Drop { names, .. }) => names
@@ -698,13 +702,14 @@ impl Prepared {
                     if args.as_ref().is_some_and(|args| !args.is_empty()) {
                         return None;
                     }
-                    if let Some(schema) = &name.schema {
+                    let owner = if let Some(schema) = &name.schema {
                         find(schema, &name.name)
                     } else {
                         self.search_path
                             .iter()
                             .find_map(|schema| find(schema, &name.name))
-                    }
+                    }?;
+                    Some((name.name.as_str(), owner))
                 })
                 .collect(),
             _ => vec![],

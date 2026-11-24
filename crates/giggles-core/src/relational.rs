@@ -2305,6 +2305,15 @@ impl Prepared {
     pub fn deferred_routine_only(&self) -> bool {
         matches!(self.statement.get(), Statement::Query(query) if query.deferred_routine_only())
     }
+    pub fn has_trigger_call(&self) -> bool {
+        matches!(self.statement.get(), Statement::Query(query) if query.has_trigger_call())
+    }
+    pub fn missing_zero_arg_projection(&self) -> Option<&str> {
+        match self.statement.get() {
+            Statement::Query(query) => query.missing_zero_arg_projection(),
+            _ => None,
+        }
+    }
     fn engine(statement: Statement, domain: u128, epoch: u64) -> Self {
         Self {
             domain,
@@ -3702,6 +3711,11 @@ impl Prepared {
     }
     /// Return the ALTER target only after parsing the complete statement.
     pub fn alter_table_target(sql: &str) -> R<Option<String>> {
+        Ok(Self::alter_table_authority_target(sql)?.map(|(table, _)| table))
+    }
+
+    /// Return the target and whether the statement changes trigger state.
+    pub fn alter_table_authority_target(sql: &str) -> R<Option<(String, bool)>> {
         let mut tokens = Vec::new();
         if let Err(error) = lex_into(sql, &mut tokens, false) {
             // Retain the leading token on failure; repeatedly re-lexing prefixes
@@ -3715,7 +3729,7 @@ impl Prepared {
         if !matches!(tokens.first(), Some(Token::Word(word)) if word == "alter") {
             return Ok(None);
         }
-        if matches!(tokens.get(1), Some(Token::Word(word)) if matches!(word.as_str(), "sequence" | "collation" | "type")) {
+        if matches!(tokens.get(1), Some(Token::Word(word)) if matches!(word.as_str(), "sequence" | "collation" | "type" | "trigger")) {
             return Ok(None);
         }
         let mut parser = Parser { privilege_seen: false, privilege_casts: false,
@@ -3724,7 +3738,9 @@ impl Prepared {
             params: BTreeSet::new(),
             relations: Vec::new(),
         };
-        Ok(Some(alter_table::parse(&mut parser)?.table))
+        let alter = alter_table::parse(&mut parser)?;
+        let changes_trigger = alter.actions.iter().any(|action| matches!(action, alter_table::Action::TriggerState(..)));
+        Ok(Some((alter.table, changes_trigger)))
     }
     /// Parse DROP ownership targets without consulting the catalog.
     pub fn drop_table_targets(sql: &str) -> R<Vec<String>> {
