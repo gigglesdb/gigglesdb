@@ -106,6 +106,140 @@ fn values(messages: &[SimpleQueryMessage]) -> Vec<String> {
         })
         .collect()
 }
+#[tokio::test]
+async fn enum_grouping_sets_match_postgres() {
+    let engine = if cfg!(feature = "engine-rocksdb") {
+        Engine::V2
+    } else {
+        Engine::Legacy
+    };
+    let fixture = Fixture::with_engine(engine).await;
+    let client = fixture.client().await;
+    client
+        .batch_execute(
+            "CREATE TYPE mood AS ENUM ('z', 'a', 'm');
+             CREATE TABLE enum_groups (k mood, ks mood[], v int);
+             INSERT INTO enum_groups VALUES
+                 ('a', '{a}', 10), ('z', '{z}', 20), ('m', '{m,z}', 30),
+                 ('z', '{m,z}', 40), (NULL, NULL, 50), ('a', '{z}', 60);",
+        )
+        .await
+        .unwrap();
+    let catalog = client
+        .query_one(
+            "SELECT oid, typarray FROM pg_type WHERE typname = 'mood'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let mood = catalog.get::<_, u32>(0);
+    let mood_array = catalog.get::<_, u32>(1);
+    let int4 = tokio_postgres::types::Type::INT4.oid();
+    let int8 = tokio_postgres::types::Type::INT8.oid();
+    let text = tokio_postgres::types::Type::TEXT.oid();
+    let window_oids = [mood, mood_array, int4, int8, int8, int8];
+
+    // PostgreSQL 18.6, with an input NULL as well as the NULLs introduced by rollup.
+    let cases = [
+        (
+            "SELECT k, grouping(k) AS g, count(*) AS n
+             FROM enum_groups GROUP BY ROLLUP(k) ORDER BY g, k",
+            &[mood, int4, int8][..],
+            "z|0|2\na|0|2\nm|0|1\nNULL|0|1\nNULL|1|6",
+        ),
+        (
+            "SELECT ks, grouping(ks) AS g, count(*) AS n
+             FROM enum_groups GROUP BY ROLLUP(ks) ORDER BY g, ks",
+            &[mood_array, int4, int8][..],
+            "{z}|0|2\n{a}|0|1\n{m,z}|0|2\nNULL|0|1\nNULL|1|6",
+        ),
+        (
+            "SELECT k, ks, grouping(k, ks) AS g, count(*) AS n,
+                    dense_rank() OVER (ORDER BY grouping(k, ks), k, ks) AS r,
+                    count(*) OVER (PARTITION BY grouping(k, ks)) AS bucket
+             FROM enum_groups GROUP BY CUBE(k, ks) ORDER BY g, k, ks",
+            &window_oids[..],
+            "z|{z}|0|1|1|6\n\
+             z|{m,z}|0|1|2|6\n\
+             a|{z}|0|1|3|6\n\
+             a|{a}|0|1|4|6\n\
+             m|{m,z}|0|1|5|6\n\
+             NULL|NULL|0|1|6|6\n\
+             z|NULL|1|2|7|4\n\
+             a|NULL|1|2|8|4\n\
+             m|NULL|1|1|9|4\n\
+             NULL|NULL|1|1|10|4\n\
+             NULL|{z}|2|2|11|4\n\
+             NULL|{a}|2|1|12|4\n\
+             NULL|{m,z}|2|2|13|4\n\
+             NULL|NULL|2|1|14|4\n\
+             NULL|NULL|3|6|15|1",
+        ),
+        (
+            "SELECT k, ks, grouping(k, ks) AS g, count(*) AS n,
+                    row_number() OVER (ORDER BY grouping(k, ks), k, ks) AS r,
+                    count(*) OVER () AS total
+             FROM enum_groups GROUP BY GROUPING SETS ((ks), (k), ()) ORDER BY g, k, ks",
+            &window_oids[..],
+            "z|NULL|1|2|1|9\n\
+             a|NULL|1|2|2|9\n\
+             m|NULL|1|1|3|9\n\
+             NULL|NULL|1|1|4|9\n\
+             NULL|{z}|2|2|5|9\n\
+             NULL|{a}|2|1|6|9\n\
+             NULL|{m,z}|2|2|7|9\n\
+             NULL|NULL|2|1|8|9\n\
+             NULL|NULL|3|6|9|9",
+        ),
+        (
+            "SELECT k, ks, pg_typeof(k)::text AS kt, pg_typeof(ks)::text AS kst,
+                    grouping(k, ks) AS g, count(*) AS n
+             FROM enum_groups GROUP BY GROUPING SETS ((k), (ks), ()) ORDER BY g, k, ks",
+            &[mood, mood_array, text, text, int4, int8][..],
+            "z|NULL|mood|mood[]|1|2\n\
+             a|NULL|mood|mood[]|1|2\n\
+             m|NULL|mood|mood[]|1|1\n\
+             NULL|NULL|mood|mood[]|1|1\n\
+             NULL|{z}|mood|mood[]|2|2\n\
+             NULL|{a}|mood|mood[]|2|1\n\
+             NULL|{m,z}|mood|mood[]|2|2\n\
+             NULL|NULL|mood|mood[]|2|1\n\
+             NULL|NULL|mood|mood[]|3|6",
+        ),
+    ];
+    for (sql, expected_oids, expected_rows) in cases {
+        let statement = client
+            .prepare(sql)
+            .await
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        let oids: Vec<_> = statement
+            .columns()
+            .iter()
+            .map(|column| column.type_().oid())
+            .collect();
+        assert_eq!(oids, expected_oids, "{sql}");
+        let messages = client
+            .simple_query(sql)
+            .await
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        let rows: Vec<_> = messages
+            .iter()
+            .filter_map(|message| match message {
+                SimpleQueryMessage::Row(row) => Some(
+                    (0..row.len())
+                        .map(|index| row.get(index).unwrap_or("NULL"))
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows, expected_rows.lines().collect::<Vec<_>>(), "{sql}");
+    }
+    drop(client);
+    fixture.stop().await;
+}
+
 fn code(error: tokio_postgres::Error) -> String {
     error.code().unwrap().code().into()
 }

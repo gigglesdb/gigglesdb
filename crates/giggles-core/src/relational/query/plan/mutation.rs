@@ -593,11 +593,12 @@ impl Mutation {
                     return Err(SqlError::Syntax);
                 }
                 for (i, (column, name)) in meta.columns.iter().zip(names.iter()).enumerate() {
-                    if meta.unknown[i].is_none()
-                        && !assignment::SourceType::new(&column.data_type, meta.type_oids.get(i))
-                            .compatible(&table.columns[super::super::super::col(table, name)?].data_type)
-                    {
-                        return Err(SqlError::Type);
+                    if meta.unknown[i].is_none() {
+                        let target = &table.columns[super::super::super::col(table, name)?];
+                        let source_enum = meta.collations.get(i).and_then(Option::as_ref)
+                            .and_then(BoundScalar::attached_enum);
+                        assignment::SourceType::new(&column.data_type, meta.type_oids.get(i))
+                            .check_column(state, target, source_enum)?;
                     }
                 }
             }

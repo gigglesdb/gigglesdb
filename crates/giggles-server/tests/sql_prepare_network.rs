@@ -1105,3 +1105,359 @@ async fn lastval_checks_session_observation_then_resolved_sequence_authority() {
     drop(pg);
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn execute_preserves_enum_parameter_and_join_result_oids() {
+    let fixture = Fixture::new("execute-enum-oids").await;
+    let mut pg = fixture.connect().await;
+    simple(
+        &mut pg,
+        "CREATE TYPE mood AS ENUM ('z', 'a');
+         CREATE TYPE \"Quoted\" AS ENUM ('q');
+         CREATE TABLE lhs (id int PRIMARY KEY, item mood, items mood[]);
+         CREATE TABLE rhs (id int PRIMARY KEY, item mood, items mood[]);
+         INSERT INTO lhs VALUES (1, 'z', '{z,a}');
+         INSERT INTO rhs VALUES (2, 'z', '{z,a}');",
+    )
+    .await
+    .tags(&["CREATE TYPE", "CREATE TYPE", "CREATE TABLE", "CREATE TABLE", "INSERT 0 1", "INSERT 0 1"]);
+    simple(&mut pg, r#"SELECT 'mood'::regtype, 'mood[]'::regtype, '"Quoted"'::regtype"#)
+        .await
+        .text_rows(&[&[Some("mood"), Some("mood[]"), Some(r#""Quoted""#)]]);
+    simple(
+        &mut pg,
+        "SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute
+         WHERE attrelid = 'lhs'::regclass AND attname IN ('item', 'items') ORDER BY attnum",
+    )
+    .await
+    .text_rows(&[&[Some("item"), Some("mood")], &[Some("items"), Some("mood[]")]]);
+    let oid_rows = simple(&mut pg, "SELECT oid, typarray FROM pg_type WHERE typname = 'mood'")
+        .await
+        .rows();
+    let parse_oid = |i: usize| {
+        std::str::from_utf8(oid_rows[0][i].as_deref().unwrap())
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+    };
+    let (enum_oid, array_oid) = (parse_oid(0), parse_oid(1));
+    assert_ne!(enum_oid, array_oid);
+    assert!(enum_oid >= 65536 && array_oid >= 65536);
+    for sql in [
+        "PREPARE typed(mood, mood[]) AS SELECT $1 AS item, $2 AS items",
+        "PREPARE inferred AS SELECT item, items FROM lhs WHERE item = $1 AND items = $2",
+        "PREPARE from_join AS SELECT item, items FROM lhs JOIN rhs USING (item, items)",
+        "PREPARE unused(mood, mood[]) AS SELECT 7",
+    ] {
+        simple(&mut pg, sql).await.tags(&["PREPARE"]);
+    }
+    simple(
+        &mut pg,
+        "SELECT name, parameter_types, result_types FROM pg_prepared_statements ORDER BY name",
+    )
+    .await
+    .text_rows(&[
+        &[Some("from_join"), Some("{}"), Some("{mood,mood[]}")],
+        &[Some("inferred"), Some("{mood,mood[]}"), Some("{mood,mood[]}")],
+        &[Some("typed"), Some("{mood,mood[]}"), Some("{mood,mood[]}")],
+        &[Some("unused"), Some("{mood,mood[]}"), Some("{integer}")],
+    ]);
+    let binary = extended(
+        &mut pg,
+        "SELECT parameter_types, result_types FROM pg_prepared_statements WHERE name = 'typed'",
+        &[],
+        true,
+    )
+    .await;
+    let mut expected_oids = Vec::new();
+    for part in [1, 0, 2206, 2, 1, 4, enum_oid, 4, array_oid] {
+        expected_oids.extend(part.to_be_bytes());
+    }
+    assert_eq!(binary.rows(), [vec![Some(expected_oids.clone()), Some(expected_oids)]]);
+    for sql in ["EXECUTE typed('z', '{z,a}')", "EXECUTE inferred('z', '{z,a}')", "EXECUTE from_join"] {
+        let response = simple(&mut pg, sql).await;
+        response.text_rows(&[&[Some("z"), Some("{z,a}")]]);
+        let mut columns = &response.0.iter().find(|(tag, _)| *tag == b'T').unwrap().1[..];
+        assert_eq!(&columns[..2], &[0, 2], "{sql}");
+        columns = &columns[2..];
+        for (expected_name, expected_oid) in [(b"item\0".as_slice(), enum_oid), (b"items\0", array_oid)] {
+            columns = columns.strip_prefix(expected_name).unwrap();
+            assert_eq!(u32::from_be_bytes(columns[6..10].try_into().unwrap()), expected_oid, "{sql}");
+            columns = &columns[18..];
+        }
+        assert!(columns.is_empty(), "{sql}");
+    }
+    simple(&mut pg, "EXECUTE unused('z', '{z}')").await.text_rows(&[&[Some("7")]]);
+    simple(&mut pg, "EXECUTE typed('z'::mood, '{z,a}'::mood[])")
+        .await
+        .text_rows(&[&[Some("z"), Some("{z,a}")]]);
+    simple(&mut pg, "EXECUTE typed(NULL, NULL)").await.text_rows(&[&[None, None]]);
+
+    simple(&mut pg, "BEGIN").await.tags(&["BEGIN"]);
+    simple(&mut pg, "ALTER TYPE mood ADD VALUE 'm' AFTER 'z'").await.tags(&["ALTER TYPE"]);
+    let unsafe_value = simple(&mut pg, "EXECUTE typed('m', '{m,a}')").await;
+    unsafe_value.assert_error("55P04", r#"unsafe use of new value "m" of enum type mood"#);
+    assert_eq!(unsafe_value.field(b'H'), Some("New enum values must be committed before they can be used."));
+    simple(&mut pg, "ROLLBACK").await.tags(&["ROLLBACK"]);
+    simple(&mut pg, "ALTER TYPE mood ADD VALUE 'm' AFTER 'z'").await.tags(&["ALTER TYPE"]);
+    simple(&mut pg, "EXECUTE typed('m', '{m,a}')").await.text_rows(&[&[Some("m"), Some("{m,a}")]]);
+    simple(&mut pg, "EXECUTE inferred('m', '{m,a}')").await.text_rows(&[]);
+    let wrong_type = simple(&mut pg, "EXECUTE typed('m'::text, '{m}'::mood[])").await;
+    wrong_type.assert_error("42804", "parameter $1 of type text cannot be coerced to the expected type mood");
+    assert_eq!(wrong_type.field(b'H'), Some("You will need to rewrite or cast the expression."));
+    drop(pg);
+    fixture.shutdown().await;
+}
+
+const ENUM_CACHE_QUERY: &str = "SELECT key_b, k, ks, $2 AS supplied FROM enum_cache WHERE k = $1";
+
+fn enum_array_binary(element_oid: u32, value: Option<&str>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend(u32::from(value.is_some()).to_be_bytes());
+    bytes.extend(0u32.to_be_bytes());
+    bytes.extend(element_oid.to_be_bytes());
+    if let Some(value) = value {
+        bytes.extend(1u32.to_be_bytes());
+        bytes.extend(1u32.to_be_bytes());
+        bytes.extend((value.len() as u32).to_be_bytes());
+        bytes.extend(value.as_bytes());
+    }
+    bytes
+}
+
+async fn execute_enum_portal(
+    pg: &mut TcpStream,
+    oid: u32,
+    value: &str,
+    items: Option<&str>,
+    binary: bool,
+) -> Response {
+    let array_text = format!("{{{}}}", items.unwrap_or_default());
+    let array_binary = enum_array_binary(oid, items);
+    let array = if binary {
+        array_binary.as_slice()
+    } else {
+        array_text.as_bytes()
+    };
+    let inputs = [value.as_bytes(), array];
+    let format = u16::from(binary);
+    let mut body = b"\0cached_wire\0".to_vec();
+    body.extend(1u16.to_be_bytes());
+    body.extend(format.to_be_bytes());
+    body.extend(2u16.to_be_bytes());
+    for input in inputs {
+        body.extend((input.len() as u32).to_be_bytes());
+        body.extend(input);
+    }
+    body.extend(1u16.to_be_bytes());
+    body.extend(format.to_be_bytes());
+    send(pg, b'B', &body).await;
+    send(pg, b'D', b"P\0").await;
+    send(pg, b'E', b"\0\0\0\0\0").await;
+    sync(pg).await
+}
+
+fn assert_enum_columns(response: &Response, oid: u32, array_oid: u32, binary: bool) {
+    response.success();
+    let desc = &response.0.iter().find(|(tag, _)| *tag == b'T').unwrap().1;
+    assert_eq!(&desc[..2], &4u16.to_be_bytes());
+    let mut fields = &desc[2..];
+    for (name, expected_oid) in [
+        ("key_b", 23),
+        ("k", oid),
+        ("ks", array_oid),
+        ("supplied", array_oid),
+    ] {
+        fields = fields.strip_prefix(name.as_bytes()).unwrap();
+        fields = fields.strip_prefix(&[0]).unwrap();
+        assert_eq!(&fields[6..10], &expected_oid.to_be_bytes());
+        assert_eq!(&fields[16..18], &u16::from(binary).to_be_bytes());
+        fields = &fields[18..];
+    }
+    assert!(fields.is_empty());
+}
+
+async fn expect_enum_portal(
+    pg: &mut TcpStream,
+    oids: (u32, u32),
+    key: i32,
+    value: &str,
+    items: Option<&str>,
+    binary: bool,
+) {
+    let (oid, array_oid) = oids;
+    let response = execute_enum_portal(pg, oid, value, items, binary).await;
+    assert_enum_columns(&response, oid, array_oid, binary);
+    if binary {
+        let array = enum_array_binary(oid, items);
+        assert_eq!(
+            response.rows(),
+            [vec![
+                Some(key.to_be_bytes().to_vec()),
+                Some(value.as_bytes().to_vec()),
+                Some(array.clone()),
+                Some(array),
+            ]],
+        );
+    } else {
+        let array = format!("{{{}}}", items.unwrap_or_default());
+        response.text_rows(&[&[
+            Some(&key.to_string()),
+            Some(value),
+            Some(&array),
+            Some(&array),
+        ]]);
+    }
+}
+
+#[tokio::test]
+async fn prepared_enum_after_catalog_changes() {
+    const UNSAFE: &str = r#"unsafe use of new value "pending" of enum type cache_mood"#;
+    const NO_SQL: &str = r#"prepared statement "cached_sql" does not exist"#;
+    const EXECUTE_OLD: &str = "EXECUTE cached_sql('old', '{old}')";
+    const EXECUTE_NEW: &str = "EXECUTE cached_sql('new', '{}')";
+
+    let fixture = Fixture::new("prepared-enum-after-catalog-changes").await;
+    let mut pg = fixture.connect().await;
+    simple(&mut pg, "CREATE TYPE cache_mood AS ENUM ('old')")
+        .await
+        .success();
+    simple(
+        &mut pg,
+        "CREATE TABLE enum_cache (
+            key_a int PRIMARY KEY, key_b int NOT NULL, k cache_mood,
+            ks cache_mood[] DEFAULT ARRAY['old']::cache_mood[]
+        )",
+    )
+    .await
+    .success();
+    simple(
+        &mut pg,
+        "INSERT INTO enum_cache (key_a, key_b, k) VALUES (1, 11, 'old')",
+    )
+    .await
+    .success();
+
+    let rows = simple(
+        &mut pg,
+        "SELECT oid, typarray FROM pg_type WHERE typname = 'cache_mood'",
+    )
+    .await
+    .rows();
+    let parse_oid = |index: usize| {
+        std::str::from_utf8(rows[0][index].as_deref().unwrap())
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+    };
+    let (oid, array_oid) = (parse_oid(0), parse_oid(1));
+    // One comparison and no sort, so V2 can reuse the streaming binding.
+    let mut body = format!("cached_wire\0{ENUM_CACHE_QUERY}\0").into_bytes();
+    body.extend(2u16.to_be_bytes());
+    body.extend(oid.to_be_bytes());
+    body.extend(array_oid.to_be_bytes());
+    send(&mut pg, b'P', &body).await;
+    send(&mut pg, b'D', b"Scached_wire\0").await;
+    let description = sync(&mut pg).await;
+    assert_enum_columns(&description, oid, array_oid, false);
+    let params = &description
+        .0
+        .iter()
+        .find(|(tag, _)| *tag == b't')
+        .unwrap()
+        .1;
+    assert_eq!(&params[..2], &2u16.to_be_bytes());
+    let (parameter_oids, trailing_bytes) = params[2..].as_chunks::<4>();
+    assert!(trailing_bytes.is_empty());
+    assert_eq!(parameter_oids, [oid.to_be_bytes(), array_oid.to_be_bytes()]);
+
+    let prepare_sql = format!("PREPARE cached_sql(cache_mood, cache_mood[]) AS {ENUM_CACHE_QUERY}");
+    simple(&mut pg, &prepare_sql).await.success();
+    for binary in [false, true, false] {
+        expect_enum_portal(&mut pg, (oid, array_oid), 11, "old", Some("old"), binary).await;
+    }
+    simple(&mut pg, EXECUTE_OLD).await.text_rows(&[&[
+        Some("11"),
+        Some("old"),
+        Some("{old}"),
+        Some("{old}"),
+    ]]);
+
+    simple(&mut pg, "BEGIN").await.success();
+    simple(&mut pg, "ALTER TYPE cache_mood ADD VALUE 'pending'")
+        .await
+        .success();
+    execute_enum_portal(&mut pg, oid, "pending", None, false)
+        .await
+        .assert_error("55P04", UNSAFE);
+    simple(&mut pg, "ROLLBACK").await.success();
+
+    simple(&mut pg, "BEGIN").await.success();
+    simple(&mut pg, "ALTER TYPE cache_mood ADD VALUE 'pending'")
+        .await
+        .success();
+    simple(&mut pg, "EXECUTE cached_sql('pending', '{}')")
+        .await
+        .assert_error("55P04", UNSAFE);
+    simple(&mut pg, "ROLLBACK").await.success();
+
+    simple(&mut pg, "ALTER TYPE cache_mood ADD VALUE 'new'")
+        .await
+        .success();
+    simple(&mut pg, "BEGIN").await.success();
+    for sql in [
+        "ALTER TABLE enum_cache DROP CONSTRAINT enum_cache_pkey",
+        "ALTER TABLE enum_cache ADD PRIMARY KEY (key_b)",
+        "ALTER TABLE enum_cache ALTER COLUMN ks SET DEFAULT ARRAY[]::cache_mood[]",
+        "INSERT INTO enum_cache (key_a, key_b, k) VALUES (1, 12, 'new')",
+    ] {
+        simple(&mut pg, sql).await.success();
+    }
+    simple(&mut pg, EXECUTE_NEW).await.text_rows(&[&[
+        Some("12"),
+        Some("new"),
+        Some("{}"),
+        Some("{}"),
+    ]]);
+    expect_enum_portal(&mut pg, (oid, array_oid), 12, "new", None, false).await;
+    simple(&mut pg, "COMMIT").await.success();
+
+    for binary in [false, true, false] {
+        expect_enum_portal(&mut pg, (oid, array_oid), 12, "new", None, binary).await;
+    }
+    simple(&mut pg, EXECUTE_NEW).await.text_rows(&[&[
+        Some("12"),
+        Some("new"),
+        Some("{}"),
+        Some("{}"),
+    ]]);
+    let bind_sql_prepare = &["new", "{}"];
+    for _ in 0..3 {
+        bind_execute(&mut pg, "cached_sql", bind_sql_prepare, false)
+            .await
+            .text_rows(&[&[Some("12"), Some("new"), Some("{}"), Some("{}")]]);
+    }
+    simple(&mut pg, "DEALLOCATE cached_sql").await.success();
+    simple(&mut pg, EXECUTE_NEW)
+        .await
+        .assert_error("26000", NO_SQL);
+    simple(&mut pg, &prepare_sql).await.success();
+    simple(&mut pg, EXECUTE_NEW).await.text_rows(&[&[
+        Some("12"),
+        Some("new"),
+        Some("{}"),
+        Some("{}"),
+    ]]);
+    bind_execute(&mut pg, "cached_sql", bind_sql_prepare, false)
+        .await
+        .text_rows(&[&[Some("12"), Some("new"), Some("{}"), Some("{}")]]);
+    simple(&mut pg, "DISCARD ALL").await.success();
+    simple(&mut pg, EXECUTE_NEW)
+        .await
+        .assert_error("26000", NO_SQL);
+    let response = execute_enum_portal(&mut pg, oid, "new", None, false).await;
+    assert_eq!(response.field(b'C'), Some("26000"), "{response:?}");
+
+    drop(pg);
+    fixture.shutdown().await;
+}

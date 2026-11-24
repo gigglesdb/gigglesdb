@@ -579,7 +579,7 @@ fn bind_scalar(
             *s = Scalar::Case(Box::new(functions::CaseExpr {
                 arms: vec![(
                     Filter::Scalar(join::col(n + 1)),
-                    cardinality(&shape.columns[*n].data_type),
+                    cardinality(&shape.columns[*n].data_type, shape.collations[*n].as_ref())?,
                 )],
                 otherwise: Some(join::col(*n)),
             }));
@@ -647,7 +647,7 @@ fn prepare(
                     constants.insert(
                         a.name.clone(),
                         if value.is_some_and(|v| v.many || v.values.len() > 1) {
-                            cardinality(&col.data_type)
+                            cardinality(&col.data_type, metadata.as_ref())?
                         } else {
                             functions::collation::scalar(literal, metadata.as_ref())?
                         },
@@ -789,7 +789,7 @@ fn prepare(
                 Scalar::Case(Box::new(functions::CaseExpr {
                     arms: vec![(
                         Filter::Scalar(join::col(n + 1)),
-                        cardinality(&shape.columns[*n].data_type),
+                        cardinality(&shape.columns[*n].data_type, shape.collations[*n].as_ref())?,
                     )],
                     otherwise: Some(join::col(*n)),
                 }))
@@ -1236,8 +1236,11 @@ pub(in crate::relational::query) fn cardinality_error() -> SqlError {
     SqlError::CardinalityViolation
 }
 
-fn cardinality(ty: &DataType) -> Scalar {
-    Scalar::Call("\0plan_cardinality".into(), vec![typed(Value::Null, ty)])
+fn cardinality(ty: &DataType, metadata: Option<&BoundScalar>) -> R<Scalar> {
+    functions::collation::scalar(
+        Scalar::Call("\0plan_cardinality".into(), vec![typed(Value::Null, ty)]),
+        metadata,
+    )
 }
 #[expect(clippy::too_many_arguments, reason = "shared query execution context")]
 fn query_values(

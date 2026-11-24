@@ -1929,6 +1929,7 @@ pub struct Prepared {
     unbound_statement: Option<std::sync::Arc<Statement>>,
     params: usize,
     parameter_types: Vec<Option<DataType>>,
+    pub(crate) declared_enum_parameters: Option<Arc<EnumParameters>>,
     relations: Vec<schemas::Reference>,
     search_path: Vec<String>,
     schema_user: String,
@@ -2164,6 +2165,7 @@ impl Prepared {
             statement: prepared_syntax::Syntax::new(statement),
             params: 0,
             parameter_types: vec![],
+            declared_enum_parameters: None,
             relations: Vec::new(),
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
@@ -2666,9 +2668,9 @@ impl Prepared {
         self.validate_immutable_constants_at_epoch(state, self.epoch)
     }
     pub(crate) fn validate_immutable_constants_at_epoch(&self, state: &Relational, epoch: u64) -> R<()> {
-        let _enum_parameters = enum_parameters::Scope::enter();
+        let _enum_parameters = enum_parameters::Scope::enter(self.declared_enum_parameters.as_deref());
         let _date_order = clock::LiteralDateOrder::enter(self.literal_date_order);
-        let _type_path = user_types::TypeDisplayScope::enter(&self.search_path);
+        let _type_path = user_types::TypeDisplayScope::enter(&self.search_path, Some(state));
         let bound = self.bind_schemas(state)?;
         let this = &bound;
         // Schema binding copies the epoch but never reads it. Accept the
@@ -2703,9 +2705,9 @@ impl Prepared {
         &self,
         state: &Relational,
     ) -> R<(Description, EnumParameters)> {
-        let _enum_parameters = enum_parameters::Scope::enter();
+        let _enum_parameters = enum_parameters::Scope::enter(self.declared_enum_parameters.as_deref());
         let _date_order = clock::LiteralDateOrder::enter(self.literal_date_order);
-        let _type_path = user_types::TypeDisplayScope::enter(&self.search_path);
+        let _type_path = user_types::TypeDisplayScope::enter(&self.search_path, Some(state));
         let bound = self.bind_schemas(state)?;
         let this = &bound;
         this.validate_schemas(state)?;
@@ -3259,6 +3261,7 @@ impl Prepared {
             engine_generation: None,
             params: 0,
             parameter_types: vec![],
+            declared_enum_parameters: None,
             relations: Vec::new(),
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
@@ -3310,6 +3313,18 @@ impl Prepared {
         }
         Ok(self)
     }
+    /// Add logical enum declarations after the built-in storage declarations.
+    pub fn with_declared_enum_parameters(mut self, parameters: EnumParameters) -> Self {
+        if let Some(&last) = parameters.keys().next_back().filter(|&&last| last < self.params) {
+            self.parameter_types.resize(self.parameter_types.len().max(last + 1), None);
+            for (&index, parameter) in &parameters {
+                self.parameter_types[index] = Some(parameter.storage_type().clone());
+            }
+            self.declared_enum_parameters = Some(Arc::new(parameters));
+        }
+        self
+    }
+
     pub fn parameter_count(&self) -> usize {
         self.params
     }
@@ -3744,6 +3759,7 @@ impl Prepared {
             statement: prepared_syntax::Syntax::new(statement),
             params,
             parameter_types: vec![],
+            declared_enum_parameters: None,
             relations: p.relations,
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
@@ -4277,7 +4293,7 @@ impl Relational {
         injected_source: Option<&dyn scan::RowSource>,
         events: &mut Vec<constraints::Event>,
     ) -> R<SqlResult> {
-        let _type_path = user_types::TypeDisplayScope::enter(&prepared.search_path);
+        let _type_path = user_types::TypeDisplayScope::enter(&prepared.search_path, Some(self));
         let bound = prepared.bind_schemas(self)?;
         let prepared = &bound;
         prepared.validate_schemas(self)?;
@@ -4391,6 +4407,7 @@ impl Relational {
                 engine_generation: prepared.engine_generation,
                 params: prepared.params,
                 parameter_types: vec![],
+                declared_enum_parameters: None,
                 relations: Vec::new(),
                 search_path: vec!["public".into()],
                 schema_user: "giggles".into(),

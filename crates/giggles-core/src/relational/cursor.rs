@@ -83,7 +83,8 @@ fn bind_query<'a>(
     let Statement::Query(query) = prepared.statement.get() else {
         return Ok(None);
     };
-    let _enum_parameters = enum_parameters::Scope::enter();
+    let _enum_parameters = enum_parameters::Scope::enter(prepared.declared_enum_parameters.as_deref());
+    let _type_path = user_types::TypeDisplayScope::enter(&prepared.search_path, Some(state));
     #[cfg(any(test, feature = "test-cursor-bindings"))]
     QUERY_BINDS.set(QUERY_BINDS.get() + 1);
     query.bind(state, prepared.params, &prepared.parameter_types).map(Some)
@@ -261,6 +262,9 @@ impl PlanCache {
                 && p.literal_date_order == source.literal_date_order
                 && p.params == source.params
                 && p.parameter_types == source.parameter_types
+                // The storage types above can represent different declared enums.
+                && p.declared_enum_parameters.as_deref().map(std::ptr::from_ref)
+                    == source.declared_enum_parameters.as_deref().map(std::ptr::from_ref)
                 && p.relations == source.relations
                 && p.search_path == source.search_path
                 && p.schema_user == source.schema_user
@@ -339,6 +343,7 @@ impl Plan {
     ) -> R<Vec<SqlRow>> {
         let prepared = &self.query.prepared;
         let _date_order = clock::LiteralDateOrder::enter(prepared.literal_date_order);
+        let _type_path = user_types::TypeDisplayScope::enter(&prepared.search_path, Some(state));
         let rebound;
         let bound = match self.query.for_image(state) {
             Some(bound) => bound,
@@ -452,6 +457,44 @@ mod tests {
         p.search_path.push("other".into());
         Plan::new(&image, &p, &params, None, Some((&mut cache, &owners))).unwrap().unwrap();
         assert_eq!(QUERY_BINDS.get(), 5);
+    }
+
+    #[test]
+    fn reused_binding_checks_logical_enum_declarations() {
+        let mut image = Relational::default();
+        for sql in [
+            "CREATE TYPE mood AS ENUM ('x')",
+            "CREATE TYPE shade AS ENUM ('x')",
+            "CREATE TABLE t(id int PRIMARY KEY, k mood, ks mood[])",
+        ] {
+            let p = Prepared::parse(sql, DOMAIN, image.epoch).unwrap();
+            image.execute_with_cancel(&p, &[], None, || false).unwrap();
+        }
+        let image = Arc::new(image);
+        let base = Prepared::parse(
+            "SELECT k, ks, $2 AS supplied FROM t WHERE k = $1",
+            DOMAIN,
+            image.epoch,
+        )
+        .unwrap().bind_schemas(&image).unwrap();
+        let oid = |name| type_oid(image.type_by_name(name).unwrap().0).unwrap();
+        let declare = |array_element| {
+            base.clone().with_declared_enum_parameters(enum_parameters::declared(
+                &image, &[oid("mood"), oid(array_element) + 1],
+            ))
+        };
+        let mut cache = PlanCache::default();
+        let owners = Arc::default();
+        let params = [Value::Text("x".into()), Value::Text("{x}".into())];
+        let mut open = |prepared| {
+            Plan::new(&image, prepared, &params, None, Some((&mut cache, &owners)))
+                .unwrap().unwrap()
+        };
+        let mood = declare("mood");
+        let shade = declare("shade");
+        let first = open(&mood);
+        assert!(Arc::ptr_eq(&first.query, &open(&mood).query));
+        assert!(!Arc::ptr_eq(&first.query, &open(&shade).query));
     }
 
     #[test]

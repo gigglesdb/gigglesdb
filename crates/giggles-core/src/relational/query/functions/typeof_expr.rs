@@ -88,7 +88,20 @@ pub(super) fn regtype(value: Value) -> R<Value> {
         user_types::type_name_syntax_error(sign, &input);
         return Err(SqlError::Syntax);
     }
-    let (ty, _) = cast_type_with_diagnostics(&mut parser, true)?;
+    let ty = match cast_type_with_diagnostics(&mut parser, true) {
+        Ok((ty, _)) => ty,
+        Err(SqlError::UndefinedObject) => {
+            parser.at = 0;
+            if let Ok(reference) = user_types::TypeReference::parse(&mut parser)
+                && parser.at == parser.tokens.len()
+                && let Some(name) = user_types::enum_regtype(&reference)
+            {
+                return Ok(Value::Text(name));
+            }
+            return Err(SqlError::UndefinedObject);
+        }
+        Err(error) => return Err(error),
+    };
     if parser.at != parser.tokens.len() {
         return Err(SqlError::InvalidTextRepresentation);
     }

@@ -944,10 +944,13 @@ impl Insert {
         if let Some(source) = &self.source {
             let targets = indexes
                 .iter()
-                .map(|index| table.columns[*index].data_type.clone())
+                .map(|index| &table.columns[*index])
                 .collect::<Vec<_>>();
             match source {
-                Source::Query(query) => { query.bind_insert_source(state, &targets, &mut parameters, declared)?; }
+                Source::Query(query) => {
+                    let types = targets.iter().map(|column| column.data_type.clone()).collect::<Vec<_>>();
+                    query.bind_insert_source(state, &types, &mut parameters, declared)?;
+                }
                 Source::Plan(plan, _) => { plan.bind_insert_outputs(state, &targets, &mut parameters)?; }
             }
             if self.overriding.is_none() {
@@ -1006,7 +1009,7 @@ fn materialize_source(
     let indexes = source_indexes(insert, state, table, declared)?;
     let targets = indexes
         .iter()
-        .map(|index| table.columns[*index].data_type.clone())
+        .map(|index| &table.columns[*index])
         .collect::<Vec<_>>();
     let mut parameters = insert
         .describe(state, params.len(), declared)?
@@ -1018,12 +1021,13 @@ fn materialize_source(
     let rows = injected_source.unwrap_or(&legacy);
     let (result, stored, types) = match source {
         Source::Query(query) => {
-            let bound = query.bind_insert_source(state, &targets, &mut parameters, declared)?
+            let target_types = targets.iter().map(|column| column.data_type.clone()).collect::<Vec<_>>();
+            let bound = query.bind_insert_source(state, &target_types, &mut parameters, declared)?
                 .with_clock(clock);
             let description = bound.description(state);
             let unknown = query.insert_outputs(state)?;
             // Input conversion is a binding obligation even when WHERE produces no rows.
-            for (value, target) in unknown.iter().zip(&targets) {
+            for (value, target) in unknown.iter().zip(&target_types) {
                 if let Some(value) = value {
                     query::assignment::literal(value.clone(), target, clock)?;
                 }

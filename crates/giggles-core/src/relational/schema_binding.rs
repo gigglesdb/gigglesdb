@@ -125,6 +125,7 @@ impl Prepared {
             unbound_statement: Some(unbound),
             params: self.params,
             parameter_types: self.parameter_types.clone(),
+            declared_enum_parameters: self.declared_enum_parameters.clone(),
             relations: self.relations.clone(),
             search_path: self.search_path.clone(),
             schema_user: self.schema_user.clone(),

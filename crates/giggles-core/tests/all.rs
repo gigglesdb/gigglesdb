@@ -613,3 +613,6 @@ mod unbounded_kv_reads;
 
 #[path = "enum_array_defaults.rs"]
 mod enum_array_defaults;
+
+#[path = "enum_dml_overlap.rs"]
+mod enum_dml_overlap;

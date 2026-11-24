@@ -328,7 +328,12 @@ impl Plan {
                 group_sets::validate(&query, self.decorations.grouping_sets.as_ref(), state, &description.parameters)?;
                 let oids = cte::projection_oids(&bound);
                 if oids.iter().any(|oid| *oid != 0) {
-                    description.type_oids = oids;
+                    description.type_oids.resize(oids.len(), 0);
+                    for (output, oid) in description.type_oids.iter_mut().zip(oids) {
+                        if oid != 0 {
+                            *output = oid;
+                        }
+                    }
                 }
                 let resolves_unknown = |output: usize, item: usize| {
                     let (_, alias) = &select.query.items[item];

@@ -691,9 +691,14 @@ pub(super) fn bind<'a>(
             false,
         ));
         if grouping_mask.as_ref().is_some_and(|mask| !mask[index]) {
-            b = Scalar::Cast(Box::new(Scalar::Literal(Value::Null)), b.ty.clone())
+            let null = Scalar::Cast(Box::new(Scalar::Literal(Value::Null)), b.ty.clone())
                 .bind(resolve, tables, &parameters)?
                 .inherit_collation(&b)?;
+            b = if let Some(enum_type) = b.attached_enum() {
+                null.with_enum(enum_type)
+            } else {
+                null
+            };
         }
         keys.push(b);
     }

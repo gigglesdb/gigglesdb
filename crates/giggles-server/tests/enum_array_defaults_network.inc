@@ -585,3 +585,43 @@ async fn inferred_enum_array_binary_bind_ignores_header_element_oid() {
     drop(pg);
     fixture.stop().await;
 }
+
+#[tokio::test]
+async fn planned_enum_insert_uses_postgres_assignment_diagnostics() {
+    let engine = if cfg!(feature = "engine-rocksdb") {
+        Engine::V2
+    } else {
+        Engine::Legacy
+    };
+    let fixture = Fixture::with_engine(engine).await;
+    let pg = fixture.client().await;
+    pg.batch_execute(
+        "CREATE TYPE mood AS ENUM ('z', 'a', 'm');
+         CREATE TABLE enum_overlap (id int PRIMARY KEY, feeling mood, feelings mood[]);
+         INSERT INTO enum_overlap
+         SELECT 1, v.feeling, v.feelings
+         FROM (VALUES ('a'::mood, ARRAY['a']::mood[])) AS v(feeling, feelings)",
+    )
+    .await
+    .unwrap();
+    expect_rows(
+        &pg,
+        "SELECT feeling, feelings FROM enum_overlap",
+        &[&[Some("a"), Some("{a}")]],
+    )
+    .await;
+    let error = pg
+        .prepare("INSERT INTO enum_overlap (id, feeling) SELECT 2, v.x FROM (VALUES ('a')) AS v(x)")
+        .await
+        .unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "42804");
+    assert_eq!(
+        error.message(),
+        r#"column "feeling" is of type mood but expression is of type text"#,
+    );
+    assert_eq!(
+        error.hint(),
+        Some("You will need to rewrite or cast the expression."),
+    );
+}

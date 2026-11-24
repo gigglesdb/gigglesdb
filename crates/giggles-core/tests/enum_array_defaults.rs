@@ -1295,17 +1295,14 @@ fn enum_array_containment_preserves_enum_types() {
 }
 
 #[test]
-fn ordinary_containment_stays_unsupported() {
+fn ordinary_array_containment_stays_unsupported() {
     let db = Admin::create(common::fresh("ordinary-containment"), Limits::default()).unwrap();
     let mut sql = db.sql_session();
     run(
         &mut sql,
-        "CREATE TABLE ordinary(id int PRIMARY KEY, xi int[], xt text[], j jsonb)",
+        "CREATE TABLE ordinary(id int PRIMARY KEY, xi int[], xt text[])",
     );
-    for expression in [
-        "xi @> $1", "xt <@ $1", "j @> $1",
-        "xt @> xt", "xt @> '{a}'", "xi @> '{1}'", r#"j @> '{"a":1}'"#,
-    ] {
+    for expression in ["xi @> $1", "xt <@ $1", "xt @> xt", "xt @> '{a}'", "xi @> '{1}'"] {
         let statement = format!("SELECT {expression} FROM ordinary");
         let plan = sql.prepare(&statement).unwrap();
         assert!(

@@ -146,11 +146,14 @@ pub(super) fn clear_sql_error_message() {
     take_sql_error_message();
 }
 
+pub(super) const USER_TYPE_OID_BASE: u32 = 65536;
+pub(super) const USER_TYPE_OID_STRIDE: u32 = 4;
+
 /// Global catalog IDs give disjoint relation/type slots (65536 + id * 4).
 pub fn type_oid(id: u64) -> R<u32> {
     u32::try_from(
-        id.checked_mul(4)
-            .and_then(|n| n.checked_add(65536))
+        id.checked_mul(u64::from(USER_TYPE_OID_STRIDE))
+            .and_then(|n| n.checked_add(u64::from(USER_TYPE_OID_BASE)))
             .ok_or(SqlError::Limit)?,
     )
     .ok()
@@ -245,29 +248,58 @@ impl TypeReference {
     }
 }
 
-thread_local! {
-    static TYPE_DISPLAY_PATH: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+struct TypeDisplayContext {
+    path: Vec<String>,
+    catalog: Option<Arc<CatalogExt>>,
 }
 
-pub(super) struct TypeDisplayScope(Option<Vec<String>>);
+thread_local! {
+    static TYPE_DISPLAY: std::cell::RefCell<Option<TypeDisplayContext>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) struct TypeDisplayScope(Option<TypeDisplayContext>);
 impl TypeDisplayScope {
-    pub(super) fn enter(path: &[String]) -> Self {
-        Self(TYPE_DISPLAY_PATH.replace(Some(path.to_vec())))
+    pub(super) fn enter(path: &[String], state: Option<&Relational>) -> Self {
+        Self(TYPE_DISPLAY.replace(Some(TypeDisplayContext {
+            path: path.to_vec(),
+            catalog: state.map(|state| Arc::clone(&state.ext)),
+        })))
     }
 }
 impl Drop for TypeDisplayScope {
     fn drop(&mut self) {
-        TYPE_DISPLAY_PATH.replace(self.0.take());
+        TYPE_DISPLAY.replace(self.0.take());
     }
 }
 
+pub(super) fn enum_regtype(reference: &TypeReference) -> Option<String> {
+    TYPE_DISPLAY.with_borrow(|context| {
+        let context = context.as_ref()?;
+        let (given_schema, name) = reference.name.split_once('\0')
+            .map_or((None, reference.name.as_str()), |(schema, name)| (Some(schema), name));
+        let ty = context.catalog.as_ref()?.types.values().find(|ty| {
+            matches!(ty, TypeDef::Enum { .. }) && ty.name() == name
+        })?;
+        let schema = ty.schema();
+        let visible = context.path.iter().any(|candidate| candidate == schema);
+        if given_schema.map_or(!visible, |given| given != schema) {
+            return None;
+        }
+        Some(display_enum_name(name, (!visible).then_some(schema), reference.array))
+    })
+}
+
 pub(super) fn enum_display(ty: &TypeDef, array: bool) -> String {
-    let visible = TYPE_DISPLAY_PATH.with_borrow(|path| {
-        path.as_ref().map_or(ty.schema() == "public", |path| path.iter().any(|schema| schema == ty.schema()))
+    let visible = TYPE_DISPLAY.with_borrow(|context| {
+        context.as_ref().map_or(ty.schema() == "public", |context| context.path.iter().any(|schema| schema == ty.schema()))
     });
-    let mut name = quote_type_ident(ty.name());
-    if !visible {
-        name = format!("{}.{name}", quote_type_ident(ty.schema()));
+    display_enum_name(ty.name(), (!visible).then_some(ty.schema()), array)
+}
+
+fn display_enum_name(name: &str, schema: Option<&str>, array: bool) -> String {
+    let mut name = quote_type_ident(name);
+    if let Some(schema) = schema {
+        name = format!("{}.{name}", quote_type_ident(schema));
     }
     if array {
         name.push_str("[]");

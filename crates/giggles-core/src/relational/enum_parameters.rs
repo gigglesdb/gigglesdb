@@ -14,12 +14,48 @@ impl EnumParameter {
         self.oid
     }
 
+    pub fn storage_type(&self) -> &DataType {
+        &self.storage
+    }
+
+    pub(crate) fn display_name(&self, search_path: &[String]) -> String {
+        let _path = user_types::TypeDisplayScope::enter(search_path, None);
+        user_types::enum_display(&self.definition, self.storage == DataType::TextArray)
+    }
+
     pub fn validate(&self, value: &Value) -> R<()> {
         user_types::coerce_user_type(&self.definition, &self.storage, value)
     }
 }
 
 pub type EnumParameters = BTreeMap<usize, EnumParameter>;
+
+pub(crate) fn could_be_enum_oid(oid: u32) -> bool {
+    oid >= user_types::USER_TYPE_OID_BASE
+        && (oid - user_types::USER_TYPE_OID_BASE) % user_types::USER_TYPE_OID_STRIDE <= 1
+}
+
+pub(crate) fn declared(state: &Relational, oids: &[u32]) -> EnumParameters {
+    oids.iter()
+        .enumerate()
+        .filter_map(|(index, &oid)| {
+            if !could_be_enum_oid(oid) {
+                return None;
+            }
+            let slot = oid - user_types::USER_TYPE_OID_BASE;
+            let id = u64::from(slot / user_types::USER_TYPE_OID_STRIDE);
+            let definition @ TypeDef::Enum { .. } = state.ext.types.get(&id)? else {
+                return None;
+            };
+            let storage = if slot % user_types::USER_TYPE_OID_STRIDE == 1 {
+                DataType::TextArray
+            } else {
+                DataType::Text
+            };
+            Some((index, EnumParameter { oid, storage, definition: Arc::new(definition.clone()) }))
+        })
+        .collect()
+}
 
 type Bindings = BTreeMap<usize, (DataType, Arc<TypeDef>)>;
 
@@ -32,8 +68,13 @@ thread_local! {
 pub(crate) struct Scope(Option<Bindings>);
 
 impl Scope {
-    pub(crate) fn enter() -> Self {
-        Self(PARAMETERS.with(|slot| slot.replace(Some(BTreeMap::new()))))
+    pub(crate) fn enter(declared: Option<&EnumParameters>) -> Self {
+        let bindings = declared
+            .into_iter()
+            .flatten()
+            .map(|(&index, parameter)| (index, (parameter.storage.clone(), parameter.definition.clone())))
+            .collect();
+        Self(PARAMETERS.with(|slot| slot.replace(Some(bindings))))
     }
 }
 

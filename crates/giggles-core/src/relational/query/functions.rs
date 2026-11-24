@@ -2456,7 +2456,15 @@ impl BoundScalar {
     }
 
     pub(super) fn cursor_clock_independent(&self) -> bool {
-        matches!(self.node, Node::Column(..) | Node::Param(_) | Node::Literal(_))
+        match &self.node {
+            Node::Column(..) | Node::Param(_) | Node::Literal(_) => true,
+            // Enum validation and ranking are clock independent.
+            Node::EnumSort(value, _) => value.cursor_clock_independent(),
+            Node::Domain(value, definition) if matches!(definition.as_ref(), TypeDef::Enum { .. }) => {
+                value.cursor_clock_independent()
+            }
+            _ => false,
+        }
     }
 
     pub(in crate::relational) fn attach_clock(

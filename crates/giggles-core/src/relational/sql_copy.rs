@@ -700,6 +700,7 @@ impl Copy {
             engine_generation: None,
             params: 0,
             parameter_types: vec![],
+            declared_enum_parameters: None,
             relations: vec![self.relation.clone()],
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),

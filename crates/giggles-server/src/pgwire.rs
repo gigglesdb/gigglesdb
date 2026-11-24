@@ -429,7 +429,8 @@ impl Diagnostic {
                     || message.ends_with(" cannot be matched") && common_type_context(" types ")
                     || self.wire_hint.as_deref() == Some("You will need to rewrite or cast the expression.")
                         && message.starts_with(r#"column ""#)
-                        && message.contains(r#"" is of type uuid[] but default expression is of type "#),
+                        && (message.contains(r#"" is of type uuid[] but default expression is of type "#)
+                            || message.contains(r#"" is of type "#) && message.contains(" but expression is of type ")),
                 _ => false,
             };
             if allowed {
@@ -1332,6 +1333,11 @@ fn prepare_declared_sql_diagnostic(
         .map(|&o| core_declared_type(o))
         .collect::<Vec<_>>();
     let prepared = diagnostic.core(if unnamed { session.prepare_unnamed(sql, &declared) } else { session.prepare_with_parameter_types(sql, &declared) })?;
+    let prepared = if oids.len() <= prepared.parameter_count() {
+        prepared.with_declared_enum_parameters(diagnostic.core(session.sql.declared_enum_parameters(oids))?)
+    } else {
+        prepared
+    };
     let (description, enum_parameters) = if prepared.is_ddl() {
         (diagnostic.core(session.describe(&prepared))?, Default::default())
     } else {
@@ -2294,6 +2300,7 @@ impl State {
         // Retry only the catalog declaration mismatch that would otherwise be
         // 0A000. Keep catalog validation and successful numeric overrides intact.
         if let Plan::Catalog(plan, _, _) = &p {
+            let declared_enums = core(session.sql.declared_enum_parameters(&oids))?;
             let mismatch =
                 oids.iter()
                     .zip(&parameter_oids)
@@ -2306,10 +2313,11 @@ impl State {
                     });
             if session.role.is_sql()
                 && mismatch
-                && oids.iter().all(|o| {
-                    *o == 0
-                        || core_declared_type(*o).is_some()
-                        || catalog_wire::parameter_type(*o).is_ok()
+                && oids.iter().enumerate().all(|(i, &oid)| {
+                    oid == 0
+                        || core_declared_type(oid).is_some()
+                        || catalog_wire::parameter_type(oid).is_ok()
+                        || declared_enums.contains_key(&i)
                 })
             {
                 let was_aborted = session.is_aborted();
@@ -2319,7 +2327,11 @@ impl State {
                             && oids
                                 .iter()
                                 .zip(&description.parameters)
-                                .all(|(o, ty)| sql_declared_type(ty, *o).is_some()) =>
+                                .enumerate()
+                                .all(|(i, (&oid, ty))| {
+                                    enums.get(&i).is_some_and(|parameter| parameter.oid() == oid)
+                                        || sql_declared_type(ty, oid).is_some()
+                                }) =>
                     {
                         p = application;
                         d = description;
@@ -2332,6 +2344,11 @@ impl State {
                     _ => {}
                 }
             }
+            if matches!(p, Plan::Catalog(..)) && !unused_slots.is_empty() {
+                enum_parameters.extend(declared_enums.into_iter().filter(|(i, _)| {
+                    unused_slots.binary_search(i).is_ok()
+                }));
+            }
         }
         for (&i, parameter) in &enum_parameters {
             parameter_oids[i] = parameter.oid();
@@ -2342,7 +2359,8 @@ impl State {
                 if unused_slots.binary_search(&i).is_ok() {
                     // The declaration governs input validation for this slot.
                     // The catalog plan has no reference to its value.
-                    *t = core_declared_type(o).unwrap_or(DataType::Text);
+                    *t = enum_parameters.get(&i).map(|parameter| parameter.storage_type().clone())
+                        .or_else(|| core_declared_type(o)).unwrap_or(DataType::Text);
                     parameter_oids[i] = o;
                     continue;
                 }
@@ -2501,7 +2519,12 @@ impl State {
                         giggles_core::PreparedCatalogState::Version(version) =>
                             old.description_version.is_none() || old.description_version != version,
                         giggles_core::PreparedCatalogState::UnknownBackend =>
-                            old.description_version.is_some_and(|version| session.sql.committed_catalog_version()
+                            // Enum Bind and EXECUTE validate labels against the prepared
+                            // definitions, which change even when the type OIDs stay fixed.
+                            ((old.origin.as_ref().is_some_and(|origin| origin.is_sql())
+                                || !old.enum_parameters.is_empty())
+                                && core(session.sql.legacy_prepared_schema_changed(p))?)
+                            || old.description_version.is_some_and(|version| session.sql.committed_catalog_version()
                                 .is_some_and(|current| current != version)),
                     }
             }
@@ -2532,7 +2555,7 @@ impl State {
         session.set_text_settings(&self.settings.current);
         let mut new = new?;
         if let Some(origin) = &old.origin {
-            new.append_unused_parameters(&origin.unused_types);
+            new.append_unused_parameters(&origin.unused_types, session)?;
         }
         new.origin = old.origin.clone();
         new.sql_bytes = old.sql_bytes;
@@ -3050,7 +3073,7 @@ impl State {
                         }
                     };
                     if let Some(parameter) = input {
-                        self.diagnostic.core(parameter.validate(&value).map_err(CoreError::Sql))?;
+                        self.diagnostic.core(session.sql.validate_enum_parameter(parameter, &value))?;
                     }
                     if catalog {
                         // An unused declaration can use a type only core decodes.

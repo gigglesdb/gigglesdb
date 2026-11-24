@@ -352,6 +352,10 @@ impl Origin {
         }
     }
 
+    pub(super) fn is_sql(&self) -> bool {
+        self.source_text.is_some()
+    }
+
     fn count_plan(&mut self, parameterized: bool, mode: &str) {
         // Auto samples five custom plans. The engine has no comparative
         // generic/custom planner cost model.
@@ -404,13 +408,17 @@ impl Statement {
         self.authorize_description(session)
     }
 
-    pub(super) fn append_unused_parameters(&mut self, types: &[u32]) {
+    pub(super) fn append_unused_parameters(&mut self, types: &[u32], session: &Session) -> R<()> {
+        let enums = core(session.sql.declared_enum_parameters(types))?;
+        let offset = self.parameter_oids.len();
         self.parameter_oids.extend_from_slice(types);
-        Arc::make_mut(&mut self.d).parameters.extend(
-            types
-                .iter()
-                .map(|&oid| core_declared_type(oid).unwrap_or(DataType::Text)),
-        );
+        Arc::make_mut(&mut self.d).parameters.extend(types.iter().enumerate().map(|(index, &oid)| {
+            enums.get(&index).map(|parameter| parameter.storage_type().clone())
+                .or_else(|| core_declared_type(oid))
+                .unwrap_or(DataType::Text)
+        }));
+        self.enum_parameters.extend(enums.into_iter().map(|(index, parameter)| (offset + index, parameter)));
+        Ok(())
     }
 }
 
@@ -524,10 +532,15 @@ impl State {
                     self.diagnostic.wire_message = Some(format!(r#"type "{name}" does not exist"#));
                     return Err("42704");
                 };
-                if core_declared_type(oid).is_none() && catalog_wire::parameter_type(oid).is_err() {
-                    return Err("0A000");
-                }
                 declared.push(oid);
+            }
+            let enums = core(session.sql.declared_enum_parameters(&declared))?;
+            if declared.iter().enumerate().any(|(index, &oid)| {
+                core_declared_type(oid).is_none()
+                    && catalog_wire::parameter_type(oid).is_err()
+                    && !enums.contains_key(&index)
+            }) {
+                return Err("0A000");
             }
         }
         let _budgets = session.sql.statement_budgets();
@@ -565,7 +578,7 @@ impl State {
             return Err("42601");
         }
         self.check_named_statement(&name, source.len())?;
-        statement.append_unused_parameters(&unused_types);
+        statement.append_unused_parameters(&unused_types, session)?;
         statement.sql_bytes = source.len();
         statement.origin = Some(Box::new(Origin {
             source_text: Some(std::sync::Arc::from(source)),
@@ -682,6 +695,7 @@ impl State {
         else {
             unreachable!()
         };
+        let source_oids = result_type_oids(&description);
         let clock = session.copy_clock();
         let mut assignments = Vec::with_capacity(args.len());
         // PostgreSQL invokes the input function for an unknown constant during
@@ -694,19 +708,33 @@ impl State {
             .enumerate()
         {
             let source_type = &source.data_type;
-            let target = match oid {
-                19 => DataType::Text,
-                26 => DataType::BigInt,
-                _ => core_declared_type(oid).ok_or("0A000")?,
-            };
-            let allowed = if oid == 26 {
-                matches!(source_type, DataType::SmallInt | DataType::Integer | DataType::BigInt)
+            let target_enum = statement.enum_parameters.get(&i);
+            let (target, allowed) = if let Some(parameter) = target_enum {
+                (parameter.storage_type().clone(), source_oids[i] == oid)
             } else {
-                execute_arguments::assignment_allowed(source_type, &target)
+                let target = match oid {
+                    19 => DataType::Text,
+                    26 => DataType::BigInt,
+                    _ => core_declared_type(oid).ok_or("0A000")?,
+                };
+                let allowed = if oid == 26 {
+                    matches!(source_type, DataType::SmallInt | DataType::Integer | DataType::BigInt)
+                } else {
+                    execute_arguments::assignment_allowed(source_type, &target)
+                };
+                (target, allowed)
             };
             if literal.is_none() && !allowed {
-                let source = argument_type_name(super::oid(&source.data_type))?;
-                let target = argument_type_name(oid)?;
+                let source_enum = core(session.sql.declared_enum_parameters(&[source_oids[i]]))?;
+                let name = |oid, enum_type: Option<&giggles_core::relational::EnumParameter>| {
+                    if let Some(parameter) = enum_type {
+                        Ok(session.sql.enum_parameter_name(parameter))
+                    } else {
+                        argument_type_name(oid).map(str::to_owned)
+                    }
+                };
+                let source = name(super::oid(source_type), source_enum.get(&0))?;
+                let target = name(oid, target_enum)?;
                 self.diagnostic.wire_message = Some(format!(
                     "parameter ${} of type {source} cannot be coerced to the expected type {target}",
                     i + 1
@@ -728,7 +756,10 @@ impl State {
                     }
                 })
                 .transpose()?;
-            assignments.push((source_type, target, oid, converted));
+            if let (Some(parameter), Some(value)) = (target_enum, &converted) {
+                self.diagnostic.core(session.sql.validate_enum_parameter(parameter, value))?;
+            }
+            assignments.push((source_type, target, oid, target_enum, converted));
         }
         let result = self
             .diagnostic
@@ -741,7 +772,7 @@ impl State {
             .iter()
             .cloned()
             .zip(assignments)
-            .map(|(value, (source, target, oid, converted))| {
+            .map(|(value, (source, target, oid, target_enum, converted))| {
                 if let Some(converted) = converted {
                     return Ok(converted);
                 }
@@ -758,9 +789,13 @@ impl State {
                         }
                     };
                 }
-                self.diagnostic.core(
+                let value = self.diagnostic.core(
                     session.sql.coerce_execute_argument(value, source, &target, false, &clock),
-                )
+                )?;
+                if let Some(parameter) = target_enum {
+                    self.diagnostic.core(session.sql.validate_enum_parameter(parameter, &value))?;
+                }
+                Ok(value)
             })
             .collect()
     }
@@ -989,7 +1024,7 @@ impl State {
                         prepare_time: origin.prepare_time,
                         parameter_types: s.parameter_oids.clone(),
                         result_types,
-                        from_sql: origin.source_text.is_some(),
+                        from_sql: origin.is_sql(),
                         generic_plans: origin.generic_plans,
                         custom_plans: origin.custom_plans,
                     })

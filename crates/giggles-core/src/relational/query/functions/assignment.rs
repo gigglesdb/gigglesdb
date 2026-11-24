@@ -50,6 +50,31 @@ impl SourceType {
         self.json && *target == DataType::Jsonb || compatible(&self.data_type, target)
     }
 
+    pub(in crate::relational) fn check_column(
+        &self,
+        state: &Relational,
+        column: &ColumnDef,
+        source_enum: Option<&TypeDef>,
+    ) -> R<()> {
+        if let Some(target @ TypeDef::Enum { .. }) = state.column_type(column.id) {
+            if source_enum == Some(target) && self.data_type == column.data_type {
+                return Ok(());
+            }
+            let target = user_types::enum_display(target, column.data_type == DataType::TextArray);
+            let source = source_enum.map_or_else(
+                || if self.json { "json".into() } else { type_display(&self.data_type).into() },
+                |ty| user_types::enum_display(ty, self.data_type == DataType::TextArray),
+            );
+            user_types::view_replace_error(format!(
+                r#"column "{}" is of type {target} but expression is of type {source}"#,
+                column.name,
+            ));
+            user_types::sql_error_hint("You will need to rewrite or cast the expression.");
+            return Err(SqlError::Type);
+        }
+        if self.compatible(&column.data_type) { Ok(()) } else { Err(SqlError::Type) }
+    }
+
     pub(in crate::relational) fn convert(
         &self,
         value: Value,

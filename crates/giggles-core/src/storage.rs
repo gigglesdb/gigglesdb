@@ -2739,6 +2739,27 @@ impl SqlSession {
             None => self.inspect_metadata(resolve),
         }
     }
+    /// Resolve explicit enum declarations against the current SQL catalog.
+    pub fn declared_enum_parameters(&self, oids: &[u32]) -> Result<relational::EnumParameters, CoreError> {
+        if !oids.iter().copied().any(relational::enum_parameters::could_be_enum_oid) {
+            return Ok(Default::default());
+        }
+        self.inspect_metadata(|state| Ok(relational::enum_parameters::declared(&state.sql, oids)))
+    }
+
+    pub fn enum_parameter_name(&self, parameter: &relational::EnumParameter) -> String {
+        parameter.display_name(&self.search_path)
+    }
+
+    pub fn validate_enum_parameter(
+        &self,
+        parameter: &relational::EnumParameter,
+        value: &relational::Value,
+    ) -> Result<(), CoreError> {
+        let _enum_scope = relational::EnumScope::enter(Some(&self.enum_transaction), false);
+        parameter.validate(value).map_err(CoreError::Sql)
+    }
+
     pub fn coerce_execute_argument(
         &self,
         value: relational::Value,
@@ -4364,6 +4385,14 @@ impl SqlSession {
             })
     }
 
+    /// Detect committed or private DDL against Legacy's transaction-visible schema.
+    pub fn legacy_prepared_schema_changed(&self, prepared: &relational::Prepared) -> Result<bool, CoreError> {
+        if !matches!(&self.admin.inner.backend, Backend::Legacy(_)) {
+            return Ok(false);
+        }
+        self.inspect_metadata(|state| Ok(prepared.epoch != state.sql.epoch))
+    }
+
     /// Catalog generation used by metadata planning at the current statement snapshot.
     /// Private DDL, failed snapshots and unsupported backends cannot be cached.
     pub fn statement_catalog_version(&self) -> Option<u64> {
@@ -5266,7 +5295,7 @@ impl SqlSession {
         db: Option<&EngineLease>,
         check_reply: Option<&mut SqlReplyCheck<'_>>,
     ) -> Result<relational::SqlResult, CoreError> {
-        let _enum_parameters = relational::enum_parameters::Scope::enter();
+        let _enum_parameters = relational::enum_parameters::Scope::enter(p.declared_enum_parameters.as_deref());
         let _date_order = relational::clock::LiteralDateOrder::enter(p.literal_date_order);
         let _value_budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
