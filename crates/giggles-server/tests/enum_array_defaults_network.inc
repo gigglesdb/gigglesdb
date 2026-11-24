@@ -39,7 +39,7 @@ async fn prisma_enum_array_and_jsonb_defaults() {
     let f = Fixture::with_engine(engine).await;
     let pg = f.client().await;
 
-    let migration = r#"
+    let migration = concat!(r#"
 CREATE TYPE "SubscriptionStatus" AS ENUM ('TRIALING', 'ACTIVE', 'PAST_DUE', 'CANCELED');
 CREATE TYPE "ObjectSource" AS ENUM ('MANUAL', 'IMPORT');
 CREATE TYPE "DesignDocSize" AS ENUM ('SMALL', 'STANDARD', 'LARGE');
@@ -60,7 +60,10 @@ ALTER TABLE "DesignDocVariationType" ALTER COLUMN "approvalFor" SET DEFAULT ARRA
 UPDATE "DesignDocVariationType" SET "requiredFor" = ARRAY[]::"DesignDocSize"[] WHERE "presetKey" = 'evidence';
 ALTER TABLE "OAuthClient" ADD COLUMN "excludedAccountIds" TEXT[] DEFAULT ARRAY[]::TEXT[], ADD COLUMN "orgExternalId" TEXT;
 ALTER TABLE "OAuthClient" ADD COLUMN "linkDismissals" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
-"#;
+CREATE TYPE "DesignAuthorKind" AS ENUM ('HUMAN', 'AGENT', 'ARCHDOCS_AI');
+"#,
+        include_str!("../../giggles-core/tests/fixtures/archdocs_page_revision.sql"),
+    );
     let completions = pg
         .simple_query(migration)
         .await
@@ -68,13 +71,15 @@ ALTER TABLE "OAuthClient" ADD COLUMN "linkDismissals" TEXT[] NOT NULL DEFAULT AR
         .into_iter()
         .filter(|message| matches!(message, SimpleQueryMessage::CommandComplete(_)))
         .count();
-    assert_eq!(completions, 17);
+    assert_eq!(completions, 19);
 
     assert_eq!(pg.execute(
         r#"INSERT INTO "Subscription" ("id", "organizationId") VALUES ('00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000002')"#,
         &[],
     ).await.unwrap(), 1);
     pg.batch_execute(r#"
+        INSERT INTO "PageRevision" ("pageId", "revision", "title", "content", "authorKind")
+            VALUES ('00000000-0000-0000-0000-000000000001', 1, 'First', 'Body', 'HUMAN');
         INSERT INTO "PersonalAccessToken" ("id") VALUES ('00000000-0000-0000-0000-000000000001');
         INSERT INTO "DesignDocVariationType" ("id", "presetKey", "requiredFor")
             VALUES ('00000000-0000-0000-0000-000000000002', 'later', ARRAY['LARGE','SMALL']::"DesignDocSize"[]);
@@ -124,6 +129,52 @@ ALTER TABLE "OAuthClient" ADD COLUMN "linkDismissals" TEXT[] NOT NULL DEFAULT AR
             &[Some(r#""DesignDocSize"[]"#), Some("{LARGE,SMALL}")],
         ],
     ).await;
+
+    expect_rows(
+        &pg,
+        r#"SELECT "authorUserIds", "id" IS NOT NULL, "createdAt" IS NOT NULL FROM "PageRevision""#,
+        &[&[Some("{}"), Some("t"), Some("t")]],
+    ).await;
+    expect_rows(
+        &pg,
+        r#"SELECT pg_get_expr(d.adbin,d.adrelid) FROM pg_attrdef d
+           JOIN pg_attribute a ON a.attrelid=d.adrelid AND a.attnum=d.adnum
+           WHERE d.adrelid='"PageRevision"'::regclass AND a.attname='authorUserIds'"#,
+        &[&[Some("ARRAY[]::uuid[]")]],
+    ).await;
+    expect_rows(
+        &pg,
+        "SELECT column_default, is_nullable, data_type, udt_name FROM information_schema.columns
+         WHERE table_name='PageRevision' AND column_name='authorUserIds'",
+        &[&[Some("ARRAY[]::uuid[]"), Some("YES"), Some("ARRAY"), Some("_uuid")]],
+    ).await;
+
+    for (sql, code, message, hint) in [
+        (
+            "CREATE TABLE pr_bad (id int PRIMARY KEY, u uuid[] DEFAULT '{nope}')",
+            "22P02",
+            r#"invalid input syntax for type uuid: "nope""#,
+            None,
+        ),
+        (
+            "CREATE TABLE pr_bad2 (id int PRIMARY KEY, u uuid[] DEFAULT ARRAY[]::text[])",
+            "42804",
+            r#"column "u" is of type uuid[] but default expression is of type text[]"#,
+            Some("You will need to rewrite or cast the expression."),
+        ),
+        (
+            "CREATE TABLE pr_bad3 (id int PRIMARY KEY, u uuid[] DEFAULT ARRAY[1])",
+            "42804",
+            r#"column "u" is of type uuid[] but default expression is of type integer[]"#,
+            Some("You will need to rewrite or cast the expression."),
+        ),
+    ] {
+        let error = pg.simple_query(sql).await.unwrap_err();
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), code, "{sql}");
+        assert_eq!(error.message(), message, "{sql}");
+        assert_eq!(error.hint(), hint, "{sql}");
+    }
 
     for (sql, code, message) in [
         (

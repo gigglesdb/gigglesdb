@@ -1227,6 +1227,7 @@ pub(super) fn cast_type(p: &mut Parser) -> R<DataType> {
             DataType::Text => DataType::TextArray,
             DataType::Integer => DataType::IntArray,
             DataType::BigInt => DataType::BigIntArray,
+            DataType::Uuid => DataType::UuidArray,
             _ => return Err(SqlError::Unsupported),
         };
     }
@@ -1421,7 +1422,8 @@ pub(super) fn parse(p: &mut Parser, target: &DataType, named_type: bool) -> R<St
     {
         return Err(SqlError::Unsupported);
     }
-    if named_type {
+    // UUID array default diagnostics need the column name at installation.
+    if named_type || *target == DataType::UuidArray {
         return Ok(value.sql());
     }
     query::InsertExpressions::default_value(&value.sql(), target, None, false)?;
@@ -1437,6 +1439,7 @@ fn array_text(
         DataType::TextArray => DataType::Text,
         DataType::IntArray => DataType::Integer,
         DataType::BigIntArray => DataType::BigInt,
+        DataType::UuidArray => DataType::Uuid,
         _ => return Err(SqlError::Type),
     };
     let name = enum_name.unwrap_or(type_name(&element));
@@ -1489,7 +1492,12 @@ fn column_default(
             _ => Err(SqlError::Type),
         };
     }
-    query::InsertExpressions::default_value(&expression.sql(), target, None, false)?;
+    let sql = expression.sql();
+    if *target == DataType::UuidArray {
+        query::InsertExpressions::validate_uuid_array_default(&sql, &column.name)?;
+    } else {
+        query::InsertExpressions::default_value(&sql, target, None, false)?;
+    }
     expression.canonical(target)
 }
 
@@ -1666,6 +1674,39 @@ pub(super) fn parse_alter_untyped(p: &mut Parser) -> R<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn uuid_array_default_reuses_existing_catalog_bytes() {
+        fn run(state: &mut Relational, sql: &str) {
+            let statement = Prepared::parse(sql, 1, state.epoch).unwrap();
+            state.execute(&statement, &[], None).unwrap();
+        }
+
+        let mut state = Relational::default();
+        run(&mut state, "CREATE TABLE t (id int PRIMARY KEY, u uuid[], a text[] DEFAULT '{}')");
+        let before = bincode::serialize(&state).unwrap();
+        let before_ext = bincode::serialize(state.ext.as_ref()).unwrap();
+        let mut reopened: Relational = bincode::deserialize(&before).unwrap();
+        assert_eq!(bincode::serialize(&reopened).unwrap(), before);
+
+        let version = reopened.ext.wire_version();
+        let column = reopened.tables["t"].columns[1].id;
+        let mut expected = reopened.ext.as_ref().clone();
+        expected.columns.entry(column).or_default().default = Some("ARRAY[]::uuid[]".into());
+
+        run(&mut reopened, "ALTER TABLE t ALTER COLUMN u SET DEFAULT ARRAY[]::uuid[]");
+        assert_eq!(reopened.ext.wire_version(), version);
+        assert_eq!(
+            bincode::serialize(reopened.ext.as_ref()).unwrap(),
+            bincode::serialize(&expected).unwrap(),
+        );
+
+        let bytes = bincode::serialize(&reopened).unwrap();
+        let mut reopened: Relational = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(reopened.column_default(column), Some("ARRAY[]::uuid[]"));
+        run(&mut reopened, "ALTER TABLE t ALTER COLUMN u DROP DEFAULT");
+        assert_eq!(bincode::serialize(reopened.ext.as_ref()).unwrap(), before_ext);
+    }
+
     #[test]
     fn present_default_preserves_sql_when_reparsing_fails() {
         let state = Relational::default();

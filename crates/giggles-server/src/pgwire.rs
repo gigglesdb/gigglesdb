@@ -426,7 +426,10 @@ impl Diagnostic {
                 SqlError::UndefinedObject => message.starts_with("type \"") && message.ends_with(" does not exist"),
                 SqlError::Type => (message.starts_with("column \"") || message.starts_with("default for column \""))
                     && message.contains(" cannot be cast automatically to type ")
-                    || message.ends_with(" cannot be matched") && common_type_context(" types "),
+                    || message.ends_with(" cannot be matched") && common_type_context(" types ")
+                    || self.wire_hint.as_deref() == Some("You will need to rewrite or cast the expression.")
+                        && message.starts_with(r#"column ""#)
+                        && message.contains(r#"" is of type uuid[] but default expression is of type "#),
                 _ => false,
             };
             if allowed {

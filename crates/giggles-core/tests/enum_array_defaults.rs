@@ -1,9 +1,10 @@
 mod common;
 
 use giggles_core::{
-    Admin, CoreError, Limits, SqlSession,
-    relational::{SqlError, Value, take_sql_error_message},
+    Admin, CoreError, Engine, Limits, SqlSession,
+    relational::{SqlError, StatementClock, Value, take_sql_error_hint, take_sql_error_message},
 };
+use giggles_pg_types::temporal::SessionZone;
 
 fn run(session: &mut SqlSession, sql: &str) -> Vec<Vec<Value>> {
     session
@@ -1167,4 +1168,160 @@ fn ordinary_containment_stays_unsupported() {
             "{statement}"
         );
     }
+}
+
+
+fn uuid_array_default_roundtrip(engine: Engine) {
+    let path = common::fresh("uuid-array-defaults");
+    let default_hint = "You will need to rewrite or cast the expression.";
+    {
+        let db = Admin::create_engine(&path, Limits::default(), engine).unwrap();
+        let mut sql = db.sql_session();
+        for statement in [
+            "CREATE TABLE pr_a (id int PRIMARY KEY, u UUID[] DEFAULT ARRAY[]::UUID[],
+                w uuid[] NOT NULL DEFAULT '{}',
+                x uuid[] DEFAULT ARRAY['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11']::uuid[],
+                y uuid[] DEFAULT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid[])",
+            "CREATE TABLE pr_b (id int PRIMARY KEY, u UUID[])",
+            "ALTER TABLE pr_b ALTER COLUMN u SET DEFAULT ARRAY[]::UUID[]",
+            "INSERT INTO pr_b (id) VALUES (1)",
+            "ALTER TABLE pr_b ADD COLUMN v UUID[] DEFAULT ARRAY[]::UUID[]",
+            "ALTER TABLE pr_b ADD COLUMN z UUID[] NOT NULL DEFAULT '{}'",
+            "INSERT INTO pr_b (id) VALUES (2)",
+            "INSERT INTO pr_a (id) VALUES (1)",
+        ] {
+            run(&mut sql, statement);
+        }
+    }
+
+    let db = Admin::open(&path, Limits::default()).unwrap();
+    let mut sql = db.sql_session();
+    let empty_row = |id| vec![Value::Int(id), text("{}"), text("{}"), text("{}")];
+    assert_eq!(
+        run(&mut sql, "SELECT id, u, v, z FROM pr_b ORDER BY id"),
+        vec![empty_row(1), empty_row(2)],
+    );
+    let populated = text("{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}");
+    assert_eq!(
+        run(&mut sql, "SELECT id, u, w, x, y FROM pr_a"),
+        vec![vec![Value::Int(1), text("{}"), text("{}"), populated.clone(), populated]],
+    );
+    assert_eq!(
+        run(&mut sql, "SELECT pg_typeof(u), pg_typeof(w), pg_typeof(x), pg_typeof(y) FROM pr_a"),
+        vec![vec![text("uuid[]"); 4]],
+    );
+    defaults(
+        &db,
+        "pr_a",
+        &[
+            ("u", "ARRAY[]::uuid[]"),
+            ("w", "'{}'::uuid[]"),
+            ("x", "ARRAY['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid]"),
+            ("y", "'{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid[]"),
+        ],
+    );
+    defaults(
+        &db,
+        "pr_b",
+        &[("u", "ARRAY[]::uuid[]"), ("v", "ARRAY[]::uuid[]"), ("z", "'{}'::uuid[]")],
+    );
+
+    run(&mut sql, "ALTER TABLE pr_b ALTER COLUMN u DROP DEFAULT");
+    let column_id = db.catalog().unwrap().1.iter().find(|t| t.name == "pr_b").unwrap().columns[1].id;
+    assert!(!db.catalog_presentation().unwrap().defaults.contains_key(&column_id));
+    run(&mut sql, "INSERT INTO pr_b (id) VALUES (3)");
+    assert_eq!(
+        run(&mut sql, "SELECT id, u, v, z FROM pr_b ORDER BY id"),
+        vec![
+            empty_row(1),
+            empty_row(2),
+            vec![Value::Int(3), Value::Null, text("{}"), text("{}")],
+        ],
+    );
+
+    error(
+        &mut sql,
+        "CREATE TABLE pr_bad (id int PRIMARY KEY, u uuid[] DEFAULT '{nope}')",
+        SqlError::InvalidTextRepresentation,
+        r#"invalid input syntax for type uuid: "nope""#,
+    );
+    assert_eq!(take_sql_error_hint(), None);
+    for (statement, message) in [
+        (
+            "CREATE TABLE pr_bad2 (id int PRIMARY KEY, u uuid[] DEFAULT ARRAY[]::text[])",
+            r#"column "u" is of type uuid[] but default expression is of type text[]"#,
+        ),
+        (
+            "CREATE TABLE pr_bad3 (id int PRIMARY KEY, u uuid[] DEFAULT ARRAY[1])",
+            r#"column "u" is of type uuid[] but default expression is of type integer[]"#,
+        ),
+        (
+            "ALTER TABLE pr_b ALTER COLUMN u SET DEFAULT ARRAY[1]",
+            r#"column "u" is of type uuid[] but default expression is of type integer[]"#,
+        ),
+        (
+            "ALTER TABLE pr_b ADD COLUMN bad uuid[] DEFAULT ARRAY[]::text[]",
+            r#"column "bad" is of type uuid[] but default expression is of type text[]"#,
+        ),
+    ] {
+        error(&mut sql, statement, SqlError::Type, message);
+        assert_eq!(take_sql_error_hint(), Some(default_hint));
+    }
+    assert_eq!(
+        run(&mut sql, "SELECT id, u, v, z FROM pr_b ORDER BY id"),
+        vec![
+            empty_row(1),
+            empty_row(2),
+            vec![Value::Int(3), Value::Null, text("{}"), text("{}")],
+        ],
+    );
+}
+
+#[test]
+fn uuid_array_defaults_survive_legacy_reopen() {
+    uuid_array_default_roundtrip(Engine::Legacy);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn uuid_array_defaults_survive_v2_reopen() {
+    uuid_array_default_roundtrip(Engine::V2);
+}
+
+#[test]
+fn archdocs_revision_tables_accept_defaults() {
+    let db = Admin::create(common::fresh("archdocs-revision-defaults"), Limits::default()).unwrap();
+    let mut sql = db.sql_session();
+    let clock = StatementClock {
+        unavailable: None,
+        transaction_us: 1_000_000,
+        statement_us: 1_000_000,
+        zone: Some(SessionZone::Fixed(0)),
+        wall: None,
+    };
+    for statement in [
+        r#"CREATE TYPE "DesignAuthorKind" AS ENUM ('HUMAN', 'AGENT', 'ARCHDOCS_AI')"#,
+        r#"CREATE TABLE "DesignDocVariation" ("id" UUID PRIMARY KEY)"#,
+        include_str!("fixtures/archdocs_page_revision.sql"),
+        include_str!("fixtures/archdocs_design_doc_variation_version.sql"),
+        r#"INSERT INTO "DesignDocVariation" VALUES ('00000000-0000-0000-0000-000000000001')"#,
+        r#"INSERT INTO "PageRevision" ("pageId", "revision", "title", "content", "authorKind")
+           VALUES ('00000000-0000-0000-0000-000000000001', 1, 'First', 'Body', 'HUMAN')"#,
+        r#"INSERT INTO "DesignDocVariationVersion"
+             ("variationId", "version", "content", "brief", "authorKind", "authorUserIds")
+           VALUES ('00000000-0000-0000-0000-000000000001', 1, 'Body', '{}', 'AGENT', '{}')"#,
+    ] {
+        sql.execute_at(statement, &[], None, &clock)
+            .unwrap_or_else(|error| panic!("{statement}: {error:?} ({:?})", take_sql_error_message()));
+    }
+
+    assert_eq!(
+        run(&mut sql, r#"SELECT "authorUserIds", "id" IS NOT NULL, "createdAt" IS NOT NULL FROM "PageRevision""#),
+        vec![vec![text("{}"), Value::Bool(true), Value::Bool(true)]],
+    );
+    assert_eq!(
+        run(&mut sql, r#"SELECT "authorUserIds", "id" IS NOT NULL, "createdAt" IS NOT NULL, "isAmendment"
+                          FROM "DesignDocVariationVersion""#),
+        vec![vec![text("{}"), Value::Bool(true), Value::Bool(true), Value::Bool(false)]],
+    );
 }

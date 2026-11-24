@@ -322,7 +322,6 @@ fn uuid_array_application_v2() {
 }
 
 #[test]
-#[ignore = "needs AM-2 array defaults"]
 fn uuid_array_migration_defaults() {
     let path = common::fresh("uuid-array-defaults");
     let admin = Admin::create(&path, Limits::default()).unwrap();

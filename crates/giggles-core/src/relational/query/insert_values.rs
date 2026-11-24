@@ -250,13 +250,7 @@ impl InsertExpressions {
         }
         dependencies
     }
-    /// Bind stored default syntax using the same assignment rules as VALUES.
-    pub(in super::super) fn default_value(
-        sql: &str,
-        target: &DataType,
-        clock: Option<&crate::relational::clock::ExecutionClock>,
-        evaluate: bool,
-    ) -> R<Option<Value>> {
+    fn bind_default(sql: &str, target: &DataType) -> R<BoundScalar> {
         let value = default_scalar(sql)?;
         let no_columns = |_: &ColumnRef, _: usize| Err(SqlError::Unsupported);
         let mut parameters = vec![];
@@ -266,13 +260,38 @@ impl InsertExpressions {
         } else {
             value
         };
-        let mut value = value
-            .bind(&no_columns, &[], &parameters)?
-            .insert_assignment(target)?;
+        value.bind(&no_columns, &[], &parameters)
+    }
+
+    pub(in super::super) fn validate_uuid_array_default(sql: &str, column: &str) -> R<()> {
+        let value = Self::bind_default(sql, &DataType::UuidArray)?;
+        if value.ty != DataType::UuidArray {
+            user_types::view_replace_error(format!(
+                r#"column "{column}" is of type uuid[] but default expression is of type {}"#,
+                defaults::type_name(&value.ty),
+            ));
+            user_types::sql_error_hint("You will need to rewrite or cast the expression.");
+            return Err(SqlError::Type);
+        }
+        Self::validate_default_value(&value).map(|_| ())
+    }
+
+    fn validate_default_value(value: &BoundScalar) -> R<Option<Value>> {
         if !value.insert_input_only() {
             return Err(SqlError::Unsupported);
         }
-        let constant = value.plan_constant(&mut 0)?;
+        value.plan_constant(&mut 0)
+    }
+
+    /// Bind stored default syntax using the same assignment rules as VALUES.
+    pub(in super::super) fn default_value(
+        sql: &str,
+        target: &DataType,
+        clock: Option<&crate::relational::clock::ExecutionClock>,
+        evaluate: bool,
+    ) -> R<Option<Value>> {
+        let mut value = Self::bind_default(sql, target)?.insert_assignment(target)?;
+        let constant = Self::validate_default_value(&value)?;
         if !evaluate {
             return Ok(constant);
         }
