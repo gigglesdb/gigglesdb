@@ -5,7 +5,7 @@ use giggles_server::{
     clock::Clock,
 };
 use std::{collections::BTreeMap, sync::Arc};
-use tokio_postgres::{Config, NoTls, SimpleQueryMessage};
+use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 
 #[test]
 fn nondeterministic_keys_over_simple_and_extended_pgwire() {
@@ -146,7 +146,90 @@ async fn check_protocols(path: &std::path::Path, engine: Engine) {
         assert_eq!(error.schema(), Some("public"));
         assert_eq!(error.constraint(), Some("c_pid_fkey"));
     }
+    deferred_fk_diagnostics(&client, running.address).await;
+    like_escape_diagnostics(&client).await;
     drop(client);
     connection.await.unwrap().unwrap();
     running.shutdown().await.unwrap();
+}
+
+async fn deferred_fk_diagnostics(admin: &Client, address: std::net::SocketAddr) {
+    admin.batch_execute("CREATE ROLE fk_delete LOGIN").await.unwrap();
+    let (restricted, connection) = Config::new()
+        .hostaddr(address.ip())
+        .port(address.port())
+        .user("fk_delete")
+        .dbname("postgres")
+        .connect(NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(connection);
+    for (collation, reference) in [("", "abc"), (" COLLATE ci", "ABC")] {
+        for sql in [
+            format!("CREATE TABLE p (id text{collation} PRIMARY KEY)"),
+            format!("CREATE TABLE d (id int PRIMARY KEY, pid text{collation} REFERENCES p
+                DEFERRABLE INITIALLY DEFERRED)"),
+            "INSERT INTO p VALUES ('abc')".into(),
+            format!("INSERT INTO d VALUES (1,'{reference}')"),
+            "GRANT DELETE ON p TO fk_delete".into(),
+            "GRANT INSERT ON d TO fk_delete".into(),
+        ] {
+            admin.batch_execute(&sql).await.unwrap();
+        }
+        for (sql, message, full, redacted) in [
+            (
+                "BEGIN; DELETE FROM p",
+                "update or delete on table \"p\" violates foreign key constraint \"d_pid_fkey\" on table \"d\"",
+                "Key (id)=(abc) is still referenced from table \"d\".",
+                "Key is still referenced from table \"d\".",
+            ),
+            (
+                "BEGIN; INSERT INTO d VALUES (2, 'missing')",
+                "insert or update on table \"d\" violates foreign key constraint \"d_pid_fkey\"",
+                "Key (pid)=(missing) is not present in table \"p\".",
+                "Key is not present in table \"p\".",
+            ),
+        ] {
+            for (client, detail) in [(admin, full), (&restricted, redacted)] {
+                for extended in [false, true] {
+                    client.batch_execute(sql).await.unwrap();
+                    let error = if extended {
+                        client.execute("COMMIT", &[]).await.unwrap_err()
+                    } else {
+                        client.simple_query("COMMIT").await.unwrap_err()
+                    };
+                    let error = error.as_db_error().unwrap();
+                    assert_eq!(error.code().code(), "23503");
+                    assert_eq!(error.message(), message);
+                    assert_eq!(error.detail(), Some(detail));
+                    assert_eq!(error.schema(), Some("public"));
+                    assert_eq!(error.table(), Some("d"));
+                    assert_eq!(error.constraint(), Some("d_pid_fkey"));
+                }
+            }
+        }
+        let row = admin.query_one("SELECT id FROM p", &[]).await.unwrap();
+        assert_eq!(row.get::<_, &str>(0), "abc");
+        admin.batch_execute("DROP TABLE d").await.unwrap();
+        admin.batch_execute("DROP TABLE p").await.unwrap();
+    }
+    drop(restricted);
+    connection.await.unwrap().unwrap();
+}
+
+async fn like_escape_diagnostics(client: &Client) {
+    for collation in ["", " COLLATE ci"] {
+        for (escape, message, hint) in [
+            ("!", "LIKE pattern must not end with escape character", None),
+            ("xy", "invalid escape string", Some("Escape string must be empty or one character.")),
+        ] {
+            let sql = format!("SELECT 'ab' LIKE 'a%!' ESCAPE '{escape}'{collation}");
+            let error = client.simple_query(&sql).await.unwrap_err();
+            let error = error.as_db_error().unwrap();
+            assert_eq!(error.code().code(), "22025");
+            assert_eq!(error.message(), message);
+            assert_eq!(error.hint(), hint);
+            assert_eq!(error.detail(), None);
+        }
+    }
 }

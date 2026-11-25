@@ -2245,11 +2245,12 @@ fn execute_control_inner(
     } else if was && let Err(error) = if implicit_commit && *implicit && actual == "COMMIT" {
         session.commit_implicit_block()
     } else { session.run_control(actual) } {
+        let code = diagnostic.core::<()>(Err(error)).unwrap_err();
         session.sql.rollback();
         settings.transaction(true, false, "ROLLBACK");
         diagnostic.pre_rollback_settings = Some(Box::new(before));
         *implicit = false;
-        return Err(crate::service::sqlstate(&error));
+        return Err(code);
     }
     if publishing {
         // Explicit COMMIT and simple implicit commits use the post-commit control path.
@@ -3180,15 +3181,13 @@ impl State {
                     } else {
                         let commit = if session.in_transaction() { session.commit_implicit_block() } else { Ok(()) };
                         if let Err(error) = commit {
+                            let code = self.diagnostic.core::<()>(Err(error)).unwrap_err();
                             session.sql.rollback();
                             self.cursors.transaction_end("ROLLBACK");
                             self.settings.transaction(true, false, "ROLLBACK");
                             self.diagnostic.pre_rollback_settings = Some(Box::new(before));
                             self.portals.clear();
-                            if matches!(&error, CoreError::WriteFenced { .. }) {
-                                self.diagnostic.wire_message = Some(error.to_string());
-                            }
-                            return Err(crate::service::sqlstate(&error));
+                            return Err(code);
                         }
                         if publishing {
                             self.diagnostic.committed = true;

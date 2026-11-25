@@ -225,6 +225,55 @@ fn foreign_key_actions_and_parent_diagnostics_use_collation() {
 }
 
 #[test]
+fn set_default_rechecks_the_removed_parent_key() {
+    each_engine(|s| {
+        for (collation, original) in [("", "dflt"), (" COLLATE ci", "DFLT")] {
+            for sql in [
+                format!("CREATE TABLE p (id text{collation} PRIMARY KEY)"),
+                format!("CREATE TABLE c (cid int PRIMARY KEY, pid text{collation} DEFAULT 'dflt'
+                    REFERENCES p ON DELETE SET DEFAULT ON UPDATE SET DEFAULT
+                    DEFERRABLE INITIALLY DEFERRED)"),
+                "INSERT INTO p VALUES ('dflt'), ('other')".into(),
+                format!("INSERT INTO c VALUES (1, '{original}'), (2, 'other')"),
+            ] {
+                run(s, &sql, &[]);
+            }
+            for sql in ["DELETE FROM p WHERE id='dflt'", "UPDATE p SET id='new' WHERE id='dflt'"] {
+                fails(
+                    s,
+                    sql,
+                    "23503",
+                    "update or delete on table \"p\" violates foreign key constraint \"c_pid_fkey\" on table \"c\"",
+                    Some("Key (id)=(dflt) is still referenced from table \"c\"."),
+                );
+            }
+            assert_eq!(rows(s, "SELECT pid FROM c ORDER BY cid", &[]), [[txt(original)], [txt("other")]]);
+            assert_eq!(run(s, "DELETE FROM p WHERE id='other'", &[]).affected, 1);
+            assert_eq!(rows(s, "SELECT pid FROM c WHERE cid=2", &[]), [[txt("dflt")]]);
+            run(s, "DROP TABLE c", &[]);
+            run(s, "DROP TABLE p", &[]);
+        }
+    });
+}
+
+#[test]
+fn large_collated_pattern_and_substring_searches() {
+    each_engine(|s| {
+        for (sql, expected) in [
+            ("SELECT repeat('a',4096) LIKE '%B' COLLATE ci", Value::Bool(false)),
+            ("SELECT strpos(repeat('a',4000) COLLATE ci,'b')", Value::Int(0)),
+            ("SELECT replace(repeat('a',2000) COLLATE ci,'b','c') = repeat('a',2000)", Value::Bool(true)),
+            ("SELECT split_part(repeat('a',2000) COLLATE ci,'b',1) = repeat('a',2000)", Value::Bool(true)),
+        ] {
+            let start = std::time::Instant::now();
+            assert_eq!(rows(s, sql, &[]), [[expected]]);
+            let elapsed = start.elapsed();
+            assert!(elapsed < std::time::Duration::from_secs(2), "{sql}: {elapsed:?}");
+        }
+    });
+}
+
+#[test]
 fn like_and_substring_functions_use_the_resolved_collation() {
     each_engine(|s| {
         run(

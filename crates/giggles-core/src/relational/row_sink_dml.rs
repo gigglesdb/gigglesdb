@@ -690,8 +690,20 @@ impl ActionWork {
                 let equality = collation_keys::Key::new(state, &parent, ref_columns, None)
                     .map_err(CoreError::Sql)?;
                 let tuple = equality.values(&values).map_err(CoreError::Sql)?;
+                let child_positions = columns.iter()
+                    .map(|id| child.columns.iter().position(|c| c.id == *id).unwrap())
+                    .collect::<Vec<_>>();
+                let references_old_key = |row: &SqlRow| -> R<bool> {
+                    let converted = child_positions.iter().zip(&parent_positions).map(|(&a, &b)| {
+                        query::constraint_key(&row.values[a], &child.columns[a].data_type,
+                            &parent.columns[b].data_type)
+                    }).collect::<R<Option<Vec<_>>>>()?;
+                    Ok(converted.as_ref().map(|v| equality.values(v)).transpose()?.flatten() == tuple)
+                };
                 let mut no_action = DeferralState::default();
                 let mut parent_values = None;
+                let set_default = *action == catalog_ext::Action::SetDefault;
+                let mut still_references_old_key = false;
                 let mut after = None;
                 let first_version = state.next_version;
                 loop {
@@ -708,14 +720,7 @@ impl ActionWork {
                             // A cascade can move an ICU-equal child ahead of the
                             // cursor. Do not act on this scan's own writes again.
                             if row.version >= first_version { continue; }
-                            let converted = columns.iter().zip(ref_columns).map(|(a, b)| {
-                                let a = child.columns.iter().position(|c| c.id == *a).unwrap();
-                                let b = parent.columns.iter().position(|c| c.id == *b).unwrap();
-                                query::constraint_key(&row.values[a], &child.columns[a].data_type,
-                                    &parent.columns[b].data_type)
-                            }).collect::<R<Option<Vec<_>>>>().map_err(CoreError::Sql)?;
-                            if converted.as_ref().map(|v| equality.values(v)).transpose()
-                                .map_err(CoreError::Sql)?.flatten() == tuple {
+                            if references_old_key(&row).map_err(CoreError::Sql)? {
                                 matching.insert(key, row);
                             }
                         }
@@ -735,7 +740,7 @@ impl ActionWork {
                             .copied().unwrap_or(*deferral == Deferral::DeferrableDeferred);
                         let pending = if deferred { &mut self.pending } else if statement_end { &mut self.immediate } else { &mut no_action };
                         let check = (c.id, *child_id);
-                        if !rows.is_empty() && equality.nondeterministic() && parent_values.is_none() {
+                        if !rows.is_empty() && (deferred || equality.nondeterministic()) && parent_values.is_none() {
                             for value in &values {
                                 self.retention.charge(value_bytes(value)).map_err(CoreError::Sql)?;
                             }
@@ -756,8 +761,7 @@ impl ActionWork {
                     if new.is_some() || *action != catalog_ext::Action::Cascade {
                         for old in rows.values() {
                             let mut row = old.clone();
-                            for (i, id) in columns.iter().enumerate() {
-                                let position = child.columns.iter().position(|c| c.id == *id).unwrap();
+                            for (i, &position) in child_positions.iter().enumerate() {
                                 row.values[position] = match action {
                                     catalog_ext::Action::Cascade => new_values.as_ref().unwrap()[i].clone(),
                                     catalog_ext::Action::SetNull => Value::Null,
@@ -771,6 +775,9 @@ impl ActionWork {
                             state.materialize_generated(&child, &mut row.values).map_err(CoreError::Sql)?;
                             row_check(&child, &row.values).map_err(CoreError::Sql)?;
                             state.check_insert_candidate(&child, &row.values).map_err(CoreError::Sql)?;
+                            if set_default && !still_references_old_key {
+                                still_references_old_key = references_old_key(&row).map_err(CoreError::Sql)?;
+                            }
                             row.version = allocate(&mut state.next_version).map_err(CoreError::Sql)?;
                             events.push(constraints::Event { table: child.id, old: old.clone(), new: Some(row.clone()) });
                             if changed.insert(pk(&child, &row.values).map_err(CoreError::Sql)?, row).is_some() {
@@ -778,7 +785,21 @@ impl ActionWork {
                             }
                         }
                     }
-                    self.publish(state, sink, &child, rows, changed, events, Some(c.id), descriptors, version_end)?;
+                    self.publish(state, sink, &child, rows, changed, events, (!set_default).then_some(c.id), descriptors, version_end)?;
+                }
+                // SET DEFAULT has its own immediate NO ACTION check of the
+                // old key. Keep child-side checks for references to new keys.
+                if still_references_old_key {
+                    let mut found = false;
+                    let exact = (!equality.nondeterministic()).then_some(values.as_slice());
+                    sink.fk_lookup(&parent, ref_columns, exact, true,
+                        &mut |candidate| Ok(equality.tuple(&candidate.values)? == tuple),
+                        &mut |_| { found = true; Ok(()) })?;
+                    if !found {
+                        return Err(CoreError::Sql(constraints::still_referenced(
+                            state, &child, &parent, &c.name, &parent_positions, &values, false,
+                        )));
+                    }
                 }
                 // Definition order decides NO ACTION versus a later RESTRICT.
                 if !no_action.pending.is_empty() { paged_pending(state, &mut no_action, &[], false, sink)?; }
@@ -834,7 +855,6 @@ impl ActionWork {
                         row.values[i] != old.values[i]
                     });
                     if force != Some(c.id) && !changed { continue; }
-                    // SET DEFAULT rechecks an unchanged reference immediately, even when deferred.
                     let deferred = changed && *deferral != Deferral::NotDeferrable && self.pending.modes.get(&c.id)
                         .copied().unwrap_or(*deferral == Deferral::DeferrableDeferred);
                     let pending = if deferred { &mut self.pending } else { &mut self.immediate };

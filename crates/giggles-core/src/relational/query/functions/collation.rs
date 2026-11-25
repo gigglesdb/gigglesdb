@@ -645,7 +645,7 @@ pub(in crate::relational::query) fn like<'a>(
         let collator = collator(n)?;
         return Ok(Some(
             crate::relational::like::collated(value, pattern, escape, work, |a, b| {
-                collator.compare_utf8(a.as_bytes(), b.as_bytes()).is_eq()
+                collator.compare_str(a, b).is_eq()
             })? != negated,
         ));
     }

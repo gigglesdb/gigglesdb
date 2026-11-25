@@ -53,7 +53,7 @@ pub(super) fn eval_collated_search(
 ) -> R<Value> {
     let source = text(&values[0])?;
     let needle = text(&values[1])?;
-    let search = CollatedSearch { needle, collator };
+    let mut search = CollatedSearch { needle, collator, work: Default::default() };
     let output = |text: &str, budget: &mut usize| {
         reserve(budget, text.len())?;
         Ok(Value::Text(text.to_owned()))
@@ -137,22 +137,28 @@ pub(super) fn eval_collated_search(
 struct CollatedSearch<'a> {
     needle: &'a str,
     collator: &'a giggles_icu::Collator,
+    work: crate::relational::like::CollationWork,
 }
 
 impl CollatedSearch<'_> {
     // Only nonempty matches advance the search. Replacement and splitting use
     // the longest match at the earliest start to consume ignorable characters.
-    fn find(&self, source: &str, greedy: bool, budget: &mut usize) -> R<Option<(usize, usize)>> {
+    fn find(&mut self, source: &str, greedy: bool, budget: &mut usize) -> R<Option<(usize, usize)>> {
         for (start, _) in source.char_indices() {
             crate::cancellation::check().map_err(|_| SqlError::Aborted)?;
             let suffix = &source[start..];
+            // strpos only needs the starting position. As in PostgreSQL, try
+            // the common case of a match with the needle's byte length first.
+            let exact = self.needle.len();
+            let tried_exact = !greedy && suffix.is_char_boundary(exact);
+            if tried_exact && self.matches(&suffix[..exact], budget)? {
+                return Ok(Some((start, start + exact)));
+            }
             let ends = suffix.char_indices().skip(1).map(|(i, _)| i)
                 .chain(std::iter::once(suffix.len()));
             let mut matched = None;
             for end in ends {
-                let candidate = &suffix[..end];
-                reserve(budget, crate::relational::like::comparison_work(candidate, self.needle))?;
-                if self.collator.compare_utf8(candidate.as_bytes(), self.needle.as_bytes()).is_eq() {
+                if !(tried_exact && end == exact) && self.matches(&suffix[..end], budget)? {
                     matched = Some((start, start + end));
                     if !greedy {
                         break;
@@ -164,6 +170,11 @@ impl CollatedSearch<'_> {
             }
         }
         Ok(None)
+    }
+
+    fn matches(&mut self, candidate: &str, budget: &mut usize) -> R<bool> {
+        self.work.compare(budget, candidate, self.needle)?;
+        Ok(self.collator.compare_str(candidate, self.needle).is_eq())
     }
 }
 

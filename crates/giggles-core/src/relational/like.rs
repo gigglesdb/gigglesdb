@@ -1,5 +1,5 @@
 //! Bounded Unicode LIKE matching; no recursion or locale-dependent folding.
-use super::{MAX_RESULT_BYTES, R, SqlError};
+use super::{MAX_RESULT_BYTES, R, SqlError, user_types};
 
 #[derive(Clone, Copy)]
 pub(super) struct Escape(Option<char>);
@@ -8,10 +8,18 @@ impl Escape {
         let mut chars = value.chars();
         let first = chars.next();
         if chars.next().is_some() {
+            user_types::view_replace_error("invalid escape string".into());
+            user_types::exact_sql_error_detail(None);
+            user_types::sql_error_hint("Escape string must be empty or one character.");
             return Err(SqlError::InvalidEscapeSequence);
         }
         Ok(Self(first))
     }
+}
+fn trailing_escape() -> SqlError {
+    user_types::view_replace_error("LIKE pattern must not end with escape character".into());
+    user_types::exact_sql_error_detail(None);
+    SqlError::InvalidEscapeSequence
 }
 fn charge(work: &mut usize, amount: usize) -> R<()> {
     let total = work.checked_add(amount).ok_or(SqlError::Limit)?;
@@ -52,7 +60,7 @@ pub(super) fn like(
             let next = pattern
                 .get(p + 1)
                 .copied()
-                .ok_or(SqlError::InvalidEscapeSequence)?;
+                .ok_or_else(trailing_escape)?;
             (Some(fold(next)), 2)
         } else if current == Some('%') {
             // A wildcard run reserves its mandatory characters before choosing
@@ -76,7 +84,7 @@ pub(super) fn like(
                 return Ok(true);
             }
             if escape.0 == pattern.get(p).copied() && p + 1 == pattern.len() {
-                return Err(SqlError::InvalidEscapeSequence);
+                return Err(trailing_escape());
             }
             star = Some((p, v));
             continue;
@@ -108,9 +116,25 @@ pub(super) fn like(
     Ok(p == pattern.len())
 }
 
-pub(super) fn comparison_work(left: &str, right: &str) -> usize {
-    // Count each comparison plus the blocks of input it can inspect.
-    1 + left.len().saturating_add(right.len()).div_ceil(16)
+/// Collation comparisons typically stop at the first difference. Charge them
+/// in batches while bounding both their number and the bytes ICU could read.
+#[derive(Default)]
+pub(super) struct CollationWork(usize);
+
+impl CollationWork {
+    pub(super) fn compare(&mut self, work: &mut usize, left: &str, right: &str) -> R<()> {
+        const BYTES_PER_UNIT: usize = 16 * 1024;
+        const COMPARISON_COST: usize = 256;
+        let cost = self.0.saturating_add(COMPARISON_COST)
+            .saturating_add(left.len()).saturating_add(right.len());
+        let units = cost / BYTES_PER_UNIT;
+        if units != 0 {
+            crate::cancellation::check().map_err(|_| SqlError::Aborted)?;
+            charge(work, units)?;
+        }
+        self.0 = cost % BYTES_PER_UNIT;
+        Ok(())
+    }
 }
 
 /// Track the reachable character boundaries after each wildcard or literal run.
@@ -157,6 +181,7 @@ pub(super) fn collated(
     offsets.push(value.len());
     let mut reachable = vec![false; offsets.len()];
     let mut next = reachable.clone();
+    let mut comparisons = CollationWork::default();
     reachable[0] = true;
     for (index, part) in parts.iter().enumerate() {
         crate::cancellation::check().map_err(|_| SqlError::Aborted)?;
@@ -176,7 +201,7 @@ pub(super) fn collated(
                 if start < end && matches!(parts.get(index + 1),
                     Some(Part::Literal(literal, false)) if literal.is_empty())
                 {
-                    return Err(SqlError::InvalidEscapeSequence);
+                    return Err(trailing_escape());
                 }
                 next[start + minimum..].fill(true);
             }
@@ -187,7 +212,7 @@ pub(super) fn collated(
                     return Ok(false);
                 }
                 if !complete {
-                    return Err(SqlError::InvalidEscapeSequence);
+                    return Err(trailing_escape());
                 }
                 let last_part = index + 1 == parts.len();
                 let trailing_percent = matches!(parts.get(index + 1..), Some([Part::Many(0)]));
@@ -195,7 +220,7 @@ pub(super) fn collated(
                     let first_end = if last_part { end } else { start };
                     for finish in first_end..=end {
                         let candidate = &value[offsets[start]..offsets[finish]];
-                        charge(work, comparison_work(candidate, pattern))?;
+                        comparisons.compare(work, candidate, pattern)?;
                         if eq(candidate, pattern) {
                             if last_part || trailing_percent {
                                 return Ok(true);

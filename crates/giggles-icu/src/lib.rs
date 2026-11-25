@@ -436,8 +436,12 @@ impl Collator {
         Ok(coll)
     }
     pub fn compare_utf8(&self, a: &[u8], b: &[u8]) -> Ordering {
-        std::str::from_utf8(a).expect("ICU requires valid UTF-8");
-        std::str::from_utf8(b).expect("ICU requires valid UTF-8");
+        self.compare_str(
+            std::str::from_utf8(a).expect("ICU requires valid UTF-8"),
+            std::str::from_utf8(b).expect("ICU requires valid UTF-8"),
+        )
+    }
+    pub fn compare_str(&self, a: &str, b: &str) -> Ordering {
         let handle = self.handle.lock().unwrap();
         let mut status = 0;
         // SAFETY: mutex excludes concurrent access; inputs have explicit lengths.

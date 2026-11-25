@@ -655,6 +655,7 @@ struct CheckDiagnostics<'a> {
     changed: &'a BTreeSet<Vec<u8>>,
     written: &'a [usize],
     parents: Option<&'a ParentDetails>,
+    deferred_children: bool,
 }
 
 fn validate_kind(
@@ -679,9 +680,11 @@ fn validate_kind(
                 check_row(state, table, name, expr, row, written)?;
             }
             ConstraintKind::ForeignKey { .. } => {
-                let child_failure = diagnostic.as_ref().filter(|d| d.changed.contains(key)).map(|_| name);
                 let parent_failure = diagnostic.as_ref().and_then(|d| d.parents)
                     .and_then(|parents| parents.get(key)).map(|values| (name, values.as_ref()));
+                let child_failure = diagnostic.as_ref().filter(|d| {
+                    d.changed.contains(key) || (d.deferred_children && parent_failure.is_none())
+                }).map(|_| name);
                 fk_row(state, table, row, kind, child_failure, parent_failure)?;
             }
             ConstraintKind::PrimaryKey | ConstraintKind::Unique { .. } => (),
@@ -1122,6 +1125,7 @@ pub(super) fn enforce_with_rows<'a>(
                                 changed: &BTreeSet::new(),
                                 written: &[],
                                 parents: parent_details.get(&(*id, *table_id)),
+                                deferred_children: false,
                             }),
                             cancel,
                         )?;
@@ -1135,7 +1139,7 @@ pub(super) fn enforce_with_rows<'a>(
                 return Err(SqlError::RestrictViolation);
             }
             if matches!(action, catalog_ext::Action::NoAction) {
-                if collated && !children.is_empty() {
+                if !children.is_empty() && (collated || deferred.deferred(constraint.id, &constraint.kind)) {
                     let details = parent_details.entry((constraint.id, child_id)).or_default();
                     let values = Arc::from(old_key);
                     for (key, _) in &children {
@@ -1151,6 +1155,7 @@ pub(super) fn enforce_with_rows<'a>(
             if matches!(action, catalog_ext::Action::Restrict) {
                 continue;
             }
+            let recheck_default = *action == catalog_ext::Action::SetDefault && !children.is_empty();
             for (old_pk, old) in children {
                 if cancel() {
                     return Err(SqlError::Aborted);
@@ -1236,6 +1241,18 @@ pub(super) fn enforce_with_rows<'a>(
                     new,
                 });
             }
+            // PostgreSQL runs a parent-side NO ACTION check after SET DEFAULT,
+            // including when the resulting reference compares equal to the old one.
+            if recheck_default
+                && !constraint_lookup::exists(state, &parent, ref_columns, &old_key, cancel)?
+                && !constraint_lookup::matching_rows_typed(
+                    state, &child, columns, &old_key, &parent_types, cancel,
+                )?.is_empty()
+            {
+                return Err(still_referenced(
+                    state, &child, &parent, &constraint.name, &ref_positions, &old_key, false,
+                ));
+            }
         }
     }
     if let Some(load) = load.as_mut() {
@@ -1320,6 +1337,7 @@ pub(super) fn enforce_with_rows<'a>(
                         changed: &changed,
                         written,
                         parents: parent_details.get(&(constraint.id, *table_id)),
+                        deferred_children: false,
                     }), cancel)?;
             }
         }
@@ -1367,6 +1385,7 @@ impl Relational {
                         changed: &BTreeSet::new(),
                         written: &[],
                         parents: deferred.parent_details.get(&(*id, *table_id)),
+                        deferred_children: deferred.deferred(*id, &c.kind),
                     }),
                     &mut cancel,
                 )?;
@@ -1439,6 +1458,7 @@ impl Relational {
                             changed: &BTreeSet::new(),
                             written: &[],
                             parents: candidate.parent_details.get(&(*id, *table_id)),
+                            deferred_children: false,
                         }),
                         &mut cancel,
                     )?;
