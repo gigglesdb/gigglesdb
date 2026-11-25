@@ -1300,6 +1300,7 @@ fn query_values(
 ) -> R<Cached> {
     let lookup = correlated.then(|| correlation::Lookup::new(child, state, source, execution)).flatten();
     let source: &dyn scan::RowSource = lookup.as_ref().map_or(source, |lookup| lookup);
+    let _limits = execution.subquery_limits();
     match child.run(state, source, params, parameters, clock, execution) {
         Ok(rows) => {
             let metadata = if scalar {
@@ -1600,6 +1601,7 @@ fn promote(mut query: Query, next: &mut usize) -> Plan {
             })))
         };
         let right = join::From::Leaf {
+            derived: i == 0 && query.derived().is_some(),
             query: Box::new(leaf_plan),
             alias: source.alias,
             aliases: vec![],

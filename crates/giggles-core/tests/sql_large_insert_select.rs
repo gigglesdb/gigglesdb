@@ -139,3 +139,23 @@ fn materialized_source_and_late_failure_are_atomic() {
     drop(session);
     std::fs::remove_dir_all(path).unwrap();
 }
+
+#[test]
+fn materialized_insert_source_keeps_the_nested_query_row_limit() {
+    let (path, mut session) = fixture("large-insert-subquery");
+    session
+        .execute("CREATE TABLE t (id int PRIMARY KEY)", &[], None)
+        .unwrap();
+    let failed = session.execute(
+        "INSERT INTO t SELECT g FROM (SELECT g FROM generate_series(1, 70000) g ORDER BY g) s",
+        &[],
+        None,
+    );
+    assert_eq!(giggles_core::sqlstate(&failed.unwrap_err()), "54000");
+    assert_eq!(
+        session.execute("SELECT count(*) FROM t", &[], None).unwrap().rows[0].values,
+        vec![Int(0)]
+    );
+    drop(session);
+    std::fs::remove_dir_all(path).unwrap();
+}

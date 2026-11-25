@@ -545,3 +545,32 @@ fn trusted_consumer_refuses_equal_numbers_on_another_source_or_descriptor() {
         .consume_for(&state, &d, state.epoch, state.generation)
         .unwrap();
 }
+
+#[test]
+fn unrelated_wide_tables_do_not_exhaust_unique_readiness_work() {
+    let (mut state, mut descriptor) = fixture(vec![]);
+    descriptor.unique = true;
+    let tables = std::sync::Arc::make_mut(&mut state.tables);
+    for number in 0..7 {
+        let table_id = state.next_id;
+        let name = format!("wide{number}");
+        let columns = (1..=MAX_TABLE_COLUMNS)
+            .map(|index| ColumnDef {
+                id: table_id + index as u64,
+                name: format!("c{index}"),
+                data_type: DataType::BigInt,
+                not_null: index == 1,
+            })
+            .collect();
+        state.next_id += (MAX_TABLE_COLUMNS + 1) as u64;
+        state.rows.insert(table_id, Default::default());
+        tables.insert(name.clone(), TableDef {
+            id: table_id,
+            name,
+            columns,
+            primary_key: vec![0],
+        });
+    }
+    descriptor.id = state.next_id;
+    assert_eq!(result(&state, &descriptor).unwrap().rows, 0);
+}

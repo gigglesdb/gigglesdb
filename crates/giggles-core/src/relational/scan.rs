@@ -388,7 +388,9 @@ pub(crate) fn sort_bounded<T>(
 #[path = "scan_tests.rs"]
 mod tests;
 
-// Complex INSERT/CTAS sources and mutation output share a byte budget.
+// The write source execution ledger caps jointly retained operator and output
+// materialization at 384 MiB. Nested queries use their usual row, byte and
+// spill limits within that ceiling.
 pub(super) const WRITE_SOURCE_BYTES: usize = 384 * 1024 * 1024;
 
 thread_local! {
@@ -400,14 +402,44 @@ pub(super) fn write_source() -> bool {
 }
 
 pub(super) fn with_write_source<T>(f: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            WRITE_SOURCE.set(self.0);
-        }
-    }
-    let _restore = Restore(WRITE_SOURCE.replace(true));
+    let _mode = WriteSourceMode::enter(true);
     f()
+}
+
+pub(super) struct WriteSourceMode(bool);
+impl WriteSourceMode {
+    pub(super) fn enter(active: bool) -> Self {
+        Self(WRITE_SOURCE.replace(active))
+    }
+}
+impl Drop for WriteSourceMode {
+    fn drop(&mut self) {
+        WRITE_SOURCE.set(self.0);
+    }
+}
+
+/// Temporarily cap a nested query's additional retention on the shared ledger.
+pub(super) struct NestedRetention<'a> {
+    ledger: &'a std::cell::RefCell<Retention>,
+    cap: usize,
+    _mode: WriteSourceMode,
+}
+impl<'a> NestedRetention<'a> {
+    pub(super) fn enter(ledger: &'a std::cell::RefCell<Retention>) -> Option<Self> {
+        if !write_source() {
+            return None;
+        }
+        let mode = WriteSourceMode::enter(false);
+        let mut retention = ledger.borrow_mut();
+        let cap = retention.cap;
+        retention.cap = cap.min(retention.used.saturating_add(retention_limit()));
+        Some(Self { ledger, cap, _mode: mode })
+    }
+}
+impl Drop for NestedRetention<'_> {
+    fn drop(&mut self) {
+        self.ledger.borrow_mut().cap = self.cap;
+    }
 }
 
 // Cursor execution has an independent retention budget. Native Vec-returning

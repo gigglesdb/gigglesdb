@@ -1198,7 +1198,7 @@ impl Grouping {
         params: &[Value],
         execution: &Execution<'_>,
         exists: bool,
-        mut output: Output,
+        mut output: Output<'_>,
     ) -> R<SqlResult> {
         let mut cancel_impl = || execution.cancelled();
         let cancel = &mut cancel_impl;

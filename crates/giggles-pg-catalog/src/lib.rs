@@ -15,10 +15,14 @@
 //! Limits: 64 KiB SQL, 8192 flat tokens / 256 constructor tokens before parsing,
 //! parser recursion 64, expression nesting 48 / 4096 AST
 //! expressions, 32 sources and queries, 1664 projection columns, 256 parameters,
-//! 128 input tables / 64 columns each / 64 KiB total input names. Materialized
-//! operator results admit at most 8192 rows / 4 MiB conservative escaped bytes;
-//! execution also admits at most two million charged work units. Input values
-//! have a 4096-node / 16-level / 4 MiB limit. Exceeding a limit returns no result.
+//! Input tables may have up to 1600 columns each. Catalog intermediates allow
+//! 196608 rows and 384 MiB of owned rows for column metadata. Construction
+//! allows 640 MiB for column metadata to handle about 100 full-width tables,
+//! including the temporarily live sources of information_schema.columns.
+//! Queries reading column metadata have a 64 million work-unit allowance.
+//! Other queries allow two million work units. Projected results admit up to
+//! 8192 rows and 4 MiB of conservatively escaped bytes. Input values have a
+//! 4096-node / 16-level / 4 MiB limit. Exceeding a limit returns no result.
 //!
 //! This is a finite virtual catalog, not a PostgreSQL server: application types
 //! are the seventeen `ScalarType` variants. Catalog arrays, vectors, and rowtype
@@ -545,6 +549,10 @@ pub const MAX_TARGET_COLUMNS: usize = 1664;
 pub const MAX_ROWS: usize = 8192;
 pub const MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_WORK: usize = 2_000_000;
+const MAX_COLUMN_ROWS: usize = 192 * 1024;
+const MAX_COLUMN_BUILD_BYTES: usize = 640 * 1024 * 1024;
+const MAX_COLUMN_BYTES: usize = 384 * 1024 * 1024;
+const MAX_COLUMN_WORK: usize = 64_000_000;
 
 /// PostgreSQL xidin's unsigned 32-bit input, including signed compatibility,
 /// C-style hexadecimal/octal prefixes and surrounding ASCII whitespace.

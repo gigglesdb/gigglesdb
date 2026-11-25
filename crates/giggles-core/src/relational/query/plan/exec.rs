@@ -1,6 +1,6 @@
 use super::*;
 use bind::{input_state, order_column, order_scalar};
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::HashSet, hash::{Hash, Hasher}};
 
 /// Each materialized relation retains its allocation charges until its consumer finishes.
 pub(super) struct Relation<'a> {
@@ -24,15 +24,33 @@ impl<'a> Relation<'a> {
         if self.rows.len() >= scan::query_row_limit() {
             return Err(SqlError::Limit);
         }
-        self.scope.borrow().charge(
-            std::mem::size_of::<SqlRow>()
-                + row.values.len() * std::mem::size_of::<Value>()
-                + row.values.iter().map(value_bytes).sum::<usize>(),
-        )?;
+        self.scope.borrow().charge(row_retention_bytes(&row))?;
         self.rows.push(row);
         Ok(())
     }
 }
+fn row_retention_bytes(row: &SqlRow) -> usize {
+    std::mem::size_of::<SqlRow>()
+        + row.values.len() * std::mem::size_of::<Value>()
+        + row.values.iter().map(value_bytes).sum::<usize>()
+}
+
+#[derive(PartialEq, Eq)]
+struct IntegerSetRow(Vec<Value>);
+
+impl Hash for IntegerSetRow {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.len().hash(state);
+        for value in &self.0 {
+            match value {
+                Value::Null => None::<i64>.hash(state),
+                Value::Int(value) => Some(*value).hash(state),
+                _ => unreachable!("integer UNION has only integer columns"),
+            }
+        }
+    }
+}
+
 fn same_types(left: &[ColumnDef], right: &[ColumnDef]) -> bool {
     left.iter().zip(right).all(|(a, b)| a.data_type == b.data_type)
 }
@@ -249,8 +267,8 @@ impl Plan {
                         .input
                         .as_ref()
                         .map(|i| {
-                            i.query
-                                .run(state, source, params, parameters, clock, execution)
+                            let _limits = execution.subquery_limits();
+                            i.query.run(state, source, params, parameters, clock, execution)
                         })
                         .transpose()?;
                     let mut input_meta = select
@@ -437,18 +455,54 @@ impl Plan {
             },
         )?;
         // Integer equality has a single representation, so a homogeneous UNION
-        // can sort/deduplicate once. Other comparisons keep their stage-local
+        // can discard duplicates as each arm runs. Other comparisons keep their stage-local
         // types, collations and representative-selection rules.
         let integer_union = rest.len() > 1
             && rest.iter().all(|arm| arm.op == SetOp::Union && !arm.all)
             && stages[0].0.iter().all(|c| integer_type(&c.data_type))
             && stages.windows(2).all(|pair| same_types(&pair[0].0, &pair[1].0));
+        if integer_union {
+            let (columns, typmods, _) = stages.pop().expect("integer UNION has a set arm");
+            let mut out = Relation::new(columns, typmods, execution);
+            let mut distinct = HashSet::new();
+            // Account for the hash buckets as well as the final row vector.
+            const BUCKET_BYTES: usize = 2 * std::mem::size_of::<IntegerSetRow>();
+            let row_limit = scan::query_row_limit();
+            let mut first_input = Some(first.run(state, source, params, parameters, clock, execution)?);
+            for arm in rest {
+                let mut right = arm.plan.run(state, source, params, parameters, clock, execution)?;
+                if let Some(left) = &mut first_input {
+                    coerce_set_rows(left, &out.columns, clock, execution)?;
+                }
+                coerce_set_rows(&mut right, &out.columns, clock, execution)?;
+                let first_rows = first_input.iter_mut().flat_map(|input| input.rows.drain(..));
+                for row in first_rows.chain(right.rows) {
+                    execution.comparison()?;
+                    let bytes = row_retention_bytes(&row) + BUCKET_BYTES;
+                    if distinct.insert(IntegerSetRow(row.values)) {
+                        if distinct.len() > row_limit {
+                            return Err(SqlError::Limit);
+                        }
+                        out.scope.borrow().charge(bytes)?;
+                    }
+                }
+                first_input = None;
+            }
+            let bucket_bytes = distinct.len() * BUCKET_BYTES;
+            out.rows = distinct.into_iter().map(|IntegerSetRow(values)| SqlRow { values, version: 0 }).collect();
+            out.scope.borrow().release(bucket_bytes);
+            setops::sort(&mut out.rows, execution, |a, b| {
+                a.values.iter().zip(&b.values).map(|(a, b)| cmp(a, b))
+                    .find(|order| *order != Ordering::Equal).unwrap_or(Ordering::Equal)
+            })?;
+            return Ok(out);
+        }
         let mut left = first.run(state, source, params, parameters, clock, execution)?;
         for (arm, (columns, typmods, collations)) in rest.iter().zip(stages) {
             let mut right = arm.plan.run(state, source, params, parameters, clock, execution)?;
             coerce_set_rows(&mut left, &columns, clock, execution)?;
             coerce_set_rows(&mut right, &columns, clock, execution)?;
-            if arm.op == SetOp::Union && arm.all || integer_union {
+            if arm.op == SetOp::Union && arm.all {
                 for row in right.rows {
                     if execution.cancelled() {
                         return Err(SqlError::Aborted);
@@ -461,17 +515,6 @@ impl Plan {
                 let mut out = Relation::new(columns, typmods, execution);
                 setops::apply(arm.op, arm.all, left, right, &mut out, execution, &collations)?;
                 left = out;
-            }
-        }
-        if integer_union {
-            let compare = |a: &SqlRow, b: &SqlRow| {
-                a.values.iter().zip(&b.values).map(|(a, b)| cmp(a, b))
-                    .find(|order| *order != Ordering::Equal).unwrap_or(Ordering::Equal)
-            };
-            setops::sort(&mut left.rows, execution, compare)?;
-            left.rows.dedup_by(|a, b| compare(a, b) == Ordering::Equal);
-            for row in &mut left.rows {
-                row.version = 0;
             }
         }
         Ok(left)

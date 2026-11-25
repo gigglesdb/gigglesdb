@@ -990,7 +990,7 @@ mod tests {
             "-- empty\n;",
             "/* outer /* inner */ */; --done",
             "--quoted ';'",
-            "/* ðŸ¦€ */",
+            "/* 🦀 */",
         ] {
             assert_eq!(empty_sql(sql), Ok(true));
         }

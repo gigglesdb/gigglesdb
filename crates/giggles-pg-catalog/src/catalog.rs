@@ -1160,7 +1160,13 @@ pub(crate) fn build(
     snapshot: &CatalogSnapshot,
     requested: &BTreeSet<String>,
 ) -> R<Relations> {
-    build_with_budget(snapshot, requested, &mut Budget::default())
+    let mut budget = Budget::default();
+    if requested.contains("pg_attribute") || requested.contains("columns") {
+        // information_schema.columns is built while its pg_attribute source
+        // is still live. The construction budget covers both owned relations.
+        budget.byte_limit = MAX_COLUMN_BUILD_BYTES;
+    }
+    build_with_budget(snapshot, requested, &mut budget)
 }
 
 fn build_with_budget(

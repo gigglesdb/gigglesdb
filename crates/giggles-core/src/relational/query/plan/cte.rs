@@ -851,19 +851,22 @@ pub(super) fn run_inner<'e>(
             base: source,
             relations: materialized.iter().map(|(n, r)| (n.clone(), r)).collect(),
         };
-        let mut rows = if let Some(dml) = &cte.dml {
-            let (target, events) = writes.as_mut().ok_or(SqlError::Unsupported)?;
-            dml::execute(
-                dml, state, &catalog, &wrapper, target, events, params, parameters, clock,
-                execution,
-            )?
-        } else if cte.recursive {
-            recurse(
-                cte, &catalog, &wrapper, params, parameters, clock, execution,
-            )?
-        } else {
-            cte.query
-                .run(&catalog, &wrapper, params, parameters, clock, execution)?
+        let mut rows = {
+            let _limits = execution.subquery_limits();
+            if let Some(dml) = &cte.dml {
+                let (target, events) = writes.as_mut().ok_or(SqlError::Unsupported)?;
+                dml::execute(
+                    dml, state, &catalog, &wrapper, target, events, params, parameters, clock,
+                    execution,
+                )?
+            } else if cte.recursive {
+                recurse(
+                    cte, &catalog, &wrapper, params, parameters, clock, execution,
+                )?
+            } else {
+                cte.query
+                    .run(&catalog, &wrapper, params, parameters, clock, execution)?
+            }
         };
         if !cte.recursive {
             for (c, n) in rows.columns.iter_mut().zip(&cte.aliases) {

@@ -174,8 +174,8 @@ impl Drop for ValueBudget {
     fn drop(&mut self) { VALUE_LIMIT.with(|v| v.set(self.0)); WIDE_VALUES.with(|v| v.set(self.1)); }
 }
 /// Bound one projected row separately from cursor pages and result collectors.
-/// Keep room for one large value and per-field overhead, with the legacy
-/// projected-row allowance as a floor.
+/// Allow one maximum-sized value plus 32 bytes per target column (1664 at
+/// most), with the legacy projected-row allowance as a floor.
 pub(crate) fn max_projected_row_bytes(value_bytes: usize) -> usize {
     const LEGACY_PROJECTED_BYTES: usize = MAX_COLUMNS * (MAX_ROW_BYTES + 32);
     value_bytes

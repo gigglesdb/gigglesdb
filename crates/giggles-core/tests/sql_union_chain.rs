@@ -97,6 +97,16 @@ fn union_distinct_and_mixed_associativity() {
 
 #[cfg(feature = "engine-rocksdb")]
 #[test]
+fn duplicate_series_arms_keep_only_distinct_rows() {
+    let mut db = fixture();
+    let text = chain(3000, " UNION ", |_| {
+        "SELECT g FROM generate_series(1,1000) g".into()
+    });
+    assert_eq!(execute(&mut db, &text).unwrap(), (1..=1000).collect::<Vec<_>>());
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
 fn over_cap_returns_stack_depth_error() {
     let mut db = fixture();
     let text = chain(8193, " UNION ALL ", |i| format!("SELECT {i}"));

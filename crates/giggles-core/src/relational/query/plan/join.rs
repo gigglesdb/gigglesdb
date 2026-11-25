@@ -31,6 +31,7 @@ pub(super) enum From {
     Lateral(Box<From>),
     Leaf {
         query: Box<Plan>,
+        derived: bool,
         alias: String,
         aliases: Vec<String>,
     },
@@ -223,6 +224,7 @@ fn item(
             let alias = format!("\0unnamed_subquery_{next}");
             *next += 1;
             From::Leaf {
+                derived: true,
                 query: Box::new(parse::child_expression(inner, p.tokens.get(end), owner, depth, next)?),
                 alias,
                 aliases: vec![],
@@ -291,6 +293,7 @@ fn item(
         })));
     plan.decorations.sample = sample.map(Box::new);
     Ok(From::Leaf {
+        derived: false,
         query: Box::new(plan),
         alias,
         aliases,
@@ -678,6 +681,7 @@ impl From {
                 query,
                 alias,
                 aliases,
+                ..
             } => {
                 let meta = query.resolve(state, parameters)?;
                 let mut shape = leaf_shape(meta.columns, meta.typmods, alias, aliases)?;
@@ -1114,7 +1118,8 @@ impl From {
         } = self
         else {
             return match self {
-                Self::Leaf { query, .. } => {
+                Self::Leaf { query, derived, .. } => {
+                    let _limits = if *derived { execution.subquery_limits() } else { None };
                     query.run(state, source, params, parameters, clock, execution)
                 }
                 Self::Function { function, .. } => {

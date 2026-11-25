@@ -382,7 +382,10 @@ impl Function {
         let mut evaluated = self
             .input
             .as_ref()
-            .map(|p| p.run(state, source, params, parameters, clock, execution))
+            .map(|p| {
+                let _limits = execution.subquery_limits();
+                p.run(state, source, params, parameters, clock, execution)
+            })
             .transpose()?;
         let mut regex_args = regexp::set_type(&self.name)
             .map(|_| self.regex_args(state, &mut parameters.to_vec()))

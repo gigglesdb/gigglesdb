@@ -1712,8 +1712,18 @@ impl<'a> Execution<'a> {
     }
 }
 impl Execution<'_> {
+    fn subquery_limits(&self) -> Option<scan::NestedRetention<'_>> {
+        scan::NestedRetention::enter(&self.retention)
+    }
+
     /// Run a derived-table or IN child, taking its spill-backed v2 result.
     pub(super) fn capture_subquery(&self, f: impl FnOnce() -> R<SqlResult>)
+        -> R<(SqlResult, Option<spill::Store<SqlRow>>)> {
+        let _limits = self.subquery_limits();
+        self.capture_rows(f)
+    }
+
+    fn capture_rows(&self, f: impl FnOnce() -> R<SqlResult>)
         -> R<(SqlResult, Option<spill::Store<SqlRow>>)> {
         self.capture.set(true);
         let result = f();
@@ -5087,26 +5097,26 @@ fn charge_projected(bytes: &mut usize, value: &Value) -> R<()> {
 }
 /// Where SELECT rows go: the capped in-memory result, a v2 SqlSession
 /// statement's spilled output (tuplestore), or a captured v2 subquery store.
-enum Output {
+enum Output<'a> {
     Capped(usize),
-    WriteMaterialized(scan::Retention),
+    WriteMaterialized(RetentionScope<'a>),
     Statement(spill::RowBuffer),
-    Capture(spill::Store<SqlRow>, Option<scan::Retention>),
+    Capture(spill::Store<SqlRow>, Option<RetentionScope<'a>>),
     WriteRows,
 }
-impl Output {
-    fn new(v2: bool, subquery: bool, insert_source: bool, capture: bool, execution: &Execution<'_>) -> R<Self> {
+impl<'a> Output<'a> {
+    fn new(v2: bool, subquery: bool, insert_source: bool, capture: bool, execution: &'a Execution<'_>) -> R<Self> {
         Ok(if insert_source && execution.write_rows.is_some() {
             Self::WriteRows
         } else if v2 && capture {
             Self::Capture(
                 spill::Store::new(),
-                scan::write_source().then(|| scan::Retention::new(scan::WRITE_SOURCE_BYTES)),
+                scan::write_source().then(|| RetentionScope::new(execution)),
             )
         } else if v2 && !subquery && !insert_source && spill::armed() {
             Self::Statement(spill::RowBuffer::new(Vec::new()).map_err(spill::sql_error)?)
         } else if scan::write_source() {
-            Self::WriteMaterialized(scan::Retention::new(scan::WRITE_SOURCE_BYTES))
+            Self::WriteMaterialized(RetentionScope::new(execution))
         } else {
             Self::Capped(0)
         })
@@ -5122,7 +5132,7 @@ impl Output {
                 Ok(())
             }
             Self::WriteMaterialized(retention) => {
-                retention.charge(searched::retained_row_bytes(&[], &row)?)?;
+                retention.borrow().charge(searched::retained_row_bytes(&[], &row)?)?;
                 result.rows.push(row);
                 Ok(())
             }
@@ -5131,7 +5141,7 @@ impl Output {
             Self::Capture(store, retention) => {
                 let bytes = searched::retained_row_bytes(&[], &row)?;
                 if let Some(retention) = retention {
-                    retention.charge(bytes)?;
+                    retention.borrow().charge(bytes)?;
                 }
                 store.push(row, bytes)
             }
@@ -5790,7 +5800,7 @@ impl BoundQuery<'_> {
         declared: &[Option<DataType>],
     ) -> R<(SqlResult, Option<spill::Store<SqlRow>>)> {
         let execution = Execution::new(cancel, declared);
-        execution.capture_subquery(|| {
+        execution.capture_rows(|| {
             self.execute_context(state, source, params, declared, &execution, false, true)
         })
     }

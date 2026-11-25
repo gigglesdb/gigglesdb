@@ -715,3 +715,54 @@ fn postgres18_collation_and_replica_identity_catalog_values() {
         ]
     );
 }
+
+#[test]
+fn psql_describes_a_full_width_table_and_information_schema_counts_six() {
+    let mut snapshot = CatalogSnapshot::default();
+    for table in 1..=6 {
+        snapshot.tables.push(TableDef {
+            id: table,
+            name: if table == 1 { "wide".into() } else { format!("wide{table}") },
+            columns: (1..=1600)
+                .map(|column| ColumnDef {
+                    id: 1600 * table + column,
+                    name: format!("c{column}"),
+                    data_type: ScalarType::Integer,
+                    not_null: column == 1,
+                })
+                .collect(),
+            primary_key: vec![0],
+        });
+    }
+    let run = |sql: &str| {
+        execute(&plan(sql).unwrap().unwrap(), &snapshot, &[])
+            .unwrap_or_else(|error| panic!("{error:?}: {sql}"))
+            .rows
+    };
+    let queries = include_str!("fixtures/psql18_describe_queries.sql")
+        .split("-- query ")
+        .skip(5)
+        .take(11)
+        .map(|block| block.split_once('\n').unwrap().1);
+    let lookup = run("SELECT oid FROM pg_catalog.pg_class WHERE relname = 'wide'");
+    let Value::Int(oid) = lookup[0][0] else { panic!("expected an OID") };
+    for (i, query) in queries.enumerate() {
+        let rows = run(&query.replace("r0g_t", "wide").replace("16384", &oid.to_string()));
+        match i {
+            0 => assert_eq!(rows, vec![vec![
+                Value::Int(oid), Value::Text("public".into()), Value::Text("wide".into()),
+            ]]),
+            1 | 3 => assert_eq!(rows.len(), 1),
+            2 => {
+                assert_eq!(rows.len(), 1600);
+                assert_eq!(rows[0][0], Value::Text("c1".into()));
+                assert_eq!(rows[1599][0], Value::Text("c1600".into()));
+            }
+            _ => assert!(rows.is_empty()),
+        }
+    }
+    assert_eq!(
+        run("SELECT count(*) FROM information_schema.columns WHERE table_name LIKE 'wide%'"),
+        vec![vec![Value::Int(9600)]],
+    );
+}

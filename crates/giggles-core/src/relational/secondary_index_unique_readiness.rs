@@ -200,20 +200,9 @@ fn metadata<'a, F: FnMut() -> bool>(
     if state.rows.len() != state.tables.len() {
         return Err(SqlError::Type);
     }
-    // All shapes admitted. Reserve bounded worst-case ID/name comparisons and
-    // scans independently of row count; no empty-table bypass.
-    let slots = state.tables.values().try_fold(0, |total, table| {
-        add(total, table.columns.len().max(MAX_COLUMNS) + 1)
-    })?;
-    meter.work(mul(mul(slots, slots)?, 2)?)?;
-    meter.work(mul(
-        state.tables.values().try_fold(0, |total, table| {
-            let width = table.columns.len().max(MAX_COLUMNS);
-            add(total, mul(width, width)?)
-        })?,
-        si::MAX_NAME,
-    )?)?;
-    let mut ids = Vec::new();
+    // Validate catalog-wide IDs and table-local names in one pass. Only the
+    // selected table needs repeated column scans for descriptor keys.
+    let mut ids = std::collections::HashSet::new();
     let mut selected = None;
     for (name, t) in state.tables.iter() {
         meter.checkpoint()?;
@@ -222,26 +211,27 @@ fn metadata<'a, F: FnMut() -> bool>(
         if name != &state.table_key(t)
             || t.id == 0
             || t.id >= state.next_id
-            || ids.contains(&t.id)
+            || !ids.insert(t.id)
             || t.columns.is_empty()
             || t.primary_key.is_empty()
             || !state.rows.contains_key(&t.id)
         {
             return Err(SqlError::Type);
         }
-        ids.push(t.id);
+        let mut names = std::collections::HashSet::new();
         for (i, c) in t.columns.iter().enumerate() {
             meter.checkpoint()?;
             t.validate_column_ident(i)?;
             if c.id == 0
                 || c.id >= state.next_id
-                || ids.contains(&c.id)
-                || t.columns[..i].iter().any(|p| p.name == c.name)
+                || !ids.insert(c.id)
+                || !names.insert(&c.name)
             {
                 return Err(SqlError::Type);
             }
-            ids.push(c.id);
+            meter.work(add(2, c.name.len())?)?;
         }
+        meter.work(mul(t.primary_key.len(), t.primary_key.len())?)?;
         for (j, p) in t.primary_key.iter().enumerate() {
             if *p >= t.columns.len() || !t.columns[*p].not_null {
                 return Err(SqlError::Null);
@@ -263,6 +253,8 @@ fn metadata<'a, F: FnMut() -> bool>(
     {
         return Err(SqlError::Type);
     }
+    meter.work(mul(mul(t.columns.len(), d.columns.len())?, 2)?)?;
+    meter.work(mul(d.columns.len(), d.columns.len())?)?;
     schema_binding::validate_key(&d.name)?;
     for p in &t.primary_key {
         let ty = &t.columns[*p].data_type;

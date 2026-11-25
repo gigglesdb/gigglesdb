@@ -137,6 +137,43 @@ async fn prepared_insert_and_read_of_three_hundred_columns() {
     assert_eq!(error.code().code(), "54011");
     assert_eq!(error.message(), "tables can have at most 1600 columns");
 
+    let columns = (1..=1600)
+        .map(|i| format!("c{i} int"))
+        .collect::<Vec<_>>()
+        .join(",");
+    client
+        .batch_execute(&format!("CREATE TABLE describe_wide ({columns})"))
+        .await
+        .unwrap();
+    let oid: u32 = client
+        .query_one("SELECT oid FROM pg_catalog.pg_class WHERE relname = 'describe_wide'", &[])
+        .await
+        .unwrap()
+        .get(0);
+    // psql 18's column query for a named table, with the relation OID bound.
+    let attributes = client.query(
+        "SELECT a.attname,
+          pg_catalog.format_type(a.atttypid, a.atttypmod),
+          (SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid, true)
+           FROM pg_catalog.pg_attrdef d
+           WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum AND a.atthasdef),
+          a.attnotnull,
+          (SELECT c.collname FROM pg_catalog.pg_collation c, pg_catalog.pg_type t
+           WHERE c.oid = a.attcollation AND t.oid = a.atttypid AND a.attcollation <> t.typcollation)
+           AS attcollation,
+          a.attidentity,
+          a.attgenerated
+        FROM pg_catalog.pg_attribute a
+        WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum",
+        &[&oid],
+    ).await.unwrap();
+    assert_eq!(attributes.len(), 1600);
+    for (index, row) in attributes.iter().enumerate() {
+        assert_eq!(row.get::<_, &str>(0), format!("c{}", index + 1));
+        assert_eq!(row.get::<_, &str>(1), "integer");
+    }
+
     drop(client);
     connection.await.unwrap().unwrap();
     running.shutdown().await.unwrap();

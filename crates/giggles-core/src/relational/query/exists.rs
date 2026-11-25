@@ -213,7 +213,10 @@ impl Execution<'_> {
             .checked_mul(2).ok_or(SqlError::Limit)? + std::mem::size_of::<Vec<Vec<Value>>>();
         self.retention.borrow_mut().charge(bytes)?;
         self.frames.borrow_mut().push(row.values.clone());
-        let result = child.exists(state, source, params, self);
+        let result = {
+            let _limits = self.subquery_limits();
+            child.exists(state, source, params, self)
+        };
         self.frames.borrow_mut().pop();
         self.retention.borrow_mut().release(bytes);
         let value = result?;

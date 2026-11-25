@@ -979,7 +979,10 @@ pub fn execute_with_startup(
             },
         );
     }
+    let column_metadata = plan.catalog_relations.contains("pg_attribute")
+        || plan.catalog_relations.contains("columns");
     let mut rt = Runtime {
+        column_metadata,
         catalogs: &catalogs,
         snapshot,
         startup,
@@ -3793,6 +3796,7 @@ fn collect_inputs(q: &Query, types: &mut [Option<PgType>], catalogs: &mut BTreeS
 }
 
 struct Runtime<'a> {
+    column_metadata: bool,
     snapshot: &'a CatalogSnapshot,
     startup: Option<i64>,
     catalogs: &'a BTreeMap<String, catalog::Relation>,
@@ -3805,7 +3809,7 @@ pub(crate) fn evaluate_privilege(name: &str, values: &[Value], effective_role: &
     validate_values(values)?;
     let requested = introspection::dependencies(name, values.len()).iter().map(|n| (*n).to_owned()).collect();
     let catalogs = catalog::build(snapshot, &requested)?;
-    let mut rt = Runtime { snapshot, startup:None, catalogs:&catalogs, parameters:&[],work:0,recursive_rows:BTreeMap::new(), introspection: introspection::Lookups::default() };
+    let mut rt = Runtime { column_metadata: false, snapshot, startup:None, catalogs:&catalogs, parameters:&[],work:0,recursive_rows:BTreeMap::new(), introspection: introspection::Lookups::default() };
     match privilege_inquiry::evaluate(&mut rt,name,values,effective_role)? {
         Value::Null=>Ok(None),Value::Bool(b)=>Ok(Some(b)),_=>Err(Error::Type),
     }
@@ -3819,11 +3823,16 @@ fn admit(rows: &[Vec<Value>], row: &[Value], bytes: &mut usize) -> R<()> {
         Ok(())
     }
 }
-fn admit_catalog_intermediate(rows: &[Vec<Value>], row: &[Value], bytes: &mut usize) -> R<()> {
-    const MAX_CATALOG_INTERMEDIATE_ROWS: usize = 65_536;
-    const MAX_CATALOG_INTERMEDIATE_BYTES: usize = 64 * 1024 * 1024;
+fn admit_catalog_intermediate(
+    rows: &[Vec<Value>], row: &[Value], bytes: &mut usize, column_metadata: bool,
+) -> R<()> {
+    let (row_limit, byte_limit) = if column_metadata {
+        (MAX_COLUMN_ROWS, MAX_COLUMN_BYTES)
+    } else {
+        (65_536, 64 * 1024 * 1024)
+    };
     *bytes = bytes.checked_add(catalog::row_bytes(row)).ok_or(Error::Limit)?;
-    if rows.len() >= MAX_CATALOG_INTERMEDIATE_ROWS || *bytes > MAX_CATALOG_INTERMEDIATE_BYTES {
+    if rows.len() >= row_limit || *bytes > byte_limit {
         return Err(Error::Limit);
     }
     Ok(())
@@ -3889,7 +3898,8 @@ fn text(v: Value) -> R<String> {
 impl Runtime<'_> {
     fn charge(&mut self, n: usize) -> R<()> {
         self.work = self.work.checked_add(n).ok_or(Error::Limit)?;
-        if self.work > MAX_WORK {
+        let work_limit = if self.column_metadata { MAX_COLUMN_WORK } else { MAX_WORK };
+        if self.work > work_limit {
             Err(Error::Limit)
         } else {
             Ok(())
@@ -3985,7 +3995,7 @@ impl Runtime<'_> {
                 let mut bytes = 0;
                 for row in rows {
                     if boolean(self.eval(filter, &row, None, 0, &[], None)?)? == Some(true) {
-                        admit_catalog_intermediate(&out, &row, &mut bytes)?;
+                        admit_catalog_intermediate(&out, &row, &mut bytes, self.column_metadata)?;
                         out.push(row);
                     }
                 }
@@ -4090,7 +4100,14 @@ impl Runtime<'_> {
                         }
                     }
                 }
-                let admit_join = if indexed.is_some() { admit_catalog_intermediate } else { admit };
+                let column_metadata = self.column_metadata;
+                let admit_join = |rows: &[Vec<Value>], row: &[Value], bytes: &mut usize| {
+                    if indexed.is_some() {
+                        admit_catalog_intermediate(rows, row, bytes, column_metadata)
+                    } else {
+                        admit(rows, row, bytes)
+                    }
+                };
                 let mut out = vec![];
                 let mut bytes = 0;
                 for l in &ls {
@@ -4173,7 +4190,7 @@ impl Runtime<'_> {
             }
             row.extend_from_slice(outer);
             if boolean(self.eval(filter, &row, None, 0, &[], None)?)? == Some(true) {
-                admit_catalog_intermediate(&filtered, &row, &mut bytes)?;
+                admit_catalog_intermediate(&filtered, &row, &mut bytes, self.column_metadata)?;
                 filtered.push(row)
             }
         }

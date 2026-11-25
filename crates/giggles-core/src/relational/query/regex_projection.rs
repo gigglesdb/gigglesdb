@@ -10,7 +10,7 @@ impl BoundQuery<'_> {
         params: &[Value],
         page: scan::Page,
         execution: &Execution<'_>,
-        mut output: Output,
+        mut output: Output<'_>,
         mut result: SqlResult,
     ) -> R<SqlResult> {
         let order_slots = self.set_order.as_ref().expect("set-returning projection");
