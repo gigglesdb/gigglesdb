@@ -250,7 +250,7 @@ fn durable_release_excludes_pending_sequence_without_catalog_writes() {
         run(&mut session, sql);
     }
     assert!(session.v2_transaction.as_ref().unwrap().local_durable_tail_eligible());
-    assert!(!session.pending_sequences.lock().unwrap().is_empty());
+    assert!(!session.v2_pending_sequences.lock().unwrap().is_empty());
 
     let context = crate::Cancellation::default();
     let _registration = context.register_durability_wait(|_, _| panic!("pending sequence released admission"));

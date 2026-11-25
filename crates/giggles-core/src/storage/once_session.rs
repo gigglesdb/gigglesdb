@@ -61,8 +61,6 @@ impl SqlSession {
                     }
                 });
                 let mut guard = guard?;
-                self.sequence_baseline = db.catalog().snapshot(guard.transaction())?
-                    .parts.ext.sequences.iter().map(|(&id, def)| (id, def.incarnation)).collect();
                 let presence = Kernel::probe(guard.transaction())?;
                 let domain = u128::from_be_bytes(db.meta.domain);
                 let (before, image) = if !presence.metadata {

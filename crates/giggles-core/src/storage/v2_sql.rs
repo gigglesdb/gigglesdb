@@ -94,18 +94,7 @@ impl SqlSession {
         }
         let mut token = [0u8; 16];
         getrandom::fill(&mut token).map_err(io)?;
-        let mut txn = db.begin(Isolation::ReadCommitted);
-        self.sequence_baseline = db
-            .catalog()
-            .snapshot(&mut txn)?
-            .parts.ext
-            .sequences
-            .iter()
-            .map(|(&id, def)| (id, def.incarnation))
-            .collect();
-        // The baseline read used a READ COMMITTED snapshot; the
-        // requested level takes its own at the first statement.
-        txn.set_isolation(self.isolation.engine())?;
+        let mut txn = db.begin(self.isolation.engine());
         inner
             .sql_transactions
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -160,13 +149,13 @@ impl SqlSession {
             None => *inner.crash.lock().map_err(|_| CoreError::Fenced)?,
         };
         let eligible = txn.local_durable_tail_eligible()
-            && self.pending_sequences.lock().map_err(|_| CoreError::Fenced)?.is_empty();
+            && self.v2_pending_sequences.lock().map_err(|_| CoreError::Fenced)?.is_empty();
         let committed = (|| {
             // Settlement can wait for a sequence slot or durable reservation.
             // Finish it before publishing both statements and transaction blocks.
             sql_sequences::settle(db, &self.sequence_unsettled)?;
             if explicit {
-                sql_sequences::stage_pending(db, &mut txn, &self.pending_sequences)?;
+                sql_sequences::stage_pending(db, &mut txn, &self.v2_pending_sequences)?;
             }
             let mut release_admission = || ticket.release();
             commit_sql(db, txn, point, eligible.then_some(&mut release_admission))?;
@@ -190,11 +179,12 @@ impl SqlSession {
         // Pending incarnations enter the live cache only after durable ack.
         // A session finding no live entry may already have loaded and advanced
         // the durable counter. Keep any such same-incarnation entry.
-        for (id, counter) in self.pending_sequences
+        for ((id, _), entry) in self.v2_pending_sequences
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
         {
+            let counter = &entry.counter;
             let slot = {
                 let mut live = db.sql_counters.lock().map_err(|_| CoreError::Fenced)?;
                 live.entry(*id).or_default().clone()
@@ -306,8 +296,8 @@ impl SqlSession {
     ) -> Result<relational::clock::SequenceCallback, CoreError> {
         let guard = sql_sequences::Guard::new(&self.sequence_authority, self.admin.roles(),
             self.v2_transaction.as_ref(), &image);
-        Ok(sql_sequences::callback(CallbackLease::new(db, self.v2_transaction.as_ref()), image, self.sequence_baseline.clone(),
-            self.pending_sequences.clone(), self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone(),
+        Ok(sql_sequences::callback(CallbackLease::new(db, self.v2_transaction.as_ref()), image,
+            self.v2_pending_sequences.clone(), self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone(),
             Arc::new(guard), false))
     }
 
@@ -430,7 +420,7 @@ impl SqlSession {
             let guard = sql_sequences::Guard::new(&self.sequence_authority, self.admin.roles(),
                 self.v2_transaction.as_ref(), &image);
             let callback = sql_sequences::callback(CallbackLease::new(db, self.v2_transaction.as_ref()), image.clone(),
-                self.sequence_baseline.clone(), self.pending_sequences.clone(),
+                self.v2_pending_sequences.clone(),
                 self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone(), Arc::new(guard), false);
             let allowed = self.sequence_tables.clone();
             let path = self.search_path.clone();
@@ -594,28 +584,45 @@ impl SqlSession {
                                 if self.v2_savepoints.len() >= 64 {
                                     return Err(CoreError::Sql(E::Limit));
                                 }
+                                // Capture only sequence versions in the in-memory overlay.
+                                // Committed predecessors are already rollback targets.
+                                let mut sequence_incarnations = BTreeMap::new();
+                                use engine::catalog_codec::{CatalogKind, classify_catalog_key, decode_sequence};
+                                for (key, value) in txn.catalog_writes() {
+                                    if let Some(value) = value
+                                        && matches!(classify_catalog_key(key), Ok(CatalogKind::Sequence))
+                                    {
+                                        let id = u64::from_be_bytes(key[1..].try_into().unwrap());
+                                        sequence_incarnations.insert(id, decode_sequence(value)?.incarnation);
+                                    }
+                                }
                                 self.copy_freeze.push(Default::default());
-                                self.v2_savepoints.push((
-                                    name.to_owned(),
-                                    txn.savepoint(),
-                                    self.deferral.clone(),
-                                    self.enum_transaction.clone(),
-                                ));
+                                self.v2_savepoints.push(V2SavepointState {
+                                    name: name.to_owned(),
+                                    mark: txn.savepoint(),
+                                    sequence_incarnations,
+                                    sequence_restore: Arc::new(()),
+                                    deferral: self.deferral.clone(),
+                                    enum_transaction: self.enum_transaction.clone(),
+                                    sequence_copy_leases: self.v2_sequence_copy_leases.clone(),
+                                });
                             } else {
                                 let index = self
                                     .v2_savepoints
                                     .iter()
-                                    .rposition(|(saved, ..)| saved == name)
+                                    .rposition(|saved| saved.name == name)
                                     .ok_or(CoreError::Sql(E::InvalidSavepoint))?;
-                                let mark = self.v2_savepoints[index].1.clone();
+                                let saved = &self.v2_savepoints[index];
+                                let mark = saved.mark.clone();
                                 if control == "release" {
                                     txn.release(mark)?;
                                     self.release_copy_freeze(index);
                                     self.v2_savepoints.truncate(index);
                                 } else {
                                     txn.rollback_to_releasing_locks(&mark)?;
-                                    self.deferral = self.v2_savepoints[index].2.clone();
-                                    self.enum_transaction = self.v2_savepoints[index].3.clone();
+                                    self.deferral = saved.deferral.clone();
+                                    self.enum_transaction = saved.enum_transaction.clone();
+                                    self.v2_sequence_copy_leases = saved.sequence_copy_leases.clone();
                                     self.rollback_copy_freeze(index);
                                     self.v2_savepoints.truncate(index + 1);
                                     self.aborted = false;
@@ -661,6 +668,7 @@ impl SqlSession {
                         txn.begin_statement();
                     }
                     let mut freeze_marks = Vec::new();
+                    let mut sequence_copy_lease = None;
                     let mark = txn.statement_savepoint();
                     let result = (|| {
                         let catalog_lock_mode = if ddl {
@@ -1130,8 +1138,7 @@ impl SqlSession {
                             clock.with_sequences(sql_sequences::callback(
                                 CallbackLease::new(db, Some(txn)),
                                 catalog_image.clone(),
-                                self.sequence_baseline.clone(),
-                                self.pending_sequences.clone(),
+                                self.v2_pending_sequences.clone(),
                                 self.sequence_values.clone(),
                                 self.sequence_unsettled.clone(),
                                 self.search_path.clone(),
@@ -1284,13 +1291,62 @@ impl SqlSession {
                         // seed separately, using the bound name and post-DDL START.
                         let restart_seed = bound.sequence_restart_seed(&image);
                         let (tables, ext, next_id, _) = image.catalog_parts();
-                        if p.truncate_restarts_identity() || restart_seed.is_some() {
-                            let mut values =
-                                self.sequence_values.lock().map_err(|_| CoreError::Fenced)?;
+                        let mut predecessor = None;
+                        let mut sequence_seed = restart_seed.map(|(id, value)| {
+                            let mut counter = sequences::fresh(&ext.sequences[&id]);
+                            counter.last_value = value;
+                            counter.log_hw = value;
+                            (id, counter)
+                        });
+                        let copy_sequence = bound.sequence_copies_counter();
+                        if p.truncate_restarts_identity() || sequence_seed.is_some() || copy_sequence {
                             for (&id, definition) in &ext.sequences {
                                 if let Some(before) = old.ext.sequences.get(&id)
                                     && before.incarnation != definition.incarnation
                                 {
+                                    if copy_sequence {
+                                        let source = if let Some((source, lease)) =
+                                            sql_sequences::reserve_copy(db, id, before)?
+                                        {
+                                            sequence_copy_lease = Some((id, lease));
+                                            Some((source, sql_sequences::RewriteRestore::Committed))
+                                        } else {
+                                            if txn.catalog_own(&engine::catalog_codec::sequence_key(id)).is_none() {
+                                                return Err(CoreError::Sql(E::Conflict));
+                                            }
+                                            let restore = self.v2_savepoints.iter().find(|saved| {
+                                                saved.sequence_incarnations.get(&id) == Some(&before.incarnation)
+                                            }).map_or(sql_sequences::RewriteRestore::Unreachable, |saved| {
+                                                sql_sequences::RewriteRestore::Savepoint(Arc::downgrade(&saved.sequence_restore))
+                                            });
+                                            let mut pending = self.v2_pending_sequences.lock().map_err(|_| CoreError::Fenced)?;
+                                            let key = (id, before.incarnation);
+                                            let source = if db.cluster_services().is_some() {
+                                                // An untouched private definition has no counter to publish.
+                                                pending.get(&key)
+                                            } else {
+                                                Some(&*pending.entry(key).or_insert_with(|| sql_sequences::PendingCounter {
+                                                    counter: sequences::fresh(before),
+                                                    predecessor: None,
+                                                }))
+                                            };
+                                            source.map(|entry| (entry.counter.clone(), restore))
+                                        };
+                                        if let Some((mut source, restore)) = source {
+                                            predecessor = Some(sql_sequences::RewritePredecessor {
+                                                definition: before.clone(),
+                                                restore,
+                                            });
+                                            bound.validate_sequence_current(&image, |_| Some(source.last_value))
+                                                .map_err(CoreError::Sql)?;
+                                            // The lease makes last_value the end of all old draws.
+                                            // Recovery already uses log_hw if no live counter exists.
+                                            source.incarnation = definition.incarnation;
+                                            source.log_hw = source.last_value;
+                                            source.stamp = 0;
+                                            sequence_seed = Some((id, source));
+                                        }
+                                    }
                                     // The existing sequence key codec binds counters to an
                                     // incarnation. Retire the old reservation in the same
                                     // transaction so reopen never loads it against the new definition.
@@ -1298,11 +1354,6 @@ impl SqlSession {
                                         id,
                                         before.incarnation,
                                     ))?;
-                                    if let Some(value) =
-                                        values.current.get(&(id, before.incarnation)).copied()
-                                    {
-                                        values.current.insert((id, definition.incarnation), value);
-                                    }
                                 }
                             }
                         }
@@ -1358,22 +1409,16 @@ impl SqlSession {
                             crate::cancellation::check().is_err()
                         })?;
                         roles::engine::assign_created(txn, old, &new, self.ddl_owner.as_deref())?;
-                        if let Some((id, value)) = restart_seed {
+                        if let Some((id, counter)) = sequence_seed {
                             let definition = &new.ext.sequences[&id];
-                            let counter = sequences::SeqCounter {
-                                incarnation: definition.incarnation,
-                                last_value: value,
-                                is_called: false,
-                                log_hw: value,
-                                stamp: 0,
-                            };
-                            if self.transaction_id.is_some() {
-                                // Keep just the final incarnation until COMMIT: repeated
-                                // RESTARTs must not stage counters for superseded definitions.
-                                self.pending_sequences
+                            if explicit {
+                                // Savepoints may restore an earlier private incarnation.
+                                self.v2_pending_sequences
                                     .lock()
                                     .map_err(|_| CoreError::Fenced)?
-                                    .insert(id, counter);
+                                    .insert((id, counter.incarnation), sql_sequences::PendingCounter {
+                                        counter, predecessor,
+                                    });
                             } else {
                                 txn.put_counter(
                                     engine::catalog_codec::counter_key(id, definition.incarnation),
@@ -1399,6 +1444,7 @@ impl SqlSession {
                         }
                     }
                     if explicit && result.is_ok() {
+                        self.v2_sequence_copy_leases.extend(sequence_copy_lease);
                         self.enum_transaction = enum_scope.changes();
                         self.copy_freeze.last_mut().unwrap().extend(freeze_marks);
                     }

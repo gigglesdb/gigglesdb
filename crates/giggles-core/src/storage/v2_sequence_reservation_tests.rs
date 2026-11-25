@@ -534,16 +534,9 @@ fn cached_callback_observes_drop_and_restart() {
     ] {
         run(&mut s1, "CREATE SEQUENCE freshness");
         let image = db.metadata_state(None).unwrap().sql;
-        let baseline = image
-            .catalog_ext()
-            .sequences
-            .iter()
-            .map(|(id, def)| (*id, def.incarnation))
-            .collect();
         let cb = callback(
             db.child(Holder::Sequence).unwrap(),
             Arc::new(image),
-            baseline,
             Default::default(),
             Default::default(),
             vec!["public".into()],
@@ -553,9 +546,10 @@ fn cached_callback_observes_drop_and_restart() {
             Value::Int(1)
         );
         run(&mut s2, ddl);
+        let expected = if ddl.starts_with("ALTER") { SqlError::Conflict } else { SqlError::UnknownTable };
         assert_eq!(
             cb("nextval", "freshness", None, false, relational::clock::SequenceOrigin::Call),
-            Err(CoreError::Sql(SqlError::UnknownTable))
+            Err(CoreError::Sql(expected))
         );
         if ddl.starts_with("ALTER") {
             assert_eq!(scalar(&mut s1, "SELECT nextval('freshness')"), 700);
@@ -884,7 +878,7 @@ fn stale_image_nextval_does_not_clobber_restarted_slot() {
     // Bypass the callback's freshness check to exercise the install guard itself.
     assert_eq!(
         committed_value(&db, &slot, id, def, "nextval", None, false),
-        Err(CoreError::Sql(SqlError::UnknownTable))
+        Err(CoreError::Sql(SqlError::Conflict))
     );
     assert_eq!(slot.counter.lock().unwrap().counter.as_ref().unwrap().incarnation, incarnation);
     assert_eq!(scalar(&mut s, "SELECT nextval('stale_slot')"), 1000);
@@ -1204,11 +1198,11 @@ fn deferred_coverage_survives_a_durable_backwards_install() {
 #[cfg(feature = "engine-rocksdb")]
 fn callback(
     db: EngineLease, image: Arc<relational::Relational>,
-    baseline: BTreeMap<u64, u128>, pending: sequences::Pending,
+    pending: Pending,
     values: sequences::SessionValues, search_path: Vec<String>,
 ) -> relational::clock::SequenceCallback {
     let unsettled = Unsettled::default();
-    let callback = super::callback(db.child(Holder::Sequence).unwrap(), image, baseline, pending, values, unsettled.clone(), search_path,
+    let callback = super::callback(db.child(Holder::Sequence).unwrap(), image, pending, values, unsettled.clone(), search_path,
         Arc::new(super::Guard::unrestricted()), false);
     Arc::new(move |operation, name, value, called, origin| {
         let result = callback(operation, name, value, called, origin);
@@ -1865,11 +1859,11 @@ mod default_memo_tests {
         reader.v2_transaction.as_mut().unwrap().snapshot_ts();
         run(&mut writer, "ALTER SEQUENCE restarted_id_seq RESTART WITH 700");
 
-        // The snapshot resolves the old incarnation, which the latest catalog rejects.
+        // The snapshot resolves the old incarnation; the latest catalog requires a retry.
         let before = SEQUENCE_RESOLUTIONS.get();
         assert_eq!(reader.execute_at(
             "INSERT INTO restarted (payload) VALUES (1), (2)", &[], None, &clock(),
-        ), Err(CoreError::Sql(SqlError::UnknownTable)));
+        ), Err(CoreError::Sql(SqlError::Conflict)));
         assert_eq!(resolutions_since(before), [1, 0, 0]);
         run(&mut reader, "ROLLBACK");
         assert_eq!(scalar(&mut writer, "SELECT count(*) FROM restarted"), 0);
@@ -1962,14 +1956,10 @@ mod default_memo_tests {
 
         let db = f.admin.as_ref().unwrap().test_v2();
         let image = Arc::new(db.metadata_state(None).unwrap().sql);
-        let baseline = image.catalog_ext().sequences.iter()
-            .map(|(&id, def)| (id, def.incarnation))
-            .collect();
         let unsettled = Unsettled::default();
         let callback = super::super::callback(
             db.child(Holder::Sequence).unwrap(),
             image,
-            baseline,
             Default::default(),
             sql.sequence_values.clone(),
             unsettled.clone(),
@@ -2152,5 +2142,204 @@ mod default_memo_tests {
                 Err(CoreError::SequencePrivilege), "{origin:?}");
             run(&mut sql, "ROLLBACK");
         }
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[path = "v2_sequence_exposure_tests.rs"]
+mod exposure_tests;
+
+#[cfg(feature = "engine-rocksdb")]
+mod alter_sequence_position {
+    use super::*;
+
+    #[test]
+    fn parameter_changes_continue_at_the_live_position() {
+        let f = Fixture::new(Engine::V2);
+        let mut s = f.session();
+        run(&mut s, "CREATE TABLE owner(id bigint PRIMARY KEY)");
+        run(&mut s, "CREATE SEQUENCE seq");
+        for expected in 1..=3 {
+            assert_eq!(scalar(&mut s, "SELECT nextval('seq')"), expected);
+        }
+        for (options, expected) in [
+            ("CACHE 2", 4),
+            ("INCREMENT BY 3", 7),
+            ("OWNED BY owner.id", 10),
+            ("AS integer", 13),
+            ("CYCLE", 16),
+        ] {
+            run(&mut s, &format!("ALTER SEQUENCE seq {options}"));
+            assert_eq!(scalar(&mut s, "SELECT nextval('seq')"), expected, "{options}");
+        }
+    }
+
+    #[test]
+    fn carried_position_survives_reopen_without_an_intervening_draw() {
+        let mut f = Fixture::new(Engine::V2);
+        let mut s = f.session();
+        run(&mut s, "CREATE SEQUENCE seq INCREMENT -2");
+        for expected in [-1, -3, -5] {
+            assert_eq!(scalar(&mut s, "SELECT nextval('seq')"), expected);
+        }
+        run(&mut s, "ALTER SEQUENCE seq CACHE 2");
+        drop(s);
+        f.reopen();
+        assert_eq!(scalar(&mut f.session(), "SELECT nextval('seq')"), -7);
+    }
+
+    #[test]
+    fn parameter_change_carries_a_cold_counter() {
+        let mut f = Fixture::new(Engine::V2);
+        let mut session = f.session();
+        run(&mut session, "CREATE SEQUENCE seq");
+        assert_eq!(scalar(&mut session, "SELECT setval('seq', 70)"), 70);
+        drop(session);
+
+        f.reopen();
+        let mut session = f.session();
+        run(&mut session, "ALTER SEQUENCE seq CACHE 2");
+        assert_eq!(scalar(&mut session, "SELECT nextval('seq')"), 71);
+    }
+
+    #[test]
+    fn staged_alter_rejects_competing_setval() {
+        let f = Fixture::new(Engine::V2);
+        let mut alter = f.session();
+        let mut caller = f.session();
+        run(&mut alter, "CREATE SEQUENCE seq");
+        assert_eq!(scalar(&mut caller, "SELECT setval('seq', 10)"), 10);
+
+        run(&mut alter, "BEGIN");
+        run(&mut alter, "ALTER SEQUENCE seq CACHE 2");
+        let competing = caller.execute_at("SELECT setval('seq', 1000)", &[], None, &clock());
+        run(&mut alter, "ROLLBACK");
+
+        assert_eq!(
+            crate::sqlstate(&competing.expect_err("setval should conflict with the staged ALTER")),
+            "40001",
+        );
+        assert_eq!(scalar(&mut caller, "SELECT nextval('seq')"), 11);
+    }
+
+    #[test]
+    fn carries_the_uncalled_position_through_start_changes() {
+        let f = Fixture::new(Engine::V2);
+        let mut s = f.session();
+        run(&mut s, "CREATE SEQUENCE seq START WITH 7");
+        run(&mut s, "ALTER SEQUENCE seq START WITH 10");
+        assert_eq!(scalar(&mut s, "SELECT nextval('seq')"), 7);
+        assert_eq!(scalar(&mut s, "SELECT setval('seq', 50, false)"), 50);
+        run(&mut s, "ALTER SEQUENCE seq CACHE 2");
+        assert_eq!(scalar(&mut s, "SELECT nextval('seq')"), 50);
+        run(&mut s, "ALTER SEQUENCE seq RESTART");
+        assert_eq!(scalar(&mut s, "SELECT nextval('seq')"), 10);
+    }
+
+    #[test]
+    fn staged_alter_excludes_draws_until_commit_or_rollback_to() {
+        let f = Fixture::new(Engine::V2);
+        let mut alter = f.session();
+        let mut caller = f.session();
+        run(&mut alter, "CREATE SEQUENCE seq");
+        assert_eq!(scalar(&mut caller, "SELECT nextval('seq')"), 1);
+
+        let db = f.admin.as_ref().unwrap().test_v2();
+        let old_image = Arc::new(db.metadata_state(None).unwrap().sql);
+        let (&id, old_def) = old_image.catalog_ext().sequences.iter().next().unwrap();
+        let slot = db.sql_counters.lock().unwrap()[&id].clone();
+        let stale_callback = callback(
+            db.child(Holder::Sequence).unwrap(),
+            old_image.clone(),
+            Default::default(),
+            Default::default(),
+            vec!["public".into()],
+        );
+        run(&mut alter, "BEGIN");
+        run(&mut alter, "ALTER SEQUENCE seq CACHE 2");
+        let concurrent = caller.execute_at("SELECT nextval('seq')", &[], None, &clock());
+        run(&mut alter, "COMMIT");
+        assert_eq!(concurrent, Err(CoreError::Sql(SqlError::Conflict)));
+        // Both a caller with an old image and one that already resolved the
+        // old committed definition must fail before touching the retired counter.
+        assert_eq!(
+            stale_callback("nextval", "seq", None, false, relational::clock::SequenceOrigin::Call),
+            Err(CoreError::Sql(SqlError::Conflict))
+        );
+        assert_eq!(
+            committed_value(&db, &slot, id, old_def, "nextval", None, false),
+            Err(CoreError::Sql(SqlError::Conflict))
+        );
+        assert_eq!(scalar(&mut caller, "SELECT nextval('seq')"), 2);
+
+        run(&mut alter, "BEGIN");
+        run(&mut alter, "SAVEPOINT before_alter");
+        run(&mut alter, "ALTER SEQUENCE seq CACHE 3");
+        run(&mut alter, "ROLLBACK TO before_alter");
+        assert_eq!(scalar(&mut caller, "SELECT nextval('seq')"), 3);
+        run(&mut alter, "COMMIT");
+
+        use std::{sync::mpsc, time::{Duration, Instant}};
+        assert_eq!(scalar(&mut alter, "SELECT setval('seq', 20)"), 20);
+        db.sequencer.gate_counter_acks(true);
+        let (sent, received) = mpsc::channel();
+        let allocating = thread::spawn(move || {
+            sent.send(caller.execute_at("SELECT nextval('seq')", &[], None, &clock())).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let held = loop {
+            if db.sequencer.held_counter_acks() > 0 && slot.counter.lock().unwrap().receiving {
+                break true;
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            thread::yield_now();
+        };
+        let rewrite = alter.execute_at("ALTER SEQUENCE seq CACHE 4", &[], None, &clock());
+        db.sequencer.gate_counter_acks(false);
+        allocating.join().unwrap();
+        assert!(held, "old draw never waited for its held reservation");
+        rewrite.unwrap();
+        assert_eq!(received.try_recv().unwrap().unwrap().rows[0].values[0], Value::Int(21));
+        assert_eq!(scalar(&mut alter, "SELECT nextval('seq')"), 22);
+    }
+
+    #[test]
+    fn explicit_alter_restores_private_position_at_savepoint() {
+        let f = Fixture::new(Engine::V2);
+        let mut s = f.session();
+        run(&mut s, "CREATE SEQUENCE seq");
+        assert_eq!(scalar(&mut s, "SELECT nextval('seq')"), 1);
+        run(&mut s, "BEGIN");
+        run(&mut s, "ALTER SEQUENCE seq CACHE 2");
+        run(&mut s, "ROLLBACK");
+        assert_eq!(scalar(&mut s, "SELECT nextval('seq')"), 2);
+
+        run(&mut s, "BEGIN");
+        run(&mut s, "ALTER SEQUENCE seq CACHE 3");
+        run(&mut s, "SAVEPOINT first_alter");
+        assert_eq!(scalar(&mut s, "SELECT nextval('seq')"), 3);
+        run(&mut s, "ALTER SEQUENCE seq INCREMENT BY 7");
+        assert_eq!(scalar(&mut s, "SELECT nextval('seq')"), 10);
+        run(&mut s, "ROLLBACK TO first_alter");
+        run(&mut s, "COMMIT");
+        assert_eq!(scalar(&mut s, "SELECT nextval('seq')"), 11);
+    }
+
+    #[test]
+    fn bounds_reject_the_live_position_and_release_the_slot() {
+        let f = Fixture::new(Engine::V2);
+        let mut s = f.session();
+        run(&mut s, "CREATE SEQUENCE seq");
+        assert_eq!(scalar(&mut s, "SELECT setval('seq', 10)"), 10);
+        let error = s
+            .execute_at("ALTER SEQUENCE seq MAXVALUE 9", &[], None, &clock())
+            .unwrap_err();
+        assert_eq!(crate::sqlstate(&error), "22023");
+        assert_eq!(scalar(&mut s, "SELECT nextval('seq')"), 11);
+        // A reservation running past MAXVALUE is fine if its unused tail is discarded.
+        run(&mut s, "ALTER SEQUENCE seq MAXVALUE 12");
+        assert_eq!(scalar(&mut s, "SELECT nextval('seq')"), 12);
     }
 }

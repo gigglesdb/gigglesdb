@@ -29,7 +29,7 @@ impl SqlSession {
             self.v2_transaction.as_mut().expect("active transaction")
                 .rollback_to(&setup.initial).map_err(CoreError::from)?;
             self.deferral = Default::default();
-            self.pending_sequences.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.v2_pending_sequences.lock().unwrap_or_else(|e| e.into_inner()).clear();
         }
         let inner = self.admin.inner.clone();
         let _ticket = inner.enter()?;
@@ -38,7 +38,7 @@ impl SqlSession {
         let txn = self.v2_transaction.as_mut().expect("active transaction");
         if mode == NativePublishMode::Success {
             v2_sql::validate_pending(db, txn, &mut self.deferral)?;
-            v2_sql::sql_sequences::stage_pending(db, txn, &self.pending_sequences)?;
+            v2_sql::sql_sequences::stage_pending(db, txn, &self.v2_pending_sequences)?;
         }
         let _gate = inner.gate.lock_notified(|| {
             inner.decision_point(DecisionPoint::WaitingLock)
@@ -107,7 +107,8 @@ impl SqlSession {
             }
             other => CoreError::from(other).into(),
         })?;
-        for (id, counter) in self.pending_sequences.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        for ((id, _), entry) in self.v2_pending_sequences.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            let counter = &entry.counter;
             let slot = live.entry(*id).or_default();
             let mut current = slot.counter.lock_cancellable()?;
             if db.catalog().current_local_view()?.sequences.get(id)

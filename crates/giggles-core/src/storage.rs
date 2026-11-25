@@ -2254,6 +2254,16 @@ impl Executor {
         })
     }
 }
+struct V2SavepointState {
+    name: String,
+    mark: engine::txn::Savepoint,
+    sequence_incarnations: BTreeMap<u64, u128>,
+    sequence_restore: Arc<()>,
+    deferral: relational::DeferralState,
+    enum_transaction: relational::EnumTransaction,
+    sequence_copy_leases: BTreeMap<u64, Arc<()>>,
+}
+
 // Legacy transactions own whole State snapshots. This named capture is the
 // session counterpart of v2 F3c's live write-set mark; future transactional
 // session state (including a deferred-work queue) belongs in this capture.
@@ -2317,7 +2327,7 @@ pub struct SqlSession {
     protected: Option<ProtectedRun>,
     copy_input: Option<CopyInput>,
     savepoints: Vec<SqlSavepoint>,
-    v2_savepoints: Vec<(String, engine::txn::Savepoint, relational::DeferralState, relational::EnumTransaction)>,
+    v2_savepoints: Vec<V2SavepointState>,
     copy_freeze: Vec<std::collections::BTreeSet<u64>>,
     savepoint_budget: u64,
     aborted: bool,
@@ -2340,9 +2350,11 @@ pub struct SqlSession {
     ddl_owner: Option<String>,
     staged_revision: u64,
     sequence_values: sequences::SessionValues,
+    v2_sequence_copy_leases: BTreeMap<u64, Arc<()>>,
     sequence_generation: Option<GenerationTag>,
     sequence_unsettled: v2_sql::sql_sequences::Unsettled,
     pending_sequences: sequences::Pending,
+    v2_pending_sequences: v2_sql::sql_sequences::Pending,
     xact: XactSlot,
     sequence_baseline: BTreeMap<u64, u128>,
     sequence_tables: Option<std::collections::BTreeSet<String>>,
@@ -2411,8 +2423,10 @@ impl Admin {
             ddl_owner: None,
             staged_revision: 0,
             sequence_values: Default::default(),
+            v2_sequence_copy_leases: BTreeMap::new(),
             sequence_unsettled: Default::default(),
             pending_sequences: Default::default(),
+            v2_pending_sequences: Default::default(),
             xact: Default::default(),
             sequence_baseline: BTreeMap::new(),
             sequence_tables: None,
@@ -5799,9 +5813,9 @@ impl SqlSession {
             for (id, counter) in before {
                 if let Some(definition) = s.sql.catalog_ext().sequences.get(&id)
                     && definition.incarnation != counter.incarnation
-                    && let Some(value) = values.current.get(&(id, counter.incarnation)).copied()
+                    && let Some(value) = values.current.get(&(id, Some(counter.incarnation))).copied()
                 {
-                    values.current.insert((id, definition.incarnation), value);
+                    values.current.insert((id, Some(definition.incarnation)), value);
                 }
             }
         }
@@ -5987,6 +6001,8 @@ impl SqlSession {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.sequence_baseline.clear();
+        self.v2_pending_sequences.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.v2_sequence_copy_leases.clear();
         self.legacy_catalog_id_at_begin = 0;
         self.deferral = Default::default();
         self.enum_transaction = Default::default();
@@ -7294,6 +7310,7 @@ impl SqlSession {
                 self.sequence_values = Default::default();
                 self.sequence_unsettled = Default::default();
                 self.pending_sequences = Default::default();
+                self.v2_pending_sequences = Default::default();
                 self.xact = Default::default();
                 self.unnamed_plans.clear();
             }

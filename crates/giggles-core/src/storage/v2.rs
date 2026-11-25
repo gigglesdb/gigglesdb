@@ -31,6 +31,7 @@ pub(crate) struct SeqSlot {
 #[derive(Default)]
 pub(crate) struct SeqSlotState {
     pub(crate) counter: Option<super::sequences::SeqCounter>,
+    pub(crate) copy_lease: Option<std::sync::Weak<()>>,
     pub(crate) durable_hw: Option<i64>,
     // A durable install drains preceding reservations, even when moving backwards.
     pub(crate) coverage_epoch: u64,

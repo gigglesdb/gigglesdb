@@ -135,9 +135,13 @@ fn terminal_aborted_session_discards_sequences_features_and_prior_writes() {
     let mut session = admin.sql_session();
     let setup = session.begin_once_engine(None).unwrap();
     session.execute("INSERT INTO items VALUES(1,10)", &[], None).unwrap();
-    let pending = session.pending_sequences.clone();
-    pending.lock().unwrap().insert(u64::MAX, crate::storage::sequences::SeqCounter {
-        incarnation: 1, last_value: 9, is_called: true, log_hw: 9, stamp: 1 });
+    let pending = session.v2_pending_sequences.clone();
+    pending.lock().unwrap().insert((u64::MAX, 1), crate::storage::v2_sql::sql_sequences::PendingCounter {
+        counter: crate::storage::sequences::SeqCounter {
+            incarnation: 1, last_value: 9, is_called: true, log_hw: 9, stamp: 1,
+        },
+        predecessor: None,
+    });
     session.deferral.pending.entry((u64::MAX, u64::MAX)).or_default().insert(vec![1]);
     session.deferral.modes.insert(u64::MAX, true);
     let txn = session.v2_transaction.as_mut().unwrap();

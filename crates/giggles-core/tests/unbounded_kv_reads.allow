@@ -112,8 +112,8 @@ storage/v2_export.rs export_inner range 2 | Local export reads counters and chec
 storage/v2_export.rs get range 1 | The import verifier reads staged export records through an in-memory adapter.
 storage/v2_sql.rs execute_v2_inner get 1 | Transaction::get reads the selected MVCC snapshot.
 storage/v2_sql.rs fk_key_changed_since range 1 | The raw witness check can only add a retryable FK conflict.
-storage/v2_sql_sequences.rs callback get 1 | Transaction::get reads the selected MVCC snapshot.
-storage/v2_sql_sequences.rs committed_value get 1 | The slot drains earlier acknowledgments and the published catalog excludes a DDL counter for an unpublished incarnation. RESTART or rewrite DDL can delete the old incarnation's key before publication. A cold slot then reads None, which forces a synchronous write_counter that validate_counter rejects with SequenceGone.
+storage/v2_sql_sequences.rs cluster_current_incarnation get 1 | Transaction::get reads the selected MVCC snapshot.
+storage/v2_sql_sequences.rs read_counter get 1 | Unversioned sequence counters are keyed by incarnation. Callers hold the slot lock and check the published definition. Allocation drains earlier acknowledgments and cold writes are checked again by the sequencer. ALTER holds the exclusive catalog barrier, then takes a rewrite lease under the slot lock before staging the replacement.
 task/approval.rs current_row get 1 | Transaction::get reads the selected MVCC snapshot.
 task/approval.rs load_approval get 1 | Transaction::get reads the selected MVCC snapshot.
 task/approval.rs load_header get 1 | Transaction::get reads the selected MVCC snapshot.

@@ -22,11 +22,13 @@ pub(super) struct Live {
 pub(super) type SessionValues = Arc<Mutex<SessionSequenceValues>>;
 #[derive(Default)]
 pub(super) struct SessionSequenceValues {
-    pub(super) current: BTreeMap<(u64, u128), i64>,
-    last: Option<(u64, u128)>,
+    // V2 reserves ids globally, so its observations follow a logical sequence
+    // across rewrites. Legacy can reuse an id from a rolled-back creation.
+    pub(super) current: BTreeMap<(u64, Option<u128>), i64>,
+    last: Option<(u64, Option<u128>)>,
 }
 impl SessionSequenceValues {
-    pub(super) fn record(&mut self, operation: &str, called: bool, key: (u64, u128), value: i64) {
+    pub(super) fn record(&mut self, operation: &str, called: bool, key: (u64, Option<u128>), value: i64) {
         if operation == "nextval" {
             self.last = Some(key);
         }
@@ -34,7 +36,7 @@ impl SessionSequenceValues {
             self.current.insert(key, value);
         }
     }
-    pub(super) fn last(&self) -> Result<(u64, u128), CoreError> {
+    pub(super) fn last(&self) -> Result<(u64, Option<u128>), CoreError> {
         self.last.ok_or_else(lastval_undefined)
     }
 }
@@ -187,9 +189,9 @@ pub(crate) fn set(c: &mut SeqCounter, value: i64, called: bool, stamp: u64) {
     c.stamp = stamp;
 }
 pub(super) fn session_value(
-    values: &SessionSequenceValues, id: u64, def: &SequenceDef, operation: &str,
+    values: &SessionSequenceValues, key: (u64, Option<u128>), def: &SequenceDef, operation: &str,
 ) -> Result<relational::Value, CoreError> {
-    if let Some(&value) = values.current.get(&(id, def.incarnation)) {
+    if let Some(&value) = values.current.get(&key) {
         return Ok(relational::Value::Int(value));
     }
     if operation == "lastval" {
@@ -330,7 +332,7 @@ impl Inner {
             let definitions = &snapshot.sql.catalog_ext().sequences;
             let (&id, def) = if operation == "lastval" {
                 let (id, incarnation) = values.lock().map_err(|_| CoreError::Fenced)?.last()?;
-                definitions.get_key_value(&id).filter(|(_, def)| def.incarnation == incarnation)
+                definitions.get_key_value(&id).filter(|(_, def)| Some(def.incarnation) == incarnation)
                     .ok_or_else(lastval_undefined)?
             } else {
                 let name = sequence_name(text).map_err(CoreError::Sql)?;
@@ -370,7 +372,7 @@ impl Inner {
             }
             if matches!(operation, "currval" | "lastval") {
                 let values = values.lock().map_err(|_| CoreError::Fenced)?;
-                return session_value(&values, id, def, operation);
+                return session_value(&values, (id, Some(def.incarnation)), def, operation);
             }
             let mut live = inner.sequences.lock().map_err(|_| CoreError::Fenced)?;
             let stamp = live
@@ -429,7 +431,7 @@ impl Inner {
                         *value = result;
                     }
                 }
-                values.record(operation, called, (id, def.incarnation), result);
+                values.record(operation, called, (id, Some(def.incarnation)), result);
             }
             Ok(relational::Value::Int(result))
         })

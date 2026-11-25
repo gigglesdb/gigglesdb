@@ -1,5 +1,7 @@
 //! SQL defaults use the existing v2 counter codec and durable reservations.
 use super::*;
+use relational::catalog_ext::SequenceDef;
+use sequences::SeqCounter;
 
 /// Values exposed even by rolled-back transactions must never be reissued after a crash.
 pub(in crate::storage) struct Obligation {
@@ -291,15 +293,9 @@ impl Guard {
         let mut private_owners = BTreeMap::new();
         let mut private_sequences = std::collections::BTreeSet::new();
         let mut private_tables = std::collections::BTreeSet::new();
-        if !matches!(authority, SequenceAuthority::Unrestricted)
-            && let Some(txn) = txn
+        if let Some(txn) = txn
             && txn.catalog_writes().next().is_some()
         {
-            private_owners = txn
-                .catalog_writes()
-                .filter(|(key, _)| key.first() == Some(&10))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
             private_sequences = image
                 .catalog_ext()
                 .sequences
@@ -307,12 +303,19 @@ impl Guard {
                 .copied()
                 .filter(|id| txn.catalog_own(&engine::catalog_codec::sequence_key(*id)).is_some())
                 .collect();
-            private_tables = image
-                .tables
-                .values()
-                .map(|table| table.id)
-                .filter(|id| txn.catalog_own(&engine::catalog::table_key(*id)).is_some())
-                .collect();
+            if !matches!(authority, SequenceAuthority::Unrestricted) {
+                private_owners = txn
+                    .catalog_writes()
+                    .filter(|(key, _)| key.first() == Some(&10))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                private_tables = image
+                    .tables
+                    .values()
+                    .map(|table| table.id)
+                    .filter(|id| txn.catalog_own(&engine::catalog::table_key(*id)).is_some())
+                    .collect();
+            }
         }
         Self {
             authority: authority.clone(),
@@ -409,8 +412,8 @@ impl Guard {
         Ok(if owner_analogue { OWNER_ANALOGUE } else { &[] })
     }
     /// Allow `operation` on sequence `id` (statement image definition `def`) or
-    /// refuse it with 42501. `committed` says whether the latest committed catalog
-    /// holds this same incarnation.
+    /// refuse it with 42501. For observations, `committed` means the logical
+    /// sequence still exists. For allocators it also requires the same incarnation.
     #[allow(clippy::too_many_arguments)]
     fn check(
         &self,
@@ -430,7 +433,8 @@ impl Guard {
         if matches!(self.authority, SequenceAuthority::Unrestricted) {
             return Ok(());
         }
-        let pin_images = self.pin_default_images && origin == SequenceOrigin::ColumnDefault;
+        let observing = matches!(operation, "currval" | "lastval");
+        let pin_images = self.pin_default_images && origin == SequenceOrigin::ColumnDefault && !observing;
         if pin_images {
             self.roles.as_ref().ok_or(CoreError::SequencePrivilege)?
                 .check_fenced().map_err(role_error)?;
@@ -471,7 +475,7 @@ impl Guard {
                 return Ok(());
             }
             drop(state);
-            self.check_permission(image, key, def, &roles, latest.as_deref())?;
+            self.check_permission(image, key, def, &roles, latest.as_deref(), observing)?;
             self.state.lock().map_err(|_| CoreError::Fenced)?.last_live =
                 Some(Decision { roles, latest, key });
             return Ok(());
@@ -491,7 +495,7 @@ impl Guard {
         }
         let roles = &state.roles.as_ref().expect("statement role image").0;
         let latest = state.latest.as_ref().filter(|_| use_latest).map(|(image, _)| &**image);
-        self.check_permission(image, key, def, roles, latest)?;
+        self.check_permission(image, key, def, roles, latest, observing)?;
         state.last_pinned = Some((key, use_latest));
         if let Some(grant) = grant {
             state.defaults.push(grant);
@@ -549,18 +553,21 @@ impl Guard {
         def: &relational::catalog_ext::SequenceDef,
         roles: &roles::RoleCatalogImage,
         latest: Option<&relational::Relational>,
+        observing: bool,
     ) -> Result<(), CoreError> {
         use relational::clock::SequenceOrigin;
         let (id, _, origin, required) = key;
         let (current, owner_key) = match latest {
             Some(latest) => {
-                // A replacement (another incarnation) is never judged under this name.
+                // Observations follow the logical ID and use its current authority.
                 let current = latest
                     .catalog_ext()
                     .sequences
                     .get(&id)
-                    .filter(|current| current.incarnation == def.incarnation)
                     .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
+                if !observing && current.incarnation != def.incarnation {
+                    return Err(CoreError::Sql(SqlError::Conflict));
+                }
                 // The ownership link (owning table id) is the latest committed one, so
                 // an OWNED BY transfer committed elsewhere applies even under
                 // REPEATABLE READ; only the table's name follows this transaction's
@@ -603,12 +610,130 @@ impl Guard {
     }
 }
 
+// Keep private allocation history per incarnation, including predecessors
+// that can be restored by savepoint rollback.
+pub(in crate::storage) type Pending = Arc<Mutex<BTreeMap<(u64, u128), PendingCounter>>>;
+pub(in crate::storage) struct PendingCounter {
+    pub(in crate::storage) counter: SeqCounter,
+    pub(in crate::storage) predecessor: Option<RewritePredecessor>,
+}
+
+#[derive(Clone)]
+pub(in crate::storage) struct RewritePredecessor {
+    pub(in crate::storage) definition: SequenceDef,
+    pub(in crate::storage) restore: RewriteRestore,
+}
+
+#[derive(Clone)]
+pub(in crate::storage) enum RewriteRestore {
+    Committed,
+    // Link to the oldest mark that can restore this incarnation. RELEASE
+    // and ROLLBACK TO remove suffixes, so dropping it expires every such mark.
+    Savepoint(std::sync::Weak<()>),
+    Unreachable,
+}
+
+impl RewritePredecessor {
+    fn restorable(&self) -> bool {
+        match &self.restore {
+            RewriteRestore::Committed => true,
+            RewriteRestore::Savepoint(mark) => mark.strong_count() != 0,
+            RewriteRestore::Unreachable => false,
+        }
+    }
+}
+
+fn advance_predecessors(
+    pending: &mut BTreeMap<(u64, u128), PendingCounter>,
+    id: u64,
+    incarnation: u128,
+    value: i64,
+    stamp: u64,
+) -> Option<SequenceDef> {
+    let mut predecessor = pending[&(id, incarnation)].predecessor.clone();
+    while let Some(before) = predecessor {
+        let def = &before.definition;
+        if matches!(before.restore, RewriteRestore::Committed) {
+            return Some(before.definition);
+        }
+        let entry = pending.get_mut(&(id, def.incarnation)).expect("private predecessor");
+        if before.restorable() && advance_past(def, &mut entry.counter, value) {
+            entry.counter.stamp = entry.counter.stamp.max(stamp);
+        }
+        predecessor = entry.predecessor.clone();
+    }
+    None
+}
+
+/// A restored counter must cover the draw monotonically within its own bounds.
+fn check_rewrite_draw(
+    pending: &BTreeMap<(u64, u128), PendingCounter>,
+    id: u64,
+    def: &SequenceDef,
+    previous: Option<&SeqCounter>,
+    value: i64,
+) -> Result<(), SqlError> {
+    let wrapped = def.cycle && previous.is_some_and(|counter| {
+        counter.is_called && covers(def, counter.last_value, value)
+    });
+    let mut predecessor = pending.get(&(id, def.incarnation))
+        .and_then(|entry| entry.predecessor.as_ref());
+    while let Some(link) = predecessor {
+        let before = &link.definition;
+        predecessor = pending.get(&(id, before.incarnation))
+            .and_then(|entry| entry.predecessor.as_ref());
+        if !link.restorable() {
+            continue;
+        }
+        if wrapped {
+            relational::sequence_session_error(
+                "cannot wrap a sequence while rollback can restore an earlier definition; commit the ALTER SEQUENCE first".into(),
+            );
+            return Err(SqlError::Unsupported);
+        }
+        if before.increment.signum() != def.increment.signum() {
+            relational::sequence_session_error(
+                "cannot draw from a sequence whose increment direction changed in this transaction".into(),
+            );
+            return Err(SqlError::Unsupported);
+        }
+        if !(before.min..=before.max).contains(&value) {
+            relational::sequence_session_error(
+                "sequence draw exceeds the bounds of a definition that rollback can restore".into(),
+            );
+            return Err(SqlError::SequenceLimit);
+        }
+    }
+    Ok(())
+}
+
+fn covers(def: &SequenceDef, position: i64, value: i64) -> bool {
+    if def.increment > 0 { position >= value } else { position <= value }
+}
+
+/// Carry the draw's position back to the restored definition. A later ALTER
+/// can change the stride again, so the position must cover the draw itself.
+fn advance_past(
+    def: &SequenceDef,
+    counter: &mut SeqCounter,
+    value: i64,
+) -> bool {
+    if covers(def, counter.last_value, value) && (counter.last_value != value || counter.is_called) {
+        return false;
+    }
+    counter.last_value = value;
+    counter.is_called = true;
+    if !covers(def, counter.log_hw, counter.last_value) {
+        counter.log_hw = counter.last_value;
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn callback(
     db: impl Into<CallbackLease>,
     image: Arc<relational::Relational>,
-    baseline: BTreeMap<u64, u128>,
-    pending: sequences::Pending,
+    pending: Pending,
     values: sequences::SessionValues,
     unsettled: Unsettled,
     search_path: Vec<String>,
@@ -624,8 +749,9 @@ pub(super) fn callback(
         let db = db.lease(Holder::Sequence)?;
         crate::cancellation::check()?;
         let lastval = operation == "lastval";
+        let observing = lastval || operation == "currval";
         let mut cache = defaults.as_ref()
-            .filter(|_| !lastval && origin == SequenceOrigin::ColumnDefault && !db.catalog().is_poisoned())
+            .filter(|_| !observing && origin == SequenceOrigin::ColumnDefault && !db.catalog().is_poisoned())
             .map(|cache| cache.lock().map_err(|_| CoreError::Fenced))
             .transpose()?;
         let (id, def, committed) = if let Some(&(id, committed)) =
@@ -646,24 +772,17 @@ pub(super) fn callback(
             }
             let definitions = &image.catalog_ext().sequences;
             let (&id, def) = if lastval {
-                let (id, incarnation) = values.lock().map_err(|_| CoreError::Fenced)?.last()?;
-                definitions.get_key_value(&id)
-                    .filter(|(_, def)| def.incarnation == incarnation)
-                    .ok_or_else(sequences::lastval_undefined)?
+                let (id, _) = values.lock().map_err(|_| CoreError::Fenced)?.last()?;
+                definitions.get_key_value(&id).ok_or_else(sequences::lastval_undefined)?
             } else {
                 let parsed = sequences::sequence_name(name).map_err(CoreError::Sql)?;
                 let key = image.resolve_relation_key(&parsed, &search_path);
                 definitions.iter().find(|(_, def)| def.name == key)
                     .ok_or(CoreError::Sql(SqlError::UnknownTable))?
             };
-            let committed = if db.cluster_services().is_some() {
+            let current = if db.cluster_services().is_some() {
                 // Gateways retain the routed fresh read; their cache can lag remote DDL.
-                let mut check = db.begin(Isolation::ReadCommitted);
-                check
-                    .get(Keyspace::Catalog, &engine::catalog_codec::sequence_key(id))?
-                    .map(|bytes| engine::catalog_codec::decode_sequence(&bytes))
-                    .transpose()?
-                    .is_some_and(|current| current.incarnation == def.incarnation)
+                cluster_current_incarnation(&db, id)?
             } else {
                 // Reuse the authority image when it is already pinned. The
                 // first draw still checks committedness before Guard::check.
@@ -675,17 +794,22 @@ pub(super) fn callback(
                 };
                 if let Some(latest) = latest {
                     latest.catalog_ext().sequences.get(&id)
-                        .is_some_and(|current| current.incarnation == def.incarnation)
+                        .map(|current| current.incarnation)
                 } else {
                     db.catalog()
                         .current_local_view()?
                         .sequences
                         .get(&id)
-                        .is_some_and(|current| current.incarnation == def.incarnation)
+                        .map(|current| current.incarnation)
                 }
             };
-            if !committed && baseline.get(&id) == Some(&def.incarnation) {
-                return Err(if lastval {
+            let committed = current == Some(def.incarnation) || observing && current.is_some();
+            // A statement can still hold the old image after ALTER publishes.
+            // Only its own buffered definition can use a transaction-private counter.
+            if !committed && !guard.private_sequences.contains(&id) {
+                return Err(if current.is_some() {
+                    CoreError::Sql(SqlError::Conflict)
+                } else if lastval {
                     sequences::lastval_undefined()
                 } else {
                     CoreError::Sql(SqlError::UnknownTable)
@@ -697,12 +821,11 @@ pub(super) fn callback(
             (id, def, committed)
         };
         drop(cache);
-        // Authority on this resolved id and incarnation, before session values,
-        // counters or the cluster sequence RPC; every use below names the same pair.
+        // Check authority before reading session values or accessing a counter.
         guard.check(&db, &image, operation, origin, id, def, committed)?;
-        if matches!(operation, "currval" | "lastval") {
+        if observing {
             let values = values.lock().map_err(|_| CoreError::Fenced)?;
-            return sequences::session_value(&values, id, def, operation);
+            return sequences::session_value(&values, (id, None), def, operation);
         }
         if committed && let Some(services) = db.cluster_services() {
             // A cluster gateway keeps no counter: the system range leader evaluates every
@@ -735,7 +858,7 @@ pub(super) fn callback(
                 values
                     .lock()
                     .map_err(|_| CoreError::Fenced)?
-                    .record(operation, called, (id, def.incarnation), result);
+                    .record(operation, called, (id, None), result);
             }
             return Ok(relational::Value::Int(result));
         }
@@ -749,7 +872,7 @@ pub(super) fn callback(
                 values
                     .lock()
                     .map_err(|_| CoreError::Fenced)?
-                    .record(operation, called, (id, def.incarnation), result);
+                    .record(operation, called, (id, None), result);
             }
             #[cfg(all(test, feature = "engine-rocksdb"))]
             if origin == SequenceOrigin::ColumnDefault
@@ -760,39 +883,116 @@ pub(super) fn callback(
             }
             return Ok(relational::Value::Int(result));
         }
-        let mut pending = if committed {
-            None
-        } else {
-            Some(pending.lock().map_err(|_| CoreError::Fenced)?)
-        };
-        let prior = pending
-            .as_ref()
-            .expect("private sequence")
-            .get(&id)
-            .cloned();
+        let mut pending = pending.lock().map_err(|_| CoreError::Fenced)?;
+        let key = (id, def.incarnation);
+        let prior = pending.get(&key).map(|entry| &entry.counter);
         let (result, counter) = match operation {
-            "nextval" => sequences::next_on(def, prior),
+            "nextval" => sequences::next_on(def, prior.cloned()),
             "setval" => sequences::set_on(
                 def,
-                prior,
+                prior.cloned(),
                 value.ok_or(CoreError::Sql(SqlError::Parameters))?,
                 called,
             ),
             _ => Err(SqlError::Unsupported),
         }
         .map_err(CoreError::Sql)?;
-        pending
-            .as_mut()
-            .expect("private sequence")
-            .insert(id, counter);
+        if operation == "nextval" {
+            check_rewrite_draw(&pending, id, def, prior, result)
+                .map_err(CoreError::Sql)?;
+        }
+        pending.entry(key).or_insert_with(|| PendingCounter {
+            counter: sequences::fresh(def),
+            predecessor: None,
+        });
+        if operation == "nextval"
+            && let Some(root) = advance_predecessors(&mut pending, id, def.incarnation, result, counter.stamp)
+        {
+            // The transaction holds the committed root's rewrite lease.
+            persist_rewrite_position(&db, id, &root, result)?;
+        }
+        pending.get_mut(&key).expect("private counter").counter = counter;
         if operation == "nextval" || called {
             values
                 .lock()
                 .map_err(|_| CoreError::Fenced)?
-                .record(operation, called, (id, def.incarnation), result);
+                .record(operation, called, (id, None), result);
         }
         Ok(relational::Value::Int(result))
     })
+}
+
+fn persist_rewrite_position(
+    db: &EngineLease,
+    id: u64,
+    def: &relational::catalog_ext::SequenceDef,
+    value: i64,
+) -> Result<(), CoreError> {
+    let slot = db.sql_counters.lock_cancellable()?.entry(id).or_default().clone();
+    let key = engine::catalog_codec::counter_key(id, def.incarnation);
+    let mut state = slot.counter.lock_cancellable()?;
+    if !is_current(db, id, def.incarnation)? {
+        return Err(CoreError::Sql(SqlError::Conflict));
+    }
+    if state.counter.as_ref().is_none_or(|counter| counter.incarnation != def.incarnation)
+        && let Some(counter) = read_counter(db, &key, def)?
+    {
+        state.install(counter);
+    }
+    let prior = state.counter.as_ref().filter(|counter| counter.incarnation == def.incarnation)
+        .cloned().unwrap_or_else(|| sequences::fresh(def));
+    let mut counter = prior.clone();
+    if !advance_past(def, &mut counter, value) && !prior.is_called {
+        return Ok(());
+    }
+
+    drain_ready(&mut state);
+    // A called counter can reuse an existing reservation, including one still
+    // in flight when ALTER captured the position. Consuming an uncalled
+    // position also requires persisting the changed is_called flag.
+    let covered = |state: &v2::SeqSlotState| {
+        prior.is_called && state.durable_hw.is_some_and(|hw| covers(def, hw, counter.last_value))
+    };
+    while !covered(&state) && (state.receiving || !state.inflight.is_empty()) {
+        state = receive_one(&slot, state)?;
+    }
+    if covered(&state) {
+        state.counter = Some(counter);
+    } else {
+        counter.log_hw = reserve_ahead(def, counter.last_value);
+        let ack = db.sequencer.send_counter(
+            key,
+            engine::catalog_codec::encode_counter(&counter, def)?,
+            256,
+        )?;
+        if !prior.is_called {
+            // The previous watermark did not cover consumption of the uncalled value.
+            state.durable_hw = None;
+        }
+        state.inflight.push_back(v2::InFlight {
+            incarnation: def.incarnation,
+            hw: counter.log_hw,
+            ack,
+        });
+        // Rollback can release the lease before this ack arrives. Keep the new
+        // live position and its queued write together so the next allocator
+        // cannot reuse the position or overtake the write.
+        state.counter = Some(counter);
+        drop(receive_one(&slot, state)?);
+        crate::cancellation::check()?;
+    }
+    Ok(())
+}
+
+fn reserve_ahead(def: &relational::catalog_ext::SequenceDef, value: i64) -> i64 {
+    let mut high = value;
+    for _ in 0..sequences::SEQ_LOG_VALS {
+        match high.checked_add(def.increment).filter(|v| *v >= def.min && *v <= def.max) {
+            Some(value) => high = value,
+            None => break,
+        }
+    }
+    high
 }
 
 type SlotGuard<'a> = crate::cancellation::WaitGuard<'a, v2::SeqSlotState>;
@@ -923,6 +1123,63 @@ fn drain_ready(guard: &mut v2::SeqSlotState) {
     }
 }
 
+/// Freeze committed draws while SQL replaces this incarnation. The slot's live
+/// position includes every draw, even one still waiting for a reservation ack.
+pub(super) fn reserve_copy(
+    db: &v2::V2Db,
+    id: u64,
+    def: &relational::catalog_ext::SequenceDef,
+) -> Result<Option<(sequences::SeqCounter, Arc<()>)>, CoreError> {
+    if db.cluster_services().is_some() {
+        if cluster_current_incarnation(db, id)? == Some(def.incarnation) {
+            // A gateway cannot migrate a system-range counter in this catalog transaction.
+            return Err(CoreError::Sql(SqlError::Unsupported));
+        }
+        return Ok(None);
+    }
+    if !is_current(db, id, def.incarnation)? {
+        return Ok(None);
+    }
+    let slot = db.sql_counters.lock_cancellable()?.entry(id).or_default().clone();
+    let mut state = slot.counter.lock_cancellable()?;
+    if state.copy_lease.as_ref().is_some_and(|lease| lease.strong_count() != 0) {
+        return Err(CoreError::Sql(SqlError::Conflict));
+    }
+    let counter = if let Some(live) = state.counter.as_ref().filter(|c| c.incarnation == def.incarnation) {
+        live.clone()
+    } else {
+        let key = engine::catalog_codec::counter_key(id, def.incarnation);
+        read_counter(db, &key, def)?.unwrap_or_else(|| sequences::fresh(def))
+    };
+    let lease = Arc::new(());
+    state.copy_lease = Some(Arc::downgrade(&lease));
+    Ok(Some((counter, lease)))
+}
+
+fn cluster_current_incarnation(db: &v2::V2Db, id: u64) -> Result<Option<u128>, CoreError> {
+    let mut check = db.begin(Isolation::ReadCommitted);
+    Ok(check
+        .get(Keyspace::Catalog, &engine::catalog_codec::sequence_key(id))?
+        .map(|bytes| engine::catalog_codec::decode_sequence(&bytes))
+        .transpose()?
+        .map(|current| current.incarnation))
+}
+
+fn is_current(db: &v2::V2Db, id: u64, incarnation: u128) -> Result<bool, CoreError> {
+    Ok(db.catalog().current_local_view()?.sequences.get(&id)
+        .is_some_and(|current| current.incarnation == incarnation))
+}
+
+fn read_counter(
+    db: &v2::V2Db,
+    key: &[u8],
+    def: &relational::catalog_ext::SequenceDef,
+) -> Result<Option<sequences::SeqCounter>, CoreError> {
+    db.kv.get(Keyspace::Seq, key)?
+        .map(|bytes| engine::catalog_codec::decode_counter(key, &bytes, def))
+        .transpose()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn committed_value(
     db: &EngineLease,
@@ -943,22 +1200,29 @@ fn committed_value(
             .counter
             .as_ref()
             .is_some_and(|c| c.incarnation == def.incarnation);
-        if !in_memory {
-            if !db
-                .catalog()
-                .current_local_view()?
-                .sequences
-                .get(&id)
-                .is_some_and(|current| current.incarnation == def.incarnation)
-            {
-                return Err(CoreError::Sql(SqlError::UnknownTable));
+        if let Some(lease) = &guard.copy_lease
+            && lease.strong_count() != 0
+        {
+            return Err(CoreError::Sql(SqlError::Conflict));
+        }
+        // After the lease ends a waiting caller may still name the retired
+        // incarnation. Recheck the catalog even if that counter is cached.
+        if guard.copy_lease.is_some() || !in_memory {
+            match db.catalog().current_local_view()?.sequences.get(&id) {
+                Some(current) if current.incarnation == def.incarnation => {}
+                Some(_) => return Err(CoreError::Sql(SqlError::Conflict)),
+                None => return Err(CoreError::Sql(SqlError::UnknownTable)),
             }
+        }
+        if in_memory {
+            guard.copy_lease = None;
+        } else {
             if guard.receiving || !guard.inflight.is_empty() {
                 guard = receive_one(slot, guard)?;
                 continue;
             }
-            if let Some(bytes) = db.kv.get(Keyspace::Seq, &key)? {
-                guard.install(engine::catalog_codec::decode_counter(&key, &bytes, def)?);
+            if let Some(counter) = read_counter(db, &key, def)? {
+                guard.install(counter);
             }
         }
         let prior = guard
@@ -1012,17 +1276,7 @@ fn committed_value(
     }
     let remaining = (i128::from(counter.log_hw) - i128::from(result)) / i128::from(def.increment);
     if remaining <= 24 {
-        let mut high = result;
-        for _ in 0..sequences::SEQ_LOG_VALS {
-            match high
-                .checked_add(def.increment)
-                .filter(|v| *v >= def.min && *v <= def.max)
-            {
-                Some(value) => high = value,
-                None => break,
-            }
-        }
-        counter.log_hw = high;
+        counter.log_hw = reserve_ahead(def, result);
     }
     if prior_hw != Some(counter.log_hw) {
         let ack = db.sequencer.send_counter(
@@ -1166,7 +1420,7 @@ fn await_retirement(
 pub(in crate::storage) fn stage_pending(
     db: &v2::V2Db,
     txn: &mut Transaction,
-    pending: &sequences::Pending,
+    pending: &Pending,
 ) -> Result<(), CoreError> {
     // No counter writes or catalog read tracking are needed for an empty map.
     // Release this guard before taking catalog locks, as on the nonempty path.
@@ -1175,22 +1429,17 @@ pub(in crate::storage) fn stage_pending(
     }
     let parts = db.catalog().parts(txn)?;
     let mut pending = pending.lock().map_err(|_| CoreError::Fenced)?;
-    // A savepoint rollback can discard a RESTART's private definition. Exclude
-    // its counter from both durable staging and the caller's live publication.
-    pending.retain(|id, counter| {
-        parts
-            .ext
-            .sequences
-            .get(id)
-            .is_some_and(|def| def.incarnation == counter.incarnation)
+    // Only publish the private incarnation that survived DDL and savepoint rollback.
+    pending.retain(|(id, incarnation), _| {
+        parts.ext.sequences.get(id).is_some_and(|def| def.incarnation == *incarnation)
     });
-    for (id, counter) in pending.iter() {
+    for ((id, incarnation), entry) in pending.iter() {
         if let Some(def) = parts.ext.sequences.get(id)
-            && def.incarnation == counter.incarnation
+            && def.incarnation == *incarnation
         {
             txn.put_counter(
                 engine::catalog_codec::counter_key(*id, def.incarnation),
-                engine::catalog_codec::encode_counter(counter, def)?,
+                engine::catalog_codec::encode_counter(&entry.counter, def)?,
             )?;
         }
     }

@@ -1229,3 +1229,32 @@ fn a_fenced_gateway_rejoins_at_its_next_select() {
     assert_eq!(gateway.services.membership_phase(), Phase::Serving);
     assert_eq!(gateway.services.membership_fences(), 1);
 }
+
+#[test]
+fn cluster_alter_sequence_position_allows_create_and_alter_in_one_transaction() {
+    let cluster = LocalCluster::new(&[]);
+    let gateway = gateway(&cluster, 1);
+    let mut sql = gateway.admin.sql_session();
+    run(&mut sql, "BEGIN");
+    run(&mut sql, "CREATE SEQUENCE seq");
+    run(&mut sql, "ALTER SEQUENCE seq CACHE 2");
+    run(&mut sql, "COMMIT");
+    assert_eq!(ints(&run(&mut sql, "SELECT nextval('seq')")), [vec![1]]);
+    assert_eq!(ints(&run(&mut sql, "SELECT nextval('seq')")), [vec![2]]);
+}
+
+#[test]
+fn cluster_alter_sequence_position_requires_system_range_migration() {
+    let cluster = LocalCluster::new(&[]);
+    let gateway = gateway(&cluster, 1);
+    let mut sql = gateway.admin.sql_session();
+    run(&mut sql, "ALTER SEQUENCE IF EXISTS missing CACHE 2");
+    run(&mut sql, "CREATE SEQUENCE seq");
+    assert_eq!(ints(&run(&mut sql, "SELECT nextval('seq')")), [vec![1]]);
+    let restart = sql.execute_at("ALTER SEQUENCE seq RESTART WITH 10", &[], None, &clock());
+    assert!(restart.is_err(), "{restart:?}");
+    assert_eq!(ints(&run(&mut sql, "SELECT nextval('seq')")), [vec![2]]);
+    let rewrite = sql.execute_at("ALTER SEQUENCE seq CACHE 2", &[], None, &clock()).unwrap_err();
+    assert_eq!(crate::sqlstate(&rewrite), "0A000");
+    assert_eq!(ints(&run(&mut sql, "SELECT nextval('seq')")), [vec![3]]);
+}
