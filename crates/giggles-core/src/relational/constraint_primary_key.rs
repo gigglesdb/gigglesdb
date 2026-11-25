@@ -94,11 +94,11 @@ pub(super) fn add(
         }
         None => state.choose_constraint_name(&state.table_key(table), &[], AutoName::Pkey),
     };
-    if state.relation_name_taken(&relation_key(state.table_schema(table.id), &name)) {
-        return Err(SqlError::DuplicateTable);
+    if sql_index::name_taken(state, &relation_key(state.table_schema(table.id), &name)) {
+        return Err(sql_index::duplicate_relation(&name));
     }
     if state.constraint_name_taken(table.id, &name) {
-        return Err(SqlError::DuplicateObject);
+        return Err(constraints::duplicate_constraint(table, &name));
     }
     let mut candidate = state.clone();
     let mut keyed = table.clone();

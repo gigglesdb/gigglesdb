@@ -1,5 +1,5 @@
 # Relative source path, containing function, call name, exact count, and justification.
-relational.rs execute_statement_described get 3 | Logical row source reads use the caller's snapshot or transient statement image.
+relational.rs execute_statement_described_with_append get 3 | Logical row source reads use the caller's snapshot or transient statement image.
 relational/query.rs bind_with_subqueries get 3 | Logical row source reads use the caller's snapshot or transient statement image.
 relational/query.rs eval_with_subqueries get 3 | Logical row source reads use the caller's snapshot or transient statement image.
 relational/query.rs execute_context get 1 | Logical row source reads use the caller's snapshot or transient statement image.

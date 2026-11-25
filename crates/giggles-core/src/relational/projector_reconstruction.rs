@@ -346,6 +346,7 @@ impl ScratchRelation {
         tick(cancel)?;
         let relation = Relational {
             format: 1,
+            v2_unique_reporting: false,
             ext: Default::default(),
             generation: counters.generation,
             epoch: counters.epoch,

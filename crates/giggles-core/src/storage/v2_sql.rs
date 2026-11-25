@@ -2090,7 +2090,7 @@ impl RowSink for SqlRows<'_> {
                 }).map_err(crate::task::limits::lock_error)?;
                 if target.current.is_some() {
                     return Err(engine::indexes::occupancy_duplicate(
-                        table, &rows, std::slice::from_ref(index), &key, &pk, true, &generated,
+                        table, &rows, std::slice::from_ref(index), &key, &pk, true, &generated, true,
                     ));
                 }
                 chunk.put(Keyspace::Index, key, pk)?;
@@ -2344,6 +2344,113 @@ impl RowSink for SqlRows<'_> {
             None => result,
         }
     }
+    fn report_append_collision(&mut self, table: &TableDef, rows: &[&SqlRow]) -> Result<(), CoreError> {
+        let image = self.catalog.image().map_err(CoreError::Sql)?;
+        let parts = self.parts;
+        let mut checks = parts.indexes.iter()
+            .filter(|index| index.table == table.id && index.unique)
+            .map(|index| (index.id, Some(index)))
+            .collect::<Vec<_>>();
+        if table.hidden_rowid().is_none() {
+            checks.push((image.primary_key_order(table.id), None));
+        }
+        checks.sort_unstable_by_key(|(order, _)| *order);
+        let mut collated = Vec::new();
+        if image.has_nondeterministic_keys(table) {
+            for (equality, name) in image.collated_unique_keys(table, &parts.indexes).map_err(CoreError::Sql)? {
+                let tuples = rows.iter().map(|row| equality.tuple(&row.values))
+                    .collect::<Result<Vec<_>, _>>().map_err(CoreError::Sql)?
+                    .into_iter().flatten().collect::<BTreeSet<_>>();
+                collated.push((equality, name, tuples, BTreeSet::new()));
+            }
+            self.at_latest(|source| source.lookup_all(table, &[], None, true, &mut |owner| {
+                for (equality, _, tuples, occupied) in &mut collated {
+                    if let Some(tuple) = equality.tuple(&owner.values)?
+                        && tuples.contains(&tuple)
+                    {
+                        occupied.insert(tuple);
+                    }
+                }
+                Ok(())
+            }))?;
+        }
+        let primary_name = image.primary_collision_name(table);
+        let mut seen = BTreeSet::new();
+        // The fast publisher locks physical keys in a consistent order. Once it
+        // detects a collision, compare witnesses in SQL input and creation order.
+        for row in rows {
+            for (order, index) in &checks {
+                let name = index.map_or(primary_name.as_str(), |d| d.name.as_str());
+                let duplicate = || CoreError::Sql(index.map_or_else(
+                    || image.primary_duplicate_values(table, &row.values),
+                    |index| relational::collation_keys::index_duplicate(
+                        table, index, &row.values, false,
+                        index.columns.iter().any(|id| parts.ext.generated_columns.contains_key(id)), true,
+                    ),
+                ));
+                if let Some((equality, _, _, occupied)) =
+                    collated.iter().find(|(_, key_name, ..)| key_name == name)
+                {
+                    let Some(tuple) = equality.tuple(&row.values).map_err(CoreError::Sql)? else { continue; };
+                    if occupied.contains(&tuple) || !seen.insert((*order, tuple)) {
+                        return Err(duplicate());
+                    }
+                    continue;
+                }
+                let (space, key) = if let Some(index) = index {
+                    let Some(key) = engine::indexes::unique_probe_key(&image, table, index, row)? else { continue; };
+                    (Keyspace::Index, key)
+                } else {
+                    let mut key = table.id.to_be_bytes().to_vec();
+                    key.extend(codec::pk_bytes(&table.primary_key.iter()
+                        .map(|i| row.values[*i].clone()).collect::<Vec<_>>())?);
+                    (Keyspace::Rows, key)
+                };
+                let occupied = self.txn.lock_for_write(
+                    space, &key, crate::task::limits::lock_deadline(),
+                    &|| crate::cancellation::check().is_err(),
+                ).map_err(crate::task::limits::lock_error)?.current.is_some();
+                if occupied || !seen.insert((*order, key)) {
+                    return Err(duplicate());
+                }
+            }
+        }
+        Ok(())
+    }
+    fn apply_append(
+        &mut self,
+        state: &relational::Relational,
+        table: &TableDef,
+        before: &DdlRows,
+        after: &DdlRows,
+        mut order: Option<Vec<relational::row_sink::AppendCandidate>>,
+    ) -> Result<(), CoreError> {
+        let mark = self.txn.statement_savepoint();
+        let result = (|| {
+            if state.has_nondeterministic_keys(table) {
+                self.check_occupancy(table, before, after)?;
+            }
+            self.apply_indexes(table, Some(table), before, after, state.secondary_descriptors_engine())?;
+            self.apply(table, before, after)
+        })();
+        if matches!(result, Err(CoreError::Sql(SqlError::Duplicate))) {
+            // The row publisher may have failed after the index writes were
+            // buffered. Roll back this page's writes while retaining its locks.
+            self.txn.rollback_to(&mark)?;
+            self.txn.release(mark)?;
+            let proposed: Vec<_> = match &mut order {
+                Some(candidates) => {
+                    candidates.sort_unstable_by_key(|candidate| candidate.input);
+                    candidates.iter().map(|candidate| &candidate.row).collect()
+                }
+                None => after.values().collect(),
+            };
+            self.report_append_collision(table, &proposed)?;
+        } else {
+            self.txn.release(mark)?;
+        }
+        result
+    }
     fn check_occupancy(
         &mut self,
         table: &TableDef,
@@ -2400,6 +2507,19 @@ impl RowSink for SqlRows<'_> {
                 .current
                 .is_some()
             {
+                let birth = image.primary_key_order(table.id);
+                if birth != 0 {
+                    let earlier = self.parts.indexes.iter()
+                        .filter(|index| index.table == table.id && index.unique && index.id < birth)
+                        .cloned().collect::<Vec<_>>();
+                    if !earlier.is_empty() {
+                        let proposal = DdlRows::from([(key.clone(), row.clone())]);
+                        engine::indexes::check_occupancy(
+                            self.txn, &image, table, before, &proposal, &earlier,
+                            &|id| self.parts.ext.generated_columns.contains_key(&id),
+                        )?;
+                    }
+                }
                 return Err(CoreError::Sql(image.primary_duplicate_values(table, &row.values)));
             }
         }
@@ -2429,7 +2549,7 @@ impl RowSink for SqlRows<'_> {
                     if let Some(tuple) = key.tuple(&row.values)?
                         && let Some(proposed) = tuples.get(&tuple)
                     {
-                        return Err(key.duplicate_detail(table, name, proposed, false)
+                        return Err(key.duplicate_detail(table, name, proposed, false, true)
                             .unwrap_or_else(|| relational::collation_keys::duplicate(name)));
                     }
                 }

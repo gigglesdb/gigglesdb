@@ -4,6 +4,7 @@ use super::*;
 #[derive(Debug, Clone)]
 pub(super) struct CreateIndex {
     pub name: String,
+    pub automatic_name: bool,
     pub table: String,
     pub columns: Vec<String>,
     pub collations: Vec<Option<String>>,
@@ -148,20 +149,14 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
     if p.at != p.tokens.len() {
         return Err(SqlError::Syntax);
     }
-    let name = match explicit_name {
-        Some(value) => value,
-        None => {
-            let table_part = ident::truncate(split_key(&table).1, 58);
-            let available = 63usize.saturating_sub(table_part.len() + 5);
-            let column_part = columns.join("_");
-            let column_part = ident::truncate(&column_part, available);
-            let value = format!("{table_part}_{column_part}_idx");
-            ident(&value)?;
-            value
-        }
-    };
+    let automatic_name = explicit_name.is_none();
+    let name = explicit_name.unwrap_or_else(|| {
+        catalog_ext::constraint_object_name(split_key(&table).1, &columns.join("_"), "idx")
+    });
+    ident(&name)?;
     Ok(CreateIndex {
         name,
+        automatic_name,
         table,
         columns,
         collations,
@@ -170,6 +165,20 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
         predicate,
         gin,
     })
+}
+
+impl CreateIndex {
+    pub(super) fn choose_name(&self, state: &Relational, table: &TableDef) -> String {
+        let columns = self.columns.join("_");
+        for attempt in 0u64.. {
+            let label = if attempt == 0 { "idx".into() } else { format!("idx{attempt}") };
+            let name = catalog_ext::constraint_object_name(&table.name, &columns, &label);
+            if !name_taken(state, &relation_key(state.table_schema(table.id), &name)) {
+                return name;
+            }
+        }
+        unreachable!("bounded catalog cannot exhaust index names")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +195,15 @@ pub(super) fn primary_table<'a>(state: &'a Relational, name: &str) -> Option<&'a
         constraint_primary_key::primary_key_name(state, table)
             .is_some_and(|key| relation_key(state.table_schema(table.id), &key) == name)
     })
+}
+
+pub(super) fn name_taken(state: &Relational, key: &str) -> bool {
+    state.relation_name_taken(key) || primary_table(state, key).is_some()
+}
+
+pub(super) fn duplicate_relation(name: &str) -> SqlError {
+    user_types::view_replace_error(format!("relation \"{}\" already exists", split_key(name).1));
+    SqlError::DuplicateTable
 }
 pub(super) fn parse_drop(p: &mut Parser) -> R<DropIndex> {
     parse_drop_impl(p, false)
@@ -213,8 +231,8 @@ fn parse_drop_impl(p: &mut Parser, authority_only: bool) -> R<DropIndex> {
         let first = p.raw_name()?;
         if p.sym('.') { relation_key(&first, &p.raw_name()?) } else { first }
     } else if alter {
-        // Resolve the index before applying name policy: every non-GIN
-        // rename retains the syntax error from before GIN renames existed.
+        // Resolve the index before applying name policy so a secondary-index
+        // rename can diagnose an occupied destination.
         let first = p.raw_name()?;
         let (schema, name) = if p.sym('.') {
             (Some(first), p.raw_name()?)

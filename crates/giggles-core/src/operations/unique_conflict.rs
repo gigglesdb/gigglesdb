@@ -670,19 +670,20 @@ fn plan_unique_conflict_evaluated<'s>(
             let values = (0..table.columns.len())
                 .map(|column| value(post, &resolved[index], &incoming[index], column).clone())
                 .collect::<Vec<_>>();
+            let old_key = resolved[index].winner.map(|(key, _)| key);
+            let primary_taken = old_key != Some(final_keys[index].as_slice())
+                && occupied.contains(&final_keys[index]);
             unique
                 .visit(
                     table,
                     resolved[index].winner,
                     &final_keys[index],
                     &values,
+                    primary_taken && src.v2_unique_reporting(),
                     &mut || cancel(),
                 )
                 .map_err(sql)?;
-            let old_key = resolved[index].winner.map(|(key, _)| key);
-            if old_key != Some(final_keys[index].as_slice())
-                && occupied.contains(&final_keys[index])
-            {
+            if primary_taken {
                 return Err(PlanError::Sql(src.primary_duplicate(table, &values)));
             }
             if let Some(old_key) = old_key {

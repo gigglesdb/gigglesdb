@@ -651,6 +651,7 @@ pub struct SqlResult {
 pub(crate) struct Relational {
     // Base in-memory format is always 1; wire format is 2 iff ext is nonempty.
     format: u32,
+    v2_unique_reporting: bool,
     pub generation: u64,
     pub epoch: u64,
     next_id: u64,
@@ -665,6 +666,7 @@ impl Default for Relational {
     fn default() -> Self {
         Self {
             format: 1,
+            v2_unique_reporting: false,
             generation: 0,
             epoch: 0,
             next_id: 1,
@@ -678,6 +680,14 @@ impl Default for Relational {
     }
 }
 impl Relational {
+    pub(crate) fn enable_v2_unique_reporting(&mut self) {
+        self.v2_unique_reporting = true;
+    }
+
+    pub(crate) fn v2_unique_reporting(&self) -> bool {
+        self.v2_unique_reporting
+    }
+
     pub(crate) fn next_catalog_id(&self) -> u64 {
         self.next_id
     }
@@ -2279,6 +2289,7 @@ impl Prepared {
                 for action in &alter.actions {
                     match action {
                         alter_table::Action::RenameColumn(..)
+                        | alter_table::Action::RenameConstraint(..)
                         | alter_table::Action::RenameTable(_)
                         | alter_table::Action::Default(..)
                         | alter_table::Action::NotNull(_, false) => (),
@@ -2518,6 +2529,7 @@ impl Prepared {
         Self::engine(
             Statement::CreateIndex(sql_index::CreateIndex {
                 gin: None,
+                automatic_name: false,
                 name,
                 table,
                 collations: vec![None; columns.len()],
@@ -3744,7 +3756,7 @@ impl Prepared {
         if !matches!(tokens.first(), Some(Token::Word(word)) if word == "alter") {
             return Ok(None);
         }
-        if matches!(tokens.get(1), Some(Token::Word(word)) if matches!(word.as_str(), "sequence" | "collation" | "type" | "trigger")) {
+        if matches!(tokens.get(1), Some(Token::Word(word)) if matches!(word.as_str(), "sequence" | "collation" | "type" | "trigger" | "index")) {
             return Ok(None);
         }
         let mut parser = Parser { privilege_seen: false, privilege_casts: false,
@@ -4571,10 +4583,27 @@ impl Relational {
         description: &StatementDescription<'_>,
         params: &[Value],
         expected: Option<u64>,
+        cancel: impl FnMut() -> bool,
+        clock: Option<&clock::ExecutionClock>,
+        injected_source: Option<&dyn scan::RowSource>,
+        events: &mut Vec<constraints::Event>,
+    ) -> R<SqlResult> {
+        self.execute_statement_described_with_append(
+            description, params, expected, cancel, clock, injected_source, events, None,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "optional V2 append ordering alongside statement inputs")]
+    fn execute_statement_described_with_append(
+        &mut self,
+        description: &StatementDescription<'_>,
+        params: &[Value],
+        expected: Option<u64>,
         mut cancel: impl FnMut() -> bool,
         clock: Option<&clock::ExecutionClock>,
         injected_source: Option<&dyn scan::RowSource>,
         events: &mut Vec<constraints::Event>,
+        append_order: Option<&mut Option<row_sink::AppendOrder>>,
     ) -> R<SqlResult> {
         let _type_path = user_types::TypeDisplayScope::enter(
             &description.prepared().search_path, Some(self),
@@ -4770,6 +4799,7 @@ impl Relational {
                     &prepared.parameter_types,
                     events,
                     injected_source,
+                    append_order,
                 );
             }
             Statement::Schema(ddl) => {
@@ -4863,8 +4893,17 @@ impl Relational {
             }
             Statement::SetConstraints(_, _) => return Err(SqlError::NoActiveTransaction),
             Statement::DropIndex(index) => {
+                if let Some(rename) = &index.rename {
+                    let key = relation_key(split_key(&index.name).0, rename);
+                    if sql_index::name_taken(self, &key) {
+                        return Err(sql_index::duplicate_relation(&key));
+                    }
+                }
                 if self.edit_gin_index(&index.name, index.rename.as_deref())? {
                     return Ok(result);
+                }
+                if index.rename.is_some() {
+                    return Err(SqlError::Syntax);
                 }
                 let descriptor = self
                     .secondary_descriptors_engine()
@@ -4916,10 +4955,8 @@ impl Relational {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
                 }
-                if index.if_not_exists
-                    && self
-                        .secondary_descriptors_engine()
-                        .iter()
+                if !self.v2_unique_reporting && index.if_not_exists
+                    && self.secondary_descriptors_engine().iter()
                         .any(|d| d.name == relation_key(split_key(&index.table).0, &index.name))
                 {
                     return Ok(result);
@@ -4929,6 +4966,27 @@ impl Relational {
                     .get(&index.table)
                     .ok_or(SqlError::UnknownTable)?
                     .clone();
+                let resolved;
+                let index = if index.automatic_name {
+                    resolved = sql_index::CreateIndex {
+                        name: index.choose_name(self, &table),
+                        ..index.clone()
+                    };
+                    &resolved
+                } else {
+                    index
+                };
+                let key = relation_key(self.table_schema(table.id), &index.name);
+                if self.v2_unique_reporting && sql_index::name_taken(self, &key) {
+                    if index.if_not_exists {
+                        user_types::sql_notice(
+                            format!("relation \"{}\" already exists, skipping", index.name),
+                            "42P07",
+                        );
+                        return Ok(result);
+                    }
+                    return Err(sql_index::duplicate_relation(&key));
+                }
                 if let Some(definition) = &index.gin {
                     gin_indexes::create(self, &table, index, definition)?;
                     return Ok(result);
@@ -5078,6 +5136,12 @@ impl Relational {
                         }))
                     };
                 let schema = prepared.creation_schema(self)?;
+                if let Some(primary) = &primary_name {
+                    let key = relation_key(&schema, primary);
+                    if key == *name || sql_index::name_taken(self, &key) {
+                        return Err(sql_index::duplicate_relation(&key));
+                    }
+                }
                 for ((column, type_id), default) in t.columns.iter().zip(&type_ids).zip(defaults) {
                     if column.data_type != DataType::TextArray {
                         enum_alter::validate_default(type_id.and_then(|id| self.ext.types.get(&id)), default.as_deref())?;
@@ -5354,14 +5418,14 @@ impl Relational {
                     });
                     // Witness ownership is admitted by secondary_admit_mutation before
                     // expression/row construction; stage checks its exact raw value.
-                    result = if new_key == b.low {
+                    let publication = if new_key == b.low {
                         self.secondary_apply_statement(
                             table_id,
                             Some((&b.low, &old)),
                             Some((&new_key, &row)),
                             next_version,
                             &mut cancel,
-                        )?
+                        )
                     } else {
                         use secondary_index_adapter::BatchRowChange;
                         let changes = [
@@ -5376,15 +5440,24 @@ impl Relational {
                                 new: Some((&new_key, &row)),
                             },
                         ];
-                        let mut result = self.secondary_apply_batch_engine(
+                        self.secondary_apply_batch_engine(
                             self.epoch,
                             &changes,
                             next_version,
                             &mut cancel,
-                        )?;
-                        result.affected = 1;
-                        result
+                        ).map(|mut result| {
+                            result.affected = 1;
+                            result
+                        })
                     };
+                    if publication == Err(SqlError::Duplicate) && self.v2_unique_reporting {
+                        let t = &self.tables[name];
+                        let primary_taken = new_key != b.low && self.rows[&table_id].contains_key(&new_key);
+                        UpdateUnique::new(self, t, &mut cancel)?.visit(
+                            t, Some((&b.low, &old)), &new_key, &row.values, primary_taken, &mut cancel,
+                        )?;
+                    }
+                    result = publication?;
                 } else {
                     result = self.secondary_apply_statement(
                         table_id,

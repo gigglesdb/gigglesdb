@@ -31,6 +31,7 @@ pub(super) enum Action {
     ),
     Drop(String, bool, bool),
     RenameColumn(String, String),
+    RenameConstraint(String, String),
     RenameTable(String),
     Default(String, Option<String>),
     Expression(String, Option<generated_columns::Definition>, bool),
@@ -186,6 +187,10 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
         } else if p.word("rename") {
             if p.word("to") {
                 Action::RenameTable(raw_name(p)?)
+            } else if p.word("constraint") {
+                let name = raw_name(p)?;
+                p.need("to")?;
+                Action::RenameConstraint(name, raw_name(p)?)
             } else {
                 p.word("column");
                 let name = raw_name(p)?;
@@ -833,6 +838,16 @@ pub(super) fn execute(
                 constraints::rename_check_column(&mut candidate, &table, old, new)?;
                 table.columns[at].name = new.clone();
                 std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(), table.clone());
+            }
+            Action::RenameConstraint(old, new) => {
+                let backed_by_index = candidate.primary_key_constraint_name(&table).as_ref() == Some(old)
+                    || candidate.table_constraints(table.id).iter().any(|constraint|
+                        constraint.name == *old && matches!(constraint.kind, ConstraintKind::Unique { .. }));
+                let key = relation_key(candidate.table_schema(table.id), new);
+                if backed_by_index && sql_index::name_taken(&candidate, &key) {
+                    return Err(sql_index::duplicate_relation(&key));
+                }
+                return Err(SqlError::Syntax);
             }
             Action::RenameTable(new) => {
                 ident::ident(new)?;

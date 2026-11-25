@@ -81,6 +81,8 @@ mod owner_key_hygiene;
 mod predicate_unknown_literals;
 #[path = "public_unique.rs"]
 mod public_unique;
+#[path = "unique_reporting.rs"]
+mod unique_reporting;
 #[path = "quoted_routines.rs"]
 mod quoted_routines;
 #[path = "read_explain.rs"]

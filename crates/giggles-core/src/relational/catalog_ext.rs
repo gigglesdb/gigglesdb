@@ -1204,7 +1204,7 @@ pub(crate) enum AutoName {
 
 // Match makeObjectName: reserve separators and label, then balance byte lengths
 // before clipping each identifier at a UTF-8 boundary.
-fn constraint_object_name(table: &str, columns: &str, label: &str) -> String {
+pub(super) fn constraint_object_name(table: &str, columns: &str, label: &str) -> String {
     let mut table_len = table.len();
     let mut columns_len = columns.len();
     let overhead = label.len() + 1 + usize::from(!columns.is_empty());

@@ -767,7 +767,7 @@ fn every_v2_commit_boundary() {
             if ddl {
                 let probe = v2_execute(&mut sql, "CREATE INDEX cb_qty ON cb_parent(qty)");
                 if committed {
-                    assert_eq!(probe.unwrap_err(), CoreError::Sql(SqlError::Duplicate));
+                    assert_eq!(probe.unwrap_err(), CoreError::Sql(SqlError::DuplicateTable));
                 } else {
                     probe.unwrap();
                 }

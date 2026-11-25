@@ -442,6 +442,8 @@ fn verify(
         u64::MAX,
     )
     .map_err(CoreError::Sql)?;
+    // The destination's catalog image enables V2 execution behavior in memory.
+    expected.enable_v2_unique_reporting();
     expected
         .catalog_indexes(s.sql.secondary_descriptors_engine())
         .map_err(CoreError::Sql)?;

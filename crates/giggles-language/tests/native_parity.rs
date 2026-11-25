@@ -306,16 +306,12 @@ fn v2_native_catalog_matches_sql_on_populated_database() {
     assert_eq!(native(&right, "items where a=10 order by id limit 1024", false), expected);
     for (statement, text, kind, code) in [
         ("create table items(id bigint primary key)", "create table items(id int64,primary key(id))", SqlError::DuplicateTable, "42P07"),
-        ("create index items_a on items(a)", "create index items_a on items(a)", SqlError::Duplicate, "23505"),
+        ("create index items_a on items(a)", "create index items_a on items(a)", SqlError::DuplicateTable, "42P07"),
         ("create index missing on items(absent)", "create index missing on items(absent)", SqlError::UnknownColumn, "42703"),
     ] {
         assert_eq!(sql(&left, statement), Step::Sql(kind.clone()));
         let actual = with_sql_parser_forbidden(|| engine.execute_catalog_text(text)).unwrap_err();
-        if kind == SqlError::Duplicate {
-            assert_eq!(actual, Error::Duplicate);
-        } else {
-            assert_eq!(actual, Error::Sql { sqlstate: code.into() });
-        }
+        assert_eq!(actual, Error::Sql { sqlstate: code.into() });
         assert_eq!(actual.sqlstate(), Some(code));
         assert_eq!(snapshot(&left), snapshot(&right));
     }

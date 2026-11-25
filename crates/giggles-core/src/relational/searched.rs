@@ -125,11 +125,11 @@ pub(super) fn route(
             let new_key = pk(table, &row.values)?;
             // Immediate uniqueness is checked in logical evaluation order. A later
             // matched row still occupies its key until that row is evaluated.
-            if postkeys.contains(&new_key)
+            let primary_taken = postkeys.contains(&new_key)
                 || new_key != *key
                     && source.contains(table, &new_key)?
-                    && !vacated.contains(new_key.as_slice())
-            {
+                    && !vacated.contains(new_key.as_slice());
+            if primary_taken && !state.v2_unique_reporting {
                 return Err(state.primary_duplicate(table, &row.values));
             }
             unique.as_mut().expect("UPDATE occupancy").visit(
@@ -137,6 +137,7 @@ pub(super) fn route(
                 Some((key, old)),
                 &new_key,
                 &row.values,
+                primary_taken,
                 cancel,
             )?;
             vacated.insert(key.as_slice());

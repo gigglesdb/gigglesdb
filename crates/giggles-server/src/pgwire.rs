@@ -317,6 +317,8 @@ impl Diagnostic {
                 || m.starts_with("constraint \"") && m.ends_with(" does not exist")
                 || m.starts_with("cannot drop constraint ") || m.starts_with("could not create unique index ")
                 || m.starts_with("duplicate key value violates unique constraint ")
+                || m.starts_with("relation \"") && m.ends_with(" already exists")
+                || m.starts_with("constraint \"") && m.contains(" for relation \"") && m.ends_with(" already exists")
                 || m == "canceling statement due to lock timeout"
                 || m.starts_with("type modifier is not allowed for type ")
                 || m.starts_with("permission denied for table ") || m.starts_with("view ") || m.starts_with("sequence ") || m.starts_with("index ")

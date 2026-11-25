@@ -240,13 +240,16 @@ impl Prepared {
             Statement::CreateIndex(index) => read(&mut index.table),
             Statement::DropIndex(index) => {
                 index.name = state.resolve_index_key(&index.name, &self.search_path);
+                index.table = state.index_table_key(&index.name);
                 if let Some(rename) = &index.rename {
-                    if state.gin_index(&index.name).is_none() {
+                    let target = relation_key(split_key(&index.name).0, rename);
+                    if index.table.is_none() || state.gin_index(&index.name).is_none()
+                        && !sql_index::name_taken(state, &target)
+                    {
                         return Err(SqlError::Syntax);
                     }
                     ident::ident(rename)?;
                 }
-                index.table = state.index_table_key(&index.name);
             }
             Statement::Sequence(ddl) => ddl.bind_schema_names(&read, &create)?,
             _ => {}

@@ -323,6 +323,13 @@ fn missing_parent(
     SqlError::ForeignKeyViolation
 }
 
+pub(super) fn duplicate_constraint(table: &TableDef, name: &str) -> SqlError {
+    user_types::view_replace_error(format!(
+        "constraint \"{name}\" for relation \"{}\" already exists", table.name,
+    ));
+    SqlError::DuplicateObject
+}
+
 pub(super) fn install_unique(
     state: &mut Relational,
     table: &TableDef,
@@ -345,11 +352,11 @@ pub(super) fn install_unique(
             AutoName::Key,
         )
     });
-    if state.relation_name_taken(&relation_key(state.table_schema(table.id), &name)) {
-        return Err(SqlError::DuplicateTable);
+    if sql_index::name_taken(state, &relation_key(state.table_schema(table.id), &name)) {
+        return Err(sql_index::duplicate_relation(&name));
     }
     if state.constraint_name_taken(table.id, &name) {
-        return Err(SqlError::DuplicateObject);
+        return Err(duplicate_constraint(table, &name));
     }
     let epoch = state.epoch;
     let index = state.create_secondary_index_populated_engine(table, epoch, &name, &ids, true, None, None, &mut *cancel)?;
@@ -515,7 +522,7 @@ pub(super) fn install(
     }
     ident(&name)?;
     if state.constraint_name_taken(table.id, &name) {
-        return Err(SqlError::DuplicateObject);
+        return Err(duplicate_constraint(table, &name));
     }
     let skip = matches!(
         &kind,

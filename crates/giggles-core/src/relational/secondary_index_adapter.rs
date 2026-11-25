@@ -568,8 +568,12 @@ pub(crate) struct BatchRowChange<'a> {
 /// Single-row point UPDATEs do not build it: per-row and final-batch checks coincide there.
 pub(crate) struct UpdateUnique {
     indexes: Vec<UpdateUniqueIndex>,
+    primary_order: u64,
+    primary_name: String,
+    detailed: bool,
 }
 struct UpdateUniqueIndex {
+    order: u64,
     key: collation_keys::Key,
     name: String,
     generated_key: bool,
@@ -582,25 +586,30 @@ impl UpdateUnique {
         cancel: &mut impl FnMut() -> bool,
     ) -> R<Self> {
         let mut indexes = Vec::new();
+        let primary_order = state.primary_key_order(table.id);
+        let primary_name = state.primary_collision_name(table);
         let primary = table.primary_key.iter().map(|i| table.columns[*i].id).collect::<Vec<_>>();
         let primary = collation_keys::Key::new(state, table, &primary, None)?;
         let mut keys = Vec::new();
         if primary.nondeterministic() {
-            keys.push((primary, state.primary_collision_name(table)));
+            keys.push((primary_order, primary, primary_name.clone()));
         }
         for d in state.secondary.descriptors().iter().filter(|d| d.table == table.id && d.unique) {
-            keys.push((collation_keys::Key::for_index(state, table, d)?, d.name.clone()));
+            keys.push((d.id, collation_keys::Key::for_index(state, table, d)?, d.name.clone()));
         }
-        for (key, name) in keys {
+        if state.v2_unique_reporting {
+            keys.sort_unstable_by_key(|(order, ..)| *order);
+        }
+        for (order, key, name) in keys {
             let mut occupied = BTreeMap::new();
             for (owner, row) in state.rows.get(&table.id).ok_or(SqlError::UnknownTable)? {
                 tick(cancel)?;
                 if let Some(tuple) = key.tuple(&row.values)? { occupied.insert(tuple, owner.clone()); }
             }
             let generated_key = key.columns.iter().any(|i| state.generated_column(table.columns[*i].id).is_some());
-            indexes.push(UpdateUniqueIndex { key, name, generated_key, occupied });
+            indexes.push(UpdateUniqueIndex { order, key, name, generated_key, occupied });
         }
-        Ok(Self { indexes })
+        Ok(Self { indexes, primary_order, primary_name, detailed: state.v2_unique_reporting })
     }
     pub(crate) fn visit(
         &mut self,
@@ -608,9 +617,17 @@ impl UpdateUnique {
         old: Option<(&[u8], &SqlRow)>,
         key: &[u8],
         values: &[Value],
+        primary_taken: bool,
         cancel: &mut impl FnMut() -> bool,
     ) -> R<()> {
-        for UpdateUniqueIndex { key: equality, name, generated_key, occupied } in &mut self.indexes {
+        let primary_error = || {
+            collation_keys::key_duplicate(table, &self.primary_name, &table.primary_key, values, false)
+                .unwrap_or_else(|| collation_keys::duplicate(&self.primary_name))
+        };
+        for UpdateUniqueIndex { order, key: equality, name, generated_key, occupied } in &mut self.indexes {
+            if primary_taken && *order >= self.primary_order {
+                return Err(primary_error());
+            }
             tick(cancel)?;
             let tuple = equality.tuple(values)?;
             if let Some(tuple) = &tuple
@@ -618,13 +635,13 @@ impl UpdateUnique {
                     .get(tuple)
                     .is_some_and(|owner| old.is_none_or(|(old_key, _)| owner.as_slice() != old_key))
             {
-                let detail = if *generated_key {
+                let detail = if self.detailed || *generated_key {
                     collation_keys::key_duplicate(table, name, &equality.columns, values, false)
                 } else {
-                    equality.duplicate_detail(table, name, values, false)
+                    equality.duplicate_detail(table, name, values, false, self.detailed)
                 };
                 return Err(detail
-                    .unwrap_or_else(|| if equality.nondeterministic() { collation_keys::duplicate(name) } else { SqlError::Duplicate }));
+                    .unwrap_or_else(|| if self.detailed || equality.nondeterministic() { collation_keys::duplicate(name) } else { SqlError::Duplicate }));
             }
             if let Some((_, old)) = old
                 && let Some(tuple) = equality.tuple(&old.values)?
@@ -634,6 +651,9 @@ impl UpdateUnique {
             if let Some(tuple) = tuple {
                 occupied.insert(tuple, key.to_vec());
             }
+        }
+        if primary_taken {
+            return Err(primary_error());
         }
         Ok(())
     }
@@ -1299,6 +1319,7 @@ impl<'de> Deserialize<'de> for Relational {
                 }
                 let mut value = Relational {
                     format: 1,
+                    v2_unique_reporting: false,
                     generation: field!("generation"),
                     epoch: field!("epoch"),
                     next_id: field!("next_id"),

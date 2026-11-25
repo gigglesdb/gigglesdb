@@ -53,6 +53,17 @@ pub(crate) fn row_key(table: &TableDef, row: &SqlRow) -> R<Vec<u8>> {
     pk(table, &row.values)
 }
 
+pub(crate) struct AppendCandidate {
+    pub(crate) key: Vec<u8>,
+    pub(crate) row: SqlRow,
+    pub(crate) input: usize,
+}
+
+pub(super) enum AppendOrder {
+    PublishedCandidates(Vec<AppendCandidate>),
+    RejectedCandidates(Vec<SqlRow>),
+}
+
 pub(crate) trait RowSink {
     fn mutation_keys(
         &mut self,
@@ -232,6 +243,23 @@ pub(crate) trait RowSink {
         _after: &DdlRows,
     ) -> Result<(), CoreError> {
         Ok(())
+    }
+    fn report_append_collision(&mut self, _table: &TableDef, _rows: &[&SqlRow]) -> Result<(), CoreError> {
+        Ok(())
+    }
+    fn apply_append(
+        &mut self,
+        state: &Relational,
+        table: &TableDef,
+        before: &DdlRows,
+        after: &DdlRows,
+        _order: Option<Vec<AppendCandidate>>,
+    ) -> Result<(), CoreError> {
+        if state.has_nondeterministic_keys(table) {
+            self.check_occupancy(table, before, after)?;
+        }
+        self.apply_indexes(table, Some(table), before, after, state.secondary_descriptors_engine())?;
+        self.apply(table, before, after)
     }
     /// Publish the difference atomically; the caller owns a statement savepoint.
     fn apply(
@@ -800,6 +828,7 @@ impl Relational {
             SqlResult::default()
         } else {
             let mut events = Vec::new();
+            let mut append_order = None;
             let result = if prepared.row_lock_command().is_some() {
                 let mut result = None;
                 let snapshot = self.clone();
@@ -810,6 +839,21 @@ impl Relational {
                     Ok(())
                 })?;
                 result.ok_or(CoreError::Sql(SqlError::InternalError))?
+            } else if append {
+                match self.execute_statement_described_with_append(
+                    &StatementDescription::new(prepared), params, expected,
+                    || crate::cancellation::check().is_err(), clock, None, &mut events,
+                    Some(&mut append_order),
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if let Some(AppendOrder::RejectedCandidates(rows)) = append_order {
+                            let rows = rows.iter().collect::<Vec<_>>();
+                            sink.report_append_collision(table.as_ref().expect("append target"), &rows)?;
+                        }
+                        return Err(CoreError::Sql(error));
+                    }
+                }
             } else {
                 self.execute_statement_inner(prepared, params, expected,
                     || crate::cancellation::check().is_err(), clock, None, &mut events)
@@ -838,19 +882,13 @@ impl Relational {
                     let table = table.as_ref().expect("append target");
                     let old = &before.rows[&table.id];
                     let new = &self.rows[&table.id];
-                    if self.has_nondeterministic_keys(table) {
-                        sink.check_occupancy(table, old, new)?;
-                    }
                     // Preserve immediate PK/UNIQUE error precedence before
                     // end-of-statement constraints. The savepoint owns rollback.
-                    sink.apply_indexes(
-                        table,
-                        Some(table),
-                        old,
-                        new,
-                        self.secondary_descriptors_engine(),
-                    )?;
-                    sink.apply(table, old, new)?;
+                    let order = match append_order {
+                        Some(AppendOrder::PublishedCandidates(rows)) => Some(rows),
+                        _ => None,
+                    };
+                    sink.apply_append(self, table, old, new, order)?;
                 }
                 let descriptors = self.secondary_descriptors_engine().to_vec();
                 let mut source_error = None;

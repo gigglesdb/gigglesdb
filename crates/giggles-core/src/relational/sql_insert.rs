@@ -938,6 +938,7 @@ impl Insert {
 struct SourceRows {
     insert: Insert,
     types: Vec<Option<SourceType>>,
+    parameters: Vec<Option<DataType>>,
     stored: Option<(SqlResult, Option<spill::Store<SqlRow>>)>,
 }
 #[expect(clippy::too_many_arguments, reason = "statement inputs plus an optional source and capture mode")]
@@ -1019,6 +1020,7 @@ fn materialize_source(
     Ok(SourceRows {
         insert: materialized,
         types,
+        parameters,
         stored,
     })
 }
@@ -1577,6 +1579,7 @@ pub(super) fn execute(
         &[],
         &mut Vec::new(),
         None,
+        None,
     )
 }
 
@@ -1595,12 +1598,13 @@ pub(super) fn execute_declared(
     declared: &[Option<DataType>],
     events: &mut Vec<constraints::Event>,
     injected_source: Option<&dyn scan::RowSource>,
+    append_order: Option<&mut Option<row_sink::AppendOrder>>,
 ) -> R<SqlResult> {
     if cancel() {
         return Err(SqlError::Aborted);
     }
     let materialized;
-    let (insert, source_types) = if insert.source.is_some() {
+    let (insert, source_types, source_parameters) = if insert.source.is_some() {
         if expected.is_some() {
             return Err(SqlError::Unsupported);
         }
@@ -1614,9 +1618,13 @@ pub(super) fn execute_declared(
             injected_source,
             false,
         )?;
-        (&materialized.insert, Some(materialized.types.as_slice()))
+        (
+            &materialized.insert,
+            Some(materialized.types.as_slice()),
+            Some(materialized.parameters.as_slice()),
+        )
     } else {
-        (insert, insert.source_types.as_deref())
+        (insert, insert.source_types.as_deref(), None)
     };
     admit_statement(insert, params)?;
     if cancel() {
@@ -1669,12 +1677,20 @@ pub(super) fn execute_declared(
     }
     if let Some(conflict) = &insert.conflict {
         let predicate = insert.arbiter_predicate(state, &table)?;
-        let parameters = insert
-            .describe(state, params.len(), declared)?
-            .parameters
-            .into_iter()
-            .map(Some)
-            .collect::<Vec<_>>();
+        let values_parameters;
+        let parameters = if let Some(parameters) = source_parameters {
+            // Materialization replaces source expressions with literals. Keep
+            // their inferred parameter types for the ON CONFLICT evaluator.
+            parameters
+        } else {
+            values_parameters = insert
+                .describe(state, params.len(), declared)?
+                .parameters
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<_>>();
+            &values_parameters
+        };
         let evaluation = conflict
             .update
             .as_ref()
@@ -1684,7 +1700,7 @@ pub(super) fn execute_declared(
                     insert.alias.as_deref(),
                     &table,
                     state,
-                    &parameters,
+                    parameters,
                     params,
                     clock,
                 )
@@ -1741,6 +1757,7 @@ pub(super) fn execute_declared(
     }
     let mut next_version = state.next_version_engine();
     // Heap tables take their hidden row id from a version allocated in VALUES order.
+    use row_sink::AppendCandidate;
     let mut proposed = if let Some(hidden) = hidden_rowid {
         incoming
             .into_iter()
@@ -1749,14 +1766,14 @@ pub(super) fn execute_declared(
                 let version = allocate(&mut next_version)?;
                 values[hidden] =
                     Value::Int(i64::try_from(version).map_err(|_| SqlError::Overflow)?);
-                Ok((pk(&table, &values)?, SqlRow { values, version }, input))
+                Ok(AppendCandidate { key: pk(&table, &values)?, row: SqlRow { values, version }, input })
             })
             .collect::<R<Vec<_>>>()?
     } else {
         incoming
             .into_iter()
             .enumerate()
-            .map(|(input, values)| Ok((pk(&table, &values)?, SqlRow { values, version: 0 }, input)))
+            .map(|(input, values)| Ok(AppendCandidate { key: pk(&table, &values)?, row: SqlRow { values, version: 0 }, input }))
             .collect::<R<Vec<_>>>()?
     };
     // Project RETURNING in VALUES order, after hidden row ids exist and before the key sort.
@@ -1765,25 +1782,25 @@ pub(super) fn execute_declared(
             returning,
             state,
             params,
-            &proposed.iter().map(|(_, row, _)| row).collect::<Vec<_>>(),
+            &proposed.iter().map(|candidate| &candidate.row).collect::<Vec<_>>(),
         )?
     } else {
         vec![]
     };
-    proposed.sort_by(|left, right| left.0.cmp(&right.0));
+    proposed.sort_by(|left, right| left.key.cmp(&right.key));
     if hidden_rowid.is_none() {
-        for (_, row, _) in &mut proposed {
+        for AppendCandidate { row, .. } in &mut proposed {
             row.version = allocate(&mut next_version)?;
         }
     }
-    for (_, row, input) in &proposed {
+    for AppendCandidate { row, input, .. } in &proposed {
         if let Some(projected) = returned.get_mut(*input) {
             projected.version = row.version;
         }
     }
     let changes = proposed
         .iter()
-        .map(|(key, row, _)| BatchRowChange {
+        .map(|AppendCandidate { key, row, .. }| BatchRowChange {
             table: table.id,
             old: None,
             new: Some((key, row)),
@@ -1791,8 +1808,32 @@ pub(super) fn execute_declared(
         .collect::<Vec<_>>();
     #[cfg(test)]
     Relational::sql_insert_test_event(4);
-    let mut result =
-        state.secondary_apply_batch_engine(state.epoch, &changes, next_version, cancel)?;
+    let result = state.secondary_apply_batch_engine(state.epoch, &changes, next_version, &mut *cancel);
+    if let Some(order) = append_order {
+        match &result {
+            Ok(_) => *order = Some(row_sink::AppendOrder::PublishedCandidates(proposed)),
+            Err(SqlError::Duplicate) => {
+                proposed.sort_unstable_by_key(|candidate| candidate.input);
+                *order = Some(row_sink::AppendOrder::RejectedCandidates(
+                    proposed.into_iter().map(|candidate| candidate.row).collect(),
+                ));
+            }
+            Err(_) => {}
+        }
+    } else if state.v2_unique_reporting && result == Err(SqlError::Duplicate) {
+        // A materialized SELECT (including a WITH body) can already have
+        // target witnesses in its statement image. The batch stager validates
+        // in key order. Revisit rejected candidates in source order.
+        proposed.sort_unstable_by_key(|candidate| candidate.input);
+        let mut check_cancel = cancel;
+        let mut unique = UpdateUnique::new(state, &table, &mut check_cancel)?;
+        let mut seen = BTreeSet::new();
+        for AppendCandidate { key, row, .. } in &proposed {
+            let primary_taken = state.rows[&table.id].contains_key(key) || !seen.insert(key);
+            unique.visit(&table, None, key, &row.values, primary_taken, &mut check_cancel)?;
+        }
+    }
+    let mut result = result?;
     returning::attach(returning, &mut result, returned);
     Ok(result)
 }

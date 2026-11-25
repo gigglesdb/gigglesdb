@@ -313,6 +313,7 @@ impl CatalogSnapshot {
                 u64::MAX,
             )?
         };
+        image.enable_v2_unique_reporting();
         image.catalog_indexes(&self.parts.indexes)?;
         image.catalog_views(&self.parts.sql_views)?;
         let image = Arc::new(image);
