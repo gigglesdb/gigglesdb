@@ -458,7 +458,7 @@ fn returning_native_wrapper_admission_and_alias_binding_are_bounded() {
         ),
         returning(
             write,
-            (0..65)
+            (0..=giggles_core::relational::MAX_TARGET_COLUMNS)
                 .map(|i| Projection {
                     expression: field("x"),
                     alias: Some(format!("c{i}")),

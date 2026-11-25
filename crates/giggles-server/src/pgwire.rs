@@ -280,7 +280,7 @@ impl Diagnostic {
     fn catalog_error(&mut self, error: giggles_pg_catalog::Error) -> &'static str {
         use giggles_pg_catalog::Error as E;
         if matches!(&error, E::InvalidTypeModifier(_) | E::TypeModifierNotAllowed(_)
-            | E::TypeNameSyntax { .. })
+            | E::TypeNameSyntax { .. } | E::TooManyColumns)
         {
             self.wire_message = Some(error.to_string());
         }
@@ -446,6 +446,7 @@ impl Diagnostic {
             &result,
             Err(CoreError::Sql(
                 giggles_core::relational::SqlError::Limit
+                    | giggles_core::relational::SqlError::TooManyColumns
                     | giggles_core::relational::SqlError::CheckViolation
                     | giggles_core::relational::SqlError::InvalidParameterValue
                     | giggles_core::relational::SqlError::Null
@@ -1388,6 +1389,7 @@ fn catalog_plan(
         // example COPY rejection). Core still parses and authorizes the entire
         // original statement; no failed catalog plan is executed as metadata.
         Err(giggles_pg_catalog::Error::Syntax) => Ok(None),
+        Err(error @ giggles_pg_catalog::Error::TooManyColumns) => Err(diagnostic.catalog_error(error)),
         other => other.map(|plan| plan.map(|plan| (plan, fence))).map_err(catalog_wire::error),
     }
 }

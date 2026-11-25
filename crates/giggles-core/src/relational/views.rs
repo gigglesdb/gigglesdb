@@ -213,6 +213,9 @@ impl Prepared {
                     columns: view.columns.iter().map(|c| ColumnDef { id: c.id, name: c.name.clone(), data_type: c.storage_type.clone(), not_null: false }).collect(), primary_key: vec![] });
             }
             let mut outputs = query.view_projection(&binding)?;
+            if outputs.len() > MAX_TABLE_COLUMNS {
+                return Err(table_column_limit());
+            }
             if ddl.columns.len() > outputs.len() { return Err(SqlError::Syntax); }
             for (column, name) in outputs.iter_mut().zip(&ddl.columns) { column.name = name.clone(); }
             let mut seen = BTreeSet::new();

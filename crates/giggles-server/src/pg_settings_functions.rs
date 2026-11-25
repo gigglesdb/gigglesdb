@@ -373,7 +373,7 @@ fn inventory(tokens: Vec<Token>) -> Option<Function> {
             let alias = if p.token(Token::Word("as".into())).is_some() { p.word()? } else { name };
             fields.push((alias, if numeric { DataType::Numeric } else { inventory_type(index) }));
             projection.push((index, numeric));
-            if fields.len() > 128 {
+            if fields.len() > giggles_core::relational::MAX_TARGET_COLUMNS {
                 return None;
             }
             if p.token(Token::Comma).is_none() {

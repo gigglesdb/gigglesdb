@@ -140,8 +140,9 @@ pub(crate) fn schema(tables: &[Table], bounds: Bounds) -> Result<()> {
         }
         prev = Some(t.name.as_str());
         if t.columns.is_empty()
-            || t.columns.len() > relational::MAX_COLUMNS
+            || t.columns.len() > relational::MAX_TABLE_COLUMNS
             || t.primary_key.is_empty()
+            || t.primary_key.len() > relational::MAX_COLUMNS
             || t.primary_key.len() > t.columns.len()
         {
             return Err(invalid("schema bounds"));

@@ -1,5 +1,5 @@
 use super::{crc32c::crc32c_parts, hlc::Ts};
-use crate::relational::{MAX_COLUMNS, MAX_VALUE_BYTES, SqlError, Value, encode_key_iter};
+use crate::relational::{MAX_COLUMNS, MAX_STORED_COLUMNS, MAX_VALUE_BYTES, SqlError, Value, encode_key_iter};
 use bincode::Options;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,15 +151,17 @@ pub(crate) fn range_stored_row_fits(value: &[u8]) -> bool {
     range_row_fits(value.strip_prefix(&[0]).unwrap_or(value))
 }
 
+const MAX_ROW_PAYLOAD: usize = MAX_VALUE_BYTES + MAX_COLUMNS * 32;
+
 pub(crate) fn encode_row(
     key: &[u8],
     row_version: u64,
     values: &[Value],
 ) -> Result<Vec<u8>, CodecError> {
-    if values.len() > MAX_COLUMNS {
+    if values.len() > MAX_STORED_COLUMNS {
         return Err(CodecError::Limit);
     }
-    let options = || super::super::codec().with_limit((MAX_VALUE_BYTES + MAX_COLUMNS * 32) as u64);
+    let options = || super::super::codec().with_limit(MAX_ROW_PAYLOAD as u64);
     let size = options()
         .serialized_size(&values)
         .map_err(|_| CodecError::Limit)?;
@@ -169,7 +171,7 @@ pub(crate) fn encode_row(
     let payload = options()
         .serialize(&values)
         .map_err(|_| CodecError::Corrupt("row serialization"))?;
-    if payload.len() > MAX_VALUE_BYTES + MAX_COLUMNS * 32 {
+    if payload.len() > MAX_ROW_PAYLOAD {
         return Err(CodecError::Limit);
     }
     encode_record(key, row_version, false, values.len(), &payload)
@@ -211,7 +213,7 @@ pub(crate) fn decode_row(key: &[u8], record: &[u8]) -> Result<RowRecord, CodecEr
     let row_version = u64::from_be_bytes(record[2..10].try_into().unwrap());
     let count = u16::from_be_bytes(record[10..12].try_into().unwrap()) as usize;
     let len = u32::from_be_bytes(record[12..16].try_into().unwrap()) as usize;
-    if count > MAX_COLUMNS || len > MAX_VALUE_BYTES + MAX_COLUMNS * 32 {
+    if count > MAX_STORED_COLUMNS || len > MAX_ROW_PAYLOAD {
         return Err(CodecError::Corrupt("row bounds"));
     }
     if record.len() != HEADER + len + 4 {
@@ -229,7 +231,7 @@ pub(crate) fn decode_row(key: &[u8], record: &[u8]) -> Result<RowRecord, CodecEr
         Vec::new()
     } else {
         super::super::codec()
-            .with_limit((MAX_VALUE_BYTES + MAX_COLUMNS * 32) as u64)
+            .with_limit(MAX_ROW_PAYLOAD as u64)
             .deserialize(&record[HEADER..end])
             .map_err(|_| CodecError::Corrupt("row payload"))?
     };

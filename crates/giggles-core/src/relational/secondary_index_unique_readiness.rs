@@ -148,7 +148,7 @@ fn admit<F: FnMut() -> bool>(state: &Relational, d: &Descriptor, meter: &mut Met
     for (name, t) in state.tables.iter() {
         cap(name.len(), si::MAX_NAME)?;
         cap(t.name.len(), si::MAX_NAME)?;
-        cap(t.columns.len(), MAX_COLUMNS)?;
+        cap(t.column_slots(), MAX_TABLE_COLUMNS)?;
         cap(t.primary_key.len(), MAX_COLUMNS)?;
         meter.bytes(add(
             add(name.len(), t.name.len())?,
@@ -170,7 +170,7 @@ fn admit<F: FnMut() -> bool>(state: &Relational, d: &Descriptor, meter: &mut Met
     meter.counts.candidates = rows.len();
     for (key, row) in rows {
         cap(key.len(), si::MAX_COMPONENT)?;
-        cap(row.values.len(), MAX_COLUMNS)?;
+        cap(row.values.len(), MAX_STORED_COLUMNS)?;
         meter.bytes(key.len())?;
         meter.work(1)?;
         meter.checkpoint()?;
@@ -202,10 +202,15 @@ fn metadata<'a, F: FnMut() -> bool>(
     }
     // All shapes admitted. Reserve bounded worst-case ID/name comparisons and
     // scans independently of row count; no empty-table bypass.
-    let slots = mul(state.tables.len(), MAX_COLUMNS + 1)?;
+    let slots = state.tables.values().try_fold(0, |total, table| {
+        add(total, table.columns.len().max(MAX_COLUMNS) + 1)
+    })?;
     meter.work(mul(mul(slots, slots)?, 2)?)?;
     meter.work(mul(
-        mul(state.tables.len(), MAX_COLUMNS * MAX_COLUMNS)?,
+        state.tables.values().try_fold(0, |total, table| {
+            let width = table.columns.len().max(MAX_COLUMNS);
+            add(total, mul(width, width)?)
+        })?,
         si::MAX_NAME,
     )?)?;
     let mut ids = Vec::new();

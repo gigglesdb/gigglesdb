@@ -1,9 +1,13 @@
 //! Wire encoding for the read-only catalog adapter. Catalog values never become
 //! executable application SQL or bypass the session's authority gate.
 use crate::{pgwire, transport::MAX_RESPONSE};
-use giggles_pg_catalog::{Field, PgType, ResultSet, Value};
+use giggles_pg_catalog::{Field, MAX_TARGET_COLUMNS, PgType, ResultSet, Value};
 use giggles_core::task::Released;
 type Result<T> = std::result::Result<T, &'static str>;
+const _: () = {
+    assert!(giggles_pg_catalog::MAX_TABLE_COLUMNS == giggles_core::relational::MAX_TABLE_COLUMNS);
+    assert!(MAX_TARGET_COLUMNS == giggles_core::relational::MAX_TARGET_COLUMNS);
+};
 pub(crate) fn value_bytes(value: &Value) -> Result<usize> {
     let extra = match value {
         Value::Text(s) | Value::Regtype(_, s) => s.len(),
@@ -37,6 +41,7 @@ pub(crate) fn error(error: giggles_pg_catalog::Error) -> &'static str {
         E::DivisionByZero => "22012",
         E::Parameters => "08P01",
         E::Limit => "54000",
+        E::TooManyColumns => "54011",
         E::InvalidSnapshot => "55000",
         E::InvalidPrivilege(_) | E::InvalidTypeModifier(_) => "22023",
         E::UnknownRelation(_) => "42P01",
@@ -1191,7 +1196,7 @@ pub(crate) fn decode(bytes: &[u8], ty: PgType, format: u16) -> Result<Value> {
 }
 
 pub(crate) fn description(fields: &[Field], formats: &[u16], out: &mut Vec<u8>) -> Result<()> {
-    if fields.len() > 256 {
+    if fields.len() > MAX_TARGET_COLUMNS {
         return Err("54000");
     }
     if fields.is_empty() {
@@ -1458,7 +1463,7 @@ fn encode_with_settings(
 }
 
 pub(crate) fn retained_bytes(result: &ResultSet) -> Result<usize> {
-    if result.rows.len() > giggles_pg_catalog::MAX_ROWS || result.fields.len() > 256 {
+    if result.rows.len() > giggles_pg_catalog::MAX_ROWS || result.fields.len() > MAX_TARGET_COLUMNS {
         return Err("54000");
     }
     let mut total = 0usize;

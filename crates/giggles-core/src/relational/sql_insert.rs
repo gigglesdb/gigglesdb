@@ -1435,12 +1435,12 @@ fn admit_statement(insert: &Insert, params: &[Value]) -> R<()> {
     if insert.rows.len() > MAX_ROWS {
         return Err(SqlError::Limit);
     }
-    if insert.columns.len() > MAX_COLUMNS {
+    if insert.columns.len() > MAX_TABLE_COLUMNS {
         return Err(SqlError::Type);
     }
     let mut admission = InputAdmission::default();
     for (row_index, row) in insert.rows.iter().enumerate() {
-        if row.len() > MAX_COLUMNS
+        if row.len() > MAX_TABLE_COLUMNS
             || !insert.columns.is_empty() && row.len() != insert.columns.len()
         {
             return Err(SqlError::Syntax);
@@ -1459,7 +1459,7 @@ fn admit_statement(insert: &Insert, params: &[Value]) -> R<()> {
         ..
     }) = &insert.conflict
     {
-        if update.sets.len() > MAX_COLUMNS {
+        if update.sets.len() > MAX_TABLE_COLUMNS {
             return Err(SqlError::Limit);
         }
         admission.row();
@@ -1512,7 +1512,7 @@ impl Relational {
         let mut admission = InputAdmission::default();
         let logical_width = table.logical_columns().count();
         for row in incoming {
-            if logical_width > MAX_COLUMNS || row.len() != table.columns.len() {
+            if logical_width > MAX_TABLE_COLUMNS || row.len() != table.columns.len() {
                 return Err(SqlError::Type);
             }
             admission.row();
@@ -1521,7 +1521,7 @@ impl Relational {
             }
         }
         if let ConflictAction::Update { guard, values } = action {
-            if values.len() > MAX_COLUMNS {
+            if values.len() > MAX_TABLE_COLUMNS {
                 return Err(SqlError::Limit);
             }
             admission.row();

@@ -7,7 +7,7 @@ use super::catalog::TableEntry;
 use crate::{
     CoreError,
     relational::{
-        ColumnDef, DataType, MAX_COLUMNS, TableDef,
+        ColumnDef, DataType, MAX_COLUMNS, MAX_TABLE_COLUMNS, TableDef,
         catalog_ext::{
             Action, ColumnExt, Constraint, ConstraintKind, Deferral, Identity, ReferencedKey, SequenceDef,
             TextKind, TypeDef, validate_typmod,
@@ -736,7 +736,7 @@ fn validate_primary_birth(entry: &TableEntry, birth: u64) -> Result<(), CoreErro
 /// caller's responsibility. The exact hidden heap column is a legacy exception to
 /// ordinary identifier validation.
 fn validate_definition(def: &TableDef) -> Result<(), CoreError> {
-    if def.id == 0 || def.columns.is_empty() || def.columns.len() > MAX_COLUMNS {
+    if def.id == 0 || def.columns.is_empty() || def.column_slots() > MAX_TABLE_COLUMNS {
         return Err(corrupt("invalid catalog table definition"));
     }
     let mut ids = BTreeSet::new();

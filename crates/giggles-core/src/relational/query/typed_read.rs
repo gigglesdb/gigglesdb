@@ -280,7 +280,7 @@ fn lower_sources(budget: &mut Budget, depth: usize, mut sources: Vec<Source>, jo
     let joins = join.map(|(left, on)| -> R<Join> {
         Ok(Join { left, on: budget.predicate(on, depth)? })
     }).transpose()?.into_iter().collect();
-    if projection.is_empty() || projection.len() > MAX_COLUMNS {
+    if projection.is_empty() || projection.len() > MAX_TARGET_COLUMNS {
         return Err(SqlError::Limit);
     }
     let items = projection.into_iter().map(|p| {

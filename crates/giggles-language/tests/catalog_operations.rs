@@ -1,6 +1,6 @@
 use giggles_core::{
     Admin, Limits,
-    relational::{DataType, with_sql_parser_forbidden},
+    relational::{DataType, MAX_TABLE_COLUMNS, with_sql_parser_forbidden},
 };
 use giggles_language::*;
 use std::{
@@ -188,7 +188,7 @@ fn catalog_version_gates_and_required_defaults_are_explicit() {
     let mut over = wide_tree.clone();
     let CatalogStatement::CreateTable { table, columns, .. } = &mut over else { unreachable!() };
     *table = "too_wide".into();
-    columns.push(column("extra", CatalogType::Int64, false));
+    columns.resize(MAX_TABLE_COLUMNS + 1, column("extra", CatalogType::Int64, false));
     assert_eq!(
         engine.prepare_catalog_bound(&over).err(),
         Some(Error::Limit)

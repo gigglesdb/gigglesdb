@@ -1117,7 +1117,7 @@ impl SqlSession {
                         }
                         // This bounds every ID E1 DDL allocates per statement.
                         let ids = if ddl {
-                            db.reserve_sql_ids(txn, 3 * relational::MAX_COLUMNS as u64 + 64)?
+                            db.reserve_sql_ids(txn, p.ddl_id_reservation())?
                         } else {
                             // DML/reads allocate no catalog objects. Derive only the
                             // validation ceiling, without a durable ID reservation.
@@ -2765,7 +2765,7 @@ pub(super) fn secondary_read_native(
     db: &v2::V2Db, txn: &mut Transaction, table: &TableDef,
     request: &relational::secondary_index_access::Request<'_>,
 ) -> Result<relational::SqlResult, CoreError> {
-    use relational::{Value, MAX_COLUMNS, MAX_RESULT_BYTES, MAX_ROWS};
+    use relational::{Value, MAX_COLUMNS, MAX_RESULT_BYTES, MAX_ROWS, MAX_TARGET_COLUMNS};
     let unsupported = CoreError::Sql(SqlError::Unsupported);
     crate::cancellation::check()?;
     let catalog = db.catalog().snapshot(txn)?;
@@ -2776,7 +2776,7 @@ pub(super) fn secondary_read_native(
     if table.hidden_rowid().is_some() || request.descending || !request.residuals.is_empty()
         || request.equal.is_empty() && request.range.is_none()
     { return Err(unsupported); }
-    if request.equal.len() > MAX_COLUMNS || request.projection.len() > MAX_COLUMNS
+    if request.equal.len() > MAX_COLUMNS || request.projection.len() > MAX_TARGET_COLUMNS
         || request.max_rows > MAX_ROWS || request.max_bytes > MAX_RESULT_BYTES
     { return Err(CoreError::Sql(SqlError::Limit)); }
     let offset = |id| table.columns.iter().position(|c| c.id == id)

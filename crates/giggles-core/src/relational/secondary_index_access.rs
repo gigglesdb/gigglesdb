@@ -69,7 +69,7 @@ fn raw(v: &Value) -> R<usize> {
 }
 fn admit(req: &Request<'_>) -> R<usize> {
     cap(req.equal.len(), MAX_COLUMNS)?;
-    cap(req.projection.len(), MAX_COLUMNS)?;
+    cap(req.projection.len(), MAX_TARGET_COLUMNS)?;
     cap(req.residuals.len(), MAX_COLUMNS)?;
     cap(req.max_rows, MAX_ROWS)?;
     cap(req.max_bytes, MAX_RESULT_BYTES)?;
@@ -134,8 +134,12 @@ impl Relational {
             &mut work,
             add(
                 request_bytes.checked_mul(64).ok_or(SqlError::Limit)?,
-                MAX_COLUMNS * MAX_COLUMNS * 64
-                    + si::MAX_CANDIDATES * 64,
+                add(
+                    table.columns.len().max(MAX_COLUMNS)
+                        .checked_mul(req.projection.len().max(MAX_COLUMNS) * 64)
+                        .ok_or(SqlError::Limit)?,
+                    si::MAX_CANDIDATES * 64,
+                )?,
             )?,
         )?;
         charge(

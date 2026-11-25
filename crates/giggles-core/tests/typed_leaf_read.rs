@@ -124,7 +124,7 @@ fn semantic_errors_and_authorization_first_are_preserved() {
 fn typed_input_admission_is_bounded() {
     let mut input = read(None); input.projection = vec![];
     assert!(matches!(Prepared::from_single_source_read(0, 0, input), Err(SqlError::Limit)));
-    let mut input = read(None); input.projection = vec![input.projection[0].clone(); MAX_COLUMNS + 1];
+    let mut input = read(None); input.projection = vec![input.projection[0].clone(); MAX_TARGET_COLUMNS + 1];
     assert!(matches!(Prepared::from_single_source_read(0, 0, input), Err(SqlError::Limit)));
     let mut input = read(None); input.projection[0].expression = L(Value::Text("x".repeat(MAX_SQL + 1)));
     assert!(matches!(Prepared::from_single_source_read(0, 0, input), Err(SqlError::Limit)));

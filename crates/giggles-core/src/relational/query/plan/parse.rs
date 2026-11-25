@@ -393,7 +393,7 @@ fn values(body: &[Token]) -> ParseResult<Plan> {
         let mut row = vec![];
         loop {
             row.push(Scalar::parse_expr(&mut p, 0, false)?);
-            if row.len() > MAX_COLUMNS {
+            if row.len() > MAX_TARGET_COLUMNS {
                 return Err(SqlError::Limit.into());
             }
             if !p.sym(',') {

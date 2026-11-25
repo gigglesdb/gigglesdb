@@ -736,7 +736,7 @@ pub(crate) fn copy_table_columns(
     if columns.is_empty() {
         return Ok(table.logical_columns().filter(|column| state.generated_column(column.id).is_none()).cloned().collect());
     }
-    if columns.len() > MAX_COLUMNS {
+    if columns.len() > MAX_TABLE_COLUMNS {
         return Err(SqlError::Limit);
     }
     let indexes = columns

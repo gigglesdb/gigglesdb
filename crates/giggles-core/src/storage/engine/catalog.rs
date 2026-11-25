@@ -1477,8 +1477,8 @@ impl Catalog {
         {
             return Err(SqlError::Duplicate.into());
         }
-        if current.def.columns.len() >= relational::MAX_COLUMNS {
-            return Err(SqlError::Limit.into());
+        if current.def.column_slots() >= relational::MAX_TABLE_COLUMNS {
+            return Err(relational::table_column_limit().into());
         }
         column.id = self.seq.next(0, 0)?;
         let mut entry = (*current).clone();
@@ -2707,8 +2707,11 @@ fn encode_parts(
 
 fn validate_definition(def: &TableDef) -> Result<(), SqlError> {
     validate_identifier(&def.name)?;
-    if def.columns.is_empty() || def.columns.len() > relational::MAX_COLUMNS {
+    if def.columns.is_empty() {
         return Err(SqlError::Limit);
+    }
+    if def.column_slots() > relational::MAX_TABLE_COLUMNS {
+        return Err(relational::table_column_limit());
     }
     let mut names = BTreeSet::new();
     for column in &def.columns {

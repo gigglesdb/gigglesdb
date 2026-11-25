@@ -14,7 +14,7 @@
 //!
 //! Limits: 64 KiB SQL, 8192 flat tokens / 256 constructor tokens before parsing,
 //! parser recursion 64, expression nesting 48 / 4096 AST
-//! expressions, 32 sources and queries, 128 projection columns, 256 parameters,
+//! expressions, 32 sources and queries, 1664 projection columns, 256 parameters,
 //! 128 input tables / 64 columns each / 64 KiB total input names. Materialized
 //! operator results admit at most 8192 rows / 4 MiB conservative escaped bytes;
 //! execution also admits at most two million charged work units. Input values
@@ -516,6 +516,7 @@ pub enum Error {
     InvalidTypeModifier(String),
     TypeModifierNotAllowed(String),
     TypeNameSyntax { near: &'static str, input: Option<String> },
+    TooManyColumns,
     Limit,
 }
 impl std::fmt::Display for Error {
@@ -530,12 +531,17 @@ impl std::fmt::Display for Error {
         if let Self::TypeNameSyntax { near, .. } = self {
             return write!(f, r#"syntax error at or near "{near}""#);
         }
+        if *self == Self::TooManyColumns {
+            return write!(f, "target lists can have at most {MAX_TARGET_COLUMNS} entries");
+        }
         write!(f, "catalog {self:?}")
     }
 }
 impl std::error::Error for Error {}
 pub(crate) type R<T> = Result<T, Error>;
 pub const MAX_SQL: usize = 65536;
+pub const MAX_TABLE_COLUMNS: usize = 1600;
+pub const MAX_TARGET_COLUMNS: usize = 1664;
 pub const MAX_ROWS: usize = 8192;
 pub const MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_WORK: usize = 2_000_000;

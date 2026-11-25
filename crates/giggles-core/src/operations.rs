@@ -326,7 +326,7 @@ impl Request {
             ) {
                 return Err(Error::Unsupported);
             }
-            if projection.len() > crate::relational::MAX_COLUMNS {
+            if projection.len() > crate::relational::MAX_TARGET_COLUMNS {
                 return Err(Error::Limit);
             }
             (request.as_ref(), Some(projection.as_slice()))
@@ -352,7 +352,7 @@ impl Request {
                 return Err(Error::Bind("conflict target".into()));
             }
             if let ConflictAction::Update { values, .. } = action
-                && (values.is_empty() || values.len() > crate::relational::MAX_COLUMNS)
+                && (values.is_empty() || values.len() > crate::relational::MAX_TABLE_COLUMNS)
             {
                 return Err(Error::Bind("assignments".into()));
             }
@@ -948,7 +948,7 @@ fn validate_request_nodes(stmt: &Request, nodes: &mut usize, v2: bool) -> Result
             }
         }
         Request::InsertExpressions { values, .. } => {
-            if values.len() > crate::relational::MAX_COLUMNS {
+            if values.len() > crate::relational::MAX_TABLE_COLUMNS {
                 return Err(Error::Bind("assignments".into()));
             }
             pending.extend(values.iter().map(|(_, e)| (e, 0)));
@@ -959,7 +959,7 @@ fn validate_request_nodes(stmt: &Request, nodes: &mut usize, v2: bool) -> Result
             values,
             ..
         } => {
-            if values.len() > crate::relational::MAX_COLUMNS {
+            if values.len() > crate::relational::MAX_TABLE_COLUMNS {
                 return Err(Error::Bind("assignments".into()));
             }
             pending.push((filter, 0));
@@ -969,7 +969,7 @@ fn validate_request_nodes(stmt: &Request, nodes: &mut usize, v2: bool) -> Result
         Request::ReadExpressions {
             filter, projection, ..
         } => {
-            if projection.len() > crate::relational::MAX_COLUMNS {
+            if projection.len() > crate::relational::MAX_TARGET_COLUMNS {
                 return Err(Error::Limit);
             }
             pending.extend(filter.iter().map(|e| (e, 0)));
@@ -980,7 +980,7 @@ fn validate_request_nodes(stmt: &Request, nodes: &mut usize, v2: bool) -> Result
     validate_expression_nodes(pending, nodes)
 }
 fn validate_insert_shape(columns: &[String], rows: &[Vec<Expr>], max_rows: usize) -> Result<()> {
-    if columns.len() > crate::relational::MAX_COLUMNS || rows.len() > max_rows {
+    if columns.len() > crate::relational::MAX_TABLE_COLUMNS || rows.len() > max_rows {
         return Err(Error::Limit);
     }
     if columns.is_empty() {
@@ -1531,7 +1531,7 @@ impl Binder<'_> {
         v: &[(String, ValueExpr)],
         insert: bool,
     ) -> Result<Vec<(usize, Value)>> {
-        if v.is_empty() || v.len() > crate::relational::MAX_COLUMNS {
+        if v.is_empty() || v.len() > crate::relational::MAX_TABLE_COLUMNS {
             return Err(Error::Bind("assignments".into()));
         }
         if insert { self.insert_targets(v.iter().map(|(name, _)| name.as_str()))?; }
@@ -1562,7 +1562,7 @@ impl Binder<'_> {
         Ok(out)
     }
     fn expression_assignments(&mut self, values: &[(String, Expr)]) -> Result<Vec<(usize, Bound)>> {
-        if values.is_empty() || values.len() > crate::relational::MAX_COLUMNS {
+        if values.is_empty() || values.len() > crate::relational::MAX_TABLE_COLUMNS {
             return Err(Error::Bind("assignments".into()));
         }
         let mut seen = BTreeSet::new();
@@ -1599,7 +1599,7 @@ impl Binder<'_> {
         if items.is_empty() {
             return Err(Error::Bind("projection".into()));
         }
-        if items.len() > crate::relational::MAX_COLUMNS {
+        if items.len() > crate::relational::MAX_TARGET_COLUMNS {
             return Err(Error::Limit);
         }
         let mut names = BTreeSet::new();
@@ -1771,7 +1771,7 @@ impl Binder<'_> {
                 }
             }
             Request::InsertExpressions { values, .. } => {
-                if values.is_empty() || values.len() > crate::relational::MAX_COLUMNS {
+                if values.is_empty() || values.len() > crate::relational::MAX_TABLE_COLUMNS {
                     return Err(Error::Bind("assignments".into()));
                 }
                 self.insert_targets(values.iter().map(|(name, _)| name.as_str()))?;

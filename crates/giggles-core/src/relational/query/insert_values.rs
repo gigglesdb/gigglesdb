@@ -317,7 +317,7 @@ impl InsertExpressions {
         let values_start = p.at;
         let mut values = vec![];
         loop {
-            if values.len() == MAX_COLUMNS {
+            if values.len() == MAX_TABLE_COLUMNS {
                 return Err(SqlError::Limit);
             }
             let value = Scalar::parse_aggregate_argument(p, 0)?;
@@ -454,7 +454,7 @@ impl InsertExpressions {
     ) -> R<BoundValues> {
         let table = state.tables.get(&self.name).ok_or(SqlError::UnknownTable)?;
         self.admit_literals()?;
-        if count > MAX_PARAMS || self.values.len() > MAX_COLUMNS {
+        if count > MAX_PARAMS || self.values.len() > MAX_TABLE_COLUMNS {
             return Err(SqlError::Limit);
         }
         let indexes = self.supplied_indexes(table)?;

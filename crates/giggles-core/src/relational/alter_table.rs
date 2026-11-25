@@ -515,8 +515,8 @@ pub(super) fn execute(
                     ));
                     return Err(SqlError::DuplicateColumn);
                 }
-                if table.columns.len() >= MAX_COLUMNS {
-                    return Err(SqlError::Limit);
+                if table.column_slots() >= MAX_TABLE_COLUMNS {
+                    return Err(table_column_limit());
                 }
                 let mut column = column.clone();
                 let mut typmod=*typmod;

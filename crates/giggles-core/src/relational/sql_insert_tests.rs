@@ -1012,7 +1012,7 @@ fn sql_insert_admission_rejects_arity_before_materialization() {
     let mut insert = admission_insert();
     insert.rows[1].pop();
     assert_admission_rejected_without_copy(&mut state, &insert, &[], SqlError::Syntax);
-    insert.rows[1] = vec![Expr::Literal(Value::Null); MAX_COLUMNS + 1];
+    insert.rows[1] = vec![Expr::Literal(Value::Null); MAX_TABLE_COLUMNS + 1];
     assert_admission_rejected_without_copy(&mut state, &insert, &[], SqlError::Syntax);
 }
 

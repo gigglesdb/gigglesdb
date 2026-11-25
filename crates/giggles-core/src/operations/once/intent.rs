@@ -209,7 +209,7 @@ impl Writer {
         })
     }
     fn columns(&mut self, columns: &[ColumnDef]) -> OnceResult<()> {
-        if columns.len() > crate::relational::MAX_COLUMNS {
+        if columns.len() > crate::relational::MAX_TARGET_COLUMNS {
             return Err(Error::Limit.into());
         }
         self.count(columns.len())?;

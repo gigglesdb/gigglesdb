@@ -513,8 +513,8 @@ pub(super) fn bind<'a>(
     mut subqueries: Subplans<'a>,
 ) -> R<BoundQuery<'a>> {
     let projection = projection(q, tables)?;
-    if projection.len() > MAX_COLUMNS {
-        return Err(SqlError::Limit);
+    if projection.len() > MAX_TARGET_COLUMNS {
+        return Err(target_column_limit());
     }
     // Projection casts can constrain a parameter used as a bare group key.
     for (item, _) in &projection {

@@ -180,7 +180,7 @@ fn preflight(
     }
     if rows.len() > limits.rows
         || table.columns.is_empty()
-        || table.columns.len() > MAX_COLUMNS
+        || table.column_slots() > MAX_TABLE_COLUMNS
         || table.primary_key.is_empty()
         || table.primary_key.len() > table.columns.len()
     {

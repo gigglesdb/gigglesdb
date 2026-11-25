@@ -659,3 +659,6 @@ mod sql_triggers_fire;
 
 #[path = "enum_array_check.rs"]
 mod enum_array_check;
+
+#[path = "sql_wide_tables.rs"]
+mod sql_wide_tables;

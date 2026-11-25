@@ -24,7 +24,7 @@ use crate::{
         ConflictStatus, ConflictTupleOutcome, EmitDescription, EmittedValue, Error,
         MAX_EMIT_VALUES, MAX_TRANSACTION_ITEMS, Outcome, StepSummary, TransactionOutcome,
     },
-    relational::{ColumnDef, DataType, MAX_COLUMNS, MAX_RESULT_BYTES, MAX_ROWS, SqlRow, Value},
+    relational::{ColumnDef, DataType, MAX_COLUMNS, MAX_RESULT_BYTES, MAX_ROWS, MAX_TARGET_COLUMNS, SqlRow, Value},
 };
 
 const MAGIC: &[u8; 4] = b"GDOU";
@@ -150,11 +150,12 @@ fn name_valid(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 fn check_names<'a>(count: usize, names: impl Iterator<Item = &'a str>) -> Checked<()> {
-    invalid(count <= MAX_COLUMNS)?;
-    let mut seen = [""; MAX_COLUMNS];
-    for (index, name) in names.enumerate() {
-        invalid(index < count && name_valid(name) && !seen[..index].contains(&name))?;
-        seen[index] = name;
+    invalid(count <= MAX_TARGET_COLUMNS)?;
+    let mut seen = Vec::new();
+    seen.try_reserve_exact(count).map_err(|_| Fault::Bound)?;
+    for name in names {
+        invalid(seen.len() < count && name_valid(name) && !seen.contains(&name))?;
+        seen.push(name);
     }
     Ok(())
 }
@@ -502,10 +503,21 @@ impl<S: Sink> Writer<S> {
         self.count(counts.changed)?;
         self.boolean(complete)
     }
+    // Keep the original one-byte width through 64. The formerly invalid
+    // 0xff byte introduces a two-byte, big-endian width for wider results.
+    fn column_count(&mut self, len: usize) -> Checked<()> {
+        invalid(len <= MAX_TARGET_COLUMNS)?;
+        if len <= MAX_COLUMNS {
+            self.u8(len as u8)
+        } else {
+            self.u8(u8::MAX)?;
+            self.sink.write(&(len as u16).to_be_bytes())
+        }
+    }
     fn columns(&mut self, columns: &[ColumnDef], allow_empty: bool) -> Checked<()> {
         check_names(columns.len(), columns.iter().map(|c| c.name.as_str()))?;
         invalid(allow_empty || !columns.is_empty())?;
-        self.u8(columns.len() as u8)?;
+        self.column_count(columns.len())?;
         for column in columns {
             self.u64(column.id)?;
             self.name(&column.name)?;
@@ -633,7 +645,7 @@ impl<S: Sink> Writer<S> {
         }
     }
     fn row(&mut self, row: &SqlRow, arity: usize, columns: Option<&[ColumnDef]>) -> Checked<()> {
-        invalid(arity != 0 && arity <= MAX_COLUMNS && row.values.len() == arity)?;
+        invalid(arity != 0 && arity <= MAX_TARGET_COLUMNS && row.values.len() == arity)?;
         self.u64(row.version)?;
         for (index, value) in row.values.iter().enumerate() {
             let column = columns.map(|columns| {
@@ -692,7 +704,7 @@ impl<S: Sink> Writer<S> {
                 .all(|(name, column)| *name == column.name),
         )?;
         self.counts(counts, out.complete)?;
-        self.u8(out.columns.len() as u8)?;
+        self.column_count(out.columns.len())?;
         for name in &out.columns {
             self.name(name)?;
         }
@@ -818,16 +830,12 @@ impl<S: Sink> Writer<S> {
 }
 
 #[derive(PartialEq, Eq)]
-struct Columns<'a> {
-    len: usize,
-    values: [Option<Column<'a>>; MAX_COLUMNS],
-}
+struct Columns<'a>(Vec<Column<'a>>);
 impl Columns<'_> {
     fn owned(&self, build: bool) -> Checked<Option<Vec<ColumnDef>>> {
-        let mut out = vector(build, self.len)?;
+        let mut out = vector(build, self.0.len())?;
         if let Some(out) = &mut out {
-            for column in &self.values[..self.len] {
-                let column = column.ok_or(Fault::Invalid)?;
+            for column in &self.0 {
                 out.push(ColumnDef {
                     id: column.id,
                     name: owned_text(column.name)?,
@@ -990,24 +998,37 @@ impl<'a> Reader<'a> {
         counts.check(self.wide)?;
         Ok((counts, self.boolean()?))
     }
+    fn column_count(&mut self) -> Checked<usize> {
+        let len = self.u8()?;
+        if len == u8::MAX {
+            let len = usize::from(u16::from_be_bytes(
+                self.take(2)?.try_into().map_err(|_| Fault::Invalid)?,
+            ));
+            invalid((MAX_COLUMNS + 1..=MAX_TARGET_COLUMNS).contains(&len))?;
+            Ok(len)
+        } else {
+            let len = usize::from(len);
+            invalid(len <= MAX_COLUMNS)?;
+            Ok(len)
+        }
+    }
     fn columns(&mut self, allow_empty: bool) -> Checked<Columns<'a>> {
-        let len = usize::from(self.u8()?);
-        invalid((allow_empty || len != 0) && len <= MAX_COLUMNS)?;
-        let mut values = [None; MAX_COLUMNS];
-        let mut names = [""; MAX_COLUMNS];
-        for index in 0..len {
+        let len = self.column_count()?;
+        invalid((allow_empty || len != 0) && len <= (self.bytes.len() - self.offset) / 12)?;
+        let mut values: Vec<Column<'a>> = Vec::new();
+        values.try_reserve_exact(len).map_err(|_| Fault::Bound)?;
+        for _ in 0..len {
             let id = self.u64()?;
             let name = self.name()?;
-            invalid(!names[..index].contains(&name))?;
-            names[index] = name;
-            values[index] = Some(Column {
+            invalid(!values.iter().any(|column| column.name == name))?;
+            values.push(Column {
                 id,
                 name,
                 kind: self.kind()?,
                 not_null: self.boolean()?,
             });
         }
-        Ok(Columns { len, values })
+        Ok(Columns(values))
     }
     fn emit_shape(&mut self) -> Checked<EmitShape<'a>> {
         Ok(match self.u8()? {
@@ -1181,11 +1202,11 @@ impl<'a> Reader<'a> {
         }
     }
     fn row(&mut self, arity: usize, columns: Option<&Columns<'a>>) -> Checked<Option<SqlRow>> {
-        invalid(arity != 0 && arity <= MAX_COLUMNS)?;
+        invalid(arity != 0 && arity <= MAX_TARGET_COLUMNS)?;
         let version = self.u64()?;
         let mut values = vector(self.build, arity)?;
         for index in 0..arity {
-            let value = self.value(columns.and_then(|c| c.values[index]))?;
+            let value = self.value(columns.and_then(|c| c.0.get(index)).copied())?;
             if let Some(values) = &mut values {
                 values.push(value.ok_or(Fault::Invalid)?);
             }
@@ -1236,15 +1257,12 @@ impl<'a> Reader<'a> {
         invalid(schema.tag == 0)?;
         let expected = Reader::new(schema.bytes, false).columns(true)?;
         let (counts, complete) = self.counts()?;
-        let len = usize::from(self.u8()?);
-        invalid(len <= MAX_COLUMNS && len == expected.len)?;
-        let mut names = [""; MAX_COLUMNS];
+        let len = self.column_count()?;
+        invalid(len == expected.0.len())?;
         let mut columns = vector(self.build, len)?;
-        for index in 0..len {
+        for expected in &expected.0 {
             let name = self.name()?;
-            invalid(!names[..index].contains(&name))?;
-            invalid(name == expected.values[index].ok_or(Fault::Invalid)?.name)?;
-            names[index] = name;
+            invalid(name == expected.name)?;
             if let Some(columns) = &mut columns {
                 columns.push(owned_text(name)?);
             }
@@ -1318,7 +1336,7 @@ impl<'a> Reader<'a> {
                 (1, EmitShape::Row(expected_columns)) => {
                     let columns = self.columns(false)?;
                     invalid(columns == expected_columns)?;
-                    let row = self.row(columns.len, Some(&columns))?;
+                    let row = self.row(columns.0.len(), Some(&columns))?;
                     if self.build {
                         Some(EmittedValue::Row {
                             columns: columns.owned(true)?.ok_or(Fault::Invalid)?,
@@ -1337,7 +1355,7 @@ impl<'a> Reader<'a> {
                     self.rows_present(len)?;
                     let mut rows = vector(self.build, len)?;
                     for _ in 0..len {
-                        let row = self.row(columns.len, Some(&columns))?;
+                        let row = self.row(columns.0.len(), Some(&columns))?;
                         if let Some(rows) = &mut rows {
                             rows.push(row.ok_or(Fault::Invalid)?);
                         }
@@ -1629,6 +1647,25 @@ mod tests {
             expected.extend(suffix);
             assert_eq!(roundtrip(&scalar(value)), expected);
         }
+    }
+
+    #[test]
+    fn wide_row_descriptor_roundtrips() {
+        let columns = (0..MAX_TARGET_COLUMNS).map(|i| format!("c{i}")).collect();
+        let result = operation(Outcome {
+            columns,
+            rows: vec![SqlRow {
+                values: vec![Value::Int(42); MAX_TARGET_COLUMNS],
+                version: 1,
+            }],
+            matched: 1,
+            affected: 1,
+            changed: 1,
+            complete: true,
+            conflict_results: None,
+        });
+        let encoded = roundtrip(&result);
+        assert!(encoded.starts_with(&golden_prefix(&[0, 0xff, 0x06, 0x80])));
     }
 
     #[test]

@@ -553,7 +553,7 @@ fn upsert_scope_caps_and_atomic_refusals_match_common_engine() {
             target: vec!["id".into()],
             action: ConflictAction::Update {
                 guard: None,
-                values: vec![("n".into(), int(0)); 65],
+                values: vec![("n".into(), int(0)); giggles_core::relational::MAX_TABLE_COLUMNS + 1],
             },
         },
         Error::Unsupported,
@@ -572,7 +572,7 @@ fn upsert_scope_caps_and_atomic_refusals_match_common_engine() {
             insert(1, int(0)),
             ConflictAction::Update {
                 guard: None,
-                values: vec![("n".into(), int(0)); 65],
+                values: vec![("n".into(), int(0)); giggles_core::relational::MAX_TABLE_COLUMNS + 1],
             },
         ),
         Error::Bind("assignments".into()),

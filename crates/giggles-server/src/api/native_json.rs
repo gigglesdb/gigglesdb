@@ -1,6 +1,7 @@
 //! Strict native JSON profile; all keys are observed before typed conversion.
 
 use super::json::{Decimal, JsonRow, JsonRows, JsonValue};
+use giggles_core::relational::{MAX_TABLE_COLUMNS, MAX_TARGET_COLUMNS};
 use serde::{
     Serialize, Serializer,
     ser::{Error as _, SerializeMap},
@@ -302,7 +303,7 @@ impl Decoder {
     pub(super) fn typed_read(&mut self, v: Json) -> R<p::NativeTypedRead> {
         let mut f = Object::new(v)?;
         let table = Some(text(f.required("table")?)?);
-        let projection = items(f.optional("projection"), 64)?.into_iter().map(|v| {
+        let projection = items(f.optional("projection"), MAX_TARGET_COLUMNS)?.into_iter().map(|v| {
             let mut f = Object::new(v)?;
             let expression = Some(self.read_expr(f.required("expression")?)?);
             let alias = f.optional("alias").map(text).transpose()?;
@@ -536,7 +537,7 @@ impl Decoder {
             .optional("limit")
             .map(|v| self.native_value_expr(v))
             .transpose()?;
-        let projection = items(f.optional("projection"), 64)?
+        let projection = items(f.optional("projection"), MAX_TARGET_COLUMNS)?
             .into_iter()
             .map(text)
             .collect::<R<Vec<_>>>()?;
@@ -552,7 +553,7 @@ impl Decoder {
     pub(super) fn native_insert(&mut self, v: Json) -> R<p::NativeInsert> {
         let mut f = Object::new(v)?;
         let table = Some(text(f.required("table")?)?);
-        let values = items(f.optional("values"), 64)?
+        let values = items(f.optional("values"), MAX_TABLE_COLUMNS)?
             .into_iter()
             .map(|v| self.native_value_assignment(v))
             .collect::<R<Vec<_>>>()?;
@@ -567,7 +568,7 @@ impl Decoder {
             .optional("guard")
             .map(|v| self.native_expr(v))
             .transpose()?;
-        let values = items(f.optional("values"), 64)?
+        let values = items(f.optional("values"), MAX_TABLE_COLUMNS)?
             .into_iter()
             .map(|v| self.native_value_assignment(v))
             .collect::<R<Vec<_>>>()?;
@@ -609,7 +610,7 @@ impl Decoder {
             .optional("guard")
             .map(|v| self.native_expr(v))
             .transpose()?;
-        let values = items(f.optional("values"), 64)?
+        let values = items(f.optional("values"), MAX_TABLE_COLUMNS)?
             .into_iter()
             .map(|v| self.native_assignment(v))
             .collect::<R<Vec<_>>>()?;
@@ -638,7 +639,7 @@ impl Decoder {
             .optional("limit")
             .map(|v| self.native_value_expr(v))
             .transpose()?;
-        let projection = items(f.optional("projection"), 64)?
+        let projection = items(f.optional("projection"), MAX_TARGET_COLUMNS)?
             .into_iter()
             .map(|v| self.native_projection(v))
             .collect::<R<Vec<_>>>()?;
@@ -654,7 +655,7 @@ impl Decoder {
     pub(super) fn native_returning(&mut self, v: Json) -> R<p::NativeReturning> {
         let mut f = Object::new(v)?;
         let request = Some(Box::new(self.native_request(f.required("request")?)?));
-        let projection = items(f.optional("projection"), 64)?
+        let projection = items(f.optional("projection"), MAX_TARGET_COLUMNS)?
             .into_iter()
             .map(|v| self.native_projection(v))
             .collect::<R<Vec<_>>>()?;
@@ -667,7 +668,7 @@ impl Decoder {
     pub(super) fn native_insert_expressions(&mut self, v: Json) -> R<p::NativeInsertExpressions> {
         let mut f = Object::new(v)?;
         let table = Some(text(f.required("table")?)?);
-        let values = items(f.optional("values"), 64)?
+        let values = items(f.optional("values"), MAX_TABLE_COLUMNS)?
             .into_iter()
             .map(|v| self.native_assignment(v))
             .collect::<R<Vec<_>>>()?;
@@ -677,7 +678,7 @@ impl Decoder {
     pub(super) fn native_insert_many(&mut self, v: Json) -> R<p::NativeInsertMany> {
         let mut f = Object::new(v)?;
         let table = Some(text(f.required("table")?)?);
-        let columns = items(f.optional("columns"), 64)?
+        let columns = items(f.optional("columns"), MAX_TABLE_COLUMNS)?
             .into_iter()
             .map(text)
             .collect::<R<Vec<_>>>()?;
@@ -732,7 +733,7 @@ impl Decoder {
     }
     pub(super) fn native_expression_row(&mut self, v: Json) -> R<p::NativeExpressionRow> {
         let mut f = Object::new(v)?;
-        let values = items(f.optional("values"), 64)?
+        let values = items(f.optional("values"), MAX_TABLE_COLUMNS)?
             .into_iter()
             .map(|v| self.native_expr(v))
             .collect::<R<Vec<_>>>()?;
@@ -795,7 +796,7 @@ impl Decoder {
             .optional("guard")
             .map(|v| self.native_expr(v))
             .transpose()?;
-        let values = items(f.optional("values"), 64)?
+        let values = items(f.optional("values"), MAX_TABLE_COLUMNS)?
             .into_iter()
             .map(|v| self.native_assignment(v))
             .collect::<R<Vec<_>>>()?;

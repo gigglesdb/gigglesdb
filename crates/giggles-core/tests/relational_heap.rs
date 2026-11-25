@@ -235,36 +235,20 @@ fn heap_star_hides_rowid_and_preserves_outer_join_padding() {
 }
 
 #[test]
-fn heap_width_reserves_one_physical_column() {
+fn heap_width_includes_one_hidden_column() {
     let (a, mut s) = db();
     let columns = (0..MAX_COLUMNS)
         .map(|index| format!("c{index} BIGINT"))
         .collect::<Vec<_>>();
-    assert_eq!(
-        s.execute(
-            &format!("CREATE TABLE wide ({})", columns.join(",")),
-            &[],
-            None
-        ),
-        Err(CoreError::Sql(E::Limit))
-    );
-    run(
-        &mut s,
-        &format!(
-            "CREATE TABLE fits ({})",
-            columns[..MAX_COLUMNS - 1].join(",")
-        ),
-    );
+    run(&mut s, &format!("CREATE TABLE fits ({})", columns.join(",")));
     let (_, tables) = a.catalog().unwrap();
     assert_eq!(tables.len(), 1);
-    assert_eq!(tables[0].columns.len(), MAX_COLUMNS);
-    assert_eq!(tables[0].logical_columns().count(), MAX_COLUMNS - 1);
-    // GD-0042 boundary: index paths cap the PHYSICAL width (logical + hidden rowid)
-    // at MAX_COLUMNS, so a full-width heap table must still index, enforce and look up.
-    let last = MAX_COLUMNS - 2;
+    assert_eq!(tables[0].columns.len(), MAX_COLUMNS + 1);
+    assert_eq!(tables[0].logical_columns().count(), MAX_COLUMNS);
+    let last = MAX_COLUMNS - 1;
     run(&mut s, &format!("CREATE UNIQUE INDEX fits_last ON fits (c{last})"));
     let values = |v: i64| {
-        (0..MAX_COLUMNS - 1)
+        (0..MAX_COLUMNS)
             .map(|i| if i == last { v.to_string() } else { i.to_string() })
             .collect::<Vec<_>>()
             .join(",")

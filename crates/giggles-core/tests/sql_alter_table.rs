@@ -3,9 +3,11 @@
 //! UnknownColumn=42703, UnknownTable=42P01, DuplicateTable=42P07,
 //! DuplicateObject=42710, InvalidTableDefinition=42P16, Overflow=22003.
 //! Bounded engine rules: Unsupported=0A000, Limit=54000, Reserved=0A000.
+mod common;
+
 use giggles_core::{
     Admin, CoreError, Limits, SqlSession,
-    relational::{SqlError, StatementClock, Value},
+    relational::{MAX_TABLE_COLUMNS, SqlError, StatementClock, Value},
 };
 use giggles_pg_types::temporal::{SessionZone, TimestampTz};
 use std::sync::{
@@ -19,11 +21,7 @@ struct Db {
 }
 impl Db {
     fn new() -> Self {
-        let mut nonce = [0; 16];
-        getrandom::fill(&mut nonce).unwrap();
-        let path = std::path::Path::new("J:/gigglesdb-work/e1-sql/tmp/alter-finish-reopen")
-            .join(format!("alter-{:032x}", u128::from_le_bytes(nonce)));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let path = common::fresh("sql-alter-table");
         Self {
             admin: Some(Admin::create(&path, Limits::default()).unwrap()),
             path,
@@ -442,7 +440,7 @@ fn bounded_rejections_and_column_limits() {
         "ALTER TABLE heap DROP COLUMN giggles_rowid",
         SqlError::Reserved,
     );
-    let columns = (0..64)
+    let columns = (0..MAX_TABLE_COLUMNS)
         .map(|i| format!("c{i} int{}", if i == 0 { " PRIMARY KEY" } else { "" }))
         .collect::<Vec<_>>()
         .join(",");
@@ -450,7 +448,7 @@ fn bounded_rejections_and_column_limits() {
     error(
         &mut s,
         "ALTER TABLE wide ADD COLUMN overflow int",
-        SqlError::Limit,
+        SqlError::TooManyColumns,
     );
 }
 

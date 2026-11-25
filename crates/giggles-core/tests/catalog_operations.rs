@@ -10,7 +10,7 @@ use giggles_core::{
         Bindings, CatalogRequest, ColumnSpec, Engine, Error, Request, Transaction, TransactionStep,
         ValueExpr,
     },
-    relational::{DataType, MAX_COLUMNS, SqlError, Value as V},
+    relational::{DataType, MAX_COLUMNS, MAX_TABLE_COLUMNS, SqlError, Value as V},
 };
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
@@ -476,7 +476,7 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
             Error::Type,
         ),
         (
-            (0..=MAX_COLUMNS)
+            (0..=MAX_TABLE_COLUMNS)
                 .map(|i| column(&format!("c{i}"), DataType::BigInt, true))
                 .collect(),
             vec!["c0".into()],

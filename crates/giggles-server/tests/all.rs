@@ -461,3 +461,6 @@ mod needs_query_network;
 
 #[path = "enum_array_check_network.rs"]
 mod enum_array_check_network;
+
+#[path = "wide_table_network.rs"]
+mod wide_table_network;

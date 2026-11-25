@@ -273,7 +273,7 @@ pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description
             }
         }
         Statement::UpdateExpressions { sets, .. } => {
-            if sets.len() > MAX_COLUMNS {
+            if sets.len() > MAX_TABLE_COLUMNS {
                 return Err(SqlError::Limit);
             }
             let indexes = assign::indexes(sets, table, state)?;

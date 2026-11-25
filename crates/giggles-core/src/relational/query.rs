@@ -2726,8 +2726,8 @@ impl Query {
             }
             let alias = Self::parse_projection_alias(p)?;
             items.push((item, alias));
-            if items.len() > MAX_COLUMNS {
-                return Err(SqlError::Limit);
+            if items.len() > MAX_TARGET_COLUMNS {
+                return Err(target_column_limit());
             }
             if !p.sym(',') {
                 break;
@@ -4673,8 +4673,8 @@ impl Query {
                 }
             }
         }
-        if columns.len() > MAX_COLUMNS {
-            return Err(SqlError::Limit);
+        if columns.len() > MAX_TARGET_COLUMNS {
+            return Err(target_column_limit());
         }
         let aggregate = items.iter().any(|i| matches!(i, BoundItem::Aggregate(..)));
         if aggregate

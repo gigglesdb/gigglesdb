@@ -154,7 +154,7 @@ fn alias(p: &mut Parser) -> R<Option<(String, Vec<String>)>> {
     if p.sym('(') {
         loop {
             columns.push(p.column_name()?);
-            if columns.len() > MAX_COLUMNS {
+            if columns.len() > MAX_TARGET_COLUMNS {
                 return Err(SqlError::Limit);
             }
             if !p.sym(',') {
@@ -349,7 +349,7 @@ fn explicit(
                     return Err(SqlError::DuplicateColumn.into());
                 }
                 columns.push(name);
-                if columns.len() > MAX_COLUMNS {
+                if columns.len() > MAX_TARGET_COLUMNS {
                     return Err(SqlError::Limit.into());
                 }
                 if !p.sym(',') {

@@ -78,7 +78,7 @@ fn inserts_share_defaults_counts_constraints_and_transactions_with_sql() {
 
 #[test]
 fn insert_requires_explicit_bounded_columns_and_exact_target_names() {
-    for columns in [vec![], vec!["id".into(); MAX_COLUMNS + 1]] {
+    for columns in [vec![], vec!["id".into(); MAX_TABLE_COLUMNS + 1]] {
         let input = TypedInsertSelect { columns, ..insert(TypedRead::Single(Box::new(read()))) };
         assert!(matches!(Prepared::from_typed_insert_select(0, 0, input), Err(SqlError::Limit)));
     }

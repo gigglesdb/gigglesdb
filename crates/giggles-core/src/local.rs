@@ -103,6 +103,7 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::Parameters
                 | relational::SqlError::TextSearchProtocolViolation => 8,
                 relational::SqlError::Limit
+                | relational::SqlError::TooManyColumns
                 | relational::SqlError::TextSearchProgramLimit
                 | relational::SqlError::TextSearchStatementTooComplex => 9,
                 relational::SqlError::Unbounded => 10,

@@ -326,7 +326,7 @@ fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
         unreachable!()
     };
     // Reject caller-owned collections before serialization or definition copies.
-    if columns.len() > crate::relational::MAX_COLUMNS
+    if columns.len() > crate::relational::MAX_TABLE_COLUMNS
         || primary_key.len() > crate::relational::MAX_COLUMNS
     {
         return Err(Error::Limit);

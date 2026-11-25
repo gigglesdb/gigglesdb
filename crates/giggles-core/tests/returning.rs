@@ -666,7 +666,7 @@ fn returning_wrapper_shares_binding_node_and_depth_budgets() {
     );
     let many_columns = returning(
         delete(yes(), Some(0)),
-        (0..65)
+        (0..=giggles_core::relational::MAX_TARGET_COLUMNS)
             .map(|i| Projection {
                 expression: field("flag"),
                 alias: Some(format!("c{i}")),

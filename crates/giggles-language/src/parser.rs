@@ -320,7 +320,15 @@ fn lex_within(s: &str, version: LanguageVersion, budget: &mut TextBudget) -> Res
         if *budget == TextBudget::Transaction && insert_step(&out) {
             *budget = TextBudget::Insert;
         }
-        let max_tokens = if *budget == TextBudget::Insert { MAX_INSERT_TOKENS } else { MAX_TOKENS };
+        let max_tokens = if *budget == TextBudget::Insert {
+            MAX_INSERT_TOKENS
+        } else if matches!(out.as_slice(), [(Token::Word(create), _), (Token::Word(table), _), ..]
+            if create.eq_ignore_ascii_case("create") && table.eq_ignore_ascii_case("table"))
+        {
+            MAX_INPUT
+        } else {
+            MAX_TOKENS
+        };
         if out.len() > max_tokens {
             return Err(Error::Limit);
         }
@@ -1021,7 +1029,7 @@ impl Parser {
             if self.version.supports_transactions() && self.symbol('(') {
                 let mut names = vec![self.name()?];
                 while self.symbol(',') {
-                    if many && names.len() >= giggles_core::relational::MAX_COLUMNS {
+                    if many && names.len() >= giggles_core::relational::MAX_TABLE_COLUMNS {
                         return Err(Error::Limit);
                     }
                     names.push(self.name()?);
@@ -1037,7 +1045,7 @@ impl Parser {
                     }
                     let mut expressions = vec![self.expr(0)?];
                     while self.symbol(',') {
-                        if many && expressions.len() >= giggles_core::relational::MAX_COLUMNS {
+                        if many && expressions.len() >= giggles_core::relational::MAX_TABLE_COLUMNS {
                             return Err(Error::Limit);
                         }
                         expressions.push(self.expr(0)?);
@@ -1555,7 +1563,7 @@ impl Parser {
                 }
                 primary_key = Some(keys);
             } else {
-                if columns.len() >= giggles_core::relational::MAX_COLUMNS {
+                if columns.len() >= giggles_core::relational::MAX_TABLE_COLUMNS {
                     return Err(Error::Limit);
                 }
                 let column = self.table_column()?;

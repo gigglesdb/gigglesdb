@@ -722,7 +722,7 @@ fn bounded_native_scan_matches_expected_composite_results() {
     oversized.upper = None;
     assert_eq!(s.scan(oversized), Err(CoreError::Sql(E::Limit)));
     let mut wide = scan.clone();
-    wide.projection = vec!["n".into(); MAX_COLUMNS + 1];
+    wide.projection = vec!["n".into(); MAX_TARGET_COLUMNS + 1];
     assert_eq!(s.scan(wide), Err(CoreError::Sql(E::Limit)));
     let mut empty = scan;
     empty.lower = Some((V::Text("z".into()), true));
@@ -776,9 +776,9 @@ fn boolean_pk_result_bytes_and_statement_rollback_bounds() {
     let body = "x".repeat(60000);
     let wide = format!(
         "SELECT {} FROM pages LIMIT 1",
-        vec!["body"; MAX_COLUMNS + 1].join(",")
+        vec!["body"; MAX_TARGET_COLUMNS + 1].join(",")
     );
-    err(&mut s, &wide, E::Limit);
+    err(&mut s, &wide, E::TooManyColumns);
     run(&mut s, "BEGIN");
     for n in 0..18 {
         s.execute(

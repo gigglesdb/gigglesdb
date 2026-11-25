@@ -1284,7 +1284,7 @@ fn build_with_budget(
             || !names.insert((snapshot.table_schema(t.id).0, &t.name))
             || t.name.is_empty()
             || t.columns.is_empty() && !snapshot.collation_oids.get(&t.id).is_some_and(Vec::is_empty)
-            || t.columns.len() > 64
+            || t.columns.len() > MAX_TABLE_COLUMNS
         {
             return Err(Error::InvalidSnapshot);
         }

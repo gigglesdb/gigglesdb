@@ -44,7 +44,7 @@ fn raw(v: &Value) -> usize {
 }
 fn table_shape(t: &TableDef) -> R<usize> {
     cap(t.name.len(), 63)?;
-    cap(t.columns.len(), MAX_COLUMNS)?;
+    cap(t.column_slots(), MAX_TABLE_COLUMNS)?;
     cap(t.primary_key.len(), MAX_COLUMNS)?;
     let mut n = add(t.name.len(), mul(t.columns.len(), 128)?)?;
     for c in &t.columns {
@@ -101,7 +101,7 @@ impl Relational {
             cap(rows, si::MAX_ROWS)?;
             for (key, row) in map {
                 cap(key.len(), si::MAX_COMPONENT)?;
-                cap(row.values.len(), MAX_COLUMNS)?;
+                cap(row.values.len(), MAX_STORED_COLUMNS)?;
                 let mut rb = 0;
                 for v in &row.values {
                     rb = add(rb, raw(v))?;

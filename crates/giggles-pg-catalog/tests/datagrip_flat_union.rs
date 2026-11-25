@@ -324,9 +324,13 @@ fn projection_parameter_token_and_prefix_edges() {
         run(&(wide(128) + " UNION ALL " + &wide(128)), &[]).rows,
         vec![vec![Value::Int(1); 128]; 2]
     );
+    let over = format!(
+        "SELECT {} FROM pg_database",
+        vec!["1"; MAX_TARGET_COLUMNS + 1].join(",")
+    );
     assert_eq!(
-        plan(&(wide(129) + " UNION ALL " + &wide(129))).unwrap_err(),
-        Error::Limit
+        plan(&format!("{over} UNION ALL {over}")).unwrap_err(),
+        Error::TooManyColumns
     );
     let sql = padded("1", 10) + " UNION ALL SELECT $256::int4";
     let p = plan(&sql).unwrap().unwrap();
@@ -360,7 +364,7 @@ fn projection_parameter_token_and_prefix_edges() {
     };
     let sql = format!("SELECT {} FROM pg_database", vec!["1"; 4095].join(","));
     assert_eq!(tokens(&sql), 8192);
-    assert_eq!(plan(&sql).unwrap_err(), Error::Limit); // projection cap on ordinary path
+    assert_eq!(plan(&sql).unwrap_err(), Error::TooManyColumns); // projection cap on ordinary path
     let sql = sql + ";";
     assert_eq!(tokens(&sql), 8193);
     assert_eq!(plan(&sql).unwrap_err(), Error::Limit); // whole-input token cap

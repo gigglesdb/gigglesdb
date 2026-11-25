@@ -282,7 +282,7 @@ fn names_list(p: &mut Parser, close: bool) -> R<Vec<String>> {
     let mut names = vec![];
     loop {
         names.push(p.column_name()?);
-        if names.len() > MAX_COLUMNS {
+        if names.len() > MAX_TARGET_COLUMNS {
             return Err(SqlError::Limit);
         }
         if !p.sym(',') {

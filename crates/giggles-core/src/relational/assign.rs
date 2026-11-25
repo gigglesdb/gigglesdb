@@ -83,7 +83,7 @@ pub(super) fn indexes(
     table: &TableDef,
     state: &Relational,
 ) -> R<Vec<usize>> {
-    if sets.len() > MAX_COLUMNS {
+    if sets.len() > MAX_TABLE_COLUMNS {
         return Err(SqlError::Limit);
     }
     sets.iter()

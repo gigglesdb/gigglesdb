@@ -1,6 +1,6 @@
 //! Bounded trusted catalog inspection, separate from data and catalog mutations.
 use super::{ENGINE_CONTRACT_VERSION, Engine, Error, Result, core, identifier, validate_size};
-use crate::{CoreError, relational::{MAX_COLUMNS, SqlError, TableDef}};
+use crate::{CoreError, relational::{MAX_COLUMNS, MAX_TABLE_COLUMNS, SqlError, TableDef}};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -95,7 +95,7 @@ impl MetadataBudget {
 }
 
 fn check_table_shape(table: &TableDef) -> Result<()> {
-    if table.logical_columns().count() > MAX_COLUMNS || table.primary_key.len() > MAX_COLUMNS {
+    if table.column_slots() > MAX_TABLE_COLUMNS || table.primary_key.len() > MAX_COLUMNS {
         return Err(Error::Limit);
     }
     Ok(())
@@ -269,7 +269,7 @@ mod tests {
         let mut table = table();
         table
             .columns
-            .resize(MAX_COLUMNS + 1, table.columns[0].clone());
+            .resize(MAX_TABLE_COLUMNS + 1, table.columns[0].clone());
         let mut tables = BTreeMap::from([("items".into(), table)]);
         assert_eq!(
             admit(

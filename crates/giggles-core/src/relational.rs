@@ -174,11 +174,32 @@ impl Drop for ValueBudget {
     fn drop(&mut self) { VALUE_LIMIT.with(|v| v.set(self.0)); WIDE_VALUES.with(|v| v.set(self.1)); }
 }
 /// Bound one projected row separately from cursor pages and result collectors.
-/// Each column may contain one maximum-sized value plus its fixed overhead.
+/// Keep room for one large value and per-field overhead, with the legacy
+/// projected-row allowance as a floor.
 pub(crate) fn max_projected_row_bytes(value_bytes: usize) -> usize {
-    value_bytes.saturating_mul(MAX_COLUMNS).saturating_add(MAX_COLUMNS * 32).max(MAX_RESULT_BYTES)
+    const LEGACY_PROJECTED_BYTES: usize = MAX_COLUMNS * (MAX_ROW_BYTES + 32);
+    value_bytes
+        .saturating_add(MAX_TARGET_COLUMNS * 32)
+        .max(LEGACY_PROJECTED_BYTES)
 }
+/// Existing limits on key arity and bounded lists unrelated to table width.
 pub const MAX_COLUMNS: usize = 64;
+/// User column slots in a table.
+pub const MAX_TABLE_COLUMNS: usize = 1600;
+/// Output fields in a SELECT or RETURNING target list.
+pub const MAX_TARGET_COLUMNS: usize = 1664;
+/// One hidden heap key can accompany a full-width table.
+pub(crate) const MAX_STORED_COLUMNS: usize = MAX_TABLE_COLUMNS + 1;
+
+pub(crate) fn table_column_limit() -> SqlError {
+    user_types::view_replace_error(format!("tables can have at most {MAX_TABLE_COLUMNS} columns"));
+    SqlError::TooManyColumns
+}
+
+fn target_column_limit() -> SqlError {
+    user_types::view_replace_error(format!("target lists can have at most {MAX_TARGET_COLUMNS} entries"));
+    SqlError::TooManyColumns
+}
 pub const MAX_PARAMS: usize = 65_535;
 pub const MAX_RESULT_BYTES: usize = 1024 * 1024;
 /// Concurrent explicit SQL/native transactions per v2 database. A v2
@@ -398,6 +419,8 @@ pub enum SqlError {
     InvalidName,
     #[serde(skip)]
     UnsafeNewEnumValue,
+    #[serde(skip)]
+    TooManyColumns,
     // Transient diagnostics from PostgreSQL text-search input and evaluation.
     #[serde(skip)]
     TextSearchInternal,
@@ -660,6 +683,10 @@ impl TableDef {
                     && column.not_null
             })
             .map(|_| *index)
+    }
+
+    pub(crate) fn column_slots(&self) -> usize {
+        self.columns.len() - usize::from(self.hidden_rowid().is_some())
     }
 
     pub fn logical_columns(&self) -> impl Iterator<Item = &ColumnDef> + '_ {
@@ -1299,6 +1326,10 @@ fn token_limit(tokens: &[Token], routing: bool) -> usize {
     if wide_values() { return max_statement_tokens(); }
     if routing || matches!(tokens.first(), Some(Token::Word(word)) if word == "insert") {
         MAX_INSERT_TOKENS
+    } else if matches!(tokens, [Token::Word(create), Token::Word(table), ..] if create == "create" && table == "table") {
+        // A full-width legacy table can exceed 4096 tokens. MAX_SQL already
+        // bounds the source bytes, and every token consumes at least one byte.
+        MAX_SQL
     } else {
         max_statement_tokens()
     }
@@ -1779,6 +1810,9 @@ impl Parser {
                     keys = self.names()?;
                     primary_name = constraint_name;
                 } else {
+                    if columns.len() == MAX_TABLE_COLUMNS {
+                        return Err(table_column_limit());
+                    }
                     let name = self.column_name()?;
                     let serial = if self.word("smallserial") || self.word("serial2") {
                         Some(DataType::SmallInt)
@@ -2222,11 +2256,11 @@ fn validate_create_columns(
     column_names: ColumnNamePolicy,
 ) -> R<()> {
     ident(name)?;
-    if columns.is_empty() || columns.len() > MAX_COLUMNS {
+    if columns.is_empty() || keys.len() > MAX_COLUMNS {
         return Err(SqlError::Limit);
     }
-    if keys.is_empty() && columns.len() == MAX_COLUMNS {
-        return Err(SqlError::Limit);
+    if columns.len() > MAX_TABLE_COLUMNS {
+        return Err(table_column_limit());
     }
     unique(columns.iter().map(|column| &column.name))?;
     unique(keys)?;
@@ -2446,7 +2480,7 @@ impl Prepared {
     }
     /// Construct an ordinary INSERT from a typed query, without parsing SQL.
     pub fn from_typed_insert_select(domain: u128, epoch: u64, insert: TypedInsertSelect) -> R<Self> {
-        if insert.columns.is_empty() || insert.columns.len() > MAX_COLUMNS { return Err(SqlError::Limit); }
+        if insert.columns.is_empty() || insert.columns.len() > MAX_TABLE_COLUMNS { return Err(SqlError::Limit); }
         let (table, schema) = match insert.table.split_once('.') {
             Some((schema, name)) => {
                 for component in [schema, name] {
@@ -2541,7 +2575,7 @@ impl Prepared {
         if keys.is_empty() {
             // Preserve the native CREATE error and its original precedence.
             schema_binding::validate_key(&name)?;
-            if columns.is_empty() || columns.len() > MAX_COLUMNS {
+            if columns.is_empty() || columns.len() > MAX_TABLE_COLUMNS {
                 return Err(SqlError::Limit);
             }
             return Err(SqlError::Unbounded);
@@ -2848,7 +2882,7 @@ impl Prepared {
         if sets.is_empty() {
             return Err(SqlError::Unsupported);
         }
-        if sets.len() > MAX_COLUMNS {
+        if sets.len() > MAX_TABLE_COLUMNS {
             return Err(SqlError::Limit);
         }
         if key.len() != table.primary_key.len() {
@@ -3376,6 +3410,17 @@ impl Prepared {
         Ok(tables)
     }
 
+    pub(crate) fn ddl_id_reservation(&self) -> u64 {
+        let width = match self.statement.get() {
+            Statement::Create { as_query: Some(_), .. } => MAX_TABLE_COLUMNS,
+            Statement::View(ddl) if ddl.query.is_some() => MAX_TABLE_COLUMNS,
+            Statement::Create { columns, .. } => columns.len().max(MAX_COLUMNS),
+            Statement::AlterTable(alter) => alter.actions.len().max(MAX_COLUMNS),
+            _ => MAX_COLUMNS,
+        };
+        3 * width as u64 + 64
+    }
+
     /// Whether this DDL statement takes its definition from a query.
     pub fn is_create_as(&self) -> bool {
         matches!(self.statement.get(), Statement::Create { as_query: Some(_), .. })
@@ -3493,7 +3538,7 @@ impl Prepared {
         }
         if scan.prefix.len() > t.primary_key.len()
             || scan.limit > MAX_ROWS
-            || scan.projection.len() > MAX_COLUMNS
+            || scan.projection.len() > MAX_TARGET_COLUMNS
         {
             return Err(SqlError::Limit);
         }
@@ -4488,8 +4533,9 @@ impl Relational {
                 || t.id >= self.next_id
                 || !ids.insert(t.id)
                 || t.columns.is_empty()
-                || t.columns.len() > MAX_COLUMNS
+                || t.column_slots() > MAX_TABLE_COLUMNS
                 || t.primary_key.is_empty()
+                || t.primary_key.len() > MAX_COLUMNS
             {
                 return Err(SqlError::Type);
             }
@@ -5161,8 +5207,11 @@ impl Relational {
                         return Err(SqlError::DuplicateObject);
                     }
                 }
-                if columns.is_empty() || columns.len() > MAX_COLUMNS {
+                if columns.is_empty() {
                     return Err(SqlError::Limit);
+                }
+                if columns.len() > MAX_TABLE_COLUMNS {
+                    return Err(table_column_limit());
                 }
                 let mut column_names = BTreeSet::new();
                 for column in columns {
@@ -5366,8 +5415,8 @@ impl Relational {
                 order,
                 limit,
             } => {
-                if projection.len() > MAX_COLUMNS {
-                    return Err(SqlError::Limit);
+                if projection.len() > MAX_TARGET_COLUMNS {
+                    return Err(target_column_limit());
                 }
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);

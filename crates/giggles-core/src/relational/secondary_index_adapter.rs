@@ -163,7 +163,7 @@ impl Snapshot {
 /// scalars, which are checked normally by row_check after this bound.
 fn shape(w: Witness<'_>) -> R<()> {
     cap(w.key.len(), si::MAX_COMPONENT)?;
-    cap(w.row.values.len(), MAX_COLUMNS)?;
+    cap(w.row.values.len(), MAX_STORED_COLUMNS)?;
     let mut bytes = 0;
     for v in &w.row.values {
         let n = match v {
@@ -186,7 +186,7 @@ fn descriptors(state: &Relational, ds: &[Descriptor], cancel: &mut impl FnMut() 
     let mut object_ids = BTreeSet::new();
     let catalog = CatalogView::new(state);
     for t in state.tables.values() {
-        cap(t.columns.len(), MAX_COLUMNS)?;
+        cap(t.column_slots(), MAX_TABLE_COLUMNS)?;
         cap(t.primary_key.len(), MAX_COLUMNS)?;
         object_ids.insert(t.id);
         object_ids.extend(t.columns.iter().map(|c| c.id));
@@ -355,7 +355,10 @@ fn admit(
     // Also reserve full borrowed row-witness equality (including typed NON-key
     // scalars) independently of index entry sizes. Numeric has private validated
     // MAX_TEXT/MAX_DIGITS bounds; neither display nor cloning is used here.
-    let witness_work = mul(mul(2, MAX_COLUMNS)?, giggles_pg_types::MAX_TEXT)?;
+    let witness_width = [overlay.old, overlay.new].into_iter().flatten()
+        .map(|witness| witness.row.values.len())
+        .fold(MAX_COLUMNS, usize::max);
+    let witness_work = mul(mul(2, witness_width)?, giggles_pg_types::MAX_TEXT)?;
     cap(
         add(
             add(work, witness_work)?,
@@ -470,7 +473,8 @@ pub(super) struct StatementProposal<'a> {
 // eight conversions per borrowed occurrence, before any formatting or copy.
 const STATEMENT_MAX_WORK: usize = si::MAX_WORK;
 fn exact_witness(a: &SqlRow, b: &SqlRow) -> R<bool> {
-    let limit = crate::relational::max_value_bytes() + MAX_COLUMNS * 16 + 32;
+    let width = a.values.len().max(b.values.len()).max(MAX_COLUMNS);
+    let limit = crate::relational::max_value_bytes() + width * 16 + 32;
     let a_size = bincode::serialized_size(a).map_err(|_| SqlError::Type)?;
     let b_size = bincode::serialized_size(b).map_err(|_| SqlError::Type)?;
     if a_size > limit as u64 || b_size > limit as u64 {
@@ -531,7 +535,7 @@ fn raw_size(v: &Value) -> usize {
 }
 fn row_bound(key: &[u8], row: &SqlRow, bytes: &mut usize, work: &mut usize) -> R<()> {
     cap(key.len(), si::MAX_COMPONENT)?;
-    cap(row.values.len(), MAX_COLUMNS)?;
+    cap(row.values.len(), MAX_STORED_COLUMNS)?;
     let mut size = 0;
     let mut copy_bytes = key.len();
     for value in &row.values {
@@ -1090,7 +1094,7 @@ impl Relational {
         mut cancel: impl FnMut() -> bool,
     ) -> R<(&Sidecar, &BTreeMap<Vec<u8>, SqlRow>)> {
         cap(table.name.len(), 63)?;
-        cap(table.columns.len(), MAX_COLUMNS)?;
+        cap(table.column_slots(), MAX_TABLE_COLUMNS)?;
         cap(table.primary_key.len(), MAX_COLUMNS)?;
         for c in &table.columns {
             cap(c.name.len(), 63)?;

@@ -415,7 +415,7 @@ fn decoded_table_column_count_is_bounded() {
     let mut dto = table_dto();
     dto.def.columns.clear();
     assert_bad_table(&dto);
-    dto.def.columns = (0..MAX_COLUMNS)
+    dto.def.columns = (0..MAX_TABLE_COLUMNS)
         .map(|i| ColumnDefDto {
             id: i as u64 + 2,
             name: format!("c{i}"),
@@ -425,7 +425,7 @@ fn decoded_table_column_count_is_bounded() {
         .collect();
     assert!(decode_table(&encode_version(2, &dto).unwrap()).is_ok());
     dto.def.columns.push(ColumnDefDto {
-        id: 100,
+        id: MAX_TABLE_COLUMNS as u64 + 2,
         name: "overflow".into(),
         data_type: DataTypeDto::Integer,
         not_null: true,

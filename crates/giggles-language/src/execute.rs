@@ -757,7 +757,7 @@ pub(crate) fn validate_catalog(
     if let CatalogStatement::CreateTableWith { table, columns, primary_key, constraints } = statement {
         // Only foreign keys are admitted; each is validated as its ALTER TABLE ADD CONSTRAINT.
         if !version.supports_r2_wave3() || constraints.iter().any(|c| !matches!(c.constraint, ConstraintSpec::ForeignKey { .. })) { return Err(Error::Unsupported); }
-        if columns.len() > giggles_core::relational::MAX_COLUMNS || primary_key.len() > giggles_core::relational::MAX_COLUMNS
+        if columns.len() > giggles_core::relational::MAX_TABLE_COLUMNS || primary_key.len() > giggles_core::relational::MAX_COLUMNS
             || constraints.len() > giggles_core::relational::MAX_COLUMNS { return Err(Error::Limit); }
         validate_size(statement)?;
         for column in columns {
@@ -812,7 +812,7 @@ pub(crate) fn validate_catalog(
         if !version.supports_indexes() {
             return Err(Error::Unsupported);
         }
-        if columns.len() > giggles_core::relational::MAX_COLUMNS {
+        if columns.len() > giggles_core::relational::MAX_TABLE_COLUMNS {
             return Err(Error::Limit);
         }
         if !parser::semantic_relation(table, version) || std::iter::once(name)
@@ -831,7 +831,7 @@ pub(crate) fn validate_catalog(
     else {
         unreachable!()
     };
-    if columns.len() > giggles_core::relational::MAX_COLUMNS
+    if columns.len() > giggles_core::relational::MAX_TABLE_COLUMNS
         || primary_key.len() > giggles_core::relational::MAX_COLUMNS
     {
         return Err(Error::Limit);
@@ -1045,7 +1045,7 @@ fn statement_parts(statement: &Statement) -> Result<StatementParts<'_>> {
             return Err(Error::Limit);
         }
         if let ConflictAction::Update { values, .. } = action
-            && (values.is_empty() || values.len() > giggles_core::relational::MAX_COLUMNS)
+            && (values.is_empty() || values.len() > giggles_core::relational::MAX_TABLE_COLUMNS)
         {
             return Err(Error::Bind("assignments".into()));
         }
@@ -1069,7 +1069,7 @@ fn statement_parts(statement: &Statement) -> Result<StatementParts<'_>> {
     {
         return Err(Error::Unsupported);
     }
-    if projection.is_some_and(|projection| projection.len() > giggles_core::relational::MAX_COLUMNS)
+    if projection.is_some_and(|projection| projection.len() > giggles_core::relational::MAX_TARGET_COLUMNS)
     {
         return Err(Error::Limit);
     }
@@ -1176,7 +1176,7 @@ fn validate_statement_depth(stmt: &Statement, nodes: &mut usize, version: Langua
             values,
             ..
         } => {
-            if values.len() > giggles_core::relational::MAX_COLUMNS {
+            if values.len() > giggles_core::relational::MAX_TABLE_COLUMNS {
                 return Err(Error::Bind("assignments".into()));
             }
             pending.push((filter, 0));
@@ -1186,14 +1186,14 @@ fn validate_statement_depth(stmt: &Statement, nodes: &mut usize, version: Langua
         Statement::ReadExpressions {
             filter, projection, ..
         } => {
-            if projection.len() > giggles_core::relational::MAX_COLUMNS {
+            if projection.len() > giggles_core::relational::MAX_TARGET_COLUMNS {
                 return Err(Error::Limit);
             }
             pending.extend(filter.iter().map(|e| (e, 0)));
             pending.extend(projection.iter().map(|p| (&p.expression, 0)));
         }
         Statement::InsertExpressions { values, .. } => {
-            if values.len() > giggles_core::relational::MAX_COLUMNS {
+            if values.len() > giggles_core::relational::MAX_TABLE_COLUMNS {
                 return Err(Error::Bind("assignments".into()));
             }
             pending.extend(values.iter().map(|(_, expr)| (expr, 0)));
@@ -1201,7 +1201,7 @@ fn validate_statement_depth(stmt: &Statement, nodes: &mut usize, version: Langua
         Statement::InsertMany { columns, rows, .. } => {
             // Check every collection and arity before gathering expression roots.
             // Row counts are engine-specific and admitted by core at bind time.
-            if columns.len() > giggles_core::relational::MAX_COLUMNS || rows.len() > MAX_INSERT_TOKENS
+            if columns.len() > giggles_core::relational::MAX_TABLE_COLUMNS || rows.len() > MAX_INSERT_TOKENS
             {
                 return Err(Error::Limit);
             }

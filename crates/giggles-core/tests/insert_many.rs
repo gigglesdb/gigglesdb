@@ -7,7 +7,7 @@ use giggles_core::{
         LocalRef, MAX_DEPTH, MAX_INSERT_BYTES, MAX_INSERT_ROWS, Projection, Request, Transaction,
         TransactionStep, ValueExpr,
     },
-    relational::{DataType, MAX_COLUMNS, MAX_RESULT_BYTES, MAX_ROW_BYTES, SqlRow, Value as V},
+    relational::{DataType, MAX_COLUMNS, MAX_RESULT_BYTES, MAX_ROW_BYTES, MAX_TABLE_COLUMNS, SqlRow, Value as V},
 };
 use std::{path::PathBuf, sync::Arc};
 
@@ -493,7 +493,7 @@ fn insert_many_row_and_table_limits_are_finite() {
             .rows
             .is_empty()
     );
-    columns.push("extra".into());
+    columns.resize(MAX_TABLE_COLUMNS + 1, "extra".into());
     static_failure(
         &admin,
         &engine,

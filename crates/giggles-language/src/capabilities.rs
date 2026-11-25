@@ -1810,7 +1810,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
             once_max_clock_lease_seconds: version.supports_once().then_some(core_once::MAX_ONCE_CLOCK_LEASE_SECONDS),
             inspection_metadata_bytes: version.supports_inspection()
                 .then_some(giggles_core::operations::MAX_INSPECTION_METADATA_BYTES),
-            columns_per_table: relational::MAX_COLUMNS,
+            columns_per_table: relational::MAX_TABLE_COLUMNS,
             catalog_tables: None,
             concurrent_explicit_sessions: relational::LEGACY_MAX_TRANSACTIONS,
             insert_text_bytes: crate::MAX_INSERT_INPUT.max(MAX_INPUT),

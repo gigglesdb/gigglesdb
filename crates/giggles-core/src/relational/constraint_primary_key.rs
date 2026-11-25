@@ -184,9 +184,6 @@ pub(super) fn drop(
     cascade: bool,
     cancel: &mut impl FnMut() -> bool,
 ) -> R<()> {
-    if table.columns.len() >= MAX_COLUMNS {
-        return Err(SqlError::Limit);
-    }
     let columns: BTreeSet<_> = table
         .primary_key
         .iter()

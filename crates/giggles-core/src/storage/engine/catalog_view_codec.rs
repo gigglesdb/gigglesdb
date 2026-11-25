@@ -2,7 +2,7 @@
 use super::{corrupt, object_key};
 use crate::{
     CoreError,
-    relational::{DataType, MAX_COLUMNS},
+    relational::{DataType, MAX_TABLE_COLUMNS},
 };
 use std::collections::BTreeSet;
 
@@ -68,7 +68,7 @@ fn validate(view: &SqlViewDef) -> Result<(), CoreError> {
     let mut names = BTreeSet::new();
     if !identifier(&view.name)
         || view.columns.is_empty()
-        || view.columns.len() > MAX_COLUMNS
+        || view.columns.len() > MAX_TABLE_COLUMNS
         || view.columns.iter().any(|c| c.source.is_some() != view.columns[0].source.is_some())
         || view.select.is_empty()
         || view.select.len() > MAX_SELECT_BYTES
@@ -86,7 +86,7 @@ fn validate(view: &SqlViewDef) -> Result<(), CoreError> {
         || view
             .dependencies
             .iter()
-            .any(|d| d.relation == 0 || d.columns.len() > MAX_COLUMNS || d.columns.contains(&0)
+            .any(|d| d.relation == 0 || d.columns.len() > MAX_TABLE_COLUMNS || d.columns.contains(&0)
                 || d.columns.iter().collect::<BTreeSet<_>>().len() != d.columns.len())
         || view.dependencies.windows(2).any(|d| d[0].relation >= d[1].relation)
     {
@@ -174,7 +174,7 @@ pub(crate) fn decode_view(bytes: &[u8]) -> Result<SqlViewDef, CoreError> {
     }
     let schema = u64::from_be_bytes(input.bytes()?);
     let name = input.string(63)?;
-    let count = input.count(MAX_COLUMNS)?;
+    let count = input.count(MAX_TABLE_COLUMNS)?;
     let mut columns = Vec::new();
     for _ in 0..count {
         columns.push(SqlViewColumn {
@@ -194,7 +194,7 @@ pub(crate) fn decode_view(bytes: &[u8]) -> Result<SqlViewDef, CoreError> {
     let mut dependencies = Vec::new();
     for _ in 0..count {
         let relation = u64::from_be_bytes(input.bytes()?);
-        let count = input.count(MAX_COLUMNS)?;
+        let count = input.count(MAX_TABLE_COLUMNS)?;
         let mut columns = Vec::new();
         for _ in 0..count {
             columns.push(u64::from_be_bytes(input.bytes()?));

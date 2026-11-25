@@ -126,7 +126,7 @@ fn native_create_still_requires_keys_with_original_error_precedence() {
     );
     assert_eq!(create("native", vec![]), SqlError::Limit);
     assert_eq!(
-        create("native", vec![column.clone(); MAX_COLUMNS + 1]),
+        create("native", vec![column.clone(); MAX_TABLE_COLUMNS + 1]),
         SqlError::Limit
     );
     assert_eq!(create("giggles_reserved", vec![]), SqlError::Reserved);

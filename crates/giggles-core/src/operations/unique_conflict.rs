@@ -992,7 +992,7 @@ impl Relational {
                 ConflictAction::Update { guard, values } => BoundConflict::Update {
                     guard: binder.optional(guard)?,
                     values: {
-                        if values.is_empty() || values.len() > crate::relational::MAX_COLUMNS {
+                        if values.is_empty() || values.len() > crate::relational::MAX_TABLE_COLUMNS {
                             return Err(Error::Bind("assignments".into()));
                         }
                         let mut seen = BTreeSet::new();

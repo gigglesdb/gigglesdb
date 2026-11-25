@@ -164,6 +164,9 @@ impl CreateAs {
             type_oids,
             ..
         } = description;
+        if columns.len() > MAX_TABLE_COLUMNS {
+            return Err(table_column_limit());
+        }
         if self.names.len() > columns.len() {
             user_types::view_replace_error("too many column names were specified".into());
             return Err(SqlError::Syntax);

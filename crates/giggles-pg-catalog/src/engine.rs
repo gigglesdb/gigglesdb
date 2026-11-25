@@ -1672,8 +1672,8 @@ impl Compiler {
                 _ => return Err(Error::Unsupported),
             }
         }
-        if projection.len() > 128 {
-            return Err(Error::Limit);
+        if projection.len() > MAX_TARGET_COLUMNS {
+            return Err(Error::TooManyColumns);
         }
         let aggregate = !group.is_empty() || projection.iter().any(has_aggregate);
         if aggregate {

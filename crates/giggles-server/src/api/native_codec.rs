@@ -88,14 +88,14 @@ impl Shape {
         Ok(())
     }
     fn assignments(&mut self, v: &[p::NativeAssignment]) -> R<()> {
-        cap(v.len(), 64)?;
+        cap(v.len(), giggles_core::relational::MAX_TABLE_COLUMNS)?;
         for a in v {
             self.expr(need(a.expression.as_ref())?)?;
         }
         Ok(())
     }
     fn projections(&mut self, v: &[p::NativeProjection]) -> R<()> {
-        cap(v.len(), 64)?;
+        cap(v.len(), giggles_core::relational::MAX_TARGET_COLUMNS)?;
         for a in v {
             self.expr(need(a.expression.as_ref())?)?;
         }
@@ -107,12 +107,12 @@ impl Shape {
         match need(r.request.as_ref())? {
             Q::Read(v) => {
                 cap(v.order.len(), 64)?;
-                cap(v.projection.len(), 64)?;
+                cap(v.projection.len(), giggles_core::relational::MAX_TARGET_COLUMNS)?;
                 self.optional(&v.filter)?;
             }
-            Q::Insert(v) => cap(v.values.len(), 64)?,
+            Q::Insert(v) => cap(v.values.len(), giggles_core::relational::MAX_TABLE_COLUMNS)?,
             Q::Update(v) => {
-                cap(v.values.len(), 64)?;
+                cap(v.values.len(), giggles_core::relational::MAX_TABLE_COLUMNS)?;
                 self.expr(need(v.filter.as_ref())?)?;
                 self.optional(&v.guard)?;
                 intent_shape(need(v.intent.as_ref())?)?;
@@ -134,10 +134,10 @@ impl Shape {
             }
             Q::InsertExpressions(v) => self.assignments(&v.values)?,
             Q::InsertMany(v) => {
-                cap(v.columns.len(), 64)?;
+                cap(v.columns.len(), giggles_core::relational::MAX_TABLE_COLUMNS)?;
                 cap(v.rows.len(), 1024)?;
                 for row in &v.rows {
-                    cap(row.values.len(), 64)?;
+                    cap(row.values.len(), giggles_core::relational::MAX_TABLE_COLUMNS)?;
                     if row.values.len() != v.columns.len() {
                         return Err(ApiError::InvalidArgument);
                     }
@@ -285,7 +285,7 @@ pub(crate) fn validate(input: &p::ExecuteRequest) -> R<()> {
 }
 
 fn read_shape(v: &p::NativeTypedRead) -> R<()> {
-    cap(v.projection.len(), 64)?;
+    cap(v.projection.len(), giggles_core::relational::MAX_TARGET_COLUMNS)?;
     cap(v.group_by.len(), 64)?;
     cap(v.order_by.len(), 64)?;
     let mut pending = Vec::new();
