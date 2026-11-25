@@ -10,7 +10,7 @@ use crate::{
 };
 use bincode::Options;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, ops::Bound, time::Instant};
+use std::{cmp::Ordering, collections::BTreeMap, ops::Bound, time::Instant};
 
 // Independent wire DTO: future changes to the legacy sidecar cannot alter v2.
 #[derive(Serialize, Deserialize)]
@@ -203,25 +203,15 @@ fn entries_for<'a>(
             if predicate.as_ref().map(|p| p.matches(&row.values)).transpose().map_err(CoreError::Sql)? == Some(false) {
                 continue;
             }
-            let values = offsets
-                .iter()
-                .map(|i| row.values[*i].clone())
-                .collect::<Vec<_>>();
-            let pk = codec::pk_bytes(
-                &table
-                    .primary_key
-                    .iter()
-                    .map(|i| row.values[*i].clone())
-                    .collect::<Vec<_>>(),
-            )?;
-            let mut key = d.id.to_be_bytes().to_vec();
-            key.extend(codec::index_tuple_bytes(
-                &values,
-                &vec![codec::Direction::Asc; values.len()],
-            )?);
+            let values = offsets.iter().map(|i| &row.values[*i]);
+            let pk = codec::pk_bytes_iter(table.primary_key.iter().map(|i| &row.values[*i]))?;
             // SQL UNIQUE permits multiple NULL tuples; their physical entries
             // use the same PK suffix as non-unique indexes.
-            if !d.unique || values.contains(&Value::Null) {
+            let suffix = !d.unique || values.clone().any(|v| matches!(v, Value::Null));
+            let mut key = Vec::with_capacity(8 + values.len() * 9 + if suffix { pk.len() } else { 0 });
+            key.extend(d.id.to_be_bytes());
+            codec::append_index_tuple(&mut key, values.map(|value| (value, codec::Direction::Asc)))?;
+            if suffix {
                 key.extend(&pk);
             }
             if entries.insert(key, pk).is_some() {
@@ -284,18 +274,42 @@ pub(crate) fn apply(
         Some(table) => entries_for(predicates, table, after.values(), new_ds, false, generated)?,
         None => BTreeMap::new(),
     };
-    let changes = old
-        .keys()
-        .chain(new.keys())
-        .filter(|key| old.get(*key) != new.get(*key))
-        .map(|key| (key.clone(), new.get(key).cloned()))
-        .collect::<BTreeMap<_, _>>();
-    for key in changes.keys() {
+    // Both maps are already sorted. Move changed owners out in physical key
+    // order, keeping the old owner for validation before buffering writes.
+    let mut old = old.into_iter().peekable();
+    let mut new = new.into_iter().peekable();
+    let mut changes = Vec::new();
+    loop {
+        let order = match (old.peek(), new.peek()) {
+            (Some((old_key, _)), Some((new_key, _))) => old_key.cmp(new_key),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => break,
+        };
+        match order {
+            Ordering::Less => {
+                let (key, pk) = old.next().unwrap();
+                changes.push((key, Some(pk), None));
+            }
+            Ordering::Equal => {
+                let (_, old_pk) = old.next().unwrap();
+                let (key, new_pk) = new.next().unwrap();
+                if old_pk != new_pk {
+                    changes.push((key, Some(old_pk), Some(new_pk)));
+                }
+            }
+            Ordering::Greater => {
+                let (key, pk) = new.next().unwrap();
+                changes.push((key, None, Some(pk)));
+            }
+        }
+    }
+    for (key, old, new) in &changes {
         let target = txn
             .lock_for_write(Keyspace::Index, key, deadline, cancel)
             .map_err(crate::task::limits::lock_error)?;
-        if target.current.is_some() && target.current.as_ref() != old.get(key) {
-            return Err(match (after_table, new.get(key)) {
+        if target.current.is_some() && target.current.as_ref() != old.as_ref() {
+            return Err(match (after_table, new.as_ref()) {
                 (Some(table), Some(pk)) => occupancy_duplicate(table, after, new_ds, key, pk, false, generated, state.is_some_and(relational::Relational::v2_unique_reporting)),
                 _ => CoreError::Sql(SqlError::Duplicate),
             });
@@ -304,7 +318,12 @@ pub(crate) fn apply(
     if !changes.is_empty() {
         txn.require_features(super::meta::SECONDARY_INDEXES);
     }
-    for (key, value) in changes {
+    for (mut key, _, value) in changes {
+        // The tuple reservation can be much larger than a nullable key.
+        // Reclaim large slack before the write set or savepoint retains it.
+        if key.capacity() > key.len() * 2 {
+            key.shrink_to_fit();
+        }
         match value {
             Some(pk) => txn.put(Keyspace::Index, key, pk)?,
             None => txn.delete(Keyspace::Index, key)?,
@@ -507,4 +526,107 @@ pub(crate) fn successor(mut prefix: Vec<u8>) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        commit::{ManualClock, Sequencer, SequencerConfig},
+        kv::Kv,
+        kv_mem::MemKv,
+        locks::{LockConfig, LockKey, LockManager, LockMode, TxnId},
+        txn::Isolation,
+    };
+    use super::*;
+    use crate::relational::{
+        ColumnDef, DataType, SqlErrorDetail, take_sql_diagnostic_detail, take_sql_error_message,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn publication_locks_physical_keys_and_reports_first_conflict() {
+        let kv = Arc::new(Kv::new(Arc::new(MemKv::new())));
+        let seq = Sequencer::open(
+            kv,
+            Arc::new(ManualClock::new(10)),
+            SequencerConfig::default(),
+        )
+        .unwrap();
+        let locks = Arc::new(LockManager::new(LockConfig::default()));
+        let table = TableDef {
+            id: 1,
+            name: "items".into(),
+            columns: [(1, "id"), (2, "amount")]
+                .into_iter()
+                .map(|(id, name)| ColumnDef {
+                    id,
+                    name: name.into(),
+                    data_type: DataType::BigInt,
+                    not_null: true,
+                })
+                .collect(),
+            primary_key: vec![0],
+        };
+        let index = Descriptor {
+            id: 3,
+            table: table.id,
+            name: "items_indexed_key".into(),
+            columns: vec![2],
+            key_encoding: 1,
+            unique: true,
+            predicate: None,
+        };
+        let descriptors = std::slice::from_ref(&index);
+        let row = |id, amount| {
+            let id = Value::Int(id);
+            let pk = codec::pk_bytes(std::slice::from_ref(&id)).unwrap();
+            let row = SqlRow { values: vec![id, Value::Int(amount)], version: 1 };
+            (pk, row)
+        };
+        let before = BTreeMap::from([row(1, 5), row(2, 30)]);
+        let after = BTreeMap::from([row(1, 20), row(2, 10)]);
+        let seed_rows = before.iter().map(|(pk, row)| (pk.clone(), row.clone()))
+            .chain([row(3, 10), row(4, 20)])
+            .collect();
+        let mut state = relational::Relational::default();
+        state.enable_v2_unique_reporting();
+        let publish = |txn: &mut Transaction, before, after| {
+            apply(
+                txn, Some(&state), &table, Some(&table), before, after,
+                descriptors, descriptors, None, &|| false, &|_| false,
+            )
+        };
+        let empty = BTreeMap::new();
+        let mut seed = Transaction::begin(&seq, &locks, TxnId(1), Isolation::ReadCommitted);
+        publish(&mut seed, &empty, &seed_rows).unwrap();
+        seed.commit().unwrap();
+
+        let id = TxnId(2);
+        let mut txn = Transaction::begin(&seq, &locks, id, Isolation::ReadCommitted);
+        // PK order proposes 20 before 10. Physical order visits the removal
+        // of 5 first, then stops on the occupied entry for 10.
+        assert!(matches!(
+            publish(&mut txn, &before, &after),
+            Err(CoreError::Sql(SqlError::Duplicate))
+        ));
+        let Some(SqlErrorDetail::DuplicateKey(detail)) = take_sql_diagnostic_detail() else {
+            panic!("expected the conflicting index entry's detail");
+        };
+        assert_eq!(
+            take_sql_error_message().as_deref(),
+            Some(r#"duplicate key value violates unique constraint "items_indexed_key""#),
+        );
+        assert_eq!(detail.constraint, index.name);
+        assert_eq!(detail.values, "Key (amount)=(10) already exists.");
+        let held = locks.held(id);
+        assert_eq!(held.len(), 2);
+        for value in [5, 10] {
+            let tuple = codec::index_tuple_bytes(&[Value::Int(value)], &[codec::Direction::Asc])
+                .unwrap();
+            assert!(held.contains(&(LockKey::Unique { index: index.id, tuple }, LockMode::Exclusive)));
+        }
+        let old_entries = entries(Some(&state), &table, &before, descriptors).unwrap();
+        let (first_key, first_owner) = old_entries.into_iter().next().unwrap();
+        assert_eq!(txn.get(Keyspace::Index, &first_key).unwrap(), Some(first_owner));
+    }
 }

@@ -935,10 +935,16 @@ pub(crate) fn row_check(t: &TableDef, values: &[Value]) -> R<()> {
 }
 /// Canonical memcomparable encoding v1: binary collation; NULL sorts first.
 pub fn encode_key(values: &[Value]) -> R<Vec<u8>> {
+    encode_key_iter(values.iter())
+}
+
+pub(crate) fn encode_key_iter<'a>(
+    values: impl ExactSizeIterator<Item = &'a Value> + Clone,
+) -> R<Vec<u8>> {
     if values.len() > MAX_COLUMNS {
         return Err(SqlError::Limit);
     }
-    payload_bound(values.iter())?;
+    payload_bound(values.clone())?;
     let mut out = Vec::new();
     for v in values {
         match v {

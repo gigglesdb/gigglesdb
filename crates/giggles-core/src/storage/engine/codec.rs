@@ -1,5 +1,5 @@
 use super::{crc32c::crc32c_parts, hlc::Ts};
-use crate::relational::{MAX_COLUMNS, MAX_VALUE_BYTES, SqlError, Value, encode_key};
+use crate::relational::{MAX_COLUMNS, MAX_VALUE_BYTES, SqlError, Value, encode_key_iter};
 use bincode::Options;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,10 +36,16 @@ pub(crate) enum Direction {
 }
 
 pub(crate) fn pk_bytes(values: &[Value]) -> Result<Vec<u8>, CodecError> {
-    if values.iter().any(|value| matches!(value, Value::Null)) {
+    pk_bytes_iter(values.iter())
+}
+
+pub(crate) fn pk_bytes_iter<'a>(
+    values: impl ExactSizeIterator<Item = &'a Value> + Clone,
+) -> Result<Vec<u8>, CodecError> {
+    if values.clone().any(|value| matches!(value, Value::Null)) {
         return Err(CodecError::NullInKey);
     }
-    Ok(encode_key(values)?)
+    Ok(encode_key_iter(values)?)
 }
 
 /// Components are prefix-free for a fixed schema (arity and directions).
@@ -50,24 +56,32 @@ pub(crate) fn index_tuple_bytes(
     if values.len() != dirs.len() {
         return Err(CodecError::Arity);
     }
+    let mut out = Vec::new();
+    append_index_tuple(&mut out, values.iter().zip(dirs.iter().copied()))?;
+    Ok(out)
+}
+
+pub(crate) fn append_index_tuple<'a>(
+    out: &mut Vec<u8>,
+    values: impl ExactSizeIterator<Item = (&'a Value, Direction)>,
+) -> Result<(), CodecError> {
     if values.len() > MAX_COLUMNS {
         return Err(CodecError::Limit);
     }
-    let mut out = Vec::new();
-    for (value, direction) in values.iter().zip(dirs) {
+    for (value, direction) in values {
         let mut component = if matches!(value, Value::Null) {
             vec![0xff]
         } else {
             crate::relational::secondary_index_keys::component(value)?
         };
-        if *direction == Direction::Desc {
+        if direction == Direction::Desc {
             for byte in &mut component {
                 *byte = !*byte;
             }
         }
         out.extend(component);
     }
-    Ok(out)
+    Ok(())
 }
 
 pub(crate) fn row_key(table_id: u64, pk: &[u8], ts: Ts) -> Vec<u8> {
