@@ -645,6 +645,9 @@ mod text_search;
 #[path = "sql_regex.rs"]
 mod sql_regex;
 
+#[path = "sql_union_resolution.rs"]
+mod sql_union_resolution;
+
 #[path = "sql_triggers_ddl.rs"]
 mod sql_triggers_ddl;
 #[cfg(feature = "engine-rocksdb")]

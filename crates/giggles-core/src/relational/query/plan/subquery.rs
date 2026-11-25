@@ -861,49 +861,12 @@ fn prepare(
     }
     Ok((join::prepare(&query, &shape)?, shape))
 }
-pub(super) fn resolve(
-    s: &Select,
-    sets: Option<&group_sets::GroupingSets>,
+pub(super) fn prepare_for_bind(
+    select: &Select,
     state: &Relational,
     parameters: &mut [Option<DataType>],
-) -> R<bind::Meta> {
-    let (q, shape) = prepare(s, state, parameters, None, false)?;
-    let catalog = join::catalog(state, &shape)?;
-    let used = q.used_parameters();
-    let mut seeded = parameters.to_vec();
-    for (i, slot) in seeded.iter_mut().enumerate() {
-        if !used.contains(&(i + 1)) {
-            slot.get_or_insert(DataType::Text);
-        }
-    }
-    let bound = q.bind_projection_seeded(&catalog, seeded)?;
-    let mut d = bound.description(&catalog);
-    group_sets::validate(&q, sets, &catalog, &d.parameters)?;
-    for column in &mut d.columns {
-        column.id = 0;
-    }
-    for n in used {
-        parameters[n - 1] = Some(d.parameters[n - 1].clone());
-    }
-    // Apply queries can aggregate or group before being materialized too.
-    // Keep output derivations exactly as the ordinary SELECT resolver does;
-    // an aggregate's input is a carrier only for a collatable result type.
-    let collations = if let Some(grouping) = bound.grouping {
-        grouping.into_collation_outputs()
-    } else {
-        bound.items.into_iter().zip(&d.columns).map(|(item, column)| match item {
-            BoundItem::Scalar(value) => Some(value),
-            BoundItem::Aggregate(kind, Some(value)) => kind.result_metadata(value, &column.data_type),
-            _ => None,
-        }).collect()
-    };
-    Ok(bind::Meta {
-        collations,
-        unknown: vec![None; d.columns.len()],
-        columns: d.columns,
-        typmods: d.typmods,
-        type_oids: d.type_oids,
-    })
+) -> R<(Query, join::Shape)> {
+    prepare(select, state, parameters, None, false)
 }
 
 #[derive(Clone)]

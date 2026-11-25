@@ -150,9 +150,7 @@ impl Plan {
         }
         match &self.body {
             Body::Select(select) if !select.applies.is_empty() => {
-                subquery::resolve(
-                    select, self.decorations.grouping_sets.as_ref(), state, &mut parameters.to_vec(),
-                )?;
+                self.clone().resolve(state, &mut parameters.to_vec())?;
             }
             Body::Select(select) => {
                 if let Some(from) = &select.from {
@@ -266,15 +264,16 @@ impl Plan {
             }
         }
         let mut meta = match &mut self.body {
-            Body::Select(select) if !select.applies.is_empty() => {
-                subquery::resolve(select, self.decorations.grouping_sets.as_ref(), state, parameters)?
-            }
             Body::Select(select) => {
-                let shape = select
-                    .from
-                    .as_mut()
-                    .map(|from| from.resolve(state, parameters))
-                    .transpose()?;
+                let (shape, apply_query) = if select.applies.is_empty() {
+                    let shape = select.from.as_mut()
+                        .map(|from| from.resolve(state, parameters))
+                        .transpose()?;
+                    (shape, None)
+                } else {
+                    let (query, shape) = subquery::prepare_for_bind(select, state, parameters)?;
+                    (Some(shape), Some(query))
+                };
                 let mut input_collations = None;
                 let synthetic = if let Some(shape) = &shape {
                     Some(join::catalog(state, shape)?)
@@ -296,7 +295,11 @@ impl Plan {
                         )
                     })
                     .transpose()?;
-                let query = if let Some(shape) = &shape {
+                let used = apply_query.as_ref().map(Query::used_parameters);
+                let used = used.as_ref().unwrap_or(&select.parameters);
+                let query = if let Some(query) = apply_query {
+                    query
+                } else if let Some(shape) = &shape {
                     join::prepare(&select.query, shape)?
                 } else {
                     let q = window::prepare(select, state)?;
@@ -337,7 +340,7 @@ impl Plan {
                     .collect();
                 let mut seeded = parameters.to_vec();
                 for (i, slot) in seeded.iter_mut().enumerate() {
-                    if !select.parameters.contains(&(i + 1)) && slot.is_none() {
+                    if !used.contains(&(i + 1)) && slot.is_none() {
                         *slot = Some(DataType::Text);
                     }
                 }
@@ -387,7 +390,7 @@ impl Plan {
                     (is_unknown && !resolves_unknown(output, item)).then_some(item)
                 }).collect::<Vec<_>>();
                 for (i, ty) in description.parameters.into_iter().enumerate() {
-                    if select.parameters.contains(&(i + 1))
+                    if used.contains(&(i + 1))
                         && (!unknown_parameters.contains(&(i + 1))
                             || !unknown.iter().flatten().any(|item| matches!(
                                 &select.query.items[*item].0, Item::Scalar(Scalar::Param(n)) if *n == i + 1
@@ -419,7 +422,8 @@ impl Plan {
                 };
                 // Synthetic IDs exist only to carry typmods inside the temporary
                 // binder catalog. Never expose them to the real catalog's OID lookup.
-                if select.input.is_some()
+                if !select.applies.is_empty()
+                    || select.input.is_some()
                     || select
                         .query
                         .sources

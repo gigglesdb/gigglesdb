@@ -9,41 +9,51 @@ pub(super) fn decline_or_limit(sql: &str) -> R<Option<Plan>> {
     }
 }
 
-fn owned(name: &str) -> bool {
+fn owned_identifier(name: &str) -> bool {
     unqualified_catalog(name)
         || matches!(
             name,
             "pg_catalog"
                 | "pg_toast"
                 | "information_schema"
-                | "pg_options_to_table"
-                | "pg_get_sequence_data"
                 | "user"
                 | "current_role"
                 | "current_catalog"
-                | "version"
-                | "pg_postmaster_start_time"
-                | "pg_backend_pid"
-                | "pg_is_in_recovery"
-                | "txid_current"
-                | "current_database"
                 | "current_schema"
                 | "current_user"
                 | "session_user"
-                | "current_schemas"
-                | "pg_get_indexdef"
-                | "pg_get_constraintdef"
-                | "pg_get_expr"
-                | "pg_get_userbyid"
-                | "format_type"
-                | "obj_description"
-                | "pg_collation_actual_version"
-                | "col_description"
-                | "shobj_description"
-                | "pg_get_viewdef"
-                | "has_table_privilege"
-                | "has_column_privilege"
+                | "pg_options_to_table"
+                | "pg_get_sequence_data"
         )
+}
+
+fn owned_routine(name: &str) -> bool {
+    matches!(
+        name,
+        "version"
+            | "pg_postmaster_start_time"
+            | "pg_backend_pid"
+            | "pg_is_in_recovery"
+            | "txid_current"
+            | "current_database"
+            | "current_schemas"
+            | "pg_get_indexdef"
+            | "pg_get_constraintdef"
+            | "pg_get_expr"
+            | "pg_get_userbyid"
+            | "format_type"
+            | "obj_description"
+            | "pg_collation_actual_version"
+            | "col_description"
+            | "shobj_description"
+            | "pg_get_viewdef"
+            | "has_table_privilege"
+            | "has_column_privilege"
+    )
+}
+
+fn owned(name: &str) -> bool {
+    owned_identifier(name) || owned_routine(name)
 }
 
 // Scan without constructing sqlparser tokens or an AST. Recognize every explicit
@@ -54,13 +64,18 @@ fn owned(name: &str) -> bool {
 pub(super) fn may_own(sql: &str) -> bool {
     let bytes = sql.as_bytes();
     let mut i = 0;
+    let mut routine = false;
     while i < bytes.len() {
+        // A routine name can also name an ordinary application column. The
+        // function forms above require a following opening parenthesis.
+        let call = routine && bytes[i] == b'(';
         match bytes[i] {
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 i += 2;
                 while i < bytes.len() && !matches!(bytes[i], b'\r' | b'\n') {
                     i += 1;
                 }
+                continue;
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
                 i += 2;
@@ -79,7 +94,13 @@ pub(super) fn may_own(sql: &str) -> bool {
                 if depth != 0 {
                     return true;
                 }
+                continue;
             }
+            b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c => {
+                i += 1;
+                continue;
+            }
+            _ if call => return true,
             quote @ (b'\'' | b'"') => {
                 i += 1;
                 let start = i;
@@ -104,13 +125,17 @@ pub(super) fn may_own(sql: &str) -> bool {
                     if escaped {
                         return true;
                     }
-                    if owned(&sql[start..i]) {
+                    if owned_identifier(&sql[start..i]) {
                         return true;
                     }
+                    routine = owned_routine(&sql[start..i]);
+                } else {
+                    routine = false;
                 }
                 i += 1;
             }
             b'$' => {
+                routine = false;
                 let start = i;
                 i += 1;
                 while bytes
@@ -137,12 +162,19 @@ pub(super) fn may_own(sql: &str) -> bool {
                 {
                     i += 1;
                 }
-                if ascii_fold(&sql[start..i], u8::make_ascii_lowercase, owned) {
+                    routine = false;
+                    if ascii_fold(&sql[start..i], u8::make_ascii_lowercase, |name| {
+                        routine = owned_routine(name);
+                        owned_identifier(name)
+                    }) {
                     return true;
                 }
             }
             b if !b.is_ascii() => return true,
-            _ => i += 1,
+            _ => {
+                routine = false;
+                i += 1;
+            }
         }
     }
     false
@@ -313,7 +345,7 @@ impl<'a> Iterator for ReadTokens<'a> {
                 let word = &self.0[..end];
                 if pg_prefixed(word)
                     || ascii_fold(word, u8::make_ascii_lowercase, |lower| {
-                        matches!(
+                        owned_routine(lower) || matches!(
                             lower,
                             "union"
                                 | "intersect"
@@ -372,6 +404,7 @@ impl<'a> Iterator for ReadTokens<'a> {
                 let token = if quote == b'"' {
                     if value.is_empty()
                         || pg_prefixed(value)
+                        || owned_routine(value)
                         || !value.bytes().all(|b| word_byte(b) || b == b' ')
                     {
                         return Some(self.invalid());
@@ -409,6 +442,19 @@ impl ReadTokens<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn application_columns_named_like_catalog_functions_do_not_claim_overflow() {
+        let predicates = " AND (1 = 1)".repeat(65);
+        for name in ["version", "\"version\"", "format_type"] {
+            let query = format!("WITH t AS (SELECT 1 AS {name}) SELECT t.{name} FROM t WHERE true{predicates}");
+            assert!(matches!(plan_gateway(&query), Ok(None)), "{query}");
+        }
+        for expr in ["version()", "\"version\" /* comment */ ()", "current_schema"] {
+            let query = format!("WITH t AS (SELECT {expr}) SELECT * FROM t WHERE true{predicates}");
+            assert!(plan_gateway(&query).is_err(), "{query}");
+        }
+    }
 
     fn assert_route(sql: &str, expected_hint: bool) {
         let hinted = application_read_hint(sql);
