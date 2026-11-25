@@ -39,13 +39,15 @@ storage/engine/kv.rs get get 3 | The Kv adapter implements or delegates a raw pr
 storage/engine/kv.rs range range 3 | The Kv adapter implements or delegates a raw primitive for its caller to constrain.
 storage/engine/kv.rs seek_ge range 1 | The Kv adapter implements or delegates a raw primitive for its caller to constrain.
 storage/engine/kv.rs seek_ge seek_ge 3 | The Kv adapter implements or delegates a raw primitive for its caller to constrain.
+storage/engine/kv.rs visit_first_in first_in 1 | The default visitor delegates the same bounded primitive and borrows the result.
+storage/engine/kv.rs visit_first_in visit_first_in 1 | The Kv adapter delegates the same bounded primitive through the read fence.
 storage/engine/meta.rs fixed get 1 | Engine format validation reads a recovery or export image.
 storage/engine/meta.rs live_role_bootstrap_entries range 1 | Engine format validation reads a recovery or export image.
 storage/engine/meta.rs optional get 1 | Engine format validation reads a recovery or export image.
 storage/engine/meta.rs validate_meta get 4 | Engine format validation reads a recovery or export image.
 storage/engine/meta.rs validate_meta range 1 | Engine format validation reads a recovery or export image.
 storage/engine/mvcc.rs new range 1 | VersionedRange filters both directions against its supplied timestamp.
-storage/engine/mvcc.rs version_at first_in 1 | The encoded seek starts at the caller's timestamp and stays inside one user key.
+storage/engine/mvcc.rs version_at visit_first_in 1 | The encoded seek starts at the caller's timestamp and stays inside one user key.
 storage/engine/native_content.rs check range 2 | Format validation scans a recovery or export image.
 storage/engine/native_content.rs load latest_version 1 | Sequencer validation reads applied predecessors. Format validation uses its supplied image.
 storage/engine/rows.rs get get 1 | Transaction::get reads the selected MVCC snapshot.

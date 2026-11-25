@@ -693,6 +693,19 @@ pub(crate) trait KvRead: Send + Sync {
         .next()
         .transpose()
     }
+    /// Visits the same pair as `first_in`, with slices valid only during the call.
+    fn visit_first_in(
+        &self,
+        ks: Keyspace,
+        start: &[u8],
+        end: &[u8],
+        visit: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<(), KvError> {
+        if let Some((key, value)) = self.first_in(ks, start, end)? {
+            visit(&key, &value);
+        }
+        Ok(())
+    }
     fn seek_ge(&self, ks: Keyspace, key: &[u8]) -> Result<Option<KvPair>, KvError> {
         self.range(
             ks,
@@ -1000,6 +1013,16 @@ impl KvRead for Kv {
     fn first_in(&self, ks: Keyspace, start: &[u8], end: &[u8]) -> Result<Option<KvPair>, KvError> {
         self.check()?;
         self.causes.read(self.backend.first_in(ks, start, end))
+    }
+    fn visit_first_in(
+        &self,
+        ks: Keyspace,
+        start: &[u8],
+        end: &[u8],
+        visit: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<(), KvError> {
+        self.check()?;
+        self.causes.read(self.backend.visit_first_in(ks, start, end, visit))
     }
     fn seek_ge(&self, ks: Keyspace, key: &[u8]) -> Result<Option<KvPair>, KvError> {
         Kv::seek_ge(self, ks, key)

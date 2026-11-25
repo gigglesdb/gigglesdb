@@ -1421,14 +1421,14 @@ fn bounded<'a>(
     }))
 }
 
-impl KvRead for RocksKv {
-    fn get(&self, ks: Keyspace, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
-        self.db
-            .get_cf(self.db.cf_handle(ks.name()).unwrap(), key)
-            .map_err(map_error)
-    }
-
-    fn first_in(&self, ks: Keyspace, start: &[u8], end: &[u8]) -> Result<Option<KvPair>, KvError> {
+impl RocksKv {
+    fn read_point<T>(
+        &self,
+        ks: Keyspace,
+        start: &[u8],
+        end: &[u8],
+        read: impl FnOnce(&[u8], &[u8]) -> T,
+    ) -> Result<Option<T>, KvError> {
         if start >= end {
             return Ok(None);
         }
@@ -1438,8 +1438,9 @@ impl KvRead for RocksKv {
             #[cfg(test)]
             let idle_timeout = pool.idle_timeout.unwrap_or(idle_timeout);
             // Sweep all CFs so activity on one also releases other stale pins.
+            let now = Instant::now();
             for idle in pool.idle.values_mut() {
-                idle.retain(|(used, _)| used.elapsed() < idle_timeout);
+                idle.retain(|(used, _)| now.duration_since(*used) < idle_timeout);
             }
             let generation = pool.generation;
             (generation, pool.idle.get_mut(&ks).and_then(Vec::pop))
@@ -1468,11 +1469,15 @@ impl KvRead for RocksKv {
         // drop the iterator rather than putting a potentially failed one back.
         iter.refresh().map_err(map_error)?;
         iter.seek(start);
-        iter.status().map_err(map_error)?;
-        let pair = iter
-            .item()
-            .filter(|(key, _)| *key < end)
-            .map(|(key, value)| (key.to_vec(), value.to_vec()));
+        let result = match iter.item() {
+            Some((key, value)) if key < end => Some(read(key, value)),
+            Some(_) => None,
+            None => {
+                // A valid RocksDB iterator always has OK status.
+                iter.status().map_err(map_error)?;
+                None
+            }
+        };
         let mut pool = self.db.points.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(test)]
         if reused {
@@ -1486,7 +1491,30 @@ impl KvRead for RocksKv {
                 idle.push((Instant::now(), iter));
             }
         }
-        Ok(pair)
+        Ok(result)
+    }
+}
+
+impl KvRead for RocksKv {
+    fn get(&self, ks: Keyspace, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        self.db
+            .get_cf(self.db.cf_handle(ks.name()).unwrap(), key)
+            .map_err(map_error)
+    }
+
+    fn first_in(&self, ks: Keyspace, start: &[u8], end: &[u8]) -> Result<Option<KvPair>, KvError> {
+        self.read_point(ks, start, end, |key, value| (key.to_vec(), value.to_vec()))
+    }
+
+    fn visit_first_in(
+        &self,
+        ks: Keyspace,
+        start: &[u8],
+        end: &[u8],
+        visit: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<(), KvError> {
+        self.read_point(ks, start, end, visit)?;
+        Ok(())
     }
 
     fn range(
@@ -3124,6 +3152,31 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn visit_first_in_matches_first_in_at_bounds() {
+        let dir = TestDir::new();
+        let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        point_put(&db, b"b", b"first");
+        point_put(&db, b"d", b"second");
+        let kv = Kv::new(Arc::new(db));
+        for (start, end, expected) in [
+            (b"b", b"d", Some((b"b", b"first".as_slice()))),
+            (b"c", b"d", None),
+            (b"c", b"e", Some((b"d", b"second".as_slice()))),
+            (b"d", b"d", None),
+            (b"e", b"z", None),
+        ] {
+            let mut visited = None;
+            kv.visit_first_in(Keyspace::Rows, start, end, &mut |key, value| {
+                assert!(visited.replace((key.to_vec(), value.to_vec())).is_none());
+            })
+            .unwrap();
+            let owned = kv.first_in(Keyspace::Rows, start, end).unwrap();
+            assert_eq!(owned, expected.map(|(key, value)| (key.to_vec(), value.to_vec())));
+            assert_eq!(visited, owned);
+        }
     }
 
     #[test]

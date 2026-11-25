@@ -56,7 +56,7 @@ fn raw_read_arity(name: &str) -> Option<usize> {
     match name {
         "get" | "seek_ge" => Some(2),
         "first_in" => Some(3),
-        "range" => Some(4),
+        "range" | "visit_first_in" => Some(4),
         _ => None,
     }
 }

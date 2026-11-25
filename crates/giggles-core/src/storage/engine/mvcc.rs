@@ -76,19 +76,39 @@ fn version_at(
     snapshot: Ts,
 ) -> Result<Option<Version>, TxnError> {
     validate_key(ks, user_key)?;
-    let seek = codec::user_key_seek_at(user_key, snapshot);
-    // Bounded to this key's versions: a routed read (GD-0075 P8-0) then waits only on prepared
-    // writes of this key, never on ones above it in the same range.
-    let upper = codec::user_key_upper_bound(user_key);
-    let Some((key, value)) = kv.first_in(ks, &seek, &upper)? else {
-        return Ok(None);
+    // Keep the same inclusive seek and exclusive upper bound as the range
+    // codec. Typical row and index keys fit both bounds on the stack.
+    let key_len = user_key.len();
+    let seek_len = key_len + 8;
+    let bounds_len = 2 * seek_len + 1;
+    let mut inline = [0; 128];
+    let mut heap;
+    let bounds = if bounds_len <= inline.len() {
+        &mut inline[..bounds_len]
+    } else {
+        heap = vec![0; bounds_len];
+        &mut heap[..]
     };
-    let (found, ts) = codec::split_versioned(&key)?;
-    validate_key(ks, found)?;
-    if found != user_key {
-        return Ok(None);
-    }
-    Ok(Some((ts, decode(&value)?.map(<[u8]>::to_vec))))
+    let (seek, upper) = bounds.split_at_mut(seek_len);
+    seek[..key_len].copy_from_slice(user_key);
+    seek[key_len..].copy_from_slice(&snapshot.inverted_be());
+    upper[..key_len].copy_from_slice(user_key);
+    upper[key_len..seek_len].fill(0xff);
+
+    // Bounded to this key's versions: a routed read (GD-0075 P8-0) waits
+    // only on prepared writes of this key.
+    let mut version = Ok(None);
+    kv.visit_first_in(ks, seek, upper, &mut |key, value| {
+        version = (|| {
+            let (found, ts) = codec::split_versioned(key)?;
+            validate_key(ks, found)?;
+            if found != user_key {
+                return Ok(None);
+            }
+            Ok(Some((ts, decode(value)?.map(<[u8]>::to_vec))))
+        })();
+    })?;
+    version
 }
 
 pub(crate) struct VersionedRange<'a> {
@@ -265,6 +285,11 @@ pub(crate) mod tests {
             codec::user_key_seek_at(b"shared-b", Ts(2)),
             encode_live(b"adjacent"),
         );
+        batch.put(
+            Keyspace::Catalog,
+            codec::user_key_seek_at(&[b'z'; 256], Ts(0)),
+            encode_live(b"long key at timestamp zero"),
+        );
         kv.write(batch, Durability::Sync).unwrap();
         check_point_versions(kv);
         check_point_versions(kv.snapshot().unwrap().as_ref());
@@ -291,7 +316,23 @@ pub(crate) mod tests {
             Some(b"adjacent".to_vec())
         );
         assert_eq!(version_at(kv, ks, b"shared-", Ts(601)).unwrap(), None);
+        let prefix = b"shared-";
+        let snapshot = Ts(u64::MAX);
+        let (neighbor, _) = kv
+            .first_in(
+                ks,
+                &codec::user_key_seek_at(prefix, snapshot),
+                &codec::user_key_upper_bound(prefix),
+            )
+            .unwrap()
+            .expect("longer key in the absent prefix's bounds");
+        assert_eq!(codec::split_versioned(&neighbor).unwrap().0, b"shared-a");
+        assert_eq!(version_at(kv, ks, prefix, snapshot).unwrap(), None);
         assert_eq!(version_at(kv, ks, b"shared-aa", Ts(601)).unwrap(), None);
+        assert_eq!(
+            version_at(kv, ks, &[b'z'; 256], Ts(0)).unwrap(),
+            Some((Ts(0), Some(b"long key at timestamp zero".to_vec())))
+        );
     }
 
     #[test]
