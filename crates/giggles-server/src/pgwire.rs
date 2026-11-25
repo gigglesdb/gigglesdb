@@ -2279,7 +2279,7 @@ fn execute_control_inner(
         session.commit_implicit_block()
     } else { session.run_control(actual) } {
         let code = diagnostic.core::<()>(Err(error)).unwrap_err();
-        session.sql.rollback();
+        session.sql.rollback_without_settling();
         settings.transaction(true, false, "ROLLBACK");
         diagnostic.pre_rollback_settings = Some(Box::new(before));
         *implicit = false;
@@ -3273,14 +3273,14 @@ impl State {
                 if self.implicit {
                     self.implicit = false;
                     if session.is_aborted() {
-                        session.sql.rollback();
+                        session.sql.rollback_without_settling();
                         self.cursors.transaction_end("ROLLBACK");
                         self.settings.transaction(true, false, "ROLLBACK");
                     } else {
                         let commit = if session.in_transaction() { session.commit_implicit_block() } else { Ok(()) };
                         if let Err(error) = commit {
                             let code = self.diagnostic.core::<()>(Err(error)).unwrap_err();
-                            session.sql.rollback();
+                            session.sql.rollback_without_settling();
                             self.cursors.transaction_end("ROLLBACK");
                             self.settings.transaction(true, false, "ROLLBACK");
                             self.diagnostic.pre_rollback_settings = Some(Box::new(before));
@@ -4247,7 +4247,7 @@ impl State {
             Ok(keep) => Ok(keep),
             Err(code) => {
                 self.diagnostic.authorize_duplicate_key(code, session);
-                session.abort();
+                session.abort_without_settling();
                 // A CopyDone rejected during post-dispatch refresh must not
                 // leave a successful COPY completion queued for Flush or Sync.
                 self.copy_completion.clear();
@@ -4259,7 +4259,7 @@ impl State {
                     self.portals.clear();
                 }
                 if tag == b'S' && self.implicit {
-                    session.sql.rollback();
+                    session.sql.rollback_without_settling();
                     self.settings.transaction(true, false, "ROLLBACK");
                     session.set_time_zone(&self.settings.current.timezone);
                     session.sync_role_settings(&mut self.settings.current).map_err(std::io::Error::other)?;
@@ -4465,7 +4465,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                     .check_binding()
                     .is_err_and(|e| !crate::service::transient(&e))
                 {
-                    session.abort();
+                    session.close();
                     // Absorb late client writes so the peer observes EOF without a reset.
                     let _ = timeout(std::time::Duration::from_secs(2), async {
                         let _ = s.shutdown().await;
@@ -4512,6 +4512,9 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                 Err(_) => return Ok(()),
             }
         };
+        if tag == b'X' && b.is_empty() {
+            return Ok(());
+        }
         // An admin command may invalidate its own login generation. Deliver its
         // completion and finish the extended cycle, then reject further work.
         if admin_sync {
@@ -4608,7 +4611,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         let (agent_slot, role_permit, permit) = match admitted {
             Ok(admitted) => admitted,
             Err((code, message)) => {
-                session.abort();
+                session.abort_without_settling();
                 let mut out = Vec::new();
                 if state.copy.is_some() {
                     state.copy_error(code, &mut session, &mut out);
@@ -4624,7 +4627,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                         error(code, &mut out);
                     }
                     if tag == b'S' && state.implicit {
-                        session.sql.rollback();
+                        session.sql.rollback_without_settling();
                         state.settings.transaction(true, false, "ROLLBACK");
                         session.set_time_zone(&state.settings.current.timezone);
                         session.set_search_path(&state.settings.current.search_path);

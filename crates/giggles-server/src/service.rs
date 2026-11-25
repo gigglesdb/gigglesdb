@@ -1380,8 +1380,7 @@ pub struct Session {
 }
 impl Drop for Session {
     fn drop(&mut self) {
-        self.abort();
-        self.service.advisory.release(self.backend_pid, false);
+        self.close();
     }
 }
 // Virtual namespaces exposed by pg_namespace exist even without physical schema metadata.
@@ -1863,6 +1862,19 @@ impl Session {
         self.service.advisory.release(self.backend_pid, true);
         self.sql.abort();
     }
+    pub(crate) fn abort_without_settling(&mut self) {
+        self.service.advisory.release(self.backend_pid, true);
+        self.sql.abort_without_settling();
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.sql.rollback_without_settling();
+        self.service.advisory.release(self.backend_pid, false);
+    }
+    pub(crate) fn abort_copy_input_with_settlement(&mut self) -> Result<(), CoreError> {
+        self.service.advisory.release(self.backend_pid, true);
+        self.sql.abort_copy_input_with_settlement()
+    }
     pub fn in_transaction(&self) -> bool {
         self.sql.in_transaction()
     }
@@ -2302,7 +2314,7 @@ impl Session {
                     )
                 )
             {
-                session.sql.abort();
+                session.sql.abort_without_settling();
                 CoreError::Policy(Error::Scope)
             } else {
                 error
@@ -2323,13 +2335,13 @@ impl Session {
             if relational::Copy::is_copy(sql) {
                 session.authorize_copy_sql(sql)?;
                 let result = relational::Copy::parse(sql).map_err(CoreError::Sql);
-                session.abort();
+                session.abort_without_settling();
                 result?;
                 return Err(CoreError::Sql(relational::SqlError::Unsupported));
             }
             session.reconcile_sequence_owners()?;
             let comment_target = Prepared::comment_table_target(sql).map_err(|error| {
-                session.sql.abort();
+                session.sql.abort_without_settling();
                 parse_error(session, CoreError::Sql(error))
             })?;
             if let Some(table) = comment_target { session.authorize_alter_table(&table)?; }
@@ -2338,7 +2350,7 @@ impl Session {
             let alter_target = Prepared::alter_table_authority_target(sql).map_err(|error| {
                 // Match SqlSession::prepare's failed-statement transaction
                 // semantics even though ALTER parsing precedes core binding.
-                session.sql.abort();
+                session.sql.abort_without_settling();
                 parse_error(session, CoreError::Sql(error))
             })?;
             if let Some((table, changes_trigger)) = alter_target {
@@ -2356,20 +2368,20 @@ impl Session {
                 }
             }
             let drop_targets = Prepared::drop_table_targets(sql).map_err(|error| {
-                session.sql.abort();
+                session.sql.abort_without_settling();
                 parse_error(session, CoreError::Sql(error))
             })?;
             for table in drop_targets {
                 session.authorize_drop_target(&table)?;
             }
             if let Some(index) = Prepared::drop_index_target(sql).map_err(|error| {
-                session.sql.abort();
+                session.sql.abort_without_settling();
                 parse_error(session, CoreError::Sql(error))
             })? {
                 session.authorize_drop_schema(&index)?;
             }
             let sequence_targets = Prepared::sequence_ddl_targets(sql).map_err(|error| {
-                session.sql.abort();
+                session.sql.abort_without_settling();
                 parse_error(session, CoreError::Sql(error))
             })?;
             // CREATE uses schema authority; ALTER/DROP must check owner keys
@@ -2394,7 +2406,7 @@ impl Session {
             // REFERENCES requires ownership before binding can reveal whether
             // the referenced relation, columns, or candidate key exist.
             let references = Prepared::constraint_references(sql).map_err(|error| {
-                session.sql.abort();
+                session.sql.abort_without_settling();
                 parse_error(session, CoreError::Sql(error))
             })?;
             for table in references {
@@ -2428,7 +2440,7 @@ impl Session {
                     session
                         .sql
                         .task_column_rules(&p)
-                        .inspect_err(|_| session.sql.abort())?
+                        .inspect_err(|_| session.sql.abort_without_settling())?
                 } else {
                     p
                 };
@@ -2481,14 +2493,14 @@ impl Session {
             false
         };
         if !allowed {
-            self.sql.abort();
+            self.sql.abort_without_settling();
             return Err(CoreError::Policy(Error::Scope));
         }
         Ok(())
     }
     fn authorize_sequences(&mut self, dependencies: &[relational::SequenceDependency]) -> Result<(), CoreError> {
         if !dependencies.is_empty() && !self.role.is_sql() && self.sql.task().is_none() {
-            self.sql.abort();
+            self.sql.abort_without_settling();
             return Err(CoreError::Policy(Error::Scope));
         }
         let sequences = self.sql.sequence_owners_shared()?;
@@ -2571,7 +2583,7 @@ impl Session {
             return Ok(());
         }
         if !allowed {
-            self.sql.abort();
+            self.sql.abort_without_settling();
             return Err(CoreError::Policy(Error::Scope));
         }
         Ok(())
@@ -2585,7 +2597,7 @@ impl Session {
                 && (is_builtin_catalog_schema(schema) || self.sql.schema_metadata()?.schemas.contains_key(schema))
                 && !self.schema_privilege_allowed(schema, name, roles::SchemaPrivilege::Usage)?
             {
-                self.sql.abort();
+                self.sql.abort_without_settling();
                 return Err(CoreError::Policy(Error::Scope));
             }
         }
@@ -2640,7 +2652,7 @@ impl Session {
             false
         };
         if !allowed {
-            self.sql.abort();
+            self.sql.abort_without_settling();
             return Err(CoreError::Policy(Error::Scope));
         }
         Ok(())
@@ -3044,7 +3056,7 @@ impl Session {
         }
         if matches!(p.command(), "CREATE FUNCTION" | "DROP FUNCTION" | "CREATE TRIGGER" | "DROP TRIGGER" | "ALTER TRIGGER") {
             let result = self.authorize_routine_ddl(p);
-            if result.is_err() { self.sql.abort(); }
+            if result.is_err() { self.sql.abort_without_settling(); }
             return result.map(drop);
         }
         if p.is_collation_ddl() {
@@ -3066,7 +3078,7 @@ impl Session {
             if !allowed {
                 let targets = self.sql.collation_authority(p)?;
                 p.collation_permission_error(targets.iter().find(|(_,o)| o.is_none()).map(|(s,_)| s.as_str()));
-                self.sql.abort(); return Err(CoreError::Policy(Error::Scope));
+                self.sql.abort_without_settling(); return Err(CoreError::Policy(Error::Scope));
             }
             return Ok(());
         }
@@ -3079,7 +3091,7 @@ impl Session {
                 role.superuser || (!create && names.iter().all(|n| self.sql.user_type_catalog().ok()
                     .and_then(|m| m.extensions.get(n).map(|e| e.owner == role.oid)).unwrap_or(true)))
             } else { false };
-            if !allowed { self.sql.abort(); return Err(CoreError::Policy(Error::Scope)); }
+            if !allowed { self.sql.abort_without_settling(); return Err(CoreError::Policy(Error::Scope)); }
             return Ok(());
         }
         if let Some((schema, owner, create)) = p.schema_ddl() {
@@ -3110,7 +3122,7 @@ impl Session {
                 false
             };
             if !allowed {
-                self.sql.abort();
+                self.sql.abort_without_settling();
                 return Err(CoreError::Policy(Error::Scope));
             }
             return Ok(());
@@ -3273,7 +3285,7 @@ impl Session {
                     break;
                 }
             }
-            self.sql.abort();
+            self.sql.abort_without_settling();
             return Err(error);
         }
         if p.command() == "TRUNCATE TABLE" && !superuser {
@@ -3288,7 +3300,7 @@ impl Session {
                     _ => false,
                 };
                 if !permitted {
-                    self.sql.abort();
+                    self.sql.abort_without_settling();
                     return Err(CoreError::Policy(Error::Scope));
                 }
             }
@@ -3370,7 +3382,7 @@ impl Session {
     fn authorize_copy_sql(&mut self, sql: &str) -> Result<(), CoreError> {
         self.admit_backstop(giggles_core::task::StatementClass::Copy)?;
         if !self.role.is_sql() {
-            self.abort();
+            self.abort_without_settling();
             return Err(CoreError::Policy(Error::Scope));
         }
         let unrestricted = if let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) {
@@ -3388,7 +3400,7 @@ impl Session {
         let target = match relational::Copy::target_reference(sql) {
             Ok(Some(target)) => self.sql.resolve_relation_reference(&target)?,
             result => {
-                self.abort();
+                self.abort_without_settling();
                 if !unrestricted {
                     return Err(CoreError::Policy(Error::Scope));
                 }
@@ -3403,7 +3415,7 @@ impl Session {
             _ => false,
         };
         if !allowed {
-            self.abort();
+            self.abort_without_settling();
             return Err(CoreError::Policy(Error::Scope));
         }
         Ok(())
@@ -3451,16 +3463,28 @@ impl Session {
             wall: Some(Arc::new(move || service.clock.sql_micros())),
         }
     }
-    pub(crate) fn normalize_copy_cells(
+    pub(crate) fn normalize_buffered_copy_cells(
         &mut self,
         prepared: &Prepared,
         input: giggles_core::relational::CopyInput,
         clock: &StatementClock,
-    ) -> Result<(Prepared, Vec<Vec<Value>>, u64), CoreError> {
+    ) -> Result<(Prepared, giggles_core::BufferedCopyRows, u64), CoreError> {
         self.authority_scope(|session| {
             session.reconcile_sequence_owners()?;
             session.authorize(prepared)?;
-            session.sql.normalize_copy_cells_at(prepared, input, clock)
+            session.sql.normalize_buffered_copy_cells_at(prepared, input, clock)
+        })
+    }
+    pub(crate) fn normalize_and_feed_copy_input(
+        &mut self,
+        prepared: &Prepared,
+        input: giggles_core::relational::CopyInput,
+        clock: &StatementClock,
+    ) -> Result<(Prepared, u64), CoreError> {
+        self.authority_scope(|session| {
+            session.reconcile_sequence_owners()?;
+            session.authorize(prepared)?;
+            session.sql.normalize_and_feed_copy_input_at(prepared, input, clock)
         })
     }
     pub(crate) fn finish_copy_input(
@@ -3482,13 +3506,13 @@ impl Session {
         &mut self,
         authority: &Prepared,
         prepared: &Prepared,
-        rows: Vec<Vec<Value>>,
+        rows: giggles_core::BufferedCopyRows,
         clock: &StatementClock,
     ) -> Result<SqlResult, CoreError> {
         self.authority_scope(|session| {
             session.reconcile_sequence_owners()?;
             session.authorize(authority)?;
-            let result = session.sql.ingest_copy_at(prepared, rows, clock);
+            let result = session.sql.ingest_buffered_copy_at(prepared, rows, clock);
             if !session.sql.in_transaction() {
                 session.transaction_us = None;
             }

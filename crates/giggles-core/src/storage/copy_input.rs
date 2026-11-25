@@ -57,6 +57,30 @@ impl SqlSession {
         Ok(true)
     }
 
+    /// Normalize and feed a bounded streaming page without returning its rows.
+    /// Reservations can remain in flight until COPY completes when no rows were skipped.
+    pub fn normalize_and_feed_copy_input_at(
+        &mut self, prepared: &relational::Prepared, input: relational::CopyInput,
+        clock: &relational::StatementClock,
+    ) -> Result<(relational::Prepared, u64), CoreError> {
+        self.refuse_task_session()?;
+        if self.copy_input.is_none() || input.rows.len() > 200 {
+            self.abort();
+            return Err(CoreError::Sql(relational::SqlError::Limit));
+        }
+        let (prepared, rows, skipped) = self.normalize_copy_cells(prepared, input, clock, false)?;
+        // Normalization already settled its notices. The insert clears the
+        // diagnostic buffer, so restore those notices ahead of its own.
+        let notices = relational::take_sql_notices();
+        let result = self.feed_copy_input_at(&prepared, rows, clock);
+        relational::prepend_sql_notices(notices);
+        result?;
+        if skipped != 0 {
+            self.settle_copy_sequences()?;
+        }
+        Ok((prepared, skipped))
+    }
+
     /// Feed at most 200 normalized rows through the ordinary insert publisher.
     pub fn feed_copy_input_at(&mut self, prepared: &relational::Prepared,
         rows: Vec<Vec<relational::Value>>, clock: &relational::StatementClock,

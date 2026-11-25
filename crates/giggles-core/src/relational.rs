@@ -41,8 +41,14 @@ mod constraint_primary_key;
 mod ddl_type;
 pub mod text_search_types;
 pub use ddl_type::take_sql_warnings;
-pub(crate) use user_types::{SqlDiagnosticScope, clear_sql_error_message};
+pub(crate) use user_types::{SqlDiagnosticScope, clear_sql_error_message, has_sql_notices, prepend_sql_notices};
 mod user_types;
+
+/// Discard diagnostics from a statement whose sequence reservations failed.
+pub(crate) fn discard_sql_diagnostics() {
+    user_types::clear_sql_error_message();
+    take_sql_warnings();
+}
 
 pub(crate) fn conflict_duplicate_target() -> SqlError {
     user_types::view_replace_error("ON CONFLICT DO UPDATE command cannot affect row a second time".into());

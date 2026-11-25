@@ -272,6 +272,11 @@ impl<T> WaitMutex<T> {
         }
     }
 
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn try_observe<R>(&self, observe: impl FnOnce(&T) -> R) -> Option<R> {
+        self.inner.try_lock().ok().map(|guard| observe(&guard))
+    }
+
     pub(crate) fn lock_cancellable(&self) -> Result<WaitGuard<'_, T>, CoreError> {
         self.lock_notified(|| {})
     }

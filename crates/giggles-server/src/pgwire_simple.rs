@@ -531,9 +531,11 @@ impl State {
             .take()
             .map_or_else(|| self.settings.current.clone(), |before| *before);
         self.diagnostic.authorize_duplicate_key(code, session);
-        session.abort();
+        // The statement exit has already fenced diagnostics. Cleanup only
+        // changes transaction state and keeps any older obligations private.
+        session.abort_without_settling();
         if implicit {
-            session.sql.rollback();
+            session.sql.rollback_without_settling();
             self.cursors.transaction_end("ROLLBACK");
             self.settings.transaction(true, false, "ROLLBACK");
         }
@@ -582,7 +584,7 @@ impl State {
         if let Some(admission) = self.execution_admission.as_mut()
             && let Err(refusal) = admission.statement(sql, session)
         {
-            session.abort();
+            session.abort_without_settling();
             self.diagnostic.wire_message = Some(refusal.message());
             return Err(refusal.sqlstate());
         }

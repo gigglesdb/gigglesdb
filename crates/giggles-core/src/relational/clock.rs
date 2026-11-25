@@ -107,9 +107,12 @@ struct PrivilegeExecution {
     provider: crate::storage::PrivilegeProvider,
     metadata: Mutex<(Option<crate::PrivilegeMetadata>, Option<Vec<String>>)>,
 }
+type WallFence = Arc<dyn Fn() -> Result<(), CoreError> + Send + Sync>;
+
 #[derive(Clone)]
 pub(crate) struct ExecutionClock {
     clock: StatementClock,
+    wall_fence: Option<WallFence>,
     error: Arc<Mutex<Option<CoreError>>>,
     sequence: Option<SequenceCallback>,
     sequence_origin: SequenceOrigin,
@@ -125,6 +128,7 @@ impl ExecutionClock {
     pub(crate) fn new(clock: &StatementClock) -> Self {
         Self {
             clock: clock.clone(),
+            wall_fence: None,
             sequence: None,
             sequence_origin: SequenceOrigin::Call,
             xact: None,
@@ -269,6 +273,16 @@ impl ExecutionClock {
     pub(crate) fn take_error(&self) -> Option<CoreError> {
         self.error.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
+    pub(crate) fn with_wall_fence<F>(mut self, make_fence: impl FnOnce() -> F) -> Self
+    where
+        F: Fn() -> Result<(), CoreError> + Send + Sync + 'static,
+    {
+        if self.clock.wall.is_some() {
+            self.wall_fence = Some(Arc::new(make_fence()));
+        }
+        self
+    }
+
     pub(crate) fn eval(&self, name: &str, precision: u32) -> Result<Value, SqlError> {
         let clock = &self.clock;
         self.observe(match name {
@@ -282,13 +296,23 @@ impl ExecutionClock {
         }
         let instant = match name {
             "statement_timestamp" => clock.statement_us,
-            "clock_timestamp" => match (clock.wall.as_ref().ok_or(SqlError::Unsupported)?)() {
-                Ok(value) => value,
-                Err(error) => {
+            "clock_timestamp" => {
+                let wall = clock.wall.as_ref().ok_or(SqlError::Unsupported)?;
+                // Even whether the callback runs can reveal a sequence draw.
+                if let Some(fence) = &self.wall_fence && let Err(error) = fence() {
                     *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
                     return Err(SqlError::Unsupported);
                 }
-            },
+                // The caller's clock can reenter SQL or read its diagnostic accessors.
+                let _diagnostics = super::SqlDiagnosticScope::enter();
+                match wall() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                        return Err(SqlError::Unsupported);
+                    }
+                }
+            }
             _ => clock.transaction_us,
         };
         let pg = |_: giggles_pg_types::Error| SqlError::DatetimeFieldOverflow;

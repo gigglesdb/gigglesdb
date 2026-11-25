@@ -188,6 +188,14 @@ fn check_autocommit_reply(
     }
     Ok(())
 }
+fn sequence_settlement_error(error: CoreError) -> CoreError {
+    relational::discard_sql_diagnostics();
+    if error != CoreError::Fenced && crate::sqlstate(&error) == "08007" {
+        return CoreError::Storage("statement outcome unknown".into());
+    }
+    error
+}
+
 fn io(e: impl std::fmt::Display) -> CoreError {
     CoreError::Storage(e.to_string())
 }
@@ -1335,6 +1343,12 @@ impl Admin {
         self.inner.sql_operations.load(Ordering::Acquire)
     }
 
+    /// Open SQL transactions for commit-Sync qualification.
+    #[cfg(feature = "test-commit-sync")]
+    pub fn sql_transactions_live(&self) -> usize {
+        self.inner.sql_transactions.load(Ordering::Acquire)
+    }
+
     /// Local database directory, when this administrator is backed by local storage.
     pub fn data_directory(&self) -> Option<&Path> { self.data_directory.as_deref() }
     fn with_data_directory(mut self, path: &Path) -> Self {
@@ -2313,6 +2327,15 @@ pub(crate) type XactSlot = Arc<Mutex<Option<engine::xact::XactGuard>>>;
 /// Sequence names and optional owning table keys, in catalog iteration order.
 pub type SequenceOwners = [(String, Option<String>)];
 
+/// A normalized COPY page or accumulated input. The cells are private.
+/// Ingest settles the session's sequence reservations before using them.
+#[derive(Default)]
+pub struct BufferedCopyRows {
+    rows: Vec<Vec<relational::Value>>,
+    bytes: usize,
+    owner: Option<std::sync::Weak<v2_sql::sql_sequences::ObligationList>>,
+}
+
 /// Trusted session only. Dropping a session discards its staged transaction.
 /// No lock or admission ticket lives across client calls.
 pub struct SqlSession {
@@ -3221,7 +3244,7 @@ impl SqlSession {
             }
         })();
         if result.is_err() {
-            self.abort();
+            self.abort_without_settling();
         }
         result
     }
@@ -3327,14 +3350,24 @@ impl SqlSession {
         result
     }
     pub(crate) fn settle_sequences(&self) -> Result<(), CoreError> {
-        if self.sequence_unsettled.lock().map_err(|_| CoreError::Fenced)?.is_empty() {
-            return Ok(());
-        }
-        // Settlement uses the generation that produced the obligations.
-        let generation = self.sequence_generation.as_ref().ok_or(CoreError::Fenced)?;
-        let db = generation.lease(Holder::Sequence)?;
-        v2_sql::sql_sequences::settle(&db, &self.sequence_unsettled)?;
-        Ok(())
+        let result = (|| {
+            if self.sequence_unsettled.is_empty() {
+                return Ok(());
+            }
+            // Settlement uses the generation that produced the obligations.
+            let generation = self.sequence_generation.as_ref().ok_or(CoreError::Fenced)?;
+            let db = generation.lease(Holder::Sequence)?;
+            v2_sql::sql_sequences::settle(&db, &self.sequence_unsettled)
+        })();
+        result.map_err(sequence_settlement_error)
+    }
+
+    /// Settle diagnostics before a gateway ends a failed COPY.
+    #[doc(hidden)]
+    pub fn abort_copy_input_with_settlement(&mut self) -> Result<(), CoreError> {
+        let result = self.settle_sequences();
+        self.abort_transaction(false);
+        result
     }
 
     /// A gateway parse/bind/authorization failure poisons an explicit transaction.
@@ -3342,6 +3375,12 @@ impl SqlSession {
         // Void cleanup retains obligations on failure; fallible exits retry settlement.
         let _ = self.settle_sequences();
         self.abort_transaction(true);
+    }
+
+    /// Abort private work while retaining sequence obligations for a future exposing exit.
+    #[doc(hidden)]
+    pub fn abort_without_settling(&mut self) {
+        self.abort_transaction(false);
     }
 
     fn abort_transaction(&mut self, settle_on_copy_rollback: bool) {
@@ -3362,7 +3401,7 @@ impl SqlSession {
         if self.is_v2_engine() {
             let db = self.v2_lease(Holder::Sql)?;
             let result = self.scan_v2_engine(&db, scan);
-            if result.is_err() { self.abort(); }
+            if result.is_err() { self.abort_without_settling(); }
             return result;
         }
         self.admin.inner.db(SQL_SESSIONS)?;
@@ -3492,7 +3531,7 @@ impl SqlSession {
     pub(crate) fn rollback_v2_engine(&mut self) -> Result<(), CoreError> {
         let db = match self.v2_lease(Holder::Sql) {
             Ok(db) => db,
-            Err(CoreError::Fenced) => { self.rollback(); return Ok(()); }
+            Err(CoreError::Fenced) => { self.rollback_without_settling(); return Ok(()); }
             Err(error) => return Err(error),
         };
         let prepared = relational::Prepared::rollback_engine(u128::from_be_bytes(db.meta.domain), 0);
@@ -4219,12 +4258,14 @@ impl SqlSession {
             if let Some(error) = clock.take_error() { return Err(error); }
             output.map_err(CoreError::Sql)
         })();
-        let result = result.and_then(|value| {
-            if settle { self.settle_sequences()?; }
-            Ok(value)
-        });
-        if result.is_err() { self.abort(); }
-        result
+        if settle {
+            let result = self.settle_sequences().and(result);
+            if result.is_err() { self.abort_transaction(false); }
+            result
+        } else {
+            if result.is_err() { self.abort(); }
+            result
+        }
     }
     pub(crate) fn insert_engine(
         &mut self,
@@ -4559,7 +4600,7 @@ impl SqlSession {
         // GIN lookup decides whether ALTER INDEX is supported syntax.
         if p.command() == "ALTER INDEX" {
             self.inspect_metadata_leased(db, |s| p.bind_schemas(&s.sql).map(|_| ()).map_err(CoreError::Sql))
-                .inspect_err(|_| self.abort())?;
+                .inspect_err(|_| self.abort_without_settling())?;
         }
         if self.task.is_none() {
             return Ok(p);
@@ -4568,7 +4609,7 @@ impl SqlSession {
         // (R3-309), when the caller set its text first.
         self.task_column_rules_leased(&p, db).inspect_err(|error| {
             self.log_unstarted_task_failure(p.task_class(), p.parameter_count(), error);
-            self.abort();
+            self.abort_without_settling();
         })
     }
     fn prepare_fenced_rollback(&self, sql: &str) -> Result<relational::Prepared, CoreError> {
@@ -4597,7 +4638,7 @@ impl SqlSession {
             return self.prepare_v2(sql, db, advisory);
         }
         if sql.len() > relational::MAX_SQL {
-            self.abort();
+            self.abort_without_settling();
             return Err(CoreError::Sql(relational::SqlError::Limit));
         }
         self.admin.inner.db(SQL_SESSIONS)?;
@@ -4691,7 +4732,7 @@ impl SqlSession {
             Ok((copy, prepared))
         })();
         if result.is_err() {
-            self.abort();
+            self.abort_without_settling();
         }
         result
     }
@@ -4774,12 +4815,75 @@ impl SqlSession {
         &mut self, prepared: &relational::Prepared, input: relational::CopyInput,
         clock: &relational::StatementClock,
     ) -> Result<(relational::Prepared, Vec<Vec<relational::Value>>, u64), CoreError> {
+        self.normalize_copy_cells(prepared, input, clock, true)
+    }
+
+    /// Normalize a gateway COPY page whose rows stay private until the final ingest.
+    #[doc(hidden)]
+    pub fn normalize_buffered_copy_cells_at(
+        &mut self, prepared: &relational::Prepared, input: relational::CopyInput,
+        clock: &relational::StatementClock,
+    ) -> Result<(relational::Prepared, BufferedCopyRows, u64), CoreError> {
+        let (prepared, rows, skipped) = self.normalize_copy_cells(prepared, input, clock, false)?;
+        let bytes = rows.iter().flatten().try_fold(0usize, |sum, value| {
+            sum.checked_add(relational::value_bytes(value))
+        }).filter(|bytes| *bytes <= crate::operations::MAX_INSERT_BYTES);
+        let Some(bytes) = bytes else {
+            return Err(self.copy_row_build_error(relational::SqlError::Limit));
+        };
+        if skipped != 0 {
+            // A caller can see the skipped count even with silent COPY logging.
+            self.settle_copy_sequences()?;
+        }
+        let owner = Some(Arc::downgrade(&self.sequence_unsettled));
+        Ok((prepared, BufferedCopyRows { rows, bytes, owner }, skipped))
+    }
+
+    /// Add a page to a gateway's opaque COPY buffer, within the input byte limit.
+    #[doc(hidden)]
+    pub fn append_buffered_copy_rows(
+        &mut self, buffer: &mut BufferedCopyRows, page: BufferedCopyRows,
+    ) -> Result<(), CoreError> {
+        self.check_buffered_copy_owner(buffer)?;
+        self.check_buffered_copy_owner(&page)?;
+        let bytes = buffer.bytes.checked_add(page.bytes).filter(|bytes| {
+            *bytes <= crate::operations::MAX_INSERT_BYTES
+                && buffer.rows.len() + page.rows.len() <= relational::MAX_ROWS
+        });
+        let Some(bytes) = bytes else {
+            return Err(self.copy_row_build_error(relational::SqlError::Limit));
+        };
+        buffer.rows.extend(page.rows);
+        buffer.bytes = bytes;
+        buffer.owner = page.owner.or(buffer.owner.take());
+        Ok(())
+    }
+
+    fn check_buffered_copy_owner(&self, buffer: &BufferedCopyRows) -> Result<(), CoreError> {
+        // The session and its engine generation own the obligations. A weak
+        // reference identifies that list without retaining it after session drop.
+        if let Some(owner) = &buffer.owner
+            && !std::ptr::eq(owner.as_ptr(), Arc::as_ptr(&self.sequence_unsettled))
+        {
+            return Err(CoreError::Sql(relational::SqlError::StaleSchema));
+        }
+        Ok(())
+    }
+
+    fn settle_copy_sequences(&mut self) -> Result<(), CoreError> {
+        self.settle_sequences().inspect_err(|_| self.abort_without_settling())
+    }
+
+    fn normalize_copy_cells(
+        &mut self, prepared: &relational::Prepared, input: relational::CopyInput,
+        clock: &relational::StatementClock, expose_rows: bool,
+    ) -> Result<(relational::Prepared, Vec<Vec<relational::Value>>, u64), CoreError> {
         let _budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         relational::assert_sql_frontend_allowed();
         if self.is_v2_engine() {
             let db = self.v2_lease(Holder::Sql)?;
-            return self.normalize_copy_v2(&db, prepared, input, clock);
+            return self.normalize_copy_v2(&db, prepared, input, clock, expose_rows);
         }
         self.admin.inner.db(SQL_SESSIONS)?;
         let result = (|| {
@@ -4849,15 +4953,24 @@ impl SqlSession {
         let _value_budget = relational::ValueBudget::enter(self.value_budget(), matches!(self.admin.inner.backend, Backend::V2(_)));
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, matches!(self.admin.inner.backend, Backend::V2(_)));
         self.refuse_task_session()?;
-        let prepared = match prepared.copy_rows(rows, None) {
-            Ok(p) => p,
-            Err(e) => {
-                self.abort();
-                return Err(CoreError::Sql(e));
-            }
-        };
+        let prepared = prepared.copy_rows(rows, None)
+            .map_err(|error| self.copy_row_build_error(error))?;
         self.execute_prepared(&prepared, &[], None)
     }
+    /// Final ingest of opaque COPY rows with their original session's coverage.
+    #[doc(hidden)]
+    pub fn ingest_buffered_copy_at(
+        &mut self,
+        prepared: &relational::Prepared,
+        buffer: BufferedCopyRows,
+        clock: &relational::StatementClock,
+    ) -> Result<relational::SqlResult, CoreError> {
+        self.refuse_task_session()?;
+        self.check_buffered_copy_owner(&buffer)?;
+        self.settle_copy_sequences()?;
+        self.ingest_copy_at(prepared, buffer.rows, clock)
+    }
+
     pub fn ingest_copy_at(
         &mut self,
         prepared: &relational::Prepared,
@@ -4869,15 +4982,17 @@ impl SqlSession {
         self.refuse_task_session()?;
         let context = relational::clock::ExecutionClock::new(clock)
             .with_text_settings(self.date_style, self.bytea_output);
-        let prepared = match prepared.copy_rows(rows, Some(&context)) {
-            Ok(p) => p,
-            Err(e) => {
-                self.abort();
-                return Err(CoreError::Sql(e));
-            }
-        };
+        let prepared = prepared.copy_rows(rows, Some(&context))
+            .map_err(|error| self.copy_row_build_error(error))?;
         self.execute_prepared_at(&prepared, &[], None, clock)
     }
+    fn copy_row_build_error(&mut self, error: relational::SqlError) -> CoreError {
+        match self.abort_copy_input_with_settlement() {
+            Ok(()) => CoreError::Sql(error),
+            Err(settlement) => settlement,
+        }
+    }
+
     /// Plain exit for trusted local callers. A task session is refused before
     /// anything runs (GD-0061 R3-301); task callers use `execute_unreleased`.
     pub fn execute(
@@ -4936,7 +5051,7 @@ impl SqlSession {
                     0,
                     || Ok(Default::default()),
                 );
-                self.rollback();
+                self.rollback_without_settling();
                 return Ok(crate::task::release::Unreleased::new(Default::default(), tag));
             }
         }
@@ -5426,7 +5541,7 @@ impl SqlSession {
                 if !params.is_empty() || expected_version.is_some() {
                     return Err(CoreError::Sql(relational::SqlError::Parameters));
                 }
-                self.rollback();
+                self.rollback_without_settling();
                 return Ok(relational::SqlResult::default());
             };
             Self::check_prepared_generation(p, Some(db))?;
@@ -5628,7 +5743,7 @@ impl SqlSession {
                     if self.staged.is_none() {
                         return Err(CoreError::Sql(E::Transaction));
                     }
-                    self.rollback();
+                    self.rollback_without_settling();
                 }
                 "commit" => {
                     let staged = self
@@ -6042,11 +6157,14 @@ impl SqlSession {
     }
 
     pub fn rollback(&mut self) {
-        let _ = self.settle_sequences();
         self.rollback_without_settling();
+        let _ = self.settle_sequences();
     }
 
-    fn rollback_without_settling(&mut self) {
+    /// Discard private transaction state while retaining any obligations for
+    /// future observations if the session is reused.
+    #[doc(hidden)]
+    pub fn rollback_without_settling(&mut self) {
         self.xact.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.copy_input = None;
         // A parked protected run is not an SQL transaction slot.
@@ -6083,7 +6201,7 @@ impl SqlSession {
 }
 impl Drop for SqlSession {
     fn drop(&mut self) {
-        self.rollback();
+        self.rollback_without_settling();
     }
 }
 #[cfg(test)]

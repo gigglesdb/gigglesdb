@@ -322,6 +322,35 @@ async fn extended_describe_copy_flush_sync() {
     f.stop().await;
 }
 #[tokio::test]
+async fn binary_copy_decode_message_is_consumed() {
+    timeout(Duration::from_secs(30), async {
+        let f = Fixture::new().await;
+        let mut s = f.connect().await;
+        let r = query(&mut s, "CREATE TABLE vectors (v tsvector)").await;
+        assert_eq!(tags(&r), b"CZ");
+        let r = query(&mut s, "COPY vectors FROM STDIN (FORMAT binary)").await;
+        assert_eq!(tags(&r), b"G");
+        let mut bytes = b"PGCOPY\n\xff\r\n\0".to_vec();
+        bytes.extend([0; 8]);
+        bytes.extend(1i16.to_be_bytes());
+        bytes.extend(4i32.to_be_bytes());
+        bytes.extend((-1i32).to_be_bytes()); // Invalid tsvector lexeme count.
+        send(&mut s, b'd', &bytes).await;
+        let r = read(&mut s).await;
+        error(&r, "XX000");
+        let response = &r.iter().find(|r| r.0 == b'E').unwrap().1;
+        assert_eq!(w1_field(response, b'M').as_deref(), Some("invalid size of tsvector"));
+        assert_eq!(r.last().unwrap().0, b'Z');
+
+        let r = query(&mut s, "SELECT 1 / 0").await;
+        error(&r, "22012");
+        let response = &r.iter().find(|r| r.0 == b'E').unwrap().1;
+        assert_ne!(w1_field(response, b'M').as_deref(), Some("invalid size of tsvector"));
+        drop(s);
+        f.stop().await;
+    }).await.expect("binary COPY diagnostic recovery deadline");
+}
+#[tokio::test]
 async fn binary_pgx_shape_without_trailer_and_disconnect() {
     let f = Fixture::new().await;
     let mut s = f.connect().await;

@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     Admin, Engine, Limits, SqlSession,
     operations::{self, Bindings, Request, ValueExpr},
-    relational::{SqlResult, Value::Int},
+    relational::{self, SqlResult, Value::Int},
     storage::{
         engine::kv::{Direction, Keyspace},
         native_once::{
@@ -811,22 +811,25 @@ fn leave_unsettled(
     drop(lease);
     let lease = admin.test_v2();
     lease.sequencer.gate_counter_acks(true);
-    let result = (|| {
-        for _ in 0..32 {
-            let Int(value) = callback("nextval", "seq", None, false, crate::relational::clock::SequenceOrigin::Call).unwrap() else {
+    let _release = ReleaseGate(|| lease.sequencer.gate_counter_acks(false));
+    let draw = callback.clone();
+    let obligations = s.sequence_unsettled.clone();
+    let (send, received) = mpsc::channel();
+    thread::spawn(move || {
+        // The initial reservation covers 32 more draws; the next is private.
+        for _ in 0..33 {
+            let Int(value) = draw("nextval", "seq", None, false, crate::relational::clock::SequenceOrigin::Call).unwrap() else {
                 panic!("sequence value");
             };
-            if !s.sequence_unsettled.lock().unwrap().is_empty() {
-                return Some(value);
+            if !obligations.is_empty() {
+                drop(draw);
+                send.send(value).unwrap();
+                return;
             }
         }
-        None
-    })();
-    lease.sequencer.gate_counter_acks(false);
-    (
-        callback,
-        result.expect("sequence must refill with a gated acknowledgement"),
-    )
+        panic!("sequence must refill with a gated acknowledgement");
+    });
+    (callback, received.recv_timeout(WAIT).expect("private draw did not report an obligation"))
 }
 
 #[test]
@@ -1196,8 +1199,45 @@ fn stale_copy_plan_aborts_an_explicit_transaction() {
     );
     assert_eq!(session.sequence_unsettled.lock().unwrap().len(), pending);
     sql(&mut session, "ROLLBACK").unwrap();
+    assert_eq!(session.sequence_unsettled.lock().unwrap().len(), pending);
+    assert!(sql(&mut session, "SELECT id FROM t").unwrap().rows.is_empty());
     assert!(session.sequence_unsettled.lock().unwrap().is_empty());
-    assert!(read_ids(&admin).is_empty());
+}
+
+struct ReleaseGate<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for ReleaseGate<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
+fn seed_copy_reservations<'a>(
+    db: &'a EngineLease, mut session: SqlSession, copy: relational::Prepared, count: usize,
+) -> (SqlSession, relational::Prepared, ReleaseGate<impl FnMut() + 'a>) {
+    db.sequencer.gate_counter_writes(true);
+    let release = ReleaseGate(|| db.sequencer.gate_counter_writes(false));
+    let (send, received) = mpsc::channel();
+    thread::spawn(move || {
+        for _ in 0..count {
+            let input = relational::CopyInput {
+                rows: vec![vec![Some(Int(1))]],
+                options: relational::CopyOptions::default(),
+                first_line: 1,
+                skipped: 0,
+            };
+            session.normalize_copy_cells(&copy, input, &clock(), false).unwrap();
+        }
+        send.send((session, copy)).unwrap();
+    });
+    match received.recv_timeout(WAIT) {
+        Ok((session, copy)) => (session, copy, release),
+        Err(error) => {
+            drop(release);
+            drop(received.recv_timeout(WAIT));
+            panic!("COPY obligation seeding waited on a held counter submission: {error}");
+        }
+    }
 }
 
 #[test]
@@ -1216,15 +1256,8 @@ fn standalone_copy_rollback_settles_a_never_bound_session() {
     s.normalize_copy_rows_at(&copy, vec![vec![Int(1)]], &clock)
         .unwrap();
     let db = admin.test_v2();
-    db.sequencer.gate_counter_writes(true);
-    for _ in 0..32 {
-        s.normalize_copy_rows_at(&copy, vec![vec![Int(1)]], &clock)
-            .unwrap();
-        if !s.sequence_unsettled.lock().unwrap().is_empty() {
-            break;
-        }
-    }
-    db.sequencer.gate_counter_writes(false);
+    let (mut s, _, release) = seed_copy_reservations(&db, s, copy, 33);
+    drop(release);
     assert!(!s.sequence_unsettled.lock().unwrap().is_empty());
     s.rollback();
     assert!(s.sequence_unsettled.lock().unwrap().is_empty());
@@ -1257,15 +1290,12 @@ fn copy_with_failed_old_reservation_cannot_regress_coverage_after_reopen() {
     let key = super::super::engine::catalog_codec::counter_key(id, def.incarnation);
     let before_reservation = db.kv.get(Keyspace::Seq, &key).unwrap().unwrap();
 
-    db.sequencer.gate_counter_writes(true);
-    for _ in 0..40 {
-        normalize(&mut s, &old_copy).unwrap();
-    }
+    let (mut s, old_copy, release) = seed_copy_reservations(&db, s, old_copy, 40);
     // Admit recovery first. Fence the held counter write and its settlement
     // on the existing lease, without attempting a reopen after a slot stop.
     let generation = slot(&admin).stop_admission(1).unwrap();
     db.sequencer.stop_submissions();
-    db.sequencer.gate_counter_writes(false);
+    drop(release);
     assert_eq!(
         sql_sequences::settle(&db, &s.sequence_unsettled),
         Err(CoreError::Fenced)

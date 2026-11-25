@@ -60,6 +60,25 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn legacy_buffered_copy_returns_opaque_cells() {
+    let fixture = Fixture::new(Engine::Legacy);
+    let mut session = fixture.session();
+    run(&mut session, "CREATE SEQUENCE buffered_seq");
+    run(&mut session, "CREATE TABLE buffered(id bigint PRIMARY KEY DEFAULT nextval('buffered_seq'), payload bigint)");
+    let (_, prepared) = session.prepare_copy("COPY buffered(payload) FROM STDIN").unwrap();
+    let input = relational::CopyInput {
+        rows: vec![vec![Some(Value::Int(42))]],
+        options: Default::default(),
+        first_line: 1,
+        skipped: 0,
+    };
+    let (_, rows, skipped) = session.normalize_buffered_copy_cells_at(&prepared, input, &clock()).unwrap();
+    assert_eq!(skipped, 0);
+    assert!(!(&rows as &dyn std::any::Any).is::<Vec<Vec<Value>>>(),
+        "buffered COPY returned a public Vec of normalized cells");
+}
+
+#[test]
 fn bounds_setval_restart_and_pending_across_reopen() {
     for engine in engines() {
         let mut f = Fixture::new(engine);
@@ -1121,7 +1140,7 @@ fn abrupt_crash_never_reissues_exposed_unsettled_values() {
 
 #[cfg(feature = "engine-rocksdb")]
 #[test]
-fn deferred_insert_avoids_coverage_wait_but_exposed_select_waits() {
+fn explicit_multirow_insert_waits_for_coverage_before_returning_count() {
     use std::{sync::mpsc, time::{Duration, Instant}};
     let f = Fixture::new(Engine::V2);
     let mut s = f.session();
@@ -1129,52 +1148,38 @@ fn deferred_insert_avoids_coverage_wait_but_exposed_select_waits() {
     scalar(&mut s, "SELECT nextval('fast_id_seq')");
     let db = f.admin.as_ref().unwrap().test_v2();
     db.sequencer.gate_counter_acks(true);
-    let admin = f.admin.as_ref().unwrap().clone();
-    let (tx, rx) = mpsc::channel();
-    let (release, proceed) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        let mut s = admin.sql_session();
+    let gate = ReleaseGate(|| db.sequencer.gate_counter_acks(false));
+    let slot = db.sql_counters.lock().unwrap().values().next().unwrap().clone();
+    let (sent, received) = mpsc::channel();
+    let (finished, done) = mpsc::channel();
+    thread::spawn(move || {
         run(&mut s, "BEGIN");
-        // Cross durable coverage (33) and reuse the queued reservation at 35.
-        for _ in 0..34 { run(&mut s, "INSERT INTO fast(payload) VALUES (1)"); }
-        tx.send(()).unwrap();
-        proceed.recv().unwrap();
+        // This one statement crosses the durable coverage at 33.
+        let rows = ["(1)"; 34].join(", ");
+        let result = run(&mut s, &format!("INSERT INTO fast(payload) VALUES {rows}"));
+        sent.send(result.affected).unwrap();
         run(&mut s, "COMMIT");
+        drop(s);
+        finished.send(()).unwrap();
     });
     let deadline = Instant::now() + Duration::from_secs(10);
-    while db.sequencer.held_counter_acks() == 0 {
+    let (position, early) = loop {
+        if let Ok(affected) = received.try_recv() {
+            break (None, Some(affected));
+        }
+        if let Some(Some(position)) = slot.counter.try_observe(|state| {
+            (state.waiting_returns != 0).then(|| state.counter.as_ref().unwrap().last_value)
+        }) {
+            break (Some(position), received.try_recv().ok());
+        }
         assert!(Instant::now() < deadline);
         thread::yield_now();
-    }
-    let completed = rx.recv_timeout(Duration::from_secs(10));
-    let admin = f.admin.as_ref().unwrap().clone();
-    let (tx, done) = mpsc::channel();
-    let reader = thread::spawn(move || {
-        let mut s = admin.sql_session();
-        run(&mut s, "BEGIN");
-        tx.send(scalar(&mut s, "SELECT nextval('fast_id_seq')")).unwrap();
-        run(&mut s, "ROLLBACK");
-    });
-    // Synchronise on the reader's actual coverage wait, not on a timeout.
-    let slot = db.sql_counters.lock().unwrap().values().next().unwrap().clone();
-    loop {
-        let cancel = crate::cancellation::Cancellation::new(Some(Instant::now() + Duration::from_millis(100)));
-        let waiting = cancel.scope(|| {
-            let guard = slot.counter.lock_cancellable().unwrap();
-            guard.waiting_returns > 0 || guard.receiving
-        });
-        if waiting { break; }
-        assert!(Instant::now() < deadline);
-        thread::yield_now();
-    }
-    assert!(done.recv_timeout(Duration::from_millis(200)).is_err());
-    assert!(db.sequencer.held_counter_acks() > 0);
-    db.sequencer.gate_counter_acks(false);
-    release.send(()).unwrap();
-    worker.join().unwrap();
-    reader.join().unwrap();
-    completed.unwrap();
-    assert_eq!(done.recv_timeout(Duration::from_secs(10)).unwrap(), 36);
+    };
+    drop(gate);
+    done.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(early, None);
+    assert_eq!(position, Some(35));
+    assert_eq!(scalar(&mut f.session(), "SELECT count(*) FROM fast"), 34);
 }
 
 #[cfg(feature = "engine-rocksdb")]
@@ -1185,12 +1190,112 @@ fn deferred_coverage_survives_a_durable_backwards_install() {
     run(&mut s, "CREATE TABLE backwards(id bigserial PRIMARY KEY, payload integer)");
     scalar(&mut s, "SELECT nextval('backwards_id_seq')");
     run(&mut s, "BEGIN");
-    for _ in 0..40 { run(&mut s, "INSERT INTO backwards(payload) VALUES (1)"); }
+    let db = f.admin.as_ref().unwrap().test_v2();
+    let (_, draw) = s.native_sequence_callback(Some(&db)).unwrap();
+    db.sequencer.gate_counter_acks(true);
+    let gate = ReleaseGate(|| db.sequencer.gate_counter_acks(false));
+    let (sent, received) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for expected in 2..=34 {
+            assert_eq!(draw("nextval", "backwards_id_seq", None, false,
+                relational::clock::SequenceOrigin::Call).unwrap(), Value::Int(expected));
+        }
+        drop(draw);
+        sent.send(()).unwrap();
+    });
+    let private_draws = received.recv_timeout(std::time::Duration::from_secs(10));
+    drop(gate);
+    if private_draws.is_err() {
+        let _ = received.recv_timeout(std::time::Duration::from_secs(10));
+    }
+    private_draws.expect("private sequence draws waited for a gated acknowledgement");
+    assert!(!s.sequence_unsettled.is_empty());
     assert_eq!(scalar(&mut s, "SELECT setval('backwards_id_seq',1,false)"), 1);
     run(&mut s, "ROLLBACK");
-    // setval is non-transactional: the durable backwards install stands, and
-    // settling the earlier deferred values did not move the counter forward.
+    // Settling the private draw must preserve the newer durable setval position.
     assert_eq!(scalar(&mut s, "SELECT nextval('backwards_id_seq')"), 1);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn durably_covered_insert_count_bypasses_contended_setval_slot() {
+    use std::{sync::mpsc, time::{Duration, Instant}};
+    const WAIT: Duration = Duration::from_secs(10);
+    let f = Fixture::new(Engine::V2);
+    let mut insert = f.session();
+    run(&mut insert, "CREATE TABLE covered(id bigserial PRIMARY KEY)");
+    for expected in 1..=8 {
+        assert_eq!(scalar(&mut insert, "SELECT nextval('covered_id_seq')"), expected);
+    }
+    run(&mut insert, "BEGIN");
+    let admin = f.admin.as_ref().unwrap();
+    let db = admin.test_v2();
+    db.sequencer.gate_counter_acks(true);
+    let refill = ReleaseGate(|| db.sequencer.gate_counter_acks(false));
+    let (drew, drawn) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel();
+    let (returned, result) = mpsc::channel();
+    thread::spawn(move || {
+        AFTER_COLUMN_DEFAULT_DRAW.set(Some(Box::new(move |value| {
+            drew.send(value).unwrap();
+            resumed.recv_timeout(WAIT).unwrap();
+            Ok(())
+        })));
+        let affected = run(&mut insert, "INSERT INTO covered DEFAULT VALUES").affected;
+        drop(insert);
+        returned.send(affected).unwrap();
+    });
+    assert_eq!(drawn.recv_timeout(WAIT).unwrap(), 9);
+    let deadline = Instant::now() + WAIT;
+    while db.sequencer.held_counter_acks() == 0 {
+        assert!(Instant::now() < deadline, "covered draw did not prefetch a reservation");
+        thread::yield_now();
+    }
+    drop(refill);
+
+    let ack = crate::CommitSyncHook::new();
+    let release = ReleaseGate(|| ack.release(false));
+    admin.set_commit_sync_hook(Some(ack.clone()));
+    let mut setval = f.session();
+    let (installed, done) = mpsc::channel();
+    thread::spawn(move || {
+        let value = scalar(&mut setval, "SELECT setval('covered_id_seq', 100)");
+        drop(setval);
+        installed.send(value).unwrap();
+    });
+    assert!(ack.wait_entered(WAIT), "setval did not reach its synchronous write");
+    resume.send(()).unwrap();
+    let returned_while_held = result.recv_timeout(Duration::from_secs(2));
+    admin.set_commit_sync_hook(None);
+    drop(release);
+    assert_eq!(done.recv_timeout(WAIT).unwrap(), 100);
+    if returned_while_held.is_err() {
+        assert_eq!(result.recv_timeout(WAIT).unwrap(), 1);
+    }
+    assert_eq!(returned_while_held, Ok(1), "covered count waited for the setval slot");
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn explicit_single_row_default_inserts_wait_at_most_once_per_reservation() {
+    const INSERTS: usize = 256;
+    let f = Fixture::new(Engine::V2);
+    let mut s = f.session();
+    run(&mut s, "CREATE TABLE measured(id bigserial PRIMARY KEY)");
+    let writes_before = RESERVATIONS_SENT.get();
+    run(&mut s, "BEGIN");
+    let mut waited = 0;
+    for _ in 0..INSERTS {
+        let before = ACK_WAIT_PATHS.get();
+        assert_eq!(run(&mut s, "INSERT INTO measured DEFAULT VALUES").affected, 1);
+        waited += usize::from(ACK_WAIT_PATHS.get() != before);
+    }
+    run(&mut s, "COMMIT");
+    let reservations = RESERVATIONS_SENT.get() - writes_before;
+    assert!((1..=reservations).contains(&waited), "{waited} waits for {reservations} reservations");
+    assert!(reservations < INSERTS, "{reservations} reservations for {INSERTS} INSERTs");
+    assert_eq!(scalar(&mut s, "SELECT count(*) FROM measured"), INSERTS as i64);
+    eprintln!("{waited} waits in {INSERTS} INSERTs across {reservations} reservations");
 }
 
 // Preserve the original direct-helper tests as synchronous callers. Sessions use
@@ -1696,6 +1801,7 @@ mod default_memo_tests {
                         // Watchdog with slack beyond every controller deadline below.
                         assert_ne!(resume.recv_timeout(wait * 3), Err(mpsc::RecvTimeoutError::Timeout));
                     }
+                    Ok(())
                 })));
                 let before = SEQUENCE_RESOLUTIONS.get();
                 let result = bounded_run(

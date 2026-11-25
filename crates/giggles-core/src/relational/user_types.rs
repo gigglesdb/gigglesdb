@@ -153,6 +153,20 @@ pub(super) fn probe_preserving_error_message<T, E>(probe: impl FnOnce() -> Resul
 pub(super) fn invalid_type_modifier_error() {
     view_replace_error("invalid type modifier".into());
 }
+pub(crate) fn has_sql_notices() -> bool {
+    SQL_NOTICES.with(|notices| !notices.borrow().is_empty())
+}
+
+pub(crate) fn prepend_sql_notices(mut notices: Vec<SqlNotice>) {
+    if !notices.is_empty() {
+        SQL_NOTICES.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            notices.append(&mut pending);
+            *pending = notices;
+        });
+    }
+}
+
 pub fn take_sql_notices() -> Vec<SqlNotice> {
     SQL_NOTICES.with(|notices| std::mem::take(&mut *notices.borrow_mut()))
 }
@@ -186,13 +200,15 @@ pub(super) fn view_replace_error(message: String) {
 pub(super) fn truncate_reference_error() {
     view_replace_error("cannot truncate a table referenced in a foreign key constraint".into());
 }
-/// Isolate diagnostics produced by nested SQL parsing on the same thread.
+/// Isolate diagnostics while running nested work on the same thread.
 pub(crate) struct SqlDiagnosticScope {
     warnings: Vec<String>,
     notices: Vec<SqlNotice>,
     hint: Option<std::borrow::Cow<'static, str>>,
     detail: Option<SqlErrorDetail>,
     message: Option<SqlErrorMessage>,
+    position: Option<usize>,
+    names: Option<SqlErrorNames>,
     routine: Option<Box<routines::RoutineDiagnostic>>,
 }
 
@@ -204,6 +220,8 @@ impl SqlDiagnosticScope {
             hint: take_sql_diagnostic_hint(),
             detail: take_sql_diagnostic_detail(),
             message: SQL_ERROR_MESSAGE.with(|pending| pending.borrow_mut().take()),
+            position: take_sql_error_position(),
+            names: take_sql_error_names(),
             routine: routines::take_diagnostic(),
         }
     }
@@ -216,6 +234,8 @@ impl Drop for SqlDiagnosticScope {
         SQL_ERROR_HINT.with(|pending| *pending.borrow_mut() = self.hint.take());
         SQL_ERROR_DETAIL.with(|pending| *pending.borrow_mut() = self.detail.take());
         SQL_ERROR_MESSAGE.with(|pending| *pending.borrow_mut() = self.message.take());
+        SQL_ERROR_POSITION.set(self.position);
+        SQL_ERROR_NAMES.with(|pending| *pending.borrow_mut() = self.names.take());
         routines::restore_diagnostic(self.routine.take());
     }
 }

@@ -12,15 +12,42 @@ pub(in crate::storage) struct Obligation {
     value: i64,
     coverage_epoch: u64,
 }
-pub(in crate::storage) type Unsettled = Arc<Mutex<Vec<Obligation>>>;
+pub(in crate::storage) type Unsettled = Arc<ObligationList>;
+
+#[derive(Default)]
+pub(in crate::storage) struct ObligationList {
+    nonempty: AtomicBool,
+    items: Mutex<Vec<Obligation>>,
+}
+
+impl ObligationList {
+    pub(in crate::storage) fn is_empty(&self) -> bool {
+        !self.nonempty.load(Ordering::Acquire)
+    }
+
+    fn push(&self, item: Obligation) -> Result<(), CoreError> {
+        let mut items = self.items.lock().map_err(|_| CoreError::Fenced)?;
+        items.push(item);
+        self.nonempty.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(in crate::storage) fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Vec<Obligation>>> {
+        self.items.lock()
+    }
+}
 
 pub(in crate::storage) fn settle(db: &EngineLease, list: &Unsettled) -> Result<(), CoreError> {
-    let mut list = list.lock().map_err(|_| CoreError::Fenced)?;
+    if list.is_empty() {
+        return Ok(());
+    }
+    let mut items = list.items.lock().map_err(|_| CoreError::Fenced)?;
     // Check the entire list before using any slot or resending any counter.
-    if list.iter().any(|item| item.generation != db.stamp()) {
+    if items.iter().any(|item| item.generation != db.stamp()) {
         return Err(CoreError::Fenced);
     }
-    for item in list.iter() {
+    for item in items.iter() {
         let mut guard = item.slot.counter.lock_cancellable()?;
         drain_ready(&mut guard);
         // A synchronous setval/wrap may have replaced durable_hw since allocation.
@@ -46,7 +73,8 @@ pub(in crate::storage) fn settle(db: &EngineLease, list: &Unsettled) -> Result<(
         guard.waiting_returns -= 1;
         outcome?;
     }
-    list.clear();
+    items.clear();
+    list.nonempty.store(false, Ordering::Release);
     Ok(())
 }
 
@@ -246,7 +274,7 @@ thread_local! {
 }
 
 #[cfg(all(test, feature = "engine-rocksdb"))]
-type ColumnDefaultDrawHook = Box<dyn FnOnce(i64)>;
+type ColumnDefaultDrawHook = Box<dyn FnOnce(i64) -> Result<(), CoreError>>;
 
 #[cfg(all(test, feature = "engine-rocksdb"))]
 thread_local! {
@@ -879,7 +907,7 @@ pub(super) fn callback(
                 && operation == "nextval"
                 && let Some(hook) = AFTER_COLUMN_DEFAULT_DRAW.take()
             {
-                hook(result);
+                hook(result)?;
             }
             return Ok(relational::Value::Int(result));
         }
@@ -995,6 +1023,12 @@ fn reserve_ahead(def: &relational::catalog_ext::SequenceDef, value: i64) -> i64 
     high
 }
 
+#[cfg(all(test, feature = "engine-rocksdb"))]
+thread_local! {
+    static ACK_WAIT_PATHS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RESERVATIONS_SENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 type SlotGuard<'a> = crate::cancellation::WaitGuard<'a, v2::SeqSlotState>;
 
 #[derive(Debug)]
@@ -1049,6 +1083,8 @@ fn receive_one<'a>(
     };
     guard.receiving = true;
     drop(guard);
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    ACK_WAIT_PATHS.set(ACK_WAIT_PATHS.get() + 1);
     let _durable = crate::Cancellation::current_durable_token();
     let outcome = loop {
         if let Err(error) = crate::cancellation::check() {
@@ -1266,11 +1302,15 @@ fn committed_value(
         break (counter, result, synchronous, prior.map(|c| c.log_hw));
     };
     if synchronous {
+        #[cfg(all(test, feature = "engine-rocksdb"))]
+        ACK_WAIT_PATHS.set(ACK_WAIT_PATHS.get() + 1);
         db.sequencer.write_counter(
             key,
             engine::catalog_codec::encode_counter(&counter, def)?,
             256,
         )?;
+        #[cfg(all(test, feature = "engine-rocksdb"))]
+        RESERVATIONS_SENT.set(RESERVATIONS_SENT.get() + 1);
         guard.install(counter);
         return Ok(result);
     }
@@ -1284,6 +1324,8 @@ fn committed_value(
             engine::catalog_codec::encode_counter(&counter, def)?,
             256,
         )?;
+        #[cfg(all(test, feature = "engine-rocksdb"))]
+        RESERVATIONS_SENT.set(RESERVATIONS_SENT.get() + 1);
         guard.inflight.push_back(v2::InFlight {
             incarnation: def.incarnation,
             hw: counter.log_hw,
@@ -1291,26 +1333,22 @@ fn committed_value(
         });
     }
     guard.counter = Some(counter);
+    // Check the durable watermark while still holding the allocation slot.
+    // A speculative refill does not make an already covered draw depend on it.
+    if guard.durable_hw.is_some_and(|hw| covers(def, hw, result)) {
+        return Ok(result);
+    }
     // The reservation precedes a later write commit in the sequencer FIFO.
     // Other outcomes must settle this obligation before returning to the caller.
     if guard.inflight.iter().any(|write| {
         write.incarnation == def.incarnation
             && if def.increment > 0 { write.hw >= result } else { write.hw <= result }
     }) {
-        unsettled.lock().map_err(|_| CoreError::Fenced)?.push(Obligation {
+        unsettled.push(Obligation {
             generation: db.stamp(),
             slot: slot.clone(), id, def: def.clone(), value: result,
             coverage_epoch: guard.coverage_epoch,
-        });
-        return Ok(result);
-    }
-    if guard.durable_hw.is_some_and(|hw| {
-        if def.increment > 0 {
-            hw >= result
-        } else {
-            hw <= result
-        }
-    }) {
+        })?;
         return Ok(result);
     }
     guard.waiting_returns += 1;

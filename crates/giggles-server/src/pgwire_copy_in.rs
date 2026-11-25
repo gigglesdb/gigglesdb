@@ -1,6 +1,6 @@
 //! COPY FROM STDIN protocol state; rows remain private until CopyDone.
 use super::*;
-use giggles_core::relational::{Copy, CopyFormat};
+use giggles_core::{BufferedCopyRows, relational::{Copy, CopyFormat}};
 
 pub(super) fn is_copy_sql(sql: &str) -> bool {
     Copy::is_copy(sql)
@@ -13,11 +13,11 @@ pub(super) struct CopyIn {
     clock: giggles_core::relational::StatementClock,
     columns: Vec<giggles_core::relational::ColumnDef>,
     decoder: copy::Decoder,
-    rows: Vec<Vec<Value>>,
+    rows: BufferedCopyRows,
+    buffered_row_count: usize,
     raw_rows: Vec<Vec<Option<Value>>>,
     next_line: u64,
     skipped: u64,
-    normalized_bytes: usize,
     input_error_message: Option<String>,
     pub(super) simple: bool,
     failed: bool,
@@ -25,8 +25,33 @@ pub(super) struct CopyIn {
     pub(super) remaining: Vec<String>,
     pub(super) prepare_source: Option<String>,
 }
+enum CopyInputError {
+    Input(&'static str),
+    Core(&'static str),
+}
+
+impl From<&'static str> for CopyInputError {
+    fn from(code: &'static str) -> Self { Self::Core(code) }
+}
+
 impl CopyIn {
-    fn normalize_rows(&mut self, rows: Vec<Vec<Option<Value>>>, session: &mut Session) -> R<(Prepared, Vec<Vec<Value>>)> {
+    fn normalize_rows(
+        &mut self, rows: Vec<Vec<Option<Value>>>, session: &mut Session,
+    ) -> R<(Prepared, BufferedCopyRows, usize)> {
+        let supplied = rows.len();
+        self.normalize_page(rows, |prepared, input, clock| {
+            session.normalize_buffered_copy_cells(prepared, input, clock)
+                .map(|(prepared, rows, skipped)| ((prepared, rows, supplied - skipped as usize), skipped))
+        })
+    }
+
+    fn normalize_page<T>(
+        &mut self,
+        rows: Vec<Vec<Option<Value>>>,
+        normalize: impl FnOnce(
+            &Prepared, giggles_core::relational::CopyInput, &giggles_core::relational::StatementClock,
+        ) -> Result<(T, u64), CoreError>,
+    ) -> R<T> {
         // Legacy scalar errors can be field-less. A syntax error in the first
         // supplied integer is unambiguously the first conversion failure;
         // retain its PG diagnostic without replacing assignment coercion.
@@ -46,7 +71,7 @@ impl CopyIn {
         let options = self.descriptor.options.clone();
         let count = rows.len() as u64;
         let input = giggles_core::relational::CopyInput { rows, options, first_line: self.next_line, skipped: self.skipped };
-        let result = session.normalize_copy_cells(&self.prepared, input, &self.clock);
+        let result = normalize(&self.prepared, input, &self.clock);
         self.next_line += count;
         match &result {
             Err(CoreError::Sql(giggles_core::relational::SqlError::InvalidTextRepresentation)) => {
@@ -57,28 +82,58 @@ impl CopyIn {
             }
             _ => {}
         }
-        let (prepared, rows, skipped) = core(result)?;
+        let (output, skipped) = core(result)?;
         self.skipped += skipped;
-        Ok((prepared, rows))
+        Ok(output)
     }
 
     fn flush_page(&mut self, session: &mut Session, count: usize, out: &mut Vec<u8>) -> R<()> {
         let rows = self.raw_rows.drain(..count).collect();
-        let (prepared, rows) = self.normalize_rows(rows, session)?;
+        let prepared = self.normalize_page(rows, |prepared, input, clock| {
+            session.normalize_and_feed_copy_input(prepared, input, clock)
+        })?;
         copy_notices(out)?;
-        core(session.sql.feed_copy_input_at(&prepared, rows, &self.clock))?;
         self.normalized = Some(prepared);
         Ok(())
     }
-    fn decoding_error(&mut self, code: &'static str, rows: Vec<Vec<copy::Field>>, session: &mut Session, out: &mut Vec<u8>) -> R<()> {
+    fn reject(&mut self, session: &mut Session, error: CopyInputError, diagnostic: &mut Diagnostic) -> &'static str {
+        match error {
+            CopyInputError::Input(code) => {
+                session.abort_without_settling();
+                if let Some(message) = giggles_core::relational::take_sql_error_message() {
+                    diagnostic.wire_message = Some(message);
+                }
+                let _ = giggles_core::relational::take_sql_diagnostic_detail();
+                code
+            }
+            CopyInputError::Core(code) => {
+                let code = match session.abort_copy_input_with_settlement() {
+                    Ok(()) => code,
+                    Err(error) => {
+                        self.input_error_message = None;
+                        self.decoder.clear_diagnostic();
+                        if code == "08007" { code } else { crate::service::sqlstate(&error) }
+                    }
+                };
+                if let Some(message) = giggles_core::relational::take_sql_error_message()
+                    .or_else(|| self.input_error_message.take())
+                {
+                    diagnostic.wire_message = Some(message);
+                }
+                diagnostic.wire_detail = diagnostic.read_core_detail();
+                code
+            }
+        }
+    }
+    fn decoding_error(&mut self, code: &'static str, rows: Vec<Vec<copy::Field>>, session: &mut Session, out: &mut Vec<u8>) -> Result<(), CopyInputError> {
         let prefix = self.convert(rows, session, out).and_then(|()| {
             if self.streaming && !self.raw_rows.is_empty() { self.flush_page(session, self.raw_rows.len(), out)?; }
             Ok(())
         });
         if let Err(earlier) = prefix { self.decoder.clear_diagnostic(); return Err(earlier); }
-        Err(code)
+        Err(CopyInputError::Input(code))
     }
-    fn feed(&mut self, bytes: &[u8], session: &mut Session, out: &mut Vec<u8>) -> R<()> {
+    fn feed(&mut self, bytes: &[u8], session: &mut Session, out: &mut Vec<u8>) -> Result<(), CopyInputError> {
         match self.decoder.feed(bytes) {
             Ok(rows) => self.convert(rows, session, out),
             Err(code) => {
@@ -88,7 +143,7 @@ impl CopyIn {
         }
     }
 
-    fn finish(&mut self, session: &mut Session, out: &mut Vec<u8>) -> R<()> {
+    fn finish(&mut self, session: &mut Session, out: &mut Vec<u8>) -> Result<(), CopyInputError> {
         match self.decoder.finish() {
             Ok(rows) => self.convert(rows, session, out),
             Err(code) => {
@@ -97,15 +152,13 @@ impl CopyIn {
             }
         }
     }
-    fn convert(&mut self, rows: Vec<Vec<copy::Field>>, session: &mut Session, out: &mut Vec<u8>) -> R<()> {
+    fn convert(&mut self, rows: Vec<Vec<copy::Field>>, session: &mut Session, out: &mut Vec<u8>) -> Result<(), CopyInputError> {
         let zone = session.zone().unwrap_or(SessionZone::Fixed(0));
         let mut converted = vec![];
         let format = u16::from(matches!(self.descriptor.format, CopyFormat::Binary));
         for row in rows {
             if row.len() > self.columns.len() {
-                return Err(crate::service::sqlstate(&CoreError::Sql(
-                    giggles_core::relational::SqlError::BadCopyFileFormat,
-                )));
+                return Err(CopyInputError::Input("22P04"));
             }
             let missing = row.len() < self.columns.len();
             let row = row.into_iter()
@@ -130,60 +183,35 @@ impl CopyIn {
                                     .map_err(|_| "22021")
                             }).map(Some)
                     })
-                    .collect::<R<Vec<_>>>()?;
+                    .collect::<R<Vec<_>>>().map_err(CopyInputError::Input)?;
             if missing {
                 // A supplied conversion failure precedes the missing next field.
                 self.accept_converted(std::mem::take(&mut converted), session, out)?;
                 if self.streaming && !self.raw_rows.is_empty() { self.flush_page(session, self.raw_rows.len(), out)?; }
-                let (_, accepted) = self.normalize_rows(vec![row], session)?;
+                let (_, _, accepted) = self.normalize_rows(vec![row], session)?;
                 copy_notices(out)?;
-                if self.descriptor.options.on_error_ignore && accepted.is_empty() { continue; }
-                return Err("22P04");
+                if self.descriptor.options.on_error_ignore && accepted == 0 { continue; }
+                return Err(CopyInputError::Core("22P04"));
             }
             converted.push(row);
         }
         self.accept_converted(converted, session, out)
     }
-    fn accept_converted(&mut self, converted: Vec<Vec<Option<Value>>>, session: &mut Session, out: &mut Vec<u8>) -> R<()> {
+    fn accept_converted(&mut self, converted: Vec<Vec<Option<Value>>>, session: &mut Session, out: &mut Vec<u8>) -> Result<(), CopyInputError> {
         if self.streaming {
             self.raw_rows.extend(converted);
             while self.raw_rows.len() >= 200 { self.flush_page(session, 200, out)?; }
             return Ok(());
         }
-        if self
-            .rows
-            .len()
-            .checked_add(converted.len())
-            .ok_or("54000")?
-            > giggles_core::relational::MAX_ROWS
-        {
-            return Err("54000");
+        if self.buffered_row_count.saturating_add(converted.len()) > giggles_core::relational::MAX_ROWS {
+            return Err(CopyInputError::Input("54000"));
         }
         if !converted.is_empty() {
-            let (prepared, rows) =
-                self.normalize_rows(converted, session)?;
+            let (prepared, rows, accepted) = self.normalize_rows(converted, session)?;
             copy_notices(out)?;
-            for value in rows.iter().flatten() {
-                let bytes = match value {
-                    Value::Text(s) => s.len(),
-                    Value::Bytes(b) => b.len(),
-                    Value::Numeric(n) => n.to_string().len(),
-                    Value::Float4(_) | Value::Date(_) => 4,
-                    Value::Float8(_)
-                    | Value::Time(_)
-                    | Value::Timestamp(_)
-                    | Value::TimestampTz(_) => 8,
-                    Value::TimeTz(_) => 12,
-                    Value::Interval(_) => 16,
-                    Value::Null | Value::Bool(_) | Value::Int(_) => 9,
-                };
-                self.normalized_bytes = self.normalized_bytes.checked_add(bytes).ok_or("54000")?;
-                if self.normalized_bytes > giggles_core::operations::MAX_INSERT_BYTES {
-                    return Err("54000");
-                }
-            }
+            core(session.sql.append_buffered_copy_rows(&mut self.rows, rows))?;
             self.normalized = Some(prepared);
-            self.rows.extend(rows);
+            self.buffered_row_count += accepted;
         }
         Ok(())
     }
@@ -233,7 +261,8 @@ impl State {
                 return;
             }
             copy.failed = true;
-            copy.rows.clear();
+            copy.rows = BufferedCopyRows::default();
+            copy.buffered_row_count = 0;
             copy.raw_rows.clear();
             copy.remaining.clear();
             self.diagnostic.unknown_outcome = code == "08007";
@@ -246,7 +275,7 @@ impl State {
             out.extend(response);
             if copy.simple {
                 if copy.simple_implicit {
-                    session.sql.rollback();
+                    session.sql.rollback_without_settling();
                     self.settings.transaction(true, false, "ROLLBACK");
                     self.portals.clear();
                 }
@@ -312,11 +341,11 @@ impl State {
             clock,
             columns,
             decoder,
-            rows: vec![],
+            rows: BufferedCopyRows::default(),
+            buffered_row_count: 0,
             raw_rows: vec![],
             next_line: 1 + u64::from(descriptor.options.header != giggles_core::relational::CopyHeader::Off),
             skipped: 0,
-            normalized_bytes: 0,
             input_error_message: None,
             simple,
             failed: false,
@@ -364,7 +393,7 @@ impl State {
                 Box::new(stdout)
             }
         };
-        let result = (|| {
+        let result = (|| -> Result<(), CopyInputError> {
             let mut bytes = [0; 8192];
             loop {
                 let count = reader.read(&mut bytes).map_err(|error| copy_external::read_error(&mut self.diagnostic, error))?;
@@ -377,9 +406,8 @@ impl State {
             Ok(())
         })();
         drop(reader);
-        if let Err(code) = result {
-            if let Some(message) = giggles_core::relational::take_sql_error_message().or_else(|| copy.input_error_message.take()) { self.diagnostic.wire_message = Some(message); }
-            self.diagnostic.wire_detail = self.diagnostic.read_core_detail();
+        if let Err(error) = result {
+            let code = copy.reject(session, error, &mut self.diagnostic);
             copy_notices(out)?;
             if let Some((mut process, _)) = child { let _ = process.kill(); let _ = process.wait(); }
             copy.decoder.diagnostic(&mut self.diagnostic);
@@ -424,7 +452,7 @@ impl State {
         let done = matches!(tag, b'c' | b'f');
         let mut completed = out.len();
         if !copy.failed {
-            let result = (|| {
+            let result = (|| -> Result<(), CopyInputError> {
                 match tag {
                     b'd' => {
                         copy.feed(b, session, out)?;
@@ -432,7 +460,7 @@ impl State {
                     }
                     b'c' => {
                         if !b.is_empty() {
-                            return Err("08P01");
+                            return Err(CopyInputError::Input("08P01"));
                         }
                         copy.finish(session, out)?;
                         let result = if copy.streaming {
@@ -469,22 +497,20 @@ impl State {
                     }
                     b'f' => {
                         let mut reader = Reader { b, at: 0 };
-                        reader.text()?;
-                        reader.end()?;
-                        return Err("57014");
+                        reader.text().map_err(CopyInputError::Input)?;
+                        reader.end().map_err(CopyInputError::Input)?;
+                        return Err(CopyInputError::Input("57014"));
                     }
-                    _ => return Err("08P01"),
+                    _ => return Err(CopyInputError::Input("08P01")),
                 }
                 Ok(())
             })();
-            if let Err(code) = result {
-                let message = giggles_core::relational::take_sql_error_message().or_else(|| copy.input_error_message.take());
-                if message.is_some() { self.diagnostic.wire_message = message; }
-                self.diagnostic.wire_detail = self.diagnostic.read_core_detail();
+            if let Err(copy_error) = result {
+                let code = copy.reject(session, copy_error, &mut self.diagnostic);
                 self.diagnostic.authorize_duplicate_key(code, session);
-                session.abort();
                 copy.failed = true;
-                copy.rows.clear();
+                copy.rows = BufferedCopyRows::default();
+                copy.buffered_row_count = 0;
                 copy.raw_rows.clear();
                 copy.remaining.clear();
                 copy.decoder.diagnostic(&mut self.diagnostic);
@@ -502,7 +528,7 @@ impl State {
                 out.extend(failure);
                 if copy.simple {
                     if copy.simple_implicit {
-                        session.sql.rollback();
+                        session.sql.rollback_without_settling();
                         self.settings.transaction(true, false, "ROLLBACK");
                         self.portals.clear();
                     }
@@ -519,7 +545,7 @@ impl State {
             return Ok(true);
         }
         if copy.failed && copy.simple_implicit {
-            session.sql.rollback();
+            session.sql.rollback_without_settling();
             self.settings.transaction(true, false, "ROLLBACK");
             self.portals.clear();
         }

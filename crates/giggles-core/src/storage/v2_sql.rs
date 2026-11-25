@@ -153,7 +153,8 @@ impl SqlSession {
         let committed = (|| {
             // Settlement can wait for a sequence slot or durable reservation.
             // Finish it before publishing both statements and transaction blocks.
-            sql_sequences::settle(db, &self.sequence_unsettled)?;
+            sql_sequences::settle(db, &self.sequence_unsettled)
+                .map_err(sequence_settlement_error)?;
             if explicit {
                 sql_sequences::stage_pending(db, &mut txn, &self.v2_pending_sequences)?;
             }
@@ -206,7 +207,8 @@ impl SqlSession {
         lo: Bound<Vec<u8>>, hi: Bound<Vec<u8>>,
         visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
     ) -> Result<(), E> {
-        sql_sequences::settle(db, &self.sequence_unsettled).map_err(map)?;
+        sql_sequences::settle(db, &self.sequence_unsettled)
+            .map_err(sequence_settlement_error).map_err(map)?;
         let _ticket = self.admin.inner.enter_sql().map_err(map)?;
         let txn = self.v2_transaction.as_mut()
             .ok_or_else(|| map(CoreError::Sql(SqlError::Transaction)))?;
@@ -250,7 +252,8 @@ impl SqlSession {
         range: (&relational::secondary_index::Descriptor, Bound<Vec<u8>>, Bound<Vec<u8>>),
         visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
     ) -> Result<(), E> {
-        sql_sequences::settle(db, &self.sequence_unsettled).map_err(map)?;
+        sql_sequences::settle(db, &self.sequence_unsettled)
+            .map_err(sequence_settlement_error).map_err(map)?;
         let _ticket = self.admin.inner.enter_sql().map_err(map)?;
         let txn = self.v2_transaction.as_mut().ok_or_else(|| map(CoreError::Sql(SqlError::Transaction)))?;
         let catalog = db.catalog().snapshot(txn).map_err(map)?;
@@ -277,7 +280,8 @@ impl SqlSession {
         &mut self, db: &EngineLease, table: &TableDef, key: &[relational::Value],
         visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
     ) -> Result<(), E> {
-        sql_sequences::settle(db, &self.sequence_unsettled).map_err(map)?;
+        sql_sequences::settle(db, &self.sequence_unsettled)
+            .map_err(sequence_settlement_error).map_err(map)?;
         let _ticket = self.admin.inner.enter_sql().map_err(map)?;
         crate::cancellation::check().map_err(map)?;
         let txn = self.v2_transaction.as_mut()
@@ -321,7 +325,7 @@ impl SqlSession {
                 conflict_floor: None, prepared: &prepared, params: &[], effects: None, scope: None },
             u64::MAX, None)?;
         crate::cancellation::check()?;
-        sql_sequences::settle(db, &self.sequence_unsettled)?;
+        sql_sequences::settle(db, &self.sequence_unsettled).map_err(sequence_settlement_error)?;
         Ok(result)
     }
 
@@ -357,7 +361,9 @@ impl SqlSession {
                 Ok(p)
             });
         if result.is_err() {
-            self.abort();
+            // Preparation draws no values. An exposing exit will settle any
+            // reservations retained from earlier statements.
+            self.abort_without_settling();
         }
         result
     }
@@ -378,12 +384,33 @@ impl SqlSession {
             .map_err(relational::routines::into_core)
     }
 
+    fn fence_v2_wall_clock(
+        clock: relational::clock::ExecutionClock,
+        db: &EngineLease,
+        txn: &Transaction,
+        unsettled: &sql_sequences::Unsettled,
+    ) -> relational::clock::ExecutionClock {
+        clock.with_wall_fence(|| {
+            let lease = CallbackLease::new(db, Some(txn));
+            let unsettled = unsettled.clone();
+            move || {
+                if unsettled.is_empty() {
+                    return Ok(());
+                }
+                let result = lease.lease(Holder::Sequence)
+                    .and_then(|db| sql_sequences::settle(&db, &unsettled));
+                result.map_err(sequence_settlement_error)
+            }
+        })
+    }
+
     pub(super) fn normalize_copy_v2(
         &mut self,
         db: &EngineLease,
         prepared: &relational::Prepared,
         input: relational::CopyInput,
         clock: &relational::StatementClock,
+        expose_rows: bool,
     ) -> Result<(relational::Prepared, Vec<Vec<relational::Value>>, u64), CoreError> {
         if let Err(error) = Self::check_prepared_generation(prepared, Some(db)) {
             // The stale plan cannot settle sequence obligations on this engine.
@@ -453,6 +480,7 @@ impl SqlSession {
                     self.xact.clone(),
                     self.v2_transaction.as_ref().map(|txn| txn.id()),
                 ));
+            let context = Self::fence_v2_wall_clock(context, db, txn, &self.sequence_unsettled);
             let _volatile = relational::volatile::Scope::statement(&self.volatile, self.in_transaction());
             let output = state.sql.normalize_copy(prepared, input, Some(&context));
             crate::cancellation::check()?;
@@ -461,15 +489,14 @@ impl SqlSession {
             }
             output.map_err(CoreError::Sql)
         })();
-        // Successful normalized rows go to COPY FROM ingest, never to a client;
-        // COPY reports a count, and its statement end or commit settles them.
-        if result.is_err() {
-            // abort() settles best-effort; surface a settle failure instead of a
-            // value-bearing error whose value is not yet durably covered.
-            let settled = sql_sequences::settle(db, &self.sequence_unsettled);
-            self.abort();
-            settled?;
+        if !expose_rows && result.is_ok() && !relational::has_sql_notices() {
+            // A gateway-buffered or internal ingest page can retain private defaults.
+            return result;
         }
+        let result = sql_sequences::settle(db, &self.sequence_unsettled)
+            .map_err(sequence_settlement_error)
+            .and(result);
+        if result.is_err() { self.abort_transaction(false); }
         result
     }
 
@@ -486,21 +513,27 @@ impl SqlSession {
         let autocommit =
             self.v2_transaction.is_none() && self.protected.is_none() && p.control().is_none();
         let result = self.execute_v2_inner(db, p, params, expected_version, clock, check_reply);
-        if result.is_ok() && (autocommit || p.control() == Some("commit")) {
-            // publish_v2_sql settled all obligations before submitting the commit.
+        if result.is_ok() && (autocommit || matches!(p.control(), Some("commit" | "rollback"))) {
+            // Publication settled before commit. Rollback can report its
+            // outcome while retaining private obligations.
             return result;
         }
-        // Result columns also identify spilled/streamed rows absent from rows.
+        // Even a command count can depend on a draw. A private COPY page
+        // reports its count only at CopyDone.
+        let private_copy_page = self.copy_input.as_ref()
+            .is_some_and(|copy| copy.executing && !copy.finishing);
         let should_settle = result.is_err()
+            || (p.control().is_none() && !private_copy_page)
             || result.as_ref().is_ok_and(|result| !result.columns.is_empty() || !result.rows.is_empty())
-            || self.v2_transaction.is_none()
-            || p.control() == Some("rollback");
-        if should_settle && let Err(error) = sql_sequences::settle(db, &self.sequence_unsettled)
-        {
-            self.abort();
-            if !result.as_ref().is_err_and(|error| crate::sqlstate(error) == "08007") {
-                return Err(error);
-            }
+            || relational::has_sql_notices()
+            || self.v2_transaction.is_none();
+        if should_settle && let Err(error) = sql_sequences::settle(db, &self.sequence_unsettled) {
+            self.abort_transaction(false);
+            let error = match result {
+                Err(original) if crate::sqlstate(&original) == "08007" => original,
+                _ => error,
+            };
+            return Err(sequence_settlement_error(error));
         }
         result
     }
@@ -644,7 +677,7 @@ impl SqlSession {
                             if self.v2_transaction.is_none() {
                                 return Err(CoreError::Sql(E::Transaction));
                             }
-                            self.rollback();
+                            self.rollback_without_settling();
                         }
                         _ => unreachable!("v2 classification limits transaction controls"),
                     }
@@ -1142,7 +1175,7 @@ impl SqlSession {
                                     txn.id(), engine::locks::LockKey::Table(0), catalog_lock_mode,
                                 )
                             ));
-                            clock.with_sequences(sql_sequences::callback(
+                            let clock = clock.with_sequences(sql_sequences::callback(
                                 CallbackLease::new(db, Some(txn)),
                                 catalog_image.clone(),
                                 self.v2_pending_sequences.clone(),
@@ -1156,11 +1189,26 @@ impl SqlSession {
                                 CallbackLease::new(db, Some(txn)),
                                 self.xact.clone(),
                                 Some(txn.id()),
-                            ))
+                            ));
+                            Self::fence_v2_wall_clock(clock, db, txn, &self.sequence_unsettled)
                         });
                         let context = context.map(|clock| match self.privilege_callback.as_ref().filter(|_| p.has_privilege_inquiry()) {
-                            Some(callback) => clock.with_privileges(callback.clone(), privilege_provider(
-                                PrivilegeImage::Catalog(catalog_image.clone()), self.search_path.clone(), Some(txn), self.admin.roles(), Some(db))),
+                            Some(callback) => {
+                                let callback = callback.clone();
+                                let lease = CallbackLease::new(db, Some(txn));
+                                let unsettled = self.sequence_unsettled.clone();
+                                let check: PrivilegeCallback = Arc::new(move |name, args, metadata| {
+                                    // The embedder can inspect sequence-derived arguments.
+                                    if !unsettled.is_empty() {
+                                        let db = lease.lease(Holder::Sequence)?;
+                                        sql_sequences::settle(&db, &unsettled)
+                                            .map_err(sequence_settlement_error)?;
+                                    }
+                                    callback(name, args, metadata)
+                                });
+                                clock.with_privileges(check, privilege_provider(
+                                    PrivilegeImage::Catalog(catalog_image.clone()), self.search_path.clone(), Some(txn), self.admin.roles(), Some(db)))
+                            }
                             None => clock,
                         });
                         if let Some(input) = self.copy_input.as_mut() {
@@ -1441,8 +1489,13 @@ impl SqlSession {
                     }
                     txn.release(mark).map_err(CoreError::from)?;
                     if self.v2_transaction.is_none() && !protected && let Ok(result) = &result {
-                        if writing {
-                            check_autocommit_reply(check_reply, result)?;
+                        if writing && let Some(check) = check_reply
+                            && (!result.columns.is_empty() || !result.rows.is_empty())
+                        {
+                            // The embedder can inspect the rows or consume a spill.
+                            sql_sequences::settle(db, &self.sequence_unsettled)
+                                .map_err(sequence_settlement_error)?;
+                            check_autocommit_reply(Some(check), result)?;
                         }
                         let txn = implicit.take().expect("implicit transaction");
                         self.publish_v2_sql(db, &inner, txn, false, &mut ticket)?;
@@ -1470,7 +1523,8 @@ impl SqlSession {
             }
         });
         if result.is_err() {
-            self.abort();
+            // The statement wrapper settles before returning the error.
+            self.abort_transaction(false);
         }
         if self.v2_transaction.is_none() {
             self.xact.lock().unwrap_or_else(|e| e.into_inner()).take();

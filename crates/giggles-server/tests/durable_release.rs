@@ -757,30 +757,37 @@ mod mechanism_a {
             let mut bytes = extended_execute(&sql);
             bytes.extend(frame(b'H', b""));
             wire.write_all(&bytes).await.unwrap();
-            assert_eq!(message(&mut wire).await.0, b'1');
-            assert_eq!(message(&mut wire).await.0, b'2');
-            assert_eq!(message(&mut wire).await, (b'C', b"INSERT 0 33\0".to_vec()));
-            assert_eq!(admin.sql_operations_live(), 0);
-            wire.write_all(&frame(b'S', b"")).await.unwrap();
         } else {
             query(&mut wire, &sql).await;
         }
         entered(&reservation).await;
-        wait_until(|| service.durable_tracker().live() == 1, "commit waiting on reservation acknowledgment").await;
-        assert_eq!(admin.sql_operations_live(), 1);
+        wait_until(|| service.durable_tracker().live() == 1, "statement waiting on reservation acknowledgment").await;
+        if !extended {
+            assert_eq!(admin.sql_operations_live(), 1);
+        }
         assert_eq!(service.blocking_permits_held(), 1);
         assert_eq!(service.durability_metrics()["durable_releases_total"]["local"], 0);
         cancel(running.address, &cancel_key).await;
-        // The cancellable wait must exit while the acknowledgment is held.
-        // Transaction cleanup can still settle the independent reservation.
-        wait_until(|| service.durable_tracker().live() == 0, "cancellation stopped reservation wait").await;
+        if extended {
+            // Execute must fail before returning CommandComplete, with Sync
+            // still unsent and the reservation still held.
+            assert_eq!(message(&mut wire).await.0, b'1');
+            assert_eq!(message(&mut wire).await.0, b'2');
+            assert_error(message(&mut wire).await, b"57014");
+            wire.write_all(&frame(b'S', b"")).await.unwrap();
+            assert_eq!(message(&mut wire).await, (b'Z', b"I".to_vec()));
+        } else {
+            wait_until(|| service.durable_tracker().live() == 0, "cancellation stopped reservation wait").await;
+        }
         admin.set_commit_sync_hook(None);
         reservation.release(false);
 
-        let replies = until_ready(&mut wire).await;
-        assert_eq!(replies.len(), 2);
-        assert_error(replies[0].clone(), b"57014");
-        assert_eq!(replies[1], (b'Z', b"I".to_vec()));
+        if !extended {
+            let replies = until_ready(&mut wire).await;
+            assert_eq!(replies.len(), 2);
+            assert_error(replies[0].clone(), b"57014");
+            assert_eq!(replies[1], (b'Z', b"I".to_vec()));
+        }
         assert_eq!(service.durability_metrics()["durable_releases_total"]["local"], 0);
         drop(wire);
         close_fixture(&admin, &service, running, client, connection).await;
@@ -797,6 +804,407 @@ mod mechanism_a {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn implicit_sync_cancel_during_reservation_ack_rolls_back() {
         cancel_while_reservation_is_pending(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_from_notice_waits_for_reservation_ack() {
+        let (path, admin, service, running, client, connection) = fixture().await;
+        client.batch_execute(
+            "CREATE SEQUENCE copy_notice_seq;
+             CREATE TABLE copy_notice(id bigint PRIMARY KEY DEFAULT nextval('copy_notice_seq'), query tsquery);
+             SELECT setval('copy_notice_seq', 2)",
+        ).await.unwrap();
+        let mut wire = connect(running.address).await;
+        query(&mut wire, "COPY copy_notice(id, query) FROM STDIN WITH (FORMAT csv, DEFAULT 'use_default')").await;
+        assert_eq!(message(&mut wire).await.0, b'G');
+
+        let reservation = giggles_core::CommitSyncHook::new();
+        let _release = ReleaseOnDrop(reservation.clone());
+        admin.set_commit_sync_hook(Some(reservation.clone()));
+        let mut data: String = (100..299).map(|id| format!("{id},cat\n")).collect();
+        data.push_str("use_default,\"   \"\n");
+        wire.write_all(&frame(b'd', data.as_bytes())).await.unwrap();
+        entered(&reservation).await;
+        let mut byte = [0];
+        tokio::select! {
+            biased;
+            early = wire.peek(&mut byte) => panic!("COPY replied before settling its notice: {early:?}"),
+            () = wait_until(|| service.durable_tracker().live() == 1, "COPY notice settlement") => {}
+        }
+        admin.set_commit_sync_hook(None);
+        reservation.release(false);
+        let (tag, notice) = message(&mut wire).await;
+        assert_eq!(tag, b'N');
+        assert!(String::from_utf8_lossy(&notice).contains("lexemes: \"   \""));
+        wire.write_all(&frame(b'c', b"")).await.unwrap();
+        let replies = until_ready(&mut wire).await;
+        assert_eq!(replies, [(b'C', b"COPY 200\0".to_vec()), (b'Z', b"I".to_vec())]);
+        drop(wire);
+        finish(path, admin, service, running, client, connection).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_from_cancelled_reservation_scrubs_default_error() {
+        let (path, admin, service, running, client, connection) = fixture().await;
+        client.batch_execute(
+            "CREATE SEQUENCE copy_error_seq;
+             CREATE TABLE copy_error(payload bigint, id uuid DEFAULT (nextval('copy_error_seq')::text)::uuid);
+             SELECT setval('copy_error_seq', 54320)",
+        ).await.unwrap();
+        let (mut wire, cancel_key) = connect_cancellable(running.address).await;
+        query(&mut wire, "COPY copy_error(payload) FROM STDIN").await;
+        assert_eq!(message(&mut wire).await.0, b'G');
+        let reservation = giggles_core::CommitSyncHook::new();
+        let _release = ReleaseOnDrop(reservation.clone());
+        admin.set_commit_sync_hook(Some(reservation.clone()));
+        wire.write_all(&frame(b'd', "1\n".repeat(200).as_bytes())).await.unwrap();
+        entered(&reservation).await;
+        cancel(running.address, &cancel_key).await;
+        let response = message(&mut wire).await;
+        admin.set_commit_sync_hook(None);
+        reservation.release(false);
+        assert_error(response.clone(), b"57014");
+        assert!(!String::from_utf8_lossy(&response.1).contains("54321"), "{response:?}");
+        assert_eq!(message(&mut wire).await, (b'Z', b"I".to_vec()));
+        drop(wire);
+        finish(path, admin, service, running, client, connection).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binary_copy_buffers_a_page_before_settling_at_done() {
+        binary_copy_with_ack_held(None).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binary_copy_fail_returns_with_ack_held() {
+        binary_copy_with_ack_held(Some((b'f', b"client stopped COPY\0", b"57014"))).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binary_copy_decoder_error_returns_with_ack_held() {
+        binary_copy_with_ack_held(Some((b'd', b"extra data", b"22P04"))).await;
+    }
+
+    async fn binary_copy_with_ack_held(failure: Option<(u8, &[u8], &[u8])>) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            binary_copy_page(failure).await;
+        }).await.expect("binary COPY fixture timed out");
+    }
+
+    async fn binary_copy_page(failure: Option<(u8, &[u8], &[u8])>) {
+        let (path, admin, service, running, client, connection) = fixture().await;
+        client.batch_execute(
+            "CREATE SEQUENCE binary_seq;
+             CREATE TABLE binary_page(id bigint PRIMARY KEY DEFAULT nextval('binary_seq'), payload int);
+             SELECT setval('binary_seq', 2)",
+        ).await.unwrap();
+        let mut wire = connect(running.address).await;
+        query(&mut wire, "SET statement_timeout = 0").await;
+        assert_eq!(until_ready(&mut wire).await.last().unwrap().1, b"I");
+        query(&mut wire, "COPY binary_page(payload) FROM STDIN (FORMAT binary)").await;
+        assert_eq!(message(&mut wire).await.0, b'G');
+
+        let reservation = giggles_core::CommitSyncHook::new();
+        let _release = ReleaseOnDrop(reservation.clone());
+        admin.set_commit_sync_hook(Some(reservation.clone()));
+        let mut data = b"PGCOPY\n\xff\r\n\0".to_vec();
+        data.extend([0; 8]); // Flags and header extension length.
+        data.extend(1i16.to_be_bytes());
+        data.extend(4i32.to_be_bytes());
+        data.extend(42i32.to_be_bytes());
+        data.extend((-1i16).to_be_bytes());
+        let tasks_before = service.pgwire_blocking_tasks();
+        wire.write_all(&frame(b'd', &data)).await.unwrap();
+        entered(&reservation).await;
+        wait_until(
+            || service.pgwire_blocking_tasks() > tasks_before && service.blocking_permits_held() == 0,
+            "binary COPY page waited for its reservation",
+        ).await;
+
+        if let Some((tag, body, code)) = failure {
+            let replies = tokio::time::timeout(Duration::from_secs(2), async {
+                wire.write_all(&frame(tag, body)).await.unwrap();
+                until_ready(&mut wire).await
+            }).await;
+            admin.set_commit_sync_hook(None);
+            reservation.release(false);
+            let replies = replies.expect("binary COPY rejection waited for the held reservation");
+            assert_eq!(replies.len(), 2);
+            assert_error(replies[0].clone(), code);
+            assert_eq!(replies[1], (b'Z', b"I".to_vec()));
+            assert_eq!(client.query_one("SELECT count(*) FROM binary_page", &[]).await.unwrap().get::<_, i64>(0), 0);
+            drop(wire);
+            finish(path, admin, service, running, client, connection).await;
+            return;
+        }
+
+        wire.write_all(&frame(b'c', b"")).await.unwrap();
+        let mut byte = [0];
+        tokio::select! {
+            biased;
+            early = wire.peek(&mut byte) => panic!("CopyDone replied while its reservation was held: {early:?}"),
+            () = wait_until(|| service.durable_tracker().live() == 1, "CopyDone settlement") => {}
+        }
+        admin.set_commit_sync_hook(None);
+        reservation.release(false);
+        assert_eq!(until_ready(&mut wire).await, [(b'C', b"COPY 1\0".to_vec()), (b'Z', b"I".to_vec())]);
+        let row = client.query_one("SELECT id, payload FROM binary_page", &[]).await.unwrap();
+        assert_eq!((row.get::<_, i64>(0), row.get::<_, i32>(1)), (3, 42));
+        drop(wire);
+        finish(path, admin, service, running, client, connection).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_sync_recovers_timed_out_execute_with_held_ack() {
+        let (path, admin, service, running, client, connection) = fixture().await;
+        client.batch_execute(
+            "CREATE SEQUENCE recover_seq;
+             CREATE TABLE recover_insert(id bigint PRIMARY KEY DEFAULT nextval('recover_seq'));
+             SELECT setval('recover_seq', 2)",
+        ).await.unwrap();
+        let mut wire = connect(running.address).await;
+        query(&mut wire, "SET statement_timeout = '2s'").await;
+        assert_eq!(until_ready(&mut wire).await.last().unwrap().1, b"I");
+        let reservation = giggles_core::CommitSyncHook::new();
+        let _release = ReleaseOnDrop(reservation.clone());
+        admin.set_commit_sync_hook(Some(reservation.clone()));
+        wire.write_all(&extended_execute("INSERT INTO recover_insert DEFAULT VALUES")).await.unwrap();
+        entered(&reservation).await;
+        assert_eq!(message(&mut wire).await.0, b'1');
+        assert_eq!(message(&mut wire).await.0, b'2');
+        assert_error(message(&mut wire).await, b"57014");
+
+        wire.write_all(&frame(b'S', b"extra")).await.unwrap();
+        assert_error(message(&mut wire).await, b"08P01");
+        assert_eq!(message(&mut wire).await, (b'Z', b"I".to_vec()));
+        assert_eq!(admin.sql_transactions_live(), 0);
+        admin.set_commit_sync_hook(None);
+        reservation.release(false);
+        drop(wire);
+        finish(path, admin, service, running, client, connection).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_with_no_statement_timeout_returns_with_held_ack() {
+        let (path, admin, service, running, client, connection) = fixture().await;
+        client.batch_execute(
+            "CREATE SEQUENCE rollback_seq;
+             CREATE TABLE rollback_insert(id bigint PRIMARY KEY DEFAULT nextval('rollback_seq'));
+             SELECT setval('rollback_seq', 2)",
+        ).await.unwrap();
+        let (mut wire, cancel_key) = connect_cancellable(running.address).await;
+        query(&mut wire, "SET statement_timeout = 0").await;
+        assert_eq!(until_ready(&mut wire).await.last().unwrap().1, b"I");
+        query(&mut wire, "BEGIN").await;
+        assert_eq!(until_ready(&mut wire).await.last().unwrap().1, b"T");
+
+        let reservation = giggles_core::CommitSyncHook::new();
+        let _release = ReleaseOnDrop(reservation.clone());
+        admin.set_commit_sync_hook(Some(reservation.clone()));
+        wire.write_all(&extended_execute("INSERT INTO rollback_insert DEFAULT VALUES")).await.unwrap();
+        entered(&reservation).await;
+        wait_until(|| service.durable_tracker().live() == 1, "Execute reservation wait").await;
+        cancel(running.address, &cancel_key).await;
+        assert_eq!(message(&mut wire).await.0, b'1');
+        assert_eq!(message(&mut wire).await.0, b'2');
+        assert_error(message(&mut wire).await, b"57014");
+        wire.write_all(&frame(b'S', b"")).await.unwrap();
+        assert_eq!(message(&mut wire).await, (b'Z', b"E".to_vec()));
+
+        query(&mut wire, "ROLLBACK").await;
+        assert_eq!(until_ready(&mut wire).await, [(b'C', b"ROLLBACK\0".to_vec()), (b'Z', b"I".to_vec())]);
+        assert_eq!(admin.sql_transactions_live(), 0);
+        admin.set_commit_sync_hook(None);
+        reservation.release(false);
+        drop(wire);
+        finish(path, admin, service, running, client, connection).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum Rejection {
+        Batch,
+        Admission,
+        SimpleQuery,
+        ExtendedParse,
+        MalformedComment,
+        UnknownColumn,
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_simple_batch_returns_ready_with_ack_held() {
+        rejection_with_ack_held(Rejection::Batch).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn simple_batch_admission_refusal_returns_ready_with_ack_held() {
+        rejection_with_ack_held(Rejection::Admission).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_simple_prepare_returns_ready_with_ack_held() {
+        rejection_with_ack_held(Rejection::SimpleQuery).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_extended_parse_returns_ready_with_ack_held() {
+        rejection_with_ack_held(Rejection::ExtendedParse).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_parse_precheck_returns_ready_with_ack_held() {
+        rejection_with_ack_held(Rejection::MalformedComment).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_parse_description_returns_ready_with_ack_held() {
+        rejection_with_ack_held(Rejection::UnknownColumn).await;
+    }
+
+    async fn rejection_with_ack_held(rejection: Rejection) {
+        tokio::time::timeout(Duration::from_secs(30), reject_with_ack_held(rejection))
+            .await.expect("statement rejection fixture timed out");
+    }
+
+    async fn reject_with_ack_held(rejection: Rejection) {
+        let (path, admin, service, running, client, connection) = fixture().await;
+        tokio::time::timeout(Duration::from_secs(10), client.batch_execute(
+            "CREATE SEQUENCE rejected_seq;
+             CREATE TABLE rejected_insert(id bigint PRIMARY KEY DEFAULT nextval('rejected_seq'));
+             CREATE TABLE admission_hold(id int PRIMARY KEY, v int);
+             INSERT INTO admission_hold VALUES (7, 0);
+             SELECT setval('rejected_seq', 2)",
+        )).await.unwrap().unwrap();
+        let (mut wire, cancel_key) = connect_cancellable(running.address).await;
+        query(&mut wire, "SET statement_timeout = 0").await;
+        assert_eq!(until_ready(&mut wire).await.last().unwrap().1, b"I");
+        query(&mut wire, "BEGIN").await;
+        assert_eq!(until_ready(&mut wire).await.last().unwrap().1, b"T");
+
+        let reservation = giggles_core::CommitSyncHook::new();
+        let _release = ReleaseOnDrop(reservation.clone());
+        admin.set_commit_sync_hook(Some(reservation.clone()));
+        wire.write_all(&extended_execute("INSERT INTO rejected_insert DEFAULT VALUES")).await.unwrap();
+        entered(&reservation).await;
+        wait_until(|| service.durable_tracker().live() == 1, "Execute reservation wait").await;
+        cancel(running.address, &cancel_key).await;
+        assert_eq!(message(&mut wire).await.0, b'1');
+        assert_eq!(message(&mut wire).await.0, b'2');
+        assert_error(message(&mut wire).await, b"57014");
+        wire.write_all(&frame(b'S', b"")).await.unwrap();
+        assert_eq!(message(&mut wire).await, (b'Z', b"E".to_vec()));
+
+        let holder = if matches!(rejection, Rejection::Admission) {
+            service.set_role_statement_limits(RoleStatementLimits {
+                concurrent: 1, queue: 0, wait_ms: 10,
+            }).unwrap();
+            // The commit hook is held, so take the row lock without committing.
+            tokio::time::timeout(Duration::from_secs(5), client.batch_execute(&format!("BEGIN; {ROW_LOCK}")))
+                .await.unwrap().unwrap();
+            Some(hold_role(&service, &running).await)
+        } else {
+            None
+        };
+        let (sql, extended, idle, code) = match rejection {
+            Rejection::Batch => ("BEGIN; SELECT 1", false, false, b"25P02"),
+            Rejection::Admission => ("ROLLBACK; BEGIN", false, false, b"53000"),
+            Rejection::SimpleQuery => ("SELECT 1 FROM rejected_insert", false, false, b"25P02"),
+            Rejection::ExtendedParse => ("SELECT 1 FROM rejected_insert", true, false, b"25P02"),
+            Rejection::MalformedComment => ("COMMENT ON TABLE", true, true, b"42601"),
+            Rejection::UnknownColumn => ("SELECT nonexistent_column FROM rejected_insert", true, true, b"42703"),
+        };
+        let send = async |wire: &mut Wire, sql: &str| {
+            if extended {
+                let mut parse = frame(b'P', format!("\0{sql}\0\0\0").as_bytes());
+                parse.extend(frame(b'S', b""));
+                wire.write_all(&parse).await.unwrap();
+            } else {
+                query(wire, sql).await;
+            }
+            until_ready(wire).await
+        };
+        let replies = tokio::time::timeout(Duration::from_secs(2), async {
+            if idle {
+                query(&mut wire, "ROLLBACK").await;
+                assert_eq!(until_ready(&mut wire).await, [(b'C', b"ROLLBACK\0".to_vec()), (b'Z', b"I".to_vec())]);
+            }
+            if matches!(rejection, Rejection::SimpleQuery | Rejection::ExtendedParse) {
+                // The bare SELECT uses the catalog route. Check it, then use an
+                // application table so the second statement reaches core prepare.
+                let replies = send(&mut wire, "SELECT 1").await;
+                assert_eq!(replies.len(), 2);
+                assert_error(replies[0].clone(), b"25P02");
+                assert_eq!(replies[1], (b'Z', b"E".to_vec()));
+            }
+            send(&mut wire, sql).await
+        }).await;
+        admin.set_commit_sync_hook(None);
+        reservation.release(false);
+        drop(wire);
+        if let Some(holder) = holder {
+            release_role(&running, holder).await;
+        }
+        tokio::time::timeout(Duration::from_secs(10),
+            finish(path, admin, service, running, client, connection),
+        ).await.unwrap();
+        let replies = replies.expect("a rejected statement waited for the held reservation");
+        if matches!(rejection, Rejection::Admission) {
+            assert_eq!(replies.len(), 3);
+            assert_eq!(replies[0], (b'C', b"ROLLBACK\0".to_vec()));
+            assert_error(replies[1].clone(), b"53000");
+            assert_eq!(replies[2], (b'Z', b"I".to_vec()));
+        } else {
+            assert_eq!(replies.len(), 2);
+            assert_error(replies[0].clone(), code);
+            assert_eq!(replies[1], (b'Z', vec![if idle { b'I' } else { b'E' }]));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_releases_session_after_execute_timeout_with_held_ack() {
+        let (path, admin, service, running, client, connection) = fixture().await;
+        client.batch_execute(
+            "CREATE SEQUENCE terminate_seq;
+             CREATE TABLE terminate_insert(id bigint PRIMARY KEY DEFAULT nextval('terminate_seq'));
+             SELECT setval('terminate_seq', 2)",
+        ).await.unwrap();
+        let mut wire = connect(running.address).await;
+        query(&mut wire, "SET statement_timeout = '2s'").await;
+        assert_eq!(until_ready(&mut wire).await.last().unwrap().1, b"I");
+        let reservation = giggles_core::CommitSyncHook::new();
+        let _release = ReleaseOnDrop(reservation.clone());
+        admin.set_commit_sync_hook(Some(reservation.clone()));
+
+        let mut bytes = extended_execute("INSERT INTO terminate_insert DEFAULT VALUES RETURNING id");
+        bytes.extend(frame(b'S', b""));
+        wire.write_all(&bytes).await.unwrap();
+        entered(&reservation).await;
+        assert_eq!(message(&mut wire).await.0, b'1');
+        assert_eq!(message(&mut wire).await.0, b'2');
+        assert_error(message(&mut wire).await, b"57014");
+        let ready = message(&mut wire).await;
+        assert_eq!(ready, (b'Z', b"I".to_vec()));
+
+        wire.write_all(&frame(b'X', b"")).await.unwrap();
+        let eof = tokio::time::timeout(Duration::from_secs(2), wire.read(&mut [0])).await;
+        admin.set_commit_sync_hook(None);
+        reservation.release(false);
+        assert_eq!(eof.expect("Terminate did not close while the reservation was held").unwrap(), 0);
+        assert!(client.query("SELECT id FROM terminate_insert", &[]).await.unwrap().is_empty());
+        let after_release: i64 = client.query_one("SELECT nextval('terminate_seq')", &[]).await.unwrap().get(0);
+        assert!(after_release > 3);
+        drop(wire);
+        close_fixture(&admin, &service, running, client, connection).await;
+        drop(service);
+        drop(admin);
+        let reopened = Admin::open(&path, Limits::default()).unwrap();
+        let clock = giggles_core::relational::StatementClock {
+            unavailable: None, transaction_us: 100, statement_us: 100, zone: None, wall: None,
+        };
+        let rows = reopened.sql_session()
+            .execute_at("SELECT nextval('terminate_seq')", &[], None, &clock).unwrap().rows;
+        assert!(matches!(rows[0].values[0], giggles_core::relational::Value::Int(value) if value > after_release));
+        drop(reopened);
+        remove_fixture(&path).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
