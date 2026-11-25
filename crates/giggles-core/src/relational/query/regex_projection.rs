@@ -110,7 +110,7 @@ impl BoundQuery<'_> {
         };
         // Check projected errors before skipping OFFSET rows.
         for row in take_set_rows(rows, page) {
-            output.push(row?.0, &mut result)?;
+            output.push(row?.0, &mut result, execution)?;
         }
         output.finish(&mut result, execution)?;
         Ok(result)

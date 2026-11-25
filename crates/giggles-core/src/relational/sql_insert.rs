@@ -634,14 +634,45 @@ impl Insert {
         clock: Option<&clock::ExecutionClock>,
         source: &dyn scan::RowSource,
     ) -> R<(Self, SqlResult, Option<spill::Store<SqlRow>>)> {
-        let materialized = materialize_source(self, state, params, declared, clock,
-            &mut || crate::cancellation::check().is_err(), Some(source), true)?;
+        let materialized = scan::with_write_source(|| materialize_source(self, state, params, declared, clock,
+            &mut || crate::cancellation::check().is_err(), Some(source), true))?;
         let mut insert = materialized.insert;
         insert.source_types = Some(materialized.types);
         let (result, store) = materialized.stored.unwrap_or_default();
         Ok((insert, result, store))
     }
+    pub(super) fn streaming_plan(&self) -> Option<&query::plan::Plan> {
+        match &self.source {
+            Some(Source::Plan(plan, _)) if plan.streams_write_source() => Some(plan),
+            _ => None,
+        }
+    }
+
+    pub(super) fn stream_template(
+        &self,
+        state: &Relational,
+        params: &[Value],
+        declared: &[Option<DataType>],
+    ) -> R<(Self, Vec<Option<DataType>>)> {
+        let plan = self.streaming_plan().ok_or(SqlError::Unsupported)?;
+        let table = state.tables.get(&self.table).ok_or(SqlError::UnknownTable)?;
+        let indexes = source_indexes(self, state, table, declared)?;
+        let targets = indexes.iter().map(|i| &table.columns[*i]).collect::<Vec<_>>();
+        let mut parameters = self.describe(state, params.len(), declared)?
+            .parameters.into_iter().map(Some).collect::<Vec<_>>();
+        let mut template = self.batch(0, 0);
+        template.source_types = Some(plan.bind_insert_outputs(state, &targets, &mut parameters)?);
+        template.columns = targets.iter().map(|c| c.name.clone()).collect();
+        Ok((template, parameters))
+    }
+
     /// One page of stored source rows on the `source_store` template.
+    fn literal_template(&self, targets: &[&ColumnDef]) -> Self {
+        let mut template = self.batch(0, 0);
+        template.columns = targets.iter().map(|column| column.name.clone()).collect();
+        template
+    }
+
     pub(super) fn literal_page(&self, rows: Vec<SqlRow>) -> Self {
         let mut page = self.batch(0, 0);
         page.source_types.clone_from(&self.source_types);
@@ -684,7 +715,11 @@ impl Insert {
             casts: BTreeMap::new(), defaults, default_values, overriding, conflict: None, returning: None }
     }
     pub(super) fn from_query(table: String, columns: Vec<String>, source: query::Query) -> Self {
-        Self { table, columns, source: Some(Source::Query(Box::new(source))), alias: None,
+        Self::from_select_source(table, columns, Source::Query(Box::new(source)))
+    }
+
+    pub(super) fn from_select_source(table: String, columns: Vec<String>, source: Source) -> Self {
+        Self { table, columns, source: Some(source), alias: None,
             copy_input: None, normalized: None, copy_precoerced: false, source_types: None, rows: vec![],
             casts: BTreeMap::new(), defaults: vec![], default_values: false,
             overriding: None, conflict: None, returning: None }
@@ -999,18 +1034,21 @@ fn materialize_source(
         Source::Plan(plan, _) => {
             let types = plan.bind_insert_outputs(state, &targets, &mut parameters)?;
             let result = plan.execute(state, rows, params.len(), params, &parameters, clock, cancel)?;
+            if capture {
+                return Ok(SourceRows {
+                    insert: insert.literal_template(&targets),
+                    types,
+                    parameters,
+                    stored: Some((result, None)),
+                });
+            }
             (result, None, types)
         }
     };
     if result.rows.len() > MAX_ROWS {
         return Err(SqlError::Limit);
     }
-    let mut materialized = insert.clone();
-    materialized.source = None;
-    materialized.columns = indexes
-        .iter()
-        .map(|index| table.columns[*index].name.clone())
-        .collect();
+    let mut materialized = insert.literal_template(&targets);
     materialized.rows = result
         .rows
         .into_iter()

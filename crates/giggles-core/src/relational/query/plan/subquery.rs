@@ -486,9 +486,11 @@ pub(super) fn instantiate_scoped(
                     map_scalar(s, &mut replace)?;
                 }
             }
-            Body::Set { left, right, .. } => {
-                visit(left, shape, row, state, parameters, blocked, used)?;
-                visit(right, shape, row, state, parameters, blocked, used)?;
+            Body::Set { first, rest } => {
+                visit(first, shape, row, state, parameters, blocked, used)?;
+                for arm in rest {
+                    visit(&mut arm.plan, shape, row, state, parameters, blocked, used)?;
+                }
             }
             Body::Select(s) => {
                 map_query(&mut s.query, &mut replace)?;

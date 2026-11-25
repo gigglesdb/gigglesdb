@@ -301,6 +301,11 @@ impl SessionSettings {
         self.registry_base(entry) == "on"
     }
 
+    pub(crate) fn stack_depth_kb(&self) -> &str {
+        let entry = registry::find("max_stack_depth").expect("registered setting");
+        self.registry_base(entry)
+    }
+
     pub(crate) fn registry_base(&self, entry: &'static registry::Entry) -> &str {
         self.current.registered.get(entry.name).map_or(entry.default, String::as_str)
     }
@@ -985,7 +990,7 @@ mod tests {
             "-- empty\n;",
             "/* outer /* inner */ */; --done",
             "--quoted ';'",
-            "/* 🦀 */",
+            "/* ðŸ¦€ */",
         ] {
             assert_eq!(empty_sql(sql), Ok(true));
         }

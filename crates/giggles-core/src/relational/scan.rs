@@ -388,6 +388,28 @@ pub(crate) fn sort_bounded<T>(
 #[path = "scan_tests.rs"]
 mod tests;
 
+// Complex INSERT/CTAS sources and mutation output share a byte budget.
+pub(super) const WRITE_SOURCE_BYTES: usize = 384 * 1024 * 1024;
+
+thread_local! {
+    static WRITE_SOURCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn write_source() -> bool {
+    WRITE_SOURCE.get()
+}
+
+pub(super) fn with_write_source<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WRITE_SOURCE.set(self.0);
+        }
+    }
+    let _restore = Restore(WRITE_SOURCE.replace(true));
+    f()
+}
+
 // Cursor execution has an independent retention budget. Native Vec-returning
 // entry points continue to use the original result and retention limits.
 thread_local! {
@@ -404,12 +426,15 @@ pub(crate) fn with_cursor_limit<T>(limit: usize, f: impl FnOnce() -> T) -> T {
     f()
 }
 pub(crate) fn result_limit() -> usize {
-    CURSOR_LIMIT.with(|c| c.get().unwrap_or(MAX_RESULT_BYTES))
+    CURSOR_LIMIT.with(|c| c.get().unwrap_or(if WRITE_SOURCE.get() { WRITE_SOURCE_BYTES } else { MAX_RESULT_BYTES }))
 }
 pub(crate) fn retention_limit() -> usize {
-    CURSOR_LIMIT.with(|c| c.get().unwrap_or(MAX_RETAINED_BYTES))
+    CURSOR_LIMIT.with(|c| c.get().unwrap_or(if WRITE_SOURCE.get() { WRITE_SOURCE_BYTES } else { MAX_RETAINED_BYTES }))
 }
 pub(crate) fn query_row_limit() -> usize {
+    if WRITE_SOURCE.get() && CURSOR_LIMIT.get().is_none() {
+        return super::spill::query_row_limit(usize::MAX);
+    }
     super::spill::query_row_limit(CURSOR_LIMIT.with(|c| {
         c.get()
             .map_or(MAX_QUERY_ROWS, |n| n / std::mem::size_of::<SqlRow>())

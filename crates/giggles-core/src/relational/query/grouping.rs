@@ -1504,7 +1504,7 @@ impl Grouping {
                     break;
                 }
                 if skipped >= page.offset {
-                    output.push(SqlRow { values, version: 0 }, &mut result)?;
+                    output.push(SqlRow { values, version: 0 }, &mut result, execution)?;
                 }
                 skipped += 1;
                 continue;
@@ -1545,7 +1545,7 @@ impl Grouping {
                 Box::new(sorted)
             };
             for item in page.apply(rows) {
-                output.push(item?.0, &mut result)?;
+                output.push(item?.0, &mut result, execution)?;
             }
             output.finish(&mut result, execution)?;
             if cancel() {
@@ -1583,7 +1583,7 @@ impl Grouping {
             Ordering::Equal
         });
         for (row, _) in page.apply(rows.into_iter()) {
-            output.push(row, &mut result)?;
+            output.push(row, &mut result, execution)?;
         }
         output.finish(&mut result, execution)?;
         if cancel() {

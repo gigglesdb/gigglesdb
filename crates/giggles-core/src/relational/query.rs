@@ -1660,6 +1660,7 @@ struct MaterializedSubquery {
     has_null: bool,
 }
 struct Execution<'a> {
+    write_rows: Option<RefCell<&'a mut dyn FnMut(SqlRow) -> R<()>>>,
     cancel: RefCell<&'a mut dyn FnMut() -> bool>,
     visits: Cell<usize>,
     subqueries: RefCell<BTreeMap<usize, MaterializedSubquery>>,
@@ -1679,6 +1680,7 @@ struct Execution<'a> {
 impl<'a> Execution<'a> {
     fn new(cancel: &'a mut dyn FnMut() -> bool, declared: &[Option<DataType>]) -> Self {
         Self {
+            write_rows: None,
             cancel: RefCell::new(cancel),
             declared: declared.to_vec(),
             exists: RefCell::new(BTreeMap::new()),
@@ -5087,20 +5089,29 @@ fn charge_projected(bytes: &mut usize, value: &Value) -> R<()> {
 /// statement's spilled output (tuplestore), or a captured v2 subquery store.
 enum Output {
     Capped(usize),
+    WriteMaterialized(scan::Retention),
     Statement(spill::RowBuffer),
-    Capture(spill::Store<SqlRow>),
+    Capture(spill::Store<SqlRow>, Option<scan::Retention>),
+    WriteRows,
 }
 impl Output {
-    fn new(v2: bool, subquery: bool, insert_source: bool, capture: bool) -> R<Self> {
-        Ok(if v2 && capture {
-            Self::Capture(spill::Store::new())
+    fn new(v2: bool, subquery: bool, insert_source: bool, capture: bool, execution: &Execution<'_>) -> R<Self> {
+        Ok(if insert_source && execution.write_rows.is_some() {
+            Self::WriteRows
+        } else if v2 && capture {
+            Self::Capture(
+                spill::Store::new(),
+                scan::write_source().then(|| scan::Retention::new(scan::WRITE_SOURCE_BYTES)),
+            )
         } else if v2 && !subquery && !insert_source && spill::armed() {
             Self::Statement(spill::RowBuffer::new(Vec::new()).map_err(spill::sql_error)?)
+        } else if scan::write_source() {
+            Self::WriteMaterialized(scan::Retention::new(scan::WRITE_SOURCE_BYTES))
         } else {
             Self::Capped(0)
         })
     }
-    fn push(&mut self, row: SqlRow, result: &mut SqlResult) -> R<()> {
+    fn push(&mut self, row: SqlRow, result: &mut SqlResult, execution: &Execution<'_>) -> R<()> {
         match self {
             Self::Capped(bytes) => {
                 if result.rows.len() >= scan::query_row_limit() {
@@ -5110,18 +5121,27 @@ impl Output {
                 result.rows.push(row);
                 Ok(())
             }
+            Self::WriteMaterialized(retention) => {
+                retention.charge(searched::retained_row_bytes(&[], &row)?)?;
+                result.rows.push(row);
+                Ok(())
+            }
+            Self::WriteRows => (execution.write_rows.as_ref().expect("write row visitor").borrow_mut())(row),
             Self::Statement(buffer) => buffer.push(row).map_err(spill::sql_error),
-            Self::Capture(store) => {
+            Self::Capture(store, retention) => {
                 let bytes = searched::retained_row_bytes(&[], &row)?;
+                if let Some(retention) = retention {
+                    retention.charge(bytes)?;
+                }
                 store.push(row, bytes)
             }
         }
     }
     fn finish(self, result: &mut SqlResult, execution: &Execution<'_>) -> R<()> {
         match self {
-            Self::Capped(_) => Ok(()),
+            Self::Capped(_) | Self::WriteMaterialized(_) | Self::WriteRows => Ok(()),
             Self::Statement(buffer) => buffer.finish(result).map_err(spill::sql_error),
-            Self::Capture(mut store) => {
+            Self::Capture(mut store, _) => {
                 store.finish()?;
                 execution.captured.replace(Some(store));
                 Ok(())
@@ -5830,7 +5850,7 @@ impl BoundQuery<'_> {
             )?;
         }
         if let Some(grouping) = &self.grouping {
-            let output = Output::new(source.streams_reductions(), subquery, insert_source, capture)?;
+            let output = Output::new(source.streams_reductions(), subquery, insert_source, capture, execution)?;
             return grouping.execute(self, state, source, params, execution, false, output);
         }
         let offset = match self.query.offset() {
@@ -5895,7 +5915,7 @@ impl BoundQuery<'_> {
                     return Ok(result);
                 }
                 if self.set_order.is_some() {
-                    let output = Output::new(source.streams_reductions(), subquery, insert_source, capture)?;
+                    let output = Output::new(source.streams_reductions(), subquery, insert_source, capture, execution)?;
                     return self.execute_regex_projection(
                         std::iter::once(Ok(row)), params, scan::Page { offset, limit },
                         execution, output, result,
@@ -6063,7 +6083,7 @@ impl BoundQuery<'_> {
             affected: 0,
         };
         if self.set_order.is_some() {
-            let output = Output::new(source.streams_reductions(), subquery, insert_source, capture)?;
+            let output = Output::new(source.streams_reductions(), subquery, insert_source, capture, execution)?;
             return self.execute_regex_projection(filtered, params, page, execution, output, result);
         }
         let mut result_bytes = 0usize;
@@ -6098,9 +6118,9 @@ impl BoundQuery<'_> {
                     |a: &(SqlRow, Vec<Value>), b: &(SqlRow, Vec<Value>)| order_values(&a.1, &b.1, order),
                     &mut retention)?)
             };
-            let mut output = Output::new(true, subquery, insert_source, capture)?;
+            let mut output = Output::new(true, subquery, insert_source, capture, execution)?;
             for item in page.apply(rows) {
-                output.push(item?.0, &mut result)?;
+                output.push(item?.0, &mut result, execution)?;
             }
             output.finish(&mut result, execution)?;
             return Ok(result);
@@ -6295,7 +6315,7 @@ impl BoundQuery<'_> {
             // A v2 SqlSession statement's own output spills past SPILL_BYTES like
             // a tuplestore, so it has no row or byte ceiling; each row still does.
             // A captured v2 subquery result is spill-backed the same way.
-            let mut output = Output::new(source.streams_reductions(), subquery, insert_source, capture)?;
+            let mut output = Output::new(source.streams_reductions(), subquery, insert_source, capture, execution)?;
             let locked = rows.filter_map(|row| {
                 let (row, keys) = match row { Ok(row) => row, Err(e) => return Some(Err(e)) };
                 row_locks::lock(self, row, physical_source, params, state, execution)
@@ -6306,7 +6326,7 @@ impl BoundQuery<'_> {
                 let mut scalar_work_bytes = 0usize;
                 if !matches!(output, Output::Capped(_)) {
                     let row = self.project_sorted_tuple(&row, params, &mut scalar_work_bytes, &mut 0, &mut keys)?;
-                    output.push(row, &mut result)?;
+                    output.push(row, &mut result, execution)?;
                     continue;
                 }
                 if result.rows.len() >= scan::query_row_limit() {

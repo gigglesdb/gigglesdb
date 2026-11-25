@@ -233,6 +233,17 @@ fn finish(
         let name = definitions[i].1.name.clone();
         definitions[i].1.recursive = references(&definitions[i].1.query, &name) > 0;
         if definitions[i].1.recursive {
+            // Recursion consumes only the final UNION as its seed/step boundary.
+            if let Body::Set { first, rest } = &mut definitions[i].1.query.body
+                && rest.len() > 1
+            {
+                let last = rest.pop().expect("recursive set operation");
+                **first = Plan::new(Body::Set {
+                    first: first.clone(),
+                    rest: std::mem::take(rest),
+                });
+                rest.push(last);
+            }
             recursive_parts(&definitions[i].1).map_err(ParseError::Definite)?;
         } else if definitions[i].1.search.is_some() || definitions[i].1.cycle.is_some() {
             return Err(ParseError::Definite(SqlError::InvalidRecursion));
@@ -315,9 +326,11 @@ pub(super) fn remap(plan: &mut Plan, alias: &str, name: &str) {
                 from.remap(alias, name);
             }
         }
-        Body::Set { left, right, .. } => {
-            remap(left, alias, name);
-            remap(right, alias, name);
+        Body::Set { first, rest } => {
+            remap(first, alias, name);
+            for arm in rest {
+                remap(&mut arm.plan, alias, name);
+            }
         }
         _ => {}
     }
@@ -454,13 +467,10 @@ fn recursive_parts(cte: &Cte) -> R<(&Plan, &Plan, bool)> {
     {
         return Err(SqlError::InvalidRecursion);
     }
-    let Body::Set {
-        op: SetOp::Union,
-        all,
-        left,
-        right,
-    } = &cte.query.body
-    else {
+    let Body::Set { first: left, rest } = &cte.query.body else {
+        return Err(SqlError::InvalidRecursion);
+    };
+    let [SetArm { op: SetOp::Union, all, plan: right }] = rest.as_slice() else {
         return Err(SqlError::InvalidRecursion);
     };
     if references(left, &cte.name) != 0 || references(right, &cte.name) != 1 {
@@ -619,7 +629,7 @@ pub(super) fn resolve(
             meta
         } else if cte.recursive {
             recursive_parts(cte)?;
-            let Body::Set { left, right, .. } = &mut cte.query.body else {
+            let Body::Set { first: left, rest } = &mut cte.query.body else {
                 unreachable!()
             };
             let mut meta = left.resolve(&state, parameters)?;
@@ -634,7 +644,7 @@ pub(super) fn resolve(
                 &meta.typmods,
                 &meta.collations,
             )?;
-            let step = right.resolve(&state, parameters)?;
+            let step = rest[0].plan.resolve(&state, parameters)?;
             if meta.columns.len() != step.columns.len() {
                 return Err(SqlError::Syntax);
             }

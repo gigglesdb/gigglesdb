@@ -408,6 +408,35 @@ impl Relational {
             }
             return paged_pending(self, deferred, names, mode, sink);
         }
+        if expected.is_none() && sink.streams_index_builds()
+            && let Statement::Create { name, optional, as_query: Some(create), .. } = prepared.statement.get()
+            && create.with_data()
+        {
+            if create_table_as::CreateAs::skip(self, name, *optional).map_err(CoreError::Sql)? {
+                return Ok(SqlResult::default());
+            }
+            // Bind and install the empty destination before publishing pages.
+            // The SQL transaction owns both the new catalog and every page.
+            let mut empty = prepared.clone();
+            if let Some(unbound) = empty.unbound_statement.take() {
+                *empty.statement.get_mut() = (*unbound).clone();
+            }
+            let Statement::Create { as_query: Some(definition), .. } = empty.statement.get_mut() else {
+                unreachable!()
+            };
+            definition.omit_data();
+            self.execute_statement_inner(&empty, params, None, || crate::cancellation::check().is_err(),
+                clock, None, &mut Vec::new()).map_err(CoreError::Sql)?;
+            let mut population = prepared.clone();
+            population.epoch = self.epoch;
+            // Its source and target were resolved before the new table existed.
+            population.unbound_statement = None;
+            population.relations.clear();
+            *population.statement.get_mut() = Statement::InsertMulti(Box::new(
+                sql_insert::Insert::from_select_source(name.clone(), vec![], create.source.clone()),
+            ));
+            return paged_insert::execute(self, &population, params, clock, sink, version_end, deferred);
+        }
         if expected.is_none()
             && sink.streams_index_builds()
             && matches!(prepared.statement.get(), Statement::InsertMulti(_))

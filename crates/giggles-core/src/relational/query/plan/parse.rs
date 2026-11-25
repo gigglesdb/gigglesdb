@@ -2,6 +2,8 @@ use super::*;
 
 pub(super) type ParseResult<T> = Result<T, ParseError>;
 
+const MAX_SET_BRANCHES: usize = 8192;
+
 pub(super) fn parser(tokens: &[Token]) -> Parser {
     Parser { privilege_seen: false, privilege_casts: false,
         tokens: tokens.to_vec(),
@@ -305,40 +307,46 @@ fn query_expression(
         })
         .unwrap_or(tokens.len());
     let body = &tokens[..tail];
-    let mut split = None;
-    for i in positions.iter().copied().filter(|i| *i < tail) {
-        if word(&tokens[i], "union") || word(&tokens[i], "except") {
-            split = Some(i);
-        }
+    let operators: Vec<_> = positions.iter().copied().take_while(|i| *i < tail)
+        .filter_map(|i| {
+            let op = if word(&body[i], "union") {
+                SetOp::Union
+            } else if word(&body[i], "except") {
+                SetOp::Except
+            } else if word(&body[i], "intersect") {
+                SetOp::Intersect
+            } else {
+                return None;
+            };
+            Some((i, op))
+        })
+        .collect();
+    if operators.len() >= MAX_SET_BRANCHES {
+        user_types::view_replace_error("stack depth limit exceeded".into());
+        user_types::sql_error_hint("Increase the configuration parameter \"max_stack_depth\" (currently 2048kB), after ensuring the platform's stack depth limit is adequate.");
+        return Err(SqlError::StackDepth.into());
     }
-    if split.is_none() {
-        split = positions
-            .iter()
-            .copied()
-            .rfind(|i| *i < tail && word(&tokens[*i], "intersect"));
-    }
-    let plan = if let Some(i) = split {
-        let op = if word(&tokens[i], "union") {
-            SetOp::Union
-        } else if word(&tokens[i], "except") {
-            SetOp::Except
-        } else {
-            SetOp::Intersect
-        };
-        let all = body.get(i + 1).is_some_and(|t| word(t, "all"));
-        let modifier = all || body.get(i + 1).is_some_and(|t| word(t, "distinct"));
-        Plan::new(Body::Set {
-            op,
-            all,
-            left: Box::new(child_expression(&body[..i], tokens.get(i), owner, depth, next)?),
-            right: Box::new(child_expression(
-                &body[i + 1 + usize::from(modifier)..],
-                tokens.get(tail).or(following),
+    let intersect_only = operators.iter().all(|(_, op)| *op == SetOp::Intersect);
+    let mut splits = operators.into_iter()
+        .filter(|(_, op)| intersect_only || *op != SetOp::Intersect)
+        .peekable();
+    let plan = if let Some(&(first_end, _)) = splits.peek() {
+        let first = Box::new(child_expression(&body[..first_end], tokens.get(first_end), owner, depth, next)?);
+        let mut rest = Vec::new();
+        while let Some((i, op)) = splits.next() {
+            let all = body.get(i + 1).is_some_and(|t| word(t, "all"));
+            let modifier = all || body.get(i + 1).is_some_and(|t| word(t, "distinct"));
+            let end = splits.peek().map_or(tail, |(index, _)| *index);
+            let plan = child_expression(
+                &body[i + 1 + usize::from(modifier)..end],
+                tokens.get(end).or(following),
                 owner,
                 depth,
                 next,
-            )?),
-        })
+            )?;
+            rest.push(SetArm { op, all, plan });
+        }
+        Plan::new(Body::Set { first, rest })
     } else if body.first() == Some(&Token::Symbol('(')) {
         if body.last() != Some(&Token::Symbol(')')) {
             return Err(SqlError::Syntax.into());

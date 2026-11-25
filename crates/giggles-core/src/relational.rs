@@ -481,6 +481,8 @@ pub enum SqlError {
     ReservedName,
     #[serde(skip)]
     UndefinedFile,
+    #[serde(skip)]
+    StackDepth,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3424,6 +3426,14 @@ impl Prepared {
     /// Whether this DDL statement takes its definition from a query.
     pub fn is_create_as(&self) -> bool {
         matches!(self.statement.get(), Statement::Create { as_query: Some(_), .. })
+    }
+
+    pub(crate) fn appends_select_rows(&self) -> bool {
+        match self.statement.get() {
+            Statement::Create { as_query: Some(create), .. } => create.with_data(),
+            Statement::InsertMulti(insert) => insert.source.is_some() && insert.append_only(),
+            _ => false,
+        }
     }
 
     /// Command used when formatting completion frames after execution.

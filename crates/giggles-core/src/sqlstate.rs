@@ -47,7 +47,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::TextSearchUndefinedFunction) => "42883",
         CoreError::Sql(S::TextSearchProgramLimit) => "54000",
         CoreError::Sql(S::TooManyColumns) => "54011",
-        CoreError::Sql(S::TextSearchStatementTooComplex) => "54001",
+        CoreError::Sql(S::TextSearchStatementTooComplex | S::StackDepth) => "54001",
         CoreError::Sql(S::Syntax) => "42601",
         CoreError::Sql(S::UnknownTable) => "42P01",
         CoreError::Sql(S::UnknownColumn) => "42703",

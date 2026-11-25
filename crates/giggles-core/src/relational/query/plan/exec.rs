@@ -33,6 +33,47 @@ impl<'a> Relation<'a> {
         Ok(())
     }
 }
+fn same_types(left: &[ColumnDef], right: &[ColumnDef]) -> bool {
+    left.iter().zip(right).all(|(a, b)| a.data_type == b.data_type)
+}
+
+fn coerce_set_rows(
+    input: &mut Relation<'_>,
+    columns: &[ColumnDef],
+    clock: Option<&super::super::super::clock::ExecutionClock>,
+    execution: &Execution<'_>,
+) -> R<()> {
+    if same_types(&input.columns, columns) {
+        return Ok(());
+    }
+    for row in &mut input.rows {
+        if execution.cancelled() {
+            return Err(SqlError::Aborted);
+        }
+        let before = row.values.iter().map(value_bytes).sum::<usize>();
+        for ((value, source), target) in row.values.iter_mut().zip(&input.columns).zip(columns) {
+            let source = &source.data_type;
+            let target = &target.data_type;
+            if source != target {
+                *value = if target == &DataType::Oid
+                    && let Some(result) = text_search_types::cast_typed(value, source, target)
+                {
+                    result?
+                } else {
+                    functions::coerce_clocked(value.clone(), target, clock)?
+                };
+            }
+        }
+        let after = row.values.iter().map(value_bytes).sum::<usize>();
+        if after > before {
+            input.scope.borrow().charge(after - before)?;
+        } else {
+            input.scope.borrow().release(before - after);
+        }
+    }
+    Ok(())
+}
+
 impl scan::RowSource for Relation<'_> {
     fn scan<'s>(
         &'s self,
@@ -51,7 +92,71 @@ impl scan::RowSource for Relation<'_> {
         Err(SqlError::Unsupported)
     }
 }
+struct SeriesRows<'s, 'e> {
+    rows: srf::Series,
+    execution: &'s Execution<'e>,
+}
+
+impl scan::RowSource for SeriesRows<'_, '_> {
+    fn scan<'s>(
+        &'s self,
+        _: &TableDef,
+        range: &scan::KeyRange,
+        _: scan::Direction,
+    ) -> R<scan::SourceRows<'s>> {
+        if range.is_empty() {
+            return Ok(Box::new(std::iter::empty()));
+        }
+        Ok(Box::new(self.rows.clone().map(|row| {
+            self.execution.comparison()?;
+            Ok(scan::SourceRow { key: Cow::Borrowed(&[]), row: Cow::Owned(row) })
+        })))
+    }
+
+    fn get<'s>(&'s self, _: &TableDef, _: &[u8]) -> R<Option<scan::SourceRow<'s>>> {
+        Err(SqlError::Unsupported)
+    }
+}
+
 impl Plan {
+    fn write_series(&self) -> Option<(&Select, &srf::Function)> {
+        let Body::Select(select) = &self.body else { return None };
+        let join::From::Function { function, .. } = select.from.as_ref()? else { return None };
+        (self.ctes.is_empty() && self.order.is_empty() && self.limit.is_none()
+            && self.offset.is_none() && self.decorations.grouping_sets.is_none()
+            && self.decorations.sample.is_none() && self.decorations.distinct_on == 0
+            && select.applies.is_empty() && select.query.pageable_insert() && function.simple_series())
+            .then_some((select, function))
+    }
+
+    pub(in crate::relational) fn streams_write_source(&self) -> bool {
+        self.write_series().is_some()
+    }
+
+    pub(in crate::relational) fn stream_write_source<'a>(
+        &self,
+        state: &Relational,
+        params: &[Value],
+        declared: &[Option<DataType>],
+        clock: Option<&super::super::super::clock::ExecutionClock>,
+        cancel: &'a mut dyn FnMut() -> bool,
+        visit: &'a mut dyn FnMut(SqlRow) -> R<()>,
+    ) -> R<()> {
+        let bound = self.bind(state, params.len(), declared)?;
+        let (select, function) = bound.plan.write_series().ok_or(SqlError::Unsupported)?;
+        let mut parameters: Vec<_> = bound.description.parameters.into_iter().map(Some).collect();
+        let shape = select.from.clone().expect("series input").resolve(state, &mut parameters)?;
+        let catalog = join::catalog(state, &shape)?;
+        let query = join::prepare(&select.query, &shape)?;
+        let bound = query.bind_projection_seeded(&catalog, parameters.clone())?.with_clock(clock);
+        let rows = function.series(params, &parameters, clock)?;
+        let mut execution = Execution::new(cancel, declared);
+        execution.write_rows = Some(RefCell::new(visit));
+        let source = SeriesRows { rows, execution: &execution };
+        bound.execute_context(&catalog, &source, params, declared, &execution, false, true)?;
+        Ok(())
+    }
+
     #[expect(clippy::too_many_arguments, reason = "shared query execution context")]
     pub(in crate::relational) fn execute(
         &self,
@@ -225,43 +330,8 @@ impl Plan {
                     result.push(SqlRow { values, version: 0 })?;
                 }
             }
-            Body::Set {
-                op,
-                all,
-                left,
-                right,
-            } => {
-                let mut left = left.run(state, source, params, parameters, clock, execution)?;
-                let mut right = right.run(state, source, params, parameters, clock, execution)?;
-                for input in [&mut left, &mut right] {
-                    for row in &mut input.rows {
-                        if execution.cancelled() {
-                            return Err(SqlError::Aborted);
-                        }
-                        for (i, v) in row.values.iter_mut().enumerate() {
-                            let source = &input.columns[i].data_type;
-                            let target = &result.columns[i].data_type;
-                            if source != target {
-                                *v = if target == &DataType::Oid
-                                    && let Some(value) = text_search_types::cast_typed(v, source, target)
-                                {
-                                    value?
-                                } else {
-                                    functions::coerce_clocked(v.clone(), target, clock)?
-                                };
-                            }
-                        }
-                    }
-                }
-                setops::apply(
-                    *op,
-                    *all,
-                    left,
-                    right,
-                    &mut result,
-                    execution,
-                    &meta.collations,
-                )?;
+            Body::Set { first, rest } => {
+                result = Self::run_set(first, rest, state, source, params, parameters, clock, execution)?;
             }
         }
         if let Some(sample) = &self.decorations.sample { sample.apply(&mut result, params, parameters, clock, execution)?; }
@@ -338,6 +408,75 @@ impl Plan {
         }
         Ok(result)
     }
+
+    #[expect(clippy::too_many_arguments, reason = "shared query execution context")]
+    fn run_set<'a>(
+        first: &Plan,
+        rest: &[SetArm],
+        state: &Relational,
+        source: &dyn scan::RowSource,
+        params: &[Value],
+        parameters: &[Option<DataType>],
+        clock: Option<&super::super::super::clock::ExecutionClock>,
+        execution: &'a Execution<'_>,
+    ) -> R<Relation<'a>> {
+        let mut stages = Vec::with_capacity(rest.len());
+        bind::resolve_set(
+            &mut first.clone(),
+            &mut rest.to_vec(),
+            state,
+            &mut parameters.to_vec(),
+            |meta| {
+                let collations = meta.collations.iter().map(|value| {
+                    value.as_ref().map(|value| {
+                        functions::collation::combined(Some(value), None, value.ty.clone())
+                    }).transpose()
+                }).collect::<R<Vec<_>>>()?;
+                stages.push((meta.columns.clone(), meta.typmods.clone(), collations));
+                Ok(())
+            },
+        )?;
+        // Integer equality has a single representation, so a homogeneous UNION
+        // can sort/deduplicate once. Other comparisons keep their stage-local
+        // types, collations and representative-selection rules.
+        let integer_union = rest.len() > 1
+            && rest.iter().all(|arm| arm.op == SetOp::Union && !arm.all)
+            && stages[0].0.iter().all(|c| integer_type(&c.data_type))
+            && stages.windows(2).all(|pair| same_types(&pair[0].0, &pair[1].0));
+        let mut left = first.run(state, source, params, parameters, clock, execution)?;
+        for (arm, (columns, typmods, collations)) in rest.iter().zip(stages) {
+            let mut right = arm.plan.run(state, source, params, parameters, clock, execution)?;
+            coerce_set_rows(&mut left, &columns, clock, execution)?;
+            coerce_set_rows(&mut right, &columns, clock, execution)?;
+            if arm.op == SetOp::Union && arm.all || integer_union {
+                for row in right.rows {
+                    if execution.cancelled() {
+                        return Err(SqlError::Aborted);
+                    }
+                    left.push(row)?;
+                }
+                left.columns = columns;
+                left.typmods = typmods;
+            } else {
+                let mut out = Relation::new(columns, typmods, execution);
+                setops::apply(arm.op, arm.all, left, right, &mut out, execution, &collations)?;
+                left = out;
+            }
+        }
+        if integer_union {
+            let compare = |a: &SqlRow, b: &SqlRow| {
+                a.values.iter().zip(&b.values).map(|(a, b)| cmp(a, b))
+                    .find(|order| *order != Ordering::Equal).unwrap_or(Ordering::Equal)
+            };
+            setops::sort(&mut left.rows, execution, compare)?;
+            left.rows.dedup_by(|a, b| compare(a, b) == Ordering::Equal);
+            for row in &mut left.rows {
+                row.version = 0;
+            }
+        }
+        Ok(left)
+    }
+
 }
 fn page(
     s: Option<&Scalar>,

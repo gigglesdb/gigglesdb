@@ -70,6 +70,14 @@ pub(super) struct Definition {
 }
 
 impl CreateAs {
+    pub(super) fn with_data(&self) -> bool {
+        !self.no_data
+    }
+
+    pub(super) fn omit_data(&mut self) {
+        self.no_data = true;
+    }
+
     pub(super) fn completion_command(&self) -> &'static str {
         if self.no_data {
             "CREATE TABLE AS WITH NO DATA"

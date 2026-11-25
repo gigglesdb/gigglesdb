@@ -14,8 +14,10 @@ pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
         return false;
     }
     matches!(prepared.statement.get(), Statement::InsertMulti(i) if i.needs_pages()
-        && i.source.as_ref().is_none_or(|source| source.query()
-            .is_some_and(|q| paged_source(state, i, q) || stored_source(state, q))))
+        && i.source.as_ref().is_none_or(|source| match source {
+            sql_insert::Source::Plan(..) => true,
+            sql_insert::Source::Query(query) => stored_source(state, query),
+        }))
 }
 
 /// Row-local SELECTs of another table are evaluated one source page at a time.
@@ -25,21 +27,18 @@ fn paged_source(state: &Relational, insert: &sql_insert::Insert, query: &query::
         && !query.read_tables().contains(&insert.table)
 }
 
-/// Other sources (ORDER BY, DISTINCT, joins, grouping, the target itself)
-/// are read completely into a spill store before the first page is inserted,
-/// so the insert never sees its own rows (PostgreSQL's statement snapshot).
 fn stored_source(state: &Relational, query: &query::Query) -> bool {
     let tables = query.read_tables();
     !tables.is_empty() && tables.iter().all(|name| state.tables.contains_key(name)
         || matches!(query::views::projection(state, name), Ok(Some(_))))
 }
 
-pub(super) fn execute(
+pub(super) fn execute<S: RowSink>(
     state: &mut Relational,
     prepared: &Prepared,
     params: &[Value],
     clock: Option<&clock::ExecutionClock>,
-    sink: &mut impl RowSink,
+    sink: &mut S,
     version_end: u64,
     mut deferred: Option<&mut DeferralState>,
 ) -> Result<SqlResult, CoreError> {
@@ -60,57 +59,9 @@ pub(super) fn execute(
         .then(|| paged_dml::ActionWork::new(deferred.as_deref().cloned().unwrap_or_default()));
     let foreign_keys = state.ext.constraints.get(&table.id).into_iter().flatten()
         .any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. }));
-    let query = insert.source.as_ref().and_then(sql_insert::Source::query);
-    let stored = match query {
-        Some(query) if !paged_source(state, insert, query) => {
-            let mut stored = None;
-            let image = &*state;
-            sink.with_row_source(&mut |source| {
-                stored = Some(insert.source_store(image, params, &prepared.parameter_types, clock, source)?);
-                Ok(())
-            })?;
-            stored
-        }
-        _ => None,
-    };
-    let mut stored_rows = match &stored {
-        Some((_, result, store)) => Some(query::subquery_rows(result, store.as_ref()).map_err(CoreError::Sql)?),
-        None => None,
-    };
-    loop {
-        let (input, done) = if let (Some((template, ..)), Some(rows)) = (&stored, stored_rows.as_mut()) {
-            crate::cancellation::check()?;
-            let page = rows.by_ref().take(SHARED_WRITE_ROWS)
-                .map(|row| row.map(std::borrow::Cow::into_owned))
-                .collect::<R<Vec<_>>>().map_err(CoreError::Sql)?;
-            if page.is_empty() {
-                break;
-            }
-            (template.literal_page(page), false)
-        } else if let Some(query) = query {
-            let table = &state.tables[&query.read_tables()[0]];
-            let next = sink.read_page(table, after.take())?;
-            let done = next.is_none();
-            let (last, rows) = next.unwrap_or_default();
-            after = Some(last);
-            let mut source = state.clone();
-            source.rows.insert(table.id, rows);
-            (
-                insert
-                    .source_page(&source, params, &prepared.parameter_types, clock)
-                    .map_err(CoreError::Sql)?,
-                done,
-            )
-        } else {
-            if start == insert.row_count() {
-                break;
-            }
-            let end = (start + SHARED_WRITE_ROWS).min(insert.row_count());
-            let input = insert.batch(start, end);
-            start = end;
-            (input, false)
-        };
-
+    let mut returned = scan::Retention::new(scan::WRITE_SOURCE_BYTES);
+    let mut publish = |state: &mut Relational, sink: &mut S,
+                       input: sql_insert::Insert| -> Result<(), CoreError> {
         let mut page = state.clone();
         // Outgoing FK checks see all input at statement end. Referenced-key
         // updates instead publish through the bounded referential-action queue.
@@ -137,9 +88,104 @@ pub(super) fn execute(
         }
         result.columns = part.columns;
         result.affected += part.affected;
+        for row in &part.rows {
+            if insert.source.is_some() {
+                let bytes = searched::retained_row_bytes(&[], row).map_err(CoreError::Sql)?;
+                returned.charge(bytes).map_err(CoreError::Sql)?;
+            }
+        }
         output.extend(part.rows)?;
-        if done {
-            break;
+        Ok(())
+    };
+
+    if let Some(plan) = insert.streaming_plan() {
+        // The source has no table dependencies. Its lazy cursor and the
+        // physical writer can advance together under one statement savepoint.
+        let catalog = state.clone();
+        let (template, parameters) = insert.stream_template(&catalog, params, &prepared.parameter_types).map_err(CoreError::Sql)?;
+        let mut rows = Vec::with_capacity(SHARED_WRITE_ROWS);
+        let mut write_error = None;
+        let mut emitted = false;
+        let streamed = plan.stream_write_source(
+            &catalog, params, &parameters, clock, &mut || crate::cancellation::check().is_err(),
+            &mut |row| {
+                emitted = true;
+                rows.push(row);
+                if rows.len() == SHARED_WRITE_ROWS {
+                    let input = template.literal_page(std::mem::replace(&mut rows, Vec::with_capacity(SHARED_WRITE_ROWS)));
+                    if let Err(error) = publish(state, sink, input) {
+                        write_error = Some(error);
+                        return Err(SqlError::Aborted);
+                    }
+                }
+                Ok(())
+            },
+        );
+        if let Some(error) = write_error { return Err(error); }
+        streamed.map_err(CoreError::Sql)?;
+        // An empty page also binds the RETURNING header for a zero-row source.
+        if !rows.is_empty() || insert.returning.is_some() && !emitted {
+            publish(state, sink, template.literal_page(rows))?;
+        }
+    } else {
+        let query = insert.source.as_ref().and_then(sql_insert::Source::query)
+            .filter(|query| paged_source(state, insert, query));
+        let stored = if insert.source.is_some() && query.is_none() {
+                let mut stored = None;
+                let image = &*state;
+                sink.with_row_source(&mut |source| {
+                    stored = Some(insert.source_store(image, params, &prepared.parameter_types, clock, source)?);
+                    Ok(())
+                })?;
+                stored
+        } else {
+            None
+        };
+        let mut stored_rows = match &stored {
+            Some((_, result, store)) => Some(query::subquery_rows(result, store.as_ref()).map_err(CoreError::Sql)?),
+            None => None,
+        };
+        let mut published = false;
+        loop {
+            let (input, done) = if let (Some((template, ..)), Some(rows)) = (&stored, stored_rows.as_mut()) {
+                crate::cancellation::check()?;
+                let page = rows.by_ref().take(SHARED_WRITE_ROWS)
+                    .map(|row| row.map(std::borrow::Cow::into_owned))
+                    .collect::<R<Vec<_>>>().map_err(CoreError::Sql)?;
+                let done = page.is_empty();
+                if done && (published || insert.returning.is_none()) {
+                    break;
+                }
+                (template.literal_page(page), done)
+            } else if let Some(query) = query {
+                let table = &state.tables[&query.read_tables()[0]];
+                let next = sink.read_page(table, after.take())?;
+                let done = next.is_none();
+                let (last, rows) = next.unwrap_or_default();
+                after = Some(last);
+                let mut source = state.clone();
+                source.rows.insert(table.id, rows);
+                (
+                    insert
+                        .source_page(&source, params, &prepared.parameter_types, clock)
+                        .map_err(CoreError::Sql)?,
+                    done,
+                )
+            } else {
+                if start == insert.row_count() {
+                    break;
+                }
+                let end = (start + SHARED_WRITE_ROWS).min(insert.row_count());
+                let input = insert.batch(start, end);
+                start = end;
+                (input, false)
+            };
+
+            publish(state, sink, input)?;
+            published = true;
+            if done {
+                break;
+            }
         }
     }
     if let Some(actions) = actions {

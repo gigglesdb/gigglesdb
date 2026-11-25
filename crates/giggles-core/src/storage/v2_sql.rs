@@ -1132,7 +1132,12 @@ impl SqlSession {
                             {
                                 range
                             } else {
-                                let range = db.sequences.reserve_range(3, 0, 1_000_001)?;
+                                let count = if p.appends_select_rows() {
+                                    txn.append_version_budget()
+                                } else {
+                                    1_000_001
+                                };
+                                let range = db.sequences.reserve_range(3, 0, count)?;
                                 if let Some(input) = self.copy_input.as_mut() {
                                     input.versions = Some(range.clone());
                                 }

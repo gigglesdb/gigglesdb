@@ -628,6 +628,13 @@ mod partial_indexes;
 #[path = "sql_dml_sources.rs"]
 mod sql_dml_sources;
 
+#[cfg(feature = "engine-rocksdb")]
+#[path = "sql_large_insert_select.rs"]
+mod sql_large_insert_select;
+
+#[path = "sql_union_chain.rs"]
+mod sql_union_chain;
+
 #[path = "window_grouping_sets.rs"]
 mod window_grouping_sets;
 #[path = "unbounded_kv_reads.rs"]

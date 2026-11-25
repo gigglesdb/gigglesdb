@@ -136,7 +136,71 @@ pub(super) fn array_values(value: Value, ty: &DataType) -> R<Vec<Value>> {
         _ => Err(SqlError::Type),
     }
 }
+#[derive(Clone)]
+pub(super) struct Series {
+    current: Option<i64>,
+    stop: i64,
+    step: i64,
+    ordinality: Option<i64>,
+}
+
+impl Iterator for Series {
+    type Item = SqlRow;
+
+    fn next(&mut self) -> Option<SqlRow> {
+        let n = self.current?;
+        if (self.step > 0 && n > self.stop) || (self.step < 0 && n < self.stop) {
+            return None;
+        }
+        self.current = n.checked_add(self.step);
+        let mut values = vec![Value::Int(n)];
+        if let Some(ordinality) = &mut self.ordinality {
+            values.push(Value::Int(*ordinality));
+            *ordinality += 1;
+        }
+        Some(SqlRow { values, version: 0 })
+    }
+}
+
 impl Function {
+    pub(super) fn simple_series(&self) -> bool {
+        self.name == "generate_series" && self.input.is_none()
+    }
+
+    pub(super) fn series(
+        &self,
+        params: &[Value],
+        parameters: &[Option<DataType>],
+        clock: Option<&super::super::super::clock::ExecutionClock>,
+    ) -> R<Series> {
+        let row = Tuple { source_versions: vec![], values: vec![], version: 0 };
+        let values = self.args.iter().map(|arg| {
+            let mut bound = arg.bind(&|_, _| Err(SqlError::UnknownColumn), &[], parameters)?;
+            bound.attach_clock(clock);
+            bound.eval(&row, params, &mut 0)
+        }).collect::<R<Vec<_>>>()?;
+        self.series_values(&values)
+    }
+
+    fn series_values(&self, values: &[Value]) -> R<Series> {
+        let ordinality = self.ordinality.then_some(1);
+        if values.contains(&Value::Null) {
+            return Ok(Series { current: None, stop: 0, step: 1, ordinality });
+        }
+        let [Value::Int(start), Value::Int(stop), ..] = values else {
+            return Err(SqlError::Type);
+        };
+        let step = match values.get(2) {
+            Some(Value::Int(n)) => *n,
+            None => 1,
+            _ => return Err(SqlError::Type),
+        };
+        if step == 0 {
+            return Err(SqlError::InvalidParameterValue);
+        }
+        Ok(Series { current: Some(*start), stop: *stop, step, ordinality })
+    }
+
     pub(super) fn ordinality(&self) -> bool { self.ordinality }
 
     fn regex_args(
@@ -390,26 +454,9 @@ impl Function {
         } else if let Some(args) = &regex_args {
             regexp::emit(&self.name, args, &values, |value| emit(vec![value]))?;
         } else {
-            let Value::Int(mut n) = values[0] else {
-                return Err(SqlError::Type);
-            };
-            let Value::Int(stop) = values[1] else {
-                return Err(SqlError::Type);
-            };
-            let step = match values.get(2) {
-                Some(Value::Int(n)) => *n,
-                None => 1,
-                _ => return Err(SqlError::Type),
-            };
-            if step == 0 {
-                return Err(SqlError::InvalidParameterValue);
-            }
-            while if step > 0 { n <= stop } else { n >= stop } {
-                emit(vec![Value::Int(n)])?;
-                let Some(next) = n.checked_add(step) else {
-                    break;
-                };
-                n = next;
+            for row in self.series_values(&values)? {
+                execution.comparison()?;
+                out.push(row)?;
             }
         }
         Ok(out)

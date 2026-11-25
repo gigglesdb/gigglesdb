@@ -18,13 +18,17 @@ pub(super) enum Body {
     Select(Box<Select>),
     Values(Vec<Vec<Scalar>>),
     Set {
-        op: SetOp,
-        all: bool,
-        left: Box<Plan>,
-        right: Box<Plan>,
+        first: Box<Plan>,
+        rest: Vec<SetArm>,
     },
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
+pub(super) struct SetArm {
+    pub op: SetOp,
+    pub all: bool,
+    pub plan: Plan,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SetOp {
     Union,
     Intersect,
@@ -187,9 +191,11 @@ impl Plan {
                     from.visit_queries(f);
                 }
             }
-            Body::Set { left, right, .. } => {
-                left.visit_queries(f);
-                right.visit_queries(f);
+            Body::Set { first, rest } => {
+                first.visit_queries(f);
+                for arm in rest {
+                    arm.plan.visit_queries(f);
+                }
             }
             _ => {}
         }
@@ -217,9 +223,11 @@ impl Plan {
                     from.visit_scalars(f);
                 }
             }
-            Body::Set { left, right, .. } => {
-                left.visit_scalars(f);
-                right.visit_scalars(f);
+            Body::Set { first, rest } => {
+                first.visit_scalars(f);
+                for arm in rest {
+                    arm.plan.visit_scalars(f);
+                }
             }
         }
     }
@@ -285,9 +293,11 @@ impl Plan {
                     from.bind_schema_names(bind, state, path)?;
                 }
             }
-            Body::Set { left, right, .. } => {
-                left.bind_schema_names(bind, state, path)?;
-                right.bind_schema_names(bind, state, path)?;
+            Body::Set { first, rest } => {
+                first.bind_schema_names(bind, state, path)?;
+                for arm in rest {
+                    arm.plan.bind_schema_names(bind, state, path)?;
+                }
             }
         }
         Ok(())

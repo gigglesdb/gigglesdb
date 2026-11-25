@@ -378,6 +378,10 @@ mod user_collation_network;
 mod nondeterministic_lookup_network;
 #[path = "insert_select_sources_network.rs"]
 mod insert_select_sources_network;
+
+#[cfg(feature = "engine-rocksdb")]
+#[path = "bulk_insert_select_network.rs"]
+mod bulk_insert_select_network;
 #[path = "implicit_block_oracle_network.rs"]
 mod implicit_block_oracle_network;
 #[path = "pipeline_oracle_network.rs"]

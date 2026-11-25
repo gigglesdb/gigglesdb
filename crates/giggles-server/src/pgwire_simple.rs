@@ -566,6 +566,7 @@ impl State {
             _ => "request rejected; consult documented code",
         });
         self.diagnostic.unknown_outcome = code == "08007";
+        self.stack_depth_hint(code);
         diagnostic_error(code, message, Some(&self.diagnostic), &mut error);
         out.extend(error);
     }

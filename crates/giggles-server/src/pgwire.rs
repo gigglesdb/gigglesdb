@@ -353,6 +353,10 @@ impl Diagnostic {
         self.wire_position = giggles_core::relational::take_sql_error_position();
         self.wire_names = giggles_core::relational::take_sql_error_names();
         use giggles_core::relational::SqlError;
+        if let Err(CoreError::Sql(SqlError::StackDepth)) = &result {
+            self.wire_message = Some("stack depth limit exceeded".into());
+            self.wire_exact = true;
+        }
         if let Err(CoreError::RoutineDdl(diagnostic)) = &result {
             self.wire_message = Some(diagnostic.message.clone());
             self.wire_detail.clone_from(&diagnostic.detail);
@@ -649,6 +653,19 @@ impl Diagnostic {
         self.query_id = Some(hex::encode(Sha256::digest(sql.as_bytes())));
     }
 }
+impl State {
+    fn stack_depth_hint(&mut self, code: &str) {
+        if code == "54001"
+            && self.diagnostic.wire_message.as_deref() == Some("stack depth limit exceeded")
+        {
+            let kb = self.settings.stack_depth_kb();
+            self.diagnostic.wire_hint = Some(format!(
+                "Increase the configuration parameter \"max_stack_depth\" (currently {kb}kB), after ensuring the platform's stack depth limit is adequate."
+            ).into());
+        }
+    }
+}
+
 fn diagnostic_error(
     code: &str,
     message: &'static str,
@@ -4284,6 +4301,7 @@ impl State {
                     self.copy_error(code, session, out);
                     Ok(true)
                 } else {
+                    self.stack_depth_hint(code);
                     diagnostic_error(code, message, Some(&self.diagnostic), out);
                     // Error formatting discards partial result frames, but role
                     // diagnostics produced before a rollback must reach the client.

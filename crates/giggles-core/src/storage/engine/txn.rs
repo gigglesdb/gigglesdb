@@ -762,6 +762,14 @@ impl Transaction {
         self.snapshot_error.as_ref()
     }
     #[allow(dead_code)] // R5-43
+    pub(crate) fn append_version_budget(&self) -> u64 {
+        // Each appended row has a physical key with an eight-byte table ID
+        // and a row payload with an eight-byte version. The write set must
+        // reject the statement before it can use more versions than this.
+        const MIN_PHYSICAL_ROW_BYTES: usize = 2 * std::mem::size_of::<u64>();
+        (self.services().write_set_bytes() / MIN_PHYSICAL_ROW_BYTES) as u64 + 1
+    }
+
     pub(crate) fn services(&self) -> &TxnServices {
         self.services.as_ref().expect("transaction services until drop")
     }

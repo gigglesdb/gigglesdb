@@ -202,9 +202,11 @@ impl Plan {
                         .plan_constant(&mut budget)?;
                 }
             }
-            Body::Set { left, right, .. } => {
-                left.validate_constants(state, parameters)?;
-                right.validate_constants(state, parameters)?;
+            Body::Set { first, rest } => {
+                first.validate_constants(state, parameters)?;
+                for arm in rest {
+                    arm.plan.validate_constants(state, parameters)?;
+                }
             }
         }
         Ok(())
@@ -498,111 +500,8 @@ impl Plan {
                     collations,
                 }
             }
-            Body::Set {
-                op,
-                all,
-                left,
-                right,
-            } => {
-                let mut a = left.resolve(state, parameters)?;
-                let b = right.resolve(state, parameters)?;
-                // bpchar consumers remain closed until DD-0068 comparison semantics land.
-                if a.columns
-                    .iter()
-                    .chain(&b.columns)
-                    .any(|c| c.data_type == DataType::Bpchar)
-                {
-                    return Err(SqlError::Unsupported);
-                }
-                if a.columns.len() != b.columns.len() {
-                    return Err(SqlError::Syntax);
-                }
-                let construct = match op {
-                    SetOp::Union => "UNION",
-                    SetOp::Intersect => "INTERSECT",
-                    SetOp::Except => "EXCEPT",
-                };
-                let a_oids = std::mem::replace(&mut a.type_oids, vec![0; a.columns.len()]);
-                a.collations.resize_with(a.columns.len(), || None);
-                for i in 0..a.columns.len() {
-                    let a_json = a_oids.get(i) == Some(&json_aggregate::OID);
-                    let b_json = b.type_oids.get(i) == Some(&json_aggregate::OID);
-                    if a_json || b_json {
-                        if a_json != b_json && (if a_json { b.unknown[i] } else { a.unknown[i] }).is_none() {
-                            let types = [(&a, a_json), (&b, b_json)].map(|(m, json)| {
-                                if json {
-                                    "json"
-                                } else {
-                                    defaults::type_name(&m.columns[i].data_type)
-                                }
-                            });
-                            user_types::view_replace_error(format!("{construct} types {} and {} cannot be matched", types[0], types[1]));
-                            return Err(SqlError::Type);
-                        }
-                        if !matches!(op, SetOp::Union) || !*all {
-                            user_types::view_replace_error("could not identify an equality operator for type json".into());
-                            return Err(SqlError::UndefinedFunction);
-                        }
-                    }
-                    let typed = [&a, &b].into_iter().filter(|m| m.unknown[i].is_none());
-                    let enum_type = functions::enum_order::common_enum(
-                        construct,
-                        typed.clone().map(|m| {
-                            (&m.columns[i].data_type, m.collations.get(i).and_then(Option::as_ref)
-                                .and_then(BoundScalar::attached_enum))
-                        }),
-                    )?;
-                    let common_type = {
-                        let types = typed.map(|m| m.columns[i].data_type.clone());
-                        if types.clone().any(|ty| ty == DataType::Oid)
-                            && types.clone().all(|ty| ty == DataType::Oid || integer_type(&ty))
-                        {
-                            Ok(DataType::Oid)
-                        } else {
-                            common(types)
-                        }
-                    };
-                    let ty = common_type.inspect_err(|error| {
-                        if *error == SqlError::Unsupported {
-                            return;
-                        }
-                        let left = &a.columns[i].data_type;
-                        let right = &b.columns[i].data_type;
-                        if matches!((left, right), (DataType::Text, _) | (_, DataType::Text)) {
-                            user_types::view_replace_error(format!(
-                                "{construct} types {} and {} cannot be matched",
-                                functions::type_display(left), functions::type_display(right),
-                            ));
-                        }
-                    })?;
-                    left.retarget(a.unknown[i], &ty, enum_type, parameters)?;
-                    right.retarget(b.unknown[i], &ty, enum_type, parameters)?;
-                    let value = functions::collation::combined(
-                        a.collations[i].as_ref().filter(|_| a.unknown[i].is_none() || enum_type.is_none()),
-                        b.collations.get(i).and_then(Option::as_ref)
-                            .filter(|_| b.unknown[i].is_none() || enum_type.is_none()),
-                        ty.clone(),
-                    )?;
-                    if !matches!(op, SetOp::Union) || !*all {
-                        value.require_collation()?;
-                    }
-                    a.type_oids[i] = if a_json || b_json { json_aggregate::OID } else { value.cast_enum_oid(state) };
-                    a.collations[i] = Some(value);
-                    let same = a.columns[i].data_type == b.columns[i].data_type
-                        && a.typmods[i] == b.typmods[i];
-                    a.columns[i].data_type = ty;
-                    a.columns[i].id = 0;
-                    a.columns[i].not_null = false;
-                    if !same {
-                        a.typmods[i] = -1;
-                    }
-                    a.unknown[i] = None;
-                }
-                if a.type_oids.iter().all(|oid| *oid == 0) {
-                    a.type_oids.clear();
-                }
-                a
-            }
+            Body::Set { first, rest } =>
+                resolve_set(first, rest, state, parameters, |_| Ok(()))?,
         };
         let table = result_table(&meta.columns);
         let _collations =
@@ -677,6 +576,120 @@ impl Plan {
         Ok(())
     }
 }
+pub(super) fn resolve_set(
+    first: &mut Plan,
+    rest: &mut [SetArm],
+    state: &Relational,
+    parameters: &mut [Option<DataType>],
+    mut stage: impl FnMut(&Meta) -> R<()>,
+) -> R<Meta> {
+    let mut a = first.resolve(state, parameters)?;
+    let mut first = Some(first);
+    for arm in rest {
+        let b = arm.plan.resolve(state, parameters)?;
+        // bpchar consumers remain closed until DD-0068 comparison semantics land.
+        if a.columns
+            .iter()
+            .chain(&b.columns)
+            .any(|c| c.data_type == DataType::Bpchar)
+        {
+            return Err(SqlError::Unsupported);
+        }
+        if a.columns.len() != b.columns.len() {
+            return Err(SqlError::Syntax);
+        }
+        let construct = match arm.op {
+            SetOp::Union => "UNION",
+            SetOp::Intersect => "INTERSECT",
+            SetOp::Except => "EXCEPT",
+        };
+        let a_oids = std::mem::replace(&mut a.type_oids, vec![0; a.columns.len()]);
+        a.collations.resize_with(a.columns.len(), || None);
+        for i in 0..a.columns.len() {
+            let a_json = a_oids.get(i) == Some(&json_aggregate::OID);
+            let b_json = b.type_oids.get(i) == Some(&json_aggregate::OID);
+            if a_json || b_json {
+                if a_json != b_json && (if a_json { b.unknown[i] } else { a.unknown[i] }).is_none() {
+                    let types = [(&a, a_json), (&b, b_json)].map(|(m, json)| {
+                        if json {
+                            "json"
+                        } else {
+                            defaults::type_name(&m.columns[i].data_type)
+                        }
+                    });
+                    user_types::view_replace_error(format!("{construct} types {} and {} cannot be matched", types[0], types[1]));
+                    return Err(SqlError::Type);
+                }
+                if arm.op != SetOp::Union || !arm.all {
+                    user_types::view_replace_error("could not identify an equality operator for type json".into());
+                    return Err(SqlError::UndefinedFunction);
+                }
+            }
+            let typed = [&a, &b].into_iter().filter(|m| m.unknown[i].is_none());
+            let enum_type = functions::enum_order::common_enum(
+                construct,
+                typed.clone().map(|m| {
+                    (&m.columns[i].data_type, m.collations.get(i).and_then(Option::as_ref)
+                        .and_then(BoundScalar::attached_enum))
+                }),
+            )?;
+            let common_type = {
+                let types = typed.map(|m| m.columns[i].data_type.clone());
+                if types.clone().any(|ty| ty == DataType::Oid)
+                    && types.clone().all(|ty| ty == DataType::Oid || integer_type(&ty))
+                {
+                    Ok(DataType::Oid)
+                } else {
+                    common(types)
+                }
+            };
+            let ty = common_type.inspect_err(|error| {
+                if *error == SqlError::Unsupported {
+                    return;
+                }
+                let left = &a.columns[i].data_type;
+                let right = &b.columns[i].data_type;
+                if matches!((left, right), (DataType::Text, _) | (_, DataType::Text)) {
+                    user_types::view_replace_error(format!(
+                        "{construct} types {} and {} cannot be matched",
+                        functions::type_display(left), functions::type_display(right),
+                    ));
+                }
+            })?;
+            if let Some(left) = first.as_deref_mut() {
+                left.retarget(a.unknown[i], &ty, enum_type, parameters)?;
+            }
+            arm.plan.retarget(b.unknown[i], &ty, enum_type, parameters)?;
+            let value = functions::collation::combined(
+                a.collations[i].as_ref().filter(|_| a.unknown[i].is_none() || enum_type.is_none()),
+                b.collations.get(i).and_then(Option::as_ref)
+                    .filter(|_| b.unknown[i].is_none() || enum_type.is_none()),
+                ty.clone(),
+            )?;
+            if arm.op != SetOp::Union || !arm.all {
+                value.require_collation()?;
+            }
+            a.type_oids[i] = if a_json || b_json { json_aggregate::OID } else { value.cast_enum_oid(state) };
+            a.collations[i] = Some(value);
+            let same = a.columns[i].data_type == b.columns[i].data_type
+                && a.typmods[i] == b.typmods[i];
+            a.columns[i].data_type = ty;
+            a.columns[i].id = 0;
+            a.columns[i].not_null = false;
+            if !same {
+                a.typmods[i] = -1;
+            }
+            a.unknown[i] = None;
+        }
+        if a.type_oids.iter().all(|oid| *oid == 0) {
+            a.type_oids.clear();
+        }
+        first = None;
+        stage(&a)?;
+    }
+    Ok(a)
+}
+
 fn retarget_enum(scalar: &mut Scalar, storage: &DataType, enum_type: &TypeDef) -> R<()> {
     if let Scalar::Literal(value) = scalar {
         BoundScalar::enum_literal(value, storage, enum_type)?;
