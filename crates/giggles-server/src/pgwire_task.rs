@@ -372,10 +372,8 @@ impl State {
             _ if use_core => return Ok(None),
             Err(giggles_pg_catalog::Error::MixedRelations) => {
                 admit(&mut self.diagnostic, session, StatementClass::Catalog)?;
-                let (epoch, tables, indexes, typmods, types) =
-                    self.diagnostic.core(session.catalog_snapshot_with_typmods())?;
-                let snapshot =
-                    catalog_wire::snapshot(session, epoch, tables, indexes, typmods, types)?;
+                let read = self.diagnostic.core(session.read_catalog())?;
+                let snapshot = catalog_wire::snapshot(session, read)?;
                 let detection = catalog_wire::task_detection_schemas(session, &snapshot);
                 if let Ok(Some(plan)) = giggles_pg_catalog::plan_gateway_with_relations(sql, &detection)
                     && plan.contains_subquery() && !plan.user_relations().is_empty()
@@ -404,10 +402,10 @@ impl State {
         }
         let epoch = if plan.depends_on_relations() {
             admit(&mut self.diagnostic, session, StatementClass::Catalog)?;
-            self.diagnostic.core(session.catalog_snapshot())?.0
+            self.diagnostic.core(session.read_catalog())?.fence
         } else {
             admit(&mut self.diagnostic, session, StatementClass::Show)?;
-            0
+            crate::service::CatalogFence::epoch(0)
         };
         let fields = giggles_pg_catalog::describe(&plan).map_err(catalog_wire::error)?;
         let d = Description {
@@ -736,7 +734,7 @@ impl State {
                 // the application rows it reads.
                 session.sql.set_task_statement_text(&s.sql);
                 let outcome =
-                    self.task_catalog(plan, fields, *epoch, catalog_params, retained, session);
+                    self.task_catalog(plan, fields, epoch.epoch, catalog_params, retained, session);
                 session.sql.finish_task_statement(match &outcome {
                     Err(TaskRun::Core(error)) => Err(error),
                     _ => Ok(()),
@@ -829,12 +827,12 @@ impl State {
         retained: usize,
         session: &mut Session,
     ) -> Result<Released<giggles_pg_catalog::ResultSet>, TaskRun> {
-        let (current, tables, indexes, typmods, types) = session.catalog_snapshot_with_typmods()?;
-        if current != epoch && !plan.refreshes_view_definitions() {
+        let read = session.read_catalog()?;
+        if read.fence.epoch != epoch && !plan.refreshes_view_definitions() {
             return Err(TaskRun::Wire("0A000"));
         }
         let snapshot = catalog_wire::with_search_path(
-            catalog_wire::snapshot(session, current, tables, indexes, typmods, types)?,
+            catalog_wire::snapshot(session, read)?,
             &self.settings.current.search_path,
         );
         let snapshot = catalog_wire::with_application_rows(session, plan, snapshot)?;

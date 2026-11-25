@@ -63,6 +63,40 @@ impl Role {
         matches!(self, Role::Application { .. } | Role::Database { .. })
     }
 }
+/// A catalog generation when available, or the backend's presentation epoch.
+#[derive(Clone, Copy)]
+pub(crate) struct CatalogFence {
+    pub(crate) epoch: u64,
+    version: Option<u64>,
+    private_ddl: bool,
+}
+
+impl CatalogFence {
+    pub(crate) const fn epoch(epoch: u64) -> Self {
+        Self { epoch, version: None, private_ddl: false }
+    }
+
+    pub(crate) fn is_current(self, other: Self) -> bool {
+        // Private DDL and rollback can change the catalog without moving the epoch.
+        !self.private_ddl && !other.private_ddl && self.matches(other)
+    }
+
+    pub(crate) fn matches(self, other: Self) -> bool {
+        self.private_ddl == other.private_ddl
+            && match (self.version, other.version) {
+                (None, None) => self.epoch == other.epoch,
+                (left, right) => left == right,
+            }
+    }
+}
+
+pub(crate) struct CatalogRead {
+    pub(crate) fence: CatalogFence,
+    pub(crate) metadata: giggles_core::CatalogMetadata,
+    pub(crate) tables: Vec<relational::TableDef>,
+    pub(crate) indexes: Vec<giggles_core::IndexInfo>,
+}
+
 /// GD-0061 R3-312: the part of the catalog a task session sees
 /// (`Session::task_catalog_view`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2019,16 +2053,14 @@ impl Session {
     /// A coherent committed catalog restricted to this live SQL session authority.
     /// Active SQL snapshots must agree with every returned table definition;
     /// metadata never falls back to an unrestricted owner query.
-    pub(crate) fn catalog_snapshot(
-        &mut self,
-    ) -> Result<(u64, Vec<relational::TableDef>, Vec<giggles_core::IndexInfo>), CoreError> {
+    pub(crate) fn read_catalog(&mut self) -> Result<CatalogRead, CoreError> {
         self.admit_backstop(giggles_core::task::StatementClass::Catalog)?;
         self.authority_scope(|session| {
             if session.is_aborted() {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
             if session.sql.task().is_some() {
-                return session.task_catalog_snapshot();
+                return session.read_task_catalog();
             }
             match session.authority_role() {
                 Role::Application { domain, .. } => {
@@ -2045,17 +2077,24 @@ impl Session {
             }
             let tables = crate::pg_catalog_wire::authorized_tables(
                 session.authority_role(), &session.service.admin.roles(), std::iter::empty())?;
+            // Bracket the metadata read and validation with the same
+            // generation. Data commits can move the presentation timestamp.
+            use giggles_core::PreparedCatalogState;
+            let state = session.sql.prepared_catalog_state();
             let metadata = session.sql.catalog_metadata()?;
-            let epoch = metadata.presentation.epoch;
-            let catalog = metadata.tables;
-            let schemas = metadata.schemas;
-            let visible = catalog
-                .into_iter()
+            let mut fence = CatalogFence::epoch(metadata.presentation.epoch);
+            match state {
+                PreparedCatalogState::Version(version) => fence.version = version,
+                PreparedCatalogState::PrivateDdl => fence.private_ddl = true,
+                PreparedCatalogState::UnknownBackend => {}
+            }
+            let visible = metadata.tables
+                .iter()
                 .filter(|table| !session.sql.table_dropped_in_transaction(table.id))
                 .filter(|table| {
                     tables.as_ref().is_none_or(|tables| {
                         tables.contains(&relational::relation_key(
-                            schemas
+                            metadata.schemas
                                 .tables
                                 .get(&table.id)
                                 .map_or("public", String::as_str),
@@ -2063,14 +2102,23 @@ impl Session {
                         ))
                     })
                 })
+                .cloned()
                 .collect::<Vec<_>>();
             let indexes = metadata.indexes
-                .into_iter()
+                .iter()
                 .filter(|index| visible.iter().any(|table| table.id == index.table))
+                .cloned()
                 .collect();
-            let (epoch, visible) = session.validate_catalog_snapshot(epoch, visible)?;
-            Ok((epoch, visible, indexes))
+            session.validate_catalog_snapshot(fence, &metadata, &visible)?;
+            Ok(CatalogRead { fence, metadata, tables: visible, indexes })
         })
+    }
+
+    pub(crate) fn catalog_snapshot(
+        &mut self,
+    ) -> Result<(u64, Vec<relational::TableDef>, Vec<giggles_core::IndexInfo>), CoreError> {
+        let read = self.read_catalog()?;
+        Ok((read.fence.epoch, read.tables, read.indexes))
     }
     /// GD-0061 R3-312: what a task session's catalog shows. Only the task's
     /// table, with its readable and masked columns (and the storage-only heap
@@ -2134,81 +2182,45 @@ impl Session {
             hidden,
         })
     }
-    /// `catalog_snapshot` of a task session: the task table filtered by
-    /// `task_catalog_view`, and its indexes on shown columns only.
-    fn task_catalog_snapshot(
-        &mut self,
-    ) -> Result<(u64, Vec<relational::TableDef>, Vec<giggles_core::IndexInfo>), CoreError> {
+    /// The task table filtered by its column rules, plus indexes on shown columns.
+    fn read_task_catalog(&mut self) -> Result<CatalogRead, CoreError> {
         let view = self.task_catalog_view()?;
         let metadata = self.sql.catalog_metadata()?;
-        let epoch = metadata.presentation.epoch;
-        let visible = metadata
-            .tables
-            .into_iter()
+        let fence = CatalogFence::epoch(metadata.presentation.epoch);
+        let visible = metadata.tables
+            .iter()
             .filter(|table| table.id == view.table)
             .filter(|table| !self.sql.table_dropped_in_transaction(table.id))
-            .map(|table| view.filter_table(table))
+            .map(|table| view.filter_table(table.clone()))
             .collect::<Vec<_>>();
-        let indexes = metadata
-            .indexes
-            .into_iter()
+        let indexes = metadata.indexes
+            .iter()
             .filter(|index| {
                 index.table == view.table
                     && index.columns.iter().all(|id| view.columns.contains(id))
                     && !view.mentions_hidden(&index.name)
             })
+            .cloned()
             .collect();
-        // The generated `SELECT *` is expanded by the task's column rules, so
-        // it describes exactly the shown columns.
-        let (epoch, visible) = self.validate_catalog_snapshot(epoch, visible)?;
-        Ok((epoch, visible, indexes))
+        // The generated SELECT * is expanded by the task's column rules.
+        self.validate_catalog_snapshot(fence, &metadata, &visible)?;
+        Ok(CatalogRead { fence, metadata, tables: visible, indexes })
     }
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn catalog_snapshot_with_typmods(
-        &mut self,
-    ) -> Result<
-        (
-            u64,
-            Vec<relational::TableDef>,
-            Vec<giggles_core::IndexInfo>,
-            BTreeMap<u64, i32>,
-            relational::UserTypeCatalog,
-        ),
-        CoreError,
-    > {
-        self.admit_backstop(giggles_core::task::StatementClass::Catalog)?;
-        self.authority_scope(|session| {
-            let (epoch, tables, indexes) = session.catalog_snapshot()?;
-            let metadata = session.sql.catalog_metadata()?;
-            let mut typmods = metadata.typmods;
-            if metadata.presentation.epoch != epoch {
-                return Err(CoreError::Sql(relational::SqlError::Conflict));
-            }
-            typmods.retain(|id, _| {
-                tables
-                    .iter()
-                    .any(|table| table.columns.iter().any(|column| column.id == *id))
-            });
-            let types = metadata.types;
-            if types.epoch != epoch {
-                return Err(CoreError::Sql(relational::SqlError::Conflict));
-            }
-            Ok((epoch, tables, indexes, typmods, types))
-        })
-    }
+
     fn validate_catalog_snapshot(
         &mut self,
-        epoch: u64,
-        visible: Vec<relational::TableDef>,
-    ) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
-        let schemas = self.sql.schema_metadata()?;
-        let views = self.sql.catalog_metadata()?.presentation.views;
-        for table in &visible {
+        fence: CatalogFence,
+        metadata: &giggles_core::CatalogMetadata,
+        visible: &[relational::TableDef],
+    ) -> Result<(), CoreError> {
+        for table in visible {
             giggles_core::cancellation::check()?;
-            if views.get(&table.id).is_some_and(|v| v.table == *table) { continue; }
+            if metadata.presentation.views.get(&table.id).is_some_and(|v| v.table == *table) {
+                continue;
+            }
             // Table names originate from the validated engine catalog, not
             // client SQL. Prepare/Describe do not access application rows.
-            let schema = schemas
+            let schema = metadata.schemas
                 .tables
                 .get(&table.id)
                 .map_or("public", String::as_str);
@@ -2224,10 +2236,14 @@ impl Session {
         }
         // A concurrent trusted DDL operation cannot splice two generations
         // into this snapshot or make validation certify a different catalog.
-        if self.sql.catalog_metadata()?.presentation.epoch != epoch {
+        let current = match fence.version {
+            Some(version) => self.sql.statement_catalog_version() == Some(version),
+            None => self.sql.catalog_metadata()?.presentation.epoch == fence.epoch,
+        };
+        if !current {
             return Err(CoreError::Sql(relational::SqlError::Conflict));
         }
-        Ok((epoch, visible))
+        Ok(())
     }
     pub(crate) fn prepare_advisory_key(
         &mut self, call: &relational::AdvisoryCall<'_>,

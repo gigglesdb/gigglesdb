@@ -1334,11 +1334,13 @@ fn sql_notice_frames(out: &mut Vec<u8>, limit: ReplyLimit) -> R<bool> {
 fn core<T>(r: Result<T, CoreError>) -> R<T> {
     r.map_err(|e| crate::service::sqlstate(&e))
 }
+type CatalogPlan = (giggles_pg_catalog::Plan, Option<crate::service::CatalogFence>);
+
 fn catalog_plan(
     sql: &str,
     diagnostic: &mut Diagnostic,
     session: &mut Session,
-) -> R<Option<giggles_pg_catalog::Plan>> {
+) -> R<Option<CatalogPlan>> {
     diagnostic.phase = "catalog planning";
     // Core owns application DML admission and authorization. This hint only
     // avoids catalog parsing; it neither binds names nor returns diagnostics.
@@ -1355,11 +1357,12 @@ fn catalog_plan(
     if !Prepared::sequence_calls_from_sql(sql).is_empty() || Prepared::extension_routine_call(sql) {
         return Ok(None);
     }
+    let mut fence = None;
     let planned = match giggles_pg_catalog::plan_gateway(sql) {
         Err(giggles_pg_catalog::Error::MixedRelations) => {
-            let (epoch, tables, indexes, typmods, types) =
-                core(session.catalog_snapshot_with_typmods())?;
-            let snapshot = catalog_wire::snapshot(session, epoch, tables, indexes, typmods, types)?;
+            let read = core(session.read_catalog())?;
+            fence = Some(read.fence);
+            let snapshot = catalog_wire::snapshot(session, read)?;
             let relations = catalog_wire::application_schemas(session, &snapshot);
             giggles_pg_catalog::plan_gateway_with_relations(sql, &relations)
         }
@@ -1382,7 +1385,7 @@ fn catalog_plan(
         // example COPY rejection). Core still parses and authorizes the entire
         // original statement; no failed catalog plan is executed as metadata.
         Err(giggles_pg_catalog::Error::Syntax) => Ok(None),
-        other => other.map_err(catalog_wire::error),
+        other => other.map(|plan| plan.map(|plan| (plan, fence))).map_err(catalog_wire::error),
     }
 }
 
@@ -1545,7 +1548,7 @@ enum Plan {
     Catalog(
         Box<giggles_pg_catalog::Plan>,
         Vec<giggles_pg_catalog::Field>,
-        u64,
+        crate::service::CatalogFence,
     ),
     Sql(Box<Prepared>),
     Copy(giggles_core::relational::Copy, Box<Prepared>),
@@ -1711,16 +1714,8 @@ impl Statement {
         match &*self.p {
             #[cfg(feature = "legacy-task")]
             Plan::Task(_) => Ok(Arc::clone(&self.d)),
-            // A task session holds only relation-free catalog plans, which
-            // read no catalog (R3-206).
-            Plan::Catalog(..) if session.task().is_some() => Ok(Arc::clone(&self.d)),
-            Plan::Catalog(plan, _, epoch) => {
-                let (current, _, _) = core(session.catalog_snapshot())?;
-                if current != *epoch && !plan.refreshes_view_definitions() {
-                    return Err("0A000");
-                }
-                Ok(Arc::clone(&self.d))
-            }
+            // Catalog callers validate the fence before using this description.
+            Plan::Catalog(..) => Ok(Arc::clone(&self.d)),
             Plan::Sql(p) => {
                 if self.description_version.is_some()
                     && self.description_version == session.sql.statement_catalog_version()
@@ -2551,8 +2546,11 @@ impl State {
             return Err("42501");
         } else if let Some(query) = explain::prepare(sql, session)? {
             { let description = explain::description(&query); (Plan::Explain(query), description) }
-        } else if let Some(plan) = catalog_plan(sql, &mut self.diagnostic, session)? {
-            let (epoch, _, _) = core(session.catalog_snapshot())?;
+        } else if let Some((plan, fence)) = catalog_plan(sql, &mut self.diagnostic, session)? {
+            let fence = match fence {
+                Some(fence) => fence,
+                None => core(session.read_catalog())?.fence,
+            };
             let fields = giggles_pg_catalog::describe(&plan).map_err(catalog_wire::error)?;
             let d = Description {
                 type_oids: fields.iter().map(|field| field.data_type.oid()).collect(),
@@ -2568,7 +2566,7 @@ impl State {
                     })
                     .collect(),
             };
-            (Plan::Catalog(Box::new(plan), fields, epoch), d)
+            (Plan::Catalog(Box::new(plan), fields, fence), d)
         } else {
             plain_application = true;
             self.diagnostic.phase = "application prepare";
@@ -2836,12 +2834,9 @@ impl State {
                         core(session.sql.legacy_prepared_schema_changed(&plan.key))?,
                 },
             Plan::Copy(_, p) => !session.sql.prepared_is_current(p),
-            Plan::Catalog(_, _, _) if session.task().is_some() => false,
-            Plan::Catalog(plan, _, epoch)
-                if !plan.depends_on_relations() || plan.reads_prepared_statements() =>
-            {
-                let (current, _, _) = core(session.catalog_snapshot())?;
-                current != *epoch
+            Plan::Catalog(_, _, fence) if session.task().is_none() => {
+                let current = core(session.read_catalog())?.fence;
+                !fence.is_current(current)
             }
             _ => false,
         };
@@ -2849,6 +2844,13 @@ impl State {
             return Ok(());
         }
         let old = old.clone();
+        let new = self.reprepare_statement(&old, session)?;
+        old.forget_cursor_plan(session);
+        self.statements.insert(name.to_owned(), new);
+        Ok(())
+    }
+
+    fn reprepare_statement(&mut self, old: &Statement, session: &mut Session) -> R<Statement> {
         let mut preparation = self.settings.current.clone();
         match &*old.p {
             Plan::Sql(prepared) => preparation.datestyle.order = prepared.literal_date_order(),
@@ -2873,10 +2875,21 @@ impl State {
             self.diagnostic.message = Some("cached plan must not change result type");
             return Err("0A000");
         }
-        old.forget_cursor_plan(session);
-        self.statements.insert(name.to_owned(), new);
+        Ok(new)
+    }
+
+    fn describe_catalog_portal(&mut self, statement: &Statement, session: &mut Session) -> R<()> {
+        if let Plan::Catalog(_, _, fence) = statement.p.as_ref()
+            && session.task().is_none()
+        {
+            let current = core(session.read_catalog())?.fence;
+            if !fence.is_current(current) {
+                self.reprepare_statement(statement, session)?;
+            }
+        }
         Ok(())
     }
+
     fn bind_statement(
         &mut self, name: &str, session: &mut Session, implicit: &mut bool,
     ) -> R<Statement> {
@@ -2890,6 +2903,9 @@ impl State {
                 session.sql.begin_prepared_statement();
             }
             core(session.bind_prepared_relations(prepared))?;
+        }
+        if matches!(statement.p.as_ref(), Plan::Catalog(..)) && session.task().is_none() {
+            session.sql.begin_prepared_statement();
         }
         // One version comparison, after locks have stabilized dependencies.
         self.refresh_statement(name, session)?;
@@ -2968,23 +2984,47 @@ impl State {
             return self.execute_advisory(p, session, implicit, retained, out);
         }
         let was_transaction = session.in_transaction();
-        if let Plan::Catalog(plan, fields, epoch) = p.s.p.as_ref() {
+        if let Plan::Catalog(old_plan, _, fence) = p.s.p.as_ref() {
             self.diagnostic.phase = "catalog execution";
-            begin_implicit(session, implicit, &mut self.settings)?;
-            let (current, tables, indexes, typmods, types) =
-                core(session.catalog_snapshot_with_typmods())?;
-            if current != *epoch && !plan.refreshes_view_definitions() {
-                return Err("0A000");
+            // Legacy metadata is already read from the committed catalog.
+            // Publishing a staged block at Sync would conflict with concurrent DML.
+            if session.service.admin.engine() != giggles_core::Engine::Legacy
+                || !old_plan.user_relations().is_empty()
+            {
+                begin_implicit(session, implicit, &mut self.settings)?;
             }
             if p.catalog_result.is_none() {
-                self.settings.queried = true;
-                let snapshot = catalog_wire::snapshot(session, current, tables, indexes, typmods, types)?;
+                session.sql.begin_prepared_statement();
+            }
+            let mut read = core(session.read_catalog())?;
+            if !fence.is_current(read.fence) {
+                // A portal owns its bound statement even if its name was closed.
+                let new = self.reprepare_statement(&p.s, session)?;
+                if p.catalog_result.is_some() && !old_plan.user_relations().is_empty()
+                    && !fence.matches(read.fence)
+                {
+                    // A new plan can bind to a different table with the same
+                    // shape. Its authorization cannot certify retained app rows.
+                    return Err("40001");
+                }
+                let Plan::Catalog(_, _, fence) = new.p.as_ref() else { unreachable!() };
+                read = core(session.read_catalog())?;
+                if !fence.matches(read.fence) {
+                    return Err("40001");
+                }
+                p.s = new;
+            }
+            let Plan::Catalog(plan, fields, _) = p.s.p.as_ref() else { unreachable!() };
+            if p.catalog_result.is_none() {
+                self.settings.queried = session.in_transaction();
+                let snapshot = catalog_wire::snapshot(session, read)?;
                 let snapshot = catalog_wire::with_search_path(snapshot, &self.settings.current.search_path);
                 let snapshot = self.prepared_snapshot(plan, snapshot);
                 let snapshot = catalog_wire::with_application_rows(session, plan, snapshot)?;
                 let result = catalog_wire::execute(plan, &snapshot, &p.catalog_params)
                     .map_err(|error| self.diagnostic.catalog_error(error))?;
                 if result.fields != *fields {
+                    self.diagnostic.message = Some("cached plan must not change result type");
                     return Err("0A000");
                 }
                 if retained
@@ -2998,6 +3038,8 @@ impl State {
                 // rows were released as they were read
                 // (`with_application_rows`, GD-0061 R3-312).
                 p.catalog_result = Some(Released::synthetic(result));
+            } else {
+                catalog_wire::authorize_application_relations(session, plan)?;
             }
             let result = p.catalog_result.as_ref().unwrap();
             let total = result.get().rows.len();
@@ -3500,11 +3542,14 @@ impl State {
                         } else {
                             &p.s
                         };
+                        let described = described.clone();
+                        self.describe_catalog_portal(&described, session)?;
+                        let formats = &self.portals[&name].formats;
                         let d = described.describe(session)?;
                         if let Some(fields) = described.catalog_fields() {
-                            catalog_wire::description(fields, &p.formats, out)?;
+                            catalog_wire::description(fields, formats, out)?;
                         } else {
-                            row_description(&d, &p.formats, out)?;
+                            row_description(&d, formats, out)?;
                         }
                     }
                     _ => return Err("08P01"),

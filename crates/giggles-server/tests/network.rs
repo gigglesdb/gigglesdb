@@ -2050,7 +2050,7 @@ async fn catalog_driver_identity_typed_metadata_and_hidden_relations() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn catalog_driver_schema_change_and_aborted_transaction_fence() {
+async fn catalog_driver_replans_after_schema_change_and_fences_aborted_transactions() {
     let f = Fixture::new().await;
     let (pg, conn) = f.pg(f.app.clone()).await;
     let prepared = pg
@@ -2065,7 +2065,11 @@ async fn catalog_driver_schema_change_and_aborted_transaction_fence() {
             None,
         )
         .unwrap();
-    assert_eq!(code(pg.query(&prepared, &[]).await.unwrap_err()), "0A000");
+    // The application binding still sees only the original authorized table.
+    let names: Vec<String> = pg.query(&prepared, &[]).await.unwrap()
+        .iter().map(|row| row.get(0)).collect();
+    assert!(names.iter().any(|name| name == "app"));
+    assert!(!names.iter().any(|name| name == "catalog_new"));
     pg.batch_execute("BEGIN").await.unwrap();
     assert!(
         pg.batch_execute("SELECT no_such_column FROM app")

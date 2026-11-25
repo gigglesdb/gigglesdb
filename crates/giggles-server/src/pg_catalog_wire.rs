@@ -103,12 +103,9 @@ pub(crate) fn privilege_callback(session: &crate::Session) -> giggles_core::Priv
                     .map_or("public", String::as_str), &table.name))));
             let tables = catalog.tables.clone();
             let indexes = catalog.indexes.clone();
-            let typmods = catalog.typmods.clone();
-            let types = catalog.types.clone();
-            let epoch = catalog.presentation.epoch;
             let path = metadata.search_path().to_vec();
             let result = snapshot_owned(SnapshotContext { identity, owners, metadata: catalog, registry: registry.clone() },
-                epoch, tables, indexes, typmods, types);
+                tables, indexes);
             registry.check_fenced().map_err(crate::service::role_lookup_error)?;
             let mut snapshot = result.map_err(giggles_core::CoreError::PrivilegeInquiry)?;
             snapshot.search_path = path;
@@ -174,29 +171,34 @@ fn owner_keys(metadata: &giggles_core::CatalogMetadata) -> Vec<String> {
         .chain(metadata.sequences.iter().map(|(_, name)| name.clone())).collect()
 }
 pub(crate) fn snapshot(
-    session: &crate::Session, epoch: u64,
-    tables: Vec<giggles_core::relational::TableDef>, indexes: Vec<giggles_core::IndexInfo>,
-    column_typmods: std::collections::BTreeMap<u64, i32>, types: giggles_core::relational::UserTypeCatalog,
+    session: &crate::Session,
+    read: crate::service::CatalogRead,
 ) -> Result<giggles_pg_catalog::CatalogSnapshot> {
-    let metadata = session.sql.catalog_metadata().map_err(|e| crate::service::sqlstate(&e))?;
+    let crate::service::CatalogRead { metadata, tables, indexes, .. } = read;
     let owners = owner_keys(&metadata).into_iter().filter_map(|key|
         session.sql.table_owner(&key).ok().flatten().map(|owner| (key,owner))).collect();
     let snapshot = snapshot_owned(SnapshotContext {
         identity: identity(session), metadata, owners,
         registry: session.service.admin.roles().image().map_err(|_| "XX000")?,
-    }, epoch, tables, indexes, column_typmods, types)?;
+    }, tables, indexes)?;
     if session.task().is_none() { return Ok(snapshot); }
     let view = session.task_catalog_view().map_err(|e| crate::service::sqlstate(&e))?;
     Ok(task_filtered(snapshot, &view))
 }
 #[allow(clippy::needless_update)]
 fn snapshot_owned(
-    context: SnapshotContext, epoch: u64,
+    mut context: SnapshotContext,
     tables: Vec<giggles_core::relational::TableDef>, indexes: Vec<giggles_core::IndexInfo>,
-    mut column_typmods: std::collections::BTreeMap<u64, i32>, types: giggles_core::relational::UserTypeCatalog,
 ) -> Result<giggles_pg_catalog::CatalogSnapshot> {
     use giggles_core::relational::DataType as C;
     use giggles_pg_catalog::ScalarType as P;
+
+    let epoch = context.metadata.presentation.epoch;
+    if context.metadata.schemas.epoch != epoch || context.metadata.types.epoch != epoch {
+        return Err("40001");
+    }
+    let mut column_typmods = std::mem::take(&mut context.metadata.typmods);
+    let types = &context.metadata.types;
     // Storage-only heap keys must disappear before deriving any catalog relation.
     // Side maps and indexes use stable column IDs, so removing the marker here
     // also keeps all user attribute positions contiguous.
@@ -347,10 +349,8 @@ fn snapshot_owned(
         })
         .collect();
     let catalog = context.metadata;
+    let types = catalog.types;
     let metadata = catalog.schemas;
-    if metadata.epoch != epoch {
-        return Err("40001");
-    }
     let schemas: std::collections::BTreeMap<String,(u32,u32)> = metadata
         .schemas
         .into_iter()
@@ -372,7 +372,6 @@ fn snapshot_owned(
         }).collect::<Result<Vec<_>>>()?;
     let generation = catalog.generation;
     let mut presentation = catalog.presentation;
-    if presentation.epoch != epoch { return Err("40001"); }
     presentation.views.retain(|id, _| visible.contains(id));
     for view in presentation.views.values() {
         column_type_oids.extend(view.table.columns.iter().zip(&view.type_oids).map(|(c, oid)| (c.id, *oid)));
@@ -598,7 +597,7 @@ fn snapshot_owned(
 }
 
 /// GD-0061 R3-312: a task session's catalog. `tables` already holds only the
-/// task's table with its shown columns (`Session::task_catalog_snapshot`);
+/// task's table with its shown columns (`Session::read_task_catalog`);
 /// this drops everything else that could name a hidden column or another
 /// relation: constraints, indexes, comments, defaults and key names that
 /// mention one, views, other schemas, other roles and their grants, and user
@@ -1579,8 +1578,8 @@ mod tests {
         let mut session=service.role_session("ext_owner").unwrap();
         session.execute_sql("CREATE EXTENSION \"uuid-ossp\"",&[]).unwrap();
         assert_eq!(session.execute_sql("SELECT uuid_nil()",&[]).unwrap().rows[0].values,vec![giggles_core::relational::Value::Text("00000000-0000-0000-0000-000000000000".into())]);
-        let (epoch,tables,indexes,typmods,types)=session.catalog_snapshot_with_typmods().unwrap();
-        let snap=snapshot(&session,epoch,tables,indexes,typmods,types).unwrap();
+        let read = session.read_catalog().unwrap();
+        let snap = snapshot(&session, read).unwrap();
         let owner=snap.roles.iter().find(|r|r.name == "ext_owner").unwrap().oid;
         assert_eq!(snap.extensions.iter().find(|e|e.name == "uuid-ossp").unwrap().installed.as_ref().unwrap().1,owner);
         for (sql, expected) in [
@@ -1606,8 +1605,8 @@ mod tests {
             session.backend_pid = 42;
             session.execute_sql("CREATE TABLE t (id INT PRIMARY KEY)", &[]).unwrap();
             let read = |session: &mut crate::Session| {
-                let (epoch, tables, indexes, typmods, types) = session.catalog_snapshot_with_typmods().unwrap();
-                let snap = snapshot(session, epoch, tables, indexes, typmods, types).unwrap();
+                let read = session.read_catalog().unwrap();
+                let snap = snapshot(session, read).unwrap();
                 let plan = giggles_pg_catalog::plan("SELECT mode, granted FROM pg_locks WHERE relation = 't'::regclass AND pid = pg_backend_pid() ORDER BY mode").unwrap().unwrap();
                 giggles_pg_catalog::execute(&plan, &snap, &[]).unwrap().rows
             };
@@ -1690,9 +1689,8 @@ mod tests {
     fn catalog_refresh_generation_survives_restart_and_tracks_commits() {
         use giggles_core::{Admin, Limits, roles::NewRole};
         fn read(session: &mut crate::Session) -> giggles_pg_catalog::CatalogSnapshot {
-            let (epoch, tables, indexes, typmods, types) =
-                session.catalog_snapshot_with_typmods().unwrap();
-            snapshot(session, epoch, tables, indexes, typmods, types).unwrap()
+            let read = session.read_catalog().unwrap();
+            snapshot(session, read).unwrap()
         }
         fn make_service(admin: Admin) -> std::sync::Arc<crate::Service> {
             crate::Service::new(admin, vec![], crate::clock::Clock::new(0, 3600).unwrap()).unwrap()
@@ -1796,13 +1794,12 @@ mod tests {
                 .execute_sql(sql, &[])
                 .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
         }
-        let (epoch, tables, mut indexes, mut typmods, mut types) =
-            session.catalog_snapshot_with_typmods().unwrap();
-        let heap = tables.iter().find(|t| t.name == "heap_table").unwrap();
+        let mut read = session.read_catalog().unwrap();
+        let heap = read.tables.iter().find(|t| t.name == "heap_table").unwrap();
         let hidden = heap.columns[heap.hidden_rowid().unwrap()].id;
         // Heap secondary-index execution is outside this adapter test. Supply
         // stable-ID catalog descriptors to prove their attribute mapping survives.
-        indexes.push(giggles_core::IndexInfo {
+        read.indexes.push(giggles_core::IndexInfo {
             id: 99,
             table: heap.id,
             name: "heap_b".into(),
@@ -1810,7 +1807,7 @@ mod tests {
             unique: false,
             predicate: None,
         });
-        indexes.push(giggles_core::IndexInfo {
+        read.indexes.push(giggles_core::IndexInfo {
             id: 100,
             table: heap.id,
             name: "hidden_storage_index".into(),
@@ -1819,9 +1816,9 @@ mod tests {
             predicate: None,
         });
         // Even stale presentation metadata for the storage marker is removed.
-        typmods.insert(hidden, 123);
-        types.column_types.insert(hidden, 999);
-        let snapshot = snapshot(&session, epoch, tables, indexes, typmods, types).unwrap();
+        read.metadata.typmods.insert(hidden, 123);
+        read.metadata.types.column_types.insert(hidden, 999);
+        let snapshot = snapshot(&session, read).unwrap();
         assert!(!snapshot.column_typmods.contains_key(&hidden));
         assert!(!snapshot.column_type_oids.contains_key(&hidden));
         let heap = snapshot
@@ -2229,14 +2226,14 @@ mod task_hidden_owners {
         let service = crate::Service::new(admin.clone(), vec![], crate::clock::Clock::new(0,3600).unwrap()).unwrap();
         let mut session = service.role_session("r").unwrap();
         let read = |session: &mut crate::Session, task, user: &str| {
-            let (epoch, tables, indexes, typmods, types) = session.catalog_snapshot_with_typmods().unwrap();
+            let crate::service::CatalogRead { metadata, tables, indexes, .. } =
+                session.read_catalog().unwrap();
             let mut identity = identity(session);
             identity.task = task;
             identity.user = user.into();
-            let metadata = session.sql.catalog_metadata().unwrap();
             let owners = owner_keys(&metadata).into_iter().filter_map(|key|
                 session.sql.table_owner(&key).unwrap().map(|owner| (key, owner))).collect();
-            snapshot_owned(SnapshotContext { identity, metadata, owners, registry: admin.roles().image().unwrap() }, epoch, tables, indexes, typmods, types).unwrap()
+            snapshot_owned(SnapshotContext { identity, metadata, owners, registry: admin.roles().image().unwrap() }, tables, indexes).unwrap()
         };
         let baseline = read(&mut session, true, "r");
         admin.roles().create(NewRole { name: "giggles".into(), ..Default::default() }).unwrap();

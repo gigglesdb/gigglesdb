@@ -887,12 +887,14 @@ impl State {
             rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
                 &result, &description, &[], 0, result.get().rows.len(), out)?;
             complete("EXPLAIN", &result, out)?;
-        } else if let Some(plan) = catalog_plan(sql, &mut self.diagnostic, session)? {
+        } else if let Some((plan, fence)) = catalog_plan(sql, &mut self.diagnostic, session)? {
             self.diagnostic.phase = "catalog execution";
             self.settings.queried = session.in_transaction();
-            let (epoch, tables, indexes, typmods, types) =
-                core(session.catalog_snapshot_with_typmods())?;
-            let snapshot = catalog_wire::snapshot(session, epoch, tables, indexes, typmods, types)?;
+            let read = core(session.read_catalog())?;
+            if fence.is_some_and(|fence| !fence.matches(read.fence)) {
+                return Err("40001");
+            }
+            let snapshot = catalog_wire::snapshot(session, read)?;
             let snapshot = catalog_wire::with_search_path(snapshot, &self.settings.current.search_path);
             let snapshot = self.prepared_snapshot(&plan, snapshot);
             let snapshot = catalog_wire::with_application_rows(session, &plan, snapshot)?;

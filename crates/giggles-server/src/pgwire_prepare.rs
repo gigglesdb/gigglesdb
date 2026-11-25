@@ -516,10 +516,9 @@ impl State {
         }
         let mut declared = Vec::with_capacity(types.len());
         if !types.is_empty() {
-            let (epoch, tables, indexes, typmods, user_types) =
-                core(session.catalog_snapshot_with_typmods())?;
+            let read = core(session.read_catalog())?;
             let snapshot = catalog_wire::with_search_path(
-                catalog_wire::snapshot(session, epoch, tables, indexes, typmods, user_types)?,
+                catalog_wire::snapshot(session, read)?,
                 &self.settings.current.search_path,
             );
             for (name, oid) in types.iter().zip(

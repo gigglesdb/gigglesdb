@@ -552,7 +552,9 @@ mod tests {
                 .len(),
             1
         );
-        let (_, tables, _, typmods, _) = session.catalog_snapshot_with_typmods().unwrap();
+        let read = session.read_catalog().unwrap();
+        let tables = read.tables;
+        let typmods = read.metadata.typmods;
         assert_eq!(tables.len(), 1);
         assert_eq!(typmods.get(&tables[0].columns[1].id), Some(&16));
         assert_eq!(
