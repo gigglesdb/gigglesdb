@@ -66,7 +66,8 @@ impl Cancellation {
     pub fn set_lock_timeout(&self, timeout: Option<Duration>) {
         *self.0.lock_timeout.lock().expect("lock timeout") = timeout;
     }
-    pub(crate) fn lock_deadline() -> Option<Instant> {
+    /// Computes the deadline once at the start of a lock acquisition.
+    pub fn lock_deadline() -> Option<Instant> {
         Self::current().and_then(|c| *c.0.lock_timeout.lock().expect("lock timeout"))
             .and_then(|duration| Instant::now().checked_add(duration))
     }

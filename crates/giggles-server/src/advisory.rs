@@ -2,7 +2,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Condvar, Mutex, atomic::Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 type LockId = (String, bool, i64);
@@ -38,6 +38,11 @@ pub(crate) enum Action {
     },
     Unlock(Mode),
     UnlockAll,
+}
+
+pub(crate) enum Admission {
+    Park,
+    Resume(Option<Instant>),
 }
 
 #[derive(Default)]
@@ -123,6 +128,7 @@ impl Locks {
         session: &crate::Session,
         action: Action,
         key: (bool, i64),
+        mut admission: impl FnMut(Admission) -> Result<(), &'static str>,
     ) -> Result<bool, &'static str> {
         let pid = session.backend_pid;
         let id = (session.database.clone().unwrap_or_default(), key.0, key.1);
@@ -154,16 +160,34 @@ impl Locks {
                 try_only,
             } => (Waiter { pid, mode }, transaction, try_only),
         };
+        let lock_deadline = giggles_core::Cancellation::lock_deadline();
+        let mut parked = false;
+        let mut waited = false;
         let result = loop {
             if session.connection_closed.load(Ordering::Acquire)
                 || giggles_core::cancellation::check().is_err()
             {
                 break Err("57014");
             }
+            if waited && lock_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break Err("55P03");
+            }
             let entry = locks.entry(id.clone()).or_default();
             if entry.holds.contains_key(&(pid, request.mode))
                 || entry.blockers(request).next().is_none()
             {
+                if parked {
+                    // Keep our place in the queue while regaining admission,
+                    // but let other backends use the lock table in the meantime.
+                    drop(locks);
+                    let admitted = admission(Admission::Resume(lock_deadline));
+                    locks = self.0.lock().map_err(|_| "XX000")?;
+                    if let Err(code) = admitted {
+                        break Err(code);
+                    }
+                    parked = false;
+                    continue;
+                }
                 let hold = entry.holds.entry((pid, request.mode)).or_default();
                 if transaction {
                     hold.transaction = true;
@@ -181,11 +205,18 @@ impl Locks {
             if deadlocked(&locks, pid) {
                 break Err("40P01");
             }
-            locks = self
-                .1
-                .wait_timeout(locks, Duration::from_millis(10))
-                .map_err(|_| "XX000")?
-                .0;
+            if !parked {
+                if let Err(code) = admission(Admission::Park) {
+                    break Err(code);
+                }
+                parked = true;
+            }
+            waited = true;
+            let slice = Duration::from_millis(10);
+            let slice = lock_deadline.map_or(slice, |deadline| {
+                slice.min(deadline.saturating_duration_since(Instant::now()))
+            });
+            locks = self.1.wait_timeout(locks, slice).map_err(|_| "XX000")?.0;
         };
         if let Some(entry) = locks.get_mut(&id) {
             entry.queue.retain(|w| w.pid != pid);

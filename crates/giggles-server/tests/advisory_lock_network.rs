@@ -214,6 +214,31 @@ async fn overloads_modes_strictness_and_result_casts() {
             "{invalid}"
         );
     }
+    for (invalid, message) in [
+        (
+            "SELECT pg_try_advisory_lock(1)::void",
+            "cannot cast type boolean to void",
+        ),
+        (
+            "SELECT pg_advisory_lock(1)::int",
+            "cannot cast type void to integer",
+        ),
+    ] {
+        for result in [
+            a.prepare(invalid).await.map(|_| ()),
+            a.simple_query(invalid).await.map(|_| ()),
+        ] {
+            let error = result.unwrap_err();
+            let error = error.as_db_error().unwrap();
+            assert_eq!(error.code().code(), "42846", "{invalid}");
+            assert_eq!(error.message(), message, "{invalid}");
+        }
+    }
+    assert!(boolean(&c, "SELECT pg_try_advisory_xact_lock(1)").await);
+    let error = a.query_one("SELECT hashtext(1)", &[]).await.unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "42883");
+    assert_eq!(error.message(), "function hashtext(integer) does not exist");
     a.batch_execute(
         "PREPARE advisory_sql(text) AS SELECT pg_advisory_xact_lock(hashtext($1))::text",
     )
@@ -349,5 +374,134 @@ async fn ordinary_role_can_run_table_free_advisory_expressions() {
     drop(client);
     driver.await.unwrap().unwrap();
     drop(admin);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn same_role_advisory_waiters_leave_admission_for_holder_dml() {
+    // Exceed both the default role limit (16) and the blocking pool (32).
+    const WAITERS: usize = 33;
+    let fixture = Fixture::with_connection_limit(WAITERS + 1).await;
+    let holder = fixture.client().await;
+    holder
+        .batch_execute("CREATE TABLE advisory_admission (id int PRIMARY KEY)")
+        .await
+        .unwrap();
+    holder
+        .batch_execute("BEGIN; SELECT pg_advisory_xact_lock(951)")
+        .await
+        .unwrap();
+
+    let mut clients = Vec::new();
+    for _ in 0..WAITERS {
+        clients.push(fixture.client().await);
+    }
+    timeout(DEADLINE, async {
+        while fixture.service.pgwire_blocking_live() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut waiters = tokio::task::JoinSet::new();
+    for client in clients {
+        // Each acquisition releases at the end of its single-statement
+        // transaction, without consuming a Legacy explicit-transaction slot.
+        waiters.spawn(async move {
+            client
+                .batch_execute("SELECT pg_advisory_xact_lock(951)")
+                .await
+        });
+    }
+    // The holder still owns the key. Live workers with all role slots returned
+    // establish that the waiters reached the lock wait before the holder's DML.
+    timeout(DEADLINE, async {
+        loop {
+            if let Some(result) = waiters.try_join_next() {
+                panic!("waiter finished before holder COMMIT: {result:?}");
+            }
+            if fixture.service.pgwire_blocking_live() == WAITERS
+                && fixture.service.blocking_permits_held() == 0
+                && fixture.service.role_pool_counts() == [(16, 16, 0)]
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("advisory waiters did not release admission");
+
+    timeout(DEADLINE, async {
+        assert_eq!(
+            holder
+                .execute("INSERT INTO advisory_admission VALUES (1)", &[])
+                .await
+                .unwrap(),
+            1
+        );
+        holder.batch_execute("COMMIT").await.unwrap();
+        while let Some(waiter) = waiters.join_next().await {
+            waiter.unwrap().unwrap();
+        }
+    })
+    .await
+    .expect("holder DML, COMMIT and queued advisory acquisitions");
+    drop(holder);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn advisory_wait_distinguishes_lock_and_statement_timeout() {
+    let fixture = Fixture::new().await;
+    let holder = fixture.client().await;
+    let waiter = fixture.client().await;
+    holder
+        .batch_execute("SELECT pg_advisory_lock(953)")
+        .await
+        .unwrap();
+
+    waiter
+        .batch_execute("SET lock_timeout='50ms'")
+        .await
+        .unwrap();
+    for extended in [false, true] {
+        let error = timeout(DEADLINE, async {
+            if extended {
+                waiter
+                    .query_one("SELECT pg_advisory_lock(953)", &[])
+                    .await
+                    .unwrap_err()
+            } else {
+                waiter
+                    .simple_query("SELECT pg_advisory_lock(953)")
+                    .await
+                    .unwrap_err()
+            }
+        })
+        .await
+        .unwrap();
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), "55P03");
+        assert_eq!(error.message(), "canceling statement due to lock timeout");
+    }
+
+    waiter
+        .batch_execute("SET lock_timeout='2s'; SET statement_timeout='50ms'")
+        .await
+        .unwrap();
+    let error = timeout(
+        DEADLINE,
+        waiter.query_one("SELECT pg_advisory_lock(953)", &[]),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.code().unwrap().code(), "57014");
+
+    assert!(boolean(&holder, "SELECT pg_advisory_unlock(953)").await);
+    assert!(boolean(&waiter, "SELECT pg_try_advisory_xact_lock(953)").await);
+    drop(holder);
+    drop(waiter);
     fixture.stop().await;
 }

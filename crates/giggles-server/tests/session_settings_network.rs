@@ -111,13 +111,19 @@ async fn catalog_introspection_table_free_and_derived_both_protocols() {
 }
 
 pub(super) struct Fixture {
-    service: Arc<Service>,
+    pub(super) service: Arc<Service>,
     pub(super) pg: Running,
     path: std::path::PathBuf,
 }
 impl Fixture {
     pub(super) async fn new() -> Self { Self::with_engine(giggles_core::Engine::Legacy).await }
     pub(super) async fn with_engine(engine: giggles_core::Engine) -> Self {
+        Self::start(engine, 8).await
+    }
+    pub(super) async fn with_connection_limit(connections: usize) -> Self {
+        Self::start(giggles_core::Engine::Legacy, connections).await
+    }
+    async fn start(engine: giggles_core::Engine, connections: usize) -> Self {
         let path = std::env::temp_dir().join(format!(
             "session-settings-{}-{}-{}",
             std::process::id(),
@@ -148,7 +154,7 @@ impl Fixture {
             certificates: BTreeMap::new(),
             databases: vec!["postgres".into()],
             loopback_trust: true,
-            connections: 8,
+            connections,
         };
         let listener = Arc::new(config.build().unwrap());
         let pg = serve_postgresql(config.listen, service.clone(), listener)
@@ -983,8 +989,8 @@ async fn advisory_warning_and_disconnected_waiter_release_locks() {
     stream.write_u32((body.len() + 4) as u32).await.unwrap(); stream.write_all(body).await.unwrap();
     wire_cycle(&mut stream).await;
     let messages = wire_query(&mut stream, "SELECT pg_advisory_unlock(101)").await;
-    assert_eq!(tags(&messages), b"NTDCZ");
-    assert!(messages[0].1.split(|b| *b == 0).any(|v| v == b"C01000"));
+    assert_eq!(tags(&messages), b"TNDCZ");
+    assert!(messages[1].1.split(|b| *b == 0).any(|v| v == b"C01000"));
     wire_query(&mut stream, "SELECT pg_advisory_lock(102)").await;
     let mut body = Vec::new(); giggles_server::pgwire::z("SELECT pg_advisory_lock(101)", &mut body);
     let mut packet = Vec::new(); giggles_server::pgwire::frame(b'Q', &body, &mut packet).unwrap();

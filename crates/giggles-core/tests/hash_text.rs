@@ -3,7 +3,7 @@ mod common;
 
 use giggles_core::{
     Admin, Limits,
-    relational::{DataType, Value},
+    relational::{DataType, Value, take_sql_error_message},
 };
 
 #[test]
@@ -79,6 +79,31 @@ fn strict_hashes_infer_text_and_bigint_parameters() {
             .rows[0]
             .values,
         [Value::Null, Value::Null, Value::Null],
+    );
+    drop(sql);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn hash_text_uses_implicit_string_casts_and_reports_missing_overloads() {
+    let path = common::fresh("hash-text-casts");
+    let admin = Admin::create(&path, Limits::default()).unwrap();
+    let mut sql = admin.sql_session();
+    let result = sql.execute(
+        "SELECT hashtext('a'::char(3)) = hashtext('a'), hashtext('a  '::varchar) = hashtext('a')",
+        &[],
+        None,
+    ).unwrap();
+    assert_eq!(
+        result.rows[0].values,
+        [Value::Bool(true), Value::Bool(false)]
+    );
+    let error = sql.execute("SELECT hashtext(1)", &[], None).unwrap_err();
+    assert_eq!(giggles_core::sqlstate(&error), "42883");
+    assert_eq!(
+        take_sql_error_message().as_deref(),
+        Some("function hashtext(integer) does not exist")
     );
     drop(sql);
     drop(admin);

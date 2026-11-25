@@ -2065,7 +2065,9 @@ async fn catalog_driver_replans_after_schema_change_and_fences_aborted_transacti
             None,
         )
         .unwrap();
-    // The application binding still sees only the original authorized table.
+    // PostgreSQL 18.6 silently re-plans with no 0A000 (review1/fence.out)
+    // and shows catalog_new. GigglesDB's hidden-relations policy hides
+    // catalog_new from this application binding.
     let names: Vec<String> = pg.query(&prepared, &[]).await.unwrap()
         .iter().map(|row| row.get(0)).collect();
     assert!(names.iter().any(|name| name == "app"));

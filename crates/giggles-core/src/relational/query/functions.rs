@@ -2262,6 +2262,9 @@ impl Scalar {
         if random_uuid::known(name) {
             return random_uuid::bind(name, original, args);
         }
+        if hash_text::known(name) {
+            return hash_text::bind(name, original, args);
+        }
         if let Some(ty) = regexp::bind(name, original, &mut args, parameters)? {
             collation::derive(args.iter())?;
             return Ok(BoundScalar {
@@ -2382,7 +2385,6 @@ impl Scalar {
                 .or_else(|| args.first().map(|a| &a.ty)),
         )
         .or_else(|| uuid_ossp::signature(name, args.len()))
-        .or_else(|| hash_text::signature(name, args.len()))
         .or_else(|| md5::signature(name, args.len(), args.first().map(|a| &a.ty)))
         .or_else(|| character::signature(name, args.len()))
         .or_else(|| unicode::signature(name, args.len()))

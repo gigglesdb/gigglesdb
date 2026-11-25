@@ -1,6 +1,6 @@
 //! Server-owned advisory calls. Core evaluates the arguments before any wait.
 use super::*;
-use crate::advisory::{Action, Mode};
+use crate::advisory::{Action, Admission, Mode};
 use giggles_core::relational::{AdvisoryCall, AdvisoryResultCast, ColumnDef, EnumParameters};
 
 pub(super) struct Plan {
@@ -136,76 +136,94 @@ fn scalar(
         .ok_or("XX000")
 }
 
-fn evaluate(
-    plan: &Plan,
-    params: &[Value],
-    description: &Description,
-    settings: &crate::pg_settings::Settings,
-    session: &mut Session,
-    diagnostic: &mut Diagnostic,
-    out: &mut Vec<u8>,
-) -> R<Released<SqlResult>> {
-    if !matches!(session.role, Role::Database { .. }) || session.task().is_some() {
-        return Err("42501");
-    }
-    if session.is_aborted() {
-        return Err("25P02");
-    }
-    diagnostic.phase = "advisory arguments";
-    let key = scalar(&plan.key, params, session, diagnostic)?;
-    // Argument evaluation and its reply have been dropped. Waiting consults
-    // only the server's lock table and the connection's cancellation state.
-    let mut value = match key {
-        Value::Null => Value::Null,
-        Value::Int(key) => {
-            diagnostic.phase = "advisory lock";
-            let success =
-                session
+impl State {
+    fn evaluate_advisory(
+        &mut self,
+        plan: &Plan,
+        params: &[Value],
+        description: &Description,
+        session: &mut Session,
+        out: &mut Vec<u8>,
+    ) -> R<Released<SqlResult>> {
+        let diagnostic = &mut self.diagnostic;
+        if !matches!(session.role, Role::Database { .. }) || session.task().is_some() {
+            return Err("42501");
+        }
+        if session.is_aborted() {
+            return Err("25P02");
+        }
+        diagnostic.phase = "advisory arguments";
+        let key = scalar(&plan.key, params, session, diagnostic)?;
+        // Argument evaluation and its reply have been dropped. Waiting consults
+        // only the server's lock table and the connection's cancellation state.
+        let mut value = match key {
+            Value::Null => Value::Null,
+            Value::Int(key) => {
+                diagnostic.phase = "advisory lock";
+                let success = session
                     .service
                     .advisory
-                    .call(session, plan.action, (plan.two_keys, key))?;
-            if let Action::Unlock(mode) = plan.action
-                && !success
-                && settings.client_min_messages != "error"
-            {
-                let mut body = Vec::new();
-                for (field, value) in [(b'S', "WARNING"), (b'V', "WARNING"), (b'C', "01000")] {
-                    body.push(field);
-                    z(value, &mut body);
+                    .call(session, plan.action, (plan.two_keys, key), |event| {
+                        if let Some(admission) = &mut self.execution_admission {
+                            match event {
+                                Admission::Park => admission.release(),
+                                Admission::Resume(deadline) => admission
+                                    .reacquire_before(session, true, deadline)
+                                    .map_err(|refusal| {
+                                        diagnostic.wire_message = Some(refusal.message());
+                                        refusal.sqlstate()
+                                    })?,
+                            }
+                        }
+                        Ok(())
+                    })
+                    .inspect_err(|&code| {
+                        if code == "55P03" {
+                            diagnostic.wire_message =
+                                Some("canceling statement due to lock timeout".into());
+                        }
+                    })?;
+                if let Action::Unlock(mode) = plan.action
+                    && !success
+                    && self.settings.current.client_min_messages != "error"
+                {
+                    let mut body = Vec::new();
+                    for (field, value) in [(b'S', "WARNING"), (b'V', "WARNING"), (b'C', "01000")] {
+                        body.push(field);
+                        z(value, &mut body);
+                    }
+                    body.push(b'M');
+                    z(
+                        &format!("you don't own a lock of type {}", mode.name()),
+                        &mut body,
+                    );
+                    body.push(0);
+                    frame(b'N', &body, out)?;
                 }
-                body.push(b'M');
-                z(
-                    &format!("you don't own a lock of type {}", mode.name()),
-                    &mut body,
-                );
-                body.push(0);
-                frame(b'N', &body, out)?;
+                if plan.returns_boolean && plan.cast_to_name {
+                    Value::Text(if success { "t" } else { "f" }.into())
+                } else if plan.returns_boolean {
+                    Value::Bool(success)
+                } else {
+                    Value::Text(String::new())
+                }
             }
-            if plan.returns_boolean && plan.cast_to_name {
-                Value::Text(if success { "t" } else { "f" }.into())
-            } else if plan.returns_boolean {
-                Value::Bool(success)
-            } else {
-                Value::Text(String::new())
-            }
+            _ => return Err("XX000"),
+        };
+        if let Some(cast) = &plan.cast {
+            diagnostic.phase = "advisory result cast";
+            value = scalar(cast, &[value], session, diagnostic)?;
         }
-        _ => return Err("XX000"),
-    };
-    if let Some(cast) = &plan.cast {
-        diagnostic.phase = "advisory result cast";
-        value = scalar(cast, &[value], session, diagnostic)?;
+        Ok(Released::synthetic(SqlResult {
+            columns: vec![description.columns[0].name.clone()],
+            rows: vec![giggles_core::relational::SqlRow {
+                version: 0,
+                values: vec![value],
+            }],
+            affected: 0,
+        }))
     }
-    Ok(Released::synthetic(SqlResult {
-        columns: vec![description.columns[0].name.clone()],
-        rows: vec![giggles_core::relational::SqlRow {
-            version: 0,
-            values: vec![value],
-        }],
-        affected: 0,
-    }))
-}
 
-impl State {
     pub(super) fn execute_advisory(
         &mut self,
         portal: &mut Portal,
@@ -232,15 +250,7 @@ impl State {
                 *implicit = true;
             }
             self.settings.queried = true;
-            let result = evaluate(
-                plan,
-                &portal.params,
-                &portal.s.d,
-                &self.settings.current,
-                session,
-                &mut self.diagnostic,
-                out,
-            )?;
+            let result = self.evaluate_advisory(plan, &portal.params, &portal.s.d, session, out)?;
             let bytes = serde_json::to_vec(result.get()).map_err(|_| "54000")?.len();
             if retained.checked_add(bytes).ok_or("54000")? > MAX_RESPONSE {
                 return Err("54000");
@@ -270,16 +280,13 @@ impl State {
     ) -> R<()> {
         self.settings.queried = true;
         let (plan, description, _) = prepare(call, &[], session, &mut self.diagnostic)?;
-        let result = evaluate(
-            &plan,
-            &[],
-            &description,
-            &self.settings.current,
-            session,
-            &mut self.diagnostic,
-            out,
-        )?;
-        row_description(&description, &[], out)?;
+        let mut notices = Vec::new();
+        let result = self.evaluate_advisory(&plan, &[], &description, session, &mut notices);
+        if result.is_ok() {
+            row_description(&description, &[], out)?;
+        }
+        out.extend(notices);
+        let result = result?;
         rows(
             &self.settings.current,
             session.zone().unwrap_or(SessionZone::Fixed(0)),

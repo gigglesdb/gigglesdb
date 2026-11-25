@@ -60,7 +60,11 @@ impl<'a> AdvisoryCall<'a> {
         };
         let result_cast = if result_type(&mut parser, "name") {
             Some(AdvisoryResultCast::Name)
-        } else if !returns_boolean(name) && result_type(&mut parser, "void") {
+        } else if result_type(&mut parser, "void") {
+            if returns_boolean(name) {
+                user_types::view_replace_error("cannot cast type boolean to void".into());
+                return Err(SqlError::CannotCoerce);
+            }
             None
         } else if parser.tokens.get(parser.at) == Some(&Token::Symbol(':')) {
             let start = spans[parser.at].start;

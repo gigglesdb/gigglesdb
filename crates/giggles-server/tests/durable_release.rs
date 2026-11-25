@@ -221,7 +221,15 @@ mod mechanism_a {
     const BIND_COMMIT: &[u8] = b"\0c\0\0\0\0\0\0\0";
     const BIND_INSERT: &[u8] = b"\0i\0\0\0\0\0\0\0";
     const BLOCKING_CAPACITY: usize = 32;
-    const ADVISORY_LOCK: &str = "SELECT pg_advisory_lock(7)";
+    const ROW_LOCK: &str = "UPDATE admission_hold SET v = 1 WHERE id = 7";
+
+    // A row-lock waiter retains its role and blocking permits.
+    async fn hold_row_lock(client: &tokio_postgres::Client) {
+        client.batch_execute(
+            "CREATE TABLE admission_hold(id int PRIMARY KEY, v int); INSERT INTO admission_hold VALUES (7, 0)",
+        ).await.unwrap();
+        client.batch_execute(&format!("BEGIN; {ROW_LOCK}")).await.unwrap();
+    }
 
     async fn fixture() -> Fixture {
         start_fixture(true, Some(RoleStatementLimits { concurrent: 1, queue: 8, wait_ms: 5000 }), 8).await
@@ -329,7 +337,7 @@ mod mechanism_a {
         for n in 0..BLOCKING_CAPACITY - occupied {
             let role = if n == 0 { "other" } else { "owner" };
             let mut waiter = connect_as(running.address, role).await;
-            query(&mut waiter, ADVISORY_LOCK).await;
+            query(&mut waiter, ROW_LOCK).await;
             waiters.push(waiter);
         }
         wait_until(|| service.blocking_permits_held() == BLOCKING_CAPACITY, "blocking pool saturated").await;
@@ -342,17 +350,23 @@ mod mechanism_a {
             Some(RoleStatementLimits { concurrent: BLOCKING_CAPACITY - 1, queue: 8, wait_ms: 5000 }),
             BLOCKING_CAPACITY + 4,
         ).await;
-        admin.roles().create(NewRole { name: "other".into(), login: true, ..Default::default() }).unwrap();
+        admin.roles().create(NewRole { name: "other".into(), login: true, superuser: true, ..Default::default() }).unwrap();
         client.batch_execute("CREATE TABLE pipeline_tail(id int PRIMARY KEY)").await.unwrap();
-        client.simple_query(ADVISORY_LOCK).await.unwrap();
+        hold_row_lock(&client).await;
         (path, admin, service, running, client, connection)
     }
 
-    async fn hold_role(service: &Service, running: &Running) -> Wire {
-        let mut holder = connect(running.address).await;
-        query(&mut holder, ADVISORY_LOCK).await;
+    async fn hold_role(service: &Service, running: &Running) -> (Wire, Vec<u8>) {
+        let (mut holder, key) = connect_cancellable(running.address).await;
+        query(&mut holder, ROW_LOCK).await;
         wait_until(|| service.role_pool_counts().contains(&(0, 1, 0)), "role permit occupied").await;
-        holder
+        (holder, key)
+    }
+
+    async fn release_role(running: &Running, (holder, key): (Wire, Vec<u8>)) {
+        // EOF alone does not cancel an executing row-lock statement.
+        cancel(running.address, &key).await;
+        drop(holder);
     }
 
     fn assert_error(reply: (u8, Vec<u8>), sqlstate: &[u8]) {
@@ -814,7 +828,7 @@ mod mechanism_a {
     async fn extended_sync_releases_and_pipeline_order_is_preserved() {
         let (path, admin, service, running, client, connection) = fixture().await;
         client.batch_execute("CREATE TABLE extended_tail(id int PRIMARY KEY)").await.unwrap();
-        client.simple_query(ADVISORY_LOCK).await.unwrap();
+        hold_row_lock(&client).await;
         let mut a = connect(running.address).await;
         let hook = giggles_core::CommitSyncHook::new(); let _release = ReleaseOnDrop(hook.clone()); admin.set_commit_sync_hook(Some(hook.clone()));
         let mut parse = b"\0INSERT INTO extended_tail VALUES (1)\0".to_vec(); parse.extend_from_slice(&0u16.to_be_bytes());
@@ -827,7 +841,7 @@ mod mechanism_a {
         hook.release(false);
         let first = until_ready(&mut a).await;
         assert_eq!(first.iter().map(|m| m.0).collect::<Vec<_>>(), b"12CZ");
-        drop(holder);
+        release_role(&running, holder).await;
         let second = until_ready(&mut a).await;
         assert_eq!(second.iter().map(|m| m.0).collect::<Vec<_>>(), b"TDCZ");
         drop(a); finish(path, admin, service, running, client, connection).await;
@@ -837,7 +851,7 @@ mod mechanism_a {
     async fn pipelined_extended_cycles_reply_before_next_role_admission() {
         let (path, admin, service, running, client, connection) = fixture().await;
         client.batch_execute("CREATE TABLE pipeline_tail(id int PRIMARY KEY)").await.unwrap();
-        client.simple_query(ADVISORY_LOCK).await.unwrap();
+        hold_row_lock(&client).await;
         let mut wire = connect(running.address).await;
         let hook = giggles_core::CommitSyncHook::new();
         let _release = ReleaseOnDrop(hook.clone());
@@ -858,7 +872,7 @@ mod mechanism_a {
         assert_eq!(first[3].1, b"I");
         queued(&service).await;
         assert_only_first_pipeline_row(&admin);
-        drop(holder);
+        release_role(&running, holder).await;
 
         let second = until_ready(&mut wire).await;
         assert_eq!(second.iter().map(|reply| reply.0).collect::<Vec<_>>(), b"12CZ");
@@ -874,7 +888,7 @@ mod mechanism_a {
         client.batch_execute("CREATE TABLE no_readmit(id int PRIMARY KEY)").await.unwrap();
         service.set_role_statement_limits(giggles_server::admission::RoleStatementLimits { concurrent: 1, queue: 0, wait_ms: 10 }).unwrap();
         let mut a = connect(running.address).await;
-        client.simple_query(ADVISORY_LOCK).await.unwrap();
+        hold_row_lock(&client).await;
         let hook = giggles_core::CommitSyncHook::new(); let _release = ReleaseOnDrop(hook.clone()); admin.set_commit_sync_hook(Some(hook.clone()));
         query(&mut a, "INSERT INTO no_readmit VALUES (1)").await; entered(&hook).await; released(&service).await;
         let b = hold_role(&service, &running).await;
@@ -882,7 +896,7 @@ mod mechanism_a {
         let responses = until_ready(&mut a).await;
         assert!(responses.iter().any(|m| m.0 == b'C'));
         assert!(!responses.iter().any(|m| m.0 == b'E'));
-        drop(a); drop(b); finish(path, admin, service, running, client, connection).await;
+        drop(a); release_role(&running, b).await; finish(path, admin, service, running, client, connection).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn simple_batches_keep_admission_through_commit() {
@@ -1059,7 +1073,7 @@ mod mechanism_a {
     async fn disconnect_cancels_a_queued_pipeline_readmission() {
         let (path, admin, service, running, client, connection) = fixture().await;
         client.batch_execute("CREATE TABLE pipeline_tail(id int PRIMARY KEY)").await.unwrap();
-        client.simple_query(ADVISORY_LOCK).await.unwrap();
+        hold_row_lock(&client).await;
         let mut a = connect(running.address).await;
         prepare_commit(&mut a, true).await;
         let hook = giggles_core::CommitSyncHook::new();
@@ -1087,7 +1101,7 @@ mod mechanism_a {
         }).await.expect("disconnected role waiter retired while the permit was still occupied");
         assert_only_first_pipeline_row(&admin);
 
-        drop(holder);
+        release_role(&running, holder).await;
         drop(a);
         finish(path, admin, service, running, client, connection).await;
     }
@@ -1295,7 +1309,7 @@ mod mechanism_a {
     async fn leadership_change_while_waiting_for_initial_role_admission_refuses_query() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let (path, admin, service, running, client, connection) = fixture().await;
-        client.simple_query(ADVISORY_LOCK).await.unwrap();
+        hold_row_lock(&client).await;
         let holder = hold_role(&service, &running).await;
         let leader = Arc::new(AtomicBool::new(true));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1313,7 +1327,7 @@ mod mechanism_a {
         queued(&service).await;
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         leader.store(false, Ordering::Release);
-        drop(holder);
+        release_role(&running, holder).await;
 
         assert_error(message(&mut simple).await, b"57P01");
         assert_eq!(calls.load(Ordering::Relaxed), 1);

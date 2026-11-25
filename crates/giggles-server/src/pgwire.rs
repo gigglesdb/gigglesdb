@@ -324,6 +324,7 @@ impl Diagnostic {
                 || m == "canceling statement due to lock timeout"
                 || m == "hashing text with a nondeterministic collation is not supported"
                 || m.starts_with("cannot cast type void to ")
+                || m == "cannot cast type boolean to void"
                 || m.starts_with("type modifier is not allowed for type ")
                 || m.starts_with("permission denied for table ") || m.starts_with("view ") || m.starts_with("sequence ") || m.starts_with("index ")
                 || m.starts_with("relation ") && m.contains(" clause not found in FROM clause")
@@ -412,6 +413,7 @@ impl Diagnostic {
                         name.strip_prefix("pg_catalog.").unwrap_or(name),
                         "gen_random_uuid" | "uuidv4" | "uuidv7" | "random" | "setseed"
                             | "uuid_extract_version" | "uuid_extract_timestamp"
+                            | "hashtext" | "hashtextextended"
                     ))
             }
             (Err(CoreError::Sql(SqlError::DatetimeFieldOverflow)), Some(m)) => matches!(
@@ -2012,15 +2014,34 @@ impl ExecutionAdmission {
         self.permits.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn reacquire(&mut self, session: &Session, needs_role: bool) -> Result<(), crate::admission::StatementRefusal> {
-        use crate::admission::StatementRefusal;
-
+    fn release(&self) {
         let old = std::mem::take(&mut *self.permits());
         drop(old);
+    }
+
+    fn reacquire(&mut self, session: &Session, needs_role: bool) -> Result<(), crate::admission::StatementRefusal> {
+        self.reacquire_before(session, needs_role, None)
+    }
+
+    fn reacquire_before(
+        &mut self,
+        session: &Session,
+        needs_role: bool,
+        lock_deadline: Option<std::time::Instant>,
+    ) -> Result<(), crate::admission::StatementRefusal> {
+        use crate::admission::StatementRefusal;
+
+        self.release();
         let permits = self.runtime.block_on(async {
             tokio::select! {
                 biased;
                 _ = self.disconnected.changed() => Err(StatementRefusal::Core(CoreError::Cancelled)),
+                _ = async {
+                    match lock_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                        None => std::future::pending().await,
+                    }
+                } => Err(StatementRefusal::Core(CoreError::LockNotAvailable)),
                 admitted = async {
                     let role_permit = if needs_role {
                         Some(session.service.admission.statement(&session.role, Some(&self.context)).await?)

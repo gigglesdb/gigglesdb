@@ -1,5 +1,5 @@
 //! GD-0075 R5-103: per-role statement admission over pgwire. Role `a` at its
-//! statement limit (blocked on an advisory lock) plus a full queue must not
+//! statement limit (blocked on a row lock) plus a full queue must not
 //! move role `b`'s latency: p99 of b's statements stays under 1 s (without per-role admission it would wait until role a releases its lock) on a
 //! loaded debug build, and a's statement beyond concurrent+queue fails 53000.
 #![cfg(feature = "engine-rocksdb")]
@@ -102,7 +102,11 @@ async fn role_at_its_limit_does_not_move_another_roles_latency() {
     let address = pg.address;
     let owner = client(address, "owner").await;
     owner
-        .simple_query("SELECT pg_advisory_lock(7)")
+        .batch_execute("CREATE TABLE admission_hold (id int PRIMARY KEY, v int); INSERT INTO admission_hold VALUES (7, 0)")
+        .await
+        .unwrap();
+    owner
+        .batch_execute("BEGIN; UPDATE admission_hold SET v = 1 WHERE id = 7")
         .await
         .unwrap();
 
@@ -117,7 +121,7 @@ async fn role_at_its_limit_does_not_move_another_roles_latency() {
     let mut blocked = Vec::new();
     for a in waiting_sessions.drain(..4) {
         blocked.push(tokio::spawn(async move {
-            a.simple_query("SELECT pg_advisory_xact_lock(7); COMMIT")
+            a.simple_query("UPDATE admission_hold SET v = 1 WHERE id = 7; COMMIT")
                 .await
                 .map(|_| ())
         }));
@@ -149,7 +153,7 @@ async fn role_at_its_limit_does_not_move_another_roles_latency() {
     for a in waiting_sessions {
         extra.push(tokio::spawn(async move {
             let started = Instant::now();
-            let result = a.simple_query("SELECT pg_advisory_xact_lock(7); COMMIT").await;
+            let result = a.simple_query("UPDATE admission_hold SET v = 1 WHERE id = 7; COMMIT").await;
             (refusal(result), started.elapsed(), a)
         }));
     }
@@ -195,10 +199,7 @@ async fn role_at_its_limit_does_not_move_another_roles_latency() {
     assert!(*wait_elapsed >= Duration::from_millis(1_900));
 
     // Releasing the lock finishes a's blocked statements and frees its slots.
-    owner
-        .simple_query("SELECT pg_advisory_unlock(7)")
-        .await
-        .unwrap();
+    owner.batch_execute("COMMIT").await.unwrap();
     for task in blocked {
         tokio::time::timeout(Duration::from_secs(30), task)
             .await

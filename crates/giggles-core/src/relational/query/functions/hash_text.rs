@@ -40,6 +40,75 @@ pub(super) fn signature(name: &str, count: usize) -> Option<R<Signature>> {
     })
 }
 
+pub(super) fn bind(name: &str, source: &[Scalar], mut args: Vec<BoundScalar>) -> R<BoundScalar> {
+    let undefined = || {
+        let types: Vec<_> = source
+            .iter()
+            .zip(&args)
+            .map(|(source, arg)| {
+                if matches!(source, Scalar::Literal(Value::Text(_) | Value::Null)) {
+                    "unknown"
+                } else {
+                    typeof_expr::name(&arg.ty)
+                }
+            })
+            .collect();
+        user_types::view_replace_error(format!(
+            "function {name}({}) does not exist",
+            types.join(", ")
+        ));
+        user_types::sql_error_hint(
+            "No function matches the given name and argument types. You might need to add explicit type casts.",
+        );
+        SqlError::UndefinedFunction
+    };
+    let (_, ty) = signature(name, args.len())
+        .and_then(Result::ok)
+        .ok_or_else(undefined)?;
+    if source
+        .iter()
+        .zip(&args)
+        .enumerate()
+        .any(|(index, (source, arg))| {
+            let accepts_type = if index == 0 {
+                matches!(
+                    arg.ty,
+                    DataType::Text | DataType::Varchar | DataType::Bpchar
+                )
+            } else {
+                integer(&arg.ty)
+            };
+            !accepts_type && !matches!(source, Scalar::Literal(Value::Text(_) | Value::Null))
+        })
+    {
+        return Err(undefined());
+    }
+    for (index, (source, arg)) in source.iter().zip(&mut args).enumerate() {
+        if index == 0 {
+            if arg.ty == DataType::Bpchar {
+                let source = std::mem::replace(
+                    arg,
+                    BoundScalar {
+                        ty: DataType::Text,
+                        node: Node::Literal(Value::Null),
+                    },
+                );
+                arg.node = cast_node(source, &DataType::Text);
+            } else {
+                arg.ty = DataType::Text;
+            }
+        } else if let Scalar::Literal(value @ (Value::Text(_) | Value::Null)) = source {
+            arg.ty = DataType::BigInt;
+            arg.node = literal_cast_node(value.clone(), &DataType::BigInt)?;
+        }
+    }
+    collation::derive(args.iter())?;
+    Ok(BoundScalar {
+        ty,
+        node: Node::Call(name.into(), args),
+    })
+}
+
 pub(super) fn eval(args: &[BoundScalar], values: &[Value], budget: &mut usize) -> R<Value> {
     let (input, seed, extended) = match values {
         [Value::Text(input)] => (input, 0, false),
