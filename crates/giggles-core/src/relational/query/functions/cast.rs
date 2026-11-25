@@ -424,12 +424,25 @@ pub(super) fn parse_expression(p: &mut Parser, value: Scalar) -> R<Scalar> {
         Ok(target) => Ok(expression(value, target)),
         Err(error @ (SqlError::UndefinedObject | SqlError::Unsupported)) => {
             p.at = start;
+            // The domain parser rejects reserved schema names. A qualified scalar
+            // json cast uses the builtin input routine, just like an unqualified cast.
+            if let [
+                Token::Word(schema) | Token::QuotedIdent(schema),
+                Token::Symbol('.'),
+                Token::Word(ty) | Token::QuotedIdent(ty),
+                tail @ ..,
+            ] = &p.tokens[start..]
+                && schema == "pg_catalog"
+                && ty == "json"
+                && !matches!(tail.first(), Some(Token::Symbol('[' | '(')))
+            {
+                p.at += 2;
+            }
             let name = user_types::TypeReference::parse(p)?;
             if p.tokens.get(p.at) == Some(&Token::Symbol('(')) {
                 return Err(SqlError::Unsupported);
             }
-            if matches!(name.name.as_str(), "json" | "pg_catalog\0json") && !name.array
-            {
+            if name.name == "json" && !name.array {
                 return Ok(Scalar::Call(json_aggregate::INPUT.into(), vec![value]));
             }
             Ok(Scalar::Domain(Box::new(value), name, Box::new(Err(error))))

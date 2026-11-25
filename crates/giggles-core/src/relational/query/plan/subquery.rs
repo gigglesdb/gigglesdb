@@ -802,8 +802,19 @@ fn prepare(
     }
     let mut query = s.query.clone();
     for (item, alias) in &mut query.items {
-        if alias.is_none()
-            && let Item::Scalar(Scalar::Column(c)) = item
+        if alias.is_some() {
+            continue;
+        }
+        let Item::Scalar(value) = item else { continue };
+        // The scalar subquery's output name is known before apply lowering
+        // replaces the reference with a value expression.
+        let mut value = &*value;
+        while let Scalar::Call(name, args) = value
+            && name == json_aggregate::INPUT
+        {
+            value = &args[0];
+        }
+        if let Scalar::Column(c) = value
             && let Some((_, _, name, _)) = names.iter().find(|(n, _, _, _)| *n == c.name)
         {
             *alias = Some(name.clone());

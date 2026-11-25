@@ -6,6 +6,8 @@ pub(super) const OID: u32 = 114;
 pub(super) const ARRAY_OID: u32 = 199;
 pub(super) const TEXT_RESULT: &str = "\0json_aggregate_text_result";
 pub(super) const INPUT: &str = "\0json_input";
+// A cast whose input was validated at bind time or is already JSON.
+pub(super) const VALIDATED_INPUT: &str = "\0json_input_validated";
 pub(super) const OBJECT: &str = "jsonb_build_object";
 pub(super) const RECORD_KEY: &str = "\0jsonb_object_record_key";
 

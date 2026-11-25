@@ -92,6 +92,76 @@ fn table_expression_matrix() {
     }
 }
 #[test]
+fn json_cast_column_labels() {
+    let a = Admin::create(common::fresh("pgparity-json-cast-labels"), Limits::default()).unwrap();
+    let mut s = a.sql_session();
+    run(&mut s, "CREATE TABLE t(id int PRIMARY KEY, s text)");
+    run(&mut s, r#"INSERT INTO t VALUES (1, '{"a":1}')"#);
+
+    for (sql, names) in [
+        (r#"SELECT '{"a":1}'::json"#, &["json"][..]),
+        ("SELECT s::json FROM t", &["s"]),
+        ("SELECT CAST(s AS json) FROM t", &["s"]),
+        ("SELECT CAST('{}' AS json)", &["json"]),
+        ("SELECT j::json FROM (SELECT '{}'::json AS j) t", &["j"]),
+        ("SELECT max(s)::json FROM t", &["max"]),
+        ("SELECT json_agg(s)::json FROM t", &["json_agg"]),
+        (
+            "SELECT s::json, row_number() OVER () FROM t",
+            &["s", "row_number"],
+        ),
+        (
+            "SELECT '{}'::json, row_number() OVER () FROM t",
+            &["json", "row_number"],
+        ),
+        (
+            "SELECT s::text, row_number() OVER () FROM t",
+            &["s", "row_number"],
+        ),
+        ("SELECT (CASE WHEN true THEN '{}'::json END)::json", &["json"]),
+        ("SELECT (CASE WHEN true THEN 'x' END)::text", &["text"]),
+        ("SELECT (CASE WHEN true THEN '{}' END)::json", &["json"]),
+        ("SELECT CASE WHEN true THEN '{}'::json END", &["case"]),
+        ("SELECT CASE WHEN true THEN s::json END FROM t", &["case"]),
+        (
+            "SELECT CASE WHEN true THEN s::json END, row_number() OVER () FROM t",
+            &["case", "row_number"],
+        ),
+        ("SELECT (SELECT s FROM t)::json", &["s"]),
+        ("SELECT coalesce(NULL::json, '{}'::json)::json", &["coalesce"]),
+        ("SELECT '{}'::json::json", &["json"]),
+        ("SELECT '[1]'::json::text", &["text"]),
+        ("SELECT s::json::text FROM t", &["s"]),
+        ("SELECT ('{}'::json)", &["json"]),
+        ("SELECT '{}'::pg_catalog.json", &["json"]),
+        (
+            "SELECT '{}'::jsonb, s::jsonb, '1'::int, s::text FROM t",
+            &["jsonb", "s", "int4", "s"],
+        ),
+    ] {
+        let result = s.execute(sql, &[], None).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert_eq!(result.columns, names, "{sql}");
+    }
+
+    for (sql, name, value) in [
+        (r#"SELECT d.s FROM (SELECT s::json FROM t) d"#, "s", r#"{"a":1}"#),
+        ("SELECT * FROM (SELECT '{}'::json) q", "json", "{}"),
+        ("SELECT d.s::json FROM (SELECT s::json FROM t) d", "s", r#"{"a":1}"#),
+        ("INSERT INTO t(id, s) VALUES (2, '[2]') RETURNING s::json", "s", "[2]"),
+    ] {
+        let result = s.execute(sql, &[], None).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert_eq!(result.columns, [name], "{sql}");
+        assert_eq!(result.rows[0].values, texts(&[value]), "{sql}");
+    }
+
+    let result = s
+        .execute("SELECT pg_typeof('{}'::json), '{}'::json AS x", &[], None)
+        .unwrap();
+    assert_eq!(result.columns, ["pg_typeof", "x"]);
+    assert_eq!(result.rows[0].values[0], Value::Text("json".into()));
+}
+
+#[test]
 fn table_free_regtype_and_enum() {
     let a = Admin::create(common::fresh("pgparity-typeof-free"), Limits::default()).unwrap();
     let mut s = a.sql_session();

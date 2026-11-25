@@ -315,13 +315,13 @@ fn cast_node(value: BoundScalar, target: &DataType) -> Node {
     }
 }
 
-fn json_literal(value: &Value) -> R<BoundScalar> {
+fn json_literal(value: &Value, name: &str) -> R<BoundScalar> {
     if let Value::Text(text) = value {
         json_aggregate::validate_input(text)?;
     }
     Ok(BoundScalar {
         ty: DataType::Text,
-        node: Node::Call(json_aggregate::TEXT_RESULT.into(), vec![BoundScalar {
+        node: Node::Call(name.into(), vec![BoundScalar {
             ty: DataType::Text,
             node: Node::Literal(value.clone()),
         }]),
@@ -1487,7 +1487,7 @@ impl Scalar {
         let result = |value: &Scalar| -> R<BoundScalar> {
             if let Self::Literal(value @ (Value::Text(_) | Value::Null)) = value {
                 if json {
-                    return json_literal(value);
+                    return json_literal(value, json_aggregate::TEXT_RESULT);
                 }
                 if let Some(enum_type) = enum_type {
                     return BoundScalar::enum_literal(value, &ty, enum_type);
@@ -1781,17 +1781,18 @@ impl Scalar {
             }
             json_aggregate::INPUT if args.len() == 1 => {
                 if let Self::Literal(value @ (Value::Text(_) | Value::Null)) = &args[0] {
-                    return json_literal(value);
+                    return json_literal(value, json_aggregate::VALIDATED_INPUT);
                 }
                 let inner = args[0].bind(resolve, tables, parameters)?;
-                if inner.result_oid() == json_aggregate::OID {
-                    return Ok(inner);
-                }
-                if !matches!(inner.ty, DataType::Text | DataType::Varchar | DataType::Bpchar | DataType::Jsonb) {
+                let (name, ty) = if inner.result_oid() == json_aggregate::OID {
+                    (json_aggregate::VALIDATED_INPUT, inner.ty.clone())
+                } else if matches!(inner.ty, DataType::Text | DataType::Varchar | DataType::Bpchar | DataType::Jsonb) {
+                    (name, DataType::Text)
+                } else {
                     return Err(SqlError::CannotCoerce);
-                }
+                };
                 Ok(BoundScalar {
-                    ty: DataType::Text,
+                    ty,
                     node: Node::Call(name.into(), vec![inner]),
                 })
             }
@@ -2283,7 +2284,7 @@ impl Scalar {
                 return Err(SqlError::UndefinedFunction);
             };
             if let Scalar::Literal(value @ (Value::Text(_) | Value::Null)) = original {
-                *arg = json_literal(value)?;
+                *arg = json_literal(value, json_aggregate::TEXT_RESULT)?;
             }
             if arg.result_oid() != json_aggregate::OID {
                 return Err(SqlError::UndefinedFunction);
@@ -2667,7 +2668,7 @@ impl Scalar {
                     for (a, original) in args.iter_mut().zip(original) {
                         if json {
                             if let Self::Literal(value @ (Value::Text(_) | Value::Null)) = original {
-                                *a = json_literal(value)?;
+                                *a = json_literal(value, json_aggregate::TEXT_RESULT)?;
                             }
                         } else if let Self::Literal(value @ (Value::Text(_) | Value::Null)) = original
                             && let Some(enum_type) = &enum_type
@@ -2768,7 +2769,7 @@ impl BoundScalar {
                 if json_array::name(name).is_some() && !json_array::binary(name) => json_aggregate::OID,
             Node::Call(name, args)
                 if name == "\0json_get" && args[0].result_oid() == json_aggregate::OID => json_aggregate::OID,
-            Node::Call(name, _) if matches!(name.as_str(), json_aggregate::TEXT_RESULT | json_aggregate::INPUT) => json_aggregate::OID,
+            Node::Call(name, _) if matches!(name.as_str(), json_aggregate::TEXT_RESULT | json_aggregate::INPUT | json_aggregate::VALIDATED_INPUT) => json_aggregate::OID,
             Node::Case(arms, other) => json_in_branches(arms.iter().map(|(_, value)| value).chain(other.as_deref())),
             Node::Call(name, args) if name == "coalesce" => json_in_branches(args.iter()),
             Node::TriggerCall(_) => routines::TRIGGER_TYPE,
@@ -2859,11 +2860,11 @@ impl BoundScalar {
         match &self.node {
             Node::ZonedOperator(name, ..) if matches!(name.as_str(), "date_trunc" | "uuidv7") => Some(name),
             Node::ZonedOperator(name, ..) => json_array::name(name),
-            Node::EnumSort(..) | Node::Predicate(_) => None,
-            Node::Case(..) => Some("case"),
+            Node::EnumSort(..) | Node::Predicate(_) | Node::Case(..) => None,
             Node::Call(name, _) if name == array_constructor::NAME => Some("array"),
             Node::Call(name, args) if collation::internal(name) || aggregate_order::internal(name) || name == "\0array_subscript" => args[0].strong_name(),
             Node::Call(name, _) if name == "\0ts_length" => Some("length"),
+            Node::Call(name, args) if matches!(name.as_str(), json_aggregate::INPUT | json_aggregate::VALIDATED_INPUT) => args[0].strong_name(),
             Node::Call(name, _) if name.starts_with("\0json_") || name.starts_with("\0ts_") => None,
             Node::Call(name, _) if arithmetic::internal_name(name) || name.starts_with(ROW_ORDER_PREFIX) => None,
             Node::Column(_, name) | Node::TriggerCall(name)
@@ -2909,6 +2910,9 @@ impl BoundScalar {
             Node::Call(n, _) if n == regexp::SUBSTRING_SIMILAR => "substring",
             Node::Call(n, _) if matches!(n.as_str(), regexp::SIMILAR_TO | regexp::NOT_SIMILAR_TO) => "?column?",
             Node::Call(n, args) if collation::internal(n) || aggregate_order::internal(n) || n == "\0array_subscript" => args[0].name(),
+            Node::Call(n, args) if matches!(n.as_str(), json_aggregate::INPUT | json_aggregate::VALIDATED_INPUT) => {
+                args[0].strong_name().unwrap_or("json")
+            }
             Node::Call(n, _) if n.starts_with("\0json_") || n.starts_with(ROW_ORDER_PREFIX) => "?column?",
             Node::Call(n, _) if n == conditional::NULLS_VARIADIC => "num_nulls",
             Node::Call(n, _) if n == conditional::NONNULLS_VARIADIC => "num_nonnulls",
@@ -3155,7 +3159,9 @@ impl BoundScalar {
                 Ok(v.clone())
             }
             Node::Call(n, _) if n == "\0plan_cardinality" => Err(plan::subquery::cardinality_error()),
-            Node::Call(n, args) if n == json_aggregate::TEXT_RESULT => args[0].eval(row, params, budget),
+            Node::Call(n, args) if matches!(n.as_str(), json_aggregate::TEXT_RESULT | json_aggregate::VALIDATED_INPUT) => {
+                args[0].eval(row, params, budget)
+            }
             Node::Call(n, args) if n == json_aggregate::INPUT => {
                 let value = args[0].eval(row, params, budget)?;
                 let value = cast_value(value, &DataType::Text, budget)?;

@@ -341,7 +341,12 @@ fn cast_output_name(s: &Scalar) -> Option<String> {
     match s {
         Scalar::Cast(inner, _) | Scalar::Domain(inner, ..) => cast_output_name(inner),
         Scalar::Column(c) => Some(c.name.clone()),
-        Scalar::Call(name, args) if name == functions::CAST_TYPMOD => {
+        Scalar::Call(name, args)
+            if matches!(
+                name.as_str(),
+                functions::CAST_TYPMOD | json_aggregate::INPUT | json_aggregate::VALIDATED_INPUT
+            ) =>
+        {
             args.first().and_then(cast_output_name)
         }
         Scalar::Call(name, _) => Some(
@@ -909,9 +914,13 @@ pub(super) fn bind<'a>(
             Item::Scalar(s)
                 if contains_aggregate(s)
                     && (matches!(s, Scalar::Cast(..) | Scalar::Domain(..))
-                        || matches!(s, Scalar::Call(name, _) if name == functions::CAST_TYPMOD)) => {
-                    Ok(cast_output_name(s).unwrap_or_else(|| b.name().to_owned()))
-                }
+                        || matches!(s, Scalar::Call(name, _) if matches!(
+                            name.as_str(),
+                            functions::CAST_TYPMOD | json_aggregate::INPUT | json_aggregate::VALIDATED_INPUT
+                        ))) =>
+            {
+                Ok(cast_output_name(s).unwrap_or_else(|| b.name().to_owned()))
+            }
             Item::Scalar(s) if !contains_aggregate(s) => {
                 Ok(s.bind(resolve, tables, &parameters)?.name().to_owned())
             }

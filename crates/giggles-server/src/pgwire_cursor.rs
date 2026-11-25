@@ -371,12 +371,14 @@ impl Cursors {
                 )
             }
             Command::Close(name) => {
-                if let Some(name) = name {
+                let tag = if let Some(name) = name {
                     self.0.remove(name).ok_or("34000")?;
+                    "CLOSE CURSOR"
                 } else {
                     self.close_all();
-                }
-                complete("CLOSE CURSOR", &empty(), out)
+                    "CLOSE CURSOR ALL"
+                };
+                complete(tag, &empty(), out)
             }
         }
     }

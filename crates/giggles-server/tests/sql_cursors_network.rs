@@ -119,6 +119,66 @@ async fn simple_fetch_move_and_close_tags() {
     f.stop().await;
 }
 #[tokio::test]
+async fn close_all_command_complete_tags() {
+    let f = Fixture::new().await;
+    let mut stream = wire(&f).await;
+    for (sql, tag, status) in [
+        ("BEGIN", "BEGIN", b'T'),
+        ("DECLARE c1 CURSOR FOR SELECT 1", "DECLARE CURSOR", b'T'),
+        ("CLOSE ALL", "CLOSE CURSOR ALL", b'T'),
+        ("CLOSE ALL", "CLOSE CURSOR ALL", b'T'),
+        ("DECLARE c2 CURSOR FOR SELECT 2", "DECLARE CURSOR", b'T'),
+        ("CLOSE c2", "CLOSE CURSOR", b'T'),
+        ("DECLARE held CURSOR WITH HOLD FOR SELECT 3", "DECLARE CURSOR", b'T'),
+        ("COMMIT", "COMMIT", b'I'),
+        ("CLOSE ALL", "CLOSE CURSOR ALL", b'I'),
+        ("CLOSE ALL", "CLOSE CURSOR ALL", b'I'),
+    ] {
+        let messages = query(&mut stream, sql, false).await;
+        assert!(
+            matches!(messages.as_slice(), [(b'C', body), (b'Z', ready)]
+                if body.strip_suffix(&[0]) == Some(tag.as_bytes()) && ready.as_slice() == [status]),
+            "{sql}: {messages:?}"
+        );
+    }
+    let fetch = query(&mut stream, "FETCH FROM held", false).await;
+    assert_eq!(error(&fetch), "34000");
+    drop(stream);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn json_cast_row_description_names() {
+    let f = Fixture::new().await;
+    let mut stream = wire(&f).await;
+    let setup = query(
+        &mut stream,
+        "CREATE TABLE t(id int PRIMARY KEY, s text); INSERT INTO t VALUES (1, '{}')",
+        false,
+    )
+    .await;
+    assert!(matches!(setup.as_slice(), [(b'C', _), (b'C', _), (b'Z', _)]));
+
+    for (sql, name) in [
+        (r#"SELECT '{"a":1}'::json"#, "json"),
+        ("SELECT s::json FROM t", "s"),
+        ("SELECT max(s)::json FROM t", "max"),
+    ] {
+        let messages = query(&mut stream, sql, false).await;
+        let [(b'T', description), ..] = messages.as_slice() else {
+            panic!("{sql}: {messages:?}");
+        };
+        assert_eq!(&description[..2], &1u16.to_be_bytes(), "{sql}");
+        let mut field = description[2..].splitn(2, |byte| *byte == 0);
+        assert_eq!(field.next(), Some(name.as_bytes()), "{sql}");
+        // The type OID follows the source table OID and attribute number.
+        assert_eq!(&field.next().unwrap()[6..10], &114u32.to_be_bytes(), "{sql}");
+    }
+    drop(stream);
+    f.stop().await;
+}
+
+#[tokio::test]
 async fn repeated_fetch_preserves_scalar_subqueries_and_volatile_calls() {
     let f = Fixture::new().await;
     let c = f.client().await;

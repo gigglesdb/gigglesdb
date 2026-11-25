@@ -694,6 +694,12 @@ fn output_name(mut s: &Scalar, calls: &[Call]) -> String {
             }
             Scalar::Domain(inner, ..) => s = inner,
             Scalar::Call(name, args)
+                if matches!(name.as_str(), json_aggregate::INPUT | json_aggregate::VALIDATED_INPUT) =>
+            {
+                cast_name.get_or_insert("json");
+                s = &args[0];
+            }
+            Scalar::Call(name, args)
                 if functions::collation::internal(name)
                     || matches!(name.as_str(), "\0array_subscript" | functions::CAST_TYPMOD) =>
             {
@@ -712,7 +718,9 @@ fn output_name(mut s: &Scalar, calls: &[Call]) -> String {
         Scalar::Call(n, _) if !n.starts_with('\0') => Some(n.as_str()),
         _ => None,
     };
-    name.or(cast_name).unwrap_or("?column?").into()
+    name.or(cast_name)
+        .unwrap_or(if matches!(s, Scalar::Case(_)) { "case" } else { "?column?" })
+        .into()
 }
 struct WindowInput {
     items: Vec<(Item, Option<String>)>,
