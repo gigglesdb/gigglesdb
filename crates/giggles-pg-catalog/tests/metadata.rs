@@ -604,7 +604,7 @@ fn exact_transport_and_parameter_descriptors() {
 fn xmin_reports_current_catalog_generation() {
     assert_eq!(
         run("SELECT xmin FROM pg_namespace").rows,
-        vec![vec![Value::Int(0)]; 3]
+        vec![vec![Value::Int(0)]; 4]
     );
     assert_eq!(
         run("SELECT xmin FROM pg_namespace").fields[0]

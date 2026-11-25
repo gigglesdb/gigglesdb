@@ -14,6 +14,7 @@ fn owned(name: &str) -> bool {
         || matches!(
             name,
             "pg_catalog"
+                | "pg_toast"
                 | "information_schema"
                 | "pg_options_to_table"
                 | "pg_get_sequence_data"

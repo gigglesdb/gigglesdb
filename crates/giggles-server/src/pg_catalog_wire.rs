@@ -824,13 +824,27 @@ pub(crate) fn with_search_path(
     path: &str,
 ) -> giggles_pg_catalog::CatalogSnapshot {
     let mut seen = std::collections::BTreeSet::new();
+    let inherits = |role: &giggles_pg_catalog::RoleDef| {
+        role.name == snapshot.user
+            || snapshot.role_privileges.get(&(snapshot.user.clone(), role.name.clone()))
+                .is_some_and(|privileges| privileges[1])
+    };
+    let all_schema_usage = snapshot.roles.iter().any(|role| {
+        (role.name == snapshot.user && role.superuser)
+            || (matches!(role.name.as_str(), "pg_read_all_data" | "pg_write_all_data") && inherits(role))
+    });
     snapshot.search_path = giggles_core::relational::schema_search_path(path, &snapshot.user)
         .into_iter()
-        .filter(|name| {
-            matches!(
-                name.as_str(),
-                "pg_catalog" | "information_schema" | "public"
-            ) || snapshot.schemas.contains_key(name)
+        .filter(|name| match name.as_str() {
+            "public" | "pg_catalog" | "information_schema" => true,
+            "pg_toast" => all_schema_usage || snapshot.roles.iter().any(|role| role.oid == 10 && inherits(role)),
+            _ => snapshot.schemas.get(name).is_some_and(|(_, owner)| {
+                all_schema_usage || snapshot.roles.iter().filter(|role| inherits(role)).any(|role| {
+                    role.oid == *owner
+                        || snapshot.schema_privileges.get(&(role.oid, name.clone()))
+                            .is_some_and(|privileges| privileges[1])
+                })
+            }),
         })
         .filter(|name| seen.insert(name.clone()))
         .collect();

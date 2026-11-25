@@ -297,6 +297,7 @@ fn owners_follow_snapshot_with_oid10_fallback() {
         vec![
             vec![s("information_schema"), i(10)],
             vec![s("pg_catalog"), i(10)],
+            vec![s("pg_toast"), i(10)],
             vec![s("public"), i(6171)]
         ]
     );

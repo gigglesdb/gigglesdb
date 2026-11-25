@@ -455,7 +455,7 @@ fn catalog_identity_authorized_facts_and_generation_xmin() {
     ));
     assert_eq!(
         run("select xmin from pg_catalog.pg_namespace", &[]).rows,
-        vec![vec![Value::Int(0)]; 3]
+        vec![vec![Value::Int(0)]; 4]
     );
     assert!(
         run("select age(xmin) from pg_catalog.pg_proc", &[])

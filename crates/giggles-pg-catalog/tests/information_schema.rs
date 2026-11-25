@@ -218,7 +218,6 @@ fn golden_rows(text: &str, fields: &[Field]) -> Vec<Vec<Value>> {
     text.lines()
         .skip(1)
         .filter(|line| !line.starts_with('('))
-        .filter(|line| !line.starts_with("postgres|pg_toast|"))
         .map(|line| {
             let cells: Vec<_> = line.split('|').collect();
             assert_eq!(cells.len(), fields.len());

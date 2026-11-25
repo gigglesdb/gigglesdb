@@ -101,7 +101,7 @@ fn namespace_inventory_computes_defaults_without_fabricating_acl_metadata() {
     assert_eq!(result.fields[4].data_type, PgType::AclItemArray);
     assert_eq!(result.fields[5].data_type, PgType::AclItemArray);
     assert_eq!(result.fields[5].data_type.oid(), 1034);
-    assert_eq!(result.rows.len(), 3);
+    assert_eq!(result.rows.len(), 4);
     for row in result.rows {
         let owner = if row[3] == Value::Int(6171) {
             "pg_database_owner"

@@ -1317,7 +1317,7 @@ impl Drop for Session {
 }
 // Virtual namespaces exposed by pg_namespace exist even without physical schema metadata.
 pub(crate) fn is_builtin_catalog_schema(schema: &str) -> bool {
-    matches!(schema, "pg_catalog" | "information_schema")
+    matches!(schema, "pg_catalog" | "pg_toast" | "information_schema")
 }
 
 impl Session {

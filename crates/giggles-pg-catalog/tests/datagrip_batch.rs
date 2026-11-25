@@ -56,9 +56,7 @@ fn captured_expanded_global_discovery() {
             4 => 2, // Built-in pg_default and pg_global tablespaces.
             5 => 3, // Two tablespaces plus the snapshot database.
             10 => 1, // Fresh PostgreSQL installs plpgsql.
-            // PostgreSQL 18.6 returns 8 rows: 4 languages and 4 namespaces.
-            // GigglesDB omits pg_toast, a pre-existing difference tracked separately.
-            11 => 7,
+            11 => 8, // PostgreSQL 18.6: 4 languages and 4 namespaces.
             12 => 26, // PG18.6 casts from the reflected integer/text GUI inventory.
             _ => 0,
         };
@@ -291,4 +289,51 @@ fn new_query_forms_preserve_fail_closed_boundaries() {
         execute(&p, &snapshot(), &[Value::Text("x".repeat(8192))]),
         Err(Error::Limit)
     );
+}
+
+#[test]
+fn table_free_regnamespace_casts_are_unsupported() {
+    for sql in [
+        "SELECT 'public'::regnamespace",
+        "SELECT 12345::regnamespace",
+        "SELECT 12345::regnamespace::text",
+        "SELECT 0::regnamespace",
+        "SELECT '5'::oid::regnamespace",
+        "SELECT 'pg_toast'::regnamespace::oid",
+        "SELECT current_schema(), 'public'::regnamespace",
+    ] {
+        assert!(matches!(plan_gateway(sql), Err(Error::Unsupported)), "{sql}");
+    }
+}
+
+#[test]
+fn toast_namespace_is_visible_without_toast_relations() {
+    let text = |value: &str| Value::Text(value.into());
+    for (sql, expected) in [
+        (
+            "SELECT oid, nspowner::regrole, nspacl FROM pg_namespace WHERE nspname = 'pg_toast'",
+            vec![Value::Int(99), text("giggles"), Value::Null],
+        ),
+        (
+            "SELECT 'pg_toast'::regnamespace::oid, oid::regnamespace
+             FROM pg_namespace WHERE nspname = 'pg_toast'",
+            vec![Value::Int(99), text("pg_toast")],
+        ),
+        (
+            "SELECT schema_owner FROM information_schema.schemata WHERE schema_name = 'pg_toast'",
+            vec![text("giggles")],
+        ),
+        (
+            "SELECT has_schema_privilege('pg_toast','USAGE'), has_schema_privilege('pg_toast','CREATE'), has_schema_privilege('pg_database_owner',99::oid,'USAGE')",
+            vec![Value::Bool(true), Value::Bool(true), Value::Bool(false)],
+        ),
+        (
+            "SELECT count(*) FROM pg_class WHERE relnamespace = 99",
+            vec![Value::Int(0)],
+        ),
+    ] {
+        let plan = plan_gateway(sql).unwrap().unwrap();
+        let result = execute(&plan, &snapshot(), &[]).unwrap();
+        assert_eq!(result.rows, vec![expected], "{sql}");
+    }
 }

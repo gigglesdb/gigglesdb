@@ -201,13 +201,17 @@ fn qualified_wildcard_excludes_system_columns_and_preserves_duplicates() {
             .collect::<Vec<_>>(),
         ["oid", "oid", "nspname", "nspowner", "nspacl", "description"]
     );
-    assert!(!result.rows.is_empty());
-    assert!(
-        result
-            .rows
-            .iter()
-            .all(|r| r[0] == r[1] && r[5] == if r[0] == Value::Int(2200) { Value::Text("standard public schema".into()) } else { Value::Null })
-    );
+    assert_eq!(result.rows.len(), 4);
+    for row in result.rows {
+        let description = match row[0] {
+            Value::Int(11) => Value::Text("system catalog schema".into()),
+            Value::Int(99) => Value::Text("reserved schema for TOAST tables".into()),
+            Value::Int(2200) => Value::Text("standard public schema".into()),
+            _ => Value::Null,
+        };
+        assert_eq!(row[0], row[1]);
+        assert_eq!(row[5], description);
+    }
     assert_eq!(
         plan("SELECT missing.* FROM pg_namespace n").unwrap_err(),
         Error::UnknownColumn

@@ -371,6 +371,7 @@ struct Scan {
     role_privilege: bool,
     introspection_only: bool,
     has_relations: bool,
+    regnamespace_cast: bool,
     user: bool,
     nodes: usize,
     depth: usize,
@@ -406,7 +407,7 @@ impl Visitor for Scan {
                 unqualified_catalog(n)
                     || matches!(n.as_str(), "pg_options_to_table" | "pg_get_sequence_data")
             }
-            [s, _] => s == "pg_catalog" || s == "information_schema",
+            [s, _] => matches!(s.as_str(), "pg_catalog" | "pg_toast" | "information_schema"),
             _ => false,
         };
         if is_catalog {
@@ -434,10 +435,9 @@ impl Visitor for Scan {
             | A::IsNull(_) | A::IsNotNull(_));
         if let A::Cast { data_type, .. } = e {
             let name = data_type.to_string().to_ascii_lowercase();
-            self.introspection |= matches!(
-                name.strip_prefix("pg_catalog.").unwrap_or(&name),
-                "regproc" | "regprocedure"
-            );
+            let name = name.strip_prefix("pg_catalog.").unwrap_or(&name);
+            self.introspection |= matches!(name, "regproc" | "regprocedure");
+            self.regnamespace_cast |= name == "regnamespace";
         }
         if let A::Function(f) = e {
             self.view_definitions |= function(&f.name).is_ok_and(|n| n == "pg_get_viewdef");
@@ -528,6 +528,7 @@ impl Scan {
             role_privilege: false,
             introspection_only: true,
             has_relations: false,
+            regnamespace_cast: false,
             user: false,
             nodes: 0,
             depth: 0,
@@ -865,6 +866,9 @@ fn plan_inner(
     }
     if scan.user && relations.is_none() {
         return Err(Error::MixedRelations);
+    }
+    if scan.regnamespace_cast && !scan.has_relations {
+        return Err(Error::Unsupported);
     }
     // Without explicit catalog context the core binder owns scalar semantics.
     if gateway && scan.core_scalar && !scan.explicit_catalog && !introspection {
@@ -1912,7 +1916,7 @@ impl Compiler {
                     && (p[0] == "public" || p[0] != catalog::relation_namespace(&n))
                 {
                     return Err(
-                        if matches!(p[0].as_str(), "pg_catalog" | "information_schema") {
+                        if matches!(p[0].as_str(), "pg_catalog" | "pg_toast" | "information_schema") {
                             Error::Unsupported
                         } else {
                             Error::MixedRelations
@@ -2540,17 +2544,18 @@ impl Compiler {
                     }
                     "regnamespace" => {
                         if let K::Literal(Value::Text(name)) = &e.kind {
-                            let oid = match name.as_str() {
-                                "pg_catalog" => 11,
-                                "public" => 2200,
-                                "information_schema" => 13293,
-                                _ => return Err(Error::Unsupported),
-                            };
+                            let &(oid, _, _, _) = catalog::BUILTIN_NAMESPACES.iter()
+                                .find(|(_, schema, _, _)| *schema == name)
+                                .ok_or(Error::Unsupported)?;
                             return Ok(literal(Value::Int(oid), PgType::Oid));
                         }
 
                         expect(&mut e, PgType::Oid)?;
                         (K::Call("_regnamespace".into(), vec![*e]), PgType::Name)
+                    }
+                    "regrole" if numeric(e.ty) => {
+                        expect(&mut e, PgType::Oid)?;
+                        (K::Call("_regrole_display".into(), vec![*e]), PgType::Text)
                     }
                     "regproc" if e.ty == PgType::Regproc => return Ok(*e),
                     "regproc" => (K::Regproc(e, false), PgType::Regproc),
@@ -5294,6 +5299,17 @@ impl Runtime<'_> {
                 &text(v[2].clone())?,
                 n == "ilike",
             )?),
+            "_regrole_display" if v[0] == N => N,
+            "_regrole_display" => {
+                let oid = integer(v[0].clone())?;
+                self.charge(self.snapshot.roles.len() + 16)?;
+                S(match oid {
+                    0 => "-".into(),
+                    _ => catalog::role_name(self.snapshot, oid)
+                        .map(catalog::quote_identifier)
+                        .unwrap_or_else(|| oid.to_string()),
+                })
+            }
             "pg_get_userbyid" => {
                 let oid = integer(v[0].clone())?;
                 self.charge(self.snapshot.roles.len() + 16)?;

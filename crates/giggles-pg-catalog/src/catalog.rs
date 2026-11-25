@@ -43,6 +43,13 @@ const PREDEFINED_ROLES: &[(u32, &str)] = &[
     (6337, "pg_maintain"),
     (6392, "pg_signal_autovacuum_worker"),
 ];
+pub(crate) const BUILTIN_NAMESPACES: [(i64, &str, i64, Option<&str>); 4] = [
+    (11, "pg_catalog", 10, Some("system catalog schema")),
+    (99, "pg_toast", 10, Some("reserved schema for TOAST tables")),
+    (2200, "public", 6171, Some("standard public schema")),
+    (13293, "information_schema", 10, None),
+];
+
 pub(crate) fn role_name(snapshot: &CatalogSnapshot, oid: i64) -> Option<&str> {
     snapshot
         .roles
@@ -1451,7 +1458,11 @@ fn build_with_budget(
                 B(ext.superuser), B(ext.trusted), B(ext.relocatable), ext.schema.as_ref().map_or(N, |v| s(v)), N, s(&ext.comment)]);
         }
     }
-    add!("pg_description", vec![I(2200), I(2615), I(0), s("standard public schema"), N]);
+    for (id, _, _, description) in BUILTIN_NAMESPACES {
+        if let Some(description) = description {
+            add!("pg_description", vec![I(id), I(2615), I(0), s(description), N]);
+        }
+    }
     if needs("pg_description") {
         for table in &snapshot.tables {
             for (&(id, column), description) in snapshot.comments.range((table.id, 0)..=(table.id, u64::MAX)) {
@@ -1533,11 +1544,7 @@ fn build_with_budget(
             B(false),
         ],
     );
-    for (id, name, owner) in [
-        (11, "pg_catalog", 10),
-        (2200, "public", 6171),
-        (13293, "information_schema", 10),
-    ] {
+    for (id, name, owner, _) in BUILTIN_NAMESPACES {
         add!("pg_namespace", vec![I(id), s(name), I(owner), N, N]);
     }
     add!(

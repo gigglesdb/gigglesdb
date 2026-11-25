@@ -318,7 +318,7 @@ fn pg_class_lists_only_task_table() {
     let rows = task_query(
         &mut state,
         &mut session,
-        "SELECT description FROM pg_catalog.pg_description WHERE objoid <> 2200 ORDER BY objsubid",
+        "SELECT description FROM pg_catalog.pg_description WHERE objoid NOT IN (11, 99, 2200) ORDER BY objsubid",
     );
     assert_eq!(rows, [vec!["current status".to_owned()]]);
 }
@@ -436,7 +436,7 @@ fn non_task_catalog_unchanged() {
     let out = simple(
         &mut state,
         &mut session,
-        "SELECT description FROM pg_catalog.pg_description WHERE objoid <> 2200 ORDER BY objsubid",
+        "SELECT description FROM pg_catalog.pg_description WHERE objoid NOT IN (11, 99, 2200) ORDER BY objsubid",
     )
     .unwrap();
     assert_eq!(

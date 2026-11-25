@@ -84,7 +84,7 @@ fn parameters_and_projection_override_guard() {
         .unwrap()
         .rows
         .len(),
-        3
+        4
     );
     let p = plan("SELECT z.oid FROM pg_namespace z WHERE z.oid IN (SELECT $1::oid FROM pg_namespace n WHERE n.oid=11)").unwrap().unwrap();
     assert!(!p.allows_numeric_input_override());

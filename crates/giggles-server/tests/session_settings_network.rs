@@ -1206,3 +1206,89 @@ async fn statement_token_session_budget() {
     assert_eq!(all_values(&c.simple_query("SHOW gigglesdb.max_value_bytes").await.unwrap()), ["67108864"]);
     drop(c); f.stop().await;
 }
+
+#[tokio::test]
+async fn toast_schema_resolves_for_introspection_and_refuses_ddl() {
+    verify_toast_schema(giggles_core::Engine::Legacy).await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn toast_schema_v2_resolves_for_introspection_and_refuses_ddl() {
+    verify_toast_schema(giggles_core::Engine::V2).await;
+}
+
+async fn verify_toast_schema(engine: giggles_core::Engine) {
+    let fixture = Fixture::with_engine(engine).await;
+    let client = fixture.client().await;
+    client
+        .batch_execute("SET search_path = pg_toast")
+        .await
+        .unwrap();
+
+    let schemas = client
+        .query_one("SELECT current_schemas(false)", &[])
+        .await
+        .unwrap();
+    assert_eq!(schemas.get::<_, Vec<String>>(0), ["pg_toast"]);
+
+    let sql = "SELECT current_schema(), current_schemas(false), current_schemas(true)";
+    let superuser = client.query_one(sql, &[]).await.unwrap();
+    assert_eq!(superuser.get::<_, String>(0), "pg_toast");
+    assert_eq!(superuser.get::<_, Vec<String>>(2), ["pg_catalog", "pg_toast"]);
+
+    client.batch_execute("CREATE ROLE toast_reader").await.unwrap();
+    client.batch_execute("SET ROLE toast_reader").await.unwrap();
+    for (path, current, explicit, implicit) in [
+        ("pg_toast", None, vec![], vec!["pg_catalog"]),
+        ("pg_toast, public", Some("public"), vec!["public"], vec!["pg_catalog", "public"]),
+    ] {
+        client.batch_execute(&format!("SET search_path = {path}")).await.unwrap();
+        let row = client.query_one(sql, &[]).await.unwrap();
+        assert_eq!(row.get::<_, Option<String>>(0).as_deref(), current, "{path}");
+        assert_eq!(row.get::<_, Vec<String>>(1), explicit, "{path}");
+        assert_eq!(row.get::<_, Vec<String>>(2), implicit, "{path}");
+        let simple = client.simple_query(sql).await.unwrap();
+        let row = simple.iter().find_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        }).expect("search path row");
+        assert_eq!(row.get(0), current, "{path}");
+    }
+    for sql in [
+        "RESET ROLE",
+        "CREATE SCHEMA toast_scope",
+        "SET ROLE toast_reader",
+        "SET search_path = toast_scope, public",
+    ] {
+        client.batch_execute(sql).await.unwrap();
+    }
+    let row = client.query_one(sql, &[]).await.unwrap();
+    assert_eq!(row.get::<_, Vec<String>>(1), ["public"]);
+    for sql in [
+        "RESET ROLE",
+        "GRANT USAGE ON SCHEMA toast_scope TO toast_reader",
+        "SET ROLE toast_reader",
+    ] {
+        client.batch_execute(sql).await.unwrap();
+    }
+    let row = client.query_one(sql, &[]).await.unwrap();
+    assert_eq!(row.get::<_, Vec<String>>(1), ["toast_scope", "public"]);
+    client.batch_execute("RESET ROLE").await.unwrap();
+    client.batch_execute("SET search_path = pg_toast").await.unwrap();
+
+    for (sql, state) in [
+        ("CREATE TABLE pg_toast.x (a int)", "42501"),
+        ("CREATE VIEW pg_toast.v AS SELECT 1", "3F000"),
+        ("CREATE SCHEMA pg_toast", "0A000"),
+        ("DROP SCHEMA pg_toast", "0A000"),
+    ] {
+        assert_eq!(
+            code(client.simple_query(sql).await.unwrap_err()),
+            state,
+            "{sql}"
+        );
+    }
+    drop(client);
+    fixture.stop().await;
+}

@@ -228,17 +228,17 @@ fn global_output_and_work_admission() {
         run(&sql, &[Value::Bytes(vec![b'a'; MAX_BYTES / 2])]).unwrap_err(),
         Error::Limit
     );
-    // This fixed three-namespace, one-result query reaches exactly2,000,000
-    // work units at653053 ASCII bytes; one more byte exceeds the work cap.
-    // Both outputs fit4MiB, so output admission cannot hide the work boundary.
+    // Scanning four namespaces and encoding one result exceeds the 2,000,000
+    // work-unit cap at MAX_ASCII_INPUT + 1. Both outputs fit the 4 MiB byte budget.
+    const MAX_ASCII_INPUT: usize = 653_051;
     assert_eq!(
-        run(&sql, &[Value::Bytes(vec![b'a'; 653_053])])
+        run(&sql, &[Value::Bytes(vec![b'a'; MAX_ASCII_INPUT])])
             .unwrap()
             .rows,
-        vec![vec![Value::Text("a".repeat(653_053))]]
+        vec![vec![Value::Text("a".repeat(MAX_ASCII_INPUT))]]
     );
     assert_eq!(
-        run(&sql, &[Value::Bytes(vec![b'a'; 653_054])]).unwrap_err(),
+        run(&sql, &[Value::Bytes(vec![b'a'; MAX_ASCII_INPUT + 1])]).unwrap_err(),
         Error::Limit
     );
 }
