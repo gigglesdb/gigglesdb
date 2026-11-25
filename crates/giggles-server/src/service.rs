@@ -2229,6 +2229,21 @@ impl Session {
         }
         Ok((epoch, visible))
     }
+    pub(crate) fn prepare_advisory_key(
+        &mut self, call: &relational::AdvisoryCall<'_>,
+    ) -> Result<Prepared, CoreError> {
+        self.authority_scope(|session| {
+            if !matches!(session.role, Role::Database { .. }) || session.task().is_some() {
+                return Err(CoreError::Policy(Error::Scope));
+            }
+            session.reconcile_sequence_owners()?;
+            session.authorize_sequence_sql(call.sql())?;
+            let key = session.sql.prepare_advisory_key(call)?;
+            session.authorize(&key)?;
+            Ok(key)
+        })
+    }
+
     pub fn prepare(&mut self, sql: &str) -> Result<Prepared, CoreError> {
         self.prepare_with_parameter_types(sql, &[])
     }

@@ -11,7 +11,6 @@ pub(crate) enum Function {
         count: bool,
         order: bool,
     },
-    Advisory { name: String, key: (bool, i64), column: String },
     Set {
         additional: Vec<Function>,
         name: String,
@@ -58,7 +57,7 @@ impl Function {
     pub fn column(&self) -> &str {
         match self {
             Self::Inventory { .. } => "setting",
-            Self::Set { column, .. } | Self::Current { column, .. } | Self::Advisory { column, .. } => column,
+            Self::Set { column, .. } | Self::Current { column, .. } => column,
         }
     }
 
@@ -86,7 +85,7 @@ impl Function {
         database: Option<&str>,
     ) -> std::result::Result<Option<String>, FunctionError> {
         match self {
-            Self::Inventory { .. } | Self::Advisory { .. } => unreachable!("wire session function"),
+            Self::Inventory { .. } => unreachable!("wire session function"),
             Self::Set { name, value, local, .. } => {
                 let name = database::lookup_assignment(name)?;
                 let assignment = match &name {
@@ -488,25 +487,6 @@ fn parse_tokens(tokens: Vec<Token>) -> Option<Function> {
         p.token(Token::Dot)?;
         function = p.word()?;
     }
-    if matches!(function.as_str(), "pg_advisory_lock" | "pg_try_advisory_lock" | "pg_advisory_unlock" | "pg_advisory_unlock_all" | "pg_advisory_xact_lock" | "pg_try_advisory_xact_lock") {
-        p.token(Token::Left)?;
-        let mut key = (false, 0);
-        if function != "pg_advisory_unlock_all" {
-            let Token::Number(first) = *p.tokens.get(p.at)? else { return None; }; p.at += 1;
-            key.1 = first;
-            if p.tokens.get(p.at) == Some(&Token::Comma) {
-                p.at += 1;
-                let Token::Number(second) = *p.tokens.get(p.at)? else { return None; }; p.at += 1;
-                key = (true, (i64::from(i32::try_from(first).ok()?) << 32) | i64::from(i32::try_from(second).ok()? as u32));
-            }
-        }
-        p.token(Token::Right)?;
-        let column = if p.tokens.get(p.at) == Some(&Token::Word("as".into())) {
-            p.at += 1;
-            let column = match p.tokens.get(p.at)? { Token::Word(s) | Token::Ident(s) => s.clone(), _ => return None }; p.at += 1; column
-        } else { function.clone() };
-        return (p.at == p.tokens.len()).then_some(Function::Advisory { name: function, key, column });
-    }
     if !matches!(function.as_str(), "set_config" | "current_setting") {
         return None;
     }
@@ -555,7 +535,7 @@ fn parse_tokens(tokens: Vec<Token>) -> Option<Function> {
         };
         p.at += 1;
         match &mut call {
-            Function::Set { column: c, .. } | Function::Current { column: c, .. } | Function::Advisory { column: c, .. } => *c = column,
+            Function::Set { column: c, .. } | Function::Current { column: c, .. } => *c = column,
             Function::Inventory { .. } => unreachable!("separate inventory grammar"),
         }
     }

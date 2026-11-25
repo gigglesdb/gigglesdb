@@ -329,9 +329,15 @@ impl SqlSession {
         &mut self,
         sql: &str,
         db: &EngineLease,
+        advisory: Option<&relational::AdvisoryCall<'_>>,
     ) -> Result<relational::Prepared, CoreError> {
         relational::assert_sql_frontend_allowed();
-        let result = relational::Prepared::parse(sql, u128::from_be_bytes(db.meta.domain), 0)
+        let domain = u128::from_be_bytes(db.meta.domain);
+        let result = if let Some(call) = advisory {
+            relational::Prepared::parse_advisory_key(call, domain, 0, true)
+        } else {
+            relational::Prepared::parse(sql, domain, 0)
+        }
             .map_err(relational::routines::into_core)
             .and_then(|mut p| {
                 if self.aborted && !p.allows_aborted_transaction() {

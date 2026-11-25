@@ -866,6 +866,8 @@ impl State {
                 &mut self.diagnostic,
                 out,
             )?;
+        } else if let Some(call) = advisory::parse(sql, session, &mut self.diagnostic)? {
+            self.simple_advisory(&call, session, out)?;
         } else if let Some(function) =
             settings_functions::parse(sql, session, &mut self.diagnostic)?
         {

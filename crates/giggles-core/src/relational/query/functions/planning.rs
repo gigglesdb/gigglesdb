@@ -180,6 +180,8 @@ fn signature(name: &str, args: &[DataType], result: &DataType) -> Option<(bool, 
         ("abs", &[SmallInt], SmallInt) => Some((true, true)),         // pg_proc 1398
         ("time", &[Interval], Time) => Some((true, true)),            // pg_proc 1419
         ("log10", &[Numeric], Numeric) => Some((true, true)),         // pg_proc 1481
+        ("hashtext", &[Text], Integer) => Some((true, true)),          // pg_proc 400
+        ("hashtextextended", &[Text, BigInt], BigInt) => Some((true, true)), // pg_proc 448
         ("md5", &[Text], Text) => Some((true, true)),                 // pg_proc 2311
         ("md5", &[Bytes], Text) => Some((true, true)),                // pg_proc 2321
         ("asind", &[DoublePrecision], DoublePrecision) => Some((true, true)), // pg_proc 2731

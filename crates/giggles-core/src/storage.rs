@@ -4540,8 +4540,20 @@ impl SqlSession {
         }
     }
 
+    /// Prepare the pure argument projection of a server-owned advisory call.
+    /// The gateway owns authorization and performs the lock only after SQL returns.
+    pub fn prepare_advisory_key(
+        &mut self, call: &relational::AdvisoryCall<'_>,
+    ) -> Result<relational::Prepared, CoreError> {
+        if self.task.is_some() {
+            return Err(CoreError::Policy(Error::Scope));
+        }
+        let lease = self.statement_lease()?;
+        self.prepare_unruled(call.sql(), lease.as_deref(), Some(call))
+    }
+
     pub(crate) fn prepare_leased(&mut self, sql: &str, db: Option<&EngineLease>) -> Result<relational::Prepared, CoreError> {
-        let p = self.prepare_unruled(sql, db)?;
+        let p = self.prepare_unruled(sql, db, None)?;
         // GIN lookup decides whether ALTER INDEX is supported syntax.
         if p.command() == "ALTER INDEX" {
             self.inspect_metadata_leased(db, |s| p.bind_schemas(&s.sql).map(|_| ()).map_err(CoreError::Sql))
@@ -4571,14 +4583,16 @@ impl SqlSession {
         Ok(p)
     }
 
-    fn prepare_unruled(&mut self, sql: &str, db: Option<&EngineLease>) -> Result<relational::Prepared, CoreError> {
+    fn prepare_unruled(
+        &mut self, sql: &str, db: Option<&EngineLease>, advisory: Option<&relational::AdvisoryCall<'_>>,
+    ) -> Result<relational::Prepared, CoreError> {
         let _date_order = relational::clock::LiteralDateOrder::enter(self.date_style.order);
         let _value_budget = relational::ValueBudget::enter(self.value_budget(), self.is_v2_engine());
         let _statement_budget = relational::StatementBudget::enter(self.max_statement_tokens, self.is_v2_engine());
         if self.is_v2_engine() {
             let db = db.ok_or(CoreError::Fenced)?;
             self.bind_sequence_generation(db);
-            return self.prepare_v2(sql, db);
+            return self.prepare_v2(sql, db, advisory);
         }
         if sql.len() > relational::MAX_SQL {
             self.abort();
@@ -4586,20 +4600,27 @@ impl SqlSession {
         }
         self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
+        let parse = |s: &State| {
+            if let Some(call) = advisory {
+                relational::Prepared::parse_advisory_key(call, s.view.domain, s.sql.epoch, false)
+            } else {
+                relational::Prepared::parse_legacy(sql, s.view.domain, s.sql.epoch)
+            }
+        };
         let mut result = if let Some(s) = &self.staged {
             if self.aborted {
-                let p = relational::Prepared::parse_legacy(sql, s.view.domain, s.sql.epoch)
+                let p = parse(s)
                     .map_err(CoreError::Sql)?;
                 if !p.allows_aborted_transaction() {
                     return Err(CoreError::Sql(relational::SqlError::Aborted));
                 }
                 Ok(p)
             } else {
-                relational::Prepared::parse_legacy(sql, s.view.domain, s.sql.epoch).map_err(CoreError::Sql)
+                parse(s).map_err(CoreError::Sql)
             }
         } else {
             self.admin.inner.inspect(|s| {
-                relational::Prepared::parse_legacy(sql, s.view.domain, s.sql.epoch).map_err(CoreError::Sql)
+                parse(s).map_err(CoreError::Sql)
             })
         };
         if result.as_ref().is_ok_and(relational::Prepared::requires_routine_catalog) {

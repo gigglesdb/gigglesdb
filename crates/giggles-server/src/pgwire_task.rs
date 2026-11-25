@@ -55,7 +55,7 @@ pub(super) fn plan_class(plan: &Plan) -> Option<StatementClass> {
             }
         }
         Plan::SettingsFunction(Function::Set { .. }) => StatementClass::Set,
-        Plan::SettingsFunction(Function::Advisory { .. }) => StatementClass::Lock,
+        Plan::Advisory(_) => StatementClass::Lock,
         Plan::SettingsFunction(Function::Inventory { .. }) => StatementClass::Catalog,
         Plan::Catalog(plan, _, _) if !plan.depends_on_relations() => StatementClass::Show,
         Plan::Catalog(..) => StatementClass::Catalog,
@@ -129,7 +129,7 @@ fn function_column_allowed(function: &Function) -> bool {
             database::lookup_name(name),
             Ok(SettingName::Registry(_) | SettingName::Native(Show::TransactionDeferrable | Show::DefaultTransactionDeferrable))
         ),
-        Function::Advisory { .. } | Function::Inventory { .. } => false,
+        Function::Inventory { .. } => false,
     }
 }
 
@@ -809,6 +809,7 @@ impl State {
             | Plan::CopyOut(_)
             | Plan::Change(_)
             | Plan::PreparedCommand(_)
+            | Plan::Advisory(_)
             | Plan::TaskDdl(_) => Err(refuse(&mut self.diagnostic, class)),
             #[cfg(feature = "legacy-task")]
             Plan::Task(_) => Err(refuse(&mut self.diagnostic, class)),
@@ -970,6 +971,11 @@ fn detect_task_settings(sql: &str, session: &mut Session, diagnostic: &mut Diagn
             .starts_with("GIGGLES")
         {
             return Err(refuse(diagnostic, StatementClass::Other));
+        }
+        if matches!(session.role, Role::Database { .. })
+            && giggles_core::relational::AdvisoryCall::is_select(sql)
+        {
+            return Err(refuse(diagnostic, StatementClass::Lock));
         }
         if let Some(function) = settings_functions::parse(sql, session, diagnostic)? {
             let plan = Plan::SettingsFunction(function);

@@ -76,6 +76,7 @@ mod numeric;
 mod projector_inspection;
 pub(crate) mod projector_reconstruction;
 mod query;
+pub use query::advisory::{AdvisoryCall, AdvisoryResultCast};
 pub use query::typed_read::{SingleSourceRead, ReadProjection, ReadExpr, ReadPredicate, ReadCompare,
     ReadAggregate, ReadClauses, ReadOrder, ReadSource, ReadJoinKind, TwoSourceRead, TypedRead, TypedInsertSelect, ViewRead};
 use query::{TypmodSource, result_typmod};
@@ -3921,17 +3922,27 @@ impl Prepared {
             .collect()
     }
     pub(crate) fn parse(sql: &str, domain: u128, epoch: u64) -> R<Self> {
-        Self::parse_with_routine_catalog(sql, domain, epoch, true)
+        Self::parse_with_routine_catalog(sql, domain, epoch, true, None)
     }
     pub(crate) fn parse_legacy(sql: &str, domain: u128, epoch: u64) -> R<Self> {
-        Self::parse_with_routine_catalog(sql, domain, epoch, false)
+        Self::parse_with_routine_catalog(sql, domain, epoch, false, None)
     }
-    fn parse_with_routine_catalog(sql: &str, domain: u128, epoch: u64, enabled: bool) -> R<Self> {
+    pub(crate) fn parse_advisory_key(call: &AdvisoryCall<'_>, domain: u128, epoch: u64, v2: bool) -> R<Self> {
+        Self::parse_with_routine_catalog(call.sql(), domain, epoch, v2, Some(call))
+    }
+    fn parse_with_routine_catalog(
+        sql: &str, domain: u128, epoch: u64, enabled: bool, advisory: Option<&AdvisoryCall<'_>>,
+    ) -> R<Self> {
         assert_sql_frontend_allowed();
         take_sql_warnings();
         routines::clear_diagnostic();
         let tokens = lex(sql)?;
         let _generated_locations = generated_columns::Locations::enter(sql, &tokens)?;
+        let tokens = if let Some(call) = advisory {
+            call.key_tokens(tokens)
+        } else {
+            tokens
+        };
         let tokens = if routines::claims(&tokens) || triggers::claims(&tokens) {
             if !enabled { return Err(SqlError::Unsupported); }
             tokens

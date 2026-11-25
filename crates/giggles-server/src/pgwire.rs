@@ -22,6 +22,8 @@ mod copy;
 mod copy_in;
 #[path = "pgwire_copy_external.rs"]
 mod copy_external;
+#[path = "pgwire_advisory.rs"]
+mod advisory;
 #[path = "pgwire_settings_functions.rs"]
 mod settings_functions;
 #[path = "pgwire_simple.rs"]
@@ -320,6 +322,8 @@ impl Diagnostic {
                 || m.starts_with("relation \"") && m.ends_with(" already exists")
                 || m.starts_with("constraint \"") && m.contains(" for relation \"") && m.ends_with(" already exists")
                 || m == "canceling statement due to lock timeout"
+                || m == "hashing text with a nondeterministic collation is not supported"
+                || m.starts_with("cannot cast type void to ")
                 || m.starts_with("type modifier is not allowed for type ")
                 || m.starts_with("permission denied for table ") || m.starts_with("view ") || m.starts_with("sequence ") || m.starts_with("index ")
                 || m.starts_with("relation ") && m.contains(" clause not found in FROM clause")
@@ -863,7 +867,12 @@ pub fn row_description(d: &Description, formats: &[u16], out: &mut Vec<u8>) -> R
         b.extend(0u32.to_be_bytes());
         b.extend(0i16.to_be_bytes());
         b.extend(type_oids[i].to_be_bytes());
-        b.extend(if matches!(d.type_oids.get(i), Some(2278 | 2279)) { 4i16 } else { size(&c.data_type) }.to_be_bytes());
+        let width = match d.type_oids.get(i) {
+            Some(19) => 64i16,
+            Some(2278 | 2279) => 4,
+            _ => size(&c.data_type),
+        };
+        b.extend(width.to_be_bytes());
         b.extend(d.typmods.get(i).copied().unwrap_or(-1).to_be_bytes());
         b.extend(format_at(formats, i).to_be_bytes());
     }
@@ -1532,6 +1541,7 @@ enum Plan {
     Settings(Vec<crate::pg_settings::Setting>),
     Inspect(crate::pg_settings::SettingName),
     SettingsFunction(crate::pg_settings::Function),
+    Advisory(Box<advisory::Plan>),
     Catalog(
         Box<giggles_pg_catalog::Plan>,
         Vec<giggles_pg_catalog::Field>,
@@ -1675,7 +1685,12 @@ impl Statement {
         {
             target.authorize_execute_description(session)?;
         }
-        if let Plan::Sql(p) = self.p.as_ref()
+        let prepared = match self.p.as_ref() {
+            Plan::Sql(p) => Some(p.as_ref()),
+            Plan::Advisory(plan) => Some(&plan.key),
+            _ => None,
+        };
+        if let Some(p) = prepared
             && session.task().is_none()
         {
             // An aborted transaction reports 25P02 before any authorization,
@@ -1733,6 +1748,7 @@ impl Statement {
             | Plan::Settings(_)
             | Plan::Control(_)
             | Plan::SettingsFunction(_)
+            | Plan::Advisory(_)
             | Plan::Inspect(_)
             | Plan::Protected(_)
             | Plan::Change(_)
@@ -2517,6 +2533,11 @@ impl State {
                 let task = crate::task_statement::TaskStatement::parse(sql)?;
                 (Plan::Task(task), task.description())
             }
+        } else if let Some(call) = advisory::parse(sql, session, &mut self.diagnostic)? {
+            let (plan, description, enums) =
+                advisory::prepare(&call, &oids, session, &mut self.diagnostic)?;
+            enum_parameters = enums;
+            (Plan::Advisory(Box::new(plan)), description)
         } else if let Some(function) =
             settings_functions::parse(sql, session, &mut self.diagnostic)?
         {
@@ -2651,7 +2672,7 @@ impl State {
                 // Application integer parameters share Value::Int, but
                 // decode using the client's declared wire width. Core
                 // still enforces the destination range at execution.
-                if !matches!(p, Plan::Sql(_)) {
+                if !matches!(p, Plan::Sql(_) | Plan::Advisory(_)) {
                     return Err("0A000");
                 }
                 *t = sql_declared_type(t, o).ok_or("0A000")?;
@@ -2661,7 +2682,7 @@ impl State {
             }
         }
         let description_version = before_version.filter(|version| {
-            matches!(&p, Plan::Sql(plan) if !plan.is_ddl())
+            (matches!(&p, Plan::Sql(plan) if !plan.is_ddl()) || matches!(p, Plan::Advisory(_)))
                 && session.sql.statement_catalog_version() == Some(*version)
         });
         let parse_context = (unnamed && description_version.is_some()
@@ -2806,6 +2827,14 @@ impl State {
                     }
             }
             Plan::Sql(p) => !session.sql.prepared_is_current(p),
+            Plan::Advisory(plan) => !session.sql.prepared_is_current(&plan.key)
+                || match session.sql.prepared_catalog_state() {
+                    giggles_core::PreparedCatalogState::PrivateDdl => true,
+                    giggles_core::PreparedCatalogState::Version(version) =>
+                        old.description_version != version,
+                    giggles_core::PreparedCatalogState::UnknownBackend =>
+                        core(session.sql.legacy_prepared_schema_changed(&plan.key))?,
+                },
             Plan::Copy(_, p) => !session.sql.prepared_is_current(p),
             Plan::Catalog(_, _, _) if session.task().is_some() => false,
             Plan::Catalog(plan, _, epoch)
@@ -2821,8 +2850,10 @@ impl State {
         }
         let old = old.clone();
         let mut preparation = self.settings.current.clone();
-        if let Plan::Sql(prepared) = &*old.p {
-            preparation.datestyle.order = prepared.literal_date_order();
+        match &*old.p {
+            Plan::Sql(prepared) => preparation.datestyle.order = prepared.literal_date_order(),
+            Plan::Advisory(plan) => preparation.datestyle.order = plan.key.literal_date_order(),
+            _ => {}
         }
         session.set_text_settings(&preparation);
         let unused_slots: &[usize] = old.origin.as_ref().map_or(&[], |origin| &origin.unused_slots);
@@ -2932,6 +2963,9 @@ impl State {
                 p.result = ran();
                 return Ok(());
             }
+        }
+        if matches!(&*p.s.p, Plan::Advisory(_)) {
+            return self.execute_advisory(p, session, implicit, retained, out);
         }
         let was_transaction = session.in_transaction();
         if let Plan::Catalog(plan, fields, epoch) = p.s.p.as_ref() {
@@ -3491,7 +3525,7 @@ impl State {
                     return self.task_execute(&name, max, retained, session, out).map(|()| true);
                 }
                 if self.portals.get(&name).is_some_and(|p| {
-                    matches!(p.s.p.as_ref(), Plan::PreparedCommand(_) | Plan::Sql(_) | Plan::Catalog(..))
+                    matches!(p.s.p.as_ref(), Plan::PreparedCommand(_) | Plan::Sql(_) | Plan::Catalog(..) | Plan::Advisory(_))
                 }) {
                     let mut portal = self.portals.remove(&name).expect("checked portal");
                     let mut implicit = self.implicit;

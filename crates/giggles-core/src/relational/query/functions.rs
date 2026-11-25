@@ -1,5 +1,6 @@
 //! Typed scalar projection binding. No SQL generation or catalog emulation.
 use super::*;
+mod advisory_key;
 mod arithmetic;
 mod array_constructor;
 pub(super) mod uuid_array_operators;
@@ -42,6 +43,7 @@ pub(super) use comparison::{comparable, compare_cross, cross_compare, oid_intege
 mod datetime_input;
 mod degree_math;
 mod greatest;
+mod hash_text;
 pub(super) mod enum_order;
 #[cfg(test)]
 mod integer_cast_tests;
@@ -890,6 +892,27 @@ impl Scalar {
         }
         Ok(value)
     }
+    pub(super) fn parse_advisory_cast(p: &mut Parser, returns_boolean: bool) -> R<()> {
+        let mut value = Self::Param(1);
+        let mut casts = 0;
+        while p.sym(':') {
+            p.punct(':')?;
+            value = cast::parse_expression(p, value)?;
+            if casts == 0 && !returns_boolean && !matches!(cast::explicit_target(&value),
+                Some(DataType::Text | DataType::Varchar | DataType::Bpchar))
+            {
+                let target = cast::explicit_target(&value).map_or("this type", typeof_expr::name);
+                user_types::view_replace_error(format!("cannot cast type void to {target}"));
+                return Err(SqlError::CannotCoerce);
+            }
+            casts += 1;
+            if casts == 32 && p.tokens.get(p.at) == Some(&Token::Symbol(':')) {
+                return Err(SqlError::Limit);
+            }
+        }
+        Ok(())
+    }
+
     // Preserve quotedness for SQL construct dispatch and truncate names without
     // applying the stored-object reservation policy to builtin routines.
     fn routine_name(p: &mut Parser) -> R<(String, bool)> {
@@ -1058,6 +1081,8 @@ impl Scalar {
                         if prefix.is_empty() { (routine, quoted) }
                         else { (format!("{prefix}{name}\0{routine}"), quoted) }
                     }
+                } else if !quoted && super::advisory::is_key_expression(&name) {
+                    (name, quoted)
                 } else if uuid_ossp::known(&name) {
                     (format!("\0uuid-ossp:{name}"), quoted)
                 } else if pg18_routines::PG_CATALOG
@@ -2231,6 +2256,9 @@ impl Scalar {
         mut args: Vec<BoundScalar>,
         parameters: &[Option<DataType>],
     ) -> R<BoundScalar> {
+        if super::advisory::is_key_expression(name) {
+            return advisory_key::bind(name, original, args);
+        }
         if random_uuid::known(name) {
             return random_uuid::bind(name, original, args);
         }
@@ -2354,6 +2382,7 @@ impl Scalar {
                 .or_else(|| args.first().map(|a| &a.ty)),
         )
         .or_else(|| uuid_ossp::signature(name, args.len()))
+        .or_else(|| hash_text::signature(name, args.len()))
         .or_else(|| md5::signature(name, args.len(), args.first().map(|a| &a.ty)))
         .or_else(|| character::signature(name, args.len()))
         .or_else(|| unicode::signature(name, args.len()))
@@ -3306,6 +3335,12 @@ impl BoundScalar {
                 }
                 if n == "format" {
                     return format::eval(&values, args, budget);
+                }
+                if super::advisory::is_key_expression(n) {
+                    return advisory_key::eval(&values);
+                }
+                if hash_text::known(n) {
+                    return hash_text::eval(args, &values, budget);
                 }
                 if let Some(result) = position::eval(n, &values, budget)
                     .or_else(|| binary::eval(n, &values, budget))
@@ -4286,7 +4321,9 @@ impl Scalar {
                         .filter_map(|(_, a)| user_types::probe_preserving_error_message(|| a.bind(resolve, tables, parameters)).ok().map(|a| a.ty))
                         .find(|t| *t == DataType::Bytes);
                     let ty = if let Some(sig) =
-                        uuid_ossp::signature(n, args.len()).or_else(|| binary::signature(n, args.len(), first_type.as_ref()))
+                        advisory_key::signature(n, args.len())
+                            .or_else(|| uuid_ossp::signature(n, args.len()))
+                            .or_else(|| binary::signature(n, args.len(), first_type.as_ref()))
                             .or_else(|| {
                                 md5::signature(n, args.len(), first_type.as_ref())
                                     .filter(|signature| signature.is_ok())
@@ -4295,6 +4332,7 @@ impl Scalar {
                                 character::signature(n, args.len())
                                     .filter(|signature| signature.is_ok())
                             })
+                            .or_else(|| hash_text::signature(n, args.len()))
                             .or_else(|| unicode::signature(n, args.len()))
                             .or_else(|| text::signature(n, args.len()))
                     {

@@ -2,6 +2,8 @@
 #![allow(clippy::duplicate_mod)]
 // Tests may call the plain exits `clippy.toml` bans in server sources (GD-0061 R3-314).
 #![allow(clippy::disallowed_methods)]
+#[path = "advisory_lock_network.rs"]
+mod advisory_lock_network;
 #[path = "release_seal.rs"]
 mod release_seal;
 #[path = "explain_text_network.rs"]

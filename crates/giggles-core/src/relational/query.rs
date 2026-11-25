@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 mod returning_images;
 mod row_locks;
 mod regex_projection;
+pub(super) mod advisory;
 mod aggregate_filter;
 mod aggregate_order;
 mod functions;
@@ -2586,6 +2587,64 @@ impl Query {
         }
         Ok(value)
     }
+    fn parse_projection_alias(p: &mut Parser) -> R<Option<String>> {
+        // PostgreSQL 18 src/include/parser/kwlist.h: AS_LABEL requires AS.
+        let bare_label = match p.tokens.get(p.at) {
+            Some(Token::QuotedIdent(_)) => true,
+            Some(Token::Word(word)) => ![
+                "array",
+                "as",
+                "char",
+                "character",
+                "create",
+                "day",
+                "except",
+                "fetch",
+                "filter",
+                "for",
+                "from",
+                "grant",
+                "group",
+                "having",
+                "hour",
+                "intersect",
+                "into",
+                "isnull",
+                "limit",
+                "minute",
+                "month",
+                "notnull",
+                "offset",
+                "on",
+                "order",
+                "over",
+                "overlaps",
+                "precision",
+                "returning",
+                "second",
+                "to",
+                "union",
+                "varying",
+                "where",
+                "window",
+                "with",
+                "within",
+                "without",
+                "year",
+            ]
+            .contains(&word.as_str()),
+            _ => false,
+        };
+        if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "year") {
+            return Err(SqlError::Syntax);
+        }
+        if p.word("as") || bare_label {
+            Ok(Some(p.column_name()?))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn parse_items(p: &mut Parser) -> R<Vec<(Item, Option<String>)>> {
         let mut items = Vec::new();
         loop {
@@ -2654,61 +2713,7 @@ impl Query {
                 p.at = item_start;
                 item = Item::Scalar(Scalar::parse_expr(p, 0, true)?);
             }
-            // PostgreSQL 18 src/include/parser/kwlist.h: AS_LABEL requires AS.
-            let bare_label = match p.tokens.get(p.at) {
-                Some(Token::QuotedIdent(_)) => true,
-                Some(Token::Word(word)) => ![
-                    "array",
-                    "as",
-                    "char",
-                    "character",
-                    "create",
-                    "day",
-                    "except",
-                    "fetch",
-                    "filter",
-                    "for",
-                    "from",
-                    "grant",
-                    "group",
-                    "having",
-                    "hour",
-                    "intersect",
-                    "into",
-                    "isnull",
-                    "limit",
-                    "minute",
-                    "month",
-                    "notnull",
-                    "offset",
-                    "on",
-                    "order",
-                    "over",
-                    "overlaps",
-                    "precision",
-                    "returning",
-                    "second",
-                    "to",
-                    "union",
-                    "varying",
-                    "where",
-                    "window",
-                    "with",
-                    "within",
-                    "without",
-                    "year",
-                ]
-                .contains(&word.as_str()),
-                _ => false,
-            };
-            if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "year") {
-                return Err(SqlError::Syntax);
-            }
-            let alias = if p.word("as") || bare_label {
-                Some(p.column_name()?)
-            } else {
-                None
-            };
+            let alias = Self::parse_projection_alias(p)?;
             items.push((item, alias));
             if items.len() > MAX_COLUMNS {
                 return Err(SqlError::Limit);
@@ -3257,7 +3262,7 @@ impl Query {
                         && aggregate_filter::decode(condition).is_ok_and(|f| filter(&f))
                 }
                 Scalar::Call(name, args) if name == functions::CAST_TYPMOD || functions::collation::internal(name)
-                    || name.starts_with(functions::ROW_ORDER_PREFIX) => {
+                    || name.starts_with(functions::ROW_ORDER_PREFIX) || advisory::is_key_expression(name) => {
                     args.iter().all(scalar)
                 }
                 Scalar::Call(name, args) => {
@@ -3292,6 +3297,8 @@ impl Query {
                             | "lower"
                             | "upper"
                             | "md5"
+                            | "hashtext"
+                            | "hashtextextended"
                             | "overlay"
                             | "ascii"
                             | "chr"

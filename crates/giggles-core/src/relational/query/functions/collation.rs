@@ -581,6 +581,16 @@ fn nondeterministic(n: &str) -> bool {
     user(n).is_some_and(|(_, deterministic, _, _)| !deterministic)
 }
 
+pub(super) fn check_hash(input: &BoundScalar) -> R<()> {
+    if comparison_locale([input])?.is_some_and(nondeterministic) {
+        user_types::view_replace_error(
+            "hashing text with a nondeterministic collation is not supported".into(),
+        );
+        return Err(SqlError::Unsupported);
+    }
+    Ok(())
+}
+
 pub(super) fn substring(
     name: &str, args: &[BoundScalar], values: &[Value], budget: &mut usize,
 ) -> Option<R<Value>> {

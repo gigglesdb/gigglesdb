@@ -394,7 +394,7 @@ impl Statement {
                 prepared.command(),
                 "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE"
             ),
-            Plan::Catalog(..) => true,
+            Plan::Catalog(..) | Plan::Advisory(_) => true,
             _ => false,
         }
     }
@@ -489,7 +489,7 @@ impl State {
         for statement in self.statements.values_mut() {
             if matches!(
                 statement.p.as_ref(),
-                Plan::Sql(_) | Plan::Catalog(..) | Plan::Copy(..)
+                Plan::Sql(_) | Plan::Catalog(..) | Plan::Copy(..) | Plan::Advisory(_)
             ) {
                 statement.discarded = true;
                 statement.validated = None;
@@ -564,7 +564,7 @@ impl State {
                         Some(format!(r#"relation "{missing}" does not exist"#));
                 }
             })?;
-        if !matches!(statement.p.as_ref(), Plan::Sql(_) | Plan::Catalog(..)) {
+        if !matches!(statement.p.as_ref(), Plan::Sql(_) | Plan::Catalog(..) | Plan::Advisory(_)) {
             return Err("0A000");
         }
         if let Plan::Sql(prepared) = statement.p.as_ref()
@@ -993,7 +993,7 @@ impl State {
                 session
                     .service
                     .advisory
-                    .call(session, "pg_advisory_unlock_all", (false, 0))?;
+                    .unlock_all(session.backend_pid)?;
                 self.discard_plans();
                 self.diagnostic.core(session.sql.discard_sequence_state())?;
                 "DISCARD ALL"

@@ -1,5 +1,7 @@
 // Each file keeps its own `mod common;`, exactly as when it was its own binary.
 #![allow(clippy::duplicate_mod)]
+#[path = "hash_text.rs"]
+mod hash_text;
 #[path = "datetime_input_grammar.rs"]
 mod datetime_input_grammar;
 #[path = "write_fence_embedded.rs"]
