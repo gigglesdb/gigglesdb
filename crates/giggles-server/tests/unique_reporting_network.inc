@@ -66,7 +66,16 @@ async fn unique_reporting_simple_and_parameterized() {
         .connect(NoTls)
         .await
         .unwrap();
-    let connection = tokio::spawn(connection);
+    let (send_notice, mut notices) = tokio::sync::mpsc::unbounded_channel();
+    let mut connection = connection;
+    let connection = tokio::spawn(async move {
+        while let Some(message) = std::future::poll_fn(|cx| connection.poll_message(cx)).await {
+            if let tokio_postgres::AsyncMessage::Notice(notice) = message? {
+                let _ = send_notice.send(notice);
+            }
+        }
+        Ok::<_, tokio_postgres::Error>(())
+    });
 
     for sql in [
         "CREATE TABLE a (id int PRIMARY KEY, e text, del boolean)",
@@ -255,6 +264,97 @@ async fn unique_reporting_simple_and_parameterized() {
     ] {
         assert_duplicate(&error, "t", "t_u_key1", "Key (u)=(1) already exists.");
     }
+
+    client
+        .batch_execute(
+            "CREATE TABLE collision (id int PRIMARY KEY, u int);
+             CREATE INDEX ON collision(u);
+             CREATE TABLE rename_source (a int);
+             INSERT INTO rename_source VALUES (7);",
+        )
+        .await
+        .unwrap();
+
+    for name in ["collision_u_idx", "collision_pkey"] {
+        for sql in [
+            format!("CREATE TABLE {name} (a int)"),
+            format!("CREATE TABLE {name} AS SELECT 1 AS a"),
+            format!("CREATE SEQUENCE {name}"),
+            format!("CREATE VIEW {name} AS SELECT 1 AS x"),
+            format!("CREATE TYPE {name} AS (a int)"),
+            format!("ALTER TABLE rename_source RENAME TO {name}"),
+        ] {
+            for error in [
+                client.simple_query(&sql).await.unwrap_err(),
+                client.execute(&sql, &[]).await.unwrap_err(),
+            ] {
+                let error = error.as_db_error().unwrap();
+                assert_eq!(error.code(), &SqlState::DUPLICATE_TABLE, "{sql}");
+                assert_eq!(
+                    error.message(),
+                    format!("relation \"{name}\" already exists"),
+                    "{sql}",
+                );
+            }
+        }
+        for sql in [
+            format!("CREATE TABLE IF NOT EXISTS {name} (a int)"),
+            format!("CREATE TABLE IF NOT EXISTS {name} AS SELECT 1 AS a"),
+            format!("CREATE SEQUENCE IF NOT EXISTS {name}"),
+        ] {
+            client.simple_query(&sql).await.unwrap();
+            client.execute(&sql, &[]).await.unwrap();
+            for _ in 0..2 {
+                let notice = notices.try_recv().unwrap_or_else(|err| panic!("{sql}: {err}"));
+                assert_eq!(notice.code(), &SqlState::DUPLICATE_TABLE, "{sql}");
+                assert_eq!(notice.severity(), "NOTICE", "{sql}");
+                assert_eq!(
+                    notice.message(),
+                    format!("relation \"{name}\" already exists, skipping"),
+                    "{sql}",
+                );
+            }
+        }
+    }
+
+    let value: i32 = client
+        .query_one("SELECT a FROM rename_source", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(value, 7);
+    let relations = client
+        .simple_query(
+            "SELECT relname, relkind FROM pg_class
+             WHERE relname IN ('collision_u_idx', 'collision_pkey') ORDER BY relname",
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some((row.get(0).unwrap().to_owned(), row.get(1).unwrap().to_owned()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relations,
+        [
+            ("collision_pkey".to_owned(), "i".to_owned()),
+            ("collision_u_idx".to_owned(), "i".to_owned()),
+        ],
+    );
+
+    let types = client
+        .simple_query(
+            "SELECT typname FROM pg_type WHERE typname IN ('collision_pkey', 'collision_u_idx')",
+        )
+        .await
+        .unwrap();
+    assert!(types
+        .iter()
+        .all(|message| !matches!(message, tokio_postgres::SimpleQueryMessage::Row(_))));
 
     drop(client);
     connection.await.unwrap().unwrap();

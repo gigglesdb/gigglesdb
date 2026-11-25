@@ -201,6 +201,18 @@ pub(super) fn name_taken(state: &Relational, key: &str) -> bool {
     state.relation_name_taken(key) || primary_table(state, key).is_some()
 }
 
+pub(super) fn skip_existing_relation(state: &Relational, key: &str, optional: bool) -> R<bool> {
+    if !name_taken(state, key) {
+        return Ok(false);
+    }
+    if !optional {
+        return Err(duplicate_relation(key));
+    }
+    let name = split_key(key).1;
+    user_types::sql_notice(format!("relation \"{name}\" already exists, skipping"), "42P07");
+    Ok(true)
+}
+
 pub(super) fn duplicate_relation(name: &str) -> SqlError {
     user_types::view_replace_error(format!("relation \"{}\" already exists", split_key(name).1));
     SqlError::DuplicateTable

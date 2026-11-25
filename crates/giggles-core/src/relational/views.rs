@@ -195,8 +195,12 @@ impl Prepared {
         if let Some(query) = &ddl.query {
             let name = &ddl.names[0];
             let existing = state.view_names.get(name).map(|v| v.0);
-            if state.relation_name_taken(name) && (!ddl.replace || existing.is_none()) {
-                return Err(if ddl.replace { SqlError::WrongObjectType } else { SqlError::Duplicate });
+            if sql_index::name_taken(state, name) && (!ddl.replace || existing.is_none()) {
+                return Err(if ddl.replace {
+                    SqlError::WrongObjectType
+                } else {
+                    sql_index::duplicate_relation(name)
+                });
             }
             let source = query.view_source()?;
             if existing.is_some() && state.view_names.get(source).is_some_and(|(_, projection)|

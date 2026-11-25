@@ -851,14 +851,13 @@ pub(super) fn execute(
             }
             Action::RenameTable(new) => {
                 ident::ident(new)?;
-                if candidate
-                    .relation_name_taken(&relation_key(candidate.table_schema(table.id), new))
-                {
-                    return Err(SqlError::DuplicateTable);
+                let key = relation_key(candidate.table_schema(table.id), new);
+                if sql_index::name_taken(&candidate, &key) {
+                    return Err(sql_index::duplicate_relation(&key));
                 }
                 constraint_primary_key::retain_name_before_rename(&mut candidate, &table)?;
                 std::sync::Arc::make_mut(&mut candidate.tables).remove(&name);
-                name = relation_key(candidate.table_schema(table.id), new);
+                name = key;
                 table.name = new.clone();
                 std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(), table.clone());
             }

@@ -71,8 +71,7 @@ async fn views_match_sql_twins() {
         let mut sql = twin.service.role_session("owner").unwrap();
         let cases = [
             (single("app.v1", "app.t"), "CREATE VIEW app.v1 AS SELECT id, v FROM app.t", "ok"),
-            // Known difference shared with SQL: V2 reports a duplicate view as 23505 (PG18: 42P07).
-            (single("app.v1", "app.t"), "CREATE VIEW app.v1 AS SELECT id, v FROM app.t", "23505"),
+            (single("app.v1", "app.t"), "CREATE VIEW app.v1 AS SELECT id, v FROM app.t", "42P07"),
             (single("app.bad", "app.missing"), "CREATE VIEW app.bad AS SELECT id, v FROM app.missing", "42P01"),
             (single("nosuch.v", "app.t"), "CREATE VIEW nosuch.v AS SELECT id, v FROM app.t", "3F000"),
             // GigglesDB SQL does not create join views yet (0A000); native matches it (PG18 accepts them).

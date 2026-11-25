@@ -637,3 +637,64 @@ fn automatic_index_and_constraint_names() {
         );
     }
 }
+
+#[test]
+fn relation_ddl_collides_with_indexes() {
+    let (admin, mut session) = cases(
+        "relation-ddl-index-collision",
+        &[
+            ("CREATE TABLE ff (id int PRIMARY KEY, u int)", "", "", ""),
+            ("CREATE INDEX ON ff(u)", "", "", ""),
+            ("CREATE TABLE rename_source (a int)", "", "", ""),
+            ("CREATE SCHEMA other", "", "", ""),
+            ("CREATE TYPE other.ff_pkey AS ENUM ('a')", "", "", ""),
+            ("CREATE TABLE other.ff_u_idx (a int)", "", "", ""),
+            (r#"CREATE INDEX "Mixed" ON other.ff_u_idx(a)"#, "", "", ""),
+        ],
+    );
+    for (target, name) in [
+        ("ff_u_idx", "ff_u_idx"),
+        ("public.ff_pkey", "ff_pkey"),
+        ("other.\"Mixed\"", "Mixed"),
+    ] {
+        for sql in [
+            format!("CREATE TABLE {target} (a int)"),
+            format!("CREATE TABLE {target} AS SELECT 1 AS a"),
+            format!("CREATE SEQUENCE {target}"),
+            format!("CREATE VIEW {target} AS SELECT 1 AS x"),
+            format!("CREATE TYPE {target} AS (a int)"),
+        ] {
+            observe(
+                &sql,
+                run(&mut session, &sql),
+                "42P07",
+                &format!("relation \"{name}\" already exists"),
+                "",
+            );
+        }
+        for sql in [
+            format!("CREATE TABLE IF NOT EXISTS {target} (a missing_type)"),
+            format!("CREATE TABLE IF NOT EXISTS {target} AS SELECT 1 AS a"),
+            format!("CREATE SEQUENCE IF NOT EXISTS {target}"),
+        ] {
+            observe(&sql, run(&mut session, &sql), "notice", name, "");
+        }
+    }
+    for name in ["ff_u_idx", "ff_pkey"] {
+        let sql = format!("ALTER TABLE rename_source RENAME TO {name}");
+        observe(
+            &sql,
+            run(&mut session, &sql),
+            "42P07",
+            &format!("relation \"{name}\" already exists"),
+            "",
+        );
+    }
+    let (_, tables) = admin.catalog().unwrap();
+    assert!(tables.iter().any(|table| table.name == "rename_source"));
+    assert_eq!(
+        tables.iter().filter(|table| table.name == "ff_u_idx").count(),
+        1
+    );
+    assert!(!tables.iter().any(|table| table.name == "ff_pkey"));
+}

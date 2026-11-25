@@ -558,19 +558,19 @@ async fn sequence_ddl(protocol: Protocol) {
     ] {
         assert_eq!(raw_tag(f.pg.address, sql).await, tag);
     }
-    // Backlog: exact PG error and notice text via a designed side channel.
-    for (sql, tag) in [
-        ("CREATE SEQUENCE IF NOT EXISTS secret", "CREATE SEQUENCE"),
-        ("DROP SEQUENCE IF EXISTS absent_notice", "DROP SEQUENCE"),
+    for (sql, tag, notice) in [
+        ("CREATE SEQUENCE IF NOT EXISTS secret", "CREATE SEQUENCE", true),
+        ("DROP SEQUENCE IF EXISTS absent_notice", "DROP SEQUENCE", true),
         (
             "ALTER SEQUENCE IF EXISTS absent_notice RESTART",
             "ALTER SEQUENCE",
+            false,
         ),
     ] {
         let messages = raw_query(protocol, f.pg.address, sql).await;
         assert_eq!(
             messages.iter().any(|(kind, _)| *kind == b'N'),
-            sql == "DROP SEQUENCE IF EXISTS absent_notice",
+            notice,
             "{messages:?}"
         );
         let (_, body) = messages

@@ -26,7 +26,7 @@ fn view_ddl_lifecycle_and_statement_lock() {
     assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), Err(CoreError::Sql(SqlError::DependentObjects)));
     thread.join().unwrap();
     for sql in ["CREATE VIEW s.w AS SELECT * FROM s.v", "CREATE VIEW s.\"count\"(n) AS SELECT id FROM s.t", "DROP VIEW s.\"count\"", "BEGIN", "DROP VIEW s.v CASCADE", "ROLLBACK"] { s.execute(sql, &[], None).unwrap_or_else(|e| panic!("{sql}: {e:?}")); }
-    for (sql, error) in [("CREATE VIEW s.v AS SELECT id FROM s.t", SqlError::Duplicate),
+    for (sql, error) in [("CREATE VIEW s.v AS SELECT id FROM s.t", SqlError::DuplicateTable),
         ("CREATE VIEW bad AS SELECT id, id FROM s.t", SqlError::DuplicateColumn),
         ("CREATE VIEW bad(a,b,c) AS SELECT id,v FROM s.t", SqlError::Syntax),
         ("CREATE VIEW bad AS SELECT id+1 FROM s.t", SqlError::Unsupported),

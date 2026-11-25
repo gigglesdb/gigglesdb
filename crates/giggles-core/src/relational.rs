@@ -4977,15 +4977,10 @@ impl Relational {
                     index
                 };
                 let key = relation_key(self.table_schema(table.id), &index.name);
-                if self.v2_unique_reporting && sql_index::name_taken(self, &key) {
-                    if index.if_not_exists {
-                        user_types::sql_notice(
-                            format!("relation \"{}\" already exists, skipping", index.name),
-                            "42P07",
-                        );
-                        return Ok(result);
-                    }
-                    return Err(sql_index::duplicate_relation(&key));
+                if self.v2_unique_reporting
+                    && sql_index::skip_existing_relation(self, &key, index.if_not_exists)?
+                {
+                    return Ok(result);
                 }
                 if let Some(definition) = &index.gin {
                     gin_indexes::create(self, &table, index, definition)?;
@@ -5042,6 +5037,9 @@ impl Relational {
                         let definition = create.bind_and_read(self, prepared, params, clock, &mut cancel, injected_source)?;
                         (definition.columns, definition.typmods, definition.collations, definition.type_ids, definition.rows)
                     } else {
+                        if *optional && sql_index::skip_existing_relation(self, name, true)? {
+                            return Ok(result);
+                        }
                         (columns.clone(), typmods.clone(), collations.clone(), vec![None; columns.len()], vec![])
                     };
                 for (i, name) in user_types.iter().enumerate() {
@@ -5059,14 +5057,13 @@ impl Relational {
                 }).collect::<R<Vec<_>>>()?;
                 let columns = &columns;
                 let typmods = &typmods;
-                if self.type_by_name(split_key(name).1).is_some() {
-                    return Err(SqlError::DuplicateObject);
-                }
-                if self.relation_name_taken(name) {
-                    if *optional {
-                        return Ok(result);
+                if as_query.is_none() {
+                    if !*optional && sql_index::name_taken(self, name) {
+                        return Err(sql_index::duplicate_relation(name));
                     }
-                    return Err(SqlError::DuplicateTable);
+                    if self.type_by_name(split_key(name).1).is_some() {
+                        return Err(SqlError::DuplicateObject);
+                    }
                 }
                 if columns.is_empty() || columns.len() > MAX_COLUMNS {
                     return Err(SqlError::Limit);

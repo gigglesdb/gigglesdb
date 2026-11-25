@@ -94,7 +94,7 @@ fn typed_view_ddl_preserves_sql_rejections_and_search_path() {
     let mut s = admin.sql_session();
     s.execute("CREATE TABLE t(id INT PRIMARY KEY)", &[], None).unwrap();
     engine.execute_catalog(&create("v", "t")).unwrap();
-    assert_eq!(engine.execute_catalog(&create("v", "t")), Err(operations::Error::Duplicate));
+    assert_eq!(engine.execute_catalog(&create("v", "t")), Err(state("42P07")));
     assert_eq!(engine.execute_catalog(&drop_view("t", false)), Err(state("42809")));
     assert_eq!(engine.execute_catalog(&drop_view("missing", false)), Err(state("42P01")));
     let join = TwoSourceRead { left: ReadSource { table: "t".into(), alias: "a".into() },

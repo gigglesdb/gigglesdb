@@ -412,11 +412,8 @@ pub(super) fn execute_sequence(state: &mut Relational, ddl: &SequenceDdl) -> R<u
             spec,
             ..
         } => {
-            if candidate.relation_name_taken(name) {
-                if *optional {
-                    return Ok(0);
-                }
-                return Err(SqlError::DuplicateTable);
+            if sql_index::skip_existing_relation(&candidate, name, *optional)? {
+                return Ok(0);
             }
             if let Some(error) = &spec.owned_by_error {
                 return Err(error.clone());

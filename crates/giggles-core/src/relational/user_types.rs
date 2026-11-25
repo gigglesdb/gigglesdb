@@ -633,7 +633,19 @@ pub(super) fn execute(
             }
             ty.set_schema(schema);
             let ty = &ty;
-            if state.ext.types.values().any(|t| t.name() == ty.name())
+            let existing_type = state.type_by_name(ty.name());
+            let key = relation_key(ty.schema(), ty.name());
+            // Composite types create relations. Tables and views already have
+            // row types, which take precedence over the relation collision.
+            if matches!(ty, TypeDef::Composite { .. })
+                && existing_type.is_none_or(|(_, existing)| existing.schema() != ty.schema())
+                && !state.tables.contains_key(&key)
+                && !state.view_names.contains_key(&key)
+                && sql_index::name_taken(state, &key)
+            {
+                return Err(sql_index::duplicate_relation(&key));
+            }
+            if existing_type.is_some()
                 || state.tables.values().any(|table| table.name == ty.name())
                 || state.relation_name_taken(ty.name())
             {

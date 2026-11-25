@@ -95,21 +95,13 @@ impl CreateAs {
     }
 
     pub(super) fn skip(state: &Relational, name: &str, optional: bool) -> R<bool> {
-        let leaf = split_key(name).1;
-        if state.type_by_name(leaf).is_some() {
+        if sql_index::skip_existing_relation(state, name, optional)? {
+            return Ok(true);
+        }
+        if state.type_by_name(split_key(name).1).is_some() {
             return Err(SqlError::DuplicateObject);
         }
-        if !state.relation_name_taken(name) {
-            return Ok(false);
-        }
-        if !optional {
-            return Err(SqlError::DuplicateTable);
-        }
-        user_types::sql_notice(
-            format!("relation \"{leaf}\" already exists, skipping"),
-            "42P07",
-        );
-        Ok(true)
+        Ok(false)
     }
 
     pub(super) fn bind_and_read(
