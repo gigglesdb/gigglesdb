@@ -2044,31 +2044,36 @@ thread_local! {
 
 mod prepared_syntax {
     use super::{R, Statement};
-    use std::{fmt, sync::OnceLock};
+    use std::{fmt, sync::{Arc, OnceLock}};
 
     pub(super) struct Syntax {
-        statement: Statement,
+        // Clones share parsed syntax until a binder or rewrite edits it.
+        statement: Arc<Statement>,
         authorization_tables: OnceLock<R<Vec<String>>>,
     }
 
     impl Syntax {
         pub(super) fn new(statement: Statement) -> Self {
-            Self { statement, authorization_tables: OnceLock::new() }
+            Self { statement: Arc::new(statement), authorization_tables: OnceLock::new() }
         }
 
         pub(super) fn get(&self) -> &Statement {
             &self.statement
         }
 
+        pub(super) fn share(&self) -> Arc<Statement> {
+            Arc::clone(&self.statement)
+        }
+
         pub(super) fn get_mut(&mut self) -> &mut Statement {
             // The dependency list belongs to this exact AST. Every mutable
             // borrow clears it before the syntax can change.
             self.authorization_tables.take();
-            &mut self.statement
+            Arc::make_mut(&mut self.statement)
         }
 
         pub(super) fn into_inner(self) -> Statement {
-            self.statement
+            Arc::unwrap_or_clone(self.statement)
         }
 
         pub(super) fn authorization_tables(
@@ -2081,7 +2086,7 @@ mod prepared_syntax {
 
     impl Clone for Syntax {
         fn clone(&self) -> Self {
-            Self::new(self.statement.clone())
+            Self { statement: self.share(), authorization_tables: OnceLock::new() }
         }
     }
 

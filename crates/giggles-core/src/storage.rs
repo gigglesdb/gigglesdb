@@ -2846,11 +2846,13 @@ impl SqlSession {
         Self::check_prepared_generation(prepared, db)?;
         let mut prepared = prepared.clone();
         if let Some(db) = db { prepared.engine_generation = Some(db.prepared_generation()); }
-        prepared.set_schema_context(self.search_path.clone(), self.schema_user.clone());
+        if prepared.schema_context_differs(&self.search_path, &self.schema_user) {
+            prepared.set_schema_context(self.search_path.clone(), self.schema_user.clone());
+        }
         prepared.clear_authorization_binding_version();
         let version = if prepared.has_sql_authorization_binding() { self.statement_catalog_version() } else { None };
         self.inspect_metadata_leased(db, |s| {
-            let Ok(mut bound) = prepared.bind_schemas(&s.sql) else { return Ok(prepared.clone()); };
+            let Ok(mut bound) = prepared.bind_schemas(&s.sql) else { return Ok(prepared); };
             // Outside a fixed snapshot the binder can observe a newer catalog
             // than the first version read. Monotonic versions bracket the
             // actual metadata read, so failed binding or drift leaves no proof.

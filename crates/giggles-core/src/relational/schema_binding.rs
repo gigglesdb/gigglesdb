@@ -1,5 +1,6 @@
 //! Bind SQL relation references without changing their user-visible names.
 use super::*;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 pub fn relation_key(schema: &str, name: &str) -> String {
@@ -65,15 +66,23 @@ impl Relational {
     }
 
     pub(crate) fn resolve_relation_key(&self, name: &str, path: &[String]) -> String {
+        self.resolve_relation_key_ref(name, path).into_owned()
+    }
+
+    fn resolve_relation_key_ref<'a>(&self, name: &'a str, path: &[String]) -> Cow<'a, str> {
         if name.contains('\0') {
-            let (schema, name) = split_key(name);
-            return relation_key(schema, name);
+            let (schema, unqualified) = split_key(name);
+            return Cow::Borrowed(if schema == "public" { unqualified } else { name });
         }
-        path.iter()
-            .map(|schema| relation_key(schema, name))
-            .find(|key| self.relation_name_taken(key))
-            // A missing relation must not accidentally resolve to public.
-            .unwrap_or_else(|| format!("\0\0{name}"))
+        for schema in path {
+            let key = if schema == "public" { Cow::Borrowed(name) }
+                else { Cow::Owned(relation_key(schema, name)) };
+            if self.relation_name_taken(&key) {
+                return key;
+            }
+        }
+        // A missing relation must not accidentally resolve to public.
+        Cow::Owned(format!("\0\0{name}"))
     }
 
     pub(crate) fn resolve_index_key(&self, name: &str, path: &[String]) -> String {
@@ -114,7 +123,7 @@ impl Prepared {
             .unbound_statement
             .as_ref()
             .map(Arc::clone)
-            .unwrap_or_else(|| Arc::new(self.statement.get().clone()));
+            .unwrap_or_else(|| self.statement.share());
         let mut bound = Self {
             domain: self.domain,
             epoch: self.epoch,
@@ -148,7 +157,10 @@ impl Prepared {
             Ok(relation_key(&schema, split_key(name).1))
         };
         let read = |name: &mut String| {
-            *name = state.resolve_relation_key(name, &self.search_path);
+            match state.resolve_relation_key_ref(name, &self.search_path) {
+                Cow::Borrowed(key) if key.len() == name.len() => {}
+                key => *name = key.into_owned(),
+            }
         };
         let created = match bound.statement.get() {
             Statement::Create { name, .. } => Some(create(name)?),
@@ -361,7 +373,7 @@ impl Prepared {
 
     pub(crate) fn set_authorization_binding_version(&mut self, version: u64) {
         // A table-free statement may have taken bind_schemas' no-op path.
-        self.unbound_statement.get_or_insert_with(|| Arc::new(self.statement.get().clone()));
+        self.unbound_statement.get_or_insert_with(|| self.statement.share());
         self.authorization_binding = Some(AuthorizationBinding::Sql(Some(version)));
     }
 
@@ -461,9 +473,11 @@ mod tests {
         assert_eq!(second.authorization_tables().unwrap(), ["b\0t"]);
         assert_eq!(AUTHORIZATION_DEPENDENCY_WALKS.get(), 2);
 
+        let unchanged = second.clone();
         *second.statement.get_mut() = first.statement.get().clone();
         assert_eq!(second.authorization_tables().unwrap(), ["a\0t"]);
         assert_eq!(AUTHORIZATION_DEPENDENCY_WALKS.get(), 3);
+        assert_eq!(unchanged.storage_table(), Some("b\0t"));
     }
 
     #[test]
