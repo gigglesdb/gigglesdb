@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io,
     sync::{Arc, MutexGuard, atomic::{AtomicU64, Ordering}},
+    time::Duration,
 };
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -264,6 +266,8 @@ fn routine_ddl_error(sqlstate: &'static str, message: String) -> CoreError {
 
 pub type StatementGate = std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
+const DURABILITY_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Default)]
 struct DurabilityPath {
     awaiting: std::sync::atomic::AtomicU64,
@@ -341,21 +345,47 @@ impl Service {
         self.drain_entries.load(std::sync::atomic::Ordering::Acquire)
     }
     pub async fn drain(&self) -> std::io::Result<()> {
-        self.drain_with_timeout(std::time::Duration::from_secs(60)).await
+        self.drain_with_timeout(DURABILITY_DRAIN_TIMEOUT).await
+    }
+
+    fn durability_pending(&self) -> bool {
+        self.durable.live() != 0
+            || self.durability.iter().any(|path| path.awaiting.load(Ordering::Acquire) != 0)
+    }
+
+    /// Call after joining the socket tasks, when the listener cannot submit new jobs.
+    pub(crate) async fn wait_for_pgwire_work(&self, work: &DurableTracker) -> io::Result<()> {
+        let started = tokio::time::Instant::now();
+        let mut workers_since = None;
+        while work.live() != 0 {
+            let now = tokio::time::Instant::now();
+            let worker_timed_out = if self.durability_pending() {
+                workers_since = None;
+                false
+            } else {
+                now.duration_since(*workers_since.get_or_insert(now)) >= crate::transport::IO_TIMEOUT
+            };
+            if worker_timed_out || now.duration_since(started) >= DURABILITY_DRAIN_TIMEOUT {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "PostgreSQL listener shutdown worker drain",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        Ok(())
     }
 
     /// Override the durability deadline for shutdown qualification tests.
     #[doc(hidden)]
     pub async fn drain_with_timeout(&self, durability_timeout: std::time::Duration) -> std::io::Result<()> {
-        use std::sync::atomic::Ordering::Acquire;
         self.drain_entries.fetch_add(1, std::sync::atomic::Ordering::Release);
         let started = tokio::time::Instant::now();
         let mut report = started;
         let mut workers_since = None;
         loop {
             let now = tokio::time::Instant::now();
-            let durable = self.durable.live() != 0
-                || self.durability.iter().any(|m| m.awaiting.load(Acquire) != 0);
+            let durable = self.durability_pending();
             let workers = self.pgwire_blocking_live() != 0
                 || self.pgwire_submitted.live() != 0 || self.blocking.in_use() != 0;
             if !durable && !workers { return Ok(()); }
@@ -840,6 +870,7 @@ impl Service {
             surface: Surface::Native,
             backend_pid: 0,
             connection_closed: Default::default(),
+            pgwire_listener_work: None,
             backend_ssl: false,
             service: self.clone(),
             fingerprint: format!("pgrole:{}", role.name),
@@ -905,6 +936,7 @@ impl Service {
             surface: Surface::Native,
             backend_pid: 0,
             connection_closed: Default::default(),
+            pgwire_listener_work: None,
             backend_ssl: false,
             service: self.clone(),
             effective_role: None,
@@ -1073,6 +1105,7 @@ impl Service {
             surface: Surface::Native,
             backend_pid: 0,
             connection_closed: Default::default(),
+            pgwire_listener_work: None,
             backend_ssl: false,
             service: self.clone(),
             fingerprint: fingerprint.to_owned(),
@@ -1188,6 +1221,7 @@ impl Service {
             surface: Surface::Native,
             backend_pid: 0,
             connection_closed: Default::default(),
+            pgwire_listener_work: None,
             backend_ssl: false,
             service: self.clone(),
             fingerprint: format!("sqlcred:{id:016x}"),
@@ -1266,6 +1300,7 @@ pub struct Session {
     pub(crate) surface: Surface,
     pub(crate) backend_pid: i32,
     pub(crate) connection_closed: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) pgwire_listener_work: Option<Arc<giggles_core::DurableTracker>>,
     pub(crate) backend_ssl: bool,
     pub(crate) service: Arc<Service>,
     pub(crate) role: Role,

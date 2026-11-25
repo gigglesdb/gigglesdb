@@ -16,6 +16,8 @@ mod comments_network;
 mod group_parser_network;
 #[path = "constraint_catalog_network.rs"]
 mod constraint_catalog_network;
+#[path = "shutdown_release_network.rs"]
+mod shutdown_release_network;
 #[path = "trigger_catalog_network.rs"]
 mod trigger_catalog_network;
 #[path = "bytea_convert_network.rs"]

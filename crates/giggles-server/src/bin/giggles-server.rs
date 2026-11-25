@@ -331,7 +331,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     service.stop_submissions();
-    let stopped = stop_all(listeners, &api).await;
+    let stopped = stop_all(listeners, Some(&api), true).await;
     if let Some(agent_api) = &agent_api {
         agent_api.shutdown().await;
     }
@@ -725,7 +725,7 @@ async fn run_replicated(c: Config, no_stdin_control: bool) -> Result<(), Box<dyn
     reader.abort();
     let _ = reader.await;
     if let Some(service) = &terminal_service { service.stop_submissions(); }
-    let stopped = stop_role(listeners, api).await;
+    let stopped = stop_all(listeners, api.as_deref(), true).await;
     if let Some(service) = &terminal_service
         && let Err(error) = service.drain().await { eprintln!("{error}"); std::process::exit(1); }
     tokio::task::spawn_blocking(move || repl.unwrap().stop()).await?;
@@ -835,21 +835,7 @@ async fn stop_role(
     listeners: Vec<Running>,
     api: Option<std::sync::Arc<ApiRuntime>>,
 ) -> io::Result<()> {
-    if let Some(api) = api {
-        return stop_all(listeners, &api).await;
-    }
-    let mut tasks = tokio::task::JoinSet::new();
-    for mut listener in listeners {
-        listener.request_shutdown();
-        tasks.spawn(listener.shutdown());
-    }
-    let mut failure = None;
-    while let Some(result) = tasks.join_next().await {
-        if let Err(error) = result.unwrap_or_else(|e| Err(io::Error::other(e))) {
-            failure.get_or_insert(error);
-        }
-    }
-    failure.map_or(Ok(()), Err)
+    stop_all(listeners, api.as_deref(), false).await
 }
 
 struct StartedListeners {
@@ -1083,7 +1069,7 @@ async fn start_listeners(
         for runtime in &role_api {
             runtime.shutdown().await;
         }
-        let _ = stop_all(listeners, &api).await;
+        let _ = stop_all(listeners, Some(&api), !retry).await;
         if let Some(agent_api) = &agent_api {
             agent_api.shutdown().await;
         }
@@ -1117,13 +1103,25 @@ async fn bind_listener(address: SocketAddr, retry: bool) -> io::Result<TcpListen
     }
 }
 
-async fn stop_all(listeners: Vec<Running>, api: &ApiRuntime) -> io::Result<()> {
+async fn stop_all(
+    listeners: Vec<Running>,
+    api: Option<&ApiRuntime>,
+    release: bool,
+) -> io::Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     for mut listener in listeners {
         listener.request_shutdown();
-        tasks.spawn(listener.shutdown());
+        tasks.spawn(async move {
+            if release {
+                listener.shutdown().await
+            } else {
+                listener.shutdown_without_release().await
+            }
+        });
     }
-    api.shutdown().await;
+    if let Some(api) = api {
+        api.shutdown().await;
+    }
     let mut failure = None;
     while let Some(result) = tasks.join_next().await {
         match result {

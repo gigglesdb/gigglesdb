@@ -8,6 +8,7 @@ use crate::{
     pgwire_startup::{StartupPolicy, parse_startup_with_diagnostics, read_startup_packet, reject_invalid_startup, reject_startup},
     transport::{IO_TIMEOUT, Running},
 };
+use giggles_core::DurableTracker;
 use std::{collections::BTreeMap, io, net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -47,6 +48,9 @@ pub async fn serve_postgresql_bound(
     }
     let address = socket.local_addr()?;
     let (stop, mut rx) = oneshot::channel();
+    let work = Arc::new(DurableTracker::default());
+    let task_work = work.clone();
+    let task_service = service.clone();
     let task = tokio::spawn(async move {
         while !*start.borrow_and_update() {
             tokio::select! {
@@ -63,24 +67,26 @@ pub async fn serve_postgresql_bound(
                 incoming = socket.accept() => {
                     let (socket, peer) = incoming?;
                     crate::transport::no_delay(&socket);
-                    let Some(shared) = service.admission.connect() else { continue; };
+                    let Some(shared) = task_service.admission.connect() else { continue; };
                     let Ok(permit) = sem.clone().try_acquire_owned() else { continue; };
-                    let service = service.clone();
+                    let service = task_service.clone();
                     let listener = listener.clone();
+                    let work = task_work.clone();
                     tasks.spawn(async move {
                         let _permit = permit;
-                        if let Err(error) = connection(socket, peer, service, listener, shared).await {
+                        if let Err(error) = connection(socket, peer, service, listener, shared, work).await {
                             eprintln!("protocol=postgresql rejected stage=wire reason={:?}", error.kind());
                         }
                     });
                 }
             }
         }
+        drop(socket);
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         Ok(())
     });
-    Ok(Running::new(address, stop, task))
+    Ok(Running::new(address, stop, task).with_pgwire_work(service, work))
 }
 
 trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -92,6 +98,7 @@ async fn connection(
     service: Arc<Service>,
     listener: Arc<PostgresListener>,
     shared: Arc<OwnedSemaphorePermit>,
+    work: Arc<DurableTracker>,
 ) -> io::Result<()> {
     if !service.admission.request() {
         return Ok(());
@@ -184,6 +191,7 @@ async fn connection(
     session.connection = Some(shared);
     session.backend_ssl = encrypted;
     session.database = Some(startup.database.clone());
+    session.pgwire_listener_work = Some(work);
     if !service.admission.request() {
         return Ok(());
     }

@@ -1883,6 +1883,45 @@ struct BlockingOwner<S, T, A, L, U> {
     _submitted: U,
 }
 
+// The queued closure and its result can each own the session. Keep the token
+// last so cancellation drops either payload before the listener sees it retire.
+struct ListenerWork<T> {
+    value: T,
+    listener_token: Option<giggles_core::LiveToken>,
+}
+
+impl<T> ListenerWork<T> {
+    fn run<R>(self) -> ListenerWork<R>
+    where
+        T: FnOnce() -> R,
+    {
+        let Self { value, listener_token } = self;
+        ListenerWork {
+            value: value(),
+            listener_token,
+        }
+    }
+
+    fn into_inner(self) -> T {
+        self.value
+    }
+}
+
+fn spawn_listener_work<F, T>(
+    listener_token: Option<giggles_core::LiveToken>,
+    job: F,
+) -> tokio::task::JoinHandle<ListenerWork<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let work = ListenerWork {
+        value: job,
+        listener_token,
+    };
+    tokio::task::spawn_blocking(move || work.run())
+}
+
 #[cfg(test)]
 mod blocking_owner_tests {
     #[test]
@@ -1903,6 +1942,35 @@ mod blocking_owner_tests {
             panic!("execution unwind");
         }).is_err());
         assert_eq!(*order.lock().unwrap(), [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn listener_token_outlives_discarded_job_and_result() {
+        use giggles_core::DurableTracker;
+        use std::sync::Arc;
+
+        struct Tracked(Arc<DurableTracker>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                assert_eq!(self.0.live(), 1);
+            }
+        }
+
+        let tracker = Arc::new(DurableTracker::default());
+        let make_work = || {
+            let payload = Tracked(tracker.clone());
+            super::ListenerWork {
+                value: move || payload,
+                listener_token: Some(tracker.register()),
+            }
+        };
+        drop(make_work());
+        assert_eq!(tracker.live(), 0);
+
+        let completed = make_work().run();
+        assert_eq!(tracker.live(), 1);
+        drop(completed);
+        assert_eq!(tracker.live(), 0);
     }
 }
 
@@ -3781,6 +3849,7 @@ pub(crate) async fn run_agent<S: AsyncRead + AsyncWrite + Unpin>(
     fingerprint: &str,
     databases: &[String],
     shared: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+    work: Arc<giggles_core::DurableTracker>,
 ) -> io::Result<()> {
     use crate::pgwire_startup::{
         StartupPolicy, parse_startup, read_startup_packet, reject_startup,
@@ -3826,6 +3895,7 @@ pub(crate) async fn run_agent<S: AsyncRead + AsyncWrite + Unpin>(
     session.connection = Some(shared);
     session.backend_ssl = true;
     session.database = Some(startup.database.clone());
+    session.pgwire_listener_work = Some(work);
     let statuses = [
         ("is_superuser", "off".to_owned()),
         ("session_authorization", executor),
@@ -3839,6 +3909,7 @@ pub(crate) async fn run_agent_password<S: AsyncRead + AsyncWrite + Unpin>(
     service: &std::sync::Arc<crate::Service>,
     databases: &[String],
     shared: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+    work: Arc<giggles_core::DurableTracker>,
 ) -> io::Result<()> {
     use crate::pgwire_startup::{
         StartupPolicy, parse_startup, read_startup_packet, reject_startup,
@@ -3901,6 +3972,7 @@ pub(crate) async fn run_agent_password<S: AsyncRead + AsyncWrite + Unpin>(
     session.connection = Some(shared);
     session.backend_ssl = true;
     session.database = Some(startup.database.clone());
+    session.pgwire_listener_work = Some(work);
     let statuses = [
         ("is_superuser", "off".to_owned()),
         ("session_authorization", startup.user.clone()),
@@ -4327,11 +4399,12 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                     {
                         let service = session.service.clone();
                         let submitted = service.pgwire_submission_token();
-                        tokio::task::spawn_blocking(move || {
+                        let listener_token = session.pgwire_listener_work.as_ref().map(|work| work.register());
+                        spawn_listener_work(listener_token, move || {
                             let _submitted = submitted;
                             let _live = service.pgwire_live_token();
                             gate()
-                        }).await
+                        }).await.map(ListenerWork::into_inner)
                     },
                     Ok(Ok(()))
                 ) {
@@ -4518,7 +4591,8 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                 .pgwire_blocking_tasks
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let submitted = session.service.pgwire_submission_token();
-            tokio::task::spawn_blocking(move || {
+            let listener_token = session.pgwire_listener_work.as_ref().map(|work| work.register());
+            spawn_listener_work(listener_token, move || {
                 let live = session.service.pgwire_live_token();
                 let mut owner = BlockingOwner {
                     session, state, _agent: agent_slot, _live: live, _submitted: submitted,
@@ -4672,7 +4746,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
             binding_lost,
             leader_shutdown,
             released_permits,
-        ) = completed;
+        ) = completed.into_inner();
         pending_frames = remaining.into_iter().chain(pending_frames).collect();
         session = returned_session;
         state = returned_state;

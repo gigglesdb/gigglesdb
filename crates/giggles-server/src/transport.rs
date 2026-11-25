@@ -1,4 +1,5 @@
 use crate::{Service, tls};
+use giggles_core::DurableTracker;
 use rustls::ServerConfig;
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
@@ -11,6 +12,7 @@ use tokio_rustls::TlsAcceptor;
 pub const MAX_FRAME: usize = 256 * 1024;
 pub const MAX_RESPONSE: usize = 8 * 1024 * 1024;
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Turns off Nagle on a server or client TCP socket. Replies leave as several
 /// small writes (pgwire message by message, TLS records, frame header then
 /// body); with Nagle on, each one after the first waits for the peer's delayed
@@ -22,6 +24,7 @@ pub struct Running {
     pub address: SocketAddr,
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<io::Result<()>>,
+    pgwire_work: Option<(Arc<Service>, Arc<DurableTracker>)>,
 }
 impl Running {
     pub(crate) fn new(
@@ -33,7 +36,17 @@ impl Running {
             address,
             stop: Some(stop),
             task,
+            pgwire_work: None,
         }
+    }
+
+    pub(crate) fn with_pgwire_work(
+        mut self,
+        service: Arc<Service>,
+        work: Arc<DurableTracker>,
+    ) -> Self {
+        self.pgwire_work = Some((service, work));
+        self
     }
 
     /// Signal every listener before awaiting any shutdown work.
@@ -43,13 +56,29 @@ impl Running {
         }
     }
 
+    /// Stops the listener and waits for its PostgreSQL jobs to release the service.
     pub async fn shutdown(mut self) -> io::Result<()> {
+        self.stop_listener().await?;
+        if let Some((service, work)) = self.pgwire_work {
+            service.wait_for_pgwire_work(&work).await?;
+        }
+        Ok(())
+    }
+
+    /// Stops the listener and its socket tasks. Blocking jobs already started
+    /// may still hold the service. Use only when the data directory stays open
+    /// in this process.
+    pub async fn shutdown_without_release(mut self) -> io::Result<()> {
+        self.stop_listener().await
+    }
+
+    async fn stop_listener(&mut self) -> io::Result<()> {
         self.request_shutdown();
-        self.task.await.map_err(io::Error::other)?
+        (&mut self.task).await.map_err(io::Error::other)?
     }
 }
-/// Connections are admitted before TLS allocation. Shutdown aborts socket tasks;
-/// synchronous core calls already started can finish their atomic decision.
+/// Connections are admitted before TLS allocation. Shutdown aborts socket tasks
+/// and waits for their outstanding blocking work.
 pub async fn serve_pg(
     address: SocketAddr,
     service: Arc<Service>,
@@ -77,6 +106,9 @@ pub async fn serve_pg_bound(
     }
     let address = listener.local_addr()?;
     let (stop, mut rx) = oneshot::channel();
+    let work = Arc::new(DurableTracker::default());
+    let task_work = work.clone();
+    let task_service = service.clone();
     let task = tokio::spawn(async move {
         while !*start.borrow_and_update() {
             tokio::select! {
@@ -94,9 +126,10 @@ pub async fn serve_pg_bound(
                 incoming=listener.accept()=>{
                     let (mut socket,_)=incoming?;
                     no_delay(&socket);
-                    let Some(shared)=service.admission.connect() else {continue};
+                    let Some(shared)=task_service.admission.connect() else {continue};
                     let Ok(permit)=sem.clone().try_acquire_owned() else {continue};
-                    let accept=accept.clone();let service=service.clone();
+                    let accept=accept.clone();let service=task_service.clone();
+                    let work = task_work.clone();
                     tasks.spawn(async move {
                         let _permit=permit;
                         if crate::pgwire::ssl_request(&mut socket).await.is_err() {
@@ -113,6 +146,7 @@ pub async fn serve_pg_bound(
                         };
                         session.connection=Some(shared);
                         session.backend_ssl=true;
+                        session.pgwire_listener_work = Some(work);
                         if let Err(error)=crate::pgwire::run(&mut stream,session).await {
                             eprintln!("protocol=postgres closed stage=wire io_kind={:?}",error.kind());
                         }
@@ -120,9 +154,10 @@ pub async fn serve_pg_bound(
                 }
             }
         }
+        drop(listener);
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         Ok(())
     });
-    Ok(Running::new(address, stop, task))
+    Ok(Running::new(address, stop, task).with_pgwire_work(service, work))
 }

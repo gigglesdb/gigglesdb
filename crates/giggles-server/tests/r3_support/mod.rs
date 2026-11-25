@@ -443,19 +443,7 @@ impl R3Fixture {
         agent.shutdown().await.unwrap();
         drop(service);
         drop(admin);
-        // Detached blocking work can still hold a Session (and its Admin)
-        // for a moment after the socket tasks stop.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let admin = loop {
-            match Admin::open(&self.path, Limits::default()) {
-                Err(giggles_core::CoreError::Storage(message))
-                    if message.contains("already open") && Instant::now() < deadline =>
-                {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                result => break result.expect("reopen the database"),
-            }
-        };
+        let admin = Admin::open(&self.path, Limits::default()).expect("reopen the database");
         if let Some(ms) = self.clock_ms {
             admin.set_task_wall_clock(Some(ms)).unwrap();
         }

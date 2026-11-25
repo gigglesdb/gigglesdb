@@ -111,7 +111,28 @@ async fn tracker_tokens_survive_unwind_and_shutdown_waits() {
 #[cfg(feature = "engine-rocksdb")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_waits_for_detached_in_sync_commit() {
-    let (path, admin, service, running, client, connection) = fixture().await;
+    shutdown_with_parked_sync_commit(Duration::from_millis(30), true).await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_waits_for_in_sync_commit_when_listener_closes_socket() {
+    shutdown_with_parked_sync_commit(Duration::from_millis(30), false).await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_shutdown_waits_past_worker_deadline_for_sync_commit() {
+    shutdown_with_parked_sync_commit(
+        giggles_server::IO_TIMEOUT + Duration::from_secs(1),
+        false,
+    ).await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+async fn shutdown_with_parked_sync_commit(listener_wait: Duration, disconnect_client: bool) {
+    let (path, admin, service, running, client, mut connection) =
+        start_fixture(false, None, 1).await;
     client.batch_execute("CREATE TABLE drain_rows(id int PRIMARY KEY)").await.unwrap();
     let hook = giggles_core::CommitSyncHook::new(); let _release = ReleaseOnDrop(hook.clone());
     admin.set_commit_sync_hook(Some(hook.clone()));
@@ -119,19 +140,36 @@ async fn shutdown_waits_for_detached_in_sync_commit() {
     let entered = { let hook = hook.clone(); tokio::task::spawn_blocking(move || hook.wait_entered(Duration::from_secs(5))).await.unwrap() };
     assert!(entered);
     assert_eq!(service.durability_metrics()["durable_completions_live"], 1);
-    connection.abort();
-    let _ = connection.await;
-    let _ = query.await;
-    let draining = service.clone();
-    let shutdown = tokio::spawn(async move {
-        draining.stop_submissions();
-        running.shutdown().await?;
-        draining.drain().await
-    });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while service.drain_entries() == 0 { tokio::task::yield_now().await; }
-    }).await.expect("drain entered");
-    assert!(!shutdown.is_finished());
+
+    if disconnect_client {
+        connection.abort();
+        assert!((&mut connection).await.unwrap_err().is_cancelled());
+        // A new SSLRequest gets a reply only after the old socket task
+        // returns the sole listener permit. The TLS-disabled listener says N.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let ssl_request = [8u32.to_be_bytes(), 80877103u32.to_be_bytes()].concat();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(mut probe) = tokio::net::TcpStream::connect(running.address).await
+                    && probe.write_all(&ssl_request).await.is_ok()
+                    && matches!(probe.read_u8().await, Ok(b'N'))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("server socket task must end before shutdown");
+    }
+    service.stop_submissions();
+    let mut shutdown = tokio::spawn(running.shutdown());
+    if !disconnect_client {
+        let _ = tokio::time::timeout(Duration::from_secs(5), &mut connection).await.unwrap().unwrap();
+    }
+    assert!(query.await.unwrap().is_err());
+    tokio::time::timeout(listener_wait, &mut shutdown)
+        .await
+        .expect_err("listener shutdown returned with a parked sync commit");
+    assert_eq!(service.drain_entries(), 0);
     assert_eq!(service.pgwire_blocking_live(), 1);
     let error = tokio::time::timeout(Duration::from_secs(1),
         service.drain_with_timeout(Duration::from_millis(30))).await
@@ -140,13 +178,18 @@ async fn shutdown_waits_for_detached_in_sync_commit() {
     assert_eq!(service.durability_metrics()["durable_completions_live"], 1);
     hook.release(false);
     shutdown.await.unwrap().unwrap();
+    if !disconnect_client {
+        service.drain().await.unwrap();
+    }
     idle(&service);
     admin.set_commit_sync_hook(None);
+    drop(service);
+    drop(admin);
+    let reopened = Admin::open(&path, Limits::default()).unwrap();
     // The in-Sync group succeeded despite disconnect and the shutdown fence.
-    let mut session = admin.sql_session();
-    let result = session.execute("SELECT * FROM drain_rows", &[], None).unwrap();
+    let result = reopened.sql_session().execute("SELECT * FROM drain_rows", &[], None).unwrap();
     assert_eq!(result.rows.len(), 1);
-    drop(session); drop(service); drop(admin);
+    drop(reopened);
     std::fs::remove_dir_all(path).unwrap();
 }
 

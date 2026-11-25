@@ -11,6 +11,7 @@ use crate::{
     api::ApiLimits,
     transport::{IO_TIMEOUT, Running},
 };
+use giggles_core::DurableTracker;
 use rustls::ServerConfig;
 use serde::Deserialize;
 use std::{io, io::Read, net::SocketAddr, sync::Arc};
@@ -176,6 +177,9 @@ pub async fn serve_agent_pg_bound(
     let address = listener.local_addr()?;
     let databases: Arc<[String]> = databases.into();
     let (stop, mut rx) = oneshot::channel();
+    let work = Arc::new(DurableTracker::default());
+    let task_work = work.clone();
+    let task_service = service.clone();
     let task = tokio::spawn(async move {
         while !*start.borrow_and_update() {
             tokio::select! {
@@ -193,11 +197,12 @@ pub async fn serve_agent_pg_bound(
                 incoming = listener.accept() => {
                     let (mut socket, _) = incoming?;
                     crate::transport::no_delay(&socket);
-                    let Some(shared) = service.admission.connect() else { continue };
+                    let Some(shared) = task_service.admission.connect() else { continue };
                     let Ok(permit) = sem.clone().try_acquire_owned() else { continue };
                     let accept = accept.clone();
-                    let service = service.clone();
+                    let service = task_service.clone();
                     let databases = databases.clone();
+                    let work = task_work.clone();
                     tasks.spawn(async move {
                         let _permit = permit;
                         if crate::pgwire::ssl_request(&mut socket).await.is_err() {
@@ -214,11 +219,11 @@ pub async fn serve_agent_pg_bound(
                             .filter(|fp| service.agent_known(fp));
                         let result = if let Some(fingerprint) = fingerprint {
                             crate::pgwire::run_agent(
-                                &mut stream, &service, &fingerprint, &databases, shared,
+                                &mut stream, &service, &fingerprint, &databases, shared, work,
                             ).await
                         } else {
                             crate::pgwire::run_agent_password(
-                                &mut stream, &service, &databases, shared,
+                                &mut stream, &service, &databases, shared, work,
                             ).await
                         };
                         if let Err(error) = result {
@@ -228,9 +233,10 @@ pub async fn serve_agent_pg_bound(
                 }
             }
         }
+        drop(listener);
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         Ok(())
     });
-    Ok(Running::new(address, stop, task))
+    Ok(Running::new(address, stop, task).with_pgwire_work(service, work))
 }
