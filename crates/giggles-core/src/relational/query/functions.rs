@@ -2,7 +2,7 @@
 use super::*;
 mod advisory_key;
 mod arithmetic;
-mod array_constructor;
+pub(super) mod array_constructor;
 pub(super) mod uuid_array_operators;
 mod array_order;
 pub(super) mod collation;
@@ -374,6 +374,9 @@ fn common_result_type(types: impl IntoIterator<Item = DataType>) -> R<DataType> 
                 } else {
                     DataType::Numeric
                 }
+            }
+            Some(ref old) if array_constructor::mixed_query_arrays(old, &ty) => {
+                return Err(SqlError::Unsupported);
             }
             _ => return Err(SqlError::Type),
         });
@@ -1693,6 +1696,12 @@ impl Scalar {
                 return Ok(BoundScalar { ty: ty.clone(), node: cast_node(a, ty) });
             }
         }
+        if assignment::array_element_assignment(&a.ty, ty).is_some() {
+            return a.insert_assignment(ty);
+        }
+        if assignment::unsupported_explicit_array_cast(&a.ty, ty) {
+            return Err(SqlError::Unsupported);
+        }
         if let Some(supported) = text_search_types::cast_supported(&a.ty, ty) {
             if !supported {
                 return Err(SqlError::CannotCoerce);
@@ -2275,7 +2284,10 @@ impl Scalar {
         if name == json_aggregate::OBJECT {
             return Ok(BoundScalar {
                 ty: DataType::Jsonb,
-                node: if args.iter().any(|arg| arg.ty == DataType::TimestampTz) {
+                node: if args.iter().any(|arg| matches!(
+                    arg.ty, DataType::TimestampTz
+                        | DataType::ExpressionArray(ExpressionArray::TimestampTz)
+                )) {
                     Node::ZonedOperator(name.into(), args, None)
                 } else {
                     Node::Call(name.into(), args)
@@ -3038,6 +3050,12 @@ impl BoundScalar {
                 if json_array::name(name).is_some() {
                     let zone = clock.as_ref().and_then(|clock| clock.zone());
                     return json_array::eval(name, args, &values, zone, budget);
+                }
+                if concat::array_operator(name) {
+                    let zone = clock.as_ref().and_then(|clock| clock.zone())
+                        .unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0));
+                    return concat::eval(name, args, &values, zone, budget)
+                        .ok_or(SqlError::InternalError)?;
                 }
                 arithmetic::eval_zoned(name, &values, clock.as_ref(), budget)
             }

@@ -286,6 +286,17 @@ fn signature(
     if a == Some(Bpchar) || b == Some(Bpchar) {
         return Err(SqlError::Unsupported);
     }
+    if let Some(array) = [a.as_ref(), b.as_ref()].into_iter().flatten().find(|ty| array_constructor::query_only(ty)) {
+        if op == Concat {
+            return concat::signature(a.as_ref(), b.as_ref()).expect("known array overload");
+        }
+        if matches!(op, Contains | ContainedBy | Overlap)
+            && *array != DataType::ExpressionArray(crate::relational::ExpressionArray::Json)
+            && [a.as_ref(), b.as_ref()].into_iter().flatten().all(|ty| ty == array)
+        {
+            return Err(SqlError::Unsupported);
+        }
+    }
     let a = a.map(|ty| if ty == Varchar { Text } else { ty });
     let b = b.map(|ty| if ty == Varchar { Text } else { ty });
     let types = [a.as_ref(), b.as_ref()];
@@ -480,6 +491,9 @@ pub(super) fn infer(
                 }
                 return bind_enum_containment(*op, [a, b], operands, &definition).map(|_| ());
             }
+            if *op == BinaryOp::Concat {
+                concat::check_json_operand(&operands)?;
+            }
             let [left, right] = operands.map(|operand| operand.map(|operand| operand.ty));
             let (at, bt, _) = signature(*op, left, right)?;
             // Overload coercions convert typed expressions; they only assign unknown parameters.
@@ -598,8 +612,18 @@ pub(super) fn bind(
             if let Some(definition) = enum_containment_type(*op, &operands) {
                 return bind_enum_containment(*op, [a, b], operands, &definition);
             }
+            if *op == BinaryOp::Concat {
+                concat::check_json_operand(&operands)?;
+            }
             let [left, right] = operands.map(|operand| operand.map(|operand| operand.ty));
             let (at, bt, ty) = signature(*op, left, right)?;
+            if *op == BinaryOp::Concat {
+                for (source, target) in [(a.as_ref(), &at), (b.as_ref(), &bt)] {
+                    if let Scalar::Literal(value) = source {
+                        concat::check_literal(value, target)?;
+                    }
+                }
+            }
             let mut args = vec![
                 operand(a, &at, resolve, tables, parameters)?,
                 operand(b, &bt, resolve, tables, parameters)?,
@@ -614,7 +638,13 @@ pub(super) fn bind(
             collation::derive(args.iter())?;
             Ok(BoundScalar {
                 ty: ty.clone(),
-                node: if matches!(
+                node: if *op == BinaryOp::Concat && array_constructor::query_only(&ty) {
+                    Node::ZonedOperator(
+                        concat::name(&at, &bt, &ty).expect("known array overload").into(),
+                        args,
+                        None,
+                    )
+                } else if matches!(
                     (*op, args[0].ty.clone(), args[1].ty.clone()),
                     (
                         BinaryOp::Add | BinaryOp::Sub,
@@ -653,7 +683,9 @@ fn checked_integer(value: i64, ty: &DataType) -> R<Value> {
 pub(super) fn eval(
     name: &str, ty: &DataType, args: &[BoundScalar], values: &[Value], budget: &mut usize,
 ) -> R<Value> {
-    if let Some(result) = concat::eval(name, values, budget) {
+    if let Some(result) = concat::eval(
+        name, args, values, giggles_pg_types::temporal::SessionZone::Fixed(0), budget,
+    ) {
         return result;
     }
     if values.contains(&Value::Null) {

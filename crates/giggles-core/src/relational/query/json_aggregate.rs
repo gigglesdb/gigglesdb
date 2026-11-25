@@ -102,20 +102,16 @@ pub(super) fn element(value: &Value, ty: &DataType, zone: SessionZone) -> R<Stri
         Value::Timestamp(v) => quote(&v.to_string().replacen(' ', "T", 1)),
         Value::TimestampTz(v) => quote(&zoned_timestamp(*v, zone)?),
         Value::Text(s) if *ty == DataType::Jsonb => Ok(s.clone()),
-        Value::Text(s) if ty.is_array() => {
-            let element_type = plan::array_element_type(ty)?;
-            let entries = logical_types::array_values(s)?
-                .into_iter()
-                .map(|item| {
-                    let value = item.map_or(Ok(Value::Null), |s| {
-                        functions::coerce_clocked(Value::Text(s), &element_type, None)
-                    })?;
-                    element(&value, &element_type, zone)
-                })
-                .collect::<R<Vec<_>>>()?;
-            Ok(format!("[{}]", entries.join(",")))
-        }
-        Value::Text(s) => quote(s),
+        Value::Text(s) => match functions::array_constructor::element_type(ty) {
+            Some(element_type) => {
+                let entries = logical_types::array_values(s)?
+                    .into_iter()
+                    .map(|item| array_element(item, ty, &element_type, zone))
+                    .collect::<R<Vec<_>>>()?;
+                Ok(format!("[{}]", entries.join(",")))
+            }
+            None => quote(s),
+        },
         other => {
             let Value::Text(s) = functions::coerce_clocked(other.clone(), &DataType::Text, None)?
             else {
@@ -130,6 +126,25 @@ pub(super) fn element(value: &Value, ty: &DataType, zone: SessionZone) -> R<Stri
             } else {
                 quote(&s)
             }
+        }
+    }
+}
+
+pub(super) fn array_element(
+    item: Option<String>,
+    array_type: &DataType,
+    element_type: &DataType,
+    zone: SessionZone,
+) -> R<String> {
+    let Some(text) = item else { return Ok("null".into()) };
+    match array_type {
+        DataType::ExpressionArray(ExpressionArray::Json) => Ok(text),
+        DataType::PgCharArray | DataType::RegDictionaryArray => {
+            serde_json::to_string(&text).map_err(|_| SqlError::Type)
+        }
+        _ => {
+            let value = functions::coerce_clocked(Value::Text(text), element_type, None)?;
+            element(&value, element_type, zone)
         }
     }
 }
@@ -157,7 +172,10 @@ pub(super) fn push(
             logical_types::json_output(&serde_json::from_str(&entry).map_err(|_| SqlError::Type)?)?;
     }
     let separator =
-        if matches!(kind, Aggregate::Json) && scalar.ty.is_array() && *input != Value::Null {
+        if matches!(kind, Aggregate::Json)
+            && functions::array_constructor::element_type(&scalar.ty).is_some()
+            && *input != Value::Null
+        {
             ", \n "
         } else {
             ", "
@@ -288,7 +306,9 @@ pub(super) fn object_key(key: &Value, scalar: &BoundScalar, zone: SessionZone) -
         return Err(SqlError::InvalidParameterValue);
     }
     let key_type = &scalar.ty;
-    if key_type.is_array() || *key_type == DataType::Jsonb || scalar.result_oid() == OID {
+    if functions::array_constructor::element_type(key_type).is_some()
+        || *key_type == DataType::Jsonb || scalar.result_oid() == OID
+    {
         return Err(invalid_object_key());
     }
     let key = element(key, key_type, zone)?;

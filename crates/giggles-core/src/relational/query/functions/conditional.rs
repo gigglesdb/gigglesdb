@@ -48,6 +48,13 @@ fn bucket_types(types: &[Option<DataType>]) -> R<(Vec<DataType>, DataType)> {
     use DataType::*;
     let signature = match types {
         [operand, Some(array)] => {
+            if array_constructor::query_only(array)
+                && let Some(element) = array_constructor::element_type(array)
+                && (operand.as_ref().is_none_or(|input| input == &element || number(input) && number(&element)
+                    || *input == Varchar && element == Text || *input == Text && element == Varchar))
+            {
+                return Err(SqlError::Unsupported);
+            }
             let element = array_element(array)?;
             let operand = match operand {
                 None => element,
@@ -194,7 +201,7 @@ pub(super) fn bind(
             let [array] = args.as_slice() else {
                 return Err(SqlError::UndefinedFunction);
             };
-            if array_element(&array.ty).is_err() {
+            if array_constructor::element_type(&array.ty).is_none() {
                 user_types::view_replace_error("VARIADIC argument must be an array".into());
                 return Err(SqlError::Type);
             }

@@ -45,6 +45,10 @@ pub(super) fn common(types: impl Iterator<Item = DataType>) -> R<DataType> {
     }
     if types.iter().all(|ty| implicit(ty, &candidate)) {
         Ok(candidate)
+    } else if types.iter().all(|ty| ty == &candidate
+        || functions::array_constructor::mixed_query_arrays(ty, &candidate))
+    {
+        Err(SqlError::Unsupported)
     } else {
         Err(SqlError::Type)
     }
@@ -558,7 +562,10 @@ impl Plan {
                             common(types)
                         }
                     };
-                    let ty = common_type.inspect_err(|_| {
+                    let ty = common_type.inspect_err(|error| {
+                        if *error == SqlError::Unsupported {
+                            return;
+                        }
                         let left = &a.columns[i].data_type;
                         let right = &b.columns[i].data_type;
                         if matches!((left, right), (DataType::Text, _) | (_, DataType::Text)) {

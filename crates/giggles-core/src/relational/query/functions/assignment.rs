@@ -11,6 +11,7 @@ pub(in crate::relational) fn compatible(source: &DataType, target: &DataType) ->
         DataType::Text | DataType::Varchar | DataType::Bpchar
     ) || source == target
         || number(source) && number(target)
+        || array_element_assignment(source, target).is_some()
         || matches!(
             target,
             DataType::Text | DataType::Varchar | DataType::Bpchar
@@ -29,6 +30,83 @@ pub(in crate::relational) fn compatible(source: &DataType, target: &DataType) ->
                 | (DataType::Time, DataType::TimeTz | DataType::Interval)
                 | (DataType::TimeTz | DataType::Interval, DataType::Time)
         )
+}
+
+pub(super) fn array_element_assignment(source: &DataType, target: &DataType) -> Option<(DataType, DataType)> {
+    use DataType::*;
+    if !array_constructor::query_only(source) {
+        return None;
+    }
+    let element = array_constructor::element_type(source)?;
+    match (target, &element) {
+        (TextArray, _) => Some((element, Text)),
+        (IntArray | BigIntArray, SmallInt | Numeric | Real | RegDictionary) => {
+            Some((element, array_constructor::element_type(target)?))
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn unsupported_explicit_array_cast(source: &DataType, target: &DataType) -> bool {
+    use DataType::*;
+    if source == target || !(array_constructor::query_only(source) || array_constructor::query_only(target)) {
+        return false;
+    }
+    let (Some(source), Some(target)) = (
+        array_constructor::element_type(source), array_constructor::element_type(target),
+    ) else {
+        return false;
+    };
+    number(&source) && number(&target) || matches!(
+        (source, target),
+        (Text | Varchar, Uuid | Real | SmallInt | PgChar)
+            | (Boolean | PgChar, Integer)
+            | (Integer, PgChar)
+    )
+}
+
+fn convert_array(
+    array: &str,
+    source: &DataType,
+    target: &DataType,
+    clock: Option<&ExecutionClock>,
+) -> R<Value> {
+    let items = logical_types::array_values(array)?;
+    let mut out = String::from("{");
+    for (i, item) in items.into_iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let item = match item {
+            None => "NULL".into(),
+            // These elements already have the same text representation.
+            Some(text) if *target == DataType::Text && !matches!(source,
+                DataType::Boolean | DataType::Date | DataType::Timestamp
+                    | DataType::TimestampTz | DataType::Real) => logical_types::array_quote(&text),
+            Some(text) => {
+                let value = coerce_clocked(Value::Text(text), source, None)?;
+                let converted = match value {
+                    Value::Numeric(n) if n.scale().is_none() => return Err(SqlError::Unsupported),
+                    Value::Int(oid) if *source == DataType::RegDictionary && *target == DataType::Integer => {
+                        Value::Int(i64::from(oid as i32))
+                    }
+                    Value::Int(_) if *source == DataType::RegDictionary => value,
+                    value => convert(value, source, target, clock)?,
+                };
+                match converted {
+                    Value::Int(n) => n.to_string(),
+                    Value::Text(text) => logical_types::array_quote(&text),
+                    _ => return Err(SqlError::InternalError),
+                }
+            }
+        };
+        if out.len().saturating_add(item.len()).saturating_add(1) > crate::relational::max_value_bytes() {
+            return Err(SqlError::Limit);
+        }
+        out.push_str(&item);
+    }
+    out.push('}');
+    Ok(Value::Text(out))
 }
 
 /// Assignment source metadata. JSON expressions use text values with a distinct OID.
@@ -125,6 +203,13 @@ pub(in crate::relational) fn convert(
     target: &DataType,
     clock: Option<&ExecutionClock>,
 ) -> R<Value> {
+    if let Some((source, target)) = array_element_assignment(source, target) {
+        return match value {
+            Value::Null => Ok(value),
+            Value::Text(array) => convert_array(&array, &source, &target, clock),
+            _ => Err(SqlError::Type),
+        };
+    }
     if !compatible(source, target) {
         return Err(SqlError::Type);
     }

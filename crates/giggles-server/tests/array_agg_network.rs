@@ -143,6 +143,38 @@ async fn archdocs_hints_describe_and_execute_with_text_parameters() {
     let frames = pg_sync(&mut stream).await;
     assert_eq!(&frame(&frames, b'D')[..2], &12u16.to_be_bytes());
 
+    let create = "CREATE TABLE array_dst (a text[])";
+    pg_send(&mut stream, b'P', &parse_oids("create_array", create, &[])).await;
+    pg_send(&mut stream, b'B', &bind("", "create_array", &[], false)).await;
+    pg_send(&mut stream, b'E', &execute("", 0)).await;
+    let frames = pg_sync(&mut stream).await;
+    assert_eq!(frame(&frames, b'C'), b"CREATE TABLE\0");
+    let insert = "INSERT INTO array_dst SELECT array_agg($1::varchar)";
+    pg_send(
+        &mut stream,
+        b'P',
+        &parse_oids("insert_array", insert, &[25]),
+    )
+    .await;
+    pg_send(
+        &mut stream,
+        b'B',
+        &bind("", "insert_array", &[Some("a,b")], false),
+    )
+    .await;
+    pg_send(&mut stream, b'E', &execute("", 0)).await;
+    let frames = pg_sync(&mut stream).await;
+    assert_eq!(frame(&frames, b'C'), b"INSERT 0 1\0");
+
+    let read = "SELECT a FROM array_dst";
+    pg_send(&mut stream, b'P', &parse_oids("read_array", read, &[])).await;
+    pg_send(&mut stream, b'B', &bind("", "read_array", &[], false)).await;
+    pg_send(&mut stream, b'D', b"P\0").await;
+    pg_send(&mut stream, b'E', &execute("", 0)).await;
+    let frames = pg_sync(&mut stream).await;
+    assert_eq!(column_oids(frame(&frames, b'T')), vec![1009]);
+    assert_eq!(frame(&frames, b'D'), b"\0\x01\0\0\0\x07{\"a,b\"}");
+
     drop(stream);
     server.shutdown().await.unwrap();
     std::fs::remove_dir_all(path).unwrap();

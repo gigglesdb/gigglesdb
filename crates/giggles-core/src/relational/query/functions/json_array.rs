@@ -159,7 +159,7 @@ pub(super) fn bind(
             }
             _ => arg.bind(resolve, tables, parameters)?,
         };
-        if !arg.ty.is_array() {
+        if array_constructor::element_type(&arg.ty).is_none() {
             user_types::view_replace_error("VARIADIC argument must be an array".into());
             return Err(SqlError::Type);
         }
@@ -284,10 +284,7 @@ pub(super) fn eval(
             let entry = match item {
                 None => "null".into(),
                 Some(text) if json => text,
-                Some(text) => {
-                    let value = coerce_clocked(Value::Text(text), &element, None)?;
-                    json_aggregate::element(&value, &element, zone)?
-                }
+                Some(text) => json_aggregate::array_element(Some(text), &args[0].ty, &element, zone)?,
             };
             append(entry)?;
         }

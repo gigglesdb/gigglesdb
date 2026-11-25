@@ -118,6 +118,7 @@ pub(in crate::relational::query) fn element(ty: &DataType) -> R<DataType> {
         DataType::TextArray => Ok(DataType::Text),
         DataType::UuidArray => Ok(DataType::Uuid),
         DataType::TsVector => Ok(DataType::TsVector),
+        ty if functions::array_constructor::query_only(ty) => Err(SqlError::Unsupported),
         _ => Err(SqlError::Type),
     }
 }

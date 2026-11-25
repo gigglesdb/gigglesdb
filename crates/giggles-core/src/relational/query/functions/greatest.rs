@@ -45,6 +45,9 @@ fn result_type(types: &[DataType]) -> R<DataType> {
     };
     // Category errors precede both impossible conversions and literal parsing.
     if types.iter().any(|ty| !same_category(first, ty)) {
+        if types.iter().all(|ty| ty == first || array_constructor::mixed_query_arrays(first, ty)) {
+            return Err(SqlError::Unsupported);
+        }
         return Err(SqlError::Type);
     }
     let mut candidate = first.clone();

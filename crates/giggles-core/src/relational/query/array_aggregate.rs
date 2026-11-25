@@ -88,14 +88,17 @@ fn array_order_input(input: &BoundScalar) -> &BoundScalar {
 }
 
 pub(super) fn element(value: &Value, input: &BoundScalar, zone: SessionZone) -> R<String> {
+    encode_element(value, &array_order_input(input).ty, zone)
+}
+
+pub(super) fn encode_element(value: &Value, ty: &DataType, zone: SessionZone) -> R<String> {
     let text = match value {
         Value::Null => return Ok("NULL".into()),
         Value::Text(text) => return Ok(logical_types::array_quote(text)),
         Value::Bool(v) => return Ok(if *v { "t".into() } else { "f".into() }),
         Value::TimestampTz(v) => v.format_in_zone(zone).map_err(|_| SqlError::Overflow)?,
         other => {
-            let scalar = array_order_input(input);
-            let value = text_search_types::cast_typed(other, &scalar.ty, &DataType::Text)
+            let value = text_search_types::cast_typed(other, ty, &DataType::Text)
                 .unwrap_or_else(|| {
                     functions::coerce_clocked(other.clone(), &DataType::Text, None)
                 })?;

@@ -26,7 +26,7 @@ pub(super) fn parse(p: &mut Parser, depth: usize, aggregate: bool) -> R<Scalar> 
     }
     Ok(Scalar::Call(NAME.into(), args))
 }
-pub(super) fn element_type(array: &DataType) -> Option<DataType> {
+pub(in crate::relational::query) fn element_type(array: &DataType) -> Option<DataType> {
     Some(match array {
         DataType::IntArray => DataType::Integer,
         DataType::BigIntArray => DataType::BigInt,
@@ -39,6 +39,29 @@ pub(super) fn element_type(array: &DataType) -> Option<DataType> {
         DataType::ExpressionArray(array) => array.metadata().0,
         _ => return None,
     })
+}
+
+pub(in crate::relational::query) fn query_only(array: &DataType) -> bool {
+    matches!(array, DataType::ExpressionArray(_) | DataType::SmallIntArray
+        | DataType::RealArray | DataType::PgCharArray | DataType::RegDictionaryArray)
+}
+
+pub(super) fn common_elements(a: &DataType, b: &DataType) -> bool {
+    use DataType::*;
+    number(a) && number(b)
+        || comparison::oid_integer_pair(a, b)
+        || matches!((a, b),
+            (Text | Varchar, Text | Varchar) |
+            (Date | Timestamp | TimestampTz, Date | Timestamp | TimestampTz) |
+            (RegDictionary, Oid | SmallInt | Integer | BigInt) |
+            (Oid | SmallInt | Integer | BigInt, RegDictionary))
+}
+
+pub(in crate::relational::query) fn mixed_query_arrays(a: &DataType, b: &DataType) -> bool {
+    let json_array = DataType::ExpressionArray(ExpressionArray::Json);
+    a != b && (query_only(a) || query_only(b))
+        && *a != json_array && *b != json_array
+        && element_type(a).zip(element_type(b)).is_some_and(|(a, b)| common_elements(&a, &b))
 }
 fn hint(
     args: &[Scalar],

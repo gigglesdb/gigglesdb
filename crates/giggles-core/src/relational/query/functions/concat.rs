@@ -1,25 +1,65 @@
 //! Array and jsonb concatenation overloads; unknown operands adopt the known type.
 use super::*;
-fn element(ty: &DataType) -> Option<DataType> {
-    Some(match ty {
-        DataType::TextArray => DataType::Text,
-        DataType::UuidArray => DataType::Uuid,
-        DataType::IntArray => DataType::Integer,
-        DataType::BigIntArray => DataType::BigInt,
-        _ => return None,
-    })
+use array_constructor::{element_type, query_only};
+use giggles_pg_types::temporal::SessionZone;
+
+fn string(ty: &DataType) -> bool {
+    matches!(ty, DataType::Text | DataType::Varchar)
+}
+
+pub(super) fn check_json_operand(operands: &[Option<BoundScalar>; 2]) -> R<()> {
+    use DataType::ExpressionArray as Array;
+    for [array, scalar] in [[&operands[0], &operands[1]], [&operands[1], &operands[0]]] {
+        if let (Some(array), Some(scalar)) = (array, scalar)
+            && query_only(&array.ty)
+            && scalar.ty == DataType::Text
+            && (array.ty == Array(ExpressionArray::Json))
+                != (scalar.result_oid() == json_aggregate::OID)
+        {
+            return Err(SqlError::UndefinedFunction);
+        }
+    }
+    Ok(())
 }
 pub(super) fn signature(
     a: Option<&DataType>,
     b: Option<&DataType>,
 ) -> Option<R<(DataType, DataType, DataType)>> {
     let ty = a
-        .filter(|t| element(t).is_some())
-        .or_else(|| b.filter(|t| element(t).is_some()));
+        .filter(|t| element_type(t).is_some())
+        .or_else(|| b.filter(|t| element_type(t).is_some()));
     if let Some(ty) = ty {
         let at = a.unwrap_or(ty);
         let bt = b.unwrap_or(ty);
-        let elem = element(ty).unwrap();
+        let elem = element_type(ty).unwrap();
+        if query_only(at) || query_only(bt) {
+            let other = if at == ty { bt } else { at };
+            let other_element = element_type(other);
+            let string_arrays = other_element.as_ref().is_some_and(|other| string(&elem) && string(other))
+                && ![at, bt].contains(&&DataType::ExpressionArray(ExpressionArray::Json));
+            let result = if at == bt || string_arrays {
+                Ok((ty.clone(), ty.clone(), ty.clone()))
+            } else if other_element.is_none()
+                && (*other == elem || string(&elem) && string(other)
+                    || elem == DataType::Numeric && integer(other)
+                    || elem == DataType::Real && (integer(other) || *other == DataType::Numeric))
+            {
+                if at == ty {
+                    Ok((ty.clone(), elem, ty.clone()))
+                } else {
+                    Ok((elem, ty.clone(), ty.clone()))
+                }
+            } else if (other_element.is_none()
+                && ty != &DataType::ExpressionArray(ExpressionArray::Json)
+                && array_constructor::common_elements(&elem, other))
+                || array_constructor::mixed_query_arrays(at, bt)
+            {
+                Err(SqlError::Unsupported)
+            } else {
+                Err(SqlError::UndefinedFunction)
+            };
+            return Some(result);
+        }
         return Some(
             if (at == ty && (bt == ty || *bt == elem)) || (bt == ty && *at == elem) {
                 Ok((at.clone(), bt.clone(), ty.clone()))
@@ -43,8 +83,18 @@ pub(super) fn signature(
     }
     None
 }
+
+pub(super) fn check_literal(value: &Value, target: &DataType) -> R<()> {
+    if query_only(target) && let Value::Text(text) = value {
+        let text = text.trim_start();
+        if text.starts_with('[') || text.strip_prefix('{').is_some_and(|s| s.trim_start().starts_with('{')) {
+            return Err(SqlError::Unsupported);
+        }
+    }
+    Ok(())
+}
 pub(super) fn name(a: &DataType, b: &DataType, result: &DataType) -> Option<&'static str> {
-    if element(result).is_some() {
+    if element_type(result).is_some() {
         Some(if a == result && b == result {
             "\u{1}operator:array_cat"
         } else if a == result {
@@ -77,7 +127,13 @@ pub(super) fn bind_enum_operands(sources: [&Scalar; 2], args: &mut [BoundScalar]
     Ok(())
 }
 
-pub(super) fn eval(name: &str, values: &[Value], budget: &mut usize) -> Option<R<Value>> {
+pub(super) fn eval(
+    name: &str,
+    args: &[BoundScalar],
+    values: &[Value],
+    zone: SessionZone,
+    budget: &mut usize,
+) -> Option<R<Value>> {
     let op = name.strip_prefix("\u{1}operator:")?;
     if !matches!(
         op,
@@ -86,7 +142,7 @@ pub(super) fn eval(name: &str, values: &[Value], budget: &mut usize) -> Option<R
         return None;
     }
     Some((|| {
-        use crate::relational::logical_types::{array_quote, array_values, json_output};
+        use crate::relational::logical_types::json_output;
         let out = if op == "jsonb_cat" {
             if values.contains(&Value::Null) {
                 return Ok(Value::Null);
@@ -119,43 +175,61 @@ pub(super) fn eval(name: &str, values: &[Value], budget: &mut usize) -> Option<R
             };
             json_output(&merged)?
         } else {
-            let array = |v: &Value| -> R<Vec<Option<String>>> {
-                match v {
-                    Value::Null => Ok(vec![]),
-                    Value::Text(s) => array_values(s),
-                    _ => Err(SqlError::Type),
-                }
-            };
-            let scalar = |v: &Value| -> R<Option<String>> {
-                match v {
-                    Value::Null => Ok(None),
-                    Value::Text(s) => Ok(Some(s.clone())),
-                    Value::Int(n) => Ok(Some(n.to_string())),
-                    _ => Err(SqlError::Type),
-                }
-            };
             let mut a = if op == "array_prepend" {
-                vec![scalar(&values[0])?]
+                vec![array_aggregate::encode_element(&values[0], &args[0].ty, zone)?]
             } else {
-                array(&values[0])?
+                encoded_array(&args[0], &values[0], zone)?
             };
             if op == "array_append" {
-                a.push(scalar(&values[1])?);
+                a.push(array_aggregate::encode_element(&values[1], &args[1].ty, zone)?);
             } else {
-                a.extend(array(&values[1])?);
+                a.extend(encoded_array(&args[1], &values[1], zone)?);
             }
             if op == "array_cat" && values.iter().all(|v| *v == Value::Null) {
                 return Ok(Value::Null);
             }
-            format!(
-                "{{{}}}",
-                a.iter()
-                    .map(|v| v.as_ref().map_or_else(|| "NULL".into(), |s| array_quote(s)))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
+            format!("{{{}}}", a.join(","))
         };
         reserve(budget, out.len())?;
         Ok(Value::Text(out))
     })())
+}
+
+fn encoded_array(arg: &BoundScalar, value: &Value, zone: SessionZone) -> R<Vec<String>> {
+    let text = match value {
+        Value::Null => return Ok(vec![]),
+        Value::Text(text) => text,
+        _ => return Err(SqlError::Type),
+    };
+    // The scalar binder gives unknown literals the other operand's array type
+    // after checking the array syntax. Check and normalize the element inputs.
+    let input_type = if query_only(&arg.ty) && matches!(arg.node, Node::Literal(_) | Node::Param(_)) {
+        element_type(&arg.ty)
+    } else {
+        None
+    };
+    logical_types::array_values(text)?
+        .into_iter()
+        .map(|item| match (item, &input_type) {
+            (None, _) => Ok("NULL".into()),
+            (Some(text), Some(element)) => {
+                let value = if arg.ty == DataType::ExpressionArray(ExpressionArray::Json) {
+                    json_aggregate::validate_input(&text)?;
+                    Value::Text(text)
+                } else if *element == DataType::TimestampTz {
+                    use giggles_pg_types::temporal::SessionSettings;
+                    Value::TimestampTz(TimestampTz::parse_in_session(
+                        &text, &SessionSettings {
+                            date_order: crate::relational::clock::LiteralDateOrder::current(),
+                            zone,
+                        },
+                    ).map_err(pg_error)?)
+                } else {
+                    coerce_clocked(Value::Text(text), element, None)?
+                };
+                array_aggregate::encode_element(&value, element, zone)
+            }
+            (Some(text), None) => Ok(logical_types::array_quote(&text)),
+        })
+        .collect()
 }

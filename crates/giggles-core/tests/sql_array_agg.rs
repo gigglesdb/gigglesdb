@@ -3,8 +3,9 @@ mod common;
 
 use giggles_core::{
     Admin, CoreError, Limits, SqlSession,
-    relational::{SqlError, Value},
+    relational::{SqlError, StatementClock, Value},
 };
+use giggles_pg_types::temporal::{DateOrder, DateStyle, DateStyleSettings, SessionZone};
 
 fn database(test: impl FnOnce(&mut SqlSession)) {
     let path = common::fresh("sql-array-agg");
@@ -28,6 +29,23 @@ fn run(session: &mut SqlSession, sql: &str) -> Vec<Vec<Value>> {
 
 fn t(text: &str) -> Value {
     Value::Text(text.into())
+}
+
+fn run_zoned(session: &mut SqlSession, sql: &str) -> Vec<Vec<Value>> {
+    let clock = StatementClock {
+        unavailable: None,
+        transaction_us: 0,
+        statement_us: 0,
+        zone: Some(SessionZone::named("America/New_York").unwrap()),
+        wall: None,
+    };
+    session
+        .execute_at(sql, &[], None, &clock)
+        .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        .rows
+        .into_iter()
+        .map(|row| row.values)
+        .collect()
 }
 
 #[test]
@@ -287,6 +305,290 @@ fn grouped_archdocs_heading_query_and_outer_array_consumers() {
                 Value::Int(3)
             ]]
         );
+    });
+}
+
+#[test]
+fn query_only_arrays_assign_to_durable_columns() {
+    database(|session| {
+        run(
+            session,
+            "CREATE TABLE src (id int, v varchar, si smallint, n numeric, b boolean, d date, ts timestamp, tz timestamptz, jb jsonb, r real)",
+        );
+        run(
+            session,
+            r#"INSERT INTO src VALUES
+            (1,'a,b',2,2.50,true,'2024-01-02','2024-01-02 03:04:05.5','2024-01-02 03:04:05+00','{"b":1}',2.5),
+            (2,'NULL',-3,-2.50,false,NULL,NULL,NULL,'[1,true]',3.5),
+            (3,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"#,
+        );
+        run(
+            session,
+            "CREATE TABLE dst (id int PRIMARY KEY, a text[], i int[], l bigint[], u uuid[])",
+        );
+        run(
+            session,
+            "INSERT INTO dst SELECT 1, array_agg(v ORDER BY id), array_agg(si ORDER BY id), array_agg(si ORDER BY id), NULL FROM src",
+        );
+        run(
+            session,
+            "INSERT INTO dst SELECT 2, array_agg(n ORDER BY id), array_agg(n ORDER BY id), array_agg(n ORDER BY id), NULL FROM src",
+        );
+        run(
+            session,
+            "INSERT INTO dst SELECT 3, array_agg(b ORDER BY id), array_agg(r ORDER BY id), array_agg(r ORDER BY id), NULL FROM src",
+        );
+        run(
+            session,
+            "INSERT INTO dst SELECT 4, array_agg(tz ORDER BY id), NULL, NULL, NULL FROM src",
+        );
+        run(
+            session,
+            "INSERT INTO dst SELECT 5, array_agg(v), array_agg(n), array_agg(si), NULL FROM src WHERE false",
+        );
+        run(
+            session,
+            "UPDATE dst SET a = (SELECT array_agg(v ORDER BY id) FROM src) WHERE id = 5",
+        );
+        run(
+            session,
+            "UPDATE dst SET (a, i) = (SELECT array_agg(b ORDER BY id), array_agg(n ORDER BY id) FROM src) WHERE id = 4",
+        );
+        assert_eq!(
+            run(session, "SELECT a, i, l FROM dst ORDER BY id"),
+            vec![
+                vec![
+                    t(r#"{"a,b","NULL",NULL}"#),
+                    t("{2,-3,NULL}"),
+                    t("{2,-3,NULL}")
+                ],
+                vec![t("{2.50,-2.50,NULL}"), t("{3,-3,NULL}"), t("{3,-3,NULL}")],
+                vec![t("{true,false,NULL}"), t("{2,4,NULL}"), t("{2,4,NULL}")],
+                vec![t("{true,false,NULL}"), t("{3,-3,NULL}"), Value::Null],
+                vec![t(r#"{"a,b","NULL",NULL}"#), Value::Null, Value::Null],
+            ],
+        );
+        let cases = [
+            ("d", "{2024-01-02,NULL,NULL}"),
+            ("ts", r#"{"2024-01-02 03:04:05.5",NULL,NULL}"#),
+            ("tz", r#"{"2024-01-01 22:04:05-05",NULL,NULL}"#),
+            ("jb", r#"{"{\"b\": 1}","[1, true]",NULL}"#),
+            ("r", "{2.5,3.5,NULL}"),
+            ("si", "{2,-3,NULL}"),
+        ];
+        for (i, (column, expected)) in cases.into_iter().enumerate() {
+            assert_eq!(
+                run_zoned(
+                    session,
+                    &format!(
+                        "INSERT INTO dst (id,a) SELECT {}, array_agg({column} ORDER BY id) FROM src RETURNING a",
+                        i + 10
+                    )
+                ),
+                vec![vec![t(expected)]],
+                "{column}",
+            );
+        }
+        assert_eq!(
+            run(
+                session,
+                r#"INSERT INTO dst (id,a) SELECT 20, array_agg('{"a":1,"a":2}'::json) RETURNING a"#
+            ),
+            vec![vec![t(r#"{"{\"a\":1,\"a\":2}"}"#)]],
+        );
+        assert_eq!(
+            run(
+                session,
+                "INSERT INTO dst (id,a) SELECT 21, array_agg(weights[1]) FROM unnest('a:1A'::tsvector) AS u(lexeme, positions, weights) RETURNING a"
+            ),
+            vec![vec![t("{A}")]],
+        );
+        assert_eq!(
+            run(
+                session,
+                "INSERT INTO dst SELECT 22, array_agg('simple'::regdictionary), array_agg('simple'::regdictionary), array_agg('simple'::regdictionary), NULL RETURNING a,i,l"
+            ),
+            vec![vec![t("{simple}"), t("{3765}"), t("{3765}")]],
+        );
+        for (sql, error) in [
+            (
+                "INSERT INTO dst (id,i) SELECT 30, array_agg(2147483647.5)",
+                SqlError::Overflow,
+            ),
+            (
+                "INSERT INTO dst (id,l) SELECT 30, array_agg(9223372036854775807.5)",
+                SqlError::Overflow,
+            ),
+            (
+                "INSERT INTO dst (id,i) SELECT 30, array_agg('NaN'::real)",
+                SqlError::Overflow,
+            ),
+            (
+                "INSERT INTO dst (id,i) SELECT 30, array_agg('NaN'::numeric)",
+                SqlError::Unsupported,
+            ),
+            (
+                "INSERT INTO dst (id,l) SELECT 30, array_agg('Infinity'::numeric)",
+                SqlError::Unsupported,
+            ),
+            (
+                "INSERT INTO dst (id,i) SELECT 30, array_agg(v) FROM src",
+                SqlError::Type,
+            ),
+            (
+                "UPDATE dst SET u = (SELECT array_agg(v) FROM src) WHERE id = 1",
+                SqlError::Type,
+            ),
+        ] {
+            assert_eq!(
+                session.execute(sql, &[], None),
+                Err(CoreError::Sql(error)),
+                "{sql}"
+            );
+        }
+        session.set_text_settings(
+            DateStyleSettings {
+                style: DateStyle::Sql,
+                order: DateOrder::Dmy,
+            },
+            Default::default(),
+        );
+        assert_eq!(
+            run_zoned(
+                session,
+                "INSERT INTO dst (id,a) SELECT 30, array_agg(d ORDER BY id) FROM src RETURNING a"
+            ),
+            vec![vec![t("{02/01/2024,NULL,NULL}")]],
+        );
+    });
+}
+
+#[test]
+fn query_only_arrays_convert_to_json() {
+    database(|session| {
+        let cases = [
+            (
+                "SELECT to_jsonb(array_agg(n ORDER BY id)) FROM (VALUES (1,2.50),(2,-2.50),(3,NULL)) s(id,n)",
+                "[2.50, -2.50, null]",
+            ),
+            (
+                "SELECT jsonb_build_object('x', array_agg('2024-01-02 03:04:05+00'::timestamptz))",
+                r#"{"x": ["2024-01-01T22:04:05-05:00"]}"#,
+            ),
+            (
+                r#"SELECT json_build_object('x', array_agg('{"a":1,"a":2}'::json))"#,
+                r#"{"x" : [{"a":1,"a":2}]}"#,
+            ),
+            (
+                r#"SELECT row_to_json(ROW(array_agg('2024-01-02 03:04:05.5'::timestamp), array_agg('{"b":1}'::jsonb)))"#,
+                r#"{"f1":["2024-01-02T03:04:05.5"],"f2":[{"b": 1}]}"#,
+            ),
+            (
+                "SELECT json_agg(x) FROM (SELECT array_agg(b ORDER BY id) x FROM (VALUES (1,true),(2,false),(3,NULL)) s(id,b)) q",
+                "[[true,false,null]]",
+            ),
+            (
+                "SELECT jsonb_agg(x) FROM (SELECT array_agg(b ORDER BY id) x FROM (VALUES (1,true),(2,false),(3,NULL)) s(id,b)) q",
+                "[[true, false, null]]",
+            ),
+            (
+                "SELECT to_json(array_agg('2024-01-02'::date))",
+                r#"["2024-01-02"]"#,
+            ),
+            ("SELECT to_json(array_agg('a,b'::varchar))", r#"["a,b"]"#),
+            ("SELECT to_json(array_agg(2.5::real))", "[2.5]"),
+            ("SELECT to_json(array_agg(2::smallint))", "[2]"),
+            (
+                "SELECT to_json(array_agg(weights[1])) FROM unnest('a:1A'::tsvector) AS u(lexeme, positions, weights)",
+                r#"["A"]"#,
+            ),
+            (
+                "SELECT to_json(array_agg('simple'::regdictionary))",
+                r#"["simple"]"#,
+            ),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(run_zoned(session, sql), vec![vec![t(expected)]], "{sql}");
+        }
+    });
+}
+
+#[test]
+fn query_only_arrays_concatenate() {
+    database(|session| {
+        let cases = [
+            (
+                "SELECT array_agg(n ORDER BY id) || 5.5 FROM (VALUES (1,2.50),(2,-2.50),(3,NULL)) s(id,n)",
+                "{2.50,-2.50,NULL,5.5}",
+            ),
+            ("SELECT 5.5 || array_agg(2.50)", "{5.5,2.50}"),
+            ("SELECT array_agg(2.50) || 5", "{2.50,5}"),
+            ("SELECT array_agg(2.50) || array_agg(3.5)", "{2.50,3.5}"),
+            ("SELECT array_agg(2.50) || '{3.50}'", "{2.50,3.50}"),
+            ("SELECT array_agg(2.50) || NULL", "{2.50}"),
+            ("SELECT array_agg(2.50) || NULL::numeric", "{2.50,NULL}"),
+            ("SELECT array_agg(true) || false", "{t,f}"),
+            (
+                "SELECT array_agg('NULL'::varchar) || 'a,b'::varchar",
+                r#"{"NULL","a,b"}"#,
+            ),
+            (
+                "SELECT array_agg('NULL'::varchar) || 'a,b'::text",
+                r#"{"NULL","a,b"}"#,
+            ),
+            (
+                "SELECT array_agg('2024-01-02 03:04:05+00'::timestamptz) || '2024-01-02 04:04:05+00'::timestamptz",
+                r#"{"2024-01-01 22:04:05-05","2024-01-01 23:04:05-05"}"#,
+            ),
+            (
+                r#"SELECT array_agg('{"a":1,"a":2}'::json) || '[]'::json"#,
+                r#"{"{\"a\":1,\"a\":2}",[]}"#,
+            ),
+            ("SELECT array_agg(2::smallint) || 3::smallint", "{2,3}"),
+            ("SELECT array_agg(2.5::real) || 3.5::real", "{2.5,3.5}"),
+            ("SELECT array_agg(2.5::numeric)::int[]", "{3}"),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(run_zoned(session, sql), vec![vec![t(expected)]], "{sql}");
+        }
+    });
+}
+
+#[test]
+fn unsupported_array_operations_keep_their_error_class() {
+    database(|session| {
+        for sql in [
+            "SELECT array_agg(n) OVER (ORDER BY n) FROM (VALUES (2.5)) s(n)",
+            "SELECT array_to_string(array_agg(2.5), '|')",
+            "SELECT unnest(array_agg(2.5))",
+            "SELECT 2.5 = ANY(array_agg(2.5))",
+            "SELECT array_agg(2.5) && array_agg(2.5)",
+            "SELECT array_append(array_agg(2.5), 5.5)",
+            "SELECT width_bucket(2.5, array_agg(1.0))",
+            "SELECT array_agg(2.5) || '{{1.0},{2.0}}'",
+            "SELECT array_agg(true)::int[]",
+            "SELECT CASE WHEN true THEN array_agg(1.5) ELSE array_agg(1) END",
+            "SELECT array_agg(1.5) UNION ALL SELECT array_agg(1)",
+            "SELECT array_agg('2024-01-02'::date) || '2024-01-02'::timestamp",
+            "CREATE TABLE ctas AS SELECT array_agg(2.5) AS a",
+            "CREATE VIEW va AS SELECT array_agg(2.5) AS a",
+        ] {
+            assert_eq!(
+                session.execute(sql, &[], None),
+                Err(CoreError::Sql(SqlError::Unsupported)),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "SELECT array_agg(true) || 1",
+            "SELECT array_agg('[]'::json) || '[]'::text",
+        ] {
+            assert_eq!(
+                session.execute(sql, &[], None),
+                Err(CoreError::Sql(SqlError::UndefinedFunction)),
+                "{sql}"
+            );
+        }
     });
 }
 

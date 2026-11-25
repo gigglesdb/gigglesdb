@@ -19,7 +19,6 @@ mod setops;
 pub(super) mod subquery;
 mod json_srf;
 mod srf;
-pub(super) use srf::element as array_element_type;
 mod window;
 pub(in crate::relational) use ast::Plan;
 use ast::*;
