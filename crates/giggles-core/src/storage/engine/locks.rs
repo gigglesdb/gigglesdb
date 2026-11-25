@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::collections::hash_map::RandomState;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -326,7 +326,7 @@ impl LockError {
 
 #[derive(Debug, Default)]
 struct KeyState {
-    holders: HashMap<TxnId, HeldModes>,
+    holders: IdMap<TxnId, HeldModes>,
     queue: Vec<u64>,
     slow: HashSet<TxnId>,
 }
@@ -431,14 +431,14 @@ impl ShardMask {
     }
 }
 #[derive(Debug)]
-struct TxnRegistry { stripes: Box<[Mutex<HashMap<TxnId, TxnLocal>>]> }
+struct TxnRegistry { stripes: Box<[Mutex<IdMap<TxnId, TxnLocal>>]> }
 impl Default for TxnRegistry {
     fn default() -> Self {
         Self { stripes: (0..64).map(|_| Mutex::default()).collect() }
     }
 }
 impl TxnRegistry {
-    fn stripe(&self, txn: TxnId) -> LeafGuard<'_, HashMap<TxnId, TxnLocal>> {
+    fn stripe(&self, txn: TxnId) -> LeafGuard<'_, IdMap<TxnId, TxnLocal>> {
         LeafGuard { guard: self.stripes[txn.0 as usize & 63].lock().unwrap_or_else(|p| p.into_inner()), _order: OrderGuard::leaf() }
     }
     fn rows(&self, txn: TxnId) -> usize { self.stripe(txn).get(&txn).map_or(0, |t| t.rows) }
@@ -485,13 +485,91 @@ impl std::ops::Deref for HashedKey {
 type KeyMap<V> = HashMap<HashedKey, V, BuildHasherDefault<PassHasher>>;
 type KeySet = HashSet<HashedKey, BuildHasherDefault<PassHasher>>;
 
+// Waiter IDs are engine-issued, but cluster peers can supply transaction IDs.
+// Key the multiply-fold with a process secret so peers cannot predict buckets.
+#[derive(Clone, Copy)]
+struct IdBuildHasher {
+    seed: u64,
+    multiplier: u64,
+}
+
+impl Default for IdBuildHasher {
+    fn default() -> Self {
+        static PROCESS_KEY: LazyLock<IdBuildHasher> = LazyLock::new(|| {
+            let random = RandomState::new();
+            IdBuildHasher {
+                seed: random.hash_one(0u64),
+                multiplier: random.hash_one(1u64) | 1,
+            }
+        });
+        *PROCESS_KEY
+    }
+}
+
+impl BuildHasher for IdBuildHasher {
+    type Hasher = IdHasher;
+
+    fn build_hasher(&self) -> IdHasher {
+        IdHasher { state: self.seed, multiplier: self.multiplier }
+    }
+}
+
+struct IdHasher {
+    state: u64,
+    multiplier: u64,
+}
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.state
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.write_u64(bytes.len() as u64);
+        let (words, tail) = bytes.as_chunks::<8>();
+        for &word in words {
+            self.write_u64(u64::from_ne_bytes(word));
+        }
+        if !tail.is_empty() {
+            let mut word = [0; 8];
+            word[..tail.len()].copy_from_slice(tail);
+            self.write_u64(u64::from_ne_bytes(word));
+        }
+    }
+
+    fn write_u64(&mut self, id: u64) {
+        let product = u128::from(self.state ^ id) * u128::from(self.multiplier);
+        self.state = product as u64 ^ (product >> 64) as u64;
+    }
+}
+
+type IdMap<K, V> = HashMap<K, V, IdBuildHasher>;
+
+#[cfg(test)]
+#[test]
+fn id_hasher_mixes_bytes_and_numeric_fields() {
+    let builder = IdBuildHasher { seed: 0x9e37_79b9_7f4a_7c15, multiplier: 0xdfae_32ee_5db4_0de5 };
+    let hash = |bytes: &[u8], id| {
+        let mut hasher = builder.build_hasher();
+        hasher.write(bytes);
+        hasher.write_u64(id);
+        hasher.finish()
+    };
+    let original = hash(b"012345678", 1);
+    assert_eq!(original, hash(b"012345678", 1));
+    assert_ne!(original, hash(b"012345678", 2));
+    assert_ne!(original, hash(b"012345679", 1));
+    assert_ne!(original, hash(b"112345678", 1));
+    assert_ne!(original, hash(b"012345678\0", 1));
+}
+
 #[derive(Debug, Default)]
 struct ShardState {
     keys: KeyMap<KeyState>,
-    waiters: HashMap<u64, Waiter>,
-    by_txn: HashMap<TxnId, Vec<u64>>,
-    held: HashMap<TxnId, KeySet>,
-    provisional: HashMap<TxnId, KeyMap<HeldModes>>,
+    waiters: IdMap<u64, Waiter>,
+    by_txn: IdMap<TxnId, Vec<u64>>,
+    held: IdMap<TxnId, KeySet>,
+    provisional: IdMap<TxnId, KeyMap<HeldModes>>,
     // Only shard zero's gap state is used, under all shard locks.
     gap: GapState,
     #[cfg(test)]
