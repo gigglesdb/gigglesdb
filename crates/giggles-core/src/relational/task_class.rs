@@ -85,6 +85,7 @@ impl Prepared {
             | Statement::DropIndex(_)
             | Statement::AlterTable(_)
             | Statement::Comment(_)
+            | Statement::AdminUtility(_)
             | Statement::SecurityLabel(_)
             | Statement::View(_)
             | Statement::Routine(_) | Statement::Trigger(_)

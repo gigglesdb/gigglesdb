@@ -3,6 +3,8 @@ use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 use std::{cmp::Ordering, fmt};
 pub mod bytea;
+#[doc(hidden)]
+pub mod admin_catalog;
 pub mod character;
 mod float;
 pub mod integer;

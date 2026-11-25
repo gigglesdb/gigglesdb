@@ -41,7 +41,7 @@ impl Token<'_> {
     pub fn string(&self) -> Result<Option<String>, PlCompileError> {
         match self.kind {
             Kind::String => Ok(Some(self.raw[1..self.raw.len() - 1].replace("''", "'"))),
-            Kind::EscapeString => crate::relational::plpgsql_string(self.raw)
+            Kind::EscapeString => crate::relational::parse_string_literal(self.raw)
                 .map(Some)
                 .map_err(|_| syntax_token(self)),
             Kind::DollarString(tag) => Ok(Some(self.raw[tag..self.raw.len() - tag].into())),

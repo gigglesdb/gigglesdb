@@ -1,9 +1,12 @@
 //! Session-local state shared by volatile SQL functions, including cursor fetches.
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     marker::PhantomData,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -13,31 +16,83 @@ use super::{R, SqlError};
 pub(crate) struct SessionVolatile {
     random: Option<Prng>,
     uuid_ns: u128,
+    subtransaction: bool,
+    snapshot_exports: SnapshotExports,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SnapshotExports {
+    serial: u64,
+    count: u32,
+}
+
+impl SnapshotExports {
+    fn next(&mut self) -> R<String> {
+        static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
+        if self.count == 0 {
+            self.serial = NEXT_SERIAL.fetch_add(1, Ordering::Relaxed);
+        }
+        self.count = self.count.checked_add(1).ok_or(SqlError::Limit)?;
+        Ok(format!(
+            "{:08X}-{:08X}-{}",
+            self.serial >> 32,
+            self.serial as u32,
+            self.count
+        ))
+    }
 }
 
 thread_local! {
     static ACTIVE: RefCell<Option<Arc<Mutex<SessionVolatile>>>> = const { RefCell::new(None) };
+    static STANDALONE_EXPORTS: Cell<Option<SnapshotExports>> = const { Cell::new(None) };
     // Direct relational execution has no SqlSession.
     static LOCAL: RefCell<SessionVolatile> = RefCell::new(SessionVolatile::default());
 }
 
-pub(crate) struct Scope {
+pub(crate) struct Scope<'a> {
     previous: Option<Arc<Mutex<SessionVolatile>>>,
+    previous_exports: Option<SnapshotExports>,
+    cursor_exports: Option<&'a mut SnapshotExports>,
     thread: PhantomData<Rc<()>>,
 }
 
-impl Scope {
-    pub(crate) fn enter(session: &Arc<Mutex<SessionVolatile>>) -> Self {
+impl<'a> Scope<'a> {
+    pub(crate) fn statement(session: &Arc<Mutex<SessionVolatile>>, in_transaction: bool) -> Self {
+        Self::enter(
+            session,
+            (!in_transaction).then_some(SnapshotExports::default()),
+            None,
+        )
+    }
+
+    pub(crate) fn cursor(
+        session: &Arc<Mutex<SessionVolatile>>,
+        exports: Option<&'a mut SnapshotExports>,
+    ) -> Self {
+        Self::enter(session, exports.as_deref().copied(), exports)
+    }
+
+    fn enter(
+        session: &Arc<Mutex<SessionVolatile>>,
+        exports: Option<SnapshotExports>,
+        cursor_exports: Option<&'a mut SnapshotExports>,
+    ) -> Self {
         Self {
             previous: ACTIVE.replace(Some(session.clone())),
+            previous_exports: STANDALONE_EXPORTS.replace(exports),
+            cursor_exports,
             thread: PhantomData,
         }
     }
 }
 
-impl Drop for Scope {
+impl Drop for Scope<'_> {
     fn drop(&mut self) {
         ACTIVE.replace(self.previous.take());
+        let exports = STANDALONE_EXPORTS.replace(self.previous_exports);
+        if let Some(cursor) = self.cursor_exports.as_deref_mut() {
+            *cursor = exports.expect("standalone cursor export state");
+        }
     }
 }
 
@@ -47,6 +102,40 @@ impl SessionVolatile {
             Some(session) => eval(&mut *session.lock().map_err(|_| SqlError::Unsupported)?),
             None => LOCAL.with(|state| eval(&mut state.borrow_mut())),
         }
+    }
+
+    pub(crate) fn set_subtransaction(session: &Mutex<Self>, open: bool) {
+        session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .subtransaction = open;
+    }
+
+    pub(crate) fn has_exported_snapshots(&self) -> bool {
+        self.snapshot_exports.count != 0
+    }
+
+    pub(crate) fn end_transaction(&mut self) {
+        self.subtransaction = false;
+        self.snapshot_exports = SnapshotExports::default();
+    }
+
+    pub(super) fn export_snapshot(&mut self) -> R<super::Value> {
+        if self.subtransaction {
+            return Err(super::user_types::exact_sql_error(
+                SqlError::ActiveSqlTransaction,
+                "cannot export a snapshot from a subtransaction",
+                None,
+            ));
+        }
+        let id = if let Some(mut exports) = STANDALONE_EXPORTS.get() {
+            let id = exports.next()?;
+            STANDALONE_EXPORTS.set(Some(exports));
+            id
+        } else {
+            self.snapshot_exports.next()?
+        };
+        Ok(super::Value::Text(id))
     }
 
     pub(super) fn seed(&mut self, seed: f64) {
@@ -72,7 +161,6 @@ impl SessionVolatile {
         Ok(self.uuid_ns)
     }
 }
-
 // PostgreSQL 18 pg_prng.c uses xoroshiro128** with SplitMix64 seeding.
 pub(super) struct Prng(u64, u64);
 

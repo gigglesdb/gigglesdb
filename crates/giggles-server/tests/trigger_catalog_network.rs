@@ -267,10 +267,9 @@ async fn archdocs_trigger_ddl_and_pg_dump_catalog_queries() {
     let rows = reader.simple_query("EXECUTE p(1)").await.unwrap();
     assert!(rows.iter().any(|message| matches!(message, SimpleQueryMessage::Row(row) if row.get(0) == Some("1"))));
     reader.batch_execute("DEALLOCATE p; DEALLOCATE ALL").await.unwrap();
-    let unsupported = "unsupported SQL feature or parameter type in this server profile";
-    assert_wire_error(&reader, "PREPARE TRANSACTION 'f2'", "0A000", unsupported).await;
+    reader.batch_execute("PREPARE TRANSACTION 'f2'").await.unwrap();
     reader.batch_execute("BEGIN").await.unwrap();
-    assert_wire_error(&reader, "PREPARE TRANSACTION 'f2'", "0A000", unsupported).await;
+    assert_wire_error(&reader, "PREPARE TRANSACTION 'f2'", "55000", "prepared transactions are disabled").await;
     reader.batch_execute("ROLLBACK").await.unwrap();
     for sql in ["SELECT f1()", "SELECT public.f1()"] {
         let error = reader.simple_query(sql).await.unwrap_err();

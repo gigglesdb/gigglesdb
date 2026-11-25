@@ -3004,6 +3004,13 @@ impl Session {
     }
 
     fn authorize_full(&mut self, p: &Prepared) -> Result<(), CoreError> {
+        if p.is_admin_utility() {
+            return if matches!(self.authority_role(), Role::Database { .. }) {
+                Ok(())
+            } else {
+                Err(CoreError::Policy(Error::Scope))
+            };
+        }
         if matches!(p.command(), "CREATE FUNCTION" | "DROP FUNCTION" | "CREATE TRIGGER" | "DROP TRIGGER" | "ALTER TRIGGER") {
             let result = self.authorize_routine_ddl(p);
             if result.is_err() { self.sql.abort(); }

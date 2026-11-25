@@ -1558,7 +1558,7 @@ fn build_with_budget(
             N,
         ],
     );
-    for (oid, name) in [(1663, "pg_default"), (1664, "pg_global")] {
+    for (oid, name) in giggles_pg_types::admin_catalog::TABLESPACES {
         add!("pg_tablespace", vec![I(oid), s(name), I(10), N, N, N]);
     }
     if snapshot.database == "postgres" {

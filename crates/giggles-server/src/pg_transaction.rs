@@ -1,5 +1,5 @@
 //! PostgreSQL transaction modes, and the level each storage engine executes.
-use crate::pg_settings::database::Parser;
+use crate::pg_settings::database::{Parser, Token};
 
 type Result<T> = std::result::Result<T, &'static str>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,10 +72,13 @@ pub(crate) enum Command {
     Release(String),
     RollbackTo(String),
     Set(Modes),
+    Prepare(String),
+    CommitPrepared(String),
+    RollbackPrepared(String),
+    ImportSnapshot { id: String, local: bool },
     Session(Modes),
 }
 fn savepoint_name(p: &mut Parser) -> Result<String> {
-    use crate::pg_settings::database::Token;
     let mut name = match p.tokens.get(p.at) {
         Some(Token::Word(s))
             if s.chars()
@@ -151,16 +154,42 @@ fn modes(p: &mut Parser, required: bool) -> Result<Modes> {
         }
     }
 }
+fn leading_word(sql: &str) -> (&str, &str) {
+    let sql = sql.trim_start();
+    let end = sql
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$')
+        .unwrap_or(sql.len());
+    sql.split_at(end)
+}
+
+pub(crate) fn is_prepare_transaction(sql: &str) -> bool {
+    let (first, tail) = leading_word(sql);
+    let (second, tail) = leading_word(tail);
+    first.eq_ignore_ascii_case("PREPARE")
+        && second.eq_ignore_ascii_case("TRANSACTION")
+        && starts_string(tail)
+}
+
+fn starts_string(sql: &str) -> bool {
+    let sql = sql.trim_start();
+    sql.starts_with(['\'', '$']) || sql.starts_with("E'") || sql.starts_with("e'")
+}
+
+fn string(sql: &str) -> Result<String> {
+    let sql = sql.trim_end();
+    let sql = sql.strip_suffix(';').unwrap_or(sql);
+    giggles_core::relational::parse_string_literal(sql).map_err(|error| {
+        giggles_core::sqlstate(&giggles_core::CoreError::Sql(error))
+    })
+}
+
 pub(crate) fn parse(sql: &str) -> Result<Option<Command>> {
-    let first = sql
-        .trim_start()
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .next()
-        .unwrap_or("");
+    let (first, tail) = leading_word(sql);
     if ![
         "BEGIN",
         "START",
         "COMMIT",
+        "PREPARE",
         "END",
         "ROLLBACK",
         "ABORT",
@@ -172,6 +201,34 @@ pub(crate) fn parse(sql: &str) -> Result<Option<Command>> {
     .any(|s| first.eq_ignore_ascii_case(s))
     {
         return Ok(None);
+    }
+    let (second, rest) = leading_word(tail);
+    if first.eq_ignore_ascii_case("PREPARE") {
+        return if is_prepare_transaction(sql) {
+            string(rest).map(Command::Prepare).map(Some)
+        } else {
+            Ok(None)
+        };
+    }
+    if second.eq_ignore_ascii_case("PREPARED") {
+        if first.eq_ignore_ascii_case("COMMIT") {
+            return string(rest).map(Command::CommitPrepared).map(Some);
+        }
+        if first.eq_ignore_ascii_case("ROLLBACK") {
+            return string(rest).map(Command::RollbackPrepared).map(Some);
+        }
+    }
+    if first.eq_ignore_ascii_case("SET") {
+        let local = second.eq_ignore_ascii_case("LOCAL");
+        let (transaction, rest) = if local || second.eq_ignore_ascii_case("SESSION") {
+            leading_word(rest)
+        } else {
+            (second, rest)
+        };
+        let (snapshot, id) = leading_word(rest);
+        if transaction.eq_ignore_ascii_case("TRANSACTION") && snapshot.eq_ignore_ascii_case("SNAPSHOT") {
+            return string(id).map(|id| Some(Command::ImportSnapshot { id, local }));
+        }
     }
     let mut p = Parser::new(sql)?;
     let command = if p.kw("BEGIN") {

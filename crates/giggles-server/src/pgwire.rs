@@ -2106,6 +2106,7 @@ fn begin_implicit(
 // re-preparation or execution (for example, turning a refusal into a rollback).
 fn needs_implicit_transaction(prepared: &Prepared) -> bool {
     !matches!(prepared.command(), "BEGIN" | "COMMIT" | "ROLLBACK")
+        && !prepared.requires_standalone_admin_utility()
 }
 
 fn control(sql: &str) -> Option<&'static str> {
@@ -3688,20 +3689,31 @@ impl State {
                     if p.result.is_some() {
                         return Err("55000");
                     }
-                    if matches!(command, crate::pg_transaction::Command::Session(_)) {
+                    use crate::pg_transaction::Command;
+                    if matches!(command, Command::Set(_)) && !session.in_transaction() {
+                        if !self.implicit {
+                            simple::warning(
+                                "SET TRANSACTION can only be used in transaction blocks",
+                                &self.settings.current,
+                                out,
+                            )?;
+                        }
+                        begin_implicit(session, &mut self.implicit, &mut self.settings)?;
+                    } else if matches!(command, Command::Session(_)) {
                         begin_implicit(session, &mut self.implicit, &mut self.settings)?;
                     }
-                    let actual = execute_mode(
+                    let result = execute_mode(
                         command.clone(),
                         session,
                         &mut self.implicit,
                         &mut self.settings,
                         &mut self.diagnostic,
                         out,
-                    )?;
+                    );
                     if !session.in_transaction() {
-                        self.cursors.transaction_end(actual);
+                        self.cursors.transaction_end(result.unwrap_or("ROLLBACK"));
                     }
+                    result?;
                     p.result = ran();
                     if !session.in_transaction() {
                         self.portals.clear();
@@ -3758,6 +3770,11 @@ impl State {
                     )?;
                     p.at = total;
                     complete("SHOW", result, out)?;
+                    // SHOW can leave an extended transaction open through Sync without
+                    // taking a storage snapshot.
+                    if matches!(session.role, Role::Database { .. }) && !session.in_transaction() {
+                        self.implicit = true;
+                    }
                     return Ok(true);
                 }
                 #[cfg(feature = "legacy-task")]
@@ -4136,7 +4153,9 @@ impl State {
                 self.copy_completion.clear();
                 // COMMIT may fail and finish rollback before returning
                 // its error. No portal can outlive that transaction.
-                if simple && !session.in_transaction() {
+                if !session.in_transaction()
+                    && (simple || self.diagnostic.pre_rollback_settings.is_some())
+                {
                     self.portals.clear();
                 }
                 if tag == b'S' && self.implicit {

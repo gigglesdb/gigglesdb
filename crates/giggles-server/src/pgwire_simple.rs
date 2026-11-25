@@ -333,7 +333,12 @@ impl State {
                 published_commit = matches!(command, Some(Command::Commit))
                     && session.in_transaction()
                     && !session.is_aborted();
-                if command.is_none_or(|command| matches!(command, Command::Set(_) | Command::Session(_)))
+                if command.is_none_or(|command| matches!(
+                    command,
+                    Command::Set(_) | Command::Session(_) | Command::Prepare(_)
+                        | Command::CommitPrepared(_) | Command::RollbackPrepared(_)
+                        | Command::ImportSnapshot { .. }
+                ))
                 {
                     begin_implicit(session, &mut implicit, &mut self.settings)?;
                 }
@@ -531,15 +536,28 @@ impl State {
             session.sql.rollback();
             self.cursors.transaction_end("ROLLBACK");
             self.settings.transaction(true, false, "ROLLBACK");
+        }
+        if !session.in_transaction() {
             self.portals.clear();
         }
-        // Keep successful statements' responses; discard only a partially
-        // encoded failing statement. The caller emits exactly one ReadyForQuery.
-        out.truncate(completed);
+        let tail = out.split_off(completed.min(out.len()));
+        let mut error = Vec::new();
+        let mut remaining = tail.as_slice();
+        // Keep complete NoticeResponse frames from the failed statement.
+        while let Some(header) = remaining.get(..5) {
+            let len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+            if len < 4 || len >= remaining.len() {
+                break;
+            }
+            let (frame, rest) = remaining.split_at(1 + len);
+            if frame[0] == b'N' {
+                error.extend_from_slice(frame);
+            }
+            remaining = rest;
+        }
         let _ = settings_status_with_limit(
             &before, &self.settings, session, out, ReplyLimit::Control,
         );
-        let mut error = Vec::new();
         let message = self.diagnostic.message.unwrap_or(match code {
             "0A000" => "unsupported SQL feature or parameter type in this server profile",
             "42601" => "statement syntax is not supported by this server SQL profile",
@@ -692,7 +710,7 @@ impl State {
                 }
             };
         }
-        if prepare::recognized(sql) {
+        if prepare::recognized(sql) && !crate::pg_transaction::is_prepare_transaction(sql) {
             prepare::guard(session)?;
             if let Some(mut command) = prepare::parse(sql, &mut self.diagnostic)? {
                 if let prepare::Command::Prepare { source: text, .. } = &mut command
@@ -806,17 +824,18 @@ impl State {
         } else if crate::pg_settings::empty_sql(sql)? {
             frame(b'I', &[], out)?;
         } else if let Some(command) = parse_control(sql, session, &mut self.diagnostic)? {
-            let actual = execute_mode(
+            let result = execute_mode(
                 command,
                 session,
                 implicit,
                 &mut self.settings,
                 &mut self.diagnostic,
                 out,
-            )?;
+            );
             if !session.in_transaction() {
-                self.cursors.transaction_end(actual);
+                self.cursors.transaction_end(result.unwrap_or("ROLLBACK"));
             }
+            result?;
         } else if let Some(show) = show_settings(sql, session, &mut self.diagnostic)? {
             let (description, result) = inspect(&show, &self.settings, session, &mut self.diagnostic)?;
             let result = &result;
@@ -928,7 +947,7 @@ impl State {
                 };
                 // Core's autocommit transaction starts inside execution, too late
                 // to set its transaction-local replica flag. Pin it here instead.
-                if self.settings.replication_role_replica() && !matches!(p.command(), "BEGIN" | "COMMIT" | "ROLLBACK") {
+                if self.settings.replication_role_replica() && needs_implicit_transaction(&p) {
                     begin_implicit(session, implicit, &mut self.settings)?;
                 }
                 self.diagnostic.core(session.sync_execution_settings(&self.settings))?;

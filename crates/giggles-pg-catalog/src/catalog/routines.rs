@@ -2,7 +2,7 @@
 use super::*;
 use crate::{RoutineDef, TriggerDef};
 
-pub(crate) const LANGUAGE_OID: i64 = 13647;
+pub(crate) use giggles_pg_types::admin_catalog::PLPGSQL_OID as LANGUAGE_OID;
 const EVENTS: [(u8, &str); 3] = [(4, "INSERT"), (8, "DELETE"), (16, "UPDATE")];
 const HANDLERS: [(u32, &str); 3] = [
     (13644, "plpgsql_call_handler"),
@@ -386,12 +386,7 @@ pub(super) fn populate(
         };
     }
     if all.contains_key("pg_language") {
-        for (oid, name, trusted, handler, inline, validator) in [
-            (12, "internal", false, 0, 0, 2246),
-            (13, "c", false, 0, 0, 2247),
-            (14, "sql", true, 0, 0, 2248),
-            (LANGUAGE_OID, "plpgsql", true, 13644, 13645, 13646),
-        ] {
+        for (oid, name, trusted, handler, inline, validator) in giggles_pg_types::admin_catalog::LANGUAGES {
             add!(
                 "pg_language",
                 vec![

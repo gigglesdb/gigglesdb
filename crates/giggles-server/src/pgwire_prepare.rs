@@ -140,14 +140,12 @@ pub(super) fn recognized(sql: &str) -> bool {
 }
 
 pub(super) fn parse(sql: &str, diagnostic: &mut Diagnostic) -> R<Option<Command>> {
+    // PREPARE TRANSACTION followed by a string is a separate command.
+    if crate::pg_transaction::is_prepare_transaction(sql) {
+        return Ok(None);
+    }
     let mut p = Prefix(sql);
     let command = if p.kw("PREPARE") {
-        // PREPARE TRANSACTION followed by a string is a separate command.
-        let start = p.0;
-        if p.kw("TRANSACTION") && p.0.trim_start().starts_with('\'') {
-            return Ok(None);
-        }
-        p.0 = start;
         let name = p.name()?;
         let types = p.list()?;
         if !p.kw("AS") {

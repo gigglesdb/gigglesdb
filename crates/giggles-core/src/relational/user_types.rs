@@ -96,6 +96,13 @@ pub(super) fn sql_foreign_key_detail(key: DuplicateKeyDetail, redacted: String) 
 pub(super) fn sql_error_detail(detail: String) {
     SQL_ERROR_DETAIL.with(|v| *v.borrow_mut() = Some(SqlErrorDetail::Text(detail)));
 }
+pub(super) fn exact_sql_error(
+    error: SqlError, message: impl Into<String>, detail: Option<&str>,
+) -> SqlError {
+    view_replace_error(message.into());
+    exact_sql_error_detail(detail);
+    error
+}
 pub(super) fn exact_sql_error_detail(detail: Option<&str>) {
     SQL_ERROR_DETAIL.with(|v| *v.borrow_mut() = Some(SqlErrorDetail::Exact(detail.map(str::to_owned))));
 }
@@ -213,7 +220,7 @@ impl Drop for SqlDiagnosticScope {
     }
 }
 
-pub(super) fn clear_sql_error_message() {
+pub(crate) fn clear_sql_error_message() {
     routines::clear_diagnostic();
     take_sql_notices();
     take_sql_diagnostic_hint();
@@ -292,7 +299,7 @@ fn parse_catalog_name(p: &mut Parser) -> R<String> {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct TypeReference {
+pub(crate) struct TypeReference {
     pub name: String,
     pub array: bool,
 }
@@ -362,7 +369,7 @@ pub(super) fn enum_regtype(reference: &TypeReference) -> Option<String> {
         if given_schema.map_or(!visible, |given| given != schema) {
             return None;
         }
-        Some(display_enum_name(name, (!visible).then_some(schema), reference.array))
+        Some(display_type_name(name, (!visible).then_some(schema), reference.array))
     })
 }
 
@@ -370,10 +377,10 @@ pub(super) fn enum_display(ty: &TypeDef, array: bool) -> String {
     let visible = TYPE_DISPLAY.with_borrow(|context| {
         context.as_ref().map_or(ty.schema() == "public", |context| context.path.iter().any(|schema| schema == ty.schema()))
     });
-    display_enum_name(ty.name(), (!visible).then_some(ty.schema()), array)
+    display_type_name(ty.name(), (!visible).then_some(ty.schema()), array)
 }
 
-fn display_enum_name(name: &str, schema: Option<&str>, array: bool) -> String {
+pub(super) fn display_type_name(name: &str, schema: Option<&str>, array: bool) -> String {
     let mut name = quote_type_ident(name);
     if let Some(schema) = schema {
         name = format!("{}.{name}", quote_type_ident(schema));

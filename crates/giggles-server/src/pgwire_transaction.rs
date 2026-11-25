@@ -63,6 +63,62 @@ pub(super) fn execute_mode(
             }
             if start_tag { "START TRANSACTION" } else { actual }
         }
+        Command::Prepare(gid) => {
+            let in_block = session.in_transaction() || *implicit;
+            if !in_block || *implicit {
+                warning("there is no transaction in progress", &settings.current, out)?;
+            }
+            if !in_block || session.is_aborted() {
+                execute_control("ROLLBACK", session, implicit, settings, diagnostic, out)?;
+                "ROLLBACK"
+            } else {
+                let exported = session.sql.has_exported_snapshots();
+                if !*implicit {
+                    let before = settings.current.clone();
+                    execute_control("ROLLBACK", session, implicit, settings, diagnostic, &mut Vec::new())?;
+                    diagnostic.pre_rollback_settings = Some(Box::new(before));
+                }
+                diagnostic.wire_exact = true;
+                if exported {
+                    diagnostic.message = Some("cannot PREPARE a transaction that has exported snapshots");
+                    return Err("0A000");
+                }
+                if gid.len() >= 200 {
+                    diagnostic.wire_message = Some(format!("transaction identifier \"{gid}\" is too long"));
+                    return Err("22023");
+                }
+                diagnostic.message = Some("prepared transactions are disabled");
+                diagnostic.wire_hint = Some("Set \"max_prepared_transactions\" to a nonzero value.".into());
+                return Err("55000");
+            }
+        }
+        Command::CommitPrepared(ref gid) | Command::RollbackPrepared(ref gid) => {
+            if session.is_aborted() {
+                return Err("25P02");
+            }
+            diagnostic.wire_exact = true;
+            if session.in_transaction() || *implicit {
+                diagnostic.message = Some(if matches!(command, Command::CommitPrepared(_)) {
+                    "COMMIT PREPARED cannot run inside a transaction block"
+                } else {
+                    "ROLLBACK PREPARED cannot run inside a transaction block"
+                });
+                return Err("25001");
+            }
+            diagnostic.wire_message = Some(format!("prepared transaction with identifier \"{gid}\" does not exist"));
+            return Err("42704");
+        }
+        Command::ImportSnapshot { id, local } => {
+            if session.is_aborted() {
+                return Err("25P02");
+            }
+            if local {
+                diagnostic.wire_exact = true;
+                diagnostic.message = Some("SET LOCAL TRANSACTION SNAPSHOT is not implemented");
+                return Err("0A000");
+            }
+            return import_snapshot(&id, session, *implicit, settings, diagnostic, out);
+        }
         Command::Commit => {
             let was = session.in_transaction();
             // execute_control appends the bounded control reply after publication.
@@ -199,6 +255,50 @@ pub(super) fn execute_mode(
     complete(actual, &empty(), out)?;
     Ok(actual)
 }
+fn import_snapshot(
+    id: &str,
+    session: &Session,
+    implicit: bool,
+    settings: &crate::pg_settings::SessionSettings,
+    diagnostic: &mut Diagnostic,
+    out: &mut Vec<u8>,
+) -> R<&'static str> {
+    use crate::pg_transaction::IsolationLevel::{RepeatableRead, Serializable};
+
+    diagnostic.wire_exact = true;
+    let in_block = session.in_transaction() || implicit;
+    if !in_block {
+        warning(
+            "SET TRANSACTION can only be used in transaction blocks",
+            &settings.current,
+            out,
+        )?;
+    }
+    if settings.queried || settings.in_subtransaction() {
+        diagnostic.message = Some("SET TRANSACTION SNAPSHOT must be called before any query");
+        return Err("25001");
+    }
+    let isolation = if session.in_transaction() {
+        settings.current.transaction_isolation
+    } else {
+        settings.current.default_isolation
+    };
+    if !matches!(isolation, RepeatableRead | Serializable) {
+        diagnostic.message = Some("a snapshot-importing transaction must have isolation level SERIALIZABLE or REPEATABLE READ");
+        return Err("0A000");
+    }
+    if !id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'A'..=b'F' | b'-')) {
+        diagnostic.wire_message = Some(format!("invalid snapshot identifier: \"{id}\""));
+        return Err("22023");
+    }
+    if id.is_empty() {
+        diagnostic.message = Some("could not read file \"pg_snapshots/\": Is a directory");
+        return Err("XX000");
+    }
+    diagnostic.wire_message = Some(format!("snapshot \"{id}\" does not exist"));
+    Err("42704")
+}
+
 pub(super) fn check_deferrable(
     settings: &crate::pg_settings::SessionSettings,
     diagnostic: &mut Diagnostic,
@@ -259,6 +359,9 @@ pub(super) fn read_only_check(
         "MERGE" => "cannot execute MERGE in a read-only transaction",
         "TRUNCATE TABLE" => "cannot execute TRUNCATE in a read-only transaction",
         "CREATE TABLE" => "cannot execute CREATE TABLE in a read-only transaction",
+        "CREATE TABLESPACE" => "cannot execute CREATE TABLESPACE in a read-only transaction",
+        "ALTER TABLESPACE" => "cannot execute ALTER TABLESPACE in a read-only transaction",
+        "DROP TABLESPACE" => "cannot execute DROP TABLESPACE in a read-only transaction",
         "CREATE VIEW" => "cannot execute CREATE VIEW in a read-only transaction",
         "DROP VIEW" => "cannot execute DROP VIEW in a read-only transaction",
         "COMMENT" => "cannot execute COMMENT in a read-only transaction",
@@ -283,5 +386,9 @@ pub(super) fn read_only_check(
         "REVOKE TASK" => "cannot execute REVOKE TASK in a read-only transaction",
         _ => return Ok(()),
     });
+    diagnostic.wire_exact |= matches!(
+        command,
+        "CREATE TABLESPACE" | "ALTER TABLESPACE" | "DROP TABLESPACE" | "SECURITY LABEL"
+    );
     Err("25006")
 }

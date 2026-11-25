@@ -14,6 +14,8 @@ mod am2_migration_network;
 mod unique_reporting_network;
 #[path = "comments_network.rs"]
 mod comments_network;
+#[path = "pg_admin_refusal_network.rs"]
+mod pg_admin_refusal_network;
 #[path = "group_parser_network.rs"]
 mod group_parser_network;
 #[path = "constraint_catalog_network.rs"]

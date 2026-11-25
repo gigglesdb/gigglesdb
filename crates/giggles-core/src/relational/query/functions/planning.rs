@@ -55,6 +55,7 @@ fn signature(name: &str, args: &[DataType], result: &DataType) -> Option<(bool, 
         .then_some((false, false));
     }
     match (name, args, result) {
+        ("pg_export_snapshot", [], Text) => Some((false, false)),
         (array_constructor::NAME, _, UuidArray) => Some((true, false)),
         ("nullif", [first, _], result) if first == result => Some((true, false)),
         (name, args, Integer) if conditional::count_nulls(name) && !args.is_empty() => Some((true, false)),

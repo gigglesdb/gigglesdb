@@ -42,6 +42,9 @@ pub(super) fn plan_class(plan: &Plan) -> Option<StatementClass> {
         Plan::Control(C::Savepoint(_) | C::Release(_) | C::RollbackTo(_)) => {
             StatementClass::Savepoint
         }
+        Plan::Control(C::Prepare(_) | C::CommitPrepared(_) | C::RollbackPrepared(_) | C::ImportSnapshot { .. }) => {
+            StatementClass::Other
+        }
         Plan::Settings(_) => StatementClass::Set,
         Plan::Inspect(_) => StatementClass::Show,
         Plan::SettingsFunction(function @ Function::Current { .. }) => {

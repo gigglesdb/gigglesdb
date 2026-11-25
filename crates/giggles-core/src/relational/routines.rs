@@ -248,7 +248,7 @@ fn type_name(p: &mut Parser) -> R<String> {
     }
     Ok(name)
 }
-fn arguments(p: &mut Parser, declaration: bool) -> R<Vec<RoutineArgument>> {
+pub(super) fn arguments(p: &mut Parser, declaration: bool) -> R<Vec<RoutineArgument>> {
     p.punct('(')?;
     let mut args = Vec::new();
     if p.sym(')') {

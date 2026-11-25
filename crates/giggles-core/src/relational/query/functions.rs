@@ -740,6 +740,7 @@ impl Scalar {
                         | "clock_timestamp"
                         | "pg_current_xact_id"
                         | "pg_current_xact_id_if_assigned"
+                        | "pg_export_snapshot"
                         | "pg_xact_status"
                 ) || args.iter().any(Self::has_volatile_call)
             }
@@ -1832,6 +1833,12 @@ impl Scalar {
             }
             name if greatest::known_name(name) => {
                 greatest::bind(name, args, resolve, tables, parameters)
+            }
+            "pg_export_snapshot" => {
+                if !args.is_empty() {
+                    return Err(SqlError::UndefinedFunction);
+                }
+                Ok(BoundScalar { ty: DataType::Text, node: Node::Call(name.into(), Vec::new()) })
             }
             "pg_current_xact_id" | "pg_current_xact_id_if_assigned" | "pg_xact_status" => {
                 Self::bind_xact(name, args, resolve, tables, parameters)
@@ -3158,6 +3165,11 @@ impl BoundScalar {
                 charge(budget, v)?;
                 Ok(v.clone())
             }
+            Node::Call(n, _) if n == "pg_export_snapshot" => {
+                let value = volatile::SessionVolatile::with(volatile::SessionVolatile::export_snapshot)?;
+                charge(budget, &value)?;
+                Ok(value)
+            }
             Node::Call(n, _) if n == "\0plan_cardinality" => Err(plan::subquery::cardinality_error()),
             Node::Call(n, args) if matches!(n.as_str(), json_aggregate::TEXT_RESULT | json_aggregate::VALIDATED_INPUT) => {
                 args[0].eval(row, params, budget)
@@ -3573,6 +3585,35 @@ fn reserve(budget: &mut usize, bytes: usize) -> R<()> {
     }
     *budget = total;
     Ok(())
+}
+
+pub(in crate::relational) fn transform_builtin_type(p: &mut Parser) -> R<Option<String>> {
+    let start = p.at;
+    match cast::target(p, false) {
+        Ok((ty, _)) => {
+            let mut array = false;
+            while p.sym('[') {
+                p.punct(']')?;
+                array = true;
+            }
+            let name = typeof_expr::name(&ty);
+            return Ok(Some(if array { format!("{name}[]") } else { name.to_owned() }));
+        }
+        Err(SqlError::UndefinedObject | SqlError::Unsupported) => p.at = start,
+        Err(error) => return Err(error),
+    }
+    // Some PostgreSQL types exist in the catalog without a scalar representation.
+    let reference = user_types::TypeReference::parse(p)?;
+    let name = match reference.name.split_once('\0') {
+        None => Some(reference.name.as_str()),
+        Some(("pg_catalog", name)) => Some(name),
+        Some(_) => None,
+    };
+    if let Some(name) = name.filter(|name| pg18_types::PG_CATALOG.binary_search(name).is_ok()) {
+        return Ok(Some(if reference.array { format!("{name}[]") } else { name.to_owned() }));
+    }
+    p.at = start;
+    Ok(None)
 }
 
 fn cast_type(p: &mut Parser) -> R<(DataType, Option<i32>)> {

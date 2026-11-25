@@ -23,6 +23,8 @@ mod typed_leaf_read;
 mod view_select;
 #[path = "comments.rs"]
 mod comments;
+#[path = "pg_admin_utility.rs"]
+mod pg_admin_utility;
 
 // Single integration-test binary: every tests/*.rs file is a module here, so the
 // crate links once instead of once per file. Files that re-run the test binary

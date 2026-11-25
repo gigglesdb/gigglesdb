@@ -16,6 +16,9 @@ pub(crate) mod triggers;
 pub use routines::{Routine, RoutineArgument, RoutineDiagnostic};
 pub use triggers::Trigger;
 mod comments;
+mod load;
+mod tablespace;
+pub(crate) mod admin_utility;
 mod security_label;
 mod extensions;
 mod views;
@@ -38,7 +41,7 @@ mod constraint_primary_key;
 mod ddl_type;
 pub mod text_search_types;
 pub use ddl_type::take_sql_warnings;
-pub(crate) use user_types::SqlDiagnosticScope;
+pub(crate) use user_types::{SqlDiagnosticScope, clear_sql_error_message};
 mod user_types;
 
 pub(crate) fn conflict_duplicate_target() -> SqlError {
@@ -440,6 +443,14 @@ pub enum SqlError {
     QueryCanceled,
     #[serde(skip)]
     RoutineDdl,
+    #[serde(skip)]
+    InsufficientPrivilege,
+    #[serde(skip)]
+    ActiveSqlTransaction,
+    #[serde(skip)]
+    ReservedName,
+    #[serde(skip)]
+    UndefinedFile,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1288,6 +1299,7 @@ enum Statement {
     Routine(routines::Ddl),
     Trigger(triggers::Ddl),
     Comment(comments::Comment),
+    AdminUtility(admin_utility::Statement),
     SecurityLabel(security_label::Label),
     Extension(extensions::Ddl),
     View(views::Ddl),
@@ -1565,12 +1577,15 @@ impl Parser {
         if views::claims(&self.tokens) {
             return views::parse(self).map(Statement::View);
         }
+        if admin_utility::claims(&self.tokens[self.at..]) {
+            return admin_utility::parse(self).map(Statement::AdminUtility);
+        }
         if self.word("comment") {
             return comments::parse(self).map(Statement::Comment);
         }
         if extensions::claims(&self.tokens[self.at..]) { return extensions::parse(self).map(Statement::Extension); }
         if security_label::claims(&self.tokens[self.at..]) {
-            return security_label::parse(self).map(Statement::SecurityLabel);
+            return security_label::parse(self, source);
         }
         if schemas::claims(&self.tokens) {
             return schemas::parse(self).map(Statement::Schema);
@@ -2281,7 +2296,7 @@ impl Prepared {
                 V2Class::Ddl
             }
             Statement::Sequence(_) | Statement::DropTable { .. } | Statement::Comment(_) | Statement::SecurityLabel(_) | Statement::View(_) | Statement::Routine(_) | Statement::Trigger(_) => V2Class::Ddl,
-            Statement::Create { .. } => V2Class::Ddl,
+            Statement::AdminUtility(_) | Statement::Create { .. } => V2Class::Ddl,
             Statement::CreateIndex(_) | Statement::DropIndex(_) => V2Class::Ddl,
             Statement::AlterTable(alter) => {
                 // v2 supports every ALTER action. The exhaustive match makes any
@@ -3333,6 +3348,7 @@ impl Prepared {
                 | Statement::DropIndex(_)
                 | Statement::AlterTable(_)
                 | Statement::Comment(_)
+                | Statement::AdminUtility(_)
                 | Statement::SecurityLabel(_)
                 | Statement::View(_)
                 | Statement::Routine(_)
@@ -3375,6 +3391,7 @@ impl Prepared {
             Statement::TypeDdl(ddl) => ddl.command(),
             Statement::Plan(plan) if plan.mutation_command().is_some() => plan.mutation_command().unwrap(),
             Statement::CollationDdl(ddl) => ddl.command(),
+            Statement::AdminUtility(utility) => utility.command(),
             Statement::Extension(ddl) => ddl.command(),
             Statement::CompositeSelect(_) | Statement::Plan(_) => "SELECT",
             Statement::Sequence(ddl) => match ddl {
@@ -3756,7 +3773,9 @@ impl Prepared {
         if !matches!(tokens.first(), Some(Token::Word(word)) if word == "alter") {
             return Ok(None);
         }
-        if matches!(tokens.get(1), Some(Token::Word(word)) if matches!(word.as_str(), "sequence" | "collation" | "type" | "trigger" | "index")) {
+        if tablespace::claims(&tokens)
+            || matches!(tokens.get(1), Some(Token::Word(word)) if matches!(word.as_str(), "sequence" | "collation" | "type" | "trigger" | "index"))
+        {
             return Ok(None);
         }
         let mut parser = Parser { privilege_seen: false, privilege_casts: false,
@@ -4260,8 +4279,8 @@ pub(crate) fn plpgsql_data_type(sql: &str) -> R<DataType> {
     Ok(parsed.data_type)
 }
 
-/// Decode a PL/pgSQL format string with the SQL literal rules.
-pub(crate) fn plpgsql_string(sql: &str) -> R<String> {
+/// Decode one SQL string literal, including escape and dollar quoting.
+pub fn parse_string_literal(sql: &str) -> R<String> {
     match lex(sql)?.as_slice() {
         [Token::String(value)] => Ok(value.clone()),
         _ => Err(SqlError::Syntax),
@@ -4861,7 +4880,7 @@ impl Relational {
                 if expected.is_some() { return Err(SqlError::Unsupported); }
                 triggers::execute(self, prepared, ddl)?;
             }
-            Statement::Comment(_) | Statement::SecurityLabel(_) | Statement::View(_) => return Err(SqlError::Unsupported), // v2 bridge only
+            Statement::AdminUtility(_) | Statement::Comment(_) | Statement::SecurityLabel(_) | Statement::View(_) => return Err(SqlError::Unsupported),
             Statement::DropTable {
                 names,
                 optional,

@@ -8,7 +8,7 @@ mod regex_projection;
 mod aggregate_filter;
 mod aggregate_order;
 mod functions;
-pub(super) use functions::{quoting::quote_identifier, random_uuid};
+pub(super) use functions::{quoting::quote_identifier, random_uuid, transform_builtin_type};
 
 pub(super) fn known_zero_argument_function(name: &str) -> bool {
     user_types::probe_preserving_error_message(|| {

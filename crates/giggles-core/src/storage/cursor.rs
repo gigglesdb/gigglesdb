@@ -58,6 +58,7 @@ enum Data {
     Scan {
         image: Arc<relational::Relational>,
         volatile: Arc<Mutex<relational::volatile::SessionVolatile>>,
+        standalone_exports: Option<relational::volatile::SnapshotExports>,
         source: Option<V2Snapshot>,
         plan: Box<Plan>,
     },
@@ -212,10 +213,11 @@ impl Cursor {
             Data::Scan {
                 image,
                 volatile,
+                standalone_exports,
                 source,
                 plan,
             } => {
-                let _volatile = relational::volatile::Scope::enter(volatile);
+                let _volatile = relational::volatile::Scope::cursor(volatile, standalone_exports.as_mut());
                 let legacy = scan::LegacyRows(image);
                 let inner = source
                     .as_ref()
@@ -539,6 +541,7 @@ impl SqlSession {
                     data: Data::Scan {
                         image,
                         volatile: self.volatile.clone(),
+                        standalone_exports: (!self.in_transaction()).then_some(Default::default()),
                         source,
                         plan: Box::new(plan),
                     },

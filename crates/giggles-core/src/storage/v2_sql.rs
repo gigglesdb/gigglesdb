@@ -447,7 +447,7 @@ impl SqlSession {
                     self.xact.clone(),
                     self.v2_transaction.as_ref().map(|txn| txn.id()),
                 ));
-            let _volatile = relational::volatile::Scope::enter(&self.volatile);
+            let _volatile = relational::volatile::Scope::statement(&self.volatile, self.in_transaction());
             let output = state.sql.normalize_copy(prepared, input, Some(&context));
             crate::cancellation::check()?;
             if let Some(error) = context.take_error() {
@@ -628,6 +628,7 @@ impl SqlSession {
                                     self.aborted = false;
                                 }
                             }
+                            relational::volatile::SessionVolatile::set_subtransaction(&self.volatile, !self.v2_savepoints.is_empty());
                         }
                         "commit" => {
                             self.commit_v2_transaction(db, &mut ticket)?;
@@ -3284,7 +3285,7 @@ impl SqlSession {
         // its partial effects (earlier pages) must be dropped too.
         let before = (!run.effects.is_empty()).then(|| run.effects.clone());
         self.protected = Some(run);
-        let _volatile = relational::volatile::Scope::enter(&self.volatile);
+        let _volatile = relational::volatile::Scope::statement(&self.volatile, self.in_transaction());
         let result = self.execute_v2(db, p, params, expected_version, clock, None);
         let mut run = self.protected.take().expect("parked protected run");
         if result.is_err() {

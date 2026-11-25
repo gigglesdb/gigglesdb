@@ -187,6 +187,10 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::InvalidUseOfEscapeCharacter => 79,
                 relational::SqlError::QueryCanceled => 77,
                 relational::SqlError::RoutineDdl => 75,
+                relational::SqlError::InsufficientPrivilege => 80,
+                relational::SqlError::ActiveSqlTransaction => 81,
+                relational::SqlError::ReservedName => 82,
+                relational::SqlError::UndefinedFile => 83,
             }
         }
     };

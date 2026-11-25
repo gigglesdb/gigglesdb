@@ -4208,7 +4208,7 @@ impl SqlSession {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
             let (state, callback) = self.native_sequence_callback(lease.as_deref())?;
-            let _volatile = relational::volatile::Scope::enter(&self.volatile);
+            let _volatile = relational::volatile::Scope::statement(&self.volatile, self.in_transaction());
             let clock = relational::clock::ExecutionClock::new(&relational::StatementClock {
                 unavailable: Some(CoreError::Sql(relational::SqlError::Unsupported)),
                 transaction_us: 0, statement_us: 0, zone: None, wall: None,
@@ -4805,7 +4805,7 @@ impl SqlSession {
                     self.sequence_tables.clone(),
                     self.search_path.clone(),
                 ));
-            let _volatile = relational::volatile::Scope::enter(&self.volatile);
+            let _volatile = relational::volatile::Scope::statement(&self.volatile, self.in_transaction());
             let output = state.sql.normalize_copy(prepared, input, Some(&context));
             crate::cancellation::check()?;
             if let Some(error) = context.take_error() {
@@ -5339,7 +5339,7 @@ impl SqlSession {
         db: Option<&EngineLease>,
         check_reply: Option<&mut SqlReplyCheck<'_>>,
     ) -> Result<relational::SqlResult, CoreError> {
-        let _volatile = relational::volatile::Scope::enter(&self.volatile);
+        let _volatile = relational::volatile::Scope::statement(&self.volatile, self.in_transaction());
         // A spilled v2 RETURNING or SELECT result is materialised here unless the
         // caller streams it (`relational::spill::streaming`); errors and unwinds drop it.
         relational::spill::statement(|| {
@@ -5363,6 +5363,39 @@ impl SqlSession {
             let mut bound = p.clone();
             bound.set_schema_context(self.search_path.clone(), self.schema_user.clone());
             return self.execute_bound_clocked_once(&bound, params, expected_version, clock, db, check_reply);
+        }
+        if let Some(utility) = p.admin_utility() {
+            use relational::admin_utility;
+            relational::clear_sql_error_message();
+            let result = (|| {
+                if self.aborted {
+                    return Err(CoreError::Sql(relational::SqlError::Aborted));
+                }
+                if !params.is_empty() || expected_version.is_some() {
+                    return Err(CoreError::Sql(relational::SqlError::Parameters));
+                }
+                if utility.requires_standalone() && self.in_transaction() {
+                    return Err(CoreError::Sql(admin_utility::block_error(utility.command())));
+                }
+                crate::cancellation::check()?;
+                let roles = self.admin.roles();
+                let actor = self.ddl_owner.as_deref().map(|name| {
+                    roles.get(name).map_err(admin_utility::role_error)?
+                        .ok_or(CoreError::Policy(Error::Authentication))
+                }).transpose()?;
+                self.inspect_metadata_leased(db, |state| {
+                    if p.domain != state.view.domain
+                        || (p.transaction.is_some() && p.transaction != self.transaction_id)
+                        || (self.is_v2_engine() && p.epoch != 0)
+                        || (!self.is_v2_engine() && p.epoch != state.sql.epoch)
+                    {
+                        return Err(CoreError::Sql(relational::SqlError::StaleSchema));
+                    }
+                    utility.execute(p, &state.sql, actor.as_ref(), &roles)
+                })
+            })();
+            if result.is_err() { self.abort(); }
+            return result;
         }
         if self.is_v2_engine() {
             let Some(db) = db else {
@@ -5566,6 +5599,7 @@ impl SqlSession {
                             self.aborted = false;
                         }
                     }
+                    relational::volatile::SessionVolatile::set_subtransaction(&self.volatile, !self.savepoints.is_empty());
                 }
                 "rollback" => {
                     if self.staged.is_none() {
@@ -5978,6 +6012,12 @@ impl SqlSession {
                 Ok(())
             })
     }
+    /// Whether the current SQL transaction has called pg_export_snapshot().
+    pub fn has_exported_snapshots(&self) -> bool {
+        self.in_transaction()
+            && self.volatile.lock().unwrap_or_else(|error| error.into_inner()).has_exported_snapshots()
+    }
+
     pub fn rollback(&mut self) {
         let _ = self.settle_sequences();
         self.rollback_without_settling();
@@ -6011,6 +6051,7 @@ impl SqlSession {
         self.copy_freeze = vec![Default::default()];
         self.savepoints.clear();
         self.v2_savepoints.clear();
+        self.volatile.lock().unwrap_or_else(|error| error.into_inner()).end_transaction();
         self.aborted = false;
         self.transaction_id = None;
         self.transaction_clock_us = None;
