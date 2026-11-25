@@ -515,10 +515,43 @@ pub enum DataType {
     PgCharArray,
     SmallIntArray,
     RegDictionaryArray,
+    /// Query results with no durable column representation.
+    ExpressionArray(ExpressionArray),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpressionArray {
+    Varchar,
+    Numeric,
+    Boolean,
+    Date,
+    Timestamp,
+    TimestampTz,
+    Json,
+    Jsonb,
+}
+
+impl ExpressionArray {
+    pub fn metadata(self) -> (DataType, u32, &'static str) {
+        match self {
+            Self::Varchar => (DataType::Varchar, 1015, "character varying[]"),
+            Self::Numeric => (DataType::Numeric, 1231, "numeric[]"),
+            Self::Boolean => (DataType::Boolean, 1000, "boolean[]"),
+            Self::Date => (DataType::Date, 1182, "date[]"),
+            Self::Timestamp => (DataType::Timestamp, 1115, "timestamp without time zone[]"),
+            Self::TimestampTz => (DataType::TimestampTz, 1185, "timestamp with time zone[]"),
+            Self::Json => (DataType::Text, 199, "json[]"),
+            Self::Jsonb => (DataType::Jsonb, 3807, "jsonb[]"),
+        }
+    }
+}
+
 impl Serialize for DataType {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let (index, name) = match self {
+            Self::ExpressionArray(_) => {
+                return Err(serde::ser::Error::custom("expression-only array type"));
+            }
             Self::Boolean => (0, "Boolean"),
             Self::SmallInt => (1, "SmallInt"),
             Self::Integer => (2, "Integer"),

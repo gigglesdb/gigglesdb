@@ -1421,7 +1421,7 @@ impl Relational {
         }
         for (id, (_, column)) in &columns {
             let expected = match column.data_type {
-                DataType::RegType | DataType::RegConfig | DataType::RegDictionary | DataType::Oid
+                DataType::ExpressionArray(_) | DataType::RegType | DataType::RegConfig | DataType::RegDictionary | DataType::Oid
                 | DataType::PgChar | DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray | DataType::RegDictionaryArray => return Err(SqlError::Unsupported),
                 DataType::Varchar => Some(TextKind::Varchar),
                 DataType::Bpchar => Some(TextKind::Bpchar),

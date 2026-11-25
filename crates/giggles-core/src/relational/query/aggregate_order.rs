@@ -91,15 +91,20 @@ pub(super) fn validate_distinct(
 pub(super) fn input_width(name: &str, args: usize) -> usize {
     args - (name.len() - PREFIX.len()) / 2
 }
-pub(super) fn same_inputs(args: &[BoundScalar], a: &[Value], b: &[Value]) -> R<bool> {
+pub(super) fn same_inputs(args: &[BoundScalar], a: &[Value], b: &[Value], kind: Aggregate) -> R<bool> {
     for ((arg, a), b) in args.iter().zip(a).zip(b) {
-        if arg.try_compare_values(a, b)? != Ordering::Equal {
+        let order = if kind.base() == Aggregate::ArrayAgg {
+            array_aggregate::compare_distinct(Some(arg), a, b)?
+        } else {
+            arg.try_compare_values(a, b)?
+        };
+        if order != Ordering::Equal {
             return Ok(false);
         }
     }
     Ok(true)
 }
-pub(super) fn compare(name: &str, args: &[BoundScalar], a: &[Value], b: &[Value], distinct: bool) -> R<Ordering> {
+pub(super) fn compare(name: &str, args: &[BoundScalar], a: &[Value], b: &[Value], kind: Aggregate) -> R<Ordering> {
     let width = input_width(name, args.len());
     for (((flags, scalar), a), b) in name.as_bytes()[PREFIX.len()..]
         .as_chunks::<2>().0.iter()
@@ -125,7 +130,11 @@ pub(super) fn compare(name: &str, args: &[BoundScalar], a: &[Value], b: &[Value]
                 }
             }
             _ => {
-                let order = scalar.try_compare_values(a, b)?;
+                let order = if kind.base() == Aggregate::ArrayAgg && scalar.ty == DataType::Jsonb {
+                    array_aggregate::compare_jsonb(a, b)?
+                } else {
+                    scalar.try_compare_values(a, b)?
+                };
                 if flags[0] == b'd' {
                     order.reverse()
                 } else {
@@ -139,7 +148,7 @@ pub(super) fn compare(name: &str, args: &[BoundScalar], a: &[Value], b: &[Value]
     }
     // PostgreSQL adds DISTINCT inputs that aren't ORDER BY keys as ascending
     // tiebreakers. Use the already evaluated argument values.
-    if distinct && width > 1 {
+    if kind.distinct() && width > 1 {
         for ((arg, a), b) in args[..width].iter().zip(a).zip(b) {
             let order = json_aggregate::compare_distinct(Some(arg), a, b)?;
             if order != Ordering::Equal {

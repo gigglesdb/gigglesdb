@@ -930,6 +930,7 @@ pub(super) fn type_name(ty: &DataType) -> &'static str {
         DataType::DoublePrecision => "double precision",
         DataType::Text => "text",
         DataType::RegType => "regtype",
+        DataType::ExpressionArray(array) => array.metadata().2,
         DataType::Varchar => "varchar",
         DataType::Bpchar => "bpchar",
         DataType::Uuid => "uuid",

@@ -35,6 +35,8 @@ pub(super) fn element_type(array: &DataType) -> Option<DataType> {
         DataType::RealArray => DataType::Real,
         DataType::PgCharArray => DataType::PgChar,
         DataType::SmallIntArray => DataType::SmallInt,
+        DataType::RegDictionaryArray => DataType::RegDictionary,
+        DataType::ExpressionArray(array) => array.metadata().0,
         _ => return None,
     })
 }

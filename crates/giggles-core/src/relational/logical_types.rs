@@ -5,7 +5,7 @@ impl DataType {
     }
 
     pub(crate) fn is_array(&self) -> bool {
-        matches!(self, Self::IntArray | Self::BigIntArray | Self::TextArray | Self::UuidArray)
+        matches!(self, Self::IntArray | Self::BigIntArray | Self::TextArray | Self::UuidArray | Self::ExpressionArray(_))
     }
 }
 pub fn coerce(value: Value, ty: &DataType) -> R<Value> {
@@ -295,6 +295,13 @@ pub fn eval(name: &str, ty: &DataType, values: &[Value]) -> R<Value> {
         };
         return Ok(match ty {
             DataType::TextArray | DataType::UuidArray => Value::Text(v.clone()),
+            DataType::RealArray => Value::Float4(giggles_pg_types::Float4::parse(v)
+                .map_err(|_| SqlError::InvalidTextRepresentation)?),
+            DataType::PgCharArray => return text_search_types::input(&DataType::PgChar, v),
+            DataType::RegDictionaryArray => return text_search_types::input(&DataType::RegDictionary, v),
+            DataType::ExpressionArray(array) => {
+                return query::array_agg_element(v, *array);
+            }
             _ => Value::Int(v.parse().map_err(|_| SqlError::InvalidTextRepresentation)?),
         });
     }

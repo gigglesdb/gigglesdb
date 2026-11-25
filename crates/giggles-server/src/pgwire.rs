@@ -779,6 +779,7 @@ pub fn oid(t: &DataType) -> u32 {
         DataType::BigIntArray => 1016,
         DataType::TextArray => 1009,
         DataType::UuidArray => 2951,
+        DataType::ExpressionArray(array) => array.metadata().1,
         DataType::RegType => 2206,
         DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
         | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray
@@ -810,7 +811,7 @@ fn size(t: &DataType) -> i16 {
         | DataType::SmallIntArray | DataType::RegDictionaryArray => -1,
         DataType::Uuid => 16,
         DataType::Jsonb | DataType::IntArray | DataType::BigIntArray | DataType::TextArray
-        | DataType::UuidArray => -1,
+        | DataType::UuidArray | DataType::ExpressionArray(_) => -1,
         DataType::Boolean => 1,
         DataType::Date => 4,
         DataType::Time => 8,
@@ -912,7 +913,7 @@ fn decode_with_order(
     if format == 0 {
         let s = std::str::from_utf8(b).map_err(|_| "22021")?;
         return match ty {
-            DataType::RegType => Err("0A000"),
+            DataType::RegType | DataType::ExpressionArray(_) => Err("0A000"),
             DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
             | DataType::Oid | DataType::PgChar => text_search_types::input(ty, s)
                 .map_err(|error| giggles_core::sqlstate(&CoreError::Sql(error))),
@@ -4977,8 +4978,11 @@ fn logical_binary_output(ty: &DataType, s: &str, type_oid: u32) -> R<Vec<u8>> {
         DataType::PgCharArray => 18,
         DataType::SmallIntArray => 21,
         DataType::RegDictionaryArray => 3769,
+        DataType::ExpressionArray(giggles_core::relational::ExpressionArray::Json) => 114,
+        DataType::ExpressionArray(array) => oid(&array.metadata().0),
         _ => 25,
     };
+    let settings = matches!(ty, DataType::ExpressionArray(_)).then(crate::pg_settings::Settings::default);
     let mut b = Vec::new();
     b.extend_from_slice(&(if vals.is_empty() { 0i32 } else { 1 }).to_be_bytes());
     b.extend_from_slice(&i32::from(vals.contains(&None)).to_be_bytes());
@@ -5009,6 +5013,13 @@ fn logical_binary_output(ty: &DataType, s: &str, type_oid: u32) -> R<Vec<u8>> {
                         .map_err(|error| giggles_core::sqlstate(&CoreError::Sql(error)))?;
                     text_search_types::binary_output(&DataType::RegDictionary, &value)
                         .map_err(|error| giggles_core::sqlstate(&CoreError::Sql(error)))?
+                }
+                DataType::ExpressionArray(array) => {
+                    let ty = array.metadata().0;
+                    let zone = SessionZone::Fixed(0);
+                    let value = decode_in_zone(s.as_bytes(), &ty, 0, zone, 0)?;
+                    encode(&value, &ty, 1, settings.as_ref().ok_or("XX000")?, zone)?
+                        .ok_or("XX000")?
                 }
                 _ => s.into_bytes(),
             };

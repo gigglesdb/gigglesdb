@@ -324,6 +324,9 @@ pub(super) fn parts(
         return Err(SqlError::WrongObjectType);
     };
     if inputs.len() != 1 {
+        if a.base() == Aggregate::ArrayAgg {
+            return Err(array_aggregate::signature_error(inputs, resolve, tables));
+        }
         return Err(SqlError::UndefinedFunction);
     }
     reject_nested_aggregate(&inputs[0])?;

@@ -160,6 +160,7 @@ pub(crate) fn schema(tables: &[Table], bounds: Bounds) -> Result<()> {
                     | DataType::TextArray
                     | DataType::UuidArray
                     | DataType::RegType
+                    | DataType::ExpressionArray(_)
             ) || c.data_type.text_search_oid().is_some() {
                 return Err(invalid(
                     "logical type is unsupported by the archive profile",
@@ -522,6 +523,7 @@ pub(crate) fn create_sql(t: &Table) -> String {
                     DataType::TextArray => "TEXT[]",
                     DataType::UuidArray => "UUID[]",
                     DataType::RegType => "REGTYPE",
+                    DataType::ExpressionArray(array) => array.metadata().2,
                     DataType::TsVector => "TSVECTOR",
                     DataType::TsQuery => "TSQUERY",
                     DataType::RegConfig => "REGCONFIG",

@@ -2329,7 +2329,7 @@ impl Scalar {
             }
             DataType::Text
         } else if name == "cardinality"
-            && matches!(args.as_slice(), [arg] if arg.ty == DataType::UuidArray)
+            && matches!(args.as_slice(), [arg] if array_constructor::element_type(&arg.ty).is_some())
         {
             DataType::Integer
         } else if matches!(
@@ -2797,6 +2797,12 @@ impl BoundScalar {
         }
         match &self.node {
             Node::Call(name, _) if name == "setseed" => random_uuid::VOID_OID,
+            Node::Call(name, args)
+                if name == "\0array_subscript"
+                    && args[0].ty == DataType::ExpressionArray(ExpressionArray::Json) =>
+            {
+                json_aggregate::OID
+            }
             Node::Call(name, args)
                 if name == array_constructor::NAME
                     && args.iter().any(|arg| arg.result_oid() == json_aggregate::OID) =>
@@ -3575,6 +3581,7 @@ pub(super) fn cast_type_name(ty: &DataType) -> &'static str {
         DataType::BigInt => "int8",
         DataType::Text => "text",
         DataType::RegType => "regtype",
+        DataType::ExpressionArray(array) => array.metadata().2.trim_end_matches("[]"),
         DataType::Varchar => "varchar",
         DataType::Bpchar => "bpchar",
         DataType::Uuid => "uuid",
@@ -3724,6 +3731,14 @@ fn cast_with_date_order(
     }
     if *ty == DataType::RegType {
         return typeof_expr::regtype(v);
+    }
+    if let DataType::ExpressionArray(_) = ty
+        && let Value::Text(text) = &v
+    {
+        // Internal casts of an already-typed query result (e.g. COALESCE).
+        logical_types::array_values(text)?;
+        charge(budget, &v)?;
+        return Ok(v);
     }
     if ty.is_extended_text() {
         let out = crate::relational::logical_types::coerce(v, ty)?;

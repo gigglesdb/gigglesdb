@@ -133,6 +133,8 @@ mod server_boundary;
 mod sql_aggregate_error_codes;
 #[path = "sql_aggregate_scalars.rs"]
 mod sql_aggregate_scalars;
+#[path = "sql_array_agg.rs"]
+mod sql_array_agg;
 #[path = "sql_alter_table.rs"]
 mod sql_alter_table;
 #[path = "sql_binary_functions.rs"]

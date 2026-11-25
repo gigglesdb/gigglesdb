@@ -179,7 +179,7 @@ impl CreateAs {
             return Err(SqlError::DuplicateColumn);
         }
         // JSON has a wire type and no durable column representation.
-        if type_oids.contains(&114) {
+        if type_oids.contains(&114) || columns.iter().any(|c| matches!(c.data_type, DataType::ExpressionArray(_))) {
             return Err(SqlError::Unsupported);
         }
         let type_ids = columns

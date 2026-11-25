@@ -150,6 +150,7 @@ impl BoundLocal {
             DataType::Boolean => Ty::Bool,
             DataType::SmallInt | DataType::Integer | DataType::BigInt => Ty::Int,
             DataType::RegType
+            | DataType::ExpressionArray(_)
             | DataType::Uuid
             | DataType::Jsonb
             | DataType::IntArray

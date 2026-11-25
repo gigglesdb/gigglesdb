@@ -695,6 +695,7 @@ fn column(v: ColumnDef) -> p::NativeColumn {
             DataType::Integer => 3,
             DataType::BigInt => 4,
             DataType::RegType
+            | DataType::ExpressionArray(_)
             | DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
             | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray | DataType::RegDictionaryArray
             | DataType::Uuid
@@ -951,6 +952,7 @@ fn catalog_type_name(v: &DataType) -> &'static str {
         DataType::TextArray => "TextArray",
         DataType::UuidArray => "UuidArray",
         DataType::RegType => "RegType",
+        DataType::ExpressionArray(array) => array.metadata().2,
         DataType::TsVector => "TsVector",
         DataType::TsQuery => "TsQuery",
         DataType::RegConfig => "RegConfig",

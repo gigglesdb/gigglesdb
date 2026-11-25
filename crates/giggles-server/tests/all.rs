@@ -37,6 +37,8 @@ mod bytea_convert_network;
 mod aggregate_avg_distinct_authority;
 #[path = "aggregate_filter_authority.rs"]
 mod aggregate_filter_authority;
+#[path = "array_agg_network.rs"]
+mod array_agg_network;
 #[path = "alter_table_ownership.rs"]
 mod alter_table_ownership;
 #[path = "ambiguous_column_error.rs"]

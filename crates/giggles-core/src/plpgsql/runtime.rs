@@ -1015,6 +1015,7 @@ fn field_type(data_type: DataType) -> ScalarType {
         DataType::BigIntArray => "bigint[]",
         DataType::TextArray => "text[]",
         DataType::RegType => "regtype",
+        DataType::ExpressionArray(array) => array.metadata().2,
         DataType::UuidArray => "uuid[]",
         DataType::TsVector => "tsvector",
         DataType::TsQuery => "tsquery",

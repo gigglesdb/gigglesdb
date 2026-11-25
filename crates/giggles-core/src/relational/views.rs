@@ -141,6 +141,7 @@ pub(super) fn oid(ty: &DataType) -> u32 {
         DataType::Jsonb => 3802, DataType::IntArray => 1007, DataType::BigIntArray => 1016,
         DataType::TextArray => 1009, DataType::UuidArray => 2951,
         DataType::RegType => 2206,
+        DataType::ExpressionArray(array) => array.metadata().1,
         DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
         | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray
         | DataType::SmallIntArray | DataType::RegDictionaryArray => ty.text_search_oid().unwrap(),

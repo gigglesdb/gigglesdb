@@ -263,12 +263,15 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
                 aggregate_slot(a, index)
             }
             Scalar::Call(n, args) if aggregate(n).is_some() => {
+                let kind = aggregate(n).ok_or(SqlError::UndefinedFunction)?;
                 if args.len() != 1 {
+                    if kind.base() == Aggregate::ArrayAgg {
+                        return Err(array_aggregate::signature_error(args, self.resolve, self.tables));
+                    }
                     return Err(SqlError::UndefinedFunction);
                 }
                 reject_nested_aggregate(&args[0])?;
                 let index = self.groups.len() + self.aggregates.len();
-                let kind = aggregate(n).ok_or(SqlError::UndefinedFunction)?;
                 self.aggregates.push((kind, Some(args[0].clone()), None));
                 aggregate_slot(kind, index)
             }
@@ -345,6 +348,7 @@ fn cast_output_name(s: &Scalar) -> Option<String> {
             if matches!(
                 name.as_str(),
                 functions::CAST_TYPMOD | json_aggregate::INPUT | json_aggregate::VALIDATED_INPUT
+                    | "\0array_subscript"
             ) =>
         {
             args.first().and_then(cast_output_name)
@@ -756,6 +760,11 @@ pub(super) fn bind<'a>(
         arg.infer(expected, &mut parameters, resolve, tables)?;
         let legacy_column = matches!(arg, Scalar::Column(_));
         if a.distinct() {aggregate_order::validate_distinct(&arg,resolve,tables)?;}
+        if a.base() == Aggregate::ArrayAgg
+            && let Some(error) = array_aggregate::unknown_input(&arg, &parameters)
+        {
+            return Err(error);
+        }
         let b = arg.bind(resolve, tables, &parameters)?;
         if json_aggregate::result_type(a).is_none() && b.ty == DataType::Bpchar {
             return Err(SqlError::Unsupported);
@@ -767,12 +776,7 @@ pub(super) fn bind<'a>(
             Aggregate::Count => DataType::BigInt,
             Aggregate::Json | Aggregate::JsonObject => DataType::Text,
             Aggregate::Jsonb | Aggregate::JsonbObject => DataType::Jsonb,
-            Aggregate::ArrayAgg => {
-                if b.ty != DataType::Text || b.attached_enum().is_none() {
-                    return Err(SqlError::Unsupported);
-                }
-                DataType::TextArray
-            }
+            Aggregate::ArrayAgg => array_aggregate::result_type(&b, a)?,
             Aggregate::Avg => match b.ty {
                 DataType::SmallInt | DataType::Integer | DataType::BigInt | DataType::Numeric => {
                     DataType::Numeric
@@ -917,6 +921,7 @@ pub(super) fn bind<'a>(
                         || matches!(s, Scalar::Call(name, _) if matches!(
                             name.as_str(),
                             functions::CAST_TYPMOD | json_aggregate::INPUT | json_aggregate::VALIDATED_INPUT
+                                | "\0array_subscript"
                         ))) =>
             {
                 Ok(cast_output_name(s).unwrap_or_else(|| b.name().to_owned()))

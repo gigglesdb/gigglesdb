@@ -29,6 +29,7 @@ pub(in crate::relational::query) fn name(ty: &DataType) -> &'static str {
         DataType::BigIntArray => "bigint[]",
         DataType::TextArray => "text[]",
         DataType::UuidArray => "uuid[]",
+        DataType::ExpressionArray(array) => array.metadata().2,
         DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
         | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray
         | DataType::SmallIntArray | DataType::RegDictionaryArray => ty.text_search_name().unwrap(),

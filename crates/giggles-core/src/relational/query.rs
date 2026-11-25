@@ -8,6 +8,8 @@ mod regex_projection;
 pub(super) mod advisory;
 mod aggregate_filter;
 mod aggregate_order;
+mod array_aggregate;
+pub(super) use array_aggregate::decode_element as array_agg_element;
 mod functions;
 pub(super) use functions::{quoting::quote_identifier, random_uuid, transform_builtin_type};
 
@@ -71,7 +73,7 @@ struct Source {
     name: String,
     alias: String,
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Aggregate {
     Count,
     Sum,
@@ -2656,7 +2658,7 @@ impl Query {
             } else {
                 let aggregate = match p.tokens.get(p.at) {
                     Some(Token::Word(w)) if p.tokens.get(p.at + 1) == Some(&Token::Symbol('(')) => {
-                        Aggregate::from_name(w)
+                        Aggregate::from_name(w).filter(|a| a.base() != Aggregate::ArrayAgg)
                     }
                     _ => None,
                 };
@@ -2684,7 +2686,16 @@ impl Query {
                     p.punct(')')?;
                     Item::Aggregate(a, c)
                 } else {
-                    Item::Scalar(Scalar::parse_expr(p, 0, false)?)
+                    match Scalar::parse_expr(p, 0, false)? {
+                        Scalar::Call(name, mut args)
+                            if args.len() == 1
+                                && let Some(kind) = Aggregate::from_name(&name)
+                                && kind.base() == Aggregate::ArrayAgg =>
+                        {
+                            Item::Aggregate(kind, args.pop())
+                        }
+                        scalar => Item::Scalar(scalar),
+                    }
                 }
             };
             if matches!(item, Item::Aggregate(..))
@@ -4309,6 +4320,11 @@ impl Query {
                 Item::Scalar(e) => e.infer(None, &mut parameters, &resolve, &tables)?,
                 Item::Aggregate(a, Some(e)) => {
                     reject_nested_aggregate(e)?;
+                    if a.base() == Aggregate::ArrayAgg
+                        && let Some(error) = array_aggregate::unknown_input(e, &parameters)
+                    {
+                        return Err(error);
+                    }
                     if matches!(a.base(), Aggregate::Count)
                         && let Scalar::Param(n) = e
                         && parameters.get(n - 1).is_none_or(Option::is_none)
@@ -4591,11 +4607,7 @@ impl Query {
                         return Err(SqlError::UndefinedFunction);
                     }
                     let data_type = if matches!(a.base(), Aggregate::ArrayAgg) {
-                        let input = c.as_ref().ok_or(SqlError::Syntax)?;
-                        if input.ty != DataType::Text || input.attached_enum().is_none() {
-                            return Err(SqlError::Unsupported);
-                        }
-                        DataType::TextArray
+                        array_aggregate::result_type(c.as_ref().ok_or(SqlError::InternalError)?, *a)?
                     } else if matches!(a.base(), Aggregate::Avg) {
                         match ty {
                             Some(DataType::Real | DataType::DoublePrecision) => {
@@ -6579,7 +6591,7 @@ fn flush_distinct(
             let (name, args) = aggregate_order::parts(input).ok_or(SqlError::Type)?;
             let error = RefCell::new(None);
             let compare = |a: &Vec<Value>, b: &Vec<Value>| {
-                aggregate_order::compare(name, args, a, b, kind.distinct()).unwrap_or_else(|e| {
+                aggregate_order::compare(name, args, a, b, *kind).unwrap_or_else(|e| {
                     *error.borrow_mut() = Some(e);
                     Ordering::Equal
                 })
@@ -6594,7 +6606,7 @@ fn flush_distinct(
                 let inputs = &input[..width];
                 if kind.distinct() {
                     if let Some(previous) = &last
-                        && aggregate_order::same_inputs(&args[..width], previous, inputs)?
+                        && aggregate_order::same_inputs(&args[..width], previous, inputs, *kind)?
                     {
                         continue;
                     }
@@ -6641,7 +6653,9 @@ fn flush_distinct(
     Ok(())
 }
 fn distinct_input_order(kind: Aggregate, input: Option<&BoundScalar>, a: &Value, b: &Value) -> R<Ordering> {
-    if json_aggregate::result_type(kind).is_some() {
+    if kind.base() == Aggregate::ArrayAgg {
+        array_aggregate::compare_distinct(input, a, b)
+    } else if json_aggregate::result_type(kind).is_some() {
         json_aggregate::compare_distinct(input, a, b)
     } else {
         input.map_or_else(|| Ok(cmp(a, b)), |input| input.try_compare_values(a, b))
@@ -6749,7 +6763,7 @@ fn update_filtered_aggregates(
             let bytes = aggregate_retained(&input);
             let error = RefCell::new(None);
             auxiliary[index].ordered.get_or_insert_with(spill::Sorter::new).push(input,bytes,
-                |left: &Vec<Value>, right: &Vec<Value>| aggregate_order::compare(name, args, left, right, a.distinct()).unwrap_or_else(|e| {
+                |left: &Vec<Value>, right: &Vec<Value>| aggregate_order::compare(name, args, left, right, *a).unwrap_or_else(|e| {
                     *error.borrow_mut()=Some(e); Ordering::Equal
                 }), retention)?;
             if let Some(e)=error.into_inner() {return Err(e);}
@@ -6779,7 +6793,9 @@ fn update_filtered_aggregates(
         }
         let state = &mut auxiliary[index];
         if a.distinct() && inject.is_none()
-            && (state.local_transition || json_aggregate::result_type(*a).is_some())
+            && (state.local_transition
+                || json_aggregate::result_type(*a).is_some()
+                || a.base() == Aggregate::ArrayAgg)
         {
             let input = evaluated.ok_or(SqlError::Type)?;
             let bytes = std::mem::size_of::<Value>() + value_bytes(&input);
@@ -6809,12 +6825,12 @@ fn update_filtered_aggregates(
         let mut value = std::mem::replace(&mut values[index], Value::Null);
         match a.base() {
             Aggregate::ArrayAgg => {
-                let element = match v.ok_or(SqlError::Type)? {
-                    Value::Text(label) => logical_types::array_quote(label),
-                    Value::Null => "NULL".into(),
-                    _ => return Err(SqlError::Type),
-                };
-                if state.array.len() + element.len() + 2 > super::DEFAULT_MAX_VALUE_BYTES {
+                let element = array_aggregate::element(
+                    v.ok_or(SqlError::InternalError)?,
+                    c.as_ref().ok_or(SqlError::InternalError)?,
+                    state.zone,
+                )?;
+                if state.array.len() + element.len() + 2 > super::max_value_bytes() {
                     return Err(SqlError::Limit);
                 }
                 retention.charge(element.len() + 1)?;
@@ -6910,6 +6926,7 @@ fn update_filtered_aggregates(
                     | DataType::BigIntArray
                     | DataType::TextArray
                     | DataType::UuidArray
+                    | DataType::ExpressionArray(_)
                     | DataType::TsVector | DataType::TsQuery | DataType::RegConfig | DataType::RegDictionary
                     | DataType::Oid | DataType::PgChar | DataType::RealArray | DataType::PgCharArray
                     | DataType::SmallIntArray | DataType::RegDictionaryArray

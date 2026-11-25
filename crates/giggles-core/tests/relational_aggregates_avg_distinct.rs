@@ -343,13 +343,14 @@ fn unknown_and_known_unsupported_aggregates_keep_error_split() {
             s.execute("SELECT made_up_agg(1)", &[], None),
             Err(CoreError::Sql(E::UndefinedFunction))
         );
-        for sql in ["SELECT stddev(v) FROM t", "SELECT array_agg(v) FROM t"] {
-            assert_eq!(
-                s.execute(sql, &[], None),
-                Err(CoreError::Sql(E::Unsupported)),
-                "{sql}"
-            );
-        }
+        assert_eq!(
+            s.execute("SELECT stddev(v) FROM t", &[], None),
+            Err(CoreError::Sql(E::Unsupported))
+        );
+        assert_eq!(
+            rows(s, "SELECT array_agg(v) FROM t"),
+            vec![vec![V::Text("{1,1,2,4,NULL}".into())]]
+        );
     });
 }
 

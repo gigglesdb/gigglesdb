@@ -51,7 +51,8 @@ fn user(n: &str) -> Option<(&str, bool, &str, &str)> {
     ))
 }
 pub(in crate::relational::query) fn is_collatable(ty: &DataType) -> bool {
-    matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar | DataType::TextArray)
+    matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar | DataType::TextArray
+        | DataType::ExpressionArray(ExpressionArray::Varchar))
 }
 
 pub(super) fn bind(name: &str, value: BoundScalar) -> R<BoundScalar> {

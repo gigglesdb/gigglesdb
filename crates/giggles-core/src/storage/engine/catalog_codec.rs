@@ -86,7 +86,7 @@ impl TryFrom<DataType> for DataTypeDto {
     type Error = CoreError;
     fn try_from(v: DataType) -> Result<Self, CoreError> {
         Ok(match v {
-            DataType::RegType | DataType::RegConfig | DataType::RegDictionary | DataType::Oid
+            DataType::ExpressionArray(_) | DataType::RegType | DataType::RegConfig | DataType::RegDictionary | DataType::Oid
             | DataType::PgChar | DataType::RealArray | DataType::PgCharArray | DataType::SmallIntArray | DataType::RegDictionaryArray => return Err(CoreError::Sql(crate::relational::SqlError::Unsupported)),
             DataType::Boolean => Self::Boolean,
             DataType::SmallInt => Self::SmallInt,

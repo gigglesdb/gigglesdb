@@ -183,6 +183,7 @@ impl Writer {
             DataType::SmallInt => 1,
             DataType::Integer => 2,
             DataType::BigInt => 3,
+            DataType::ExpressionArray(_) => return Err(Error::Type.into()),
             DataType::RegType
             | DataType::Uuid
             | DataType::Jsonb

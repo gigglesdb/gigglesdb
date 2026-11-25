@@ -561,7 +561,7 @@ fn snapshot_owned(
                             C::Integer => P::Integer,
                             C::BigInt => P::BigInt,
                             C::Text => P::Text,
-                            C::RegType => P::Text,
+                            C::RegType | C::ExpressionArray(_) => P::Text,
                             C::Varchar => P::Varchar,
                             C::Bpchar => P::Bpchar,
                             C::Uuid => P::Uuid,
