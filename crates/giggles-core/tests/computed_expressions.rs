@@ -6,7 +6,7 @@ use giggles_core::{
         Arithmetic, Bindings, Compare, Engine, Error, Expr, Intent, MAX_BINDING_BYTES, MAX_DEPTH,
         MAX_EXPRESSION_NODES, MAX_INPUT, MAX_MUTATION_BYTES, Projection, Request, Sort, ValueExpr,
     },
-    relational::{DataType, MAX_RESULT_BYTES, MAX_ROW_BYTES, SqlRow, Value as V},
+    relational::{DataType, MAX_RESULT_BYTES, MAX_ROW_BYTES, MAX_TARGET_COLUMNS, SqlRow, Value as V},
 };
 use std::sync::Arc;
 
@@ -740,16 +740,17 @@ fn computed_expression_roots_share_binding_depth_node_and_projection_limits() {
             .err(),
         Some(Error::Limit)
     );
-    let too_many = (0..65)
+    let too_many = (0..=MAX_TARGET_COLUMNS)
         .map(|i| Projection {
             expression: field("x"),
             alias: Some(format!("c{i}")),
         })
         .collect();
-    assert!(
+    assert_eq!(
         engine
             .prepare_bound(&select(too_many, None), &Bindings::new())
-            .is_err()
+            .err(),
+        Some(Error::Limit)
     );
     let bindings = Bindings::from([("p".into(), V::Text("x".repeat(MAX_BINDING_BYTES / 2 + 1)))]);
     for request in [

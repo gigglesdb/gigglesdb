@@ -1,5 +1,8 @@
 mod common;
-use giggles_core::{Admin, Engine, Limits, SqlSession, relational::Value::Int};
+use giggles_core::{
+    Admin, Engine, Limits, SqlSession,
+    relational::Value::{Int, Text},
+};
 
 fn fixture(name: &str) -> (std::path::PathBuf, SqlSession) {
     let path = common::fresh(name);
@@ -136,6 +139,37 @@ fn materialized_source_and_late_failure_are_atomic() {
             .affected,
         100_000
     );
+    drop(session);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn grouped_json_insert_source_with_correlated_exists() {
+    let (path, mut session) = fixture("grouped-json-insert");
+    for sql in [
+        "CREATE TABLE events (id int PRIMARY KEY, account int, label text)",
+        "CREATE TABLE eligible (id int PRIMARY KEY)",
+        "CREATE TABLE summary (account int PRIMARY KEY, payload jsonb)",
+        "INSERT INTO events VALUES (1,10,'a'),(2,10,'b'),(3,20,'c')",
+        "INSERT INTO eligible VALUES (1),(2)",
+    ] {
+        session.execute(sql, &[], None).unwrap();
+    }
+    let inserted = session
+        .execute(
+            "INSERT INTO summary SELECT e.account, json_agg(e.label ORDER BY e.id)
+             FROM events e WHERE EXISTS (SELECT 1 FROM eligible a WHERE a.id = e.id)
+             GROUP BY e.account",
+            &[],
+            None,
+        )
+        .unwrap();
+    assert_eq!(inserted.affected, 1);
+    let result = session
+        .execute("SELECT account, payload::text FROM summary", &[], None)
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].values, [Int(10), Text(r#"["a", "b"]"#.into())]);
     drop(session);
     std::fs::remove_dir_all(path).unwrap();
 }

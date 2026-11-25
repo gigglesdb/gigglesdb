@@ -1,5 +1,6 @@
 use super::*;
 use crate::api::{json, proto as p};
+use giggles_core::relational::{MAX_TABLE_COLUMNS, MAX_TARGET_COLUMNS};
 use prost::Message;
 use serde_json::{Value as J, json as j};
 
@@ -361,11 +362,20 @@ fn bindings_lists_rows_and_block_item_limits_are_checked_before_conversion() {
     for size in [65_536, 65_537] {
         assert_eq!(decode(j!({"operation":{"request":read(),"bindings":[{"name":"p","value":{"textValue":"a".repeat(size)}}]}})).is_ok(),size==65_536);
     }
-    for n in [64, 65] {
+    for n in [MAX_TARGET_COLUMNS, MAX_TARGET_COLUMNS + 1] {
         assert_eq!(
             operation(j!({"read":{"table":"app","projection":vec!["id";n]}})).is_ok(),
-            n == 64
+            n == MAX_TARGET_COLUMNS
         );
+    }
+    for n in [MAX_TABLE_COLUMNS, MAX_TABLE_COLUMNS + 1] {
+        let columns: Vec<_> = (0..n).map(|i| format!("c{i}")).collect();
+        let request = j!({"insertMany": {
+            "table": "app", "columns": columns,
+            "rows": [{"values": vec![literal(0); n]}],
+            "cap": {"literal": {"intValue": "1"}}
+        }});
+        assert_eq!(operation(request).is_ok(), n == MAX_TABLE_COLUMNS);
     }
     for n in [1024, 1025] {
         assert_eq!(operation(j!({"insertMany":{"table":"app","columns":["id"],"rows":vec![j!({"values":[field()]});n],"cap":{"literal":{"intValue":"1024"}}}})).is_ok(),n==1024);
@@ -446,10 +456,11 @@ fn direct_protobuf_rejects_missing_presence_unknown_enums_and_excess_collections
             }],
             vec![],
         ),
-        (vec![], vec!["id".into(); 65]),
+        (vec![], vec!["id".into(); MAX_TARGET_COLUMNS + 1]),
     ] {
         assert!(direct(read(None, order, projection)).is_err());
     }
+    assert!(direct(read(None, vec![], vec!["id".into(); MAX_TARGET_COLUMNS])).is_ok());
     for enum_value in [0, 7, i32::MAX, -1] {
         let leaf = || {
             Some(Box::new(p::NativeExpr {

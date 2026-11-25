@@ -58,7 +58,9 @@ fn flat_literal_and_table_arms_fit_default_stack() {
 #[test]
 fn union_distinct_and_mixed_associativity() {
     let mut db = fixture();
-    let distinct = chain(1000, " UNION ", |i| format!("SELECT {} AS x", i % 13));
+    // Each arm uses about five tokens; the legacy parser admits 4096 per statement.
+    let arms = if cfg!(feature = "engine-rocksdb") { 1000 } else { 800 };
+    let distinct = chain(arms, " UNION ", |i| format!("SELECT {} AS x", i % 13));
     assert_eq!(
         execute(&mut db, &format!("SELECT count(*) FROM ({distinct}) s")),
         Ok(vec![13])

@@ -365,7 +365,7 @@ fn authenticated_malformed_headers_and_payloads_are_rejected() {
         encode_row(
             &key,
             0,
-            &vec![Value::Null; crate::relational::MAX_COLUMNS + 1]
+            &vec![Value::Null; crate::relational::MAX_STORED_COLUMNS + 1]
         )
         .is_err()
     );

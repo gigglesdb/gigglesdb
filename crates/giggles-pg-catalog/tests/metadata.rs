@@ -715,14 +715,16 @@ fn every_attribute_references_an_actual_type_and_index_shape() {
 #[test]
 fn row_number_work_bound_without_output_overflow() {
     let mut sn = CatalogSnapshot::default();
-    for id in 0..128 {
+    let tables = 24;
+    let columns = 12;
+    for id in 0..tables {
         sn.tables.push(TableDef {
             id,
             name: format!("table_{id}"),
-            columns: (0..12)
+            columns: (0..columns)
                 .map(|n| ColumnDef {
-                    id: n,
-                    name: format!("col_{n}"),
+                    id: id * columns + n + 1,
+                    name: format!("bound_col_{n}"),
                     data_type: ScalarType::Integer,
                     not_null: false,
                 })
@@ -730,9 +732,22 @@ fn row_number_work_bound_without_output_overflow() {
             primary_key: vec![],
         });
     }
-    let p = plan("SELECT row_number() OVER () FROM pg_attribute")
+    let input = "FROM pg_attribute WHERE attnum > 0 AND attname LIKE 'bound_col_%'";
+    let p = plan(&format!("SELECT row_number() OVER () {input}"))
         .unwrap()
         .unwrap();
+    assert_eq!(
+        execute(&p, &sn, &[]).unwrap().rows.len(),
+        (tables * columns) as usize
+    );
+    // Every row_number comparison evaluates the order key, which charges
+    // the bytes inspected by IS DISTINCT FROM. The 288 x 288 comparisons
+    // therefore exceed the 64M-unit column metadata budget.
+    let needle = "x".repeat(1024);
+    let sql = format!(
+        "SELECT row_number() OVER (ORDER BY attname IS DISTINCT FROM '{needle}') {input}"
+    );
+    let p = plan(&sql).unwrap().unwrap();
     assert_eq!(execute(&p, &sn, &[]).unwrap_err(), Error::Limit);
 }
 #[test]

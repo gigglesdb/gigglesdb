@@ -208,6 +208,31 @@ async fn migration_and_ctas_report_postgres_command_tags() {
             .is_empty()
     );
 
+    client
+        .batch_execute(
+            "CREATE TABLE events (id int PRIMARY KEY, account int, label text);
+             CREATE TABLE eligible (id int PRIMARY KEY);
+             CREATE TABLE summary (account int PRIMARY KEY, payload jsonb);
+             INSERT INTO events VALUES (1,10,'a'),(2,10,'b'),(3,20,'c');
+             INSERT INTO eligible VALUES (1),(2);",
+        )
+        .await
+        .unwrap();
+    command(
+        &mut socket,
+        "INSERT INTO summary SELECT e.account, json_agg(e.label ORDER BY e.id)
+         FROM events e WHERE EXISTS (SELECT 1 FROM eligible a WHERE a.id = e.id)
+         GROUP BY e.account",
+        b"INSERT 0 1\0",
+    )
+    .await;
+    let row = client
+        .query_one("SELECT account, payload::text FROM summary", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i32>(0), 10);
+    assert_eq!(row.get::<_, &str>(1), r#"["a", "b"]"#);
+
     drop(socket);
     drop(client);
     connection.await.unwrap().unwrap();

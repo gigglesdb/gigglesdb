@@ -484,7 +484,7 @@ fn borrowed_source_shape_admission_and_finite_limit_overflows_precede_callback()
                     .values_mut()
                     .next()
                     .unwrap()
-                    .values = vec![Value::Null; 65]
+                    .values = vec![Value::Null; MAX_STORED_COLUMNS + 1]
             }
             _ => {
                 std::sync::Arc::make_mut(&mut bad.tables).get_mut("things").unwrap().primary_key = vec![0; 65];

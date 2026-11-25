@@ -288,12 +288,14 @@ fn profile_0_21_capabilities_unchanged() {
     // engine_rows.*.concurrent_explicit_sessions (+68 bytes in both profiles).
     // Refrozen at GD-0092 AM-3, whose removal of the per-database table cap
     // made limits.catalog_tables null instead of 128 (+1 byte in both profiles).
+    // Refrozen for GD-0092's table width increase from 64 to 1600 columns
+    // (+2 bytes in limits.columns_per_table in both profiles).
     // The manifest text differs slightly without the v2 engine.
     if cfg!(feature = "engine-rocksdb") {
-        assert_eq!(fingerprint(LanguageVersion::Embedded020), (193_966, 0xe724_9eb8_111d_e3d0));
-        assert_eq!(fingerprint(PREVIOUS), (201_608, 0xef85_bf52_bccc_454e));
+        assert_eq!(fingerprint(LanguageVersion::Embedded020), (193_968, 0xe4ac_f177_3279_5193));
+        assert_eq!(fingerprint(PREVIOUS), (201_610, 0xbdc1_f673_0fb5_8fe9));
     } else {
-        assert_eq!(fingerprint(LanguageVersion::Embedded020), (193_963, 0x201a_a814_5070_83f7));
-        assert_eq!(fingerprint(PREVIOUS), (201_605, 0xc1af_699b_6049_a65b));
+        assert_eq!(fingerprint(LanguageVersion::Embedded020), (193_965, 0x9e55_0e7b_f0fa_5406));
+        assert_eq!(fingerprint(PREVIOUS), (201_607, 0xa4d5_a467_d47a_7fa6));
     }
 }

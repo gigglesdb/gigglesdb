@@ -1,6 +1,6 @@
 mod common;
 use common::*;
-use giggles_core::relational::{DataType, Value};
+use giggles_core::relational::{DataType, MAX_TABLE_COLUMNS, Value};
 use giggles_export::*;
 use sha2::{Digest, Sha256};
 fn rehash(lines: &mut [serde_json::Value]) {
@@ -136,7 +136,7 @@ fn schema_maxima_and_exact_row_cap() {
     assert!(encode(&a, Bounds::default()).is_err());
     let mut a = sample();
     a.rows[0].clear();
-    a.tables[0].columns = (0..64)
+    a.tables[0].columns = (0..MAX_TABLE_COLUMNS)
         .map(|i| Column {
             name: format!("c{i}"),
             data_type: DataType::BigInt,

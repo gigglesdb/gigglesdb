@@ -1470,7 +1470,6 @@ impl Grouping {
                     }
                 }
             }
-            let mut retention = scope.borrow();
             if exists && (!query.query.distinct() || page.offset == 0) {
                 if skipped == page.offset {
                     result.rows.push(SqlRow { values: vec![], version: 0 });
@@ -1490,7 +1489,7 @@ impl Grouping {
                 if distinct.contains(&key) {
                     continue;
                 }
-                distinct_charge(&key.0, &self.order_slots, &mut retention)?;
+                distinct_charge(&key.0, &self.order_slots, &mut scope.borrow())?;
                 let values = key.0.clone();
                 distinct.insert(key);
                 values
@@ -1504,6 +1503,7 @@ impl Grouping {
                     break;
                 }
                 if skipped >= page.offset {
+                    // The output can charge the same ledger.
                     output.push(SqlRow { values, version: 0 }, &mut result, execution)?;
                 }
                 skipped += 1;
@@ -1526,11 +1526,11 @@ impl Grouping {
             let item = (SqlRow { values, version: 0 }, keys);
             if v2 {
                 let bytes = keyed_row_bytes(&item);
-                ordered.push(item, bytes, order_cmp, &mut *retention)?;
+                ordered.push(item, bytes, order_cmp, &mut scope)?;
                 continue;
             }
             if !query.query.distinct() {
-                retention.charge(retained(&item.0.values) + retained(&item.1))?;
+                scope.borrow().charge(retained(&item.0.values) + retained(&item.1))?;
             }
             rows.push(item);
         }
