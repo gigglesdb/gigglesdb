@@ -3308,10 +3308,11 @@ impl SqlSession {
             if let Some(s) = &self.staged { check(&MetadataState::borrow(s)) }
             else { self.inspect_metadata(check) }
         })();
-        if result.is_err() { self.abort(); }
+        if result.is_err() { self.abort_without_settling(); }
         result
     }
     /// Validate dependency-free immutable projection/order constants without executing SQL.
+    /// Failures contain no drawn value; older reservations remain private.
     pub fn validate_immutable_constants(
         &mut self,
         p: &relational::Prepared,
@@ -3345,7 +3346,7 @@ impl SqlSession {
             }
         })();
         if result.is_err() {
-            self.abort();
+            self.abort_without_settling();
         }
         result
     }
@@ -4777,7 +4778,7 @@ impl SqlSession {
             None => self.inspect_metadata(columns),
         };
         if result.is_err() {
-            self.abort();
+            self.abort_without_settling();
         }
         result
     }

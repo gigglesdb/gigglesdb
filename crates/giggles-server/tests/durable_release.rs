@@ -1028,6 +1028,12 @@ mod mechanism_a {
         ExtendedParse,
         MalformedComment,
         UnknownColumn,
+        BindError,
+        BindFresh,
+        BindCached,
+        CopyView,
+        CopyFreeze,
+        CopyUnknown,
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1060,6 +1066,43 @@ mod mechanism_a {
         rejection_with_ack_held(Rejection::UnknownColumn).await;
     }
 
+    // Contract tests: in an aborted transaction Bind refresh returns 25P02 before
+    // the constant checks, so these two pass without N2. The switched checks are
+    // covered by service::lifecycle_tests::n2_constants_* and by
+    // n2_bind_constant_error_with_ack_held below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn n2_bind_constants_fresh_with_ack_held() {
+        rejection_with_ack_held(Rejection::BindFresh).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn n2_bind_constants_cached_with_ack_held() {
+        rejection_with_ack_held(Rejection::BindCached).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn n2_copy_view_setup_with_ack_held() {
+        rejection_with_ack_held(Rejection::CopyView).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn n2_copy_freeze_setup_with_ack_held() {
+        rejection_with_ack_held(Rejection::CopyFreeze).await;
+    }
+
+    // Contract test: COPY prepare rejects the unknown column before copy_columns,
+    // so it passes without N2; copy_columns itself is covered by
+    // service::lifecycle_tests::n2_copy_columns_refusal_with_ack_held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn n2_copy_unknown_column_setup_with_ack_held() {
+        rejection_with_ack_held(Rejection::CopyUnknown).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn n2_bind_constant_error_with_ack_held() {
+        rejection_with_ack_held(Rejection::BindError).await;
+    }
+
     async fn rejection_with_ack_held(rejection: Rejection) {
         tokio::time::timeout(Duration::from_secs(30), reject_with_ack_held(rejection))
             .await.expect("statement rejection fixture timed out");
@@ -1070,6 +1113,7 @@ mod mechanism_a {
         tokio::time::timeout(Duration::from_secs(10), client.batch_execute(
             "CREATE SEQUENCE rejected_seq;
              CREATE TABLE rejected_insert(id bigint PRIMARY KEY DEFAULT nextval('rejected_seq'));
+             CREATE VIEW rejected_view AS SELECT id FROM rejected_insert;
              CREATE TABLE admission_hold(id int PRIMARY KEY, v int);
              INSERT INTO admission_hold VALUES (7, 0);
              SELECT setval('rejected_seq', 2)",
@@ -1079,6 +1123,20 @@ mod mechanism_a {
         assert_eq!(until_ready(&mut wire).await.last().unwrap().1, b"I");
         query(&mut wire, "BEGIN").await;
         assert_eq!(until_ready(&mut wire).await.last().unwrap().1, b"T");
+
+        if matches!(rejection, Rejection::BindFresh | Rejection::BindCached | Rejection::BindError) {
+            let sql = if matches!(rejection, Rejection::BindError) { "SELECT 1 / 0 FROM rejected_insert" } else { "SELECT 1 + 2 FROM rejected_insert" };
+            let mut bytes = frame(b'P', format!("n2\0{sql}\0\0\0").as_bytes());
+            if matches!(rejection, Rejection::BindCached) {
+                bytes.extend(frame(b'B', b"\0n2\0\0\0\0\0\0\0"));
+            }
+            bytes.extend(frame(b'H', b""));
+            wire.write_all(&bytes).await.unwrap();
+            assert_eq!(message(&mut wire).await.0, b'1');
+            if matches!(rejection, Rejection::BindCached) {
+                assert_eq!(message(&mut wire).await.0, b'2');
+            }
+        }
 
         let reservation = giggles_core::CommitSyncHook::new();
         let _release = ReleaseOnDrop(reservation.clone());
@@ -1111,6 +1169,11 @@ mod mechanism_a {
             Rejection::ExtendedParse => ("SELECT 1 FROM rejected_insert", true, false, b"25P02"),
             Rejection::MalformedComment => ("COMMENT ON TABLE", true, true, b"42601"),
             Rejection::UnknownColumn => ("SELECT nonexistent_column FROM rejected_insert", true, true, b"42703"),
+            Rejection::BindFresh | Rejection::BindCached => ("", true, false, b"25P02"),
+            Rejection::BindError => ("", true, false, b"22012"),
+            Rejection::CopyView => ("COPY rejected_view FROM STDIN", false, false, b"42809"),
+            Rejection::CopyFreeze => ("COPY rejected_insert FROM STDIN (FREEZE)", false, false, b"55000"),
+            Rejection::CopyUnknown => ("COPY rejected_insert(missing) FROM STDIN", false, false, b"42703"),
         };
         let send = async |wire: &mut Wire, sql: &str| {
             if extended {
@@ -1122,7 +1185,9 @@ mod mechanism_a {
             }
             until_ready(wire).await
         };
-        let replies = tokio::time::timeout(Duration::from_secs(2), async {
+        // An unbounded wait on the held reservation is the failure this detects;
+        // 5 s leaves room for the ROLLBACK/BEGIN steps on a loaded machine.
+        let replies = tokio::time::timeout(Duration::from_secs(5), async {
             if idle {
                 query(&mut wire, "ROLLBACK").await;
                 assert_eq!(until_ready(&mut wire).await, [(b'C', b"ROLLBACK\0".to_vec()), (b'Z', b"I".to_vec())]);
@@ -1135,7 +1200,21 @@ mod mechanism_a {
                 assert_error(replies[0].clone(), b"25P02");
                 assert_eq!(replies[1], (b'Z', b"E".to_vec()));
             }
-            send(&mut wire, sql).await
+            if matches!(rejection, Rejection::CopyView | Rejection::CopyFreeze | Rejection::CopyUnknown | Rejection::BindError) {
+                query(&mut wire, "ROLLBACK").await;
+                assert_eq!(until_ready(&mut wire).await.last().unwrap().1, b"I");
+                query(&mut wire, "BEGIN").await;
+                assert_eq!(until_ready(&mut wire).await.last().unwrap().1, b"T");
+            }
+            if matches!(rejection, Rejection::BindFresh | Rejection::BindCached | Rejection::BindError) {
+                let mut bytes = frame(b'B', b"\0n2\0\0\0\0\0\0\0");
+                bytes.extend(frame(b'E', EXECUTE_UNNAMED));
+                bytes.extend(frame(b'S', b""));
+                wire.write_all(&bytes).await.unwrap();
+                until_ready(&mut wire).await
+            } else {
+                send(&mut wire, sql).await
+            }
         }).await;
         admin.set_commit_sync_hook(None);
         reservation.release(false);
@@ -1146,7 +1225,8 @@ mod mechanism_a {
         tokio::time::timeout(Duration::from_secs(10),
             finish(path, admin, service, running, client, connection),
         ).await.unwrap();
-        let replies = replies.expect("a rejected statement waited for the held reservation");
+        let mut replies = replies.expect("a rejected statement waited for the held reservation");
+        replies.retain(|(tag, _)| *tag != b'G');
         if matches!(rejection, Rejection::Admission) {
             assert_eq!(replies.len(), 3);
             assert_eq!(replies[0], (b'C', b"ROLLBACK\0".to_vec()));

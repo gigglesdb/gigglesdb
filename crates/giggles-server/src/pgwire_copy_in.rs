@@ -358,7 +358,7 @@ impl State {
             let name = self.copy.as_ref().unwrap().descriptor.table.rsplit('\0').next().unwrap();
             self.diagnostic.wire_message = Some(format!("cannot copy to view \"{name}\""));
             self.diagnostic.wire_hint = Some("To enable copying to a view, provide an INSTEAD OF INSERT trigger.".into());
-            session.sql.abort();
+            session.sql.abort_without_settling();
             self.copy_error("42809", session, out);
             return Ok(());
         }
@@ -370,7 +370,7 @@ impl State {
             } else { None };
             if let Some((code, message)) = failure {
                 self.diagnostic.wire_message = Some(message.into());
-                session.sql.abort();
+                session.sql.abort_without_settling();
                 self.copy_error(code, session, out);
                 return Ok(());
             }

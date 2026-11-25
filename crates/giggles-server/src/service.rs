@@ -2901,7 +2901,7 @@ impl Session {
         self.authority_scope(|session| {
             let superuser = session.table_privilege_superuser()?;
             if !session.table_requirements_allowed(reqs, superuser, true)? {
-                session.sql.abort();
+                session.sql.abort_without_settling();
                 return Err(CoreError::Policy(Error::Scope));
             }
             Ok(())
@@ -2967,7 +2967,7 @@ impl Session {
                 self.schema_privilege_allowed(&schema, name, roles::SchemaPrivilege::Create)?
             }
         };
-        if !allowed { self.sql.abort(); return Err(CoreError::Policy(Error::Scope)); }
+        if !allowed { self.sql.abort_without_settling(); return Err(CoreError::Policy(Error::Scope)); }
         Ok(())
     }
     fn authorization_context(&self) -> Option<AuthorizationContext> {
@@ -3845,7 +3845,7 @@ impl Session {
             session.reconcile_sequence_owners()?;
             let authorization = if bound.is_drop_trigger() {
                 session.admit_backstop(bound.task_class())?;
-                if let Some(restricted) = session.authorize_routine_ddl(&bound).inspect_err(|_| session.sql.abort())? {
+                if let Some(restricted) = session.authorize_routine_ddl(&bound).inspect_err(|_| session.sql.abort_without_settling())? {
                     bound = restricted;
                 }
                 None
@@ -4269,7 +4269,7 @@ impl Session {
         let (request, budget) = match request {
             Request::Deadline { budget_ms, request } => {
                 if budget_ms > 10_000 || matches!(*request, Request::Deadline { .. }) {
-                    self.abort();
+                    self.abort_without_settling();
                     return Response::code("54000");
                 }
                 (*request, Some(std::time::Duration::from_millis(budget_ms)))
@@ -4307,7 +4307,7 @@ impl Session {
             None
         };
         if context.check().is_err() {
-            self.abort();
+            self.abort_without_settling();
             return Response {
                 operation,
                 ..Response::code("57014")
@@ -4902,6 +4902,115 @@ mod lifecycle_tests {
                 Some(SqlErrorDetail::DuplicateKey(key)) if key.values == KEY_DETAIL));
         }
     }
+
+    #[cfg(feature = "engine-rocksdb")]
+    fn n2_refusal_with_ack_held(kind: &str) {
+        let service = authorization_fixture(Engine::V2);
+        let mut owner = service.role_session("owner").unwrap();
+        owner.execute_sql("CREATE SEQUENCE n2_seq", &[]).unwrap();
+        owner.execute_sql("CREATE TABLE n2_buffer(payload int, id bigint DEFAULT nextval('n2_seq'))", &[]).unwrap();
+        owner.execute_sql("SELECT setval('n2_seq', 2)", &[]).unwrap();
+        owner.execute_sql("CREATE SCHEMA n2_hidden", &[]).unwrap();
+        owner.execute_sql("CREATE TABLE n2_hidden.t(id int)", &[]).unwrap();
+        service.admin.roles().set_table_owner("n2_seq", "reader").unwrap();
+        let mut session = service.role_session("reader").unwrap();
+        session.sql.execute("BEGIN", &[], None).unwrap();
+        let (_, copy) = session.sql.prepare_copy("COPY n2_buffer(payload) FROM STDIN").unwrap();
+        let drop_trigger = session.sql.prepare("DROP TRIGGER absent ON n2_hidden.t").unwrap();
+        let constants = session.sql.prepare("SELECT 1 + 2 FROM t").unwrap();
+        session.sql.validate_immutable_constants(&constants).unwrap();
+        let hook = giggles_core::CommitSyncHook::new();
+        struct Release(Arc<giggles_core::CommitSyncHook>);
+        impl Drop for Release {
+            fn drop(&mut self) { self.0.release(false); }
+        }
+        let _release = Release(hook.clone());
+        service.admin.set_commit_sync_hook(Some(hook.clone()));
+        // Buffered normalization draws privately, leaving the transaction usable
+        // and its reservation pending without exposing the default value.
+        let buffer = session.sql.normalize_buffered_copy_cells_at(&copy,
+            relational::CopyInput {
+                rows: vec![vec![Some(Value::Int(1))]],
+                options: Default::default(), first_line: 1, skipped: 0,
+            }, &StatementClock { unavailable: None, transaction_us: 0, statement_us: 0, zone: None, wall: None }).unwrap();
+        assert!(hook.wait_entered(std::time::Duration::from_secs(5)));
+        let (send, recv) = std::sync::mpsc::channel();
+        let expected = match kind { "deadline" => "54000", "cancel" => "57014", "constants_fresh" | "constants_cached" => "25P02", "copy_columns" => "42703", _ => "42501" };
+        let kind = kind.to_owned();
+        let worker = std::thread::spawn(move || {
+            let code = match kind.as_str() {
+                "constants_fresh" | "constants_cached" => {
+                    session.sql.abort_without_settling();
+                    let result = if kind == "constants_cached" {
+                        session.sql.constants_validated_preflight(&constants)
+                    } else {
+                        session.sql.validate_immutable_constants(&constants)
+                    };
+                    sqlstate(&result.unwrap_err()).to_owned()
+                }
+                "copy_columns" => {
+                    let copy = relational::Copy::parse("COPY n2_buffer(missing) FROM STDIN").unwrap();
+                    sqlstate(&session.sql.copy_columns(&copy).unwrap_err()).to_owned()
+                }
+                "table" => sqlstate(&session.authorize_table_requirements(&[("t".into(), roles::TablePrivilege::Insert)]).unwrap_err()).to_owned(),
+                "ddl" => sqlstate(&session.authorize_native_catalog(&giggles_core::operations::CatalogRequest::CreateTable {
+                    table: "denied".into(), columns: vec![], primary_key: vec![],
+                }).unwrap_err()).to_owned(),
+                "routine" => {
+                    // Schema USAGE denial precedes the restricted trigger lookup.
+                    sqlstate(&session.execute_prepared_unreleased(&drop_trigger, &[]).unwrap_err()).to_owned()
+                }
+                "deadline" => session.handle(Request::Deadline { budget_ms: 10_001, request: Box::new(Request::Ping) }).code,
+                "cancel" => {
+                    let cancel = Cancellation::default();
+                    cancel.cancel();
+                    session.handle_scoped(Request::Ping, std::time::Instant::now(), &cancel, None).code
+                }
+                _ => unreachable!(),
+            };
+            assert!(send.send((code, session)).is_ok());
+        });
+        let reply = recv.recv_timeout(std::time::Duration::from_secs(2));
+        service.admin.set_commit_sync_hook(None);
+        hook.release(false);
+        worker.join().unwrap();
+        let (code, mut session) = reply.expect("N2 refusal waited for held reservation");
+        assert_eq!(code, expected);
+        session.sql.rollback();
+        drop(buffer);
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn n2_table_refusal_with_ack_held() { n2_refusal_with_ack_held("table"); }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn n2_ddl_refusal_with_ack_held() { n2_refusal_with_ack_held("ddl"); }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn n2_routine_refusal_with_ack_held() { n2_refusal_with_ack_held("routine"); }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn n2_deadline_refusal_with_ack_held() { n2_refusal_with_ack_held("deadline"); }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn n2_cancel_refusal_with_ack_held() { n2_refusal_with_ack_held("cancel"); }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn n2_constants_fresh_refusal_with_ack_held() { n2_refusal_with_ack_held("constants_fresh"); }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn n2_constants_cached_refusal_with_ack_held() { n2_refusal_with_ack_held("constants_cached"); }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn n2_copy_columns_refusal_with_ack_held() { n2_refusal_with_ack_held("copy_columns"); }
 
     fn authorization_fixture(engine: Engine) -> Arc<Service> {
         static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
