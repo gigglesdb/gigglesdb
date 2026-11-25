@@ -283,14 +283,18 @@ fn review_ilike_locale_and_pattern_collation_budget() {
         r#"SELECT U&'\0130' ILIKE 'i', U&'\00C9' COLLATE "C" ILIKE U&'\00E9',
          U&'\0130' COLLATE "POSIX" ILIKE 'i', U&'\0130' COLLATE "und-x-icu" ILIKE 'i',
          U&'\0130' COLLATE "pg_unicode_fast" ILIKE 'i', 'a' ILIKE ('A' COLLATE "en_US"),
-         repeat('a', 4096) LIKE 'b%' COLLATE w4_ci,
-         repeat('a', 4096) ILIKE 'B%' COLLATE w4_ci"#,
+         repeat('a', 4096) LIKE 'b%' COLLATE w4_ci"#,
         &[], None,
     ).unwrap();
     assert_eq!(
         result.rows[0].values,
-        [true, false, false, false, false, true, false, false].map(Value::Bool),
+        [true, false, false, false, false, true, false].map(Value::Bool),
     );
+    let error = session.execute("SELECT repeat('a', 4096) ILIKE 'B%' COLLATE w4_ci", &[], None)
+        .unwrap_err();
+    assert_eq!(giggles_core::sqlstate(&error), "0A000");
+    assert_eq!(giggles_core::relational::take_sql_error_message().as_deref(),
+        Some("nondeterministic collations are not supported for ILIKE"));
 }
 
 #[test]

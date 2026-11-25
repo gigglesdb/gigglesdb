@@ -47,6 +47,126 @@ pub(super) fn eval(n: &str, v: &[Value], budget: &mut usize) -> Option<R<Value>>
     }
     Some(evaluate(n, v, budget))
 }
+
+pub(super) fn eval_collated_search(
+    name: &str, values: &[Value], collator: &giggles_icu::Collator, budget: &mut usize,
+) -> R<Value> {
+    let source = text(&values[0])?;
+    let needle = text(&values[1])?;
+    let search = CollatedSearch { needle, collator };
+    let output = |text: &str, budget: &mut usize| {
+        reserve(budget, text.len())?;
+        Ok(Value::Text(text.to_owned()))
+    };
+    match name {
+        "strpos" | "position" => {
+            let index = if needle.is_empty() {
+                1
+            } else {
+                search.find(source, false, budget)?
+                    .map_or(0, |(start, _)| source[..start].chars().count() + 1)
+            };
+            reserve(budget, 8)?;
+            Ok(Value::Int(i64::from(i32::try_from(index).map_err(|_| SqlError::Overflow)?)))
+        }
+        "replace" => {
+            if needle.is_empty() {
+                return output(source, budget);
+            }
+            let replacement = text(&values[2])?;
+            let mut remaining = source;
+            let mut result = String::new();
+            let mut append = |prefix: &str, replacement: &str, budget: &mut usize| {
+                let added = prefix.len().saturating_add(replacement.len());
+                if result.len().saturating_add(added) > crate::relational::max_value_bytes() {
+                    return Err(SqlError::Limit);
+                }
+                reserve(budget, added)?;
+                result.push_str(prefix);
+                result.push_str(replacement);
+                Ok(())
+            };
+            while let Some((start, end)) = search.find(remaining, true, budget)? {
+                append(&remaining[..start], replacement, budget)?;
+                remaining = &remaining[end..];
+            }
+            append(remaining, "", budget)?;
+            Ok(Value::Text(result))
+        }
+        "split_part" => {
+            let Value::Int(field) = values[2] else { return Err(SqlError::Type); };
+            if field == 0 {
+                user_types::view_replace_error("field position must not be zero".into());
+                return Err(SqlError::InvalidParameterValue);
+            }
+            if needle.is_empty() || source.is_empty() {
+                return output(if field == 1 || field == -1 { source } else { "" }, budget);
+            }
+            let target = if field > 0 {
+                field as u64
+            } else {
+                let mut remaining = source;
+                let mut fields = 1u64;
+                while let Some((_, end)) = search.find(remaining, true, budget)? {
+                    remaining = &remaining[end..];
+                    fields += 1;
+                }
+                if field == -1 {
+                    return output(remaining, budget);
+                }
+                let Some(index) = fields.checked_sub(field.unsigned_abs()) else {
+                    return output("", budget);
+                };
+                index + 1
+            };
+            let mut remaining = source;
+            for field in 1..=target {
+                let found = search.find(remaining, true, budget)?;
+                match found {
+                    Some((start, _)) if field == target => return output(&remaining[..start], budget),
+                    Some((_, end)) => remaining = &remaining[end..],
+                    None => return output(if field == target { remaining } else { "" }, budget),
+                }
+            }
+            unreachable!("positive field number")
+        }
+        _ => Err(SqlError::UndefinedFunction),
+    }
+}
+
+struct CollatedSearch<'a> {
+    needle: &'a str,
+    collator: &'a giggles_icu::Collator,
+}
+
+impl CollatedSearch<'_> {
+    // Only nonempty matches advance the search. Replacement and splitting use
+    // the longest match at the earliest start to consume ignorable characters.
+    fn find(&self, source: &str, greedy: bool, budget: &mut usize) -> R<Option<(usize, usize)>> {
+        for (start, _) in source.char_indices() {
+            crate::cancellation::check().map_err(|_| SqlError::Aborted)?;
+            let suffix = &source[start..];
+            let ends = suffix.char_indices().skip(1).map(|(i, _)| i)
+                .chain(std::iter::once(suffix.len()));
+            let mut matched = None;
+            for end in ends {
+                let candidate = &suffix[..end];
+                reserve(budget, crate::relational::like::comparison_work(candidate, self.needle))?;
+                if self.collator.compare_utf8(candidate.as_bytes(), self.needle.as_bytes()).is_eq() {
+                    matched = Some((start, start + end));
+                    if !greedy {
+                        break;
+                    }
+                }
+            }
+            if matched.is_some() {
+                return Ok(matched);
+            }
+        }
+        Ok(None)
+    }
+}
+
 fn evaluate(n: &str, v: &[Value], budget: &mut usize) -> R<Value> {
     let output = |s: &str, budget: &mut usize| {
         reserve(budget, s.len())?;

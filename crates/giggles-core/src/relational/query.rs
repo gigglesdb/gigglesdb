@@ -1965,7 +1965,7 @@ impl BoundFilter {
                 insensitive,
                 negated,
             } => {
-                let args = [value, pattern];
+                let args = [value, pattern].into_iter().chain(escape.as_deref());
                 let pattern = pattern.plan_constant(budget)?;
                 let escape = match escape {
                     Some(a) => a.plan_constant(budget)?,
@@ -2028,7 +2028,7 @@ impl BoundFilter {
                 insensitive,
                 negated,
             } => {
-                let args = [value, pattern];
+                let args = [value, pattern].into_iter().chain(escape.as_deref());
                 let pattern = pattern.eval(row, params, bytes)?;
                 let escape = match escape {
                     Some(a) => a.eval(row, params, bytes)?,
@@ -4267,6 +4267,9 @@ impl Query {
         }
         if grouped {
             let mut bound = grouping::bind(self, &tables, parameters, &resolve, subqueries)?;
+            bound.predicates.retain(|(c, op, _)| {
+                state.byte_key_predicate(&tables[c.source].columns[c.column], op)
+            });
             bound.exists_keys = exists::probe_keys(self, &tables,
                 &bound.parameters.iter().cloned().map(Some).collect::<Vec<_>>(), &resolve)?;
             bound.outer_slots = outer_slots.into_inner();
@@ -4398,11 +4401,7 @@ impl Query {
                 return Err(SqlError::Unsupported);
             }
             let column = &tables[c.source].columns[c.column];
-            let id = column.id;
-            // Array keys retain their byte encoding for equality lookups.
-            if !state.deterministic_column(id)
-                || op != "=" && (column.data_type.is_array() || !state.byte_ordered(id))
-            {
+            if !state.byte_key_predicate(column, op) {
                 continue;
             }
             if let Expr::Literal(value) = e
@@ -5489,6 +5488,9 @@ impl BoundQuery<'_> {
             for (c, op, expr) in &self.query.predicates {
                 let offset = col(self.tables[0], &c.name)?;
                 let column = &self.tables[0].columns[offset];
+                if !state.byte_key_predicate(column, op) {
+                    continue;
+                }
                 let mut value = expr.value(params)?;
                 if let Expr::Literal(literal) = expr
                     && let Some(typed) = unknown_comparison_literal(literal, &column.data_type)?

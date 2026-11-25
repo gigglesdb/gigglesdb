@@ -4224,6 +4224,22 @@ fn bounds(t: &TableDef, preds: &[Predicate], params: &[Value]) -> R<Bounds> {
         point: false,
     })
 }
+impl Relational {
+    fn mutation_bounds(
+        &self, prepared: &Prepared, table: &TableDef, predicates: &[Predicate], params: &[Value],
+    ) -> R<Bounds> {
+        // A searched SQL mutation compares values. Internal point publishers
+        // (including joined DML and MERGE) already hold the selected row's key.
+        if searched::target(prepared).is_some() {
+            for p in predicates {
+                if !self.byte_key_predicate(&table.columns[col(table, &p.column)?], &p.op) {
+                    return Err(SqlError::Unbounded);
+                }
+            }
+        }
+        bounds(table, predicates, params)
+    }
+}
 /// Parse a PL/pgSQL variable's SQL type without binding to a catalog.
 pub(crate) fn plpgsql_data_type(sql: &str) -> R<DataType> {
     let mut p = Parser {
@@ -5359,7 +5375,7 @@ impl Relational {
                 name, predicates, ..
             } => {
                 let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
-                let b = match bounds(t, predicates, params) {
+                let b = match self.mutation_bounds(prepared, t, predicates, params) {
                     Ok(b)
                         if b.point
                             && !searched::target(prepared)
@@ -5469,7 +5485,7 @@ impl Relational {
                 name, predicates, ..
             } => {
                 let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
-                let b = match bounds(t, predicates, params) {
+                let b = match self.mutation_bounds(prepared, t, predicates, params) {
                     Ok(b)
                         if b.point
                             && !searched::target(prepared)

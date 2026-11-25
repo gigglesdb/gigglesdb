@@ -554,6 +554,8 @@ mod user_collation_ddl;
 
 #[path = "column_collation_ddl.rs"] mod column_collation_ddl;
 #[path = "column_collation_query.rs"] mod column_collation_query;
+#[path = "sql_nondeterministic_lookup.rs"]
+mod sql_nondeterministic_lookup;
 #[path = "column_collation_index.rs"] mod column_collation_index;
 
 #[path = "nondeterministic_unique.rs"] mod nondeterministic_unique;

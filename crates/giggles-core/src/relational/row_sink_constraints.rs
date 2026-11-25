@@ -306,7 +306,7 @@ pub(super) fn paged_pending(
     state: &Relational, deferred: &mut DeferralState, names: &[String], mode: bool,
     sink: &mut impl RowSink,
 ) -> Result<SqlResult, CoreError> {
-    let mut selected = DeferralState { replica: deferred.replica, modes: deferred.modes.clone(), pending: BTreeMap::new() };
+    let mut selected = DeferralState { replica: deferred.replica, modes: deferred.modes.clone(), ..Default::default() };
     state.set_constraints(&mut selected, names, mode, || crate::cancellation::check().is_err())
         .map_err(CoreError::Sql)?;
     if !mode {
@@ -318,10 +318,19 @@ pub(super) fn paged_pending(
             let mut after = None;
             while let Some((last, rows)) = sink.fk_read_page(table, after.take())? {
                 after = Some(last);
-                let mut pending = DeferralState { replica: deferred.replica, modes: deferred.modes.clone(), pending: BTreeMap::new() };
+                let mut pending = DeferralState { replica: deferred.replica, modes: deferred.modes.clone(), ..Default::default() };
                 for ((id, table_id), keys) in &checks {
                     let keys = rows.keys().filter(|key| keys.contains(*key)).cloned().collect::<BTreeSet<_>>();
-                    if !keys.is_empty() { pending.pending.insert((*id, *table_id), keys); }
+                    if !keys.is_empty() {
+                        let check = (*id, *table_id);
+                        if let Some(details) = deferred.parent_details.get(&check) {
+                            let filtered = keys.iter().filter_map(|key| {
+                                Some((key.clone(), Arc::clone(details.get(key)?)))
+                            }).collect();
+                            pending.parent_details.insert(check, filtered);
+                        }
+                        pending.pending.insert(check, keys);
+                    }
                 }
                 if pending.pending.is_empty() { continue; }
                 let mut page = state.clone();
@@ -337,6 +346,7 @@ pub(super) fn paged_pending(
         }
         deferred.pending.retain(|(id, table_id), _| !state.ext.constraints.get(table_id)
             .is_some_and(|cs| cs.iter().any(|c| c.id == *id && (names.is_empty() || names.contains(&c.name)))));
+        deferred.prune_parent_details();
     }
     deferred.modes = selected.modes;
     Ok(SqlResult::default())

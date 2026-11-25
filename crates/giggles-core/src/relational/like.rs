@@ -108,35 +108,107 @@ pub(super) fn like(
     Ok(p == pattern.len())
 }
 
-/// PG18 nondeterministic LIKE: wildcards consume characters, literal runs
-/// compare whole substrings under the collation (including ignorable chars).
-pub(super) fn collated(value:&str,pattern:&str,escape:Escape,work:&mut usize,eq:impl Fn(&str,&str)->bool)->R<bool> {
-    enum Part { Literal(String), One, Many }
-    let mut parts=Vec::new(); let mut literal=String::new(); let mut chars=pattern.chars();
-    while let Some(c)=chars.next() {
-        if Some(c)==escape.0 {literal.push(chars.next().ok_or(SqlError::InvalidEscapeSequence)?);}
-        else if matches!(c,'_'|'%') {
-            if !literal.is_empty() {parts.push(Part::Literal(std::mem::take(&mut literal)));}
-            parts.push(if c=='_' {Part::One} else {Part::Many});
-        } else {literal.push(c);}
+pub(super) fn comparison_work(left: &str, right: &str) -> usize {
+    // Count each comparison plus the blocks of input it can inspect.
+    1 + left.len().saturating_add(right.len()).div_ceil(16)
+}
+
+/// Track the reachable character boundaries after each wildcard or literal run.
+pub(super) fn collated(
+    value: &str, pattern: &str, escape: Escape, work: &mut usize,
+    eq: impl Fn(&str, &str) -> bool,
+) -> R<bool> {
+    enum Part {
+        Literal(String, bool),
+        One,
+        Many(usize),
     }
-    if !literal.is_empty() {parts.push(Part::Literal(literal));}
-    let mut offsets:Vec<_>=value.char_indices().map(|(i,_)|i).collect(); offsets.push(value.len());
-    charge(work,offsets.len().saturating_mul(2))?;
-    let mut previous=vec![false;offsets.len()];previous[0]=true;
-    for part in parts {
-        let mut next=vec![false;offsets.len()];
-        match part {
-            Part::Many=>{let mut seen=false;for (n,p) in next.iter_mut().zip(&previous) {seen|=*p;*n=seen;}},
-            Part::One=>next[1..].copy_from_slice(&previous[..previous.len()-1]),
-            Part::Literal(p)=>for (start,matched) in previous.iter().enumerate() {if *matched {for end in start..offsets.len() {
-                charge(work,1+offsets[end]-offsets[start])?;
-                if eq(&value[offsets[start]..offsets[end]],&p) {next[end]=true;}
-            }}},
+    charge(work, value.len().saturating_add(pattern.len()))?;
+    let mut parts = Vec::new();
+    let mut literal = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if Some(c) == escape.0 {
+            let Some(escaped) = chars.next() else {
+                parts.push(Part::Literal(std::mem::take(&mut literal), false));
+                break;
+            };
+            literal.push(escaped);
+        } else if matches!(c, '_' | '%') {
+            if !literal.is_empty() {
+                parts.push(Part::Literal(std::mem::take(&mut literal), true));
+            }
+            if let Some(Part::Many(minimum)) = parts.last_mut() {
+                *minimum += usize::from(c == '_');
+            } else if c == '_' {
+                parts.push(Part::One);
+            } else {
+                parts.push(Part::Many(0));
+            }
+        } else {
+            literal.push(c);
         }
-        previous=next;
     }
-    Ok(previous.last().copied().unwrap_or(false))
+    if !literal.is_empty() {
+        parts.push(Part::Literal(literal, true));
+    }
+    let mut offsets: Vec<_> = value.char_indices().map(|(i, _)| i).collect();
+    let end = offsets.len();
+    offsets.push(value.len());
+    let mut reachable = vec![false; offsets.len()];
+    let mut next = reachable.clone();
+    reachable[0] = true;
+    for (index, part) in parts.iter().enumerate() {
+        crate::cancellation::check().map_err(|_| SqlError::Aborted)?;
+        charge(work, offsets.len())?;
+        next.fill(false);
+        match part {
+            Part::Many(minimum) => {
+                let Some(start) = reachable.iter().position(|matched| *matched) else {
+                    return Ok(false);
+                };
+                if *minimum > end - start {
+                    return Ok(false);
+                }
+                if index + 1 == parts.len() {
+                    return Ok(true);
+                }
+                if start < end && matches!(parts.get(index + 1),
+                    Some(Part::Literal(literal, false)) if literal.is_empty())
+                {
+                    return Err(SqlError::InvalidEscapeSequence);
+                }
+                next[start + minimum..].fill(true);
+            }
+            Part::One => next[1..].copy_from_slice(&reachable[..end]),
+            Part::Literal(pattern, complete) => {
+                let mut starts = reachable[..end].iter().enumerate().filter(|(_, yes)| **yes).peekable();
+                if starts.peek().is_none() {
+                    return Ok(false);
+                }
+                if !complete {
+                    return Err(SqlError::InvalidEscapeSequence);
+                }
+                let last_part = index + 1 == parts.len();
+                let trailing_percent = matches!(parts.get(index + 1..), Some([Part::Many(0)]));
+                for (start, _) in starts {
+                    let first_end = if last_part { end } else { start };
+                    for finish in first_end..=end {
+                        let candidate = &value[offsets[start]..offsets[finish]];
+                        charge(work, comparison_work(candidate, pattern))?;
+                        if eq(candidate, pattern) {
+                            if last_part || trailing_percent {
+                                return Ok(true);
+                            }
+                            next[finish] = true;
+                        }
+                    }
+                }
+            }
+        }
+        std::mem::swap(&mut reachable, &mut next);
+    }
+    Ok(reachable[end])
 }
 
 #[cfg(test)]

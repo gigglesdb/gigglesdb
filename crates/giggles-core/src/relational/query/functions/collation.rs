@@ -567,13 +567,12 @@ pub(super) fn casing(
     Ok(Some(value))
 }
 
-fn comparison_locale<'a>(a: &'a BoundScalar, b: &'a BoundScalar) -> R<Option<&'a str>> {
-    let d = merge([a, b].into_iter())?;
+fn comparison_locale<'a>(
+    args: impl IntoIterator<Item = &'a BoundScalar>,
+) -> R<Option<&'a str>> {
+    let d = merge(args.into_iter())?;
     if d.conflict.is_some() {
         return indeterminate();
-    }
-    if let Some(n) = d.name {
-        ready(n)?;
     }
     Ok(d.name)
 }
@@ -582,23 +581,45 @@ fn nondeterministic(n: &str) -> bool {
     user(n).is_some_and(|(_, deterministic, _, _)| !deterministic)
 }
 
+pub(super) fn substring(
+    name: &str, args: &[BoundScalar], values: &[Value], budget: &mut usize,
+) -> Option<R<Value>> {
+    if !matches!(name, "strpos" | "position" | "replace" | "split_part")
+        || !matches!(values, [Value::Text(_), Value::Text(_), ..])
+    {
+        return None;
+    }
+    match comparison_locale(args) {
+        Ok(Some(locale)) if nondeterministic(locale) => {
+            Some(collator(locale).and_then(|collator| {
+                text::eval_collated_search(name, values, &collator, budget)
+            }))
+        }
+        Ok(_) => None,
+        Err(error) => Some(Err(error)),
+    }
+}
+
 pub(super) fn starts_with(args: &[BoundScalar], values: &[Value], budget: &mut usize) -> R<Value> {
     let [Value::Text(value), Value::Text(prefix)] = values else {
         return Err(SqlError::UndefinedFunction);
     };
-    if comparison_locale(&args[0], &args[1])?.is_some_and(nondeterministic) {
-        user_types::view_replace_error(
-            "nondeterministic collations are not supported for substring searches".into(),
-        );
-        return Err(SqlError::Unsupported);
+    if let Some(locale) = comparison_locale(args)? {
+        ready(locale)?;
+        if nondeterministic(locale) {
+            user_types::view_replace_error(
+                "nondeterministic collations are not supported for substring searches".into(),
+            );
+            return Err(SqlError::Unsupported);
+        }
     }
     let result = Value::Bool(value.starts_with(prefix));
     charge(budget, &result)?;
     Ok(result)
 }
 
-pub(in crate::relational::query) fn like(
-    args: [&BoundScalar; 2],
+pub(in crate::relational::query) fn like<'a>(
+    args: impl IntoIterator<Item = &'a BoundScalar>,
     value: &Value,
     pattern: &Value,
     escape: crate::relational::like::Escape,
@@ -613,25 +634,21 @@ pub(in crate::relational::query) fn like(
             Err(SqlError::UndefinedFunction)
         };
     };
-    // LIKE has historically taken its matching collation from the value. In
-    // particular a pattern-only collation must not select the costlier matcher.
-    args[0].check_comparison_collation()?;
-    let input_locale = args[0].explicit_collation()?;
-    if let Some(n) = input_locale.filter(|n| nondeterministic(n)) {
+    let locale = comparison_locale(args)?;
+    if let Some(n) = locale.filter(|n| nondeterministic(n)) {
         if insensitive {
             user_types::view_replace_error(
                 "nondeterministic collations are not supported for ILIKE".into(),
             );
             return Err(SqlError::Unsupported);
         }
-        ready(n)?;
+        let collator = collator(n)?;
         return Ok(Some(
             crate::relational::like::collated(value, pattern, escape, work, |a, b| {
-                compare_text(Some(n), a, b).is_eq()
+                collator.compare_utf8(a.as_bytes(), b.as_bytes()).is_eq()
             })? != negated,
         ));
     }
-    let locale = input_locale.or(args[1].explicit_collation()?);
     let fold = |c: char| {
         if !insensitive {
             return c;

@@ -99,7 +99,10 @@ impl Key {
     pub(crate) fn duplicate_detail(
         &self, table: &TableDef, name: &str, values: &[Value], build: bool, v2: bool,
     ) -> Option<SqlError> {
-        detailed_duplicate(table, name, &self.columns, values, build, self.partial(), v2)
+        detailed_duplicate(
+            table, name, &self.columns, values, build, self.partial(),
+            v2 || self.nondeterministic(),
+        )
     }
     pub(crate) fn nondeterministic(&self) -> bool {
         self.collators.iter().any(Option::is_some)
@@ -251,7 +254,7 @@ impl Relational {
     }
 
     pub(crate) fn primary_duplicate_values(&self, table: &TableDef, values: &[Value]) -> SqlError {
-        if self.v2_unique_reporting || primary_has_uuid(table) {
+        if self.v2_unique_reporting || primary_has_uuid(table) || self.primary_has_nondeterministic_collation(table) {
             return self.primary_duplicate(table, values);
         }
         if let Some(name) = self.primary_key_constraint_name(table) {
@@ -265,7 +268,9 @@ impl Relational {
 
     pub(crate) fn primary_collision_name(&self, table: &TableDef) -> String {
         let name = self.primary_key_constraint_name(table).unwrap_or_default();
-        if self.v2_unique_reporting || primary_has_uuid(table) || self.primary_has_generated(table) {
+        if self.v2_unique_reporting || primary_has_uuid(table) || self.primary_has_generated(table)
+            || self.primary_has_nondeterministic_collation(table)
+        {
             schema_binding::relation_key(self.table_schema(table.id), &name)
         } else {
             name
@@ -273,19 +278,16 @@ impl Relational {
     }
 
     pub(crate) fn primary_duplicate(&self, table: &TableDef, row: &[Value]) -> SqlError {
-        if self.v2_unique_reporting || primary_has_uuid(table) || self.primary_has_generated(table) {
+        if self.v2_unique_reporting || primary_has_uuid(table) || self.primary_has_generated(table)
+            || self.primary_has_nondeterministic_collation(table)
+        {
             return key_duplicate(table, &self.primary_collision_name(table), &table.primary_key, row, false)
                 .unwrap_or_else(|| duplicate(&self.primary_collision_name(table)));
         }
-        if table
-            .primary_key
-            .iter()
-            .any(|i| !self.deterministic_column(table.columns[*i].id))
-        {
-            duplicate(&self.primary_key_constraint_name(table).unwrap_or_default())
-        } else {
-            SqlError::Duplicate
-        }
+        SqlError::Duplicate
+    }
+    fn primary_has_nondeterministic_collation(&self, table: &TableDef) -> bool {
+        table.primary_key.iter().any(|i| !self.deterministic_column(table.columns[*i].id))
     }
     pub(crate) fn has_nondeterministic_keys(&self, table: &TableDef) -> bool {
         table.columns.iter().any(|c| !self.deterministic_column(c.id)) || self.secondary.descriptors().iter()
@@ -302,7 +304,7 @@ impl Relational {
         cancel: &mut impl FnMut() -> bool,
     ) -> R<()> {
         for (key, name) in self.collated_unique_keys(table, descriptors)? {
-            let mut occupied = BTreeSet::new();
+            let mut occupied = BTreeMap::<_, &SqlRow>::new();
             let mut bytes = 0usize;
             for row in rows.values() {
                 if cancel() {
@@ -313,13 +315,11 @@ impl Relational {
                     if bytes > MAX_RESULT_BYTES {
                         return Err(SqlError::Limit);
                     }
-                    if !occupied.insert(tuple) {
-                        let detail = if key.columns.iter().any(|i| self.generated_column(table.columns[*i].id).is_some()) {
-                            key_duplicate(table, &name, &key.columns, &row.values, false)
-                        } else {
-                            key.duplicate_detail(table, &name, &row.values, false, self.v2_unique_reporting)
-                        };
-                        return Err(detail
+                    if let Some(previous) = occupied.insert(tuple, row) {
+                        // Report the proposed value even when its bytes sort
+                        // before the existing spelling of the collated key.
+                        let attempted = if row.version < previous.version { previous } else { row };
+                        return Err(key_duplicate(table, &name, &key.columns, &attempted.values, false)
                             .unwrap_or_else(|| duplicate(&name)));
                     }
                 }

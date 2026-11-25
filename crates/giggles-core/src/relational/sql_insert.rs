@@ -1820,7 +1820,10 @@ pub(super) fn execute_declared(
             }
             Err(_) => {}
         }
-    } else if state.v2_unique_reporting && result == Err(SqlError::Duplicate) {
+    } else if result == Err(SqlError::Duplicate)
+        && (state.v2_unique_reporting
+            || !state.collated_unique_keys(&table, state.secondary.descriptors())?.is_empty())
+    {
         // A materialized SELECT (including a WITH body) can already have
         // target witnesses in its statement image. The batch stager validates
         // in key order. Revisit rejected candidates in source order.

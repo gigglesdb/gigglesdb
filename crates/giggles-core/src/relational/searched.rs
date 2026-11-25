@@ -63,13 +63,10 @@ pub(super) fn route(
     injected_source: Option<&dyn scan::RowSource>,
     events: &mut Vec<constraints::Event>,
 ) -> R<SqlResult> {
-    if expected.is_some() {
-        return Err(SqlError::Unbounded);
-    }
     if let Err(error) = bounds
         && !matches!(error, SqlError::Unbounded | SqlError::Unsupported)
     {
-        return Err(error);
+        return Err(if expected.is_some() { SqlError::Unbounded } else { error });
     }
     let prepared = description.prepared();
     let target = target(prepared).ok_or(SqlError::Unbounded)?;
@@ -77,6 +74,22 @@ pub(super) fn route(
         .tables
         .get(prepared.table().ok_or(SqlError::UnknownTable)?)
         .ok_or(SqlError::UnknownTable)?;
+    if expected.is_some() {
+        let predicates = match prepared.statement.get() {
+            Statement::Update { predicates, .. }
+            | Statement::UpdateExpressions { predicates, .. }
+            | Statement::Delete { predicates, .. } => predicates,
+            _ => return Err(SqlError::Unbounded),
+        };
+        // Version-guarded SQL is still restricted to a complete PK equality.
+        // The bound proves that shape. The scan locates the collated key.
+        if target.has_in_subquery()
+            || table.primary_key.iter().all(|i| state.deterministic_column(table.columns[*i].id))
+            || !super::bounds(table, predicates, params).is_ok_and(|bound| bound.point)
+        {
+            return Err(SqlError::Unbounded);
+        }
+    }
     let table_id = table.id;
     let parameters = description.searched_parameters(state)?;
     let bound = target.bind_seeded(state, parameters)?.with_clock(clock);
@@ -94,6 +107,11 @@ pub(super) fn route(
     let legacy = scan::LegacyRows(&*state);
     let source = injected_source.unwrap_or(&legacy);
     let matched = bound.matching_rows(state, source, params, &mut retention, cancel)?;
+    if let Some(want) = expected
+        && !matches!(matched.as_slice(), [(_, row)] if row.version == want)
+    {
+        return Err(SqlError::Version);
+    }
     // Compare against the statement's selected row image, after writer locks.
     // The sink checks every target (including absent keys) before paging writes.
     if let Some(expected) = &prepared.native_delete {

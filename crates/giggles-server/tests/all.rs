@@ -368,6 +368,8 @@ mod write_fence_holder_network;
 mod user_collation_network;
 
 #[path="column_collation_network.rs"] mod column_collation_network;
+#[path = "nondeterministic_lookup_network.rs"]
+mod nondeterministic_lookup_network;
 #[path = "insert_select_sources_network.rs"]
 mod insert_select_sources_network;
 #[path = "implicit_block_oracle_network.rs"]

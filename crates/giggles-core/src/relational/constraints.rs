@@ -53,16 +53,42 @@ pub(super) fn canonicalize_create(
     }
     (primary_name, kept)
 }
+type ParentDetails = BTreeMap<Vec<u8>, Arc<[Value]>>;
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DeferralState {
     // Transaction-local trigger mode; never part of the persisted catalog.
     pub(crate) replica: bool,
     pub(crate) modes: BTreeMap<u64, bool>,
     pub(crate) pending: BTreeMap<(u64, u64), BTreeSet<Vec<u8>>>,
+    pub(super) parent_details: BTreeMap<(u64, u64), ParentDetails>,
 }
 impl DeferralState {
     fn deferred(&self, id: u64, kind: &ConstraintKind) -> bool {
         matches!(kind, ConstraintKind::ForeignKey { deferral, .. } if *deferral != Deferral::NotDeferrable && self.modes.get(&id).copied().unwrap_or(*deferral == Deferral::DeferrableDeferred))
+    }
+
+    pub(super) fn prune_parent_details(&mut self) {
+        self.parent_details.retain(|check, _| self.pending.contains_key(check));
+    }
+
+    pub(super) fn move_parent_details(&mut self, table: u64, old: &[u8], new: Option<&[u8]>) {
+        for ((_, table_id), details) in &mut self.parent_details {
+            if *table_id == table
+                && let Some(values) = details.remove(old)
+                && let Some(key) = new
+            {
+                details.insert(key.to_vec(), values);
+            }
+        }
+    }
+
+    pub(crate) fn parent_detail_bytes(&self) -> usize {
+        self.parent_details.values().flat_map(|details| details.iter())
+            .fold(0usize, |bytes, (key, values)| {
+                values.iter().fold(bytes.saturating_add(key.len()).saturating_add(96),
+                    |bytes, value| bytes.saturating_add(value_bytes(value)))
+            })
     }
 }
 pub(super) fn parse_check(p: &mut Parser, name: Option<String>) -> R<Definition> {
@@ -253,6 +279,7 @@ fn key_values(row: &SqlRow, positions: &[usize]) -> Vec<Value> {
 }
 fn fk_row(
     state: &Relational, table: &TableDef, row: &SqlRow, kind: &ConstraintKind, name: Option<&str>,
+    parent_failure: Option<(&str, &[Value])>,
 ) -> R<()> {
     let ConstraintKind::ForeignKey {
         columns,
@@ -270,9 +297,15 @@ fn fk_row(
     }
     let parent = table_by_id(state, *ref_table)?;
     let positions = id_positions(parent, ref_columns)?;
-    let missing = || name.map_or(SqlError::ForeignKeyViolation, |name| {
-        missing_parent(state, table, parent, name, &child_positions, row)
-    });
+    let missing = || {
+        if let Some(name) = name {
+            missing_parent(state, table, parent, name, &child_positions, row)
+        } else if let Some((name, values)) = parent_failure {
+            still_referenced(state, table, parent, name, &positions, values, false)
+        } else {
+            SqlError::ForeignKeyViolation
+        }
+    };
     let key = key
         .iter()
         .zip(child_positions.iter().zip(&positions))
@@ -321,6 +354,34 @@ fn missing_parent(
         values: detail,
     }, redacted);
     SqlError::ForeignKeyViolation
+}
+
+pub(super) fn still_referenced(
+    state: &Relational, child: &TableDef, parent: &TableDef, name: &str,
+    positions: &[usize], values: &[Value], restrict: bool,
+) -> SqlError {
+    let setting = if restrict { "RESTRICT setting of " } else { "" };
+    let still = if restrict { "" } else { "still " };
+    user_types::view_replace_error(format!(
+        "update or delete on table \"{}\" violates {setting}foreign key constraint \"{}\" on table \"{}\"",
+        parent.name, name, child.name,
+    ));
+    let redacted = format!("Key is {still}referenced from table \"{}\".", child.name);
+    let names = positions.iter().map(|i| parent.columns[*i].name.as_str())
+        .collect::<Vec<_>>().join(", ");
+    let values = values.iter().map(collation_keys::detail_text).collect::<Option<Vec<_>>>();
+    let detail = values.map_or_else(|| redacted.clone(), |values| format!(
+        "Key ({names})=({}) is {still}referenced from table \"{}\".", values.join(", "), child.name,
+    ));
+    user_types::sql_error_names(state, child, None, Some(name));
+    user_types::sql_foreign_key_detail(DuplicateKeyDetail {
+        table_id: parent.id,
+        schema: state.table_schema(parent.id).to_owned(),
+        table: parent.name.clone(),
+        constraint: name.to_owned(),
+        values: detail,
+    }, redacted);
+    if restrict { SqlError::RestrictViolation } else { SqlError::ForeignKeyViolation }
 }
 
 pub(super) fn duplicate_constraint(table: &TableDef, name: &str) -> SqlError {
@@ -590,13 +651,19 @@ pub(super) fn drop_check_column(state: &mut Relational, table: &TableDef, column
     Ok(())
 }
 
+struct CheckDiagnostics<'a> {
+    changed: &'a BTreeSet<Vec<u8>>,
+    written: &'a [usize],
+    parents: Option<&'a ParentDetails>,
+}
+
 fn validate_kind(
     state: &Relational,
     table: &TableDef,
     name: &str,
     kind: &ConstraintKind,
     keys: Option<&BTreeSet<Vec<u8>>>,
-    diagnostic: Option<(&BTreeSet<Vec<u8>>, &[usize])>,
+    diagnostic: Option<CheckDiagnostics<'_>>,
     cancel: &mut impl FnMut() -> bool,
 ) -> R<()> {
     for (key, row) in state.rows.get(&table.id).ok_or(SqlError::Type)? {
@@ -608,12 +675,14 @@ fn validate_kind(
         }
         match kind {
             ConstraintKind::Check { expr, .. } => {
-                let written = keys.map(|_| diagnostic.map_or(&[][..], |(_, written)| written));
+                let written = keys.map(|_| diagnostic.as_ref().map_or(&[][..], |d| d.written));
                 check_row(state, table, name, expr, row, written)?;
             }
             ConstraintKind::ForeignKey { .. } => {
-                let name = diagnostic.filter(|(changed, _)| changed.contains(key)).map(|_| name);
-                fk_row(state, table, row, kind, name)?;
+                let child_failure = diagnostic.as_ref().filter(|d| d.changed.contains(key)).map(|_| name);
+                let parent_failure = diagnostic.as_ref().and_then(|d| d.parents)
+                    .and_then(|parents| parents.get(key)).map(|values| (name, values.as_ref()));
+                fk_row(state, table, row, kind, child_failure, parent_failure)?;
             }
             ConstraintKind::PrimaryKey | ConstraintKind::Unique { .. } => (),
         }
@@ -821,6 +890,7 @@ pub(super) fn enforce_with_rows<'a>(
     // DDL may have removed constraints with queued checks or explicit modes.
     deferred.modes.retain(|id, _| state.ext.constraints.values().flatten().any(|c| c.id == *id));
     deferred.pending.retain(|(id, table), _| state.table_constraints(*table).iter().any(|c| c.id == *id));
+    deferred.prune_parent_details();
     // UNIQUE is enforced by its index; it must not activate row-event checks.
     if !state.ext.constraints.values().flatten().any(|c| matches!(c.kind,
         ConstraintKind::Check { .. } | ConstraintKind::ForeignKey { .. })) {
@@ -879,6 +949,14 @@ pub(super) fn enforce_with_rows<'a>(
                     }).collect();
                 }
             }
+            for ((_, table), details) in &mut deferred.parent_details {
+                if table == id {
+                    *details = std::mem::take(details).into_iter().filter_map(|(key, values)| {
+                        let old = rows.get(&key)?;
+                        by_version.get(&old.version).map(|(new, _)| ((*new).clone(), values))
+                    }).collect();
+                }
+            }
             continue;
         }
         for (key, old) in rows {
@@ -921,6 +999,7 @@ pub(super) fn enforce_with_rows<'a>(
     let mut visited = BTreeSet::new();
     let mut affected = 0usize;
     let mut parent_checks: BTreeMap<(u64, u64), BTreeSet<Vec<u8>>> = BTreeMap::new();
+    let mut parent_details = BTreeMap::<_, ParentDetails>::new();
     while let Some(event) = events.pop_front() {
         if let Some(load) = load.as_mut() {
             load(state, before.to_mut())?;
@@ -955,6 +1034,15 @@ pub(super) fn enforce_with_rows<'a>(
                 }
             }
         }
+        for ((_, table_id), details) in &mut parent_details {
+            if *table_id == event.table
+                && let Some(values) = details.remove(&old_pk)
+                && let Some(new_pk) = &new_pk
+            {
+                details.insert(new_pk.clone(), values);
+            }
+        }
+        deferred.move_parent_details(event.table, &old_pk, new_pk.as_deref());
         affected = affected.checked_add(1).ok_or(SqlError::Limit)?;
         if affected > MAX_ROWS {
             return Err(SqlError::Limit);
@@ -1014,6 +1102,7 @@ pub(super) fn enforce_with_rows<'a>(
             } else {
                 on_delete
             };
+            let collated = ref_columns.iter().any(|id| !state.deterministic_column(*id));
             if matches!(action, catalog_ext::Action::Restrict) && !children.is_empty() {
                 // The statement already fails: report an earlier immediate
                 // NO ACTION trigger first, without changing deferred checks.
@@ -1029,14 +1118,30 @@ pub(super) fn enforce_with_rows<'a>(
                             &prior.name,
                             &prior.kind,
                             Some(keys),
-                            None,
+                            Some(CheckDiagnostics {
+                                changed: &BTreeSet::new(),
+                                written: &[],
+                                parents: parent_details.get(&(*id, *table_id)),
+                            }),
                             cancel,
                         )?;
                     }
                 }
+                if collated {
+                    return Err(still_referenced(
+                        state, &child, &parent, &constraint.name, &ref_positions, &old_key, true,
+                    ));
+                }
                 return Err(SqlError::RestrictViolation);
             }
             if matches!(action, catalog_ext::Action::NoAction) {
+                if collated && !children.is_empty() {
+                    let details = parent_details.entry((constraint.id, child_id)).or_default();
+                    let values = Arc::from(old_key);
+                    for (key, _) in &children {
+                        details.entry(key.clone()).or_insert_with(|| Arc::clone(&values));
+                    }
+                }
                 parent_checks
                     .entry((constraint.id, child_id))
                     .or_default()
@@ -1188,13 +1293,22 @@ pub(super) fn enforce_with_rows<'a>(
                 changed.clone()
             };
             if deferred.deferred(constraint.id, &constraint.kind) {
+                let check = (constraint.id, *table_id);
                 let pending = deferred
                     .pending
-                    .entry((constraint.id, *table_id))
+                    .entry(check)
                     .or_default();
                 pending.extend(changed.iter().cloned());
-                if let Some(keys) = parent_checks.get(&(constraint.id, *table_id)) {
+                if let Some(keys) = parent_checks.get(&check) {
                     pending.extend(keys.iter().cloned());
+                }
+                if let Some(details) = parent_details.remove(&check) {
+                    deferred.parent_details.entry(check).or_default().extend(
+                        details.into_iter().filter(|(key, _)| !changed.contains(key)),
+                    );
+                }
+                if let Some(details) = deferred.parent_details.get_mut(&check) {
+                    details.retain(|key, _| !changed.contains(key));
                 }
             } else {
                 let mut keys = changed.clone();
@@ -1202,7 +1316,11 @@ pub(super) fn enforce_with_rows<'a>(
                     keys.extend(parent.iter().cloned());
                 }
                 validate_kind(state, table, &constraint.name, &constraint.kind, Some(&keys),
-                    Some((&changed, written)), cancel)?;
+                    Some(CheckDiagnostics {
+                        changed: &changed,
+                        written,
+                        parents: parent_details.get(&(constraint.id, *table_id)),
+                    }), cancel)?;
             }
         }
     }
@@ -1245,12 +1363,17 @@ impl Relational {
                     &c.name,
                     &c.kind,
                     Some(keys),
-                    None,
+                    Some(CheckDiagnostics {
+                        changed: &BTreeSet::new(),
+                        written: &[],
+                        parents: deferred.parent_details.get(&(*id, *table_id)),
+                    }),
                     &mut cancel,
                 )?;
             }
         }
         deferred.pending.clear();
+        deferred.parent_details.clear();
         Ok(())
     }
     pub(crate) fn set_constraints(
@@ -1312,12 +1435,17 @@ impl Relational {
                         &c.name,
                         &c.kind,
                         Some(keys),
-                        None,
+                        Some(CheckDiagnostics {
+                            changed: &BTreeSet::new(),
+                            written: &[],
+                            parents: candidate.parent_details.get(&(*id, *table_id)),
+                        }),
                         &mut cancel,
                     )?;
                 }
             }
             candidate.pending.retain(|(id, _), _| !ids.contains(id));
+            candidate.prune_parent_details();
         }
         *deferred = candidate;
         Ok(())

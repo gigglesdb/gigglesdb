@@ -3289,6 +3289,9 @@ impl BoundScalar {
                 if n == "starts_with" {
                     return collation::starts_with(args, &values, budget);
                 }
+                if let Some(result) = collation::substring(n, args, &values, budget) {
+                    return result;
+                }
                 if n == "format" {
                     return format::eval(&values, args, budget);
                 }
@@ -4036,6 +4039,15 @@ impl Scalar {
                     return Err(SqlError::Syntax);
                 };
                 inner.infer(expected, parameters, resolve, tables)?;
+            }
+            Self::Call(n, args) if collation::internal(n) => {
+                let [input] = args.as_slice() else {
+                    return Err(SqlError::Syntax);
+                };
+                // COLLATE resolves an unknown input as text and preserves
+                // the type of inputs that were already declared or inferred.
+                let expected = input.aggregate_unknown(parameters).then_some(&DataType::Text);
+                input.infer(expected, parameters, resolve, tables)?;
             }
             Self::Call(n, args) if let Some(error) = deferred_routine_error(n) => {
                 // Validate ordinary arguments without inventing a signature for

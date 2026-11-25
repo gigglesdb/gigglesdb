@@ -2294,7 +2294,9 @@ fn snapshot_bytes(s: &State) -> Result<u64, CoreError> {
 }
 fn deferral_bytes(state: &relational::DeferralState) -> Result<u64, CoreError> {
     let modes = u64::try_from(state.modes.len()).map_err(|_| CoreError::Limit)?;
-    let mut bytes = modes.checked_mul(9).ok_or(CoreError::Limit)?;
+    let mut bytes = modes.checked_mul(9)
+        .and_then(|bytes| bytes.checked_add(state.parent_detail_bytes() as u64))
+        .ok_or(CoreError::Limit)?;
     for keys in state.pending.values() {
         bytes = bytes.checked_add(24).ok_or(CoreError::Limit)?;
         for key in keys {

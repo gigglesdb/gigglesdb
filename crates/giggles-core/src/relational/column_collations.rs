@@ -229,6 +229,10 @@ impl Relational {
     pub(crate) fn deterministic_column(&self, id: u64) -> bool {
         !matches!(self.column_collation(id),Some(Reference::User(id)) if self.ext.collations.get(id).is_some_and(|c|!c.deterministic))
     }
+    pub(super) fn byte_key_predicate(&self, column: &ColumnDef, op: &str) -> bool {
+        self.deterministic_column(column.id)
+            && (op == "=" || !column.data_type.is_array() && self.byte_ordered(column.id))
+    }
     /// Catalog OIDs for both columns and explicitly collated index attributes.
     pub fn collation_oids(&self) -> R<BTreeMap<u64, Vec<u32>>> {
         let oid = |r: &Reference| match r {

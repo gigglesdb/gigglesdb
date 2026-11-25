@@ -260,7 +260,7 @@ impl Diagnostic {
     }
 
     fn authorize_duplicate_key(&mut self, code: &str, session: &mut Session) {
-        if matches!(code, "23503" | "23505" | "23514")
+        if matches!(code, "23001" | "23503" | "23505" | "23514")
             && self.duplicate_key_visible.is_none()
             && let Some(detail) = &self.duplicate_key
         {
@@ -394,8 +394,12 @@ impl Diagnostic {
                 m.starts_with("duplicate key value violates unique constraint ")
                     || m.starts_with("could not create unique index ")
             }
-            (Err(CoreError::Sql(SqlError::ForeignKeyViolation)), Some(m)) if self.duplicate_key.is_some() => {
-                m.starts_with("insert or update on table ")
+            (Err(CoreError::Sql(SqlError::ForeignKeyViolation | SqlError::RestrictViolation)), Some(m))
+                if self.duplicate_key.is_some() => {
+                m.starts_with("insert or update on table ") || m.starts_with("update or delete on table ")
+            }
+            (Err(CoreError::Sql(SqlError::InvalidParameterValue)), Some(m)) => {
+                m == "field position must not be zero"
             }
             (Err(CoreError::Sql(SqlError::UndefinedFunction | SqlError::AmbiguousFunction)), Some(m)) => {
                 m.strip_prefix("function ")
@@ -690,7 +694,7 @@ fn diagnostic_error(
         .or_else(|| diagnostic.and_then(|d| d.wire_message.as_deref()));
     z(wire_message.unwrap_or(message), &mut b);
     if let Some((diagnostic, key)) = diagnostic
-        .filter(|_| matches!(code, "23503" | "23505" | "23514"))
+        .filter(|_| matches!(code, "23001" | "23503" | "23505" | "23514"))
         .and_then(|d| d.duplicate_key.as_ref().map(|key| (d, key)))
     {
         let detail = if diagnostic.duplicate_key_visible == Some(true) {
@@ -702,9 +706,13 @@ fn diagnostic_error(
             b.push(b'D');
             z(detail, &mut b);
         }
-        for (field, name) in [(b's', &key.schema), (b't', &key.table), (b'n', &key.constraint)] {
-            b.push(field);
-            z(name, &mut b);
+        // FK parent diagnostics authorize the parent key's values while
+        // identifying the child's constraint in the ErrorResponse fields.
+        if diagnostic.wire_names.is_none() {
+            for (field, name) in [(b's', &key.schema), (b't', &key.table), (b'n', &key.constraint)] {
+                b.push(field);
+                z(name, &mut b);
+            }
         }
     } else if let Some(detail) = match registry_error {
         Some(error) => error.detail,

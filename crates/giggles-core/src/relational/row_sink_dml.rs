@@ -646,12 +646,23 @@ impl ActionWork {
                             found = true;
                             Ok(())
                         })?;
-                        if !found { return Err(CoreError::Sql(SqlError::ForeignKeyViolation)); }
+                        if !found {
+                            let error = pending.parent_details.get(&(c.id, table.id))
+                                .and_then(|details| details.get(key))
+                                .map_or(SqlError::ForeignKeyViolation, |values| {
+                                    let parent_positions = positions.iter().map(|(_, i)| *i).collect::<Vec<_>>();
+                                    constraints::still_referenced(
+                                        state, table, parent, &c.name, &parent_positions, values, false,
+                                    )
+                                });
+                            return Err(CoreError::Sql(error));
+                        }
                     }
                 }
             }
         }
         pending.pending.clear();
+        pending.parent_details.clear();
         Ok(())
     }
     pub(super) fn drain(&mut self, state: &mut Relational, sink: &mut impl RowSink,
@@ -667,8 +678,12 @@ impl ActionWork {
             for (child_id, c) in &incoming {
                 let ConstraintKind::ForeignKey { ref_table, columns, ref_columns, on_delete, on_update, .. } = &c.kind else { continue; };
                 if *ref_table != parent_id { continue; }
-                let values = ref_columns.iter().map(|id| old.values[parent.columns.iter().position(|c| c.id == *id).unwrap()].clone()).collect::<Vec<_>>();
-                let new_values = new.as_ref().map(|row| ref_columns.iter().map(|id| row.values[parent.columns.iter().position(|c| c.id == *id).unwrap()].clone()).collect::<Vec<_>>());
+                let parent_positions = ref_columns.iter()
+                    .map(|id| parent.columns.iter().position(|c| c.id == *id).unwrap())
+                    .collect::<Vec<_>>();
+                let values = parent_positions.iter().map(|i| old.values[*i].clone()).collect::<Vec<_>>();
+                let new_values = new.as_ref().map(|row| parent_positions.iter()
+                    .map(|i| row.values[*i].clone()).collect::<Vec<_>>());
                 if values.contains(&Value::Null) || new_values.as_ref() == Some(&values) { continue; }
                 let action = if new.is_some() { on_update } else { on_delete };
                 let child = state.tables.values().find(|t| t.id == *child_id).unwrap().clone();
@@ -676,6 +691,7 @@ impl ActionWork {
                     .map_err(CoreError::Sql)?;
                 let tuple = equality.values(&values).map_err(CoreError::Sql)?;
                 let mut no_action = DeferralState::default();
+                let mut parent_values = None;
                 let mut after = None;
                 let first_version = state.next_version;
                 loop {
@@ -706,6 +722,11 @@ impl ActionWork {
                         rows = matching;
                     }
                     if !rows.is_empty() && *action == catalog_ext::Action::Restrict {
+                        if equality.nondeterministic() {
+                            return Err(CoreError::Sql(constraints::still_referenced(
+                                state, &child, &parent, &c.name, &parent_positions, &values, true,
+                            )));
+                        }
                         return Err(CoreError::Sql(SqlError::RestrictViolation));
                     }
                     if *action == catalog_ext::Action::NoAction {
@@ -713,9 +734,20 @@ impl ActionWork {
                         let deferred = *deferral != Deferral::NotDeferrable && self.pending.modes.get(&c.id)
                             .copied().unwrap_or(*deferral == Deferral::DeferrableDeferred);
                         let pending = if deferred { &mut self.pending } else if statement_end { &mut self.immediate } else { &mut no_action };
+                        let check = (c.id, *child_id);
+                        if !rows.is_empty() && equality.nondeterministic() && parent_values.is_none() {
+                            for value in &values {
+                                self.retention.charge(value_bytes(value)).map_err(CoreError::Sql)?;
+                            }
+                            parent_values = Some(Arc::<[Value]>::from(values.clone()));
+                        }
                         for key in rows.keys() {
                             self.retention.charge(key.len() + 96).map_err(CoreError::Sql)?;
-                            pending.pending.entry((c.id, *child_id)).or_default().insert(key.clone());
+                            pending.pending.entry(check).or_default().insert(key.clone());
+                            if let Some(values) = &parent_values {
+                                pending.parent_details.entry(check).or_default()
+                                    .insert(key.clone(), Arc::clone(values));
+                            }
                         }
                         continue;
                     }
@@ -783,6 +815,8 @@ impl ActionWork {
                 + 96).map_err(CoreError::Sql)?;
             self.visited.insert((table.id, old.version));
             let new_key = new.as_ref().map(|r| pk(table, &r.values)).transpose().map_err(CoreError::Sql)?;
+            self.pending.move_parent_details(table.id, key, new_key.as_deref());
+            self.immediate.move_parent_details(table.id, key, new_key.as_deref());
             for checks in [&mut self.pending.pending, &mut self.immediate.pending] {
                 for ((_, id), keys) in checks {
                     if *id == table.id && keys.remove(key) && let Some(new_key) = &new_key {
@@ -806,7 +840,11 @@ impl ActionWork {
                     let pending = if deferred { &mut self.pending } else { &mut self.immediate };
                     let key = new_key.as_ref().unwrap();
                     self.retention.charge(key.len() + 96).map_err(CoreError::Sql)?;
-                    pending.pending.entry((c.id, table.id)).or_default().insert(key.clone());
+                    let check = (c.id, table.id);
+                    pending.pending.entry(check).or_default().insert(key.clone());
+                    if let Some(details) = pending.parent_details.get_mut(&check) {
+                        details.remove(key);
+                    }
                 }
             }
             self.queue.push_back((table.id, old.clone(), new));
