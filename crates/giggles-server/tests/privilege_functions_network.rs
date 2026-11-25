@@ -482,9 +482,8 @@ async fn application_inquiry_contextual_casts_on(engine: giggles_core::Engine) {
         let e = owner.query(&format!("SELECT pg_has_role({input}::oid,'owner','MEMBER') FROM w1d_cast"), &[]).await.unwrap_err();
         assert_eq!(e.code().unwrap().code(), state);
     }
-    // These casts are available in their supported contexts. An ordinary
-    // application projection, predicate, or sort key still refuses them.
-    for ty in ["oid", "name", r#""char""#] {
+    // Keep the scoped name and internal char refusals.
+    for ty in ["name", r#""char""#] {
         for (sql, state) in [
             (format!("SELECT '1'::{ty} FROM w1d_cast"), "0A000"),
             (format!("SELECT id FROM w1d_cast WHERE '1'::{ty} = '1'::{ty}"), "0A000"),
@@ -500,6 +499,11 @@ async fn application_inquiry_contextual_casts_on(engine: giggles_core::Engine) {
             }
         }
     }
+    let ddl = "CREATE TABLE cast_col (id int PRIMARY KEY, val oid)";
+    let simple = owner.simple_query(ddl).await.unwrap_err();
+    let extended = owner.query(ddl, &[]).await.unwrap_err();
+    assert_eq!(simple.code().unwrap().code(), "42704");
+    assert_eq!(extended.code().unwrap().code(), "42704");
     application_parameter_refusals_wire(&owner).await;
     drop(owner);
     f.finish().await;
@@ -661,4 +665,56 @@ async fn application_parameter_refusals_wire(client: &tokio_postgres::Client) {
     let rows = client.simple_query("EXECUTE p7('english')").await.unwrap();
     assert!(rows.iter().any(|message| matches!(message,
         tokio_postgres::SimpleQueryMessage::Row(row) if row.get(0) == Some("'cat':1"))));
+}
+
+async fn oid_casts_over_pgwire(engine: giggles_core::Engine) {
+    use tokio_postgres::types::Type;
+
+    let fixture = Fixture::new_engine(engine).await;
+    let client = fixture.connect("owner", "owner-pw").await;
+    client
+        .batch_execute("CREATE TABLE t (id integer PRIMARY KEY); INSERT INTO t VALUES (1), (2)")
+        .await
+        .unwrap();
+
+    let simple = client
+        .simple_query("SELECT id, '255'::oid FROM t ORDER BY id")
+        .await
+        .unwrap();
+    let rows = simple
+        .iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => {
+                assert_eq!(row.columns()[1].name(), "oid");
+                Some((row.get(0).unwrap(), row.get(1).unwrap()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows, [("1", "255"), ("2", "255")]);
+
+    let statement = client
+        .prepare("SELECT id, '0x10'::oid FROM t ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(statement.columns()[1].name(), "oid");
+    assert_eq!(*statement.columns()[1].type_(), Type::OID);
+    let rows = client.query(&statement, &[]).await.unwrap();
+    let rows = rows
+        .iter()
+        .map(|row| (row.get::<_, i32>(0), row.get::<_, u32>(1)))
+        .collect::<Vec<_>>();
+    assert_eq!(rows, [(1, 16), (2, 16)]);
+
+    let error = client.prepare("SELECT $1::oid").await.unwrap_err();
+    assert_eq!(error.code().unwrap().code(), "0A000");
+    drop(client);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn application_oid_casts_simple_and_extended() {
+    oid_casts_over_pgwire(giggles_core::Engine::Legacy).await;
+    #[cfg(feature = "engine-rocksdb")]
+    oid_casts_over_pgwire(giggles_core::Engine::V2).await;
 }

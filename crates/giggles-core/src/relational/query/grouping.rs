@@ -541,6 +541,14 @@ pub(super) fn bind<'a>(
     // FILTER consumes input rows, so validate its routine and Boolean predicate
     // before an unrelated ungrouped output column can mask those errors.
     for (item, _) in &projection {
+        // Resolve unsupported OID arithmetic aggregates before checking grouping.
+        if let Item::Aggregate(kind, Some(input)) = item
+            && matches!(kind.base(), Aggregate::Sum | Aggregate::Avg)
+            && user_types::probe_preserving_error_message(|| input.bind(resolve, tables, &parameters))
+                .is_ok_and(|input| input.ty == DataType::Oid)
+        {
+            return Err(SqlError::UndefinedFunction);
+        }
         if let Item::Scalar(s) | Item::Aggregate(_, Some(s)) = item {
             aggregate_filter::validate_scalar(s, &parameters, resolve, tables)?;
         }

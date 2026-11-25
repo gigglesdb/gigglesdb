@@ -94,6 +94,7 @@ pub(super) fn element(value: &Value, ty: &DataType, zone: SessionZone) -> R<Stri
     let quote = |text: &str| serde_json::to_string(text).map_err(|_| SqlError::Type);
     match value {
         Value::Null => Ok("null".into()),
+        Value::Int(n) if *ty == DataType::Oid => quote(&n.to_string()),
         Value::Int(n) if *ty != DataType::RegType => Ok(n.to_string()),
         Value::Bool(v) => Ok(v.to_string()),
         Value::Timestamp(v) => quote(&v.to_string().replacen(' ', "T", 1)),
@@ -254,14 +255,7 @@ pub(super) fn push_object(
         user_types::view_replace_error(message.into());
         return Err(error);
     }
-    let key_type = &args[0].ty;
-    if key_type.is_array() || *key_type == DataType::Jsonb {
-        return Err(invalid_object_key());
-    }
-    let mut key = element(key, key_type, zone)?;
-    if !key.starts_with('"') {
-        key = serde_json::to_string(&key).map_err(|_| SqlError::Type)?;
-    }
+    let key = object_key(key, &args[0], zone)?;
     let entry = bound_element(&input[1], &args[1], zone)?;
     let bytes = key.len() + entry.len() + 6;
     let text = match state {
@@ -284,6 +278,23 @@ pub(super) fn push_object(
     text.push_str(" : ");
     text.push_str(&entry);
     Ok(())
+}
+
+pub(super) fn object_key(key: &Value, scalar: &BoundScalar, zone: SessionZone) -> R<String> {
+    if *key == Value::Null {
+        user_types::view_replace_error("field name must not be null".into());
+        return Err(SqlError::InvalidParameterValue);
+    }
+    let key_type = &scalar.ty;
+    if key_type.is_array() || *key_type == DataType::Jsonb || scalar.result_oid() == OID {
+        return Err(invalid_object_key());
+    }
+    let key = element(key, key_type, zone)?;
+    if key.starts_with('"') {
+        Ok(key)
+    } else {
+        serde_json::to_string(&key).map_err(|_| SqlError::Type)
+    }
 }
 pub(super) fn finish(value: &mut Value, kind: Aggregate, work: &mut usize) -> R<()> {
     if let Value::Text(text) = value {

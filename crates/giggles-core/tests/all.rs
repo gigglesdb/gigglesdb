@@ -14,6 +14,8 @@ mod check_column_ddl;
 mod generated_columns;
 #[path = "gin_indexes.rs"]
 mod gin_indexes;
+#[path = "oid_casts.rs"]
+mod oid_casts;
 #[path = "native_once_v2_replay.rs"] mod native_once_v2_replay;
 #[path = "typed_leaf_read.rs"]
 mod typed_leaf_read;

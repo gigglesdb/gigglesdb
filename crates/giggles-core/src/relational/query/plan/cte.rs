@@ -1290,6 +1290,27 @@ fn order_info(name: &str) -> Option<(usize, u32)> {
 /// The private columns do not participate in star expansion.
 pub(super) fn prepare_query(query: &Query, state: &Relational) -> R<Query> {
     let mut query = query.clone();
+    if let [source] = query.sources.as_slice()
+        && query.derived().is_none()
+    {
+        let table = views::table(state, &source.name)?;
+        for (item, _) in &mut query.items {
+            if let Item::Scalar(scalar) = item {
+                subquery::map_scalar(scalar, &mut |scalar| {
+                    functions::json_array::lower_row(scalar, &|column| {
+                        (column.name == source.alias && !table.columns.iter().any(|c| c.name == column.name))
+                            .then(|| table.logical_columns().filter(|c| !c.name.starts_with('\0')).map(|c| {
+                                (c.name.clone(), Scalar::Column(ColumnRef {
+                                    qualifier: Some(source.alias.clone()),
+                                    name: c.name.clone(),
+                                }))
+                            }).collect())
+                    });
+                    Ok(())
+                })?;
+            }
+        }
+    }
     if !query.sources.iter().any(|s| {
         state
             .tables

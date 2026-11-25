@@ -819,18 +819,23 @@ impl Filter {
                     value.clone()
                 };
                 let bound = value.bind(resolve, tables, params)?;
-                if bound.ty == DataType::Bpchar {
+                if bound.ty == DataType::Bpchar
+                    || functions::oid_integer_pair(&bound.ty, column_type)
+                {
+                    // Membership keys use the original types. Mixed oid/integer
+                    // equality would need a conversion before either lookup.
                     return Err(SqlError::Unsupported);
                 }
-                // Compare's existing type policy, using a typed parameter as the RHS.
+                // Check the same comparison type policy as an ordinary equality.
                 let mut comparison_params = params.to_vec();
-                comparison_params.push(Some(column_type.clone()));
-                Filter::Compare(
-                    value.clone(),
-                    "=".into(),
-                    Scalar::Param(comparison_params.len()),
-                )
-                .bind(&comparison_params, resolve, tables)?;
+                let rhs = if *column_type == DataType::Oid {
+                    Scalar::Cast(Box::new(Scalar::Literal(Value::Null)), DataType::Oid)
+                } else {
+                    comparison_params.push(Some(column_type.clone()));
+                    Scalar::Param(comparison_params.len())
+                };
+                Filter::Compare(value, "=".into(), rhs)
+                    .bind(&comparison_params, resolve, tables)?;
                 let (collation,collation_conflict)=functions::collation::comparison_binding(std::iter::once(&bound).chain(subqueries.get(key,SubplanMode::In)?.items.iter().filter_map(|i|if let BoundItem::Scalar(s)=i {Some(s)} else {None})))?;
                 BoundFilter::InSubquery {
                     query: key,
@@ -1570,6 +1575,12 @@ impl Filter {
                         av = bind(&Scalar::Cast(Box::new(a.clone()), bv.ty.clone()))?;
                     } else if unknown(b) {
                         bv = bind(&Scalar::Cast(Box::new(b.clone()), av.ty.clone()))?;
+                    } else if functions::oid_integer_pair(&av.ty, &bv.ty) {
+                        if av.ty == DataType::Oid {
+                            bv = bind(&Scalar::Cast(Box::new(b.clone()), DataType::Oid))?;
+                        } else {
+                            av = bind(&Scalar::Cast(Box::new(a.clone()), DataType::Oid))?;
+                        }
                     } else if matches!(
                         av.ty,
                         DataType::SmallInt | DataType::Integer | DataType::BigInt
@@ -3188,6 +3199,10 @@ impl Query {
                 };
                 let outer_ty = &tables[outer.source].columns[outer.column].data_type;
                 let inner_ty = &tables[inner.source].columns[inner.column].data_type;
+                if functions::oid_integer_pair(outer_ty, inner_ty) {
+                    // The bound ON filter converts the integer before comparison.
+                    continue;
+                }
                 if !functions::comparable(outer_ty, inner_ty) {
                     return Err(functions::comparison_mismatch(outer_ty, inner_ty));
                 }
@@ -4317,6 +4332,11 @@ impl Query {
         let bind_expr = |e: &Expr, ty: &DataType, parameters: &mut [Option<DataType>]| -> R<bool> {
             if let Expr::Param(n) = e {
                 let slot = parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?;
+                if slot.as_ref() == Some(&DataType::Oid)
+                    || (slot.is_none() && *ty == DataType::Oid)
+                {
+                    return Err(SqlError::Unsupported);
+                }
                 if let Some(old) = slot.as_ref().filter(|old| *old != ty) {
                     if integer_width(old) && integer_width(ty) {
                         return Ok(true);

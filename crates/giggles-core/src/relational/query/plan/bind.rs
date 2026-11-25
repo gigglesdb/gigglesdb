@@ -544,7 +544,17 @@ impl Plan {
                                 .and_then(BoundScalar::attached_enum))
                         }),
                     )?;
-                    let ty = common(typed.map(|m| m.columns[i].data_type.clone())).inspect_err(|_| {
+                    let common_type = {
+                        let types = typed.map(|m| m.columns[i].data_type.clone());
+                        if types.clone().any(|ty| ty == DataType::Oid)
+                            && types.clone().all(|ty| ty == DataType::Oid || integer_type(&ty))
+                        {
+                            Ok(DataType::Oid)
+                        } else {
+                            common(types)
+                        }
+                    };
+                    let ty = common_type.inspect_err(|_| {
                         let left = &a.columns[i].data_type;
                         let right = &b.columns[i].data_type;
                         if matches!((left, right), (DataType::Text, _) | (_, DataType::Text)) {

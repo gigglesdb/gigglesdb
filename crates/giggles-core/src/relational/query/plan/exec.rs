@@ -239,12 +239,16 @@ impl Plan {
                             return Err(SqlError::Aborted);
                         }
                         for (i, v) in row.values.iter_mut().enumerate() {
-                            if input.columns[i].data_type != result.columns[i].data_type {
-                                *v = functions::coerce_clocked(
-                                    v.clone(),
-                                    &result.columns[i].data_type,
-                                    clock,
-                                )?;
+                            let source = &input.columns[i].data_type;
+                            let target = &result.columns[i].data_type;
+                            if source != target {
+                                *v = if target == &DataType::Oid
+                                    && let Some(value) = text_search_types::cast_typed(v, source, target)
+                                {
+                                    value?
+                                } else {
+                                    functions::coerce_clocked(v.clone(), target, clock)?
+                                };
                             }
                         }
                     }

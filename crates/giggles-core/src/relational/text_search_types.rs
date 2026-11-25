@@ -158,15 +158,38 @@ pub fn input(ty: &DataType, text: &str) -> R<Value> {
         DataType::RegDictionary => {
             Value::Int(reg_oid(text, |name| Dictionary::lookup(name).map(Dictionary::oid))?.into())
         }
-        DataType::Oid => Value::Int(
-            text.trim_ascii()
-                .parse::<u32>()
-                .map_err(|_| SqlError::InvalidTextRepresentation)?
-                .into(),
-        ),
+        DataType::Oid => oid_input(text)?,
         DataType::PgChar => Value::Int(i64::from(text.bytes().next().unwrap_or(0) as i8)),
         _ => return Err(SqlError::Type),
     })
+}
+
+fn oid_input(text: &str) -> R<Value> {
+    let text = text.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
+    let negative = text.starts_with('-');
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let (digits, radix) = if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+        (hex, 16)
+    } else if let Some(binary) = digits.strip_prefix("0b").or_else(|| digits.strip_prefix("0B")) {
+        (binary, 2)
+    } else if digits.starts_with('0') {
+        (digits, 8)
+    } else {
+        (digits, 10)
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return Err(SqlError::InvalidTextRepresentation);
+    }
+    let magnitude = u32::from_str_radix(digits, radix).map_err(|_| SqlError::Overflow)?;
+    let oid = if negative {
+        if magnitude > i32::MIN.unsigned_abs() {
+            return Err(SqlError::Overflow);
+        }
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    };
+    Ok(Value::Int(oid.into()))
 }
 
 fn reg_oid(text: &str, lookup: impl FnOnce(&str) -> Result<u32, TsError>) -> R<u32> {
@@ -327,7 +350,8 @@ pub(super) fn cast_supported(source: &DataType, target: &DataType) -> Option<boo
                 ) | (RegConfig | RegDictionary, Oid)
                     | (Oid, RegConfig | RegDictionary)
                     | (SmallInt | Integer | BigInt, Oid | PgChar)
-                    | (Oid | PgChar, SmallInt | Integer | BigInt)
+                    | (Oid, Integer | BigInt)
+                    | (PgChar, SmallInt | Integer | BigInt)
             ),
     )
 }
@@ -346,9 +370,10 @@ pub(super) fn cast_typed(value: &Value, source: &DataType, target: &DataType) ->
         (RegConfig | RegDictionary, Oid, _) | (Oid, RegConfig | RegDictionary, _) => {
             Some(Ok(value.clone()))
         }
-        (SmallInt | Integer | BigInt, Oid, Value::Int(n)) => Some(
+        // int2 and int4 widen through the unsigned 32-bit OID representation.
+        (SmallInt | Integer, Oid, Value::Int(n)) => Some(Ok(Value::Int((*n as u32).into()))),
+        (BigInt, Oid, Value::Int(n)) => Some(
             u32::try_from(*n)
-                .or_else(|e| i32::try_from(*n).map(|n| n as u32).map_err(|_| e))
                 .map(|n| Value::Int(n.into()))
                 .map_err(|_| SqlError::Overflow),
         ),

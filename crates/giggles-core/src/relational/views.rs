@@ -130,7 +130,7 @@ pub(super) fn drop_column_views(
     state.view_names.retain(|name, _| !dropped.contains(name));
     Ok(())
 }
-fn oid(ty: &DataType) -> u32 {
+pub(super) fn oid(ty: &DataType) -> u32 {
     match ty {
         DataType::Boolean => 16, DataType::SmallInt => 21, DataType::Integer => 23,
         DataType::BigInt => 20, DataType::Text => 25, DataType::Bytes => 17,

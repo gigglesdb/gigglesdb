@@ -6,7 +6,7 @@ pub(super) mod uuid_array_operators;
 mod array_order;
 pub(super) mod collation;
 mod concat;
-mod json_array;
+pub(super) mod json_array;
 mod jsonb_mutation;
 pub(in crate::relational) mod assignment;
 mod binary;
@@ -38,7 +38,7 @@ mod pg18_types;
 pub(super) mod typeof_expr;
 pub(super) use typeof_expr::name as type_display;
 pub(super) mod text_search;
-pub(super) use comparison::{comparable, compare_cross, cross_compare};
+pub(super) use comparison::{comparable, compare_cross, cross_compare, oid_integer_pair};
 mod datetime_input;
 mod degree_math;
 mod greatest;
@@ -356,6 +356,7 @@ fn common_result_type(types: impl IntoIterator<Item = DataType>) -> R<DataType> 
         common = Some(match common {
             None => ty,
             Some(ref old) if *old == ty => ty,
+            Some(ref old) if comparison::oid_integer_pair(old, &ty) => DataType::Oid,
             Some(ref old) if integer(old) && integer(&ty) => {
                 if *old == DataType::BigInt || ty == DataType::BigInt {
                     DataType::BigInt
@@ -1074,6 +1075,12 @@ impl Scalar {
                 // MERGE RETURNING rewrites this contextual expression before scalar parsing.
                 if name == "merge_action" { return Err(SqlError::Syntax); }
                 p.punct('(')?;
+                if let Some(row_name) = json_array::row_name(&name)
+                    && matches!(p.tokens.get(p.at), Some(Token::Word(word)) if word == "row")
+                    && p.tokens.get(p.at + 1) == Some(&Token::Symbol('('))
+                {
+                    return json_array::parse_row(p, row_name, depth, aggregate_argument);
+                }
                 if name == "normalize" && !qualified_call && !quoted {
                     let input = Self::parse_expr(p, depth + 1, aggregate_argument)?;
                     let mut args = vec![input];
@@ -1383,21 +1390,7 @@ impl Scalar {
             Self::Unary(..) | Self::Binary(..) => {
                 arithmetic::bind(self, resolve, tables, parameters)
             }
-            // Grouping identity probes omit parameter types before inference.
-            // Report an unresolved binding so those probes retain the syntax.
-            Self::Param(n) => {
-                let ty = parameters.get(n - 1).and_then(Clone::clone).ok_or(SqlError::Parameters)?;
-                let definition = enum_parameters::definition(n - 1, &ty);
-                let parameter = BoundScalar { ty, node: Node::Param(*n) };
-                Ok(if let Some(definition) = definition {
-                    BoundScalar {
-                        ty: parameter.ty.clone(),
-                        node: Node::Domain(Box::new(parameter), definition),
-                    }
-                } else {
-                    parameter
-                })
-            }
+            Self::Param(n) => Self::bind_parameter(*n, parameters, false),
             Self::Domain(a, name, target) => Self::bind_domain(a, (name, target), resolve, tables, parameters),
             Self::Cast(a, ty) => Self::bind_cast(a, ty, false, resolve, tables, parameters),
             Self::Column(c) => Self::bind_column(c, resolve, tables),
@@ -1407,6 +1400,28 @@ impl Scalar {
             }
             Self::Call(name, args) => Self::bind_call(name, args, resolve, tables, parameters),
         }
+    }
+
+    fn bind_parameter(
+        n: usize,
+        parameters: &[Option<DataType>],
+        text_search_oid: bool,
+    ) -> R<BoundScalar> {
+        // Grouping probes omit parameter types before inference.
+        let ty = parameters.get(n - 1).and_then(Clone::clone).ok_or(SqlError::Parameters)?;
+        if ty == DataType::Oid && !text_search_oid {
+            return Err(SqlError::Unsupported);
+        }
+        let definition = enum_parameters::definition(n - 1, &ty);
+        let parameter = BoundScalar { ty, node: Node::Param(n) };
+        Ok(if let Some(definition) = definition {
+            BoundScalar {
+                ty: parameter.ty.clone(),
+                node: Node::Domain(Box::new(parameter), definition),
+            }
+        } else {
+            parameter
+        })
     }
 
     fn expression_parameter_error(error: SqlError, parameters: &[Option<DataType>]) -> SqlError {
@@ -1591,13 +1606,36 @@ impl Scalar {
                 node: Node::Literal(value.clone()),
             });
         }
-        if let Self::Literal(Value::Text(_) | Value::Null) = a
-            && *ty != DataType::TimestampTz
-        {
-            if *ty == DataType::Oid && !text_search_argument {
+        if *ty == DataType::Oid && !text_search_argument {
+            // A parameter remains unsupported through explicit casts, including
+            // casts with a type modifier.
+            let mut source = a;
+            loop {
+                source = match source {
+                    Self::Cast(inner, _) | Self::Domain(inner, ..) => inner,
+                    Self::Call(name, args) if name == CAST_TYPMOD => &args[0],
+                    _ => break,
+                };
+            }
+            if matches!(source, Self::Param(_)) {
                 return Err(SqlError::Unsupported);
             }
-            let Self::Literal(v) = a else { unreachable!() };
+        }
+        if *ty == DataType::Oid
+            && let Some(value) = cast::regclass_literal(a)
+        {
+            let value = cast::regclass_oid_literal(value)?;
+            return Ok(BoundScalar {
+                ty: DataType::Oid,
+                node: Node::Cast(Box::new(BoundScalar {
+                    ty: DataType::Oid,
+                    node: Node::Literal(value),
+                })),
+            });
+        }
+        if let Self::Literal(v @ (Value::Text(_) | Value::Null)) = a
+            && *ty != DataType::TimestampTz
+        {
             let v = cast_value(v.clone(), ty, &mut 0)?;
             return Ok(BoundScalar {
                 ty: ty.clone(),
@@ -1611,13 +1649,23 @@ impl Scalar {
             && matches!(ty, DataType::RegConfig | DataType::RegDictionary)
         {
             Self::bind_cast(input, &DataType::Oid, true, resolve, tables, parameters)?
+        } else if text_search_argument && *ty == DataType::Oid && let Self::Param(n) = a {
+            // The exception applies to this cast operand, not to other uses
+            // of the same parameter in the query.
+            Self::bind_parameter(*n, parameters, true)?
         } else {
             a.bind(resolve, tables, parameters)?
         };
-        if *ty == DataType::Oid && !text_search_argument
-            && !matches!(a.ty, DataType::RegConfig | DataType::RegDictionary)
-        {
+        if a.ty == DataType::Oid && *ty == DataType::RegType {
             return Err(SqlError::Unsupported);
+        }
+        if *ty == DataType::Oid {
+            if a.result_oid() == json_aggregate::OID || a.attached_enum().is_some() {
+                return Err(SqlError::CannotCoerce);
+            }
+            if a.ty == DataType::RegType {
+                return Ok(BoundScalar { ty: ty.clone(), node: cast_node(a, ty) });
+            }
         }
         if let Some(supported) = text_search_types::cast_supported(&a.ty, ty) {
             if !supported {
@@ -1723,7 +1771,8 @@ impl Scalar {
         }
         match name {
             array_constructor::NAME => array_constructor::bind(args, array_constructor::Binding::Inferred, resolve, tables, parameters),
-            name if json_array::name(name).is_some() => {
+            // The regular call path leaves jsonb_build_object validation to evaluation.
+            name if name != json_aggregate::OBJECT && json_array::name(name).is_some() => {
                 json_array::bind(name, args, resolve, tables, parameters)
             }
             name if uuid_array_operators::is_quantified(name) => uuid_array_operators::bind_quantified(name, args, resolve, tables, parameters),
@@ -2148,7 +2197,12 @@ impl Scalar {
                     user_types::view_replace_error(format!("could not determine data type of parameter ${n}"));
                     return Err(SqlError::IndeterminateDatatype);
                 }
-                a.bind(resolve, tables, parameters)
+                let bound = a.bind(resolve, tables, parameters)?;
+                if name == json_aggregate::OBJECT {
+                    json_array::preserve_json_column(a, bound, resolve, tables)
+                } else {
+                    Ok(bound)
+                }
             })
             .collect::<R<Vec<_>>>()
             .map_err(|e| {
@@ -2224,6 +2278,17 @@ impl Scalar {
         } else if name == "jsonb_typeof" {
             jsonb_mutation::bind_type(original, &mut args)?;
             DataType::Text
+        } else if name == "json_typeof" {
+            let ([original], [arg]) = (original, args.as_mut_slice()) else {
+                return Err(SqlError::UndefinedFunction);
+            };
+            if let Scalar::Literal(value @ (Value::Text(_) | Value::Null)) = original {
+                *arg = json_literal(value)?;
+            }
+            if arg.result_oid() != json_aggregate::OID {
+                return Err(SqlError::UndefinedFunction);
+            }
+            DataType::Text
         } else if name == "cardinality"
             && matches!(args.as_slice(), [arg] if arg.ty == DataType::UuidArray)
         {
@@ -2249,12 +2314,13 @@ impl Scalar {
                     }
                 }
                 _ => {
-                    if args[0].ty != DataType::Jsonb
+                    let json = args[0].result_oid() == json_aggregate::OID;
+                    if (!json && args[0].ty != DataType::Jsonb)
                         || !(integer(&args[1].ty) || args[1].ty == DataType::Text)
                     {
                         return Err(SqlError::UndefinedFunction);
                     }
-                    if name == "\0json_get" {
+                    if name == "\0json_get" && !json {
                         DataType::Jsonb
                     } else {
                         DataType::Text
@@ -2610,6 +2676,11 @@ impl Scalar {
                         } else if let Self::Literal(Value::Text(s)) = original {
                             a.node = literal_cast_node(Value::Text(s.clone()), &ty)?;
                             a.ty = ty.clone();
+                        } else if ty == DataType::Oid && integer(&a.ty) {
+                            let source = std::mem::replace(a, BoundScalar {
+                                ty: ty.clone(), node: Node::Literal(Value::Null),
+                            });
+                            a.node = cast_node(source, &ty);
                         } else if null(a) {
                             a.ty = ty.clone();
                         }
@@ -2693,9 +2764,10 @@ impl BoundScalar {
             {
                 json_aggregate::ARRAY_OID
             }
-            Node::ZonedOperator(name, ..) if json_array::name(name) == Some("json_build_array") => {
-                json_aggregate::OID
-            }
+            Node::ZonedOperator(name, ..)
+                if json_array::name(name).is_some() && !json_array::binary(name) => json_aggregate::OID,
+            Node::Call(name, args)
+                if name == "\0json_get" && args[0].result_oid() == json_aggregate::OID => json_aggregate::OID,
             Node::Call(name, _) if matches!(name.as_str(), json_aggregate::TEXT_RESULT | json_aggregate::INPUT) => json_aggregate::OID,
             Node::Case(arms, other) => json_in_branches(arms.iter().map(|(_, value)| value).chain(other.as_deref())),
             Node::Call(name, args) if name == "coalesce" => json_in_branches(args.iter()),
@@ -3043,6 +3115,11 @@ impl BoundScalar {
                     charge(budget, &value)?;
                     return Ok(value);
                 }
+                if a.ty == DataType::RegType && self.ty == DataType::Oid && v != Value::Null {
+                    let value = cast::regtype_oid(&v)?;
+                    charge(budget, &value)?;
+                    return Ok(value);
+                }
                 if a.ty != self.ty && a.ty.is_temporal() && self.ty.is_temporal() {
                     let value = assignment::convert(v, &a.ty, &self.ty, None)?;
                     charge(budget, &value)?;
@@ -3118,7 +3195,13 @@ impl BoundScalar {
                         .iter()
                         .map(|a| a.eval(row, params, budget))
                         .collect::<R<Vec<_>>>()?;
-                    let result = crate::relational::logical_types::eval(n, &args[0].ty, &values)?;
+                    let result = if matches!(n.as_str(), "\0json_get" | "\0json_text")
+                        && args[0].result_oid() == json_aggregate::OID
+                    {
+                        json_array::access(n, &values)?
+                    } else {
+                        crate::relational::logical_types::eval(n, &args[0].ty, &values)?
+                    };
                     charge(budget, &result)?;
                     return Ok(result);
                 }
@@ -3171,7 +3254,7 @@ impl BoundScalar {
                     charge(budget, &value)?;
                     return Ok(value);
                 }
-                if n == "jsonb_typeof" {
+                if matches!(n.as_str(), "json_typeof" | "jsonb_typeof") {
                     let value = jsonb_mutation::json_type(&values[0])?;
                     charge(budget, &value)?;
                     return Ok(value);
@@ -3843,6 +3926,11 @@ impl Scalar {
             }
             Self::Param(n) => {
                 let slot = parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?;
+                if slot.as_ref() == Some(&DataType::Oid)
+                    || (slot.is_none() && expected == Some(&DataType::Oid))
+                {
+                    return Err(SqlError::Unsupported);
+                }
                 if let Some(ty) = expected {
                     if slot.as_ref().is_some_and(|old| old != ty) {
                         return Err(SqlError::Type);
@@ -3857,6 +3945,15 @@ impl Scalar {
                     a.infer_enum_parameter(&base, Some(ty), parameters)?;
                 }
                 Self::Cast(a.clone(), base).infer(expected, parameters, resolve, tables)?;
+            }
+            Self::Cast(a, ty) if *ty == DataType::Oid && cast::regclass_literal(a).is_some() => {}
+            Self::Cast(a, DataType::RegConfig | DataType::RegDictionary)
+                if let Self::Cast(input, DataType::Oid) = a.as_ref()
+                    && let Self::Param(n) = input.as_ref() =>
+            {
+                // Text-search casts retain their dedicated oid input route.
+                parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?
+                    .get_or_insert(DataType::Oid);
             }
             Self::Cast(a, ty) => {
                 // An explicit cast converts the already chosen input type; it
@@ -4000,6 +4097,16 @@ impl Scalar {
                 for arg in args {
                     arg.infer(Some(&DataType::BigInt), parameters, resolve, tables)?;
                 }
+            }
+            Self::Call(n, args) if n == json_array::ROW => {
+                args[0].infer(Some(&DataType::Boolean), parameters, resolve, tables)?;
+                for arg in &args[1..] {
+                    arg.infer(None, parameters, resolve, tables)?;
+                }
+            }
+            Self::Call(n, args) if n == "json_typeof" => {
+                let [arg] = args.as_slice() else { return Err(SqlError::UndefinedFunction) };
+                arg.infer(Some(&DataType::Text), parameters, resolve, tables)?;
             }
             Self::Call(n, args) if n == "jsonb_typeof" => {
                 let [arg] = args.as_slice() else { return Err(SqlError::UndefinedFunction) };

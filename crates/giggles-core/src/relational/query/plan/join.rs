@@ -1066,6 +1066,19 @@ pub(super) fn prepare(query: &Query, shape: &Shape) -> R<Query> {
         }
     }
     query.items = items;
+    if let [(alias, fields)] = shape.namespace.qualified.as_slice() {
+        for (item, _) in &mut query.items {
+            if let Item::Scalar(scalar) = item {
+                subquery::map_scalar(scalar, &mut |scalar| {
+                    functions::json_array::lower_row(scalar, &|column| {
+                        (column.name == *alias && matches!(shape.namespace.resolve(column), Err(SqlError::UnknownColumn)))
+                            .then(|| fields.iter().map(|(name, index)| (name.clone(), col(*index))).collect())
+                    });
+                    Ok(())
+                })?;
+            }
+        }
+    }
     // Keep ORDER BY positions and names until binding, after star expansion.
     query.predicates.clear();
     if !matches!(query.filter, Some(Filter::Clauses(_))) {

@@ -12,8 +12,13 @@ pub(in crate::relational::query) fn comparable(a: &DataType, b: &DataType) -> bo
     {
         return true;
     }
-    a == b || comparison_type(a, b).is_some() || temporal_pair(a, b)
+    a == b || oid_integer_pair(a, b) || comparison_type(a, b).is_some() || temporal_pair(a, b)
 }
+
+pub(in crate::relational::query) fn oid_integer_pair(a: &DataType, b: &DataType) -> bool {
+    *a == DataType::Oid && integer(b) || *b == DataType::Oid && integer(a)
+}
+
 fn temporal_pair(a: &DataType, b: &DataType) -> bool {
     matches!(
         (a, b),

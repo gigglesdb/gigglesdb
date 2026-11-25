@@ -189,6 +189,7 @@ fn decode_escape(raw: &[u8]) -> R<String> {
                 b't' => append(&mut out, b"\t")?,
                 b'r' => append(&mut out, b"\r")?,
                 b'b' => append(&mut out, &[8])?,
+                b'v' => append(&mut out, &[11])?,
                 b'f' => append(&mut out, &[12])?,
                 c => append(&mut out, &[c])?,
             }

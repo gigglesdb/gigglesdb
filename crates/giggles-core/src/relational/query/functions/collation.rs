@@ -268,10 +268,15 @@ struct Metadata {
     explicit: bool,
     conflict: Option<(String, String)>,
     enum_type: Option<TypeDef>,
+    json: bool,
 }
 std::thread_local! { static MATERIALIZED: std::cell::RefCell<BTreeMap<u64, Metadata>> = const { std::cell::RefCell::new(BTreeMap::new()) }; }
 pub(in crate::relational::query) fn has_materialized_columns() -> bool {
     MATERIALIZED.with(|columns| !columns.borrow().is_empty())
+}
+
+pub(super) fn materialized_json(id: u64) -> bool {
+    MATERIALIZED.with_borrow(|columns| columns.get(&id).is_some_and(|column| column.json))
 }
 pub(in crate::relational::query) struct ColumnScope(BTreeMap<u64, Metadata>);
 impl ColumnScope {
@@ -299,6 +304,7 @@ impl ColumnScope {
                 Metadata {
                     name: d.name.map(str::to_owned),
                     enum_type: m.and_then(BoundScalar::attached_enum).cloned(),
+                    json: m.is_some_and(|value| value.result_oid() == json_aggregate::OID),
                     explicit: d.explicit,
                     conflict: d.conflict.map(|(a, b)| (a.to_owned(), b.to_owned())),
                 },
@@ -769,6 +775,7 @@ pub(in crate::relational::query) fn register(
                 Metadata {
                     name: d.name.map(str::to_owned),
                     enum_type: m.as_ref().and_then(BoundScalar::attached_enum).cloned(),
+                    json: m.as_ref().is_some_and(|value| value.result_oid() == json_aggregate::OID),
                     explicit: false,
                     conflict: d.conflict.map(|(a, b)| (a.to_owned(), b.to_owned())),
                 },
@@ -802,6 +809,11 @@ pub(in crate::relational::query) fn materialized(metadata: Option<&BoundScalar>,
     let value = BoundScalar { ty, node: Node::Literal(Value::Null) }.inherit_derivation(d)?;
     Ok(if let Some(ty) = metadata.and_then(BoundScalar::attached_enum) {
         value.with_enum(ty)
+    } else if metadata.is_some_and(|value| value.result_oid() == json_aggregate::OID) {
+        BoundScalar {
+            ty: value.ty.clone(),
+            node: Node::Call(json_aggregate::TEXT_RESULT.into(), vec![value]),
+        }
     } else {
         value
     })
