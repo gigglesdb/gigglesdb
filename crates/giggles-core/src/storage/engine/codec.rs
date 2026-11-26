@@ -69,17 +69,17 @@ pub(crate) fn append_index_tuple<'a>(
         return Err(CodecError::Limit);
     }
     for (value, direction) in values {
-        let mut component = if matches!(value, Value::Null) {
-            vec![0xff]
+        let start = out.len();
+        if matches!(value, Value::Null) {
+            out.push(0xff);
         } else {
-            crate::relational::secondary_index_keys::component(value)?
-        };
+            crate::relational::secondary_index_keys::append_component(out, value)?;
+        }
         if direction == Direction::Desc {
-            for byte in &mut component {
+            for byte in &mut out[start..] {
                 *byte = !*byte;
             }
         }
-        out.extend(component);
     }
     Ok(())
 }
@@ -248,6 +248,36 @@ pub(crate) fn decode_row(key: &[u8], record: &[u8]) -> Result<RowRecord, CodecEr
 #[cfg(test)]
 mod tests {
     use super::{CodecError, Ts, split_versioned, user_key_seek_at};
+
+    #[test]
+    fn appended_index_tuple_keeps_existing_component_bytes_and_prefix() {
+        use super::{Direction, Value, append_index_tuple};
+        use crate::relational::encode_key;
+
+        let values = [
+            Value::Text("é".repeat(4096)),
+            Value::Null,
+            Value::Bytes(vec![0, 255, 0, 6]),
+            Value::Int(-13),
+        ];
+        let dirs = [Direction::Asc, Direction::Desc, Direction::Desc, Direction::Asc];
+        let prefix = b"index id";
+        let mut expected = prefix.to_vec();
+        for (value, dir) in values.iter().zip(dirs) {
+            let mut component = if *value == Value::Null {
+                vec![0xff]
+            } else {
+                encode_key(std::slice::from_ref(value)).unwrap()
+            };
+            if dir == Direction::Desc {
+                component.iter_mut().for_each(|byte| *byte = !*byte);
+            }
+            expected.extend(component);
+        }
+        let mut actual = prefix.to_vec();
+        append_index_tuple(&mut actual, values.iter().zip(dirs)).unwrap();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn versioned_key_concatenation_equivalence() {

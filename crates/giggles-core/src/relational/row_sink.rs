@@ -59,8 +59,13 @@ pub(crate) struct AppendCandidate {
     pub(crate) input: usize,
 }
 
+pub(crate) enum AppendReplay {
+    Candidates(Vec<AppendCandidate>),
+    SortedOrdinals(Vec<u16>),
+}
+
 pub(super) enum AppendOrder {
-    PublishedCandidates(Vec<AppendCandidate>),
+    Published(AppendReplay),
     RejectedCandidates(Vec<SqlRow>),
 }
 
@@ -253,7 +258,7 @@ pub(crate) trait RowSink {
         table: &TableDef,
         before: &DdlRows,
         after: &DdlRows,
-        _order: Option<Vec<AppendCandidate>>,
+        _order: Option<AppendReplay>,
     ) -> Result<(), CoreError> {
         if state.has_nondeterministic_keys(table) {
             self.check_occupancy(table, before, after)?;
@@ -918,7 +923,7 @@ impl Relational {
                     // Preserve immediate PK/UNIQUE error precedence before
                     // end-of-statement constraints. The savepoint owns rollback.
                     let order = match append_order {
-                        Some(AppendOrder::PublishedCandidates(rows)) => Some(rows),
+                        Some(AppendOrder::Published(order)) => Some(order),
                         _ => None,
                     };
                     sink.apply_append(self, table, old, new, order)?;

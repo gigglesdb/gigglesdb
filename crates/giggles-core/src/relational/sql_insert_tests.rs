@@ -1341,3 +1341,56 @@ fn v2_single_wide_insert_returning_update_and_scan_cursor() {
     drop(cursor); drop(session); drop(admin);
     std::fs::remove_dir_all(path).unwrap();
 }
+
+
+#[test]
+fn sorted_values_append_matches_general_row_and_index_bytes() {
+    use crate::storage::engine::{codec, indexes};
+
+    let mut general = Relational::default();
+    for ddl in [
+        r#"CREATE TABLE sample (id TEXT COLLATE "C" PRIMARY KEY, email TEXT COLLATE "C", n INTEGER)"#,
+        "CREATE UNIQUE INDEX sample_email ON sample (email)",
+    ] {
+        let stmt = Prepared::parse(ddl, 0, general.epoch).unwrap();
+        general.execute(&stmt, &[], None).unwrap();
+    }
+    let mut optimized = general.clone();
+    let stmt = Prepared::parse(
+        "INSERT INTO sample VALUES ('z',NULL,3), ($1,'Äbc',2), ('a','x',1) RETURNING id",
+        1, general.epoch,
+    ).unwrap();
+    let params = [Value::Text("m".repeat(8192))];
+    let expected = general.execute(&stmt, &params, None).unwrap();
+    let mut order = None;
+    let actual = optimized.execute_statement_described_with_append(
+        &StatementDescription::new(&stmt), &params, None, || false, None, None,
+        &mut Vec::new(), Some(&mut order), None,
+    ).unwrap();
+    assert_eq!(actual, expected);
+    assert!(matches!(
+        order, Some(row_sink::AppendOrder::Published(row_sink::AppendReplay::SortedOrdinals(ordinals)))
+            if ordinals == [2, 1, 0]
+    ));
+    let table = &general.tables["sample"];
+    let expected = &general.rows[&table.id];
+    let actual = &optimized.rows[&table.id];
+    assert_eq!(actual, expected);
+    for (key, row) in actual {
+        let pk = codec::pk_bytes_iter(table.primary_key.iter().map(|i| &row.values[*i])).unwrap();
+        assert_eq!(&pk, key);
+        let before = &expected[key];
+        assert_eq!(
+            codec::encode_row(key, row.version, &row.values).unwrap(),
+            codec::encode_row(&pk, before.version, &before.values).unwrap(),
+        );
+    }
+    assert_eq!(
+        indexes::entries(Some(&optimized), table, actual, optimized.secondary_descriptors_engine()).unwrap(),
+        indexes::entries(Some(&general), table, expected, general.secondary_descriptors_engine()).unwrap(),
+    );
+    assert_eq!(
+        optimized.secondary_persistence_engine(|| false).unwrap(),
+        general.secondary_persistence_engine(|| false).unwrap(),
+    );
+}

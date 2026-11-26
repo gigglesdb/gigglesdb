@@ -717,6 +717,126 @@ impl Relational {
         proposal: StatementProposal<'_>,
         cancel: &mut impl FnMut() -> bool,
     ) -> R<StagedStatement> {
+        let work = self.admit_statement_preimage(&proposal, false, cancel)?;
+        let mut rows = BTreeMap::new();
+        for change in proposal.changes {
+            tick(cancel)?;
+            rows.entry(change.table)
+                .or_insert_with(|| self.rows[&change.table].clone());
+        }
+        // Remove ALL old memberships before adding ANY new row. Uniqueness is
+        // recomputed once over untouched survivors plus the complete new batch.
+        for change in proposal.changes {
+            tick(cancel)?;
+            if let Some((key, _)) = change.old {
+                rows.get_mut(&change.table)
+                    .expect("staged table")
+                    .remove(key);
+            }
+        }
+        for change in proposal.changes {
+            tick(cancel)?;
+            if let Some((key, row)) = change.new {
+                rows.get_mut(&change.table)
+                    .expect("staged table")
+                    .insert(key.to_vec(), row.clone());
+            }
+        }
+        let secondary = self.validate_statement_postimage(
+            &rows, proposal.next_version, work, false,
+            |id, pk| proposal.changes.iter().any(|change| change.table == id
+                && change.new.is_some_and(|(key, _)| key == pk)),
+            cancel,
+        )?;
+        Ok(StagedStatement {
+            rows,
+            secondary,
+            next_version: proposal.next_version,
+            result: SqlResult {
+                affected: proposal.changes.iter().filter(|c| c.old.is_some() || c.new.is_some()).count() as u64,
+                ..SqlResult::default()
+            },
+        })
+    }
+
+    /// V2 VALUES proposals already have sorted, canonical keys. The target
+    /// preimage is empty here; the physical publisher still checks occupancy.
+    pub(super) fn secondary_apply_sorted_append(
+        &mut self,
+        table: u64,
+        mut candidates: Vec<row_sink::AppendCandidate>,
+        next_version: u64,
+        order: &mut Option<row_sink::AppendOrder>,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> R<SqlResult> {
+        debug_assert!(self.rows[&table].is_empty());
+        debug_assert!(candidates.windows(2).all(|pair| pair[0].key <= pair[1].key));
+        let changes = candidates.iter().map(|candidate| RowChange {
+            table,
+            old: None,
+            new: Some((&candidate.key, &candidate.row)),
+        }).collect::<Vec<_>>();
+        let work = match self.admit_statement_preimage(
+            &StatementProposal { changes: &changes, next_version }, true, cancel,
+        ) {
+            Ok(work) => work,
+            Err(error) => {
+                if error == SqlError::Duplicate {
+                    candidates.sort_unstable_by_key(|candidate| candidate.input);
+                    *order = Some(row_sink::AppendOrder::RejectedCandidates(
+                        candidates.into_iter().map(|candidate| candidate.row).collect(),
+                    ));
+                }
+                return Err(error);
+            }
+        };
+        // Retain the table-copy and old-removal cancellation fences.
+        for _ in 0..2 * candidates.len() {
+            tick(cancel)?;
+        }
+        let mut staged = row_sink::DdlRows::new();
+        let mut ordinals = Vec::with_capacity(candidates.len());
+        for row_sink::AppendCandidate { key, row, input } in candidates {
+            tick(cancel)?;
+            staged.insert(key, row);
+            ordinals.push(u16::try_from(input).expect("bounded VALUES input ordinal"));
+        }
+        let mut rows = BTreeMap::new();
+        if !staged.is_empty() {
+            rows.insert(table, staged);
+        }
+        let secondary = match self.validate_statement_postimage(
+            &rows, next_version, work, true, |id, _| id == table, cancel,
+        ) {
+            Ok(secondary) => secondary,
+            Err(error) => {
+                if error == SqlError::Duplicate {
+                    let staged = rows.remove(&table).into_iter().flatten().map(|(_, row)| row);
+                    let mut rejected = ordinals.into_iter().zip(staged).collect::<Vec<_>>();
+                    rejected.sort_unstable_by_key(|(input, _)| *input);
+                    *order = Some(row_sink::AppendOrder::RejectedCandidates(
+                        rejected.into_iter().map(|(_, row)| row).collect(),
+                    ));
+                }
+                return Err(error);
+            }
+        };
+        let affected = ordinals.len() as u64;
+        if let Some(staged) = rows.remove(&table) {
+            *self.rows.get_mut(&table).expect("admitted table") = staged;
+        }
+        self.secondary = secondary;
+        self.next_version = next_version;
+        *order = Some(row_sink::AppendOrder::Published(row_sink::AppendReplay::SortedOrdinals(ordinals)));
+        Ok(SqlResult { affected, ..SqlResult::default() })
+    }
+
+    fn admit_statement_preimage(
+        &self,
+        proposal: &StatementProposal<'_>,
+        sorted_append: bool,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> R<usize> {
         cap(proposal.changes.len(), MAX_ROWS)?;
         let mut bytes = 0;
         let mut work = 0;
@@ -776,14 +896,19 @@ impl Relational {
             tick(cancel)?;
             let rows = self.rows.get(&change.table).ok_or(SqlError::UnknownTable)?;
             let identity = change.old.or(change.new).map(|(k, _)| k);
-            if proposal.changes[..i].iter().any(|prior| {
-                prior.table == change.table
-                    && identity.is_some()
-                    && prior
-                        .old
-                        .or(prior.new)
-                        .is_some_and(|(k, _)| Some(k) == identity)
-            }) {
+            let duplicate = if sorted_append {
+                i > 0 && proposal.changes[i - 1].new.map(|(key, _)| key) == identity
+            } else {
+                proposal.changes[..i].iter().any(|prior| {
+                    prior.table == change.table
+                        && identity.is_some()
+                        && prior
+                            .old
+                            .or(prior.new)
+                            .is_some_and(|(k, _)| Some(k) == identity)
+                })
+            };
+            if duplicate {
                 let row = change.new.or(change.old).expect("matching row identity").1;
                 return Err(self.primary_duplicate(table(self, change.table)?, &row.values));
             }
@@ -809,7 +934,10 @@ impl Relational {
             if let Some((key, row)) = change.new {
                 let t = table(self, change.table)?;
                 row_check(t, &row.values)?;
-                if pk(t, &row.values)? != key {
+                if sorted_append {
+                    // VALUES constructed this key from these exact normalized cells.
+                    debug_assert_eq!(pk(t, &row.values).as_deref(), Ok(key));
+                } else if pk(t, &row.values)? != key {
                     return Err(SqlError::Type);
                 }
                 if row.version == 0 || row.version >= proposal.next_version {
@@ -877,31 +1005,20 @@ impl Relational {
                 return Err(SqlError::Version);
             }
         }
-        let mut rows = BTreeMap::new();
-        for change in proposal.changes {
-            tick(cancel)?;
-            rows.entry(change.table)
-                .or_insert_with(|| self.rows[&change.table].clone());
-        }
-        // Remove ALL old memberships before adding ANY new row. Uniqueness is
-        // recomputed once over untouched survivors plus the complete new batch.
-        for change in proposal.changes {
-            tick(cancel)?;
-            if let Some((key, _)) = change.old {
-                rows.get_mut(&change.table)
-                    .expect("staged table")
-                    .remove(key);
-            }
-        }
-        for change in proposal.changes {
-            tick(cancel)?;
-            if let Some((key, row)) = change.new {
-                rows.get_mut(&change.table)
-                    .expect("staged table")
-                    .insert(key.to_vec(), row.clone());
-            }
-        }
-        for (id, map) in &rows {
+        Ok(work)
+    }
+
+    fn validate_statement_postimage(
+        &self,
+        rows: &BTreeMap<u64, row_sink::DdlRows>,
+        next_version: u64,
+        work: usize,
+        discard_namespace: bool,
+        is_new: impl Fn(u64, &[u8]) -> bool,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> R<Sidecar> {
+        let ds = self.secondary.descriptors();
+        for (id, map) in rows {
             self.validate_collated_unique(table(self, *id)?, map, ds, cancel)?;
         }
         let mut count = 0;
@@ -940,11 +1057,10 @@ impl Relational {
             .map_err(|failure| {
                 let failure = error(failure);
                 if failure == SqlError::Duplicate {
-                    for (id, map) in &rows {
+                    for (id, map) in rows {
                         let table = table(self, *id).expect("projected table");
                         if self.validate_index_details(table, map, ds, false, |pk| {
-                            proposal.changes.iter().any(|change| change.table == *id
-                                && change.new.is_some_and(|(key, _)| key == pk))
+                            is_new(*id, pk)
                         }, cancel) == Err(SqlError::Duplicate)
                         {
                             break;
@@ -953,18 +1069,10 @@ impl Relational {
                 }
                 failure
             })?;
-        let result = SqlResult {
-            affected: proposal
-                .changes
-                .iter()
-                .filter(|c| c.old.is_some() || c.new.is_some())
-                .count() as u64,
-            ..SqlResult::default()
-        };
         let image = StatementNamespace5 {
             source: self,
-            replacements: &rows,
-            next_version: proposal.next_version,
+            replacements: rows,
+            next_version,
         };
         let base_size = bincode::serialized_size(&image).map_err(|_| SqlError::Type)?;
         let base_size = usize::try_from(base_size).map_err(|_| SqlError::Limit)?;
@@ -973,14 +1081,13 @@ impl Relational {
         let payload = si::codec::encode(&secondary, &mut *cancel).map_err(error)?;
         cap(add(add(base_size, payload.len())?, 42)?, si::MAX_BYTES)?;
         tick(cancel)?;
-        let _base = bincode::serialize(&image).map_err(|_| SqlError::Type)?;
+        if discard_namespace {
+            bincode::serialize_into(std::io::sink(), &image).map_err(|_| SqlError::Type)?;
+        } else {
+            let _base = bincode::serialize(&image).map_err(|_| SqlError::Type)?;
+        }
         tick(cancel)?; // Last fallible operation before publication of every field.
-        Ok(StagedStatement {
-            rows,
-            secondary,
-            next_version: proposal.next_version,
-            result,
-        })
+        Ok(secondary)
     }
     pub(super) fn secondary_apply_statement(
         &mut self,

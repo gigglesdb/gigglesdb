@@ -1,5 +1,5 @@
 //! Memcomparable secondary components. Primary keys use the separate row codec.
-use super::{Interval, R, Value, encode_key, escaped};
+use super::{Interval, R, Value, append_key_iter, escaped};
 
 enum TemporalKey {
     Scalar(i64),
@@ -59,17 +59,28 @@ pub(super) fn temporal_len(value: &Value) -> Option<usize> {
 }
 
 pub(crate) fn component(value: &Value) -> R<Vec<u8>> {
-    match TemporalKey::from_value(value) {
-        Some(TemporalKey::Scalar(n)) => encode_key(&[Value::Int(n)]),
+    let mut out = Vec::new();
+    append_component(&mut out, value)?;
+    Ok(out)
+}
+
+pub(crate) fn append_component(out: &mut Vec<u8>, value: &Value) -> R<()> {
+    let start = out.len();
+    let result = match TemporalKey::from_value(value) {
+        Some(TemporalKey::Scalar(n)) => append_key_iter(out, std::iter::once(&Value::Int(n))),
         Some(key) => {
             // Reuse the existing byte component framing. A descriptor fixes
             // each component's SQL type via the referenced column.
-            let mut out = vec![4];
-            escaped(key.bytes(), &mut out);
-            Ok(out)
+            out.push(4);
+            escaped(key.bytes(), out);
+            Ok(())
         }
-        None => encode_key(std::slice::from_ref(value)),
+        None => append_key_iter(out, std::iter::once(value)),
+    };
+    if result.is_err() {
+        out.truncate(start);
     }
+    result
 }
 
 /// The exclusive end of a byte prefix, including all suffixes at that prefix.

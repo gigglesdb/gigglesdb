@@ -1637,7 +1637,7 @@ pub(super) fn execute_declared(
     expected: Option<u64>,
     returning: &Option<returning::Plan<'_>>,
     clock: Option<&clock::ExecutionClock>,
-    cancel: &mut dyn FnMut() -> bool,
+    mut cancel: &mut dyn FnMut() -> bool,
     declared: &[Option<DataType>],
     events: &mut Vec<constraints::Event>,
     injected_source: Option<&dyn scan::RowSource>,
@@ -1845,6 +1845,20 @@ pub(super) fn execute_declared(
             projected.version = row.version;
         }
     }
+    if insert.copy_input.is_none()
+        && !insert.copy_precoerced
+        && source_types.is_none()
+        && state.rows.get(&table.id).is_some_and(BTreeMap::is_empty)
+        && let Some(order) = append_order
+    {
+        #[cfg(test)]
+        Relational::sql_insert_test_event(4);
+        let mut result = state.secondary_apply_sorted_append(
+            table.id, proposed, next_version, order, &mut cancel,
+        )?;
+        returning::attach(returning, &mut result, returned);
+        return Ok(result);
+    }
     let changes = proposed
         .iter()
         .map(|AppendCandidate { key, row, .. }| BatchRowChange {
@@ -1858,7 +1872,7 @@ pub(super) fn execute_declared(
     let result = state.secondary_apply_batch_engine(state.epoch, &changes, next_version, &mut *cancel);
     if let Some(order) = append_order {
         match &result {
-            Ok(_) => *order = Some(row_sink::AppendOrder::PublishedCandidates(proposed)),
+            Ok(_) => *order = Some(row_sink::AppendOrder::Published(row_sink::AppendReplay::Candidates(proposed))),
             Err(SqlError::Duplicate) => {
                 proposed.sort_unstable_by_key(|candidate| candidate.input);
                 *order = Some(row_sink::AppendOrder::RejectedCandidates(

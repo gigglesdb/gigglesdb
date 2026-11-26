@@ -1009,11 +1009,20 @@ pub fn encode_key(values: &[Value]) -> R<Vec<u8>> {
 pub(crate) fn encode_key_iter<'a>(
     values: impl ExactSizeIterator<Item = &'a Value> + Clone,
 ) -> R<Vec<u8>> {
+    let mut out = Vec::new();
+    append_key_iter(&mut out, values)?;
+    Ok(out)
+}
+
+fn append_key_iter<'a>(
+    out: &mut Vec<u8>,
+    values: impl ExactSizeIterator<Item = &'a Value> + Clone,
+) -> R<()> {
     if values.len() > MAX_COLUMNS {
         return Err(SqlError::Limit);
     }
     payload_bound(values.clone())?;
-    let mut out = Vec::new();
+    let start = out.len();
     for v in values {
         match v {
             Value::Date(_)
@@ -1024,7 +1033,7 @@ pub(crate) fn encode_key_iter<'a>(
             | Value::Interval(_) => return Err(SqlError::Unsupported),
             Value::Numeric(n) => {
                 out.push(5);
-                numeric::key(n, &mut out);
+                numeric::key(n, out);
             }
             Value::Float4(n) => {
                 out.push(6);
@@ -1045,18 +1054,18 @@ pub(crate) fn encode_key_iter<'a>(
             }
             Value::Text(s) => {
                 out.push(3);
-                escaped(s.as_bytes(), &mut out);
+                escaped(s.as_bytes(), out);
             }
             Value::Bytes(b) => {
                 out.push(4);
-                escaped(b, &mut out);
+                escaped(b, out);
             }
         }
-        if out.len() > MAX_ROW_BYTES * 2 + MAX_COLUMNS * 3 {
+        if out.len() - start > MAX_ROW_BYTES * 2 + MAX_COLUMNS * 3 {
             return Err(SqlError::Limit);
         }
     }
-    Ok(out)
+    Ok(())
 }
 fn escaped(b: &[u8], out: &mut Vec<u8>) {
     for c in b {
@@ -5412,13 +5421,26 @@ impl Relational {
                     version,
                 };
                 returned_rows = returning::project(&returning, self, params, &[&row])?;
-                result = self.secondary_apply_statement(
-                    table_id,
-                    None,
-                    Some((&key, &row)),
-                    next_version,
-                    &mut cancel,
-                )?;
+                result = if self.rows.get(&table_id).is_some_and(BTreeMap::is_empty)
+                    && let Some(order) = append_order
+                {
+                    let result = self.secondary_apply_sorted_append(
+                        table_id,
+                        vec![row_sink::AppendCandidate { key, row, input: 0 }],
+                        next_version,
+                        order,
+                        &mut cancel,
+                    );
+                    if result.is_err() {
+                        // This single-row path has no logical collision replay.
+                        *order = None;
+                    }
+                    result?
+                } else {
+                    self.secondary_apply_statement(
+                        table_id, None, Some((&key, &row)), next_version, &mut cancel,
+                    )?
+                };
             }
             Statement::Select {
                 name,

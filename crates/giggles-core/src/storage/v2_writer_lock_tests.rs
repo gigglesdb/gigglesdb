@@ -27,7 +27,11 @@ fn run(s: &mut SqlSession, sql: &str) -> relational::SqlResult {
 fn clock() -> relational::StatementClock {
     relational::StatementClock { unavailable: None, transaction_us: 1, statement_us: 1, zone: None, wall: None }
 }
-struct Pending { done: mpsc::Receiver<Result<relational::SqlResult, CoreError>>, worker: JoinHandle<()> }
+type Outcome = (Result<relational::SqlResult, CoreError>, Option<String>);
+struct Pending<T = Result<relational::SqlResult, CoreError>> {
+    done: mpsc::Receiver<T>,
+    worker: JoinHandle<()>,
+}
 impl Pending {
     fn start(f: &Fixture, sql: &str) -> Self {
         Self::start_expected(f, sql, None, "")
@@ -44,6 +48,8 @@ impl Pending {
             send.send(result).unwrap(); });
         Self { done, worker }
     }
+}
+impl<T> Pending<T> {
     fn blocked(&self, holder: &SqlSession) {
         let until = Instant::now() + Duration::from_secs(10);
         loop {
@@ -53,7 +59,7 @@ impl Pending {
             thread::sleep(Duration::from_millis(1));
         }
     }
-    fn finish(self) -> Result<relational::SqlResult, CoreError> {
+    fn finish(self) -> T {
         let result = self.done.recv_timeout(Duration::from_secs(20)).unwrap();
         self.worker.join().unwrap();
         result
@@ -160,6 +166,70 @@ fn concurrent_insert_pk_and_unique_wait_then_duplicate_or_success() {
             else { assert_eq!(result.unwrap().affected, 1); }
         }
     }
+}
+
+
+fn assert_append_duplicate(result: Outcome, constraint: &str) {
+    let (result, message) = result;
+    let error = result.unwrap_err();
+    assert_eq!(crate::sqlstate(&error), "23505");
+    assert_eq!(message, Some(format!("duplicate key value violates unique constraint \"{constraint}\"")));
+}
+
+#[test]
+fn values_append_replays_input_order_before_physical_key_order() {
+    let f = Fixture::new();
+    f.exec("CREATE TABLE t(id bigint PRIMARY KEY, email text UNIQUE, payload text)");
+    let mut session = f.sql();
+    for (sql, constraint) in [
+        ("INSERT INTO t VALUES (9,'dup',NULL),(8,'dup',NULL),(1,'a',NULL),(1,'b',NULL)", "t_email_key"),
+        ("INSERT INTO t VALUES (9,'a',NULL),(9,'b',NULL),(1,'dup',NULL),(2,'dup',NULL)", "t_pkey"),
+        ("INSERT INTO t VALUES (9,'dup',NULL),(8,'dup',NULL),(1,'a',NULL)", "t_email_key"),
+    ] {
+        let result = session.execute_at(sql, &[], None, &clock());
+        assert_append_duplicate((result, relational::take_sql_error_message()), constraint);
+        assert!(run(&mut session, "SELECT id FROM t LIMIT 5").rows.is_empty());
+    }
+    let error = session.execute_at(
+        "INSERT INTO t VALUES (9,'dup',NULL),(8,'dup',NULL),(1,'a',$1),(1,'b',NULL)",
+        &[Text("x".repeat(relational::MAX_VALUE_BYTES + 1))],
+        None,
+        &clock(),
+    ).unwrap_err();
+    assert_eq!(error, CoreError::Sql(SqlError::Limit));
+    assert!(run(&mut session, "SELECT id FROM t LIMIT 5").rows.is_empty());
+}
+
+#[test]
+fn values_append_uses_committed_email_owner_in_input_order() {
+    let f = Fixture::new();
+    f.exec("CREATE TABLE t(id bigint PRIMARY KEY, email text UNIQUE)");
+    let mut holder = f.sql();
+    run(&mut holder, "BEGIN");
+    run(&mut holder, "INSERT INTO t VALUES (1,'owner-pk'),(10,'owner-email')");
+    let admin = f.admin().clone();
+    let (send, done) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let result = admin.sql_session().execute_at(
+            "INSERT INTO t VALUES (9,'owner-email'),(1,'other'),(2,'free')",
+            &[], None, &clock(),
+        );
+        send.send((result, relational::take_sql_error_message())).unwrap();
+    });
+    let pending = Pending { done, worker };
+    pending.blocked(&holder);
+    run(&mut holder, "COMMIT");
+    assert_append_duplicate(pending.finish(), "t_email_key");
+    let values = run(&mut f.sql(), "SELECT id FROM t ORDER BY id").rows;
+    assert_eq!(
+        values.into_iter().map(|row| row.values).collect::<Vec<_>>(),
+        [vec![Int(1)], vec![Int(10)]],
+    );
+    let result = f.sql().execute_at(
+        "INSERT INTO t VALUES (1,'provisional'),(2,'free')", &[], None, &clock(),
+    );
+    assert_append_duplicate((result, relational::take_sql_error_message()), "t_pkey");
+    assert_eq!(run(&mut f.sql(), "INSERT INTO t VALUES (2,'free')").affected, 1);
 }
 
 #[test]

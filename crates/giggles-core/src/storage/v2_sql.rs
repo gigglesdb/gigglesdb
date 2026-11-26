@@ -2535,7 +2535,7 @@ impl RowSink for SqlRows<'_> {
         table: &TableDef,
         before: &DdlRows,
         after: &DdlRows,
-        mut order: Option<Vec<relational::row_sink::AppendCandidate>>,
+        mut order: Option<relational::row_sink::AppendReplay>,
     ) -> Result<(), CoreError> {
         let mark = self.txn.statement_savepoint();
         let result = (|| {
@@ -2543,7 +2543,13 @@ impl RowSink for SqlRows<'_> {
                 self.check_occupancy(table, before, after)?;
             }
             self.apply_indexes(table, Some(table), before, after, state.secondary_descriptors_engine())?;
-            self.apply(table, before, after)
+            if matches!(order, Some(relational::row_sink::AppendReplay::SortedOrdinals(_)))
+                && before.is_empty()
+            {
+                self.apply_sorted_append_rows(table, after)
+            } else {
+                self.apply(table, before, after)
+            }
         })();
         if matches!(result, Err(CoreError::Sql(SqlError::Duplicate))) {
             // The row publisher may have failed after the index writes were
@@ -2551,9 +2557,15 @@ impl RowSink for SqlRows<'_> {
             self.txn.rollback_to(&mark)?;
             self.txn.release(mark)?;
             let proposed: Vec<_> = match &mut order {
-                Some(candidates) => {
+                Some(relational::row_sink::AppendReplay::Candidates(candidates)) => {
                     candidates.sort_unstable_by_key(|candidate| candidate.input);
                     candidates.iter().map(|candidate| &candidate.row).collect()
+                }
+                Some(relational::row_sink::AppendReplay::SortedOrdinals(ordinals)) => {
+                    debug_assert_eq!(ordinals.len(), after.len());
+                    let mut proposed = ordinals.iter().copied().zip(after.values()).collect::<Vec<_>>();
+                    proposed.sort_unstable_by_key(|(input, _)| *input);
+                    proposed.into_iter().map(|(_, row)| row).collect()
                 }
                 None => after.values().collect(),
             };
@@ -2697,9 +2709,40 @@ impl RowSink for SqlRows<'_> {
             physical.extend(codec::pk_bytes(&pk)?);
             changes.insert(physical, (old, new));
         }
+        self.publish_row_changes(table, changes.iter())
+    }
+}
+
+impl SqlRows<'_> {
+    fn apply_sorted_append_rows(
+        &mut self,
+        table: &TableDef,
+        after: &DdlRows,
+    ) -> Result<(), CoreError> {
+        if !self.writing {
+            return Ok(());
+        }
+        let changes = after.iter().map(|(key, row)| {
+            debug_assert_eq!(
+                codec::pk_bytes_iter(table.primary_key.iter().map(|i| &row.values[*i])).as_deref(),
+                Ok(key.as_slice()),
+            );
+            let mut physical = Vec::with_capacity(8 + key.len());
+            physical.extend_from_slice(&table.id.to_be_bytes());
+            physical.extend_from_slice(key);
+            (physical, (None, Some(row)))
+        }).collect::<Vec<_>>();
+        self.publish_row_changes(table, changes.iter().map(|(key, change)| (key, change)))
+    }
+
+    fn publish_row_changes<'a>(
+        &mut self,
+        table: &TableDef,
+        changes: impl Clone + Iterator<Item = (&'a Vec<u8>, &'a (Option<&'a SqlRow>, Option<&'a SqlRow>))>,
+    ) -> Result<(), CoreError> {
         // Acquire and validate every witness before buffering any write, with
         // deterministic physical key order for re-key and searched mutations.
-        for (key, (old, new)) in &changes {
+        for (key, (old, new)) in changes.clone() {
             crate::cancellation::check()?;
             if matches!(self.txn.services(), engine::txn::TxnServices::Local { .. })
                 && old.is_some_and(|old| new.is_none_or(|new|
@@ -2740,7 +2783,7 @@ impl RowSink for SqlRows<'_> {
                 (None, None) => (),
             }
         }
-        for (key, (_, new)) in &changes {
+        for (key, (_, new)) in changes.clone() {
             crate::cancellation::check()?;
             match new {
                 Some(row) => self.txn.put(
@@ -2756,7 +2799,7 @@ impl RowSink for SqlRows<'_> {
             }
         }
         if let Some(effects) = self.effects.as_deref_mut() {
-            for (key, (old, new)) in &changes {
+            for (key, (old, new)) in changes {
                 effects.record(table.id, key, *old, *new)?;
             }
         }
