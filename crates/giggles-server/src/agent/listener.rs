@@ -188,17 +188,23 @@ pub async fn serve_agent_pg_bound(
             }
         }
         let sem = Arc::new(Semaphore::new(connections));
+        let rejections = crate::auth::listener::ConnectionRejections::new();
         let accept = TlsAcceptor::from(tls);
         let mut tasks = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
+                biased;
                 _ = &mut rx => break,
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                 incoming = listener.accept() => {
                     let (mut socket, _) = incoming?;
                     crate::transport::no_delay(&socket);
-                    let Some(shared) = task_service.admission.connect() else { continue };
-                    let Ok(permit) = sem.clone().try_acquire_owned() else { continue };
+                    let (Some(shared), Ok(permit)) =
+                        (task_service.admission.connect(), sem.clone().try_acquire_owned())
+                    else {
+                        rejections.reject(&mut tasks, socket, Some(&accept), "agent_postgres");
+                        continue;
+                    };
                     let accept = accept.clone();
                     let service = task_service.clone();
                     let databases = databases.clone();

@@ -23,14 +23,20 @@ pub async fn serve_refusal_bound(
     let (stop, mut rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         let sem = Arc::new(Semaphore::new(connections));
+        let rejections = crate::auth::listener::ConnectionRejections::new();
+        let accept = tls.clone().map(TlsAcceptor::from);
         let mut tasks = JoinSet::new();
         loop {
             tokio::select! {
+                biased;
                 _ = &mut rx => break,
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                 incoming = listener.accept() => {
                     let (socket, _) = incoming?;
-                    let Ok(permit) = sem.clone().try_acquire_owned() else { continue };
+                    let Ok(permit) = sem.clone().try_acquire_owned() else {
+                        rejections.reject(&mut tasks, socket, accept.as_ref(), "postgresql");
+                        continue;
+                    };
                     let tls = tls.clone();
                     let hint = hint.clone();
                     tasks.spawn(async move {

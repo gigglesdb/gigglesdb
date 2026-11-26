@@ -1,4 +1,4 @@
-use crate::{Service, tls};
+use crate::{Service, auth::listener::ConnectionRejections, tls};
 use giggles_core::DurableTracker;
 use rustls::ServerConfig;
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
@@ -77,8 +77,9 @@ impl Running {
         (&mut self.task).await.map_err(io::Error::other)?
     }
 }
-/// Connections are admitted before TLS allocation. Shutdown aborts socket tasks
-/// and waits for their outstanding blocking work.
+/// Accepted sessions acquire admission before TLS allocation. A separate budget
+/// covers TLS for overload replies. Shutdown aborts socket tasks and waits for
+/// their outstanding blocking work.
 pub async fn serve_pg(
     address: SocketAddr,
     service: Arc<Service>,
@@ -117,17 +118,23 @@ pub async fn serve_pg_bound(
             }
         }
         let sem = Arc::new(Semaphore::new(connections));
+        let rejections = ConnectionRejections::new();
         let accept = TlsAcceptor::from(config);
         let mut tasks = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
+                biased;
                 _=&mut rx => break,
                 Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},
                 incoming=listener.accept()=>{
                     let (mut socket,_)=incoming?;
                     no_delay(&socket);
-                    let Some(shared)=task_service.admission.connect() else {continue};
-                    let Ok(permit)=sem.clone().try_acquire_owned() else {continue};
+                    let (Some(shared), Ok(permit)) =
+                        (task_service.admission.connect(), sem.clone().try_acquire_owned())
+                    else {
+                        rejections.reject(&mut tasks, socket, Some(&accept), "postgres");
+                        continue;
+                    };
                     let accept=accept.clone();let service=task_service.clone();
                     let work = task_work.clone();
                     tasks.spawn(async move {

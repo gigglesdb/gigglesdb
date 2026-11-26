@@ -49,6 +49,38 @@ async fn plain() {
 }
 
 #[tokio::test]
+async fn saturated_follower_reports_too_many_connections() {
+    let server = start(None).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let mut socket = TcpStream::connect(server.address).await.unwrap();
+            socket.write_u32(8).await.unwrap();
+            socket.write_u32(80877103).await.unwrap();
+            assert_eq!(socket.read_u8().await.unwrap(), b'N');
+            held.push(socket);
+        }
+        let error = tokio_postgres::Config::new()
+            .host("127.0.0.1")
+            .port(server.address.port())
+            .user("x")
+            .dbname("x")
+            .ssl_mode(SslMode::Disable)
+            .connect(NoTls)
+            .await
+            .err()
+            .expect("follower must refuse startup");
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code(), &SqlState::TOO_MANY_CONNECTIONS);
+        assert_eq!(error.severity(), "FATAL");
+        assert_eq!(error.message(), "sorry, too many clients already");
+    })
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn multi_host() {
     let follower = start(None).await;
     let leader = super::postgresql_network::Fixture::new(TlsMode::Disabled, true, false).await;

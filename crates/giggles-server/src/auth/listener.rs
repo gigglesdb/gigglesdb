@@ -9,11 +9,12 @@ use crate::{
     transport::{IO_TIMEOUT, Running},
 };
 use giggles_core::DurableTracker;
-use std::{collections::BTreeMap, io, net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, io, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch},
+    task::JoinSet,
     time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
@@ -59,16 +60,23 @@ pub async fn serve_postgresql_bound(
             }
         }
         let sem = Arc::new(Semaphore::new(listener.connections));
-        let mut tasks = tokio::task::JoinSet::new();
+        let rejections = ConnectionRejections::new();
+        let accept = listener.tls_config.clone().map(TlsAcceptor::from);
+        let mut tasks = JoinSet::new();
         loop {
             tokio::select! {
+                biased;
                 _ = &mut rx => break,
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                 incoming = socket.accept() => {
                     let (socket, peer) = incoming?;
                     crate::transport::no_delay(&socket);
-                    let Some(shared) = task_service.admission.connect() else { continue; };
-                    let Ok(permit) = sem.clone().try_acquire_owned() else { continue; };
+                    let (Some(shared), Ok(permit)) =
+                        (task_service.admission.connect(), sem.clone().try_acquire_owned())
+                    else {
+                        rejections.reject(&mut tasks, socket, accept.as_ref(), "postgresql");
+                        continue;
+                    };
                     let service = task_service.clone();
                     let listener = listener.clone();
                     let work = task_work.clone();
@@ -91,6 +99,71 @@ pub async fn serve_postgresql_bound(
 
 trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
+
+const MAX_REJECTION_TASKS: usize = 8;
+const REJECTION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A listener's independent budget for replying to startup attempts it cannot admit.
+/// Its accept loop reaps completed tasks before accepting more sockets.
+pub(crate) struct ConnectionRejections(Arc<Semaphore>);
+
+impl ConnectionRejections {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(Semaphore::new(MAX_REJECTION_TASKS)))
+    }
+
+    pub(crate) fn reject(
+        &self,
+        tasks: &mut JoinSet<()>,
+        socket: TcpStream,
+        accept: Option<&TlsAcceptor>,
+        protocol: &str,
+    ) {
+        eprintln!("protocol={protocol} rejected stage=admission reason=too_many_connections");
+        let Ok(permit) = self.0.clone().try_acquire_owned() else {
+            return;
+        };
+        let accept = accept.cloned();
+        tasks.spawn(async move {
+            let _permit = permit;
+            let _ = timeout(REJECTION_TIMEOUT, reject_connection(socket, accept)).await;
+        });
+    }
+}
+
+async fn reject_connection(socket: TcpStream, accept: Option<TlsAcceptor>) -> io::Result<()> {
+    let mut stream: Box<dyn Stream> = Box::new(socket);
+    let mut negotiations = 0;
+    let mut ssl_seen = false;
+    loop {
+        let body = read_startup_packet(&mut stream).await?;
+        match u32::from_be_bytes(body[..4].try_into().unwrap()) {
+            code @ (80877103 | 80877104) if body.len() == 4 && negotiations < 2 => {
+                negotiations += 1;
+                if code == 80877103 {
+                    if ssl_seen {
+                        return Ok(());
+                    }
+                    ssl_seen = true;
+                    // TLS-required listeners still negotiate TLS for clients that ask.
+                    // A plaintext startup receives only the public error and is closed.
+                    if let Some(accept) = &accept {
+                        send(&mut stream, b"S").await?;
+                        stream = Box::new(accept.accept(stream).await?);
+                        continue;
+                    }
+                }
+                send(&mut stream, b"N").await?;
+            }
+            196608 => {
+                fatal(&mut stream, "53300", "sorry, too many clients already").await?;
+                return stream.shutdown().await;
+            }
+            // CancelRequest has no response. Ignore malformed negotiations too.
+            _ => return Ok(()),
+        }
+    }
+}
 
 async fn connection(
     socket: TcpStream,
@@ -118,7 +191,8 @@ async fn connection(
                     || negotiations > 2
                     || (code == 80877103 && (ssl_seen || encrypted))
                 {
-                    return fatal(&mut stream, "08P01", "invalid negotiation packet").await;
+                    return authentication_fatal(&mut stream, "08P01", "invalid negotiation packet")
+                        .await;
                 }
                 if code == 80877103 {
                     ssl_seen = true;
@@ -143,7 +217,8 @@ async fn connection(
             }
             80877102 => {
                 if body.len() != 12 {
-                    return fatal(&mut stream, "08P01", "invalid cancellation packet").await;
+                    return authentication_fatal(&mut stream, "08P01", "invalid cancellation packet")
+                        .await;
                 }
                 service.cancellations.cancel_key(
                     "pgrole:",
@@ -186,7 +261,10 @@ async fn connection(
     }
     let mut session = match signin::open_role_session(&service, &startup.user) {
         Ok(session) => session,
-        Err(_) => return fatal(&mut stream, "28P01", "password authentication failed").await,
+        Err(_) => {
+            return authentication_fatal(&mut stream, "28P01", "password authentication failed")
+                .await;
+        }
     };
     session.connection = Some(shared);
     session.backend_ssl = encrypted;
@@ -234,7 +312,6 @@ async fn authentication<S: AsyncWrite + Unpin>(
 }
 
 async fn fatal<S: AsyncWrite + Unpin>(stream: &mut S, code: &str, message: &str) -> io::Result<()> {
-    eprintln!("protocol=postgresql rejected stage=authentication reason={code}");
     let mut body = b"SFATAL\0VFATAL\0C".to_vec();
     crate::pgwire::z(code, &mut body);
     body.push(b'M');
@@ -244,6 +321,15 @@ async fn fatal<S: AsyncWrite + Unpin>(stream: &mut S, code: &str, message: &str)
     frame.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
     frame.extend_from_slice(&body);
     send(stream, &frame).await
+}
+
+async fn authentication_fatal<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    code: &str,
+    message: &str,
+) -> io::Result<()> {
+    eprintln!("protocol=postgresql rejected stage=authentication reason={code}");
+    fatal(stream, code, message).await
 }
 
 async fn password_message<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Option<Vec<u8>>> {
@@ -283,24 +369,24 @@ async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
     authentication(stream, 10, &mechanisms).await?;
     let mut exchange = ServerExchange::new(user, verifier);
     let Some(body) = password_message(stream).await? else {
-        fatal(stream, "08P01", "invalid SCRAM exchange").await?;
+        authentication_fatal(stream, "08P01", "invalid SCRAM exchange").await?;
         return Ok(false);
     };
     let Some((mechanism, data)) = initial_response(&body) else {
-        fatal(stream, "08P01", "invalid SCRAM exchange").await?;
+        authentication_fatal(stream, "08P01", "invalid SCRAM exchange").await?;
         return Ok(false);
     };
     let Ok(first) = exchange.client_first(mechanism, data) else {
-        fatal(stream, "28P01", "password authentication failed").await?;
+        authentication_fatal(stream, "28P01", "password authentication failed").await?;
         return Ok(false);
     };
     authentication(stream, 11, &first).await?;
     let Some(body) = password_message(stream).await? else {
-        fatal(stream, "08P01", "invalid SCRAM exchange").await?;
+        authentication_fatal(stream, "08P01", "invalid SCRAM exchange").await?;
         return Ok(false);
     };
     let Ok(final_message) = exchange.client_final(&body) else {
-        fatal(stream, "28P01", "password authentication failed").await?;
+        authentication_fatal(stream, "28P01", "password authentication failed").await?;
         return Ok(false);
     };
     authentication(stream, 12, &final_message).await?;

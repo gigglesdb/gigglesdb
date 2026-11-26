@@ -19,13 +19,15 @@ use tokio::{io::AsyncReadExt, net::TcpListener, sync::watch};
 const DEFAULT_ENGINE: Engine = Engine::V2;
 #[cfg(not(feature = "engine-rocksdb"))]
 const DEFAULT_ENGINE: Engine = Engine::Legacy;
+const API_CONNECTIONS: usize = 32;
 
-pub const USAGE: &str = "usage: giggles-server [--no-stdin-control] CONFIG.json | --dev [--data DIR] [--port N] [--engine legacy|v2] [--owner NAME] [--database NAME] [--trust-local] [--no-api] [--reset-owner-password] (creation default: v2 with engine-rocksdb, otherwise legacy)";
+pub const USAGE: &str = "usage: giggles-server [--no-stdin-control] CONFIG.json | --dev [--data DIR] [--port N] [--max-connections N] [--engine legacy|v2] [--owner NAME] [--database NAME] [--trust-local] [--no-api] [--reset-owner-password] (max-connections: 1-128, default 100; creation default: v2 with engine-rocksdb, otherwise legacy)";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Options {
     pub data: PathBuf,
     pub port: u16,
+    pub max_connections: usize,
     /// Creation only; existing directories are detected by their format.
     pub engine: Engine,
     pub owner: String,
@@ -40,6 +42,7 @@ impl Options {
         let mut options = Self {
             data: "giggles-data".into(),
             port: 5432,
+            max_connections: 100,
             engine: DEFAULT_ENGINE,
             owner: "postgres".into(),
             database: "postgres".into(),
@@ -53,7 +56,7 @@ impl Options {
                 "--trust-local" => options.trust_local = true,
                 "--no-api" => options.no_api = true,
                 "--reset-owner-password" => options.reset_owner_password = true,
-                "--data" | "--port" | "--owner" | "--database" | "--engine" => {
+                "--data" | "--port" | "--max-connections" | "--owner" | "--database" | "--engine" => {
                     let value = args
                         .next()
                         .filter(|value| !value.is_empty() && !value.starts_with("--"))
@@ -72,6 +75,16 @@ impl Options {
                                 return Err(USAGE);
                             }
                             options.port = value.parse().map_err(|_| USAGE)?;
+                        }
+                        "--max-connections" => {
+                            if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                                return Err(USAGE);
+                            }
+                            let connections = value.parse().map_err(|_| USAGE)?;
+                            if !(1..=128).contains(&connections) {
+                                return Err(USAGE);
+                            }
+                            options.max_connections = connections;
                         }
                         "--owner" => options.owner = value,
                         "--database" => options.database = value,
@@ -265,7 +278,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         certificates: Default::default(),
         databases: vec![options.database.clone()],
         loopback_trust: options.trust_local,
-        connections: 32,
+        connections: options.max_connections,
     };
     let listener = std::sync::Arc::new(config.build()?);
     let socket = TcpListener::bind(config.listen).await?;
@@ -291,7 +304,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 certificates: Default::default(),
                 databases: config.databases.clone(),
                 loopback_trust: config.loopback_trust,
-                connections: config.connections,
+                connections: API_CONNECTIONS,
                 idle_timeout_seconds: None,
                 max_age_seconds: None,
             };
@@ -474,6 +487,15 @@ mod tests {
     fn defaults_and_explicit_options() {
         let defaults = parse(&[]).unwrap();
         assert_eq!(defaults.port, 5432);
+        assert_eq!(defaults.max_connections, 100);
+        assert_eq!(
+            parse(&["--max-connections", "1"]).unwrap().max_connections,
+            1
+        );
+        assert_eq!(
+            parse(&["--max-connections", "128"]).unwrap().max_connections,
+            128
+        );
         assert_eq!(
             defaults.engine,
             if cfg!(feature = "engine-rocksdb") {
@@ -596,6 +618,10 @@ mod tests {
             vec!["--port", "65535"],
             vec!["--port", "-1"],
             vec!["--port", "+1"],
+            vec!["--max-connections"],
+            vec!["--max-connections", "0"],
+            vec!["--max-connections", "129"],
+            vec!["--max-connections", "+1"],
             vec!["--owner", "1bad"],
             vec!["--database", "a-b"],
             vec!["--owner", "é"],

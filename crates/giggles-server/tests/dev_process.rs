@@ -185,6 +185,121 @@ async fn connect(url: &str) -> Client {
     client
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dev_default_admits_100_postgresql_sessions_and_reuses_a_slot() {
+    use giggles_server::api::proto;
+    use tokio::{io::AsyncReadExt, net::TcpStream, task::JoinSet};
+    use tokio_postgres::{
+        SimpleQueryMessage,
+        error::{Severity, SqlState},
+    };
+
+    async fn select_one(client: &Client) {
+        let messages = client.simple_query("SELECT 1").await.unwrap();
+        assert!(matches!(
+            &messages[..],
+            [
+                SimpleQueryMessage::RowDescription(_),
+                SimpleQueryMessage::Row(row),
+                SimpleQueryMessage::CommandComplete(1),
+            ] if row.get(0) == Some("1")
+        ));
+    }
+
+    let root = fixture();
+    let (server, url) = Server::start(&root, true).await;
+    timeout(BOUND, async {
+        let mut opening = JoinSet::new();
+        for _ in 0..100 {
+            let url = url.clone();
+            opening.spawn(async move {
+                let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+                let driver = tokio::spawn(connection);
+                select_one(&client).await;
+                (client, driver)
+            });
+        }
+        let mut sessions = Vec::new();
+        while let Some(session) = opening.join_next().await {
+            sessions.push(session.unwrap());
+        }
+        assert_eq!(sessions.len(), 100);
+
+        // Both API listeners can still answer while the PostgreSQL pool is full.
+        let mut grpc =
+            proto::giggles_client::GigglesClient::connect(format!("http://{}", server.3.unwrap()))
+                .await
+                .unwrap();
+        let error = grpc
+            .open_session(proto::OpenSessionRequest {
+                role: Some("owner".into()),
+                database: Some("app".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        let request = json!({"role":"owner","database":"app"});
+        assert_eq!(
+            http(server.2.unwrap(), "POST", "/v1/sessions", None, request)
+                .await
+                .0,
+            401
+        );
+        drop(grpc);
+
+        let config: tokio_postgres::Config = url.parse().unwrap();
+        let port = config.get_ports()[0];
+        let mut excess = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        for code in [80877104, 80877103] {
+            excess.write_u32(8).await.unwrap();
+            excess.write_u32(code).await.unwrap();
+            assert_eq!(excess.read_u8().await.unwrap(), b'N');
+        }
+        let startup = b"\0\x03\0\0user\0owner\0database\0app\0\0";
+        excess.write_u32((startup.len() + 4) as u32).await.unwrap();
+        excess.write_all(startup).await.unwrap();
+        assert_eq!(excess.read_u8().await.unwrap(), b'E');
+        let expected = b"SFATAL\0VFATAL\0C53300\0Msorry, too many clients already\0\0";
+        assert_eq!(excess.read_u32().await.unwrap() as usize, expected.len() + 4);
+        let mut reply = vec![0; expected.len()];
+        excess.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, expected);
+        assert_eq!(excess.read(&mut [0]).await.unwrap(), 0);
+
+        let (client, driver) = sessions.pop().unwrap();
+        drop(client);
+        driver.await.unwrap().unwrap();
+        // The client driver may finish sending Terminate before the server reclaims the slot.
+        let replacement = loop {
+            match tokio_postgres::connect(&url, NoTls).await {
+                Ok(session) => break session,
+                Err(error) => {
+                    let error = error.as_db_error().expect("server admission error");
+                    assert_eq!(error.code(), &SqlState::TOO_MANY_CONNECTIONS);
+                    assert_eq!(error.parsed_severity(), Some(Severity::Fatal));
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        };
+        let (client, connection) = replacement;
+        let driver = tokio::spawn(connection);
+        select_one(&client).await;
+        sessions.push((client, driver));
+        for (client, driver) in sessions {
+            drop(client);
+            driver.await.unwrap().unwrap();
+        }
+    })
+    .await
+    .expect("dev connection-limit scenario exceeded bound");
+    let stderr = server.shutdown().await;
+    assert!(stderr.contains(
+        "protocol=postgresql rejected stage=admission reason=too_many_connections"
+    ));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn dev_binary_crud_password_restart_and_filesystem_contract() {
     timeout(BOUND * 4, async {

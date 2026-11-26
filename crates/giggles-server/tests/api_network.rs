@@ -60,6 +60,12 @@ async fn native_postgres_http_and_grpc_share_physical_socket_admission() {
             .connect(ServerName::try_from("localhost").unwrap(), socket)
             .await
     }
+    async fn startup(stream: &mut TlsStream<TcpStream>) -> io::Result<u8> {
+        let body = b"\0\x03\0\0user\0giggles\0database\0giggles\0\0";
+        stream.write_u32((body.len() + 4) as u32).await?;
+        stream.write_all(body).await?;
+        stream.read_u8().await
+    }
     let endpoints = [
         (native.address, false, false),
         (pg.address, true, false),
@@ -71,15 +77,32 @@ async fn native_postgres_http_and_grpc_share_physical_socket_admission() {
         // authenticated socket; every other protocol must share the same cap.
         let held = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                match connect(&f, address, is_pg, h2).await {
-                    Ok(stream) => break stream,
-                    Err(_) => tokio::task::yield_now().await,
+                if let Ok(mut stream) = connect(&f, address, is_pg, h2).await
+                    && (!is_pg || startup(&mut stream).await.is_ok_and(|tag| tag == b'R'))
+                {
+                    break stream;
                 }
+                tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
         for (contender, pg, h2) in endpoints {
+            if pg {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    let mut stream = connect(&f, contender, true, h2).await.unwrap();
+                    assert_eq!(startup(&mut stream).await.unwrap(), b'E');
+                    let expected = b"SFATAL\0VFATAL\0C53300\0Msorry, too many clients already\0\0";
+                    assert_eq!(stream.read_u32().await.unwrap() as usize, expected.len() + 4);
+                    let mut body = vec![0; expected.len()];
+                    stream.read_exact(&mut body).await.unwrap();
+                    assert_eq!(body, expected);
+                    assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+                })
+                .await
+                .unwrap();
+                continue;
+            }
             assert!(
                 tokio::time::timeout(Duration::from_secs(2), connect(&f, contender, pg, h2))
                     .await
