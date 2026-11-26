@@ -422,6 +422,38 @@ fn named_bootstrap_is_distinct_from_logical_bootstrap() {
 
 #[cfg(feature = "engine-rocksdb")]
 #[test]
+fn prefixed_point_versions_role_membership() {
+    use super::super::engine::{kv::Keyspace, mvcc};
+
+    let (_dir, admin) = database();
+    let roles = admin.roles();
+    roles
+        .grant_membership_options(
+            "g",
+            "peer",
+            BOOTSTRAP,
+            MembershipOptions {
+                admin: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    roles
+        .grant_membership_options("g", "u", "peer", MembershipOptions::default())
+        .unwrap();
+    roles.grant_membership("g", "u").unwrap();
+
+    let key = engine::encode_key(b"member/g\0u").unwrap();
+    assert_eq!(
+        mvcc::latest_version(admin.test_v2().kv.as_ref(), Keyspace::Catalog, &key)
+            .unwrap()
+            .and_then(|(_, value)| value),
+        Some(vec![1])
+    );
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
 fn promoted_named_grantor_addresses_existing_edge_after_reopen() {
     let (dir, admin) = database();
     let roles = admin.roles();

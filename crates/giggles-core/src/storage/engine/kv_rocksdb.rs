@@ -3122,6 +3122,20 @@ mod tests {
     }
 
     #[test]
+    fn prefixed_point_versions_rocksdb() {
+        let dir = TestDir::new();
+        let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        super::super::mvcc::tests::prefixed_point_versions(&db);
+    }
+
+    #[test]
+    fn prefixed_point_versions_tombstone_and_snapshot_rocksdb() {
+        let dir = TestDir::new();
+        let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        super::super::mvcc::tests::prefixed_point_versions_tombstone_and_snapshot(&db);
+    }
+
+    #[test]
     fn first_in_borrowed_and_reopened() {
         let dir = TestDir::new();
         {

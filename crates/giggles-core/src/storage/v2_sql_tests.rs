@@ -1018,6 +1018,117 @@ fn dml_script_matches_legacy_results_and_errors() {
 }
 
 #[test]
+fn prefixed_point_versions_sql_drop_primary_key() {
+    use relational::Value::Int;
+
+    let f = Fixture::new();
+    f.execute("CREATE TABLE t (a int, b int, PRIMARY KEY (a,b))");
+    f.execute("INSERT INTO t VALUES (-1,7)");
+    f.execute("ALTER TABLE t DROP CONSTRAINT t_pkey");
+
+    let mut session = f.admin().sql_session();
+    assert_eq!(
+        values(&mut session, "SELECT a,b FROM t FOR UPDATE"),
+        vec![vec![Int(-1), Int(7)]]
+    );
+}
+
+#[test]
+fn prefixed_point_versions_sql_add_primary_key() {
+    use relational::Value::Int;
+
+    let f = Fixture::new();
+    f.execute("CREATE TABLE t (a int, b int, PRIMARY KEY (a,b))");
+    f.execute("INSERT INTO t VALUES (1,7)");
+    f.execute("ALTER TABLE t DROP CONSTRAINT t_pkey");
+    f.execute("ALTER TABLE t ADD PRIMARY KEY (a)");
+
+    let mut session = f.admin().sql_session();
+    assert_eq!(
+        values(&mut session, "SELECT a,b FROM t WHERE a=1 FOR UPDATE"),
+        vec![vec![Int(1), Int(7)]]
+    );
+}
+
+#[test]
+fn prefixed_point_versions_sql_rebuilt_index() {
+    use relational::Value::Int;
+
+    let f = Fixture::new();
+    f.execute("CREATE TABLE t (a int, b int, c int, PRIMARY KEY (a,b))");
+    f.execute("CREATE INDEX ix ON t(c)");
+    f.execute("INSERT INTO t VALUES (-1,7,10)");
+    f.execute("ALTER TABLE t DROP CONSTRAINT t_pkey");
+
+    let mut key = f.parts().indexes[0].id.to_be_bytes().to_vec();
+    codec::append_index_tuple(&mut key, [(&Int(10), codec::Direction::Asc)].into_iter()).unwrap();
+    let pk = codec::pk_bytes(&[Int(-1)]).unwrap();
+    key.extend_from_slice(&pk);
+    let db = f.db();
+    let mut txn = db.begin(Isolation::ReadCommitted);
+    let target = txn
+        .lock_for_write(Keyspace::Index, &key, None, &|| false)
+        .unwrap();
+    assert_eq!(target.current, Some(pk));
+}
+
+fn check_prefixed_versions_scans(add_primary_key: bool) {
+    use relational::Value::Int;
+
+    let f = Fixture::new();
+    f.execute("CREATE TABLE t (a int, b int, PRIMARY KEY (a,b))");
+    f.execute("INSERT INTO t VALUES (-1,7),(1,8),(2,9)");
+    f.execute("ALTER TABLE t DROP CONSTRAINT t_pkey");
+    if add_primary_key {
+        f.execute("ALTER TABLE t ADD PRIMARY KEY (a)");
+    }
+    let expected = vec![vec![Int(-1), Int(7)], vec![Int(1), Int(8)], vec![Int(2), Int(9)]];
+    let sql = values(&mut f.admin().sql_session(), "SELECT a,b FROM t ORDER BY a,b");
+    let db = f.db();
+    let mut txn = db.begin(Isolation::ReadCommitted);
+    let scan = txn.scan(Keyspace::Rows, Bound::Unbounded, Bound::Unbounded, Direction::Forward, None)
+        .unwrap()
+        .map(|item| {
+            let (key, value) = item.unwrap();
+            let values = codec::decode_row(&key, &value).unwrap().values.into_iter().take(2).collect::<Vec<_>>();
+            (key, values)
+        })
+        .collect::<Vec<_>>();
+    assert!(scan.windows(2).all(|pair| pair[0].0 < pair[1].0), "full scan keys must increase strictly: {scan:?}");
+    // DROP assigns -1,-2,-3 in the old PK order, so heap-key order is reversed.
+    let expected_scan = if add_primary_key { expected.clone() } else { expected.iter().rev().cloned().collect() };
+    let scan = scan.into_iter().map(|(_, values)| values).collect::<Vec<_>>();
+    assert_eq!((sql, scan), (expected, expected_scan));
+}
+
+#[test]
+fn prefixed_versions_scans_sql_drop_primary_key() {
+    check_prefixed_versions_scans(false);
+}
+
+#[test]
+fn prefixed_versions_scans_sql_add_primary_key() {
+    check_prefixed_versions_scans(true);
+}
+
+#[test]
+fn prefixed_point_versions_sql_catalog_name() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE t (id int PRIMARY KEY)");
+    f.execute("CREATE SCHEMA t");
+    f.execute("CREATE TABLE t.x (id int PRIMARY KEY)");
+
+    let id = f.parts().tables["t"].id;
+    let key = catalog_codec::name_key("t");
+    assert_eq!(
+        mvcc::latest_version(f.db().kv.as_ref(), Keyspace::Catalog, &key)
+            .unwrap()
+            .and_then(|(_, value)| value),
+        Some(id.to_be_bytes().to_vec())
+    );
+}
+
+#[test]
 fn dml_versions_rekey_reopen_and_mvcc_visibility() {
     use relational::Value::Int;
     let mut f = Fixture::new();

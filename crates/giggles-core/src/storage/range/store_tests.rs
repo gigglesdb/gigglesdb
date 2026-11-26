@@ -133,6 +133,36 @@ fn ranges_apply_independently_with_skip_and_gap_rules() {
 }
 
 #[test]
+fn prefixed_point_versions_range_apply() {
+    use crate::storage::engine::mvcc;
+
+    let dir = Dir::new("range-prefix");
+    let store = two_ranges(&dir);
+    let ks = Keyspace::Rows;
+    let short = 7u64.to_be_bytes();
+    let long = [&short[..], &[0x42]].concat();
+    let mut batch = WriteBatch::default();
+    batch.put(
+        ks,
+        codec::user_key_seek_at(&short, Ts(1)),
+        mvcc::encode_live(b"short"),
+    );
+    batch.put(
+        ks,
+        codec::user_key_seek_at(&long, Ts(2)),
+        mvcc::encode_live(b"long"),
+    );
+    assert_eq!(
+        store.apply(RangeId(1), &batch.encode(), pos(1, 1)).unwrap(),
+        RangeApplyOutcome::Applied
+    );
+    assert_eq!(
+        mvcc::latest_version(store.kv().as_ref(), ks, &short).unwrap(),
+        Some((Ts(1), Some(b"short".to_vec())))
+    );
+}
+
+#[test]
 fn out_of_range_batches_are_refused_identically() {
     let dir = Dir::new("range-store");
     let dir_a = Dir::new("range-store-a");

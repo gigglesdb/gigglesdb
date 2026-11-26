@@ -1,4 +1,7 @@
-//! Snapshot visibility over prefix-free user keys and descending timestamp suffixes.
+//! Snapshot visibility over user keys with descending timestamp suffixes.
+//! User keys are not guaranteed prefix-free: point lookups select the newest
+//! version of exactly the requested key at or before the snapshot. Range scans
+//! still rely on each user key's versions forming a contiguous group.
 use std::ops::Bound;
 
 use super::{
@@ -69,6 +72,8 @@ pub(crate) fn latest_committed_at_most(
     version_at(kv, ks, user_key, bound)
 }
 
+/// Return the newest version of exactly `user_key` with timestamp <= `snapshot`.
+/// User keys need not be prefix-free; skip interfering keys within the bounds.
 fn version_at(
     kv: &dyn KvRead,
     ks: Keyspace,
@@ -95,20 +100,55 @@ fn version_at(
     upper[..key_len].copy_from_slice(user_key);
     upper[key_len..seek_len].fill(0xff);
 
-    // Bounded to this key's versions: a routed read (GD-0075 P8-0) waits
-    // only on prepared writes of this key.
-    let mut version = Ok(None);
-    kv.visit_first_in(ks, seek, upper, &mut |key, value| {
-        version = (|| {
-            let (found, ts) = codec::split_versioned(key)?;
-            validate_key(ks, found)?;
-            if found != user_key {
-                return Ok(None);
-            }
-            Ok(Some((ts, decode(value)?.map(<[u8]>::to_vec))))
-        })();
-    })?;
-    version
+    // Keep routed reads within the original bounds (GD-0075 P8-0). The common
+    // exact match takes one borrowed visit with no heap allocation for bounds.
+    let mut retry = None;
+    loop {
+        let mut next = None;
+        let mut version: Result<Option<Version>, TxnError> = Ok(None);
+        kv.visit_first_in(
+            ks,
+            retry.as_deref().unwrap_or(seek),
+            upper,
+            &mut |key, value| {
+                version = (|| {
+                    let (found, ts) = codec::split_versioned(key)?;
+                    validate_key(ks, found)?;
+                    if found != user_key {
+                        next = if key.len() > seek_len {
+                            // U||w precedes this longer key. An exact version still
+                            // ahead must have a suffix > w; skip all keys sharing w.
+                            // Extensions shorter than 8 bytes put timestamp bytes in w,
+                            // so each of their versions may cost one re-seek (bounded by
+                            // the GC'd version count), on this rare path only.
+                            let w = u64::from_be_bytes(key[key_len..seek_len].try_into().unwrap());
+                            w.checked_add(1).map(|suffix| {
+                                let mut start = user_key.to_vec();
+                                start.extend_from_slice(&suffix.to_be_bytes());
+                                start
+                            })
+                        } else {
+                            // A shorter user's version fell inside U's bounds.
+                            // Advance just past that physical key, not its extensions.
+                            let mut start = key.to_vec();
+                            start.push(0);
+                            Some(start)
+                        };
+                        if let Some(start) = &next {
+                            debug_assert!(start.as_slice() > key);
+                        }
+                        return Ok(None);
+                    }
+                    Ok(Some((ts, decode(value)?.map(<[u8]>::to_vec))))
+                })();
+            },
+        )?;
+        let version = version?;
+        match next {
+            Some(start) => retry = Some(start),
+            None => return Ok(version),
+        }
+    }
 }
 
 pub(crate) struct VersionedRange<'a> {
@@ -338,6 +378,170 @@ pub(crate) mod tests {
     #[test]
     fn point_versions_mem() {
         point_versions(&MemKv::new());
+    }
+
+    pub(crate) fn prefixed_point_versions(kv: &dyn KvBackend) {
+        let ks = Keyspace::Rows;
+        let short = 7u64.to_be_bytes();
+        let longer_neighbor = [&short[..], &[0x42]].concat();
+
+        let shorter_neighbor = 8u64.to_be_bytes();
+        let long = [&shorter_neighbor[..], &[0x42]].concat();
+        // The shorter neighbor's inverted timestamp begins with the long
+        // key's final byte and sorts before the long key's visible version.
+        let interfering_ts = Ts(!0x4200_0000_0000_0001);
+
+        let mut batch = WriteBatch::default();
+        for (key, ts, value) in [
+            (short.as_slice(), Ts(1), b"short".as_slice()),
+            (&longer_neighbor, Ts(2), b"extension"),
+            (&shorter_neighbor, interfering_ts, b"newer neighbor"),
+            (&shorter_neighbor, Ts(1), b"older neighbor"),
+            (&long, Ts(2), b"long"),
+        ] {
+            batch.put(ks, codec::user_key_seek_at(key, ts), encode_live(value));
+        }
+        kv.write(batch, Durability::Sync).unwrap();
+
+        assert_eq!(
+            (
+                latest_version(kv, ks, &short).unwrap(),
+                read_at(kv, ks, &long, Ts(u64::MAX - 1)).unwrap(),
+            ),
+            (
+                Some((Ts(1), Some(b"short".to_vec()))),
+                Some(b"long".to_vec())
+            )
+        );
+    }
+
+    #[test]
+    fn prefixed_point_versions_mem() {
+        prefixed_point_versions(&MemKv::new());
+    }
+
+    pub(crate) fn prefixed_point_versions_tombstone_and_snapshot(kv: &dyn KvBackend) {
+        let ks = Keyspace::Rows;
+        let deleted = 10u64.to_be_bytes();
+        let future = 11u64.to_be_bytes();
+        let tombstone_ts = Ts(30);
+        let snapshot = Ts(0xc000_0000_0000_0000);
+        let mut batch = WriteBatch::default();
+        for user in [&deleted, &future] {
+            let longer = [&user[..], &[0x42]].concat();
+            batch.put(
+                ks,
+                codec::user_key_seek_at(&longer, Ts(1)),
+                encode_live(b"neighbor"),
+            );
+        }
+        batch.put(
+            ks,
+            codec::user_key_seek_at(&deleted, Ts(10)),
+            encode_live(b"old live"),
+        );
+        batch.put(
+            ks,
+            codec::user_key_seek_at(&deleted, tombstone_ts),
+            encode_tombstone(),
+        );
+        batch.put(
+            ks,
+            codec::user_key_seek_at(&future, Ts(u64::MAX)),
+            encode_live(b"future"),
+        );
+        kv.write(batch, Durability::Sync).unwrap();
+
+        // Both probes must actually encounter a longer key first.
+        for (user, bound) in [(&deleted, Ts(u64::MAX)), (&future, snapshot)] {
+            let (physical, _) = kv
+                .first_in(
+                    ks,
+                    &codec::user_key_seek_at(user, bound),
+                    &codec::user_key_upper_bound(user),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                codec::split_versioned(&physical).unwrap().0,
+                [&user[..], &[0x42]].concat()
+            );
+        }
+        assert_eq!(
+            latest_version(kv, ks, &deleted).unwrap(),
+            Some((tombstone_ts, None))
+        );
+        for bound in [tombstone_ts, Ts(u64::MAX)] {
+            assert_eq!(read_at(kv, ks, &deleted, bound).unwrap(), None);
+        }
+        assert_eq!(
+            latest_committed_at_most(kv, ks, &future, snapshot).unwrap(),
+            None
+        );
+        assert_eq!(read_at(kv, ks, &future, snapshot).unwrap(), None);
+        // Adding an older version must make it visible past the same neighbor.
+        let mut batch = WriteBatch::default();
+        batch.put(
+            ks,
+            codec::user_key_seek_at(&future, Ts(10)),
+            encode_live(b"visible"),
+        );
+        kv.write(batch, Durability::Sync).unwrap();
+        assert_eq!(
+            latest_committed_at_most(kv, ks, &future, snapshot).unwrap(),
+            Some((Ts(10), Some(b"visible".to_vec())))
+        );
+        assert_eq!(
+            read_at(kv, ks, &future, snapshot).unwrap(),
+            Some(b"visible".to_vec())
+        );
+    }
+
+    #[test]
+    fn prefixed_point_versions_tombstone_and_snapshot_mem() {
+        prefixed_point_versions_tombstone_and_snapshot(&MemKv::new());
+    }
+
+    #[test]
+    fn prefixed_point_versions_skip_shared_suffix_and_max() {
+        let kv = MemKv::new();
+        let ks = Keyspace::Rows;
+        let user = 9u64.to_be_bytes();
+        let mut batch = WriteBatch::default();
+        // Two longer keys share w; a third requires another iteration. Its
+        // successor is ff*8, which must still find the exact timestamp-zero key.
+        for (w, tail) in [
+            (0x4242_4242_4242_4242u64, 1),
+            (0x4242_4242_4242_4242, 2),
+            (u64::MAX - 1, 1),
+        ] {
+            let longer = [&user[..], &w.to_be_bytes(), &[tail]].concat();
+            batch.put(
+                ks,
+                codec::user_key_seek_at(&longer, Ts(1)),
+                encode_live(b"longer"),
+            );
+        }
+        // ff*8 extensions lie beyond the exclusive upper bound, including
+        // when there is no exact version left to return.
+        let max_extension = [&user[..], &[0xff; 8]].concat();
+        batch.put(
+            ks,
+            codec::user_key_seek_at(&max_extension, Ts(u64::MAX)),
+            encode_live(b"outside"),
+        );
+        let exact = codec::user_key_seek_at(&user, Ts(0));
+        batch.put(ks, exact.clone(), encode_live(b"zero"));
+        kv.write(batch, Durability::Sync).unwrap();
+        assert_eq!(
+            latest_version(&kv, ks, &user).unwrap(),
+            Some((Ts(0), Some(b"zero".to_vec())))
+        );
+
+        let mut batch = WriteBatch::default();
+        batch.delete(ks, exact);
+        kv.write(batch, Durability::Sync).unwrap();
+        assert_eq!(latest_version(&kv, ks, &user).unwrap(), None);
     }
 
     #[test]
