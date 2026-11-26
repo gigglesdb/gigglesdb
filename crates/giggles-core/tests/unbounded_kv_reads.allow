@@ -28,6 +28,7 @@ storage/engine/content_check.rs check_protected_kernel range 2 | Engine format v
 storage/engine/gc.rs open get 1 | Recovers GC's dedicated watermark, written by the GC state owner.
 storage/engine/gc.rs reclaim_table range 1 | A dropped, non-reused prefix is reclaimed only below the durable watermark.
 storage/engine/gc.rs step get 1 | GC's own progress cursor is serialized by its work mutex.
+storage/engine/gc.rs step latest_committed_at_most 2 | Exact-key anchor and older-version probes at or below the watermark, beside prefix-related user keys and once for a resumed step's first run (Q40).
 storage/engine/gc.rs step range 2 | Physical maintenance only deletes versions at or below its visibility-bounded watermark.
 storage/engine/indexes.rs entries_for get 1 | Memory lookup of catalog-derived predicate metadata.
 storage/engine/indexes.rs visit_page get 1 | Transaction::get reads the selected MVCC snapshot.
@@ -52,7 +53,7 @@ storage/engine/native_content.rs check range 2 | Format validation scans a recov
 storage/engine/native_content.rs load latest_version 1 | Sequencer validation reads applied predecessors. Format validation uses its supplied image.
 storage/engine/rows.rs get get 1 | Transaction::get reads the selected MVCC snapshot.
 storage/engine/seq.rs highwater get 1 | The per-allocator mutex and extension acknowledgment serialize the separate nine-byte key.
-storage/engine/ssi_validate.rs validate_kv latest_version 1 | Sequencer SSI point validation includes every applied predecessor.
+storage/engine/ssi_validate.rs validate_kv latest_version 2 | Two calls: the SSI point probe, and the end-key prefix probe of interval validation (Q40), which runs on the local durable fallback only. Both include every applied predecessor.
 storage/engine/ssi_validate.rs validate_kv range 1 | Sequencer SSI interval validation includes every applied predecessor.
 storage/engine/txn.rs catalog_latest_committed latest_committed_at_most 2 | The local path uses sequencer visibility. The routed path uses the oracle timestamp supplied to the same reader.
 storage/engine/txn.rs changed_since latest_version 2 | The only caller treats an early positive as a retryable FK conflict.

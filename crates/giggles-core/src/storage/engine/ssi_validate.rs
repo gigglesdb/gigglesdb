@@ -187,13 +187,22 @@ impl Validator {
         if intersects {
             return Err(conflict());
         }
-        self.validate_kv(kv, snapshot)
+        self.validate_kv(kv, snapshot, true)
     }
     /// Fails when `kv` holds a version newer than `snapshot` of any key read: every raw
     /// version of each point and range, tombstones included. A cluster gateway calls it with
     /// a reader at a timestamp taken after its shared locks over the read set were granted
     /// (GD-0075 R5-71), where the reader serves each key's newest version at or below it.
-    pub(crate) fn validate_kv(&self, kv: &dyn KvRead, snapshot: Ts) -> Result<(), TxnError> {
+    ///
+    /// `probe_end_prefixes` adds one exact point probe per proper prefix of each bounded
+    /// range end (Q40). The local durable fallback passes true; the cluster gateway passes
+    /// false, because each probe there is a remote page read.
+    pub(crate) fn validate_kv(
+        &self,
+        kv: &dyn KvRead,
+        snapshot: Ts,
+        probe_end_prefixes: bool,
+    ) -> Result<(), TxnError> {
         let mut examined = 0usize;
         for (ks, space) in &self.spaces {
             for key in &space.points {
@@ -207,11 +216,18 @@ impl Validator {
             // first user key or use the snapshot-visible MVCC iterator here.
             // Overlapping recorded ranges can examine an entry more than once;
             // each physical examination consumes the same shared total budget.
+            // User keys need not be prefix-free (Q40): the physical interval
+            // can hold versions of out-of-range prefix-related keys, which the
+            // exact user-key test below skips, and miss in-range proper
+            // prefixes of the end key, which are probed after the scan.
             for range in &space.ranges {
                 let start = match &range.start {
                     Bound::Unbounded => Bound::Unbounded,
-                    Bound::Included(k) => Bound::Included(codec::user_key_seek_at(k, Ts(u64::MAX))),
-                    Bound::Excluded(k) => Bound::Included(codec::user_key_upper_bound(k)),
+                    // (k,... also starts at k's newest version: extensions of
+                    // k can sort below k||ff*8||00. k itself is skipped below.
+                    Bound::Included(k) | Bound::Excluded(k) => {
+                        Bound::Included(codec::user_key_seek_at(k, Ts(u64::MAX)))
+                    }
                 };
                 let end = match &range.end {
                     Bound::Unbounded => Bound::Unbounded,
@@ -229,10 +245,38 @@ impl Validator {
                 {
                     let (key, value) = item.map_err(TxnError::Kv)?;
                     self.charge(&mut examined)?;
-                    let (_, ts) = codec::split_versioned(&key).map_err(TxnError::Codec)?;
+                    let (user, ts) = codec::split_versioned(&key).map_err(TxnError::Codec)?;
                     mvcc::decode(&value).map_err(TxnError::Kv)?;
-                    if ts > snapshot {
+                    if ts > snapshot
+                        && starts_before(&range.start, user)
+                        && ends_after(&range.end, user)
+                    {
                         return Err(conflict());
+                    }
+                }
+                // A proper prefix p of the end key b can have versions above
+                // b's physical end while p < b is read. Probe each exactly;
+                // prefixes not after the start are outside the range.
+                if !probe_end_prefixes {
+                    continue;
+                }
+                if let Bound::Included(end) | Bound::Excluded(end) = &range.end {
+                    let minimum = if matches!(ks, Keyspace::Rows | Keyspace::Index) {
+                        8
+                    } else {
+                        1
+                    };
+                    for len in minimum..end.len() {
+                        let prefix = &end[..len];
+                        if !starts_before(&range.start, prefix) {
+                            continue;
+                        }
+                        self.charge(&mut examined)?;
+                        if mvcc::latest_version(kv, *ks, prefix)?
+                            .is_some_and(|(ts, _)| ts > snapshot)
+                        {
+                            return Err(conflict());
+                        }
                     }
                 }
             }
@@ -523,5 +567,71 @@ mod tests {
             validator(reads, 100).validate(&overflow(), &mem, Ts(0)),
             Err(TxnError::Codec(_))
         ));
+    }
+}
+
+
+#[cfg(test)]
+mod q40_exact_key_boundary {
+    use super::*;
+    use crate::storage::engine::{
+        kv::{Durability, KvBackend, WriteBatch}, kv_mem::MemKv, txn::ReadRange,
+    };
+    use std::sync::Arc;
+
+    fn check(start: Bound<Vec<u8>>, end: Bound<Vec<u8>>, neighbor: &[u8]) -> Result<(), TxnError> {
+        let kv = MemKv::new();
+        let mut batch = WriteBatch::default();
+        batch.put(Keyspace::Rows, codec::user_key_seek_at(neighbor, Ts(2)), mvcc::encode_live(b"new"));
+        kv.write(batch, Durability::Sync).unwrap();
+        let reads = ReadSet {
+            points: BTreeSet::new(),
+            ranges: vec![ReadRange { ks: Keyspace::Rows, start, end }],
+        };
+        let validator = Validator::new(reads, ValidationConfig::default());
+        // Trim an unrelated write to force the durable fallback at snapshot 1.
+        let mut log = RecentLog::new(0);
+        log.append(Ts(10), Arc::from([(Keyspace::Rows, 99u64.to_be_bytes().to_vec())]));
+        log.trim(Some(Ts(0)));
+        let actual = validator.validate(&log, &kv, Ts(1));
+        assert_eq!(validator.fallback_count(), 1);
+        actual
+    }
+
+    #[test]
+    fn fallback_included_end_must_not_false_conflict_on_longer_neighbor() {
+        let user = 7u64.to_be_bytes().to_vec();
+        let neighbor = [&user[..], &[0x42]].concat();
+        assert_eq!(check(Bound::Included(user.clone()), Bound::Included(user), &neighbor), Ok(()));
+    }
+
+    #[test]
+    fn fallback_included_end_must_detect_prefix_write_above_bound() {
+        let user = 7u64.to_be_bytes().to_vec();
+        let neighbor = [&user[..], &[0x42]].concat();
+        // user||!2 sorts after neighbor||ff*8||00, but user < neighbor is read.
+        assert_eq!(check(Bound::Unbounded, Bound::Included(neighbor), &user), Err(conflict()));
+    }
+
+    #[test]
+    fn fallback_excluded_end_must_detect_prefix_write_above_bound() {
+        let user = 7u64.to_be_bytes().to_vec();
+        let neighbor = [&user[..], &[0x42]].concat();
+        assert_eq!(check(Bound::Unbounded, Bound::Excluded(neighbor), &user), Err(conflict()));
+    }
+
+    #[test]
+    fn fallback_included_start_must_not_false_conflict_on_shorter_prefix() {
+        let user = 7u64.to_be_bytes().to_vec();
+        let neighbor = [&user[..], &[0x42]].concat();
+        // user||!2 = user||ff..fd lies inside [neighbor||00*8, ...) but user < neighbor.
+        assert_eq!(check(Bound::Included(neighbor), Bound::Unbounded, &user), Ok(()));
+    }
+
+    #[test]
+    fn fallback_excluded_start_must_detect_longer_neighbor_write() {
+        let user = 7u64.to_be_bytes().to_vec();
+        let neighbor = [&user[..], &[0x42]].concat();
+        assert_eq!(check(Bound::Excluded(user), Bound::Unbounded, &neighbor), Err(conflict()));
     }
 }

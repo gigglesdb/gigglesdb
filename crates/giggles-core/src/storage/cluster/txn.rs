@@ -795,7 +795,10 @@ impl ClusterTxnServices {
             points: BTreeSet::new(),
             ranges: reads.ranges,
         };
-        Validator::new(intervals, validation).validate_kv(&reader, snapshot)
+        // No end-prefix probes here: each would be a remote page read per proper prefix of
+        // every bounded range end. The exact user-key filter still applies. Whether this
+        // path needs them for prefix-related keys is open: GD-0084 Q40.
+        Validator::new(intervals, validation).validate_kv(&reader, snapshot, false)
     }
 
     /// Locks held on ranges the commit does not write (FOR UPDATE / FOR SHARE rows, table

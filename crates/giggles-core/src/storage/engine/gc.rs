@@ -25,6 +25,12 @@ const WATERMARK_KEY: &[u8] = b"gc_watermark";
 /// size rather than refused (R3-620).
 pub(crate) const DELETE_BATCH: usize = 10_000;
 
+/// Whether one user key is a byte prefix of the other. Only then can their
+/// versions interleave under bytewise order; prefix-free neighbours never do.
+fn prefix_related(a: &[u8], b: &[u8]) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
 fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }
@@ -230,23 +236,49 @@ impl Gc {
         // Deletes in `batch` not yet counted into the shared totals.
         let mut unflushed = 0usize;
         let mut next_cursor = Vec::new();
+        // User keys need not be prefix-free, so one key's versions can form
+        // several physical runs split by a prefix-related key (Q40). The user
+        // key processed just before the current run, within this step.
+        let mut previous_user: Option<Vec<u8>> = None;
+        // A step resuming from a cursor cannot know what came before its
+        // first run, so that run always looks up its exact anchor.
+        let mut resumed = matches!(lower, Bound::Included(_));
         while let Some((first_key, first_value)) = pending.take() {
             let (user, _) = codec::split_versioned(&first_key)?;
             if matches!(ks, Keyspace::Rows | Keyspace::Index) && user.len() < 8 {
                 return Err(codec::CodecError::Corrupt("short GC row/index user key").into());
             }
             let user = user.to_vec();
+            // A run after a prefix-related neighbour may continue a key whose
+            // anchor (newest version <= W) lies in an earlier run.
+            let related = std::mem::take(&mut resumed)
+                || previous_user
+                    .as_deref()
+                    .is_some_and(|previous| prefix_related(previous, &user));
+            let known_anchor = if related {
+                mvcc::latest_committed_at_most(self.kv.as_ref(), ks, &user, watermark)?
+                    .map(|(ts, _)| ts)
+            } else {
+                None
+            };
             let mut current = Some((first_key, first_value));
             let mut anchor_seen = false;
+            let mut oldest = Ts(u64::MAX);
             // A tombstone anchor hides every older version from snapshots
             // >= W. It is deleted only after all of them, in the group's
             // final batch, so no crash image can resurrect an older value.
             let mut tombstone_anchor = None;
+            let mut next_user_related = false;
             while let Some((key, value)) = current.take() {
                 stats.examined += 1;
                 let (_, ts) = codec::split_versioned(&key)?;
+                oldest = ts;
                 let mut resume_after = None;
                 if ts <= watermark {
+                    if !anchor_seen && known_anchor.is_some_and(|anchor| ts < anchor) {
+                        // The anchor is in an earlier run of this key.
+                        anchor_seen = true;
+                    }
                     if anchor_seen {
                         // Older than the anchor: invisible to every live
                         // snapshot, so any number of batches may remove them.
@@ -282,18 +314,41 @@ impl Gc {
                     if next_user == user {
                         current = Some((key, value));
                     } else {
+                        next_user_related = prefix_related(next_user, &user);
                         pending = Some((key, value));
                     }
                 }
             }
             if let Some(key) = tombstone_anchor {
-                batch.delete(ks, key);
-                stats.deleted += 1;
-                unflushed += 1;
+                // Older versions in a later run of this key are deleted first;
+                // a later pass removes the tombstone once none remain.
+                let older_run = next_user_related
+                    && match oldest.0.checked_sub(1) {
+                        Some(below) => mvcc::latest_committed_at_most(
+                            self.kv.as_ref(),
+                            ks,
+                            &user,
+                            Ts(below),
+                        )?
+                        .is_some(),
+                        None => false,
+                    };
+                if !older_run {
+                    batch.delete(ks, key);
+                    stats.deleted += 1;
+                    unflushed += 1;
+                }
             }
             stats.keys += 1;
-            next_cursor = codec::user_key_upper_bound(&user);
+            previous_user = Some(user);
             if pending.is_none() || stats.examined >= budget {
+                // Resume at the first raw key not yet processed: the start of
+                // the next run, which may be a prefix-related neighbour or a
+                // later run of a key already seen (Q40). An inclusive lower
+                // bound, like the `user_key_upper_bound` cursors before it.
+                if let Some((key, _)) = &pending {
+                    next_cursor = key.clone();
+                }
                 break;
             }
         }

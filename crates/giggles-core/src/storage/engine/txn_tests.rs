@@ -2081,3 +2081,26 @@ mod f8a_commit_tests {
         ))
     }
 }
+
+
+mod q40_exact_key_boundary {
+    use super::*;
+
+    #[test]
+    #[ignore = "GD-0084 Q40: range order needs prefix-free user keys (open design decision)"]
+    fn overlay_delete_must_suppress_committed_prefix_after_neighbor() {
+        let (_, seq, locks) = setup(SequencerConfig::default());
+        let user = 7u64.to_be_bytes().to_vec();
+        let neighbor = [&user[..], &[0x42]].concat();
+        store(&seq, &locks, 1, &user, b"short");
+        store(&seq, &locks, 2, &neighbor, b"long");
+        let mut t = txn(&seq, &locks, 3, Isolation::ReadCommitted);
+        t.lock_for_write(Keyspace::Rows, &user, None, &|| false).unwrap();
+        t.delete(Keyspace::Rows, user.clone()).unwrap();
+        assert_eq!(t.get(Keyspace::Rows, &user).unwrap(), None);
+        let actual = t.scan(
+            Keyspace::Rows, Bound::Unbounded, Bound::Unbounded, Direction::Forward, None,
+        ).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(actual, vec![(neighbor, b"long".to_vec())]);
+    }
+}

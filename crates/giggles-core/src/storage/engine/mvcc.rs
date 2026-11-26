@@ -617,3 +617,105 @@ pub(crate) mod tests {
         assert!(scan.next().is_none());
     }
 }
+
+
+#[cfg(test)]
+mod q40_exact_key_boundary {
+    use super::*;
+    use crate::storage::engine::{
+        kv::{Durability, KvBackend, WriteBatch},
+        kv_mem::MemKv,
+    };
+
+    fn neighbors() -> (MemKv, Vec<u8>, Vec<u8>) {
+        let kv = MemKv::new();
+        let user = 7u64.to_be_bytes().to_vec();
+        let neighbor = [&user[..], &[0x42]].concat();
+        let mut batch = WriteBatch::default();
+        for (key, value) in [(&user, b"short".as_slice()), (&neighbor, b"long".as_slice())] {
+            batch.put(Keyspace::Rows, codec::user_key_seek_at(key, Ts(1)), encode_live(value));
+        }
+        kv.write(batch, Durability::Sync).unwrap();
+        (kv, user, neighbor)
+    }
+
+    #[test]
+    #[ignore = "GD-0084 Q40: range order needs prefix-free user keys (open design decision)"]
+    fn included_end_must_not_return_a_longer_neighbor() {
+        let (kv, user, _) = neighbors();
+        let actual = VersionedRange::new(
+            &kv, Keyspace::Rows, Bound::Included(&user), Bound::Included(&user),
+            Direction::Forward, Ts(2),
+        ).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(actual, vec![(user, b"short".to_vec())]);
+    }
+
+    #[test]
+    #[ignore = "GD-0084 Q40: range order needs prefix-free user keys (open design decision)"]
+    fn excluded_start_must_not_skip_a_longer_neighbor() {
+        let (kv, user, neighbor) = neighbors();
+        let actual = VersionedRange::new(
+            &kv, Keyspace::Rows, Bound::Excluded(&user), Bound::Unbounded,
+            Direction::Forward, Ts(2),
+        ).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(actual, vec![(neighbor, b"long".to_vec())]);
+    }
+
+    #[test]
+    #[ignore = "GD-0084 Q40: range order needs prefix-free user keys (open design decision)"]
+    fn reverse_must_visit_longer_neighbor_before_its_prefix() {
+        let (kv, user, neighbor) = neighbors();
+        let actual = VersionedRange::new(
+            &kv, Keyspace::Rows, Bound::Unbounded, Bound::Unbounded,
+            Direction::Reverse, Ts(2),
+        ).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(actual, vec![(neighbor, b"long".to_vec()), (user, b"short".to_vec())]);
+    }
+
+    #[test]
+    #[ignore = "GD-0084 Q40: range order needs prefix-free user keys (open design decision)"]
+    fn forward_must_visit_prefix_before_longer_neighbor() {
+        let (kv, user, neighbor) = neighbors();
+        let actual = VersionedRange::new(
+            &kv, Keyspace::Rows, Bound::Unbounded, Bound::Unbounded,
+            Direction::Forward, Ts(2),
+        ).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(actual, vec![(user, b"short".to_vec()), (neighbor, b"long".to_vec())]);
+    }
+
+    #[test]
+    #[ignore = "GD-0084 Q40: range order needs prefix-free user keys (open design decision)"]
+    fn forward_must_not_emit_old_live_version_after_split_tombstone() {
+        let kv = MemKv::new();
+        let user = 7u64.to_be_bytes().to_vec();
+        let neighbor = [&user[..], &[0x80]].concat();
+        let mut batch = WriteBatch::default();
+        batch.put(Keyspace::Rows, codec::user_key_seek_at(&user, Ts(1)), encode_live(b"old"));
+        batch.put(Keyspace::Rows, codec::user_key_seek_at(&user, Ts(0xc000_0000_0000_0000)), encode_tombstone());
+        batch.put(Keyspace::Rows, codec::user_key_seek_at(&neighbor, Ts(2)), encode_live(b"neighbor"));
+        kv.write(batch, Durability::Sync).unwrap();
+        let actual = VersionedRange::new(
+            &kv, Keyspace::Rows, Bound::Unbounded, Bound::Unbounded,
+            Direction::Forward, Ts(0xe000_0000_0000_0000),
+        ).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(actual, vec![(neighbor, b"neighbor".to_vec())]);
+    }
+
+    #[test]
+    #[ignore = "GD-0084 Q40: range order needs prefix-free user keys (open design decision)"]
+    fn reverse_must_not_emit_old_live_version_before_split_tombstone() {
+        let kv = MemKv::new();
+        let user = 7u64.to_be_bytes().to_vec();
+        let neighbor = [&user[..], &[0x80]].concat();
+        let mut batch = WriteBatch::default();
+        batch.put(Keyspace::Rows, codec::user_key_seek_at(&user, Ts(1)), encode_live(b"old"));
+        batch.put(Keyspace::Rows, codec::user_key_seek_at(&user, Ts(0xc000_0000_0000_0000)), encode_tombstone());
+        batch.put(Keyspace::Rows, codec::user_key_seek_at(&neighbor, Ts(2)), encode_live(b"neighbor"));
+        kv.write(batch, Durability::Sync).unwrap();
+        let actual = VersionedRange::new(
+            &kv, Keyspace::Rows, Bound::Unbounded, Bound::Unbounded,
+            Direction::Reverse, Ts(0xe000_0000_0000_0000),
+        ).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(actual, vec![(neighbor, b"neighbor".to_vec())]);
+    }
+}

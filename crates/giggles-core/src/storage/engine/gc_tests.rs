@@ -1048,3 +1048,168 @@ fn concurrent_history(seed_value: u64) {
         "seed {seed_value:#x}: final storage differs from exact keep rule at {watermark:?}"
     );
 }
+
+mod q40_exact_key_boundary {
+    use super::*;
+
+    #[test]
+    fn gc_must_not_resurrect_history_split_by_a_prefixed_key() {
+        let backend = Arc::new(MemKv::new());
+        let user = 7u64.to_be_bytes();
+        let neighbor = [&user[..], &[0x80]].concat();
+        let watermark = Ts(0xe000_0000_0000_0000);
+        let mut batch = WriteBatch::default();
+        // Physical order: U||3fff.. (tombstone), U||80||ffff.. (neighbor),
+        // U||ffff..fffe (old live value). All three timestamps are below W.
+        version(&mut batch, Keyspace::Rows, &user, Ts(1), Some(b"old"));
+        version(&mut batch, Keyspace::Rows, &user, Ts(0xc000_0000_0000_0000), None);
+        version(&mut batch, Keyspace::Rows, &neighbor, Ts(2), Some(b"neighbor"));
+        seed(backend.as_ref(), watermark, batch);
+        let (kv, _, gc) = open(backend, Duration::ZERO);
+        assert_eq!(mvcc::read_at(kv.as_ref(), Keyspace::Rows, &user, watermark).unwrap(), None);
+        assert_eq!(gc.advance().unwrap(), watermark);
+        gc.step(Keyspace::Rows, usize::MAX).unwrap();
+        assert_eq!(
+            (
+                mvcc::read_at(kv.as_ref(), Keyspace::Rows, &user, watermark).unwrap(),
+                mvcc::read_at(kv.as_ref(), Keyspace::Rows, &neighbor, watermark).unwrap(),
+            ),
+            (None, Some(b"neighbor".to_vec())),
+            "GC must preserve the tombstone until every exact-key older version is gone"
+        );
+        // The next pass finds no older exact-key version and collects the tombstone.
+        gc.step(Keyspace::Rows, usize::MAX).unwrap();
+        let raw = kv
+            .range(Keyspace::Rows, Bound::Unbounded, Bound::Unbounded, Direction::Forward)
+            .unwrap()
+            .map(|item| codec::split_versioned(&item.unwrap().0).unwrap().0.to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(raw, vec![neighbor.clone()]);
+        assert_eq!(mvcc::read_at(kv.as_ref(), Keyspace::Rows, &user, watermark).unwrap(), None);
+    }
+
+    const W: Ts = Ts(0xe000_0000_0000_0000);
+
+    fn user() -> Vec<u8> {
+        7u64.to_be_bytes().to_vec()
+    }
+
+    fn neighbor() -> Vec<u8> {
+        [&user()[..], &[0x80]].concat()
+    }
+
+    /// Raw timestamps of every stored version of exactly `key`, newest first.
+    fn exact_versions(kv: &dyn KvRead, key: &[u8]) -> Vec<Ts> {
+        records(kv, Keyspace::Rows)
+            .into_iter()
+            .filter_map(|(raw, _)| {
+                let (user, ts) = codec::split_versioned(&raw).unwrap();
+                (user == key).then_some(ts)
+            })
+            .collect::<Vec<_>>()
+    }
+
+    /// U||3fff.. tombstone, U||80||ffff..fd neighbour, U||ffff..fe old live value,
+    /// all below W. Small fixed budgets must still reach U's later run.
+    #[test]
+    fn budget_limited_gc_reaches_a_split_keys_later_run() {
+        let tombstone = Ts(0xc000_0000_0000_0000);
+        for budget in [1, 2] {
+            let backend = Arc::new(MemKv::new());
+            let mut batch = WriteBatch::default();
+            version(&mut batch, Keyspace::Rows, &user(), Ts(1), Some(b"old"));
+            version(&mut batch, Keyspace::Rows, &user(), tombstone, None);
+            version(&mut batch, Keyspace::Rows, &neighbor(), Ts(2), Some(b"neighbor"));
+            seed(backend.as_ref(), W, batch);
+            let (kv, _, gc) = open(backend, Duration::ZERO);
+            assert_eq!(gc.advance().unwrap(), W);
+            let mut done = false;
+            for step in 1..=10 {
+                gc.step(Keyspace::Rows, budget).unwrap();
+                let at = format!("budget {budget}, step {step}");
+                assert_eq!(
+                    mvcc::read_at(kv.as_ref(), Keyspace::Rows, &user(), W).unwrap(),
+                    None,
+                    "{at}: the deleted row must stay deleted"
+                );
+                let versions = exact_versions(kv.as_ref(), &user());
+                if versions.iter().any(|ts| *ts < tombstone) {
+                    assert!(
+                        versions.contains(&tombstone),
+                        "{at}: tombstone dropped while an older version remains: {versions:?}"
+                    );
+                }
+                assert_eq!(
+                    mvcc::read_at(kv.as_ref(), Keyspace::Rows, &neighbor(), W).unwrap(),
+                    Some(b"neighbor".to_vec()),
+                    "{at}"
+                );
+                if versions.is_empty() {
+                    done = true;
+                    break;
+                }
+            }
+            assert!(done, "budget {budget}: U was never fully reclaimed");
+        }
+    }
+
+    /// Run 1 holds U's live anchor <= W; run 2 (after the neighbour) holds an older
+    /// tombstone and an older live value. Both later versions go; the anchor stays.
+    #[test]
+    fn later_run_below_an_earlier_live_anchor_is_collected() {
+        let anchor = Ts(0xc000_0000_0000_0000);
+        for budget in [1, usize::MAX] {
+            let backend = Arc::new(MemKv::new());
+            let mut batch = WriteBatch::default();
+            version(&mut batch, Keyspace::Rows, &user(), anchor, Some(b"anchor"));
+            version(&mut batch, Keyspace::Rows, &user(), Ts(2), None);
+            version(&mut batch, Keyspace::Rows, &user(), Ts(1), Some(b"old"));
+            version(&mut batch, Keyspace::Rows, &neighbor(), Ts(3), Some(b"neighbor"));
+            seed(backend.as_ref(), W, batch);
+            let (kv, _, gc) = open(backend, Duration::ZERO);
+            assert_eq!(gc.advance().unwrap(), W);
+            for step in 1..=10 {
+                gc.step(Keyspace::Rows, budget).unwrap();
+                assert_eq!(
+                    mvcc::read_at(kv.as_ref(), Keyspace::Rows, &user(), W).unwrap(),
+                    Some(b"anchor".to_vec()),
+                    "budget {budget}, step {step}"
+                );
+            }
+            assert_eq!(exact_versions(kv.as_ref(), &user()), vec![anchor], "budget {budget}");
+            assert_eq!(exact_versions(kv.as_ref(), &neighbor()), vec![Ts(3)], "budget {budget}");
+        }
+    }
+
+    /// Run 1 holds only a version above W; run 2 holds a tombstone <= W and an older
+    /// live value. The row stays deleted at W after every step.
+    #[test]
+    fn later_run_tombstone_anchor_below_versions_above_watermark() {
+        let above = Ts(0xf000_0000_0000_0000);
+        for budget in [1, usize::MAX] {
+            let backend = Arc::new(MemKv::new());
+            let mut batch = WriteBatch::default();
+            version(&mut batch, Keyspace::Rows, &user(), above, Some(b"new"));
+            version(&mut batch, Keyspace::Rows, &user(), Ts(2), None);
+            version(&mut batch, Keyspace::Rows, &user(), Ts(1), Some(b"old"));
+            version(&mut batch, Keyspace::Rows, &neighbor(), Ts(3), Some(b"neighbor"));
+            seed(backend.as_ref(), Ts(above.0 + 1), batch);
+            let (kv, _, gc) = open(backend, Duration::ZERO);
+            let _pin = gc.pin(W, "reader".into()).unwrap();
+            assert_eq!(gc.advance().unwrap(), W);
+            for step in 1..=10 {
+                gc.step(Keyspace::Rows, budget).unwrap();
+                assert_eq!(
+                    mvcc::read_at(kv.as_ref(), Keyspace::Rows, &user(), W).unwrap(),
+                    None,
+                    "budget {budget}, step {step}"
+                );
+            }
+            assert_eq!(
+                mvcc::read_at(kv.as_ref(), Keyspace::Rows, &user(), Ts(u64::MAX)).unwrap(),
+                Some(b"new".to_vec())
+            );
+            assert_eq!(exact_versions(kv.as_ref(), &user()), vec![above], "budget {budget}");
+        }
+    }
+}
