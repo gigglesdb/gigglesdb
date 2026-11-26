@@ -252,29 +252,33 @@ mod tests {
     #[test]
     fn appended_index_tuple_keeps_existing_component_bytes_and_prefix() {
         use super::{Direction, Value, append_index_tuple};
-        use crate::relational::encode_key;
 
         let values = [
-            Value::Text("é".repeat(4096)),
             Value::Null,
+            Value::Text("a\0b".into()),
             Value::Bytes(vec![0, 255, 0, 6]),
-            Value::Int(-13),
+            Value::Text("\u{c4}bc".into()),
+            Value::Text("m".repeat(8192)),
         ];
-        let dirs = [Direction::Asc, Direction::Desc, Direction::Desc, Direction::Asc];
-        let prefix = b"index id";
-        let mut expected = prefix.to_vec();
-        for (value, dir) in values.iter().zip(dirs) {
-            let mut component = if *value == Value::Null {
-                vec![0xff]
-            } else {
-                encode_key(std::slice::from_ref(value)).unwrap()
-            };
-            if dir == Direction::Desc {
-                component.iter_mut().for_each(|byte| *byte = !*byte);
-            }
-            expected.extend(component);
-        }
-        let mut actual = prefix.to_vec();
+        let dirs = [
+            Direction::Asc,
+            Direction::Desc,
+            Direction::Desc,
+            Direction::Asc,
+            Direction::Asc,
+        ];
+
+        // Captured from c761b044f before direct-to-buffer component encoding.
+        let mut expected = b"index id".to_vec();
+        expected.extend([0xff]);
+        expected.extend([0xfc, 0x9e, 0xff, 0x00, 0x9d, 0xff, 0xff]);
+        expected.extend([0xfb, 0xff, 0x00, 0x00, 0xff, 0x00, 0xf9, 0xff, 0xff]);
+        expected.extend([0x03, 0xc3, 0x84, 0x62, 0x63, 0x00, 0x00]);
+        expected.push(0x03);
+        expected.resize(expected.len() + 8192, 0x6d);
+        expected.extend([0x00, 0x00]);
+
+        let mut actual = b"index id".to_vec();
         append_index_tuple(&mut actual, values.iter().zip(dirs)).unwrap();
         assert_eq!(actual, expected);
     }

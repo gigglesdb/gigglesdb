@@ -2714,6 +2714,9 @@ impl RowSink for SqlRows<'_> {
 }
 
 impl SqlRows<'_> {
+    /// Publish the admitted rows under their supplied primary keys. The caller
+    /// must pass keys encoded from the corresponding row values. Release builds
+    /// use the supplied keys directly.
     fn apply_sorted_append_rows(
         &mut self,
         table: &TableDef,

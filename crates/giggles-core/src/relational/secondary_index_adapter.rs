@@ -759,8 +759,10 @@ impl Relational {
         })
     }
 
-    /// V2 VALUES proposals already have sorted, canonical keys. The target
-    /// preimage is empty here; the physical publisher still checks occupancy.
+    /// V2 VALUES proposals already have sorted, canonical keys. Each caller
+    /// must derive each candidate key from its final row values. Release builds
+    /// trust that the key matches those values. The target preimage is empty
+    /// here; the physical publisher still checks occupancy.
     pub(super) fn secondary_apply_sorted_append(
         &mut self,
         table: u64,
@@ -795,6 +797,7 @@ impl Relational {
             tick(cancel)?;
         }
         let mut staged = row_sink::DdlRows::new();
+        const _: () = assert!(MAX_ROWS <= u16::MAX as usize);
         let mut ordinals = Vec::with_capacity(candidates.len());
         for row_sink::AppendCandidate { key, row, input } in candidates {
             tick(cancel)?;

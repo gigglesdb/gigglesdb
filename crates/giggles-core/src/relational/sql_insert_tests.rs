@@ -459,6 +459,169 @@ fn repeated_defaults_keep_draws_before_failed_assignment() {
     }
 }
 
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn prepared_paged_serial_insert_uses_current_defaults_and_sequence() {
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce).unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "paged-serial-{:032x}",
+        u128::from_be_bytes(nonce)
+    ));
+    let admin = Admin::create_engine(&path, Limits::default(), crate::Engine::V2).unwrap();
+    let mut session = admin.sql_session();
+    run(
+        &mut session,
+        "CREATE TABLE defaults_batch (
+            id BIGSERIAL PRIMARY KEY, label TEXT DEFAULT 'original', n INTEGER NOT NULL
+        )",
+    );
+
+    let count = 202; // The V2 VALUES page holds 200 rows.
+    let tuples = (1..=count)
+        .map(|n| format!("({n})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let prepared = session
+        .prepare(&format!(
+            "INSERT INTO defaults_batch (n) VALUES {tuples} RETURNING id, label, n"
+        ))
+        .unwrap();
+    assert!(matches!(
+        prepared.statement.get(), Statement::InsertMulti(insert) if insert.needs_pages()
+    ));
+    let clock = clock::ExecutionClock::pinned(100, None);
+    let check = |session: &mut SqlSession, start, label: &str| {
+        let result = session
+            .execute_prepared_at(&prepared, &[], None, &clock)
+            .unwrap();
+        assert_eq!(result.affected, count as u64);
+        assert_eq!(result.rows.len(), count);
+        for (offset, row) in result.rows.iter().enumerate() {
+            let offset = i64::try_from(offset).unwrap();
+            assert_eq!(
+                row.values,
+                [Value::Int(start + offset), Value::Text(label.into()), Value::Int(offset + 1)]
+            );
+        }
+    };
+    check(&mut session, 1, "original");
+    run(
+        &mut session,
+        "ALTER TABLE defaults_batch ALTER COLUMN label SET DEFAULT 'changed'",
+    );
+    run(
+        &mut session,
+        "ALTER SEQUENCE defaults_batch_id_seq RESTART WITH 1000",
+    );
+    check(&mut session, 1000, "changed");
+
+    drop(session);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn repeated_volatile_defaults_evaluate_each_row() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    };
+
+    let (admin, mut session, path) = fixture();
+    run(
+        &mut session,
+        "CREATE TABLE defaults_batch (
+            id INTEGER PRIMARY KEY, stamp TIMESTAMPTZ DEFAULT clock_timestamp(),
+            uid UUID DEFAULT gen_random_uuid()
+        )",
+    );
+    let mut clock = clock::ExecutionClock::pinned(100, None);
+    let wall = AtomicI64::new(101);
+    clock.wall = Some(Arc::new(move || Ok(wall.fetch_add(1, Ordering::Relaxed))));
+    let result = session
+        .execute_at(
+            "INSERT INTO defaults_batch (id) VALUES (9), (1), (5) RETURNING id, stamp, uid",
+            &[],
+            None,
+            &clock,
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 3);
+    let mut uuids = std::collections::BTreeSet::new();
+    for (row, (id, us)) in result.rows.iter().zip([(9, 101), (1, 102), (5, 103)]) {
+        let stamp = giggles_pg_types::temporal::TimestampTz::from_microseconds(us).unwrap();
+        assert_eq!(row.values[..2], [Value::Int(id), Value::TimestampTz(stamp)]);
+        let Value::Text(uuid) = &row.values[2] else {
+            panic!("expected a UUID, got {:?}", row.values[2]);
+        };
+        assert!(uuids.insert(uuid), "reused UUID {uuid}");
+    }
+    drop(session);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn single_values_append_clears_order_after_staging_error() {
+    let mut state = Relational::default();
+    let create = Prepared::parse("CREATE TABLE items (id INTEGER PRIMARY KEY)", 1, state.epoch)
+        .unwrap();
+    state.execute(&create, &[], None).unwrap();
+    let insert = Prepared::parse("INSERT INTO items VALUES (1) RETURNING id", 1, state.epoch)
+        .unwrap();
+    assert!(matches!(insert.statement.get(), Statement::Insert { .. }));
+    let description = StatementDescription::new(&insert);
+    let mut events = Vec::new();
+    let mut order = Some(row_sink::AppendOrder::RejectedCandidates(Vec::new()));
+
+    // An index-free empty preimage makes its first cancellation check in append staging.
+    let error = state.execute_statement_described_with_append(
+        &description, &[], None, || true, None, None, &mut events, Some(&mut order), None,
+    ).unwrap_err();
+    assert_eq!(error, SqlError::Aborted);
+    assert!(order.is_none());
+    assert!(state.rows[&state.tables["items"].id].is_empty());
+
+    let result = state.execute_statement_described_with_append(
+        &description, &[], None, || false, None, None, &mut events, Some(&mut order), None,
+    ).unwrap();
+    assert_eq!(result.affected, 1);
+    assert_eq!(result.rows[0].values, [Value::Int(1)]);
+    assert!(matches!(
+        order, Some(row_sink::AppendOrder::Published(row_sink::AppendReplay::SortedOrdinals(ordinals)))
+            if ordinals == [0]
+    ));
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn v2_single_values_append_succeeds_after_unique_error_in_same_session() {
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce).unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "single-append-{:032x}",
+        u128::from_be_bytes(nonce)
+    ));
+    let admin = Admin::create_engine(&path, Limits::default(), crate::Engine::V2).unwrap();
+    let mut session = admin.sql_session();
+    run(&mut session, "CREATE TABLE items (id INTEGER PRIMARY KEY, email TEXT UNIQUE)");
+    run(&mut session, "INSERT INTO items VALUES (1, 'taken')");
+    let error = session
+        .execute("INSERT INTO items VALUES (2, 'taken')", &[], None)
+        .unwrap_err();
+    assert_eq!(crate::sqlstate(&error), "23505");
+    let result = run(
+        &mut session,
+        "INSERT INTO items VALUES (2, 'free') RETURNING id, email",
+    );
+    assert_eq!(result.affected, 1);
+    assert_eq!(result.rows[0].values, [Value::Int(2), Value::Text("free".into())]);
+    drop(session);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
 #[test]
 fn sql_insert_primary_do_nothing_affected_counts() {
     let (_, mut s, _) = fixture();
@@ -1349,7 +1512,8 @@ fn sorted_values_append_matches_general_row_and_index_bytes() {
 
     let mut general = Relational::default();
     for ddl in [
-        r#"CREATE TABLE sample (id TEXT COLLATE "C" PRIMARY KEY, email TEXT COLLATE "C", n INTEGER)"#,
+        "CREATE COLLATION ci(provider=icu,locale='und-u-ks-level2',deterministic=false)",
+        "CREATE TABLE sample (id TEXT COLLATE ci PRIMARY KEY, email TEXT COLLATE ci, n INTEGER)",
         "CREATE UNIQUE INDEX sample_email ON sample (email)",
     ] {
         let stmt = Prepared::parse(ddl, 0, general.epoch).unwrap();
@@ -1357,7 +1521,7 @@ fn sorted_values_append_matches_general_row_and_index_bytes() {
     }
     let mut optimized = general.clone();
     let stmt = Prepared::parse(
-        "INSERT INTO sample VALUES ('z',NULL,3), ($1,'Äbc',2), ('a','x',1) RETURNING id",
+        "INSERT INTO sample VALUES ('z',NULL,3), ($1,'Äbc',2) RETURNING id",
         1, general.epoch,
     ).unwrap();
     let params = [Value::Text("m".repeat(8192))];
@@ -1370,7 +1534,7 @@ fn sorted_values_append_matches_general_row_and_index_bytes() {
     assert_eq!(actual, expected);
     assert!(matches!(
         order, Some(row_sink::AppendOrder::Published(row_sink::AppendReplay::SortedOrdinals(ordinals)))
-            if ordinals == [2, 1, 0]
+            if ordinals == [1, 0]
     ));
     let table = &general.tables["sample"];
     let expected = &general.rows[&table.id];
@@ -1385,9 +1549,40 @@ fn sorted_values_append_matches_general_row_and_index_bytes() {
             codec::encode_row(&pk, before.version, &before.values).unwrap(),
         );
     }
+    let entries = indexes::entries(
+        Some(&optimized), table, actual, optimized.secondary_descriptors_engine(),
+    ).unwrap();
     assert_eq!(
-        indexes::entries(Some(&optimized), table, actual, optimized.secondary_descriptors_engine()).unwrap(),
+        entries,
         indexes::entries(Some(&general), table, expected, general.secondary_descriptors_engine()).unwrap(),
+    );
+
+    // The baseline at c761b044f wrote these bytes for the NULL and collated
+    // index entries, the wide primary key, and the row with a NULL column.
+    let nullable_pk = [0x03, 0x7a, 0x00, 0x00];
+    let nullable_entry = [0, 0, 0, 0, 0, 0, 0, 6, 0xff, 0x03, 0x7a, 0, 0];
+    assert_eq!(entries[nullable_entry.as_slice()], nullable_pk);
+    let collated_entry = [0, 0, 0, 0, 0, 0, 0, 6, 0x03, 0xc3, 0x84, 0x62, 0x63, 0, 0];
+    let mut wide_pk = vec![0x03];
+    wide_pk.resize(8193, 0x6d);
+    wide_pk.extend([0, 0]);
+    assert_eq!(entries[collated_entry.as_slice()], wide_pk);
+    assert!(actual.contains_key(&wide_pk));
+
+    let ts = crate::storage::engine::hlc::Ts(42);
+    let nullable_row = &actual[nullable_pk.as_slice()];
+    assert_eq!(
+        codec::row_key(table.id, &nullable_pk, ts),
+        [0, 0, 0, 0, 0, 0, 0, 2, 0x03, 0x7a, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xd5],
+    );
+    assert_eq!(
+        codec::encode_row(&nullable_pk, nullable_row.version, &nullable_row.values).unwrap(),
+        [
+            0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0x03, 0, 0, 0, 0x25,
+            0, 0, 0, 0, 0, 0, 0, 0x03, 0, 0, 0, 0x03, 0, 0, 0, 0,
+            0, 0, 0, 0x01, 0x7a, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0, 0,
+            0, 0, 0, 0, 0x03, 0x29, 0x92, 0x1b, 0x2f,
+        ],
     );
     assert_eq!(
         optimized.secondary_persistence_engine(|| false).unwrap(),

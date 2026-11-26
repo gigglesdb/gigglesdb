@@ -190,9 +190,10 @@ fn values_append_replays_input_order_before_physical_key_order() {
         assert_append_duplicate((result, relational::take_sql_error_message()), constraint);
         assert!(run(&mut session, "SELECT id FROM t LIMIT 5").rows.is_empty());
     }
+    session.set_max_value_bytes(relational::MAX_ROW_BYTES);
     let error = session.execute_at(
         "INSERT INTO t VALUES (9,'dup',NULL),(8,'dup',NULL),(1,'a',$1),(1,'b',NULL)",
-        &[Text("x".repeat(relational::MAX_VALUE_BYTES + 1))],
+        &[Text("x".repeat(relational::MAX_ROW_BYTES + 1))],
         None,
         &clock(),
     ).unwrap_err();
