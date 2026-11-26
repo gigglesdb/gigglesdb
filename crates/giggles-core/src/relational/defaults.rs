@@ -5,7 +5,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 thread_local! {
     // Only syntax is cached: catalog lookup and evaluation stay with the caller.
     static DEPENDENCIES: RefCell<HashMap<String, Rc<[String]>>> = RefCell::new(HashMap::new());
-    static QUALIFIED_DEFAULTS: RefCell<HashMap<String, Rc<str>>> = RefCell::new(HashMap::new());
+    static QUALIFIED_DEFAULTS: RefCell<HashMap<String, QualifiedDefault>> = RefCell::new(HashMap::new());
 }
 
 fn cached_syntax<T: Clone>(
@@ -991,6 +991,17 @@ enum Expression {
     Array(Vec<Expression>),
 }
 impl Expression {
+    fn reusable_default(&self) -> bool {
+        match self {
+            Self::Extension(..) | Self::Builtin(..) => false,
+            Self::Negative(value) | Self::Cast(value, _) | Self::NamedCast(value, _) => {
+                value.reusable_default()
+            }
+            Self::Array(values) => values.iter().all(Self::reusable_default),
+            _ => true,
+        }
+    }
+
     fn qualify_stored_sequences(&mut self) -> R<()> {
         match self {
             Self::Sequence(name) => {
@@ -1573,24 +1584,39 @@ pub(super) fn evaluate_sql(
     clock: Option<&clock::ExecutionClock>,
 ) -> R<Value> {
     let qualified = cached_syntax(&QUALIFIED_DEFAULTS, sql, || qualify_default(sql))?;
-    let legacy_text = target.is_extended_text() && qualified.ends_with("::text");
-    let qualified = if legacy_text {
-        qualified.strip_suffix("::text").expect("text suffix")
-    } else {
-        &qualified
-    };
-    // Character defaults are stored as text constants. Evaluate that physical
-    // value before the caller applies the destination column's character rules;
-    // relabeling a text cast as varchar/bpchar would change its scalar cast type.
-    let evaluation_target = match target {
-        DataType::Varchar | DataType::Bpchar => &DataType::Text,
-        other => other,
-    };
-    let clock = clock.map(clock::ExecutionClock::for_column_default);
-    query::InsertExpressions::default_value(qualified, evaluation_target, clock.as_ref(), true)?
-        .ok_or(SqlError::Type)
+    qualified.bind(target, clock)?.evaluate()
 }
-fn qualify_default(sql: &str) -> R<Rc<str>> {
+
+#[derive(Clone)]
+struct QualifiedDefault {
+    sql: Rc<str>,
+    reusable: bool,
+}
+
+impl QualifiedDefault {
+    fn bind(
+        &self,
+        target: &DataType,
+        clock: Option<&clock::ExecutionClock>,
+    ) -> R<query::BoundDefault> {
+        let sql = if target.is_extended_text() {
+            self.sql.strip_suffix("::text").unwrap_or(&self.sql)
+        } else {
+            &self.sql
+        };
+        // Character defaults are stored as text constants. Evaluate that physical
+        // value before the caller applies the destination column's character rules;
+        // relabeling a text cast as varchar/bpchar would change its scalar cast type.
+        let evaluation_target = match target {
+            DataType::Varchar | DataType::Bpchar => &DataType::Text,
+            other => other,
+        };
+        let clock = clock.map(clock::ExecutionClock::for_column_default);
+        query::BoundDefault::bind(sql, evaluation_target, clock.as_ref())
+    }
+}
+
+fn qualify_default(sql: &str) -> R<QualifiedDefault> {
     let mut parser = Parser { privilege_seen: false, privilege_casts: false,
         tokens: lex(&format!("{sql},"))?,
         at: 0,
@@ -1604,7 +1630,10 @@ fn qualify_default(sql: &str) -> R<Rc<str>> {
     {
         return Err(SqlError::Unsupported);
     }
-    Ok(Rc::from(value.render(true)))
+    Ok(QualifiedDefault {
+        sql: Rc::from(value.render(true)),
+        reusable: value.reusable_default(),
+    })
 }
 
 pub(super) fn evaluate(
@@ -1616,6 +1645,10 @@ pub(super) fn evaluate(
         Some(sql) => evaluate_sql(&sql, &column.data_type, clock)?,
         None => Value::Null,
     };
+    assign_default(state, column, value)
+}
+
+fn assign_default(state: &Relational, column: &ColumnDef, value: Value) -> R<Value> {
     let value = coerce_to_column(state, column, value)?;
     apply_typmod(value, state.column_typmod(column.id))
 }
@@ -1671,6 +1704,14 @@ pub(super) fn row(
     supplied: &[usize],
     clock: Option<&clock::ExecutionClock>,
 ) -> R<Vec<Value>> {
+    row_with(table, supplied, |_, column| evaluate(state, column, clock))
+}
+
+fn row_with(
+    table: &TableDef,
+    supplied: &[usize],
+    mut evaluate: impl FnMut(usize, &ColumnDef) -> R<Value>,
+) -> R<Vec<Value>> {
     table
         .columns
         .iter()
@@ -1679,10 +1720,52 @@ pub(super) fn row(
             if supplied.contains(&index) || column.name == HIDDEN_ROWID {
                 Ok(Value::Null)
             } else {
-                evaluate(state, column, clock)
+                evaluate(index, column)
             }
         })
         .collect()
+}
+
+/// The normalized rows of one INSERT share their pinned catalog and clock.
+/// Cache only evaluators, so each occurrence still draws sequences and applies
+/// the destination typmod at the original position in the row walk.
+pub(super) struct InsertDefaults(Option<Vec<Option<query::BoundDefault>>>);
+
+impl InsertDefaults {
+    pub(super) fn new(rows: usize) -> Self {
+        Self((rows > 1).then(Vec::new))
+    }
+
+    pub(super) fn row(
+        &mut self,
+        state: &Relational,
+        table: &TableDef,
+        supplied: &[usize],
+        clock: Option<&clock::ExecutionClock>,
+    ) -> R<Vec<Value>> {
+        let Some(evaluators) = &mut self.0 else {
+            return row(state, table, supplied, clock);
+        };
+        row_with(table, supplied, |index, column| {
+            let value = if let Some(Some(evaluator)) = evaluators.get(index) {
+                evaluator.evaluate()?
+            } else if let Some(sql) = default_sql(state, column) {
+                let qualified = cached_syntax(&QUALIFIED_DEFAULTS, &sql, || qualify_default(&sql))?;
+                let evaluator = qualified.bind(&column.data_type, clock)?;
+                let value = evaluator.evaluate()?;
+                if qualified.reusable {
+                    if evaluators.is_empty() {
+                        evaluators.resize_with(table.columns.len(), || None);
+                    }
+                    evaluators[index] = Some(evaluator);
+                }
+                value
+            } else {
+                Value::Null
+            };
+            assign_default(state, column, value)
+        })
+    }
 }
 
 pub(super) fn install_alter(

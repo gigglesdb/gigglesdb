@@ -290,18 +290,12 @@ impl InsertExpressions {
         clock: Option<&crate::relational::clock::ExecutionClock>,
         evaluate: bool,
     ) -> R<Option<Value>> {
-        let mut value = Self::bind_default(sql, target)?.insert_assignment(target)?;
+        let value = Self::bind_default(sql, target)?.insert_assignment(target)?;
         let constant = Self::validate_default_value(&value)?;
         if !evaluate {
             return Ok(constant);
         }
-        value.attach_clock(clock);
-        let empty = Tuple {
-            source_versions: vec![],
-            values: vec![],
-            version: 0,
-        };
-        value.eval(&empty, &[], &mut 0).map(Some)
+        BoundDefault::with_clock(value, clock).evaluate().map(Some)
     }
     pub(in super::super) fn parse(p: &mut Parser) -> R<Self> {
         p.need("insert")?;
@@ -580,6 +574,34 @@ impl InsertExpressions {
             return Err(SqlError::Aborted);
         }
         Ok(values.into_iter().map(Expr::Literal).collect())
+    }
+}
+
+pub(in crate::relational) struct BoundDefault(BoundScalar);
+
+impl BoundDefault {
+    pub(in crate::relational) fn bind(
+        sql: &str,
+        target: &DataType,
+        clock: Option<&clock::ExecutionClock>,
+    ) -> R<Self> {
+        let value = InsertExpressions::bind_default(sql, target)?.insert_assignment(target)?;
+        InsertExpressions::validate_default_value(&value)?;
+        Ok(Self::with_clock(value, clock))
+    }
+
+    fn with_clock(mut value: BoundScalar, clock: Option<&clock::ExecutionClock>) -> Self {
+        value.attach_clock(clock);
+        Self(value)
+    }
+
+    pub(in crate::relational) fn evaluate(&self) -> R<Value> {
+        let empty = Tuple {
+            source_versions: vec![],
+            values: vec![],
+            version: 0,
+        };
+        self.0.eval(&empty, &[], &mut 0)
     }
 }
 

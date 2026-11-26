@@ -446,6 +446,7 @@ impl Insert {
     pub(super) fn witness_rows(
         &mut self, state: &Relational, params: &[Value], declared: &[Option<DataType>],
         clock: Option<&clock::ExecutionClock>,
+        insert_defaults: Option<&mut defaults::InsertDefaults>,
     ) -> R<Option<Vec<Vec<Value>>>> {
         let table = state.tables.get(&self.table).ok_or(SqlError::UnknownTable)?;
         if self.rows.len() > 200 || self.source.is_some() || !self.can_witness(state) {
@@ -454,9 +455,11 @@ impl Insert {
         let indexes = indexes(self, table)?;
         admit_statement(self, params)?;
         self.check_explicit(state, table, &indexes)?;
+        let mut local_defaults = defaults::InsertDefaults::new(self.rows.len());
+        let evaluators = insert_defaults.unwrap_or(&mut local_defaults);
         let rows = self.rows.iter().zip(&self.defaults).enumerate().map(|(i, (row, defaults))| {
             normalize_row(state, table, self, &indexes, row, i, defaults, params,
-                declared, clock, self.source_types.as_deref())
+                declared, clock, self.source_types.as_deref(), evaluators)
         }).collect::<R<Vec<_>>>()?;
         self.normalized = Some(rows.clone());
         Ok(Some(rows))
@@ -1099,6 +1102,7 @@ fn normalize_row(
     declared: &[Option<DataType>],
     clock: Option<&clock::ExecutionClock>,
     source_types: Option<&[Option<SourceType>]>,
+    evaluators: &mut defaults::InsertDefaults,
 ) -> R<Vec<Value>> {
     let replaced = |index: usize, default: bool| {
         default
@@ -1110,7 +1114,7 @@ fn normalize_row(
         .zip(row_defaults)
         .filter_map(|(i, default)| (!replaced(*i, *default)).then_some(*i))
         .collect::<Vec<_>>();
-    let mut row = defaults::row(state, table, &supplied, clock)?;
+    let mut row = evaluators.row(state, table, &supplied, clock)?;
     for (slot, ((expression, index), default)) in
         values.iter().zip(indexes).zip(row_defaults).enumerate()
     {
@@ -1618,6 +1622,7 @@ pub(super) fn execute(
         &mut Vec::new(),
         None,
         None,
+        None,
     )
 }
 
@@ -1637,6 +1642,7 @@ pub(super) fn execute_declared(
     events: &mut Vec<constraints::Event>,
     injected_source: Option<&dyn scan::RowSource>,
     append_order: Option<&mut Option<row_sink::AppendOrder>>,
+    insert_defaults: Option<&mut defaults::InsertDefaults>,
 ) -> R<SqlResult> {
     if cancel() {
         return Err(SqlError::Aborted);
@@ -1685,6 +1691,8 @@ pub(super) fn execute_declared(
     let mut incoming = Vec::with_capacity(insert.rows.len());
     let mut total = 0usize;
     insert.check_explicit(state, &table, &indexes)?;
+    let mut local_defaults = defaults::InsertDefaults::new(insert.rows.len());
+    let evaluators = insert_defaults.unwrap_or(&mut local_defaults);
     for (row_index, (values, row_defaults)) in insert.rows.iter().zip(&insert.defaults).enumerate()
     {
         if cancel() {
@@ -1702,6 +1710,7 @@ pub(super) fn execute_declared(
             declared,
             clock,
             source_types,
+            evaluators,
         )? };
         for value in &row {
             total = total

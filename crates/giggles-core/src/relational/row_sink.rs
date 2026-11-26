@@ -354,14 +354,15 @@ impl Relational {
         version_end: u64,
         deferred: Option<&mut DeferralState>,
     ) -> Result<SqlResult, CoreError> {
-        self.execute_with_sink_actions(prepared, params, expected, clock, sink, version_end, deferred, None)
+        self.execute_with_sink_actions(prepared, params, expected, clock, sink, version_end, deferred, None, None)
     }
 
-    #[expect(clippy::too_many_arguments, reason = "statement inputs plus paged referential actions")]
+    #[expect(clippy::too_many_arguments, reason = "statement inputs and shared INSERT page state")]
     fn execute_with_sink_actions(
         &mut self, prepared: &Prepared, params: &[Value], expected: Option<u64>,
         clock: Option<&clock::ExecutionClock>, sink: &mut impl RowSink, version_end: u64,
         deferred: Option<&mut DeferralState>, actions: Option<&mut paged_dml::ActionWork>,
+        mut insert_defaults: Option<&mut defaults::InsertDefaults>,
     ) -> Result<SqlResult, CoreError> {
         let returning_scope = sink.streams_index_builds().then(spill::returning_unbounded);
         let bound = prepared.bind_schemas(self).map_err(CoreError::Sql)?;
@@ -591,7 +592,7 @@ impl Relational {
         let conflict_rows = if sink.streams_index_builds() {
             if let Statement::InsertMulti(insert) = normalized.statement.get_mut() {
                 insert
-                    .witness_rows(self, params, &prepared.parameter_types, clock)
+                    .witness_rows(self, params, &prepared.parameter_types, clock, insert_defaults.as_deref_mut())
                     .map_err(CoreError::Sql)?
             } else {
                 None
@@ -873,6 +874,7 @@ impl Relational {
                     &StatementDescription::new(prepared), params, expected,
                     || crate::cancellation::check().is_err(), clock, None, &mut events,
                     Some(&mut append_order),
+                    insert_defaults,
                 ) {
                     Ok(result) => result,
                     Err(error) => {
@@ -884,9 +886,11 @@ impl Relational {
                     }
                 }
             } else {
-                self.execute_statement_inner(prepared, params, expected,
-                    || crate::cancellation::check().is_err(), clock, None, &mut events)
-                    .map_err(CoreError::Sql)?
+                self.execute_statement_described_with_append(
+                    &StatementDescription::new(prepared), params, expected,
+                    || crate::cancellation::check().is_err(), clock, None, &mut events,
+                    None, insert_defaults,
+                ).map_err(CoreError::Sql)?
             };
             if let Some(actions) = actions {
                 let table = table.as_ref().expect("conflict page target");

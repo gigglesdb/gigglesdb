@@ -52,6 +52,7 @@ pub(super) fn execute<S: RowSink>(
     let mut result = SqlResult::default();
     let mut after = None;
     let mut start = 0;
+    let mut insert_defaults = defaults::InsertDefaults::new(SHARED_WRITE_ROWS);
     let first_version = state.next_version;
     if insert.updates_conflicts() { sink.begin_conflict_pages(first_version); }
     let table = state.tables[&insert.table].clone();
@@ -81,6 +82,7 @@ pub(super) fn execute<S: RowSink>(
             version_end,
             deferred.as_deref_mut(),
             actions.as_mut(),
+            Some(&mut insert_defaults),
         )?;
         state.next_version = page.next_version;
         if let Some(actions) = &mut actions {

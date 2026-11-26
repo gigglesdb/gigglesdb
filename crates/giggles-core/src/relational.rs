@@ -4741,7 +4741,7 @@ impl Relational {
         events: &mut Vec<constraints::Event>,
     ) -> R<SqlResult> {
         self.execute_statement_described_with_append(
-            description, params, expected, cancel, clock, injected_source, events, None,
+            description, params, expected, cancel, clock, injected_source, events, None, None,
         )
     }
 
@@ -4756,6 +4756,7 @@ impl Relational {
         injected_source: Option<&dyn scan::RowSource>,
         events: &mut Vec<constraints::Event>,
         append_order: Option<&mut Option<row_sink::AppendOrder>>,
+        insert_defaults: Option<&mut defaults::InsertDefaults>,
     ) -> R<SqlResult> {
         let _type_path = user_types::TypeDisplayScope::enter(
             &description.prepared().search_path, Some(self),
@@ -4952,6 +4953,7 @@ impl Relational {
                     events,
                     injected_source,
                     append_order,
+                    insert_defaults,
                 );
             }
             Statement::Schema(ddl) => {
