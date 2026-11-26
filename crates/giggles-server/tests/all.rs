@@ -473,3 +473,5 @@ mod wide_table_network;
 
 #[path = "named_arguments_network.rs"]
 mod named_arguments_network;
+
+#[path = "maintenance_network.rs"] mod maintenance_network;

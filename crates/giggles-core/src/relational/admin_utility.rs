@@ -1,20 +1,32 @@
 //! PostgreSQL administrative statements that have no storage effects.
 use super::*;
 
+pub(crate) struct MaintenanceContext<'a> {
+    pub image: Option<&'a crate::roles::RoleCatalogImage>,
+    pub database: &'a str,
+    pub private_owner: Option<(&'a str, u64)>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum Statement {
     Comment(comments::AdminTarget),
     Tablespace(tablespace::Command),
     Load(String),
+    Maintenance(maintenance::Command),
     SecurityLabel(Option<String>),
 }
 
 pub(super) fn claims(tokens: &[Token]) -> bool {
-    comments::admin_claims(tokens) || tablespace::claims(tokens) || load::claims(tokens)
+    comments::admin_claims(tokens)
+        || tablespace::claims(tokens)
+        || load::claims(tokens)
+        || maintenance::claims(tokens)
 }
 
 pub(super) fn parse(p: &mut Parser) -> R<Statement> {
-    let statement = if p.word("comment") {
+    let statement = if maintenance::claims(&p.tokens[p.at..]) {
+        Statement::Maintenance(maintenance::parse(p)?)
+    } else if p.word("comment") {
         Statement::Comment(comments::parse_admin(p)?)
     } else if p.word("load") {
         Statement::Load(string(p)?)
@@ -42,12 +54,21 @@ impl Statement {
             Self::Comment(_) => "COMMENT",
             Self::Tablespace(command) => command.tag(),
             Self::Load(_) => "LOAD",
+            Self::Maintenance(c) => c.tag(),
             Self::SecurityLabel(_) => "SECURITY LABEL",
         }
     }
 
     pub(crate) fn requires_standalone(&self) -> bool {
         matches!(self, Self::Tablespace(command) if command.requires_standalone())
+            || matches!(self, Self::Maintenance(c) if c.block_command().is_some())
+    }
+
+    pub(crate) fn block_command(&self) -> &str {
+        match self {
+            Self::Maintenance(c) => c.block_command().unwrap_or(c.tag()),
+            _ => self.command(),
+        }
     }
 
     pub(crate) fn execute(
@@ -56,6 +77,7 @@ impl Statement {
         state: &Relational,
         actor: Option<&crate::roles::CatalogRole>,
         roles: &crate::roles::RoleCatalog,
+        maintenance: MaintenanceContext<'_>,
     ) -> Result<SqlResult, crate::CoreError> {
         let superuser = actor.is_none_or(|actor| actor.superuser);
         match self {
@@ -66,8 +88,18 @@ impl Statement {
                 load::execute(filename, superuser).map_err(crate::CoreError::Sql)?
             }
             Self::Tablespace(command) => command.execute(actor, roles)?,
+            Self::Maintenance(c) => c.execute(
+                prepared,
+                state,
+                actor,
+                maintenance.image.expect("maintenance role image"),
+                maintenance.database,
+                maintenance.private_owner,
+            )?,
             Self::SecurityLabel(provider) => {
-                return Err(crate::CoreError::Sql(security_label::refuse(provider.as_deref())));
+                return Err(crate::CoreError::Sql(security_label::refuse(
+                    provider.as_deref(),
+                )));
             }
         }
         Ok(SqlResult::default())

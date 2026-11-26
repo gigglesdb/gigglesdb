@@ -115,7 +115,8 @@ impl RoleCatalogImage {
         self.owner_in_image(table)
     }
 
-    fn owner_in_image(&self, table: &str) -> Result<Option<String>, RoleError> {
+    // Caller has already resolved and validated this relation against its catalog image.
+    pub(crate) fn owner_in_image(&self, table: &str) -> Result<Option<String>, RoleError> {
         raw_get(&self.image.table, &key(b"owner/", table))?
             .map(|value| {
                 String::from_utf8(value)

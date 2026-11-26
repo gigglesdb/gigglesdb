@@ -672,3 +672,5 @@ mod sql_wide_tables;
 
 #[path = "sql_named_arguments.rs"]
 mod sql_named_arguments;
+
+#[path = "sql_maintenance.rs"] mod sql_maintenance;

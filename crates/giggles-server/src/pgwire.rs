@@ -4170,11 +4170,12 @@ async fn agent_refusal<S: AsyncWrite + Unpin>(s: &mut S) -> io::Result<()> {
 /// no client byte is waiting), as PostgreSQL does. Wire bytes are unchanged.
 pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut S,
-    session: Session,
+    mut session: Session,
     startup: crate::pgwire_startup::Startup,
     authenticated_already: bool,
     extra_status: &[(&str, String)],
 ) -> io::Result<()> {
+    session.sql.set_maintenance_database(&startup.database);
     // The frame reader reads tag, length and body separately. Without a read
     // buffer each piece is a recv syscall (measured: 41 recvfrom per read op).
     let mut s = tokio::io::BufWriter::with_capacity(

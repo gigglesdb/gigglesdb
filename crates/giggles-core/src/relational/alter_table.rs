@@ -42,6 +42,8 @@ pub(super) enum Action {
     Validate(String),
     DropConstraint(String, bool, bool),
     TriggerState(triggers::Target, u8),
+    AccessMethod(String),
+    Tablespace(String),
 }
 #[derive(Debug, Clone, Default)]
 pub(super) struct AddConstraints {
@@ -256,7 +258,14 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
             p.need("constraint")?;
             Action::Validate(raw_name(p)?)
         } else if p.word("set") {
-            return Err(SqlError::Unsupported);
+            if p.word("access") {
+                p.need("method")?;
+                Action::AccessMethod(raw_name(p)?)
+            } else if p.word("tablespace") {
+                Action::Tablespace(raw_name(p)?)
+            } else {
+                return Err(SqlError::Unsupported);
+            }
         } else {
             return Err(SqlError::Syntax);
         };
@@ -472,6 +481,8 @@ pub(super) fn execute(
             .ok_or(SqlError::UnknownTable)?
             .clone();
         match action {
+            Action::AccessMethod(method) => maintenance::access_method(method)?,
+            Action::Tablespace(name) => maintenance::tablespace(name)?,
             Action::TriggerState(target, enabled) => triggers::set_enabled(&mut candidate, &table, target, *enabled)?,
             Action::PrimaryKey(explicit, columns) => constraint_primary_key::add(
                 &mut candidate,

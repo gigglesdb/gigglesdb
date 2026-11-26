@@ -19,6 +19,7 @@ mod comments;
 mod load;
 mod tablespace;
 pub(crate) mod admin_utility;
+mod maintenance;
 mod security_label;
 mod extensions;
 mod views;
@@ -2423,7 +2424,9 @@ impl Prepared {
                         )
                         | alter_table::Action::Validate(_)
                         | alter_table::Action::DropConstraint(..)
-                        | alter_table::Action::TriggerState(..) => (),
+                        | alter_table::Action::TriggerState(..)
+                        | alter_table::Action::AccessMethod(..)
+                        | alter_table::Action::Tablespace(..) => (),
                     }
                 }
                 V2Class::Ddl

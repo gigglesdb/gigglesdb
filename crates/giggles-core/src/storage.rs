@@ -2373,6 +2373,7 @@ pub struct SqlSession {
     authorization_bindings: bool,
     authority_managed: bool,
     ddl_owner: Option<String>,
+    maintenance_database: String,
     staged_revision: u64,
     sequence_values: sequences::SessionValues,
     v2_sequence_copy_leases: BTreeMap<u64, Arc<()>>,
@@ -2446,6 +2447,7 @@ impl Admin {
             authorization_bindings: false,
             authority_managed: false,
             ddl_owner: None,
+            maintenance_database: "postgres".into(),
             staged_revision: 0,
             sequence_values: Default::default(),
             v2_sequence_copy_leases: BTreeMap::new(),
@@ -2954,6 +2956,11 @@ impl SqlSession {
     /// creates a replacement whose authority the caller has installed.
     pub fn set_authority_managed(&mut self, managed: bool) {
         self.authority_managed = managed;
+    }
+
+    /// Set the database identity used by maintenance commands.
+    pub fn set_maintenance_database(&mut self, database: &str) {
+        self.maintenance_database = database.to_owned();
     }
 
     /// Set the creator for SQL DDL. V2 maintains all ownership records itself.
@@ -5514,7 +5521,7 @@ impl SqlSession {
                     return Err(CoreError::Sql(relational::SqlError::Parameters));
                 }
                 if utility.requires_standalone() && self.in_transaction() {
-                    return Err(CoreError::Sql(admin_utility::block_error(utility.command())));
+                    return Err(CoreError::Sql(admin_utility::block_error(utility.block_command())));
                 }
                 crate::cancellation::check()?;
                 let roles = self.admin.roles();
@@ -5522,6 +5529,15 @@ impl SqlSession {
                     roles.get(name).map_err(admin_utility::role_error)?
                         .ok_or(CoreError::Policy(Error::Authentication))
                 }).transpose()?;
+                let role_image = if matches!(utility, admin_utility::Statement::Maintenance(_)) {
+                    Some(if let Some(db) = db {
+                        let mut read = db.begin(engine::txn::Isolation::ReadCommitted);
+                        roles.image_from_v2_read(db, &mut read, self.v2_transaction.as_ref())
+                    } else { roles.image_leased(db) }.map_err(admin_utility::role_error)?)
+                } else { None };
+                let private_owner = if !self.is_v2_engine() && self.staged.is_some() {
+                    self.ddl_owner.as_deref().map(|o| (o, self.legacy_catalog_id_at_begin))
+                } else { None };
                 self.inspect_metadata_leased(db, |state| {
                     if p.domain != state.view.domain
                         || (p.transaction.is_some() && p.transaction != self.transaction_id)
@@ -5530,7 +5546,7 @@ impl SqlSession {
                     {
                         return Err(CoreError::Sql(relational::SqlError::StaleSchema));
                     }
-                    utility.execute(p, &state.sql, actor.as_ref(), &roles)
+                    utility.execute(p, &state.sql, actor.as_ref(), &roles, admin_utility::MaintenanceContext { image: role_image.as_ref(), database: &self.maintenance_database, private_owner })
                 })
             })();
             if result.is_err() { self.abort(); }
