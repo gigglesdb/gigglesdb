@@ -3,7 +3,7 @@
 use super::*;
 
 const PREFIX: &str = "\0named-call:";
-pub(super) const HINT: &str = "No function matches the given name and argument types. You might need to add explicit type casts.";
+pub(in crate::relational::query) const HINT: &str = "No function matches the given name and argument types. You might need to add explicit type casts.";
 const AMBIGUOUS_HINT: &str =
     "Could not choose a best candidate function. You might need to add explicit type casts.";
 
@@ -121,22 +121,26 @@ pub(in crate::relational::query) fn parse(
 
 struct Call<'a> {
     name: &'a str,
+    catalog_qualified: bool,
     positional: usize,
     names: Vec<&'a str>,
     variadic: bool,
 }
 
-pub(super) fn scalar(name: String, names: Names, args: Vec<Scalar>) -> Scalar {
+pub(super) fn scalar(name: CallName, names: Names, args: Vec<Scalar>) -> Scalar {
     // The length separates the routine name from labels, since schema lookup
     // already uses NUL inside its internal routine names.
     Scalar::Call(
-        format!(
-            "{PREFIX}{}:{}:{}:{name}{}",
-            name.len(),
-            names.positional,
-            u8::from(names.variadic),
-            names.names.join("\0")
-        ),
+        CallName {
+            name: format!(
+                "{PREFIX}{}:{}:{}:{name}{}",
+                name.len(),
+                names.positional,
+                u8::from(names.variadic),
+                names.names.join("\0")
+            ),
+            catalog_qualified: name.catalog_qualified,
+        },
         args,
     )
 }
@@ -152,6 +156,7 @@ fn decode(s: &str) -> Option<Call<'_>> {
     }
     Some(Call {
         name,
+        catalog_qualified: false,
         positional: positional.parse().ok()?,
         names: labels,
         variadic: match variadic {
@@ -162,10 +167,12 @@ fn decode(s: &str) -> Option<Call<'_>> {
     })
 }
 
-fn decode_arguments(name: &str, count: usize) -> R<Call<'_>> {
-    decode(name)
+fn decode_arguments(name: &CallName, count: usize) -> R<Call<'_>> {
+    let mut call = decode(name)
         .filter(|call| call.positional.checked_add(call.names.len()) == Some(count))
-        .ok_or(SqlError::InternalError)
+        .ok_or(SqlError::InternalError)?;
+    call.catalog_qualified = name.catalog_qualified;
+    Ok(call)
 }
 
 pub(in crate::relational::query) fn routine(name: &str) -> &str {
@@ -253,7 +260,7 @@ fn diagnostic<'a>(
     Ok(error)
 }
 
-pub(super) fn undefined_signature(name: &str, types: &[impl AsRef<str>]) -> String {
+pub(in crate::relational::query) fn undefined_signature(name: &str, types: &[impl AsRef<str>]) -> String {
     let types = types
         .iter()
         .map(AsRef::as_ref)
@@ -350,7 +357,7 @@ impl Call<'_> {
         parameters: &[Option<DataType>],
     ) -> R<SqlError> {
         diagnostic(
-            self.name,
+            &diagnostic_call_name(self.name, self.catalog_qualified),
             args,
             self.labels(),
             error,
@@ -418,7 +425,7 @@ fn compatible(actual: &DataType, expected: &DataType) -> bool {
 
 /// Resolve a named call before passing its arguments to the positional binder.
 pub(super) fn bind(
-    name: &str,
+    name: &CallName,
     args: &[Scalar],
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     tables: &[&TableDef],
@@ -428,7 +435,8 @@ pub(super) fn bind(
     if call.uses_positional_lookup() {
         // Keep the positional lookup error for missing schemas and catalog
         // routines whose named signatures are outside this profile.
-        return Scalar::bind_call(call.name, args, resolve, tables, parameters)
+        return Scalar::bind_call(&CallName { name: call.name.into(), catalog_qualified: call.catalog_qualified },
+            args, resolve, tables, parameters)
             .and(Err(SqlError::Unsupported));
     }
     for layout in call.layouts() {
@@ -487,7 +495,7 @@ pub(super) fn bind(
 }
 
 pub(super) fn infer(
-    name: &str,
+    name: &CallName,
     args: &[Scalar],
     parameters: &mut [Option<DataType>],
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
@@ -495,7 +503,8 @@ pub(super) fn infer(
 ) -> R<()> {
     let call = decode_arguments(name, args.len())?;
     if call.uses_positional_lookup() {
-        return Scalar::Call(call.name.into(), args.to_vec())
+        let name = CallName { name: call.name.into(), catalog_qualified: call.catalog_qualified };
+        return Scalar::Call(name, args.to_vec())
             .infer(None, parameters, resolve, tables);
     }
     if let Some(layout) = call.layouts().next() {
@@ -653,6 +662,7 @@ impl Names {
     fn call<'a>(&'a self, name: &'a str) -> Call<'a> {
         Call {
             name,
+            catalog_qualified: false,
             positional: self.positional,
             names: self.names.iter().map(String::as_str).collect(),
             variadic: self.variadic,
@@ -673,12 +683,13 @@ mod tests {
             "\0named-call:13:0:2:make_intervaldays",
             "\0named-call:bad:0:0:make_intervaldays",
         ] {
+            let invalid = CallName::from(invalid);
             assert!(matches!(
-                bind(invalid, &[], &resolve, &[], &[]),
+                bind(&invalid, &[], &resolve, &[], &[]),
                 Err(SqlError::InternalError)
             ));
             assert_eq!(
-                infer(invalid, &[], &mut [], &resolve, &[]),
+                infer(&invalid, &[], &mut [], &resolve, &[]),
                 Err(SqlError::InternalError)
             );
         }

@@ -130,9 +130,7 @@ impl From<TxnError> for crate::CoreError {
             TxnError::PendingWriteLimit => Self::Task(crate::task::TaskError::BudgetExceeded(
                 crate::task::Budget::PendingWrite,
             )),
-            TxnError::Serialization(_) | TxnError::SnapshotTooOld => {
-                Self::Sql(crate::relational::SqlError::Conflict)
-            }
+            TxnError::Serialization(_) | TxnError::SnapshotTooOld => Self::Sql(crate::relational::SqlError::Conflict),
             TxnError::Deadlock => Self::Deadlock,
             TxnError::LockTimeout if crate::Cancellation::lock_deadline().is_some() => Self::LockNotAvailable,
             TxnError::LockTimeout => Self::Busy,

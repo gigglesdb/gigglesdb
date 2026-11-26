@@ -106,7 +106,7 @@ pub(in crate::relational) fn projection<'a>(state: &'a Relational, name: &str) -
 }
 pub(super) fn table<'a>(state: &'a Relational, name: &str) -> R<&'a TableDef> {
     let name = projection(state, name)?.map_or(name, |p| p.base.as_str());
-    state.tables.get(name).ok_or(SqlError::UnknownTable)
+    state.tables.get(name).ok_or_else(|| missing_relation(name))
 }
 impl Query {
     pub(in crate::relational) fn view_source(&self) -> R<&String> {

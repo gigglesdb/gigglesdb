@@ -70,7 +70,7 @@ pub(in crate::relational) fn parse_default(
         return Err(diagnostic(routine, &types, SqlError::UndefinedFunction));
     }
     let name = schema.map_or_else(|| routine.to_owned(), |schema| format!("{schema}.{routine}"));
-    let bound = Scalar::Call(name, args).bind(&no_columns, &[], &[])?;
+    let bound = Scalar::Call(name.into(), args).bind(&no_columns, &[], &[])?;
     Ok((default_sql(&bound, &mut 0)?, bound.ty))
 }
 

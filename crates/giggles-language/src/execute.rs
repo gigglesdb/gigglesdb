@@ -1551,7 +1551,7 @@ fn contains_local(value: &serde_json::Value) -> bool {
 fn control_error(e: giggles_core::CoreError) -> Error {
     use giggles_core::{CoreError, relational::SqlError};
     error(match e {
-        CoreError::Sql(SqlError::Conflict) => operations::Error::Conflict,
+        CoreError::Sql(SqlError::Conflict) | CoreError::SqlSerialization(_) => operations::Error::Conflict,
         CoreError::Sql(SqlError::Duplicate) => operations::Error::Duplicate,
         CoreError::Sql(SqlError::Overflow) => operations::Error::Overflow,
         CoreError::Sql(_) => operations::Error::Sql { sqlstate: giggles_core::sqlstate(&e).into() },

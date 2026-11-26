@@ -166,9 +166,18 @@ impl Prepared {
         } }
         ids
     }
-    pub(crate) fn check_view_drop(&self, state: &Relational) -> R<()> {
-        if self.command() == "DROP TABLE" && self.drop_tables().iter().any(|n| state.view_names.contains_key(n)) {
-            return Err(SqlError::WrongObjectType);
+    pub(crate) fn check_view_drop(&self, state: &Relational, views: &BTreeMap<u64, SqlViewDef>) -> R<()> {
+        if let Statement::DropTable { names, optional, cascade, resolution_error: None } = self.statement.get() {
+            if names.iter().any(|name| state.view_names.contains_key(name)) {
+                return Err(SqlError::WrongObjectType);
+            }
+            if !cascade && !views.is_empty() {
+                let tables = names.iter().filter_map(|name| state.tables.get(name)).collect::<Vec<_>>();
+                // The statement reports missing targets before checking dependencies.
+                if *optional || tables.len() == names.len() {
+                    constraints::check_drop_dependencies(state, &tables, names.len(), &self.search_path, Some(views))?;
+                }
+            }
         }
         Ok(())
     }

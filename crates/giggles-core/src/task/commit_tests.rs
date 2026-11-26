@@ -371,6 +371,46 @@ fn revoked_before_and_during_run() {
 }
 
 #[test]
+fn successful_retry_does_not_leave_sql_diagnostics() {
+    use crate::relational::{
+        clear_sql_diagnostics, take_sql_diagnostic_detail, take_sql_diagnostic_hint, take_sql_error_message,
+    };
+    use crate::storage::engine::txn::{SerializationReason, TxnError};
+
+    let assert_diagnostics_empty = || {
+        assert!(take_sql_error_message().is_none());
+        assert!(take_sql_diagnostic_hint().is_none());
+        assert!(take_sql_diagnostic_detail().is_none());
+    };
+    let f = fixture();
+    let mut session = f.admin().sql_session();
+    let request = direct(&mut session, REQUEUE);
+    let mut latest = 0;
+    let mut load = |db: &V2Db, task: TaskObjectId, at: DefAt<'_>| {
+        if matches!(at, DefAt::Latest) {
+            latest += 1;
+            if latest == 2 {
+                let error = CoreError::from(TxnError::Serialization(SerializationReason::ReadWriteConflict));
+                assert_eq!(crate::sqlstate(&error), "40001");
+                assert_diagnostics_empty();
+                return Err(error);
+            }
+        }
+        catalog_def(db, task, at)
+    };
+    clear_sql_diagnostics();
+    commit_with(&mut session, Actor::Executor(&f.ctx), &op("retry-then-succeed"), request, &mut load).unwrap();
+    assert_eq!(latest, 3);
+    assert_diagnostics_empty();
+
+    let error = session.execute("SELECT 1/0", &[], None).unwrap_err();
+    assert_eq!(crate::sqlstate(&error), "22012");
+    assert_eq!(take_sql_error_message().as_deref(), Some("division by zero"));
+    assert!(take_sql_diagnostic_hint().is_none());
+    assert!(take_sql_diagnostic_detail().is_none());
+}
+
+#[test]
 fn expired_by_clock() {
     let f = fixture();
     clock(&f.db(), EXPIRES);

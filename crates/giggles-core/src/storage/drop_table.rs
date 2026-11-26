@@ -5,6 +5,13 @@ impl Admin {
     /// `if_exists`, or `SqlError::UnknownTable` when absent and !if_exists.
     /// Active SQL transactions must finish or roll back first.
     pub fn drop_table(&self, name: &str, if_exists: bool) -> Result<bool, CoreError> {
+        self.drop_table_with_search_path(name, if_exists, &["public".into()])
+    }
+
+    /// Drop a resolved table, using the caller's search path for diagnostics.
+    pub fn drop_table_with_search_path(
+        &self, name: &str, if_exists: bool, path: &[String],
+    ) -> Result<bool, CoreError> {
         if self.inner.sql_transactions.load(Ordering::Acquire) != 0 {
             return Err(CoreError::Sql(relational::SqlError::Conflict));
         }
@@ -19,6 +26,7 @@ impl Admin {
                     Err(CoreError::Sql(relational::SqlError::UnknownTable))
                 };
             }
+            session.search_path = path.to_vec();
             let (schema, name) = relational::split_key(name);
             let sql = format!(
                 "DROP TABLE \"{}\".\"{}\"",
@@ -60,7 +68,7 @@ impl Admin {
             if self.inner.sql_transactions.load(Ordering::Acquire) != 0 {
                 return Err(CoreError::Sql(relational::SqlError::Conflict));
             }
-            let dropped = state.sql.drop_table(name).map_err(CoreError::Sql)?;
+            let dropped = state.sql.drop_table(name, path).map_err(CoreError::Sql)?;
             if !dropped && !if_exists {
                 return Err(CoreError::Sql(relational::SqlError::UnknownTable));
             }
@@ -371,7 +379,7 @@ mod tests {
                 let mut state = s.sql.clone();
                 state.epoch = u64::MAX;
                 let before = state.clone();
-                assert_eq!(state.drop_table("doomed"), Err(SqlError::Overflow));
+                assert_eq!(state.drop_table("doomed", &["public".into()]), Err(SqlError::Overflow));
                 assert_eq!(state, before);
                 Ok(())
             })

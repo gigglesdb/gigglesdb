@@ -229,13 +229,13 @@ pub(super) fn shape(value: &Scalar, depth: usize, nodes: &mut usize) -> R<()> {
 }
 impl InsertExpressions {
     pub(in super::super) fn check_identity(&self, state: &Relational) -> R<()> {
-        let table = state.tables.get(&self.name).ok_or(SqlError::UnknownTable)?;
+        let table = state.tables.get(&self.name).ok_or_else(|| missing_relation(&self.name))?;
         let indexes = if self.columns.is_empty() {
             table.logical_offsets()
         } else {
             self.columns
                 .iter()
-                .map(|name| col(table, name))
+                .map(|name| target_col(table, name))
                 .collect::<R<Vec<_>>>()?
         };
         for index in indexes {
@@ -446,7 +446,7 @@ impl InsertExpressions {
         count: usize,
         declared: &[Option<DataType>],
     ) -> R<BoundValues> {
-        let table = state.tables.get(&self.name).ok_or(SqlError::UnknownTable)?;
+        let table = state.tables.get(&self.name).ok_or_else(|| missing_relation(&self.name))?;
         self.admit_literals()?;
         if count > MAX_PARAMS || self.values.len() > MAX_TABLE_COLUMNS {
             return Err(SqlError::Limit);
@@ -479,7 +479,13 @@ impl InsertExpressions {
             } else {
                 value.bind(&no_columns, &[], &parameters)?
             };
-            let bound = bound.insert_assignment(target)?;
+            let source = bound.ty.clone();
+            let bound = bound.insert_assignment(target).inspect_err(|error| {
+                if *error == SqlError::Type {
+                    assignment::column_type_error(&table.columns[index],
+                        functions::type_display(target), functions::type_display(&source));
+                }
+            })?;
             if !bound.insert_input_only() {
                 return Err(SqlError::Unsupported);
             }

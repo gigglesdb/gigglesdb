@@ -160,7 +160,7 @@ pub(super) fn hydrate_with_probes(
                             .map(|(_, row)| (None, row.clone()))
                             .collect(),
                         ParentRows::Pending(pending) => pending.pending.get(&probe_key)
-                            .into_iter().flatten()
+                            .into_iter().flat_map(BTreeMap::keys)
                             .filter_map(|key| staged.rows.get(&source_id)?.get(key))
                             .map(|row| (None, row.clone()))
                             .collect(),
@@ -401,33 +401,27 @@ fn lock_action_witnesses(
 
 /// Validate transaction-local pending keys in physical pages, including own writes.
 pub(super) fn paged_pending(
-    state: &Relational, deferred: &mut DeferralState, names: &[String], mode: bool,
+    state: &Relational, deferred: &mut DeferralState, names: &[String], path: &[String], mode: bool,
     sink: &mut impl RowSink,
 ) -> Result<SqlResult, CoreError> {
-    let mut selected = DeferralState { replica: deferred.replica, modes: deferred.modes.clone(), ..Default::default() };
-    state.set_constraints(&mut selected, names, mode, || crate::cancellation::check().is_err())
-        .map_err(CoreError::Sql)?;
+    let mut modes = deferred.modes.clone();
+    let ids = state.constraint_modes(&mut modes, names, path, mode).map_err(CoreError::Sql)?;
+    let selected = |id: &u64| names.is_empty() || ids.contains(id);
     if !mode {
         for table in state.tables.values() {
             let checks = deferred.pending.iter().filter(|((id, table_id), _)| *table_id == table.id
-                && state.ext.constraints.get(table_id).is_some_and(|cs| cs.iter().any(|c|
-                    c.id == *id && (names.is_empty() || names.contains(&c.name))))).collect::<Vec<_>>();
+                && selected(id)).collect::<Vec<_>>();
             if checks.is_empty() { continue; }
             let mut after = None;
             while let Some((last, rows)) = sink.fk_read_page(table, after.take())? {
                 after = Some(last);
                 let mut pending = DeferralState { replica: deferred.replica, modes: deferred.modes.clone(), ..Default::default() };
                 for ((id, table_id), keys) in &checks {
-                    let keys = rows.keys().filter(|key| keys.contains(*key)).cloned().collect::<BTreeSet<_>>();
+                    let keys = rows.keys().filter_map(|key| {
+                        Some((key.clone(), keys.get(key)?.clone()))
+                    }).collect::<constraints::PendingReferences>();
                     if !keys.is_empty() {
-                        let check = (*id, *table_id);
-                        if let Some(details) = deferred.parent_details.get(&check) {
-                            let filtered = keys.iter().filter_map(|key| {
-                                Some((key.clone(), Arc::clone(details.get(key)?)))
-                            }).collect();
-                            pending.parent_details.insert(check, filtered);
-                        }
-                        pending.pending.insert(check, keys);
+                        pending.pending.insert((*id, *table_id), keys);
                     }
                 }
                 if pending.pending.is_empty() { continue; }
@@ -442,10 +436,8 @@ pub(super) fn paged_pending(
                     .map_err(CoreError::Sql)?;
             }
         }
-        deferred.pending.retain(|(id, table_id), _| !state.ext.constraints.get(table_id)
-            .is_some_and(|cs| cs.iter().any(|c| c.id == *id && (names.is_empty() || names.contains(&c.name)))));
-        deferred.prune_parent_details();
+        deferred.pending.retain(|(id, _), _| !selected(id));
     }
-    deferred.modes = selected.modes;
+    deferred.modes = modes;
     Ok(SqlResult::default())
 }

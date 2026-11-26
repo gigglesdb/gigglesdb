@@ -404,14 +404,14 @@ pub(super) fn execute(
                 let deferred = *deferral != Deferral::NotDeferrable && pending.modes.get(&c.id)
                     .copied().unwrap_or(*deferral == Deferral::DeferrableDeferred);
                 let target = if deferred { &mut pending } else { &mut immediate };
-                target.pending.entry((c.id, table.id)).or_default().insert(key.clone());
+                target.pending.entry((c.id, table.id)).or_default().insert(key.clone(), constraints::PendingReference::Child);
             }
         }
         unchanged.extend(page.rows.remove(&table.id).unwrap_or_default());
         Ok(unchanged)
     })?;
-    paged_pending(state, &mut immediate, &[], false, sink)?;
-    if deferred.is_none() { paged_pending(state, &mut pending, &[], false, sink)?; }
+    paged_pending(state, &mut immediate, &[], &[], false, sink)?;
+    if deferred.is_none() { paged_pending(state, &mut pending, &[], &[], false, sink)?; }
     if let Some(deferred) = deferred { *deferred = pending; }
     output.finish(&mut result)?;
     Ok(result)
@@ -595,8 +595,8 @@ pub(super) fn cascade(
         }
     }
     work.drain(state, sink, clock, &descriptors, version_end, false)?;
-    paged_pending(state, &mut work.immediate, &[], false, sink)?;
-    if deferred.is_none() { paged_pending(state, &mut work.pending, &[], false, sink)?; }
+    paged_pending(state, &mut work.immediate, &[], &[], false, sink)?;
+    if deferred.is_none() { paged_pending(state, &mut work.pending, &[], &[], false, sink)?; }
     if let Some(d) = deferred { *d = work.pending; }
     output.finish(&mut result)?;
     Ok(result)
@@ -688,7 +688,7 @@ impl ActionWork {
     pub(super) fn new(pending: DeferralState) -> Self {
         // Inherited deferred keys already occupy memory. Include them in the
         // ledger so a rekey can release its old key without crediting other work.
-        let inherited = pending.pending.values().flatten().map(|key| Self::key_bytes(key)).sum::<usize>();
+        let inherited = pending.pending.values().flat_map(BTreeMap::keys).map(|key| Self::key_bytes(key)).sum::<usize>();
         let mut retention = scan::Retention::new(scan::retention_limit().saturating_add(inherited));
         retention.charge(inherited).expect("inherited keys fit their own allowance");
         Self { queue: std::collections::VecDeque::new(), visited: BTreeSet::new(), retention,
@@ -734,11 +734,12 @@ impl ActionWork {
                         && deferred.deferred(c.id, &c.kind)
                     {
                         deferred.pending.entry(check).or_default().extend(rows.iter()
-                            .filter(|(_, row)| matches_version(row)).map(|(key, _)| key.clone()));
+                            .filter(|(_, row)| matches_version(row))
+                            .map(|(key, _)| (key.clone(), constraints::PendingReference::Child)));
                         true
                     } else { false };
-                    Self::validate_references(state, table, c, pending.parent_details.get(&check),
-                        rows.iter().filter(|(key, row)| keys.is_some_and(|keys| keys.contains(*key))
+                    Self::validate_references(state, table, c, keys,
+                        rows.iter().filter(|(key, row)| keys.is_some_and(|keys| keys.contains_key(*key))
                             || !deferred && matches_version(row)), sink)?;
                 }
             }
@@ -750,7 +751,7 @@ impl ActionWork {
     // snapshot checks for queued actions and version-selected updates.
     fn validate_references<'a>(
         state: &Relational, table: &TableDef, c: &Constraint,
-        details: Option<&BTreeMap<Vec<u8>, Arc<[Value]>>>,
+        references: Option<&constraints::PendingReferences>,
         rows: impl Iterator<Item = (&'a Vec<u8>, &'a SqlRow)>, sink: &mut impl RowSink,
     ) -> Result<(), CoreError> {
         let ConstraintKind::ForeignKey { columns, ref_table, ref_columns, .. } = &c.kind
@@ -769,9 +770,12 @@ impl ActionWork {
             crate::cancellation::check()?;
             if positions.iter().any(|(i, _)| row.values[*i] == Value::Null) { continue; }
             let missing = || {
-                if let Some(values) = details.and_then(|details| details.get(key)) {
+                if let Some(parent_values) = references.and_then(|references| references.get(key))
+                    .and_then(constraints::PendingReference::parent_values)
+                {
                     let parent_positions = positions.iter().map(|(_, i)| *i).collect::<Vec<_>>();
-                    constraints::still_referenced(state, table, parent, &c.name, &parent_positions, values, false)
+                    constraints::still_referenced(state, table, parent, &c.name, &parent_positions,
+                        parent_values, false)
                 } else {
                     let child_positions = positions.iter().map(|(i, _)| *i).collect::<Vec<_>>();
                     constraints::missing_parent(state, table, parent, &c.name, &child_positions, row)
@@ -878,12 +882,9 @@ impl ActionWork {
                         rows = matching;
                     }
                     if !rows.is_empty() && *action == catalog_ext::Action::Restrict {
-                        if equality.nondeterministic() {
-                            return Err(CoreError::Sql(constraints::still_referenced(
-                                state, &child, &parent, &c.name, &parent_positions, &values, true,
-                            )));
-                        }
-                        return Err(CoreError::Sql(SqlError::RestrictViolation));
+                        return Err(CoreError::Sql(constraints::still_referenced(
+                            state, &child, &parent, &c.name, &parent_positions, &values, true,
+                        )));
                     }
                     if *action == catalog_ext::Action::NoAction {
                         let ConstraintKind::ForeignKey { deferral, .. } = &c.kind else { unreachable!() };
@@ -891,19 +892,24 @@ impl ActionWork {
                             .copied().unwrap_or(*deferral == Deferral::DeferrableDeferred);
                         let pending = if deferred { &mut self.pending } else if statement_end { &mut self.immediate } else { &mut no_action };
                         let check = (c.id, *child_id);
-                        if !rows.is_empty() && (deferred || equality.nondeterministic()) && parent_values.is_none() {
+                        if !rows.is_empty() && parent_values.is_none() {
                             for value in &values {
                                 self.retention.charge(value_bytes(value)).map_err(CoreError::Sql)?;
                             }
                             parent_values = Some(Arc::<[Value]>::from(values.clone()));
                         }
-                        for key in rows.keys() {
-                            if pending.pending.entry(check).or_default().insert(key.clone()) {
-                                self.retention.charge(Self::key_bytes(key)).map_err(CoreError::Sql)?;
-                            }
-                            if let Some(values) = &parent_values {
-                                pending.parent_details.entry(check).or_default()
-                                    .insert(key.clone(), Arc::clone(values));
+                        for key in rows.into_keys() {
+                            let reference = constraints::PendingReference::Parent(
+                                Arc::clone(parent_values.as_ref().expect("matched child has a parent key")),
+                            );
+                            match pending.pending.entry(check).or_default().entry(key) {
+                                std::collections::btree_map::Entry::Vacant(entry) => {
+                                    self.retention.charge(Self::key_bytes(entry.key())).map_err(CoreError::Sql)?;
+                                    entry.insert(reference);
+                                }
+                                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                                    entry.insert(reference);
+                                }
                             }
                         }
                         continue;
@@ -949,7 +955,7 @@ impl ActionWork {
                                 };
                             }
                             state.materialize_generated(&child, &mut row.values).map_err(CoreError::Sql)?;
-                            row_check(&child, &row.values).map_err(CoreError::Sql)?;
+                            row_check_with_diagnostics(state, &child, &row.values).map_err(CoreError::Sql)?;
                             state.check_insert_candidate(&child, &row.values).map_err(CoreError::Sql)?;
                             if set_default && !still_references_old_key {
                                 still_references_old_key = references_old_key(&row).map_err(CoreError::Sql)?;
@@ -978,7 +984,7 @@ impl ActionWork {
                     }
                 }
                 // Definition order decides NO ACTION versus a later RESTRICT.
-                if !no_action.pending.is_empty() { paged_pending(state, &mut no_action, &[], false, sink)?; }
+                if !no_action.pending.is_empty() { paged_pending(state, &mut no_action, &[], &[], false, sink)?; }
             }
             self.retention.release(searched::retained_row_bytes(&[], &old).map_err(CoreError::Sql)?
                 + new.as_ref().map(|r| searched::retained_row_bytes(&[], r)).transpose().map_err(CoreError::Sql)?.unwrap_or(0));
@@ -999,29 +1005,37 @@ impl ActionWork {
             &mut self.immediate
         };
         let check = (constraint.id, table);
-        if !by_version {
-            let keys = pending.pending.entry(check).or_default();
-            if !keys.contains(key) {
-                self.retention.charge(Self::key_bytes(key)).map_err(CoreError::Sql)?;
-                keys.insert(key.to_vec());
+        if by_version {
+            if let Some(reference) = pending.pending.get_mut(&check).and_then(|keys| keys.get_mut(key)) {
+                *reference = constraints::PendingReference::Child;
             }
-        }
-        if let Some(details) = pending.parent_details.get_mut(&check) {
-            details.remove(key);
+        } else {
+            let keys = pending.pending.entry(check).or_default();
+            if let Some(reference) = keys.get_mut(key) {
+                *reference = constraints::PendingReference::Child;
+            } else {
+                self.retention.charge(Self::key_bytes(key)).map_err(CoreError::Sql)?;
+                keys.insert(key.to_vec(), constraints::PendingReference::Child);
+            }
         }
         Ok(())
     }
 
-    fn move_pending_key(retention: &mut scan::Retention, keys: &mut BTreeSet<Vec<u8>>,
+    fn move_pending_key(retention: &mut scan::Retention, keys: &mut constraints::PendingReferences,
         old: &[u8], new: Option<&[u8]>,
     ) -> Result<(), CoreError> {
-        if new == Some(old) || !keys.remove(old) { return Ok(()); }
+        if new == Some(old) { return Ok(()); }
+        let Some(reference) = keys.remove(old) else { return Ok(()); };
         retention.release(Self::key_bytes(old));
-        if let Some(new) = new
-            && !keys.contains(new)
-        {
-            retention.charge(Self::key_bytes(new)).map_err(CoreError::Sql)?;
-            keys.insert(new.to_vec());
+        if let Some(new) = new {
+            if let Some(existing) = keys.get_mut(new) {
+                if !matches!(reference, constraints::PendingReference::Child) {
+                    *existing = reference;
+                }
+            } else {
+                retention.charge(Self::key_bytes(new)).map_err(CoreError::Sql)?;
+                keys.insert(new.to_vec(), reference);
+            }
         }
         Ok(())
     }
@@ -1055,8 +1069,6 @@ impl ActionWork {
                 + 96).map_err(CoreError::Sql)?;
             self.visited.insert((table.id, old.version));
             let new_key = new.as_ref().map(|r| pk(table, &r.values)).transpose().map_err(CoreError::Sql)?;
-            self.pending.move_parent_details(table.id, key, new_key.as_deref());
-            self.immediate.move_parent_details(table.id, key, new_key.as_deref());
             for checks in [&mut self.pending.pending, &mut self.immediate.pending] {
                 for ((_, id), keys) in checks {
                     if *id == table.id {
@@ -1152,12 +1164,13 @@ mod upsert_fk_tests {
     fn moving_an_fk_check_replaces_its_key_charge() {
         let old = vec![1];
         let new = vec![2; 8];
-        let mut keys = BTreeSet::from([old.clone()]);
+        let mut keys = BTreeMap::from([(old.clone(), constraints::PendingReference::Parent(Arc::from([Value::Int(1)])))]);
         let new_bytes = ActionWork::key_bytes(&new);
         let mut retention = scan::Retention::new(new_bytes);
         retention.charge(ActionWork::key_bytes(&old)).unwrap();
         ActionWork::move_pending_key(&mut retention, &mut keys, &old, Some(&new)).unwrap();
-        assert_eq!(keys, BTreeSet::from([new.clone()]));
+        assert_eq!(keys.len(), 1);
+        assert!(matches!(keys.get(&new), Some(constraints::PendingReference::Parent(_))));
         assert_eq!(retention.used(), new_bytes);
         ActionWork::move_pending_key(&mut retention, &mut keys, &new, None).unwrap();
         assert!(keys.is_empty());

@@ -38,6 +38,10 @@ thread_local! {
 }
 
 impl SqlSession {
+    /// Request typed serialization causes for a PostgreSQL protocol session.
+    pub fn set_wire_serialization_diagnostics(&mut self, enabled: bool) {
+        self.wire_serialization_diagnostics = enabled;
+    }
 
     /// BEGIN without parsing SQL; legacy and task sessions retain the SQL path.
     pub fn begin_block(&mut self) -> Result<(), CoreError> {
@@ -160,7 +164,8 @@ impl SqlSession {
                 sql_sequences::stage_pending(db, &mut txn, &self.v2_pending_sequences)?;
             }
             let mut release_admission = || ticket.release();
-            commit_sql(db, txn, point, eligible.then_some(&mut release_admission))?;
+            commit_sql(db, txn, point, eligible.then_some(&mut release_admission), explicit,
+                self.wire_serialization_diagnostics)?;
             let installed = if explicit {
                 self.install_committed_sequence_counters(db).map_err(|error| {
                     CoreError::Storage(format!("could not install committed sequence counters: {error}"))
@@ -322,7 +327,7 @@ impl SqlSession {
         let prepared = relational::Prepared::scan(scan,
             u128::from_be_bytes(db.meta.domain), &image).map_err(CoreError::Sql)?;
         let result = image.execute_with_sink(&prepared, &[], None, None,
-            &mut SqlRows { db, txn, parts: &catalog.parts, catalog: &catalog, writing: false,
+            &mut SqlRows { wire_diagnostics: false, db, txn, parts: &catalog.parts, catalog: &catalog, writing: false,
                 conflict_floor: None, prepared: &prepared, params: &[], row_locked_cascade: false, fk_action_snapshot: None, effects: None, scope: None },
             u64::MAX, None)?;
         crate::cancellation::check()?;
@@ -1032,7 +1037,7 @@ impl SqlSession {
                                 }).collect::<Result<BTreeSet<_>, CoreError>>()?;
                                 for key in physical {
                                     txn.lock_for_write(Keyspace::Rows, &key, crate::task::limits::lock_deadline(),
-                                        &cancelled).map_err(crate::task::limits::lock_error)?;
+                                        &cancelled).map_err(|error| sql_lock_error(error, self.wire_serialization_diagnostics))?;
                                 }
                             }
                             let key_prelock = matches!(txn.services(), engine::txn::TxnServices::Local { .. })
@@ -1055,7 +1060,7 @@ impl SqlSession {
                                             .map_err(crate::task::limits::lock_error)?;
                                     }
                                     let target = txn.lock_for_write(Keyspace::Rows, &key, crate::task::limits::lock_deadline(),
-                                        &cancelled).map_err(crate::task::limits::lock_error)?;
+                                        &cancelled).map_err(|error| sql_lock_error(error, self.wire_serialization_diagnostics))?;
                                     if let Some(bytes) = target.current {
                                         // Locked targets cannot grow before the final
                                         // snapshot. Reuse the publisher's exact budget.
@@ -1096,12 +1101,12 @@ impl SqlSession {
                                 }
                                 for key in &physical {
                                     txn.lock_for_write(Keyspace::Rows, key, crate::task::limits::lock_deadline(),
-                                        &cancelled).map_err(crate::task::limits::lock_error)?;
+                                        &cancelled).map_err(|error| sql_lock_error(error, self.wire_serialization_diagnostics))?;
                                 }
                                 let mut upgrade = false;
                                 for key in witnesses {
                                     let target = txn.lock_for_write(Keyspace::Index, &key, crate::task::limits::lock_deadline(),
-                                        &cancelled).map_err(crate::task::limits::lock_error)?;
+                                        &cancelled).map_err(|error| sql_lock_error(error, self.wire_serialization_diagnostics))?;
                                     if let Some(owner) = target.current {
                                         let mut row = table.id.to_be_bytes().to_vec();
                                         row.extend(owner);
@@ -1146,9 +1151,7 @@ impl SqlSession {
                             if live_bound.storage_table() != target_name.as_deref()
                                 || target_name.as_ref().is_some_and(|name| parts.tables.get(name) != live.parts.tables.get(name))
                             {
-                                return Err(engine::txn::TxnError::Serialization(
-                                    engine::txn::SerializationReason::WriteConflict,
-                                ).into());
+                                return Err(write_conflict(self.wire_serialization_diagnostics));
                             }
                             live
                         } else {
@@ -1270,7 +1273,7 @@ impl SqlSession {
                             let floor = *input.floor.get_or_insert(versions.start);
                             image.copy_input_page(
                                 &bound,
-                                &mut SqlRows {
+                                &mut SqlRows { wire_diagnostics: self.wire_serialization_diagnostics,
                                     conflict_floor: None,
                                     db,
                                     txn,
@@ -1320,7 +1323,7 @@ impl SqlSession {
                         // expanded output must not inherit the legacy image cap.
                         let reads_view = names.iter().any(|name| binding.view_names.contains_key(name));
                         if !writing && (scope.is_some() || image.streaming_reduction(&bound) || reads_view) {
-                            let source = reduction::Source::new(SqlRows {
+                            let source = reduction::Source::new(SqlRows { wire_diagnostics: self.wire_serialization_diagnostics,
                                 conflict_floor: None, row_locked_cascade: false, fk_action_snapshot: None, db, txn, parts: old, catalog: &catalog,
                                 writing, prepared: &bound, params, effects: None, scope: None,
                             });
@@ -1341,7 +1344,7 @@ impl SqlSession {
                             if let Some(error) = context.as_ref().and_then(|c| c.take_error()) { return Err(error); }
                             return result.map_err(CoreError::Sql);
                         }
-                        bound.check_view_drop(&image).map_err(CoreError::Sql)?;
+                        bound.check_view_drop(&image, &old.sql_views).map_err(CoreError::Sql)?;
                         let freeze_before = bound.copy_freeze_created(&image);
                         let configured;
                         let p = if !self.check_function_bodies && p.command() == "CREATE FUNCTION" {
@@ -1363,7 +1366,7 @@ impl SqlSession {
                             params,
                             expected_version,
                             context.as_ref(),
-                            &mut SqlRows {
+                            &mut SqlRows { wire_diagnostics: self.wire_serialization_diagnostics,
                                 conflict_floor: None,
                                 db,
                                 txn,
@@ -1601,7 +1604,7 @@ impl SqlSession {
 // use this seam. None adds only the crash-point read and untaken fault branches.
 fn commit_sql(
     db: &v2::V2Db, txn: Transaction, point: CrashPoint,
-    release_admission: Option<&mut dyn FnMut()>,
+    release_admission: Option<&mut dyn FnMut()>, explicit: bool, wire_diagnostics: bool,
 ) -> Result<(), CoreError> {
     if point == CrashPoint::BeforeCommit {
         crash_now();
@@ -1610,7 +1613,16 @@ fn commit_sql(
         return Err(CoreError::Storage("injected before commit".into()));
     }
     let reclaim = txn.reclaim_after_commit;
-    db.catalog().commit_sql_ddl(txn, release_admission)?;
+    db.catalog().commit_sql_ddl(txn, release_admission).map_err(|error| {
+        use engine::txn::{SerializationReason, TxnError};
+        match error {
+            TxnError::Serialization(SerializationReason::ReadWriteConflict) if wire_diagnostics && explicit =>
+                CoreError::SqlSerialization(SqlSerialization::CommitPivot),
+            TxnError::Serialization(SerializationReason::WriteConflict) if wire_diagnostics =>
+                CoreError::SqlSerialization(SqlSerialization::ConcurrentUpdate),
+            other => other.into(),
+        }
+    })?;
     if point == CrashPoint::AfterCommit {
         crash_now();
     }
@@ -1657,7 +1669,7 @@ pub(super) fn validate_pending(
         &[],
         None,
         None,
-        &mut SqlRows {
+        &mut SqlRows { wire_diagnostics: false,
             conflict_floor: None,
             row_locked_cascade: false,
             fk_action_snapshot: None,
@@ -1724,6 +1736,7 @@ struct SqlRows<'a> {
     catalog: &'a CatalogSnapshot,
     writing: bool,
     conflict_floor: Option<u64>,
+    pub(super) wire_diagnostics: bool,
     prepared: &'a relational::Prepared,
     params: &'a [relational::Value],
     row_locked_cascade: bool,
@@ -2049,7 +2062,7 @@ impl RowSink for SqlRows<'_> {
             }))?;
             for values in seen {
                 if self.fk_changed(table, &values, ts)? {
-                    return Err(CoreError::Sql(SqlError::Conflict));
+                    return Err(write_conflict(self.wire_diagnostics));
                 }
             }
             return Ok(());
@@ -2112,7 +2125,7 @@ impl RowSink for SqlRows<'_> {
                 if self.fk_key_changed_since(table, &row)?
                     || !latest.iter().any(|current| !fk_key_changed(table, &self.parts.indexes,
                     &row.values, &current.values)) {
-                    return Err(CoreError::Sql(SqlError::Conflict));
+                    return Err(write_conflict(self.wire_diagnostics));
                 }
                 visit(row).map_err(CoreError::Sql)?;
             }
@@ -2154,7 +2167,7 @@ impl RowSink for SqlRows<'_> {
                     .map_err(crate::task::limits::lock_error)?;
             }
             self.txn.lock_for_write(Keyspace::Rows, &key, deadline, &cancel)
-                .map_err(crate::task::limits::lock_error)?.current
+                .map_err(|error| sql_lock_error(error, self.wire_diagnostics))?.current
         };
         bytes.map(|bytes| {
             let record = codec::decode_row(&key, &bytes)?;
@@ -2202,7 +2215,7 @@ impl RowSink for SqlRows<'_> {
         &mut self,
         read: &mut dyn FnMut(&dyn relational::scan::RowSource) -> Result<(), SqlError>,
     ) -> Result<(), CoreError> {
-        let source = reduction::Source::new(SqlRows {
+        let source = reduction::Source::new(SqlRows { wire_diagnostics: false,
             conflict_floor: None, row_locked_cascade: false, fk_action_snapshot: None, db: self.db, txn: &mut *self.txn, parts: self.parts, catalog: self.catalog,
             writing: self.writing, prepared: self.prepared, params: self.params,
             // The INSERT source is only read; protected write effects are
@@ -2430,7 +2443,7 @@ impl RowSink for SqlRows<'_> {
             for (key, pk) in entries {
                 let target = chunk.lock_for_write(Keyspace::Index, &key, crate::task::limits::lock_deadline(), &|| {
                     crate::cancellation::check().is_err()
-                }).map_err(crate::task::limits::lock_error)?;
+                }).map_err(|error| sql_lock_error(error, self.wire_diagnostics))?;
                 if target.current.is_some() {
                     return Err(engine::indexes::occupancy_duplicate(
                         table, &rows, std::slice::from_ref(index), &key, &pk, true, &generated, true,
@@ -2597,6 +2610,7 @@ impl RowSink for SqlRows<'_> {
             crate::task::limits::lock_deadline(),
             &|| crate::cancellation::check().is_err(),
             &|id| self.parts.ext.generated_columns.contains_key(&id),
+            self.wire_diagnostics,
         )?;
         if let Some(new) = after_table
             && (new.primary_key != table.primary_key || new.columns.len() != table.columns.len())
@@ -2752,7 +2766,7 @@ impl RowSink for SqlRows<'_> {
                 let occupied = self.txn.lock_for_write(
                     space, &key, crate::task::limits::lock_deadline(),
                     &|| crate::cancellation::check().is_err(),
-                ).map_err(crate::task::limits::lock_error)?.current.is_some();
+                ).map_err(|error| sql_lock_error(error, self.wire_diagnostics))?.current.is_some();
                 if occupied || !seen.insert((*order, key)) {
                     return Err(duplicate());
                 }
@@ -2836,7 +2850,7 @@ impl RowSink for SqlRows<'_> {
                 // reporting any child witness discovered after this wait.
                 self.txn.lock_for_write(Keyspace::Rows, &physical,
                     crate::task::limits::lock_deadline(), &|| crate::cancellation::check().is_err())
-                    .map_err(crate::task::limits::lock_error)?;
+                    .map_err(|error| sql_lock_error(error, self.wire_diagnostics))?;
             }
         }
         debug_assert!(std::ptr::eq(self.parts, &self.catalog.parts));
@@ -2863,7 +2877,7 @@ impl RowSink for SqlRows<'_> {
                 .txn
                 .lock_for_write(Keyspace::Rows, &physical, crate::task::limits::lock_deadline(), &|| {
                     crate::cancellation::check().is_err()
-                }).map_err(crate::task::limits::lock_error)?
+                }).map_err(|error| sql_lock_error(error, self.wire_diagnostics))?
                 .current
                 .is_some()
             {
@@ -2877,6 +2891,7 @@ impl RowSink for SqlRows<'_> {
                         engine::indexes::check_occupancy(
                             self.txn, &image, table, before, &proposal, &earlier,
                             &|id| self.parts.ext.generated_columns.contains_key(&id),
+                            self.wire_diagnostics,
                         )?;
                     }
                 }
@@ -2917,7 +2932,7 @@ impl RowSink for SqlRows<'_> {
             }))?;
         }
         engine::indexes::check_occupancy(self.txn, &image, table, before, after, &self.parts.indexes,
-            &|id| self.parts.ext.generated_columns.contains_key(&id))
+            &|id| self.parts.ext.generated_columns.contains_key(&id), self.wire_diagnostics)
     }
     fn apply(
         &mut self,
@@ -2992,7 +3007,7 @@ impl SqlRows<'_> {
             }
             let target = self.txn.lock_for_write(Keyspace::Rows, key, crate::task::limits::lock_deadline(), &|| {
                 crate::cancellation::check().is_err()
-            }).map_err(crate::task::limits::lock_error)?;
+            }).map_err(|error| sql_lock_error(error, self.wire_diagnostics))?;
             match (old, target.current) {
                 (None, Some(_)) => {
                     let generated_key = table.primary_key.iter().any(|i|
@@ -3015,10 +3030,10 @@ impl SqlRows<'_> {
                     }
                     values.resize(table.columns.len(), relational::Value::Null);
                     if values != old.values || record.row_version != old.version {
-                        return Err(CoreError::Sql(SqlError::Conflict));
+                        return Err(write_conflict(self.wire_diagnostics));
                     }
                 }
-                (Some(_), None) => return Err(CoreError::Sql(SqlError::Conflict)),
+                (Some(_), None) => return Err(write_conflict(self.wire_diagnostics)),
                 (None, None) => (),
             }
         }
@@ -3043,6 +3058,22 @@ impl SqlRows<'_> {
             }
         }
         Ok(())
+    }
+}
+
+pub(super) fn sql_lock_error(error: engine::txn::TxnError, wire_diagnostics: bool) -> CoreError {
+    use engine::txn::{SerializationReason, TxnError};
+    match error {
+        TxnError::Serialization(SerializationReason::WriteConflict) => write_conflict(wire_diagnostics),
+        other => crate::task::limits::lock_error(other),
+    }
+}
+
+fn write_conflict(wire_diagnostics: bool) -> CoreError {
+    if wire_diagnostics {
+        CoreError::SqlSerialization(SqlSerialization::ConcurrentUpdate)
+    } else {
+        CoreError::Sql(SqlError::Conflict)
     }
 }
 

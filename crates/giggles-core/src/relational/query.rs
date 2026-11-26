@@ -15,7 +15,7 @@ pub(super) use functions::{named_args, quoting::quote_identifier, random_uuid, t
 
 pub(super) fn known_zero_argument_function(name: &str) -> bool {
     user_types::probe_preserving_error_message(|| {
-        Scalar::Call(name.to_owned(), vec![]).bind(&|_, _| Err(SqlError::UnknownColumn), &[], &[])
+        Scalar::Call(name.into(), vec![]).bind(&|_, _| Err(SqlError::UnknownColumn), &[], &[])
     }).is_ok()
 }
 pub(super) mod plan;
@@ -67,6 +67,22 @@ pub(super) fn result_typmod(state: &Relational, source: TypmodSource<'_>) -> i32
 struct ColumnRef {
     qualifier: Option<String>,
     name: String,
+}
+impl ColumnRef {
+    fn diagnose(&self, error: &SqlError) {
+        match (error, &self.qualifier) {
+            (SqlError::UnknownColumn, Some(table)) => {
+                user_types::sql_error_message_if_absent(|| format!("column {table}.{} does not exist", self.name));
+            }
+            (SqlError::UnknownColumn, None) => {
+                user_types::sql_error_message_if_absent(|| format!(r#"column "{}" does not exist"#, self.name));
+            }
+            (SqlError::UnknownTable, Some(table)) => {
+                user_types::sql_error_message_if_absent(|| format!(r#"missing FROM-clause entry for table "{table}""#));
+            }
+            _ => {}
+        }
+    }
 }
 #[derive(Debug, Clone)]
 struct Source {
@@ -1298,7 +1314,7 @@ impl Filter {
         let pair_op = if distinct.is_some() { "=" } else { op };
         let args = pairs.map(|(a, b)| Scalar::Predicate(Box::new(Self::Compare(a, pair_op.into(), b))))
             .collect();
-        Ok(Self::Scalar(Scalar::Call(format!("{}{op}", functions::ROW_ORDER_PREFIX), args)))
+        Ok(Self::Scalar(Scalar::Call(format!("{}{op}", functions::ROW_ORDER_PREFIX).into(), args)))
     }
 
     fn row_filter(p: &mut Parser, depth: usize, aggregate_argument: bool) -> R<Self> {
@@ -1312,7 +1328,7 @@ impl Filter {
                 if !p.sym(',') { break; }
             }
             p.punct(')')?;
-            admit_expansion(&Scalar::Call(String::new(), a.clone()), rows.len())?;
+            admit_expansion(&Scalar::Call("".into(), a.clone()), rows.len())?;
             let comparisons = rows.into_iter().map(|b| Self::row_compare(a.clone(), "=", b))
                 .collect::<R<Vec<_>>>()?;
             let f = Self::combine(&comparisons, false);
@@ -1483,7 +1499,7 @@ impl Filter {
             | Self::Compare(Scalar::Param(n), _, Scalar::Column(column))
                 if declared.get(n - 1).is_some_and(Option::is_some) =>
             {
-                let column = resolve(column, 0)?;
+                let column = resolve(column, 0).inspect_err(|error| column.diagnose(error))?;
                 infer_mutation_parameter(
                     &Expr::Param(*n),
                     &tables[column.source].columns[column.column].data_type,
@@ -2836,7 +2852,7 @@ impl Query {
         let table = state
             .tables
             .get(&source.name)
-            .ok_or(SqlError::UnknownTable)?;
+            .ok_or_else(|| missing_relation(&source.name))?;
         let resolve = |column: &ColumnRef, _scope: usize| -> R<BoundColumn> {
             if column
                 .qualifier
@@ -2845,12 +2861,13 @@ impl Query {
             {
                 return Err(SqlError::UnknownTable);
             }
-            let column = table
+            let position = table
                 .columns
                 .iter()
                 .position(|c| c.name == column.name)
-                .ok_or(SqlError::UnknownColumn)?;
-            Ok(BoundColumn { source: 0, column })
+                .ok_or(SqlError::UnknownColumn)
+                .inspect_err(|error| column.diagnose(error))?;
+            Ok(BoundColumn { source: 0, column: position })
         };
         if self.has_in_subquery()
             && let Some(f) = self.where_filter()
@@ -4435,7 +4452,7 @@ impl Query {
         };
         let mut predicates = vec![];
         for (c, op, e) in &self.predicates {
-            let c = resolve(c, tables.len())?;
+            let c = resolve(c, tables.len()).inspect_err(|error| c.diagnose(error))?;
             if tables[c.source].columns[c.column].data_type == DataType::Bpchar {
                 return Err(SqlError::Unsupported);
             }
@@ -4523,7 +4540,7 @@ impl Query {
                     if let Scalar::Column(c) = e
                         && c.name == "ctid"
                     {
-                        let column = resolve(c, tables.len())?;
+                        let column = resolve(c, tables.len()).inspect_err(|error| c.diagnose(error))?;
                         if tables[column.source].hidden_rowid() == Some(column.column) {
                             push(BoundItem::Ctid(column), ColumnDef { id: 0, name: "ctid".into(), data_type: DataType::Text, not_null: true });
                             continue;
@@ -4533,7 +4550,7 @@ impl Query {
                     if self.distinct() { e.require_collation()?; }
                     let (source_column, d) = if let Item::Scalar(Scalar::Column(c)) = item {
                         let name = c.name.clone();
-                        let c = resolve(c, tables.len())?;
+                        let c = resolve(c, tables.len()).inspect_err(|error| c.diagnose(error))?;
                         let mut d = tables[c.source].columns[c.column].clone();
                         if let Some(source) = self.sources.get(c.source) && let Some(view) = views::projection(state, &source.name)? {
                             d = view.columns.iter().find(|(_, offset)| *offset == c.column).ok_or(SqlError::UnknownColumn)?.0.clone();

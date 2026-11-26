@@ -415,7 +415,7 @@ pub(super) fn parse_expression(p: &mut Parser, value: Scalar) -> R<Scalar> {
             && matches!(name.as_str(), "oid" | "name") {
                 let name = format!("\0inquiry_{name}");
                 p.at += 1;
-                return Ok(Scalar::Call(name, vec![value]));
+                return Ok(Scalar::Call(name.into(), vec![value]));
         }
         p.at = start;
     }

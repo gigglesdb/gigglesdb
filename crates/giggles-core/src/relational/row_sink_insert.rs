@@ -246,7 +246,7 @@ pub(super) fn validate_append(state: &Relational, table: &TableDef, versions: st
                 &mut || crate::cancellation::check().is_err(), clock).map_err(CoreError::Sql)?;
         }
         if immediate_mode {
-            paged_pending(state, &mut immediate, &[], false, sink)?;
+            paged_pending(state, &mut immediate, &[], &[], false, sink)?;
         }
     Ok(())
 }

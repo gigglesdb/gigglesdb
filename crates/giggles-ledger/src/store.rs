@@ -17,7 +17,7 @@ fn core(e: CoreError) -> Error {
     Error::Core(e.to_string())
 }
 fn retry(e: &CoreError) -> bool {
-    matches!(e, CoreError::Busy | CoreError::Deadlock | CoreError::Sql(SqlError::Conflict))
+    matches!(e, CoreError::Busy | CoreError::Deadlock | CoreError::Sql(SqlError::Conflict) | CoreError::SqlSerialization(_))
 }
 fn encode(state: &State) -> Result<Vec<u8>> {
     let b = serde_json::to_vec(state).map_err(|e| Error::Corrupt(e.to_string()))?;

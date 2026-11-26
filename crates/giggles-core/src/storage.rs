@@ -145,6 +145,8 @@ pub enum CoreError {
     /// Execution-time refusal to use a sequence.
     SequencePrivilege,
     Sql(relational::SqlError),
+    /// A transient SQL serialization diagnostic requested by the wire frontend.
+    SqlSerialization(SqlSerialization),
     /// Transient routine and trigger diagnostics with PostgreSQL wire fields.
     RoutineDdl(Box<relational::RoutineDiagnostic>),
     /// Schema DDL error outside the frozen, persisted scalar-error enum.
@@ -158,6 +160,12 @@ pub enum CoreError {
     /// A query temp (spill) file failed: 53100 when the device is full, else 58030.
     TempFile { disk_full: bool, detail: String },
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlSerialization {
+    ConcurrentUpdate,
+    CommitPivot,
+}
+
 impl std::fmt::Display for CoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Self::WriteFenced { epoch } = self {
@@ -2319,7 +2327,7 @@ fn deferral_bytes(state: &relational::DeferralState) -> Result<u64, CoreError> {
         .ok_or(CoreError::Limit)?;
     for keys in state.pending.values() {
         bytes = bytes.checked_add(24).ok_or(CoreError::Limit)?;
-        for key in keys {
+        for key in keys.keys() {
             bytes = bytes
                 .checked_add(8)
                 .and_then(|n| n.checked_add(key.len() as u64))
@@ -2378,6 +2386,7 @@ pub struct SqlSession {
     schema_binding_memo: relational::SchemaBindingMemo,
     cursor_plan_cache: relational::cursor::PlanCache,
     authorization_bindings: bool,
+    wire_serialization_diagnostics: bool,
     authority_managed: bool,
     ddl_owner: Option<String>,
     maintenance_database: String,
@@ -2453,6 +2462,7 @@ impl Admin {
             schema_binding_memo: Default::default(),
             cursor_plan_cache: Default::default(),
             authorization_bindings: false,
+            wire_serialization_diagnostics: false,
             authority_managed: false,
             ddl_owner: None,
             maintenance_database: "postgres".into(),
@@ -3115,7 +3125,9 @@ impl SqlSession {
         &self,
         p: &relational::Prepared,
     ) -> Result<Vec<Option<String>>, CoreError> {
-        let dependencies = |s: &MetadataState<'_>| p.implicit_sequences(&s.sql).map_err(CoreError::Sql);
+        let dependencies = |s: &MetadataState<'_>| {
+            p.implicit_sequences(&s.sql).map_err(CoreError::Sql)
+        };
         match &self.staged {
             Some(s) => dependencies(&MetadataState::borrow(s)),
             None => self.inspect_metadata(dependencies),
@@ -3764,7 +3776,8 @@ impl SqlSession {
                     locks.insert(*id, (name, true));
                     pending.extend(projection.reads.iter().cloned());
                 } else {
-                    return Err(CoreError::Sql(relational::SqlError::UnknownTable));
+                    let error = relational::missing_relation(&name);
+                    return Err(CoreError::Sql(error));
                 }
             }
             Ok(locks)
@@ -5880,14 +5893,14 @@ impl SqlSession {
             self.staged.as_ref().map(|_| &self.enum_transaction),
             !self.savepoints.is_empty(),
         );
-        let result = if let Some((names, deferred)) = p.set_constraints() {
+        let result = if let Some((names, path, deferred)) = p.set_constraints() {
             // Outside a block PostgreSQL still resolves named constraints;
             // ALL succeeds while the ephemeral mode change is discarded.
             if !params.is_empty() || expected_version.is_some() {
                 return Err(CoreError::Sql(E::Parameters));
             }
             s.sql
-                .set_constraints(&mut deferral, names, deferred, || {
+                .set_constraints(&mut deferral, names, path, deferred, || {
                     crate::cancellation::check().is_err()
                 })
                 .map(|()| Default::default())
@@ -6091,6 +6104,9 @@ impl SqlSession {
 
     /// Resolve a staged table name to its durable owner key by stable table id.
     pub fn table_authority_name(&self, name: &str) -> Result<String, CoreError> {
+        // Bindings retain explicit public qualification for missing-relation
+        // diagnostics. The authority catalog still uses bare public keys.
+        let name = name.strip_prefix("public\0").unwrap_or(name);
         // V2 reconciles authority keys inside each DDL statement, so staged
         // names already are the authority names (including renames).
         if matches!(self.admin.inner.backend, Backend::V2(_)) {

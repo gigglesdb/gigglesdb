@@ -264,7 +264,7 @@ impl Relational {
             }
             for name in extensions { std::sync::Arc::make_mut(&mut self.ext).extensions.remove(&name); }
             for table in tables {
-                self.drop_table_with_actions(&table, true)?;
+                self.drop_table_with_actions(&table, true, &[])?;
             }
             std::sync::Arc::make_mut(&mut self.ext)
                 .sequences.retain(|_, sequence| split_key(&sequence.name).0 != ddl.name);
@@ -351,7 +351,7 @@ impl Prepared {
                     | Statement::Comment(_) | Statement::SecurityLabel(_) | Statement::View(_) => SqlError::InvalidSchema,
                     _ => SqlError::UnknownTable,
                 };
-                return Err(error);
+                return Err(if error == SqlError::UnknownTable { missing_relation(&key) } else { error });
             }
         }
         Ok(())

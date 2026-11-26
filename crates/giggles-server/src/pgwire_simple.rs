@@ -233,6 +233,7 @@ impl State {
         out: &mut Vec<u8>,
         received: std::time::Instant,
     ) -> R<()> {
+        authorize_set_constraints(sql, session)?;
         // GD-0061 R3-206: one statement per Query, admitted before it runs.
         if session.task().is_some() {
             return self.task_simple(sql, session, out);
@@ -241,14 +242,17 @@ impl State {
         if !matches!(session.role, Role::Database { .. }) {
             return self.simple_statement(sql, None, session, out, received, &mut implicit);
         }
-        let statements = split(sql)?;
+        let mut statements = split_with_spans(sql)?;
         if statements.is_empty() {
             return frame(b'I', &[], out);
         }
         if statements.len() == 1 {
             let was_in_transaction = session.in_transaction();
             let completed = out.len();
-            let result = self.simple_statement(&statements[0], Some(sql), session, out, received, &mut implicit);
+            let statement = statements.pop().expect("one statement");
+            let result = self.simple_statement(
+                &statement.sql, Some((sql, &statement.span)), session, out, received, &mut implicit,
+            );
             if let Err(code) = result {
                 if implicit {
                     self.simple_failure(code, true, completed, session, out);
@@ -277,7 +281,7 @@ impl State {
 
     fn simple_batch(
         &mut self,
-        statements: Vec<String>,
+        statements: Vec<SimpleStatement>,
         source: &str,
         session: &mut Session,
         out: &mut Vec<u8>,
@@ -289,7 +293,8 @@ impl State {
         // in a Query message, even if the message contains explicit COMMITs.
         // GD-0061 R3-707: so are the approver forms, which write approval
         // records outside the SQL snapshot, and (R3-110) the task statements.
-        if statements.iter().any(|sql| {
+        if statements.iter().any(|statement| {
+            let sql = &statement.sql;
             crate::auth::statements::parse(sql).is_some()
                 || crate::task_ddl::parse(sql).is_some()
                 || matches!(crate::agent::preview::approver_statement(sql), Ok(Some(_)))
@@ -310,7 +315,7 @@ impl State {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn continue_simple_batch(
         &mut self,
-        mut statements: impl Iterator<Item = String>,
+        mut statements: impl Iterator<Item = SimpleStatement>,
         source: Option<&str>,
         session: &mut Session,
         out: &mut Vec<u8>,
@@ -321,13 +326,14 @@ impl State {
         use crate::pg_transaction::Command;
 
         let mut published_commit = false;
-        while let Some(sql) = statements.next() {
+        while let Some(SimpleStatement { sql, span }) = statements.next() {
             // A publishing COMMIT ends the previous checked reply budget.
             // Send its reply before framing the next statement on this socket.
             if published_commit || out.len() > MAX_RESPONSE {
                 flush_output(output, out).map_err(|code| self.diagnostic.reply_error(code))?;
             }
             let completed = out.len();
+            giggles_core::relational::clear_sql_diagnostics();
             let result = (|| {
                 let command = parse_control(&sql, session, &mut self.diagnostic)?;
                 published_commit = matches!(command, Some(Command::Commit))
@@ -342,7 +348,7 @@ impl State {
                 {
                     begin_implicit(session, &mut implicit, &mut self.settings)?;
                 }
-                self.simple_statement(&sql, source, session, out, received, &mut implicit)
+                self.simple_statement(&sql, source.map(|source| (source, &span)), session, out, received, &mut implicit)
             })();
             if let Err(code) = result {
                 self.simple_failure(code, implicit, completed, session, out);
@@ -350,8 +356,8 @@ impl State {
             }
             if let Some(copy) = self.copy.as_mut() {
                 copy.remaining = statements.collect();
-                if copy.remaining.iter().any(|sql| prepare::is_prepare(sql)) {
-                    copy.prepare_source = source.map(str::to_owned);
+                if !copy.remaining.is_empty() {
+                    copy.batch_source = source.map(str::to_owned);
                 }
                 return Ok(());
             }
@@ -576,7 +582,7 @@ impl State {
     pub(super) fn simple_statement(
         &mut self,
         sql: &str,
-        source: Option<&str>,
+        source: Option<(&str, &std::ops::Range<usize>)>,
         session: &mut Session,
         out: &mut Vec<u8>,
         received: std::time::Instant,
@@ -601,8 +607,11 @@ impl State {
         giggles_core::relational::take_sql_notices();
         let config = self.settings.default_text_search_config().to_owned();
         let result = text_search_types::with_default_config(config, || {
-            self.simple_statement_inner(sql, source, session, out, received, implicit)
+            self.simple_statement_inner(sql, source.map(|(query, _)| query), session, out, received, implicit)
         });
+        if let (Err(code), Some((query, span))) = (result, source) {
+            self.diagnostic.annotate_sql_error(code, &query[span.clone()], &query[..span.start]);
+        }
         if !self.copy_receiving() && let Some(admission) = self.execution_admission.as_mut() {
             admission.permits().role_permit = None;
         }
@@ -936,6 +945,9 @@ impl State {
             } else {
                 let p = self.diagnostic.core(session.prepare(sql))?;
                 let d = self.diagnostic.core(session.describe(&p))?;
+                if p.command() == "SET CONSTRAINTS" && (!was_transaction || *implicit) {
+                    warning("SET CONSTRAINTS can only be used in transaction blocks", &self.settings.current, out)?;
+                }
                 let writes = p.write_tables();
                 let command = p
                     .row_lock_command()
@@ -1093,12 +1105,22 @@ impl State {
 // A boundary lexer, not a second SQL parser. Preserve quoted bytes exactly;
 // replace comments with whitespace so every dispatch path sees the same SQL.
 pub(super) fn split(sql: &str) -> R<Vec<String>> {
+    Ok(split_with_spans(sql)?.into_iter().map(|statement| statement.sql).collect())
+}
+
+pub(super) struct SimpleStatement {
+    sql: String,
+    span: std::ops::Range<usize>,
+}
+
+fn split_with_spans(sql: &str) -> R<Vec<SimpleStatement>> {
     if sql.len() > giggles_core::relational::MAX_STATEMENT_SQL {
         return Err("54000");
     }
     let b = sql.as_bytes();
     let mut statements = Vec::new();
     let mut statement = Vec::new();
+    let mut statement_start = 0;
     let mut at = 0;
     while at < b.len() {
         let start = at;
@@ -1139,15 +1161,16 @@ pub(super) fn split(sql: &str) -> R<Vec<String>> {
         if let Some(end) = quoted_end(b, at)? {
             at = end;
         } else if b[at] == b';' {
-            push_statement(&mut statements, &mut statement);
+            push_statement(&mut statements, &mut statement, statement_start..at);
             at += 1;
+            statement_start = at;
             continue;
         } else {
             at += 1;
         }
         statement.extend_from_slice(&b[start..at]);
     }
-    push_statement(&mut statements, &mut statement);
+    push_statement(&mut statements, &mut statement, statement_start..at);
     Ok(statements)
 }
 
@@ -1219,11 +1242,22 @@ fn dollar_delimiter(b: &[u8]) -> Option<&[u8]> {
     (b.get(at) == Some(&b'$')).then(|| &b[..at + 1])
 }
 
-fn push_statement(statements: &mut Vec<String>, statement: &mut Vec<u8>) {
-    let text = String::from_utf8(std::mem::take(statement)).expect("SQL remains UTF-8");
-    if !text.trim().is_empty() {
-        statements.push(text);
+fn push_statement(
+    statements: &mut Vec<SimpleStatement>, statement: &mut Vec<u8>, span: std::ops::Range<usize>,
+) {
+    let sql = String::from_utf8(std::mem::take(statement)).expect("SQL remains UTF-8");
+    if !sql.trim().is_empty() {
+        statements.push(SimpleStatement { sql, span });
     }
+}
+
+pub(super) fn authorize_set_constraints(sql: &str, session: &Session) -> R<bool> {
+    let authorized = session.role.is_sql() && session.task().is_none();
+    let setting = Prepared::is_set_constraints_sql(sql);
+    if setting && !authorized {
+        return Err("42501");
+    }
+    Ok(setting)
 }
 
 pub(super) fn parse_settings(
@@ -1231,6 +1265,9 @@ pub(super) fn parse_settings(
     session: &Session,
     diagnostic: &mut Diagnostic,
 ) -> R<Option<Vec<crate::pg_settings::Setting>>> {
+    if authorize_set_constraints(sql, session)? {
+        return Ok(None);
+    }
     if matches!(session.role, Role::Database { .. }) {
         if let Ok(tokens) = crate::pg_settings::database::lex(sql) {
             use crate::pg_settings::database::{Parser, Token};

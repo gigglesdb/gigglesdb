@@ -6,7 +6,7 @@ pub(super) const CALL: &str = "\0aggregate-filter:apply";
 pub(super) const COUNT_STAR: &str = "\0aggregate-filter:count-star";
 const PLACEHOLDER: &str = "\0aggregate-filter:placeholder";
 fn node(name: &str, args: Vec<Scalar>) -> Scalar {
-    Scalar::Call(format!("{PREFIX}{name}"), args)
+    Scalar::Call(format!("{PREFIX}{name}").into(), args)
 }
 // Bare string literals have UNKNOWN type until their Boolean context chooses
 // a type. Explicit casts and operands of comparisons retain their own types.
@@ -299,7 +299,7 @@ pub(super) fn parts(
     args: &[Scalar],
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     tables: &[&TableDef],
-) -> R<(Aggregate, Option<Scalar>, Filter)> {
+) -> R<(Aggregate, Option<Scalar>, Filter, bool)> {
     let [call, encoded_filter] = args else {
         return Err(SqlError::Syntax);
     };
@@ -311,7 +311,7 @@ pub(super) fn parts(
         return Err(SqlError::WrongObjectType);
     };
     if name == COUNT_STAR {
-        return Ok((Aggregate::Count, None, filter));
+        return Ok((Aggregate::Count, None, filter, name.catalog_qualified));
     }
     let Some(a) = Aggregate::from_name(name) else {
         if name.starts_with("schema.\0") {
@@ -325,12 +325,14 @@ pub(super) fn parts(
     };
     if inputs.len() != 1 {
         if a.base() == Aggregate::ArrayAgg {
-            return Err(array_aggregate::signature_error(inputs, resolve, tables));
+            return Err(array_aggregate::signature_error(name, inputs, resolve, tables));
         }
+        let signature = functions::diagnostic_call_name(a.name(), name.catalog_qualified);
+        functions::report_routine_signature(&signature, inputs, resolve, tables, &[]);
         return Err(SqlError::UndefinedFunction);
     }
     reject_nested_aggregate(&inputs[0])?;
-    Ok((a, Some(inputs[0].clone()), filter))
+    Ok((a, Some(inputs[0].clone()), filter, name.catalog_qualified))
 }
 // Transform argument expressions before FILTER. Nested aggregates contribute
 // their bound result types so surrounding scalar signatures can be resolved,
@@ -571,7 +573,7 @@ pub(super) fn validate_scalar(
                     result?;
                 }
             }
-            let (a, arg, filter) = parts(args, resolve, tables)?;
+            let (a, arg, filter, _) = parts(args, resolve, tables)?;
             let mut scratch = parameters.to_vec();
             if let Some(arg) = &arg {
                 let expected = if matches!(a.base(), Aggregate::Min | Aggregate::Max)

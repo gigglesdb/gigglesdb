@@ -150,19 +150,60 @@ fn deferred_call_error(
 ) -> R<SqlError> {
     let Some(routine) = name.strip_prefix(UNDEFINED_TRIGGER_CALL_PREFIX) else {
         uuid_ossp::missing_diagnostic(name, args, resolve, tables, parameters)?;
+        if fallback == SqlError::UndefinedFunction
+            && let Some(routine) = name.strip_prefix(UNDEFINED_ROUTINE_PREFIX)
+        {
+            let types = routine_argument_types(args, resolve, tables, parameters)?;
+            user_types::sql_routine_signature(
+                || Some(named_args::undefined_signature(&routine.replace('\0', "."), &types)),
+                named_args::HINT,
+            );
+        } else if fallback == SqlError::UndefinedFunction
+            && let Some(routine) = name.strip_prefix(PG_TOAST_ROUTINE_PREFIX)
+        {
+            report_routine_signature(&routine.replace('\0', "."), args, resolve, tables, parameters);
+        }
         return Ok(fallback);
     };
-    let types = args.iter().map(|arg| {
-        if arg.aggregate_unknown(parameters) {
-            Ok("unknown")
-        } else {
-            arg.bind(resolve, tables, parameters).map(|bound| typeof_expr::name(&bound.ty))
-        }
-    }).collect::<R<Vec<_>>>()?;
+    let types = routine_argument_types(args, resolve, tables, parameters)?;
     let mut diagnostic = RoutineDiagnostic::new("42883", named_args::undefined_signature(routine, &types));
     diagnostic.hint = Some(named_args::HINT.into());
     Ok(diagnostic.error())
 }
+fn routine_argument_types(
+    args: &[Scalar],
+    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+    tables: &[&TableDef],
+    parameters: &[Option<DataType>],
+) -> R<Vec<std::borrow::Cow<'static, str>>> {
+    args.iter().map(|arg| {
+        if arg.aggregate_unknown(parameters) {
+            return Ok("unknown".into());
+        }
+        let bound = arg.bind(resolve, tables, parameters)?;
+        Ok(match bound.result_oid() {
+            random_uuid::VOID_OID => "void".into(),
+            json_aggregate::OID => "json".into(),
+            _ => match bound.user_enum_type(tables) {
+                Some(ty) => user_types::enum_display(&ty, bound.ty == DataType::TextArray).into(),
+                None => type_display(&bound.ty).into(),
+            },
+        })
+    }).collect()
+}
+
+pub(super) fn report_routine_signature(
+    name: &str, args: &[Scalar],
+    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+    tables: &[&TableDef], parameters: &[Option<DataType>],
+) {
+    user_types::sql_routine_signature(|| {
+        let _diagnostics = user_types::SqlDiagnosticScope::enter();
+        let types = routine_argument_types(args, resolve, tables, parameters).ok()?;
+        Some(named_args::undefined_signature(name, &types))
+    }, named_args::HINT);
+}
+
 pub(super) fn is_deferred_routine_name(name: &str) -> bool {
     named_args::requires_lookup(name) || deferred_routine_error(name).is_some()
 }
@@ -210,6 +251,62 @@ pub(super) enum BinaryOp {
     NotRegexInsensitive,
 }
 #[derive(Debug, Clone)]
+pub(super) struct CallName {
+    name: String,
+    pub(super) catalog_qualified: bool,
+}
+
+impl CallName {
+    pub(super) fn as_str(&self) -> &str {
+        &self.name
+    }
+
+    pub(super) fn normalized_mut(&mut self) -> &mut String {
+        &mut self.name
+    }
+
+    pub(super) fn diagnostic_name(&self) -> std::borrow::Cow<'_, str> {
+        diagnostic_call_name(&self.name, self.catalog_qualified)
+    }
+}
+
+pub(super) fn diagnostic_call_name(name: &str, catalog_qualified: bool) -> std::borrow::Cow<'_, str> {
+    if catalog_qualified { format!("pg_catalog.{name}").into() } else { name.into() }
+}
+
+impl From<String> for CallName {
+    fn from(name: String) -> Self {
+        Self { name, catalog_qualified: false }
+    }
+}
+
+impl From<&str> for CallName {
+    fn from(name: &str) -> Self {
+        name.to_owned().into()
+    }
+}
+
+impl std::ops::Deref for CallName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<str> for CallName {
+    fn eq(&self, other: &str) -> bool {
+        self.name == other
+    }
+}
+
+impl std::fmt::Display for CallName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.name)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) enum Scalar {
     Predicate(Box<super::Filter>),
     Case(Box<CaseExpr>),
@@ -221,7 +318,7 @@ pub(super) enum Scalar {
     Domain(Box<Scalar>, user_types::TypeReference, Box<R<TypeDef>>),
     Column(ColumnRef),
     Literal(Value),
-    Call(String, Vec<Scalar>),
+    Call(CallName, Vec<Scalar>),
     SubstringOrder([Box<Scalar>; 3]),
 }
 #[derive(Debug, Clone)]
@@ -811,7 +908,7 @@ impl Scalar {
             let right = Self::parse_binary(p, depth + 1, aggregate_argument, precedence + 1)?;
             value = match operator {
                 Ok(op) => Self::Binary(op, Box::new(value), Box::new(right)),
-                Err(name) => Self::Call(name, vec![value, right]),
+                Err(name) => Self::Call(name.into(), vec![value, right]),
             };
             arithmetic::admit_shape(&value, depth, &mut 0)?;
         }
@@ -865,7 +962,7 @@ impl Scalar {
             let name = if op == "!!" { "\0ts_negate".into() } else { arithmetic::unknown_operator(op) };
             p.at += 1;
             let right = Self::parse_binary(p, depth + 1, aggregate_argument, 2)?;
-            Self::Call(name, vec![right])
+            Self::Call(name.into(), vec![right])
         } else {
             let value = Self::primary_context(p, depth, aggregate_argument)?;
             return Self::parse_casts(p, depth, value);
@@ -1024,7 +1121,7 @@ impl Scalar {
                 p.punct(')')?;
                 args.push(Self::Literal(Value::Int(i64::from(value))));
             }
-            return Ok(Self::Call(name, args));
+            return Ok(Self::Call(name.into(), args));
         }
         if p.word("cast") {
             p.punct('(')?;
@@ -1055,6 +1152,7 @@ impl Scalar {
                 && p.tokens.get(p.at + 3) == Some(&Token::Symbol('('));
             if p.tokens.get(p.at + 1) == Some(&Token::Symbol('(')) || qualified_call {
                 let (name, quoted) = Self::routine_name(p)?;
+                let mut catalog_qualified = false;
                 let (name, quoted) = if qualified_call {
                     p.punct('.')?;
                     let (routine, quoted) = Self::routine_name(p)?;
@@ -1083,8 +1181,12 @@ impl Scalar {
                     } else if name == "pg_catalog" && random_uuid::known(&routine) {
                         (format!("pg_catalog.{routine}"), quoted)
                     } else {
-                        if prefix.is_empty() { (routine, quoted) }
-                        else { (format!("{prefix}{name}\0{routine}"), quoted) }
+                        if prefix.is_empty() {
+                            catalog_qualified = true;
+                            (routine, quoted)
+                        } else {
+                            (format!("{prefix}{name}\0{routine}"), quoted)
+                        }
                     }
                 } else if !quoted && super::advisory::is_key_expression(&name) {
                     (name, quoted)
@@ -1119,7 +1221,7 @@ impl Scalar {
                         args.push(unicode::take_form(p).ok_or_else(|| unicode::invalid_form(p))?);
                     }
                     p.punct(')')?;
-                    return Ok(Self::Call(name, args));
+                    return Ok(Self::Call(name.into(), args));
                 }
                 if name == "position" && !qualified_call && !quoted {
                     if matches!(
@@ -1138,17 +1240,17 @@ impl Scalar {
                     }
                     let source = Self::parse_context(p, depth + 1, aggregate_argument)?;
                     p.punct(')')?;
-                    return Ok(Self::Call(name, vec![source, needle]));
+                    return Ok(Self::Call(name.into(), vec![source, needle]));
                 }
                 if deferred_routine_error(&name).is_some() && p.sym('*') {
                     p.punct(')')?;
-                    return Ok(Self::Call(name, vec![Self::Literal(Value::Null)]));
+                    return Ok(Self::Call(CallName { name, catalog_qualified }, vec![Self::Literal(Value::Null)]));
                 }
                 if name == "count" && p.sym('*') {
                     p.punct(')')?;
                     // Nested scalar aggregate expressions use the same nonnull
                     // input as query grouping's COUNT(*) normalization.
-                    return Ok(Self::Call(name, vec![Self::Literal(Value::Int(1))]));
+                    return Ok(Self::Call(CallName { name, catalog_qualified }, vec![Self::Literal(Value::Int(1))]));
                 }
                 if aggregate_argument && p.sym('*') {
                     p.punct(')')?;
@@ -1172,7 +1274,7 @@ impl Scalar {
                     let value = Self::parse_context(p, depth + 1, aggregate_argument)?;
                     p.punct(')')?;
                     return Ok(Self::Call(
-                        name,
+                        CallName { name, catalog_qualified },
                         vec![Self::Literal(Value::Text(field)), value],
                     ));
                 }
@@ -1182,7 +1284,7 @@ impl Scalar {
                         && matches!(name.as_str(), "coalesce" | "greatest" | "least" | "nullif");
                     let (names, args) = named_args::parse(p, depth + 1, aggregate_argument, grammar_construct)?;
                     p.punct(')')?;
-                    return Ok(named_args::scalar(name, names, args));
+                    return Ok(named_args::scalar(CallName { name, catalog_qualified }, names, args));
                 }
                 if !p.sym(')') {
                     loop {
@@ -1352,7 +1454,7 @@ impl Scalar {
                     user_types::view_replace_error("syntax error at or near \")\"".into());
                     return Err(SqlError::Syntax);
                 }
-                Ok(Self::Call(name, args))
+                Ok(Self::Call(CallName { name, catalog_qualified }, args))
             } else {
                 Ok(Self::Column(p.column_ref()?))
             }
@@ -1759,7 +1861,7 @@ impl Scalar {
         resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
         tables: &[&TableDef],
     ) -> R<BoundScalar> {
-        let bound = resolve(c, tables.len())?;
+        let bound = resolve(c, tables.len()).inspect_err(|error| c.diagnose(error))?;
         let column = &tables[bound.source].columns[bound.column];
         if let Some(value) = super::generated::virtual_binding(tables, bound)? {
             return collation::column(value, column.id);
@@ -1803,7 +1905,7 @@ impl Scalar {
 
     #[inline(never)]
     fn bind_call(
-        name: &str,
+        name: &CallName,
         args: &[Self],
         resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
         tables: &[&TableDef],
@@ -1812,6 +1914,21 @@ impl Scalar {
         if named_args::is_named(name) {
             return named_args::bind(name, args, resolve, tables, parameters);
         }
+        Self::bind_call_inner(name, args, resolve, tables, parameters).inspect_err(|error| {
+            if *error == SqlError::UndefinedFunction && !name.contains('\0') {
+                report_routine_signature(&name.diagnostic_name(), args, resolve, tables, parameters);
+            }
+        })
+    }
+
+    #[inline(never)]
+    fn bind_call_inner(
+        name: &str,
+        args: &[Self],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        parameters: &[Option<DataType>],
+    ) -> R<BoundScalar> {
         if args.is_empty() && let Some(name) = name.strip_prefix(TRIGGER_CALL_PREFIX) {
             // The result OID carries the pseudo-type. There is no stored trigger value.
             return Ok(BoundScalar { ty: DataType::Text, node: Node::TriggerCall(name.into()) });
@@ -4249,11 +4366,17 @@ impl Scalar {
                 }
             }
             Self::Call(n, args) if n == "json_typeof" => {
-                let [arg] = args.as_slice() else { return Err(SqlError::UndefinedFunction) };
+                let [arg] = args.as_slice() else {
+                    report_routine_signature(&n.diagnostic_name(), args, resolve, tables, parameters);
+                    return Err(SqlError::UndefinedFunction);
+                };
                 arg.infer(Some(&DataType::Text), parameters, resolve, tables)?;
             }
             Self::Call(n, args) if n == "jsonb_typeof" => {
-                let [arg] = args.as_slice() else { return Err(SqlError::UndefinedFunction) };
+                let [arg] = args.as_slice() else {
+                    report_routine_signature(&n.diagnostic_name(), args, resolve, tables, parameters);
+                    return Err(SqlError::UndefinedFunction);
+                };
                 arg.infer(Some(&DataType::Jsonb), parameters, resolve, tables)?;
             }
             Self::Call(n, args) if n == "jsonb_set" => {
@@ -4541,7 +4664,10 @@ fn numeric_input_error(text: &str, error: giggles_pg_types::Error) -> SqlError {
                 SqlError::Overflow
             }
         }
-        Error::DivisionByZero => SqlError::DivisionByZero,
+        Error::DivisionByZero => {
+            user_types::view_replace_error("division by zero".into());
+            SqlError::DivisionByZero
+        },
     }
 }
 
@@ -4549,7 +4675,10 @@ fn pg_error(e: giggles_pg_types::Error) -> SqlError {
     match e {
         giggles_pg_types::Error::Limit => SqlError::Limit,
         giggles_pg_types::Error::Range => SqlError::Overflow,
-        giggles_pg_types::Error::DivisionByZero => SqlError::DivisionByZero,
+        giggles_pg_types::Error::DivisionByZero => {
+            user_types::view_replace_error("division by zero".into());
+            SqlError::DivisionByZero
+        },
         giggles_pg_types::Error::TimeZoneDisplacement => SqlError::InvalidTimeZoneDisplacementValue,
         _ => SqlError::Type,
     }

@@ -14,7 +14,8 @@ const CREATE: &str =
     "CREATE TABLE outbox_internal_state (id BIGINT PRIMARY KEY, body BYTEA NOT NULL)";
 fn core(e: CoreError) -> Error {
     match e {
-        CoreError::Sql(SqlError::Conflict | SqlError::Version | SqlError::Duplicate) => {
+        CoreError::Sql(SqlError::Conflict | SqlError::Version | SqlError::Duplicate)
+        | CoreError::SqlSerialization(_) => {
             Error::Conflict
         }
         CoreError::Limit | CoreError::Sql(SqlError::Limit) => Error::Limit,

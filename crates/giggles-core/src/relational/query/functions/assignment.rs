@@ -109,6 +109,14 @@ fn convert_array(
     Ok(Value::Text(out))
 }
 
+pub(in crate::relational) fn column_type_error(column: &ColumnDef, target: &str, source: &str) {
+    user_types::view_replace_error(format!(
+        r#"column "{}" is of type {target} but expression is of type {source}"#,
+        column.name,
+    ));
+    user_types::sql_error_hint("You will need to rewrite or cast the expression.");
+}
+
 /// Assignment source metadata. JSON expressions use text values with a distinct OID.
 #[derive(Debug, Clone)]
 pub(in crate::relational) struct SourceType {
@@ -150,7 +158,13 @@ impl SourceType {
             user_types::sql_error_hint("You will need to rewrite or cast the expression.");
             return Err(SqlError::Type);
         }
-        if self.compatible(&column.data_type) { Ok(()) } else { Err(SqlError::Type) }
+        if self.compatible(&column.data_type) {
+            Ok(())
+        } else {
+            column_type_error(column, type_display(&column.data_type),
+                if self.json { "json" } else { type_display(&self.data_type) });
+            Err(SqlError::Type)
+        }
     }
 
     pub(in crate::relational) fn convert(

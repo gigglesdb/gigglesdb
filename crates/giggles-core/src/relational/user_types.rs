@@ -15,6 +15,8 @@ pub enum SqlErrorDetail {
     Text(String),
     /// Preserve the detail field exactly, including its absence.
     Exact(Option<String>),
+    /// A failed routine lookup's signature, visible to database roles.
+    RoutineSignature(String),
     DuplicateKey(DuplicateKeyDetail),
     FailingCheckRow { row: DuplicateKeyDetail, written: Option<String> },
     ForeignKey { key: DuplicateKeyDetail, redacted: String },
@@ -58,6 +60,7 @@ pub fn take_sql_error_detail() -> Option<String> {
     take_sql_diagnostic_detail().and_then(|detail| match detail {
         SqlErrorDetail::Text(text) => Some(text),
         SqlErrorDetail::Exact(detail) => detail,
+        SqlErrorDetail::RoutineSignature(_) => None,
         SqlErrorDetail::DuplicateKey(detail)
         | SqlErrorDetail::FailingCheckRow { row: detail, .. }
         | SqlErrorDetail::ForeignKey { key: detail, .. } => Some(detail.values),
@@ -123,6 +126,107 @@ pub fn take_sql_error_message_with_context() -> (Option<String>, Option<String>)
         })
     })
 }
+/// Recover a star argument that normalized syntax discarded.
+pub fn routine_signature_from_source(sql: &str, message: &str) -> Option<String> {
+    let signature = message.strip_prefix("function ")?.strip_suffix(" does not exist")?;
+    let name = signature.strip_suffix("(unknown)")?;
+    let (schema, local) = name.rsplit_once('.').map_or((None, name), |(schema, local)| (Some(schema), local));
+    let tokens = lex(sql).ok()?;
+    let matches_name = |token: &Token| {
+        matches!(token, Token::Word(value) | Token::QuotedIdent(value) if value == local)
+    };
+    let mut calls = tokens.windows(2).enumerate().filter_map(|(i, pair)| {
+        let qualifier = if i >= 2 && tokens[i - 1] == Token::Symbol('.') {
+            match &tokens[i - 2] {
+                Token::Word(schema) | Token::QuotedIdent(schema) => Some(schema.as_str()),
+                _ => return None,
+            }
+        } else {
+            None
+        };
+        (qualifier == schema && matches_name(&pair[0]) && pair[1] == Token::Symbol('(')).then_some(i)
+    });
+    let start = calls.next()?;
+    if calls.next().is_some() { return None; }
+    if tokens.get(start + 2..start + 4) != Some(&[Token::Symbol('*'), Token::Symbol(')')]) {
+        return None;
+    }
+    Some(format!("function {name}() does not exist"))
+}
+
+/// Locate an unambiguous relation reference in the original pgwire input.
+pub fn missing_relation_position(sql: &str, message: &str) -> Option<usize> {
+    let name = message.strip_prefix("relation \"")?.strip_suffix("\" does not exist")?;
+    let mut tokens = Vec::new();
+    let mut spans = Vec::new();
+    lex_with_spans(sql, &mut tokens, false, Some(&mut spans)).ok()?;
+    #[derive(Default)]
+    struct Clause {
+        command: Option<Command>,
+        from_list: bool,
+    }
+    enum Command { Select, Insert, Update, Delete }
+    let mut clause = Clause::default();
+    let mut outer = Vec::new();
+    let mut position = None;
+    let identifier = |index| match tokens.get(index) {
+        Some(Token::Word(name) | Token::QuotedIdent(name)) => Some(ident::truncate(name, 63)),
+        _ => None,
+    };
+    for (i, token) in tokens.iter().enumerate() {
+        let relation = match token {
+            Token::Symbol('(') => { outer.push(std::mem::take(&mut clause)); false }
+            Token::Symbol(')') => { clause = outer.pop()?; false }
+            Token::Symbol(';') => { clause = Clause::default(); false }
+            Token::Symbol(',') => clause.from_list,
+            Token::Word(word) => match word.as_str() {
+                "select" if matches!(clause.command, None | Some(Command::Insert)) => {
+                    clause.command = Some(Command::Select);
+                    false
+                }
+                "insert" if clause.command.is_none() => { clause.command = Some(Command::Insert); false }
+                "delete" if clause.command.is_none() => { clause.command = Some(Command::Delete); false }
+                "update" if clause.command.is_none() => { clause.command = Some(Command::Update); true }
+                "into" if matches!(clause.command, Some(Command::Insert)) => true,
+                "from" if matches!(clause.command, Some(Command::Select | Command::Update | Command::Delete)) => {
+                    clause.from_list = true;
+                    true
+                }
+                "using" if matches!(clause.command, Some(Command::Delete)) => {
+                    clause.from_list = true;
+                    true
+                }
+                "join" if clause.from_list => true,
+                "where" | "group" | "having" | "order" | "limit" | "offset" | "returning"
+                    | "union" | "intersect" | "except" | "window" | "for" => {
+                    clause.from_list = false;
+                    false
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if !relation { continue; }
+        let mut start = i + 1;
+        if matches!(tokens.get(start), Some(Token::Word(word)) if word == "only" || word == "lateral") {
+            start += 1;
+        }
+        let Some(first) = identifier(start) else { continue; };
+        let matched = if tokens.get(start + 1) == Some(&Token::Symbol('.')) {
+            let Some(second) = identifier(start + 2) else { continue; };
+            name.strip_prefix(first).and_then(|tail| tail.strip_prefix('.')) == Some(second)
+                && !matches!(tokens.get(start + 3), Some(Token::Symbol('(' | '.')))
+        } else {
+            first == name && !matches!(tokens.get(start + 1), Some(Token::Symbol('(')))
+        };
+        if matched {
+            if position.is_some() { return None; }
+            position = Some(spans.get(start)?.start);
+        }
+    }
+    position.map(|offset| sql[..offset].chars().count() + 1)
+}
+
 pub fn take_sql_error_position() -> Option<usize> {
     SQL_ERROR_POSITION.with(std::cell::Cell::take)
 }
@@ -194,7 +298,29 @@ pub(super) fn duplicate_column_notice(column: &str, table: &str) {
         Some("42701"),
     )));
 }
+pub(super) fn sql_routine_signature(message: impl FnOnce() -> Option<String>, hint: &'static str) {
+    if SQL_ERROR_MESSAGE.with(|pending| pending.borrow().is_some()) {
+        return;
+    }
+    if let Some(message) = message() {
+        SQL_ERROR_MESSAGE.with(|pending| *pending.borrow_mut() = Some((message.clone(), None)));
+        SQL_ERROR_DETAIL.with(|detail| *detail.borrow_mut() = Some(SqlErrorDetail::RoutineSignature(message)));
+        sql_error_hint(hint);
+    }
+}
+
+pub(super) fn sql_error_message_if_absent(message: impl FnOnce() -> String) {
+    SQL_ERROR_MESSAGE.with(|pending| {
+        pending.borrow_mut().get_or_insert_with(|| (message(), None));
+    });
+}
 pub(super) fn view_replace_error(message: String) {
+    SQL_ERROR_DETAIL.with(|detail| {
+        if matches!(*detail.borrow(), Some(SqlErrorDetail::RoutineSignature(_))) {
+            detail.borrow_mut().take();
+            take_sql_diagnostic_hint();
+        }
+    });
     SQL_ERROR_MESSAGE.with(|pending| *pending.borrow_mut() = Some((message, None)));
 }
 pub(super) fn truncate_reference_error() {
@@ -240,9 +366,18 @@ impl Drop for SqlDiagnosticScope {
     }
 }
 
+pub fn clear_sql_diagnostics() {
+    take_sql_warnings();
+    clear_sql_error_message();
+}
+
 pub(crate) fn clear_sql_error_message() {
     routines::clear_diagnostic();
     take_sql_notices();
+    clear_sql_error_fields();
+}
+
+pub fn clear_sql_error_fields() {
     take_sql_diagnostic_hint();
     take_sql_diagnostic_detail();
     take_sql_error_message();
@@ -1115,6 +1250,19 @@ impl Relational {
 mod tests {
     use super::*;
     use bincode::Options;
+
+    #[test]
+    fn replaced_message_discards_its_routine_signature_and_hint() {
+        clear_sql_diagnostics();
+        sql_routine_signature(|| Some("function nosuch(integer) does not exist".into()),
+            "No function matches the given name and argument types. You might need to add explicit type casts.");
+        view_replace_error("view projection bindings unavailable; recreate the view".into());
+        assert!(take_sql_diagnostic_detail().is_none());
+        assert!(take_sql_diagnostic_hint().is_none());
+        assert_eq!(take_sql_error_message().as_deref(),
+            Some("view projection bindings unavailable; recreate the view"));
+    }
+
     #[test]
     fn enum_array_round_trip_preserves_legacy_catalog_bytes() {
         fn run(state: &mut Relational, sql: &str) -> R<SqlResult> {

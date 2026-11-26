@@ -45,10 +45,8 @@ pub(super) fn has_duplicates(prepared: &Prepared) -> bool {
 
 // PG18.6 analyzes SQL before rejecting duplicate targets, before binding values.
 pub(super) fn check_duplicate_literals(prepared: &Prepared, state: &Relational) -> R<()> {
-    let table = state
-        .tables
-        .get(prepared.table().ok_or(SqlError::UnknownTable)?)
-        .ok_or(SqlError::UnknownTable)?;
+    let name = prepared.table().ok_or(SqlError::UnknownTable)?;
+    let table = state.tables.get(name).ok_or_else(|| missing_relation(name))?;
     let values: Vec<(&String, Option<&Expr>)> = match prepared.statement.get() {
         Statement::Update { sets, .. } => sets
             .iter()
@@ -88,7 +86,7 @@ pub(super) fn indexes(
     }
     sets.iter()
         .map(|(name, value)| {
-            let index = col(table, name)?;
+            let index = target_col(table, name)?;
             if !matches!(value, Value::Default | Value::Rows(_)) {
                 state.check_generated_explicit(&table.columns[index], true)?;
                 defaults::check_explicit_identity(state, &table.columns[index])?;
@@ -149,7 +147,7 @@ pub(super) fn describe(
     count: usize,
     declared: &[Option<DataType>],
 ) -> R<Description> {
-    let table = state.tables.get(name).ok_or(SqlError::UnknownTable)?;
+    let table = state.tables.get(name).ok_or_else(|| missing_relation(name))?;
     let indexes = indexes(sets, table, state)?;
     let mut parameters = vec![None; count];
     if declared.len() > parameters.len() {
@@ -179,7 +177,7 @@ pub(super) fn describe(
     for predicate in predicates {
         infer_mutation_parameter(
             &predicate.value,
-            &table.columns[col(table, &predicate.column)?].data_type,
+            &table.columns[predicate_col(table, &predicate.column)?].data_type,
             &mut parameters,
             declared,
             false,

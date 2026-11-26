@@ -201,13 +201,20 @@ fn canonical_filter(
         }
     })
 }
+struct AggregateInput {
+    kind: Aggregate,
+    argument: Option<Scalar>,
+    filter: Option<Filter>,
+    catalog_qualified: bool,
+}
+
 struct Lower<'a, F> {
     groups: Vec<String>,
     grouping_mask: Option<Vec<bool>>,
     scope: usize,
     resolve: &'a F,
     tables: &'a [&'a TableDef],
-    aggregates: Vec<(Aggregate, Option<Scalar>, Option<Filter>)>,
+    aggregates: Vec<AggregateInput>,
     dependent_sources: Vec<bool>,
     dependents: Vec<BoundColumn>,
 }
@@ -220,7 +227,7 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
                 if let Ok(bound) = user_types::probe_preserving_error_message(|| s.bind(self.resolve, self.tables, &[]))
                     && let Some(collation) = bound.explicit_collation()?
                 {
-                    return Ok(Scalar::Call(format!("\0collate:{collation}"), vec![value]));
+                    return Ok(Scalar::Call(format!("\0collate:{collation}").into(), vec![value]));
                 }
                 return Ok(value);
             }
@@ -257,22 +264,26 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
                 })
             }
             Scalar::Call(n, args) if n == aggregate_filter::CALL => {
-                let (a, arg, filter) = aggregate_filter::parts(args, self.resolve, self.tables)?;
+                let (kind, argument, filter, catalog_qualified) = aggregate_filter::parts(args, self.resolve, self.tables)?;
                 let index = self.groups.len() + self.aggregates.len();
-                self.aggregates.push((a, arg, Some(filter)));
-                aggregate_slot(a, index)
+                self.aggregates.push(AggregateInput { kind, argument, filter: Some(filter), catalog_qualified });
+                aggregate_slot(kind, index)
             }
             Scalar::Call(n, args) if aggregate(n).is_some() => {
                 let kind = aggregate(n).ok_or(SqlError::UndefinedFunction)?;
                 if args.len() != 1 {
                     if kind.base() == Aggregate::ArrayAgg {
-                        return Err(array_aggregate::signature_error(args, self.resolve, self.tables));
+                        return Err(array_aggregate::signature_error(n, args, self.resolve, self.tables));
                     }
+                    let name = functions::diagnostic_call_name(kind.name(), n.catalog_qualified);
+                    functions::report_routine_signature(&name, args, self.resolve, self.tables, &[]);
                     return Err(SqlError::UndefinedFunction);
                 }
                 reject_nested_aggregate(&args[0])?;
                 let index = self.groups.len() + self.aggregates.len();
-                self.aggregates.push((kind, Some(args[0].clone()), None));
+                self.aggregates.push(AggregateInput {
+                    kind, argument: Some(args[0].clone()), filter: None, catalog_qualified: n.catalog_qualified,
+                });
                 aggregate_slot(kind, index)
             }
             Scalar::Unary(op, a) => Scalar::Unary(*op, Box::new(self.scalar(a)?)),
@@ -356,7 +367,7 @@ fn cast_output_name(s: &Scalar) -> Option<String> {
         Scalar::Call(name, _) => Some(
             aggregate_filter::kind(s)
                 .or_else(|| aggregate(name))
-                .map_or_else(|| name.clone(), |a| a.name().into()),
+                .map_or_else(|| name.to_string(), |a| a.name().into()),
         ),
         _ => None,
     }
@@ -365,7 +376,7 @@ pub(super) fn output_scalar(item: &Item) -> R<Scalar> {
     match item {
         Item::Scalar(s) => Ok(s.clone()),
         Item::Aggregate(a, arg) => Ok(Scalar::Call(
-            a.call_name(),
+            a.call_name().into(),
             vec![arg.clone().unwrap_or(Scalar::Literal(Value::Int(1)))],
         )),
         Item::Star | Item::QualifiedStar { .. } => Err(SqlError::GroupingError),
@@ -556,6 +567,7 @@ pub(super) fn bind<'a>(
             && user_types::probe_preserving_error_message(|| input.bind(resolve, tables, &parameters))
                 .is_ok_and(|input| input.ty == DataType::Oid)
         {
+            functions::report_routine_signature(kind.name(), std::slice::from_ref(input), resolve, tables, &parameters);
             return Err(SqlError::UndefinedFunction);
         }
         if let Item::Scalar(s) | Item::Aggregate(_, Some(s)) = item {
@@ -606,7 +618,9 @@ pub(super) fn bind<'a>(
         .map(|(i, _)| {
             if let Item::Aggregate(Aggregate::Count, None) = i {
                 let index = lower.groups.len() + lower.aggregates.len();
-                lower.aggregates.push((Aggregate::Count, None, None));
+                lower.aggregates.push(AggregateInput {
+                    kind: Aggregate::Count, argument: None, filter: None, catalog_qualified: false,
+                });
                 Ok(slot(index))
             } else {
                 lower.scalar(&output_scalar(i)?)
@@ -661,7 +675,7 @@ pub(super) fn bind<'a>(
         })
         .collect::<R<Vec<_>>>()?;
     let mut unresolved_count = vec![];
-    for (a, arg, _) in &lower.aggregates {
+    for AggregateInput { kind: a, argument: arg, .. } in &lower.aggregates {
         let Some(arg) = arg else {
             continue;
         };
@@ -684,7 +698,7 @@ pub(super) fn bind<'a>(
         };
         arg.infer(expected, &mut parameters, resolve, tables)?;
     }
-    for (_, _, filter) in &lower.aggregates {
+    for AggregateInput { filter, .. } in &lower.aggregates {
         if let Some(filter) = filter {
             filter.infer(&mut parameters, resolve, tables)?;
         }
@@ -725,10 +739,10 @@ pub(super) fn bind<'a>(
     let mut aggregate_filters = vec![];
     // V2 DISTINCT inputs spill (R2-PGLIMITS-4), so a direct column read is
     // row-local for them too.
-    let direct_inputs = lower.aggregates.iter().map(|(_, arg, _)|
+    let direct_inputs = lower.aggregates.iter().map(|AggregateInput { argument: arg, .. }|
         matches!(arg, Some(Scalar::Column(_))))
         .collect::<Vec<_>>();
-    for (a, arg, filter) in lower.aggregates {
+    for AggregateInput { kind: a, argument: arg, filter, catalog_qualified } in lower.aggregates {
         aggregate_filters.push(
             filter
                 .as_ref()
@@ -772,6 +786,11 @@ pub(super) fn bind<'a>(
         aggregate_order::check_types(&b)?;
         if a.distinct() { b.require_collation()?; }
         if matches!(a.base(), Aggregate::Min | Aggregate::Max) && let Some(n)=b.explicit_collation()? { functions::collation::ready(n)?; }
+        let undefined_signature = || {
+            let name = functions::diagnostic_call_name(a.name(), catalog_qualified);
+            functions::report_routine_signature(&name, std::slice::from_ref(&arg), resolve, tables, &parameters);
+            SqlError::UndefinedFunction
+        };
         let ty = match a.base() {
             Aggregate::Count => DataType::BigInt,
             Aggregate::Json | Aggregate::JsonObject => DataType::Text,
@@ -782,7 +801,7 @@ pub(super) fn bind<'a>(
                     DataType::Numeric
                 }
                 DataType::Real | DataType::DoublePrecision => DataType::DoublePrecision,
-                _ => return Err(SqlError::UndefinedFunction),
+                _ => return Err(undefined_signature()),
             },
             Aggregate::Sum => match b.ty {
                 DataType::SmallInt | DataType::Integer => DataType::BigInt,
@@ -793,7 +812,7 @@ pub(super) fn bind<'a>(
                     return Err(if legacy_column {
                         SqlError::Type
                     } else {
-                        SqlError::UndefinedFunction
+                        undefined_signature()
                     });
                 }
             },
@@ -802,7 +821,7 @@ pub(super) fn bind<'a>(
                     return Err(functions::text_search::aggregate_error(a.name(), &b.ty));
                 }
                 if !legacy_column && matches!(b.ty, DataType::Boolean | DataType::Bytes) {
-                    return Err(SqlError::UndefinedFunction);
+                    return Err(undefined_signature());
                 }
                 b.ty.clone()
             }

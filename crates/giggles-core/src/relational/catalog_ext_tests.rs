@@ -214,7 +214,7 @@ fn catalog_ext_all_metadata_roundtrips_and_drop_cleans_owned_entries() {
     removed.remove_sequence(seq).unwrap();
     assert!(removed.catalog_ext().is_empty());
     assert_eq!(codec().serialize(&removed).unwrap(), legacy(&removed));
-    assert!(state.drop_table("t").unwrap());
+    assert!(state.drop_table("t", &["public".into()]).unwrap());
     assert!(state.catalog_ext().is_empty());
     assert_eq!(codec().serialize(&state).unwrap(), legacy(&state));
 }
@@ -474,7 +474,7 @@ fn catalog_ext_incoming_foreign_key_drop_is_atomic() {
     state.validate().unwrap();
     let before = state.clone();
     assert!(matches!(
-        state.drop_table("t"),
+        state.drop_table("t", &["public".into()]),
         Err(SqlError::DependentObjects)
     ));
     assert_eq!(state.tables, before.tables);

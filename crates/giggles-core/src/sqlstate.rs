@@ -55,7 +55,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::Null) => "23502",
         CoreError::Sql(S::Type | S::Parameters) => "42804",
         CoreError::Sql(S::Limit | S::Unbounded) | CoreError::Limit => "54000",
-        CoreError::Sql(S::Version | S::Conflict) => "40001",
+        CoreError::Sql(S::Version | S::Conflict) | CoreError::SqlSerialization(_) => "40001",
         CoreError::Sql(S::StaleSchema) => "0A000",
         CoreError::Sql(S::Transaction) => "25000",
         CoreError::Sql(S::ActiveSqlTransaction) => "25001",

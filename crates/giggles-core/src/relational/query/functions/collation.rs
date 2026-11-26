@@ -18,7 +18,7 @@ pub(super) fn parse(p: &mut Parser, value: Scalar) -> R<Scalar> {
             name = last;
         }
     }
-    Ok(Scalar::Call(format!("{PREFIX}{name}"), vec![value]))
+    Ok(Scalar::Call(format!("{PREFIX}{name}").into(), vec![value]))
 }
 pub(in crate::relational::query) fn resolve_name(
     name: &mut String,
@@ -756,7 +756,7 @@ pub(in crate::relational::query) fn scalar(
     let d = metadata.collation_derivation()?;
     if let Some((a, b)) = d.conflict {
         let carrier =
-            |n: &str| Scalar::Call(format!("{IMPLICIT}{n}"), vec![Scalar::Cast(Box::new(Scalar::Literal(Value::Null)),metadata.ty.clone())]);
+            |n: &str| Scalar::Call(format!("{IMPLICIT}{n}").into(), vec![Scalar::Cast(Box::new(Scalar::Literal(Value::Null)),metadata.ty.clone())]);
         return Ok(Scalar::Call(
             "coalesce".into(),
             vec![value, carrier(a), carrier(b)],
@@ -764,7 +764,7 @@ pub(in crate::relational::query) fn scalar(
     }
     Ok(if let Some(n) = d.name {
         Scalar::Call(
-            format!("{}{n}", if d.explicit { PREFIX } else { IMPLICIT }),
+            format!("{}{n}", if d.explicit { PREFIX } else { IMPLICIT }).into(),
             vec![value],
         )
     } else {

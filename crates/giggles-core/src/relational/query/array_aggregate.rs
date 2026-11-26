@@ -45,6 +45,7 @@ pub(super) fn result_type(input: &BoundScalar, kind: Aggregate) -> R<DataType> {
 }
 
 pub(super) fn signature_error(
+    name: &functions::CallName,
     args: &[Scalar],
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     tables: &[&TableDef],
@@ -63,10 +64,10 @@ pub(super) fn signature_error(
         Ok(types) => types,
         Err(error) => return error,
     };
-    user_types::view_replace_error(format!(
-        "function array_agg({}) does not exist",
-        types.join(", ")
-    ));
+    user_types::sql_routine_signature(
+        || Some(functions::named_args::undefined_signature(&functions::diagnostic_call_name("array_agg", name.catalog_qualified), &types)),
+        functions::named_args::HINT,
+    );
     SqlError::UndefinedFunction
 }
 

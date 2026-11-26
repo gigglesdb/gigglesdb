@@ -457,13 +457,13 @@ impl Relational {
             return Ok(SqlResult::default());
         }
         if sink.streams_index_builds()
-            && let Some((names, mode)) = prepared.set_constraints()
+            && let Some((names, path, mode)) = prepared.set_constraints()
         {
-            let deferred = deferred.ok_or(CoreError::Sql(SqlError::NoActiveTransaction))?;
             if !params.is_empty() || expected.is_some() {
                 return Err(CoreError::Sql(SqlError::Parameters));
             }
-            return paged_pending(self, deferred, names, mode, sink);
+            let mut temporary = DeferralState::default();
+            return paged_pending(self, deferred.unwrap_or(&mut temporary), names, path, mode, sink);
         }
         if expected.is_none() && sink.streams_index_builds()
             && let Statement::Create { name, optional, as_query: Some(create), .. } = prepared.statement.get()
@@ -916,14 +916,11 @@ impl Relational {
         rebuild(&mut before, &sink.indexes())?;
         rebuild(self, &sink.indexes())?;
         let mut pending = deferred.as_deref().cloned().unwrap_or_default();
-        let mut result = if let Some((names, mode)) = prepared.set_constraints() {
-            if deferred.is_none() {
-                return Err(CoreError::Sql(SqlError::NoActiveTransaction));
-            }
+        let mut result = if let Some((names, path, mode)) = prepared.set_constraints() {
             if !params.is_empty() || expected.is_some() {
                 return Err(CoreError::Sql(SqlError::Parameters));
             }
-            self.set_constraints(&mut pending, names, mode, || {
+            self.set_constraints(&mut pending, names, path, mode, || {
                 crate::cancellation::check().is_err()
             })
             .map_err(CoreError::Sql)?;

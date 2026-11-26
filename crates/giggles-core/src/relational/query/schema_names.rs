@@ -38,6 +38,7 @@ pub(super) fn scalar(
     path: &[String],
 ) {
     if let Scalar::Call(name, args) = s {
+        let name = name.normalized_mut();
         functions::resolve_trigger_call(name, !args.is_empty(), state, path);
         functions::collation::resolve_name(name, state, path);
         functions::uuid_ossp::resolve_name(name, state, path);

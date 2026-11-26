@@ -317,6 +317,12 @@ impl Relational {
     }
 
     pub(crate) fn materialize_generated(&self, table: &TableDef, values: &mut [Value]) -> R<()> {
+        self.materialize_generated_written(table, values, &[])
+    }
+
+    pub(super) fn materialize_generated_written(
+        &self, table: &TableDef, values: &mut [Value], written: &[usize],
+    ) -> R<()> {
         if self.ext.generated_columns.is_empty() {
             return Ok(());
         }
@@ -343,11 +349,7 @@ impl Relational {
                     column.name != HIDDEN_ROWID && column.not_null && *value == Value::Null
                 };
                 if null {
-                    let detail = logical_types::failing_row_detail_with(table, values, |id| {
-                        self.generated_column(id).is_some_and(|generation| !generation.stored)
-                    });
-                    logical_types::not_null_violation(table, column, detail);
-                    user_types::sql_error_names(self, table, Some(&column.name), None);
+                    logical_types::not_null_row(self, table, column, values, written);
                     return Err(SqlError::Null);
                 }
             }

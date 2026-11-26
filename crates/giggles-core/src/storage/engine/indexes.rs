@@ -261,6 +261,7 @@ pub(crate) fn apply(
     deadline: Option<Instant>,
     cancel: &dyn Fn() -> bool,
     generated: &dyn Fn(u64) -> bool,
+    wire_diagnostics: bool,
 ) -> Result<(), CoreError> {
     let image;
     let predicates = if state.is_none() && old_ds.iter().chain(new_ds).any(|d| d.predicate.is_some()) {
@@ -307,7 +308,7 @@ pub(crate) fn apply(
     for (key, old, new) in &changes {
         let target = txn
             .lock_for_write(Keyspace::Index, key, deadline, cancel)
-            .map_err(crate::task::limits::lock_error)?;
+            .map_err(|error| crate::storage::v2_sql::sql_lock_error(error, wire_diagnostics))?;
         if target.current.is_some() && target.current.as_ref() != old.as_ref() {
             return Err(match (after_table, new.as_ref()) {
                 (Some(table), Some(pk)) => occupancy_duplicate(table, after, new_ds, key, pk, false, generated, state.is_some_and(relational::Relational::v2_unique_reporting)),
@@ -332,10 +333,12 @@ pub(crate) fn apply(
     Ok(())
 }
 /// Lock proposed UNIQUE owners without publishing, preserving FK error precedence.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn check_occupancy(
     txn: &mut Transaction, state: &relational::Relational, table: &TableDef, before: &BTreeMap<Vec<u8>, SqlRow>,
     after: &BTreeMap<Vec<u8>, SqlRow>, ds: &[Descriptor],
     generated: &dyn Fn(u64) -> bool,
+    wire_diagnostics: bool,
 ) -> Result<(), CoreError> {
     let old = entries(Some(state), table, before, ds)?;
     for (key, pk) in entries_for(Predicates::Bind(Some(state)), table, after.values(), ds, false, generated)? {
@@ -343,7 +346,7 @@ pub(crate) fn check_occupancy(
         let target = txn
             .lock_for_write(Keyspace::Index, &key, crate::task::limits::lock_deadline(),
                 &|| crate::cancellation::check().is_err())
-            .map_err(crate::task::limits::lock_error)?;
+            .map_err(|error| crate::storage::v2_sql::sql_lock_error(error, wire_diagnostics))?;
         if target.current.is_some() && target.current.as_ref() != old.get(&key) {
             return Err(occupancy_duplicate(table, after, ds, &key, &pk, false, generated, state.v2_unique_reporting()));
         }
@@ -389,6 +392,7 @@ pub(crate) fn maintain(
         deadline,
         cancel,
         &|_| false,
+        false,
     )
 }
 
@@ -593,7 +597,7 @@ mod tests {
         let publish = |txn: &mut Transaction, before, after| {
             apply(
                 txn, Some(&state), &table, Some(&table), before, after,
-                descriptors, descriptors, None, &|| false, &|_| false,
+                descriptors, descriptors, None, &|| false, &|_| false, false,
             )
         };
         let empty = BTreeMap::new();

@@ -150,7 +150,7 @@ impl RowSource for Source<'_> {
                 relational::row_lock_wait_error(table, wait == scan::RowWait::NoWait);
                 return Err(self.error(CoreError::LockNotAvailable));
             }
-            Err(error) => return Err(self.error(crate::task::limits::lock_error(error))),
+            Err(error) => return Err(self.error(super::v2_sql::sql_lock_error(error, rows.wire_diagnostics))),
         };
         let Some(bytes) = target.current else { return Ok(None); };
         let mut physical = table.id.to_be_bytes().to_vec(); physical.extend_from_slice(&key);

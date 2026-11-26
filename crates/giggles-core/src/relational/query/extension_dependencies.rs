@@ -30,7 +30,7 @@ fn call(s: &Scalar, state: &Relational, path: &[String], found: &mut Option<Stri
     if found.is_none()
         && let Scalar::Call(n, _) = s
     {
-        let mut n = n.clone();
+        let mut n = n.to_string();
         functions::uuid_ossp::resolve_name(&mut n, state, path);
         if functions::uuid_ossp::known(&n) {
             *found = Some(n);

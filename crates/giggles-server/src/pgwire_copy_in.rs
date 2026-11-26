@@ -22,8 +22,8 @@ pub(super) struct CopyIn {
     pub(super) simple: bool,
     failed: bool,
     pub(super) simple_implicit: bool,
-    pub(super) remaining: Vec<String>,
-    pub(super) prepare_source: Option<String>,
+    pub(super) remaining: Vec<super::simple::SimpleStatement>,
+    pub(super) batch_source: Option<String>,
 }
 enum CopyInputError {
     Input(&'static str),
@@ -351,7 +351,7 @@ impl State {
             failed: false,
             simple_implicit,
             remaining: vec![],
-            prepare_source: None,
+            batch_source: None,
             descriptor,
         });
         if self.copy.as_ref().unwrap().descriptor.target_is_view {
@@ -559,7 +559,7 @@ impl State {
             } else {
                 self.continue_simple_batch(
                     copy.remaining.into_iter(),
-                    copy.prepare_source.as_deref(),
+                    copy.batch_source.as_deref(),
                     session,
                     out,
                     received,

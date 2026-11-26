@@ -70,10 +70,8 @@ pub(super) fn route(
     }
     let prepared = description.prepared();
     let target = target(prepared).ok_or(SqlError::Unbounded)?;
-    let table = state
-        .tables
-        .get(prepared.table().ok_or(SqlError::UnknownTable)?)
-        .ok_or(SqlError::UnknownTable)?;
+    let name = prepared.table().ok_or(SqlError::UnknownTable)?;
+    let table = state.tables.get(name).ok_or_else(|| missing_relation(name))?;
     if expected.is_some() {
         let predicates = match prepared.statement.get() {
             Statement::Update { predicates, .. }
@@ -137,8 +135,8 @@ pub(super) fn route(
             for (index, value) in assignments.evaluate(table, old, params, cancel)? {
                 row.values[index] = value;
             }
-            state.materialize_generated(table, &mut row.values)?;
-            row_check(table, &row.values)?;
+            state.materialize_generated_written(table, &mut row.values, &written)?;
+            row_check_written(state, table, &row.values, &written)?;
             state.check_written_candidate(table, &row.values, &written)?;
             let new_key = pk(table, &row.values)?;
             // Immediate uniqueness is checked in logical evaluation order. A later
@@ -249,10 +247,8 @@ pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description
     #[cfg(test)]
     DESCRIBE_CALLS.set(DESCRIBE_CALLS.get() + 1);
 
-    let table = state
-        .tables
-        .get(prepared.table().ok_or(SqlError::UnknownTable)?)
-        .ok_or(SqlError::UnknownTable)?;
+    let name = prepared.table().ok_or(SqlError::UnknownTable)?;
+    let table = state.tables.get(name).ok_or_else(|| missing_relation(name))?;
     let mut parameters = vec![None; prepared.params];
     if prepared.parameter_types.len() > parameters.len() {
         return Err(SqlError::Parameters);
@@ -267,7 +263,7 @@ pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description
             for (name, value) in sets {
                 infer(
                     value,
-                    &table.columns[col(table, name)?],
+                    &table.columns[target_col(table, name)?],
                     &mut parameters,
                 )?;
             }

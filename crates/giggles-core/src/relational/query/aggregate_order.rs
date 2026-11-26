@@ -55,7 +55,7 @@ fn parse_order(p: &mut Parser, mut args: Vec<Scalar>, depth: usize) -> R<Scalar>
             break;
         }
     }
-    Ok(Scalar::Call(name, args))
+    Ok(Scalar::Call(name.into(), args))
 }
 pub(super) fn parts(input: &BoundScalar) -> Option<(&str, &[BoundScalar])> {
     input.aggregate_order_parts()

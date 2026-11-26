@@ -277,6 +277,7 @@ pub(crate) fn transient(error: &CoreError) -> bool {
     matches!(
         error,
         CoreError::Sql(relational::SqlError::Conflict)
+            | CoreError::SqlSerialization(_)
             | CoreError::Deadlock
             | CoreError::Storage(_)
             | CoreError::Busy
@@ -1942,7 +1943,7 @@ impl Session {
             }
         };
         self.admit_backstop(class).map_err(|error| sqlstate(&error))?;
-        let Role::Database { .. } = &self.role else {
+        let Role::Database { name: schema_user } = &self.role else {
             return Err("42501");
         };
         self.check_binding().map_err(|error| sqlstate(&error))?;
@@ -2017,6 +2018,7 @@ impl Session {
         }
         let mut execute = || crate::auth::statements::execute(
             &bound, &self.service.admin, &actor, &mut self.role_notices,
+            self.sql.search_path_input().map_or("public", |path| path.as_ref()), schema_user,
         );
         let result = if let Some(before) = target {
             self.service.update_password_generations(&mut aliases, |aliases| {
@@ -5422,6 +5424,11 @@ mod lifecycle_tests {
         let code = |error: RoleError| sqlstate(&role_lookup_error(error));
         let conflict = CoreError::Sql(relational::SqlError::Conflict);
         assert_eq!(code(RoleError::Core(conflict)), "40001");
+        for reason in [giggles_core::SqlSerialization::ConcurrentUpdate, giggles_core::SqlSerialization::CommitPivot] {
+            let error = CoreError::SqlSerialization(reason);
+            assert!(transient(&error));
+            assert_eq!(code(RoleError::Core(error)), "40001");
+        }
         assert_eq!(code(RoleError::Core(CoreError::Deadlock)), "40P01");
         assert_eq!(code(RoleError::Core(CoreError::Storage("range".into()))), "08007");
         assert_eq!(code(RoleError::Core(CoreError::Fenced)), "28000");

@@ -448,7 +448,7 @@ impl Insert {
         clock: Option<&clock::ExecutionClock>,
         insert_defaults: Option<&mut defaults::InsertDefaults>,
     ) -> R<Option<Vec<Vec<Value>>>> {
-        let table = state.tables.get(&self.table).ok_or(SqlError::UnknownTable)?;
+        let table = state.tables.get(&self.table).ok_or_else(|| missing_relation(&self.table))?;
         if self.rows.len() > 200 || self.source.is_some() || !self.can_witness(state) {
             return Ok(None);
         }
@@ -661,7 +661,7 @@ impl Insert {
         declared: &[Option<DataType>],
     ) -> R<(Self, Vec<Option<DataType>>)> {
         let plan = self.streaming_plan().ok_or(SqlError::Unsupported)?;
-        let table = state.tables.get(&self.table).ok_or(SqlError::UnknownTable)?;
+        let table = state.tables.get(&self.table).ok_or_else(|| missing_relation(&self.table))?;
         let indexes = source_indexes(self, state, table, declared)?;
         let targets = indexes.iter().map(|i| &table.columns[*i]).collect::<Vec<_>>();
         let mut parameters = self.describe(state, params.len(), declared)?
@@ -806,7 +806,7 @@ impl Insert {
         let table = state
             .tables
             .get(&self.table)
-            .ok_or(SqlError::UnknownTable)?;
+            .ok_or_else(|| missing_relation(&self.table))?;
         let indexes = source_indexes(self, state, table, declared)?;
         let mut dependencies = vec![];
         // Each column's stored default text is built once per call. The syntax
@@ -870,7 +870,7 @@ impl Insert {
         let table = state
             .tables
             .get(&self.table)
-            .ok_or(SqlError::UnknownTable)?;
+            .ok_or_else(|| missing_relation(&self.table))?;
         let indexes = source_indexes(self, state, table, declared)?;
         let mut parameters = vec![None; count];
         if declared.len() > count {
@@ -997,7 +997,7 @@ fn materialize_source(
     let table = state
         .tables
         .get(&insert.table)
-        .ok_or(SqlError::UnknownTable)?;
+        .ok_or_else(|| missing_relation(&insert.table))?;
     let indexes = source_indexes(insert, state, table, declared)?;
     let targets = indexes
         .iter()
@@ -1137,22 +1137,22 @@ fn normalize_row(
             };
         }
     }
-    finish_row(state, table, insert, &supplied, row)
+    finish_row(state, table, insert, indexes, row)
 }
 
 // COPY already has an owned row with defaults resolved in input order. Share
 // INSERT's coercion and checks without rebuilding defaults and literal cells.
 fn finish_row(
     state: &Relational, table: &TableDef, insert: &Insert,
-    supplied: &[usize], mut row: Vec<Value>,
+    written: &[usize], mut row: Vec<Value>,
 ) -> R<Vec<Value>> {
     let hidden_rowid = table.hidden_rowid();
     for (index, (value, column)) in row.iter_mut().zip(&table.columns).enumerate() {
-        if !insert.copy_precoerced || !supplied.contains(&index) {
+        if !insert.copy_precoerced || !written.contains(&index) {
             *value = coerce_to_column(state, column, value.clone())?;
         }
     }
-    state.materialize_generated(table, &mut row)?;
+    state.materialize_generated_written(table, &mut row, written)?;
     Relational::secondary_admit_values(row.iter())?;
     if let Some(hidden) = hidden_rowid {
         // The NULL placeholder has the same fixed byte budget as its future Int.
@@ -1161,8 +1161,8 @@ fn finish_row(
         for (index, (value, column)) in row.iter().zip(&table.columns).enumerate() {
             if index != hidden {
                 check(value, column).inspect_err(|error| {
-                    if *error == SqlError::Null && column.data_type == DataType::UuidArray {
-                        logical_types::not_null_violation(table, column, logical_types::failing_row_detail(table, &row));
+                    if *error == SqlError::Null {
+                        logical_types::not_null_row(state, table, column, &row, written);
                     }
                 })?;
             }
@@ -1174,7 +1174,7 @@ fn finish_row(
             return Err(SqlError::Limit);
         }
     } else {
-        row_check(table, &row)?;
+        row_check_written(state, table, &row, written)?;
     }
     if insert.copy_input.is_some() {
         state.check_insert_candidate(table, &row)?;
@@ -1189,7 +1189,7 @@ pub(super) fn normalize_copy(
     if prepared.epoch != state.epoch { return Err(SqlError::StaleSchema); }
     if input.rows.len() > MAX_ROWS { return Err(SqlError::Limit); }
     let Statement::InsertMulti(template) = prepared.statement.get() else { return Err(SqlError::Unsupported); };
-    let table = state.tables.get(&template.table).ok_or(SqlError::UnknownTable)?;
+    let table = state.tables.get(&template.table).ok_or_else(|| missing_relation(&template.table))?;
     let target_indexes = indexes(template, table)?;
     let logical = table.logical_offsets();
     let mut insert = Insert::copy(template.table.clone(),
@@ -1683,7 +1683,7 @@ pub(super) fn execute_declared(
     let table = state
         .tables
         .get(&insert.table)
-        .ok_or(SqlError::UnknownTable)?;
+        .ok_or_else(|| missing_relation(&insert.table))?;
     let indexes = indexes(insert, table)?;
     #[cfg(test)]
     Relational::sql_insert_test_event(0);

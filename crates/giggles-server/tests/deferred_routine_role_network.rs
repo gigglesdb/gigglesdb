@@ -156,10 +156,20 @@ fn field(body: &[u8], key: u8) -> Option<&str> {
         .map(|part| std::str::from_utf8(&part[1..]).unwrap())
 }
 
-fn assert_error(code: &str, message: &str, detail: Option<&str>, sql: &str, expected: &str) {
-    // Neither generic diagnostics nor optional detail may echo SQL, routine names,
-    // schema/table identifiers, or literal expressions from the submitted query.
-    for text in [Some(message), detail].into_iter().flatten() {
+fn assert_error(
+    code: &str, message: &str, detail: Option<&str>, hint: Option<&str>,
+    sql: &str, expected: &str, signature: Option<&str>,
+) {
+    assert_eq!(code, expected, "{sql}: {message}");
+    if let Some(signature) = signature {
+        assert_eq!(message, format!("function {signature} does not exist"), "{sql}");
+        assert_eq!(hint, Some(
+            "No function matches the given name and argument types. You might need to add explicit type casts."
+        ), "{sql}");
+    }
+    // Only the exact PostgreSQL routine signature may include submitted identifiers.
+    // All other fields still exclude SQL text, names and literal expressions.
+    for text in [signature.is_none().then_some(message), detail, hint].into_iter().flatten() {
         let text = text.to_ascii_lowercase();
         for secret in [
             sql.to_ascii_lowercase(),
@@ -187,7 +197,6 @@ fn assert_error(code: &str, message: &str, detail: Option<&str>, sql: &str, expe
             );
         }
     }
-    assert_eq!(code, expected, "{sql}: {message}");
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -198,7 +207,10 @@ enum Protocol {
     Statement,
 }
 
-async fn observe(fixture: &Fixture, user: &str, sql: &str, expected: &str, protocol: Protocol) {
+async fn observe(
+    fixture: &Fixture, user: &str, sql: &str, expected: &str,
+    signature: Option<&str>, protocol: Protocol,
+) {
     if matches!(protocol, Protocol::Simple | Protocol::Prepare) {
         let client = fixture.client(user).await;
         let error = match protocol {
@@ -211,8 +223,10 @@ async fn observe(fixture: &Fixture, user: &str, sql: &str, expected: &str, proto
             error.code().code(),
             error.message(),
             error.detail(),
+            error.hint(),
             sql,
             expected,
+            signature,
         );
         println!(
             "F9 user={user} protocol={protocol:?} code={} stage={}",
@@ -257,8 +271,10 @@ async fn observe(fixture: &Fixture, user: &str, sql: &str, expected: &str, proto
                     field(&body, b'C').expect("SQLSTATE"),
                     field(&body, b'M').expect("message"),
                     field(&body, b'D'),
+                    field(&body, b'H'),
                     sql,
                     expected,
+                    signature,
                 );
                 println!("F9 user={user} protocol={protocol:?} code={expected} stage={stage}");
                 // The baseline and F9 both reject at Parse; do not claim a Bind failure.
@@ -277,7 +293,7 @@ async fn observe(fixture: &Fixture, user: &str, sql: &str, expected: &str, proto
     }
 }
 
-async fn matrix(user: &str, cases: &[(&str, &str)]) {
+async fn matrix(user: &str, cases: &[(&str, &str, Option<&str>)]) {
     let fixture = Fixture::new().await;
     for protocol in [
         Protocol::Simple,
@@ -285,8 +301,8 @@ async fn matrix(user: &str, cases: &[(&str, &str)]) {
         Protocol::Portal,
         Protocol::Statement,
     ] {
-        for &(sql, expected) in cases {
-            observe(&fixture, user, sql, expected, protocol).await;
+        for &(sql, expected, signature) in cases {
+            observe(&fixture, user, sql, expected, signature, protocol).await;
         }
     }
     fixture.stop().await;
@@ -297,23 +313,23 @@ async fn deferred_routines_nonsuperuser_four_protocols() {
     matrix(
         "probe",
         &[
-            ("SELECT nosuchfn()", "42883"),
-            ("SELECT \"LOWER\"('a')", "42883"),
-            ("SELECT pg_catalog.nosuchfn()", "42883"),
-            ("SELECT public.coalesce(1,2)", "42883"),
-            ("SELECT nosuchagg(1)", "42883"),
-            ("SELECT avg(nosuchfn(1))", "42883"),
-            ("SELECT count(DISTINCT nosuchfn(1))", "42883"),
-            ("SELECT count(*),nosuchfn()", "42883"),
-            ("SELECT 1 WHERE nosuchfn(1)=1", "42883"),
-            ("SELECT nosuchschema.lower('a')", "3F000"),
-            ("SELECT nosuchschema.lower(1/0)", "3F000"),
-            ("SELECT information_schema._pg_expandarray(1)", "0A000"),
-            ("SELECT pg_toast.lower('a')", "42501"),
+            ("SELECT nosuchfn()", "42883", Some("nosuchfn()")),
+            ("SELECT \"LOWER\"('a')", "42883", Some("LOWER(unknown)")),
+            ("SELECT pg_catalog.nosuchfn()", "42883", Some("pg_catalog.nosuchfn()")),
+            ("SELECT public.coalesce(1,2)", "42883", Some("public.coalesce(integer, integer)")),
+            ("SELECT nosuchagg(1)", "42883", Some("nosuchagg(integer)")),
+            ("SELECT avg(nosuchfn(1))", "42883", Some("nosuchfn(integer)")),
+            ("SELECT count(DISTINCT nosuchfn(1))", "42883", Some("nosuchfn(integer)")),
+            ("SELECT count(*),nosuchfn()", "42883", Some("nosuchfn()")),
+            ("SELECT 1 WHERE nosuchfn(1)=1", "42883", Some("nosuchfn(integer)")),
+            ("SELECT nosuchschema.lower('a')", "3F000", None),
+            ("SELECT nosuchschema.lower(1/0)", "3F000", None),
+            ("SELECT information_schema._pg_expandarray(1)", "0A000", None),
+            ("SELECT pg_toast.lower('a')", "42501", None),
             // Deliberate fail-closed policy: PG 18 returns 42703 for the unresolved x.
-            ("SELECT nosuchfn(x)", "42501"),
-            ("SELECT nosuchfn(x) FROM denied_table", "42501"),
-            ("SELECT nextval('denied_table_id_seq'),nosuchfn()", "42501"),
+            ("SELECT nosuchfn(x)", "42501", None),
+            ("SELECT nosuchfn(x) FROM denied_table", "42501", None),
+            ("SELECT nextval('denied_table_id_seq'),nosuchfn()", "42501", None),
         ],
     )
     .await;
@@ -324,9 +340,9 @@ async fn deferred_routines_superuser_four_protocols() {
     matrix(
         "owner",
         &[
-            ("SELECT nosuchfn()", "42883"),
-            ("SELECT nosuchschema.lower('a')", "3F000"),
-            ("SELECT pg_toast.lower('a')", "42883"),
+            ("SELECT nosuchfn()", "42883", Some("nosuchfn()")),
+            ("SELECT nosuchschema.lower('a')", "3F000", None),
+            ("SELECT pg_toast.lower('a')", "42883", Some("pg_toast.lower(unknown)")),
         ],
     )
     .await;

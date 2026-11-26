@@ -86,6 +86,7 @@ pub fn failure(e: CoreError) -> Reply {
         CoreError::Task(_) => 20,
         CoreError::TempFile { .. } => 21,
         CoreError::RoutineDdl(_) => 275,
+        CoreError::SqlSerialization(_) => 212, // Same native code as SqlError::Conflict.
         CoreError::Sql(e) => {
             200 + match e {
                 relational::SqlError::Unsupported

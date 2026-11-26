@@ -409,7 +409,7 @@ fn signature(
         (Some(a), Some(b)) => (a, b),
     };
     if !number(&a) || !number(&b) {
-        return Err(SqlError::UndefinedFunction);
+        return Err(undefined_operator(op, [Some(&a), Some(&b)]));
     }
     let result = if matches!(a, Real | DoublePrecision) || matches!(b, Real | DoublePrecision) {
         if op == BinaryOp::Mod {
@@ -672,11 +672,16 @@ pub(super) fn bind(
         _ => unreachable!(),
     }
 }
+fn integer_overflow(ty: &DataType) -> SqlError {
+    user_types::view_replace_error(format!("{} out of range", type_display(ty)));
+    SqlError::Overflow
+}
+
 fn checked_integer(value: i64, ty: &DataType) -> R<Value> {
     if (*ty == DataType::SmallInt && i16::try_from(value).is_err())
         || (*ty == DataType::Integer && i32::try_from(value).is_err())
     {
-        return Err(SqlError::Overflow);
+        return Err(integer_overflow(ty));
     }
     Ok(Value::Int(value))
 }
@@ -767,7 +772,7 @@ pub(super) fn eval(
                 .checked_neg()
                 .map(Value::Interval)
                 .map_err(temporal::function_error),
-            Value::Int(a) => checked_integer(a.checked_neg().ok_or(SqlError::Overflow)?, ty),
+            Value::Int(a) => checked_integer(a.checked_neg().ok_or_else(|| integer_overflow(ty))?, ty),
             Value::Numeric(a) => Numeric::parse("0")
                 .map_err(pg_error)?
                 .checked_sub(a)
@@ -815,6 +820,7 @@ pub(super) fn eval(
         (Value::Int(a), Value::Int(b)) => {
             reserve(budget, 8)?;
             if matches!(op, "/" | "%") && *b == 0 {
+                user_types::view_replace_error("division by zero".into());
                 return Err(SqlError::DivisionByZero);
             }
             let out = match op {
@@ -839,7 +845,7 @@ pub(super) fn eval(
                 "%" => a.checked_rem(*b),
                 _ => None,
             }
-            .ok_or(SqlError::Overflow)?;
+            .ok_or_else(|| integer_overflow(ty))?;
             checked_integer(out, ty)
         }
         (Value::Numeric(a), Value::Numeric(b)) => {
@@ -859,6 +865,7 @@ pub(super) fn eval(
             reserve(budget, 4)?;
             let (a, b) = (a.value(), b.value());
             if op == "/" && b == 0.0 && !a.is_nan() {
+                user_types::view_replace_error("division by zero".into());
                 return Err(SqlError::DivisionByZero);
             }
             let out = match op {
@@ -875,6 +882,7 @@ pub(super) fn eval(
             reserve(budget, 8)?;
             let (a, b) = (a.value(), b.value());
             if op == "/" && b == 0.0 && !a.is_nan() {
+                user_types::view_replace_error("division by zero".into());
                 return Err(SqlError::DivisionByZero);
             }
             let out = match op {

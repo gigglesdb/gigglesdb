@@ -330,7 +330,7 @@ fn corrupt(message: &str) -> TaskError {
 /// passes through unchanged.
 pub(crate) fn engine(error: CoreError) -> TaskError {
     match error {
-        CoreError::Sql(SqlError::Conflict) | CoreError::Deadlock => TaskError::Retry,
+        CoreError::Sql(SqlError::Conflict) | CoreError::SqlSerialization(_) | CoreError::Deadlock => TaskError::Retry,
         other => other.into(),
     }
 }
@@ -558,9 +558,19 @@ fn retryable(error: &TaskError) -> bool {
         TaskError::Retry | TaskError::Sql(SqlError::Conflict) => true,
         TaskError::Core(core) => matches!(
             **core,
-            CoreError::Deadlock | CoreError::Sql(SqlError::Conflict)
+            CoreError::Deadlock | CoreError::Sql(SqlError::Conflict) | CoreError::SqlSerialization(_)
         ),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn sql_serialization_errors_retry_task_commit() {
+    for reason in [crate::SqlSerialization::ConcurrentUpdate, crate::SqlSerialization::CommitPivot] {
+        let error = CoreError::SqlSerialization(reason);
+        assert!(matches!(engine(error.clone()), TaskError::Retry));
+        assert!(retryable(&TaskError::Core(Box::new(error))));
     }
 }
 

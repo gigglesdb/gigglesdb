@@ -142,7 +142,7 @@ fn terminal_aborted_session_discards_sequences_features_and_prior_writes() {
         },
         predecessor: None,
     });
-    session.deferral.pending.entry((u64::MAX, u64::MAX)).or_default().insert(vec![1]);
+    session.deferral.pending.entry((u64::MAX, u64::MAX)).or_default().insert(vec![1], Default::default());
     session.deferral.modes.insert(u64::MAX, true);
     let txn = session.v2_transaction.as_mut().unwrap();
     assert_eq!(before_meta.features & 16, 0);

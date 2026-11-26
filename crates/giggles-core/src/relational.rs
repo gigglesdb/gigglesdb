@@ -47,8 +47,7 @@ mod user_types;
 
 /// Discard diagnostics from a statement whose sequence reservations failed.
 pub(crate) fn discard_sql_diagnostics() {
-    user_types::clear_sql_error_message();
-    take_sql_warnings();
+    user_types::clear_sql_diagnostics();
 }
 
 pub(crate) fn conflict_duplicate_target() -> SqlError {
@@ -62,7 +61,7 @@ pub(crate) fn conflict_duplicate_target() -> SqlError {
 pub use extensions::{InstalledExtension, BuiltinExtension, ExtensionFunction, BUILTINS as BUILTIN_EXTENSIONS};
 pub use user_types::{take_sql_diagnostic_hint, take_sql_error_hint, take_sql_error_message_with_context};
 pub use user_types::{
-    DuplicateKeyDetail, SqlErrorDetail, SqlErrorNames, TypeDef, UserTypeCatalog, take_sql_diagnostic_detail, take_sql_error_names,
+    clear_sql_diagnostics, clear_sql_error_fields, missing_relation_position, routine_signature_from_source, DuplicateKeyDetail, SqlErrorDetail, SqlErrorNames, TypeDef, UserTypeCatalog, take_sql_diagnostic_detail, take_sql_error_names,
     retain_sql_duplicate_key_detail, take_sql_error_detail, take_sql_error_message, take_sql_error_position, take_sql_notices, type_oid,
 };
 pub(crate) mod defaults;
@@ -981,7 +980,11 @@ fn coerce_base_to_column(rel: &Relational, column: &ColumnDef, value: Value) -> 
     match value {
         Value::Text(text) => Ok(Value::Text(
             coerce_assignment(&text, typmod)
-                .map_err(|_| SqlError::StringDataRightTruncation)?
+                .map_err(|_| {
+                    let ty = if kind == CharKind::Varchar { "character varying" } else { "character" };
+                    user_types::view_replace_error(format!("value too long for type {ty}({})", typmod.length()));
+                    SqlError::StringDataRightTruncation
+                })?
                 .into_owned(),
         )),
         value => Ok(value),
@@ -1005,6 +1008,21 @@ pub(crate) fn row_check(t: &TableDef, values: &[Value]) -> R<()> {
     }
     Ok(())
 }
+fn row_check_with_diagnostics(state: &Relational, table: &TableDef, values: &[Value]) -> R<()> {
+    row_check_written(state, table, values, &[])
+}
+
+fn row_check_written(state: &Relational, table: &TableDef, values: &[Value], written: &[usize]) -> R<()> {
+    row_check(table, values).inspect_err(|error| {
+        if *error == SqlError::Null
+            && let Some((column, _)) = table.columns.iter().zip(values)
+                .find(|(column, value)| column.not_null && **value == Value::Null)
+        {
+            logical_types::not_null_row(state, table, column, values, written);
+        }
+    })
+}
+
 /// Canonical memcomparable encoding v1: binary collation; NULL sorts first.
 pub fn encode_key(values: &[Value]) -> R<Vec<u8>> {
     encode_key_iter(values.iter())
@@ -1138,14 +1156,21 @@ fn lex_with_spans(
     s: &str,
     out: &mut Vec<Token>,
     routing: bool,
-    mut spans: Option<&mut Vec<std::ops::Range<usize>>>,
+    spans: Option<&mut Vec<std::ops::Range<usize>>>,
+) -> R<()> {
+    lex_until(s, out, routing, spans, usize::MAX)
+}
+
+fn lex_until(
+    s: &str, out: &mut Vec<Token>, routing: bool,
+    mut spans: Option<&mut Vec<std::ops::Range<usize>>>, max_tokens: usize,
 ) -> R<()> {
     if s.len() > MAX_STATEMENT_SQL {
         return Err(SqlError::Limit);
     }
     let b = s.as_bytes();
     let mut i = 0;
-    while i < b.len() {
+    while i < b.len() && out.len() < max_tokens {
         if b[i].is_ascii_whitespace() {
             i += 1;
             continue;
@@ -1472,7 +1497,7 @@ mod task_refs;
 mod truncate;
 #[doc(hidden)]
 pub use schema_binding::relation_key;
-pub(crate) use schema_binding::split_key;
+pub(crate) use schema_binding::{missing_relation, split_key};
 pub use schemas::{SchemaMetadata, schema_search_path};
 
 struct Parser {
@@ -1767,9 +1792,14 @@ impl Parser {
             }
             let mut names = vec![];
             if !self.word("all") {
-                names.push(self.name()?);
-                while self.sym(',') {
-                    names.push(self.name()?);
+                loop {
+                    let first = self.raw_name()?;
+                    names.push(if self.sym('.') {
+                        format!("{first}\0{}", self.raw_name()?)
+                    } else {
+                        first
+                    });
+                    if !self.sym(',') { break; }
                 }
             }
             let deferred = if self.word("deferred") {
@@ -2135,8 +2165,8 @@ impl Relational {
             *value = coerce_to_column(self, column, value.clone())?;
         }
         Relational::secondary_admit_values(row.iter())?;
-        self.materialize_generated(table, &mut row)?;
-        row_check(table, &row)?;
+        self.materialize_generated_written(table, &mut row, supplied)?;
+        row_check_written(self, table, &row, supplied)?;
         Ok(row)
     }
 }
@@ -3149,7 +3179,7 @@ impl Prepared {
             if self.is_ddl() {
                 return Err(SqlError::Unsupported);
             }
-            let t = state.tables.get(name).ok_or(SqlError::UnknownTable)?;
+            let t = state.tables.get(name).ok_or_else(|| missing_relation(name))?;
             let mut bind = |e: &Expr, ty: &DataType| -> R<()> {
                 if let Expr::Param(n) = e {
                     let slot = params.get_mut(n - 1).ok_or(SqlError::Parameters)?;
@@ -3196,7 +3226,7 @@ impl Prepared {
                             .collect::<R<Vec<_>>>()?
                     };
                     for p in predicates {
-                        bind(&p.value, &t.columns[col(t, &p.column)?].data_type)?;
+                        bind(&p.value, &t.columns[predicate_col(t, &p.column)?].data_type)?;
                     }
                     if let Some(e) = limit {
                         bind(e, &DataType::BigInt)?;
@@ -3219,7 +3249,7 @@ impl Prepared {
                     for p in predicates {
                         infer_mutation_parameter(
                             &p.value,
-                            &t.columns[col(t, &p.column)?].data_type,
+                            &t.columns[predicate_col(t, &p.column)?].data_type,
                             &mut params,
                             &self.parameter_types,
                             false,
@@ -3230,7 +3260,7 @@ impl Prepared {
                     for p in predicates {
                         infer_mutation_parameter(
                             &p.value,
-                            &t.columns[col(t, &p.column)?].data_type,
+                            &t.columns[predicate_col(t, &p.column)?].data_type,
                             &mut params,
                             &self.parameter_types,
                             false,
@@ -3816,7 +3846,7 @@ impl Prepared {
         };
         match self.statement.get() {
             Statement::Insert { name, columns, values, .. } => {
-                let table = state.tables.get(name).ok_or(SqlError::UnknownTable)?;
+                let table = state.tables.get(name).ok_or_else(|| missing_relation(name))?;
                 let supplied = insert_value_indexes(table, columns, values.len())?;
                 for index in table.logical_offsets() {
                     if !supplied.contains(&index) {
@@ -3828,7 +3858,7 @@ impl Prepared {
                 let table = state
                     .tables
                     .get(&values.name)
-                    .ok_or(SqlError::UnknownTable)?;
+                    .ok_or_else(|| missing_relation(&values.name))?;
                 let supplied = values.supplied_indexes(table)?;
                 for index in table.logical_offsets() {
                     if !supplied.contains(&index) {
@@ -3837,10 +3867,10 @@ impl Prepared {
                 }
             }
             Statement::UpdateExpressions { name, sets, .. } => {
-                let table = state.tables.get(name).ok_or(SqlError::UnknownTable)?;
+                let table = state.tables.get(name).ok_or_else(|| missing_relation(name))?;
                 for (name, value) in sets {
                     if matches!(value, assign::Value::Default) {
-                        add(&table.columns[col(table, name)?])?;
+                        add(&table.columns[target_col(table, name)?])?;
                     }
                 }
             }
@@ -3988,6 +4018,19 @@ impl Prepared {
         }
     }
     /// Reserved engine names must retain authority checks before classification.
+    pub fn is_set_constraints_sql(sql: &str) -> bool {
+        let sql = sql.trim_start();
+        if !sql.starts_with("--") && !sql.starts_with("/*") && !sql.get(..3).is_some_and(|head| head.eq_ignore_ascii_case("SET")) {
+            return false;
+        }
+        let mut tokens = Vec::new();
+        // The head is enough for an authority check, including when later
+        // tokens make the statement invalid.
+        let _ = lex_until(sql, &mut tokens, true, None, 2);
+        matches!(tokens.as_slice(), [Token::Word(set), Token::Word(constraints)]
+            if set == "set" && constraints == "constraints")
+    }
+
     pub fn reserved_relation_name(name: &str) -> bool {
         matches!(schema_binding::validate_key(name.trim_start_matches('\0')), Err(SqlError::Reserved))
     }
@@ -4217,9 +4260,9 @@ impl Prepared {
         })
     }
     /// Transaction-local name, normalized using PostgreSQL identifier rules.
-    pub(crate) fn set_constraints(&self) -> Option<(&[String], bool)> {
+    pub(crate) fn set_constraints(&self) -> Option<(&[String], &[String], bool)> {
         match self.statement.get() {
-            Statement::SetConstraints(names, deferred) => Some((names, *deferred)),
+            Statement::SetConstraints(names, deferred) => Some((names, &self.search_path, *deferred)),
             _ => None,
         }
     }
@@ -4271,6 +4314,18 @@ impl Prepared {
         )
     }
 }
+fn predicate_col(t: &TableDef, name: &str) -> R<usize> {
+    col(t, name).inspect_err(|_| {
+        user_types::sql_error_message_if_absent(|| format!(r#"column "{name}" does not exist"#));
+    })
+}
+fn target_col(t: &TableDef, name: &str) -> R<usize> {
+    col(t, name).inspect_err(|_| {
+        user_types::view_replace_error(format!(
+            r#"column "{name}" of relation "{}" does not exist"#, t.name,
+        ));
+    })
+}
 fn col(t: &TableDef, name: &str) -> R<usize> {
     t.columns
         .iter()
@@ -4282,7 +4337,7 @@ fn insert_indexes(table: &TableDef, columns: &[String]) -> R<Vec<usize>> {
     let indexes = if columns.is_empty() {
         table.logical_offsets()
     } else {
-        columns.iter().map(|name| col(table, name)).collect::<R<Vec<_>>>()?
+        columns.iter().map(|name| target_col(table, name)).collect::<R<Vec<_>>>()?
     };
     unique(&indexes).map_err(|_| SqlError::DuplicateColumn)?;
     Ok(indexes)
@@ -4324,7 +4379,7 @@ fn successor(mut v: Vec<u8>) -> Option<Vec<u8>> {
 fn bounds(t: &TableDef, preds: &[Predicate], params: &[Value]) -> R<Bounds> {
     let mut by: BTreeMap<usize, Vec<(&str, Value)>> = BTreeMap::new();
     for p in preds {
-        let i = col(t, &p.column)?;
+        let i = predicate_col(t, &p.column)?;
         if !t.primary_key.contains(&i) {
             return Err(SqlError::Unbounded);
         }
@@ -4505,14 +4560,17 @@ impl Relational {
     pub(crate) fn primary_key_constraint_name(&self, table: &TableDef) -> Option<String> {
         constraint_primary_key::primary_key_name(self, table)
     }
-    pub(crate) fn drop_table(&mut self, name: &str) -> R<bool> {
-        self.drop_table_with_actions(name, false)
+    pub(crate) fn drop_table(&mut self, name: &str, path: &[String]) -> R<bool> {
+        self.drop_table_with_actions(name, false, path)
     }
-    fn drop_table_with_actions(&mut self, name: &str, cascade: bool) -> R<bool> {
+    fn drop_table_with_actions(&mut self, name: &str, cascade: bool, path: &[String]) -> R<bool> {
         let Some(table) = self.tables.get(name) else {
             return Ok(false);
         };
         let table_id = table.id;
+        if !cascade {
+            constraints::check_drop_dependencies(self, &[table], 1, path, None)?;
+        }
         let epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
         let mut ext = (*self.ext).clone();
         for column in &table.columns {
@@ -4531,9 +4589,6 @@ impl Relational {
         ext.table_storage.remove(&table_id);
         for constraints in ext.constraints.values_mut() {
             let incoming = |constraint: &Constraint| matches!(&constraint.kind,ConstraintKind::ForeignKey {ref_table,..} if *ref_table == table_id);
-            if !cascade && constraints.iter().any(incoming) {
-                return Err(SqlError::DependentObjects);
-            }
             constraints.retain(|constraint| !incoming(constraint));
         }
         ext.sequences
@@ -5091,10 +5146,9 @@ impl Relational {
                 if !optional && names.iter().any(|n| !self.tables.contains_key(n)) {
                     return Err(SqlError::UnknownTable);
                 }
-                if !cascade && self.ext.constraints.iter().any(|(id, constraints)|
-                    !ids.contains(id) && constraints.iter().any(|c|
-                        matches!(&c.kind, ConstraintKind::ForeignKey { ref_table, .. } if ids.contains(ref_table)))) {
-                    return Err(SqlError::DependentObjects);
+                if !cascade {
+                    let tables = names.iter().filter_map(|name| self.tables.get(name)).collect::<Vec<_>>();
+                    constraints::check_drop_dependencies(self, &tables, names.len(), &prepared.search_path, None)?;
                 }
                 if *cascade {
                     let mut notices = Vec::new();
@@ -5116,7 +5170,7 @@ impl Relational {
                         user_types::sql_notice_detail(format!("drop cascades to {} other objects", notices.len()), notices.join("\n"), "00000");
                     }
                 }
-                for name in names { self.drop_table_with_actions(name, true)?; }
+                for name in names { self.drop_table_with_actions(name, true, &prepared.search_path)?; }
             }
             Statement::SetConstraints(_, _) => return Err(SqlError::NoActiveTransaction),
             Statement::DropIndex(index) => {
@@ -5464,7 +5518,7 @@ impl Relational {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
                 }
-                let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
+                let t = self.tables.get(name).ok_or_else(|| missing_relation(name))?;
                 let indexes = insert_value_indexes(t, columns, values.len())?;
                 for index in &indexes {
                     defaults::check_explicit(self, &t.columns[*index])?;
@@ -5507,8 +5561,8 @@ impl Relational {
                 for (value, column) in row.iter_mut().zip(&t.columns) {
                     *value = coerce_to_column(self, column, value.clone())?;
                 }
-                self.materialize_generated(t, &mut row)?;
-                row_check(t, &row)?;
+                self.materialize_generated_written(t, &mut row, &indexes)?;
+                row_check_written(self, t, &row, &indexes)?;
                 let key = pk(t, &row)?;
                 let table_id = t.id;
                 let legacy = scan::LegacyRows(&*self);
@@ -5559,7 +5613,7 @@ impl Relational {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
                 }
-                let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
+                let t = self.tables.get(name).ok_or_else(|| missing_relation(name))?;
                 if t.hidden_rowid().is_some() {
                     return Err(SqlError::Unsupported);
                 }
@@ -5577,7 +5631,7 @@ impl Relational {
                 } else {
                     projection
                         .iter()
-                        .map(|c| col(t, c))
+                        .map(|c| predicate_col(t, c))
                         .collect::<R<Vec<_>>>()?
                 };
                 let desc = order.first().is_some_and(|v| v.1);
@@ -5588,7 +5642,7 @@ impl Relational {
                             if *d != desc {
                                 return Err(SqlError::Unsupported);
                             }
-                            col(t, c)
+                            predicate_col(t, c)
                         })
                         .collect::<R<Vec<_>>>()?;
                     let eq = predicates.iter().filter(|p| p.op == "=").count();
@@ -5641,7 +5695,7 @@ impl Relational {
             | Statement::UpdateExpressions {
                 name, predicates, ..
             } => {
-                let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
+                let t = self.tables.get(name).ok_or_else(|| missing_relation(name))?;
                 let b = match self.mutation_bounds(prepared, t, predicates, params) {
                     Ok(b)
                         if b.point
@@ -5681,9 +5735,9 @@ impl Relational {
                     for (i, v) in indexes {
                         row.values[i] = v;
                     }
-                    self.materialize_generated(t, &mut row.values)?;
-                    row_check(t, &row.values)?;
                     let written = assignments.written_offsets().collect::<Vec<_>>();
+                    self.materialize_generated_written(t, &mut row.values, &written)?;
+                    row_check_written(self, t, &row.values, &written)?;
                     self.check_written_candidate(t, &row.values, &written)?;
                     let new_key = pk(t, &row.values)?;
                     // One-row UPDATE: per-row and statement-end UNIQUE checking coincide, so the
@@ -5751,7 +5805,7 @@ impl Relational {
             Statement::Delete {
                 name, predicates, ..
             } => {
-                let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
+                let t = self.tables.get(name).ok_or_else(|| missing_relation(name))?;
                 let b = match self.mutation_bounds(prepared, t, predicates, params) {
                     Ok(b)
                         if b.point

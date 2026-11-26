@@ -471,7 +471,7 @@ pub struct Engine {
 }
 fn core(e: CoreError) -> Error {
     match e {
-        CoreError::Sql(SqlError::Conflict) => Error::Conflict,
+        CoreError::Sql(SqlError::Conflict) | CoreError::SqlSerialization(_) => Error::Conflict,
         CoreError::Sql(SqlError::Duplicate) => Error::Duplicate,
         CoreError::Sql(SqlError::Overflow) => Error::Overflow,
         CoreError::Sql(_) | CoreError::SequencePrivilege => Error::Sql {

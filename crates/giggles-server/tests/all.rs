@@ -278,6 +278,8 @@ mod fk_section_network;
 #[path = "replication_history.rs"] mod replication_history;
 
 #[path = "xact_status_network.rs"] mod xact_status_network;
+#[path = "pg_error_messages_network.rs"]
+mod pg_error_messages_network;
 #[path = "isolation_anomalies.rs"]
 mod isolation_anomalies;
 #[path = "task_only_role_sql.rs"]

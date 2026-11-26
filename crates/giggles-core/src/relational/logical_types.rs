@@ -83,12 +83,31 @@ fn uuid_input(input: &str) -> R<String> {
 }
 
 pub(super) fn not_null_violation(table: &TableDef, column: &ColumnDef, detail: String) {
+    not_null_message(table, column);
+    user_types::sql_error_detail(detail);
+}
+
+fn not_null_message(table: &TableDef, column: &ColumnDef) {
     let table_name = split_key(&table.name).1;
     user_types::view_replace_error(format!(
         "null value in column \"{}\" of relation \"{table_name}\" violates not-null constraint",
         column.name,
     ));
-    user_types::sql_error_detail(detail);
+}
+
+pub(super) fn not_null_row(
+    state: &Relational, table: &TableDef, column: &ColumnDef, values: &[Value], written: &[usize],
+) {
+    let is_virtual = |id| state.generated_column(id).is_some_and(|generation| !generation.stored);
+    not_null_message(table, column);
+    user_types::sql_error_names(state, table, Some(&column.name), None);
+    user_types::sql_failing_check_detail(DuplicateKeyDetail {
+        table_id: table.id,
+        schema: state.table_schema(table.id).into(),
+        table: table.name.clone(),
+        constraint: String::new(),
+        values: failing_row_detail_with(table, values, is_virtual),
+    }, failing_row_written_detail(table, values, written, is_virtual));
 }
 
 pub(super) fn failing_row_detail(table: &TableDef, values: &[Value]) -> String {

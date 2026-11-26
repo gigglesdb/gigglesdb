@@ -104,7 +104,7 @@ fn scalar(tokens: &[Token]) -> R<Scalar> {
     match q.items.as_slice() {
         [(Item::Scalar(s), None)] => Ok(s.clone()),
         [(Item::Aggregate(a, arg), None)] => Ok(Scalar::Call(
-            a.call_name(),
+            a.call_name().into(),
             vec![arg.clone().unwrap_or(Scalar::Literal(Value::Int(1)))],
         )),
         _ => Err(SqlError::Unsupported),
@@ -569,7 +569,7 @@ pub(super) fn parse(
             }
             Item::Aggregate(a, arg) => {
                 let v = Scalar::Call(
-                    a.call_name(),
+                    a.call_name().into(),
                     vec![arg.clone().unwrap_or(Scalar::Literal(Value::Int(1)))],
                 );
                 let mut v = v;

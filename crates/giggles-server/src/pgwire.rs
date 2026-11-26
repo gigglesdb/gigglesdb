@@ -215,6 +215,10 @@ pub(crate) fn error_message(code: &str, message: &'static str, out: &mut Vec<u8>
 }
 #[derive(Default)]
 struct Diagnostic {
+    database_role: bool,
+    task_session: bool,
+    task_sql_error: bool,
+    routine_signature: Option<String>,
     unknown_outcome: bool,
     committed: bool,
     // A failed commit restores session settings before its error is framed.
@@ -275,6 +279,7 @@ impl Diagnostic {
     }
     fn read_core_detail(&mut self) -> Option<String> {
         self.exact_sql_detail = false;
+        self.routine_signature = None;
         self.written_check_row = None;
         match giggles_core::relational::take_sql_diagnostic_detail() {
             Some(SqlErrorDetail::DuplicateKey(detail)) => {
@@ -293,6 +298,10 @@ impl Diagnostic {
                 self.duplicate_key_visible = None;
                 Some(redacted)
             }
+            Some(SqlErrorDetail::RoutineSignature(signature)) => {
+                self.routine_signature = Some(signature);
+                None
+            }
             Some(SqlErrorDetail::Text(detail)) => Some(detail),
             Some(SqlErrorDetail::Exact(detail)) => {
                 self.exact_sql_detail = true;
@@ -303,13 +312,13 @@ impl Diagnostic {
     }
 
     fn authorize_duplicate_key(&mut self, code: &str, session: &mut Session) {
-        if matches!(code, "23001" | "23503" | "23505" | "23514")
+        if matches!(code, "23001" | "23502" | "23503" | "23505" | "23514")
             && self.duplicate_key_visible.is_none()
             && let Some(detail) = &self.duplicate_key
         {
             let full = session.can_read_duplicate_key(detail);
             self.duplicate_key_visible = Some(full);
-            if !full && code == "23514"
+            if !full && matches!(code, "23502" | "23514")
                 && let Some(written) = self.written_check_row.take()
                 && session.can_show_written_check_row(detail)
             {
@@ -346,7 +355,43 @@ impl Diagnostic {
     }
 
     fn core<T>(&mut self, result: Result<T, CoreError>) -> R<T> {
+        if result.is_ok() {
+            giggles_core::relational::clear_sql_error_fields();
+            return core(result);
+        }
+        if let Err(CoreError::Task(task)) = &result
+            && task.name().is_some()
+        {
+            self.message = Some(task.message());
+        }
+        if self.task_session {
+            // The protected statement can produce diagnostics from rows that
+            // the task is forbidden to observe, even when its role can read them.
+            giggles_core::relational::clear_sql_error_fields();
+            self.task_sql_error = matches!(
+                &result,
+                Err(CoreError::Sql(_) | CoreError::SqlSerialization(_) | CoreError::RoutineDdl(_) | CoreError::Deadlock)
+            );
+            if self.task_sql_error {
+                // A named task error earlier in this message must not label this one.
+                self.message = None;
+            }
+            return core(result);
+        }
         let (message, context) = giggles_core::relational::take_sql_error_message_with_context();
+        // Authorization may probe syntax to identify requested privileges.
+        // Discard diagnostics from those probes when the request is refused.
+        if matches!(&result, Err(CoreError::Policy(giggles_core::Error::Scope)))
+            && !message.as_deref().is_some_and(|message| {
+                message.starts_with("permission denied for ") || message.starts_with("must be owner of ")
+            })
+        {
+            giggles_core::relational::take_sql_diagnostic_detail();
+            giggles_core::relational::take_sql_diagnostic_hint();
+            giggles_core::relational::take_sql_error_position();
+            giggles_core::relational::take_sql_error_names();
+            return core(result);
+        }
         if result.is_err() && context.is_some() {
             self.wire_context = context;
         }
@@ -395,9 +440,27 @@ impl Diagnostic {
         }
         self.sql_detail = self.read_core_detail();
         self.wire_hint = giggles_core::relational::take_sql_diagnostic_hint();
+        let routine_signature = self.routine_signature.as_deref()
+            .is_some_and(|signature| message.as_deref() == Some(signature));
+        if self.routine_signature.is_some() && (!routine_signature || !self.database_role) {
+            self.wire_hint = None;
+        }
         self.wire_position = giggles_core::relational::take_sql_error_position();
         self.wire_names = giggles_core::relational::take_sql_error_names();
         use giggles_core::relational::SqlError;
+        use giggles_core::SqlSerialization;
+        match &result {
+            Err(CoreError::Sql(SqlError::Version) | CoreError::SqlSerialization(SqlSerialization::ConcurrentUpdate)) => {
+                self.wire_message = Some(CONCURRENT_UPDATE.into());
+                self.wire_hint = None;
+            }
+            Err(CoreError::SqlSerialization(SqlSerialization::CommitPivot)) => {
+                self.wire_message = Some(SERIALIZATION_FAILURE.into());
+                self.wire_hint = Some(SERIALIZATION_RETRY_HINT.into());
+                self.sql_detail = Some("Reason code: Canceled on identification as a pivot, during commit attempt.".into());
+            }
+            _ => {}
+        }
         if let Err(CoreError::Sql(SqlError::StackDepth)) = &result {
             self.wire_message = Some("stack depth limit exceeded".into());
             self.wire_exact = true;
@@ -440,12 +503,30 @@ impl Diagnostic {
             }
             (Err(CoreError::Sql(SqlError::UnknownTable)), Some(m)) => {
                 m.starts_with("missing FROM-clause entry for table ")
+                    || m.starts_with("relation \"") && m.ends_with("\" does not exist")
             }
             (Err(CoreError::Sql(SqlError::UnknownColumn)), Some(m)) => {
-                m.starts_with("column \"") && m.ends_with(" does not exist")
+                m.starts_with("column ") && m.ends_with(" does not exist")
+            }
+            (Err(CoreError::Sql(SqlError::UndefinedFunction)), Some(m))
+                if routine_signature => self.database_role
+                    && m.starts_with("function ") && m.ends_with(" does not exist"),
+            (Err(CoreError::Sql(SqlError::DivisionByZero)), Some("division by zero")) => true,
+            (Err(CoreError::Sql(SqlError::StringDataRightTruncation)), Some(m)) => {
+                m.starts_with("value too long for type character")
+            }
+            (Err(CoreError::Sql(SqlError::DependentObjects)), Some(m)) => {
+                m.starts_with("cannot drop table ") && m.ends_with(" because other objects depend on it")
+                    || m == "cannot drop desired object(s) because other objects depend on them"
             }
             (Err(CoreError::Sql(SqlError::Type)), Some(m)) => {
                 m.starts_with("argument of WHERE must be type boolean, not type ")
+            }
+            (Err(CoreError::Sql(SqlError::InvalidSchema)), Some(m)) => {
+                m.starts_with("schema \"") && m.ends_with("\" does not exist")
+            }
+            (Err(CoreError::Sql(SqlError::WrongObjectType)), Some(m)) => {
+                m.starts_with("constraint \"") && m.ends_with("\" is not deferrable")
             }
             (Err(CoreError::Sql(SqlError::UndefinedObject)), Some(m)) => {
                 m.starts_with("constraint \"") && m.contains(" for table \"") && m.ends_with(" does not exist")
@@ -482,7 +563,8 @@ impl Diagnostic {
             self.wire_message = message.clone();
         }
         if result.is_err() && message.as_deref().is_some_and(|message| {
-            self.wire_position.is_some()
+            (self.wire_position.is_some()
+                && !matches!(&result, Err(CoreError::Sql(SqlError::UnknownTable))))
                 || matches!(&result, Err(CoreError::Sql(SqlError::InvalidObjectDefinition)))
                 || message.starts_with("cannot insert a non-DEFAULT value into column ")
                 || message.starts_with("access method ")
@@ -569,11 +651,6 @@ impl Diagnostic {
         if let Err(error @ CoreError::WriteFenced { .. }) = &result {
             self.wire_message = Some(error.to_string());
         }
-        if let Err(CoreError::Task(task)) = &result
-            && task.name().is_some()
-        {
-            self.message = Some(task.message());
-        }
         core(result)
     }
 
@@ -581,6 +658,11 @@ impl Diagnostic {
     fn role_admin_error(&mut self, session: &Session, stmt: &crate::auth::statements::AdminStatement, code: &'static str) -> &'static str {
         use crate::auth::statements::AdminStatement as A;
         match (code, stmt) {
+            ("2BP01", A::DropTable(..)) => {
+                let _ = self.core::<()>(Err(CoreError::Sql(
+                    giggles_core::relational::SqlError::DependentObjects,
+                )));
+            }
             ("42P01", A::DropTable(_, names)) => {
                 let sql = session.service.admin.sql_session();
                 if let Some(name) = names.iter().find(|name| {
@@ -700,6 +782,25 @@ impl Diagnostic {
         self.wire_message = Some("permission denied to set parameter \"session_replication_role\"".into());
         Err("42501")
     }
+    fn annotate_sql_error(&mut self, code: &str, sql: &str, prefix: &str) {
+        if self.task_session {
+            return;
+        }
+        let Some(message) = self.wire_message.as_deref() else { return; };
+        match code {
+            "42P01" if self.wire_position.is_none() => {
+                self.wire_position = giggles_core::relational::missing_relation_position(sql, message)
+                    .map(|position| prefix.chars().count() + position);
+            }
+            "42883" if self.routine_signature.as_deref() == Some(message) => {
+                if let Some(signature) = giggles_core::relational::routine_signature_from_source(sql, message) {
+                    self.wire_message = Some(signature);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn query(&mut self, sql: &str) {
         use sha2::{Digest, Sha256};
         self.query_id = Some(hex::encode(Sha256::digest(sql.as_bytes())));
@@ -718,13 +819,25 @@ impl State {
     }
 }
 
+const CONCURRENT_UPDATE: &str = "could not serialize access due to concurrent update";
+const SERIALIZATION_FAILURE: &str = "could not serialize access due to read/write dependencies among transactions";
+const SERIALIZATION_RETRY_HINT: &str = "The transaction might succeed if retried.";
+
 fn diagnostic_error(
     code: &str,
     message: &'static str,
     diagnostic: Option<&Diagnostic>,
     out: &mut Vec<u8>,
 ) {
+    let task_session = diagnostic.is_some_and(|d| d.task_session);
+    let task_sql_error = diagnostic.is_some_and(|d| d.task_sql_error && d.message.is_none());
     let message = match code {
+        _ if task_sql_error => GENERIC_MESSAGE,
+        "25P02" if !task_session && message == GENERIC_MESSAGE => {
+            "current transaction is aborted, commands ignored until end of transaction block"
+        }
+        "40001" if !task_session && message == GENERIC_MESSAGE => SERIALIZATION_FAILURE,
+        "40P01" if !task_session && message == GENERIC_MESSAGE => "deadlock detected",
         "21000" => "more than one row returned by a subquery used as an expression",
         "42P22" => "could not determine which collation to use for string comparison",
         "42P10" => "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
@@ -747,6 +860,9 @@ fn diagnostic_error(
     } else {
         eprintln!("protocol=postgres sqlstate={code} reason={message}");
     }
+    // Task SQL errors keep the pre-stack frame: generic text and the
+    // phase/query_id DETAIL, with no SQL diagnostic fields.
+    let diagnostic = if task_sql_error { None } else { diagnostic };
     // Notices already produced by COPY input functions precede a later error.
     // Keep these frames when discarding a partial result response.
     let mut notices = vec![];
@@ -770,7 +886,7 @@ fn diagnostic_error(
         .or_else(|| diagnostic.and_then(|d| d.wire_message.as_deref()));
     z(wire_message.unwrap_or(message), &mut b);
     if let Some((diagnostic, key)) = diagnostic
-        .filter(|_| matches!(code, "23001" | "23503" | "23505" | "23514"))
+        .filter(|_| matches!(code, "23001" | "23502" | "23503" | "23505" | "23514"))
         .and_then(|d| d.duplicate_key.as_ref().map(|key| (d, key)))
     {
         let detail = if diagnostic.duplicate_key_visible == Some(true) {
@@ -784,7 +900,7 @@ fn diagnostic_error(
         }
         // FK parent diagnostics authorize the parent key's values while
         // identifying the child's constraint in the ErrorResponse fields.
-        if diagnostic.wire_names.is_none() {
+        if code != "23502" && diagnostic.wire_names.is_none() {
             for (field, name) in [(b's', &key.schema), (b't', &key.table), (b'n', &key.constraint)] {
                 b.push(field);
                 z(name, &mut b);
@@ -804,7 +920,14 @@ fn diagnostic_error(
     }
     if let Some(context) = diagnostic.and_then(|d| d.wire_context.as_deref()) { b.push(b'W'); z(context, &mut b); }
     if let Some(hint) = registry_error.and_then(|error| error.hint.as_deref())
-        .or_else(|| diagnostic.and_then(|d| d.routine_hint.as_deref().or(d.wire_hint.as_deref()))) {
+        .or_else(|| diagnostic.and_then(|d| d.routine_hint.as_deref().or(d.wire_hint.as_deref())))
+        .or_else(|| match code {
+            "40P01" if !task_session => Some("See server log for query details."),
+            "40001" if !task_session && diagnostic.is_none_or(|d| d.wire_message.is_none()) => {
+                Some(SERIALIZATION_RETRY_HINT)
+            }
+            _ => None,
+        }) {
         b.push(b'H');
         z(hint, &mut b);
     }
@@ -2382,6 +2505,10 @@ impl State {
         out: &mut Vec<u8>,
         received: std::time::Instant,
     ) -> R<bool> {
+        giggles_core::relational::clear_sql_diagnostics();
+        self.diagnostic.task_session = session.task().is_some();
+        self.diagnostic.database_role = matches!(session.role, Role::Database { .. }) && !self.diagnostic.task_session;
+        session.sql.set_wire_serialization_diagnostics(self.diagnostic.database_role);
         // Settings also change through set_config and transaction recovery. Keep
         // the execution clock's zone aligned on every dispatch exit, including errors.
         session.set_time_zone(&self.settings.current.timezone);
@@ -2444,6 +2571,7 @@ impl State {
     ) -> R<Statement> {
         #[cfg(test)]
         PREPARE_CALLS.with(|calls| calls.set(calls.get() + 1));
+        simple::authorize_set_constraints(sql, session)?;
         self.invalidate_unnamed_for_sql(sql);
         let before_version = session.sql.statement_catalog_version();
         // GD-0061 R3-206: a task session admits the class before any catalog
@@ -2865,12 +2993,7 @@ impl State {
             self.unnamed_cache.clear();
             return Ok(None);
         }
-        giggles_core::relational::take_sql_error_message();
-        giggles_core::relational::take_sql_error_detail();
-        giggles_core::relational::take_sql_error_hint();
-        giggles_core::relational::take_sql_error_position();
-        giggles_core::relational::take_sql_error_names();
-        giggles_core::relational::take_sql_warnings();
+        giggles_core::relational::clear_sql_diagnostics();
         let mut statement = old.clone();
         statement.query_id = self.diagnostic.query_id.clone();
         self.diagnostic.phase = "parameter type declaration";
@@ -3216,6 +3339,9 @@ impl State {
         }
         if p.result.is_none() {
             let command = prepared.command();
+            if command == "SET CONSTRAINTS" && (!was_transaction || *implicit) {
+                simple::warning("SET CONSTRAINTS can only be used in transaction blocks", &self.settings.current, out)?;
+            }
             read_only_check(prepared.row_lock_command().filter(|_| !prepared.row_lock_tables().is_empty()).unwrap_or_else(|| prepared.write_tables().first().map_or(command, |(_, command)| *command)), &self.settings, session, &mut self.diagnostic)?;
             if needs_implicit_transaction(prepared) {
                 begin_implicit(session, implicit, &mut self.settings)?;
@@ -3421,7 +3547,8 @@ impl State {
                 let reused = if name.is_empty() { self.reuse_unnamed(&sql, &oids, session)? } else { None };
                 let mut statement = match reused {
                     Some(statement) => statement,
-                    None => self.prepare_statement(&sql, oids, &[], session, name.is_empty())?,
+                    None => self.prepare_statement(&sql, oids, &[], session, name.is_empty())
+                        .inspect_err(|code| self.diagnostic.annotate_sql_error(code, &sql, ""))?,
                 };
                 if name.is_empty() {
                     self.cache_unnamed(&statement);
@@ -4288,6 +4415,7 @@ impl State {
             || (matches!(tag, b'c' | b'f') && self.copy.as_ref().is_some_and(|c| c.simple));
         let context = active.context.clone();
         self.diagnostic = Diagnostic {
+            task_session: session.task().is_some(),
             phase: match tag {
                 b'Q' => "simple query",
                 b'P' => "parse",

@@ -127,10 +127,6 @@ impl<'a> Prefix<'a> {
     }
 }
 
-pub(super) fn is_prepare(sql: &str) -> bool {
-    Prefix(sql).kw("PREPARE")
-}
-
 pub(super) fn recognized(sql: &str) -> bool {
     Prefix(sql).word().is_some_and(|word| {
         ["PREPARE", "EXECUTE", "DEALLOCATE", "DISCARD"]

@@ -19,7 +19,7 @@ pub use storage::replicated;
 pub use storage::roles;
 pub use storage::{FenceCause, FenceClass, FenceRecovery, FenceSite, Holder, RocksStatus, StorageStatus};
 pub use storage::{
-    Admin, CoreError, CrashPoint, DecisionPoint, Engine, IndexInfo, Limits, ReclaimStats,
+    Admin, CoreError, SqlSerialization, CrashPoint, DecisionPoint, Engine, IndexInfo, Limits, ReclaimStats,
     RecoveryPoint, SqlIsolation, UpgradePoint, UpgradeReport, WriteFenceStatus,
 };
 #[doc(hidden)]

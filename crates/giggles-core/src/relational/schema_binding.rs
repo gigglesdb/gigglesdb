@@ -14,6 +14,12 @@ pub(crate) fn split_key(key: &str) -> (&str, &str) {
     key.split_once('\0').unwrap_or(("public", key))
 }
 
+pub(crate) fn missing_relation(key: &str) -> SqlError {
+    let name = key.strip_prefix("\0\0").unwrap_or(key).replace('\0', ".");
+    user_types::view_replace_error(format!(r#"relation "{name}" does not exist"#));
+    SqlError::UnknownTable
+}
+
 pub(super) fn validate_key(key: &str) -> R<()> {
     let (schema, name) = split_key(key);
     ident(name)?;
@@ -270,7 +276,8 @@ impl Prepared {
         };
         let read = |name: &mut String| {
             match state.resolve_relation_key_ref(name, &self.search_path) {
-                Cow::Borrowed(key) if key.len() == name.len() => {}
+                Cow::Borrowed(key) if key.len() == name.len()
+                    || (name.starts_with("public\0") && !state.relation_name_taken(key)) => {}
                 key => *name = key.into_owned(),
             }
         };

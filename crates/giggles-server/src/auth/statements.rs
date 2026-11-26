@@ -454,6 +454,8 @@ pub(crate) fn execute(
     admin: &Admin,
     actor: &CatalogRole,
     notices: &mut Vec<(bool, String)>,
+    search_path: &str,
+    schema_user: &str,
 ) -> Result<&'static str, &'static str> {
     let catalog = admin.roles();
     match stmt {
@@ -682,11 +684,13 @@ pub(crate) fn execute(
                         let (schema, table) = name.split_once('\0').unwrap_or(("public", name.as_str()));
                         format!("{}.{}", quote(schema), quote(table))
                     }).collect::<Vec<_>>().join(", ");
-                    admin.sql_session().execute_unreleased(
+                    let mut session = admin.sql_session();
+                    session.set_search_path(search_path, schema_user);
+                    session.execute_unreleased(
                         &format!("DROP TABLE {}{target}", if *if_exists { "IF EXISTS " } else { "" }),
                         &[], None,
                     ).and_then(|result| result.untasked()).map_err(|e| match e {
-                        CoreError::Sql(SqlError::Conflict) => "55P03",
+                        CoreError::Sql(SqlError::Conflict) | CoreError::SqlSerialization(_) => "55P03",
                         _ => crate::service::sqlstate(&e),
                     })?;
                     // No role-catalog cleanup until the whole core drop commits.
@@ -703,9 +707,10 @@ pub(crate) fn execute(
                 }
                 return Ok("DROP TABLE");
             }
+            let path = giggles_core::relational::schema_search_path(search_path, schema_user);
             for name in names {
-                let dropped = admin.drop_table(name, *if_exists).map_err(|e| match e {
-                    CoreError::Sql(SqlError::Conflict) => "55P03",
+                let dropped = admin.drop_table_with_search_path(name, *if_exists, &path).map_err(|e| match e {
+                    CoreError::Sql(SqlError::Conflict) | CoreError::SqlSerialization(_) => "55P03",
                     CoreError::Sql(SqlError::UnknownTable) => "42P01",
                     _ => crate::service::sqlstate(&e),
                 })?;
@@ -1096,7 +1101,7 @@ mod tests {
             let actor = catalog.create(NewRole { name: "manager".into(), createrole: true, ..Default::default() }).unwrap();
             let mut notices = Vec::new();
             for sql in ["CREATE ROLE child", "ALTER ROLE child LOGIN"] {
-                execute(&parse(sql).unwrap(), &admin, &actor, &mut notices).unwrap();
+                execute(&parse(sql).unwrap(), &admin, &actor, &mut notices, "public", &actor.name).unwrap();
             }
             let edges: Vec<_> = catalog.edges().unwrap().into_iter().filter(|edge| edge.role == "child").collect();
             if engine == giggles_core::Engine::Legacy {
@@ -1106,7 +1111,7 @@ mod tests {
                 assert_eq!(edges[0].member, "manager");
                 assert!(edges[0].admin && !edges[0].inherit && !edges[0].set);
             }
-            execute(&parse("DROP ROLE child").unwrap(), &admin, &actor, &mut notices).unwrap();
+            execute(&parse("DROP ROLE child").unwrap(), &admin, &actor, &mut notices, "public", &actor.name).unwrap();
             assert!(catalog.get("child").unwrap().is_none());
             drop(catalog);
             drop(admin);
