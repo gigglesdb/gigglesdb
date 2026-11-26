@@ -5,7 +5,7 @@ use engine::{catalog::TableEntry, codec, kv::Keyspace, locks::LockMode, txn::Tra
 use relational::{
     SqlError, SqlRow, TableDef,
     catalog_ext::{Action, CatalogExt, ConstraintKind},
-    row_sink::{DdlRows, FkRowLock, PageMode, RowSink},
+    row_sink::{DdlRows, FkRowLock, PageMode, RowSink, SinkStatement},
 };
 use std::{collections::BTreeSet, ops::Bound};
 /// Encoded primary-key bounds of a read (GD-0075 P8-0).
@@ -754,7 +754,7 @@ impl SqlSession {
                                 CoreError::Corrupt(format!("invalid stored v2 catalog: {error:?}"))
                             }
                         })?;
-                        let bound = p.bind_schemas(&binding).map_err(CoreError::Sql)?;
+                        let bound = self.schema_binding_memo.at(&binding).bind(p).map_err(CoreError::Sql)?;
                         let target_name = bound.storage_table().map(str::to_owned);
                         if writing && !ddl && target_name.as_ref().is_some_and(|n| binding.view_names.contains_key(n)) { return Err(CoreError::Sql(E::Unsupported)); }
                         let mut names = bound.read_tables().into_iter().collect::<BTreeSet<_>>();
@@ -1142,7 +1142,7 @@ impl SqlSession {
                             // longer names the same table the statement locked.
                             let live = db.catalog().latest_snapshot(txn)?;
                             let live_image = live.image().map_err(CoreError::Sql)?;
-                            let live_bound = p.bind_schemas(&live_image).map_err(CoreError::Sql)?;
+                            let live_bound = self.schema_binding_memo.at(&live_image).bind(p).map_err(CoreError::Sql)?;
                             if live_bound.storage_table() != target_name.as_deref()
                                 || target_name.as_ref().is_some_and(|name| parts.tables.get(name) != live.parts.tables.get(name))
                             {
@@ -1330,7 +1330,8 @@ impl SqlSession {
                                 p, params, expected_version, context.as_ref(),
                                 scoped.as_ref().map_or(
                                     &source as &dyn relational::scan::RowSource,
-                                    |s| s as &dyn relational::scan::RowSource));
+                                    |s| s as &dyn relational::scan::RowSource),
+                                self.schema_binding_memo.at(&catalog_image));
                             if let Some(scoped) = &scoped {
                                 crate::task::rows::record(meter.counts());
                                 if let Some(state) = &read_state { state.add_meter(&meter); }
@@ -1351,8 +1352,14 @@ impl SqlSession {
                         } else {
                             p
                         };
-                        let result = if !bound.is_collation_ddl() && matches!(bound.command(), "COMMENT" | "SECURITY LABEL" | "CREATE VIEW" | "DROP VIEW") { Ok(Default::default()) } else { image.execute_with_sink(
-                            p,
+                        let statement = if self.copy_input.is_some() {
+                            // COPY may have changed the statement image before this call.
+                            SinkStatement::Unbound(p)
+                        } else {
+                            SinkStatement::Catalog(p, self.schema_binding_memo.at(&catalog_image))
+                        };
+                        let result = if !bound.is_collation_ddl() && matches!(bound.command(), "COMMENT" | "SECURITY LABEL" | "CREATE VIEW" | "DROP VIEW") { Ok(Default::default()) } else { image.execute_with_sink_statement(
+                            statement,
                             params,
                             expected_version,
                             context.as_ref(),

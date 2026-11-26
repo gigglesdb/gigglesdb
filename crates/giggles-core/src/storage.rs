@@ -310,6 +310,7 @@ pub(super) struct MetadataState<'a> {
     sql: MetadataSql<'a>,
     view: MetadataDomain,
     catalog: Option<&'a engine::catalog::CatalogSnapshot>,
+    catalog_image: Option<&'a Arc<relational::Relational>>,
 }
 struct MetadataDomain {
     domain: u128,
@@ -370,9 +371,14 @@ fn view_table(id: u64, v: &SqlViewDef) -> relational::TableDef {
             data_type: c.storage_type.clone(), not_null: false }).collect() }
 }
 impl<'a> MetadataState<'a> {
+    fn schema_binding<'b>(&'b self, memo: &'b relational::SchemaBindingMemo) -> Option<relational::SchemaBinding<'b>> {
+        self.catalog_image.map(|image| memo.at(image))
+    }
+
     fn new(image: &'a relational::Relational, epoch: u64, domain: u128) -> Self {
         Self {
             sql: MetadataSql { image, epoch, comments: None, views: None },
+            catalog_image: None,
             view: MetadataDomain { domain },
             catalog: None,
         }
@@ -2369,6 +2375,7 @@ pub struct SqlSession {
     schema_context_revision: Option<u64>,
     search_path_input: Option<(Arc<str>, (usize, usize, bool))>,
     unnamed_plans: Vec<(UnnamedPlanKey, relational::Prepared)>,
+    schema_binding_memo: relational::SchemaBindingMemo,
     cursor_plan_cache: relational::cursor::PlanCache,
     authorization_bindings: bool,
     authority_managed: bool,
@@ -2443,6 +2450,7 @@ impl Admin {
             schema_context_revision: Some(0),
             search_path_input: None,
             unnamed_plans: Vec::new(),
+            schema_binding_memo: Default::default(),
             cursor_plan_cache: Default::default(),
             authorization_bindings: false,
             authority_managed: false,
@@ -2877,7 +2885,8 @@ impl SqlSession {
         prepared.clear_authorization_binding_version();
         let version = if prepared.has_sql_authorization_binding() { self.statement_catalog_version() } else { None };
         self.inspect_metadata_leased(db, |s| {
-            let Ok(mut bound) = prepared.bind_schemas(&s.sql) else { return Ok(prepared); };
+            let Ok(mut bound) = prepared.bind_schemas_with(&s.sql, s.schema_binding(&self.schema_binding_memo))
+                else { return Ok(prepared); };
             // Outside a fixed snapshot the binder can observe a newer catalog
             // than the first version read. Monotonic versions bracket the
             // actual metadata read, so failed binding or drift leaves no proof.
@@ -3242,7 +3251,8 @@ impl SqlSession {
                 if matches!(self.admin.inner.backend, Backend::V2(_)) {
                     metadata_plan.epoch = s.sql.image.epoch;
                 }
-                metadata_plan.describe_with_enum_parameters(&s.sql).map_err(relational::routines::into_core)
+                metadata_plan.describe_with_enum_parameters(&s.sql, s.schema_binding(&self.schema_binding_memo))
+                    .map_err(relational::routines::into_core)
             };
             if let Some(s) = &self.staged {
                 describe(&MetadataState::borrow(s))
@@ -3343,7 +3353,7 @@ impl SqlSession {
                 } else {
                     p.epoch
                 };
-                p.validate_immutable_constants_at_epoch(&s.sql, epoch)
+                p.validate_immutable_constants_at_epoch(&s.sql, epoch, s.schema_binding(&self.schema_binding_memo))
                     .map_err(relational::routines::into_core)
             };
             if let Some(s) = &self.staged {
@@ -3739,7 +3749,8 @@ impl SqlSession {
         // Bind and expand from one image of the portal's statement snapshot.
         // Runtime view projections already contain nested physical dependencies.
         let locks = self.inspect_metadata_leased(Some(&db), |state| {
-            let bound = scoped.bind_schemas(&state.sql).map_err(CoreError::Sql)?;
+            let bound = scoped.bind_schemas_with(&state.sql, state.schema_binding(&self.schema_binding_memo))
+                .map_err(CoreError::Sql)?;
             let mut pending = bound.authorization_tables().map_err(CoreError::Sql)?;
             pending.extend(bound.write_tables().into_iter().map(|(name, _)| name));
             let mut seen = std::collections::BTreeSet::new();

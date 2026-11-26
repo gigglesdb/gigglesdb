@@ -325,20 +325,20 @@ impl Prepared {
 
 pub(super) fn execute(
     state: &mut Relational,
-    prepared: &Prepared,
+    description: &StatementDescription<'_>,
     params: &[Value],
     clock: Option<&clock::ExecutionClock>,
     sink: &mut impl RowSink,
     version_end: u64,
     deferred: Option<&mut DeferralState>,
 ) -> Result<SqlResult, CoreError> {
+    let prepared = description.prepared();
     let table = state.tables[prepared.table().expect("mutation target")].clone();
     // Analyze even an empty table before opening the cursor. No writes escape
     // the outer statement savepoint, including failures on the final page.
-    let description = StatementDescription::new(prepared);
     let mut result = state
         .execute_statement_described(
-            &description,
+            description,
             params,
             None,
             || crate::cancellation::check().is_err(),
@@ -347,10 +347,10 @@ pub(super) fn execute(
             &mut Vec::new(),
         )
         .map_err(CoreError::Sql)?;
-    let (template, keys) = selection(state, &description, params, clock, sink)?;
+    let (template, keys) = selection(state, description, params, clock, sink)?;
     let page_description = StatementDescription::new(&template);
     let unique = sink.indexes().into_iter().filter(|d| d.table == table.id && d.unique).collect::<Vec<_>>();
-    let description = page_memo(state, &unique, keys.is_some(), &description, &page_description);
+    let description = page_memo(state, &unique, keys.is_some(), description, &page_description);
     let mut pending = deferred.as_deref().cloned().unwrap_or_default();
     let mut immediate = DeferralState::default();
     let mut checks = scan::Retention::new(scan::retention_limit());
@@ -531,20 +531,20 @@ pub(super) fn cascade_eligible(state: &Relational, prepared: &Prepared) -> bool 
 }
 
 pub(super) fn cascade(
-    state: &mut Relational, prepared: &Prepared, params: &[Value],
+    state: &mut Relational, description: &StatementDescription<'_>, params: &[Value],
     clock: Option<&clock::ExecutionClock>, sink: &mut impl RowSink,
     deferred: Option<&mut DeferralState>, version_end: u64,
 ) -> Result<SqlResult, CoreError> {
+    let prepared = description.prepared();
     let pk_move = moves_primary_key(state, prepared);
     let pending = deferred.as_deref().cloned().unwrap_or_default();
     let table = state.tables[prepared.table().unwrap()].clone();
     let descriptors = sink.indexes();
-    let description = StatementDescription::new(prepared);
-    let mut result = state.execute_statement_described(&description, params, None,
+    let mut result = state.execute_statement_described(description, params, None,
         || crate::cancellation::check().is_err(), clock, None, &mut Vec::new()).map_err(CoreError::Sql)?;
-    let (template, keys) = selection(state, &description, params, clock, sink)?;
+    let (template, keys) = selection(state, description, params, clock, sink)?;
     let page_description = StatementDescription::new(&template);
-    let description = page_memo(state, &descriptors, keys.is_some(), &description, &page_description);
+    let description = page_memo(state, &descriptors, keys.is_some(), description, &page_description);
     let prepared = description.prepared();
     let first_version = state.next_version;
     let mut work = ActionWork::new(pending);

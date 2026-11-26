@@ -72,6 +72,7 @@ pub(crate) mod catalog_ext;
 mod catalog_presentation;
 pub(crate) mod catalog_scale;
 pub use schema_binding::AuthorizationPlanKey;
+pub(crate) use schema_binding::{SchemaBinding, SchemaBindingMemo};
 use schema_binding::AuthorizationBinding;
 pub use catalog_presentation::{CatalogConstraint, CatalogPresentation, CatalogView, ForeignKeyTarget};
 use catalog_ext::*;
@@ -2164,7 +2165,11 @@ mod prepared_syntax {
         }
 
         pub(super) fn share(&self) -> Arc<Statement> {
-            Arc::clone(&self.statement)
+            self.shared().clone()
+        }
+
+        pub(super) fn shared(&self) -> &Arc<Statement> {
+            &self.statement
         }
 
         pub(super) fn get_mut(&mut self) -> &mut Statement {
@@ -2969,13 +2974,18 @@ impl Prepared {
         ))
     }
     pub(crate) fn validate_immutable_constants(&self, state: &Relational) -> R<()> {
-        self.validate_immutable_constants_at_epoch(state, self.epoch)
+        self.validate_immutable_constants_at_epoch(state, self.epoch, None)
     }
-    pub(crate) fn validate_immutable_constants_at_epoch(&self, state: &Relational, epoch: u64) -> R<()> {
+    pub(crate) fn validate_immutable_constants_at_epoch(
+        &self,
+        state: &Relational,
+        epoch: u64,
+        binding: Option<SchemaBinding<'_>>,
+    ) -> R<()> {
         let _enum_parameters = enum_parameters::Scope::enter(self.declared_enum_parameters.as_deref());
         let _date_order = clock::LiteralDateOrder::enter(self.literal_date_order);
         let _type_path = user_types::TypeDisplayScope::enter(&self.search_path, Some(state));
-        let bound = self.bind_schemas(state)?;
+        let bound = self.bind_schemas_with(state, binding)?;
         let this = &bound;
         // Schema binding copies the epoch but never reads it. Accept the
         // caller's presentation epoch separately instead of cloning the entire
@@ -3002,25 +3012,27 @@ impl Prepared {
         Ok(())
     }
     pub(crate) fn describe(&self, state: &Relational) -> R<Description> {
-        self.describe_with_enum_parameters(state).map(|(description, _)| description)
+        self.describe_with_enum_parameters(state, None).map(|(description, _)| description)
     }
 
     pub(crate) fn describe_with_enum_parameters(
         &self,
         state: &Relational,
+        binding: Option<SchemaBinding<'_>>,
     ) -> R<(Description, EnumParameters)> {
-        self.describe_with_searched(state, None)
+        self.describe_with_searched(state, None, binding)
     }
 
     fn describe_with_searched(
         &self,
         state: &Relational,
         searched_description: Option<&Description>,
+        binding: Option<SchemaBinding<'_>>,
     ) -> R<(Description, EnumParameters)> {
         let _enum_parameters = enum_parameters::Scope::enter(self.declared_enum_parameters.as_deref());
         let _date_order = clock::LiteralDateOrder::enter(self.literal_date_order);
         let _type_path = user_types::TypeDisplayScope::enter(&self.search_path, Some(state));
-        let bound = self.bind_schemas(state)?;
+        let bound = self.bind_schemas_with(state, binding)?;
         let this = &bound;
         this.validate_schemas(state)?;
         if this.epoch != state.epoch {

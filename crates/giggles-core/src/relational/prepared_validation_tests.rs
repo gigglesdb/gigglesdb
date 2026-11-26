@@ -29,7 +29,7 @@ fn compare(p: &Prepared, state: &Relational) {
         assert_eq!(
             format!(
                 "{:?}",
-                p.validate_immutable_constants_at_epoch(state, epoch)
+                p.validate_immutable_constants_at_epoch(state, epoch, None)
             ),
             format!("{:?}", reference(p, state, epoch))
         );

@@ -1,7 +1,6 @@
 //! Bind SQL relation references without changing their user-visible names.
 use super::*;
-use std::borrow::Cow;
-use std::sync::Arc;
+use std::{borrow::Cow, sync::{Arc, Mutex}};
 
 pub fn relation_key(schema: &str, name: &str) -> String {
     if schema == "public" {
@@ -110,30 +109,137 @@ impl Relational {
 
 }
 
-impl Prepared {
-    pub(crate) fn bind_schemas(&self, state: &Relational) -> R<Self> {
-        let _date_order = super::clock::LiteralDateOrder::enter(self.literal_date_order);
-        if self.relations.is_empty()
-            && !matches!(self.statement.get(), Statement::Plan(_))
-            && !matches!(self.statement.get(), Statement::Query(q) if q.has_domain_expression() || !state.ext.routines.is_empty() || self.unbound_statement.is_some())
+/// Session-local reuse of successful schema rewrites. Keep just the last
+/// binding so named statements cannot collectively retain old catalog images.
+#[derive(Default)]
+pub(crate) struct SchemaBindingMemo(Mutex<Option<SchemaBindingEntry>>);
+
+struct SchemaBindingEntry {
+    source: Arc<Statement>,
+    catalog: Arc<Relational>,
+    relations: Vec<schemas::Reference>,
+    search_path: Vec<String>,
+    schema_user: String,
+    date_order: giggles_pg_types::temporal::DateOrder,
+    syntax: prepared_syntax::Syntax,
+}
+
+/// Witness for a catalog obtained by the current metadata or execution read.
+#[derive(Clone, Copy)]
+pub(crate) struct SchemaBinding<'a> {
+    memo: &'a SchemaBindingMemo,
+    catalog: &'a Arc<Relational>,
+}
+
+impl SchemaBindingMemo {
+    pub(crate) fn at<'a>(&'a self, catalog: &'a Arc<Relational>) -> SchemaBinding<'a> {
+        SchemaBinding { memo: self, catalog }
+    }
+}
+
+impl SchemaBinding<'_> {
+    pub(crate) fn bind(self, prepared: &Prepared) -> R<Prepared> {
+        let state = self.catalog;
+        if !prepared.needs_schema_binding(state) {
+            return Ok(prepared.clone());
+        }
+        let source = prepared.schema_binding_source();
+        // Shared session APIs can bind concurrently. Bypass the memo if
+        // another caller is using this session's entry.
+        let Ok(mut last) = self.memo.0.try_lock() else {
+            return prepared.bind_schemas(state);
+        };
+        if let Some(entry) = last.as_ref()
+            && Arc::ptr_eq(source, &entry.source)
+            && Arc::ptr_eq(state, &entry.catalog)
+            && prepared.relations == entry.relations
+            && prepared.search_path == entry.search_path
+            && prepared.schema_user == entry.schema_user
+            && prepared.literal_date_order == entry.date_order
         {
+            return Ok(prepared.with_schema_binding(source.clone(), entry.syntax.clone()));
+        }
+        *last = None;
+        let projection_reads = (!state.view_names.is_empty()).then(query::views::projection_reads);
+        let bound = prepared.bind_schema_names(state, source.clone())?;
+        // View predicates can be reparsed under the ambient lexer budgets.
+        // Unsupported projections can publish diagnostics even on a successful bind.
+        if !bound.authorization_has_views
+            && projection_reads.is_none_or(|before| before == query::views::projection_reads())
+            && !state.view_names.values().any(|(_, view)| *view == Err(SqlError::Unsupported))
+        {
+            *last = Some(SchemaBindingEntry {
+                source: source.clone(),
+                catalog: state.clone(),
+                relations: prepared.relations.clone(),
+                search_path: prepared.search_path.clone(),
+                schema_user: prepared.schema_user.clone(),
+                date_order: prepared.literal_date_order,
+                syntax: bound.statement.clone(),
+            });
+        }
+        Ok(bound)
+    }
+
+    /// A statement fork may hydrate rows, replace index entries or change
+    /// allocator ceilings. Page preparation can also change the binding
+    /// catalog itself, so check every catalog input before reusing its Arc.
+    pub(super) fn bind_fork(self, prepared: &Prepared, fork: &Relational) -> R<Prepared> {
+        let state = self.catalog;
+        if std::ptr::eq(state.as_ref(), fork)
+            || Arc::ptr_eq(&state.tables, &fork.tables)
+            && Arc::ptr_eq(&state.ext, &fork.ext)
+            && state.view_names == fork.view_names
+            && state.secondary.descriptors().iter().map(|index| (&index.name, index.table, index.id))
+                .eq(fork.secondary.descriptors().iter().map(|index| (&index.name, index.table, index.id)))
+        {
+            self.bind(prepared)
+        } else {
+            prepared.bind_schemas(fork)
+        }
+    }
+}
+
+impl Prepared {
+    fn needs_schema_binding(&self, state: &Relational) -> bool {
+        !self.relations.is_empty()
+            || matches!(self.statement.get(), Statement::Plan(_))
+            || matches!(self.statement.get(), Statement::Query(q) if q.has_domain_expression() || !state.ext.routines.is_empty() || self.unbound_statement.is_some())
+    }
+
+    fn schema_binding_source(&self) -> &Arc<Statement> {
+        self.unbound_statement.as_ref().unwrap_or_else(|| self.statement.shared())
+    }
+
+    pub(crate) fn bind_schemas(&self, state: &Relational) -> R<Self> {
+        if !self.needs_schema_binding(state) {
             return Ok(self.clone());
         }
-        let unbound = self
-            .unbound_statement
-            .as_ref()
-            .map(Arc::clone)
-            .unwrap_or_else(|| self.statement.share());
-        let mut bound = Self {
+        self.bind_schema_names(state, self.schema_binding_source().clone())
+    }
+
+    pub(crate) fn bind_schemas_with(
+        &self,
+        state: &Relational,
+        binding: Option<SchemaBinding<'_>>,
+    ) -> R<Self> {
+        match binding {
+            Some(binding) => binding.bind_fork(self, state),
+            None => self.bind_schemas(state),
+        }
+    }
+
+    fn with_schema_binding(&self, source: Arc<Statement>, syntax: prepared_syntax::Syntax) -> Self {
+        Self {
             domain: self.domain,
             epoch: self.epoch,
             transaction: self.transaction,
             engine_generation: self.engine_generation,
             literal_date_order: self.literal_date_order,
-            statement: prepared_syntax::Syntax::new((*unbound).clone()),
+            statement: syntax,
             native_delete: self.native_delete.clone(),
             native_insert_many: self.native_insert_many,
-            unbound_statement: Some(unbound),
+            unbound_statement: Some(source),
             params: self.params,
             parameter_types: self.parameter_types.clone(),
             declared_enum_parameters: self.declared_enum_parameters.clone(),
@@ -147,7 +253,13 @@ impl Prepared {
             // A caller must witness the catalog version of this binding anew.
             authorization_binding: self.authorization_binding.map(AuthorizationBinding::without_version),
             privilege_inquiry: self.privilege_inquiry,
-        };
+        }
+    }
+
+    fn bind_schema_names(&self, state: &Relational, unbound: Arc<Statement>) -> R<Self> {
+        let _date_order = super::clock::LiteralDateOrder::enter(self.literal_date_order);
+        let syntax = prepared_syntax::Syntax::new((*unbound).clone());
+        let mut bound = self.with_schema_binding(unbound, syntax);
         let create = |name: &str| -> R<String> {
             let schema = if name.contains('\0') {
                 split_key(name).0.to_owned()
@@ -480,6 +592,168 @@ mod tests {
         assert_eq!(second.authorization_tables().unwrap(), ["a\0t"]);
         assert_eq!(AUTHORIZATION_DEPENDENCY_WALKS.get(), 3);
         assert_eq!(unchanged.storage_table(), Some("b\0t"));
+    }
+
+    fn memo_fixture() -> Arc<Relational> {
+        let mut state = Relational::default();
+        for sql in [
+            "CREATE SCHEMA a",
+            "CREATE SCHEMA b",
+            "CREATE TABLE a.t(id int PRIMARY KEY)",
+            "CREATE TABLE b.t(id int PRIMARY KEY)",
+        ] {
+            run(&mut state, sql);
+        }
+        Arc::new(state)
+    }
+
+    #[test]
+    fn schema_memo_keys_the_original_statement() {
+        let state = memo_fixture();
+        let memo = SchemaBindingMemo::default();
+        let binding = memo.at(&state);
+        let first = Prepared::parse("SELECT id FROM a.t WHERE id = 1", 1, state.epoch).unwrap();
+        let second = Prepared::parse("SELECT id FROM a.t WHERE id = 2", 1, state.epoch).unwrap();
+        let first = binding.bind(&first).unwrap();
+        let second = binding.bind(&second).unwrap();
+        assert!(!Arc::ptr_eq(first.statement.shared(), second.statement.shared()));
+    }
+
+    #[test]
+    fn schema_memo_keys_the_search_path_and_creation_references() {
+        let state = memo_fixture();
+        let memo = SchemaBindingMemo::default();
+        let binding = memo.at(&state);
+        let mut read = Prepared::parse("SELECT id FROM t", 1, state.epoch).unwrap();
+        read.set_schema_context(vec!["a".into()], "postgres".into());
+        let bound = binding.bind(&read).unwrap();
+        assert_eq!(bound.storage_table(), Some("a\0t"));
+
+        read.set_schema_context(vec!["b".into()], "postgres".into());
+        assert_eq!(binding.bind(&read).unwrap().storage_table(), Some("b\0t"));
+
+        let mut create = Prepared::parse("CREATE TABLE x(id int)", 1, state.epoch).unwrap();
+        let first = binding.bind(&create).unwrap();
+        create.relations.iter_mut().find(|reference| reference.create).unwrap().schema = Some("a".into());
+        let second = binding.bind(&create).unwrap();
+        let Statement::Create { name: first, .. } = first.statement.get() else { unreachable!() };
+        let Statement::Create { name: second, .. } = second.statement.get() else { unreachable!() };
+        assert_eq!(first, "x");
+        assert_eq!(second, "a\0x");
+    }
+
+    #[test]
+    fn schema_memo_keys_date_order_and_schema_user() {
+        use giggles_pg_types::temporal::DateOrder;
+
+        let state = memo_fixture();
+        let memo = SchemaBindingMemo::default();
+        let binding = memo.at(&state);
+        let mut prepared = Prepared::parse(
+            "SELECT '01/02/2024'::date FROM a.t", 1, state.epoch,
+        ).unwrap();
+        prepared.literal_date_order = DateOrder::Mdy;
+        let original = binding.bind(&prepared).unwrap();
+        let same = binding.bind(&prepared).unwrap();
+        assert!(Arc::ptr_eq(original.statement.shared(), same.statement.shared()));
+
+        prepared.literal_date_order = DateOrder::Dmy;
+        let date_changed = binding.bind(&prepared).unwrap();
+        assert!(!Arc::ptr_eq(same.statement.shared(), date_changed.statement.shared()));
+        assert_eq!(date_changed.literal_date_order, DateOrder::Dmy);
+
+        // Different roles can expand to the same path when both lack a schema.
+        prepared.set_schema_context(prepared.search_path.clone(), "other".into());
+        let user_changed = binding.bind(&prepared).unwrap();
+        assert!(!Arc::ptr_eq(date_changed.statement.shared(), user_changed.statement.shared()));
+    }
+
+    #[test]
+    fn schema_memo_preserves_current_prepared_fields_and_clears_the_version() {
+        let state = memo_fixture();
+        let memo = SchemaBindingMemo::default();
+        let binding = memo.at(&state);
+        let mut prepared = Prepared::parse("SELECT id FROM a.t WHERE id = $1", 1, state.epoch).unwrap();
+        let first = binding.bind(&prepared).unwrap();
+
+        prepared.domain = 2;
+        prepared.epoch = 42;
+        prepared.transaction = Some(5);
+        prepared.parameter_types = vec![Some(DataType::Integer)];
+        prepared.privilege_inquiry = true;
+        prepared.enable_sql_authorization_binding();
+        prepared.set_authorization_binding_version(17);
+        let rebound = binding.bind(&prepared).unwrap();
+
+        assert!(Arc::ptr_eq(first.statement.shared(), rebound.statement.shared()));
+        assert_eq!((rebound.domain, rebound.epoch, rebound.transaction), (2, 42, Some(5)));
+        assert_eq!(rebound.parameter_types, [Some(DataType::Integer)]);
+        assert!(rebound.has_privilege_inquiry());
+        assert!(matches!(rebound.authorization_binding, Some(AuthorizationBinding::Sql(None))));
+    }
+
+    #[test]
+    fn schema_memo_rechecks_view_privilege_inquiry_after_token_budget_change() {
+        use crate::storage::{SqlViewColumn, SqlViewDef, SqlViewDependency};
+
+        let mut state = Relational::default();
+        run(&mut state, "CREATE TABLE t(id int PRIMARY KEY)");
+        let table = &state.tables["t"];
+        let column = table.logical_columns().next().unwrap();
+        let view = SqlViewDef {
+            schema: 0,
+            name: "v".into(),
+            select: "SELECT id FROM t WHERE has_table_privilege('t', 'SELECT')".into(),
+            columns: vec![SqlViewColumn {
+                id: 101,
+                name: "id".into(),
+                storage_type: DataType::Integer,
+                pg_type_oid: 23,
+                typmod: -1,
+                source: Some((table.id, column.id)),
+            }],
+            dependencies: vec![SqlViewDependency { relation: table.id, columns: vec![column.id] }],
+        };
+        state.catalog_views(&BTreeMap::from([(100, view)])).unwrap();
+        let state = Arc::new(state);
+        let prepared = Prepared::parse("SELECT id FROM v", 1, state.epoch).unwrap();
+        let memo = SchemaBindingMemo::default();
+        let binding = memo.at(&state);
+
+        let low = {
+            let _budget = StatementBudget::enter(5, true);
+            binding.bind(&prepared).unwrap()
+        };
+        assert!(low.authorization_has_views());
+        assert!(!low.has_privilege_inquiry());
+
+        let _budget = StatementBudget::enter(100, true);
+        let fresh = prepared.bind_schemas(&state).unwrap();
+        let rebound = binding.bind(&prepared).unwrap();
+        assert!(fresh.has_privilege_inquiry());
+        assert_eq!(rebound.has_privilege_inquiry(), fresh.has_privilege_inquiry());
+        assert_eq!(rebound.authorization_has_views(), fresh.authorization_has_views());
+    }
+
+    #[test]
+    fn schema_memo_republishes_unsupported_view_projection_diagnostic() {
+        let mut state = Relational::default();
+        state.view_names.insert("v".into(), (100, Err(SqlError::Unsupported)));
+        let state = Arc::new(state);
+        // The searched DELETE binds a synthetic query over v, even though
+        // it requires no read privilege on v's columns.
+        let prepared = Prepared::parse("DELETE FROM v WHERE true", 1, state.epoch).unwrap();
+        let memo = SchemaBindingMemo::default();
+        let binding = memo.at(&state);
+
+        for _ in 0..2 {
+            let bound = binding.bind(&prepared).unwrap();
+            assert!(!bound.authorization_has_views());
+            assert_eq!(
+                user_types::take_sql_error_message().as_deref(),
+                Some("view projection bindings unavailable; recreate the view"),
+            );
+        }
     }
 
     #[test]

@@ -15,6 +15,130 @@ use engine::{
 use std::ops::Bound;
 
 #[test]
+fn prepared_dml_uses_current_search_path_defaults_and_values_error_order() {
+    use relational::Value;
+
+    let f = Fixture::new();
+    for sql in [
+        "CREATE SCHEMA alternate",
+        "CREATE TABLE public.t(id int PRIMARY KEY, v int NOT NULL DEFAULT 10)",
+        "CREATE TABLE alternate.t(id int PRIMARY KEY, v int NOT NULL DEFAULT 20)",
+    ] {
+        f.execute(sql);
+    }
+    let mut session = f.admin().sql_session();
+    session.set_search_path("public", "postgres");
+    let insert = session.prepare("INSERT INTO t(id) VALUES ($1) RETURNING id,v").unwrap();
+    let update = session.prepare("UPDATE t SET v=v+1 WHERE id=$1 RETURNING id,v").unwrap();
+    let delete = session.prepare("DELETE FROM t WHERE id=$1 RETURNING id,v").unwrap();
+    let id = [Value::Int(1)];
+    let execute = |session: &mut SqlSession, statement: &relational::Prepared, v| {
+        let result = session.execute_prepared(statement, &id, None).unwrap();
+        assert_eq!(result.affected, 1);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values, [Value::Int(1), Value::Int(v)]);
+    };
+    execute(&mut session, &insert, 10);
+    execute(&mut session, &update, 11);
+    execute(&mut session, &delete, 11);
+
+    session.set_search_path("alternate,public", "postgres");
+    execute(&mut session, &insert, 20);
+    execute(&mut session, &update, 21);
+    execute(&mut session, &delete, 21);
+
+    f.execute("ALTER TABLE alternate.t ALTER COLUMN v SET DEFAULT 30");
+    f.execute("ALTER TABLE alternate.t ADD COLUMN added int DEFAULT 40");
+    execute(&mut session, &insert, 30);
+    assert_eq!(values(&mut session, "SELECT added FROM t"), [vec![Value::Int(40)]]);
+    execute(&mut session, &update, 31);
+    execute(&mut session, &delete, 31);
+
+    // Fail in the second and last input rows, on opposite sides of a page boundary.
+    for (first, last, state) in [
+        ("NULL", "$1::text::integer", "23502"),
+        ("$1::text::integer", "NULL", "22P02"),
+    ] {
+        let rows = (0..=200)
+            .map(|id| {
+                let value = match id {
+                    1 => first,
+                    200 => last,
+                    _ => "DEFAULT",
+                };
+                format!("({id},{value})")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let statement = session.prepare(&format!("INSERT INTO t(id,v) VALUES {rows} RETURNING id,v")).unwrap();
+        let error = session.execute_prepared(&statement, &[Value::Text("bad".into())], None).unwrap_err();
+        assert_eq!(crate::sqlstate(&error), state, "{error:?}");
+        assert!(values(&mut session, "SELECT id FROM t ORDER BY id").is_empty());
+    }
+    assert!(values(&mut session, "SELECT id FROM public.t ORDER BY id").is_empty());
+}
+
+#[test]
+fn sink_binding_falls_back_when_the_final_catalog_changes_relation_resolution() {
+    let f = Fixture::new();
+    f.execute("CREATE SCHEMA alternate");
+    f.execute("CREATE TABLE public.first_rows(id int PRIMARY KEY)");
+    f.execute("CREATE TABLE alternate.second_rows(id int PRIMARY KEY)");
+    f.execute("CREATE INDEX t ON public.first_rows(id)");
+    let mut session = f.admin().sql_session();
+    session.set_search_path("alternate,public", "postgres");
+    let prepared = session.prepare("DROP INDEX t").unwrap();
+    let db = f.db();
+    let image = || db.catalog().snapshot(&mut db.begin(Isolation::ReadCommitted))
+        .unwrap().image().unwrap();
+    let preliminary = image();
+    let memo = relational::SchemaBindingMemo::default();
+    let bound = memo.at(&preliminary).bind(&prepared).unwrap();
+    assert_eq!(bound.table(), Some("first_rows"));
+
+    f.execute("CREATE INDEX t ON alternate.second_rows(id)");
+    let final_catalog = image();
+    let mut fork = preliminary.catalog_image_for_statement(0, 0);
+    fork.catalog_indexes(final_catalog.secondary_descriptors_engine()).unwrap();
+    let selected = prepared.bind_schemas_with(&fork, Some(memo.at(&preliminary))).unwrap();
+    assert_eq!(selected.table(), Some("alternate\0second_rows"));
+}
+
+#[test]
+fn schema_memo_rebinds_after_savepoint_restores_the_catalog() {
+    use relational::Value;
+
+    let f = Fixture::new();
+    f.execute("CREATE SCHEMA alternate");
+    f.execute("CREATE TABLE t(id int PRIMARY KEY, v int DEFAULT 10)");
+    let mut session = f.admin().sql_session();
+    session.set_search_path("alternate,public", "postgres");
+    let prepared = session.prepare("INSERT INTO t(id) VALUES ($1) RETURNING v").unwrap();
+
+    for sql in [
+        "BEGIN",
+        "SAVEPOINT before_ddl",
+        "CREATE TABLE alternate.t(id int PRIMARY KEY, v int DEFAULT 20)",
+    ] {
+        session.execute(sql, &[], None).unwrap();
+    }
+    let run = |session: &mut SqlSession, expected| {
+        let result = session.execute_prepared(&prepared, &[Value::Int(1)], None).unwrap();
+        assert_eq!(result.rows[0].values, [Value::Int(expected)]);
+    };
+    let private = session.bind_relation_context(&prepared).unwrap();
+    assert_eq!(private.table(), Some("alternate\0t"));
+    run(&mut session, 20);
+    session.bind_relation_context(&prepared).unwrap();
+    session.execute("ROLLBACK TO SAVEPOINT before_ddl", &[], None).unwrap();
+
+    let restored = session.bind_relation_context(&prepared).unwrap();
+    assert_eq!(restored.table(), Some("t"));
+    run(&mut session, 10);
+    session.execute("COMMIT", &[], None).unwrap();
+}
+
+#[test]
 fn occupancy_uses_the_statement_catalog_image_including_private_unique_ddl() {
     let f = Fixture::new();
     f.execute("CREATE TABLE t(id int PRIMARY KEY,k text)");

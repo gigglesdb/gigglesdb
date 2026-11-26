@@ -51,6 +51,47 @@ const MAX_NAMED_STATEMENT_BYTES: usize = {
     let headroom = 2 * giggles_core::relational::MAX_STATEMENT_SQL;
     if headroom > 16 * 1024 * 1024 { headroom } else { 16 * 1024 * 1024 }
 };
+// Bind charges the compact JSON representation of the retained core parameters.
+// Core Value uses externally tagged variants. Its scalar adapters encode numerics
+// as decimal strings, floats as bit patterns, and temporal values as byte arrays.
+fn bind_parameter_bytes(params: &[Value]) -> usize {
+    let values = params.iter().map(|value| match value {
+        Value::Null => r#""Null""#.len(),
+        Value::Bool(value) => r#"{"Bool":}"#.len() + if *value { 4 } else { 5 },
+        Value::Int(value) => {
+            r#"{"Int":}"#.len() + decimal_digits(value.unsigned_abs()) + usize::from(*value < 0)
+        }
+        Value::Text(value) => {
+            let escapes: usize = value.bytes().map(|b| match b {
+                b'"' | b'\\' | b'\x08' | b'\t' | b'\n' | b'\x0c' | b'\r' => 1,
+                0..=0x1f => 5,
+                _ => 0,
+            }).sum();
+            r#"{"Text":""}"#.len() + value.len() + escapes
+        }
+        Value::Bytes(value) => r#"{"Bytes":}"#.len() + json_byte_array_len(value),
+        Value::Numeric(value) => r#"{"Numeric":""}"#.len() + value.to_string().len(),
+        Value::Float4(value) => r#"{"Float4":}"#.len() + decimal_digits(u64::from(value.to_bits())),
+        Value::Float8(value) => r#"{"Float8":}"#.len() + decimal_digits(value.to_bits()),
+        Value::Date(value) => r#"{"Date":}"#.len() + json_byte_array_len(&value.to_binary()),
+        Value::Time(value) => r#"{"Time":}"#.len() + json_byte_array_len(&value.to_binary()),
+        Value::TimeTz(value) => r#"{"TimeTz":}"#.len() + json_byte_array_len(&value.to_binary()),
+        Value::Timestamp(value) => r#"{"Timestamp":}"#.len() + json_byte_array_len(&value.to_binary()),
+        Value::TimestampTz(value) => r#"{"TimestampTz":}"#.len() + json_byte_array_len(&value.to_binary()),
+        Value::Interval(value) => r#"{"Interval":}"#.len() + json_byte_array_len(&value.to_binary()),
+    });
+    2 + params.len().saturating_sub(1) + values.sum::<usize>()
+}
+
+fn decimal_digits(value: u64) -> usize {
+    value.max(1).ilog10() as usize + 1
+}
+
+fn json_byte_array_len(bytes: &[u8]) -> usize {
+    let digits: usize = bytes.iter().map(|&b| 1 + usize::from(b >= 10) + usize::from(b >= 100)).sum();
+    2 + bytes.len().saturating_sub(1) + digits
+}
+
 pub async fn ssl_request<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S) -> io::Result<()> {
     timeout(IO_TIMEOUT, async {
         let mut b = [0; 8];
@@ -3530,7 +3571,7 @@ impl State {
                     return Err("54000");
                 }
                 parameter_bytes = parameter_bytes
-                    .checked_add(serde_json::to_vec(&params).map_err(|_| "54000")?.len())
+                    .checked_add(bind_parameter_bytes(&params))
                     .ok_or("54000")?;
                 let bound = self.portals.values().try_fold(0usize, |sum, p| {
                     sum.checked_add(p.retained_bytes()?).ok_or("54000")
@@ -5966,6 +6007,52 @@ mod prepared_validation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bind_parameter_bytes_matches_compact_json() {
+        use giggles_pg_types::{Float4, Float8, Numeric};
+
+        let mut values = vec![
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Int(0),
+            Value::Int(-1),
+            Value::Int(i64::MIN),
+            Value::Int(i64::MAX),
+            Value::Text(String::new()),
+            Value::Text((0u8..=31).map(char::from).collect()),
+            Value::Text("a\"b\\c / café 🙂".into()),
+            // Logical arrays and JSON use the Text variant.
+            Value::Text("{}".into()),
+            Value::Text(r#"[["a", null], ["\\b", "é"]]"#.into()),
+            Value::Bytes(vec![]),
+            Value::Bytes((0..=255).collect()),
+            Value::Float4(Float4::from_bits(0x7fc0_0001)),
+            Value::Float8(Float8::from_bits(0x8000_0000_0000_0000)),
+        ];
+        for numeric in ["-12345.00600", "0", "NaN", "Infinity", "-Infinity"] {
+            values.push(Value::Numeric(Numeric::parse(numeric).unwrap()));
+        }
+        for (data_type, input) in [
+            (DataType::Date, "-infinity"),
+            (DataType::Time, "12:34:56.78"),
+            (DataType::TimeTz, "12:34:56.78-03:30"),
+            (DataType::Timestamp, "1999-11-02 12:34:56.78"),
+            (DataType::TimestampTz, "1999-11-02 12:34:56.78+12"),
+            (DataType::Interval, "-1 mon 3 days -0.123456 seconds"),
+        ] {
+            values.push(decode(input.as_bytes(), &data_type, 0).unwrap());
+        }
+        let compare = |params: &[Value]| {
+            assert_eq!(bind_parameter_bytes(params), serde_json::to_vec(params).unwrap().len(), "{params:?}");
+        };
+        compare(&[]);
+        for value in &values {
+            compare(std::slice::from_ref(value));
+        }
+        compare(&values);
+    }
 
     #[test]
     fn result_type_oids_matches_row_description() {

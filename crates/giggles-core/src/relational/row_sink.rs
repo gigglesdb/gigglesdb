@@ -16,6 +16,11 @@ pub(crate) enum PageMode {
     Mutation,
 }
 
+pub(crate) enum SinkStatement<'a> {
+    Unbound(&'a Prepared),
+    Catalog(&'a Prepared, SchemaBinding<'a>),
+}
+
 impl Prepared {
     // Insert pages replace input rows after schema binding. Preserve
     // their target identity when the page is bound again: a bare storage key
@@ -318,8 +323,10 @@ impl Relational {
         expected: Option<u64>,
         clock: Option<&clock::ExecutionClock>,
         source: &dyn scan::RowSource,
+        binding: SchemaBinding<'_>,
     ) -> R<SqlResult> {
-        self.execute_statement_inner(p, params, expected,
+        let description = StatementDescription::new(p).with_schema_binding(Some(binding));
+        self.execute_statement_described(&description, params, expected,
             || crate::cancellation::check().is_err(), clock, Some(source), &mut Vec::new())
     }
 
@@ -390,18 +397,31 @@ impl Relational {
         version_end: u64,
         deferred: Option<&mut DeferralState>,
     ) -> Result<SqlResult, CoreError> {
-        self.execute_with_sink_actions(prepared, params, expected, clock, sink, version_end, deferred, None, None)
+        self.execute_with_sink_statement(SinkStatement::Unbound(prepared), params, expected, clock, sink, version_end, deferred)
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "statement inputs plus transaction-local deferral")]
+    pub(crate) fn execute_with_sink_statement(
+        &mut self, statement: SinkStatement<'_>, params: &[Value], expected: Option<u64>,
+        clock: Option<&clock::ExecutionClock>, sink: &mut impl RowSink, version_end: u64,
+        deferred: Option<&mut DeferralState>,
+    ) -> Result<SqlResult, CoreError> {
+        self.execute_with_sink_actions(statement, params, expected, clock, sink, version_end, deferred, None, None)
     }
 
     #[expect(clippy::too_many_arguments, reason = "statement inputs and shared INSERT page state")]
     fn execute_with_sink_actions(
-        &mut self, prepared: &Prepared, params: &[Value], expected: Option<u64>,
+        &mut self, statement: SinkStatement<'_>, params: &[Value], expected: Option<u64>,
         clock: Option<&clock::ExecutionClock>, sink: &mut impl RowSink, version_end: u64,
         deferred: Option<&mut DeferralState>, actions: Option<&mut paged_dml::ActionWork>,
         mut insert_defaults: Option<&mut defaults::InsertDefaults>,
     ) -> Result<SqlResult, CoreError> {
         let returning_scope = sink.streams_index_builds().then(spill::returning_unbounded);
-        let bound = prepared.bind_schemas(self).map_err(CoreError::Sql)?;
+        let (prepared, binding) = match statement {
+            SinkStatement::Unbound(prepared) => (prepared, None),
+            SinkStatement::Catalog(prepared, binding) => (prepared, Some(binding)),
+        };
+        let bound = prepared.bind_schemas_with(self, binding).map_err(CoreError::Sql)?;
         let prepared = &bound;
         prepared.validate_schemas(self).map_err(CoreError::Sql)?;
         // Native witnesses are request prechecks: stale/missing wins over any
@@ -472,7 +492,7 @@ impl Relational {
             *population.statement.get_mut() = Statement::InsertMulti(Box::new(
                 sql_insert::Insert::from_select_source(name.clone(), vec![], create.source.clone()),
             ));
-            return paged_insert::execute(self, &population, params, clock, sink, version_end, deferred);
+            return paged_insert::execute(self, &StatementDescription::new(&population), params, clock, sink, version_end, deferred);
         }
         if expected.is_none()
             && sink.streams_index_builds()
@@ -481,7 +501,7 @@ impl Relational {
         {
             return paged_insert::execute(
                 self,
-                prepared,
+                &StatementDescription::new(prepared).with_schema_binding(binding),
                 params,
                 clock,
                 sink,
@@ -502,7 +522,8 @@ impl Relational {
             return mutation.paged(self,prepared,params,clock,sink,version_end,deferred);
         }
         if expected.is_none() && sink.streams_index_builds() && paged_dml::cascade_eligible(self, prepared) {
-            return paged_dml::cascade(self, prepared, params, clock, sink, deferred, version_end);
+            let description = StatementDescription::new(prepared).with_schema_binding(binding);
+            return paged_dml::cascade(self, &description, params, clock, sink, deferred, version_end);
         }
         let append = sink.streams_index_builds()
             && match prepared.statement.get() {
@@ -512,10 +533,12 @@ impl Relational {
             };
         if expected.is_none() && sink.streams_index_builds() && paged_dml::eligible(self, prepared)
         {
-            return paged_dml::execute(self, prepared, params, clock, sink, version_end, deferred);
+            let description = StatementDescription::new(prepared).with_schema_binding(binding);
+            return paged_dml::execute(self, &description, params, clock, sink, version_end, deferred);
         }
         if prepared.routine_catalog_only() {
-            return self.execute_statement_inner(prepared, params, expected,
+            let description = StatementDescription::new(prepared).with_schema_binding(binding);
+            return self.execute_statement_described(&description, params, expected,
                 || crate::cancellation::check().is_err(), clock, None, &mut Vec::new())
                 .map_err(CoreError::Sql);
         }
@@ -535,10 +558,11 @@ impl Relational {
             _ => false,
         };
         if streamed_ddl && sink.streams_index_builds() {
+            let description = StatementDescription::new(prepared).with_schema_binding(binding);
             let original = self.clone();
             let result = self
-                .execute_statement_inner(
-                    prepared,
+                .execute_statement_described(
+                    &description,
                     params,
                     expected,
                     || crate::cancellation::check().is_err(),
@@ -563,8 +587,9 @@ impl Relational {
                 sink.ddl_pages(table, updated, mode, &mut |rows| {
                     let mut page = original.clone();
                     page.rows.insert(table.id, rows);
-                    page.execute_statement_inner(
-                        prepared,
+                    let description = StatementDescription::new(prepared).with_schema_binding(binding);
+                    page.execute_statement_described(
+                        &description,
                         params,
                         expected,
                         || crate::cancellation::check().is_err(),
@@ -594,10 +619,11 @@ impl Relational {
         let collated = self.tables.values().any(|t| self.has_nondeterministic_keys(t))
             || matches!(prepared.statement.get(), Statement::CreateIndex(i) if i.collations.iter().any(Option::is_some));
         if index_build && sink.streams_index_builds() && !collated {
+            let description = StatementDescription::new(prepared).with_schema_binding(binding);
             let old: BTreeSet<_> = sink.indexes().iter().map(|index| index.id).collect();
             let result = self
-                .execute_statement_inner(
-                    prepared,
+                .execute_statement_described(
+                    &description,
                     params,
                     expected,
                     || crate::cancellation::check().is_err(),
@@ -812,9 +838,10 @@ impl Relational {
             // transaction-local writes). Legacy query execution consumes the
             // hydrated row maps; it has no need for a transient index sidecar.
             self.secondary = secondary_index::Sidecar::default();
+            let description = StatementDescription::new(prepared).with_schema_binding(binding);
             return self
-                .execute_statement_inner(
-                    prepared,
+                .execute_statement_described(
+                    &description,
                     params,
                     expected,
                     || crate::cancellation::check().is_err(),
@@ -904,19 +931,20 @@ impl Relational {
         } else {
             let mut events = Vec::new();
             let mut append_order = None;
+            let description = StatementDescription::new(prepared).with_schema_binding(binding);
             let result = if prepared.row_lock_command().is_some() {
                 let mut result = None;
                 let snapshot = self.clone();
                 sink.with_row_source(&mut |source| {
                     let source = scan::LockedSnapshot { snapshot: scan::LegacyRows(&snapshot), locks: source };
-                    result = Some(self.execute_statement_inner(prepared, params, expected,
+                    result = Some(self.execute_statement_described(&description, params, expected,
                         || crate::cancellation::check().is_err(), clock, Some(&source), &mut events)?);
                     Ok(())
                 })?;
                 result.ok_or(CoreError::Sql(SqlError::InternalError))?
             } else if append {
                 match self.execute_statement_described_with_append(
-                    &StatementDescription::new(prepared), params, expected,
+                    &description, params, expected,
                     || crate::cancellation::check().is_err(), clock, None, &mut events,
                     Some(&mut append_order),
                     insert_defaults,
@@ -932,7 +960,7 @@ impl Relational {
                 }
             } else {
                 self.execute_statement_described_with_append(
-                    &StatementDescription::new(prepared), params, expected,
+                    &description, params, expected,
                     || crate::cancellation::check().is_err(), clock, None, &mut events,
                     None, insert_defaults,
                 ).map_err(CoreError::Sql)?

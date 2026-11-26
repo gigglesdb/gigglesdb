@@ -2,6 +2,14 @@
 use super::*;
 use crate::storage::SqlViewDef;
 
+thread_local! {
+    static PROJECTION_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub(in crate::relational) fn projection_reads() -> u64 {
+    PROJECTION_READS.get()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Projection {
     pub base: String,
@@ -86,10 +94,15 @@ fn expand(state: &Relational, definitions: &BTreeMap<u64, SqlViewDef>, id: u64, 
 }
 pub(in crate::relational) fn projection<'a>(state: &'a Relational, name: &str) -> R<Option<&'a Projection>> {
     if state.tables.contains_key(name) { return Ok(None); }
-    state.view_names.get(name).map(|(_, p)| p.as_ref().map_err(|e| {
-        if *e == SqlError::Unsupported { user_types::view_recreate_error(); }
-        e.clone()
-    })).transpose()
+    let Some((_, projection)) = state.view_names.get(name) else { return Ok(None); };
+    if *projection == Err(SqlError::Unsupported) {
+        user_types::view_recreate_error();
+        return Err(SqlError::Unsupported);
+    }
+    // An outer bind can consult a projection through a nested bind without
+    // including it in the outer statement's authorization reads.
+    PROJECTION_READS.set(PROJECTION_READS.get().wrapping_add(1));
+    projection.as_ref().map(Some).map_err(Clone::clone)
 }
 pub(super) fn table<'a>(state: &'a Relational, name: &str) -> R<&'a TableDef> {
     let name = projection(state, name)?.map_or(name, |p| p.base.as_str());

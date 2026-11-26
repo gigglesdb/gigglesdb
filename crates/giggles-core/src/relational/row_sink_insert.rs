@@ -35,18 +35,20 @@ fn stored_source(state: &Relational, query: &query::Query) -> bool {
 
 pub(super) fn execute<S: RowSink>(
     state: &mut Relational,
-    prepared: &Prepared,
+    description: &StatementDescription<'_>,
     params: &[Value],
     clock: Option<&clock::ExecutionClock>,
     sink: &mut S,
     version_end: u64,
     mut deferred: Option<&mut DeferralState>,
 ) -> Result<SqlResult, CoreError> {
+    let prepared = description.prepared();
     let Statement::InsertMulti(insert) = prepared.statement.get() else {
         unreachable!()
     };
     let mut template = prepared.clone();
-    template.parameter_types = prepared.describe(state).map_err(CoreError::Sql)?.parameters.into_iter().map(Some).collect();
+    template.parameter_types = description.input().describe(state).map_err(CoreError::Sql)?
+        .parameters.iter().cloned().map(Some).collect();
     *template.statement.get_mut() = Statement::InsertMulti(Box::new(insert.batch(0, 0)));
     let mut output = spill::RowBuffer::new(Vec::new())?;
     let mut result = SqlResult::default();
@@ -78,7 +80,7 @@ pub(super) fn execute<S: RowSink>(
         *batch.statement.get_mut() = Statement::InsertMulti(Box::new(input));
         batch.preserve_page_target();
         let part = page.execute_with_sink_actions(
-            &batch,
+            SinkStatement::Unbound(&batch),
             params,
             None,
             clock,

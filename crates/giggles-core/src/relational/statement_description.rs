@@ -1,4 +1,4 @@
-use super::{DataType, Description, EnumParameters, Prepared, R, Relational, clock, searched};
+use super::{DataType, Description, EnumParameters, Prepared, R, Relational, SchemaBinding, clock, searched};
 use std::{borrow::Cow, cell::OnceCell};
 
 /// A lazy description for one immutable statement input and binding catalog.
@@ -6,6 +6,7 @@ use std::{borrow::Cow, cell::OnceCell};
 /// execution still binds and validates its own statement before using it.
 pub(crate) struct StatementDescription<'a> {
     prepared: &'a Prepared,
+    binding: Option<SchemaBinding<'a>>,
     full: OnceCell<(Description, EnumParameters)>,
     searched: [OnceCell<Description>; 3],
 }
@@ -14,9 +15,15 @@ impl<'a> StatementDescription<'a> {
     pub(super) fn new(prepared: &'a Prepared) -> Self {
         Self {
             prepared,
+            binding: None,
             full: OnceCell::new(),
             searched: Default::default(),
         }
+    }
+
+    pub(super) fn with_schema_binding(mut self, binding: Option<SchemaBinding<'a>>) -> Self {
+        self.binding = binding;
+        self
     }
 
     pub(crate) fn prepared(&self) -> &'a Prepared {
@@ -33,7 +40,7 @@ impl<'a> StatementDescription<'a> {
     pub(super) fn bind_schemas(&self, state: &Relational) -> R<StatementDescriptionInput<'_>> {
         Ok(StatementDescriptionInput {
             memo: self,
-            prepared: Cow::Owned(self.prepared.bind_schemas(state)?),
+            prepared: Cow::Owned(self.prepared.bind_schemas_with(state, self.binding)?),
         })
     }
 
@@ -72,7 +79,7 @@ impl StatementDescriptionInput<'_> {
             .searched_slot(self.prepared.literal_date_order)
             .get()
             .filter(|_| self.can_share_searched(state));
-        let description = self.prepared.describe_with_searched(state, searched_description)?;
+        let description = self.prepared.describe_with_searched(state, searched_description, self.memo.binding)?;
         Ok(&self.memo.full.get_or_init(|| description).0)
     }
 

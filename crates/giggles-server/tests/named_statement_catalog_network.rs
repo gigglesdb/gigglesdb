@@ -83,7 +83,10 @@ async fn case(label: &str, setup: &str, sql: &str, change: &str, expected: Optio
             .await
             .unwrap();
     }
-    let result = if label.starts_with("bind-churn") {
+    let result = if label.starts_with("schema-memo") {
+        schema_memo_probe(pg.address, &clients[0], label).await;
+        None
+    } else if label.starts_with("bind-churn") {
         bind_churn_probe(pg.address, &clients[0], &admin, label).await;
         None
     } else if label.starts_with("bind-drift") {
@@ -1275,4 +1278,136 @@ async fn bind_catalog_churn_is_cancellable() {
 #[tokio::test]
 async fn bind_catalog_churn_checks_statement_deadline() {
     case("bind-churn-timeout", "CREATE TABLE t(a int)", "", "", None).await;
+}
+
+async fn schema_memo_probe(
+    address: std::net::SocketAddr,
+    ddl: &tokio_postgres::Client,
+    label: &str,
+) {
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    let startup = b"\0\x03\0\0user\0owner\0database\0postgres\0\0";
+    stream.write_u32((startup.len() + 4) as u32).await.unwrap();
+    stream.write_all(startup).await.unwrap();
+    receive(&mut stream, b'Z').await;
+
+    async fn simple(stream: &mut TcpStream, sql: &str) {
+        let mut body = Vec::new();
+        giggles_server::pgwire::z(sql, &mut body);
+        send(stream, &[(b'Q', &body)]).await;
+        let result = receive(stream, b'Z').await;
+        assert_eq!(response_code(&result), None, "{sql}: {result:?}");
+    }
+
+    let ddl_change = label.contains("ddl");
+    let date = label.ends_with("date");
+    let role = label.ends_with("role");
+    let name = if label.ends_with("unnamed") { "" } else { "s" };
+    let sql = if ddl_change {
+        "INSERT INTO t(id) VALUES($1) RETURNING v"
+    } else if date {
+        "SELECT '01/02/2024'::text::date FROM t"
+    } else {
+        "SELECT id FROM t"
+    };
+    let mut parse = Vec::new();
+    giggles_server::pgwire::z(name, &mut parse);
+    giggles_server::pgwire::z(sql, &mut parse);
+    parse.extend_from_slice(&[0, 0]);
+    let mut describe = vec![b'S'];
+    giggles_server::pgwire::z(name, &mut describe);
+    send(&mut stream, &[(b'P', &parse), (b'D', &describe), (b'S', b"")]).await;
+    let described = receive(&mut stream, b'Z').await;
+    assert_eq!(response_code(&described), None, "{described:?}");
+    assert!(described.iter().any(|(tag, _)| *tag == b'T'));
+
+    if ddl_change {
+        ddl.batch_execute(
+            "ALTER TABLE t ADD COLUMN added int DEFAULT 40; ALTER TABLE t ALTER COLUMN v SET DEFAULT 30",
+        ).await.unwrap();
+    } else if role {
+        simple(&mut stream, "SET search_path TO \"$user\", public").await;
+        simple(&mut stream, "SET ROLE r").await;
+    } else if date {
+        simple(&mut stream, "SET DateStyle='ISO, DMY'").await;
+    } else {
+        simple(&mut stream, "SET search_path TO r, public").await;
+    }
+
+    let mut bind = b"p\0".to_vec();
+    giggles_server::pgwire::z(name, &mut bind);
+    bind.extend_from_slice(&[0, 0]);
+    if ddl_change {
+        bind.extend_from_slice(&[0, 1, 0, 0, 0, 1, b'7']);
+    } else {
+        bind.extend_from_slice(&[0, 0]);
+    }
+    bind.extend_from_slice(&[0, 0]);
+    let run = [(b'B', bind.as_slice()), (b'E', b"p\0\0\0\0\0"), (b'S', b"")];
+    let expect_row = |result: &[(u8, Vec<u8>)], expected: &[u8]| {
+        assert_eq!(response_code(result), None, "{label}: {result:?}");
+        let row = &result.iter().find(|(tag, _)| *tag == b'D').unwrap().1;
+        assert_eq!(&row[6..], expected);
+    };
+    send(&mut stream, &run).await;
+    let result = receive(&mut stream, b'Z').await;
+    if ddl_change {
+        let fresh = ddl.query_one(sql, &[&8i32]).await.unwrap().get::<_, i32>(0);
+        assert_eq!(fresh, 30);
+        expect_row(&result, fresh.to_string().as_bytes());
+        let saved = ddl.query_one("SELECT added FROM t WHERE id=7", &[]).await.unwrap();
+        assert_eq!(saved.get::<_, i32>(0), 40);
+    } else if date {
+        expect_row(&result, b"2024-02-01");
+    } else if role {
+        // This server expands $user using the authenticated role's schema.
+        expect_row(&result, b"3");
+    } else {
+        expect_row(&result, b"2");
+    }
+
+    if role {
+        simple(&mut stream, "RESET ROLE").await;
+        simple(&mut stream, "SET SESSION AUTHORIZATION r").await;
+        send(&mut stream, &run).await;
+        expect_row(&receive(&mut stream, b'Z').await, b"3");
+
+        simple(&mut stream, "BEGIN").await;
+        send(&mut stream, &[(b'B', &bind), (b'S', b"")]).await;
+        let bound = receive(&mut stream, b'Z').await;
+        assert_eq!(response_code(&bound), None, "{bound:?}");
+        assert!(bound.iter().any(|(tag, _)| *tag == b'2'));
+        ddl.batch_execute("REVOKE SELECT ON owner.t FROM r").await.unwrap();
+        send(&mut stream, &[(b'E', b"p\0\0\0\0\0"), (b'S', b"")]).await;
+        let denied = receive(&mut stream, b'Z').await;
+        assert_eq!(response_code(&denied), Some("42501"), "{denied:?}");
+        assert!(denied.iter().all(|(tag, _)| *tag != b'D'));
+        simple(&mut stream, "ROLLBACK").await;
+    }
+}
+
+#[tokio::test]
+async fn schema_memo_revalidates_named_and_unnamed_statements_after_describe() {
+    for label in ["schema-memo-ddl-named", "schema-memo-ddl-unnamed"] {
+        case(label, "CREATE TABLE t(id int PRIMARY KEY, v int DEFAULT 10)", "", "", None).await;
+    }
+}
+
+#[tokio::test]
+async fn schema_memo_preserves_search_path_role_grants_and_literal_date_order() {
+    for label in ["schema-memo-path", "schema-memo-date", "schema-memo-role"] {
+        case(
+            label,
+            concat!(
+                "CREATE SCHEMA r; CREATE SCHEMA owner; ",
+                "CREATE TABLE public.t(id int PRIMARY KEY); ",
+                "CREATE TABLE r.t(id int PRIMARY KEY); ",
+                "CREATE TABLE owner.t(id int PRIMARY KEY); ",
+                "INSERT INTO public.t VALUES(1); INSERT INTO r.t VALUES(2); ",
+                "INSERT INTO owner.t VALUES(3); GRANT USAGE ON SCHEMA owner TO r; ",
+                "GRANT SELECT ON public.t TO r; GRANT SELECT ON owner.t TO r",
+            ),
+            "", "", None,
+        ).await;
+    }
 }

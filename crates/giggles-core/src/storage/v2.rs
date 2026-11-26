@@ -742,6 +742,7 @@ impl V2Db {
                 u128::from_be_bytes(self.meta.domain),
             );
             state.catalog = Some(&catalog);
+            state.catalog_image = Some(&image);
             state.sql.comments = Some(&catalog.parts.comments);
             state.sql.views = Some(&catalog.parts.sql_views);
             inspect(&state)
