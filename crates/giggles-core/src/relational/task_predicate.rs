@@ -14,6 +14,7 @@ use super::*;
 /// with doubled quotes, one space between tokens. Canonical text is a fixed point.
 pub(crate) fn canonical(state: &Relational, table: &TableDef, sql: &str) -> Result<String, SqlError> {
     let tokens = lex(sql)?;
+    query::named_args::reject_stored(&tokens)?;
     let text = render(&tokens)?;
     let again = lex(&text)?;
     if render(&again)? != text

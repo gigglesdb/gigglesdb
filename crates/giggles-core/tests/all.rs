@@ -669,3 +669,6 @@ mod enum_array_check;
 
 #[path = "sql_wide_tables.rs"]
 mod sql_wide_tables;
+
+#[path = "sql_named_arguments.rs"]
+mod sql_named_arguments;

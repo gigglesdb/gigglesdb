@@ -715,7 +715,9 @@ fn output_name(mut s: &Scalar, calls: &[Call]) -> String {
             .map(|w| w.name.as_str())
             .or_else(|| (!c.name.starts_with('\0')).then_some(c.name.as_str())),
         Scalar::Call(n, _) if n == "\0array_constructor" => Some("array"),
-        Scalar::Call(n, _) if !n.starts_with('\0') => Some(n.as_str()),
+        Scalar::Call(n, _) if !functions::named_args::routine(n).starts_with('\0') => {
+            Some(functions::named_args::routine(n))
+        }
         _ => None,
     };
     name.or(cast_name)

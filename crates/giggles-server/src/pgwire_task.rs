@@ -393,6 +393,8 @@ impl State {
                 return Err(catalog_wire::error(giggles_pg_catalog::Error::Unsupported));
             }
             Ok(None) | Err(giggles_pg_catalog::Error::Syntax) => return Ok(None),
+            Err(error @ giggles_pg_catalog::Error::UndefinedFunction(_)) =>
+                return Err(self.diagnostic.catalog_error(error)),
             Err(error) => return Err(catalog_wire::error(error)),
         };
         if plan.contains_subquery() && !plan.user_relations().is_empty() {

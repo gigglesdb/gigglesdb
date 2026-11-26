@@ -470,3 +470,6 @@ mod enum_array_check_network;
 
 #[path = "wide_table_network.rs"]
 mod wide_table_network;
+
+#[path = "named_arguments_network.rs"]
+mod named_arguments_network;

@@ -284,6 +284,10 @@ impl Diagnostic {
         {
             self.wire_message = Some(error.to_string());
         }
+        if let E::UndefinedFunction(message) = &error {
+            self.wire_message = Some(message.clone());
+            self.wire_hint = Some("No function matches the given name and argument types. You might need to add explicit type casts.".into());
+        }
         if let E::TypeNameSyntax { input: Some(input), .. } = &error {
             let input = input.replace('\0', "\\0");
             self.wire_context = Some(format!(r#"invalid type name "{input}""#));
@@ -366,6 +370,13 @@ impl Diagnostic {
         }
         let postgres_diagnostic = match (&result, message.as_deref()) {
             (Err(CoreError::Sql(_)), Some(_)) if self.exact_sql_detail => true,
+            (Err(CoreError::Sql(SqlError::Syntax)), Some(m)) => {
+                m == "positional argument cannot follow named argument"
+                    || m.starts_with("argument name \"") && m.ends_with("\" used more than once")
+            }
+            (Err(CoreError::Sql(SqlError::Unsupported)), Some("aggregates cannot use named arguments")) => true,
+            (Err(CoreError::Sql(SqlError::UndefinedFunction)), Some(m))
+                if m.starts_with("function ") && m.contains(" => ") && m.ends_with(" does not exist") => true,
             (Err(CoreError::Sql(SqlError::CharacterNotInRepertoire)), Some(m)) => {
                 m.starts_with("invalid byte sequence for encoding \"UTF8\": ")
                     || m == "invalid byte sequence for encoding \"SQL_ASCII\": 0x00"
@@ -1406,7 +1417,8 @@ fn catalog_plan(
         // example COPY rejection). Core still parses and authorizes the entire
         // original statement; no failed catalog plan is executed as metadata.
         Err(giggles_pg_catalog::Error::Syntax) => Ok(None),
-        Err(error @ giggles_pg_catalog::Error::TooManyColumns) => Err(diagnostic.catalog_error(error)),
+        Err(error @ (giggles_pg_catalog::Error::TooManyColumns
+            | giggles_pg_catalog::Error::UndefinedFunction(_))) => Err(diagnostic.catalog_error(error)),
         other => other.map(|plan| plan.map(|plan| (plan, fence))).map_err(catalog_wire::error),
     }
 }

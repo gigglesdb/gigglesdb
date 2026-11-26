@@ -799,6 +799,13 @@ fn plan_inner(
         }
         i += 1;
     }
+    // sqlparser's PostgreSQL dialect accepts =>. The legacy spelling is
+    // the same operator in function calls. Tokenized literals remain intact.
+    for token in &mut tokens {
+        if *token == Token::Assignment {
+            *token = Token::RArrow;
+        }
+    }
     let statements = match Parser::new(&PostgreSqlDialect {})
         .with_recursion_limit(64)
         .with_tokens(tokens)
@@ -1789,11 +1796,13 @@ impl Compiler {
             aggregate,
         })
     }
-    fn acl_source(&mut self, args: &[a::FunctionArg], outer: &Schema) -> R<(Source, Vec<Field>)> {
+    fn acl_source(
+        &mut self, routine: &a::ObjectName, args: &[a::FunctionArg], outer: &Schema,
+    ) -> R<(Source, Vec<Field>)> {
         if args.len() != 1 {
             return Err(Error::Unsupported);
         }
-        let mut args = self.args(args, outer)?;
+        let mut args = vec![self.single_argument(&args[0], routine, "acl", outer)?];
         expect(&mut args[0], PgType::AclItemArray)?;
         no_set_or_window(&args[0])?;
         Ok((
@@ -1871,7 +1880,7 @@ impl Compiler {
                 {
                     return Err(Error::Unsupported);
                 }
-                let (source, fields) = self.acl_source(args, outer)?;
+                let (source, fields) = self.acl_source(name, args, outer)?;
                 (source, fields, alias, "aclexplode".into())
             }
             a::TableFactor::Table {
@@ -1928,7 +1937,7 @@ impl Compiler {
                 }
                 if let Some(args) = args {
                     if n == "aclexplode" && args.settings.is_none() {
-                        let (source, fields) = self.acl_source(&args.args, outer)?;
+                        let (source, fields) = self.acl_source(name, &args.args, outer)?;
                         (source, fields, alias, n)
                     } else if n == "pg_available_extension_versions"
                         && args.args.is_empty()
@@ -1957,10 +1966,10 @@ impl Compiler {
                         && args.args.len() == 1
                         && args.settings.is_none()
                     {
-                        let mut es = self.args(&args.args, outer)?;
-                        expect(&mut es[0], PgType::Oid)?;
-                        no_set_or_window(&es[0])?;
-                        if !matches!(&es[0].kind, K::Column(i)
+                        let mut e = self.single_argument(&args.args[0], name, "sequence_oid", outer)?;
+                        expect(&mut e, PgType::Oid)?;
+                        no_set_or_window(&e)?;
+                        if !matches!(&e.kind, K::Column(i)
                             if outer[*i].qualifier == "pg_sequence"
                                 && outer[*i].field.name == "seqrelid")
                         {
@@ -1987,8 +1996,7 @@ impl Compiler {
                         && args.args.len() == 1
                         && args.settings.is_none()
                     {
-                        let mut es = self.args(&args.args, outer)?;
-                        let mut e = es.remove(0);
+                        let mut e = self.single_argument(&args.args[0], name, "options_array", outer)?;
                         expect(&mut e, PgType::TextArray)?;
                         no_set_or_window(&e)?;
                         (
@@ -2171,6 +2179,42 @@ impl Compiler {
             });
         }
         Ok((source, schema))
+    }
+    fn single_argument(
+        &mut self, arg: &a::FunctionArg, routine: &a::ObjectName, label: &str, schema: &Schema,
+    ) -> R<E> {
+        match arg {
+            a::FunctionArg::Unnamed(a::FunctionArgExpr::Expr(expr)) => self.expr(expr, schema),
+            a::FunctionArg::Named {
+                name,
+                arg: a::FunctionArgExpr::Expr(expr),
+                operator: a::FunctionArgOperator::RightArrow,
+            }
+            | a::FunctionArg::ExprNamed {
+                name: A::Identifier(name),
+                arg: a::FunctionArgExpr::Expr(expr),
+                operator: a::FunctionArgOperator::RightArrow,
+            } => {
+                let name = ident(name);
+                let input = self.expr(expr, schema)?;
+                if name == label {
+                    return Ok(input);
+                }
+                let ty = if unknown(&input) {
+                    "unknown".into()
+                } else {
+                    let requested = BTreeSet::from(["pg_type".into()]);
+                    let builtins = catalog::build(&CatalogSnapshot::default(), &requested)?;
+                    let types = builtins.get("pg_type").ok_or(Error::Unsupported)?;
+                    format_type(i64::from(input.ty.oid()), Value::Null, &types.rows)?
+                };
+                let routine = object(routine).join(".");
+                Err(Error::UndefinedFunction(format!(
+                    "function {routine}({name} => {ty}) does not exist"
+                )))
+            }
+            _ => Err(Error::Unsupported),
+        }
     }
     fn args(&mut self, args: &[a::FunctionArg], schema: &Schema) -> R<Vec<E>> {
         args.iter()
@@ -2661,7 +2705,7 @@ impl Compiler {
                     {
                         return Err(Error::Unsupported);
                     }
-                    let mut input = self.args(&args.args, schema)?.remove(0);
+                    let mut input = self.single_argument(&args.args[0], &f.name, "partitionid", schema)?;
                     expect(&mut input, PgType::Oid)?;
                     // This snapshot has no partition hierarchy, so there are no ancestors.
                     return Ok(E {
@@ -2815,7 +2859,11 @@ impl Compiler {
                     a::FunctionArguments::List(l)
                         if l.duplicate_treatment.is_none() && l.clauses.is_empty() =>
                     {
-                        self.args(&l.args, schema)?
+                        if n == "aclexplode" && l.args.len() == 1 {
+                            vec![self.single_argument(&l.args[0], &f.name, "acl", schema)?]
+                        } else {
+                            self.args(&l.args, schema)?
+                        }
                     }
                     _ => return Err(Error::Unsupported),
                 };

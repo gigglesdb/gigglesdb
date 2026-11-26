@@ -36,6 +36,7 @@ pub(crate) fn error(error: giggles_pg_catalog::Error) -> &'static str {
         E::Syntax | E::TypeModifierNotAllowed(_) | E::TypeNameSyntax { .. } => "42601",
         E::MixedRelations | E::Mutation => "42501",
         E::UnknownColumn => "42703",
+        E::UndefinedFunction(_) => "42883",
         E::AmbiguousColumn => "42702",
         E::Type => "42804",
         E::DivisionByZero => "22012",

@@ -1386,8 +1386,10 @@ fn local_names(query: &Query, state: &Relational) -> Vec<String> {
         match item {
             Item::Scalar(Scalar::Column(c)) => out.push(c.name.clone()),
             Item::Aggregate(a, _) => out.push(a.name().into()),
-            Item::Scalar(Scalar::Call(name, _)) if !name.starts_with('\0') => {
-                out.push(name.clone())
+            Item::Scalar(Scalar::Call(name, _))
+                if !functions::named_args::routine(name).starts_with('\0') =>
+            {
+                out.push(functions::named_args::routine(name).into())
             }
             Item::Star | Item::QualifiedStar { .. } => {
                 if let Some(derived) = query.derived() {

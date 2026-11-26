@@ -11,6 +11,7 @@ pub(super) struct Function {
     name: String,
     pub args: Vec<Scalar>,
     pub input: Option<Box<Plan>>,
+    named: Option<functions::named_args::SourceLayout>,
     ordinality: bool,
 }
 fn known(name: &str) -> bool {
@@ -36,7 +37,10 @@ pub(super) fn parse(
         .strip_prefix("pg_catalog\0")
         .unwrap_or(name)
         .to_string();
-    if !known(&name) {
+    if !known(&name)
+        && (functions::named_args::postgres_has_named_inputs(&name)
+            || !p.tokens.get(p.at + 1..).is_some_and(functions::named_args::in_call))
+    {
         return Err(SqlError::UndefinedFunction);
     }
     let open = p.at;
@@ -57,7 +61,19 @@ pub(super) fn parse(
     p.at = close + 1;
     let mut arguments = parse::parser(&tokens);
     let mut args = vec![];
-    if !tokens.is_empty() || !text_search_srf::known(&name) {
+    let mut named = None;
+    if functions::named_args::in_call(&tokens) {
+        let (names, values) = functions::named_args::parse(&mut arguments, 0, false, false)?;
+        if arguments.at != arguments.tokens.len() {
+            return Err(SqlError::Syntax);
+        }
+        if !known(&name) {
+            return Err(names.undefined_source(&name, &values)?);
+        }
+        let layout = functions::named_args::SourceLayout::new(&name, names, &values)?;
+        args = layout.arguments(values)?;
+        named = Some(layout);
+    } else if !tokens.is_empty() || !text_search_srf::known(&name) {
         loop {
             args.push(Scalar::parse_expr(&mut arguments, 0, false)?);
             if !arguments.sym(',') {
@@ -73,7 +89,7 @@ pub(super) fn parse(
         None
     } else {
         let mut select = vec![Token::Word("select".into())];
-        select.extend(tokens);
+        select.extend(named.as_ref().map_or_else(|| tokens.clone(), |layout| layout.tokens(&tokens)));
         let mut parser = parse::parser(&select);
         let query = Query::parse(&mut parser)?;
         owner.relations.extend(parser.relations);
@@ -108,6 +124,7 @@ pub(super) fn parse(
         name,
         args,
         input,
+        named,
         ordinality,
     })
 }
@@ -265,7 +282,7 @@ impl Function {
                 if meta.columns.len() != 1 {
                     return Err(SqlError::UndefinedFunction);
                 }
-                return element(&meta.columns[0].data_type);
+                return self.unnest_type(&meta.columns[0].data_type);
             }
             if !(2..=3).contains(&meta.columns.len())
                 || meta.columns.iter().any(|c| !integer_type(&c.data_type))
@@ -284,7 +301,12 @@ impl Function {
             if self.args.len() != 1 {
                 return Err(SqlError::UndefinedFunction);
             }
-            return element(&bind::scalar_type(&self.args[0], parameters)?);
+            let arg = &self.args[0];
+            if self.named.is_some() && arg.aggregate_unknown(parameters) {
+                arg.infer(Some(&DataType::TsVector), parameters, &|_, _| Err(SqlError::UnknownColumn), &[])?;
+                return Ok(DataType::TsVector);
+            }
+            return self.unnest_type(&bind::scalar_type(arg, parameters)?);
         }
         if !(2..=3).contains(&self.args.len()) {
             return Err(SqlError::UndefinedFunction);
@@ -323,19 +345,40 @@ impl Function {
             DataType::Integer
         })
     }
+    fn unnest_type(&self, ty: &DataType) -> R<DataType> {
+        if self.named.is_some() && ty != &DataType::TsVector {
+            return Err(SqlError::UndefinedFunction);
+        }
+        element(ty)
+    }
+
     pub fn resolve(
         &self,
         state: &Relational,
         parameters: &mut [Option<DataType>],
     ) -> R<(Vec<ColumnDef>, Vec<i32>)> {
+        match self.resolve_positional(state, parameters) {
+            Err(SqlError::UndefinedFunction | SqlError::TextSearchUndefinedFunction) if let Some(named) = &self.named => {
+                Err(named.error(&self.name, &self.args, parameters)?)
+            }
+            result => result,
+        }
+    }
+
+    fn resolve_positional(
+        &self,
+        state: &Relational,
+        parameters: &mut [Option<DataType>],
+    ) -> R<(Vec<ColumnDef>, Vec<i32>)> {
         let mut columns = if text_search_srf::known(&self.name) {
+            let first = self.named.as_ref().and_then(functions::named_args::SourceLayout::parser_type);
             if let Some(input) = &self.input {
                 let meta = input.clone().resolve(state, parameters)?;
                 let types = meta.columns.into_iter().zip(meta.unknown)
                     .map(|(column, unknown)| unknown.is_none().then_some(column.data_type)).collect::<Vec<_>>();
-                functions::text_search::row_arg_types(&self.name, &types)?;
+                functions::text_search::row_arg_types(&self.name, first.as_ref(), &types)?;
             } else {
-                functions::text_search::bind_row_args(&self.name, &self.args, parameters)?;
+                functions::text_search::bind_row_args(&self.name, first.as_ref(), &self.args, parameters)?;
             }
             text_search_srf::columns(&self.name)
         } else {
@@ -405,15 +448,23 @@ impl Function {
             args.iter_mut().map(eval).collect::<R<Vec<_>>>()?
         } else {
             let mut bound = if text_search_srf::known(&self.name) {
-                functions::text_search::bind_row_args(&self.name, &self.args, &mut parameters.to_vec())?
+                let first = self.named.as_ref().and_then(functions::named_args::SourceLayout::parser_type);
+                functions::text_search::bind_row_args(&self.name, first.as_ref(), &self.args, &mut parameters.to_vec())?
             } else {
                 self.args.iter().map(|scalar| {
-                    if json_srf::known(&self.name) && scalar.aggregate_unknown(parameters) {
-                        Scalar::Cast(Box::new(scalar.clone()), DataType::Jsonb)
-                            .bind(&|_, _| Err(SqlError::UnknownColumn), &[], parameters)
+                    let target = if json_srf::known(&self.name) {
+                        Some(DataType::Jsonb)
+                    } else if self.name == "unnest" && self.named.is_some() {
+                        Some(DataType::TsVector)
                     } else {
-                        scalar.bind(&|_, _| Err(SqlError::UnknownColumn), &[], parameters)
+                        None
+                    };
+                    let no_columns = |_: &ColumnRef, _: usize| Err(SqlError::UnknownColumn);
+                    if let Some(target) = target && scalar.aggregate_unknown(parameters) {
+                        return Scalar::Cast(Box::new(scalar.clone()), target)
+                            .bind(&no_columns, &[], parameters);
                     }
+                    scalar.bind(&no_columns, &[], parameters)
                 }).collect::<R<Vec<_>>>()?
             };
             bound.iter_mut().map(eval).collect::<R<Vec<_>>>()?

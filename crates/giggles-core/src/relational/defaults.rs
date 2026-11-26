@@ -1288,6 +1288,11 @@ fn expression(p: &mut Parser, depth: usize) -> R<Expression> {
     if matches!(p.tokens.get(p.at),Some(Token::Word(_) | Token::QuotedIdent(_))) {
         let first=alter_table::raw_name(p)?;
         let (schema,routine)=if p.sym('.') {(Some(first),alter_table::raw_name(p)?)} else {(None,first)};
+        if p.tokens.get(p.at) == Some(&Token::Symbol('('))
+            && query::named_args::in_call(&p.tokens[p.at + 1..])
+        {
+            return Err(SqlError::Unsupported);
+        }
         if query::random_uuid::default_candidate(schema.as_deref(), &routine) && p.sym('(') {
             let (sql, ty) = query::random_uuid::parse_default(p, schema.as_deref(), &routine, depth + 1)?;
             call = Some(Expression::Builtin(sql, ty));

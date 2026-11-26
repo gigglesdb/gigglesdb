@@ -258,6 +258,7 @@ pub(in crate::relational) fn bind_definition(
         user_types::view_replace_error("aggregate functions are not allowed in column generation expressions".into());
         return Err(SqlError::GroupingError);
     }
+    functions::named_args::reject_stored(&definition.tokens)?;
     let mut value = parse(definition.tokens.clone())?;
     if matches!(value, Scalar::Literal(Value::Null)) {
         value = Scalar::Cast(Box::new(value), target.data_type.clone());

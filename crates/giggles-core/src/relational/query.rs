@@ -11,7 +11,7 @@ mod aggregate_order;
 mod array_aggregate;
 pub(super) use array_aggregate::decode_element as array_agg_element;
 mod functions;
-pub(super) use functions::{quoting::quote_identifier, random_uuid, transform_builtin_type};
+pub(super) use functions::{named_args, quoting::quote_identifier, random_uuid, transform_builtin_type};
 
 pub(super) fn known_zero_argument_function(name: &str) -> bool {
     user_types::probe_preserving_error_message(|| {
@@ -2670,7 +2670,10 @@ impl Query {
             } else {
                 let aggregate = match p.tokens.get(p.at) {
                     Some(Token::Word(w)) if p.tokens.get(p.at + 1) == Some(&Token::Symbol('(')) => {
-                        Aggregate::from_name(w).filter(|a| a.base() != Aggregate::ArrayAgg)
+                        Aggregate::from_name(w).filter(|a| {
+                            a.base() != Aggregate::ArrayAgg
+                                && !functions::named_args::in_call(&p.tokens[p.at + 2..])
+                        })
                     }
                     _ => None,
                 };
@@ -3289,8 +3292,9 @@ impl Query {
                     args.iter().all(scalar)
                 }
                 Scalar::Call(name, args) => {
+                    let name = functions::named_args::routine(name);
                     (s.is_trigger_call() || random_uuid::known(name) || functions::text_search::known(name) || matches!(
-                        name.as_str(),
+                        name,
                         "abs"
                             | "pg_collation_for"
                             // Clock functions read only the per-execution StatementClock.

@@ -154,6 +154,7 @@ pub(in crate::relational::query) fn aggregate_error(name: &str, ty: &DataType) -
 
 fn choose(
     name: &str,
+    first_type: Option<&DataType>,
     args: &[Scalar],
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     tables: &[&TableDef],
@@ -172,6 +173,7 @@ fn choose(
         .iter()
         .filter(|(signature, _, _)| {
             signature.len() == args.len()
+                && first_type.is_none_or(|ty| signature.first() == Some(ty))
                 && signature
                     .iter()
                     .zip(&types)
@@ -218,12 +220,13 @@ fn choose(
 
 pub(super) fn bind(
     name: &str,
+    first_type: Option<&DataType>,
     args: &[Scalar],
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     tables: &[&TableDef],
     parameters: &[Option<DataType>],
 ) -> R<BoundScalar> {
-    let (arg_types, ty, _) = choose(name, args, resolve, tables, parameters)?;
+    let (arg_types, ty, _) = choose(name, first_type, args, resolve, tables, parameters)?;
     let args = args
         .iter()
         .zip(*arg_types)
@@ -250,6 +253,7 @@ pub(super) fn bind(
 
 pub(super) fn infer(
     name: &str,
+    first_type: Option<&DataType>,
     args: &[Scalar],
     parameters: &mut [Option<DataType>],
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
@@ -260,7 +264,7 @@ pub(super) fn infer(
             arg.infer(None, parameters, resolve, tables)?;
         }
     }
-    let (types, _, _) = choose(name, args, resolve, tables, parameters)?;
+    let (types, _, _) = choose(name, first_type, args, resolve, tables, parameters)?;
     for (arg, target) in args.iter().zip(*types) {
         let hint = (arg.aggregate_unknown(parameters)
             || matches!(arg, Scalar::Call(n, _) if n == array_constructor::NAME))
@@ -271,20 +275,21 @@ pub(super) fn infer(
 }
 
 pub(in crate::relational::query) fn bind_row_args(
-    name: &str, args: &[Scalar], parameters: &mut [Option<DataType>],
+    name: &str, first_type: Option<&DataType>, args: &[Scalar], parameters: &mut [Option<DataType>],
 ) -> R<Vec<BoundScalar>> {
     let no_columns = |_: &ColumnRef, _: usize| Err(SqlError::UnknownColumn);
-    infer(name, args, parameters, &no_columns, &[])?;
-    let bound = bind(name, args, &no_columns, &[], parameters)?;
+    infer(name, first_type, args, parameters, &no_columns, &[])?;
+    let bound = bind(name, first_type, args, &no_columns, &[], parameters)?;
     let Node::Call(_, args) = bound.node else { unreachable!() };
     Ok(args)
 }
 
 pub(in crate::relational::query) fn row_arg_types(
-    name: &str, types: &[Option<DataType>],
+    name: &str, first_type: Option<&DataType>, types: &[Option<DataType>],
 ) -> R<()> {
     if signatures(name).iter().any(|(sig, _, _)| {
-        sig.len() == types.len() && sig.iter().zip(types).all(|(target, source)| {
+        sig.len() == types.len() && first_type.is_none_or(|ty| sig.first() == Some(ty))
+            && sig.iter().zip(types).all(|(target, source)| {
             source.as_ref().is_none_or(|source| compatible(source, target))
         })
     }) {

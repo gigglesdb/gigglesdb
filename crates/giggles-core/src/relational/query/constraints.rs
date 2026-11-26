@@ -288,6 +288,7 @@ fn parse_expression(tokens: Vec<Token>) -> R<(Filter, Vec<schemas::Reference>)> 
     Ok((filter, p.relations))
 }
 pub(in crate::relational) fn validate_trigger_condition(tokens: &[Token]) -> R<()> {
+    functions::named_args::reject_stored(tokens)?;
     expression(tokens.to_vec()).map(drop)
 }
 pub(in crate::relational) fn constraint_deparse(tokens: &[Token]) -> R<String> {

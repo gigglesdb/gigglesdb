@@ -51,6 +51,7 @@ mod integer_formats;
 mod join;
 pub(super) use join::{join_equal, join_key, join_key_supported};
 mod md5;
+pub(in crate::relational) mod named_args;
 pub(super) mod uuid_ossp;
 mod numeric;
 mod overlay;
@@ -158,17 +159,16 @@ fn deferred_call_error(
             arg.bind(resolve, tables, parameters).map(|bound| typeof_expr::name(&bound.ty))
         }
     }).collect::<R<Vec<_>>>()?;
-    let mut diagnostic = RoutineDiagnostic::new(
-        "42883", format!("function {routine}({}) does not exist", types.join(", ")),
-    );
-    diagnostic.hint = Some("No function matches the given name and argument types. You might need to add explicit type casts.".into());
+    let mut diagnostic = RoutineDiagnostic::new("42883", named_args::undefined_signature(routine, &types));
+    diagnostic.hint = Some(named_args::HINT.into());
     Ok(diagnostic.error())
 }
 pub(super) fn is_deferred_routine_name(name: &str) -> bool {
-    deferred_routine_error(name).is_some()
+    named_args::requires_lookup(name) || deferred_routine_error(name).is_some()
 }
 pub(super) fn deferred_routine_binds_for_sql_role(name: &str) -> bool {
-    deferred_routine_error(name).is_some() && !name.starts_with(PG_TOAST_ROUTINE_PREFIX)
+    is_deferred_routine_name(name)
+        && !named_args::routine(name).starts_with(PG_TOAST_ROUTINE_PREFIX)
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum UnaryOp {
@@ -656,7 +656,8 @@ impl Scalar {
                     .is_some_and(Self::has_undefined_routine)
             }
             Self::Call(name, args) => {
-                deferred_routine_error(name).is_some()
+                named_args::requires_lookup(name)
+                    || deferred_routine_error(name).is_some()
                     || args.iter().any(Self::has_undefined_routine)
             }
             Self::Cast(arg, _) | Self::Domain(arg, ..) | Self::Unary(_, arg) => {
@@ -734,8 +735,9 @@ impl Scalar {
                 }) || case.otherwise.as_ref().is_some_and(Self::has_volatile_call)
             }
             Self::Call(name, args) => {
+                let name = named_args::routine(name);
                 self.is_trigger_call() || uuid_ossp::volatile_name(name) || random_uuid::volatile(name) || matches!(
-                    name.as_str(),
+                    name,
                     "uuid_generate_v1" | "uuid_generate_v1mc" | "uuid_generate_v4" | "nextval"
                         | "setval"
                         | "currval"
@@ -789,7 +791,7 @@ impl Scalar {
             let (operator, precedence) = if let Some((op, precedence)) = arithmetic::token_operator(token) {
                 (Ok(op), precedence)
             } else if let Some(Token::Op(op)) = token
-                && !matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "=>")
+                && !matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "=>" | ":=")
             {
                 let name = match op.as_str() {
                     "->" => "\0json_get".into(),
@@ -858,7 +860,7 @@ impl Scalar {
                 }),
             )
         } else if let Some(Token::Op(op)) = p.tokens.get(p.at)
-            && !matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "=>")
+            && !matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "=>" | ":=")
         {
             let name = if op == "!!" { "\0ts_negate".into() } else { arithmetic::unknown_operator(op) };
             p.at += 1;
@@ -1175,6 +1177,13 @@ impl Scalar {
                     ));
                 }
 
+                if named_args::in_call(&p.tokens[p.at..]) {
+                    let grammar_construct = !quoted && !qualified_call
+                        && matches!(name.as_str(), "coalesce" | "greatest" | "least" | "nullif");
+                    let (names, args) = named_args::parse(p, depth + 1, aggregate_argument, grammar_construct)?;
+                    p.punct(')')?;
+                    return Ok(named_args::scalar(name, names, args));
+                }
                 if !p.sym(')') {
                     loop {
                         if args.len() >= MAX_COLUMNS {
@@ -1800,6 +1809,9 @@ impl Scalar {
         tables: &[&TableDef],
         parameters: &[Option<DataType>],
     ) -> R<BoundScalar> {
+        if named_args::is_named(name) {
+            return named_args::bind(name, args, resolve, tables, parameters);
+        }
         if args.is_empty() && let Some(name) = name.strip_prefix(TRIGGER_CALL_PREFIX) {
             // The result OID carries the pseudo-type. There is no stored trigger value.
             return Ok(BoundScalar { ty: DataType::Text, node: Node::TriggerCall(name.into()) });
@@ -1855,11 +1867,11 @@ impl Scalar {
                 Err(deferred_call_error(name, args, resolve, tables, parameters, error)?)
             }
             "overlay" => Self::bind_overlay(args, resolve, tables, parameters),
-            name if text_search::known(name) => text_search::bind(name, args, resolve, tables, parameters),
+            name if text_search::known(name) => text_search::bind(name, None, args, resolve, tables, parameters),
             "length" if args.len() == 1
                 && arithmetic::known(&args[0], resolve, tables, parameters)? == Some(DataType::TsVector) =>
             {
-                text_search::bind("\0ts_length", args, resolve, tables, parameters)
+                text_search::bind("\0ts_length", None, args, resolve, tables, parameters)
             }
             typeof_expr::NAME => typeof_expr::bind(args, resolve, tables, parameters),
             name if arithmetic::is_unknown_operator(name) => {
@@ -4120,7 +4132,7 @@ impl Scalar {
                 args[1].infer(hint, parameters, resolve, tables)?;
             }
             Self::Call(n, args) if text_search::known(n) => {
-                text_search::infer(n, args, parameters, resolve, tables)?;
+                text_search::infer(n, None, args, parameters, resolve, tables)?;
             }
             Self::Call(n, args) if arithmetic::is_unknown_operator(n) => {
                 for arg in args {
@@ -4159,6 +4171,9 @@ impl Scalar {
                 // the type of inputs that were already declared or inferred.
                 let expected = input.aggregate_unknown(parameters).then_some(&DataType::Text);
                 input.infer(expected, parameters, resolve, tables)?;
+            }
+            Self::Call(n, args) if named_args::is_named(n) => {
+                named_args::infer(n, args, parameters, resolve, tables)?;
             }
             Self::Call(n, args) if let Some(error) = deferred_routine_error(n) => {
                 // Validate ordinary arguments without inventing a signature for

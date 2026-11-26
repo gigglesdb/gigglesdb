@@ -509,6 +509,7 @@ pub enum Error {
     TaskRestrictedRelation,
     Mutation,
     UnknownColumn,
+    UndefinedFunction(String),
     UnknownRelation(String),
     UnknownRole(String),
     AmbiguousColumn,
@@ -526,7 +527,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Self::UnknownRole(name) = self { return write!(f, "role \"{name}\" does not exist"); }
-        if let Self::InvalidPrivilege(message) | Self::InvalidTypeModifier(message) = self {
+        if let Self::UndefinedFunction(message) | Self::InvalidPrivilege(message) | Self::InvalidTypeModifier(message) = self {
             return f.write_str(message);
         }
         if let Self::TypeModifierNotAllowed(name) = self {

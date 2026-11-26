@@ -1272,6 +1272,9 @@ fn lex_with_spans(
                 }
                 out.push(Token::Param(n));
             }
+        } else if c == b':' && b.get(i + 1) == Some(&b'=') {
+            out.push(Token::Op(":=".into()));
+            i += 2;
         } else if b"(),;.:[]".contains(&c) {
             out.push(Token::Symbol(c as char));
             i += 1;

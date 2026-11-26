@@ -15,6 +15,7 @@ pub(crate) struct Predicate {
 
 impl Predicate {
     pub(super) fn create(state: &Relational, table: &TableDef, tokens: &[Token]) -> R<Self> {
+        query::named_args::reject_stored(tokens)?;
         let predicate = query::index_predicate::create(state, table, tokens, true)?;
         predicate.deparse(state, table)?;
         Ok(predicate)
