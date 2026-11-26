@@ -69,6 +69,13 @@ pub(super) enum AppendOrder {
     RejectedCandidates(Vec<SqlRow>),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum FkRowLock<'a> {
+    KeyShare,
+    Delete,
+    Update(&'a [u64]),
+}
+
 pub(crate) trait RowSink {
     fn mutation_keys(
         &mut self,
@@ -97,6 +104,30 @@ pub(crate) trait RowSink {
             Ok(())
         })
     }
+    /// Local DELETE actions lock and recheck candidates at the physical row.
+    fn row_locked_cascade(&self) -> bool {
+        false
+    }
+
+    /// One page of a writing RI scan, pinned to the same snapshot until the
+    /// caller reaches EOF or restarts with no resume key.
+    fn fk_action_page(
+        &mut self, _table: &TableDef, _probe: Option<(&[u64], &[Value])>, _after: Option<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        Err(CoreError::Sql(SqlError::Unsupported))
+    }
+
+    fn lock_fk_action_row(
+        &mut self, _table: &TableDef, _row: &SqlRow, _mode: FkRowLock<'_>,
+    ) -> Result<Option<SqlRow>, CoreError> {
+        Err(CoreError::Sql(SqlError::Unsupported))
+    }
+
+    /// A deferred child check probes and locks its parent at validation time.
+    fn defer_fk_parent_probes(&self) -> bool {
+        false
+    }
+
     /// Whether this sink keeps exact FK parent lookups stable during a DDL
     /// statement. The first lookup must still perform all checks and locks.
     fn stable_fk_ddl_reads(&self) -> bool {
@@ -828,7 +859,9 @@ impl Relational {
                 constraints::Definition::ForeignKey { .. }
             )])) && sink.stable_fk_ddl_reads();
         let mut parent_probes = stable_fk.then(constraint_rows::ParentProbes::default);
-        if writing && actions.is_none() {
+        let concurrent_actions = sink.row_locked_cascade();
+        let deferred_probes = deferred.as_deref().filter(|_| sink.defer_fk_parent_probes());
+        if writing && actions.is_none() && !concurrent_actions {
             loop {
                 let seeds = (!stable_fk).then(|| self.clone());
                 if hydrate_with_probes(
@@ -841,6 +874,7 @@ impl Relational {
                     append,
                     &write_targets,
                     parent_probes.as_mut(),
+                    deferred_probes,
                 )? == 0 {
                     break;
                 }
@@ -904,6 +938,23 @@ impl Relational {
                 return Ok(result);
             }
             if writing {
+                if concurrent_actions {
+                    // The full-image executor has staged its direct writes in
+                    // memory. Pin their preimages before RI discovers children.
+                    for table in before.tables.values() {
+                        for (key, old) in &before.rows[&table.id] {
+                            let new = self.rows[&table.id].get(key);
+                            if new == Some(old) { continue; }
+                            let assigned = new.map(|new| table.columns.iter().enumerate()
+                                .filter_map(|(i, column)| (old.values[i] != new.values[i]).then_some(column.id))
+                                .collect::<Vec<_>>());
+                            let mode = assigned.as_deref().map_or(FkRowLock::Delete, FkRowLock::Update);
+                            if sink.lock_fk_action_row(table, old, mode)?.as_ref() != Some(old) {
+                                return Err(CoreError::Sql(SqlError::Conflict));
+                            }
+                        }
+                    }
+                }
                 if !append
                     && let Some(table) = &table
                     && matches!(prepared.v2_class(), V2Class::Dml)
@@ -939,7 +990,7 @@ impl Relational {
                     &mut || crate::cancellation::check().is_err(),
                     clock,
                     insert_columns,
-                    Some(&mut |state, old| {
+                    Some(constraints::LoadRows { concurrent_actions, refresh: &mut |state, old| {
                         let result = (|| {
                             loop {
                                 let seeds = (!stable_fk).then(|| state.clone());
@@ -954,6 +1005,7 @@ impl Relational {
                                     append,
                                     &write_targets,
                                     parent_probes.as_mut(),
+                                    deferred_probes,
                                 )? == 0
                                 {
                                     break;
@@ -967,7 +1019,7 @@ impl Relational {
                             source_error = Some(error);
                             SqlError::Aborted
                         })
-                    }),
+                    }}),
                 );
                 if let Some(error) = source_error {
                     return Err(error);
@@ -1096,7 +1148,7 @@ mod constraint_rows;
 mod paged_dml;
 #[path = "row_sink_insert.rs"]
 mod paged_insert;
-use constraint_rows::{hydrate, hydrate_with_probes, paged_pending, rebuild};
+use constraint_rows::{hydrate_with_probes, paged_pending, rebuild};
 
 #[cfg(test)]
 mod tests {

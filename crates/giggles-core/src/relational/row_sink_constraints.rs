@@ -49,7 +49,7 @@ pub(super) fn hydrate(
     write_targets: &BTreeSet<u64>,
 ) -> Result<usize, CoreError> {
     hydrate_with_probes(
-        Some(seeds), edges, before, staged, sink, budget, parents_only, write_targets, None,
+        Some(seeds), edges, before, staged, sink, budget, parents_only, write_targets, None, None,
     )
 }
 
@@ -81,6 +81,7 @@ pub(super) fn hydrate_with_probes(
     parents_only: bool,
     write_targets: &BTreeSet<u64>,
     mut parent_probes: Option<&mut ParentProbes>,
+    deferred: Option<&DeferralState>,
 ) -> Result<usize, CoreError> {
     if edges.is_empty() {
         return Ok(0);
@@ -94,6 +95,7 @@ pub(super) fn hydrate_with_probes(
     for table in before.tables.values() {
         target_by_id.entry(table.id).or_insert(table);
     }
+    let concurrent_actions = sink.row_locked_cascade();
     let mut added = 0;
     for (child_id, cs) in edges {
         for c in cs {
@@ -109,7 +111,9 @@ pub(super) fn hydrate_with_probes(
                 (*child_id, columns, *ref_table, ref_columns, true),
                 (*ref_table, ref_columns, *child_id, columns, false),
             ] {
-                if parents_only && !parent {
+                if parents_only && !parent
+                    || parent && deferred.is_some_and(|state| state.deferred(c.id, &c.kind))
+                {
                     continue;
                 }
                 let Some(&source) = source_by_id.get(&source_id) else {
@@ -217,6 +221,45 @@ pub(super) fn hydrate_with_probes(
                     let mut witnessed = false;
                     let collated = target_columns.iter().any(|id| !before.deterministic_column(*id));
                     let source_equality = collation_keys::Key::new(before, source, source_columns, None).map_err(CoreError::Sql)?;
+                    let matches_child = |row: &SqlRow| -> R<bool> {
+                        let candidate = targets.iter().zip(&positions).map(|(a, b)| {
+                            query::constraint_key(&row.values[*a], &target.columns[*a].data_type,
+                                &source.columns[*b].data_type)
+                        }).collect::<R<Option<Vec<_>>>>()?;
+                        let tuple = source_equality.values(&values)?;
+                        Ok(tuple.is_some() && candidate.as_ref().map(|v| source_equality.values(v))
+                            .transpose()?.flatten() == tuple)
+                    };
+                    if !parent && concurrent_actions {
+                        use catalog_ext::Action;
+                        let source_key = pk(source, &row.values).map_err(CoreError::Sql)?;
+                        let removed = !staged.rows[&source_id].contains_key(&source_key);
+                        let action = if removed { on_delete } else { on_update };
+                        // A rekey also removes the old physical key. In that
+                        // case protect candidates of either writing action.
+                        let writes = |action: &Action| matches!(action, Action::Cascade | Action::SetNull | Action::SetDefault);
+                        let mode = if writes(action) || removed && writes(on_update) {
+                            Some(if removed && *on_delete == Action::Cascade {
+                                FkRowLock::Delete
+                            } else {
+                                FkRowLock::Update(target_columns)
+                            })
+                        } else if *action == Action::NoAction && *deferral != catalog_ext::Deferral::NotDeferrable {
+                            // Pending references are stored by child PK. Keep a
+                            // concurrent rekey from moving one past commit validation.
+                            Some(FkRowLock::KeyShare)
+                        } else {
+                            None
+                        };
+                        if let Some(mode) = mode {
+                            added += lock_action_witnesses(
+                                target, target_columns, if collated { None } else { converted.as_deref() },
+                                mode, before.rows.get_mut(&target_id).unwrap(),
+                                staged.rows.get_mut(&target_id).unwrap(), sink, budget, matches_child,
+                            )?;
+                            continue;
+                        }
+                    }
                     sink.fk_lookup(
                         target,
                         target_columns,
@@ -272,7 +315,7 @@ pub(super) fn hydrate_with_probes(
                             // direct write targets and transitive referential-action children.
                             // An existence-only parent can have a newer reserved range,
                             // just like a source row, without consuming our reservation.
-                            if write_targets.contains(&target.id) {
+                            if !concurrent_actions && write_targets.contains(&target.id) {
                                 before.next_version = before
                                     .next_version
                                     .max(row.version.checked_add(1).ok_or(SqlError::Overflow)?);
@@ -299,6 +342,64 @@ pub(super) fn hydrate_with_probes(
         }
     }
     Ok(added)
+}
+
+/// The in-memory fallback can already contain a candidate from the SQL input
+/// snapshot. Reconcile unchanged preimages with the latest physical witness,
+/// while leaving direct writes and earlier referential actions staged.
+#[expect(clippy::too_many_arguments, reason = "FK probe, staged images, and statement retention")]
+fn lock_action_witnesses(
+    table: &TableDef, columns: &[u64], probe: Option<&[Value]>, mode: FkRowLock<'_>,
+    old: &mut DdlRows, rows: &mut DdlRows, sink: &mut impl RowSink,
+    budget: &mut scan::Retention, matches: impl Fn(&SqlRow) -> R<bool>,
+) -> Result<usize, CoreError> {
+    let mut candidates = DdlRows::new();
+    let mut temporary = scan::Retention::new(scan::retention_limit());
+    let mut add_candidate = |row: SqlRow| {
+        let key = pk(table, &row.values)?;
+        if old.get(&key) != rows.get(&key) || candidates.contains_key(&key) {
+            return Ok(());
+        }
+        if candidates.len() >= MAX_ROWS { return Err(SqlError::Limit); }
+        temporary.charge(searched::retained_row_bytes(&key, &row)?)?;
+        candidates.insert(key, row);
+        Ok(())
+    };
+    sink.fk_lookup(table, columns, probe, false, &mut |row| matches(row), &mut add_candidate)?;
+    // A child may have left the key before the latest probe, but still be
+    // present in both statement images (for example a self-referential DELETE).
+    for row in old.values() {
+        if matches(row).map_err(CoreError::Sql)? {
+            add_candidate(row.clone()).map_err(CoreError::Sql)?;
+        }
+    }
+    let mut updated = 0;
+    for (key, candidate) in candidates {
+        let current = sink.lock_fk_action_row(table, &candidate, mode)?;
+        if current.as_ref() == old.get(&key) {
+            // The probe's row changed before its lock. A PK move can preserve
+            // the FK, so repeat discovery at a fresh snapshot.
+            updated += usize::from(current.as_ref() != Some(&candidate));
+            continue;
+        }
+        if let Some(row) = old.remove(&key) {
+            // Reconciliation must charge the replacement's size too.
+            budget.release(searched::retained_row_bytes(&key, &row).map_err(CoreError::Sql)?);
+        }
+        if let Some(row) = current
+            && (rows.contains_key(&key) || matches(&row).map_err(CoreError::Sql)?)
+        {
+            if old.len() >= MAX_ROWS { return Err(CoreError::Sql(SqlError::Limit)); }
+            budget.charge(searched::retained_row_bytes(&key, &row).map_err(CoreError::Sql)?)
+                .map_err(CoreError::Sql)?;
+            rows.insert(key.clone(), row.clone());
+            old.insert(key, row);
+        } else {
+            rows.remove(&key);
+        }
+        updated += 1;
+    }
+    Ok(updated)
 }
 
 /// Validate transaction-local pending keys in physical pages, including own writes.

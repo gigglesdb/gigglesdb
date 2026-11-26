@@ -5,7 +5,7 @@ use engine::{catalog::TableEntry, codec, kv::Keyspace, locks::LockMode, txn::Tra
 use relational::{
     SqlError, SqlRow, TableDef,
     catalog_ext::{Action, CatalogExt, ConstraintKind},
-    row_sink::{DdlRows, PageMode, RowSink},
+    row_sink::{DdlRows, FkRowLock, PageMode, RowSink},
 };
 use std::{collections::BTreeSet, ops::Bound};
 /// Encoded primary-key bounds of a read (GD-0075 P8-0).
@@ -323,7 +323,7 @@ impl SqlSession {
             u128::from_be_bytes(db.meta.domain), &image).map_err(CoreError::Sql)?;
         let result = image.execute_with_sink(&prepared, &[], None, None,
             &mut SqlRows { db, txn, parts: &catalog.parts, catalog: &catalog, writing: false,
-                conflict_floor: None, prepared: &prepared, params: &[], effects: None, scope: None },
+                conflict_floor: None, prepared: &prepared, params: &[], row_locked_cascade: false, fk_action_snapshot: None, effects: None, scope: None },
             u64::MAX, None)?;
         crate::cancellation::check()?;
         sql_sequences::settle(db, &self.sequence_unsettled).map_err(sequence_settlement_error)?;
@@ -779,22 +779,33 @@ impl SqlSession {
                         let cluster = matches!(txn.services(), engine::txn::TxnServices::Cluster(_));
                         let fixed_dml = matches!(class, V2Class::Dml)
                             && !write_ids.is_empty() && txn.isolation() != Isolation::ReadCommitted;
-                        // A fixed row snapshot must not hide triggers enabled now.
-                        // Local UPDATE needs those states before choosing table locks.
+                        let delete_roots = writes.iter()
+                            .filter(|(_, command)| *command == "DELETE" && !ddl && !cluster && !protected)
+                            .filter_map(|(name, _)| parts.tables.get(name).map(|table| table.id))
+                            .collect::<BTreeSet<_>>();
+                        // A fixed row snapshot must not hide a new FK or
+                        // triggers enabled since the transaction began.
                         let mut latest = (fixed_dml && !cluster && !protected
-                            && writes.iter().any(|(_, command)| *command == "UPDATE"))
+                            && (!delete_roots.is_empty() || writes.iter().any(|(_, command)| *command == "UPDATE")))
                             .then(|| db.catalog().latest_snapshot(txn))
                             .transpose()?;
                         let live = latest.as_ref().map_or(&parts.ext, |snapshot| &snapshot.parts.ext);
                         let mut connected = target_id.into_iter().chain(write_ids.iter().copied()).collect::<BTreeSet<_>>();
-                        // Local FK witnesses use RowKey locks. Expand from UPDATE
-                        // targets whose referential actions can write child rows.
+                        let (cascade_writes, cascade_updates) = delete_action_targets(&parts.ext, delete_roots.iter().copied());
+                        if fixed_dml && !delete_roots.is_empty() {
+                            let participants = delete_roots.union(&cascade_writes).copied().collect();
+                            if delete_fks_changed(&parts.ext, live, &participants) {
+                                return Err(CoreError::Sql(E::Conflict));
+                            }
+                        }
+                        // UPDATE can still require an undirected component fence.
                         let mut pending = Vec::new();
                         if writing {
                             if ddl || cluster {
                                 pending.extend(connected.iter().copied());
                             } else {
                                 for (name, command) in &writes {
+                                    if *command == "DELETE" && !protected { continue; }
                                     let Some(table) = parts.tables.get(name) else { continue; };
                                     let assigned = if *command == "UPDATE" && !protected {
                                         bound.update_columns(name)
@@ -802,9 +813,8 @@ impl SqlSession {
                                         None
                                     };
                                     if requires_fk_component_lock(&parts.ext, live, table, command, assigned.as_ref()) {
-                                        if protected || *command == "DELETE" {
-                                            // Preserve the R3 protected-run snapshot fence
-                                            // and the existing DELETE component protocol.
+                                        if protected {
+                                            // Preserve the R3 protected-run snapshot fence.
                                             pending.extend(connected.iter().copied());
                                             break;
                                         }
@@ -867,6 +877,12 @@ impl SqlSession {
                                     },
                                 );
                             }
+                            for &id in &cascade_writes {
+                                // A mixed statement can still need the UPDATE fence.
+                                if locks.get(&id) != Some(&LockMode::Share) {
+                                    locks.insert(id, LockMode::RowExclusive);
+                                }
+                            }
                         }
                         for id in bound.view_drop_locks(&binding, parts) {
                             locks.insert(id, LockMode::AccessExclusive);
@@ -907,8 +923,16 @@ impl SqlSession {
                         }
                         // A WITH statement can own several mutation targets.
                         if writing && !ddl {
-                            for id in write_ids.iter().filter(|id| Some(**id) != target_id) {
-                                txn.lock_sql_sentinel(*id, if txn.isolation() == Isolation::ReadCommitted && bound.row_lock_command().is_none() {
+                            // Nondeterministic UNIQUE has no byte-key lock. Its
+                            // existing writer sentinel also covers SET actions
+                            // and their UPDATE descendants on that table.
+                            let collated_updates = parts.tables.values()
+                                .filter(|table| cascade_updates.contains(&table.id) && binding.has_nondeterministic_keys(table))
+                                .map(|table| table.id)
+                                .collect::<BTreeSet<_>>();
+                            for id in write_ids.union(&collated_updates).filter(|id| Some(**id) != target_id) {
+                                txn.lock_sql_sentinel(*id, if collated_updates.contains(id)
+                                        || txn.isolation() == Isolation::ReadCommitted && bound.row_lock_command().is_none() {
                                     LockMode::Exclusive
                                 } else { LockMode::Shared }, &cancelled)?;
                             }
@@ -929,12 +953,20 @@ impl SqlSession {
                             let candidates = (self.copy_input.is_none()
                                 && txn.isolation() == Isolation::ReadCommitted)
                                 .then(|| bound.fk_delete_lock_keys(&binding, params)
+                                    .or_else(|| (!cascade_writes.is_empty())
+                                        .then(|| bound.cascade_delete_point_keys(&binding, params)).flatten())
                                     .or_else(|| bound.mutation_lock_keys(&binding, params, &parts.indexes)))
                                 .flatten();
                             let append = self.copy_input.is_none()
                                 && txn.isolation() == Isolation::ReadCommitted
                                 && expected_version.is_none()
-                                && bound.plain_values_append(&binding);
+                                && if cluster || protected {
+                                    bound.plain_values_append(&binding)
+                                } else {
+                                    // Self-cascade point deletes share this sentinel.
+                                    // Plain inserts validate their FK after publication.
+                                    bound.plain_values_append_with_local_cascade(&binding, true)
+                                };
                             #[cfg(test)]
                             let candidates = if DISABLE_MUTATION_POINTS.get() { None } else { candidates };
                             #[cfg(test)]
@@ -1247,6 +1279,8 @@ impl SqlSession {
                                     writing,
                                     prepared: &bound,
                                     params,
+                                    row_locked_cascade: false,
+                                    fk_action_snapshot: None,
                                     effects: None,
                                     scope: None,
                                 },
@@ -1287,7 +1321,7 @@ impl SqlSession {
                         let reads_view = names.iter().any(|name| binding.view_names.contains_key(name));
                         if !writing && (scope.is_some() || image.streaming_reduction(&bound) || reads_view) {
                             let source = reduction::Source::new(SqlRows {
-                                conflict_floor: None, db, txn, parts: old, catalog: &catalog,
+                                conflict_floor: None, row_locked_cascade: false, fk_action_snapshot: None, db, txn, parts: old, catalog: &catalog,
                                 writing, prepared: &bound, params, effects: None, scope: None,
                             });
                             let scoped = scope.as_ref().map(|scope|
@@ -1331,6 +1365,8 @@ impl SqlSession {
                                 writing,
                                 prepared: &bound,
                                 params,
+                                row_locked_cascade: !cascade_writes.is_empty(),
+                                fk_action_snapshot: None,
                                 effects: protected_effects.as_deref_mut(),
                                 scope: scope.as_ref().map(|scope| (scope, &meter)),
                             },
@@ -1614,6 +1650,8 @@ pub(super) fn validate_pending(
         None,
         &mut SqlRows {
             conflict_floor: None,
+            row_locked_cascade: false,
+            fk_action_snapshot: None,
             db,
             txn,
             parts,
@@ -1679,6 +1717,8 @@ struct SqlRows<'a> {
     conflict_floor: Option<u64>,
     prepared: &'a relational::Prepared,
     params: &'a [relational::Value],
+    row_locked_cascade: bool,
+    fk_action_snapshot: Option<engine::commit::SnapshotHandle>,
     /// Effects collector of a protected run (R3-609); `None` on every
     /// ordinary path.
     effects: Option<&'a mut crate::task::effects::Effects>,
@@ -1723,6 +1763,66 @@ impl<'a> SqlRows<'a> {
         }
         Ok(())
     }
+}
+
+fn delete_fks_changed(old: &CatalogExt, live: &CatalogExt, participants: &BTreeSet<u64>) -> bool {
+    fn relevant<'a>(ext: &'a CatalogExt, tables: &'a BTreeSet<u64>)
+        -> impl Iterator<Item = (u64, &'a relational::catalog_ext::Constraint)>
+    {
+        ext.constraints.iter().flat_map(move |(&owner, constraints)| {
+            constraints.iter().filter_map(move |constraint| {
+                matches!(constraint.kind, ConstraintKind::ForeignKey { ref_table, .. }
+                    if tables.contains(&owner) || tables.contains(&ref_table)).then_some((owner, constraint))
+            })
+        })
+    }
+    !std::ptr::eq(old, live) && !relevant(old, participants).eq(relevant(live, participants))
+}
+
+/// Track whether each incoming edge sees a DELETE or an UPDATE. SET actions
+/// only start UPDATE chains on keys they can change, including generated keys.
+fn delete_action_targets(ext: &CatalogExt, roots: impl IntoIterator<Item = u64>) -> (BTreeSet<u64>, BTreeSet<u64>) {
+    let mut pending = roots.into_iter().map(|table| (table, None)).collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Default::default();
+    }
+    let mut incoming = BTreeMap::<_, Vec<_>>::new();
+    for (&child, constraints) in &ext.constraints {
+        for constraint in constraints {
+            if let ConstraintKind::ForeignKey {
+                ref_table, ref_columns, columns, on_delete, on_update, ..
+            } = &constraint.kind {
+                incoming.entry(*ref_table).or_default()
+                    .push((child, constraint.id, ref_columns, columns, on_delete, on_update));
+            }
+        }
+    }
+    let mut targets = BTreeSet::new();
+    let mut updates = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    while let Some((parent, changed_columns)) = pending.pop() {
+        for &(child, id, ref_columns, columns, on_delete, on_update) in
+            incoming.get(&parent).into_iter().flatten()
+        {
+            let deleting = changed_columns.is_none();
+            if changed_columns.is_some_and(|changed: &[u64]| {
+                !ref_columns.iter().any(|column| changed.contains(column)
+                    || ext.generated_columns.contains_key(column))
+            }) || !visited.insert((id, deleting)) {
+                continue;
+            }
+            let action = if deleting { on_delete } else { on_update };
+            if matches!(action, Action::Cascade | Action::SetNull | Action::SetDefault) {
+                targets.insert(child);
+                let update = !(deleting && *action == Action::Cascade);
+                if update {
+                    updates.insert(child);
+                }
+                pending.push((child, update.then_some(columns.as_slice())));
+            }
+        }
+    }
+    (targets, updates)
 }
 
 fn requires_fk_component_lock(
@@ -1855,6 +1955,12 @@ impl RowSink for SqlRows<'_> {
         if let Some(error) = source.error.into_inner() { return Err(error); }
         result.map_err(CoreError::Sql)
     }
+    fn defer_fk_parent_probes(&self) -> bool {
+        self.effects.is_none()
+            && matches!(self.prepared.v2_class(), relational::V2Class::Dml)
+            && matches!(self.txn.services(), engine::txn::TxnServices::Local { .. })
+    }
+
     fn stable_fk_ddl_reads(&self) -> bool {
         matches!(self.txn.services(), engine::txn::TxnServices::Local { locks, .. }
             if self.txn.isolation() == Isolation::ReadCommitted
@@ -1866,8 +1972,7 @@ impl RowSink for SqlRows<'_> {
     // their witnesses and crosscheck every committed version for key changes/deletes.
     // RowKey is separate from Row: ordinary writes act like NO KEY UPDATE,
     // while deletes/key changes take RowKey Exclusive (FOR UPDATE) BEFORE Row.
-    // Writing referential actions retain component table locks. Cluster keeps
-    // its existing protocol below.
+    // Cluster keeps its existing protocol below.
     fn fk_lookup(
         &mut self, table: &TableDef, columns: &[u64], values: Option<&[relational::Value]>,
         parent: bool, matches: &mut dyn FnMut(&SqlRow) -> Result<bool, SqlError>,
@@ -2002,6 +2107,68 @@ impl RowSink for SqlRows<'_> {
         Ok(())
     }
 
+    fn row_locked_cascade(&self) -> bool {
+        self.row_locked_cascade
+    }
+
+    fn lock_fk_action_row(
+        &mut self, table: &TableDef, row: &SqlRow, mode: FkRowLock<'_>,
+    ) -> Result<Option<SqlRow>, CoreError> {
+        let deadline = crate::task::limits::lock_deadline();
+        let cancel = || crate::cancellation::check().is_err();
+        let pk = table.primary_key.iter().map(|&i| row.values[i].clone()).collect::<Vec<_>>();
+        let mut key = table.id.to_be_bytes().to_vec();
+        key.extend(codec::pk_bytes(&pk)?);
+        let bytes = if matches!(mode, FkRowLock::KeyShare) {
+            self.txn.lock_row_key(table.id, &key[8..], LockMode::Shared, deadline, &cancel)
+                .map_err(crate::task::limits::lock_error)?;
+            self.at_latest(|rows| Ok(rows.txn.get(Keyspace::Rows, &key)?))?
+        } else {
+            let key_write = match mode {
+                FkRowLock::Delete => true,
+                FkRowLock::Update(columns) => table.columns.iter().enumerate().any(|(i, column)| {
+                    (columns.contains(&column.id) || self.parts.ext.generated_columns.contains_key(&column.id))
+                        && (table.primary_key.contains(&i) || self.parts.indexes.iter().any(|index| {
+                            index.table == table.id && index.unique && index.columns.contains(&column.id)
+                        }))
+                }),
+                FkRowLock::KeyShare => unreachable!(),
+            };
+            if key_write {
+                self.txn.lock_row_write_group(table.id, &key[8..], deadline, &cancel)
+                    .map_err(crate::task::limits::lock_error)?;
+            }
+            self.txn.lock_for_write(Keyspace::Rows, &key, deadline, &cancel)
+                .map_err(crate::task::limits::lock_error)?.current
+        };
+        bytes.map(|bytes| {
+            let record = codec::decode_row(&key, &bytes)?;
+            if record.tombstone || record.values.len() > table.columns.len() {
+                return Err(CoreError::Corrupt("invalid v2 SQL row witness".into()));
+            }
+            let mut values = record.values;
+            values.resize(table.columns.len(), relational::Value::Null);
+            Ok(SqlRow { values, version: record.row_version })
+        }).transpose()
+    }
+
+    fn fk_action_page(
+        &mut self, table: &TableDef, probe: Option<(&[u64], &[relational::Value])>,
+        after: Option<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        let snapshot = self.fk_action_snapshot.take();
+        self.txn.begin_fk_action_page(snapshot.filter(|_| after.is_some()));
+        let page = match probe {
+            Some((columns, values)) => self.child_page(table, columns, values, after),
+            None => self.read_page_all(table, after, None),
+        };
+        let snapshot = self.txn.end_fk_action_page();
+        if matches!(page, Ok(Some(_))) {
+            self.fk_action_snapshot = Some(snapshot);
+        }
+        page
+    }
+
     fn fk_child_page(
         &mut self, table: &TableDef, columns: &[u64], values: &[relational::Value],
         after: Option<Vec<u8>>,
@@ -2021,7 +2188,7 @@ impl RowSink for SqlRows<'_> {
         read: &mut dyn FnMut(&dyn relational::scan::RowSource) -> Result<(), SqlError>,
     ) -> Result<(), CoreError> {
         let source = reduction::Source::new(SqlRows {
-            conflict_floor: None, db: self.db, txn: &mut *self.txn, parts: self.parts, catalog: self.catalog,
+            conflict_floor: None, row_locked_cascade: false, fk_action_snapshot: None, db: self.db, txn: &mut *self.txn, parts: self.parts, catalog: self.catalog,
             writing: self.writing, prepared: self.prepared, params: self.params,
             // The INSERT source is only read; protected write effects are
             // recorded by the insert pages that follow.

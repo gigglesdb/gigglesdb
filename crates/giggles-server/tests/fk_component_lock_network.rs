@@ -342,3 +342,319 @@ async fn conflict_update_of_nonkey_column_allows_component_insert() {
     );
     fixture.stop(a, b).await;
 }
+
+async fn assert_ids(client: &Client, sql: &str, expected: &[i32]) {
+    let ids: Vec<i32> = client
+        .query(sql, &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(ids, expected, "{sql}");
+}
+
+async fn assert_no_orphans(client: &Client, edges: &[(&str, &str, &str)]) {
+    for (child, column, parent) in edges {
+        assert_ids(
+            client,
+            &format!(
+                "SELECT c.id FROM {child} c LEFT JOIN {parent} p ON c.{column}=p.id \
+             WHERE p.id IS NULL AND c.{column} IS NOT NULL"
+            ),
+            &[],
+        )
+        .await;
+    }
+}
+
+async fn execute_without_wait(client: &Client, sql: &str) {
+    assert_eq!(
+        timeout(NONBLOCKING, client.execute(sql, &[]))
+            .await
+            .unwrap_or_else(|_| panic!("blocked during cascade: {sql}"))
+            .unwrap(),
+        1
+    );
+}
+
+async fn expect_fk_wait(holder: &Client, other: &Client, sql: &str) {
+    let statement = other.prepare(sql).await.unwrap();
+    let pending = other.execute(&statement, &[]);
+    tokio::pin!(pending);
+    assert!(timeout(MUST_WAIT, &mut pending).await.is_err(), "{sql}");
+    holder.batch_execute("COMMIT").await.unwrap();
+    let error = timeout(COMPLETION, pending).await.unwrap().unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::FOREIGN_KEY_VIOLATION));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cascade_delete_allows_disjoint_writes_and_fences_deleted_keys() {
+    let (fixture, a, b) = Fixture::new().await;
+    a.batch_execute(
+        "CREATE TABLE \"Organization\"(id int PRIMARY KEY, owner int REFERENCES usr(id)); \
+         CREATE TABLE membership(id int PRIMARY KEY, org_id int REFERENCES \"Organization\"(id) ON DELETE CASCADE); \
+         CREATE TABLE invoices(id int PRIMARY KEY, member_id int REFERENCES membership(id) ON DELETE CASCADE); \
+         CREATE TABLE requests(id int PRIMARY KEY, org_id int REFERENCES \"Organization\"(id) \
+             ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED); \
+         INSERT INTO \"Organization\" VALUES(1,1),(2,2); \
+         INSERT INTO membership VALUES(1,1),(2,2); \
+         INSERT INTO invoices VALUES(1,1); \
+         INSERT INTO requests VALUES(1,1)",
+    ).await.unwrap();
+    a.batch_execute("BEGIN").await.unwrap();
+    assert_eq!(
+        a.execute("DELETE FROM \"Organization\" WHERE id = $1", &[&1_i32])
+            .await
+            .unwrap(),
+        1
+    );
+    for sql in [
+        "INSERT INTO usr VALUES(10,'u10')",
+        "UPDATE usr SET email='b' WHERE id=1",
+        "INSERT INTO other VALUES(10,'b')",
+        "INSERT INTO \"Organization\" VALUES(3,NULL)",
+        "INSERT INTO membership VALUES(3,2)",
+        "DELETE FROM membership WHERE id=2",
+        "INSERT INTO invoices VALUES(2,3)",
+    ] {
+        execute_without_wait(&b, sql).await;
+    }
+    expect_fk_wait(&a, &b, "INSERT INTO membership VALUES(4,1)").await;
+    assert_ids(&b, "SELECT id FROM \"Organization\" ORDER BY id", &[2, 3]).await;
+    assert_ids(&b, "SELECT id FROM membership ORDER BY id", &[3]).await;
+    assert_ids(&b, "SELECT id FROM invoices ORDER BY id", &[2]).await;
+    assert_ids(&b, "SELECT id FROM requests", &[]).await;
+    assert_no_orphans(
+        &b,
+        &[
+            ("membership", "org_id", "\"Organization\""),
+            ("invoices", "member_id", "membership"),
+            ("requests", "org_id", "\"Organization\""),
+        ],
+    )
+    .await;
+    fixture.stop(a, b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multilevel_and_self_cascades_lock_each_deleted_key() {
+    let (fixture, a, b) = Fixture::new().await;
+    a.batch_execute(
+        "INSERT INTO msg VALUES(3,2,2,'run'); \
+         CREATE TABLE tree(id int PRIMARY KEY, parent int REFERENCES tree(id) ON DELETE CASCADE); \
+         INSERT INTO tree VALUES(1,NULL),(2,1),(3,2),(10,NULL),(11,10)",
+    )
+    .await
+    .unwrap();
+    a.batch_execute("BEGIN; DELETE FROM org WHERE id=1")
+        .await
+        .unwrap();
+    execute_without_wait(&b, "INSERT INTO turn VALUES(30,3,'x')").await;
+    expect_fk_wait(&a, &b, "INSERT INTO turn VALUES(31,2,'x')").await;
+    assert_ids(&b, "SELECT id FROM turn ORDER BY id", &[30]).await;
+    assert_no_orphans(&b, &[("turn", "msg_id", "msg"), ("msg", "org_id", "org")]).await;
+
+    a.batch_execute("BEGIN; DELETE FROM tree WHERE id=1")
+        .await
+        .unwrap();
+    execute_without_wait(&b, "INSERT INTO tree VALUES(21,11)").await;
+    expect_fk_wait(&a, &b, "INSERT INTO tree VALUES(20,3)").await;
+    assert_ids(&b, "SELECT id FROM tree ORDER BY id", &[10, 11, 21]).await;
+    assert_no_orphans(&b, &[("tree", "parent", "tree")]).await;
+    fixture.stop(a, b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_null_preserves_a_waiting_nonkey_update() {
+    let (fixture, a, b) = Fixture::new().await;
+    a.batch_execute("BEGIN; DELETE FROM usr WHERE id=1")
+        .await
+        .unwrap();
+    execute_without_wait(&b, "INSERT INTO msg VALUES(12,2,2,'x')").await;
+    let update = b
+        .prepare("UPDATE msg SET status='b' WHERE id=1")
+        .await
+        .unwrap();
+    {
+        let pending = b.execute(&update, &[]);
+        tokio::pin!(pending);
+        assert!(timeout(MUST_WAIT, &mut pending).await.is_err());
+        a.batch_execute("COMMIT").await.unwrap();
+        assert_eq!(timeout(COMPLETION, pending).await.unwrap().unwrap(), 1);
+    }
+    assert_ids(
+        &b,
+        "SELECT id FROM msg WHERE author IS NULL AND status='b'",
+        &[1],
+    )
+    .await;
+    assert_no_orphans(&b, &[("msg", "author", "usr")]).await;
+    fixture.stop(a, b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_child_checks_wait_at_commit() {
+    let (fixture, a, b) = Fixture::new().await;
+    a.batch_execute(
+        "CREATE TABLE deferred_child(id int PRIMARY KEY, p int REFERENCES org(id) \
+         ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)",
+    )
+    .await
+    .unwrap();
+    a.batch_execute("BEGIN; DELETE FROM org WHERE id=1")
+        .await
+        .unwrap();
+    b.batch_execute("BEGIN").await.unwrap();
+    execute_without_wait(&b, "INSERT INTO deferred_child VALUES(1,1)").await;
+    expect_fk_wait(&a, &b, "COMMIT").await;
+    assert_ids(&a, "SELECT id FROM deferred_child", &[]).await;
+
+    b.batch_execute("BEGIN").await.unwrap();
+    let values = (1..=201)
+        .map(|id| format!("({id},2)"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let insert = format!("INSERT INTO deferred_child VALUES {values}");
+    assert_eq!(
+        timeout(NONBLOCKING, b.execute(&insert, &[]))
+            .await
+            .unwrap()
+            .unwrap(),
+        201,
+    );
+    execute_without_wait(&a, "DELETE FROM org WHERE id=2").await;
+    let error = b.batch_execute("COMMIT").await.unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::FOREIGN_KEY_VIOLATION));
+    assert_ids(&a, "SELECT id FROM deferred_child", &[]).await;
+    assert_no_orphans(&a, &[("deferred_child", "p", "org")]).await;
+    fixture.stop(a, b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fixed_snapshot_rejects_new_or_changed_cascade_children() {
+    let (fixture, a, b) = Fixture::new().await;
+    for sql in [
+        "INSERT INTO member VALUES(1,1,1)",
+        "UPDATE member SET user_id=2 WHERE id=1",
+    ] {
+        a.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM org")
+            .await
+            .unwrap();
+        execute_without_wait(&b, sql).await;
+        let error = a
+            .execute("DELETE FROM org WHERE id=1", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some(&SqlState::T_R_SERIALIZATION_FAILURE));
+        a.batch_execute("ROLLBACK").await.unwrap();
+        assert_ids(&a, "SELECT id FROM org ORDER BY id", &[1, 2]).await;
+        assert_ids(&a, "SELECT id FROM member", &[1]).await;
+    }
+    assert_no_orphans(&a, &[("member", "org_id", "org")]).await;
+    fixture.stop(a, b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disjoint_cascades_then_opposing_writes_detect_deadlock() {
+    let (fixture, a, b) = Fixture::new().await;
+    for (client, id) in [(&a, 1_i32), (&b, 2_i32)] {
+        client.batch_execute("BEGIN").await.unwrap();
+        assert_eq!(
+            timeout(
+                NONBLOCKING,
+                client.execute("DELETE FROM org WHERE id=$1", &[&id])
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            1
+        );
+    }
+    async fn update_then_end(client: &Client, id: i32) -> Result<u64, Error> {
+        let result = client
+            .execute("UPDATE org SET name='b' WHERE id=$1", &[&id])
+            .await;
+        client
+            .batch_execute(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })
+            .await
+            .unwrap();
+        result
+    }
+    let (a_result, b_result) = timeout(COMPLETION, async {
+        tokio::join!(update_then_end(&a, 2), update_then_end(&b, 1))
+    })
+    .await
+    .unwrap();
+    let surviving = match (a_result, b_result) {
+        (Ok(1), Err(error)) => {
+            assert_eq!(error.code(), Some(&SqlState::T_R_DEADLOCK_DETECTED));
+            2
+        }
+        (Err(error), Ok(1)) => {
+            assert_eq!(error.code(), Some(&SqlState::T_R_DEADLOCK_DETECTED));
+            1
+        }
+        outcomes => panic!("expected exactly one deadlock victim, got {outcomes:?}"),
+    };
+    assert_ids(&a, "SELECT id FROM org", &[surviving]).await;
+    assert_no_orphans(&a, &[("msg", "org_id", "org"), ("turn", "msg_id", "msg")]).await;
+    fixture.stop(a, b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cascade_rechecks_children_moved_away_from_and_into_the_deleted_key() {
+    for (initial, moved, expected) in [(1_i32, 2_i32, &[1][..]), (2, 1, &[][..])] {
+        let (fixture, a, b) = Fixture::new().await;
+        a.execute("INSERT INTO member VALUES(1,$1,1)", &[&initial])
+            .await
+            .unwrap();
+        a.batch_execute("BEGIN").await.unwrap();
+        a.execute("UPDATE member SET org_id=$1 WHERE id=1", &[&moved])
+            .await
+            .unwrap();
+        let delete = b.prepare("DELETE FROM org WHERE id=$1").await.unwrap();
+        {
+            let params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&1_i32];
+            let pending = b.execute(&delete, &params);
+            tokio::pin!(pending);
+            assert!(timeout(MUST_WAIT, &mut pending).await.is_err());
+            a.batch_execute("COMMIT").await.unwrap();
+            assert_eq!(timeout(COMPLETION, pending).await.unwrap().unwrap(), 1);
+        }
+        assert_ids(&b, "SELECT id FROM member ORDER BY id", expected).await;
+        assert_ids(&b, "SELECT id FROM member WHERE org_id=2", expected).await;
+        assert_no_orphans(&b, &[("member", "org_id", "org")]).await;
+        fixture.stop(a, b).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cascade_follows_a_child_rekey_that_keeps_the_reference() {
+    for full_image in [false, true] {
+        let (fixture, a, b) = Fixture::new().await;
+        if full_image {
+            a.batch_execute(
+                "CREATE TABLE restricts_org(id int PRIMARY KEY, p int REFERENCES org(id))",
+            )
+            .await
+            .unwrap();
+        }
+        a.batch_execute(
+            "INSERT INTO member VALUES(300,1,1); BEGIN; UPDATE member SET id=0 WHERE id=300",
+        )
+        .await
+        .unwrap();
+        let delete = b.prepare("DELETE FROM org WHERE id=1").await.unwrap();
+        {
+            let pending = b.execute(&delete, &[]);
+            tokio::pin!(pending);
+            assert!(timeout(MUST_WAIT, &mut pending).await.is_err());
+            a.batch_execute("COMMIT").await.unwrap();
+            assert_eq!(timeout(COMPLETION, pending).await.unwrap().unwrap(), 1);
+        }
+        assert_ids(&b, "SELECT id FROM member", &[]).await;
+        assert_no_orphans(&b, &[("member", "org_id", "org")]).await;
+        fixture.stop(a, b).await;
+    }
+}

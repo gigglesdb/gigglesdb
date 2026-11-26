@@ -982,6 +982,21 @@ impl Transaction {
             self.snapshot = Some(snapshot);
         }
     }
+    /// Use one pinned local RI snapshot across pages, restoring the
+    /// statement snapshot before any wait or write crosscheck.
+    pub(crate) fn begin_fk_action_page(&mut self, snapshot: Option<SnapshotHandle>) {
+        debug_assert!(self.set_aside.is_none());
+        let TxnServices::Local { seq, .. } = self.services() else { unreachable!("local FK scan"); };
+        self.set_aside = self.snapshot.replace(Snapshot::Local(snapshot.unwrap_or_else(|| seq.snapshot())));
+    }
+
+    pub(crate) fn end_fk_action_page(&mut self) -> SnapshotHandle {
+        let Snapshot::Local(snapshot) = self.snapshot.take().expect("local FK snapshot")
+            else { unreachable!("local FK scan"); };
+        self.end_latest();
+        snapshot
+    }
+
     /// Whether a committed version of `key` is newer than `ts`.
     pub(crate) fn changed_since(&self, ks: Keyspace, key: &[u8], ts: Ts) -> Result<bool, TxnError> {
         let latest = match self.services() {

@@ -279,6 +279,22 @@ impl Prepared {
             for id in sinks { edges.remove(&id); }
         }
         if !incoming { return None; }
+        self.delete_point_keys(state, params, table)
+    }
+
+    /// A point cascade may prelock its parent even if a descendant is deferred
+    /// or the graph has a cycle. SET DEFAULT retains its existing admission.
+    pub(crate) fn cascade_delete_point_keys(&self, state: &Relational, params: &[Value]) -> Option<Vec<Vec<Value>>> {
+        if !matches!(self.statement.get(), Statement::Delete { .. }) { return None; }
+        let table = state.tables.get(self.table()?)?;
+        if state.ext.constraints.values().flatten().any(|constraint| {
+            matches!(constraint.kind, ConstraintKind::ForeignKey { ref_table, on_delete: catalog_ext::Action::SetDefault, .. }
+                if ref_table == table.id)
+        }) { return None; }
+        self.delete_point_keys(state, params, table)
+    }
+
+    fn delete_point_keys(&self, state: &Relational, params: &[Value], table: &TableDef) -> Option<Vec<Vec<Value>>> {
         let keys = if self.native_delete.is_some() { native_lock_key(state, self, table)? }
         else if let Some(query) = searched::target(self) {
             query.mutation_primary_keys(state, table, params)?
@@ -291,12 +307,17 @@ impl Prepared {
 
     /// Plain VALUES appends use physical latest-owner PK/UNIQUE checks.
     pub(crate) fn plain_values_append(&self, state: &Relational) -> bool {
+        self.plain_values_append_with_local_cascade(state, false)
+    }
+
+    pub(crate) fn plain_values_append_with_local_cascade(&self, state: &Relational, local: bool) -> bool {
         let Some(table) = self.table().and_then(|name| state.tables.get(name)) else { return false; };
         if state.has_nondeterministic_keys(table) { return false; }
-        if state.ext.constraints.get(&table.id).into_iter().flatten().any(|c|
-            matches!(c.kind, ConstraintKind::ForeignKey { ref_table, .. } if ref_table == table.id)) {
-            return false;
-        }
+        if state.ext.constraints.get(&table.id).into_iter().flatten().any(|c| {
+            matches!(&c.kind, ConstraintKind::ForeignKey { ref_table, on_delete, .. }
+                if *ref_table == table.id && !(local && matches!(on_delete,
+                    catalog_ext::Action::Cascade | catalog_ext::Action::SetNull)))
+        }) { return false; }
         matches!(self.statement.get(), Statement::Insert { .. } | Statement::InsertExpressions(_))
             || matches!(self.statement.get(), Statement::InsertMulti(i) if i.append_only() && i.source.is_none() && (self.native_insert_many || i.row_count() <= paged_insert::SHARED_WRITE_ROWS))
     }
@@ -706,10 +727,15 @@ impl ActionWork {
                 let mut still_references_old_key = false;
                 let mut after = None;
                 let first_version = state.next_version;
+                let row_locks = sink.row_locked_cascade()
+                    && matches!(action, catalog_ext::Action::Cascade | catalog_ext::Action::SetNull | catalog_ext::Action::SetDefault);
                 loop {
                     // Byte indexes cannot find every ICU-equal child. Read bounded
                     // physical pages at the RI snapshot, then compare parent keys.
-                    let page = if equality.nondeterministic() {
+                    let page = if row_locks {
+                        let probe = (!equality.nondeterministic()).then_some((columns.as_slice(), values.as_slice()));
+                        sink.fk_action_page(&child, probe, after)?
+                    } else if equality.nondeterministic() {
                         sink.fk_read_page(&child, after)?
                     } else { sink.fk_child_page(&child, columns, &values, after)? };
                     let Some((last, mut rows)) = page else { break; };
@@ -719,7 +745,7 @@ impl ActionWork {
                         for (key, row) in rows {
                             // A cascade can move an ICU-equal child ahead of the
                             // cursor. Do not act on this scan's own writes again.
-                            if row.version >= first_version { continue; }
+                            if row.version >= first_version && (!row_locks || row.version < version_end) { continue; }
                             if references_old_key(&row).map_err(CoreError::Sql)? {
                                 matching.insert(key, row);
                             }
@@ -756,9 +782,30 @@ impl ActionWork {
                         }
                         continue;
                     }
+                    let updating = new.is_some() || *action != catalog_ext::Action::Cascade;
+                    if row_locks {
+                        let mut locked = DdlRows::new();
+                        let mut restart = false;
+                        for (key, row) in rows {
+                            if (first_version..version_end).contains(&row.version) { continue; }
+                            let mode = if updating { FkRowLock::Update(columns) } else { FkRowLock::Delete };
+                            let current = sink.lock_fk_action_row(&child, &row, mode)?;
+                            // A concurrent PK update can preserve the FK and
+                            // move the old row behind the cursor. Its old PK
+                            // could even have been reused by another row.
+                            restart |= current.as_ref() != Some(&row);
+                            if let Some(current) = current
+                                && references_old_key(&current).map_err(CoreError::Sql)?
+                            {
+                                locked.insert(key, current);
+                            }
+                        }
+                        if restart { after = None; }
+                        rows = locked;
+                    }
                     let mut changed = DdlRows::new();
                     let mut events = Vec::new();
-                    if new.is_some() || *action != catalog_ext::Action::Cascade {
+                    if updating {
                         for old in rows.values() {
                             let mut row = old.clone();
                             for (i, &position) in child_positions.iter().enumerate() {

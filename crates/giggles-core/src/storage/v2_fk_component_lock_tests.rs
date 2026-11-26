@@ -143,3 +143,147 @@ fn component_lock_requires_a_writing_action_and_potential_key_change() {
         Some(&nonkey)
     ));
 }
+
+#[test]
+fn delete_paths_follow_only_writing_actions() {
+    let state = catalog(&[
+        "CREATE TABLE owner(id int PRIMARY KEY)",
+        "CREATE TABLE p(id int PRIMARY KEY, owner int REFERENCES owner(id))",
+        "CREATE TABLE c(id int PRIMARY KEY, p int REFERENCES p(id) ON DELETE CASCADE)",
+        "CREATE TABLE leaf(id int PRIMARY KEY, c int REFERENCES c(id) ON DELETE CASCADE)",
+        "CREATE TABLE a(id int PRIMARY KEY, p int UNIQUE REFERENCES p(id) ON DELETE SET NULL)",
+        "CREATE TABLE update_leaf(id int PRIMARY KEY, a int REFERENCES a(p) ON UPDATE CASCADE)",
+        "CREATE TABLE delete_leaf(id int PRIMARY KEY, a int REFERENCES a(id) ON DELETE CASCADE)",
+        "CREATE TABLE other_key(id int PRIMARY KEY, a int REFERENCES a(id) ON UPDATE CASCADE)",
+        "CREATE TABLE witness(id int PRIMARY KEY, p int REFERENCES p(id))",
+        "CREATE TABLE tree(id int PRIMARY KEY, p int REFERENCES tree(id) ON DELETE CASCADE)",
+    ]);
+    let id = |name: &str| state.tables[name].id;
+    assert_eq!(
+        delete_action_targets(state.catalog_ext(), [id("p")]),
+        (
+            ["c", "leaf", "a", "update_leaf"]
+                .into_iter()
+                .map(id)
+                .collect(),
+            ["a", "update_leaf"].into_iter().map(id).collect(),
+        ),
+    );
+    assert_eq!(
+        delete_action_targets(state.catalog_ext(), [id("tree")]),
+        (BTreeSet::from([id("tree")]), BTreeSet::new()),
+    );
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn local_delete_and_protected_delete_hold_their_respective_table_locks() {
+    use engine::locks::LockKey;
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce).unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "fk-delete-lock-set-{:032x}",
+        u128::from_be_bytes(nonce)
+    ));
+    let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+    let db = admin.test_v2();
+    let mut session = admin.sql_session();
+    for sql in [
+        "CREATE TABLE owner(id int PRIMARY KEY)",
+        "CREATE TABLE p(id int PRIMARY KEY, owner int REFERENCES owner(id))",
+        "CREATE TABLE c(id int PRIMARY KEY, p int REFERENCES p(id) ON DELETE CASCADE)",
+        "CREATE TABLE leaf(id int PRIMARY KEY, c int REFERENCES c(id) ON DELETE CASCADE)",
+        "CREATE TABLE witness(id int PRIMARY KEY, p int REFERENCES p(id))",
+        "INSERT INTO owner VALUES(1)",
+        "INSERT INTO p VALUES(1,1)",
+        "INSERT INTO c VALUES(1,1)",
+        "INSERT INTO leaf VALUES(1,1)",
+    ] {
+        session.execute(sql, &[], None).unwrap();
+    }
+    let assert_modes = |txn: &mut Transaction, expected: &[(&str, Option<LockMode>)]| {
+        let tables = db.catalog().snapshot(txn).unwrap();
+        let engine::txn::TxnServices::Local { locks, .. } = txn.services() else {
+            unreachable!()
+        };
+        for (name, held) in expected {
+            let key = LockKey::Table(tables.parts.tables[*name].id);
+            for mode in [
+                LockMode::AccessShare,
+                LockMode::RowShare,
+                LockMode::RowExclusive,
+                LockMode::Share,
+                LockMode::AccessExclusive,
+            ] {
+                assert_eq!(
+                    locks.holds_mode(txn.id(), key.clone(), mode),
+                    *held == Some(mode),
+                    "{name}: {mode:?}"
+                );
+            }
+        }
+    };
+    for sql in [
+        "DELETE FROM p WHERE id=1",
+        "WITH gone AS (DELETE FROM p WHERE id=1 RETURNING id) SELECT id FROM gone",
+        "MERGE INTO p USING (SELECT 1 AS id) AS input ON p.id=input.id WHEN MATCHED THEN DELETE",
+    ] {
+        session.execute("BEGIN", &[], None).unwrap();
+        session
+            .execute(sql, &[], None)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        assert_modes(
+            session.v2_transaction.as_mut().unwrap(),
+            &[
+                ("p", Some(LockMode::RowExclusive)),
+                ("c", Some(LockMode::RowExclusive)),
+                ("leaf", Some(LockMode::RowExclusive)),
+                ("owner", None),
+                ("witness", None),
+            ],
+        );
+        assert!(
+            session
+                .execute("SELECT id FROM leaf", &[], None)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        session.execute("ROLLBACK", &[], None).unwrap();
+    }
+    let run = ProtectedRun {
+        txn: db.begin(Isolation::Serializable),
+        effects: Default::default(),
+    };
+    let prepared = session.prepare("DELETE FROM p WHERE id=1").unwrap();
+    let (mut run, result) = session.execute_protected_v2(&db, run, &prepared, &[], None);
+    result.unwrap();
+    assert_modes(
+        &mut run.txn,
+        &[
+            ("p", Some(LockMode::RowExclusive)),
+            ("c", Some(LockMode::Share)),
+            ("leaf", Some(LockMode::Share)),
+            ("owner", Some(LockMode::Share)),
+            ("witness", Some(LockMode::Share)),
+        ],
+    );
+    drop(run);
+    session.execute("BEGIN", &[], None).unwrap();
+    session
+        .execute("ALTER TABLE p ADD COLUMN extra int", &[], None)
+        .unwrap();
+    assert_modes(
+        session.v2_transaction.as_mut().unwrap(),
+        &[
+            ("p", Some(LockMode::AccessExclusive)),
+            ("c", Some(LockMode::AccessExclusive)),
+            ("leaf", Some(LockMode::AccessExclusive)),
+            ("owner", Some(LockMode::AccessExclusive)),
+            ("witness", Some(LockMode::AccessExclusive)),
+        ],
+    );
+    session.execute("ROLLBACK", &[], None).unwrap();
+    drop((session, db, admin));
+    std::fs::remove_dir_all(path).unwrap();
+}

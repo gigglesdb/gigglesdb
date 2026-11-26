@@ -64,7 +64,7 @@ pub(crate) struct DeferralState {
     pub(super) parent_details: BTreeMap<(u64, u64), ParentDetails>,
 }
 impl DeferralState {
-    fn deferred(&self, id: u64, kind: &ConstraintKind) -> bool {
+    pub(super) fn deferred(&self, id: u64, kind: &ConstraintKind) -> bool {
         matches!(kind, ConstraintKind::ForeignKey { deferral, .. } if *deferral != Deferral::NotDeferrable && self.modes.get(&id).copied().unwrap_or(*deferral == Deferral::DeferrableDeferred))
     }
 
@@ -864,7 +864,12 @@ pub(super) fn enforce(
     )
     .map(|_| ())
 }
-type LoadRows<'a> = dyn FnMut(&mut Relational, &mut Relational) -> R<()> + 'a;
+type LoadImageRows<'a> = dyn FnMut(&mut Relational, &mut Relational) -> R<()> + 'a;
+
+pub(super) struct LoadRows<'a> {
+    pub(super) refresh: &'a mut LoadImageRows<'a>,
+    pub(super) concurrent_actions: bool,
+}
 pub(super) fn insert_check_columns(state: &Relational, prepared: &Prepared) -> Option<(u64, Vec<usize>)> {
     let table = state.tables.get(prepared.table()?)?;
     if !state.table_constraints(table.id).iter().any(|constraint| matches!(constraint.kind, ConstraintKind::Check { .. })) {
@@ -888,7 +893,7 @@ pub(super) fn enforce_with_rows<'a>(
     cancel: &mut impl FnMut() -> bool,
     clock: Option<&clock::ExecutionClock>,
     insert_columns: Option<(u64, Vec<usize>)>,
-    mut load: Option<&mut LoadRows<'_>>,
+    mut load: Option<LoadRows<'_>>,
 ) -> R<std::borrow::Cow<'a, Relational>> {
     // DDL may have removed constraints with queued checks or explicit modes.
     deferred.modes.retain(|id, _| state.ext.constraints.values().flatten().any(|c| c.id == *id));
@@ -900,7 +905,7 @@ pub(super) fn enforce_with_rows<'a>(
         return Ok(before);
     }
     if let Some(load) = load.as_mut() {
-        load(state, before.to_mut())?;
+        (load.refresh)(state, before.to_mut())?;
     }
     let type_rewrite = !Arc::ptr_eq(&before.ext, &state.ext) && before.ext.types != state.ext.types;
     let mut touched_old = captured
@@ -1005,7 +1010,7 @@ pub(super) fn enforce_with_rows<'a>(
     let mut parent_details = BTreeMap::<_, ParentDetails>::new();
     while let Some(event) = events.pop_front() {
         if let Some(load) = load.as_mut() {
-            load(state, before.to_mut())?;
+            (load.refresh)(state, before.to_mut())?;
         }
         if cancel() {
             return Err(SqlError::Aborted);
@@ -1226,12 +1231,19 @@ pub(super) fn enforce_with_rows<'a>(
                             .map(|(k, r)| (k.as_slice(), r)),
                     }]
                 };
-                state.secondary_apply_batch_engine(
-                    state.epoch,
-                    &changes,
-                    state.next_version,
-                    &mut *cancel,
-                )?;
+                let next_version = state.next_version;
+                // A transient RI image may contain already committed witnesses
+                // from a later reservation. Keep this statement's own allocator
+                // in its range while validating those preimages.
+                let ceiling = if load.as_ref().is_some_and(|loader| loader.concurrent_actions) {
+                    let last = state.rows.values().flat_map(BTreeMap::values)
+                        .map(|row| row.version).max().unwrap_or(0);
+                    next_version.max(last.checked_add(1).ok_or(SqlError::Overflow)?)
+                } else {
+                    next_version
+                };
+                state.secondary_apply_batch_engine(state.epoch, &changes, ceiling, &mut *cancel)?;
+                state.next_version = next_version;
                 if let Some(new) = &new {
                     touched_old.insert((child_id, new.version), old.clone());
                 }
@@ -1256,7 +1268,7 @@ pub(super) fn enforce_with_rows<'a>(
         }
     }
     if let Some(load) = load.as_mut() {
-        load(state, before.to_mut())?;
+        (load.refresh)(state, before.to_mut())?;
     }
     for (table_id, cs) in &state.ext.constraints {
         let table = table_by_id(state, *table_id)?;

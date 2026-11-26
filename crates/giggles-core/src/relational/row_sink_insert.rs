@@ -219,8 +219,9 @@ pub(crate) fn validate_append(state: &Relational, table: &TableDef, first_versio
             let mut retention = scan::Retention::new(scan::retention_limit());
             // Only new rows need outgoing witnesses. Hydrated parents are identical
             // in before/page; recursively expanding them walks self-FK chains.
-            hydrate(&page.clone(), &state.ext.constraints, &mut before, &mut page,
-                sink, &mut retention, true, &BTreeSet::new())?;
+            let deferred_probes = (!immediate_mode && sink.defer_fk_parent_probes()).then_some(&*pending);
+            hydrate_with_probes(Some(&page.clone()), &state.ext.constraints, &mut before, &mut page,
+                sink, &mut retention, true, &BTreeSet::new(), None, deferred_probes)?;
             // A new self-FK row can also witness another new row's parent.
             // Hydration must not make that seed look unchanged and skip its FK.
             for key in inserted {
