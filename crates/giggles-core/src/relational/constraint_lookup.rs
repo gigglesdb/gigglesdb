@@ -161,20 +161,18 @@ pub(super) fn matching_rows_typed(
     if base.len() > MAX_ROWS {
         return Err(SqlError::Limit);
     }
+    // A nondeterministic collation is identical on both sides of the FK.
+    let equality = collation_keys::Key::new(state, table, columns, None)?;
+    let tuple = equality.values(values)?;
     let mut result = Vec::new();
     for (key, row) in base {
         tick(cancel)?;
-        let mut matches = true;
-        for ((i, source), value) in offsets.iter().zip(source_types).zip(values) {
-            if query::constraint_key(&row.values[*i], &table.columns[*i].data_type, source)?
-                .as_ref()
-                != Some(value)
-            {
-                matches = false;
-                break;
-            }
-        }
-        if matches {
+        let converted = offsets.iter().zip(source_types).map(|(i, source)| {
+            query::constraint_key(&row.values[*i], &table.columns[*i].data_type, source)
+        }).collect::<R<Option<Vec<_>>>>()?;
+        if let Some(converted) = converted
+            && equality.values(&converted)? == tuple
+        {
             result.push((key.clone(), row.clone()));
         }
     }

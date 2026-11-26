@@ -8,6 +8,13 @@ pub(in crate::relational) fn constraint_types_compatible(
     child: &DataType,
     parent: &DataType,
 ) -> bool {
+    // The integer operator family has no numeric equality operator or implicit
+    // numeric-to-integer cast. Keep the exact conversion for existing FKs.
+    if *child == DataType::Numeric
+        && matches!(parent, DataType::SmallInt | DataType::Integer | DataType::BigInt)
+    {
+        return false;
+    }
     functions::comparable(child, parent) && functions::join_key_supported(child, parent)
 }
 
@@ -23,6 +30,14 @@ pub(in crate::relational) fn constraint_key(
     source: &DataType,
     target: &DataType,
 ) -> R<Option<Value>> {
+    if *target == DataType::Real
+        && matches!(source, DataType::SmallInt | DataType::Integer | DataType::BigInt | DataType::Numeric)
+        && *value != Value::Null
+    {
+        // The real FK operator family compares both operands as real. SQL
+        // joins use a wider comparison type for these mixed operands.
+        return functions::assignment::convert(value.clone(), source, target, None).map(Some);
+    }
     functions::join_key(value, source, target)
 }
 

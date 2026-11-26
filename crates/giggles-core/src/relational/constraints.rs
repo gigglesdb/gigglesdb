@@ -277,6 +277,40 @@ fn referenced_key(
 fn key_values(row: &SqlRow, positions: &[usize]) -> Vec<Value> {
     positions.iter().map(|i| row.values[*i].clone()).collect()
 }
+// Parent-side RI triggers compare the stored images, before applying SQL equality.
+pub(super) fn key_image_eq(old: &Value, new: &Value) -> bool {
+    match (old, new) {
+        (Value::Numeric(old), Value::Numeric(new)) => old == new && old.scale() == new.scale(),
+        (Value::Float4(old), Value::Float4(new)) => old.to_bits() == new.to_bits(),
+        (Value::Float8(old), Value::Float8(new)) => old.to_bits() == new.to_bits(),
+        _ => old == new,
+    }
+}
+
+pub(super) fn row_image_eq(old: &[Value], new: &[Value]) -> bool {
+    old.len() == new.len() && old.iter().zip(new).all(|(old, new)| key_image_eq(old, new))
+}
+
+pub(super) fn cascade_value(
+    state: &Relational, parent: &ColumnDef, child: &ColumnDef, value: &Value,
+) -> R<Value> {
+    if same_fk_type(state, parent, child) {
+        return Ok(value.clone());
+    }
+    if matches!(value, Value::Numeric(n) if n.scale().is_none())
+        && matches!(child.data_type, DataType::SmallInt | DataType::Integer | DataType::BigInt)
+    {
+        // PostgreSQL reports 0A000 when a cascade casts a special numeric to integer.
+        return Err(SqlError::Unsupported);
+    }
+    let value = query::assignment::convert(value.clone(), &parent.data_type, &child.data_type, None)?;
+    coerce_to_column(state, child, value)
+}
+
+pub(super) fn same_fk_type(state: &Relational, parent: &ColumnDef, child: &ColumnDef) -> bool {
+    parent.data_type == child.data_type && state.column_typmod(parent.id) == state.column_typmod(child.id)
+}
+
 fn fk_row(
     state: &Relational, table: &TableDef, row: &SqlRow, kind: &ConstraintKind, name: Option<&str>,
     parent_failure: Option<(&str, &[Value])>,
@@ -871,6 +905,7 @@ pub(super) fn enforce(
 pub(super) struct FkPreimages {
     by_version: BTreeMap<(u64, u64), Option<Arc<SqlRow>>>,
     captured_old: BTreeSet<(u64, u64)>,
+    cascade_checks: BTreeMap<(u64, u64), BTreeSet<u64>>,
     dml: bool,
 }
 
@@ -879,11 +914,17 @@ impl FkPreimages {
         let original = self.by_version.get(&(table, old.version)).cloned()
             .unwrap_or_else(|| original.cloned().map(Arc::new));
         self.by_version.insert((table, new.version), original);
+        if let Some(checks) = self.cascade_checks.remove(&(table, old.version)) {
+            self.cascade_checks.insert((table, new.version), checks);
+        }
     }
 
-    pub(super) fn changed(&self, table: u64, key: &[u8], row: &SqlRow,
-        before: Option<&super::row_sink::DdlRows>, positions: &[usize],
+    pub(super) fn requires_check(&self, table: u64, key: &[u8], row: &SqlRow,
+        before: Option<&super::row_sink::DdlRows>, positions: &[usize], constraint: u64,
     ) -> bool {
+        if self.cascade_checks.get(&(table, row.version)).is_some_and(|ids| ids.contains(&constraint)) {
+            return true;
+        }
         let original = self.by_version.get(&(table, row.version)).map_or_else(
             || before.and_then(|rows| rows.get(key)).filter(|old| {
                 // DML records every logical update. A new version without a
@@ -1024,7 +1065,7 @@ pub(super) fn enforce_with_rows<'a>(
             } else {
                 std::borrow::Cow::Borrowed(old)
             };
-            if new.is_some_and(|r| r.values == old.values) {
+            if new.is_some_and(|r| row_image_eq(&r.values, &old.values)) {
                 continue;
             }
             if events.len() >= MAX_ROWS {
@@ -1122,11 +1163,19 @@ pub(super) fn enforce_with_rows<'a>(
             let ref_positions = id_positions(&parent, ref_columns)?;
             let old_key = key_values(&event.old, &ref_positions);
             let new_key = event.new.as_ref().map(|r| key_values(r, &ref_positions));
-            if new_key.as_ref() == Some(&old_key) || old_key.contains(&Value::Null) {
+            if old_key.contains(&Value::Null) {
                 continue;
             }
             let child = table_by_id(state, child_id)?.clone();
             let positions = id_positions(&child, columns)?;
+            let cross_type = ref_positions.iter().zip(&positions).any(|(&p, &c)| {
+                !same_fk_type(state, &parent.columns[p], &child.columns[c])
+            });
+            if new_key.as_ref().is_some_and(|key| {
+                if cross_type { row_image_eq(&old_key, key) } else { old_key == *key }
+            }) {
+                continue;
+            }
             let parent_types: Vec<_> = ref_positions
                 .iter()
                 .map(|i| parent.columns[*i].data_type.clone())
@@ -1220,7 +1269,10 @@ pub(super) fn enforce_with_rows<'a>(
                         for (i, position) in positions.iter().enumerate() {
                             row.values[*position] = match action {
                                 catalog_ext::Action::Cascade => {
-                                    new_key.as_ref().ok_or(SqlError::Type)?[i].clone()
+                                    cascade_value(
+                                        state, &parent.columns[ref_positions[i]], &child.columns[*position],
+                                        &new_key.as_ref().ok_or(SqlError::Type)?[i],
+                                    )?
                                 }
                                 catalog_ext::Action::SetNull => Value::Null,
                                 catalog_ext::Action::SetDefault => {
@@ -1282,6 +1334,12 @@ pub(super) fn enforce_with_rows<'a>(
                     let original = before.rows.get(&child_id).and_then(|rows| rows.get(&old_pk))
                         .filter(|original| original.version == old.version);
                     preimages.record(child_id, &old, new, original);
+                    if *action == Action::Cascade && cross_type {
+                        // Assignment can round back to the old child key, which
+                        // may no longer reference a parent.
+                        preimages.cascade_checks.entry((child_id, new.version)).or_default()
+                            .insert(constraint.id);
+                    }
                 }
                 events.push_back(Event {
                     table: child_id,
@@ -1341,7 +1399,7 @@ pub(super) fn enforce_with_rows<'a>(
                 let positions = id_positions(table, columns)?;
                 changed
                     .iter()
-                    .filter(|key| preimages.changed(*table_id, key, &rows[*key], before_rows, &positions))
+                    .filter(|key| preimages.requires_check(*table_id, key, &rows[*key], before_rows, &positions, constraint.id))
                     .cloned()
                     .collect::<BTreeSet<_>>()
             } else {

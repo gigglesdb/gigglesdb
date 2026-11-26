@@ -810,15 +810,33 @@ impl ActionWork {
                 let values = parent_positions.iter().map(|i| old.values[*i].clone()).collect::<Vec<_>>();
                 let new_values = new.as_ref().map(|row| parent_positions.iter()
                     .map(|i| row.values[*i].clone()).collect::<Vec<_>>());
-                if values.contains(&Value::Null) || new_values.as_ref() == Some(&values) { continue; }
+                if values.contains(&Value::Null) { continue; }
                 let action = if new.is_some() { on_update } else { on_delete };
                 let child = state.tables.values().find(|t| t.id == *child_id).unwrap().clone();
-                let equality = collation_keys::Key::new(state, &parent, ref_columns, None)
-                    .map_err(CoreError::Sql)?;
-                let tuple = equality.values(&values).map_err(CoreError::Sql)?;
                 let child_positions = columns.iter()
                     .map(|id| child.columns.iter().position(|c| c.id == *id).unwrap())
                     .collect::<Vec<_>>();
+                let positions = || parent_positions.iter().zip(&child_positions);
+                let cross_type = positions().any(|(&p, &c)| {
+                    !constraints::same_fk_type(state, &parent.columns[p], &child.columns[c])
+                });
+                if new_values.as_ref().is_some_and(|new| {
+                    if cross_type { constraints::row_image_eq(&values, new) } else { values == *new }
+                }) { continue; }
+                let equality = collation_keys::Key::new(state, &parent, ref_columns, None)
+                    .map_err(CoreError::Sql)?;
+                let tuple = equality.values(&values).map_err(CoreError::Sql)?;
+                let probe = if !equality.nondeterministic() && positions().all(|(&p, &c)| {
+                    query::constraint_key_supported(&parent.columns[p].data_type, &child.columns[c].data_type)
+                }) {
+                    let converted = positions().zip(&values).map(|((&p, &c), value)| {
+                        query::constraint_key(value, &parent.columns[p].data_type, &child.columns[c].data_type)
+                    }).collect::<R<Option<Vec<_>>>>().map_err(CoreError::Sql)?;
+                    let Some(converted) = converted else { continue; };
+                    Some(converted)
+                } else {
+                    None
+                };
                 let references_old_key = |row: &SqlRow| -> R<bool> {
                     let converted = child_positions.iter().zip(&parent_positions).map(|(&a, &b)| {
                         query::constraint_key(&row.values[a], &child.columns[a].data_type,
@@ -832,25 +850,27 @@ impl ActionWork {
                 let mut still_references_old_key = false;
                 let mut after = None;
                 let first_version = state.next_version;
-                let row_locks = sink.row_locked_cascade()
-                    && matches!(action, catalog_ext::Action::Cascade | catalog_ext::Action::SetNull | catalog_ext::Action::SetDefault);
+                let writes = matches!(action,
+                    catalog_ext::Action::Cascade | catalog_ext::Action::SetNull | catalog_ext::Action::SetDefault);
+                let row_locks = writes && sink.row_locked_cascade();
                 loop {
-                    // Byte indexes cannot find every ICU-equal child. Read bounded
-                    // physical pages at the RI snapshot, then compare parent keys.
+                    // A directional cast or nondeterministic collation can make
+                    // an exact probe incomplete. Compare physical pages instead.
                     let page = if row_locks {
-                        let probe = (!equality.nondeterministic()).then_some((columns.as_slice(), values.as_slice()));
-                        sink.fk_action_page(&child, probe, after)?
-                    } else if equality.nondeterministic() {
+                        sink.fk_action_page(&child, probe.as_deref().map(|v| (columns.as_slice(), v)), after)?
+                    } else if let Some(probe) = &probe {
+                        sink.fk_child_page(&child, columns, probe, after)?
+                    } else {
                         sink.fk_read_page(&child, after)?
-                    } else { sink.fk_child_page(&child, columns, &values, after)? };
+                    };
                     let Some((last, mut rows)) = page else { break; };
                     after = Some(last);
-                    if equality.nondeterministic() {
+                    if probe.is_none() {
                         let mut matching = DdlRows::new();
                         for (key, row) in rows {
-                            // A cascade can move an ICU-equal child ahead of the
+                            // A cascade can move a matching child ahead of the
                             // cursor. Do not act on this scan's own writes again.
-                            if row.version >= first_version && (!row_locks || row.version < version_end) { continue; }
+                            if writes && (first_version..version_end).contains(&row.version) { continue; }
                             if references_old_key(&row).map_err(CoreError::Sql)? {
                                 matching.insert(key, row);
                             }
@@ -916,7 +936,10 @@ impl ActionWork {
                             let mut row = old.clone();
                             for (i, &position) in child_positions.iter().enumerate() {
                                 row.values[position] = match action {
-                                    catalog_ext::Action::Cascade => new_values.as_ref().unwrap()[i].clone(),
+                                    catalog_ext::Action::Cascade => constraints::cascade_value(
+                                        state, &parent.columns[parent_positions[i]], &child.columns[position],
+                                        &new_values.as_ref().unwrap()[i],
+                                    ).map_err(CoreError::Sql)?,
                                     catalog_ext::Action::SetNull => Value::Null,
                                     // Runs as the referencing table's owner (GD-0084 Q24).
                                     catalog_ext::Action::SetDefault => defaults::evaluate(state, &child.columns[position],
@@ -968,9 +991,9 @@ impl ActionWork {
     }
 
     fn queue_child_check(&mut self, table: u64, key: &[u8], constraint: &Constraint,
-        changed: bool, by_version: bool,
+        by_version: bool,
     ) -> Result<(), CoreError> {
-        let pending = if changed && self.pending.deferred(constraint.id, &constraint.kind) {
+        let pending = if self.pending.deferred(constraint.id, &constraint.kind) {
             &mut self.pending
         } else {
             &mut self.immediate
@@ -1021,7 +1044,7 @@ impl ActionWork {
                 upsert.record_update(old.version, row.version, &mut self.retention).map_err(CoreError::Sql)?
             } else { false };
             let track_upsert = upsert.is_some();
-            if force.is_none() && new.as_ref().is_some_and(|row| row.values == old.values)
+            if force.is_none() && new.as_ref().is_some_and(|row| constraints::row_image_eq(&old.values, &row.values))
                 || !state.ext.constraints.iter().any(|(owner, cs)| cs.iter().any(|c|
                     matches!(&c.kind, ConstraintKind::ForeignKey { ref_table, .. }
                         if *owner == table.id || *ref_table == table.id))) { continue; }
@@ -1045,19 +1068,20 @@ impl ActionWork {
             if let Some(row) = &new {
                 for c in state.ext.constraints.get(&table.id).into_iter().flatten() {
                     let ConstraintKind::ForeignKey { columns, .. } = &c.kind else { continue; };
-                    let changed = columns.iter().any(|id| {
+                    // A cast can keep the child's old key after the parent moved.
+                    // Queue that recheck in the same mode as a changed reference.
+                    let changed = force == Some(c.id) || columns.iter().any(|id| {
                         let i = table.columns.iter().position(|c| c.id == *id).unwrap();
                         row.values[i] != old.values[i]
                     });
-                    if force != Some(c.id) && !changed { continue; }
-                    if changed && existing {
+                    if !changed { continue; }
+                    if existing {
                         self.upsert.as_mut().unwrap().record_reference(c.id, row.version, &mut self.retention)
                             .map_err(CoreError::Sql)?;
                     }
                     // Inserts, including action-rewritten inserts, are checked
                     // by the append scan. Explicit action rechecks keep their timing.
-                    self.queue_child_check(table.id, new_key.as_ref().unwrap(), c, changed,
-                        track_upsert && changed)?;
+                    self.queue_child_check(table.id, new_key.as_ref().unwrap(), c, track_upsert)?;
                 }
             }
             self.queue.push_back((table.id, old.clone(), new));

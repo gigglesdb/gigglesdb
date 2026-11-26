@@ -155,8 +155,8 @@ pub(super) fn hydrate_with_probes(
                             .collect::<Vec<_>>(),
                         ParentRows::Changed(preimages) => staged.rows.get(&source_id)
                             .into_iter().flatten()
-                            .filter(|(key, row)| preimages.changed(source_id, key, row,
-                                before.rows.get(&source_id), &positions))
+                            .filter(|(key, row)| preimages.requires_check(source_id, key, row,
+                                before.rows.get(&source_id), &positions, c.id))
                             .map(|(_, row)| (None, row.clone()))
                             .collect(),
                         ParentRows::Pending(pending) => pending.pending.get(&probe_key)
@@ -169,7 +169,8 @@ pub(super) fn hydrate_with_probes(
                     // Only changed parent keys need incoming witnesses.
                     before.rows.get(&source_id).into_iter().flat_map(|rows| rows.iter())
                         .filter(|(key, row)| staged.rows.get(&source_id).and_then(|rows| rows.get(*key))
-                            .is_none_or(|new| positions.iter().any(|i| row.values[*i] != new.values[*i])))
+                            .is_none_or(|new| positions.iter().any(|i|
+                                !constraints::key_image_eq(&row.values[*i], &new.values[*i]))))
                         .map(|(_, row)| (None, row.clone())).collect()
                 };
                 let mut keys = BTreeSet::new();
@@ -211,10 +212,7 @@ pub(super) fn hydrate_with_probes(
                         return Err(CoreError::Sql(SqlError::Type));
                     }
                     // Deduplicate encoded probes without relying on Value's SQL order.
-                    let signature = converted
-                        .as_ref()
-                        .map(|v| encode_key(v))
-                        .transpose()
+                    let signature = encode_key(converted.as_deref().unwrap_or(&values))
                         .map_err(CoreError::Sql)?;
                     if !keys.insert(signature) {
                         continue;
@@ -227,15 +225,22 @@ pub(super) fn hydrate_with_probes(
                             && *deferral == catalog_ext::Deferral::NotDeferrable);
                     let mut witnessed = false;
                     let collated = target_columns.iter().any(|id| !before.deterministic_column(*id));
-                    let source_equality = collation_keys::Key::new(before, source, source_columns, None).map_err(CoreError::Sql)?;
+                    let equality = if parent {
+                        collation_keys::Key::new(before, target, target_columns, None)
+                    } else {
+                        collation_keys::Key::new(before, source, source_columns, None)
+                    }.map_err(CoreError::Sql)?;
+                    let tuple = equality.values(if parent { converted.as_deref().unwrap() } else { &values })
+                        .map_err(CoreError::Sql)?;
                     let matches_child = |row: &SqlRow| -> R<bool> {
                         let candidate = targets.iter().zip(&positions).map(|(a, b)| {
                             query::constraint_key(&row.values[*a], &target.columns[*a].data_type,
                                 &source.columns[*b].data_type)
                         }).collect::<R<Option<Vec<_>>>>()?;
-                        let tuple = source_equality.values(&values)?;
-                        Ok(tuple.is_some() && candidate.as_ref().map(|v| source_equality.values(v))
-                            .transpose()?.flatten() == tuple)
+                        Ok(candidate.as_ref().map(|v| equality.values(v)).transpose()?.flatten() == tuple)
+                    };
+                    let matches_target = |row: &SqlRow| -> R<bool> {
+                        if parent { Ok(equality.tuple(&row.values)? == tuple) } else { matches_child(row) }
                     };
                     if !parent && concurrent_actions {
                         use catalog_ext::Action;
@@ -272,15 +277,7 @@ pub(super) fn hydrate_with_probes(
                         target_columns,
                         if collated { None } else { converted.as_deref() },
                         parent,
-                        &mut |row| {
-                            if !collated { return Ok(true); }
-                            let candidate = targets.iter().zip(&positions).map(|(a, b)|
-                                if parent { Ok(Some(row.values[*a].clone())) } else {
-                                    query::constraint_key(&row.values[*a], &target.columns[*a].data_type, &source.columns[*b].data_type)
-                                }).collect::<R<Option<Vec<_>>>>()?;
-                            Ok(candidate.as_ref().map(|v| source_equality.values(v)).transpose()?.flatten()
-                                == source_equality.values(&values)?)
-                        },
+                        &mut |row| if collated || !supported { matches_target(row) } else { Ok(true) },
                         &mut |row| {
                             if existence && witnessed { return Ok(()); }
                             let key = pk(target, &row.values)?;
@@ -291,20 +288,8 @@ pub(super) fn hydrate_with_probes(
                             if existence && before.rows[&target.id].contains_key(&key) && effective.is_none() {
                                 return Ok(());
                             }
-                            if collated {
-                                let candidate_values = targets.iter().zip(&positions).map(|(a,b)|
-                                    if parent { Ok(Some(candidate.values[*a].clone())) } else {
-                                        query::constraint_key(&candidate.values[*a], &target.columns[*a].data_type, &source.columns[*b].data_type)
-                                    }).collect::<R<Option<Vec<_>>>>()?;
-                                if candidate_values.as_ref().map(|v| source_equality.values(v)).transpose()?.flatten()
-                                    != source_equality.values(&values)? { return Ok(()); }
-                            } else if !parent {
-                                for ((a, b), value) in targets.iter().zip(&positions).zip(&values) {
-                                    if query::constraint_key(&candidate.values[*a], &target.columns[*a].data_type,
-                                        &source.columns[*b].data_type)?.as_ref() != Some(value) {
-                                        return Ok(());
-                                    }
-                                }
+                            if (collated || !parent) && !matches_target(candidate)? {
+                                return Ok(());
                             }
                             witnessed = true;
                             // An append may already be physically visible. Keep
