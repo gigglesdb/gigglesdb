@@ -41,7 +41,10 @@ invariants and FAIL. It is bounded greedy reduction, not a minimum-size proof.
 
 There is no timeout-to-success path. `--nodes` bounds search nodes (default
 1,000,000); `--memory` bounds a conservative accounted model allocation estimate
-(default 64 MiB). This is **not an operating-system RSS limit**: parser,
+(default 64 MiB). A memo of exhaustively rejected search states (placed set,
+state, time, receipts) uses whatever that estimate leaves of `--memory`, and
+stops growing when it is full; it only skips repeated rejections, so it never
+changes a verdict the search could reach without it. This is **not an operating-system RSS limit**: parser,
 allocator, executable and library overhead are outside that estimate. Input
 size bounds apply before search. Finite search is exponential; rejecting a
 large history on limits is expected and gives no consistency verdict.

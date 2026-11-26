@@ -1,6 +1,9 @@
 use crate::{Attempt, History, Observation, Op, Outcome, Receipt, State};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    mem::size_of,
+};
 
 /// Limits are hard exploration/model bounds, not a timeout that can pass.
 #[derive(Clone, Copy, Debug)]
@@ -211,12 +214,40 @@ fn invariants(h: &History, s: &State) -> bool {
             .all(|k| s.get(k).copied().unwrap_or(0) >= 0)
 }
 
+#[derive(PartialEq, Eq, Hash)]
+struct VisitKey {
+    mask: u128,
+    state: State,
+    time: u64,
+    receipts: BTreeSet<String>,
+    spent: BTreeMap<String, u64>,
+}
+
+impl VisitKey {
+    fn estimated_bytes(&self) -> usize {
+        // Allow for unused hash buckets and transient storage during growth.
+        let buckets = 5 * (size_of::<Self>() + 1) + 64;
+        // The trees allocate nodes in blocks, including for a single entry.
+        let tree_bytes = |len: usize| if len == 0 { 0 } else { 512 + 128 * len };
+        buckets
+            + tree_bytes(self.state.len())
+            + tree_bytes(self.receipts.len())
+            + tree_bytes(self.spent.len())
+            + self.receipts.iter().map(String::capacity).sum::<usize>()
+            + self.spent.keys().map(String::capacity).sum::<usize>()
+    }
+}
+
 struct Search<'a> {
     h: &'a History,
     groups: Vec<Group<'a>>,
     limits: Limits,
     result: Check,
     limited: bool,
+    failures: HashSet<VisitKey>,
+    memo_bytes: usize,
+    memo_budget: usize,
+    memo_full: bool,
 }
 impl Search<'_> {
     fn diagnostic(&mut self, id: &str, why: &str) {
@@ -224,20 +255,39 @@ impl Search<'_> {
             self.result.diagnostics.push(format!("{id}: {why}"));
         }
     }
-    fn visit(
-        &mut self,
-        mask: u128,
-        s: &State,
-        time: u64,
-        path: &mut Vec<Step>,
-        receipts: &BTreeSet<String>,
-        spent: &BTreeMap<String, u64>,
-    ) -> bool {
+    fn visit(&mut self, key: VisitKey, path: &mut Vec<Step>) -> bool {
         if self.result.explored >= self.limits.max_nodes {
             self.limited = true;
             return false;
         }
         self.result.explored += 1;
+        if self.failures.contains(&key) {
+            return false;
+        }
+
+        let passed = self.visit_uncached(&key, path);
+        // A node-limit cutoff proves nothing about the unexplored suffix.
+        if !passed && !self.limited && !self.memo_full {
+            let bytes = self.memo_bytes.saturating_add(key.estimated_bytes());
+            if bytes <= self.memo_budget {
+                self.failures.insert(key);
+                self.memo_bytes = bytes;
+            } else {
+                self.memo_full = true;
+            }
+        }
+        passed
+    }
+
+    fn visit_uncached(&mut self, key: &VisitKey, path: &mut Vec<Step>) -> bool {
+        let VisitKey {
+            mask,
+            state: s,
+            time,
+            receipts,
+            spent,
+        } = key;
+        let (mask, time) = (*mask, *time);
         if self
             .groups
             .iter()
@@ -328,12 +378,14 @@ impl Search<'_> {
                     at,
                 });
                 if self.visit(
-                    mask | (1u128 << i),
-                    &next,
-                    at,
+                    VisitKey {
+                        mask: mask | (1u128 << i),
+                        state: next,
+                        time: at,
+                        receipts: next_receipts,
+                        spent: next_spent,
+                    },
                     path,
-                    &next_receipts,
-                    &next_spent,
                 ) {
                     return true;
                 }
@@ -411,6 +463,7 @@ pub fn check(h: &History, limits: Limits) -> Result<Check, String> {
     // Conservative accounted modeled allocation, not an OS RSS cap. Includes
     // all possible distinct keys, recursive state copies, receipt sets, output,
     // cloned candidate vectors and input/serde representation headroom.
+    // The failure memo gets only the budget this bound leaves (memo_budget).
     let wire = serde_json::to_vec(h).map_err(|e| e.to_string())?.len();
     let key_count = h.initial.len() + h.attempts.iter().map(|a| a.ops.len() * 2).sum::<usize>();
     // Unknown/durable origins may omit observations on the wire, but execution
@@ -443,6 +496,10 @@ pub fn check(h: &History, limits: Limits) -> Result<Check, String> {
         groups,
         limits,
         limited: false,
+        failures: HashSet::new(),
+        memo_bytes: 0,
+        memo_budget: limits.max_memory_bytes.saturating_sub(memory_bound),
+        memo_full: false,
         result: Check {
             verdict: Verdict::Fail,
             explored: 0,
@@ -461,12 +518,14 @@ pub fn check(h: &History, limits: Limits) -> Result<Check, String> {
     }
     let passed = invariants(h, &h.initial)
         && search.visit(
-            0,
-            &h.initial,
-            0,
+            VisitKey {
+                mask: 0,
+                state: h.initial.clone(),
+                time: 0,
+                receipts: BTreeSet::new(),
+                spent: BTreeMap::new(),
+            },
             &mut vec![],
-            &BTreeSet::new(),
-            &BTreeMap::new(),
         );
     search.result.verdict = if passed {
         Verdict::Pass

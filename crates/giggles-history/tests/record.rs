@@ -184,3 +184,28 @@ fn read_committed_safe_workload_and_stale_read_control() {
         }
     }
 }
+
+#[test]
+fn overlapping_replication_history_rejects_negative_controls() {
+    let input = include_bytes!("fixtures/loaded-replication-window.jsonl");
+    let history = giggles_history::parse_jsonl(input.as_slice()).unwrap();
+    verdict(&history, Verdict::Pass);
+
+    for (name, control) in [
+        (
+            "stale_read",
+            controls::stale_read as fn(&History) -> Option<History>,
+        ),
+        ("aborted_but_visible", controls::aborted_but_visible),
+        ("duplicate_apply", controls::duplicate_apply),
+    ] {
+        let altered = control(&history).unwrap_or_else(|| panic!("missing {name} candidate"));
+        let result = check(&altered, Limits::default()).unwrap();
+        assert_eq!(
+            result.verdict,
+            Verdict::Fail,
+            "{name} explored {} nodes",
+            result.explored
+        );
+    }
+}
