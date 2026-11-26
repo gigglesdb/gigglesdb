@@ -610,7 +610,6 @@ async fn application_parameter_refusals_wire(client: &tokio_postgres::Client) {
         ("ALTER INDEX t_s_key RENAME TO x", "42601"),
         ("ALTER INDEX t_s RENAME TO x", "42601"),
         ("ALTER INDEX missing_schema.missing_idx RENAME TO x", "42601"),
-        ("ALTER INDEX t_s SET (fillfactor = 50)", "42601"),
         ("ALTER INDEX t_s RENAME x", "42601"),
     ] {
         let error = client.simple_query(sql).await.unwrap_err();

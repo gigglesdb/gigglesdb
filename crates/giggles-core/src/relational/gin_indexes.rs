@@ -99,7 +99,7 @@ const OPCLASSES: &[OperatorClass] = &[
     },
 ];
 
-fn valid_boolean(value: &str) -> bool {
+pub(super) fn valid_boolean(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     matches!(lower.as_str(), "0" | "1" | "on" | "of" | "off")
         || (!lower.is_empty()

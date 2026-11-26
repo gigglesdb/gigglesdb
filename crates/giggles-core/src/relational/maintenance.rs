@@ -362,7 +362,7 @@ impl Command {
         image: &crate::roles::RoleCatalogImage,
         database: &str,
         private_owner: Option<(&str, u64)>,
-    ) -> Result<(), crate::CoreError> {
+    ) -> Result<Option<storage_options::ClusterMarker>, crate::CoreError> {
         let superuser = actor.is_none_or(|a| a.superuser);
         let privileges = actor
             .map(|a| image.privileges_of(&a.name))
@@ -386,7 +386,7 @@ impl Command {
                     ),
                 )));
             }
-            return Ok(());
+            return Ok(None);
         }
         if self.kind == "system" && self.concurrently {
             return Err(crate::CoreError::Sql(error(
@@ -412,7 +412,7 @@ impl Command {
                     "schema", name,
                 )));
             }
-            return Ok(());
+            return Ok(None);
         }
         if matches!(self.kind.as_str(), "database" | "system") {
             // Core defaults to postgres; pgwire supplies the connection database identity.
@@ -431,7 +431,7 @@ impl Command {
                     "database", database,
                 )));
             }
-            return Ok(());
+            return Ok(None);
         }
         let all;
         let targets =
@@ -644,36 +644,44 @@ impl Command {
                 }
             }
             if self.verb == "cluster" {
-                if let Some(index) = &self.index {
-                    let index = if index.contains('\0') {
-                        state.resolve_index_key(index, &visible_path)
+                let previous = state.ext.table_storage.get(&table.id).and_then(|storage| storage.clustered_index);
+                if let Some(requested) = &self.index {
+                    let index = if requested.contains('\0') {
+                        state.resolve_index_key(requested, &visible_path)
                     } else {
-                        relation_key(state.table_schema(table.id), index)
+                        relation_key(state.table_schema(table.id), requested)
                     };
-                    if state.index_table_key(&index).as_deref() != Some(table_key) {
-                        return Err(crate::CoreError::Sql(error(
-                            SqlError::UndefinedObject,
-                            format!(
-                                "index \"{}\" for table \"{}\" does not exist",
-                                self.index.as_ref().unwrap().replace('\0', "."),
-                                table.name
-                            ),
-                        )));
+                    if !state.v2_unique_reporting() {
+                        if state.index_table_key(&index).as_deref() != Some(table_key) {
+                            return Err(crate::CoreError::Sql(error(
+                                SqlError::UndefinedObject,
+                                format!(
+                                    "index \"{}\" for table \"{}\" does not exist",
+                                    requested.replace('\0', "."),
+                                    table.name
+                                ),
+                            )));
+                        }
+                        return Ok(None);
                     }
-                } else {
+                    let id = storage_options::cluster_index(state, table, &index).map_err(crate::CoreError::Sql)?;
+                    if previous == Some(id) {
+                        return Ok(None);
+                    }
+                    return Ok(Some(storage_options::ClusterMarker { key: table_key.into(), table: table.id, index: id }));
+                }
+                if previous.is_none() {
                     return Err(crate::CoreError::Sql(error(
                         SqlError::UndefinedObject,
-                        format!(
-                            "there is no previously clustered index for table \"{}\"",
-                            table.name
-                        ),
+                        format!(r#"there is no previously clustered index for table "{}""#, table.name),
                     )));
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
+
 pub(super) fn tablespace(name: &str) -> R<()> {
     if !super::tablespace::exists(name) {
         return Err(admin_utility::missing("tablespace", name));

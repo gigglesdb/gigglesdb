@@ -2237,7 +2237,10 @@ fn build_with_budget(
         let keys = index.map(|i| i.columns.clone())
             .unwrap_or_else(|| table.primary_key.iter().map(|i| table.columns[*i].id).collect());
         let overrides = index.and_then(|i| snapshot.collation_oids.get(&i.id));
+        let clustered = snapshot.relation_storage.get(&table.id)
+            .is_some_and(|storage| storage.clustered_index == Some(index.map_or(table.id, |i| i.id)));
         budget.rewrite(row, |row| {
+            row[17] = B(clustered);
             if let Some(gin) = gin {
                 row[12] = Value::Array(gin.opclasses.iter().map(|oid| I(i64::from(*oid))).collect());
                 return;
@@ -2262,6 +2265,20 @@ fn build_with_budget(
     // Append descriptor extensions here so established field positions remain stable.
     for row in rows_mut(&mut all, "pg_class") {
         budget.rewrite(row, |row| {
+            let oid = row_oid(&row[0]);
+            let index = lookup.index_relations.get(&oid);
+            let primary = lookup.primary_indexes.get(&oid);
+            let table_id = index.map(|i| i.table)
+                .or_else(|| primary.or_else(|| lookup.relations.get(&oid)).map(|t| t.id));
+            if let Some(storage) = table_id.and_then(|id| snapshot.relation_storage.get(&id)) {
+                if storage.unlogged { row[7] = s("u"); }
+                let index_id = index.map(|i| i.id).or_else(|| primary.map(|t| t.id));
+                row[12] = if let Some(index_id) = index_id {
+                    storage.index_options.get(&index_id).map_or(N, |options| options_array(options))
+                } else {
+                    options_array(&storage.options)
+                };
+            }
             if row[2] == I(2200) && row[3] != s("v") {
                 row[10] = I(if row[3] == s("i") { 403 } else { 2 });
             }
@@ -2269,8 +2286,8 @@ fn build_with_budget(
                 .and_then(|index| snapshot.gin_indexes.get(&index.id))
             {
                 row[10] = I(2742);
-                if !gin.options.is_empty() {
-                    row[12] = Value::Array(gin.options.iter().map(|(name, value)| s(&format!("{name}={value}"))).collect());
+                if row[12] == N {
+                    row[12] = options_array(&gin.options);
                 }
             }
             row.extend([
@@ -2417,6 +2434,7 @@ fn build_with_budget(
             let oid = row_oid(&row[2]);
             let mut collation = type_collation(&lookup, oid);
             let mut column_acl = None;
+            let mut attribute_storage = None;
             if let I(n) = row[3] && n > 0 {
                 let offset = (n - 1) as usize;
                 if let Some(table) = lookup.relations.get(&rel)
@@ -2426,6 +2444,8 @@ fn build_with_budget(
                         collation = i64::from(*oid);
                     }
                     column_acl = snapshot.column_acls.get(&(table.id, column.id));
+                    attribute_storage = snapshot.relation_storage.get(&table.id)
+                        .and_then(|storage| storage.columns.get(&column.id));
                 }
                 if let Some(index) = lookup.index_relations.get(&rel) {
                     let column = index.columns.get(offset).and_then(|id| lookup.column(lookup.tables.get(&index.table)?, *id));
@@ -2472,8 +2492,10 @@ fn build_with_budget(
                         | 3220
                 )),
                 s(align),
-                s(storage),
-                s(""),
+                attribute_storage.and_then(|options| options.storage)
+                    .map_or_else(|| s(storage), |value| s(&char::from(value).to_string())),
+                attribute_storage.and_then(|options| options.compression)
+                    .map_or_else(|| s(""), |value| s(&char::from(value).to_string())),
                 old[4].clone(),
                 if enum_array { I(1) } else { old[10].clone() },
                 B(false),
@@ -2483,9 +2505,10 @@ fn build_with_budget(
                 old[14].clone(),
                 I(0),
                 I(collation),
-                N,
+                attribute_storage.and_then(|options| options.stattarget)
+                    .map_or(N, |target| I(i64::from(target))),
                 column_acl,
-                N,
+                attribute_storage.map_or(N, |options| options_array(&options.options)),
                 old[15].clone(),
                 N,
                 old[12].clone(),
@@ -2717,7 +2740,8 @@ fn type_layout(oid: i64) -> (&'static str, &'static str) {
         | 1270
         | 2951
         | 3614 | 3643..=3645 | 3735 | 3770
-        | 3221 => "x",
+        | 3221
+        | 3802 => "x",
         n if n >= 32768 => "x",
         _ => "p",
     };
@@ -2885,6 +2909,28 @@ fn column_collation(snapshot:&CatalogSnapshot, lookup: &Lookup<'_>, column:&Colu
         type_collation(lookup,i64::from(oid)) as u32
     })
 }
+fn options_array(options: &[(String, String)]) -> Value {
+    if options.is_empty() {
+        return N;
+    }
+    Value::Array(options.iter().map(|(name, value)| s(&format!("{name}={value}"))).collect())
+}
+
+fn append_index_options(definition: &mut String, options: &[(String, String)]) {
+    if options.is_empty() {
+        return;
+    }
+    let options = options.iter().map(|(name, value)| {
+        let value = if quote_identifier(value) == *value {
+            value.clone()
+        } else {
+            format!("'{}'", value.replace('\'', "''"))
+        };
+        format!("{}={value}", quote_identifier(name))
+    }).collect::<Vec<_>>().join(", ");
+    definition.push_str(&format!(" WITH ({options})"));
+}
+
 fn index_definition(
     snapshot:&CatalogSnapshot,
     lookup: &Lookup<'_>,
@@ -2895,24 +2941,18 @@ fn index_definition(
     keys: &[usize],
 ) -> String {
     let unique = index.is_none_or(|index| index.unique);
+    let index_id = index.map_or(t.id, |i| i.id);
+    let stored_options = snapshot.relation_storage.get(&t.id)
+        .and_then(|storage| storage.index_options.get(&index_id));
     if let Some(gin) = index.and_then(|index| snapshot.gin_indexes.get(&index.id)) {
         let keys = keys.iter().zip(&gin.opclasses).map(|(offset, oid)| {
             let name = quote_identifier(&t.columns[*offset].name);
             if *oid == 10091 { format!("{name} jsonb_path_ops") } else { name }
         }).collect::<Vec<_>>().join(", ");
-        let options = if gin.options.is_empty() { String::new() } else {
-            let options = gin.options.iter().map(|(name, value)| {
-                let value = if quote_identifier(value) == *value {
-                    value.clone()
-                } else {
-                    format!("'{}'", value.replace('\'', "''"))
-                };
-                format!("{name}={value}")
-            }).collect::<Vec<_>>().join(", ");
-            format!(" WITH ({options})")
-        };
-        return format!("CREATE INDEX {} ON {}.{} USING gin ({keys}){options}",
+        let mut definition = format!("CREATE INDEX {} ON {}.{} USING gin ({keys})",
             quote_identifier(name), quote_identifier(schema), quote_identifier(&t.name));
+        append_index_options(&mut definition, stored_options.unwrap_or(&gin.options));
+        return definition;
     }
     let mut definition = format!(
         "CREATE {}INDEX {} ON {}.{} USING btree ({})",
@@ -2945,6 +2985,9 @@ fn index_definition(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if let Some(options) = stored_options {
+        append_index_options(&mut definition, options);
+    }
     if let Some(predicate) = index.and_then(|index| snapshot.index_predicates.get(&index.id)) {
         definition.push_str(" WHERE ");
         definition.push_str(predicate);

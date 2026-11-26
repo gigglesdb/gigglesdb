@@ -5,14 +5,15 @@ use std::fmt;
 pub(crate) const UNSUPPORTED_CATALOG_EXT: &str = "unsupported relational catalog extension";
 const MAX_EXPR: usize = 65536;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TableMetadata {
     pub(crate) gin: BTreeMap<u64, gin_indexes::GinIndex>,
     pub(crate) generated: BTreeMap<u64, generated_columns::GeneratedColumn>,
+    pub(crate) storage: TableStorage,
 }
 impl TableMetadata {
     pub(crate) fn is_empty(&self) -> bool {
-        self.gin.is_empty() && self.generated.is_empty()
+        self.gin.is_empty() && self.generated.is_empty() && self.storage.is_empty()
     }
 }
 
@@ -37,6 +38,7 @@ pub(crate) struct CatalogExt {
     // Serialized in the feature-gated table metadata trailer.
     pub(crate) gin_indexes: BTreeMap<u64, gin_indexes::GinIndex>,
     pub(crate) generated_columns: BTreeMap<u64, generated_columns::GeneratedColumn>,
+    pub(crate) table_storage: BTreeMap<u64, TableStorage>,
 }
 /// Initial labels use their original creation slots. Only ADD VALUE needs
 /// an explicit identity; rename keeps the same ID under the new spelling.
@@ -88,12 +90,16 @@ impl Default for CatalogExt {
             column_collations: BTreeMap::new(),
             gin_indexes: BTreeMap::new(),
             generated_columns: BTreeMap::new(),
+            table_storage: BTreeMap::new(),
         }
     }
 }
 impl CatalogExt {
     pub(crate) fn is_empty(&self) -> bool {
-        self.namespace5_ext_is_empty() && self.generated_columns.is_empty() && self.gin_indexes.is_empty()
+        self.namespace5_ext_is_empty()
+            && self.generated_columns.is_empty()
+            && self.gin_indexes.is_empty()
+            && self.table_storage.is_empty()
     }
 
     // Generated columns and GIN indexes have their own format-53 envelope maps
@@ -818,6 +824,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     added_enum_labels: if ext_version >= 12 { next!(EnumLabels).0 } else { BTreeMap::new() },
                     gin_indexes: BTreeMap::new(),
                     generated_columns: BTreeMap::new(),
+                    table_storage: BTreeMap::new(),
                     routines: BTreeMap::new(),
                     triggers: BTreeMap::new(),
                 };

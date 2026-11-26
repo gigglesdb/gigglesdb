@@ -30,6 +30,7 @@ pub struct CatalogPresentation {
     pub defaults: BTreeMap<u64, String>,
     pub identities: BTreeMap<u64, char>,
     pub gin_indexes: BTreeMap<u64, gin_indexes::GinIndex>,
+    pub table_storage: BTreeMap<u64, TableStorage>,
     pub generated_columns: BTreeMap<u64, generated_columns::GeneratedColumn>,
     pub primary_names: BTreeMap<u64, String>,
     pub constraints: Vec<CatalogConstraint>,
@@ -50,6 +51,7 @@ impl Relational {
             ..Default::default()
         };
         out.gin_indexes.clone_from(&self.ext.gin_indexes);
+        out.table_storage.clone_from(&self.ext.table_storage);
         out.generated_columns.clone_from(&self.ext.generated_columns);
         let action = |a: &Action| match a {
             Action::NoAction => 'a', Action::Restrict => 'r', Action::Cascade => 'c',

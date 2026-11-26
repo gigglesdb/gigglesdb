@@ -9,7 +9,7 @@ pub(super) struct CreateAs {
     no_data: bool,
 }
 
-pub(super) fn parse(p: &mut Parser, name: &str, optional: bool) -> R<Option<Statement>> {
+pub(super) fn parse(p: &mut Parser, name: &str, optional: bool, persistence: Persistence) -> R<Option<Statement>> {
     let start = p.at;
     let names = if p.word("as") {
         vec![]
@@ -53,6 +53,8 @@ pub(super) fn parse(p: &mut Parser, name: &str, optional: bool) -> R<Option<Stat
         keys: vec![],
         constraints: vec![],
         primary_name: None,
+        persistence,
+        reloptions: Default::default(),
         as_query: Some(Box::new(CreateAs {
             source,
             names,

@@ -733,10 +733,17 @@ pub(super) fn execute(
             }
             let mut candidate = state.clone();
             let mut detail = Vec::new();
+            let mut dropped_indexes = BTreeSet::new();
             let descriptors: Vec<_> = state
                 .secondary_descriptors_engine()
                 .iter()
-                .filter(|d| !d.columns.iter().any(|id| columns.contains(id)))
+                .filter(|index| {
+                    let dropped = columns.iter().any(|id| index.uses_column(*id));
+                    if dropped {
+                        dropped_indexes.insert(index.id);
+                    }
+                    !dropped
+                })
                 .cloned()
                 .collect();
             for (key, original) in state.tables.iter() {
@@ -781,6 +788,7 @@ pub(super) fn execute(
                     }
                 }
                 if heap {
+                    Arc::make_mut(&mut candidate.ext).primary_index_birth.remove(&table.id);
                     table.primary_key = vec![table.columns.len()];
                     table.columns.push(ColumnDef {
                         id: allocate(&mut candidate.next_id)?,
@@ -810,6 +818,7 @@ pub(super) fn execute(
                             query::constraint_validate(&candidate, &table, expr).is_ok()
                         }
                         ConstraintKind::PrimaryKey => !heap,
+                        ConstraintKind::Unique { index, .. } => !dropped_indexes.contains(index),
                         _ => true,
                     })
                     .collect();
@@ -820,6 +829,8 @@ pub(super) fn execute(
                 constraints.retain(|c| !matches!(&c.kind, ConstraintKind::ForeignKey { columns: local, ref_columns, .. } if local.iter().chain(ref_columns).any(|id| columns.contains(id))));
             }
             let ext = Arc::make_mut(&mut candidate.ext);
+            ext.gin_indexes.retain(|_, index| !index.columns.iter().any(|id| columns.contains(id)));
+            ext.column_collations.retain(|id, _| !dropped_indexes.contains(id));
             ext.types.retain(|id, _| !ids.contains(id));
             ext.added_enum_labels.retain(|id, _| !ids.contains(id));
             Relational::normalize_ext(std::sync::Arc::make_mut(&mut candidate.ext));

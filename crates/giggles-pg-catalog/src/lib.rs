@@ -206,6 +206,23 @@ pub struct PreparedStatementRow {
     pub custom_plans: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct AttributeStorage {
+    pub stattarget: Option<i16>,
+    pub storage: Option<u8>,
+    pub compression: Option<u8>,
+    pub options: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RelationStorage {
+    pub unlogged: bool,
+    pub options: Vec<(String, String)>,
+    pub clustered_index: Option<u64>,
+    pub index_options: std::collections::BTreeMap<u64, Vec<(String, String)>>,
+    pub columns: std::collections::BTreeMap<u64, AttributeStorage>,
+}
+
 /// The caller must supply a coherent, freshly authorized set, including on repeated Execute.
 /// Roles include exactly one bootstrap role (OID 10); predefined PostgreSQL roles
 /// are supplied by the catalog. Ownership references snapshot roles, with omitted
@@ -250,6 +267,7 @@ pub struct CatalogSnapshot {
     pub collation_oids: std::collections::BTreeMap<u64,Vec<u32>>,
     pub column_type_oids: std::collections::BTreeMap<u64, u32>,
     pub tables: Vec<TableDef>,
+    pub relation_storage: std::collections::BTreeMap<u64, RelationStorage>,
     pub schemas: std::collections::BTreeMap<String, (u32, u32)>,
     pub table_schemas: std::collections::BTreeMap<u64, String>,
     pub indexes: Vec<IndexDef>,
@@ -300,6 +318,7 @@ impl Default for CatalogSnapshot {
             generated_columns: Default::default(),
             column_identities: Default::default(), primary_names: Default::default(),
             comments: Default::default(),
+            relation_storage: Default::default(),
             backend_pid: 0,
             prepared_statements: Vec::new(),
             table_locks: Vec::new(),

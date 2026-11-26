@@ -289,6 +289,7 @@ pub(super) fn drop(
         rows.insert(pk(&heap, &row.values)?, row);
     }
     state.rows.insert(heap.id, rows);
+    state.forget_primary_index_storage(table.id);
     let key = state.table_key(&heap);
     Arc::make_mut(&mut state.tables).insert(key, heap);
     if notices.len() == 1 {

@@ -117,6 +117,8 @@ pub use copy_encoding::CopyEncoding;
 mod sql_index;
 pub(crate) mod partial_index;
 pub(crate) mod gin_indexes;
+pub(crate) mod storage_options;
+pub use storage_options::{ColumnStorage, Persistence, TableStorage};
 pub(crate) mod generated_columns;
 mod select_source;
 mod create_table_as;
@@ -1413,6 +1415,8 @@ enum Statement {
         keys: Vec<String>,
         constraints: Vec<constraints::Definition>,
         primary_name: Option<String>,
+        persistence: Persistence,
+        reloptions: storage_options::OptionChange,
         as_query: Option<Box<create_table_as::CreateAs>>,
     },
     InsertExpressions(query::InsertExpressions),
@@ -1775,6 +1779,7 @@ impl Parser {
             };
             Statement::SetConstraints(names, deferred)
         } else if self.word("create") {
+            let persistence = if self.word("unlogged") { Persistence::Unlogged } else { Persistence::Permanent };
             self.need("table")?;
             let optional = if self.word("if") {
                 self.need("not")?;
@@ -1784,7 +1789,7 @@ impl Parser {
                 false
             };
             let name = self.create_table_name()?;
-            if let Some(statement) = create_table_as::parse(self, &name, optional)? {
+            if let Some(statement) = create_table_as::parse(self, &name, optional, persistence)? {
                 return Ok(statement);
             }
             let table_name = name.clone();
@@ -1937,6 +1942,7 @@ impl Parser {
                 }
             }
             self.punct(')')?;
+            let reloptions = storage_options::parse_create(self)?;
             Statement::Create {
                 name,
                 optional,
@@ -1950,6 +1956,8 @@ impl Parser {
                 keys,
                 constraints,
                 primary_name,
+                persistence,
+                reloptions,
                 as_query: None,
             }
         } else if self.word("insert") {
@@ -2425,6 +2433,7 @@ impl Prepared {
                         | alter_table::Action::Validate(_)
                         | alter_table::Action::DropConstraint(..)
                         | alter_table::Action::TriggerState(..)
+                        | alter_table::Action::Storage(..)
                         | alter_table::Action::AccessMethod(..)
                         | alter_table::Action::Tablespace(..) => (),
                     }
@@ -2628,6 +2637,8 @@ impl Prepared {
                 keys,
                 constraints: vec![],
                 primary_name: None,
+                persistence: Persistence::Permanent,
+                reloptions: Default::default(),
                 as_query: None,
             },
             domain,
@@ -2646,6 +2657,7 @@ impl Prepared {
         Self::engine(
             Statement::CreateIndex(sql_index::CreateIndex {
                 gin: None,
+                reloptions: Default::default(),
                 automatic_name: false,
                 name,
                 table,
@@ -2685,6 +2697,7 @@ impl Prepared {
     pub(crate) fn drop_index_engine(name: String, table: Option<String>, cascade: bool, domain: u128, epoch: u64) -> Self {
         Self::engine(Statement::DropIndex(sql_index::DropIndex {
             rename: None,
+            reloptions: None,
             name, table, optional: false, cascade,
         }), domain, epoch)
     }
@@ -2702,7 +2715,7 @@ impl Prepared {
             A::RenameTable { to } => Action::RenameTable(to),
         };
         let mut prepared = Self::engine(Statement::AlterTable(alter_table::AlterTable {
-            table: table.clone(), actions: vec![action], resolution_error: None,
+            table: table.clone(), optional: false, actions: vec![action], resolution_error: None,
             column_names: ColumnNamePolicy::Native,
         }), domain, epoch);
         prepared.relations.push(schemas::Reference::read(table, None));
@@ -2743,7 +2756,7 @@ impl Prepared {
             _ => return Err(SqlError::Unsupported),
         };
         ident(split_key(table).0)?; ident(split_key(table).1)?;
-        let mut prepared = Self::engine(Statement::AlterTable(alter_table::AlterTable { table: table.clone(), actions: vec![action], resolution_error: None, column_names: ColumnNamePolicy::Sql }), domain, epoch);
+        let mut prepared = Self::engine(Statement::AlterTable(alter_table::AlterTable { table: table.clone(), optional: false, actions: vec![action], resolution_error: None, column_names: ColumnNamePolicy::Sql }), domain, epoch);
         prepared.relations.push(schemas::Reference::read(table.clone(), None));
         if let Some(parent) = parent { prepared.relations.push(schemas::Reference::read(parent, None)); }
         Ok(prepared)
@@ -3567,7 +3580,7 @@ impl Prepared {
             Statement::View(ddl) => if ddl.query.is_some() { "CREATE VIEW" } else { "DROP VIEW" },
             Statement::Create { .. } => "CREATE TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
-            Statement::DropIndex(index) => if index.rename.is_some() { "ALTER INDEX" } else { "DROP INDEX" },
+            Statement::DropIndex(index) => if index.rename.is_some() || index.reloptions.is_some() { "ALTER INDEX" } else { "DROP INDEX" },
             Statement::Insert { .. }
             | Statement::InsertExpressions(_)
             | Statement::InsertMulti(_) => "INSERT",
@@ -3909,7 +3922,7 @@ impl Prepared {
         Ok(Self::alter_table_authority_target(sql)?.map(|(table, _)| table))
     }
 
-    /// Return the target and whether the statement changes trigger state.
+    /// Return the target and whether PostgreSQL's owner diagnostic applies.
     pub fn alter_table_authority_target(sql: &str) -> R<Option<(String, bool)>> {
         let mut tokens = Vec::new();
         if let Err(error) = lex_into(sql, &mut tokens, false) {
@@ -3936,8 +3949,10 @@ impl Prepared {
             relations: Vec::new(),
         };
         let alter = alter_table::parse(&mut parser)?;
-        let changes_trigger = alter.actions.iter().any(|action| matches!(action, alter_table::Action::TriggerState(..)));
-        Ok(Some((alter.table, changes_trigger)))
+        let owner_diagnostic = alter.actions.iter().any(|action| {
+            matches!(action, alter_table::Action::TriggerState(..) | alter_table::Action::Storage(..))
+        });
+        Ok(Some((alter.table, owner_diagnostic)))
     }
     /// Parse DROP ownership targets without consulting the catalog.
     pub fn drop_table_targets(sql: &str) -> R<Vec<String>> {
@@ -4501,6 +4516,7 @@ impl Relational {
         ext.table_schemas.remove(&table_id);
         ext.primary_index_birth.remove(&table_id);
         ext.gin_indexes.retain(|_, index| index.table != table_id);
+        ext.table_storage.remove(&table_id);
         for constraints in ext.constraints.values_mut() {
             let incoming = |constraint: &Constraint| matches!(&constraint.kind,ConstraintKind::ForeignKey {ref_table,..} if *ref_table == table_id);
             if !cascade && constraints.iter().any(incoming) {
@@ -5092,6 +5108,10 @@ impl Relational {
             }
             Statement::SetConstraints(_, _) => return Err(SqlError::NoActiveTransaction),
             Statement::DropIndex(index) => {
+                if let Some(change) = &index.reloptions {
+                    storage_options::alter_index(self, index, change)?;
+                    return Ok(result);
+                }
                 if let Some(rename) = &index.rename {
                     let key = relation_key(split_key(&index.name).0, rename);
                     if sql_index::name_taken(self, &key) {
@@ -5101,8 +5121,21 @@ impl Relational {
                 if self.edit_gin_index(&index.name, index.rename.as_deref())? {
                     return Ok(result);
                 }
-                if index.rename.is_some() {
-                    return Err(SqlError::Syntax);
+                if let Some(rename) = &index.rename {
+                    let mut descriptors = self.secondary_descriptors_engine().to_vec();
+                    let descriptor = descriptors.iter_mut()
+                        .find(|descriptor| descriptor.name == index.name && self.has_index_storage(descriptor))
+                        .ok_or(SqlError::Syntax)?;
+                    let (table, id) = (descriptor.table, descriptor.id);
+                    descriptor.name = relation_key(split_key(&index.name).0, rename);
+                    self.secondary = self.secondary_build_complete_engine(&descriptors, &mut cancel)?;
+                    if let Some(constraint) = Arc::make_mut(&mut self.ext).constraints.get_mut(&table)
+                        .into_iter().flatten().find(|c| matches!(c.kind, ConstraintKind::Unique { index, .. } if index == id))
+                    {
+                        constraint.name.clone_from(rename);
+                    }
+                    self.epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
+                    return Ok(result);
                 }
                 let descriptor = self
                     .secondary_descriptors_engine()
@@ -5182,8 +5215,16 @@ impl Relational {
                     return Ok(result);
                 }
                 if let Some(definition) = &index.gin {
+                    if index.if_not_exists && self.gin_index(&key).is_some() {
+                        sql_index::skip_existing_relation(self, &key, true)?;
+                        return Ok(result);
+                    }
                     gin_indexes::create(self, &table, index, definition)?;
                     return Ok(result);
+                }
+                let options = index.reloptions.apply(&[], storage_options::OptionTarget::Btree)?;
+                if !options.is_empty() {
+                    self.require_storage_metadata()?;
                 }
                 let ids = index
                     .columns
@@ -5198,7 +5239,7 @@ impl Relational {
                 }).collect::<R<Vec<_>>>()?;
                 let predicate = index.predicate.as_deref().map(|tokens|
                     partial_index::Predicate::create(self, &table, tokens)).transpose()?;
-                self.create_secondary_index_populated_engine(
+                let id = self.create_secondary_index_populated_engine(
                     &table,
                     self.epoch,
                     &index.name,
@@ -5208,7 +5249,9 @@ impl Relational {
                     index.collations.iter().any(Option::is_some).then_some(collations.as_slice()),
                     &mut cancel,
                 )?;
-
+                if !options.is_empty() {
+                    self.set_index_reloptions(table.id, id, options);
+                }
             }
             Statement::Create {
                 name,
@@ -5223,6 +5266,8 @@ impl Relational {
                 primary_name,
                 user_types,
                 collations,
+                persistence,
+                reloptions,
                 as_query,
             } => {
                 if expected.is_some() {
@@ -5241,6 +5286,14 @@ impl Relational {
                         }
                         (columns.clone(), typmods.clone(), collations.clone(), vec![None; columns.len()], vec![])
                     };
+                let storage = TableStorage {
+                    persistence: *persistence,
+                    reloptions: reloptions.apply(&[], storage_options::OptionTarget::Heap)?,
+                    ..TableStorage::default()
+                };
+                if !storage.is_empty() {
+                    self.require_storage_metadata()?;
+                }
                 for (i, name) in user_types.iter().enumerate() {
                     if let Some(name) = name {
                         let (id, ty) = name.resolve(self, &prepared.search_path)?;
@@ -5356,6 +5409,9 @@ impl Relational {
                     (&schema, &prepared.search_path),
                 )?;
                 let table = self.tables.get(name).ok_or(SqlError::UnknownTable)?.clone();
+                if !storage.is_empty() {
+                    self.set_table_storage(table.id, storage);
+                }
                 self.mutate_ext(|ext, _| {
                     for (column, reference) in table.columns.iter().zip(&collation_refs) {
                         if let Some(reference) = reference { ext.column_collations.insert(column.id, column_collations::Binding::Column(reference.clone())); }

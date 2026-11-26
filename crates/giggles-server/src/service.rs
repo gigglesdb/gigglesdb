@@ -2353,8 +2353,8 @@ impl Session {
                 session.sql.abort_without_settling();
                 parse_error(session, CoreError::Sql(error))
             })?;
-            if let Some((table, changes_trigger)) = alter_target {
-                if changes_trigger && matches!(session.authority_role(), Role::Database { .. })
+            if let Some((table, owner_diagnostic)) = alter_target {
+                if owner_diagnostic && matches!(session.authority_role(), Role::Database { .. })
                     && session.service.admin.engine() == giggles_core::Engine::V2
                 {
                     session.authorize_alter_table(&table).map_err(|error| match error {

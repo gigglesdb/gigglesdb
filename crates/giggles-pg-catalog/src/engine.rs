@@ -278,6 +278,15 @@ fn regclass_oid(value: &str, snapshot: &CatalogSnapshot) -> R<u32> {
             t.name == *name && snapshot.table_schema(t.id).0 == namespace) {
             return catalog::table_oid(table.id);
         }
+        if let Some(index) = snapshot.indexes.iter().find(|index|
+            index.name == *name && snapshot.table_schema(index.table).0 == namespace) {
+            return catalog::table_oid(index.id);
+        }
+        if let Some(table) = snapshot.tables.iter().filter(|table|
+            !table.primary_key.is_empty() && snapshot.table_schema(table.id).0 == namespace
+        ).find(|table| snapshot.primary_names.get(&table.id) == Some(name)) {
+            return catalog::table_oid(table.id).map(|oid| oid + 1);
+        }
     }
     Err(Error::Unsupported)
 }
@@ -325,7 +334,7 @@ fn binary(l: E, op: Op, r: E) -> E {
     ) {
         PgType::Int8
     } else if op == Op::StringConcat {
-        PgType::Text
+        if l.ty.array_element().is_some() { l.ty } else { PgType::Text }
     } else {
         PgType::Bool
     };
@@ -2402,6 +2411,7 @@ impl Compiler {
                 }
                 if op == Op::StringConcat
                     && (lhs.ty.array_element().is_some() || rhs.ty.array_element().is_some())
+                    && lhs.ty != rhs.ty
                 {
                     return Err(Error::Unsupported);
                 }
@@ -3409,6 +3419,7 @@ fn check_expr(e: &mut E) -> R<()> {
                 expect(l, PgType::Int8)?;
                 expect(r, PgType::Int8)?;
             }
+            Op::StringConcat if l.ty.array_element().is_some() => compatible(l, r)?,
             Op::StringConcat
             | Op::PGRegexMatch
             | Op::PGRegexNotMatch
@@ -5770,6 +5781,21 @@ fn cast(v: Value, t: PgType) -> R<Value> {
 }
 fn binary_value(l: Value, op: &Op, r: Value) -> R<Value> {
     use Value::{Bool as B, Int as I, Null as N, Text as S};
+    if op == &Op::StringConcat && (matches!(l, Value::Array(_)) || matches!(r, Value::Array(_))) {
+        return match (l, r) {
+            (Value::Array(mut left), Value::Array(right)) => {
+                if left.len() + right.len() > MAX_ROWS
+                    || left.iter().chain(&right).map(Value::bytes).sum::<usize>() > MAX_BYTES
+                {
+                    return Err(Error::Limit);
+                }
+                left.extend(right);
+                Ok(Value::Array(left))
+            }
+            (array @ Value::Array(_), N) | (N, array @ Value::Array(_)) => Ok(array),
+            _ => Err(Error::Type),
+        };
+    }
     if l == N || r == N {
         return Ok(N);
     }

@@ -475,3 +475,6 @@ mod wide_table_network;
 mod named_arguments_network;
 
 #[path = "maintenance_network.rs"] mod maintenance_network;
+
+#[cfg(feature = "engine-rocksdb")]
+#[path = "storage_options_network.rs"] mod storage_options_network;

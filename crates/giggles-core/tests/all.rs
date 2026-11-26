@@ -674,3 +674,5 @@ mod sql_wide_tables;
 mod sql_named_arguments;
 
 #[path = "sql_maintenance.rs"] mod sql_maintenance;
+
+#[path = "sql_storage_options.rs"] mod sql_storage_options;

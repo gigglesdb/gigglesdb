@@ -95,7 +95,6 @@ fn sql_index_grammar_reject_matrix() {
         "CREATE INDEX ix ON items ((email))",
         "CREATE INDEX ix ON items (lower(email))",
         "CREATE INDEX ix ON items (email) INCLUDE (other)",
-        "CREATE INDEX ix ON items (email) WITH (fillfactor=50)",
         "CREATE INDEX ix ON items (email) TABLESPACE foo",
         "CREATE INDEX ix ON items USING hash (email)",
         "CREATE INDEX ix ON items ()",

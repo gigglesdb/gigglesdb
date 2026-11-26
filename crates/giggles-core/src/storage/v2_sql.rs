@@ -1399,6 +1399,8 @@ impl SqlSession {
                         // RESTART WITH does not change the recorded START. Carry its
                         // seed separately, using the bound name and post-DDL START.
                         let restart_seed = bound.sequence_restart_seed(&image);
+                        // Every V2 DDL postimage shares this path, including cascades.
+                        image.prune_table_storage();
                         let (tables, ext, next_id, _) = image.catalog_parts();
                         let mut predecessor = None;
                         let mut sequence_seed = restart_seed.map(|(id, value)| {

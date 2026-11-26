@@ -12,6 +12,7 @@ pub(super) struct CreateIndex {
     pub if_not_exists: bool,
     pub predicate: Option<Vec<Token>>,
     pub gin: Option<gin_indexes::Definition>,
+    pub reloptions: storage_options::OptionChange,
 }
 
 fn opclass_name(p: &mut Parser) -> R<String> {
@@ -127,10 +128,13 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
         }
         return Err(SqlError::Unsupported);
     }
-    if let Some(gin) = &mut gin
-        && p.word("with")
-    {
-        gin.options = gin_indexes::parse_options(p)?;
+    let mut reloptions = storage_options::OptionChange::default();
+    if p.word("with") {
+        if let Some(gin) = &mut gin {
+            gin.options = gin_indexes::parse_options(p)?;
+        } else {
+            reloptions = storage_options::parse_change(p, false)?;
+        }
     }
     if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if ["include", "with", "tablespace"].contains(&w.as_str()) || (gin.is_some() && w == "where"))
     {
@@ -164,6 +168,7 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
         if_not_exists,
         predicate,
         gin,
+        reloptions,
     })
 }
 
@@ -188,6 +193,7 @@ pub(super) struct DropIndex {
     pub optional: bool,
     pub cascade: bool,
     pub rename: Option<String>,
+    pub reloptions: Option<storage_options::OptionChange>,
 }
 
 pub(super) fn primary_table<'a>(state: &'a Relational, name: &str) -> Option<&'a TableDef> {
@@ -256,11 +262,17 @@ fn parse_drop_impl(p: &mut Parser, authority_only: bool) -> R<DropIndex> {
     } else {
         p.table_name()?
     };
-    let rename = if alter {
+    let (rename, reloptions) = if !alter {
+        (None, None)
+    } else if p.word("set") {
+        (None, Some(storage_options::parse_change(p, false)?))
+    } else if p.word("reset") {
+        (None, Some(storage_options::parse_change(p, true)?))
+    } else {
         p.need("rename")?;
         p.need("to")?;
-        Some(p.raw_name()?)
-    } else { None };
+        (Some(p.raw_name()?), None)
+    };
     let cascade = !alter && p.word("cascade");
     if !alter && !cascade {
         p.word("restrict");
@@ -275,6 +287,7 @@ fn parse_drop_impl(p: &mut Parser, authority_only: bool) -> R<DropIndex> {
         optional,
         cascade,
         rename,
+        reloptions,
     })
 }
 

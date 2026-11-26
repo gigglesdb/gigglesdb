@@ -184,6 +184,7 @@ fn v2_statement_classes_and_reachable_refusals() {
     // cover Definition::Unique too so either representation is enabled.
     let prepared = Prepared::engine(
         Statement::AlterTable(alter_table::AlterTable {
+            optional: false,
             table: "t".into(),
             actions: vec![alter_table::Action::Constraint(
                 constraints::Definition::Unique {

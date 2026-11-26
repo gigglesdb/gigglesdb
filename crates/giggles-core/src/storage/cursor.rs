@@ -1100,6 +1100,51 @@ mod tests {
     }
 
     #[test]
+    fn renamed_storage_index_serves_cursor_after_reopen() {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "renamed-storage-index-{:032x}",
+            u128::from_be_bytes(nonce)
+        ));
+        let limits = Limits::default();
+        let admin = Admin::create_engine(&path, limits, Engine::V2).unwrap();
+        let mut sql = admin.sql_session();
+        for statement in [
+            "CREATE TABLE t (id int PRIMARY KEY, v text)",
+            "CREATE INDEX t_v ON t(v) WITH (fillfactor=80)",
+            "INSERT INTO t VALUES (1, 'match'), (2, 'other'), (3, 'match')",
+            "ALTER INDEX t_v RENAME TO t_value",
+        ] {
+            sql.execute(statement, &[], None)
+                .unwrap_or_else(|error| panic!("{statement}: {error:?}"));
+        }
+        drop((sql, admin));
+
+        let admin = Admin::open(&path, limits).unwrap();
+        let mut sql = admin.sql_session();
+        let query = sql.prepare("SELECT id FROM t WHERE v = 'match'").unwrap();
+        let mut cursor = sql.open_cursor(&query, &[]).unwrap();
+        let rows = cursor.fetch(10, 1024).unwrap();
+        let Data::Scan {
+            source: Some(source),
+            ..
+        } = &cursor.data
+        else {
+            panic!("expected a streaming cursor")
+        };
+        assert_eq!(source.indexes.len(), 1);
+        assert_eq!(source.indexes[0].name, "t_value");
+        assert_eq!(source.index_reads.get(), 2);
+        assert_eq!(
+            rows.into_iter().map(|row| row.values).collect::<Vec<_>>(),
+            [vec![Value::Int(1)], vec![Value::Int(3)]]
+        );
+        drop((cursor, sql, admin));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn secondary_cursor_matches_scan_and_resumes() {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).unwrap();

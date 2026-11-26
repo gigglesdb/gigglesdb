@@ -78,7 +78,7 @@ impl Statement {
         actor: Option<&crate::roles::CatalogRole>,
         roles: &crate::roles::RoleCatalog,
         maintenance: MaintenanceContext<'_>,
-    ) -> Result<SqlResult, crate::CoreError> {
+    ) -> Result<Option<storage_options::ClusterMarker>, crate::CoreError> {
         let superuser = actor.is_none_or(|actor| actor.superuser);
         match self {
             Self::Comment(target) => {
@@ -88,25 +88,40 @@ impl Statement {
                 load::execute(filename, superuser).map_err(crate::CoreError::Sql)?
             }
             Self::Tablespace(command) => command.execute(actor, roles)?,
-            Self::Maintenance(c) => c.execute(
+            Self::Maintenance(c) => return c.execute(
                 prepared,
                 state,
                 actor,
                 maintenance.image.expect("maintenance role image"),
                 maintenance.database,
                 maintenance.private_owner,
-            )?,
+            ),
             Self::SecurityLabel(provider) => {
                 return Err(crate::CoreError::Sql(security_label::refuse(
                     provider.as_deref(),
                 )));
             }
         }
-        Ok(SqlResult::default())
+        Ok(None)
     }
 }
 
 impl Prepared {
+    pub(crate) fn cluster_ddl(&self, marker: storage_options::ClusterMarker) -> Self {
+        let mut ddl = self.clone();
+        let table = marker.key.clone();
+        *ddl.statement.get_mut() = super::Statement::AlterTable(alter_table::AlterTable {
+            table,
+            optional: false,
+            actions: vec![alter_table::Action::Storage(storage_options::TableAction::ClusterBound(marker))],
+            resolution_error: None,
+            column_names: ColumnNamePolicy::Sql,
+        });
+        ddl.relations.clear();
+        ddl.unbound_statement = None;
+        ddl
+    }
+
     pub(crate) fn admin_utility(&self) -> Option<&Statement> {
         match self.statement.get() {
             super::Statement::AdminUtility(utility) => Some(utility),

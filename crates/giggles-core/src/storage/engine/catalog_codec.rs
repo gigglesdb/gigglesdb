@@ -651,13 +651,75 @@ pub(crate) fn encode_table_with_metadata(
         validate_primary_birth(entry, birth)?;
         encode_version(3, &(dto, birth))
     } else { encode_version(2, &dto) }?;
-    if !metadata.is_empty() {
-        encoded.extend(super::super::encode(metadata)?);
+    if !metadata.storage.is_empty() {
+        validate_column_storage(entry, &metadata.storage)?;
+        encoded.extend([0xFF, 1]);
+        encoded.extend(super::super::encode(&TableMetadataV1 {
+            gin: &metadata.gin, generated: &metadata.generated, storage: &metadata.storage,
+        })?);
+    } else if !metadata.is_empty() {
+        encoded.extend(super::super::encode(&OldTableMetadata {
+            gin: &metadata.gin, generated: &metadata.generated,
+        })?);
     }
     Ok(encoded)
 }
 
 pub(crate) use crate::relational::catalog_ext::TableMetadata;
+use crate::relational::{TableStorage, generated_columns::GeneratedColumn, gin_indexes::GinIndex};
+
+#[derive(Serialize, Deserialize)]
+struct OldTableMetadata<G, C> {
+    gin: G,
+    generated: C,
+}
+
+// Field order and nested enum variant order are part of the V1 wire format.
+#[derive(Serialize, Deserialize)]
+struct TableMetadataV1<G, C, S> {
+    gin: G,
+    generated: C,
+    storage: S,
+}
+
+type GinMap = BTreeMap<u64, GinIndex>;
+type GeneratedMap = BTreeMap<u64, GeneratedColumn>;
+
+fn decode_table_metadata(tail: &[u8]) -> Result<TableMetadata, CoreError> {
+    match tail {
+        [] => Ok(TableMetadata::default()),
+        [0, ..] => {
+            let OldTableMetadata { gin, generated }: OldTableMetadata<GinMap, GeneratedMap> =
+                super::super::decode(tail)?;
+            if gin.is_empty() && generated.is_empty() {
+                return Err(corrupt("empty table metadata trailer"));
+            }
+            Ok(TableMetadata { gin, generated, storage: TableStorage::default() })
+        }
+        [0xFF, 1, data @ ..] => {
+            let TableMetadataV1 { gin, generated, storage }: TableMetadataV1<GinMap, GeneratedMap, TableStorage> =
+                super::super::decode(data)?;
+            if storage.is_empty() {
+                return Err(corrupt("empty storage metadata in versioned table trailer"));
+            }
+            Ok(TableMetadata { gin, generated, storage })
+        }
+        [0xFF, _, ..] => Err(CoreError::Unsupported),
+        _ => Err(corrupt("invalid table metadata trailer prefix")),
+    }
+}
+
+fn validate_column_storage(entry: &TableEntry, storage: &TableStorage) -> Result<(), CoreError> {
+    if storage.columns.iter().any(|(id, options)| {
+        !entry.def.logical_columns().any(|column| column.id == *id) || !options.is_canonical()
+    }) {
+        return Err(corrupt("invalid table column storage metadata"));
+    }
+    if storage.index_reloptions.values().any(Vec::is_empty) {
+        return Err(corrupt("empty index reloptions"));
+    }
+    Ok(())
+}
 
 pub(crate) fn decode_table(
     value: &[u8],
@@ -680,13 +742,7 @@ pub(crate) fn decode_table_with_metadata(
         _ => return Err(corrupt("unsupported table version")),
     };
     let tail = &value[1 + input.position() as usize..];
-    let metadata = if tail.is_empty() { TableMetadata::default() } else {
-        let metadata: TableMetadata = super::super::decode(tail)?;
-        if metadata.is_empty() {
-            return Err(corrupt("empty table metadata trailer"));
-        }
-        metadata
-    };
+    let metadata = decode_table_metadata(tail)?;
     if dto
             .columns_ext
             .values()
@@ -710,6 +766,7 @@ pub(crate) fn decode_table_with_metadata(
                 .map_err(|_| corrupt("invalid catalog column typmod"))?;
         }
     }
+    validate_column_storage(&entry, &metadata.storage)?;
     Ok((entry, ext, metadata))
 }
 // On a freshly decoded entry only UserTypeArray has both a textual

@@ -179,9 +179,9 @@ fn feature_positions_and_validation() {
     assert_eq!(
         FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit),
         0x1FFFF | KEY_DEPENDENCY_IDENTITY | RANGES | WIDE_ONCE_RECEIPTS | TASK_CATALOG | PROTECTED_RECORDS | WRITE_FENCE | USER_COLLATIONS | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS | ROLE_MEMBERSHIP | WIDE_ROWS
-            | ENUM_ARRAY_COLUMNS | ENUM_LABEL_IDENTITIES | UUID_ARRAY_COLUMNS | WIDE_CATALOG | PARTIAL_INDEXES | TEMPORAL_INDEXES | GENERATED_COLUMNS | TEXT_SEARCH_TYPES | GIN_INDEXES | USER_ROUTINES
+            | ENUM_ARRAY_COLUMNS | ENUM_LABEL_IDENTITIES | UUID_ARRAY_COLUMNS | WIDE_CATALOG | PARTIAL_INDEXES | TEMPORAL_INDEXES | GENERATED_COLUMNS | TEXT_SEARCH_TYPES | GIN_INDEXES | USER_ROUTINES | STORAGE_METADATA
     );
-    assert_eq!(FEATURE_TABLE.len(), 38);
+    assert_eq!(FEATURE_TABLE.len(), 39);
     assert_eq!(FEATURE_TABLE[30], (UUID_ARRAY_COLUMNS, "uuid_array_columns"));
     assert_eq!(TEXT_SEARCH_TYPES, 1 << 37);
     assert!(check_features(TEXT_SEARCH_TYPES).is_ok());
@@ -192,6 +192,9 @@ fn feature_positions_and_validation() {
     assert_eq!(FEATURE_TABLE[37], (USER_ROUTINES, "user_routines"));
     assert_eq!(USER_ROUTINES, 1 << 39);
     check_features(USER_ROUTINES).unwrap();
+    assert_eq!(FEATURE_TABLE[38], (STORAGE_METADATA, "storage_metadata"));
+    assert_eq!(STORAGE_METADATA, 1 << 40);
+    check_features(STORAGE_METADATA).unwrap();
     assert_eq!(UUID_ARRAY_COLUMNS, 1 << 32);
     assert!(check_features(UUID_ARRAY_COLUMNS).is_ok());
     assert!(matches!(
@@ -605,7 +608,7 @@ fn replicated_creation_is_v2() {
 fn key_dependency_feature_requires_catalog_ext_and_is_monotone() {
     assert!(check_features(64 | KEY_DEPENDENCY_IDENTITY).is_ok());
     assert!(matches!(check_features(KEY_DEPENDENCY_IDENTITY), Err(FormatError::Corrupt(_))));
-    for unknown in [1 << 26, 1 << 40] {
+    for unknown in [1 << 26, 1 << 41] {
         assert!(matches!(check_features(unknown | KEY_DEPENDENCY_IDENTITY), Err(FormatError::Unsupported(_))));
     }
     let kv = base();

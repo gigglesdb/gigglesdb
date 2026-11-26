@@ -255,8 +255,10 @@ impl Prepared {
                 index.table = state.index_table_key(&index.name);
                 if let Some(rename) = &index.rename {
                     let target = relation_key(split_key(&index.name).0, rename);
+                    let has_index_storage = state.secondary_descriptors_engine().iter()
+                        .any(|descriptor| descriptor.name == index.name && state.has_index_storage(descriptor));
                     if index.table.is_none() || state.gin_index(&index.name).is_none()
-                        && !sql_index::name_taken(state, &target)
+                        && !has_index_storage && !sql_index::name_taken(state, &target)
                     {
                         return Err(SqlError::Syntax);
                     }

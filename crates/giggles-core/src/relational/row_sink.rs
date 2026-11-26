@@ -548,14 +548,19 @@ impl Relational {
                 )
                 .map_err(CoreError::Sql)?;
             if let Statement::AlterTable(alter) = prepared.statement.get() {
-                let table = &original.tables[&alter.table];
+                let Some(table) = original.tables.get(&alter.table) else {
+                    // ALTER TABLE IF EXISTS already reported the missing relation.
+                    return Ok(result);
+                };
+                let updated = self.tables.get(&alter.table)
+                    .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
                 let rewrites_text_search = alter.actions.iter().any(|action| {
                     matches!(action, alter_table::Action::Type(column, ty, ..)
                         if ty.is_text_search() || table.columns.iter().any(|old|
                             old.name == *column && old.data_type.is_text_search()))
                 });
                 let mode = if rewrites_text_search { PageMode::TypeRewrite } else { PageMode::Catalog };
-                sink.ddl_pages(table, &self.tables[&alter.table], mode, &mut |rows| {
+                sink.ddl_pages(table, updated, mode, &mut |rows| {
                     let mut page = original.clone();
                     page.rows.insert(table.id, rows);
                     page.execute_statement_inner(

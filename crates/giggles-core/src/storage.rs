@@ -5549,8 +5549,16 @@ impl SqlSession {
                     utility.execute(p, &state.sql, actor.as_ref(), &roles, admin_utility::MaintenanceContext { image: role_image.as_ref(), database: &self.maintenance_database, private_owner })
                 })
             })();
-            if result.is_err() { self.abort(); }
-            return result;
+            return match result {
+                Ok(Some(marker)) => {
+                    self.execute_bound_clocked_once(&p.cluster_ddl(marker), params, expected_version, clock, db, check_reply)
+                }
+                Ok(None) => Ok(relational::SqlResult::default()),
+                Err(error) => {
+                    self.abort();
+                    Err(error)
+                }
+            };
         }
         if self.is_v2_engine() {
             let Some(db) = db else {

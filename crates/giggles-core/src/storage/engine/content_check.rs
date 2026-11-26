@@ -78,10 +78,16 @@ pub(crate) fn required_bits_for_catalog_value(
     }
     match catalog_codec::classify_catalog_key(key).map_err(corrupt)? {
         CatalogKind::Table => {
-            let (entry, ext, metadata) = catalog_codec::decode_table_with_metadata(value).map_err(corrupt)?;
+            let (entry, ext, metadata) = catalog_codec::decode_table_with_metadata(value).map_err(|error| match error {
+                crate::CoreError::Unsupported => FormatError::Unsupported("table metadata trailer version".into()),
+                other => corrupt(other),
+            })?;
             let mut required = if ext.is_empty() { 0 } else { 64 };
             if !metadata.gin.is_empty() {
                 required |= super::meta::GIN_INDEXES;
+            }
+            if !metadata.storage.is_empty() {
+                required |= super::meta::STORAGE_METADATA;
             }
             if !metadata.generated.is_empty() {
                 required |= super::meta::GENERATED_COLUMNS;

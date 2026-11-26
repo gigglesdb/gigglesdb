@@ -462,6 +462,20 @@ fn snapshot_owned(
                 references: generation.references.clone(),
             })).collect(),
         gin_indexes,
+        relation_storage: presentation.table_storage.into_iter()
+            .filter(|(table, _)| visible.contains(table))
+            .map(|(table, storage)| (table, giggles_pg_catalog::RelationStorage {
+                unlogged: matches!(storage.persistence, giggles_core::relational::Persistence::Unlogged),
+                options: storage.reloptions.into_iter().filter(|(name, _)| !name.starts_with("toast.")).collect(),
+                clustered_index: storage.clustered_index,
+                index_options: storage.index_reloptions,
+                columns: storage.columns.into_iter().map(|(col, options)| (col, giggles_pg_catalog::AttributeStorage {
+                    stattarget: options.stattarget,
+                    storage: options.storage,
+                    compression: options.compression,
+                    options: options.options,
+                })).collect(),
+            })).collect(),
         primary_names: presentation.primary_names,
         constraints: presentation.constraints.into_iter().filter(|c| visible.contains(&c.table)
             && (c.foreign_table == 0 || visible.contains(&c.foreign_table)))
@@ -1405,7 +1419,7 @@ fn encode_with_settings(
                             // array_out quotes empty, NULL-like and delimiter-bearing elements.
                             let quote = item.is_empty() || item.eq_ignore_ascii_case(b"NULL")
                                 || item.iter().any(|b| b.is_ascii_whitespace() || matches!(b, b',' | b'{' | b'}' | b'"' | b'\\'));
-                            if quote || matches!(scalar, PgType::Text | PgType::Varchar | PgType::Char) {
+                            if quote || matches!(scalar, PgType::Varchar | PgType::Char) {
                                 encoded.push(b'"');
                                 for byte in item {
                                     if matches!(byte, b'"' | b'\\') {
@@ -1671,9 +1685,10 @@ mod tests {
         for row in result.rows {
             assert_eq!(encode(&row[4], PgType::AclItemArray, 0).unwrap(), None);
             let bytes = encode(&row[5], PgType::AclItemArray, 0).unwrap().unwrap();
-            // Array escaping surrounds the independently quoted ACL role names.
+            // array_out quotes only elements that need it (PostgreSQL 18.6:
+            // acldefault('n', 10) = {postgres=UC/postgres}); quoted role names do.
             let expected: &[u8] = if row[3] == Value::Int(6171) {
-                br#"{"pg_database_owner=UC/pg_database_owner"}"#
+                br#"{pg_database_owner=UC/pg_database_owner}"#
             } else {
                 br#"{"\"a\"\"b\\c\"=UC/\"a\"\"b\\c\""}"#
             };
@@ -1687,7 +1702,7 @@ mod tests {
                 0
             )
             .unwrap(),
-            Some(b"{\"giggles=UC/giggles\"}".to_vec())
+            Some(b"{giggles=UC/giggles}".to_vec())
         );
     }
 
@@ -2011,7 +2026,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(encode(&value, PgType::TextArray, 0).unwrap().unwrap()).unwrap(),
-            "{\"NULL\",NULL,\"a,\\\"b\\\\c\",\"Î»\"}"
+            "{\"NULL\",NULL,\"a,\\\"b\\\\c\",Î»}"
         );
         let empty = encode(&Value::Array(vec![]), PgType::OidArray, 1)
             .unwrap()

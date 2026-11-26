@@ -195,9 +195,12 @@ impl CatalogView {
             .map(|(id, cs)| (*id, cs.values().cloned().collect()))
             .collect();
         parts.indexes = self.indexes.values().cloned().collect();
-        for table in self.metadata.values() {
+        for (&id, table) in &self.metadata {
             parts.ext.gin_indexes.extend(table.gin.clone());
             parts.ext.generated_columns.extend(table.generated.clone());
+            if !table.storage.is_empty() {
+                parts.ext.table_storage.insert(id, table.storage.clone());
+            }
         }
         parts.ext.sequences = self.sequences.clone();
         parts.ext.types = self.types.clone();
@@ -1107,7 +1110,7 @@ impl Catalog {
                 // Admit these features from the final catalog overlay.
                 txn.require_features(bits & !(super::meta::UUID_ARRAY_COLUMNS
                     | super::meta::GENERATED_COLUMNS | super::meta::TEXT_SEARCH_TYPES
-                    | super::meta::GIN_INDEXES | super::meta::PARTIAL_INDEXES));
+                    | super::meta::GIN_INDEXES | super::meta::PARTIAL_INDEXES | super::meta::STORAGE_METADATA));
             }
         }
         self.lock_and_write(txn, &old_records, &new_records, deadline, cancel)?;
@@ -1443,6 +1446,7 @@ impl Catalog {
         new.heap.remove(&entry.def.id);
         new.indexes.retain(|d| d.table != entry.def.id);
         new.ext.gin_indexes.retain(|_, index| index.table != entry.def.id);
+        new.ext.table_storage.remove(&entry.def.id);
         for column in &entry.def.columns {
             new.ext.columns.remove(&column.id);
             new.ext.generated_columns.remove(&column.id);
@@ -1614,6 +1618,9 @@ impl Catalog {
         }
         if final_view.metadata.values().any(|table| !table.generated.is_empty()) {
             txn.require_features(super::meta::GENERATED_COLUMNS);
+        }
+        if final_view.metadata.values().any(|table| !table.storage.is_empty()) {
+            txn.require_features(super::meta::STORAGE_METADATA);
         }
         if final_view.metadata.values().any(|table| !table.gin.is_empty()) {
             txn.require_features(super::meta::GIN_INDEXES);
@@ -2274,6 +2281,13 @@ fn finish_view(
         if metadata.generated.keys().any(|id| !entry.def.columns.iter().any(|c| c.id == *id)) {
             return Err(corrupt("generated column absent"));
         }
+        for id in metadata.storage.clustered_index.iter().chain(metadata.storage.index_reloptions.keys()) {
+            let primary = *id == entry.def.id && !entry.heap;
+            let secondary = view.indexes.get(id).is_some_and(|index| index.table == *table);
+            if !primary && !secondary && !metadata.gin.contains_key(id) {
+                return Err(corrupt("table storage metadata references absent index"));
+            }
+        }
         for (id, index) in &metadata.gin {
             index.validate(&entry.def).map_err(|_| corrupt("invalid GIN index"))?;
             if expected.insert(index.name.clone(), *id).is_some() {
@@ -2469,6 +2483,7 @@ impl<'a> UnchangedRecords<'a> {
                 && old.heap.contains(&table.id) == new.heap.contains(&table.id)
                 && old.ext.primary_index_birth.get(&table.id) == new.ext.primary_index_birth.get(&table.id)
                 && !changed_gin_tables.contains(&table.id)
+                && old.ext.table_storage.get(&table.id) == new.ext.table_storage.get(&table.id)
                 && table.columns.iter().all(|column| {
                     old.ext.columns.get(&column.id) == new.ext.columns.get(&column.id)
                         && old.ext.generated_columns.get(&column.id)
@@ -2618,12 +2633,13 @@ fn encode_parts(
             generated: def.columns.iter().filter_map(|column|
                 parts.ext.generated_columns.get(&column.id).map(|generation| (column.id, generation.clone()))
             ).collect(),
+            storage: parts.ext.table_storage.get(&def.id).cloned().unwrap_or_default(),
         };
         let value = catalog_codec::encode_table_with_metadata(&entry, &entry.columns_ext, &parts.ext.types, &metadata)?;
         decode_entry(&value)?;
         records.insert(table_key(def.id), value);
     }
-    if parts.heap.iter().any(|id| !table_ids.contains_key(id))
+    if parts.heap.iter().chain(parts.ext.table_storage.keys()).any(|id| !table_ids.contains_key(id))
         || parts.ext.columns.keys().chain(parts.ext.generated_columns.keys()).any(|id| !columns.contains(id))
     {
         return Err(corrupt("catalog extension owner absent"));

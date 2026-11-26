@@ -208,6 +208,44 @@ fn sequence_rejects_corrupt_highwater_and_overflow() {
 }
 
 #[test]
+fn catalog_drop_table_removes_storage_metadata() {
+    let (_, seq, locks, catalog) = catalog_setup();
+    let entry = create(&catalog, &seq, &locks, 1, "t");
+    let mut ddl = transaction(&seq, &locks, 2, Isolation::ReadCommitted);
+    let old = catalog.parts(&mut ddl).unwrap();
+    let mut new = old.clone();
+    new.ext.table_storage.insert(
+        entry.def.id,
+        crate::relational::TableStorage {
+            reloptions: vec![("fillfactor".into(), "80".into())],
+            ..Default::default()
+        },
+    );
+    catalog
+        .apply_diff(&mut ddl, &old, &new, &(0..0), None, &|| false)
+        .unwrap();
+    catalog.commit_ddl(ddl).unwrap();
+
+    let mut ddl = transaction(&seq, &locks, 3, Isolation::ReadCommitted);
+    assert!(
+        catalog
+            .parts(&mut ddl)
+            .unwrap()
+            .ext
+            .table_storage
+            .contains_key(&entry.def.id)
+    );
+    catalog.drop_table(&mut ddl, "t", None, &|| false).unwrap();
+    catalog.commit_ddl(ddl).unwrap();
+
+    let mut reader = transaction(&seq, &locks, 4, Isolation::ReadCommitted);
+    let parts = catalog.parts(&mut reader).unwrap();
+    assert!(parts.tables.is_empty());
+    assert!(parts.ext.table_storage.is_empty());
+    reader.rollback();
+}
+
+#[test]
 fn catalog_create_resolve_drop_recreate_allocates_fresh_object_and_column_ids() {
     let (_, seq, locks, catalog) = catalog_setup();
     let first = create(&catalog, &seq, &locks, 1, "t");

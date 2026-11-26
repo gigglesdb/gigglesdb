@@ -4,6 +4,7 @@ use super::*;
 #[derive(Debug, Clone)]
 pub(super) struct AlterTable {
     pub table: String,
+    pub optional: bool,
     pub actions: Vec<Action>,
     pub resolution_error: Option<SqlError>,
     pub column_names: ColumnNamePolicy,
@@ -44,6 +45,7 @@ pub(super) enum Action {
     TriggerState(triggers::Target, u8),
     AccessMethod(String),
     Tablespace(String),
+    Storage(storage_options::TableAction),
 }
 #[derive(Debug, Clone, Default)]
 pub(super) struct AddConstraints {
@@ -71,6 +73,8 @@ impl AlterTable {
 pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
     p.need("alter")?;
     p.need("table")?;
+    let optional = p.word("if");
+    if optional { p.need("exists")?; }
     p.word("only");
     // Keep relation policy out of parsing so syntax wins over lookup and authority.
     let first = raw_name(p)?;
@@ -203,6 +207,11 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
             p.word("column");
             let name = raw_name(p)?;
             let set = p.word("set");
+            if let Some(action) = storage_options::parse_column(p, set)? {
+                actions.push(Action::Storage(storage_options::TableAction::Column(name, action)));
+                if p.sym(',') { continue; }
+                break;
+            }
             let type_change = if set && p.word("data") {
                 p.need("type")?;
                 true
@@ -263,9 +272,16 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
                 Action::AccessMethod(raw_name(p)?)
             } else if p.word("tablespace") {
                 Action::Tablespace(raw_name(p)?)
+            } else if let Some(action) = storage_options::parse_table_set(p)? {
+                Action::Storage(action)
             } else {
                 return Err(SqlError::Unsupported);
             }
+        } else if p.word("reset") {
+            Action::Storage(storage_options::TableAction::Options(storage_options::parse_change(p, true)?))
+        } else if p.word("cluster") {
+            p.need("on")?;
+            Action::Storage(storage_options::TableAction::Cluster(Some(raw_name(p)?)))
         } else {
             return Err(SqlError::Syntax);
         };
@@ -281,6 +297,7 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
 
     Ok(AlterTable {
         table,
+        optional,
         actions,
         resolution_error,
         column_names: ColumnNamePolicy::Sql,
@@ -468,8 +485,30 @@ pub(super) fn execute(
     if let Some(error) = &alter.resolution_error {
         return Err(error.clone());
     }
-    let mut candidate = state.clone();
     let mut name = alter.table.clone();
+    if !state.tables.contains_key(&name) {
+        if state.view_names.contains_key(&name)
+            && alter.actions.iter().all(|action| matches!(action, Action::Storage(storage_options::TableAction::Options(_))))
+        {
+            for action in &alter.actions {
+                if let Action::Storage(storage_options::TableAction::Options(change)) = action {
+                    change.apply(&[], storage_options::OptionTarget::View)?;
+                }
+            }
+            return Ok(());
+        }
+        let name = name.trim_start_matches('\0').replace('\0', ".");
+        if alter.optional {
+            user_types::missing_object_notice("relation", &name);
+            return Ok(());
+        }
+        if alter.actions.iter().any(|action| matches!(action, Action::Storage(_))) {
+            return Err(user_types::exact_sql_error(
+                SqlError::UnknownTable, format!(r#"relation "{name}" does not exist"#), None,
+            ));
+        }
+    }
+    let mut candidate = state.clone();
     let epoch = state.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
     for action in &alter.actions {
         if cancel() {
@@ -481,6 +520,7 @@ pub(super) fn execute(
             .ok_or(SqlError::UnknownTable)?
             .clone();
         match action {
+            Action::Storage(action) => storage_options::alter_table(&mut candidate, &table, action)?,
             Action::AccessMethod(method) => maintenance::access_method(method)?,
             Action::Tablespace(name) => maintenance::tablespace(name)?,
             Action::TriggerState(target, enabled) => triggers::set_enabled(&mut candidate, &table, target, *enabled)?,
@@ -782,6 +822,7 @@ pub(super) fn execute(
                 )?;
                 if !dependents.is_empty() {
                     let dependent_drops = AlterTable {
+                        optional: false,
                         table: name.clone(),
                         actions: dependents.into_iter().map(|column| Action::Drop(column.name.clone(), false, true)).collect(),
                         resolution_error: None,
@@ -792,7 +833,8 @@ pub(super) fn execute(
                 }
                 let at = position(&table, column)?;
                 let was_generated = Arc::make_mut(&mut candidate.ext).generated_columns.remove(&id).is_some();
-                Arc::make_mut(&mut candidate.ext).gin_indexes.retain(|_, index| !index.columns.contains(&id));
+                Arc::make_mut(&mut candidate.ext).gin_indexes
+                    .retain(|_, index| !index.columns.contains(&id));
                 let collation_cascade=was_generated || *cascade && candidate.column_collation(id).is_some();
                 let replace_primary=table.primary_key.contains(&at);
                 if (table.logical_columns().count() <= 1 || replace_primary) && !collation_cascade {return Err(SqlError::Unsupported);}
@@ -818,7 +860,10 @@ pub(super) fn execute(
                     .cloned()
                     .collect::<Vec<_>>();
                 let removed_indexes=candidate.secondary_descriptors_engine().iter().filter(|d|d.table==table.id && d.uses_column(id)).map(|d|d.id).collect::<Vec<_>>();
-                for id in removed_indexes {std::sync::Arc::make_mut(&mut candidate.ext).column_collations.remove(&id);}
+                for id in removed_indexes {
+                    Arc::make_mut(&mut candidate.ext).column_collations.remove(&id);
+                }
+                if replace_primary { candidate.forget_primary_index_storage(table.id); }
                 table.columns.remove(at);
                 if replace_primary {
                     table.primary_key=vec![table.columns.len()];
@@ -926,6 +971,9 @@ pub(super) fn execute(
                 constraints::install_unique(&mut candidate, &table, explicit, columns, cancel)?;
             }
         }
+    }
+    if !candidate.ext.table_storage.is_empty() {
+        candidate.require_storage_metadata()?;
     }
     let descriptors = candidate.secondary_descriptors_engine().to_vec();
     candidate.secondary = candidate.secondary_build_complete_engine(&descriptors, &mut *cancel)?;

@@ -871,3 +871,158 @@ fn pre_am2_enum_definition_has_the_same_v2_records_until_add_value() {
     parts.ext.types.insert(9, TypeDef::Enum { name: "collision".into(), schema: "public".into(), labels: vec![] });
     assert!(catalog::parts_records(&parts).is_err());
 }
+
+#[test]
+fn storage_metadata_preserves_old_trailer_bytes() {
+    let entry = table();
+    let empty = BTreeMap::new();
+    let former_gin = GinIndex {
+        table: 1, name: "t_gin".into(), columns: vec![2], opclasses: vec![10073],
+        options: vec![("fastupdate".into(), "off".into())],
+    };
+    let former_generated = GeneratedColumn {
+        sql: "1".into(), stored: true, not_null: false, references: vec![],
+    };
+    #[derive(Serialize)]
+    struct FormerTrailer<'a> {
+        gin: &'a GinMap,
+        generated: &'a GeneratedMap,
+    }
+
+    for (gin, generated) in [(false, false), (true, false), (false, true), (true, true)] {
+        let metadata = TableMetadata {
+            gin: gin.then(|| (3, former_gin.clone())).into_iter().collect(),
+            generated: generated.then(|| (2, former_generated.clone())).into_iter().collect(),
+            ..TableMetadata::default()
+        };
+        let mut old = hex(TABLE);
+        if gin || generated {
+            old.extend(super::super::super::encode(&FormerTrailer {
+                gin: &metadata.gin,
+                generated: &metadata.generated,
+            }).unwrap());
+        }
+        let (decoded, columns, decoded_metadata) = decode_table_with_metadata(&old).unwrap();
+        assert_eq!(decoded, entry);
+        assert_eq!(columns, empty);
+        assert_eq!(decoded_metadata, metadata);
+        assert_eq!(encode_table_with_metadata(&decoded, &columns, &BTreeMap::new(), &decoded_metadata).unwrap(), old);
+    }
+}
+
+#[test]
+fn storage_metadata_v1_round_trips_each_attribute_and_requires_feature() {
+    use crate::relational::{ColumnStorage, Persistence};
+    let entry = table();
+    let base = hex(TABLE);
+    let options = || vec![("fillfactor".into(), "80".into())];
+    let mut storage = vec![
+        TableStorage { reloptions: options(), ..TableStorage::default() },
+        TableStorage { persistence: Persistence::Unlogged, ..TableStorage::default() },
+        TableStorage { clustered_index: Some(1), ..TableStorage::default() },
+        TableStorage { index_reloptions: BTreeMap::from([(1, options())]), ..TableStorage::default() },
+    ];
+    for column in [
+        ColumnStorage { stattarget: Some(200), ..ColumnStorage::default() },
+        ColumnStorage { storage: Some(b'e'), ..ColumnStorage::default() },
+        ColumnStorage { compression: Some(b'l'), ..ColumnStorage::default() },
+        ColumnStorage { options: vec![("n_distinct".into(), "0.5".into())], ..ColumnStorage::default() },
+    ] {
+        storage.push(TableStorage { columns: BTreeMap::from([(2, column)]), ..TableStorage::default() });
+    }
+    for storage in storage {
+        let metadata = TableMetadata { storage, ..TableMetadata::default() };
+        let bytes = encode_table_with_metadata(&entry, &BTreeMap::new(), &BTreeMap::new(), &metadata).unwrap();
+        assert_eq!(&bytes[..base.len()], base);
+        assert_eq!(&bytes[base.len()..][..2], &[0xFF, 1]);
+        assert_eq!(decode_table_with_metadata(&bytes).unwrap().2, metadata);
+        assert_eq!(
+            super::super::content_check::required_bits_for_catalog_value(&table_key(1), &bytes).unwrap(),
+            super::super::meta::STORAGE_METADATA,
+        );
+        let mut extra = bytes;
+        extra.push(0);
+        assert_corrupt(decode_table_with_metadata(&extra));
+    }
+}
+
+#[test]
+fn storage_metadata_v1_fully_populated_tail_matches_golden() {
+    use crate::relational::{ColumnStorage, Persistence};
+
+    let metadata = TableMetadata {
+        gin: BTreeMap::from([(
+            3,
+            GinIndex {
+                table: 1,
+                name: "t_gin".into(),
+                columns: vec![2],
+                opclasses: vec![10073],
+                options: vec![("fastupdate".into(), "off".into())],
+            },
+        )]),
+        generated: BTreeMap::from([(
+            2,
+            GeneratedColumn {
+                sql: "1".into(),
+                stored: true,
+                not_null: false,
+                references: vec![],
+            },
+        )]),
+        storage: TableStorage {
+            reloptions: vec![("fillfactor".into(), "70".into())],
+            persistence: Persistence::Unlogged,
+            clustered_index: Some(1),
+            index_reloptions: BTreeMap::from([(1, vec![("fillfactor".into(), "80".into())])]),
+            columns: BTreeMap::from([(
+                2,
+                ColumnStorage {
+                    stattarget: Some(200),
+                    storage: Some(b'e'),
+                    compression: Some(b'p'),
+                    options: vec![("n_distinct".into(), "0.5".into())],
+                },
+            )]),
+        },
+    };
+    let golden = [
+        hex(TABLE),
+        hex(concat!(
+            "ff01", // Tag, version
+            "0000000000000001000000000000000300000000000000010000000000000005745f67696e000000000000000100000000000000020000000000000001000027590000000000000001000000000000000a6661737475706461746500000000000000036f6666", // GIN map and descriptor
+            "0000000000000001000000000000000200000000000000013101000000000000000000", // Generated column map and expression
+            "0000000000000001000000000000000a66696c6c666163746f7200000000000000023730", // Table reloptions
+            "00000001010000000000000001", // Unlogged and clustered index
+            "000000000000000100000000000000010000000000000001000000000000000a66696c6c666163746f7200000000000000023830", // Index reloptions map
+            "000000000000000100000000000000020100c801650170", // Column storage map, statistics, storage and compression
+            "0000000000000001000000000000000a6e5f64697374696e63740000000000000003302e35", // Column options
+        )),
+    ]
+    .concat();
+    let encoded =
+        encode_table_with_metadata(&table(), &BTreeMap::new(), &BTreeMap::new(), &metadata)
+            .unwrap();
+    assert_eq!(encoded, golden);
+    assert_eq!(decode_table_with_metadata(&golden).unwrap().2, metadata);
+}
+
+#[test]
+fn storage_metadata_rejects_bad_versions_prefixes_and_noncanonical_tails() {
+    let base = hex(TABLE);
+    for tail in [vec![1], vec![0xFF], vec![0; 16], vec![0xFF, 1]] {
+        assert_corrupt(decode_table_with_metadata(&[base.clone(), tail].concat()));
+    }
+    assert!(matches!(decode_table_with_metadata(&[base.clone(), vec![0xFF, 2]].concat()),
+        Err(CoreError::Unsupported)));
+    let empty = TableMetadata::default();
+    let dto = TableMetadataV1 { gin: &empty.gin, generated: &empty.generated, storage: &empty.storage };
+    let empty_v1 = super::super::super::encode(&dto).unwrap();
+    assert_corrupt(decode_table_with_metadata(&[base.clone(), vec![0xFF, 1], empty_v1].concat()));
+
+    let oversize = TableStorage { reloptions: vec![("fillfactor".into(), "x".repeat(65_537))],
+        ..TableStorage::default() };
+    let dto = TableMetadataV1 { gin: &empty.gin, generated: &empty.generated, storage: &oversize };
+    let oversized = super::super::super::encode(&dto).unwrap();
+    assert_corrupt(decode_table_with_metadata(&[base, vec![0xFF, 1], oversized].concat()));
+}

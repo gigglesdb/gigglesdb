@@ -76,9 +76,23 @@ fn lifecycle(engine: Engine) {
         json.options,
         [
             ("fastupdate".into(), "off".into()),
-            ("gin_pending_list_limit".into(), "128".into())
+            ("gin_pending_list_limit".into(), "128".into()),
         ]
     );
+    run(&mut sql, "ALTER INDEX items_j SET (fastupdate=on)");
+    run(
+        &mut sql,
+        "ALTER INDEX items_j RESET (gin_pending_list_limit)",
+    );
+    drop((sql, admin));
+    let admin = Admin::open(&path, limits).unwrap();
+    let mut sql = admin.sql_session();
+    let indexes = sql.catalog_metadata().unwrap().presentation.gin_indexes;
+    let changed = indexes
+        .values()
+        .find(|index| index.name == "items_j")
+        .unwrap();
+    assert_eq!(changed.options, [("fastupdate".into(), "on".into())]);
     run(&mut sql, "ALTER INDEX items_v RENAME TO items_array");
     run(&mut sql, "DROP INDEX items_array");
     run(&mut sql, "DROP INDEX IF EXISTS items_array");
@@ -129,7 +143,6 @@ fn non_gin_rename_refusals(engine: Engine) {
         "ALTER INDEX t_s_key RENAME TO x",
         "ALTER INDEX t_s RENAME TO x",
         "ALTER INDEX missing_schema.missing_idx RENAME TO x",
-        "ALTER INDEX t_s SET (fillfactor = 50)",
         "ALTER INDEX t_s RENAME x",
         "ALTER INDEX CONCURRENTLY t_s RENAME TO x",
         "ALTER INDEX pg_catalog.pg_class RENAME TO x",
