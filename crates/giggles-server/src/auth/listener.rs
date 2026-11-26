@@ -103,13 +103,26 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 const MAX_REJECTION_TASKS: usize = 8;
 const REJECTION_TIMEOUT: Duration = Duration::from_secs(2);
 
+const REJECTION_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
 /// A listener's independent budget for replying to startup attempts it cannot admit.
 /// Its accept loop reaps completed tasks before accepting more sockets.
-pub(crate) struct ConnectionRejections(Arc<Semaphore>);
+/// Refusals are logged at most once per `REJECTION_LOG_INTERVAL`, with the
+/// number of sockets refused since the previous line, so a connection flood
+/// cannot turn the accept loop into a blocking stderr writer.
+pub(crate) struct ConnectionRejections {
+    slots: Arc<Semaphore>,
+    refused: std::cell::Cell<u64>,
+    logged: std::cell::Cell<Option<std::time::Instant>>,
+}
 
 impl ConnectionRejections {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(Semaphore::new(MAX_REJECTION_TASKS)))
+        Self {
+            slots: Arc::new(Semaphore::new(MAX_REJECTION_TASKS)),
+            refused: std::cell::Cell::new(0),
+            logged: std::cell::Cell::new(None),
+        }
     }
 
     pub(crate) fn reject(
@@ -119,8 +132,18 @@ impl ConnectionRejections {
         accept: Option<&TlsAcceptor>,
         protocol: &str,
     ) {
-        eprintln!("protocol={protocol} rejected stage=admission reason=too_many_connections");
-        let Ok(permit) = self.0.clone().try_acquire_owned() else {
+        let refused = self.refused.get() + 1;
+        let now = std::time::Instant::now();
+        if self.logged.get().is_none_or(|at| now.duration_since(at) >= REJECTION_LOG_INTERVAL) {
+            eprintln!(
+                "protocol={protocol} rejected stage=admission reason=too_many_connections refused={refused}"
+            );
+            self.logged.set(Some(now));
+            self.refused.set(0);
+        } else {
+            self.refused.set(refused);
+        }
+        let Ok(permit) = self.slots.clone().try_acquire_owned() else {
             return;
         };
         let accept = accept.cloned();
