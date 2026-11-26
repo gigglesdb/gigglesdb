@@ -1498,6 +1498,7 @@ fn phase3_release_recovers_a_poisoned_shard_during_fallback() {
 #[test]
 fn phase3_blocking_mixed_key_stress_cleans_up_all_shards_and_stripes() {
     const WORKERS: u64 = 8;
+    const ITERATIONS: usize = 32;
     for shards in [2, 64] {
         for forced in [false, true] {
             let mut cfg = phase3_config(shards);
@@ -1505,7 +1506,26 @@ fn phase3_blocking_mixed_key_stress_cleans_up_all_shards_and_stripes() {
                 cfg.placement = None;
             }
             let lm = Arc::new(LockManager::new(cfg));
-            let table = LockKey::Table(1);
+            // The Unique-space interval below turns gap mode on for the rest of
+            // this manager's life, so every Unique point a worker holds forces
+            // its release to the global fallback at that point's shard.
+            // release_all visits shards in index order, so a shard can only be
+            // released locally before that one. Put the table on shard 0 and
+            // every Unique tuple elsewhere, so each release frees shard 0
+            // locally and then falls back for the rest. Left to hashed placement,
+            // two shards put all four tuples on shard 0 with probability 1/16,
+            // and then no release could ever be local.
+            let table = (1..).map(LockKey::Table).find(|key| lm.shard(key) == 0).unwrap();
+            let tuples: Vec<u8> = (0..=u8::MAX)
+                .filter(|&b| lm.shard(&LockKey::Unique { index: 1, tuple: vec![b] }) != 0)
+                .take(4)
+                .collect();
+            assert_eq!(tuples.len(), 4);
+            let fallbacks = Arc::new(AtomicUsize::new(0));
+            let counter = fallbacks.clone();
+            *lm.hooks.release_global.lock().unwrap() = Some(Arc::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }));
             lm.acquire(TxnId(0), table.clone(), LockMode::AccessExclusive, None, &|| false).unwrap();
             // Force an interval fallback while the workers are queued on the table.
             let interval = LockKey::Interval {
@@ -1518,16 +1538,17 @@ fn phase3_blocking_mixed_key_stress_cleans_up_all_shards_and_stripes() {
             for worker in 1..=WORKERS {
                 let lm = lm.clone();
                 let table = table.clone();
+                let tuples = tuples.clone();
                 let (send, recv) = mpsc::channel();
                 let handle = thread::spawn(move || {
                     let txn = TxnId(worker);
                     let mut rng = worker;
                     let releases_before = SHARD_RELEASES.get();
-                    for _ in 0..32 {
+                    for _ in 0..ITERATIONS {
                         let group_pk = (random(&mut rng) % 4) as u8;
                         let row_pk = 4 + (random(&mut rng) % 4) as u8;
                         let row_key_pk = 8 + (random(&mut rng) % 4) as u8;
-                        let tuple = vec![(random(&mut rng) % 4) as u8];
+                        let tuple = vec![tuples[(random(&mut rng) % 4) as usize]];
                         let group = [
                             (LockKey::RowKey { table: 1, pk: vec![group_pk] }, LockMode::Exclusive),
                             (row(group_pk), LockMode::Exclusive),
@@ -1541,11 +1562,15 @@ fn phase3_blocking_mixed_key_stress_cleans_up_all_shards_and_stripes() {
                             lm.acquire(txn, LockKey::Unique { index: 1, tuple },
                                 LockMode::Exclusive, None, &|| false)
                         })();
+                        let iteration_before = SHARD_RELEASES.get();
                         lm.release_all(txn);
                         if let Err(error) = result {
                             send.send(Err(error)).unwrap();
                             return;
                         }
+                        // The table's shard 0 is always freed locally.
+                        assert!(SHARD_RELEASES.get() > iteration_before,
+                            "a worker release skipped its local shard 0 release");
                     }
                     send.send(Ok(SHARD_RELEASES.get() - releases_before)).unwrap();
                 });
@@ -1555,8 +1580,17 @@ fn phase3_blocking_mixed_key_stress_cleans_up_all_shards_and_stripes() {
             let locks_before = SHARD_LOCKS.get();
             lm.release_all(TxnId(0));
             assert!(SHARD_LOCKS.get() - locks_before > shards, "interval release did not escalate");
-            let local_releases: usize = workers.into_iter().map(|worker| finish(worker).unwrap()).sum();
-            assert!(local_releases > 0, "no worker released a shard locally (shards={shards}, forced={forced})");
+            for worker in workers {
+                // Every iteration holds the table on shard 0 and a Unique point
+                // on a later shard: at least one local release (checked per
+                // iteration in the worker), then exactly one fallback.
+                assert!(finish(worker).unwrap() >= ITERATIONS,
+                    "too few local shard releases (shards={shards}, forced={forced})");
+            }
+            // One fallback per worker iteration, plus the interval holder's.
+            assert_eq!(fallbacks.load(Ordering::Relaxed), ITERATIONS * WORKERS as usize + 1,
+                "each worker release falls back exactly once (shards={shards}, forced={forced})");
+            *lm.hooks.release_global.lock().unwrap() = None;
             assert_eq!(lm.waiting_count(), 0);
             let state = lm.global().unwrap();
             for txn in 0..=WORKERS {
