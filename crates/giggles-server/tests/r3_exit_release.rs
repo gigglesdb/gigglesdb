@@ -797,6 +797,8 @@ async fn limit_refusal_leaves_session_usable() {
     f.create_inc_436();
     seed_limit_rows(&f);
     let mut guard = ExposureGuard::new(f.admin());
+    // A deadline the scan meter detects answers 57014, not the meter's 25P02
+    // (GD-0061 E116): one millisecond over 1031 visible rows.
     create_variant(
         &f,
         &mut guard,
@@ -814,6 +816,62 @@ async fn limit_refusal_leaves_session_usable() {
         code(error),
         "57014",
         "deadline must be cancellation, not aborted transaction"
+    );
+    // This session's next statements run under the same 1 ms deadline, so one
+    // may meet it too: that, and only that, is retried. A failed transaction
+    // (25P02), a held slot (54T01) or a lost connection fails at once.
+    let mut usable = None;
+    for _ in 0..50 {
+        match rows(&client, "SELECT id FROM shipments WHERE id = 1 LIMIT 1").await {
+            Ok(found) => {
+                usable = Some(found);
+                break;
+            }
+            Err(error) => assert_eq!(code(error), "57014", "session left unusable"),
+        }
+    }
+    assert_eq!(
+        usable,
+        Some(vec![vec![Some("1".into())]]),
+        "no statement ran after the refusal"
+    );
+    // The deterministic proof: a session a deadline refusal leaves behind runs
+    // its next statement. That statement must never race the deadline, so the
+    // deadline is the task's ordinary 2 s. The refused statement can never
+    // finish: no split of an odd run of a's satisfies the mirrored
+    // backreferences, so the matcher tries every split (about n^4/24, 4x10^10
+    // at n = 1001), checking for cancellation as it goes. With one statement
+    // slot, a refusal that left its slot held would refuse the follow-up.
+    const STATEMENT_MS: u64 = 2000;
+    create_variant(
+        &f,
+        &mut guard,
+        "exit-time-usable",
+        42,
+        &format!(
+            "statement_ms = {STATEMENT_MS}, rows_scanned = 100000, concurrent_statements = 1"
+        ),
+    )
+    .await;
+    let client = credential_agent(&f, "exit-time-usable").await;
+    let started = std::time::Instant::now();
+    let never_finishes = format!(
+        r"SELECT id FROM shipments WHERE (status || '{}b') ~ '^failed(a*)(a*)(a*)(a*)\4\3\2\1b$'",
+        "a".repeat(1001)
+    );
+    let error = tokio::time::timeout(Duration::from_secs(60), client.simple_query(&never_finishes))
+        .await
+        .expect("the deadline must cancel the statement")
+        .unwrap_err();
+    let refused_after = started.elapsed();
+    assert_eq!(
+        code(error),
+        "57014",
+        "deadline must be cancellation, not aborted transaction"
+    );
+    assert!(
+        refused_after >= Duration::from_millis(STATEMENT_MS),
+        "refused after {refused_after:?}, before the {STATEMENT_MS} ms deadline"
     );
     assert_eq!(
         rows(&client, "SELECT id FROM shipments WHERE id = 1 LIMIT 1")
