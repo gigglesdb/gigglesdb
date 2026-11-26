@@ -247,6 +247,8 @@ mod write_fence_termination_network;
 #[path = "privilege_functions_network.rs"]
 mod privilege_functions_network;
 
+#[path = "fk_component_lock_network.rs"]
+mod fk_component_lock_network;
 #[path = "fk_section_network.rs"]
 mod fk_section_network;
 #[path = "api_search_path.rs"] mod api_search_path;

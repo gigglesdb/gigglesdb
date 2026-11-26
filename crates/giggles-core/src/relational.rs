@@ -3361,6 +3361,36 @@ impl Prepared {
             _ => vec![],
         }
     }
+    /// The union of SET column names for every UPDATE of this bound table.
+    /// None means an UPDATE's assignments could not be determined.
+    pub(crate) fn update_columns(&self, table: &str) -> Option<BTreeSet<&str>> {
+        let mut columns = BTreeSet::new();
+        self.collect_update_columns(table, &mut columns)?;
+        Some(columns)
+    }
+
+    fn collect_update_columns<'a>(
+        &'a self,
+        table: &str,
+        columns: &mut BTreeSet<&'a str>,
+    ) -> Option<()> {
+        match self.statement.get() {
+            Statement::Update { name, sets, .. } if name == table => {
+                columns.extend(sets.iter().map(|(name, _)| name.as_str()));
+            }
+            Statement::UpdateExpressions { name, sets, .. } if name == table => {
+                columns.extend(sets.iter().map(|(name, _)| name.as_str()));
+            }
+            Statement::InsertMulti(insert) if insert.table == table => {
+                columns.extend(insert.conflict_update_columns());
+            }
+            Statement::Plan(plan) => plan.collect_update_columns(table, columns)?,
+            _ if self.command() == "UPDATE" && self.table() == Some(table) => return None,
+            _ => {}
+        }
+        Some(())
+    }
+
     /// Additional command privilege for syntactic ON CONFLICT DO UPDATE.
     pub fn authorization_update_table(&self) -> Option<&str> {
         match self.statement.get() {

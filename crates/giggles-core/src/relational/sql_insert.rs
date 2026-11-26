@@ -511,8 +511,7 @@ impl Insert {
         Some(LockConflict {
             columns: c.columns.as_deref(),
             constraint: c.constraint.as_deref(),
-            sets: c.update.as_ref().map(|u| u.sets.iter().map(|(name, _)| name.as_str()).collect())
-                .unwrap_or_default(),
+            sets: self.conflict_update_columns().collect(),
         })
     }
     /// Static VALUES admission plus the executor's exact assignment/coercion.
@@ -571,6 +570,10 @@ impl Insert {
     pub(super) fn arbiter_predicate(&self, state: &Relational, table: &TableDef) -> R<Option<partial_index::Predicate>> {
         self.conflict.as_ref().and_then(|c| c.predicate.as_deref())
             .map(|tokens| partial_index::Predicate::for_conflict(state, table, tokens)).transpose()
+    }
+    pub(super) fn conflict_update_columns(&self) -> impl Iterator<Item = &str> {
+        self.conflict.iter().filter_map(|conflict| conflict.update.as_ref())
+            .flat_map(|update| update.sets.iter().map(|(name, _)| name.as_str()))
     }
     pub(super) fn updates_conflicts(&self) -> bool {
         self.conflict.as_ref().is_some_and(|c| c.update.is_some())

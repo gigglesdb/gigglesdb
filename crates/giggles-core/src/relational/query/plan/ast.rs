@@ -128,6 +128,34 @@ impl Plan {
         if let Some(insert) = &self.insert { tables.extend(insert.prepared.write_tables()); }
         tables
     }
+    pub(in crate::relational) fn collect_update_columns<'a>(
+        &'a self,
+        table: &str,
+        columns: &mut BTreeSet<&'a str>,
+    ) -> Option<()> {
+        for cte in &self.ctes {
+            if let Some(dml) = &cte.dml {
+                dml.collect_update_columns(table, columns)?;
+            } else {
+                cte.query.collect_update_columns(table, columns)?;
+            }
+        }
+        if let Some(mutation) = &self.mutation
+            && !mutation.deleting && mutation.target == table
+        {
+            columns.extend(mutation.groups.iter().flat_map(|(names, _)| {
+                names.iter().map(String::as_str)
+            }));
+        }
+        if let Some(merge) = &self.merge {
+            merge.collect_update_columns(table, columns);
+        }
+        if let Some(insert) = &self.insert {
+            insert.prepared.collect_update_columns(table, columns)?;
+        }
+        Some(())
+    }
+
     pub(in crate::relational) fn authorization_tables(&self) -> R<Vec<String>> {
         let mut out = self.mutation.as_ref().map_or_else(Vec::new, |m| m.read_tables());
         if let Some(m) = &self.merge { out.extend(m.read_tables()); }

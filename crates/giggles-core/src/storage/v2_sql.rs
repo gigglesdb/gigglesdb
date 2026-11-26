@@ -4,6 +4,7 @@ use engine::{catalog::{CatalogParts, CatalogSnapshot}, txn::Isolation};
 use engine::{catalog::TableEntry, codec, kv::Keyspace, locks::LockMode, txn::Transaction};
 use relational::{
     SqlError, SqlRow, TableDef,
+    catalog_ext::{Action, CatalogExt, ConstraintKind},
     row_sink::{DdlRows, PageMode, RowSink},
 };
 use std::{collections::BTreeSet, ops::Bound};
@@ -764,38 +765,55 @@ impl SqlSession {
                         if let Some(name) = &target_name {
                             names.insert(name.clone());
                         }
-                        let write_ids = bound.write_tables().into_iter().filter_map(|(name, _)| parts.tables.get(&name).map(|t| t.id)).collect::<BTreeSet<_>>();
-                        if bound.write_tables().iter().any(|(name, _)| binding.view_names.contains_key(name)) {
+                        let writes = bound.write_tables();
+                        let write_ids = writes.iter()
+                            .filter_map(|(name, _)| parts.tables.get(name).map(|table| table.id))
+                            .collect::<BTreeSet<_>>();
+                        if writes.iter().any(|(name, _)| binding.view_names.contains_key(name)) {
                             return Err(CoreError::Sql(E::Unsupported));
                         }
                         let target_id = target_name
                             .as_ref()
                             .and_then(|name| parts.tables.get(name))
                             .map(|t| t.id);
-                        // Local FK witnesses use RowKey locks. Only writing referential
-                        // actions retain the full component's Share/RowExclusive locks.
-                        // Cluster and DDL keep their existing component protocol.
-                        let component_locks = ddl
-                            || matches!(txn.services(), engine::txn::TxnServices::Cluster(_))
-                            || bound.write_tables().iter().any(|(name, command)| {
-                                let Some(table) = parts.tables.get(name) else { return false; };
-                                parts.ext.constraints.values().flatten().any(|c| {
-                                    let relational::catalog_ext::ConstraintKind::ForeignKey {
-                                        ref_table, on_delete, on_update, ..
-                                    } = &c.kind else { return false; };
-                                    let action = match *command {
-                                        "DELETE" => on_delete,
-                                        "UPDATE" => on_update,
-                                        _ => return false,
-                                    };
-                                    *ref_table == table.id && matches!(action,
-                                        relational::catalog_ext::Action::Cascade
-                                        | relational::catalog_ext::Action::SetNull
-                                        | relational::catalog_ext::Action::SetDefault)
-                                })
-                            });
+                        let cluster = matches!(txn.services(), engine::txn::TxnServices::Cluster(_));
+                        let fixed_dml = matches!(class, V2Class::Dml)
+                            && !write_ids.is_empty() && txn.isolation() != Isolation::ReadCommitted;
+                        // A fixed row snapshot must not hide triggers enabled now.
+                        // Local UPDATE needs those states before choosing table locks.
+                        let mut latest = (fixed_dml && !cluster && !protected
+                            && writes.iter().any(|(_, command)| *command == "UPDATE"))
+                            .then(|| db.catalog().latest_snapshot(txn))
+                            .transpose()?;
+                        let live = latest.as_ref().map_or(&parts.ext, |snapshot| &snapshot.parts.ext);
                         let mut connected = target_id.into_iter().chain(write_ids.iter().copied()).collect::<BTreeSet<_>>();
-                        if writing && component_locks {
+                        // Local FK witnesses use RowKey locks. Expand from UPDATE
+                        // targets whose referential actions can write child rows.
+                        let mut pending = Vec::new();
+                        if writing {
+                            if ddl || cluster {
+                                pending.extend(connected.iter().copied());
+                            } else {
+                                for (name, command) in &writes {
+                                    let Some(table) = parts.tables.get(name) else { continue; };
+                                    let assigned = if *command == "UPDATE" && !protected {
+                                        bound.update_columns(name)
+                                    } else {
+                                        None
+                                    };
+                                    if requires_fk_component_lock(&parts.ext, live, table, command, assigned.as_ref()) {
+                                        if protected || *command == "DELETE" {
+                                            // Preserve the R3 protected-run snapshot fence
+                                            // and the existing DELETE component protocol.
+                                            pending.extend(connected.iter().copied());
+                                            break;
+                                        }
+                                        pending.push(table.id);
+                                    }
+                                }
+                            }
+                        }
+                        if !pending.is_empty() {
                             let mut neighbors = BTreeMap::<_, Vec<_>>::new();
                             for (&child, constraints) in &parts.ext.constraints {
                                 for constraint in constraints {
@@ -807,14 +825,15 @@ impl SqlSession {
                                     }
                                 }
                             }
-                            let mut pending: Vec<_> = connected.iter().copied().collect();
+                            let mut component = pending.iter().copied().collect::<BTreeSet<_>>();
                             while let Some(table) = pending.pop() {
                                 for &neighbor in neighbors.get(&table).into_iter().flatten() {
-                                    if connected.insert(neighbor) {
+                                    if component.insert(neighbor) {
                                         pending.push(neighbor);
                                     }
                                 }
                             }
+                            connected.extend(component);
                         }
                         let row_lock_names = bound.row_lock_tables().into_iter().collect::<BTreeSet<_>>();
                         let mut locks = BTreeMap::new();
@@ -878,16 +897,10 @@ impl SqlSession {
                                 })?;
                         }
                         if matches!(class, V2Class::Dml) && !write_ids.is_empty() {
-                            // The catalog barrier excludes trigger DDL even on
-                            // other gateways. A fixed row snapshot must not
-                            // hide any trigger that is enabled now.
-                            let latest;
-                            let live = if txn.isolation() == Isolation::ReadCommitted {
-                                &parts.ext
-                            } else {
-                                latest = db.catalog().latest_snapshot(txn)?;
-                                &latest.parts.ext
-                            };
+                            if fixed_dml && latest.is_none() {
+                                latest = Some(db.catalog().latest_snapshot(txn)?);
+                            }
+                            let live = latest.as_ref().map_or(&parts.ext, |snapshot| &snapshot.parts.ext);
                             binding.check_unimplemented_trigger_firing(
                                 &bound, live, self.deferral.replica, self.copy_input.is_some(),
                             ).map_err(relational::routines::into_core)?;
@@ -1642,6 +1655,9 @@ mod tests;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "v2_writer_lock_tests.rs"]
 mod writer_lock_tests;
+#[cfg(test)]
+#[path = "v2_fk_component_lock_tests.rs"]
+mod fk_component_lock_tests;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "v2_fk_delete_lock_tests.rs"]
 mod fk_delete_lock_tests;
@@ -1707,6 +1723,39 @@ impl<'a> SqlRows<'a> {
         }
         Ok(())
     }
+}
+
+fn requires_fk_component_lock(
+    ext: &CatalogExt,
+    live: &CatalogExt,
+    table: &TableDef,
+    command: &str,
+    assigned: Option<&BTreeSet<&str>>,
+) -> bool {
+    let update = match command {
+        "UPDATE" => true,
+        "DELETE" => false,
+        _ => return false,
+    };
+    let before_update = update
+        && live.triggers.get(&table.id).into_iter().flat_map(BTreeMap::values).any(|trigger| {
+            trigger.before && trigger.row && trigger.events & relational::triggers::UPDATE != 0
+                && trigger.enabled != b'D'
+        });
+    ext.constraints.values().flatten().any(|constraint| {
+        let ConstraintKind::ForeignKey { ref_table, ref_columns, on_delete, on_update, .. } =
+            &constraint.kind else { return false; };
+        let action = if update { on_update } else { on_delete };
+        *ref_table == table.id && matches!(action, Action::Cascade | Action::SetNull | Action::SetDefault)
+            && (!update || before_update || assigned.is_none_or(|columns| {
+                ref_columns.iter().any(|id| {
+                    ext.generated_columns.contains_key(id)
+                        || table.columns.iter().any(|column| {
+                            column.id == *id && columns.contains(column.name.as_str())
+                        })
+                })
+            }))
+    })
 }
 
 fn fk_referenced(parts: &CatalogParts, table: u64) -> bool {

@@ -532,6 +532,16 @@ impl Merge {
             .map(|c| (self.input.target.clone(), c))
             .collect()
     }
+    pub(super) fn collect_update_columns<'a>(&'a self, table: &str, columns: &mut BTreeSet<&'a str>) {
+        if self.input.target == table {
+            for clause in &self.clauses {
+                if let Action::Update(groups) = &clause.action {
+                    columns.extend(groups.iter().flat_map(|(names, _)| names.iter().map(String::as_str)));
+                }
+            }
+        }
+    }
+
     pub(super) fn remap(&mut self, alias: &str, name: &str) {
         self.input.remap(alias, name);
         self.map_plans(|p| {
