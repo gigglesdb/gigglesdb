@@ -145,6 +145,31 @@ data stays on `/home/user`, and both summary.md and meta.json say so.
 - Client and servers share one box. The client is pinned to two cores, which
   can limit very high client counts.
 
+## Disk flush latency (`--slow-disk`)
+
+Before the build, the runner measures raw `fdatasync` on the data directory
+(400 appends of 1 KB, each followed by `fdatasync`) and writes the mean, p50
+and p99 in microseconds to `logs/fsync-probe.txt`. Commit latency, and on a
+slow device also CPU per operation, depends on this value, so record it with
+every result.
+
+- `--slow-disk off` (default): probe only. A failed probe is logged and the
+  run continues.
+- `--slow-disk require`: when the mean is under `--min-fsync-us` (default
+  2000), stop before any run. `summary.md` says so and the script exits 6, so
+  a fast-disk box costs one start and no matrix time.
+- `--slow-disk auto`: when the mean is under the threshold, build a 10 GB
+  ext4 device from dm-delay (write 1 ms, flush 3 ms; `SLOW_WRITE_MS` /
+  `SLOW_FLUSH_MS` on the box) over a direct-I/O loop file, probe it again and
+  run there. Setup fails (rc 2) if the emulated device still measures under
+  the threshold. Emulated WAL syncs measured about 7.5-9 ms (GD-0084 E1086).
+
+With `--profile`, each profiled window also records exact per-thread CPU and
+context switches from `/proc` (`profiles/threads{0,1,2}-<key>.txt`, with the
+load's `completed=` count; use threads0 to threads2 for per-op figures, since
+the count is logged every 2 s), and a `comm,dso` perf report. The profile
+phase skips targets that cannot finish 15 minutes before the box TTL.
+
 ## Optional profiling (`--profile`)
 
 Add `--profile` for one diagnostic run per selected GigglesDB target/client

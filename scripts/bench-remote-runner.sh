@@ -7,7 +7,8 @@
 # CLIENT_CPUS, stops the server and deletes its data. Writes
 # /home/user/bench/{progress,done,meta.json,results.jsonl,summary.md,logs/}.
 # done holds rc=0 when every measured run passed (including --max-error-rate 0
-# and the invariants), rc=1 otherwise, rc=2 when setup failed.
+# and the invariants), rc=1 otherwise, rc=2 when setup failed, rc=6 when
+# SLOW_DISK=require found a fast disk (nothing ran).
 #
 # Environment (set by bench-remote.sh): TARGETS CLIENTS MIXES PROTOCOLS WARMUP
 # DURATION REPEATS ROWS OPSET [SERVER_CPUS CLIENT_CPUS DATA_ROOT BASE_COMMIT].
@@ -24,6 +25,13 @@ PROFILE_PHASE_BUDGET=1800
 PROFILE_TARGET_WORST=900
 PROFILE_TARGET_STEPS=840
 PROFILE_LOAD_SECONDS=360
+# BOX_DEADLINE (epoch, from bench-remote.sh): the profile phase starts no target
+# that cannot finish before it, so results are copied back before the TTL.
+BOX_DEADLINE=${BOX_DEADLINE:-}
+# SLOW_DISK: off (default) | require (stop with rc=6 if the raw fdatasync mean is
+# under MIN_FSYNC_US) | auto (emulate a slow device with dm-delay when it is).
+SLOW_DISK=${SLOW_DISK:-off}
+MIN_FSYNC_US=${MIN_FSYNC_US:-2000}
 cap() { # cap <max-secs> <deadline-epoch>; leave room for timeout's kill-after
   local secs=$(( $2 - $(date +%s) - 10 ))
   [ "$secs" -gt "$1" ] && secs=$1
@@ -88,6 +96,57 @@ data_fstype=$(findmnt -n -o FSTYPE -T "$data" | head -1)
 data_source=$(findmnt -n -o SOURCE -T "$data" | head -1)
 data_mount=$(findmnt -n -o TARGET -T "$data" | head -1)
 progress "data dir $data on $data_fstype $data_source ($data_note)"
+
+# 0b. Raw fdatasync probe: mean/p50/p99 us of 400 x (append 1 KB + fdatasync).
+fsync_probe() { python3 -I -c '
+import os, sys, time
+p = os.path.join(sys.argv[1], "fsync-probe.bin")
+fd = os.open(p, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+ts = []
+for _ in range(400):
+    os.write(fd, b"x" * 1024); t = time.perf_counter(); os.fdatasync(fd); ts.append(time.perf_counter() - t)
+os.close(fd); os.unlink(p); ts.sort()
+print("%.0f %.0f %.0f" % (sum(ts) / len(ts) * 1e6, ts[len(ts) // 2] * 1e6, ts[int(len(ts) * .99)] * 1e6))
+' "$1"; }
+emulate_slow_disk() { # dm-delay over a direct-I/O loop device; echoes the mount point
+  local img=$1/slow.img mnt=$1/slowmnt dev sectors w=${SLOW_WRITE_MS:-1} f=${SLOW_FLUSH_MS:-3}
+  sudo -n modprobe dm_delay >&2 || return 1
+  # Allocate up front: a sparse image could hit ENOSPC mid-run and surface as I/O errors.
+  fallocate -l 10G "$img" || return 1
+  dev=$(sudo -n losetup --direct-io=on -f --show "$img") || return 1
+  sectors=$(sudo -n blockdev --getsz "$dev") || return 1
+  echo "0 $sectors delay $dev 0 0 $dev 0 $w $dev 0 $f" | sudo -n dmsetup create ggslow >&2 ||
+    echo "0 $sectors delay $dev 0 0 $dev 0 $f" | sudo -n dmsetup create ggslow >&2 || return 1
+  sudo -n mkfs.ext4 -q -E lazy_itable_init=0,lazy_journal_init=0 /dev/mapper/ggslow >&2 || return 1
+  mkdir -p "$mnt" && sudo -n mount /dev/mapper/ggslow "$mnt" && sudo -n chown "$(id -u):$(id -g)" "$mnt" || return 1
+  sudo -n dmsetup table ggslow >&2
+  echo "$mnt"
+}
+case "$SLOW_DISK" in off|require|auto) ;; *) fail_setup "bad SLOW_DISK=$SLOW_DISK (off|require|auto)" ;; esac
+[[ "$MIN_FSYNC_US" =~ ^[0-9]+$ ]] || fail_setup "bad MIN_FSYNC_US=$MIN_FSYNC_US"
+if ! read -r fs_mean fs_p50 fs_p99 < <(fsync_probe "$data"); then
+  [ "$SLOW_DISK" = off ] || fail_setup "fsync probe"
+  progress "raw fdatasync probe failed on $data (SLOW_DISK=off; continuing)"
+  echo "device probe failed" > "$out/logs/fsync-probe.txt"; fs_mean='' fs_p50='' fs_p99=''
+else
+progress "raw fdatasync probe: mean ${fs_mean}us p50 ${fs_p50}us p99 ${fs_p99}us (SLOW_DISK=$SLOW_DISK min ${MIN_FSYNC_US}us)"
+echo "device mean=$fs_mean p50=$fs_p50 p99=$fs_p99" > "$out/logs/fsync-probe.txt"
+fi
+if [ "$SLOW_DISK" != off ] && [ "$fs_mean" -lt "$MIN_FSYNC_US" ]; then
+  if [ "$SLOW_DISK" = require ]; then
+    progress "FAST DISK: fdatasync mean ${fs_mean}us < ${MIN_FSYNC_US}us; stopping (SLOW_DISK=require)"
+    printf 'fast disk: raw fdatasync mean %sus p50 %sus p99 %sus < %sus; no runs (SLOW_DISK=require)\n' "$fs_mean" "$fs_p50" "$fs_p99" "$MIN_FSYNC_US" > "$out/summary.md"
+    echo "rc=6" > "$out/done"; exit 6
+  fi
+  slow_mnt=$(emulate_slow_disk "${data%/run}" 2> "$out/logs/slow-disk.log") || fail_setup "dm-delay emulation (see logs/slow-disk.log)"
+  data=$slow_mnt/run; mkdir -p "$data" || fail_setup "cannot create $data"
+  data_note="EMULATED slow device: dm-delay write ${SLOW_WRITE_MS:-1} ms / flush ${SLOW_FLUSH_MS:-3} ms over a direct-I/O loop file; $data_note"
+  data_fstype=$(findmnt -n -o FSTYPE -T "$data" | head -1); data_source=$(findmnt -n -o SOURCE -T "$data" | head -1); data_mount=$(findmnt -n -o TARGET -T "$data" | head -1)
+  read -r fs_mean fs_p50 fs_p99 < <(fsync_probe "$data") || fail_setup "fsync probe (emulated)"
+  progress "EMULATED slow disk on $data_source: fdatasync mean ${fs_mean}us p50 ${fs_p50}us p99 ${fs_p99}us"
+  echo "emulated mean=$fs_mean p50=$fs_p50 p99=$fs_p99" >> "$out/logs/fsync-probe.txt"
+  [ "$fs_mean" -ge "$MIN_FSYNC_US" ] || fail_setup "emulated device still fast (fdatasync mean ${fs_mean}us < ${MIN_FSYNC_US}us)"
+fi
 
 # 1. app-loadtest dependencies (snapshot has them; reinstall if the lock changed).
 lt=$repo/scripts/app-loadtest
@@ -442,9 +501,20 @@ done
 # Capture and processing run separately so every capture overlaps diagnostic load.
 # Redirects intentionally create user-owned artifacts; only collectors need root.
 # shellcheck disable=SC2024
-bench_profile() ( # <pid> <profile-dir> <key> <deadline> <callgraph> <progress-file>
+bench_profile() ( # <pid> <profile-dir> <key> <deadline> <callgraph> <progress-file> [load-log]
   set -uo pipefail
-  local pid=$1 dest=$2 key=$3 tdl=$4 mode=$5 progress_file=$6 raw s rc
+  local pid=$1 dest=$2 key=$3 tdl=$4 mode=$5 progress_file=$6 loadlog=${7:-} raw s rc
+  # Exact per-thread CPU (utime/stime ticks) and context switches, plus the
+  # load's completed count, so CPU and switches can be divided per op.
+  threads_snap() {
+    { echo "epoch $(date +%s.%N) clk_tck $(getconf CLK_TCK)"
+      echo "load $( [ -n "$loadlog" ] && grep -o 'completed=[0-9]*' "$loadlog" | tail -1)"
+      echo "proc $(sed 's/.*) //' "/proc/$pid/stat" | cut -d' ' -f12,13)"
+      for t in /proc/"$pid"/task/*; do
+        printf '%s %s %s %s\n' "${t##*/}" "$(sed 's/.*) //' "$t/stat" | cut -d' ' -f12,13)" \
+          "$(awk '/ctxt_switches/{printf "%s ", $2}' "$t/status")" "$(tr ' ' _ < "$t/comm")"
+      done; } > "$1" 2>/dev/null || true
+  }
   local manifest bg
   local -a jobs=()
   mkdir -p "$dest/raw-$key"
@@ -456,14 +526,15 @@ bench_profile() ( # <pid> <profile-dir> <key> <deadline> <callgraph> <progress-f
   step() { echo "$(date -u +%T) profile-$key $*" >> "$progress_file"; }
   budget() { cap "$1" "$tdl" || { step "skipped $2: per-target budget spent"; return 1; }; }
   capture() { # name limit output command...; each invocation also works in background
-    local name=$1 limit=$2 output=$3 s rc=0 start epoch status
+    local name=$1 limit=$2 output=$3 s rc=0 start epoch status sig=TERM
+    [ "$name" != pidstat ] || sig=INT  # pidstat prints its Average lines only on SIGINT
     shift 3
     start=$(date -u +%FT%TZ); epoch=$(date +%s)
     if ! command -v "$1" >/dev/null 2>&1; then
       status=skipped; log "$name skipped: $1 missing"
     elif s=$(budget "$limit" "$name"); then
       step "capture $name"
-      sudo -n timeout --kill-after=10 "$s" "$@" > "$output" 2> "$dest/$name-$key.err" || rc=$?
+      sudo -n timeout --signal="$sig" --kill-after=10 "$s" "$@" > "$output" 2> "$dest/$name-$key.err" || rc=$?
       status=ok
       # timeout/SIGINT are normal for continuous observers, only with data.
       if [ "$rc" != 0 ] && { [ "$limit" != 310 ] || { [ "$rc" != 124 ] && [ "$rc" != 130 ]; } || [ ! -s "$output" ]; }; then
@@ -506,6 +577,9 @@ BT
   capture biolatency 310 "$dest/biolatency-$key.txt" biolatency-bpfcc -m 300 1 & jobs+=("$!")
   capture fsync 310 "$dest/fsync-$key.txt" bpftrace "$raw/fsync.bt" & jobs+=("$!")
   capture syscount 310 "$dest/syscount-$key.txt" syscount-bpfcc -p "$pid" -L -d 300 & jobs+=("$!")
+  # Clean 30 s window (only the low-overhead observers above attached), then
+  # threads2 closes the whole profiled window after the last capture.
+  threads_snap "$dest/threads0-$key.txt"; sleep 30; threads_snap "$dest/threads1-$key.txt"
   if [ "$mode" = fp ]; then
     capture cpu 45 "$dest/cpu-$key.txt" perf record -F 499 -g --call-graph fp -p "$pid" -o "$raw/perf.data" -- sleep 30 || true
   else
@@ -524,6 +598,7 @@ BT
     printf 'capture=lock status=skipped duration_seconds=0 start_utc=%s pid=%s\n' "$(date -u +%FT%TZ)" "$pid" >> "$manifest"
   fi
   capture wakeup 45 "$dest/wakeup-$key.folded" wakeuptime-bpfcc -f -p "$pid" 20 || true
+  threads_snap "$dest/threads2-$key.txt"
   for bg in "${jobs[@]}"; do wait "$bg" || true; done
   exit 0
 )
@@ -553,6 +628,9 @@ bench_profile_post() ( # <profile-dir> <key> <deadline> <progress-file>
   if [ -s "$raw/perf.data" ]; then
     if s=$(budget 60); then
       sudo -n timeout --kill-after=10 "$s" perf report -i "$raw/perf.data" --stdio --no-children --percent-limit 0.5 > "$dest/top-$key.txt" || log 'report failed'
+    fi
+    if s=$(budget 60); then
+      sudo -n timeout --kill-after=10 "$s" perf report -i "$raw/perf.data" --stdio --no-children -g none --sort comm,dso --percent-limit 0.2 > "$dest/comm-$key.txt" || log 'comm report failed'
     fi
     size=1073741825
     if s=$(budget 15); then size=$(sudo -n timeout --kill-after=10 "$s" stat -c %s "$raw/perf.data") || size=1073741825; fi
@@ -630,6 +708,10 @@ if [ "$PROFILE" = 1 ] && { has giggles-sql || has giggles-native; }; then
       callgraph=$profile_callgraph
       [ "$t" != giggles-sql-base ] || callgraph=dwarf
       elapsed=$(( $(date +%s) - phase_start ))
+      if [ -n "$BOX_DEADLINE" ] && [ $(( $(date +%s) + PROFILE_TARGET_WORST )) -gt "$BOX_DEADLINE" ]; then
+        progress "box deadline: skipping $tag and later targets ($(( BOX_DEADLINE - $(date +%s) ))s left)"
+        break 2
+      fi
       if [ $(( elapsed + PROFILE_TARGET_WORST )) -gt "$PROFILE_PHASE_BUDGET" ]; then
         progress "profile budget: skipping $tag and later targets (elapsed ${elapsed}s)"
         break 2
@@ -642,7 +724,7 @@ if [ "$PROFILE" = 1 ] && { has giggles-sql || has giggles-native; }; then
           load_pid=$!
           # First progress line is after schema setup and seeding.
           if wait_line "$out/logs/$tag.log" 'completed=' 60; then
-            bench_profile "$gg_pid" "$out/profiles" "$t-c$c" "$tdl" "$callgraph" "$out/progress" > "$out/logs/$tag.capture.txt" 2>&1 || progress "$tag capture failed (nonfatal)"
+            bench_profile "$gg_pid" "$out/profiles" "$t-c$c" "$tdl" "$callgraph" "$out/progress" "$out/logs/$tag.log" > "$out/logs/$tag.capture.txt" 2>&1 || progress "$tag capture failed (nonfatal)"
           else progress "$tag load not ready; skipping captures"
           fi
           wait "$load_pid" || progress "$tag diagnostic load failed (nonfatal)"

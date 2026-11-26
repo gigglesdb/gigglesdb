@@ -37,6 +37,11 @@
 #   --slot-wait <seconds>   how long to wait for a free slot (default 1800)
 #   --data-root <box path>  server data parent dir on the box (default: probe
 #                           for a block-device-backed path; /home/user is FUSE)
+#   --slow-disk off|require|auto   matrix only (default off). The runner always
+#                           probes raw fdatasync; require stops with exit 6 when
+#                           its mean is under --min-fsync-us, auto emulates a
+#                           slow device with dm-delay (write 1 ms / flush 3 ms)
+#   --min-fsync-us <us>     slow-disk threshold (default 2000)
 #   --build-snapshot        start from gigglesdb-gate-base, run
 #                           scripts/bench-snapshot-setup.sh, save the box as
 #                           gigglesdb-bench-base (never touches gigglesdb-gate-base)
@@ -46,7 +51,7 @@
 #
 # Exit: 0 every run passed (0 errors, invariants held), 1 some run failed, 2 usage error or matrix too
 # long, 3 daily start cap reached, 4 no slot free in time, 5 infrastructure
-# error. Results land in J:/gigglesdb-work/boat/bench/<utc>-<tip12>-<who>-<pid>/
+# error, 6 fast disk with --slow-disk require (nothing ran). Results land in J:/gigglesdb-work/boat/bench/<utc>-<tip12>-<who>-<pid>/
 # (summary.md, results.jsonl, meta.json, logs.tar.gz).
 #
 # Start it only as a harness background task, never with a trailing `&` inside
@@ -67,7 +72,7 @@ max_starts=200   # plan-included starts per day, all agents
 max_boxes=${GATE_MAX_BOXES:-10}   # concurrent boxes, account-wide, shared with gates
 type=large       # benches run on large only
 suite=matrix results_root=J:/gigglesdb-work/boat/bench
-tip='' base='' who='' ttl=7200 slot_wait=1800 build_snapshot=0 profile=0
+tip='' base='' who='' ttl=7200 slot_wait=1800 build_snapshot=0 profile=0 slow_disk=off min_fsync_us=2000
 targets=pg,giggles-sql clients=8,32 mixes=read,write,tx protocols=all opset=common data_root=''
 warmup=30 duration=300 repeats=3 rows=1000 server_cpus='' client_cpus=''
 while [ $# -gt 0 ]; do
@@ -80,6 +85,8 @@ while [ $# -gt 0 ]; do
     --ttl) ttl=$2; shift 2 ;;
     --slot-wait) slot_wait=$2; shift 2 ;;
     --profile) profile=1; shift ;;
+    --slow-disk) slow_disk=$2; shift 2 ;;   # off|require|auto (runner SLOW_DISK)
+    --min-fsync-us) min_fsync_us=$2; shift 2 ;;
     --build-snapshot) build_snapshot=1; shift ;;
     --targets) targets=$2; shift 2 ;;
     --clients) clients=$2; shift 2 ;;
@@ -96,7 +103,7 @@ while [ $# -gt 0 ]; do
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
-usage() { sed -n '2,40p' "$0" >&2; exit 2; }
+usage() { sed -n '2,47p' "$0" >&2; exit 2; }
 [ -n "$tip" ] && [ -n "$who" ] || usage
 [[ "$who" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "bad --who" >&2; exit 2; }
 who=bench-${who#bench-}
@@ -104,6 +111,11 @@ who=bench-${who#bench-}
 case "$suite" in matrix|agent-load) ;; *) echo "bad --suite (matrix|agent-load)" >&2; exit 2 ;; esac
 if [ "$suite" = agent-load ] && { [ "$profile" = 1 ] || [ "$build_snapshot" = 1 ]; }; then
   echo "agent-load refuses --profile and --build-snapshot" >&2; exit 2
+fi
+[[ "$slow_disk" =~ ^(off|require|auto)$ ]] || { echo "bad --slow-disk (off|require|auto)" >&2; exit 2; }
+[[ "$min_fsync_us" =~ ^[0-9]+$ ]] || { echo "bad --min-fsync-us (microseconds)" >&2; exit 2; }
+if [ "$slow_disk" != off ] && { [ "$suite" != matrix ] || [ "$build_snapshot" = 1 ]; }; then
+  echo "--slow-disk requires a matrix benchmark" >&2; exit 2
 fi
 if [ -n "$base" ] && { [ "$suite" != matrix ] || [ "$build_snapshot" = 1 ]; }; then
   echo "--base requires a matrix benchmark" >&2; exit 2
@@ -451,7 +463,7 @@ if [ "$suite" = agent-load ]; then
   bj exec "$box" --detach -- bash -lc "$envs bash /home/user/bench-agent-load-runner.sh > /home/user/bench.out 2>&1" >/dev/null
 else
 # 6. Run the bench in the background on the box and wait for it.
-envs="PROFILE=$profile TARGETS=$targets CLIENTS=$clients MIXES=$mixes PROTOCOLS=$protocols OPSET=$opset WARMUP=$warmup DURATION=$duration REPEATS=$repeats ROWS=$rows"
+envs="BOX_DEADLINE=$(( started + ttl - 900 )) SLOW_DISK=$slow_disk MIN_FSYNC_US=$min_fsync_us PROFILE=$profile TARGETS=$targets CLIENTS=$clients MIXES=$mixes PROTOCOLS=$protocols OPSET=$opset WARMUP=$warmup DURATION=$duration REPEATS=$repeats ROWS=$rows"
 [ -z "$base" ] || envs+=" BASE_COMMIT=$base"
 [ -n "$data_root" ] && envs+=" DATA_ROOT=$data_root"
 [ -n "$server_cpus" ] && envs+=" SERVER_CPUS=$server_cpus"
@@ -470,4 +482,5 @@ done
 cat "$run/summary.md"
 grc=$(echo "$st" | grep -o '^rc=[0-9]*' | cut -d= -f2)
 log "bench rc=$grc; results in $run"
+[ "$grc" != 6 ] || { log "fast disk (SLOW_DISK=require): no runs; see $run/summary.md"; exit 6; }
 [ "$grc" = 0 ] && exit 0 || exit 1

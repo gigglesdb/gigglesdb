@@ -17,7 +17,7 @@ set -eu
 name=${0##*/}
 case "$name" in
  sudo) [ "${1:-}" != -n ] || shift; exec "$@" ;;
- timeout) shift; shift; exec "$@" ;;
+ timeout) while [ "${1#-}" != "$1" ]; do shift; done; shift; exec "$@" ;;
  perf)
    case "$1" in
      record) while [ $# -gt 0 ]; do if [ "$1" = -o ]; then printf data > "$2"; break; fi; shift; done ;;
@@ -54,10 +54,13 @@ data=$work/data
 mkdir -p "$data/gg/nested"; echo 'rocks log' > "$data/gg/nested/LOG"
 bench_profile_rocksdb "$work/profiles" fake
 bench_profile_post "$work/profiles" fake "$deadline" "$work/progress"
-for file in wait-report-fake.md manifest-fake.txt offcpu-fake.folded futex-fake.txt flame-cpu-fake.svg flame-offcpu-fake.svg flame-wakeup-fake.svg pidstat-fake.txt iostat-fake.txt biolatency-fake.txt fsync-fake.txt syscount-fake.txt folded-fake.txt ran-fake ran-offcpu-fake rocksdb-fake/LOG-1; do
+for file in wait-report-fake.md manifest-fake.txt offcpu-fake.folded futex-fake.txt flame-cpu-fake.svg flame-offcpu-fake.svg flame-wakeup-fake.svg pidstat-fake.txt iostat-fake.txt biolatency-fake.txt fsync-fake.txt syscount-fake.txt threads0-fake.txt threads1-fake.txt threads2-fake.txt comm-fake.txt folded-fake.txt ran-fake ran-offcpu-fake rocksdb-fake/LOG-1; do
   test -f "$work/profiles/$file" || { echo "missing $file" >&2; exit 1; }
 done
 grep -q '## fake' "$work/profiles/wait-report-fake.md"
+grep -q '^proc ' "$work/profiles/threads2-fake.txt"
+# Per-thread lines need Linux /proc/<pid>/task (absent under Git Bash).
+[ ! -d /proc/$$/task ] || grep -Eq '^[0-9]+ [0-9]+ [0-9]+ ' "$work/profiles/threads2-fake.txt"
 grep -q 'capture=lock status=skipped' "$work/profiles/manifest-fake.txt"
 grep -q 'capture=offcpu status=ok' "$work/profiles/manifest-fake.txt"
 grep -q '^worker;' "$work/profiles/folded-fake.txt"
