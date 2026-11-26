@@ -2029,18 +2029,24 @@ fn fk_validation_at_fixed_snapshots_crosschecks_witnesses() {
         validate_pending(&f.db(), &mut txn, &mut pending).unwrap();
         drop(txn);
         s.execute("COMMIT", &[], None).unwrap();
-        // A parent deleted after the snapshot. PostgreSQL 18.6 fails the
-        // deferred check at COMMIT; the parent probe runs at the INSERT, so it
-        // fails there (published divergence, GD-0075 R5-77): same outcome, earlier.
+        // A parent deleted after the snapshot. PostgreSQL 18.6 accepts the
+        // INSERT (INSERT 0 1) and fails the deferred check at COMMIT with
+        // 40001 "could not serialize access due to concurrent update". The
+        // deferred FK is no longer probed at the INSERT (GD-0092), so the
+        // former GD-0075 R5-77 divergence (40001 at the INSERT) is gone.
         s.execute("BEGIN", &[], None).unwrap();
         s.v2_transaction = Some(f.db().begin(isolation));
         s.execute("SELECT count(*) FROM u", &[], None).unwrap();
         f.execute("DELETE FROM p WHERE id = 2");
         assert_eq!(
-            s.execute("INSERT INTO c VALUES(2,2)", &[], None),
+            s.execute("INSERT INTO c VALUES(2,2)", &[], None).map(|r| r.affected),
+            Ok(1)
+        );
+        assert_eq!(
+            s.execute("COMMIT", &[], None),
             Err(CoreError::Sql(SqlError::Conflict))
         );
-        s.execute("ROLLBACK", &[], None).unwrap();
+        assert!(s.execute("SELECT * FROM c WHERE id = 2", &[], None).unwrap().rows.is_empty());
     }
 }
 
