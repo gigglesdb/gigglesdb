@@ -560,6 +560,31 @@ async fn fk_postimages_survive_merge_upsert_and_referential_actions() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_reference_to_an_insert_does_not_hide_its_missing_parent() {
+    let (fixture, a, b) = Fixture::new().await;
+    a.batch_execute("CREATE TABLE sr4(id int PRIMARY KEY, parent int REFERENCES sr4(id)); \
+                     INSERT INTO sr4 VALUES (1,NULL)")
+        .await
+        .unwrap();
+    for sql in [
+        "INSERT INTO sr4 VALUES (2,3),(3,99)",
+        "INSERT INTO sr4 VALUES (2,3),(3,99) ON CONFLICT (id) DO UPDATE SET parent=excluded.parent",
+        "INSERT INTO sr4 SELECT g, CASE WHEN g=3 THEN 99 WHEN g=2 THEN 3 END
+         FROM generate_series(2,202) g WHERE g<>99
+         ON CONFLICT (id) DO UPDATE SET parent=excluded.parent",
+    ] {
+        let error = b.simple_query(sql).await.unwrap_err();
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code(), &SqlState::FOREIGN_KEY_VIOLATION, "{sql}");
+        assert_eq!(error.message(),
+            "insert or update on table \"sr4\" violates foreign key constraint \"sr4_parent_fkey\"");
+        assert_eq!(error.detail(), Some("Key (parent)=(99) is not present in table \"sr4\"."));
+        assert_ids(&b, "SELECT id FROM sr4", &[1]).await;
+    }
+    fixture.stop(a, b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multilevel_and_self_cascades_lock_each_deleted_key() {
     let (fixture, a, b) = Fixture::new().await;
     a.batch_execute(

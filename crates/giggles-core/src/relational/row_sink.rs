@@ -364,8 +364,8 @@ impl Relational {
             paged_insert::validate_append(
                 self,
                 &table,
-                range.start,
-                range.end,
+                range,
+                None,
                 sink,
                 Some(deferred),
                 clock,
@@ -936,7 +936,7 @@ impl Relational {
                 let table = table.as_ref().expect("conflict page target");
                 let old = before.rows.remove(&table.id).unwrap();
                 let new = &self.rows[&table.id];
-                actions.publish(self, sink, table, old, new.clone(), events, None, true, &sink.indexes(), version_end)?;
+                actions.publish(self, sink, table, old, new.clone(), events, None, &sink.indexes(), version_end)?;
                 return Ok(result);
             }
             if writing {

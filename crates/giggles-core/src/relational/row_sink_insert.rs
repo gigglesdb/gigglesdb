@@ -61,12 +61,15 @@ pub(super) fn execute<S: RowSink>(
     let mut actions = (foreign_keys && insert.updates_conflicts()
         || !insert.stable_referenced_keys(state, &table))
         .then(|| paged_dml::ActionWork::new(deferred.as_deref().cloned().unwrap_or_default()));
+    if foreign_keys && insert.updates_conflicts() && let Some(actions) = &mut actions {
+        actions.upsert = Some(paged_dml::UpsertChecks::new(table.id, first_version..version_end));
+    }
     let mut returned = scan::Retention::new(scan::WRITE_SOURCE_BYTES);
     let mut publish = |state: &mut Relational, sink: &mut S,
                        input: sql_insert::Insert| -> Result<(), CoreError> {
         let mut page = state.clone();
-        // At statement end an append can find its inserts by version range.
-        // An upsert instead queues inserts and changed references separately.
+        // Insert checks see all input at statement end. Upsert publication
+        // tracks which versions came from updates, including action rewrites.
         if foreign_keys && actions.is_none() {
             std::sync::Arc::make_mut(&mut page.ext).constraints.get_mut(&table.id).expect("FK constraints")
                 .retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
@@ -191,26 +194,38 @@ pub(super) fn execute<S: RowSink>(
             }
         }
     }
-    if let Some(actions) = actions {
-        actions.finish(state, sink, deferred.as_deref_mut())?;
-    } else if foreign_keys {
-        validate_append(state, &table, first_version, state.next_version, sink, deferred, clock)?;
+    let upsert = match actions {
+        Some(actions) => actions.finish(state, sink, deferred.as_deref_mut())?,
+        None => None,
+    };
+    if foreign_keys && upsert.as_ref().is_none_or(paged_dml::UpsertChecks::has_inserts) {
+        validate_append(state, &table, first_version..state.next_version, upsert.as_ref(), sink, deferred, clock)?;
     }
     output.finish(&mut result)?;
     Ok(result)
 }
 
-pub(crate) fn validate_append(state: &Relational, table: &TableDef, first_version: u64,
-    version_end: u64, sink: &mut impl RowSink, deferred: Option<&mut DeferralState>, clock: Option<&clock::ExecutionClock>,
+pub(super) fn validate_append(state: &Relational, table: &TableDef, versions: std::ops::Range<u64>,
+    upsert: Option<&paged_dml::UpsertChecks>, sink: &mut impl RowSink,
+    deferred: Option<&mut DeferralState>, clock: Option<&clock::ExecutionClock>,
 ) -> Result<(), CoreError> {
         if deferred.as_ref().is_some_and(|state| state.replica) { return Ok(()); }
         let immediate_mode = deferred.is_none();
         let mut immediate = DeferralState::default();
         let pending = match deferred { Some(deferred) => deferred, None => &mut immediate };
         let mut after = None;
-        while let Some((last, mut rows)) = sink.read_page(table, after.take())? {
+        loop {
+            // The upsert's RI checks must also see writes outside a task's
+            // visible rows, as they did when they were checked by pending key.
+            let next = if upsert.is_some() {
+                sink.fk_read_page(table, after.take())?
+            } else {
+                sink.read_page(table, after.take())?
+            };
+            let Some((last, mut rows)) = next else { break; };
             after = Some(last);
-            rows.retain(|_, row| row.version >= first_version && row.version < version_end);
+            rows.retain(|_, row| versions.contains(&row.version)
+                && upsert.is_none_or(|upsert| upsert.is_insert(row.version)));
             if rows.is_empty() { continue; }
             let mut page = state.clone();
             page.rows.insert(table.id, rows);
@@ -218,7 +233,10 @@ pub(crate) fn validate_append(state: &Relational, table: &TableDef, first_versio
             let mut retention = scan::Retention::new(scan::retention_limit());
             // Only new rows need outgoing witnesses. Hydrated parents are identical
             // in before/page; recursively expanding them walks self-FK chains.
-            let deferred_probes = (!immediate_mode && sink.defer_fk_parent_probes()).then_some(&*pending);
+            // A paged upsert records deferred obligations without probing
+            // their parents until SET CONSTRAINTS or COMMIT.
+            let deferred_probes = (!immediate_mode && (upsert.is_some() || sink.defer_fk_parent_probes()))
+                .then_some(&*pending);
             hydrate_with_probes(ParentRows::Changed(&constraints::FkPreimages::default()), &state.ext.constraints, &mut before, &mut page,
                 sink, &mut retention, true, &BTreeSet::new(), None, deferred_probes)?;
             rebuild(&mut page, &sink.indexes())?;

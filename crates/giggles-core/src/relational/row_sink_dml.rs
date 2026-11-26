@@ -591,7 +591,7 @@ pub(super) fn cascade(
             result.affected += batch.affected;
             output.extend(batch.rows)?;
             state.next_version = page.next_version;
-            work.publish(state, sink, &table, rows, page.rows.remove(&table.id).unwrap(), events, None, false, &descriptors, version_end)?;
+            work.publish(state, sink, &table, rows, page.rows.remove(&table.id).unwrap(), events, None, &descriptors, version_end)?;
         }
     }
     work.drain(state, sink, clock, &descriptors, version_end, false)?;
@@ -603,90 +603,192 @@ pub(super) fn cascade(
 }
 
 
+/// A bit per reserved version, allocated only when that version needs a mark.
+#[derive(Default)]
+struct VersionBits(Vec<u64>);
+
+impl VersionBits {
+    fn contains(&self, offset: u64) -> bool {
+        self.0.get((offset / 64) as usize)
+            .is_some_and(|word| word & (1 << (offset % 64)) != 0)
+    }
+
+    fn insert(&mut self, offset: u64, retention: &mut scan::Retention) -> R<()> {
+        let index = (offset / 64) as usize;
+        if index >= self.0.capacity() {
+            let capacity = (index + 1).next_power_of_two();
+            retention.charge((capacity - self.0.capacity()) * size_of::<u64>())?;
+            self.0.reserve_exact(capacity - self.0.len());
+        }
+        if index >= self.0.len() {
+            self.0.resize(index + 1, 0);
+        }
+        self.0[index] |= 1 << (offset % 64);
+        Ok(())
+    }
+}
+
+/// Distinguish existing-row postimages from inserts in the statement's version
+/// range. Track changed references by version until all pages and actions can
+/// supply witnesses, including forward self-references.
+pub(super) struct UpsertChecks {
+    table: u64,
+    versions: std::ops::Range<u64>,
+    updates: VersionBits,
+    references: BTreeMap<u64, VersionBits>,
+    has_inserts: bool,
+}
+
+impl UpsertChecks {
+    pub(super) fn new(table: u64, versions: std::ops::Range<u64>) -> Self {
+        Self { table, versions, updates: VersionBits::default(),
+            references: BTreeMap::new(), has_inserts: false }
+    }
+
+    pub(super) fn is_insert(&self, version: u64) -> bool {
+        self.versions.contains(&version) && !self.updates.contains(version - self.versions.start)
+    }
+
+    pub(super) fn has_inserts(&self) -> bool {
+        self.has_inserts
+    }
+
+    fn record_update(&mut self, old: u64, new: u64, retention: &mut scan::Retention) -> R<bool> {
+        if self.is_insert(old) { return Ok(false); }
+        let offset = new - self.versions.start;
+        self.updates.insert(offset, retention)?;
+        if self.versions.contains(&old) {
+            for versions in self.references.values_mut() {
+                if versions.contains(old - self.versions.start) {
+                    versions.insert(offset, retention)?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn record_reference(&mut self, constraint: u64, version: u64, retention: &mut scan::Retention) -> R<()> {
+        self.references.entry(constraint).or_default().insert(version - self.versions.start, retention)
+    }
+
+    fn needs_reference_check(&self, versions: &VersionBits, version: u64) -> bool {
+        self.versions.contains(&version) && versions.contains(version - self.versions.start)
+    }
+}
+
 pub(super) struct ActionWork {
     queue: std::collections::VecDeque<(u64, SqlRow, Option<SqlRow>)>,
     visited: BTreeSet<(u64, u64)>,
     retention: scan::Retention,
     pending: DeferralState,
     immediate: DeferralState,
+    pub(super) upsert: Option<UpsertChecks>,
 }
 impl ActionWork {
     pub(super) fn new(pending: DeferralState) -> Self {
-        Self { queue: std::collections::VecDeque::new(), visited: BTreeSet::new(),
-            retention: scan::Retention::new(scan::retention_limit()), pending,
-            immediate: DeferralState::default() }
+        // Inherited deferred keys already occupy memory. Include them in the
+        // ledger so a rekey can release its old key without crediting other work.
+        let inherited = pending.pending.values().flatten().map(|key| Self::key_bytes(key)).sum::<usize>();
+        let mut retention = scan::Retention::new(scan::retention_limit().saturating_add(inherited));
+        retention.charge(inherited).expect("inherited keys fit their own allowance");
+        Self { queue: std::collections::VecDeque::new(), visited: BTreeSet::new(), retention,
+            pending, immediate: DeferralState::default(), upsert: None }
     }
+
+    fn key_bytes(key: &[u8]) -> usize {
+        key.len() + 96
+    }
+
     pub(super) fn finish(mut self, state: &Relational, sink: &mut impl RowSink,
         deferred: Option<&mut DeferralState>,
-    ) -> Result<(), CoreError> {
-        Self::validate_pending(state, &mut self.immediate, sink)?;
+    ) -> Result<Option<UpsertChecks>, CoreError> {
+        let updates = self.upsert.as_ref().map(|upsert| (upsert, &mut self.pending));
+        Self::validate_pending(state, sink, &self.immediate, updates)?;
         if let Some(deferred) = deferred { *deferred = self.pending; }
-        else { Self::validate_pending(state, &mut self.pending, sink)?; }
-        Ok(())
+        else { Self::validate_pending(state, sink, &self.pending, None)?; }
+        Ok(self.upsert)
     }
-    // Action checks already carry child keys. Probe final physical parents
-    // directly instead of certifying a transient parent sidecar per child.
-    fn validate_pending(state: &Relational, pending: &mut DeferralState,
-        sink: &mut impl RowSink,
+
+    // Outgoing upsert checks select final rows by version. Build their physical
+    // keys one page at a time, retaining only transaction-deferred obligations.
+    fn validate_pending(state: &Relational, sink: &mut impl RowSink, pending: &DeferralState,
+        mut updates: Option<(&UpsertChecks, &mut DeferralState)>,
     ) -> Result<(), CoreError> {
         for table in state.tables.values() {
-            let checks = pending.pending.iter().filter_map(|((id, table_id), keys)| {
-                if *table_id != table.id { return None; }
-                let c = state.ext.constraints.get(table_id)?.iter().find(|c| c.id == *id)?;
-                Some((c, keys))
+            let upsert = updates.as_ref().map(|(upsert, _)| *upsert).filter(|upsert| upsert.table == table.id);
+            let checks = state.table_constraints(table.id).iter().filter_map(|c| {
+                let check = (c.id, table.id);
+                let keys = pending.pending.get(&check).filter(|keys| !keys.is_empty());
+                let versions = upsert.and_then(|upsert| Some((upsert, upsert.references.get(&c.id)?)));
+                (keys.is_some() || versions.is_some()).then_some((c, check, keys, versions))
             }).collect::<Vec<_>>();
             if checks.is_empty() { continue; }
             let mut after = None;
             while let Some((last, rows)) = sink.fk_read_page(table, after.take())? {
                 after = Some(last);
-                for (c, keys) in &checks {
-                    let ConstraintKind::ForeignKey { columns, ref_table, ref_columns, .. } = &c.kind
-                        else { continue; };
-                    let parent = state.tables.values().find(|t| t.id == *ref_table)
-                        .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
-                    let positions = columns.iter().zip(ref_columns).map(|(child, parent_id)| (
-                        table.columns.iter().position(|c| c.id == *child).unwrap(),
-                        parent.columns.iter().position(|c| c.id == *parent_id).unwrap(),
-                    )).collect::<Vec<_>>();
-                    let equality = collation_keys::Key::new(state, parent, ref_columns, None)
-                        .map_err(CoreError::Sql)?;
-                    for (key, row) in &rows {
-                        if !keys.contains(key) { continue; }
-                        crate::cancellation::check()?;
-                        if positions.iter().any(|(i, _)| row.values[*i] == Value::Null) { continue; }
-                        let missing = || {
-                            if let Some(values) = pending.parent_details.get(&(c.id, table.id))
-                                .and_then(|details| details.get(key))
-                            {
-                                let parent_positions = positions.iter().map(|(_, i)| *i).collect::<Vec<_>>();
-                                constraints::still_referenced(state, table, parent, &c.name, &parent_positions, values, false)
-                            } else {
-                                let child_positions = positions.iter().map(|(i, _)| *i).collect::<Vec<_>>();
-                                constraints::missing_parent(state, table, parent, &c.name, &child_positions, row)
-                            }
-                        };
-                        let values = positions.iter().map(|(i, j)| query::constraint_key(
-                            &row.values[*i], &table.columns[*i].data_type, &parent.columns[*j].data_type,
-                        )).collect::<R<Option<Vec<_>>>>().map_err(CoreError::Sql)?
-                            .ok_or_else(|| CoreError::Sql(missing()))?;
-                        let mut found = false;
-                        let tuple = equality.values(&values).map_err(CoreError::Sql)?;
-                        sink.fk_lookup(parent, ref_columns,
-                            if equality.nondeterministic() { None } else { Some(&values) }, true,
-                            &mut |candidate| Ok(equality.tuple(&candidate.values)? == tuple),
-                            &mut |_| {
-                            found = true;
-                            Ok(())
-                        })?;
-                        if !found {
-                            return Err(CoreError::Sql(missing()));
-                        }
-                    }
+                for &(c, check, keys, versions) in &checks {
+                    let matches_version = |row: &SqlRow| versions.is_some_and(|(upsert, versions)|
+                        upsert.needs_reference_check(versions, row.version));
+                    let deferred = if versions.is_some()
+                        && let Some((_, deferred)) = &mut updates
+                        && deferred.deferred(c.id, &c.kind)
+                    {
+                        deferred.pending.entry(check).or_default().extend(rows.iter()
+                            .filter(|(_, row)| matches_version(row)).map(|(key, _)| key.clone()));
+                        true
+                    } else { false };
+                    Self::validate_references(state, table, c, pending.parent_details.get(&check),
+                        rows.iter().filter(|(key, row)| keys.is_some_and(|keys| keys.contains(*key))
+                            || !deferred && matches_version(row)), sink)?;
                 }
             }
         }
-        pending.pending.clear();
-        pending.parent_details.clear();
+        Ok(())
+    }
+
+    // Probe final physical parents directly, using the same KEY SHARE and
+    // snapshot checks for queued actions and version-selected updates.
+    fn validate_references<'a>(
+        state: &Relational, table: &TableDef, c: &Constraint,
+        details: Option<&BTreeMap<Vec<u8>, Arc<[Value]>>>,
+        rows: impl Iterator<Item = (&'a Vec<u8>, &'a SqlRow)>, sink: &mut impl RowSink,
+    ) -> Result<(), CoreError> {
+        let ConstraintKind::ForeignKey { columns, ref_table, ref_columns, .. } = &c.kind
+            else { return Ok(()); };
+        let mut rows = rows.peekable();
+        if rows.peek().is_none() { return Ok(()); }
+        let parent = state.tables.values().find(|t| t.id == *ref_table)
+            .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
+        let positions = columns.iter().zip(ref_columns).map(|(child, parent_id)| (
+            table.columns.iter().position(|c| c.id == *child).unwrap(),
+            parent.columns.iter().position(|c| c.id == *parent_id).unwrap(),
+        )).collect::<Vec<_>>();
+        let equality = collation_keys::Key::new(state, parent, ref_columns, None)
+            .map_err(CoreError::Sql)?;
+        for (key, row) in rows {
+            crate::cancellation::check()?;
+            if positions.iter().any(|(i, _)| row.values[*i] == Value::Null) { continue; }
+            let missing = || {
+                if let Some(values) = details.and_then(|details| details.get(key)) {
+                    let parent_positions = positions.iter().map(|(_, i)| *i).collect::<Vec<_>>();
+                    constraints::still_referenced(state, table, parent, &c.name, &parent_positions, values, false)
+                } else {
+                    let child_positions = positions.iter().map(|(i, _)| *i).collect::<Vec<_>>();
+                    constraints::missing_parent(state, table, parent, &c.name, &child_positions, row)
+                }
+            };
+            let values = positions.iter().map(|(i, j)| query::constraint_key(
+                &row.values[*i], &table.columns[*i].data_type, &parent.columns[*j].data_type,
+            )).collect::<R<Option<Vec<_>>>>().map_err(CoreError::Sql)?
+                .ok_or_else(|| CoreError::Sql(missing()))?;
+            let mut found = false;
+            let tuple = equality.values(&values).map_err(CoreError::Sql)?;
+            sink.fk_lookup(parent, ref_columns,
+                if equality.nondeterministic() { None } else { Some(&values) }, true,
+                &mut |candidate| Ok(equality.tuple(&candidate.values)? == tuple),
+                &mut |_| { found = true; Ok(()) })?;
+            if !found { return Err(CoreError::Sql(missing())); }
+        }
         Ok(())
     }
     pub(super) fn drain(&mut self, state: &mut Relational, sink: &mut impl RowSink,
@@ -776,8 +878,9 @@ impl ActionWork {
                             parent_values = Some(Arc::<[Value]>::from(values.clone()));
                         }
                         for key in rows.keys() {
-                            self.retention.charge(key.len() + 96).map_err(CoreError::Sql)?;
-                            pending.pending.entry(check).or_default().insert(key.clone());
+                            if pending.pending.entry(check).or_default().insert(key.clone()) {
+                                self.retention.charge(Self::key_bytes(key)).map_err(CoreError::Sql)?;
+                            }
                             if let Some(values) = &parent_values {
                                 pending.parent_details.entry(check).or_default()
                                     .insert(key.clone(), Arc::clone(values));
@@ -835,7 +938,7 @@ impl ActionWork {
                             }
                         }
                     }
-                    self.publish(state, sink, &child, rows, changed, events, (!set_default).then_some(c.id), false, descriptors, version_end)?;
+                    self.publish(state, sink, &child, rows, changed, events, (!set_default).then_some(c.id), descriptors, version_end)?;
                 }
                 // SET DEFAULT has its own immediate NO ACTION check of the
                 // old key. Keep child-side checks for references to new keys.
@@ -864,35 +967,21 @@ impl ActionWork {
         Ok(())
     }
 
-    fn queue_insert_checks(&mut self, state: &Relational, table: &TableDef,
-        before: &DdlRows, after: &DdlRows, updated: &BTreeSet<u64>,
+    fn queue_child_check(&mut self, table: u64, key: &[u8], constraint: &Constraint,
+        changed: bool, by_version: bool,
     ) -> Result<(), CoreError> {
-        if self.pending.replica { return Ok(()); }
-        for constraint in state.table_constraints(table.id) {
-            let ConstraintKind::ForeignKey { columns, .. } = &constraint.kind else { continue; };
-            let positions = constraints::id_positions(table, columns).map_err(CoreError::Sql)?;
-            for (key, row) in after {
-                if before.get(key) == Some(row) || updated.contains(&row.version)
-                    || positions.iter().any(|i| row.values[*i] == Value::Null)
-                { continue; }
-                crate::cancellation::check()?;
-                self.queue_child_check(table.id, key, constraint, true)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn queue_child_check(&mut self, table: u64, key: &[u8], constraint: &Constraint, changed: bool) -> Result<(), CoreError> {
         let pending = if changed && self.pending.deferred(constraint.id, &constraint.kind) {
             &mut self.pending
         } else {
             &mut self.immediate
         };
         let check = (constraint.id, table);
-        let keys = pending.pending.entry(check).or_default();
-        if !keys.contains(key) {
-            self.retention.charge(key.len() + 96).map_err(CoreError::Sql)?;
-            keys.insert(key.to_vec());
+        if !by_version {
+            let keys = pending.pending.entry(check).or_default();
+            if !keys.contains(key) {
+                self.retention.charge(Self::key_bytes(key)).map_err(CoreError::Sql)?;
+                keys.insert(key.to_vec());
+            }
         }
         if let Some(details) = pending.parent_details.get_mut(&check) {
             details.remove(key);
@@ -900,10 +989,24 @@ impl ActionWork {
         Ok(())
     }
 
+    fn move_pending_key(retention: &mut scan::Retention, keys: &mut BTreeSet<Vec<u8>>,
+        old: &[u8], new: Option<&[u8]>,
+    ) -> Result<(), CoreError> {
+        if new == Some(old) || !keys.remove(old) { return Ok(()); }
+        retention.release(Self::key_bytes(old));
+        if let Some(new) = new
+            && !keys.contains(new)
+        {
+            retention.charge(Self::key_bytes(new)).map_err(CoreError::Sql)?;
+            keys.insert(new.to_vec());
+        }
+        Ok(())
+    }
+
     #[expect(clippy::too_many_arguments, reason = "bounded action page and statement reservation")]
     pub(super) fn publish(&mut self, state: &Relational, sink: &mut impl RowSink, table: &TableDef,
         before: DdlRows, after: DdlRows, mut events: Vec<constraints::Event>, force: Option<u64>,
-        check_inserts: bool, descriptors: &[secondary_index::Descriptor], version_end: u64,
+        descriptors: &[secondary_index::Descriptor], version_end: u64,
     ) -> Result<(), CoreError> {
         if state.next_version > version_end { return Err(CoreError::Sql(SqlError::Limit)); }
         let captured = events.iter().map(|e| e.old.version).collect::<BTreeSet<_>>();
@@ -912,9 +1015,12 @@ impl ActionWork {
                 events.push(constraints::Event { table: table.id, old: old.clone(), new: after.get(key).cloned() });
             }
         }
-        let updated = check_inserts.then(|| events.iter().filter_map(|event| event.new.as_ref().map(|row| row.version))
-            .collect::<BTreeSet<_>>());
         for constraints::Event { old, new, .. } in events {
+            let mut upsert = self.upsert.as_mut().filter(|upsert| upsert.table == table.id);
+            let existing = if let (Some(upsert), Some(row)) = (&mut upsert, &new) {
+                upsert.record_update(old.version, row.version, &mut self.retention).map_err(CoreError::Sql)?
+            } else { false };
+            let track_upsert = upsert.is_some();
             if force.is_none() && new.as_ref().is_some_and(|row| row.values == old.values)
                 || !state.ext.constraints.iter().any(|(owner, cs)| cs.iter().any(|c|
                     matches!(&c.kind, ConstraintKind::ForeignKey { ref_table, .. }
@@ -930,9 +1036,8 @@ impl ActionWork {
             self.immediate.move_parent_details(table.id, key, new_key.as_deref());
             for checks in [&mut self.pending.pending, &mut self.immediate.pending] {
                 for ((_, id), keys) in checks {
-                    if *id == table.id && keys.remove(key) && let Some(new_key) = &new_key {
-                        self.retention.charge(new_key.len() + 96).map_err(CoreError::Sql)?;
-                        keys.insert(new_key.clone());
+                    if *id == table.id {
+                        Self::move_pending_key(&mut self.retention, keys, key, new_key.as_deref())?;
                     }
                 }
             }
@@ -945,19 +1050,94 @@ impl ActionWork {
                         row.values[i] != old.values[i]
                     });
                     if force != Some(c.id) && !changed { continue; }
-                    self.queue_child_check(table.id, new_key.as_ref().unwrap(), c, changed)?;
+                    if changed && existing {
+                        self.upsert.as_mut().unwrap().record_reference(c.id, row.version, &mut self.retention)
+                            .map_err(CoreError::Sql)?;
+                    }
+                    // Inserts, including action-rewritten inserts, are checked
+                    // by the append scan. Explicit action rechecks keep their timing.
+                    self.queue_child_check(table.id, new_key.as_ref().unwrap(), c, changed,
+                        track_upsert && changed)?;
                 }
             }
             self.queue.push_back((table.id, old.clone(), new));
         }
-        // Move previous checks off vacated PKs before queuing fresh inserts
-        // that may have reused those keys on this page.
-        if let Some(updated) = updated {
-            self.queue_insert_checks(state, table, &before, &after, &updated)?;
+        if let Some(upsert) = self.upsert.as_mut().filter(|upsert| upsert.table == table.id)
+            && !upsert.has_inserts
+        {
+            upsert.has_inserts = after.iter().any(|(key, row)|
+                upsert.is_insert(row.version) && before.get(key) != Some(row));
         }
         sink.check_occupancy(table, &before, &after)?;
         sink.apply_indexes(table, Some(table), &before, &after, descriptors)?;
         sink.apply(table, &before, &after)
+    }
+}
+
+#[cfg(test)]
+mod upsert_fk_tests {
+    use super::*;
+
+    struct AppendSink;
+
+    impl RowSink for AppendSink {
+        fn scan(&mut self, _: &TableDef, _: &mut dyn FnMut(SqlRow) -> R<()>) -> Result<(), CoreError> {
+            panic!("publish should not scan for parents");
+        }
+
+        fn apply(&mut self, _: &TableDef, _: &DdlRows, _: &DdlRows) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn inserted_rows_do_not_grow_the_upsert_fk_retention() {
+        let mut state = Relational::default();
+        for sql in [
+            "CREATE TABLE parent(id int PRIMARY KEY)",
+            "CREATE TABLE child(id int PRIMARY KEY, p int REFERENCES parent(id))",
+        ] {
+            let ddl = Prepared::parse(sql, 1, state.epoch).unwrap();
+            state.execute(&ddl, &[], None).unwrap();
+        }
+        let table = &state.tables["child"];
+        let start = state.next_version;
+        let end = start + 1_000;
+        let mut actions = ActionWork::new(DeferralState::default());
+        actions.upsert = Some(UpsertChecks::new(table.id, start..end));
+        let mut sink = AppendSink;
+        for first in (start..end).step_by(200) {
+            let rows = (first..first + 200).map(|version| {
+                let values = vec![Value::Int(version as i64), Value::Int(1)];
+                (pk(table, &values).unwrap(), SqlRow { values, version })
+            }).collect();
+            actions.publish(&state, &mut sink, table, DdlRows::new(), rows,
+                Vec::new(), None, &[], end).unwrap();
+            assert_eq!(actions.retention.used(), 0);
+            assert!(actions.immediate.pending.is_empty());
+            assert!(actions.pending.pending.is_empty());
+        }
+        let checks = actions.upsert.unwrap();
+        assert!(checks.has_inserts());
+        assert!((start..end).all(|version| checks.is_insert(version)));
+        assert_eq!(checks.updates.0.capacity(), 0);
+        assert!(checks.references.is_empty());
+    }
+
+    #[test]
+    fn moving_an_fk_check_replaces_its_key_charge() {
+        let old = vec![1];
+        let new = vec![2; 8];
+        let mut keys = BTreeSet::from([old.clone()]);
+        let new_bytes = ActionWork::key_bytes(&new);
+        let mut retention = scan::Retention::new(new_bytes);
+        retention.charge(ActionWork::key_bytes(&old)).unwrap();
+        ActionWork::move_pending_key(&mut retention, &mut keys, &old, Some(&new)).unwrap();
+        assert_eq!(keys, BTreeSet::from([new.clone()]));
+        assert_eq!(retention.used(), new_bytes);
+        ActionWork::move_pending_key(&mut retention, &mut keys, &new, None).unwrap();
+        assert!(keys.is_empty());
+        assert_eq!(retention.used(), 0);
     }
 }
 

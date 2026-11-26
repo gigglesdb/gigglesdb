@@ -1209,3 +1209,72 @@ fn single_transaction_key_change_away_and_back_repeatable_read() {
     fixed_snapshot_chain(SqlIsolation::RepeatableRead,
         &["BEGIN", "UPDATE p SET code=20 WHERE id=1", "UPDATE p SET code=10 WHERE id=1", "COMMIT"], "40001");
 }
+
+#[test]
+fn self_reference_to_an_insert_does_not_hide_its_missing_parent() {
+    let fixture = Fixture::new(
+        "CREATE TABLE sr4(id int PRIMARY KEY, parent int REFERENCES sr4(id));
+         INSERT INTO sr4 VALUES (1,NULL)",
+    );
+    let mut session = fixture.admin().sql_session();
+    for sql in [
+        "INSERT INTO sr4 VALUES (2,3),(3,99)",
+        "INSERT INTO sr4 VALUES (2,3),(3,99) ON CONFLICT (id) DO UPDATE SET parent=excluded.parent",
+        "INSERT INTO sr4 SELECT g, CASE WHEN g=3 THEN 99 WHEN g=2 THEN 3 END
+         FROM generate_series(2,202) g WHERE g<>99
+         ON CONFLICT (id) DO UPDATE SET parent=excluded.parent",
+    ] {
+        let error = session.execute(sql, &[], None).unwrap_err();
+        assert_eq!(giggles_core::sqlstate(&error), "23503", "{sql}: {error:?}");
+        assert_eq!(rows(&mut session, "SELECT id FROM sr4"), [vec![1]]);
+    }
+}
+
+#[test]
+fn paged_upsert_checks_final_references_and_carries_deferred_checks_on_rekey() {
+    let fixture = Fixture::new(
+        "CREATE TABLE sr4(id int PRIMARY KEY, parent int REFERENCES sr4(id));
+         INSERT INTO sr4 VALUES (1,NULL);
+         CREATE TABLE dp(id int PRIMARY KEY);
+         CREATE TABLE dc(id int PRIMARY KEY, p int REFERENCES dp(id) DEFERRABLE INITIALLY DEFERRED);
+         INSERT INTO dp VALUES(1); INSERT INTO dc VALUES(1,1)",
+    );
+    let mut session = fixture.admin().sql_session();
+    ok(&mut session, "INSERT INTO sr4 SELECT g, CASE WHEN g=1 THEN 202 END
+        FROM generate_series(1,202) g ON CONFLICT (id) DO UPDATE SET parent=excluded.parent");
+    assert_eq!(rows(&mut session, "SELECT parent FROM sr4 WHERE id=1"), [vec![202]]);
+
+    ok(&mut session, "BEGIN");
+    ok(&mut session, "INSERT INTO dc SELECT g, CASE WHEN g=1 THEN 99 ELSE 1 END
+        FROM generate_series(1,202) g ON CONFLICT (id) DO UPDATE SET id=303, p=excluded.p");
+    ok(&mut session, "UPDATE dc SET id=304 WHERE id=303");
+    let error = session.execute("COMMIT", &[], None).unwrap_err();
+    assert_eq!(giggles_core::sqlstate(&error), "23503", "{error:?}");
+    assert_eq!(rows(&mut session, "SELECT id FROM dc"), [vec![1]]);
+}
+
+#[test]
+fn paged_upsert_retains_outbound_checks_when_cascade_rewrites_the_row() {
+    let fixture = Fixture::new(
+        "CREATE TABLE p(id int PRIMARY KEY);
+         CREATE TABLE ar(id int PRIMARY KEY, parent int REFERENCES ar(id) ON UPDATE CASCADE,
+             p int REFERENCES p(id));
+         INSERT INTO p VALUES(1); INSERT INTO ar VALUES(1,NULL,1)",
+    );
+    let mut session = fixture.admin().sql_session();
+    let upsert = |invalid| format!(
+        "INSERT INTO ar SELECT g, CASE WHEN g=2 THEN 1 END, CASE WHEN g=2 THEN {invalid} ELSE 1 END
+         FROM generate_series(1,201) g ORDER BY g DESC
+         ON CONFLICT (id) DO UPDATE SET id=CASE WHEN ar.id=1 THEN 1000 ELSE ar.id END, p=excluded.p"
+    );
+    let error = session.execute(&upsert(99), &[], None).unwrap_err();
+    assert_eq!(giggles_core::sqlstate(&error), "23503", "{error:?}");
+    assert_eq!(rows(&mut session, "SELECT id FROM ar"), [vec![1]]);
+
+    ok(&mut session, "INSERT INTO ar VALUES (2,1,1)");
+    let error = session.execute(&upsert(99), &[], None).unwrap_err();
+    assert_eq!(giggles_core::sqlstate(&error), "23503", "{error:?}");
+    assert_eq!(rows(&mut session, "SELECT id FROM ar ORDER BY id"), [vec![1], vec![2]]);
+    ok(&mut session, &upsert(1));
+    assert_eq!(rows(&mut session, "SELECT parent FROM ar WHERE id=2"), [vec![1000]]);
+}
