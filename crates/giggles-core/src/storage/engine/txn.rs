@@ -1567,6 +1567,26 @@ impl Drop for Transaction {
 }
 type OwnEntry<'a> = (&'a (Keyspace, Vec<u8>), &'a Option<Vec<u8>>);
 type OwnIter<'a> = Box<dyn Iterator<Item = OwnEntry<'a>> + 'a>;
+/// Merge of the snapshot base (`VersionedRange`) and the transaction's own
+/// writes (a `BTreeMap` range with exact bounds).
+///
+/// GD-0084 Q40: the merge assumes the base arrives in user-key order and that
+/// both sides apply the same bounds, which holds only over prefix-free regions.
+/// Where the base holds prefix-related visible keys (Catalog name and role
+/// membership keys), an own delete or overwrite of the shorter key can be
+/// passed before the base reaches it, so the committed value is emitted again.
+/// Such callers must reapply `catalog_writes()` to a keyed result. Inside a DDL
+/// rekey transaction (ADD/DROP PRIMARY KEY under the same table id) the base
+/// holds the old arity and the overlay the new one plus deletes of the old
+/// keys. The base's start bounds and `Included` end are exact for that layout
+/// (`VersionedRange` drops proper prefixes of the start key, an excluded start
+/// key itself, and extensions of an `Included` end key), so an old key outside
+/// the overlay's exact range is never emitted: for example `DROP CONSTRAINT
+/// t_pkey; ADD PRIMARY KEY (a)` on `(a, b)` then `WHERE a = 5` no longer counts
+/// the old `tid||5||1`. Emission order and end bounds' omission of proper
+/// prefixes of the end key stay layout-dependent; in a rekey transaction the
+/// omitted base keys are old-arity keys the overlay deleted. See the module
+/// docs of `mvcc.rs`.
 pub(crate) struct TxnScan<'a> {
     base: std::iter::Peekable<mvcc::VersionedRange<'a>>,
     own: std::iter::Peekable<OwnIter<'a>>,

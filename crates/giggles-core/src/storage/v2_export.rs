@@ -142,14 +142,31 @@ fn export_inner(
         (2, Keyspace::Rows),
         (3, Keyspace::Index),
     ] {
-        for item in mvcc::VersionedRange::new(
+        let records = mvcc::VersionedRange::new(
             read.as_ref(),
             ks,
             Bound::Unbounded,
             Bound::Unbounded,
             Direction::Forward,
             ts,
-        )? {
+        )?;
+        // `verify` requires strictly increasing user keys. VersionedRange emits
+        // physical order, which differs from user-key order where one stored key
+        // is a proper prefix of another (GD-0084 Q40). Catalog keys are not
+        // prefix-free (name keys `3|s|00` and `3|s|00|t|00`, membership keys with
+        // and without a grantor), so sort that keyspace. Its records are
+        // buffered in memory, bounded by the catalog's size, which the
+        // CatalogCache already holds in memory as decoded maps. Rows and Index
+        // keys visible at one snapshot share one arity per table or index and
+        // are prefix-free, so they stream in order.
+        if ks == Keyspace::Catalog {
+            let records = records.collect::<Result<BTreeMap<_, _>, _>>()?;
+            for (key, value) in records {
+                write_record(&mut file, &mut hash, tag, &key, &value)?;
+            }
+            continue;
+        }
+        for item in records {
             let (key, value) = item?;
             write_record(&mut file, &mut hash, tag, &key, &value)?;
         }

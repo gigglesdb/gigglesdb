@@ -929,3 +929,49 @@ fn role_cache_decoded_misses_keep_raw_errors() {
         expected
     );
 }
+
+/// GD-0084 Q40: the bootstrap-grantor key `9|g|00|u|00` is a proper prefix of
+/// the named-grantor key `9|g|00|u|00|peer|00`, and both are live, so the
+/// TxnScan overlay merge alone would re-emit the committed bootstrap edge after
+/// this transaction deleted or replaced it. `load_txn` must stay exact.
+mod q40_exact_key_boundary {
+    use super::*;
+    use crate::storage::engine::{kv::Keyspace, txn::Isolation};
+
+    #[test]
+    fn load_txn_sees_own_writes_to_a_prefix_membership_key() {
+        let dir = Directory::new();
+        let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
+        let db = admin.test_v2();
+        let roles = admin.roles();
+        for name in ["postgres", "g", "u", "peer"] {
+            roles.create(NewRole { superuser: name == "postgres", ..role(name) }).unwrap();
+        }
+        let admin_option = MembershipOptions { admin: Some(true), ..Default::default() };
+        roles.grant_membership_options("g", "peer", "postgres", admin_option).unwrap();
+        roles.grant_membership_options("g", "u", "peer", Default::default()).unwrap();
+        roles.grant_membership("g", "u").unwrap();
+        let bootstrap = b"member/g\0u".to_vec();
+        let named = b"member/g\0u\0peer".to_vec();
+        let committed = engine::load_txn(&mut db.begin(Isolation::ReadCommitted)).unwrap();
+        assert!(committed.0.contains_key(&bootstrap) && committed.0.contains_key(&named));
+        let encoded = engine::encode_key(&bootstrap).unwrap();
+        assert!(engine::encode_key(&named).unwrap().starts_with(&encoded));
+
+        let mut deleted = db.begin(Isolation::ReadCommitted);
+        deleted.delete(Keyspace::Catalog, encoded.clone()).unwrap();
+        let image = engine::load_txn(&mut deleted).unwrap();
+        assert!(!image.0.contains_key(&bootstrap), "deleted edge reappeared");
+        assert_eq!(image.0.get(&named), committed.0.get(&named));
+
+        let mut replaced = db.begin(Isolation::ReadCommitted);
+        let edge = MembershipEdge {
+            role: "g".into(), member: "u".into(), grantor: "bootstrap".into(),
+            admin: true, inherit: true, set: true,
+        };
+        let value = [vec![1], json(&edge).unwrap()].concat();
+        replaced.put(Keyspace::Catalog, encoded, value.clone()).unwrap();
+        let image = engine::load_txn(&mut replaced).unwrap();
+        assert_eq!(image.0.get(&bootstrap), Some(&value[1..].to_vec()), "stale edge value won");
+    }
+}

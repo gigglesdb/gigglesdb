@@ -457,3 +457,72 @@ fn restore_refuses_export_with_write_fence_bit() {
     assert!(!root.join("restored").exists());
     fs::remove_dir_all(root).unwrap();
 }
+
+/// GD-0084 Q40: Catalog user keys are not prefix-free (see `export_inner`).
+mod q40_exact_key_boundary {
+    use super::*;
+    use crate::roles::MembershipOptions;
+
+    fn round_trip(source: &Admin, root: &std::path::Path) -> Admin {
+        source.export(root.join("backup")).unwrap();
+        Admin::verify_export(root.join("backup")).unwrap();
+        Admin::restore(root.join("backup"), root.join("restored"), Limits::default()).unwrap()
+    }
+
+    /// A public relation named like a schema has the name key `3|s|00`, a proper
+    /// prefix of `3|s|00|t|00` for `s.t`, and both are live.
+    #[test]
+    fn export_orders_a_public_relation_named_like_a_schema() {
+        let root = directory();
+        fs::create_dir(&root).unwrap();
+        let source = Admin::create_engine(root.join("db"), Limits::default(), Engine::V2).unwrap();
+        let mut sql = source.sql_session();
+        for statement in [
+            "CREATE SCHEMA s",
+            "CREATE TABLE s.t (id BIGINT PRIMARY KEY)",
+            "CREATE TABLE s (id BIGINT PRIMARY KEY)",
+            "INSERT INTO s.t VALUES (1)",
+            "INSERT INTO s VALUES (2)",
+        ] {
+            sql.execute(statement, &[], None).unwrap();
+        }
+        let restored = round_trip(&source, &root);
+        let mut session = restored.sql_session();
+        for (query, expected) in [("SELECT id FROM s.t", 1), ("SELECT id FROM s", 2)] {
+            let rows = session.execute(query, &[], None).unwrap().rows;
+            assert_eq!(rows.len(), 1, "{query}");
+            assert_eq!(rows[0].values, vec![Value::Int(expected)], "{query}");
+        }
+        drop((session, sql, restored, source));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The bootstrap-grantor membership key `9|g|00|u|00` is a proper prefix of
+    /// the named-grantor key `9|g|00|u|00|peer|00`, and both are live.
+    #[test]
+    fn export_orders_bootstrap_and_named_grantor_memberships() {
+        let root = directory();
+        fs::create_dir(&root).unwrap();
+        let source = Admin::create_engine(root.join("db"), Limits::default(), Engine::V2).unwrap();
+        let roles = source.roles();
+        for name in ["postgres", "g", "u", "peer"] {
+            roles
+                .create(NewRole { name: name.into(), superuser: name == "postgres", ..Default::default() })
+                .unwrap();
+        }
+        let admin = MembershipOptions { admin: Some(true), ..Default::default() };
+        roles.grant_membership_options("g", "peer", "postgres", admin).unwrap();
+        roles.grant_membership_options("g", "u", "peer", Default::default()).unwrap();
+        roles.grant_membership("g", "u").unwrap();
+        let mut before = roles.edges().unwrap();
+        assert_eq!(before.iter().filter(|e| e.role == "g" && e.member == "u").count(), 2);
+        drop(roles);
+        let restored = round_trip(&source, &root);
+        let mut after = restored.roles().edges().unwrap();
+        before.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        after.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        assert_eq!(after, before);
+        drop((restored, source));
+        fs::remove_dir_all(root).unwrap();
+    }
+}

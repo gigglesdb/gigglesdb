@@ -39,6 +39,10 @@ pub(crate) fn pk_bytes(values: &[Value]) -> Result<Vec<u8>, CodecError> {
     pk_bytes_iter(values.iter())
 }
 
+/// Each component is self-delimiting (type tag plus a fixed width, an
+/// escaped `00 00`-terminated body, or a terminated numeric body), so keys of
+/// one arity are prefix-free. VersionedRange and TxnScan rely on this
+/// (GD-0084 Q40); a different arity under the same table id is prefix-related.
 pub(crate) fn pk_bytes_iter<'a>(
     values: impl ExactSizeIterator<Item = &'a Value> + Clone,
 ) -> Result<Vec<u8>, CodecError> {
@@ -49,6 +53,9 @@ pub(crate) fn pk_bytes_iter<'a>(
 }
 
 /// Components are prefix-free for a fixed schema (arity and directions).
+/// NULL is the single byte `FF`, never a component tag, so a UNIQUE index's
+/// NULL tuple with a PK suffix is not prefix-related to a non-NULL tuple of the
+/// same arity (GD-0084 Q40).
 pub(crate) fn index_tuple_bytes(
     values: &[Value],
     dirs: &[Direction],
@@ -118,7 +125,16 @@ pub(crate) fn user_key_seek_at(user_key: &[u8], snapshot: Ts) -> Vec<u8> {
 }
 
 /// Exclusive upper bound `user_key || [0xff; 8] || [0x00]`, including timestamp zero.
-/// Range isolation assumes prefix-free user keys under the fixed schema.
+///
+/// GD-0084 Q40: the interval `[user_key || !MAX, user_key_upper_bound(user_key))`
+/// holds exactly one user key's versions only if no stored key extends
+/// `user_key` with bytes that sort below `[0xff; 8] || [0x00]`. That holds over
+/// prefix-free regions (Rows and Index at one snapshot, fixed-width kinds), not
+/// for Catalog name and role membership keys. `VersionedRange` drops the
+/// extensions this bound admits for an `Included` end (`above_end`); its
+/// emission order, the `TxnScan` merge and the routed read pager's reverse
+/// resume (`range/engine/read.rs`) still rely on it; GC, the local SSI fallback
+/// and point lookups do not. See `mvcc.rs`.
 pub(crate) fn user_key_upper_bound(user_key: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(user_key.len() + 9);
     key.extend_from_slice(user_key);

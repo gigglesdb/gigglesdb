@@ -949,6 +949,8 @@ pub(crate) fn encode_type(v: TypeDef) -> Result<Vec<u8>, CoreError> {
 pub(crate) fn decode_type(v: &[u8]) -> Result<TypeDef, CoreError> {
     decode_version(1, v)
 }
+/// `[14] || name || [0]`; schema names hold no NUL, so kind 14 is prefix-free
+/// (GD-0084 Q40; `classify_catalog_key` enforces it on load).
 pub(crate) fn schema_key(name: &str) -> Vec<u8> {
     let mut key = vec![14];
     key.extend(name.as_bytes());
@@ -1061,6 +1063,7 @@ pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError>
         _ => return Err(corrupt("invalid catalog user key")),
     })
 }
+/// `[kind] || id` (nine bytes): fixed width, so prefix-free (GD-0084 Q40).
 fn object_key(kind: u8, id: u64) -> Vec<u8> {
     let mut key = vec![kind];
     key.extend(id.to_be_bytes());
@@ -1112,6 +1115,14 @@ pub(crate) fn validate_comments<'a>(
 pub(crate) fn table_key(id: u64) -> Vec<u8> {
     object_key(1, id)
 }
+/// `[3] || name || [0]`, with `name` the relation key: `bare` for public,
+/// `schema \0 bare` otherwise (`relational::relation_key`); neither part holds
+/// a NUL (`classify_catalog_key` rejects any other shape on load).
+///
+/// GD-0084 Q40: NOT prefix-free. A public relation `s` has `3|s|00`, a proper
+/// prefix of `3|s|00|t|00` for `s.t`, and both are live. Range scans over kind 3
+/// must load the whole region into a keyed map and must not rely on
+/// `VersionedRange` / `TxnScan` order or bounds (see `mvcc.rs`).
 pub(crate) fn name_key(name: &str) -> Vec<u8> {
     let mut key = vec![3];
     key.extend(name.as_bytes());

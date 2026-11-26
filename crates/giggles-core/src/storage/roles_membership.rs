@@ -77,7 +77,22 @@ pub(super) fn role_record(table: &RoleTable, name: &str) -> Result<Option<Catalo
 // Logical grantor identity; bootstrap's display name may change, its key never does.
 pub const BOOTSTRAP: &str = "\0bootstrap";
 
+/// `member/<role>\0<member>` for the bootstrap grantor, else
+/// `member/<role>\0<member>\0<grantor>`; encoded as kind 9 with a trailing NUL.
+///
+/// GD-0084 Q40: NOT prefix-free. The bootstrap-grantor key is a proper prefix
+/// of every named-grantor key of the same edge, and both can be live. Readers
+/// load the whole role region into a keyed map (`roles_engine::load_txn`
+/// reapplies the transaction's own role writes) and must not rely on
+/// `VersionedRange` / `TxnScan` order or bounds. Names never hold a NUL
+/// (`validate_name`), so no other kind-9 keys are prefix-related.
 pub(super) fn membership_key(edge: &MembershipEdge, bootstrap: &str) -> Vec<u8> {
+    // The bootstrap sentinel starts with a NUL but is never written into a key.
+    debug_assert!(
+        [&edge.role, &edge.member].into_iter().chain((edge.grantor != bootstrap).then_some(&edge.grantor))
+            .all(|name| !name.contains(char::from(0))),
+        "role names hold no NUL (GD-0084 Q40 membership key layout)"
+    );
     let mut key = grant_key(b"member/", &edge.role, &edge.member);
     if edge.grantor != bootstrap {
         key.push(0);

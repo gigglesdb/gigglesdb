@@ -1756,6 +1756,14 @@ pub(crate) fn table_key(id: u64) -> Vec<u8> {
     key.extend_from_slice(&id.to_be_bytes());
     key
 }
+/// `[3] || name || [0]`, with `name` the relation key: `bare` for public,
+/// `schema \0 bare` otherwise (`relational::relation_key`); neither part holds
+/// a NUL (`classify_catalog_key` rejects any other shape on load).
+///
+/// GD-0084 Q40: NOT prefix-free. A public relation `s` has `3|s|00`, a proper
+/// prefix of `3|s|00|t|00` for `s.t`, and both are live. Range scans over kind 3
+/// must load the whole region into a keyed map and must not rely on
+/// `VersionedRange` / `TxnScan` order or bounds (see `mvcc.rs`).
 pub(crate) fn name_key(name: &str) -> Vec<u8> {
     let mut key = vec![3];
     key.extend_from_slice(name.as_bytes());
@@ -1820,6 +1828,14 @@ fn catalog_end(services: &TxnServices) -> Bound<&'static [u8]> {
     match services {
         TxnServices::Cluster(_) => Bound::Excluded(CLUSTER_RECORDS),
         TxnServices::Local { .. } => Bound::Unbounded,
+    }
+}
+
+fn end_contains(end: Bound<&[u8]>, key: &[u8]) -> bool {
+    match end {
+        Bound::Included(end) => key <= end,
+        Bound::Excluded(end) => key < end,
+        Bound::Unbounded => true,
     }
 }
 
@@ -1951,6 +1967,20 @@ pub(super) fn index_predicate_image(txn: &mut Transaction) -> Result<Arc<IndexPr
         if key != GENERATION_KEY {
             apply_record(&mut view, &mut names, &key, Some(&value))?;
         }
+    }
+    // GD-0084 Q40: Catalog keys are not prefix-free (`name_key("s")` is a proper
+    // prefix of `name_key("s\0t")`), so the TxnScan overlay merge can re-emit a
+    // committed value that this transaction overwrote or deleted. apply_record is
+    // keyed and idempotent: reapplying the transaction's own writes makes the
+    // image exact. A transaction without catalog writes pays one seek into the
+    // overlay map; otherwise one pass over its catalog writes.
+    let own: Vec<_> = txn
+        .catalog_writes()
+        .filter(|(key, _)| key.as_slice() != GENERATION_KEY && end_contains(end, key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    for (key, value) in own {
+        apply_record(&mut view, &mut names, &key, value.as_deref())?;
     }
     finish_view(view, names, None).map(|view| view.index_predicates)
 }

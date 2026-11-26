@@ -1899,7 +1899,13 @@ impl SqlRows<'_> {
             .map_err(engine::txn::TxnError::from)?;
         for version in versions {
             crate::cancellation::check()?;
-            let (_, bytes) = version.map_err(engine::txn::TxnError::from)?;
+            let (key, bytes) = version.map_err(engine::txn::TxnError::from)?;
+            // GD-0084 Q40: `[K || !MAX, K || !ts)` also holds the versions of any
+            // stored extension `K || x` (another PK arity under this table id,
+            // for example across ADD PRIMARY KEY). Only K's own versions count.
+            if codec::split_versioned(&key)?.0 != physical.as_slice() {
+                continue;
+            }
             let Some(bytes) = engine::mvcc::decode(&bytes).map_err(engine::txn::TxnError::from)? else {
                 return Ok(true);
             };

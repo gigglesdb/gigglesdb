@@ -2086,6 +2086,48 @@ mod f8a_commit_tests {
 mod q40_exact_key_boundary {
     use super::*;
 
+    /// The shape of `DROP CONSTRAINT; ADD PRIMARY KEY (a)` on `(a, b)`: the
+    /// base holds the old extension `user||42`, the overlay deletes it and
+    /// writes `user`. The point scan's overlay range never reaches that delete,
+    /// so the base must not emit the extension of the `Included` end.
+    #[test]
+    fn point_scan_must_not_return_an_extension_deleted_outside_its_range() {
+        let (_, seq, locks) = setup(SequencerConfig::default());
+        let user = 7u64.to_be_bytes().to_vec();
+        let neighbor = [&user[..], &[0x42]].concat();
+        store(&seq, &locks, 1, &neighbor, b"old");
+        let mut t = txn(&seq, &locks, 2, Isolation::ReadCommitted);
+        t.lock_for_write(Keyspace::Rows, &neighbor, None, &|| false).unwrap();
+        t.delete(Keyspace::Rows, neighbor.clone()).unwrap();
+        t.lock_for_write(Keyspace::Rows, &user, None, &|| false).unwrap();
+        t.put(Keyspace::Rows, user.clone(), b"new".to_vec()).unwrap();
+        // `limit` 1 is the shape of `v2_reduction`'s point `get`.
+        for dir in [Direction::Forward, Direction::Reverse] {
+            for limit in [None, Some(1)] {
+                let actual = t.scan(
+                    Keyspace::Rows, Bound::Included(&user), Bound::Included(&user), dir, limit,
+                ).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+                assert_eq!(actual, vec![(user.clone(), b"new".to_vec())], "{dir:?} {limit:?}");
+            }
+        }
+    }
+
+    /// A pager that resumes with `Excluded(user)` must still see `user`'s
+    /// committed extension, which sorts after it.
+    #[test]
+    fn excluded_start_scan_must_return_a_committed_extension() {
+        let (_, seq, locks) = setup(SequencerConfig::default());
+        let user = 7u64.to_be_bytes().to_vec();
+        let neighbor = [&user[..], &[0x42]].concat();
+        store(&seq, &locks, 1, &user, b"short");
+        store(&seq, &locks, 2, &neighbor, b"long");
+        let mut t = txn(&seq, &locks, 3, Isolation::ReadCommitted);
+        let actual = t.scan(
+            Keyspace::Rows, Bound::Excluded(&user), Bound::Unbounded, Direction::Forward, Some(1),
+        ).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(actual, vec![(neighbor, b"long".to_vec())]);
+    }
+
     #[test]
     #[ignore = "GD-0084 Q40: range order needs prefix-free user keys (open design decision)"]
     fn overlay_delete_must_suppress_committed_prefix_after_neighbor() {

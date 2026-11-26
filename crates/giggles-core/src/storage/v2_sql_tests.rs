@@ -343,6 +343,8 @@ mod reduction;
 mod indexed_join;
 #[path = "v2_ordered_range_tests.rs"]
 mod ordered_range;
+#[path = "v2_q40_prefix_key_tests.rs"]
+mod q40_exact_key_boundary;
 
 struct Fixture {
     path: std::path::PathBuf,

@@ -168,6 +168,10 @@ pub(crate) fn membership_features(key: &[u8], value: &[u8]) -> u64 {
     }
 }
 
+/// Catalog kinds 8..=13 for the role image. GD-0084 Q40: kinds 8, 10, 11, 12
+/// and 13 are prefix-free (NUL-free names, a leading 0 marks qualified
+/// relations, and every key ends with one NUL); kind 9 is not (see
+/// `roles_membership::membership_key`).
 pub(crate) fn encode_key(raw: &[u8]) -> Result<Vec<u8>, CoreError> {
     for (index, prefix) in PREFIXES.iter().enumerate() {
         if let Some(name) = raw.strip_prefix(*prefix) {
@@ -203,6 +207,22 @@ pub(crate) fn load_txn(txn: &mut Transaction) -> Result<RoleTable, RoleError> {
     {
         let (key, value) = entry.map_err(CoreError::from)?;
         apply_read_record(&mut image, &key, Some(&value))?;
+    }
+    // GD-0084 Q40: membership keys are not prefix-free (the bootstrap-grantor key
+    // `9|role|00|member|00` is a proper prefix of the named-grantor key
+    // `9|role|00|member|00|grantor|00`, and both can be live), so the TxnScan
+    // overlay merge can re-emit a committed value that this transaction
+    // overwrote or deleted. Reapplying the transaction's own role writes, which
+    // are keyed like the image, makes it exact. A transaction without catalog
+    // writes pays one seek into the overlay map; otherwise one pass over its
+    // catalog writes.
+    let own: Vec<_> = txn
+        .catalog_writes()
+        .filter(|(key, _)| matches!(key.first(), Some(8..=13)))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    for (key, value) in own {
+        apply_read_record(&mut image, &key, value.as_deref())?;
     }
     Ok(image)
 }

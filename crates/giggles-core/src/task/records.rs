@@ -121,6 +121,8 @@ pub(crate) fn disclosure_head_key(task: TaskObjectId) -> Vec<u8> {
     authority_key(task, AUTHORITY_DISCLOSURE)
 }
 /// `21 | task | table | pk`; `pk` is the non-empty, prefix-free primary-key encoding.
+/// GD-0084 Q40: keys of one table stay prefix-free only while its PK arity is
+/// unchanged; they are read by point (`txn.get`) or by whole-task region.
 pub(crate) fn membership_key(task: TaskObjectId, table: u64, pk: &[u8]) -> Vec<u8> {
     assert!(!pk.is_empty(), "membership primary key");
     task_key(NS_MEMBERSHIP, task, &[&table.to_be_bytes(), pk])
