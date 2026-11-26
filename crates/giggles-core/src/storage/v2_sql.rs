@@ -2561,13 +2561,18 @@ impl RowSink for SqlRows<'_> {
                     candidates.sort_unstable_by_key(|candidate| candidate.input);
                     candidates.iter().map(|candidate| &candidate.row).collect()
                 }
-                Some(relational::row_sink::AppendReplay::SortedOrdinals(ordinals)) => {
-                    debug_assert_eq!(ordinals.len(), after.len());
+                Some(relational::row_sink::AppendReplay::SortedOrdinals(ordinals))
+                    if ordinals.len() == after.len() =>
+                {
+                    // Error path only: a length mismatch (never expected) falls
+                    // back to physical order below instead of dropping rows.
                     let mut proposed = ordinals.iter().copied().zip(after.values()).collect::<Vec<_>>();
                     proposed.sort_unstable_by_key(|(input, _)| *input);
                     proposed.into_iter().map(|(_, row)| row).collect()
                 }
-                None => after.values().collect(),
+                Some(relational::row_sink::AppendReplay::SortedOrdinals(_)) | None => {
+                    after.values().collect()
+                }
             };
             self.report_append_collision(table, &proposed)?;
         } else {
