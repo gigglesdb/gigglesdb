@@ -374,7 +374,8 @@ async fn execute_without_wait(client: &Client, sql: &str) {
             .await
             .unwrap_or_else(|_| panic!("blocked during cascade: {sql}"))
             .unwrap(),
-        1
+        1,
+        "{sql}"
     );
 }
 
@@ -434,6 +435,127 @@ async fn cascade_delete_allows_disjoint_writes_and_fences_deleted_keys() {
         ],
     )
     .await;
+    fixture.stop(a, b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fk_updates_probe_only_their_changed_references() {
+    let (fixture, a, b) = Fixture::new().await;
+    a.batch_execute(
+        "INSERT INTO usr VALUES(3,'u3'); \
+         INSERT INTO member VALUES(1,1,1),(2,2,2); \
+         INSERT INTO msg VALUES(3,2,2,'run')",
+    )
+    .await
+    .unwrap();
+    a.batch_execute("BEGIN; DELETE FROM org WHERE id=1")
+        .await
+        .unwrap();
+    for sql in [
+        "UPDATE msg SET author=3 WHERE id=3",
+        "UPDATE member SET user_id=3 WHERE id=2",
+    ] {
+        b.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .await
+            .unwrap();
+        execute_without_wait(&b, sql).await;
+        timeout(NONBLOCKING, b.batch_execute("COMMIT"))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    execute_without_wait(&b, "UPDATE member SET user_id=2 WHERE id=2").await;
+    a.batch_execute("COMMIT").await.unwrap();
+    assert_ids(&b, "SELECT id FROM org", &[2]).await;
+    a.batch_execute("INSERT INTO org VALUES(1,NULL,'o1'); INSERT INTO member VALUES(1,1,1)")
+        .await
+        .unwrap();
+
+    // org 1 belongs to an untouched row. org 2 belongs to the updated row,
+    // but that reference also stays unchanged.
+    a.batch_execute("BEGIN; SELECT id FROM org ORDER BY id FOR UPDATE")
+        .await
+        .unwrap();
+    execute_without_wait(&b, "UPDATE member SET user_id=3 WHERE id=2").await;
+    execute_without_wait(&b, "UPDATE member SET id=4 WHERE id=2").await;
+    let values = (100..300)
+        .map(|id| format!("({id},NULL,NULL)"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let upsert = format!("INSERT INTO member VALUES (4,1,3),{values} \
+        ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id");
+    assert_eq!(timeout(NONBLOCKING, b.execute(&upsert, &[])).await.unwrap().unwrap(), 201);
+    a.batch_execute("COMMIT").await.unwrap();
+    for bad_row in ["(500,99,1)", "(4,2,99)"] {
+        let upsert = format!("INSERT INTO member VALUES {bad_row},{values} \
+            ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id");
+        let error = b.execute(&upsert, &[]).await.unwrap_err();
+        assert_eq!(error.code(), Some(&SqlState::FOREIGN_KEY_VIOLATION), "{bad_row}");
+    }
+    assert_ids(&b, "SELECT id FROM msg WHERE author=3", &[3]).await;
+    assert_ids(&b, "SELECT id FROM member WHERE org_id=2 AND user_id=3", &[4]).await;
+    assert_ids(&b, "SELECT id FROM member WHERE id=500", &[]).await;
+    assert_no_orphans(&b, &[("msg", "org_id", "org"), ("msg", "author", "usr"),
+        ("member", "org_id", "org"), ("member", "user_id", "usr")]).await;
+    fixture.stop(a, b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn moved_fk_waits_for_the_new_parent_and_cascade_waits_for_the_child() {
+    let (fixture, a, b) = Fixture::new().await;
+    a.batch_execute("INSERT INTO member VALUES(1,1,1),(2,2,2)")
+        .await
+        .unwrap();
+    a.batch_execute("BEGIN; DELETE FROM org WHERE id=1")
+        .await
+        .unwrap();
+    expect_fk_wait(&a, &b, "UPDATE member SET org_id=1 WHERE id=2").await;
+    assert_ids(&b, "SELECT id FROM member WHERE org_id=2", &[2]).await;
+
+    b.batch_execute("BEGIN; UPDATE member SET org_id=org_id WHERE id=2")
+        .await
+        .unwrap();
+    let delete = a.prepare("DELETE FROM org WHERE id=2").await.unwrap();
+    {
+        let pending = a.execute(&delete, &[]);
+        tokio::pin!(pending);
+        assert!(timeout(MUST_WAIT, &mut pending).await.is_err());
+        b.batch_execute("COMMIT").await.unwrap();
+        assert_eq!(timeout(COMPLETION, pending).await.unwrap().unwrap(), 1);
+    }
+    assert_ids(&a, "SELECT id FROM member", &[]).await;
+    assert_ids(&a, "SELECT id FROM org", &[]).await;
+    assert_no_orphans(&a, &[("member", "org_id", "org")]).await;
+    fixture.stop(a, b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fk_postimages_survive_merge_upsert_and_referential_actions() {
+    let (fixture, a, b) = Fixture::new().await;
+    a.batch_execute(
+        "CREATE TABLE parent_key(id int PRIMARY KEY); \
+         CREATE TABLE child_key(id int PRIMARY KEY, p int REFERENCES parent_key(id) ON UPDATE CASCADE, \
+             org_id int REFERENCES org(id)); \
+         INSERT INTO parent_key VALUES(1); INSERT INTO child_key VALUES(1,1,1)",
+    )
+    .await
+    .unwrap();
+    for sql in [
+        "MERGE INTO child_key c USING (VALUES (1,99)) AS s(id,p) ON c.id=s.id \
+         WHEN MATCHED THEN UPDATE SET org_id=s.p",
+        "INSERT INTO child_key VALUES(1,1,99) ON CONFLICT(id) DO UPDATE SET org_id=excluded.org_id",
+        "WITH written AS (UPDATE child_key SET org_id=99 WHERE id=1 RETURNING id), \
+         rekeyed AS (UPDATE parent_key SET id=2 WHERE id=1 RETURNING id) SELECT id FROM written",
+        "WITH written AS (INSERT INTO child_key VALUES(2,1,99) RETURNING id), \
+         rekeyed AS (UPDATE parent_key SET id=2 WHERE id=1 RETURNING id) SELECT id FROM written",
+    ] {
+        let error = b.simple_query(sql).await.unwrap_err();
+        assert_eq!(error.code(), Some(&SqlState::FOREIGN_KEY_VIOLATION), "{sql}");
+        assert_ids(&b, "SELECT id FROM child_key WHERE p=1 AND org_id=1", &[1]).await;
+        assert_ids(&b, "SELECT id FROM parent_key", &[1]).await;
+    }
+    assert_ids(&b, "SELECT id FROM child_key", &[1]).await;
+    assert_no_orphans(&b, &[("child_key", "p", "parent_key"), ("child_key", "org_id", "org")]).await;
     fixture.stop(a, b).await;
 }
 

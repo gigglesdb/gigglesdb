@@ -861,11 +861,12 @@ impl Relational {
         let mut parent_probes = stable_fk.then(constraint_rows::ParentProbes::default);
         let concurrent_actions = sink.row_locked_cascade();
         let deferred_probes = deferred.as_deref().filter(|_| sink.defer_fk_parent_probes());
-        if writing && actions.is_none() && !concurrent_actions {
+        let dml = matches!(prepared.v2_class(), V2Class::Dml);
+        if writing && !dml && actions.is_none() && !concurrent_actions {
             loop {
                 let seeds = (!stable_fk).then(|| self.clone());
                 if hydrate_with_probes(
-                    seeds.as_ref(),
+                    ParentRows::Images(seeds.as_ref()),
                     &edges,
                     &mut before,
                     self,
@@ -933,8 +934,9 @@ impl Relational {
             };
             if let Some(actions) = actions {
                 let table = table.as_ref().expect("conflict page target");
-                actions.publish(self, sink, table, before.rows.remove(&table.id).unwrap(),
-                    self.rows[&table.id].clone(), events, None, &sink.indexes(), version_end)?;
+                let old = before.rows.remove(&table.id).unwrap();
+                let new = &self.rows[&table.id];
+                actions.publish(self, sink, table, old, new.clone(), events, None, true, &sink.indexes(), version_end)?;
                 return Ok(result);
             }
             if writing {
@@ -990,13 +992,18 @@ impl Relational {
                     &mut || crate::cancellation::check().is_err(),
                     clock,
                     insert_columns,
-                    Some(constraints::LoadRows { concurrent_actions, refresh: &mut |state, old| {
+                    Some(constraints::LoadRows { concurrent_actions, dml, refresh: &mut |state, old, preimages| {
                         let result = (|| {
                             loop {
-                                let seeds = (!stable_fk).then(|| state.clone());
+                                let seeds = (!dml && !stable_fk).then(|| state.clone());
+                                let parent_rows = if dml {
+                                    ParentRows::Changed(preimages)
+                                } else {
+                                    ParentRows::Images(seeds.as_ref())
+                                };
                                 let ext = state.ext.clone();
                                 if hydrate_with_probes(
-                                    seeds.as_ref(),
+                                    parent_rows,
                                     &ext.constraints,
                                     old,
                                     state,
@@ -1148,7 +1155,7 @@ mod constraint_rows;
 mod paged_dml;
 #[path = "row_sink_insert.rs"]
 mod paged_insert;
-use constraint_rows::{hydrate_with_probes, paged_pending, rebuild};
+use constraint_rows::{ParentRows, hydrate_with_probes, paged_pending, rebuild};
 
 #[cfg(test)]
 mod tests {

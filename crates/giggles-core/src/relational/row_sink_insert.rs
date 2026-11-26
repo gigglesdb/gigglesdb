@@ -56,16 +56,17 @@ pub(super) fn execute<S: RowSink>(
     let first_version = state.next_version;
     if insert.updates_conflicts() { sink.begin_conflict_pages(first_version); }
     let table = state.tables[&insert.table].clone();
-    let mut actions = (!insert.stable_referenced_keys(state, &table))
-        .then(|| paged_dml::ActionWork::new(deferred.as_deref().cloned().unwrap_or_default()));
     let foreign_keys = state.ext.constraints.get(&table.id).into_iter().flatten()
         .any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. }));
+    let mut actions = (foreign_keys && insert.updates_conflicts()
+        || !insert.stable_referenced_keys(state, &table))
+        .then(|| paged_dml::ActionWork::new(deferred.as_deref().cloned().unwrap_or_default()));
     let mut returned = scan::Retention::new(scan::WRITE_SOURCE_BYTES);
     let mut publish = |state: &mut Relational, sink: &mut S,
                        input: sql_insert::Insert| -> Result<(), CoreError> {
         let mut page = state.clone();
-        // Outgoing FK checks see all input at statement end. Referenced-key
-        // updates instead publish through the bounded referential-action queue.
+        // At statement end an append can find its inserts by version range.
+        // An upsert instead queues inserts and changed references separately.
         if foreign_keys && actions.is_none() {
             std::sync::Arc::make_mut(&mut page.ext).constraints.get_mut(&table.id).expect("FK constraints")
                 .retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
@@ -192,8 +193,7 @@ pub(super) fn execute<S: RowSink>(
     }
     if let Some(actions) = actions {
         actions.finish(state, sink, deferred.as_deref_mut())?;
-    }
-    if foreign_keys {
+    } else if foreign_keys {
         validate_append(state, &table, first_version, state.next_version, sink, deferred, clock)?;
     }
     output.finish(&mut result)?;
@@ -212,7 +212,6 @@ pub(crate) fn validate_append(state: &Relational, table: &TableDef, first_versio
             after = Some(last);
             rows.retain(|_, row| row.version >= first_version && row.version < version_end);
             if rows.is_empty() { continue; }
-            let inserted = rows.keys().cloned().collect::<Vec<_>>();
             let mut page = state.clone();
             page.rows.insert(table.id, rows);
             let mut before = state.clone();
@@ -220,13 +219,8 @@ pub(crate) fn validate_append(state: &Relational, table: &TableDef, first_versio
             // Only new rows need outgoing witnesses. Hydrated parents are identical
             // in before/page; recursively expanding them walks self-FK chains.
             let deferred_probes = (!immediate_mode && sink.defer_fk_parent_probes()).then_some(&*pending);
-            hydrate_with_probes(Some(&page.clone()), &state.ext.constraints, &mut before, &mut page,
+            hydrate_with_probes(ParentRows::Changed(&constraints::FkPreimages::default()), &state.ext.constraints, &mut before, &mut page,
                 sink, &mut retention, true, &BTreeSet::new(), None, deferred_probes)?;
-            // A new self-FK row can also witness another new row's parent.
-            // Hydration must not make that seed look unchanged and skip its FK.
-            for key in inserted {
-                before.rows.get_mut(&table.id).expect("append table").remove(&key);
-            }
             rebuild(&mut page, &sink.indexes())?;
             constraints::enforce(&mut page, &before, Vec::new(), pending,
                 &mut || crate::cancellation::check().is_err(), clock).map_err(CoreError::Sql)?;

@@ -37,20 +37,11 @@ pub(super) fn write_targets(
     }
 }
 
-#[expect(clippy::too_many_arguments, reason = "FK hydration shares statement images, budget and write targets")]
-pub(super) fn hydrate(
-    seeds: &Relational,
-    edges: &BTreeMap<u64, Vec<Constraint>>,
-    before: &mut Relational,
-    staged: &mut Relational,
-    sink: &mut impl RowSink,
-    budget: &mut scan::Retention,
-    parents_only: bool,
-    write_targets: &BTreeSet<u64>,
-) -> Result<usize, CoreError> {
-    hydrate_with_probes(
-        Some(seeds), edges, before, staged, sink, budget, parents_only, write_targets, None, None,
-    )
+pub(super) enum ParentRows<'a> {
+    /// Schema validation needs old and new rows, including untouched ones.
+    Images(Option<&'a Relational>),
+    Changed(&'a constraints::FkPreimages),
+    Pending(&'a DeferralState),
 }
 
 /// Completed probes are only carried across passes of one metadata-only ALTER.
@@ -72,7 +63,7 @@ impl ParentProbes {
 
 #[expect(clippy::too_many_arguments, reason = "the DDL caller supplies statement-local probe evidence")]
 pub(super) fn hydrate_with_probes(
-    seeds: Option<&Relational>,
+    parent_rows: ParentRows<'_>,
     edges: &BTreeMap<u64, Vec<Constraint>>,
     before: &mut Relational,
     staged: &mut Relational,
@@ -86,6 +77,10 @@ pub(super) fn hydrate_with_probes(
     if edges.is_empty() {
         return Ok(0);
     }
+    let seeds = match parent_rows {
+        ParentRows::Images(seeds) => seeds,
+        _ => None,
+    };
     let source_tables = seeds.map_or(&staged.tables, |seeds| &seeds.tables);
     let mut source_by_id = BTreeMap::new();
     let mut target_by_id = BTreeMap::new();
@@ -149,17 +144,29 @@ pub(super) fn hydrate_with_probes(
                 let probe_key = (c.id, source_id);
                 let witnessed_rows = parent_probes.as_ref().filter(|_| exact_parent)
                     .and_then(|probes| probes.witnessed.get(&probe_key));
-                // Only changed parent keys need incoming witnesses. Rows loaded
-                // merely to prove an outgoing FK must not expand into every sibling.
                 let rows = if parent {
-                    seeds.iter().map(|seeds| &seeds.rows)
-                        .chain([&before.rows, &staged.rows])
-                        .filter_map(|rows| rows.get(&source_id))
-                        .flat_map(|rows| rows.iter())
-                        .filter(|(key, _)| !witnessed_rows.is_some_and(|known| known.contains(*key)))
-                        .map(|(key, row)| (exact_parent.then(|| key.clone()), row.clone()))
-                        .collect::<Vec<_>>()
+                    match &parent_rows {
+                        ParentRows::Images(_) => seeds.iter().map(|seeds| &seeds.rows)
+                            .chain([&before.rows, &staged.rows])
+                            .filter_map(|rows| rows.get(&source_id))
+                            .flat_map(|rows| rows.iter())
+                            .filter(|(key, _)| !witnessed_rows.is_some_and(|known| known.contains(*key)))
+                            .map(|(key, row)| (exact_parent.then(|| key.clone()), row.clone()))
+                            .collect::<Vec<_>>(),
+                        ParentRows::Changed(preimages) => staged.rows.get(&source_id)
+                            .into_iter().flatten()
+                            .filter(|(key, row)| preimages.changed(source_id, key, row,
+                                before.rows.get(&source_id), &positions))
+                            .map(|(_, row)| (None, row.clone()))
+                            .collect(),
+                        ParentRows::Pending(pending) => pending.pending.get(&probe_key)
+                            .into_iter().flatten()
+                            .filter_map(|key| staged.rows.get(&source_id)?.get(key))
+                            .map(|row| (None, row.clone()))
+                            .collect(),
+                    }
                 } else {
+                    // Only changed parent keys need incoming witnesses.
                     before.rows.get(&source_id).into_iter().flat_map(|rows| rows.iter())
                         .filter(|(key, row)| staged.rows.get(&source_id).and_then(|rows| rows.get(*key))
                             .is_none_or(|new| positions.iter().any(|i| row.values[*i] != new.values[*i])))
@@ -300,6 +307,11 @@ pub(super) fn hydrate_with_probes(
                                 }
                             }
                             witnessed = true;
+                            // An append may already be physically visible. Keep
+                            // staged inserts out of the statement's preimage.
+                            if parent && matches!(parent_rows, ParentRows::Changed(_)) && effective.is_some() {
+                                return Ok(());
+                            }
                             let old = before
                                 .rows
                                 .get_mut(&target.id)
@@ -438,8 +450,8 @@ pub(super) fn paged_pending(
                 page.rows.insert(table.id, rows);
                 let mut before = state.clone();
                 let mut retention = scan::Retention::new(scan::retention_limit());
-                while hydrate(&page.clone(), &state.ext.constraints, &mut before, &mut page,
-                    sink, &mut retention, true, &BTreeSet::new())? > 0 {}
+                hydrate_with_probes(ParentRows::Pending(&pending), &state.ext.constraints,
+                    &mut before, &mut page, sink, &mut retention, true, &BTreeSet::new(), None, None)?;
                 rebuild(&mut page, &sink.indexes())?;
                 page.validate_deferred(&mut pending, || crate::cancellation::check().is_err())
                     .map_err(CoreError::Sql)?;

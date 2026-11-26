@@ -227,7 +227,7 @@ pub(super) fn parse_foreign(
         },
     })
 }
-fn id_positions(table: &TableDef, ids: &[u64]) -> R<Vec<usize>> {
+pub(super) fn id_positions(table: &TableDef, ids: &[u64]) -> R<Vec<usize>> {
     ids.iter()
         .map(|id| {
             table
@@ -326,7 +326,7 @@ fn fk_row(
     Ok(())
 }
 /// A child row failed to find a matching referenced key.
-fn missing_parent(
+pub(super) fn missing_parent(
     state: &Relational,
     child: &TableDef,
     parent: &TableDef,
@@ -864,11 +864,44 @@ pub(super) fn enforce(
     )
     .map(|_| ())
 }
-type LoadImageRows<'a> = dyn FnMut(&mut Relational, &mut Relational) -> R<()> + 'a;
+/// Follow an FK postimage back to its statement preimage, even when a direct
+/// update or a referential action changes its physical key. None marks an
+/// inserted row that was subsequently rewritten by an action.
+#[derive(Default)]
+pub(super) struct FkPreimages {
+    by_version: BTreeMap<(u64, u64), Option<Arc<SqlRow>>>,
+    captured_old: BTreeSet<(u64, u64)>,
+    dml: bool,
+}
+
+impl FkPreimages {
+    fn record(&mut self, table: u64, old: &SqlRow, new: &SqlRow, original: Option<&SqlRow>) {
+        let original = self.by_version.get(&(table, old.version)).cloned()
+            .unwrap_or_else(|| original.cloned().map(Arc::new));
+        self.by_version.insert((table, new.version), original);
+    }
+
+    pub(super) fn changed(&self, table: u64, key: &[u8], row: &SqlRow,
+        before: Option<&super::row_sink::DdlRows>, positions: &[usize],
+    ) -> bool {
+        let original = self.by_version.get(&(table, row.version)).map_or_else(
+            || before.and_then(|rows| rows.get(key)).filter(|old| {
+                // DML records every logical update. A new version without a
+                // preimage is an insert, even if it reuses a vacated key.
+                old.version == row.version || !self.dml
+            }),
+            |old| old.as_deref(),
+        );
+        original.is_none_or(|old| positions.iter().any(|&i| old.values[i] != row.values[i]))
+    }
+}
+
+type LoadImageRows<'a> = dyn FnMut(&mut Relational, &mut Relational, &FkPreimages) -> R<()> + 'a;
 
 pub(super) struct LoadRows<'a> {
     pub(super) refresh: &'a mut LoadImageRows<'a>,
     pub(super) concurrent_actions: bool,
+    pub(super) dml: bool,
 }
 pub(super) fn insert_check_columns(state: &Relational, prepared: &Prepared) -> Option<(u64, Vec<usize>)> {
     let table = state.tables.get(prepared.table()?)?;
@@ -904,25 +937,26 @@ pub(super) fn enforce_with_rows<'a>(
         ConstraintKind::Check { .. } | ConstraintKind::ForeignKey { .. })) {
         return Ok(before);
     }
-    if let Some(load) = load.as_mut() {
-        (load.refresh)(state, before.to_mut())?;
-    }
     let type_rewrite = !Arc::ptr_eq(&before.ext, &state.ext) && before.ext.types != state.ext.types;
-    let mut touched_old = captured
-        .iter()
-        .filter_map(|event| {
-            event
-                .new
-                .as_ref()
-                .map(|new| ((event.table, new.version), event.old.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let captured_old = captured
-        .iter()
-        .map(|e| (e.table, e.old.version))
-        .collect::<BTreeSet<_>>();
     if captured.len() > MAX_ROWS {
         return Err(SqlError::Limit);
+    }
+    let mut preimages = FkPreimages {
+        dml: load.as_ref().is_some_and(|loader| loader.dml),
+        ..Default::default()
+    };
+    for event in &captured {
+        preimages.captured_old.insert((event.table, event.old.version));
+        if let Some(new) = &event.new {
+            let table = table_by_id(state, event.table)?;
+            let key = pk(table, &event.old.values)?;
+            let original = before.rows.get(&event.table).and_then(|rows| rows.get(&key))
+                .filter(|original| original.version == event.old.version);
+            preimages.record(event.table, &event.old, new, original);
+        }
+    }
+    if let Some(load) = load.as_mut() {
+        (load.refresh)(state, before.to_mut(), &preimages)?;
     }
     let mut events = std::collections::VecDeque::from(captured);
     for (id, rows) in &before.rows {
@@ -971,7 +1005,7 @@ pub(super) fn enforce_with_rows<'a>(
             if cancel() {
                 return Err(SqlError::Aborted);
             }
-            if captured_old.contains(&(*id, old.version)) {
+            if preimages.captured_old.contains(&(*id, old.version)) {
                 continue;
             }
             let new = by_version.get(&old.version).map(|(_, row)| *row).or_else(|| after.get(key));
@@ -1010,7 +1044,7 @@ pub(super) fn enforce_with_rows<'a>(
     let mut parent_details = BTreeMap::<_, ParentDetails>::new();
     while let Some(event) = events.pop_front() {
         if let Some(load) = load.as_mut() {
-            (load.refresh)(state, before.to_mut())?;
+            (load.refresh)(state, before.to_mut(), &preimages)?;
         }
         if cancel() {
             return Err(SqlError::Aborted);
@@ -1245,7 +1279,9 @@ pub(super) fn enforce_with_rows<'a>(
                 state.secondary_apply_batch_engine(state.epoch, &changes, ceiling, &mut *cancel)?;
                 state.next_version = next_version;
                 if let Some(new) = &new {
-                    touched_old.insert((child_id, new.version), old.clone());
+                    let original = before.rows.get(&child_id).and_then(|rows| rows.get(&old_pk))
+                        .filter(|original| original.version == old.version);
+                    preimages.record(child_id, &old, new, original);
                 }
                 events.push_back(Event {
                     table: child_id,
@@ -1268,7 +1304,7 @@ pub(super) fn enforce_with_rows<'a>(
         }
     }
     if let Some(load) = load.as_mut() {
-        (load.refresh)(state, before.to_mut())?;
+        (load.refresh)(state, before.to_mut(), &preimages)?;
     }
     for (table_id, cs) in &state.ext.constraints {
         let table = table_by_id(state, *table_id)?;
@@ -1305,17 +1341,7 @@ pub(super) fn enforce_with_rows<'a>(
                 let positions = id_positions(table, columns)?;
                 changed
                     .iter()
-                    .filter(|key| {
-                        let row = &rows[*key];
-                        let old = touched_old
-                            .get(&(*table_id, row.version))
-                            .or_else(|| before.rows.get(table_id).and_then(|rows| rows.get(*key)));
-                        old.is_none_or(|old| {
-                            positions
-                                .iter()
-                                .any(|index| old.values[*index] != row.values[*index])
-                        })
-                    })
+                    .filter(|key| preimages.changed(*table_id, key, &rows[*key], before_rows, &positions))
                     .cloned()
                     .collect::<BTreeSet<_>>()
             } else {
