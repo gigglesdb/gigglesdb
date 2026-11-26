@@ -1258,3 +1258,102 @@ fn cluster_alter_sequence_position_requires_system_range_migration() {
     assert_eq!(crate::sqlstate(&rewrite), "0A000");
     assert_eq!(ints(&run(&mut sql, "SELECT nextval('seq')")), [vec![3]]);
 }
+
+/// GD-0084 Q40: routed reverse paging across a key that is a proper prefix of other keys.
+mod q40_exact_key_boundary {
+    use super::*;
+
+    /// Rows of `sql` through a cursor (the path pgwire's extended protocol takes for a
+    /// read-only SELECT): an ORDER BY on the primary key scans the table in key order.
+    fn cursor_rows(session: &mut crate::storage::SqlSession, sql: &str) -> Vec<Vec<i64>> {
+        let prepared = session
+            .prepare(sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        let mut cursor = session
+            .open_cursor_at(&prepared, &[], &clock())
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        let mut rows = Vec::new();
+        while !cursor.is_exhausted() {
+            let chunk = session
+                .fetch_cursor_unreleased(&mut cursor, 5, 1 << 20)
+                .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+                .untasked()
+                .unwrap();
+            rows.extend(chunk.into_iter().map(|row| {
+                row.values
+                    .iter()
+                    .map(|v| match v {
+                        Value::Int(i) => *i,
+                        other => panic!("not an int: {other:?}"),
+                    })
+                    .collect::<Vec<i64>>()
+            }));
+        }
+        rows
+    }
+
+    /// Widening the primary key `(a)` to `(a, b)` leaves the old key `tid||a`'s tombstone next
+    /// to the live `tid||a||b` rows (range engines keep every version of a live table). Going
+    /// backward a range meets `tid||a`'s versions before its extensions; a page that fills on
+    /// that tombstone must resume above `tid||a||b`, or the reverse scan skips the new rows.
+    #[test]
+    fn reverse_scan_after_widening_the_primary_key_returns_every_row() {
+        let cluster = LocalCluster::new(&splits());
+        for page_bytes in [1, 64, 1 << 20] {
+            let gateway = attach_with(
+                &cluster,
+                ClusterConfig {
+                    node: 1,
+                    heartbeat: Duration::from_millis(200),
+                    page_bytes,
+                    ..ClusterConfig::default()
+                },
+            );
+            let mut sql = gateway.admin.sql_session();
+            let table = format!("w{page_bytes}");
+            run(
+                &mut sql,
+                &format!("CREATE TABLE {table}(a bigint PRIMARY KEY, b bigint NOT NULL)"),
+            );
+            run(
+                &mut sql,
+                &format!("INSERT INTO {table} SELECT g, g * 10 FROM generate_series(1, 12) AS g"),
+            );
+            run(&mut sql, "BEGIN");
+            run(
+                &mut sql,
+                &format!("ALTER TABLE {table} DROP CONSTRAINT {table}_pkey"),
+            );
+            run(
+                &mut sql,
+                &format!("ALTER TABLE {table} ADD PRIMARY KEY (a, b)"),
+            );
+            run(&mut sql, "COMMIT");
+            let ascending: Vec<Vec<i64>> = (1..=12).map(|g| vec![g, g * 10]).collect();
+            let descending: Vec<Vec<i64>> = ascending.iter().rev().cloned().collect();
+            for (query, expected) in [
+                (
+                    format!("SELECT a, b FROM {table} ORDER BY a, b"),
+                    &ascending,
+                ),
+                (
+                    format!("SELECT a, b FROM {table} ORDER BY a DESC, b DESC"),
+                    &descending,
+                ),
+            ] {
+                assert_eq!(
+                    &ints(&run(&mut sql, &query)),
+                    expected,
+                    "{query}, page_bytes {page_bytes}"
+                );
+                // Only the cursor takes the routed reverse pager (`cursor_direction`); this
+                // assertion is the one that failed on main.
+                assert_eq!(
+                    &cursor_rows(&mut sql, &query),
+                    expected,
+                    "cursor {query}, page_bytes {page_bytes}"
+                );
+            }
+        }
+    }
+}

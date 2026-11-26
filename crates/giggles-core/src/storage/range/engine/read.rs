@@ -57,11 +57,26 @@ struct Page {
     bytes: usize,
     limit: usize,
     dir: ReadDirection,
+    /// The read timestamp: a versioned user key's versions at or below it are what the page
+    /// chose from.
+    at: Ts,
     resume: Option<Raw>,
 }
 impl Page {
     /// Adds a pair; true when the page is full (then `resume` continues after it). `user` is
     /// the pair's user key in a versioned space.
+    ///
+    /// A versioned resume skips only raw versions of `user`, never another user key's raw keys.
+    /// Raw keys are `user || !ts`, and a proper extension `user || x` of a user key (a row key
+    /// after a widening rekey, whose old short key keeps its tombstone) sorts below `user`'s
+    /// versions whenever `x[0]` is below `!ts[0]` (0xfe for today's timestamps; row and index
+    /// tags and catalog bytes stop at 0xf4). Forward has read those
+    /// extensions before `user`, so it resumes past all of `user`'s versions. Reverse meets
+    /// them after `user`, so it resumes just below `user || !at`, the lowest version the page
+    /// chose from: the next page reads `user`'s versions newer than `at` (skipped, nothing
+    /// emitted) and then the extensions. (Resuming below `user || !u64::MAX` skipped them.)
+    /// The covered span (`covered`) then still holds `user`'s prepared-write position (its
+    /// seek key at `at`) and none of the extensions' positions, which the next page covers.
     fn push(&mut self, key: Vec<u8>, value: Vec<u8>, user: Option<&[u8]>) -> bool {
         self.bytes += key.len() + value.len();
         let resume = match (user, self.dir) {
@@ -70,7 +85,7 @@ impl Page {
                 Bound::Included(codec::user_key_upper_bound(user))
             }
             (Some(user), ReadDirection::Reverse) => {
-                Bound::Excluded(codec::user_key_seek_at(user, Ts(u64::MAX)))
+                Bound::Excluded(codec::user_key_seek_at(user, self.at))
             }
         };
         self.pairs.push((key, value));
@@ -288,6 +303,7 @@ impl RangeEngine {
             bytes: 0,
             limit: req.page_bytes.max(1),
             dir: req.dir,
+            at,
             resume: None,
         };
         if !versioned {

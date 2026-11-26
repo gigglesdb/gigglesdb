@@ -132,7 +132,7 @@ pub(crate) fn user_key_seek_at(user_key: &[u8], snapshot: Ts) -> Vec<u8> {
 /// prefix-free regions (Rows and Index at one snapshot, fixed-width kinds), not
 /// for Catalog name and role membership keys. `VersionedRange` drops the
 /// extensions this bound admits for an `Included` end (`above_end`); its
-/// emission order, the `TxnScan` merge and the routed read pager's reverse
+/// emission order, the `TxnScan` merge and the routed read pager's forward
 /// resume (`range/engine/read.rs`) still rely on it; GC, the local SSI fallback
 /// and point lookups do not. See `mvcc.rs`.
 pub(crate) fn user_key_upper_bound(user_key: &[u8]) -> Vec<u8> {

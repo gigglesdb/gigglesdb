@@ -1156,3 +1156,184 @@ fn recovery_refuses_wide_prepared_rows() {
         Err(RangeError::Corrupt(_))
     ));
 }
+
+/// GD-0084 Q40: reverse pages over a user key that is a proper prefix of other stored keys.
+mod q40_exact_key_boundary {
+    use super::*;
+
+    /// `key(5)` extended by one more key column, as a widening rekey writes it.
+    fn extension(b: u64) -> Vec<u8> {
+        let mut key = key(5);
+        key.push(2);
+        key.extend_from_slice(&b.to_be_bytes());
+        key
+    }
+
+    fn commit_key(
+        e: &RangeEngine,
+        t: ClusterTxnId,
+        key: Vec<u8>,
+        value: Option<&[u8]>,
+    ) -> Timestamp {
+        let grant = lock_key(e, t, &key).unwrap();
+        let write = RangeWrite {
+            space: RangeSpace::Rows,
+            key,
+            value: value.map(<[u8]>::to_vec),
+        };
+        e.commit(epoch(e), t, vec![write], None, Some(grant.generation))
+            .unwrap()
+    }
+
+    fn lock_key(e: &RangeEngine, t: ClusterTxnId, key: &[u8]) -> Result<LockGrant, RangeError> {
+        e.lock(LockRequest {
+            range: B,
+            epoch: epoch(e),
+            txn: t,
+            priority: Timestamp(0),
+            target: LockTarget::Key {
+                space: RangeSpace::Rows,
+                key: key.to_vec(),
+            },
+            mode: RangeLockMode::Exclusive,
+            timeout_ms: Some(1000),
+        })
+    }
+
+    fn page(e: &RangeEngine, end: Bound<Vec<u8>>, at: Timestamp) -> Result<ReadPage, RangeError> {
+        e.read(ReadRequest {
+            range: B,
+            epoch: epoch(e),
+            space: RangeSpace::Rows,
+            start: Bound::Unbounded,
+            end,
+            dir: ReadDirection::Reverse,
+            ts: at,
+            page_bytes: 1,
+        })
+    }
+
+    /// Live user keys of a reverse read at `at`, page by page.
+    fn reverse_live(e: &RangeEngine, at: Timestamp, page_bytes: usize) -> Vec<Vec<u8>> {
+        let mut live = Vec::new();
+        let mut end = Bound::Unbounded;
+        loop {
+            let page = e
+                .read(ReadRequest {
+                    range: B,
+                    epoch: epoch(e),
+                    space: RangeSpace::Rows,
+                    start: Bound::Unbounded,
+                    end: end.clone(),
+                    dir: ReadDirection::Reverse,
+                    ts: at,
+                    page_bytes,
+                })
+                .unwrap();
+            for (raw, value) in page.pairs {
+                if mvcc::decode(&value).unwrap().is_some() {
+                    live.push(codec::split_versioned(&raw).unwrap().0.to_vec());
+                }
+            }
+            match page.resume {
+                Some(next) => end = next,
+                None => return live,
+            }
+        }
+    }
+
+    /// Key 5 was deleted and rewritten as `key(5) || b`; a reverse page that fills on key 5's
+    /// tombstone resumes at key 5's versions at or below the read ts, so the next page reads
+    /// the extensions. Key 5 versions newer than the read ts are re-read and skipped there.
+    #[test]
+    fn a_reverse_page_ending_on_a_tombstone_keeps_the_keys_it_prefixes() {
+        let f = fixture();
+        let e = f.open();
+        for n in [4, 5, 6] {
+            commit_key(&e, txn(n), key(n), Some(b"v"));
+        }
+        commit_key(&e, txn(10), key(5), None);
+        for b in 1..=3 {
+            commit_key(&e, txn(10 + b), extension(b), Some(b"w"));
+        }
+        let at = f.oracle.next(1).unwrap();
+        // A version of key 5 above the read ts sits between its chosen version and the
+        // extensions in raw order.
+        commit_key(&e, txn(20), key(5), Some(b"later"));
+        let expected = vec![key(6), extension(3), extension(2), extension(1), key(4)];
+        for page_bytes in [1, 20, 40, 1 << 20] {
+            assert_eq!(
+                reverse_live(&e, at, page_bytes),
+                expected,
+                "page_bytes {page_bytes}"
+            );
+        }
+        // The page that fills on key 5 resumes just below key 5 at the read ts.
+        let first = page(&e, Bound::Unbounded, at).unwrap();
+        let second = page(&e, first.resume.unwrap(), at).unwrap();
+        assert_eq!(
+            codec::split_versioned(&second.pairs[0].0).unwrap().0,
+            key(5)
+        );
+        assert_eq!(
+            second.resume,
+            Some(Bound::Excluded(codec::user_key_seek_at(&key(5), ts(at))))
+        );
+    }
+
+    /// Prepared waits follow what each page read: the page ending on key 5 waits for a
+    /// prepared write of key 5 but not for one of an extension, which the next page reads.
+    #[test]
+    fn reverse_prepared_waits_cover_the_prefix_key_and_not_its_unread_extensions() {
+        let f = fixture();
+        let e = f.open();
+        for n in [5, 6] {
+            commit_key(&e, txn(n), key(n), Some(b"v"));
+        }
+        commit_key(&e, txn(10), key(5), None);
+        commit_key(&e, txn(11), extension(1), Some(b"w"));
+        lock_key(&e, txn(30), &extension(1)).unwrap();
+        let p = e
+            .prepare(
+                epoch(&e),
+                txn(30),
+                B,
+                vec![RangeWrite {
+                    space: RangeSpace::Rows,
+                    key: extension(1),
+                    value: Some(b"prepared".to_vec()),
+                }],
+                None,
+            )
+            .unwrap();
+        let at = Timestamp(p.0 + 1);
+        // A wait on the unread extension's prepared write would fail with Unavailable.
+        let first = page(&e, Bound::Unbounded, at).unwrap();
+        let second = page(&e, first.resume.unwrap(), at).unwrap();
+        assert_eq!(
+            codec::split_versioned(&second.pairs[0].0).unwrap().0,
+            key(5)
+        );
+        let reached = page(&e, second.resume.clone().unwrap(), at).unwrap_err();
+        assert!(matches!(reached, RangeError::Unavailable(_)), "{reached:?}");
+
+        lock_key(&e, txn(31), &key(5)).unwrap();
+        let p = e
+            .prepare(
+                epoch(&e),
+                txn(31),
+                B,
+                vec![RangeWrite {
+                    space: RangeSpace::Rows,
+                    key: key(5),
+                    value: Some(b"prepared".to_vec()),
+                }],
+                None,
+            )
+            .unwrap();
+        let at = Timestamp(p.0 + 1);
+        let first = page(&e, Bound::Unbounded, at).unwrap();
+        let blocked = page(&e, first.resume.unwrap(), at).unwrap_err();
+        assert!(matches!(blocked, RangeError::Unavailable(_)), "{blocked:?}");
+    }
+}

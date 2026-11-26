@@ -847,3 +847,53 @@ fn gap_lock_intervals_are_clipped_to_each_range() {
         Some((inc(b"m"), Bound::Unbounded))
     );
 }
+
+/// GD-0084 Q40: routed SERIALIZABLE validation of a scanned interval whose end key has a proper
+/// prefix that is a user key of its own.
+mod q40_exact_key_boundary {
+    use super::*;
+    use crate::storage::engine::kv::Direction;
+
+    /// T1 scans [a, `end`] at SERIALIZABLE and finds nothing, T2 commits a row at `written`
+    /// afterwards, then T1 writes elsewhere and commits: the commit's validation must see T2's
+    /// version inside what T1 read.
+    fn scan_then_concurrent_write(written: &[u8], end: &[u8]) -> Result<Ts, TxnError> {
+        let cluster = cluster();
+        let gw = services(&cluster, ClusterConfig::default());
+        let mut t1 = begin(&gw, Isolation::Serializable);
+        let (start, end) = (row(10, b"a"), row(10, end));
+        let seen = t1
+            .scan(
+                Keyspace::Rows,
+                Bound::Included(&start),
+                Bound::Included(&end),
+                Direction::Forward,
+                None,
+            )
+            .unwrap()
+            .count();
+        assert_eq!(seen, 0);
+        let mut t2 = begin(&gw, Isolation::Serializable);
+        put_row(&mut t2, 10, written, b"t2");
+        t2.commit().unwrap();
+        put_row(&mut t1, 10, b"z", b"t1");
+        t1.commit()
+    }
+
+    /// Control: a concurrent write strictly inside the interval fails T1's commit.
+    #[test]
+    fn serializable_scan_sees_a_concurrent_write_inside_its_interval() {
+        let error = scan_then_concurrent_write(b"b", b"cy").unwrap_err();
+        assert_eq!(error.sqlstate(), "40001", "{error:?}");
+    }
+
+    /// `c` lies inside [a, cy] in user-key order, but its raw versions `c||!ts` sort above every
+    /// raw key of `cy`, so a physical re-scan of the interval without end-prefix probes misses
+    /// it (txn.rs `validate_reads`, `validate_kv(.., false)`).
+    #[test]
+    #[ignore = "GD-0084 Q40: routed validate_kv runs without end-prefix probes, so a write to a proper prefix of a scan's end key goes unseen"]
+    fn serializable_scan_sees_a_concurrent_write_to_a_proper_prefix_of_its_end() {
+        let result = scan_then_concurrent_write(b"c", b"cy");
+        assert_eq!(result.map_err(|e| e.sqlstate()), Err("40001"));
+    }
+}

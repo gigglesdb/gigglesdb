@@ -318,8 +318,10 @@ impl FakeCluster {
                     codec::split_versioned(last).map_err(|e| corrupt(format!("{e:?}")))?;
                 Some(match req.dir {
                     ReadDirection::Forward => Bound::Included(codec::user_key_upper_bound(user)),
+                    // Just below the versions at or below req.ts, so the next page reads
+                    // the user key's extensions (range/engine/read.rs `Page::push`).
                     ReadDirection::Reverse => {
-                        Bound::Excluded(codec::user_key_seek_at(user, Ts(u64::MAX)))
+                        Bound::Excluded(codec::user_key_seek_at(user, Ts(req.ts.0)))
                     }
                 })
             }

@@ -20,9 +20,10 @@
 //! omission by either end bound of proper prefixes of the end key (`P || !ts`
 //! sorts above `P || y || ..` for real timestamps), the `TxnScan` overlay merge
 //! built on it, and reverse paging: an `Excluded(last)` end omits proper
-//! prefixes of `last`, and the routed pager's reverse resume (`user || !MAX`,
-//! `range/engine/read.rs`) skips the extensions of the key a page ends on,
-//! which in reverse follow that key's versions. Forward resume is exact. An
+//! prefixes of `last`. The routed pager's resume (`range/engine/read.rs`) is
+//! exact both ways: reverse resumes below `user || !at`, so the next page reads
+//! the extensions of the key a page ends on, which in reverse follow that key's
+//! versions (it used to resume below `user || !MAX` and skip them). An
 //! example that the exact bounds fix: `ALTER TABLE t DROP CONSTRAINT t_pkey;
 //! ALTER TABLE t ADD PRIMARY KEY (a)` on a table keyed `(a, b)`, then
 //! `WHERE a = 5` in the same transaction. The point range `[tid||5, tid||5]`
