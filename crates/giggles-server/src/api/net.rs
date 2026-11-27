@@ -1,6 +1,6 @@
 //! Shared authenticated accept loop and bounded HTTP protocol driver.
 use super::{
-    body::ResponseBody, dispatch::ApiRuntime, error::ApiError, identity::ConnectionIdentity,
+    body::TransportBody, dispatch::ApiRuntime, error::ApiError, identity::ConnectionIdentity,
 };
 use crate::{Running, tls, transport::IO_TIMEOUT};
 use http::{HeaderMap, Request, Response};
@@ -15,10 +15,13 @@ use std::{
     convert::Infallible,
     io,
     net::SocketAddr,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll, Waker},
     time::Instant,
 };
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpListener,
     sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch},
     time::timeout,
@@ -120,6 +123,7 @@ async fn serve_bound(
                         let identity = cert.map_or(Err(ApiError::Unauthenticated), |cert| runtime.authenticate(&tls::fingerprint(cert.as_ref())));
                         let activity = Arc::new(ConnectionActivity::new());
                         let monitor = activity.clone();
+                        let stream = FlushIo { inner: stream, tracker: activity.flush.clone() };
                         let handler = service_fn(move |request| {
                             let headers_received = Instant::now();
                             handle(request, runtime.clone(), identity.clone(), shared.clone(), activity.clone(), grpc, headers_received)
@@ -220,6 +224,7 @@ pub async fn serve_role_bound(
                         let identity = Ok(ConnectionIdentity::role_connection(RoleConnection { peer, certificate, tls }));
                         let activity = Arc::new(ConnectionActivity::new());
                         let monitor = activity.clone();
+                        let stream = FlushIo { inner: stream, tracker: activity.flush.clone() };
                         let handler = service_fn(move |request| {
                             let headers_received = Instant::now();
                             handle(request, runtime.clone(), identity.clone(), shared.clone(), activity.clone(), grpc, headers_received)
@@ -265,7 +270,7 @@ async fn handle(
     activity: Arc<ConnectionActivity>,
     grpc: bool,
     headers_received: Instant,
-) -> Result<Response<ResponseBody>, Infallible> {
+) -> Result<Response<TransportBody>, Infallible> {
     let identity = if runtime.kind() == super::dispatch::ListenerKind::Agent && identity.is_err() {
         bearer_secret(request.headers())
             .and_then(|secret| ConnectionIdentity::verified_credential(runtime.service(), secret))
@@ -333,7 +338,10 @@ async fn handle(
     {
         response.body_mut().guard_binding(identity, service);
     }
-    Ok(response)
+    Ok(response.map(|body| {
+        body.with_flush_tracker(activity.flush.clone())
+            .into_transport()
+    }))
 }
 
 fn bearer_secret(headers: &HeaderMap) -> Result<&str, ApiError> {
@@ -432,6 +440,7 @@ struct ActivityState {
 }
 
 pub(crate) struct ConnectionActivity {
+    flush: Arc<FlushTracker>,
     state: Mutex<ActivityState>,
     changed: Notify,
 }
@@ -439,6 +448,7 @@ pub(crate) struct ConnectionActivity {
 impl ConnectionActivity {
     pub(crate) fn new() -> Self {
         Self {
+            flush: Arc::new(FlushTracker::default()),
             state: Mutex::new(ActivityState {
                 next: 0,
                 last_application: Instant::now(),
@@ -569,5 +579,263 @@ mod tests {
         assert!(session_header(&headers, false).is_err());
         headers.append("x-giggles-session", "b".repeat(64).parse().unwrap());
         assert!(session_header(&headers, true).is_err());
+    }
+}
+
+// Receipts are per response; the tracker belongs to exactly one connection.
+// Registration means protocol consumption, never socket completion. Only a
+// successful downstream flush acknowledges registered receipts. Hyper/h2 drain
+// their codec buffers before calling this IO's poll_flush.
+#[derive(Default)]
+pub(crate) struct FlushTracker {
+    pending: Mutex<Vec<Arc<FlushReceipt>>>,
+}
+#[derive(Default)]
+pub(crate) struct FlushReceipt(Mutex<(bool, Option<Waker>)>);
+impl FlushReceipt {
+    pub(crate) fn poll_flushed(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut state = self.0.lock().expect("flush receipt");
+        if state.0 {
+            Poll::Ready(())
+        } else {
+            state.1 = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+    fn acknowledge(&self) {
+        let wake = {
+            let mut state = self.0.lock().expect("flush receipt");
+            state.0 = true;
+            state.1.take()
+        };
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+    }
+}
+impl FlushTracker {
+    pub(crate) fn consumed(&self, receipt: Arc<FlushReceipt>) {
+        self.pending.lock().expect("connection flush").push(receipt);
+    }
+}
+struct FlushIo<T> {
+    inner: T,
+    tracker: Arc<FlushTracker>,
+}
+impl<T: AsyncRead + Unpin> AsyncRead for FlushIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+impl<T: AsyncWrite + Unpin> AsyncWrite for FlushIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        // Consumption cannot occur concurrently: protocol buffers and IO are
+        // driven by the same connection task. Do not hold locks while waking.
+        std::task::ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
+        let receipts = std::mem::take(&mut *this.tracker.pending.lock().expect("connection flush"));
+        for receipt in receipts {
+            receipt.acknowledge();
+        }
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod flush_tests {
+    use super::super::body::ResponseBody;
+    use super::*;
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Empty, StreamBody};
+
+    #[test]
+    fn receipt_requires_successful_flush_on_its_own_connection() {
+        struct Gate(bool);
+        impl AsyncWrite for Gate {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(bytes.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                if self.0 {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let tracker = Arc::new(FlushTracker::default());
+        let receipt = Arc::new(FlushReceipt::default());
+        let mut io = FlushIo {
+            inner: Gate(false),
+            tracker: tracker.clone(),
+        };
+        let mut other = FlushIo {
+            inner: Gate(true),
+            tracker: Arc::new(FlushTracker::default()),
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        tracker.consumed(receipt.clone());
+        assert!(Pin::new(&mut other).poll_flush(&mut cx).is_ready());
+        assert!(receipt.poll_flushed(&mut cx).is_pending());
+        assert!(Pin::new(&mut io).poll_flush(&mut cx).is_pending());
+        assert!(receipt.poll_flushed(&mut cx).is_pending());
+        io.inner.0 = true;
+        assert!(Pin::new(&mut io).poll_flush(&mut cx).is_ready());
+        assert!(receipt.poll_flushed(&mut cx).is_ready());
+    }
+
+    async fn diagnostic_stall(h2: bool) {
+        // One-byte h2 window, and a small duplex transport for h1, make a
+        // partially sent diagnostic unavoidable before we suspend consumption.
+        let (server, client) = tokio::io::duplex(64);
+        let diagnostic = serde_json::json!({"sql":{"streamError":{
+            "code":"58030", "message":"x".repeat(4096)
+        }}})
+        .to_string();
+        let expected = diagnostic.clone();
+        let activity = Arc::new(ConnectionActivity::new());
+        let tracker = activity.flush.clone();
+        let service = service_fn(move |_: Request<Incoming>| {
+            let frames = vec![
+                Ok(http_body::Frame::data(Bytes::from(diagnostic.clone()))),
+                Err(tonic::Status::internal("58030")),
+            ];
+            let inner = StreamBody::new(tonic::codegen::tokio_stream::iter(frames));
+            let body =
+                ResponseBody::new_http(tonic::body::Body::new(inner), None, None, activity.begin())
+                    .with_flush_tracker(activity.flush.clone())
+                    .into_transport();
+            async move { Ok::<_, Infallible>(Response::new(body)) }
+        });
+        let server_task = tokio::spawn(async move {
+            let mut builder = auto::Builder::new(TokioExecutor::new());
+            if h2 {
+                builder = builder.http2_only();
+            } else {
+                builder = builder.http1_only();
+            }
+            let _ = builder
+                .serve_connection(
+                    TokioIo::new(FlushIo {
+                        inner: server,
+                        tracker,
+                    }),
+                    service,
+                )
+                .await;
+        });
+        let (mut body, client_task) = if h2 {
+            let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+                .initial_stream_window_size(1)
+                .adaptive_window(false)
+                .handshake::<_, Empty<Bytes>>(TokioIo::new(client))
+                .await
+                .unwrap();
+            let task = tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let response = sender
+                .send_request(
+                    Request::builder()
+                        .uri("https://localhost/")
+                        .body(Empty::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            (response.into_body(), task)
+        } else {
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(client))
+                .await
+                .unwrap();
+            let task = tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let response = sender
+                .send_request(
+                    Request::builder()
+                        .uri("/")
+                        .body(Empty::<Bytes>::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            (response.into_body(), task)
+        };
+        let mut bytes = body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap()
+            .to_vec();
+        assert!(bytes.len() < expected.len());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let read = async {
+            while let Some(frame) = body.frame().await {
+                match frame {
+                    Ok(frame) => {
+                        if let Ok(data) = frame.into_data() {
+                            bytes.extend_from_slice(&data);
+                        }
+                    }
+                    Err(_) => return true,
+                }
+            }
+            false
+        };
+        assert!(
+            timeout(std::time::Duration::from_secs(5), read)
+                .await
+                .unwrap(),
+            "body must fail"
+        );
+        assert_eq!(bytes, expected.as_bytes());
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["sql"]["streamError"]["code"], "58030");
+        client_task.abort();
+        server_task.abort();
+        let _ = client_task.await;
+        let _ = server_task.await;
+    }
+    #[tokio::test]
+    async fn h2_diagnostic_survives_stalled_window_before_body_error() {
+        diagnostic_stall(true).await;
+    }
+    #[tokio::test]
+    async fn h1_diagnostic_survives_stalled_transport_before_body_error() {
+        diagnostic_stall(false).await;
     }
 }

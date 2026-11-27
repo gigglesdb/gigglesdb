@@ -258,7 +258,7 @@ fn response_body(
     lease: Option<ResponseLease>,
     ticket: ActivityTicket,
 ) -> Response<ResponseBody> {
-    let mut response = Response::new(ResponseBody::new(body, ownership, lease, ticket));
+    let mut response = Response::new(ResponseBody::new_http(body, ownership, lease, ticket));
     *response.status_mut() = status;
     response.headers_mut().insert(
         header::CACHE_CONTROL,

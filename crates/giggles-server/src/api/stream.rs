@@ -14,10 +14,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::sync::mpsc;
-use tonic::{
-    Status,
-    codegen::tokio_stream::{Stream, StreamExt},
-};
+use tonic::{Status, codegen::tokio_stream::Stream};
 
 const CHUNK: usize = 64 * 1024;
 
@@ -157,13 +154,7 @@ pub(super) fn json_body(
         chunk.extend_from_slice(&suffix);
         send(chunk);
     });
-    let stream = Receiver(receiver).then(|item: Result<Frame<Bytes>, Status>| async move {
-        if item.is_err() {
-            // Allow the preceding diagnostic DATA frame to flush before aborting.
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        item
-    });
+    let stream = Receiver(receiver);
     Ok(tonic::body::Body::new(StreamBody::new(stream)))
 }
 
@@ -263,7 +254,10 @@ fn protobuf_chunks(
         };
         let after_commit = report_committed && spill.after_commit();
         let send = |reply| {
-            if grpc_cap && after_commit && let Err(error) = check_grpc_envelope(&reply) {
+            if grpc_cap
+                && after_commit
+                && let Err(error) = check_grpc_envelope(&reply)
+            {
                 let _ = sender.blocking_send(Err(status(&replay_error(error, true))));
                 return false;
             }

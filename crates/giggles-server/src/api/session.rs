@@ -558,7 +558,11 @@ fn expired(entry: &Entry, state: &State, now: Instant) -> bool {
         || (!state.busy && now >= state.last_completed + entry.idle_timeout)
 }
 
-/// Owns the unique live Session while a call is queued, running, or being sent.
+/// Owns the unique live Session while a call is queued and running, and until
+/// its response completion boundary. HTTP JSON restores it after producer EOF
+/// and final-slice authorization, before exposing the final payload bytes.
+/// Queued HTTP bytes retain delivery admission separately; gRPC keeps this lease
+/// through response delivery. A live producer or partial payload stays exclusive.
 /// Dropping a response can restore it; unwinding/Closing can only discard it.
 pub(crate) struct SessionLease {
     registry: Weak<Registry>,

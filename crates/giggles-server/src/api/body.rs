@@ -3,10 +3,10 @@ use super::{
     dispatch::{CallOwnership, ResponseLease},
     error::ApiError,
     identity::ConnectionIdentity,
-    net::ActivityTicket,
+    net::{ActivityTicket, FlushReceipt, FlushTracker},
 };
 use crate::Service;
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use std::{
@@ -66,13 +66,20 @@ where
         .map_err(|_| ApiError::DeadlineExceeded)?
 }
 
-/// Both the body and its queued output bytes own the response lease. The final
-/// owner releases it even when the caller has stopped awaiting the response.
+/// The body and queued bytes retain delivery admission. HTTP releases the
+/// session before its final DATA slice; other protocols retain the response lease.
 pub(crate) struct ResponseBody {
     inner: tonic::body::Body,
     pending: Bytes,
     delivery: Option<Arc<Mutex<DeliveryOwnership>>>,
     done: bool,
+    http_completion: bool,
+    inner_done: bool,
+    next: Option<Result<Frame<Bytes>, tonic::Status>>,
+    transport: bool,
+    final_data: bool,
+    flush_tracker: Option<Arc<FlushTracker>>,
+    last_data: Option<Arc<FlushReceipt>>,
 }
 
 struct DeliveryOwnership {
@@ -113,7 +120,25 @@ impl ResponseBody {
                 ticket,
             }))),
             done: false,
+            http_completion: false,
+            inner_done: false,
+            next: None,
+            transport: false,
+            final_data: false,
+            flush_tracker: None,
+            last_data: None,
         }
+    }
+
+    pub(crate) fn new_http(
+        inner: tonic::body::Body,
+        ownership: Option<Arc<CallOwnership>>,
+        lease: Option<ResponseLease>,
+        ticket: ActivityTicket,
+    ) -> Self {
+        let mut body = Self::new(inner, ownership, lease, ticket);
+        body.http_completion = true;
+        body
     }
 
     pub(crate) fn guard_binding(&mut self, identity: ConnectionIdentity, service: Arc<Service>) {
@@ -128,6 +153,16 @@ impl ResponseBody {
     fn finish(&mut self) {
         self.done = true;
         self.delivery.take();
+    }
+
+    fn release_session(&mut self) {
+        if let Some(delivery) = &self.delivery {
+            delivery
+                .lock()
+                .expect("delivery ownership lock")
+                .lease
+                .take();
+        }
     }
 
     fn chunk(&mut self) -> Result<Frame<Bytes>, tonic::Status> {
@@ -162,6 +197,15 @@ impl ResponseBody {
             .map_err(|_| ApiError::Internal.grpc_status())?
             .ticket
             .write_stage();
+        let final_slice =
+            self.http_completion && self.inner_done && self.pending.len() <= 16 * 1024;
+        self.final_data = final_slice;
+        if final_slice && !self.transport {
+            // Session state is no longer used by the producer. Restore it before
+            // a client can observe the complete payload, even if Hyper retains
+            // this Body and every queued DeliveryChunk indefinitely.
+            self.release_session();
+        }
         let bytes = self.pending.split_to(self.pending.len().min(16 * 1024));
         Ok(Frame::data(Bytes::from_owner(DeliveryChunk {
             bytes,
@@ -182,27 +226,66 @@ impl Body for ResponseBody {
         if this.done {
             return Poll::Ready(None);
         }
-        if !this.pending.is_empty() {
-            return Poll::Ready(Some(this.chunk()));
-        }
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(None) => {
-                this.finish();
-                Poll::Ready(None)
-            }
-            Poll::Ready(Some(Err(error))) => {
-                this.finish();
-                Poll::Ready(Some(Err(error)))
-            }
-            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                Ok(bytes) if !bytes.is_empty() => {
-                    this.pending = bytes;
-                    Poll::Ready(Some(this.chunk()))
+        loop {
+            if !this.pending.is_empty() {
+                // HTTP JSON has no trailers. A one-frame lookahead establishes
+                // EOF for unknown-length streams before their final DATA slice
+                // escapes. Never buffer more than one producer frame ahead.
+                if this.http_completion
+                    && this.pending.len() <= 16 * 1024
+                    && !this.inner_done
+                    && this.next.is_none()
+                {
+                    match Pin::new(&mut this.inner).poll_frame(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(None) => this.inner_done = true,
+                        Poll::Ready(Some(Ok(frame)))
+                            if frame.data_ref().is_some_and(Bytes::is_empty) =>
+                        {
+                            // Ignore empty DATA while proving EOF, with bounded work per poll.
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Some(frame)) => this.next = Some(frame),
+                    }
                 }
-                Ok(bytes) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
-                Err(frame) => Poll::Ready(Some(Ok(frame))),
-            },
-            Poll::Pending => Poll::Pending,
+                return Poll::Ready(Some(this.chunk()));
+            }
+            let frame = if let Some(frame) = this.next.take() {
+                Poll::Ready(Some(frame))
+            } else if this.inner_done {
+                Poll::Ready(None)
+            } else {
+                Pin::new(&mut this.inner).poll_frame(cx)
+            };
+            match frame {
+                Poll::Ready(None) => {
+                    if this.http_completion && !this.transport {
+                        this.release_session();
+                    }
+                    this.finish();
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    // Buf consumption alone leaves bytes in the protocol codec.
+                    // Defer the terminal error until the connection has flushed
+                    // after consuming the last preceding DATA in full.
+                    if let Some(receipt) = &this.last_data
+                        && receipt.poll_flushed(cx).is_pending()
+                    {
+                        this.next = Some(Err(error));
+                        return Poll::Pending;
+                    }
+                    this.finish();
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(bytes) if !bytes.is_empty() => this.pending = bytes,
+                    Ok(bytes) => return Poll::Ready(Some(Ok(Frame::data(bytes)))),
+                    Err(frame) => return Poll::Ready(Some(Ok(frame))),
+                },
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 
@@ -214,15 +297,112 @@ impl Body for ResponseBody {
             return SizeHint::with_exact(0);
         }
         let inner = self.inner.size_hint();
+        let buffered = self.pending.len() as u64
+            + self
+                .next
+                .as_ref()
+                .and_then(|frame| frame.as_ref().ok())
+                .and_then(Frame::data_ref)
+                .map_or(0, |bytes| bytes.len() as u64);
         let mut hint = SizeHint::new();
-        hint.set_lower(inner.lower().saturating_add(self.pending.len() as u64));
-        if let Some(upper) = inner
-            .upper()
-            .and_then(|upper| upper.checked_add(self.pending.len() as u64))
-        {
+        hint.set_lower(inner.lower().saturating_add(buffered));
+        if let Some(upper) = inner.upper().and_then(|upper| upper.checked_add(buffered)) {
             hint.set_upper(upper);
         }
         hint
+    }
+}
+
+/// Hyper consumes Buf only as protocol capacity accepts DATA. In particular h2
+/// can enqueue a complete frame while consuming only its flow-control window.
+/// Keeping the lease in the final Buf prevents producer EOF from releasing it.
+pub(crate) struct TransportBody(ResponseBody);
+
+pub(crate) struct TransportData {
+    bytes: Bytes,
+    completion: Option<Arc<Mutex<DeliveryOwnership>>>,
+    flush: Option<(Arc<FlushTracker>, Arc<FlushReceipt>)>,
+}
+
+impl Buf for TransportData {
+    fn remaining(&self) -> usize {
+        self.bytes.remaining()
+    }
+    fn chunk(&self) -> &[u8] {
+        self.bytes.chunk()
+    }
+    fn advance(&mut self, count: usize) {
+        self.bytes.advance(count);
+        if self.bytes.is_empty()
+            && let Some((tracker, receipt)) = self.flush.take()
+        {
+            tracker.consumed(receipt);
+        }
+        if self.bytes.is_empty()
+            && let Some(delivery) = self.completion.take()
+        {
+            delivery
+                .lock()
+                .expect("delivery ownership lock")
+                .lease
+                .take();
+        }
+    }
+}
+
+impl ResponseBody {
+    pub(crate) fn with_flush_tracker(mut self, tracker: Arc<FlushTracker>) -> Self {
+        self.flush_tracker = Some(tracker);
+        self
+    }
+
+    pub(crate) fn into_transport(mut self) -> TransportBody {
+        self.transport = true;
+        TransportBody(self)
+    }
+}
+
+impl Body for TransportBody {
+    type Data = TransportData;
+    type Error = tonic::Status;
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        this.0.final_data = false;
+        let frame = std::task::ready!(Pin::new(&mut this.0).poll_frame(cx));
+        let completion = if this.0.final_data {
+            this.0.delivery.clone()
+        } else {
+            None
+        };
+        Poll::Ready(frame.map(|frame| {
+            frame.map(|frame| {
+                frame.map_data(|bytes| {
+                    let flush = if !bytes.is_empty() && this.0.http_completion {
+                        this.0.flush_tracker.as_ref().map(|tracker| {
+                            let receipt = Arc::new(FlushReceipt::default());
+                            this.0.last_data = Some(receipt.clone());
+                            (tracker.clone(), receipt)
+                        })
+                    } else {
+                        None
+                    };
+                    TransportData {
+                        bytes,
+                        completion,
+                        flush,
+                    }
+                })
+            })
+        }))
+    }
+    fn is_end_stream(&self) -> bool {
+        self.0.is_end_stream()
+    }
+    fn size_hint(&self) -> SizeHint {
+        self.0.size_hint()
     }
 }
 
@@ -253,6 +433,10 @@ mod tests {
 
     impl ReleaseFixture {
         fn new() -> Self {
+            Self::with_connections(1)
+        }
+
+        fn with_connections(connections: usize) -> Self {
             let path = crate::test_support::fixture_root().join(format!(
                 "api-body-{}-{}-{}",
                 std::process::id(),
@@ -280,7 +464,7 @@ mod tests {
                 vec![binding.clone()],
                 Clock::new(0, 3600).unwrap(),
                 ServiceLimits {
-                    sessions: 1,
+                    sessions: connections,
                     ..ServiceLimits::default()
                 },
             )
@@ -318,6 +502,406 @@ mod tests {
                 .reload_bindings(vec![self.binding.clone()])
                 .unwrap();
         }
+    }
+
+    async fn execute_ping(
+        f: &ReleaseFixture,
+        token: &str,
+    ) -> Result<super::super::dispatch::Completion, ApiError> {
+        let service = f.runtime.service();
+        f.runtime
+            .execute(
+                &f.identity,
+                token,
+                super::super::proto::ExecuteRequest {
+                    request: Some(super::super::proto::execute_request::Request::Ping(
+                        super::super::proto::PingRequest {},
+                    )),
+                    ..Default::default()
+                },
+                Instant::now(),
+                None,
+                f.runtime
+                    .admit_call(service.admission.connect().unwrap())
+                    .unwrap(),
+                super::super::dispatch::Encoding::Json,
+                true,
+            )
+            .await
+    }
+
+    async fn session_body(f: &ReleaseFixture, inner: tonic::body::Body) -> (String, ResponseBody) {
+        let token = f.runtime.open(&f.identity).unwrap().session_id;
+        let completion = execute_ping(f, &token).await.unwrap();
+        let activity = Arc::new(super::super::net::ConnectionActivity::new());
+        (
+            token,
+            ResponseBody::new_http(inner, None, Some(completion.lease), activity.begin()),
+        )
+    }
+
+    async fn assert_busy(f: &ReleaseFixture, token: &str) {
+        let error = execute_ping(f, token).await.err().unwrap();
+        assert_eq!(error, ApiError::SessionBusy);
+        assert_eq!(error.http_status(), 409);
+    }
+
+    #[tokio::test]
+    async fn http_final_slice_releases_session_with_all_delivery_frames_retained() {
+        for len in [1, 16 * 1024, 16 * 1024 + 1, 50000] {
+            let f = ReleaseFixture::with_connections(8);
+            let (token, mut body) = session_body(
+                &f,
+                tonic::body::Body::new(Full::new(Bytes::from(vec![7; len]))),
+            )
+            .await;
+            let delivery = Arc::downgrade(body.delivery.as_ref().unwrap());
+            let mut frames = Vec::new();
+            let mut received = 0;
+            while received < len {
+                assert_busy(&f, &token).await;
+                let frame = body.frame().await.unwrap().unwrap().into_data().unwrap();
+                received += frame.len();
+                frames.push(frame);
+            }
+            // Neither a subsequent EOF poll nor Body/queued-frame cleanup has occurred.
+            drop(
+                execute_ping(&f, &token)
+                    .await
+                    .expect("complete HTTP payload must release session"),
+            );
+            assert!(delivery.upgrade().is_some());
+            drop(body);
+            assert!(delivery.upgrade().is_some());
+            drop(frames);
+            assert!(delivery.upgrade().is_none());
+            f.runtime.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn http_stream_final_boundary_waits_for_eof_and_retains_concurrent_exclusion() {
+        let f = ReleaseFixture::with_connections(8);
+        let (sender, receiver) =
+            tokio::sync::mpsc::channel::<Result<Frame<Bytes>, tonic::Status>>(4);
+        let stream = tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(receiver);
+        let (token, mut body) = session_body(
+            &f,
+            tonic::body::Body::new(http_body_util::StreamBody::new(stream)),
+        )
+        .await;
+        sender
+            .send(Ok(Frame::data(Bytes::from(vec![1; 16 * 1024 + 1]))))
+            .await
+            .unwrap();
+        let first = body.frame().await.unwrap().unwrap();
+        assert_busy(&f, &token).await;
+        // The final one-byte slice cannot escape while the producer is still live.
+        assert!(
+            Pin::new(&mut body)
+                .poll_frame(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_busy(&f, &token).await;
+        drop(sender);
+        let last = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(last.len(), 1);
+        drop(execute_ping(&f, &token).await.unwrap());
+        drop((first, last, body));
+        f.runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn http_stream_error_and_cancellation_keep_queued_cleanup_ownership() {
+        for fail in [false, true] {
+            let f = ReleaseFixture::with_connections(8);
+            let (sender, receiver) =
+                tokio::sync::mpsc::channel::<Result<Frame<Bytes>, tonic::Status>>(4);
+            let stream = tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(receiver);
+            let (token, mut body) = session_body(
+                &f,
+                tonic::body::Body::new(http_body_util::StreamBody::new(stream)),
+            )
+            .await;
+            sender
+                .send(Ok(Frame::data(Bytes::from(vec![1; 16 * 1024 + 1]))))
+                .await
+                .unwrap();
+            let first = body.frame().await.unwrap().unwrap();
+            if fail {
+                sender
+                    .send(Err(tonic::Status::internal("producer failed")))
+                    .await
+                    .unwrap();
+                let last = body.frame().await.unwrap().unwrap();
+                assert_busy(&f, &token).await;
+                assert!(body.frame().await.unwrap().is_err());
+                drop(last);
+            }
+            drop(body);
+            assert_busy(&f, &token).await;
+            drop(first);
+            drop(execute_ping(&f, &token).await.unwrap());
+            drop(sender);
+            f.runtime.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn http_final_slice_rechecks_authority_after_pending_lookahead() {
+        let f = ReleaseFixture::with_connections(8);
+        let (sender, receiver) =
+            tokio::sync::mpsc::channel::<Result<Frame<Bytes>, tonic::Status>>(4);
+        let stream = tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(receiver);
+        let (_, mut body) = session_body(
+            &f,
+            tonic::body::Body::new(http_body_util::StreamBody::new(stream)),
+        )
+        .await;
+        sender
+            .send(Ok(Frame::data(Bytes::from(vec![1; 16 * 1024 + 1]))))
+            .await
+            .unwrap();
+        let first = body.frame().await.unwrap().unwrap();
+        assert!(
+            Pin::new(&mut body)
+                .poll_frame(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        f.remove_readd();
+        drop(sender);
+        assert_eq!(
+            body.frame().await.unwrap().unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        drop((first, body));
+        f.runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn transport_final_data_waits_for_full_buf_consumption_even_after_eof() {
+        for len in [1, 16 * 1024, 16 * 1024 + 1] {
+            let f = ReleaseFixture::with_connections(8);
+            let (token, body) = session_body(
+                &f,
+                tonic::body::Body::new(Full::new(Bytes::from(vec![7; len]))),
+            )
+            .await;
+            let delivery = Arc::downgrade(body.delivery.as_ref().unwrap());
+            let mut body = body.into_transport();
+            let mut frames = Vec::new();
+            let mut received = 0;
+            while received < len {
+                let data = body
+                    .frame()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_data()
+                    .ok()
+                    .unwrap();
+                received += data.remaining();
+                frames.push(data);
+            }
+            // Hyper may poll EOF and discard the Body while DATA remains queued.
+            assert!(body.frame().await.is_none());
+            assert_busy(&f, &token).await;
+            let mut last = frames.pop().unwrap();
+            drop(body);
+            // Model h2's flow-control-limited Take<Buf>, including a zero advance.
+            last.advance(0);
+            assert_busy(&f, &token).await;
+            let partial = last.remaining() - 1;
+            let mut window = (&mut last).take(partial);
+            window.advance(partial);
+            assert_eq!(last.remaining(), 1);
+            assert_busy(&f, &token).await;
+            last.advance(1);
+            drop(
+                execute_ping(&f, &token)
+                    .await
+                    .expect("protocol accepted final DATA"),
+            );
+            // Delivery admission still follows queued bytes after session release.
+            assert!(delivery.upgrade().is_some());
+            drop((last, frames));
+            assert!(delivery.upgrade().is_none());
+            f.runtime.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_cancelled_partial_data_keeps_lease_until_last_owner_drops() {
+        for body_first in [false, true] {
+            let f = ReleaseFixture::with_connections(8);
+            let (token, body) = session_body(
+                &f,
+                tonic::body::Body::new(Full::new(Bytes::from_static(b"payload"))),
+            )
+            .await;
+            let delivery = Arc::downgrade(body.delivery.as_ref().unwrap());
+            let mut body = body.into_transport();
+            let mut data = body
+                .frame()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_data()
+                .ok()
+                .unwrap();
+            data.advance(1);
+            assert_busy(&f, &token).await;
+            if body_first {
+                drop(body);
+                assert_busy(&f, &token).await;
+                drop(data);
+            } else {
+                drop(data);
+                assert_busy(&f, &token).await;
+                drop(body);
+            }
+            assert!(delivery.upgrade().is_none());
+            drop(
+                execute_ping(&f, &token)
+                    .await
+                    .expect("cancelled delivery cleaned up"),
+            );
+            f.runtime.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_error_data_consumption_does_not_signal_success() {
+        let f = ReleaseFixture::with_connections(8);
+        let (sender, receiver) =
+            tokio::sync::mpsc::channel::<Result<Frame<Bytes>, tonic::Status>>(4);
+        let stream = tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(receiver);
+        let (token, body) = session_body(
+            &f,
+            tonic::body::Body::new(http_body_util::StreamBody::new(stream)),
+        )
+        .await;
+        let delivery = Arc::downgrade(body.delivery.as_ref().unwrap());
+        let mut body = body.into_transport();
+        sender
+            .send(Ok(Frame::data(Bytes::from_static(b"diagnostic"))))
+            .await
+            .unwrap();
+        sender
+            .send(Err(tonic::Status::internal("producer failed")))
+            .await
+            .unwrap();
+        let mut data = body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .ok()
+            .unwrap();
+        data.advance(data.remaining());
+        assert_busy(&f, &token).await;
+        assert!(body.frame().await.unwrap().is_err());
+        assert_busy(&f, &token).await;
+        drop(body);
+        assert_busy(&f, &token).await;
+        drop(data);
+        assert!(delivery.upgrade().is_none());
+        drop(execute_ping(&f, &token).await.unwrap());
+        drop(sender);
+        f.runtime.shutdown().await;
+    }
+
+    struct ExactFrames(std::collections::VecDeque<Bytes>);
+    impl Body for ExactFrames {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            Poll::Ready(self.0.pop_front().map(|bytes| Ok(Frame::data(bytes))))
+        }
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(self.0.iter().map(|bytes| bytes.len() as u64).sum())
+        }
+    }
+
+    #[tokio::test]
+    async fn http_size_hint_includes_prefetched_data() {
+        let activity = Arc::new(super::super::net::ConnectionActivity::new());
+        let inner = ExactFrames([Bytes::from_static(b"a"), Bytes::from_static(b"bcd")].into());
+        let mut body =
+            ResponseBody::new_http(tonic::body::Body::new(inner), None, None, activity.begin());
+        assert_eq!(body.size_hint().exact(), Some(4));
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            "a"
+        );
+        assert_eq!(body.size_hint().exact(), Some(3));
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            "bcd"
+        );
+        assert_eq!(body.size_hint().exact(), Some(0));
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn http_trailing_empty_data_proves_eof_before_final_payload() {
+        let f = ReleaseFixture::with_connections(8);
+        let (sender, receiver) =
+            tokio::sync::mpsc::channel::<Result<Frame<Bytes>, tonic::Status>>(4);
+        let stream = tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(receiver);
+        let (token, mut body) = session_body(
+            &f,
+            tonic::body::Body::new(http_body_util::StreamBody::new(stream)),
+        )
+        .await;
+        sender
+            .send(Ok(Frame::data(Bytes::from_static(b"payload"))))
+            .await
+            .unwrap();
+        sender.send(Ok(Frame::data(Bytes::new()))).await.unwrap();
+        drop(sender);
+        let payload = body.frame().await.unwrap().unwrap();
+        drop(
+            execute_ping(&f, &token)
+                .await
+                .expect("empty trailing DATA must not delay release"),
+        );
+        drop((payload, body));
+        f.runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn http_trailers_preserve_order_and_session_until_eof() {
+        let f = ReleaseFixture::with_connections(8);
+        let (sender, receiver) =
+            tokio::sync::mpsc::channel::<Result<Frame<Bytes>, tonic::Status>>(4);
+        let stream = tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(receiver);
+        let (token, mut body) = session_body(
+            &f,
+            tonic::body::Body::new(http_body_util::StreamBody::new(stream)),
+        )
+        .await;
+        sender
+            .send(Ok(Frame::data(Bytes::from_static(b"payload"))))
+            .await
+            .unwrap();
+        sender
+            .send(Ok(Frame::trailers(http::HeaderMap::new())))
+            .await
+            .unwrap();
+        drop(sender);
+        let data = body.frame().await.unwrap().unwrap();
+        assert_busy(&f, &token).await;
+        assert!(body.frame().await.unwrap().unwrap().is_trailers());
+        assert_busy(&f, &token).await;
+        assert!(body.frame().await.is_none());
+        drop(execute_ping(&f, &token).await.unwrap());
+        drop((data, body));
+        f.runtime.shutdown().await;
     }
 
     #[tokio::test]

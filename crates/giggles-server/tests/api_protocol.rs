@@ -570,3 +570,16 @@ async fn header_count_and_decoded_size_reject_before_dispatch() {
     assert_eq!(f.open_http(&f.app, true).await.len(), 64);
     f.stop().await;
 }
+
+#[tokio::test]
+async fn reading_http_client_immediately_reuses_completed_session() {
+    let f = Fixture::new().await;
+    for h2 in [false, true] {
+        let token = f.open_http(&f.app, h2).await;
+        for _ in 0..16 {
+            let result = f.exec_http(&f.app, &token, serde_json::json!({"ping":{}}), h2).await;
+            assert_eq!(result["transactionState"], "TRANSACTION_STATE_IDLE");
+        }
+    }
+    f.stop().await;
+}
