@@ -13,11 +13,59 @@ pub(super) mod reclaim;
 pub(super) mod maintenance;
 
 /// A stable allocation identity: entries are never replaced while the DB is open.
-#[derive(Default)]
 pub(crate) struct SeqSlot {
     pub(crate) counter: crate::cancellation::WaitMutex<SeqSlotState>,
-    pub(crate) ack_gen: std::sync::Mutex<u64>,
-    pub(crate) ack_cv: std::sync::Condvar,
+    pub(crate) ack_signal: Arc<AckSignal>,
+    pub(crate) reply_notifier: Arc<dyn Fn() + Send + Sync>,
+    pub(crate) cancel_notifier: Arc<dyn Fn() + Send + Sync>,
+}
+impl Default for SeqSlot {
+    fn default() -> Self {
+        let ack_signal = Arc::new(AckSignal::default());
+        let reply = ack_signal.clone();
+        let cancel = ack_signal.clone();
+        Self {
+            counter: Default::default(),
+            ack_signal,
+            reply_notifier: Arc::new(move || { let _ = reply.wake(false, true); }),
+            cancel_notifier: Arc::new(move || { let _ = cancel.wake(true, true); }),
+        }
+    }
+}
+impl SeqSlot {
+    // All production reservations attach the cached reply notifier here.
+    pub(crate) fn reservation(&self, sequencer: &engine::commit::Sequencer, key: Vec<u8>, value: Vec<u8>, incarnation: u128, hw: i64) -> Result<InFlight, engine::txn::TxnError> {
+        let ack = sequencer.send_counter_notified(key, value, 256, Some(self.reply_notifier.clone()))?;
+        Ok(InFlight { incarnation, hw, ack, _notifier_attached: () })
+    }
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn test_inflight(&self, incarnation: u128, hw: i64, ack: engine::commit::CounterAck) -> InFlight {
+        // Synthetic channels in direct wait tests have no engine reply wrapper.
+        InFlight { incarnation, hw, ack, _notifier_attached: () }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct AckSignal {
+    // State publication and reply arrival have separate generations. A reply
+    // must wake only the receiver, before that receiver publishes coverage.
+    pub(crate) generation: std::sync::Mutex<(u64, u64)>,
+    pub(crate) cv: std::sync::Condvar,
+    pub(crate) reply_cv: std::sync::Condvar,
+}
+impl AckSignal {
+    pub(crate) fn wake(&self, state: bool, reply: bool) -> Result<(), CoreError> {
+        let mut generation = self.generation.lock().map_err(|_| CoreError::Fenced)?;
+        if state {
+            generation.0 = generation.0.wrapping_add(1);
+            self.cv.notify_all();
+        }
+        if reply {
+            generation.1 = generation.1.wrapping_add(1);
+        }
+        if state || reply { self.reply_cv.notify_all(); }
+        Ok(())
+    }
 }
 
 /// (a) A returned value is covered by an Ok durable ack for its incarnation,
@@ -41,6 +89,8 @@ pub(crate) struct SeqSlotState {
     pub(crate) waiting_returns: usize,
 }
 pub(crate) struct InFlight {
+    // Prevent construction outside this module except through reservation().
+    _notifier_attached: (),
     pub(crate) incarnation: u128,
     pub(crate) hw: i64,
     pub(crate) ack: engine::commit::CounterAck,

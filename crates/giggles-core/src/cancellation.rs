@@ -17,6 +17,7 @@ type DurabilityCallback = Arc<dyn Fn(crate::DurabilityKind, &mut dyn FnMut()) ->
 struct Context {
     durable: Mutex<Option<Arc<crate::DurableTracker>>>,
     durability_wait: Mutex<Option<DurabilityCallback>>,
+    wakers: Mutex<Vec<Arc<RegisteredWaker>>>,
     state: AtomicU8,
     deadline: Mutex<Option<Instant>>,
     lock_timeout: Mutex<Option<Duration>>,
@@ -27,6 +28,7 @@ impl Cancellation {
         Self(Arc::new(Context {
             durable: Mutex::new(None),
             durability_wait: Mutex::new(None),
+            wakers: Mutex::new(Vec::new()),
             state: AtomicU8::new(0),
             deadline: Mutex::new(deadline),
             lock_timeout: Mutex::new(None),
@@ -73,14 +75,37 @@ impl Cancellation {
     }
     pub fn deadline(&self, at: Instant) {
         let mut d = self.0.deadline.lock().expect("deadline lock");
-        *d = Some(d.map_or(at, |old| old.min(at)));
+        let lowered = d.is_none_or(|old| at < old);
+        if lowered { *d = Some(at); }
+        drop(d);
+        if lowered { self.wake(); }
+    }
+    /// Register a cheap wakeup; callers must recheck cancellation before sleeping.
+    pub(crate) fn register_waker(&self, waker: Arc<dyn Fn() + Send + Sync>) -> WakerGuard {
+        let waker = Arc::new(RegisteredWaker(waker));
+        self.0.wakers.lock().unwrap_or_else(PoisonError::into_inner).push(waker.clone());
+        WakerGuard(self.clone(), waker)
+    }
+    fn wake(&self) {
+        let wakers = self.0.wakers.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        for wake in wakers { (wake.0)(); }
     }
     /// True only if cancellation wins before decision. Too late is never rollback.
     pub fn cancel(&self) -> bool {
-        self.0
-            .state
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        let won = self.0.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok();
+        if won { self.wake(); }
+        won
+    }
+    /// Inspect without invoking callbacks while a waiter's signal lock is held.
+    pub(crate) fn wait_remaining(&self) -> Result<Duration, CoreError> {
+        let deadline = *self.0.deadline.lock().expect("deadline lock");
+        const CAP: Duration = Duration::from_secs(1);
+        match self.0.state.load(Ordering::Acquire) {
+            1 => return Err(CoreError::Cancelled),
+            2 => return Ok(CAP), // A decided request cannot cancel at its expired deadline.
+            _ => {}
+        }
+        Ok(deadline.map_or(CAP, |at| CAP.min(at.saturating_duration_since(Instant::now()))))
     }
     pub fn check(&self) -> Result<(), CoreError> {
         if self
@@ -132,6 +157,16 @@ impl Cancellation {
         }
         let _restore = Restore(CURRENT.with(|c| c.replace(Some(self.clone()))));
         work()
+    }
+}
+struct RegisteredWaker(Arc<dyn Fn() + Send + Sync>);
+/// Removes a wakeup, including when the waiter unwinds.
+#[must_use]
+pub(crate) struct WakerGuard(Cancellation, Arc<RegisteredWaker>);
+impl Drop for WakerGuard {
+    fn drop(&mut self) {
+        self.0.0.wakers.lock().unwrap_or_else(PoisonError::into_inner)
+            .retain(|waker| !Arc::ptr_eq(waker, &self.1));
     }
 }
 /// Clears the per-statement callback, including on unwind.
@@ -319,6 +354,44 @@ impl<T> WaitMutex<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn notification_wait_cap_and_decided_deadline() {
+        let c = Cancellation::new(Some(Instant::now() + Duration::from_secs(60)));
+        assert_eq!(c.wait_remaining().unwrap(), Duration::from_secs(1));
+        c.decide().unwrap();
+        c.deadline(Instant::now() - Duration::from_secs(1));
+        assert_eq!(c.wait_remaining().unwrap(), Duration::from_secs(1));
+        assert!(!c.cancel());
+    }
+    #[test]
+    fn wakers_unregister_on_unwind_and_run_outside_registry_lock() {
+        use std::sync::atomic::AtomicUsize;
+        let c = Cancellation::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let other = c.clone();
+        let guard = c.register_waker(Arc::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            drop(other.register_waker(Arc::new(|| {})));
+        }));
+        let at = Instant::now() + Duration::from_secs(10);
+        c.deadline(at);
+        c.deadline(at + Duration::from_secs(1));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(c.cancel());
+        assert!(!c.cancel());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        drop(guard);
+        let count = calls.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = c.register_waker(Arc::new(move || { count.fetch_add(1, Ordering::Relaxed); }));
+            panic!("unwind waiter");
+        }));
+        c.deadline(Instant::now());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(c.0.wakers.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn guard_wait_has_no_lost_unlock() {
         for _ in 0..100 {

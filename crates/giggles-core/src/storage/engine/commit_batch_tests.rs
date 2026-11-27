@@ -98,7 +98,7 @@ fn gather_includes_counters_and_preserves_shutdown() {
                 key: vec![],
                 value: vec![],
                 features_or: 0,
-                reply,
+                reply: reply.into(),
             }
         })
         .unwrap();
@@ -323,7 +323,7 @@ fn counter_fixture() -> (Arc<Sequencer>, Vec<u8>, Vec<u8>) {
 
 fn counter_message(key: Vec<u8>, value: Vec<u8>) -> (Message, mpsc::Receiver<Result<(), TxnError>>) {
     let (reply, receive) = mpsc::channel();
-    (Message::Counter { key, value, features_or: 0, reply }, receive)
+    (Message::Counter { key, value, features_or: 0, reply: reply.into() }, receive)
 }
 
 // Predetermined mixed groups exercise the exact worker publication path. The
@@ -447,7 +447,7 @@ fn row_version_highwaters_validate_and_share_commit_sync() {
     assert_eq!(seq.write_highwater_async(key.clone(), 1_u64.to_be_bytes().to_vec()).unwrap().recv().unwrap(), Err(TxnError::Misuse));
     let (reply, receive) = mpsc::channel();
     let (commit, committed) = pending(42);
-    let group = vec![Message::Highwater { key: key.clone(), value: 100_u64.to_be_bytes().to_vec(), reply }, Message::Commit(commit)];
+    let group = vec![Message::Highwater { key: key.clone(), value: 100_u64.to_be_bytes().to_vec(), reply: reply.into() }, Message::Commit(commit)];
     let mut hlc = HlcClock::new(Ts(0));
     let mut log = RecentLog::new(1_000_000);
     let mut features = 0;

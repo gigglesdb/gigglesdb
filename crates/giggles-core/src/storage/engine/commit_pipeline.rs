@@ -54,7 +54,7 @@ impl GroupNumber {
 
 pub(super) enum Reply {
     Commit(mpsc::Sender<Result<Ts, TxnError>>, Result<Ts, TxnError>),
-    Unit(mpsc::Sender<Result<(), TxnError>>, Result<(), TxnError>),
+    Unit(CounterReply, Result<(), TxnError>),
     Fence(
         mpsc::Sender<Result<Option<WriteFenceRecord>, TxnError>>,
         Result<Option<WriteFenceRecord>, TxnError>,
@@ -88,7 +88,7 @@ impl Reply {
         }
         match self {
             Self::Commit(reply, result) => send(reply, result, override_error),
-            Self::Unit(reply, result) => send(reply, result, override_error),
+            Self::Unit(reply, result) => { let _ = reply.send(override_error.map_or(result, |error| Err(error.clone()))); },
             Self::Fence(reply, result) => send(reply, result, override_error),
             Self::Snapshot(reply, result) => send(reply, result, override_error),
         }
@@ -405,7 +405,7 @@ impl Group<'_> {
         mut batch: WriteBatch,
         max: Ts,
         commits: Vec<(mpsc::Sender<Result<Ts, TxnError>>, Ts)>,
-        counters: Vec<mpsc::Sender<Result<(), TxnError>>>,
+        counters: Vec<CounterReply>,
         kv: &Kv,
         shared: &Shared,
     ) -> bool {

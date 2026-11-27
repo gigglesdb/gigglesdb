@@ -133,7 +133,7 @@ fn cap_preserves_counter_and_shutdown_handling() {
                 key: vec![1],
                 value: vec![2],
                 features_or: 4,
-                reply,
+                reply: reply.into(),
             }
         })
         .unwrap();

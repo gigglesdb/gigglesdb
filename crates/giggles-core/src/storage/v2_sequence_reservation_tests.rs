@@ -1467,7 +1467,8 @@ fn coverage_nonreceiver_survives_ddl_restart() {
             thread::sleep(Duration::from_millis(1));
         }
     }
-    let before = *slot.ack_gen.lock().unwrap();
+    // State generation only: a released reply bumps the reply generation too.
+    let before = slot.ack_signal.generation.lock().unwrap().0;
     let admin = f.admin.as_ref().unwrap().clone();
     let (tx, restarted) = mpsc::channel();
     let restart = thread::spawn(move || {
@@ -1478,11 +1479,13 @@ fn coverage_nonreceiver_survives_ddl_restart() {
         tx.send(()).unwrap();
     });
     let outcome = restarted.recv_timeout(Duration::from_secs(10));
+    // The committed install must wake state waiters before any gated reply is released.
+    let woke = slot.ack_signal.generation.lock().unwrap().0 != before;
     // Release even on failure, so fixture teardown cannot hang on gated acks.
     db.sequencer.gate_counter_acks(false);
     outcome.unwrap();
     restart.join().unwrap();
-    assert_ne!(*slot.ack_gen.lock().unwrap(), before);
+    assert!(woke, "DDL install did not bump the state generation");
     let values: BTreeSet<_> = (0..2).map(|_| rx.recv_timeout(Duration::from_secs(10)).unwrap()).collect();
     assert_eq!(values, BTreeSet::from([34, 35]));
     for worker in workers { worker.join().unwrap(); }
@@ -2448,4 +2451,263 @@ mod alter_sequence_position {
         run(&mut s, "ALTER SEQUENCE seq MAXVALUE 12");
         assert_eq!(scalar(&mut s, "SELECT nextval('seq')"), 12);
     }
+}
+
+// Direct wait-path tests isolate notification from SQL allocation and disk timing.
+#[cfg(feature = "engine-rocksdb")]
+fn notification_slot(receiver: bool) -> (std::sync::Arc<v2::SeqSlot>, std::sync::mpsc::Sender<Result<(), engine::txn::TxnError>>) {
+    let slot = std::sync::Arc::new(v2::SeqSlot::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let mut state = slot.counter.lock().unwrap();
+        state.receiving = !receiver;
+        if receiver {
+            state.inflight.push_back(slot.test_inflight(7, 41, engine::commit::CounterAck(rx)));
+            let (_tx, rx) = std::sync::mpsc::channel();
+            state.inflight.push_back(slot.test_inflight(7, 73, engine::commit::CounterAck(rx)));
+        }
+    }
+    (slot, tx)
+}
+
+#[cfg(feature = "engine-rocksdb")]
+fn notification_cancel_or_deadline(receiver: bool, mode: usize) {
+    use std::{sync::mpsc, time::{Duration, Instant}};
+    // Explicit cancel, initial deadline, and a deadline lowered while asleep.
+    let (slot, _reply) = notification_slot(receiver);
+    let deadline = Instant::now() + Duration::from_millis(450);
+    let cancel = crate::Cancellation::new(match mode { 1 => Some(deadline), 2 => Some(Instant::now() + Duration::from_secs(10)), _ => None });
+    let c = cancel.clone();
+    let other = slot.clone();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        ACK_PARKS.set(0);
+        let result = c.scope(|| {
+            let mut guard = other.counter.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            loop {
+                match receive_one(&other, guard) {
+                    Ok(next) => guard = next,
+                    Err(error) => break CoreError::from(error),
+                }
+            }
+        });
+        tx.send((result, ACK_PARKS.get(), Instant::now())).unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    if mode == 1 {
+        // Observe the negative window relative to the actual deadline, allowing startup delay.
+        let window = deadline.saturating_duration_since(Instant::now()).saturating_sub(Duration::from_millis(50));
+        assert!(rx.recv_timeout(window).is_err());
+    } else {
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+    let expected = match mode {
+        0 => { let at = Instant::now(); assert!(cancel.cancel()); at },
+        1 => deadline,
+        _ => { let at = Instant::now() + Duration::from_millis(80); cancel.deadline(at); at },
+    };
+    let (error, parks, finished) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    worker.join().unwrap();
+    assert_eq!(error, CoreError::Cancelled);
+    assert!(finished >= expected);
+    assert!(finished.duration_since(expected) < Duration::from_millis(250), "receiver={receiver} mode={mode}");
+    assert!(parks <= 3, "timed polling: receiver={receiver} mode={mode} parks={parks}");
+    if receiver {
+        let guard = slot.counter.lock().unwrap();
+        assert!(!guard.receiving);
+        assert_eq!(guard.inflight.iter().map(|w| w.hw).collect::<Vec<_>>(), [41, 73]);
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn notification_nonreceiver_cancel_does_not_poll() { notification_cancel_or_deadline(false, 0); }
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn notification_nonreceiver_initial_deadline_does_not_poll() { notification_cancel_or_deadline(false, 1); }
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn notification_nonreceiver_lowered_deadline_does_not_poll() { notification_cancel_or_deadline(false, 2); }
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn notification_receiver_cancel_does_not_poll() { notification_cancel_or_deadline(true, 0); }
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn notification_receiver_initial_deadline_does_not_poll() { notification_cancel_or_deadline(true, 1); }
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn notification_receiver_lowered_deadline_does_not_poll() { notification_cancel_or_deadline(true, 2); }
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn notification_ack_cancel_race_has_no_lost_wakeup() {
+    use std::{sync::{Arc, Barrier, mpsc}, time::{Duration, Instant}};
+    for iteration in 0..200 {
+        let (slot, reply) = notification_slot(true);
+        // This test needs only one write; the extra write tests restoration above.
+        slot.counter.lock().unwrap().inflight.pop_back();
+        let barrier = Arc::new(Barrier::new(33));
+        let (tx, rx) = mpsc::channel();
+        let mut workers = Vec::new();
+        let mut cancellations = Vec::new();
+        let (parked_tx, parked_rx) = mpsc::channel();
+        for _ in 0..32 {
+            let c = crate::Cancellation::default();
+            cancellations.push(c.clone());
+            let slot = slot.clone();
+            let barrier = barrier.clone();
+            let tx = tx.clone();
+            let parked = parked_tx.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                ACK_PARKS.set(0);
+                if iteration == 199 { ACK_PARK_HOOK.with(|hook| *hook.borrow_mut() = Some(parked)); }
+                let result = c.scope(|| {
+                    let mut guard = slot.counter.lock_cancellable()?;
+                    while guard.receiving || !guard.inflight.is_empty() {
+                        guard = receive_one(&slot, guard).map_err(CoreError::from)?;
+                    }
+                    Ok::<_, CoreError>(())
+                });
+                tx.send((result, ACK_PARKS.get())).unwrap();
+            }));
+        }
+        barrier.wait();
+        let began = Instant::now();
+        if iteration == 0 { assert!(rx.recv_timeout(Duration::from_millis(300)).is_err()); }
+        if iteration == 199 {
+            for _ in 0..32 { parked_rx.recv_timeout(Duration::from_secs(2)).unwrap(); }
+        }
+        let completed = Instant::now();
+        // The first iteration measures idle waiting with only ack notifications.
+        // Later iterations race cancellation around completion and receiver handoff.
+        if iteration == 199 { for c in &cancellations { c.cancel(); } }
+        if iteration != 0 { for c in cancellations.iter().step_by(2) { c.cancel(); } }
+        if iteration != 199 {
+            reply.send(Ok(())).unwrap();
+            (slot.reply_notifier)();
+        }
+        if iteration != 0 { for c in cancellations.iter().skip(1).step_by(2) { c.cancel(); } }
+        let mut parks = 0;
+        for _ in 0..32 {
+            let (result, count) = rx.recv_timeout(Duration::from_millis(800)).unwrap();
+            parks += count;
+            assert!(matches!(result, Ok(()) | Err(CoreError::Cancelled)));
+        }
+        assert!(completed.elapsed() < Duration::from_millis(800));
+        if iteration == 0 { assert!(parks <= 128, "timed polling: {parks} parks after {:?}", began.elapsed()); }
+        for worker in workers { worker.join().unwrap(); }
+        if iteration == 199 {
+            reply.send(Ok(())).unwrap();
+            (slot.reply_notifier)();
+        }
+        // A final uncancelled receiver consumes an ack restored by cancellation.
+        let guard = slot.counter.lock().unwrap();
+        if !guard.inflight.is_empty() { drop(receive_one(&slot, guard).unwrap()); } else { drop(guard); }
+        let state = slot.counter.lock().unwrap();
+        assert!(!state.receiving);
+        assert!(state.inflight.is_empty());
+    }
+}
+
+
+#[cfg(feature = "engine-rocksdb")]
+fn notification_real_reply(dropped: bool) {
+    use std::{sync::mpsc, time::{Duration, Instant}};
+    let f = Fixture::new(Engine::V2);
+    let mut session = f.session();
+    run(&mut session, "CREATE SEQUENCE real_notify");
+    let db = f.admin.as_ref().unwrap().test_v2();
+    let (id, def) = db.catalog().current_local_view().unwrap().sequences.iter().next().map(|(id, def)| (*id, def.clone())).unwrap();
+    let counter = sequences::fresh(&def);
+    let slot = Arc::new(v2::SeqSlot::default());
+    slot.counter.lock().unwrap().install(counter.clone());
+    db.sequencer.gate_counter_acks(true);
+    let _release = ReleaseGate(|| db.sequencer.gate_counter_acks(false));
+    let key = engine::catalog_codec::counter_key(id, def.incarnation);
+    let write = slot.reservation(&db.sequencer, key, engine::catalog_codec::encode_counter(&counter, &def).unwrap(), def.incarnation, counter.log_hw).unwrap();
+    slot.counter.lock().unwrap().inflight.push_back(write);
+    let until = Instant::now() + Duration::from_secs(5);
+    while db.sequencer.held_counter_acks() != 1 {
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(1));
+    }
+    let (parked, ready) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
+    let other = slot.clone();
+    let receiver = thread::spawn(move || {
+        ACK_PARKS.set(0);
+        ACK_PARK_HOOK.with(|hook| *hook.borrow_mut() = Some(parked));
+        let result = receive_one(&other, other.counter.lock().unwrap()).map(|_| ()).map_err(CoreError::from);
+        tx.send((result, ACK_PARKS.get(), Instant::now())).unwrap();
+    });
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (parked, ready) = mpsc::channel();
+    let (tx, nr) = mpsc::channel();
+    let other = slot.clone();
+    let waiter = thread::spawn(move || {
+        ACK_PARKS.set(0);
+        ACK_PARK_HOOK.with(|hook| *hook.borrow_mut() = Some(parked));
+        drop(receive_one(&other, other.counter.lock().unwrap()).unwrap());
+        tx.send(ACK_PARKS.get()).unwrap();
+    });
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    // Hold publication back while the reply arrives. A reply must not change
+    // the state generation or wake a non-receiver into slot-lock contention.
+    let guard = slot.counter.lock().unwrap();
+    let before = slot.ack_signal.generation.lock().unwrap().0;
+    let released = Instant::now();
+    if dropped { db.sequencer.drop_counter_acks(); }
+    else { db.sequencer.gate_counter_acks(false); }
+    assert_eq!(slot.ack_signal.generation.lock().unwrap().0, before);
+    drop(guard);
+    let (result, parks, finished) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(result, if dropped { Err(CoreError::Fenced) } else { Ok(()) });
+    assert!(finished.duration_since(released) < Duration::from_millis(250));
+    assert!(parks <= 2, "receiver parks={parks}");
+    let parks = nr.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(parks <= 2, "non-receiver parks={parks}");
+    receiver.join().unwrap();
+    waiter.join().unwrap();
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn notification_real_ack_wakes_receiver_once_then_state_waiters() { notification_real_reply(false); }
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn notification_real_reply_drop_fences_promptly() { notification_real_reply(true); }
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn notification_decided_expired_deadline_parks() {
+    use std::{sync::mpsc, time::{Duration, Instant}};
+    let (slot, reply) = notification_slot(true);
+    slot.counter.lock().unwrap().inflight.pop_back();
+    let cancellation = crate::Cancellation::default();
+    cancellation.scope(|| crate::cancellation::decide().unwrap());
+    cancellation.deadline(Instant::now() - Duration::from_secs(1));
+    let other = slot.clone();
+    let (parked, ready) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        ACK_PARKS.set(0);
+        ACK_PARK_HOOK.with(|hook| *hook.borrow_mut() = Some(parked));
+        cancellation.scope(|| drop(receive_one(&other, other.counter.lock().unwrap()).unwrap()));
+        tx.send(ACK_PARKS.get()).unwrap();
+    });
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    reply.send(Ok(())).unwrap();
+    (slot.reply_notifier)();
+    assert!(rx.recv_timeout(Duration::from_millis(250)).unwrap() <= 3);
+    worker.join().unwrap();
 }

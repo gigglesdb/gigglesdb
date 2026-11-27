@@ -312,7 +312,7 @@ thread_local! {
     static SNAPSHOT_SHARD: usize = NEXT_SNAPSHOT_SHARD.fetch_add(1, Ordering::Relaxed) % SNAPSHOT_SHARDS;
 }
 #[cfg(test)]
-type HeldCounterReplies = Option<Vec<mpsc::Sender<Result<(), TxnError>>>>;
+type HeldCounterReplies = Option<Vec<CounterReply>>;
 struct Shared {
     stopped: AtomicBool,
     fenced: AtomicBool,
@@ -401,12 +401,12 @@ enum Message {
         key: Vec<u8>,
         value: Vec<u8>,
         features_or: u64,
-        reply: mpsc::Sender<Result<(), TxnError>>,
+        reply: CounterReply,
     },
     Highwater {
         key: Vec<u8>,
         value: Vec<u8>,
-        reply: mpsc::Sender<Result<(), TxnError>>,
+        reply: CounterReply,
     },
     Fence {
         action: FenceAction,
@@ -463,6 +463,31 @@ impl FenceAccess {
         Ok(())
     }
 }
+struct CounterReply {
+    sender: Option<mpsc::Sender<Result<(), TxnError>>>,
+    notify: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+#[cfg(test)]
+impl From<mpsc::Sender<Result<(), TxnError>>> for CounterReply {
+    fn from(sender: mpsc::Sender<Result<(), TxnError>>) -> Self {
+        Self { sender: Some(sender), notify: None }
+    }
+}
+impl CounterReply {
+    fn send(mut self, result: Result<(), TxnError>) -> Result<(), mpsc::SendError<Result<(), TxnError>>> {
+        let result = self.sender.take().expect("live reply").send(result);
+        if let Some(notify) = self.notify.take() { notify(); }
+        result
+    }
+}
+impl Drop for CounterReply {
+    fn drop(&mut self) {
+        // Disconnect must be visible before waking the receiver.
+        drop(self.sender.take());
+        if let Some(notify) = self.notify.take() { notify(); }
+    }
+}
+
 pub(crate) struct CounterAck(pub(crate) mpsc::Receiver<Result<(), TxnError>>);
 impl CounterAck {
     pub(crate) fn wait(self) -> Result<(), TxnError> {
@@ -556,6 +581,11 @@ impl Sequencer {
         else if let Some(replies) = gate.take() {
             for reply in replies { let _ = reply.send(Ok(())); }
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn drop_counter_acks(&self) {
+        // Drop the real reply wrappers, exercising disconnect-before-notify.
+        self.shared.counter_gate.lock().unwrap().take();
     }
     #[cfg(test)]
     pub(crate) fn held_counter_acks(&self) -> usize {
@@ -800,6 +830,7 @@ impl Sequencer {
         }
         if self.stopped() || self.kv.is_fenced() { return Err(TxnError::Fenced); }
         let (reply, receive) = mpsc::channel();
+        let reply = CounterReply { sender: Some(reply), notify: None };
         self.sender.send(Message::Highwater { key, value, reply })
             .map_err(|_| TxnError::Fenced)?;
         Ok(receive)
@@ -808,9 +839,16 @@ impl Sequencer {
     pub(crate) fn send_counter(
         &self, key: Vec<u8>, value: Vec<u8>, features_or: u64,
     ) -> Result<CounterAck, TxnError> {
+        self.send_counter_notified(key, value, features_or, None)
+    }
+    pub(crate) fn send_counter_notified(
+        &self, key: Vec<u8>, value: Vec<u8>, features_or: u64,
+        notify: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<CounterAck, TxnError> {
         if !valid_counter_key(&key) { return Err(TxnError::Misuse); }
         if self.stopped() || self.kv.is_fenced() { return Err(TxnError::Fenced); }
         let (reply, receive) = mpsc::channel();
+        let reply = CounterReply { sender: Some(reply), notify };
         let message = Message::Counter { key, value, features_or, reply };
         #[cfg(test)]
         if let Some(writes) = self.shared.counter_writes.lock().unwrap().as_mut() {

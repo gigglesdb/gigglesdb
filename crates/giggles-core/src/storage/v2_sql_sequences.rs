@@ -988,20 +988,12 @@ fn persist_rewrite_position(
         state.counter = Some(counter);
     } else {
         counter.log_hw = reserve_ahead(def, counter.last_value);
-        let ack = db.sequencer.send_counter(
-            key,
-            engine::catalog_codec::encode_counter(&counter, def)?,
-            256,
-        )?;
+        let write = slot.reservation(&db.sequencer, key, engine::catalog_codec::encode_counter(&counter, def)?, def.incarnation, counter.log_hw)?;
         if !prior.is_called {
             // The previous watermark did not cover consumption of the uncalled value.
             state.durable_hw = None;
         }
-        state.inflight.push_back(v2::InFlight {
-            incarnation: def.incarnation,
-            hw: counter.log_hw,
-            ack,
-        });
+        state.inflight.push_back(write);
         // Rollback can release the lease before this ack arrives. Keep the new
         // live position and its queued write together so the next allocator
         // cannot reuse the position or overtake the write.
@@ -1025,6 +1017,8 @@ fn reserve_ahead(def: &relational::catalog_ext::SequenceDef, value: i64) -> i64 
 
 #[cfg(all(test, feature = "engine-rocksdb"))]
 thread_local! {
+    static ACK_PARK_HOOK: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    static ACK_PARKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ACK_WAIT_PATHS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RESERVATIONS_SENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1055,27 +1049,13 @@ fn receive_one<'a>(
     slot: &'a v2::SeqSlot,
     mut guard: SlotGuard<'a>,
 ) -> Result<SlotGuard<'a>, ReceiveError> {
+    if !guard.receiving && guard.inflight.is_empty() { return Ok(guard); }
+    let cancellation = crate::Cancellation::current();
+    let _waker = cancellation.as_ref().map(|c| c.register_waker(slot.cancel_notifier.clone()));
     if guard.receiving {
-        // Observe under the slot lock so a subsequent state change either bumps
-        // the generation before we sleep or notifies us. Always reacquire the
-        // slot after at most one cancellation slice: this also rechecks state
-        // after a missed signal and returns Fenced if the slot was poisoned.
-        let observed = *slot.ack_gen.lock().map_err(|_| CoreError::Fenced)?;
+        let observed = *slot.ack_signal.generation.lock().map_err(|_| CoreError::Fenced)?;
         drop(guard);
-        crate::cancellation::check()?;
-        let slice = crate::cancellation::Cancellation::current()
-            .map_or(std::time::Duration::from_millis(5), |c| c.wait_slice());
-        let deadline = std::time::Instant::now() + slice;
-        let mut generation = slot.ack_gen.lock().map_err(|_| CoreError::Fenced)?;
-        while *generation == observed {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() { break; }
-            let (next, timeout) = slot.ack_cv.wait_timeout(generation, remaining)
-                .map_err(|_| CoreError::Fenced)?;
-            generation = next;
-            if timeout.timed_out() { break; }
-        }
-        drop(generation);
+        wait_ack_signal(slot, observed, cancellation.as_ref(), false)?;
         return slot.counter.lock_cancellable().map_err(ReceiveError::Core);
     }
     let Some(write) = guard.inflight.pop_front() else {
@@ -1087,23 +1067,28 @@ fn receive_one<'a>(
     ACK_WAIT_PATHS.set(ACK_WAIT_PATHS.get() + 1);
     let _durable = crate::Cancellation::current_durable_token();
     let outcome = loop {
+        let observed = match slot.ack_signal.generation.lock() {
+            Ok(generation) => *generation,
+            Err(_) => break Err(engine::txn::TxnError::Fenced),
+        };
         if let Err(error) = crate::cancellation::check() {
-            // Cancellation must not lose the oldest ack or leave receiving set.
             let mut guard = slot.counter.lock().map_err(|_| CoreError::Fenced)?;
             guard.inflight.push_front(write);
             guard.receiving = false;
             wake_ack_waiters(slot)?;
             return Err(error.into());
         }
-        match write
-            .ack
-            .0
-            .recv_timeout(std::time::Duration::from_millis(5))
-        {
+        // Snapshot before try_recv: a send/drop racing with Empty changes the
+        // generation, so the subsequent wait cannot miss its notification.
+        match write.ack.0.try_recv() {
             Ok(result) => break result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                break Err(engine::txn::TxnError::Fenced);
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break Err(engine::txn::TxnError::Fenced),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Handle cancellation at the loop head to restore the oldest ack.
+                match wait_ack_signal(slot, observed, cancellation.as_ref(), true) {
+                    Ok(()) | Err(CoreError::Cancelled) => {},
+                    Err(_) => break Err(engine::txn::TxnError::Fenced),
+                }
             }
         }
     };
@@ -1120,16 +1105,42 @@ fn receive_one<'a>(
     }
 }
 
-// Only callers that observed receiving=true use this wakeup. drain_ready cannot
+// Every notifier changes generation under the same lock used by the wait.
+fn wait_ack_signal(slot: &v2::SeqSlot, observed: (u64, u64), cancellation: Option<&crate::Cancellation>, receiver: bool) -> Result<(), CoreError> {
+    let mut generation = slot.ack_signal.generation.lock().map_err(|_| CoreError::Fenced)?;
+    let unchanged = |generation: &(u64, u64)| generation.0 == observed.0 && (!receiver || generation.1 == observed.1);
+    while unchanged(&generation) {
+        let remaining = match cancellation.map(|c| c.wait_remaining()).transpose() {
+            Ok(remaining) => remaining.unwrap_or(std::time::Duration::from_secs(1)),
+            Err(error) => { drop(generation); return Err(error); }
+        };
+        if remaining.is_zero() { break; }
+        #[cfg(all(test, feature = "engine-rocksdb"))]
+        {
+            ACK_PARKS.set(ACK_PARKS.get() + 1);
+            ACK_PARK_HOOK.with(|hook| { if let Some(tx) = hook.borrow().as_ref() { let _ = tx.send(()); } });
+        }
+        // Windows may round a fractional millisecond down. Avoid repeated
+        // zero-duration waits immediately before the deadline. The predicate
+        // absorbs spurious wakes; every real notification changes generation.
+        let remaining = remaining.max(std::time::Duration::from_millis(1));
+        let cv = if receiver { &slot.ack_signal.reply_cv } else { &slot.ack_signal.cv };
+        let (next, timeout) = cv.wait_timeout_while(generation, remaining, |generation| unchanged(generation))
+            .map_err(|_| CoreError::Fenced)?;
+        generation = next;
+        if timeout.timed_out() { break; }
+    }
+    drop(generation);
+    crate::cancellation::check()
+}
+
+// Receivers and other coverage waiters share this signal. drain_ready cannot
 // advance coverage while receiving; synchronous installs drain receivers first.
 // The durable DDL publication path also signals after installing a new incarnation.
 // Inflight pushes do not complete the oldest ack. Retirement without an install
 // is observed when the retired receiver finishes (including SequenceGone).
 pub(super) fn wake_ack_waiters(slot: &v2::SeqSlot) -> Result<(), CoreError> {
-    let mut generation = slot.ack_gen.lock().map_err(|_| CoreError::Fenced)?;
-    *generation = generation.wrapping_add(1);
-    slot.ack_cv.notify_all();
-    Ok(())
+    slot.ack_signal.wake(true, false)
 }
 
 /// Publish a durable incarnation and wake callers waiting on the old receiver.
@@ -1319,18 +1330,10 @@ fn committed_value(
         counter.log_hw = reserve_ahead(def, result);
     }
     if prior_hw != Some(counter.log_hw) {
-        let ack = db.sequencer.send_counter(
-            key.clone(),
-            engine::catalog_codec::encode_counter(&counter, def)?,
-            256,
-        )?;
+        let write = slot.reservation(&db.sequencer, key.clone(), engine::catalog_codec::encode_counter(&counter, def)?, def.incarnation, counter.log_hw)?;
         #[cfg(all(test, feature = "engine-rocksdb"))]
         RESERVATIONS_SENT.set(RESERVATIONS_SENT.get() + 1);
-        guard.inflight.push_back(v2::InFlight {
-            incarnation: def.incarnation,
-            hw: counter.log_hw,
-            ack,
-        });
+        guard.inflight.push_back(write);
     }
     guard.counter = Some(counter);
     // Check the durable watermark while still holding the allocation slot.
@@ -1403,11 +1406,7 @@ fn await_coverage<'a>(
         if !guard.receiving && guard.inflight.is_empty() {
             let counter = guard.counter.as_ref().ok_or(CoreError::Fenced)?;
             let hw = counter.log_hw;
-            let ack = match db.sequencer.send_counter(
-                key.to_vec(),
-                engine::catalog_codec::encode_counter(counter, def)?,
-                256,
-            ) {
+            let write = match slot.reservation(&db.sequencer, key.to_vec(), engine::catalog_codec::encode_counter(counter, def)?, def.incarnation, hw) {
                 Ok(ack) => ack,
                 Err(engine::txn::TxnError::SequenceGone) => {
                     drop(guard);
@@ -1415,11 +1414,7 @@ fn await_coverage<'a>(
                 }
                 Err(error) => return Err(error.into()),
             };
-            guard.inflight.push_back(v2::InFlight {
-                incarnation: def.incarnation,
-                hw,
-                ack,
-            });
+            guard.inflight.push_back(write);
         }
         guard = match receive_one(slot, guard) {
             Ok(guard) => guard,

@@ -205,7 +205,7 @@ fn counter_only_and_mixed_read_groups_preserve_durable_counter() {
             key: key.clone(),
             value: after.clone(),
             features_or: 0,
-            reply,
+            reply: reply.into(),
         }];
         let (reply, read) = mpsc::channel();
         if with_read {
