@@ -1885,6 +1885,83 @@ fn fk_referenced(parts: &CatalogParts, table: u64) -> bool {
         relational::catalog_ext::ConstraintKind::ForeignKey { ref_table, .. } if ref_table == table))
 }
 
+/// The byte-prefix access selected by both the point probe and the batch proof.
+struct FkChildAccess<'a> {
+    index: Option<&'a relational::secondary_index::Descriptor>,
+    positions: Vec<usize>,
+}
+
+impl<'a> FkChildAccess<'a> {
+    fn select(indexes: &'a [relational::secondary_index::Descriptor], table: &TableDef,
+        columns: &[u64], has_null: bool,
+    ) -> Option<Self> {
+        let primary = table.primary_key.iter().map(|i| table.columns[*i].id).collect::<Vec<_>>();
+        let matches = |ids: &[u64]| ids.len() >= columns.len()
+            && ids[..columns.len()].iter().all(|id| columns.contains(id));
+        let primary_matches = matches(&primary) && !has_null;
+        let index = indexes.iter().find(|d| d.table == table.id
+            && d.predicate.is_none() && d.columns.len() == columns.len() && matches(&d.columns))
+            .or_else(|| {
+                if primary_matches { return None; }
+                indexes.iter().find(|d| d.table == table.id && d.predicate.is_none() && matches(&d.columns))
+            });
+        if index.is_none() && !primary_matches { return None; }
+        let ids = index.map_or(primary.as_slice(), |d| d.columns.as_slice());
+        let positions = ids[..columns.len()].iter()
+            .map(|id| columns.iter().position(|c| c == id).unwrap()).collect();
+        Some(Self { index, positions })
+    }
+
+    fn prefix<'v>(&self, value: impl Fn(usize) -> &'v relational::Value) -> Result<Vec<u8>, CoreError> {
+        let ordered = self.positions.iter().map(|&i| value(i));
+        if self.index.is_some() {
+            let mut prefix = Vec::new();
+            codec::append_index_tuple(&mut prefix, ordered.map(|v| (v, codec::Direction::Asc)))?;
+            Ok(prefix)
+        } else {
+            Ok(codec::pk_bytes_iter(ordered)?)
+        }
+    }
+}
+
+fn empty_child_keys(
+    tuples: &[(Vec<u8>, usize)], entries: impl Iterator<Item = Result<Vec<u8>, CoreError>>,
+    namespace_bytes: usize, limit: usize,
+) -> Result<Vec<usize>, CoreError> {
+    let mut entries = entries.peekable();
+    let mut remaining = limit;
+    let mut empty = Vec::new();
+    for same_key in tuples.chunk_by(|a, b| a.0 == b.0) {
+        let prefix = same_key[0].0.as_slice();
+        loop {
+            crate::cancellation::check()?;
+            match entries.peek() {
+                Some(Ok(key)) if &key[namespace_bytes..] < prefix => {
+                    entries.next();
+                    remaining -= 1;
+                }
+                Some(Ok(key)) => {
+                    if !key[namespace_bytes..].starts_with(prefix) {
+                        empty.extend(same_key.iter().map(|(_, position)| position));
+                    }
+                    break;
+                }
+                Some(Err(_)) => {
+                    entries.next().transpose()?;
+                }
+                // An exhausted cap does not prove EOF. Only keys already
+                // passed by a visible entry in this visit can be skipped.
+                None if remaining == 0 => return Ok(empty),
+                None => {
+                    empty.extend(same_key.iter().map(|(_, position)| position));
+                    break;
+                }
+            }
+        }
+    }
+    Ok(empty)
+}
+
 fn fk_key_changed(table: &TableDef, indexes: &[relational::secondary_index::Descriptor],
     old: &[relational::Value], new: &[relational::Value]) -> bool {
     table.columns.iter().enumerate().any(|(i, c)| old[i] != new[i]
@@ -2180,10 +2257,42 @@ impl RowSink for SqlRows<'_> {
         }).transpose()
     }
 
+    fn fk_empty_children(
+        &mut self, table: &TableDef, columns: &[u64],
+        row_locks: bool, keys: &mut dyn Iterator<Item = (usize, Vec<relational::Value>)>,
+    ) -> Vec<usize> {
+        #[cfg(test)]
+        if DISABLE_FK_CHILD_BATCH.get() { return Vec::new(); }
+        if !matches!(self.txn.services(), engine::txn::TxnServices::Local { .. }) {
+            return Vec::new();
+        }
+        let Some(access) = FkChildAccess::select(&self.parts.indexes, table, columns, false) else {
+            return Vec::new();
+        };
+        #[cfg(test)]
+        FK_CHILD_BATCHES.set(FK_CHILD_BATCHES.get() + 1);
+        let mut check = |rows: &mut Self| rows.empty_child_positions(table, &access, keys);
+        // Both local paths take a fresh sequencer snapshot. The first probe's
+        // snapshot also covers queued events that would use the other path.
+        let empty = if row_locks {
+            self.txn.begin_fk_action_page(None);
+            let empty = check(self);
+            self.txn.end_fk_action_page();
+            empty
+        } else {
+            self.at_latest(check)
+        };
+        // A speculative range can encounter an unrelated failure. Leave
+        // anything uncertain to the normal per-parent probe in action order.
+        empty.unwrap_or_default()
+    }
+
     fn fk_action_page(
         &mut self, table: &TableDef, probe: Option<(&[u64], &[relational::Value])>,
         after: Option<Vec<u8>>,
     ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        #[cfg(test)]
+        FK_CHILD_PROBES.set(FK_CHILD_PROBES.get() + 1);
         let snapshot = self.fk_action_snapshot.take();
         self.txn.begin_fk_action_page(snapshot.filter(|_| after.is_some()));
         let page = match probe {
@@ -2201,10 +2310,14 @@ impl RowSink for SqlRows<'_> {
         &mut self, table: &TableDef, columns: &[u64], values: &[relational::Value],
         after: Option<Vec<u8>>,
     ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        #[cfg(test)]
+        FK_CHILD_PROBES.set(FK_CHILD_PROBES.get() + 1);
         self.at_latest(|rows| rows.child_page(table, columns, values, after))
     }
     fn fk_read_page(&mut self, table: &TableDef, after: Option<Vec<u8>>)
         -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        #[cfg(test)]
+        FK_CHILD_PROBES.set(FK_CHILD_PROBES.get() + 1);
         self.at_latest(|rows| rows.read_page_all(table, after, None))
     }
 
@@ -2499,36 +2612,26 @@ impl RowSink for SqlRows<'_> {
     fn child_page(&mut self, table: &TableDef, columns: &[u64], values: &[relational::Value],
         after: Option<Vec<u8>>) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
         crate::cancellation::check()?;
-        let primary = table.primary_key.iter().map(|i| table.columns[*i].id).collect::<Vec<_>>();
-        let matches = |ids: &[u64]| ids.len() >= columns.len()
-            && ids[..columns.len()].iter().all(|id| columns.contains(id));
-        let primary_matches = matches(&primary) && !values.contains(&relational::Value::Null);
-        let descriptor = self.parts.indexes.iter().find(|d| d.table == table.id
-            && d.predicate.is_none() && d.columns.len() == columns.len() && matches(&d.columns))
-            .or_else(|| (!primary_matches).then(|| self.parts.indexes.iter()
-                .find(|d| d.table == table.id && d.predicate.is_none() && matches(&d.columns))).flatten());
-        let page = if descriptor.is_some() || primary_matches {
-            let ids = descriptor.map_or(primary.as_slice(), |d| d.columns.as_slice());
-            let ordered = ids[..columns.len()].iter().map(|id|
-                values[columns.iter().position(|c| c == id).unwrap()].clone()).collect::<Vec<_>>();
-            let entry = TableEntry { primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(), def: table.clone(), heap: self.parts.heap.contains(&table.id), columns_ext: BTreeMap::new() };
+        let page = if let Some(access) = FkChildAccess::select(&self.parts.indexes, table, columns,
+            values.contains(&relational::Value::Null))
+        {
+            let prefix = access.prefix(|i| &values[i])?;
+            let entry = self.child_table_entry(table);
             let mut rows = DdlRows::new();
             let mut collect = |row: engine::rows::Row| {
                 let row = SqlRow { values: row.values, version: row.version };
                 rows.insert(relational::row_sink::row_key(table, &row).map_err(CoreError::Sql)?, row);
                 Ok(())
             };
-            let last = if let Some(d) = descriptor {
-                let tuple = codec::index_tuple_bytes(&ordered, &vec![codec::Direction::Asc; ordered.len()])?;
+            let last = if let Some(d) = access.index {
                 // Included upper tuple bounds already use the prefix successor,
                 // covering every trailing index component and PK suffix.
                 engine::indexes::visit_page(self.txn, &entry, d,
-                    Bound::Included(tuple.clone()), Bound::Included(tuple), after,
+                    Bound::Included(prefix.clone()), Bound::Included(prefix), after,
                     &mut |_, row| collect(row), 200)?
             } else {
                 // pk_bytes concatenates components without an arity/header suffix.
                 // Scan the same transaction so snapshot and own writes agree.
-                let prefix = codec::pk_bytes(&ordered)?;
                 let upper = engine::indexes::successor(prefix.clone())
                     .map_or(Bound::Unbounded, Bound::Excluded);
                 let mut last = None;
@@ -2965,6 +3068,51 @@ impl RowSink for SqlRows<'_> {
 }
 
 impl SqlRows<'_> {
+    fn child_table_entry(&self, table: &TableDef) -> TableEntry {
+        TableEntry { primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(),
+            def: table.clone(), heap: self.parts.heap.contains(&table.id), columns_ext: BTreeMap::new() }
+    }
+
+    fn empty_child_positions(
+        &mut self, table: &TableDef, access: &FkChildAccess<'_>,
+        keys: &mut dyn Iterator<Item = (usize, Vec<relational::Value>)>,
+    ) -> Result<Vec<usize>, CoreError> {
+        let mut tuples = Vec::new();
+        for (position, values) in keys {
+            crate::cancellation::check()?;
+            let prefix = access.prefix(|i| &values[i])?;
+            tuples.push((prefix, position));
+        }
+        tuples.sort_unstable();
+        let (Some((first, _)), Some((last, _))) = (tuples.first(), tuples.last()) else {
+            return Ok(Vec::new());
+        };
+        let limit = tuples.chunk_by(|a, b| a.0 == b.0).count().saturating_mul(4).saturating_add(8);
+        let mut empty = if let Some(descriptor) = access.index {
+            engine::indexes::validate_descriptor(descriptor, table)?;
+            let key = |tuple: &[u8]| {
+                let mut key = descriptor.id.to_be_bytes().to_vec();
+                key.extend_from_slice(tuple);
+                key
+            };
+            let lo = key(first);
+            let hi = engine::indexes::successor(key(last)).map_or(Bound::Unbounded, Bound::Excluded);
+            let entries = self.txn.scan(Keyspace::Index, Bound::Included(&lo),
+                hi.as_ref().map(Vec::as_slice), engine::kv::Direction::Forward, Some(limit))?;
+            // Even a dangling entry makes the tuple unknown so child_page
+            // still gets the chance to validate the row and report its error.
+            empty_child_keys(&tuples, entries.map(|pair| Ok(pair?.0)), 8, limit)?
+        } else {
+            let entry = self.child_table_entry(table);
+            let hi = engine::indexes::successor(last.clone()).map_or(Bound::Unbounded, Bound::Excluded);
+            let rows = self.db.rows.scan(self.txn, &entry, Bound::Included(first.clone()), hi,
+                engine::kv::Direction::Forward, Some(limit))?;
+            empty_child_keys(&tuples, rows.map(|pair| Ok(pair?.0)), 0, limit)?
+        };
+        empty.sort_unstable();
+        Ok(empty)
+    }
+
     /// Publish the admitted rows under their supplied primary keys. The caller
     /// must pass keys encoded from the corresponding row values. Release builds
     /// use the supplied keys directly.
@@ -3580,6 +3728,9 @@ type TableScanHook = Box<dyn FnMut(&str)>;
 
 #[cfg(test)]
 thread_local! {
+    static DISABLE_FK_CHILD_BATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FK_CHILD_BATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FK_CHILD_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static DISABLE_MUTATION_POINTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static MUTATION_PAGE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static MUTATION_POINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

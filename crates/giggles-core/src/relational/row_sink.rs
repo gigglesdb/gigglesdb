@@ -122,6 +122,15 @@ pub(crate) trait RowSink {
         Err(CoreError::Sql(SqlError::Unsupported))
     }
 
+    /// Return the sorted queue positions whose first child page is known empty.
+    /// Any position omitted from the result still needs the ordinary probe.
+    fn fk_empty_children(
+        &mut self, _table: &TableDef, _columns: &[u64],
+        _row_locks: bool, _keys: &mut dyn Iterator<Item = (usize, Vec<Value>)>,
+    ) -> Vec<usize> {
+        Vec::new()
+    }
+
     fn lock_fk_action_row(
         &mut self, _table: &TableDef, _row: &SqlRow, _mode: FkRowLock<'_>,
     ) -> Result<Option<SqlRow>, CoreError> {

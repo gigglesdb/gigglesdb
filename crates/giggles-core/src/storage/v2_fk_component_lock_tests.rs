@@ -1,6 +1,15 @@
 use super::*;
 use crate::relational::{Prepared, Relational, triggers};
 
+#[test]
+fn batch_proves_only_prefixes_passed_by_the_capped_visit() {
+    let tuples = [(vec![1], 1), (vec![1], 4), (vec![3], 2), (vec![5], 3)];
+    let keys = [vec![2, 0], vec![3, 0], vec![4, 0]];
+    let scan = |limit| keys.iter().take(limit).cloned().map(Ok);
+    assert_eq!(empty_child_keys(&tuples, scan(2), 0, 2).unwrap(), [1, 4]);
+    assert_eq!(empty_child_keys(&tuples, scan(4), 0, 4).unwrap(), [1, 4, 3]);
+}
+
 fn catalog(ddls: &[&str]) -> Relational {
     let mut state = Relational::default();
     for ddl in ddls {

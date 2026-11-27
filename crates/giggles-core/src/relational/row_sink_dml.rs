@@ -802,7 +802,10 @@ impl ActionWork {
         let mut incoming = state.ext.constraints.iter().flat_map(|(id, cs)|
             cs.iter().map(move |c| (*id, c.clone()))).collect::<Vec<_>>();
         incoming.sort_by_key(|(_, c)| c.id);
+        let mut empty_by_fk = BTreeMap::<(u64, u64), Vec<usize>>::new();
+        let mut queue_position = 0;
         while let Some((parent_id, old, new)) = self.queue.pop_front() {
+            queue_position += 1;
             crate::cancellation::check()?;
             let parent = state.tables.values().find(|t| t.id == parent_id).unwrap().clone();
             for (child_id, c) in &incoming {
@@ -857,6 +860,29 @@ impl ActionWork {
                 let writes = matches!(action,
                     catalog_ext::Action::Cascade | catalog_ext::Action::SetNull | catalog_ext::Action::SetDefault);
                 let row_locks = writes && sink.row_locked_cascade();
+                if *child_id != parent_id && probe.is_some() {
+                    let empty = empty_by_fk.entry((*child_id, c.id)).or_insert_with(|| {
+                        // Queue positions are stable; newly appended events cannot
+                        // reuse a proof. Speculative conversion errors stay queued.
+                        let queued = self.queue.iter().enumerate().filter_map(|(i, (id, old, new))| {
+                            if *id != parent_id { return None; }
+                            let values = parent_positions.iter().map(|&p| old.values[p].clone()).collect::<Vec<_>>();
+                            if values.contains(&Value::Null) { return None; }
+                            let new_values = new.as_ref().map(|row| parent_positions.iter()
+                                .map(|&p| row.values[p].clone()).collect::<Vec<_>>());
+                            if new_values.as_ref().is_some_and(|new| {
+                                if cross_type { constraints::row_image_eq(&values, new) } else { values == *new }
+                            }) { return None; }
+                            let converted = positions().zip(&values).map(|((&p, &c), value)| {
+                                query::constraint_key(value, &parent.columns[p].data_type, &child.columns[c].data_type)
+                            }).collect::<R<Option<Vec<_>>>>().ok().flatten()?;
+                            Some((queue_position + 1 + i, converted))
+                        });
+                        let mut keys = std::iter::once((queue_position, probe.as_ref().unwrap().clone())).chain(queued);
+                        sink.fk_empty_children(&child, columns, row_locks, &mut keys)
+                    });
+                    if empty.binary_search(&queue_position).is_ok() { continue; }
+                }
                 loop {
                     // A directional cast or nondeterministic collation can make
                     // an exact probe incomplete. Compare physical pages instead.
@@ -967,7 +993,15 @@ impl ActionWork {
                             }
                         }
                     }
+                    let wrote_child = !rows.is_empty();
                     self.publish(state, sink, &child, rows, changed, events, (!set_default).then_some(c.id), descriptors, version_end)?;
+                    if wrote_child {
+                        // Keep the attempted checks, but discard every proof for
+                        // this table. The action may have added a new reference.
+                        for (_, empty) in empty_by_fk.range_mut((*child_id, 0)..=(*child_id, u64::MAX)) {
+                            *empty = Vec::new();
+                        }
+                    }
                 }
                 // SET DEFAULT has its own immediate NO ACTION check of the
                 // old key. Keep child-side checks for references to new keys.
