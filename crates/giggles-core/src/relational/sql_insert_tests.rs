@@ -986,6 +986,197 @@ fn sql_insert_row_cap_and_expected_version_rejected() {
     assert_eq!(rows(&mut s).len(), 512);
 }
 
+fn values_parser(sql: &str) -> Parser {
+    Parser {
+        privilege_seen: false,
+        privilege_casts: false,
+        tokens: lex(sql).unwrap(),
+        at: 0,
+        params: BTreeSet::new(),
+        relations: Vec::new(),
+    }
+}
+
+// The old VALUES cell probe eagerly recorded its parameter and rolled back
+// both the token cursor and a clone of the full set on expression fallback.
+fn legacy_plain_value(p: &mut Parser) -> Option<Expr> {
+    let start = p.at;
+    let parameters = p.params.clone();
+    let plain = if matches!(
+        p.tokens.get(p.at),
+        None | Some(Token::Symbol(')' | ',' | ';'))
+    ) {
+        Err(SqlError::Syntax)
+    } else {
+        p.expr()
+    };
+    if plain.is_err() || !matches!(p.tokens.get(p.at), Some(Token::Symbol(',' | ')'))) {
+        p.at = start;
+        p.params = parameters;
+        None
+    } else {
+        plain.ok()
+    }
+}
+
+#[test]
+fn sql_insert_values_parameters_match_snapshot_backtracking() {
+    let mut state = Relational::default();
+    let ddl = Prepared::parse(
+        "CREATE TABLE items (id BIGINT PRIMARY KEY, email TEXT DEFAULT 'none', n INTEGER DEFAULT 0)",
+        1,
+        state.epoch,
+    )
+    .unwrap();
+    state.execute(&ddl, &[], None).unwrap();
+    let template = Prepared::parse("INSERT INTO items (id) VALUES (1), (2)", 1, state.epoch).unwrap();
+    let too_many = format!(
+        "INSERT INTO items (id, n) VALUES ($1, DEFAULT){}",
+        ",($1, DEFAULT)".repeat(MAX_ROWS)
+    );
+    let mut described = 0;
+    for sql in [
+        "INSERT INTO items (id) VALUES ($1)",
+        "INSERT INTO items DEFAULT VALUES",
+        "INSERT INTO items (id) VALUES ($1) ON CONFLICT DO NOTHING",
+        "INSERT INTO items (id, email) VALUES ($2, $1), ($2, $1)",
+        "INSERT INTO items (id, n) VALUES ($1, $2), ($1, $2 + 1)",
+        "INSERT INTO items (id, n) VALUES ($1, $2::int), ($1, DEFAULT)",
+        "INSERT INTO items (id, email) VALUES ($1, lower($2)), ($3, DEFAULT)",
+        "INSERT INTO items (id, n) VALUES ($1, $2 + 1), ($3, $2)",
+        "INSERT INTO items (id, n) VALUES ($1, DEFAULT), ($2, 10) ON CONFLICT DO NOTHING",
+        "INSERT INTO items (id, n) VALUES ($1, DEFAULT), ($2, 10) ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n",
+        "INSERT INTO items (id, n) VALUES ($1, $2), ($3, DEFAULT) ON CONFLICT (id) DO UPDATE SET n = $4 WHERE items.n < $5 RETURNING id",
+        "INSERT INTO items (id, n) VALUES ($2, $2), ($3, 0)",
+        "INSERT INTO items (id, n) VALUES ($1, $1), ($2, 0)",
+        "INSERT INTO items (id, email) VALUES ($2, ;), ($1, 'x')",
+        "INSERT INTO items (id, n) VALUES ($3, 1), ($2, $3 + )",
+        "INSERT INTO items (id, n) VALUES ($1, 1), ($2, lower( )",
+        "INSERT INTO items (id, n) VALUES ($1, 1), ($2, $1 + 2) ON CONFLICT DO UPDATE SET n = $3",
+        "INSERT INTO missing (id, n) VALUES ($2, 1), ($2, $3 + 2)",
+        &too_many,
+    ] {
+        let mut actual = values_parser(sql);
+        let mut legacy = values_parser(sql);
+        let new = parse(&mut actual);
+        let old = parse_with_plain_value(&mut legacy, legacy_plain_value);
+
+        // Debug captures the full private AST, including rows, the fallback
+        // expressions by cell, defaults, and the conflict clause.
+        assert_eq!(format!("{new:?}"), format!("{old:?}"), "{sql}");
+        assert_eq!(actual.at, legacy.at, "{sql}");
+        assert_eq!(actual.params, legacy.params, "{sql}");
+
+        let describe = |p: Parser, result: R<Insert>| -> R<(usize, Vec<DataType>)> {
+            let insert = result?;
+            let count = p.params.last().copied().unwrap_or(0);
+            if p.params.len() != count {
+                return Err(SqlError::Parameters);
+            }
+            let mut prepared = template.clone();
+            prepared.params = count;
+            prepared.relations = p.relations;
+            prepared.statement = prepared_syntax::Syntax::new(Statement::InsertMulti(Box::new(insert)));
+            Ok((count, prepared.describe(&state)?.parameters))
+        };
+
+        if sql == too_many {
+            assert_eq!(admit_statement(new.as_ref().unwrap(), &[]), Err(SqlError::Limit));
+            assert_eq!(admit_statement(old.as_ref().unwrap(), &[]), Err(SqlError::Limit));
+        }
+        // Where the real router claims this grammar, also compare the full
+        // prepare/Describe result to the legacy outcome, including error order.
+        let routed = claims(&actual.tokens);
+        let expected = describe(legacy, old);
+        let observed = describe(actual, new);
+        assert_eq!(observed, expected, "{sql}");
+        described += usize::from(expected.is_ok());
+        if routed {
+            let wire_description = Prepared::parse(sql, 1, state.epoch).and_then(|prepared| {
+                Ok((prepared.parameter_count(), prepared.describe(&state)?.parameters))
+            });
+            assert_eq!(wire_description, expected, "{sql}");
+            // The missing parameter wins before the missing relation can bind.
+            if sql.starts_with("INSERT INTO missing ") {
+                let error = wire_description.unwrap_err();
+                assert_eq!(error, SqlError::Parameters);
+                assert_eq!(crate::sqlstate(&CoreError::Sql(error)), "42804");
+            }
+        }
+    }
+    assert!(described >= 8, "inference corpus must include successful Describe cases");
+}
+
+#[global_allocator]
+static TEST_ALLOCATOR: ValuesTestAllocator = ValuesTestAllocator;
+
+struct ValuesTestAllocator;
+
+thread_local! {
+    static PARSE_ALLOCATED_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+impl ValuesTestAllocator {
+    fn record(bytes: usize) {
+        let _ = PARSE_ALLOCATED_BYTES.try_with(|count| {
+            if let Some(total) = count.get() {
+                count.set(Some(total.saturating_add(bytes)));
+            }
+        });
+    }
+}
+
+// Count allocation traffic on the measuring thread only, then delegate to
+// the system allocator. Cloning a BTreeSet allocates a fresh node per node.
+unsafe impl std::alloc::GlobalAlloc for ValuesTestAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        Self::record(layout.size());
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        Self::record(layout.size());
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        Self::record(size);
+        unsafe { std::alloc::System.realloc(ptr, layout, size) }
+    }
+}
+
+#[test]
+fn sql_insert_values_parameter_allocations_scale_with_rows() {
+    fn allocated_bytes(rows: usize) -> usize {
+        let sql = format!(
+            "INSERT INTO items (id, n) VALUES {}",
+            (0..rows)
+                .map(|row| format!("({d}{}, {d}{})", 2 * row + 1, 2 * row + 2, d = '$'))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let mut parser = values_parser(&sql);
+        PARSE_ALLOCATED_BYTES.set(Some(0));
+        let insert = parse(&mut parser);
+        let allocated = PARSE_ALLOCATED_BYTES.replace(None).unwrap();
+        assert_eq!(insert.unwrap().rows.len(), rows);
+        assert_eq!(parser.params.len(), 2 * rows);
+        allocated
+    }
+
+    let small = allocated_bytes(100);
+    let large = allocated_bytes(1000);
+    eprintln!("100 rows: {small} bytes, 1000 rows: {large} bytes");
+    assert!(
+        small > 0 && large < 15 * small,
+        "100 rows: {small} bytes, 1000 rows: {large} bytes"
+    );
+}
+
 #[test]
 fn sql_insert_parser_row_cap_1024_and_1025() {
     // Parse large VALUES lists, then check the unchanged legacy admission cap.

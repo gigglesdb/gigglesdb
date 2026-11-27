@@ -1609,6 +1609,31 @@ impl Parser {
         }
     }
     fn expr(&mut self) -> R<Expr> {
+        let value = self.expr_atom()?;
+        self.record_expr_parameter(&value);
+        Ok(value)
+    }
+
+    fn try_plain_expr(&mut self, ends: impl FnOnce(Option<&Token>) -> bool) -> Option<Expr> {
+        let start = self.at;
+        if let Ok(value) = self.expr_atom()
+            && ends(self.tokens.get(self.at))
+        {
+            // Record the parameter only after the caller accepts a whole atom.
+            self.record_expr_parameter(&value);
+            return Some(value);
+        }
+        self.at = start;
+        None
+    }
+
+    fn record_expr_parameter(&mut self, value: &Expr) {
+        if let Expr::Param(n) = value {
+            self.params.insert(*n);
+        }
+    }
+
+    fn expr_atom(&mut self) -> R<Expr> {
         let mut t = self.tokens.get(self.at).cloned().ok_or(SqlError::Syntax)?;
         self.at += 1;
         if let Token::Op(sign) = &t
@@ -1621,10 +1646,7 @@ impl Parser {
             self.at += 1;
         }
         Ok(match t {
-            Token::Param(n) => {
-                self.params.insert(n);
-                Expr::Param(n)
-            }
+            Token::Param(n) => Expr::Param(n),
             Token::String(s) => Expr::Literal(Value::Text(s)),
             Token::Number(n) => Expr::Literal(match n.parse::<i64>() {
                 Ok(n) => Value::Int(n),

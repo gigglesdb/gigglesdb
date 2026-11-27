@@ -144,15 +144,6 @@ fn names(p: &mut Parser) -> R<Vec<String>> {
     p.punct(')')?;
     Ok(names)
 }
-fn value(p: &mut Parser) -> R<Expr> {
-    if matches!(
-        p.tokens.get(p.at),
-        None | Some(Token::Symbol(')' | ',' | ';'))
-    ) {
-        return Err(SqlError::Syntax);
-    }
-    p.expr()
-}
 fn unsupported_or_syntax(p: &Parser) -> SqlError {
     if matches!(p.tokens.get(p.at), None | Some(Token::Symbol(';' | ')'))) {
         SqlError::Syntax
@@ -198,6 +189,17 @@ impl Insert {
 }
 
 pub(super) fn parse(p: &mut Parser) -> R<Insert> {
+    parse_with_plain_value(p, |p| {
+        p.try_plain_expr(|next| matches!(next, Some(Token::Symbol(',' | ')'))))
+    })
+}
+
+// The cell probe is a parameter so the differential test can run the same grammar
+// with the original clone-and-restore probe (sql_insert_tests.rs).
+fn parse_with_plain_value(
+    p: &mut Parser,
+    mut plain_value: impl FnMut(&mut Parser) -> Option<Expr>,
+) -> R<Insert> {
     p.need("insert")?;
     p.need("into")?;
     let table = p.table_name()?;
@@ -249,21 +251,14 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
                 row_defaults.push(default);
                 row.push(if default {
                     Expr::Literal(Value::Null)
+                } else if let Some(plain) = plain_value(p) {
+                    plain
                 } else {
-                    let start = p.at;
-                    let parameters = p.params.clone();
-                    let plain = value(p);
-                    if plain.is_err() || !matches!(p.tokens.get(p.at), Some(Token::Symbol(',' | ')'))) {
-                        p.at = start;
-                        p.params = parameters;
-                        casts.insert(
-                            (rows.len(), row.len()),
-                            query::conflict::Expression::input(p)?,
-                        );
-                        Expr::Literal(Value::Null)
-                    } else {
-                        plain?
-                    }
+                    casts.insert(
+                        (rows.len(), row.len()),
+                        query::conflict::Expression::input(p)?,
+                    );
+                    Expr::Literal(Value::Null)
                 });
                 if !p.sym(',') {
                     break;

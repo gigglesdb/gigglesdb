@@ -14,16 +14,12 @@ impl Value {
         if p.word("default") {
             return Ok(Self::Default);
         }
-        let start = p.at;
-        let parameters = p.params.clone();
-        if let Ok(value) = p.expr()
-            && (matches!(p.tokens.get(p.at), None | Some(Token::Symbol(',' | ';')))
-                || matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "where" || w == "returning"))
-        {
+        if let Some(value) = p.try_plain_expr(|next| {
+            matches!(next, None | Some(Token::Symbol(',' | ';')))
+                || matches!(next, Some(Token::Word(w)) if w == "where" || w == "returning")
+        }) {
             return Ok(Self::Plain(value));
         }
-        p.at = start;
-        p.params = parameters;
         query::Query::assignment(p, table).map(|value| Self::Scalar(Box::new(value.normalize_assignment_alias())))
     }
 }
