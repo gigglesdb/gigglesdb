@@ -776,8 +776,14 @@ fn session_sequence_and_xid_state_are_rebound_after_reopen() {
     // Inject an outstanding reservation using the normal callback, but skip
     // the statement exit where it would otherwise be settled.
     let old_xact = Arc::clone(&s.xact);
-    let (exposed, last) = leave_unsettled(&admin, &mut s);
-    swap(&admin);
+    let (stale_callback, private_draw, release) = leave_unsettled(&admin, &mut s);
+    // Refuse the held refill before it reaches the worker, forcing the race
+    // where shutdown rejects it instead of making it durable.
+    let generation = slot(&admin).stop_admission(1).unwrap();
+    generation.db.sequencer.stop_submissions();
+    drop(release);
+    let candidate = close_and_reopen(slot(&admin), generation);
+    slot(&admin).install(candidate).unwrap();
     let before = stamp(&admin);
     assert_eq!(s.settle_sequences(), Err(CoreError::Fenced));
     assert_eq!(before, stamp(&admin));
@@ -794,10 +800,14 @@ fn session_sequence_and_xid_state_are_rebound_after_reopen() {
     let Int(next_xid) = scalar(&mut s, "SELECT pg_current_xact_id()") else {
         panic!("xid");
     };
-    assert!(next > last);
+    // The SQL result was settled before exposure and must never be reused.
+    assert!(next > value);
+    // The injected callback draw never crossed statement settlement. With its
+    // refill rejected, recovery may reissue it, but skips the durable prefix.
+    assert_eq!(next, private_draw);
     assert!(next_xid > xid);
     assert_eq!(
-        exposed("nextval", "seq", None, false, crate::relational::clock::SequenceOrigin::Call),
+        stale_callback("nextval", "seq", None, false, crate::relational::clock::SequenceOrigin::Call),
         Err(CoreError::Fenced)
     );
 }
@@ -805,18 +815,18 @@ fn session_sequence_and_xid_state_are_rebound_after_reopen() {
 fn leave_unsettled(
     admin: &Admin,
     s: &mut SqlSession,
-) -> (crate::relational::clock::SequenceCallback, i64) {
+) -> (crate::relational::clock::SequenceCallback, i64, ReleaseGate<impl FnMut()>) {
     let lease = s.native_sequence_lease().unwrap();
     let (_, callback) = s.native_sequence_callback(lease.as_deref()).unwrap();
     drop(lease);
     let lease = admin.test_v2();
-    lease.sequencer.gate_counter_acks(true);
-    let _release = ReleaseGate(|| lease.sequencer.gate_counter_acks(false));
+    lease.sequencer.gate_counter_writes(true);
+    let release = ReleaseGate(move || lease.sequencer.gate_counter_writes(false));
     let draw = callback.clone();
     let obligations = s.sequence_unsettled.clone();
     let (send, received) = mpsc::channel();
-    thread::spawn(move || {
-        // The initial reservation covers 32 more draws; the next is private.
+    let worker = thread::spawn(move || {
+        // Draw past the initial durable reservation; the next draw is private.
         for _ in 0..33 {
             let Int(value) = draw("nextval", "seq", None, false, crate::relational::clock::SequenceOrigin::Call).unwrap() else {
                 panic!("sequence value");
@@ -827,9 +837,11 @@ fn leave_unsettled(
                 return;
             }
         }
-        panic!("sequence must refill with a gated acknowledgement");
+        panic!("sequence must refill with a held submission");
     });
-    (callback, received.recv_timeout(WAIT).expect("private draw did not report an obligation"))
+    let last = received.recv_timeout(WAIT).expect("private draw did not report an obligation");
+    worker.join().unwrap();
+    (callback, last, release)
 }
 
 #[test]
@@ -841,7 +853,8 @@ fn standalone_native_sequence_callback_binds_before_issuing_obligations() {
         .execute_at("SELECT nextval('seq')", &[], None, &clock())
         .unwrap();
     let mut s = admin.sql_session();
-    leave_unsettled(&admin, &mut s);
+    let (_, _, release) = leave_unsettled(&admin, &mut s);
+    drop(release);
     assert!(s.sequence_generation.is_some());
     assert_eq!(s.settle_sequences(), Ok(()));
 }
