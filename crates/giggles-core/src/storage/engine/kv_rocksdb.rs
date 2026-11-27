@@ -200,6 +200,19 @@ impl WriterLock {
 // At most two idle iterators per CF. Checked-out iterators are exclusively owned.
 const POINT_POOL_CAP: usize = 2;
 const POINT_POOL_IDLE: Duration = Duration::from_secs(1);
+// Caps DBIter-level work only: point delete markers and hidden versions. DeleteRange
+// keys skip below DBIter in the merging iterator and are not counted or bounded here.
+// Without a bound, DBIter::Seek on a miss walks every delete
+// marker and hidden entry between start and the next live key, however far past end. A
+// pooled iterator cannot take iterate_upper_bound, which is fixed in its ReadOptions at
+// creation while each probe has its own end. Instead DBIter counts each internal entry it
+// visits and gives up with status Incomplete past this limit (db_iter.cc
+// TooManyInternalKeysSkipped); the next Seek resets the counter and status
+// (ResetSeekState), so the iterator stays poolable. Such a probe reruns once on a fresh
+// iterator bounded by end.
+// The count includes the returned entry; a live key behind more than this many markers
+// pays a limited seek plus a bounded retry (at most about one extra iterator creation).
+const POINT_SKIP_LIMIT: u64 = 32;
 #[derive(Default)]
 struct PointPool {
     generation: u64,
@@ -209,6 +222,8 @@ struct PointPool {
     created: usize,
     #[cfg(test)]
     refreshed_reuses: usize,
+    #[cfg(test)]
+    bounded_fallbacks: usize,
     idle: BTreeMap<Keyspace, Vec<(Instant, rocksdb::DBRawIterator<'static>)>>,
 }
 
@@ -1450,9 +1465,11 @@ impl RocksKv {
         let mut iter = match cached {
             Some((_, iter)) => iter,
             None => {
+                let mut options = rocksdb::ReadOptions::default();
+                options.set_max_skippable_internal_keys(POINT_SKIP_LIMIT);
                 let iter = self
                     .db
-                    .raw_iterator_cf(self.db.cf_handle(ks.name()).unwrap());
+                    .raw_iterator_cf_opt(self.db.cf_handle(ks.name()).unwrap(), options);
                 // SAFETY: constructed only after LockedDb is in its stable Arc allocation.
                 // The iterator never escapes this method or LockedDb::points. This call's
                 // &self keeps the Arc alive while checked out; idle iterators are dropped
@@ -1469,14 +1486,17 @@ impl RocksKv {
         // drop the iterator rather than putting a potentially failed one back.
         iter.refresh().map_err(map_error)?;
         iter.seek(start);
-        let result = match iter.item() {
-            Some((key, value)) if key < end => Some(read(key, value)),
-            Some(_) => None,
-            None => {
-                // A valid RocksDB iterator always has OK status.
-                iter.status().map_err(map_error)?;
-                None
-            }
+        // Default read tier rules out block-cache-only Incomplete: treat it as the skip
+        // limit. Revisit this interpretation if the read tier ever changes. Err keeps read.
+        let limited = match iter.item() {
+            Some((key, value)) if key < end => Ok(Some(read(key, value))),
+            Some(_) => Ok(None),
+            // A valid RocksDB iterator always has OK status.
+            None => match iter.status() {
+                Ok(()) => Ok(None),
+                Err(error) if error.kind() == rocksdb::ErrorKind::Incomplete => Err(read),
+                Err(error) => return Err(map_error(error)),
+            },
         };
         let mut pool = self.db.points.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(test)]
@@ -1485,13 +1505,50 @@ impl RocksKv {
         } else {
             pool.created += 1;
         }
+        #[cfg(test)]
+        if limited.is_err() {
+            pool.bounded_fallbacks += 1;
+        }
         if pool.generation == generation {
             let idle = pool.idle.entry(ks).or_default();
             if idle.len() < POINT_POOL_CAP {
                 idle.push((Instant::now(), iter));
             }
         }
-        Ok(result)
+        drop(pool);
+        // On fallback the pooled iterator is already checked in before the visitor runs;
+        // reentrant reuse is harmless because the fallback uses a separate iterator.
+        match limited {
+            Ok(result) => Ok(result),
+            Err(read) => self.read_point_bounded(ks, start, end, read),
+        }
+    }
+
+    // Reruns a pooled probe that hit POINT_SKIP_LIMIT on a fresh iterator whose upper bound
+    // stops the walk at end. It may see newer writes than the refreshed pooled iterator;
+    // the pooled result is discarded, so this call still reads one iterator view. Never pooled.
+    fn read_point_bounded<T>(
+        &self,
+        ks: Keyspace,
+        start: &[u8],
+        end: &[u8],
+        read: impl FnOnce(&[u8], &[u8]) -> T,
+    ) -> Result<Option<T>, KvError> {
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_iterate_upper_bound(end);
+        let mut iter = self
+            .db
+            .raw_iterator_cf_opt(self.db.cf_handle(ks.name()).unwrap(), options);
+        iter.seek(start);
+        match iter.item() {
+            // The bound makes key < end hold already; keep the check as a defence.
+            Some((key, value)) if key < end => Ok(Some(read(key, value))),
+            Some(_) => Ok(None),
+            None => {
+                iter.status().map_err(map_error)?;
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -3360,6 +3417,333 @@ mod tests {
             db.first_in(Keyspace::Rows, b"a", b"b").unwrap(),
             Some((b"a".to_vec(), b"new".to_vec()))
         );
+    }
+
+    // Internal entries DBIter visited on this thread while `probe` ran (perf context).
+    fn skipped<R>(probe: impl FnOnce() -> R) -> (R, u64) {
+        use rocksdb::perf::{PerfContext, PerfMetric, PerfStatsLevel, set_perf_stats};
+        set_perf_stats(PerfStatsLevel::EnableCount);
+        let mut context = PerfContext::default();
+        context.reset();
+        let result = probe();
+        let count = context.metric(PerfMetric::InternalDeleteSkippedCount)
+            + context.metric(PerfMetric::InternalKeySkippedCount);
+        set_perf_stats(PerfStatsLevel::Disable);
+        (result, count)
+    }
+
+    fn point_counters(db: &RocksKv) -> (usize, usize, usize) {
+        let pool = db.db.points.lock().unwrap();
+        (pool.created, pool.refreshed_reuses, pool.bounded_fallbacks)
+    }
+
+    // Puts then deletes each key, leaving a delete marker per key.
+    fn point_markers(db: &RocksKv, keys: impl Iterator<Item = Vec<u8>> + Clone) {
+        let mut batch = WriteBatch::default();
+        for key in keys.clone() {
+            batch.put(Keyspace::Rows, key, b"gone".to_vec());
+        }
+        db.write(batch, Durability::NoSync).unwrap();
+        let mut batch = WriteBatch::default();
+        for key in keys {
+            batch.delete(Keyspace::Rows, key);
+        }
+        db.write(batch, Durability::Sync).unwrap();
+    }
+
+    fn marker_keys(prefix: &'static [u8], count: usize) -> impl Iterator<Item = Vec<u8>> + Clone {
+        (0..count).map(move |n| [prefix, format!("{n:08}").as_bytes()].concat())
+    }
+
+    // Probes [k0, k1), which has nothing live: delete markers and then "z" lie above it.
+    fn assert_bounded_miss(db: &RocksKv, markers: usize, reused: bool) {
+        let before = point_counters(db);
+        let (pair, skips) = skipped(|| db.first_in(Keyspace::Rows, b"k0", b"k1").unwrap());
+        assert_eq!(pair, None);
+        assert!(skips <= POINT_SKIP_LIMIT + 8, "{markers} markers: {skips} skipped");
+        let after = point_counters(db);
+        let expected = if reused {
+            (before.0, before.1 + 1, before.2 + 1)
+        } else {
+            (before.0 + 1, before.1, before.2 + 1)
+        };
+        assert_eq!(after, expected, "{markers} markers");
+        let ((), skips) = skipped(|| {
+            db.visit_first_in(Keyspace::Rows, b"k0", b"k1", &mut |key, _| {
+                panic!("visited {key:?}")
+            })
+            .unwrap()
+        });
+        assert!(skips <= POINT_SKIP_LIMIT + 8, "{markers} markers: {skips} skipped");
+        assert_eq!(point_counters(db), (after.0, after.1 + 1, after.2 + 1));
+        assert!(db.db.points.lock().unwrap().idle[&Keyspace::Rows].len() <= POINT_POOL_CAP);
+
+        // Control: the same seek without a limit or bound walks every marker.
+        let mut iter = db
+            .db
+            .raw_iterator_cf(db.db.cf_handle(Keyspace::Rows.name()).unwrap());
+        let (key, skips) = skipped(|| {
+            iter.seek(b"k0");
+            iter.key().map(<[u8]>::to_vec)
+        });
+        assert_eq!(key.as_deref(), Some(b"z".as_slice()));
+        assert!(skips >= markers as u64, "{markers} markers: control skipped {skips}");
+    }
+
+    #[test]
+    fn point_miss_work_is_bounded_by_skip_limit() {
+        for markers in [1_000, 10_000, 100_000] {
+            let dir = TestDir::new();
+            let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+            disable_point_eviction(&db);
+            point_put(&db, b"z", b"live");
+            point_markers(&db, marker_keys(b"m", markers));
+            assert_bounded_miss(&db, markers, false);
+            // Bypass the clearing helper: the pooled iterator rebuilds on refresh with
+            // its read options and must stay limited against markers in an SST.
+            let cf = db.db.cf_handle(Keyspace::Rows.name()).unwrap();
+            db.db.flush_cf(cf).unwrap();
+            assert_bounded_miss(&db, markers, true);
+            db.flush_memtables().unwrap();
+            assert_bounded_miss(&db, markers, false);
+        }
+    }
+
+    #[test]
+    fn point_skip_limit_fallback_is_exact() {
+        let dir = TestDir::new();
+        let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        disable_point_eviction(&db);
+        let behind = 4 * POINT_SKIP_LIMIT as usize;
+        // (a) a live key in range behind in-range markers.
+        point_markers(&db, marker_keys(b"a/", behind));
+        point_put(&db, b"a/zz", b"found");
+        // (b) a live key at end, behind markers.
+        point_markers(&db, marker_keys(b"b/", behind));
+        point_put(&db, b"c", b"past");
+        // (c) a live key with no markers, and one behind fewer markers than the limit.
+        point_put(&db, b"d", b"plain");
+        point_markers(&db, marker_keys(b"e/", POINT_SKIP_LIMIT as usize / 4));
+        point_put(&db, b"e/zz", b"near");
+        type Expected<'a> = Option<(&'a [u8], &'a [u8])>;
+        let probe = |start: &[u8], end: &[u8], expected: Expected, falls: bool| {
+            let expected = expected.map(|(key, value)| (key.to_vec(), value.to_vec()));
+            let before = point_counters(&db);
+            assert_eq!(db.first_in(Keyspace::Rows, start, end).unwrap(), expected);
+            let mut visited = None;
+            db.visit_first_in(Keyspace::Rows, start, end, &mut |key, value| {
+                assert!(visited.replace((key.to_vec(), value.to_vec())).is_none());
+            })
+            .unwrap();
+            assert_eq!(visited, expected);
+            let after = point_counters(&db);
+            let fallbacks = if falls { 2 } else { 0 };
+            assert_eq!(after.2 - before.2, fallbacks, "{start:?}..{end:?}");
+            // Every probe, fallback or not, checks out a pooled iterator once.
+            assert_eq!(after.0 + after.1 - before.0 - before.1, 2);
+        };
+        for flushed in [false, true] {
+            probe(b"a/", b"b", Some((b"a/zz", b"found")), true);
+            probe(b"b/", b"c", None, true);
+            probe(b"d", b"e", Some((b"d", b"plain")), false);
+            probe(b"e/", b"f", Some((b"e/zz", b"near")), false);
+            probe(b"c", b"c\0", Some((b"c", b"past")), false);
+            // (d) after a fallback the pooled iterator is reused, not recreated.
+            probe(b"b/", b"c", None, true);
+            assert_eq!(reused_point(&db, b"b/", b"c"), None);
+            assert_eq!(
+                reused_point(&db, b"a/", b"b"),
+                Some((b"a/zz".to_vec(), b"found".to_vec()))
+            );
+            assert!(db.db.points.lock().unwrap().idle[&Keyspace::Rows].len() <= POINT_POOL_CAP);
+            if !flushed {
+                db.flush_memtables().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn point_skip_limit_fallback_prefix_keys_are_exact() {
+        let dir = TestDir::new();
+        let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        disable_point_eviction(&db);
+        let count = 4 * POINT_SKIP_LIMIT as usize;
+        // Short user keys coexist with NUL and non-NUL extensions, as in Q40.
+        for key in [b"ab".as_slice(), b"ab\0zz", b"abc", b"abc\0zz"] {
+            point_put(&db, key, key);
+        }
+        for prefix in [b"aa/".as_slice(), b"ab\0/", b"ab\x01/", b"abc\0/", b"z/"] {
+            point_markers(&db, marker_keys(prefix, count));
+        }
+        for round in 0..2 {
+            for (start, end, expected_key) in [
+                (
+                    b"aa/".as_slice(),
+                    b"ab\0".as_slice(),
+                    Some(b"ab".as_slice()),
+                ),
+                (b"ab\0/", b"ab\0zzz", Some(b"ab\0zz")),
+                (b"ab\x01/", b"abc\0", Some(b"abc")),
+                (b"abc\0/", b"abd", Some(b"abc\0zz")),
+                (b"aa/", b"ab", None),      // first live key is exactly end
+                (b"ab\0/", b"ab\0z", None), // first live key is past end
+                (b"z/", b"zz", None),       // no live key remains
+            ] {
+                let mut control = db
+                    .db
+                    .raw_iterator_cf(db.db.cf_handle(Keyspace::Rows.name()).unwrap());
+                control.seek(start);
+                let expected = control
+                    .item()
+                    .filter(|(key, _)| *key < end)
+                    .map(|(key, value)| (key.to_vec(), value.to_vec()));
+                control.status().unwrap();
+                assert_eq!(
+                    expected.as_ref().map(|pair| pair.0.as_slice()),
+                    expected_key
+                );
+                let before = point_counters(&db).2;
+                assert_eq!(db.first_in(Keyspace::Rows, start, end).unwrap(), expected);
+                assert_eq!(
+                    point_counters(&db).2,
+                    before + 1,
+                    "round {round}: {start:?}..{end:?}"
+                );
+                let mut visited = None;
+                db.visit_first_in(Keyspace::Rows, start, end, &mut |key, value| {
+                    assert!(visited.replace((key.to_vec(), value.to_vec())).is_none());
+                })
+                .unwrap();
+                assert_eq!(visited, expected);
+                assert_eq!(
+                    point_counters(&db).2,
+                    before + 2,
+                    "round {round}: {start:?}..{end:?}"
+                );
+            }
+            if round == 0 {
+                db.flush_memtables().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn point_skip_limit_live_key_boundary() {
+        let mut observations = Vec::new();
+        for markers in POINT_SKIP_LIMIT - 2..=POINT_SKIP_LIMIT + 2 {
+            let dir = TestDir::new();
+            let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+            disable_point_eviction(&db);
+            // Standalone deletes leave one counted entry each, unlike point_markers'
+            // delete + hidden value pairs (confirmed by the unlimited perf count).
+            let mut batch = WriteBatch::default();
+            for key in marker_keys(b"a/", markers as usize) {
+                batch.delete(Keyspace::Rows, key);
+            }
+            db.write(batch, Durability::Sync).unwrap();
+            point_put(&db, b"a/z", b"live");
+            let mut control = db
+                .db
+                .raw_iterator_cf(db.db.cf_handle(Keyspace::Rows.name()).unwrap());
+            let ((), control_skips) = skipped(|| control.seek(b"a/"));
+            assert_eq!(
+                control.item(),
+                Some((b"a/z".as_slice(), b"live".as_slice()))
+            );
+            control.status().unwrap();
+            let before = point_counters(&db).2;
+            let (pair, probe_skips) = skipped(|| db.first_in(Keyspace::Rows, b"a/", b"b").unwrap());
+            assert_eq!(pair, Some((b"a/z".to_vec(), b"live".to_vec())));
+            let falls = point_counters(&db).2 - before;
+            assert_eq!(control_skips, markers);
+            // Observed threshold: 32 skipped markers + returned entry succeeds;
+            // 33 markers triggers fallback. DBIter tests > limit before incrementing.
+            assert_eq!(falls, usize::from(control_skips > POINT_SKIP_LIMIT));
+            observations.push((markers, control_skips, probe_skips, falls));
+        }
+        eprintln!("boundary (markers, control skips, probe skips, fallbacks): {observations:?}");
+        assert_eq!(observations.first().unwrap().3, 0);
+        assert_eq!(observations.last().unwrap().3, 1);
+    }
+
+    #[test]
+    fn point_skip_limit_with_range_tombstones() {
+        let dir = TestDir::new();
+        let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        disable_point_eviction(&db);
+        let count = 4 * POINT_SKIP_LIMIT as usize;
+        let mut batch = WriteBatch::default();
+        for key in marker_keys(b"r/", count).chain(marker_keys(b"s/", count)) {
+            batch.put(Keyspace::Rows, key, b"covered".to_vec());
+        }
+        batch.put(Keyspace::Rows, b"r/zz".to_vec(), b"uncovered".to_vec());
+        batch.put(Keyspace::Rows, b"t".to_vec(), b"past".to_vec());
+        db.write(batch, Durability::Sync).unwrap();
+        // (e) DeleteRange covers keys in the probed ranges and past them; point markers
+        // follow the second range.
+        let mut batch = WriteBatch::default();
+        batch.delete_range(Keyspace::Rows, b"r/".to_vec(), b"r/z".to_vec());
+        batch.delete_range(Keyspace::Rows, b"r/zzz".to_vec(), b"s/~".to_vec());
+        db.write(batch, Durability::Sync).unwrap();
+        point_markers(&db, marker_keys(b"s/~", count));
+        type Case<'a> = (&'a [u8], &'a [u8], Option<(&'a [u8], &'a [u8])>);
+        let cases: [Case; 5] = [
+            (b"r/", b"s", Some((b"r/zz", b"uncovered"))),
+            (b"r/zzz", b"s", None),
+            (b"s/", b"t", None),
+            (b"s/", b"t\0", Some((b"t", b"past"))),
+            (b"r/0", b"r/1", None),
+        ];
+        for round in 0..2 {
+            for (start, end, expected) in cases {
+                let expected = expected.map(|(key, value)| (key.to_vec(), value.to_vec()));
+                assert_eq!(
+                    db.first_in(Keyspace::Rows, start, end).unwrap(),
+                    expected,
+                    "round {round}: {start:?}..{end:?}"
+                );
+            }
+            if round == 0 {
+                db.flush_memtables().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn point_skip_limit_generation_bump_during_probe() {
+        let dir = TestDir::new();
+        let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        disable_point_eviction(&db);
+        point_markers(&db, marker_keys(b"a/", 4 * POINT_SKIP_LIMIT as usize));
+        point_put(&db, b"a/zz", b"found");
+        point_put(&db, b"b", b"plain");
+        // (f) clear the pool inside the visitor. On the limited path the visitor runs
+        // before check-in, so the iterator is dropped; on the fallback path it was
+        // already checked in and the clear drops it.
+        for (start, end, key, falls) in [
+            (b"b".as_slice(), b"c".as_slice(), b"b".as_slice(), false),
+            (b"a/", b"b", b"a/zz", true),
+        ] {
+            db.first_in(Keyspace::Rows, start, end).unwrap();
+            let before = point_counters(&db);
+            let mut visited = None;
+            db.visit_first_in(Keyspace::Rows, start, end, &mut |found, _| {
+                db.db.clear_points();
+                visited = Some(found.to_vec());
+            })
+            .unwrap();
+            assert_eq!(visited.as_deref(), Some(key));
+            let after = point_counters(&db);
+            assert_eq!(after, (before.0, before.1 + 1, before.2 + usize::from(falls)));
+            let idle = db.db.points.lock().unwrap().idle.get(&Keyspace::Rows).map(Vec::len);
+            assert!(idle.unwrap_or(0) == 0);
+            // The next probe creates a fresh iterator and is still exact.
+            assert_eq!(
+                db.first_in(Keyspace::Rows, start, end).unwrap().map(|pair| pair.0),
+                Some(key.to_vec())
+            );
+            assert_eq!(point_counters(&db).0, after.0 + 1);
+        }
     }
 
     fn reopen(durability: Durability) {
