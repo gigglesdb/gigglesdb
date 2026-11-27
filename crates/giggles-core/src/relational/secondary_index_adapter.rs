@@ -1110,6 +1110,48 @@ impl Relational {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(PartialEq, Eq)]
+struct ValidationContext {
+    value_bytes: usize,
+    wide_values: bool,
+    statement_tokens: usize,
+}
+
+impl ValidationContext {
+    fn current() -> Self {
+        Self {
+            value_bytes: max_value_bytes(),
+            wide_values: wide_values(),
+            statement_tokens: max_statement_tokens(),
+        }
+    }
+}
+
+/// Proof for the exact borrowed state, issued only after complete recomputation.
+pub(crate) struct ValidatedSecondary<'a> {
+    source: &'a Relational,
+    context: Option<ValidationContext>,
+}
+
+impl<'a> ValidatedSecondary<'a> {
+    pub(crate) fn sidecar(&self) -> &'a Sidecar {
+        &self.source.secondary
+    }
+
+    pub(super) fn source(&self) -> &'a Relational {
+        self.source
+    }
+
+    pub(super) fn matches_context(&self) -> bool {
+        self.context == Some(ValidationContext::current())
+    }
+}
+
 impl Relational {
     pub(crate) fn has_secondary_indexes_engine(&self) -> bool {
         !self.secondary.descriptors().is_empty()
@@ -1185,9 +1227,27 @@ impl Relational {
         Ok((base, payload))
     }
 
+    pub(crate) fn secondary_validated_engine(
+        &self,
+        mut cancel: impl FnMut() -> bool,
+    ) -> R<ValidatedSecondary<'_>> {
+        let context = ValidationContext::current();
+        // A callback can change a budget for only part of validation.
+        let mut stable = true;
+        self.secondary_validate_engine(|| {
+            let cancelled = cancel();
+            stable = stable && context == ValidationContext::current();
+            cancelled
+        })?;
+        Ok(ValidatedSecondary {
+            source: self,
+            context: stable.then_some(context),
+        })
+    }
+
     /// Read-only persistence handoff: a validated runtime sidecar, including
     /// descriptors on empty tables. Does not serialize or admit a new index.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn secondary_state_engine(&self, cancel: impl FnMut() -> bool) -> R<&Sidecar> {
         self.secondary_validate_engine(cancel)?;
         Ok(&self.secondary)
@@ -1196,13 +1256,26 @@ impl Relational {
     /// Stage2 access bridge: exact schema fence and complete authoritative
     /// recomputation, then borrowed sidecar and base row map. Bounds/projection,
     /// residual evaluation, output budgets and truthful explain belong to caller.
-    #[allow(dead_code)] // Stage2 internal read handoff; no planner is enabled.
     pub(crate) fn secondary_access_engine(
         &self,
         table: &TableDef,
         epoch: u64,
         mut cancel: impl FnMut() -> bool,
     ) -> R<(&Sidecar, &BTreeMap<Vec<u8>, SqlRow>)> {
+        self.secondary_access_fence(table, epoch, &mut cancel)?;
+        self.secondary_validate_engine(&mut cancel)?;
+        Ok((
+            &self.secondary,
+            self.rows.get(&table.id).ok_or(SqlError::UnknownTable)?,
+        ))
+    }
+
+    pub(super) fn secondary_access_fence(
+        &self,
+        table: &TableDef,
+        epoch: u64,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> R<()> {
         cap(table.name.len(), 63)?;
         cap(table.column_slots(), MAX_TABLE_COLUMNS)?;
         cap(table.primary_key.len(), MAX_COLUMNS)?;
@@ -1212,15 +1285,17 @@ impl Relational {
         if epoch != self.epoch {
             return Err(SqlError::StaleSchema);
         }
-        tick(&mut cancel)?;
-        Prepared::engine_table(table, self)?;
-        self.secondary_validate_engine(&mut cancel)?;
-        Ok((
-            &self.secondary,
-            self.rows.get(&table.id).ok_or(SqlError::UnknownTable)?,
-        ))
+        tick(cancel)?;
+        Prepared::engine_table(table, self)
     }
+    #[cfg(test)]
+    pub(crate) fn secondary_validation_count() -> usize {
+        VALIDATIONS.with(std::cell::Cell::get)
+    }
+
     pub(crate) fn secondary_validate_engine(&self, mut cancel: impl FnMut() -> bool) -> R<()> {
+        #[cfg(test)]
+        VALIDATIONS.with(|count| count.set(count.get() + 1));
         let ds = self.secondary.descriptors();
         let snap = snapshot(self, ds, NONE, &mut cancel)?;
         let tuples = snap.tuples();

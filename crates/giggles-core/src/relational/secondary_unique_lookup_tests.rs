@@ -308,6 +308,8 @@ fn cancellation_every_stage_and_ambient_independence() {
 #[test]
 fn finite_bytes_work_candidates_exact_boundaries_and_overflow() {
     let (s, t, d) = fixture();
+    let proof = s.secondary_validated_engine(|| false).unwrap();
+    let mut certified = UniqueLookup::new(proof, &t, s.epoch);
     // Find the exact conservative admission boundary independently for each quota.
     for axis in 0..3 {
         let mut lo = 0;
@@ -342,6 +344,7 @@ fn finite_bytes_work_candidates_exact_boundaries_and_overflow() {
             s.secondary_unique_lookup_engine(&t, s.epoch, &d, &eq(), &l, || false)
                 .is_ok()
         );
+        assert!(certified.lookup(&d, &eq(), &l, || false).unwrap().is_some());
         match axis {
             0 => l.bytes -= 1,
             1 => l.work -= 1,
@@ -356,6 +359,10 @@ fn finite_bytes_work_candidates_exact_boundaries_and_overflow() {
             Err(SqlError::Limit)
         );
         assert_eq!(calls, 0);
+        assert_eq!(
+            certified.lookup(&d, &eq(), &l, || panic!("callback before admission")),
+            Err(SqlError::Limit)
+        );
     }
     assert_eq!(add(usize::MAX, 1), Err(SqlError::Limit));
     assert_eq!(mul(usize::MAX, 2), Err(SqlError::Limit));
@@ -514,4 +521,244 @@ fn borrowed_source_shape_admission_and_finite_limit_overflows_precede_callback()
             Err(SqlError::Limit)
         );
     }
+}
+
+fn with_large_payload() -> (Relational, TableDef, Descriptor) {
+    let (mut source, mut table, descriptor) = fixture();
+    table.columns[4].data_type = DataType::Text;
+    std::sync::Arc::make_mut(&mut source.tables).insert(table.name.clone(), table.clone());
+    source
+        .rows
+        .get_mut(&table.id)
+        .unwrap()
+        .values_mut()
+        .next()
+        .unwrap()
+        .values[4] = Value::Text("x".repeat(256));
+    (source, table, descriptor)
+}
+
+#[test]
+fn optimized_lookup_revalidates_after_value_budget_changes_in_callback() {
+    let (source, table, descriptor) = with_large_payload();
+    let missing = [Value::Text("missing".into()), Value::Bytes(vec![])];
+    for warm in [false, true] {
+        for change_at in [0, 1] {
+            for reference in [false, true] {
+                let proof = source.secondary_validated_engine(|| false).unwrap();
+                let mut lookup = UniqueLookup::new(proof, &table, source.epoch);
+                lookup.use_reference(reference);
+                if warm {
+                    assert!(
+                        lookup
+                            .lookup(&descriptor, &missing, &limits(), || false)
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+                let mut budget = None;
+                let mut calls = 0;
+                let result = lookup.lookup(&descriptor, &missing, &limits(), || {
+                    if calls == change_at {
+                        budget = Some(ValueBudget::enter(64, true));
+                    }
+                    calls += 1;
+                    false
+                });
+                assert_eq!(
+                    result,
+                    Err(SqlError::Limit),
+                    "warm={warm} change_at={change_at} reference={reference}"
+                );
+                drop(budget);
+                assert!(
+                    lookup
+                        .lookup(&descriptor, &missing, &limits(), || false)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn optimized_rows_revalidate_after_statement_token_budget_changes() {
+    let mut source = Relational::default();
+    for sql in [
+        "CREATE TABLE items (id INT PRIMARY KEY, email TEXT, live BOOLEAN)",
+        "CREATE UNIQUE INDEX live_email ON items(email) WHERE live AND id > 0",
+        "INSERT INTO items VALUES (1, 'a', true)",
+    ] {
+        let statement = Prepared::parse(sql, 1, source.epoch).unwrap();
+        source.execute(&statement, &[], None).unwrap();
+    }
+    let table = source.tables.values().next().unwrap();
+    let proof = source.secondary_validated_engine(|| false).unwrap();
+    let mut lookup = UniqueLookup::new(proof, table, source.epoch);
+    assert_eq!(lookup.rows(|| false).unwrap().len(), 1);
+    let _budget = StatementBudget::enter(1, true);
+    let expected = source
+        .secondary_access_engine(table, source.epoch, || false)
+        .unwrap_err();
+    assert_eq!(lookup.rows(|| false), Err(expected));
+}
+
+#[test]
+fn optimized_lookup_polls_at_each_cold_and_warm_callback() {
+    let (source, table, descriptor) = fixture();
+    for warm in [false, true] {
+        // Entry, access, tuple, matching entry, finish. A miss skips the
+        // matching-entry tick, and a NULL tuple ends after its own tick.
+        for (equal, polls, hit) in [
+            (eq(), 5, true),
+            (
+                [Value::Text("missing".into()), Value::Bytes(vec![])],
+                4,
+                false,
+            ),
+            ([Value::Null, Value::Bytes(vec![])], 3, false),
+        ] {
+            for stop in 0..=polls {
+                let proof = source.secondary_validated_engine(|| false).unwrap();
+                let mut lookup = UniqueLookup::new(proof, &table, source.epoch);
+                if warm {
+                    assert!(
+                        lookup
+                            .lookup(&descriptor, &eq(), &limits(), || false)
+                            .unwrap()
+                            .is_some()
+                    );
+                }
+                let mut calls = 0;
+                let result = lookup.lookup(&descriptor, &equal, &limits(), || {
+                    calls += 1;
+                    calls - 1 == stop
+                });
+                if stop < polls {
+                    assert_eq!(
+                        result,
+                        Err(SqlError::Aborted),
+                        "warm={warm} stop={stop} equal={equal:?}"
+                    );
+                    assert_eq!(calls, stop + 1);
+                } else {
+                    assert_eq!(result.unwrap().is_some(), hit);
+                    assert_eq!(calls, polls);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn optimized_rows_poll_on_cold_and_warm_access() {
+    let (source, table, _) = fixture();
+    for warm in [false, true] {
+        for stop in 0..=1 {
+            let proof = source.secondary_validated_engine(|| false).unwrap();
+            let mut lookup = UniqueLookup::new(proof, &table, source.epoch);
+            if warm {
+                assert_eq!(lookup.rows(|| false).unwrap().len(), 1);
+            }
+            let mut calls = 0;
+            let result = lookup.rows(|| {
+                calls += 1;
+                calls - 1 == stop
+            });
+            if stop == 0 {
+                assert_eq!(result, Err(SqlError::Aborted), "warm={warm}");
+            } else {
+                assert!(std::ptr::eq(result.unwrap(), &source.rows[&table.id]));
+            }
+            assert_eq!(calls, 1);
+        }
+    }
+}
+
+#[test]
+fn optimized_lookup_error_precedence_and_null_access_fence() {
+    let (source, table, descriptor) = fixture();
+    let proof = source.secondary_validated_engine(|| false).unwrap();
+    let mut lookup = UniqueLookup::new(proof, &table, source.epoch + 1);
+    let mut bad_descriptor = descriptor.clone();
+    bad_descriptor.id = u64::MAX;
+    let wrong_type = [Value::Bool(false), Value::Bytes(vec![])];
+    let null = [Value::Null, Value::Bytes(vec![])];
+
+    let exhausted = Limits {
+        bytes: 0,
+        ..limits()
+    };
+    let no_poll = || panic!("before the callback fence");
+    assert_eq!(
+        lookup.lookup(&bad_descriptor, &wrong_type, &exhausted, no_poll),
+        Err(SqlError::Limit)
+    );
+    assert_eq!(
+        lookup.lookup(&bad_descriptor, &wrong_type, &limits(), no_poll),
+        Err(SqlError::Unsupported)
+    );
+    assert_eq!(
+        lookup.lookup(&descriptor, &wrong_type, &limits(), no_poll),
+        Err(SqlError::Type)
+    );
+
+    let mut polls = 0;
+    assert_eq!(
+        lookup.lookup(&descriptor, &null, &limits(), || {
+            polls += 1;
+            false
+        }),
+        Err(SqlError::StaleSchema)
+    );
+    assert_eq!(polls, 1, "stale epoch precedes the access and NULL ticks");
+}
+
+#[test]
+fn optimized_later_lookup_recaps_admitted_row_before_descriptor_checks() {
+    let (source, table, descriptor) = with_large_payload();
+    let proof = source.secondary_validated_engine(|| false).unwrap();
+    let mut lookup = UniqueLookup::new(proof, &table, source.epoch);
+    assert!(
+        lookup
+            .lookup(&descriptor, &eq(), &limits(), || false)
+            .unwrap()
+            .is_some()
+    );
+
+    let _budget = ValueBudget::enter(256, true);
+    let mut bad_descriptor = descriptor;
+    bad_descriptor.id = u64::MAX;
+    assert_eq!(
+        lookup.lookup(&bad_descriptor, &eq(), &limits(), || panic!(
+            "callback before admission"
+        )),
+        Err(SqlError::Limit)
+    );
+}
+
+#[test]
+fn proof_is_not_reused_after_context_changes_during_validation() {
+    let (source, table, _) = fixture();
+    let mut budget = None;
+    let mut polls = 0;
+    let proof = source
+        .secondary_validated_engine(|| {
+            match polls {
+                0 => budget = Some(StatementBudget::enter(2, true)),
+                1 => drop(budget.take()),
+                _ => {}
+            }
+            polls += 1;
+            false
+        })
+        .unwrap();
+    assert!(polls > 1);
+    assert!(budget.is_none());
+
+    let mut lookup = UniqueLookup::new(proof, &table, source.epoch);
+    let before = Relational::secondary_validation_count();
+    assert_eq!(lookup.rows(|| false).unwrap().len(), 1);
+    assert_eq!(Relational::secondary_validation_count(), before + 1);
 }

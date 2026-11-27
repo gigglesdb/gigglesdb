@@ -641,6 +641,22 @@ impl Sidecar {
         Ok(out)
     }
 }
+
+impl super::secondary_index_adapter::ValidatedSecondary<'_> {
+    /// Seek to a tuple prefix using the proof for this exact sidecar.
+    pub(super) fn lookup_prefix<'a>(
+        &'a self,
+        index: u64,
+        prefix: &'a [u8],
+    ) -> Result<impl Iterator<Item = (&'a [u8], &'a [u8])>> {
+        use std::ops::Bound::{Included, Unbounded};
+        let map = self.sidecar().entries.get(&index).ok_or(Error::Descriptor)?;
+        Ok(map
+            .range::<[u8], _>((Included(prefix), Unbounded))
+            .take_while(move |(key, _)| key.starts_with(prefix))
+            .map(|(key, pk)| (key.as_slice(), pk.as_slice())))
+    }
+}
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Change<'a> {
     Insert(BaseRow<'a>),

@@ -3,7 +3,7 @@ use super::*;
 use crate::relational::{
     Relational,
     secondary_index::{self, Descriptor},
-    secondary_unique_lookup::Limits,
+    secondary_unique_lookup::{Limits, UniqueLookup},
 };
 
 /// Preserve SQL failures until the frontend chooses its error representation.
@@ -255,7 +255,10 @@ fn plan_unique_conflict_evaluated<'s>(
         debug_assert!(false, "heap primary key cannot be a SQL arbiter");
         return Err(Error::Unsupported.into());
     }
-    let sidecar = src.secondary_state_engine(&mut *cancel).map_err(sql)?;
+    // This snapshot is immutable for the entire plan. Preserve the existing
+    // validation point for arbiter resolution and reuse its proof for probes.
+    let validated = src.secondary_validated_engine(&mut *cancel).map_err(sql)?;
+    let sidecar = validated.sidecar();
     let mut targets = Vec::new();
     let include_pk = hidden_rowid.is_none() && match &arbiter {
         Arbiter::Unique(_) => false,
@@ -336,16 +339,17 @@ fn plan_unique_conflict_evaluated<'s>(
         work: secondary_index::MAX_WORK * 3,
         candidates: secondary_index::MAX_CANDIDATES,
     };
+    let mut lookup = UniqueLookup::new(validated, table, epoch);
+    #[cfg(test)]
+    lookup.use_reference(differential_tests::reference_lookup());
     let base = if include_pk {
-        Some(
-            src.secondary_access_engine(table, epoch, &mut *cancel)
-                .map_err(sql)?
-                .1,
-        )
+        Some(lookup.rows(&mut *cancel).map_err(sql)?)
     } else {
         None
     };
     let mut resolved = Vec::new();
+    // Poll per proposal, per nondeterministic row, on each rows() access,
+    // and per matching sidecar entry in the deterministic lookup.
     for row in incoming {
         tick(cancel)?;
         let mut winner = None;
@@ -356,7 +360,7 @@ fn plan_unique_conflict_evaluated<'s>(
                 && let Some(tuple) = &tuple
             {
                 winner = if arbiter.equality.nondeterministic() {
-                    let rows = src.secondary_access_engine(table, epoch, &mut *cancel).map_err(sql)?.1;
+                    let rows = lookup.rows(&mut *cancel).map_err(sql)?;
                     let mut found = None;
                     for (key, old) in rows {
                         tick(cancel)?;
@@ -372,15 +376,7 @@ fn plan_unique_conflict_evaluated<'s>(
                         .iter()
                         .map(|index| row[*index].clone())
                         .collect::<Vec<_>>();
-                    src.secondary_unique_lookup_engine(
-                        table,
-                        epoch,
-                        target,
-                        &values,
-                        &limits,
-                        &mut *cancel,
-                    )
-                    .map_err(sql)?
+                    lookup.lookup(target, &values, &limits, &mut *cancel).map_err(sql)?
                 } else {
                     base.expect("PK base map")
                         .get_key_value(tuple)
@@ -436,11 +432,7 @@ fn plan_unique_conflict_evaluated<'s>(
         }
     }
     tick(cancel)?;
-    let source_rows = src
-        .secondary_access_engine(table, epoch, &mut *cancel)
-        .map_err(sql)?
-        .1
-        .len();
+    let source_rows = lookup.rows(&mut *cancel).map_err(sql)?.len();
     if source_rows.checked_add(inserts.len()).ok_or(Error::Limit)? > crate::relational::MAX_ROWS {
         return Err(Error::Limit.into());
     }
@@ -653,10 +645,9 @@ fn plan_unique_conflict_evaluated<'s>(
         })
         .collect::<std::result::Result<Vec<_>, PlanError>>()?;
     if semantics == Semantics::Sql {
-        let mut occupied = src
-            .secondary_access_engine(table, epoch, &mut *cancel)
+        let mut occupied = lookup
+            .rows(&mut *cancel)
             .map_err(sql)?
-            .1
             .keys()
             .cloned()
             .collect::<BTreeSet<_>>();
@@ -1092,3 +1083,7 @@ impl Relational {
 #[cfg(test)]
 #[path = "unique_conflict_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "unique_conflict_differential_tests.rs"]
+mod differential_tests;
