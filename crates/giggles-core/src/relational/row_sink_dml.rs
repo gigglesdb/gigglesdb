@@ -782,7 +782,7 @@ impl ActionWork {
                 }
             };
             let values = positions.iter().map(|(i, j)| query::constraint_key(
-                &row.values[*i], &table.columns[*i].data_type, &parent.columns[*j].data_type,
+                &row.values[*i], &table.columns[*i].data_type, &parent.columns[*j].data_type, query::FkKeyDirection::ToParent,
             )).collect::<R<Option<Vec<_>>>>().map_err(CoreError::Sql)?
                 .ok_or_else(|| CoreError::Sql(missing()))?;
             let mut found = false;
@@ -817,27 +817,28 @@ impl ActionWork {
                 let values = parent_positions.iter().map(|i| old.values[*i].clone()).collect::<Vec<_>>();
                 let new_values = new.as_ref().map(|row| parent_positions.iter()
                     .map(|i| row.values[*i].clone()).collect::<Vec<_>>());
-                if values.contains(&Value::Null) { continue; }
+                if values.contains(&Value::Null)
+                    || new_values.as_ref().is_some_and(|new| constraints::row_image_eq(&values, new))
+                {
+                    continue;
+                }
                 let action = if new.is_some() { on_update } else { on_delete };
                 let child = state.tables.values().find(|t| t.id == *child_id).unwrap().clone();
                 let child_positions = columns.iter()
                     .map(|id| child.columns.iter().position(|c| c.id == *id).unwrap())
                     .collect::<Vec<_>>();
                 let positions = || parent_positions.iter().zip(&child_positions);
-                let cross_type = positions().any(|(&p, &c)| {
-                    !constraints::same_fk_type(state, &parent.columns[p], &child.columns[c])
-                });
-                if new_values.as_ref().is_some_and(|new| {
-                    if cross_type { constraints::row_image_eq(&values, new) } else { values == *new }
-                }) { continue; }
                 let equality = collation_keys::Key::new(state, &parent, ref_columns, None)
                     .map_err(CoreError::Sql)?;
                 let tuple = equality.values(&values).map_err(CoreError::Sql)?;
                 let probe = if !equality.nondeterministic() && positions().all(|(&p, &c)| {
-                    query::constraint_key_supported(&parent.columns[p].data_type, &child.columns[c].data_type)
+                    query::constraint_key_supported(
+                        &child.columns[c].data_type, &parent.columns[p].data_type, query::FkKeyDirection::ToChild,
+                    )
                 }) {
                     let converted = positions().zip(&values).map(|((&p, &c), value)| {
-                        query::constraint_key(value, &parent.columns[p].data_type, &child.columns[c].data_type)
+                        query::constraint_key(value, &child.columns[c].data_type, &parent.columns[p].data_type,
+                            query::FkKeyDirection::ToChild)
                     }).collect::<R<Option<Vec<_>>>>().map_err(CoreError::Sql)?;
                     let Some(converted) = converted else { continue; };
                     Some(converted)
@@ -847,7 +848,7 @@ impl ActionWork {
                 let references_old_key = |row: &SqlRow| -> R<bool> {
                     let converted = child_positions.iter().zip(&parent_positions).map(|(&a, &b)| {
                         query::constraint_key(&row.values[a], &child.columns[a].data_type,
-                            &parent.columns[b].data_type)
+                            &parent.columns[b].data_type, query::FkKeyDirection::ToParent)
                     }).collect::<R<Option<Vec<_>>>>()?;
                     Ok(converted.as_ref().map(|v| equality.values(v)).transpose()?.flatten() == tuple)
                 };
@@ -870,11 +871,12 @@ impl ActionWork {
                             if values.contains(&Value::Null) { return None; }
                             let new_values = new.as_ref().map(|row| parent_positions.iter()
                                 .map(|&p| row.values[p].clone()).collect::<Vec<_>>());
-                            if new_values.as_ref().is_some_and(|new| {
-                                if cross_type { constraints::row_image_eq(&values, new) } else { values == *new }
-                            }) { return None; }
+                            if new_values.as_ref().is_some_and(|new| constraints::row_image_eq(&values, new)) {
+                                return None;
+                            }
                             let converted = positions().zip(&values).map(|((&p, &c), value)| {
-                                query::constraint_key(value, &parent.columns[p].data_type, &child.columns[c].data_type)
+                                query::constraint_key(value, &child.columns[c].data_type,
+                                    &parent.columns[p].data_type, query::FkKeyDirection::ToChild)
                             }).collect::<R<Option<Vec<_>>>>().ok().flatten()?;
                             Some((queue_position + 1 + i, converted))
                         });

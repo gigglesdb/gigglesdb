@@ -7370,7 +7370,7 @@ pub(super) use generated::{
     rename_reference as rename_generated_reference, value as generated_expression_value,
 };
 pub(super) use constraints::{
-    check_enum_text_retype, constraint_check, constraint_columns, constraint_deparse, constraint_eval,
+    FkKeyDirection, check_enum_text_retype, constraint_check, constraint_columns, constraint_deparse, constraint_eval,
     constraint_key,
     constraint_key_supported, constraint_quote, constraint_shape, constraint_types_compatible,
     constraint_references, constraint_rename, constraint_table_deparse, constraint_validate,

@@ -477,6 +477,8 @@ mod fk_target_codec;
 
 #[path = "fk_cross_type.rs"]
 mod fk_cross_type;
+#[path = "fk_type_pairs.rs"]
+mod fk_type_pairs;
 #[path = "fk_create_candidates.rs"] mod fk_create_candidates;
 
 #[path = "fk_index_binding.rs"] mod fk_index_binding;

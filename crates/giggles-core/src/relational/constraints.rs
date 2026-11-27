@@ -350,6 +350,7 @@ fn fk_row(
                 value,
                 &table.columns[*child].data_type,
                 &parent.columns[*parent_at].data_type,
+                query::FkKeyDirection::ToParent,
             )
         })
         .collect::<R<Option<Vec<_>>>>()?
@@ -879,6 +880,19 @@ pub(super) fn validate_named(
     }
     Ok(())
 }
+pub(super) fn column_has_foreign_key(state: &Relational, table: u64, column: u64) -> bool {
+    state.ext.constraints.iter().any(|(&child, constraints)| {
+        constraints.iter().any(|constraint| {
+            let ConstraintKind::ForeignKey { columns, ref_table, ref_columns, .. } = &constraint.kind
+            else {
+                return false;
+            };
+            (child == table && columns.contains(&column))
+                || (*ref_table == table && ref_columns.contains(&column))
+        })
+    })
+}
+
 /// Persisted bindings are authoritative; legacy Unknown bindings block by column set.
 pub(super) fn key_dependents(
     state: &Relational, table: u64, key: catalog_ext::ReferencedKey, columns: &[u64],
@@ -1233,16 +1247,14 @@ pub(super) fn enforce_with_rows<'a>(
             if old_key.contains(&Value::Null) {
                 continue;
             }
+            if new_key.as_ref().is_some_and(|key| row_image_eq(&old_key, key)) {
+                continue;
+            }
             let child = table_by_id(state, child_id)?.clone();
             let positions = id_positions(&child, columns)?;
             let cross_type = ref_positions.iter().zip(&positions).any(|(&p, &c)| {
                 !same_fk_type(state, &parent.columns[p], &child.columns[c])
             });
-            if new_key.as_ref().is_some_and(|key| {
-                if cross_type { row_image_eq(&old_key, key) } else { old_key == *key }
-            }) {
-                continue;
-            }
             let parent_types: Vec<_> = ref_positions
                 .iter()
                 .map(|i| parent.columns[*i].data_type.clone())

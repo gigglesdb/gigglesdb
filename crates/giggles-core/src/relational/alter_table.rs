@@ -694,17 +694,58 @@ pub(super) fn execute(
                             return Err(SqlError::Type);
                         }
                     }
-                } else {
-                    if !matches!(ty, DataType::Text | DataType::Varchar) {
-                        query::check_enum_text_retype(&candidate, &table, old)?;
-                    }
-                    if collation.is_none()
-                        && !ty.is_text_search()
-                        && !matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
-                        && candidate.generated_column(old.id).is_none()
-                    {
-                        return Err(SqlError::Unsupported);
-                    }
+                } else if !matches!(ty, DataType::Text | DataType::Varchar) {
+                    query::check_enum_text_retype(&candidate, &table, old)?;
+                }
+                let reference = column_collations::resolve_column(
+                    &candidate, &new, type_id, collation.as_deref(), path
+                )?;
+                let unsupported_primary_key = table.primary_key.contains(&at)
+                    && (new.data_type.is_temporal() || new.data_type == DataType::Bpchar);
+                let unsupported_secondary_key = new.data_type == DataType::Bpchar
+                    && candidate.secondary_descriptors_engine().iter().any(|index| {
+                        index.table == table.id && index.columns.contains(&old.id)
+                    });
+                if unsupported_primary_key || unsupported_secondary_key {
+                    return Err(SqlError::Unsupported);
+                }
+                let old_type_id = candidate.ext.columns.get(&old.id).and_then(|c| c.type_id);
+                // text/varchar retypes keep every stored byte and FK equality
+                // (varchar(100) -> varchar(255) in ORM migrations), so the FK stays valid.
+                // Narrowing is not byte-preserving: assignment drops excess
+                // trailing spaces ('ab   ' -> 'ab ' in varchar(3)), which would
+                // orphan the other side. Admit only unbounded or widening targets.
+                let text_family = |ty: &DataType| matches!(ty, DataType::Text | DataType::Varchar);
+                let old_typmod = candidate.column_typmod(old.id);
+                let new_typmod = typmod.unwrap_or(-1);
+                let widening = new_typmod < 0 || (old_typmod >= 0 && new_typmod >= old_typmod);
+                let byte_preserving_text = text_family(&old.data_type)
+                    && text_family(&new.data_type)
+                    && widening
+                    && old_type_id == type_id
+                    && candidate.column_collation(old.id) == reference.as_ref()
+                    && conversion.is_none();
+                if !byte_preserving_text
+                    && (old.data_type != new.data_type
+                    || candidate.column_typmod(old.id) != typmod.unwrap_or(-1)
+                    || old_type_id != type_id
+                    || candidate.column_collation(old.id) != reference.as_ref()
+                    || conversion.is_some())
+                    && constraints::column_has_foreign_key(&candidate, table.id, old.id)
+                {
+                    // The paged layout rewrite has no cross-table FK validation.
+                    user_types::view_replace_error(format!(
+                        "cannot alter type of column \"{column}\" because it is used by a foreign key constraint"
+                    ));
+                    return Err(SqlError::Unsupported);
+                }
+                if user_type.is_none()
+                    && collation.is_none()
+                    && !ty.is_text_search()
+                    && !matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
+                    && candidate.generated_column(old.id).is_none()
+                {
+                    return Err(SqlError::Unsupported);
                 }
                 // The v2 layout rewrite leaves same-width rows and existing
                 // index tuples in place. Admit only a byte-preserving text change.
@@ -719,9 +760,6 @@ pub(super) fn execute(
                 }) {
                     return Err(SqlError::Unsupported);
                 }
-                let reference = column_collations::resolve_column(
-                    &candidate, &new, type_id, collation.as_deref(), path
-                )?;
                 if new.data_type.is_text_search() && conversion.is_none() && old.data_type != new.data_type {
                     return Err(text_search_types::error_message("42804", format!(
                         "column \"{column}\" cannot be cast automatically to type {}",

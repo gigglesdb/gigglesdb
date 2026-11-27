@@ -137,6 +137,19 @@ pub(super) fn hydrate_with_probes(
                             .ok_or(CoreError::Sql(SqlError::UnknownColumn))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let (child_table, parent_table, direction) = if parent {
+                    (source, target, query::FkKeyDirection::ToParent)
+                } else {
+                    (target, source, query::FkKeyDirection::ToChild)
+                };
+                let key_types = |source_at: usize, target_at: usize| {
+                    let (child_at, parent_at) = if parent {
+                        (source_at, target_at)
+                    } else {
+                        (target_at, source_at)
+                    };
+                    (&child_table.columns[child_at].data_type, &parent_table.columns[parent_at].data_type)
+                };
                 let exact_parent = parent_probes.is_some() && parent
                     && target.primary_key.iter().map(|i| target.columns[*i].id)
                         .eq(target_columns.iter().copied())
@@ -184,21 +197,16 @@ pub(super) fn hydrate_with_probes(
                         continue;
                     }
                     let supported = positions.iter().zip(&targets).all(|(a, b)| {
-                        query::constraint_key_supported(
-                            &source.columns[*a].data_type,
-                            &target.columns[*b].data_type,
-                        )
+                        let (child, parent) = key_types(*a, *b);
+                        query::constraint_key_supported(child, parent, direction)
                     });
                     let converted = if supported {
                         values
                             .iter()
                             .zip(positions.iter().zip(&targets))
                             .map(|(v, (a, b))| {
-                                query::constraint_key(
-                                    v,
-                                    &source.columns[*a].data_type,
-                                    &target.columns[*b].data_type,
-                                )
+                                let (child, parent) = key_types(*a, *b);
+                                query::constraint_key(v, child, parent, direction)
                             })
                             .collect::<R<Option<Vec<_>>>>()
                             .map_err(CoreError::Sql)?
@@ -212,8 +220,12 @@ pub(super) fn hydrate_with_probes(
                         return Err(CoreError::Sql(SqlError::Type));
                     }
                     // Deduplicate encoded probes without relying on Value's SQL order.
-                    let signature = encode_key(converted.as_deref().unwrap_or(&values))
-                        .map_err(CoreError::Sql)?;
+                    let probe_values = converted.as_deref().unwrap_or(&values);
+                    let signature = if probe_values.iter().any(Value::is_temporal) {
+                        secondary_index_adapter::encode_tuple(probe_values.iter())
+                    } else {
+                        encode_key(probe_values)
+                    }.map_err(CoreError::Sql)?;
                     if !keys.insert(signature) {
                         continue;
                     }
@@ -235,7 +247,7 @@ pub(super) fn hydrate_with_probes(
                     let matches_child = |row: &SqlRow| -> R<bool> {
                         let candidate = targets.iter().zip(&positions).map(|(a, b)| {
                             query::constraint_key(&row.values[*a], &target.columns[*a].data_type,
-                                &source.columns[*b].data_type)
+                                &source.columns[*b].data_type, query::FkKeyDirection::ToParent)
                         }).collect::<R<Option<Vec<_>>>>()?;
                         Ok(candidate.as_ref().map(|v| equality.values(v)).transpose()?.flatten() == tuple)
                     };

@@ -15,21 +15,83 @@ pub(in crate::relational) fn constraint_types_compatible(
     {
         return false;
     }
-    functions::comparable(child, parent) && functions::join_key_supported(child, parent)
+    constraint_key_supported(child, parent, FkKeyDirection::ToParent)
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::relational) enum FkKeyDirection {
+    ToParent,
+    ToChild,
+}
+
+impl FkKeyDirection {
+    fn source_and_target<'a>(
+        self,
+        child: &'a DataType,
+        parent: &'a DataType,
+    ) -> (&'a DataType, &'a DataType) {
+        match self {
+            Self::ToParent => (child, parent),
+            Self::ToChild => (parent, child),
+        }
+    }
 }
 
 pub(in crate::relational) fn constraint_key_supported(
-    source: &DataType,
-    target: &DataType,
+    child: &DataType,
+    parent: &DataType,
+    direction: FkKeyDirection,
 ) -> bool {
-    functions::join_key_supported(source, target)
+    let (source, target) = direction.source_and_target(child, parent);
+    fk_specific_key(child, parent, direction)
+        || functions::comparable(source, target) && functions::join_key_supported(source, target)
+}
+
+fn fk_specific_key(child: &DataType, parent: &DataType, direction: FkKeyDirection) -> bool {
+    use DataType::*;
+    // Only the child-to-parent probe can trim bpchar to compare with text.
+    matches!(
+        (direction, child, parent),
+        (FkKeyDirection::ToParent, Bpchar, Text | Varchar)
+            | (_, Date | Timestamp, Date | Timestamp)
+            | (_, Time, Time)
+            | (_, TimeTz, TimeTz)
+            | (_, TimestampTz, TimestampTz)
+    )
 }
 
 pub(in crate::relational) fn constraint_key(
     value: &Value,
-    source: &DataType,
-    target: &DataType,
+    child: &DataType,
+    parent: &DataType,
+    direction: FkKeyDirection,
 ) -> R<Option<Value>> {
+    let (source, target) = direction.source_and_target(child, parent);
+    if fk_specific_key(child, parent, direction) {
+        if *value == Value::Null {
+            return Ok(None);
+        }
+        if source == target {
+            return Ok(Some(value.clone()));
+        }
+        if *source == DataType::Bpchar {
+            let Value::Text(text) = value else {
+                return Err(SqlError::Type);
+            };
+            let text = giggles_pg_types::character::bpchar_trim(text);
+            return Ok(Some(Value::Text(text.to_owned())));
+        }
+        // The datetime operator family compares dates at midnight. A finite
+        // date outside the timestamp range or a non-midnight timestamp has
+        // no equal value to probe in the other type.
+        let converted = match functions::assignment::convert(value.clone(), source, target, None) {
+            Ok(converted) => converted,
+            Err(SqlError::DatetimeFieldOverflow) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        return Ok((functions::compare_cross(value, &converted, None)? == std::cmp::Ordering::Equal)
+            .then_some(converted));
+    }
     if *target == DataType::Real
         && matches!(source, DataType::SmallInt | DataType::Integer | DataType::BigInt | DataType::Numeric)
         && *value != Value::Null

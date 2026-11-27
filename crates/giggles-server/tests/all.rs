@@ -251,6 +251,8 @@ mod privilege_functions_network;
 mod fk_component_lock_network;
 #[path = "fk_cross_type_network.rs"]
 mod fk_cross_type_network;
+#[path = "fk_type_pairs_network.rs"]
+mod fk_type_pairs_network;
 #[path = "fk_section_network.rs"]
 mod fk_section_network;
 #[path = "api_search_path.rs"] mod api_search_path;

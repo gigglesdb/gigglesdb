@@ -129,24 +129,26 @@ pub(super) fn matching_rows_typed(
     table: &TableDef,
     columns: &[u64],
     values: &[Value],
-    source_types: &[DataType],
+    parent_types: &[DataType],
     cancel: &mut impl FnMut() -> bool,
 ) -> R<Rows> {
     tick(cancel)?;
     let offsets = positions(table, columns, values)?;
-    if source_types.len() != values.len() {
+    if parent_types.len() != values.len() {
         return Err(SqlError::InvalidForeignKey);
     }
     if offsets
         .iter()
-        .zip(source_types)
-        .all(|(i, source)| query::constraint_key_supported(source, &table.columns[*i].data_type))
+        .zip(parent_types)
+        .all(|(i, parent)| query::constraint_key_supported(
+            &table.columns[*i].data_type, parent, query::FkKeyDirection::ToChild,
+        ))
     {
         let converted = values
             .iter()
-            .zip(source_types.iter().zip(&offsets))
-            .map(|(value, (source, i))| {
-                query::constraint_key(value, source, &table.columns[*i].data_type)
+            .zip(parent_types.iter().zip(&offsets))
+            .map(|(value, (parent, i))| {
+                query::constraint_key(value, &table.columns[*i].data_type, parent, query::FkKeyDirection::ToChild)
             })
             .collect::<R<Option<Vec<_>>>>()?;
         return match converted {
@@ -167,8 +169,8 @@ pub(super) fn matching_rows_typed(
     let mut result = Vec::new();
     for (key, row) in base {
         tick(cancel)?;
-        let converted = offsets.iter().zip(source_types).map(|(i, source)| {
-            query::constraint_key(&row.values[*i], &table.columns[*i].data_type, source)
+        let converted = offsets.iter().zip(parent_types).map(|(i, parent)| {
+            query::constraint_key(&row.values[*i], &table.columns[*i].data_type, parent, query::FkKeyDirection::ToParent)
         }).collect::<R<Option<Vec<_>>>>()?;
         if let Some(converted) = converted
             && equality.values(&converted)? == tuple
