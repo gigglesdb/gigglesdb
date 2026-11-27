@@ -249,6 +249,8 @@ mod privilege_functions_network;
 
 #[path = "fk_component_lock_network.rs"]
 mod fk_component_lock_network;
+#[path = "fk_bulk_network.rs"]
+mod fk_bulk_network;
 #[path = "fk_cross_type_network.rs"]
 mod fk_cross_type_network;
 #[path = "fk_type_pairs_network.rs"]

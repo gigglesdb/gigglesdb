@@ -1107,6 +1107,20 @@ impl From {
         clock: Option<&super::super::super::clock::ExecutionClock>,
         execution: &'a Execution<'_>,
     ) -> R<Relation<'a>> {
+        self.run_with_output(state, source, params, parameters, clock, execution, None)
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "join execution context and optional MERGE output sink")]
+    pub(super) fn run_with_output<'a>(
+        &self,
+        state: &Relational,
+        source: &dyn scan::RowSource,
+        params: &[Value],
+        parameters: &[Option<DataType>],
+        clock: Option<&super::super::super::clock::ExecutionClock>,
+        execution: &'a Execution<'_>,
+        mut output: Option<&mut dyn FnMut(SqlRow) -> R<()>>,
+    ) -> R<Relation<'a>> {
         if execution.cancelled() {
             return Err(SqlError::Aborted);
         }
@@ -1245,6 +1259,13 @@ impl From {
             spec.shape.typmods.clone(),
             execution,
         );
+        let mut emit = |values, version| {
+            let row = join_row(values, version, &spec, *kind, offset, clock)?;
+            match &mut output {
+                Some(output) => output(row),
+                None => out.push(row),
+            }
+        };
         let mut bytes = 0;
         for row in &a.rows {
             execution.comparison()?;
@@ -1275,42 +1296,18 @@ impl From {
                 if on.eval(&tuple, params, &mut bytes)? == Some(true) {
                     found = true;
                     matched[i] = true;
-                    emit(
-                        tuple.values.into_iter().next().unwrap(),
-                        tuple.version,
-                        &spec,
-                        *kind,
-                        offset,
-                        clock,
-                        &mut out,
-                    )?;
+                    emit(tuple.values.into_iter().next().unwrap(), tuple.version)?;
                 }
             }
             if !found && matches!(kind, Kind::Left | Kind::Full | Kind::MergeFull) {
-                emit(
-                    pair(Some(row), None, offset, right_width),
-                    row.version,
-                    &spec,
-                    *kind,
-                    offset,
-                    clock,
-                    &mut out,
-                )?;
+                emit(pair(Some(row), None, offset, right_width), row.version)?;
             }
         }
         if matches!(kind, Kind::Right | Kind::Full | Kind::MergeFull) {
             for (row, matched) in b.rows.iter().zip(matched) {
                 execution.comparison()?;
                 if !matched {
-                    emit(
-                        pair(None, Some(row), offset, right_width),
-                        row.version,
-                        &spec,
-                        *kind,
-                        offset,
-                        clock,
-                        &mut out,
-                    )?;
+                    emit(pair(None, Some(row), offset, right_width), row.version)?;
                 }
             }
         }
@@ -1322,15 +1319,14 @@ fn pair(a: Option<&SqlRow>, b: Option<&SqlRow>, aw: usize, bw: usize) -> Vec<Val
     out.extend(b.map_or_else(|| vec![Value::Null; bw], |r| r.values.clone()));
     out
 }
-fn emit(
+fn join_row(
     mut values: Vec<Value>,
     version: u64,
     spec: &JoinShape,
     kind: Kind,
     offset: usize,
     clock: Option<&super::super::super::clock::ExecutionClock>,
-    out: &mut Relation<'_>,
-) -> R<()> {
+) -> R<SqlRow> {
     for (a, b, ty, prefer_right) in &spec.merged {
         let value = if *prefer_right {
             &values[offset + b]
@@ -1342,7 +1338,7 @@ fn emit(
         };
         values.push(functions::coerce_clocked(value.clone(), ty, clock)?);
     }
-    out.push(SqlRow { values, version })
+    Ok(SqlRow { values, version })
 }
 
 impl From {
@@ -1484,27 +1480,25 @@ fn lateral_run<'a>(
             };
             if on.eval(&tuple, params, &mut 0)? == Some(true) {
                 matched = true;
-                emit(
+                out.push(join_row(
                     tuple.values.into_iter().next().unwrap(),
                     tuple.version,
                     &spec,
                     kind,
                     aw,
                     clock,
-                    &mut out,
-                )?;
+                )?)?;
             }
         }
         if !matched && matches!(kind, Kind::Left) {
-            emit(
+            out.push(join_row(
                 pair(Some(row), None, aw, bw),
                 row.version,
                 &spec,
                 kind,
                 aw,
                 clock,
-                &mut out,
-            )?;
+            )?)?;
         }
     }
     Ok(out)

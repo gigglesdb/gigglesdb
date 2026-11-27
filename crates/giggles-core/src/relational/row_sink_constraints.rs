@@ -424,9 +424,7 @@ pub(super) fn paged_pending(
             let checks = deferred.pending.iter().filter(|((id, table_id), _)| *table_id == table.id
                 && selected(id)).collect::<Vec<_>>();
             if checks.is_empty() { continue; }
-            let mut after = None;
-            while let Some((last, rows)) = sink.fk_read_page(table, after.take())? {
-                after = Some(last);
+            check_pending_pages(state, table, sink, |rows| {
                 let mut pending = DeferralState { replica: deferred.replica, modes: deferred.modes.clone(), ..Default::default() };
                 for ((id, table_id), keys) in &checks {
                     let keys = rows.keys().filter_map(|key| {
@@ -436,20 +434,33 @@ pub(super) fn paged_pending(
                         pending.pending.insert((*id, *table_id), keys);
                     }
                 }
-                if pending.pending.is_empty() { continue; }
-                let mut page = state.clone();
-                page.rows.insert(table.id, rows);
-                let mut before = state.clone();
-                let mut retention = scan::Retention::new(scan::retention_limit());
-                hydrate_with_probes(ParentRows::Pending(&pending), &state.ext.constraints,
-                    &mut before, &mut page, sink, &mut retention, true, &BTreeSet::new(), None, None)?;
-                rebuild(&mut page, &sink.indexes())?;
-                page.validate_deferred(&mut pending, || crate::cancellation::check().is_err())
-                    .map_err(CoreError::Sql)?;
-            }
+                pending
+            })?;
         }
         deferred.pending.retain(|(id, _), _| !selected(id));
     }
     deferred.modes = modes;
     Ok(SqlResult::default())
+}
+
+pub(super) fn check_pending_pages(
+    state: &Relational, table: &TableDef, sink: &mut impl RowSink,
+    mut pending_for: impl FnMut(&DdlRows) -> DeferralState,
+) -> Result<(), CoreError> {
+    let mut after = None;
+    while let Some((last, rows)) = sink.fk_read_page(table, after.take())? {
+        after = Some(last);
+        let mut pending = pending_for(&rows);
+        if pending.pending.is_empty() { continue; }
+        let mut page = state.clone();
+        page.rows.insert(table.id, rows);
+        let mut before = state.clone();
+        let mut retention = scan::Retention::new(scan::retention_limit());
+        hydrate_with_probes(ParentRows::Pending(&pending), &state.ext.constraints,
+            &mut before, &mut page, sink, &mut retention, true, &BTreeSet::new(), None, None)?;
+        rebuild(&mut page, &sink.indexes())?;
+        page.validate_deferred(&mut pending, || crate::cancellation::check().is_err())
+            .map_err(CoreError::Sql)?;
+    }
+    Ok(())
 }

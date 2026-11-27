@@ -40,7 +40,21 @@ pub(super) fn execute<S: RowSink>(
     clock: Option<&clock::ExecutionClock>,
     sink: &mut S,
     version_end: u64,
+    deferred: Option<&mut DeferralState>,
+) -> Result<SqlResult, CoreError> {
+    execute_with_input(state, description, params, clock, sink, version_end, deferred, None)
+}
+
+#[expect(clippy::too_many_arguments, reason = "shared INSERT page and optional CTE input")]
+pub(super) fn execute_with_input<S: RowSink>(
+    state: &mut Relational,
+    description: &StatementDescription<'_>,
+    params: &[Value],
+    clock: Option<&clock::ExecutionClock>,
+    sink: &mut S,
+    version_end: u64,
     mut deferred: Option<&mut DeferralState>,
+    cte: Option<(&dyn scan::RowSource, &mut paged_dml::ActionWork)>,
 ) -> Result<SqlResult, CoreError> {
     let prepared = description.prepared();
     let Statement::InsertMulti(insert) = prepared.statement.get() else {
@@ -56,13 +70,14 @@ pub(super) fn execute<S: RowSink>(
     let mut start = 0;
     let mut insert_defaults = defaults::InsertDefaults::new(SHARED_WRITE_ROWS);
     let first_version = state.next_version;
-    if insert.updates_conflicts() { sink.begin_conflict_pages(first_version); }
+    if cte.is_none() && insert.updates_conflicts() { sink.set_conflict_floor(Some(first_version)); }
     let table = state.tables[&insert.table].clone();
     let foreign_keys = state.ext.constraints.get(&table.id).into_iter().flatten()
         .any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. }));
-    let mut actions = (foreign_keys && insert.updates_conflicts()
-        || !insert.stable_referenced_keys(state, &table))
-        .then(|| paged_dml::ActionWork::new(deferred.as_deref().cloned().unwrap_or_default()));
+    let (source, mut shared_actions) = cte.unzip();
+    let mut actions = (shared_actions.is_none() && (foreign_keys && insert.updates_conflicts()
+        || !insert.stable_referenced_keys(state, &table)))
+        .then(|| paged_dml::ActionWork::new(deferred.as_deref().cloned().unwrap_or_default())).transpose()?;
     if foreign_keys && insert.updates_conflicts() && let Some(actions) = &mut actions {
         actions.upsert = Some(paged_dml::UpsertChecks::new(table.id, first_version..version_end));
     }
@@ -72,7 +87,7 @@ pub(super) fn execute<S: RowSink>(
         let mut page = state.clone();
         // Insert checks see all input at statement end. Upsert publication
         // tracks which versions came from updates, including action rewrites.
-        if foreign_keys && actions.is_none() {
+        if foreign_keys && actions.is_none() && shared_actions.is_none() {
             std::sync::Arc::make_mut(&mut page.ext).constraints.get_mut(&table.id).expect("FK constraints")
                 .retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
         }
@@ -87,12 +102,12 @@ pub(super) fn execute<S: RowSink>(
             sink,
             version_end,
             deferred.as_deref_mut(),
-            actions.as_mut(),
+            shared_actions.as_deref_mut().or(actions.as_mut()),
             Some(&mut insert_defaults),
         )?;
         state.next_version = page.next_version;
         if let Some(actions) = &mut actions {
-            actions.drain(state, sink, clock, &sink.indexes(), version_end, true)?;
+            actions.drain(state, sink, clock, version_end, true, true)?;
         }
         result.columns = part.columns;
         result.affected += part.affected;
@@ -137,14 +152,16 @@ pub(super) fn execute<S: RowSink>(
         }
     } else {
         let query = insert.source.as_ref().and_then(sql_insert::Source::query)
-            .filter(|query| paged_source(state, insert, query));
+            .filter(|query| source.is_none() && paged_source(state, insert, query));
         let stored = if insert.source.is_some() && query.is_none() {
                 let mut stored = None;
                 let image = &*state;
-                sink.with_row_source(&mut |source| {
+                let mut store = |source: &dyn scan::RowSource| {
                     stored = Some(insert.source_store(image, params, &prepared.parameter_types, clock, source)?);
                     Ok(())
-                })?;
+                };
+                if let Some(source) = source { store(source).map_err(CoreError::Sql)?; }
+                else { sink.with_row_source(&mut store)?; }
                 stored
         } else {
             None
@@ -200,7 +217,7 @@ pub(super) fn execute<S: RowSink>(
         Some(actions) => actions.finish(state, sink, deferred.as_deref_mut())?,
         None => None,
     };
-    if foreign_keys && upsert.as_ref().is_none_or(paged_dml::UpsertChecks::has_inserts) {
+    if source.is_none() && foreign_keys && upsert.as_ref().is_none_or(paged_dml::UpsertChecks::has_inserts) {
         validate_append(state, &table, first_version..state.next_version, upsert.as_ref(), sink, deferred, clock)?;
     }
     output.finish(&mut result)?;
@@ -215,6 +232,7 @@ pub(super) fn validate_append(state: &Relational, table: &TableDef, versions: st
         let immediate_mode = deferred.is_none();
         let mut immediate = DeferralState::default();
         let pending = match deferred { Some(deferred) => deferred, None => &mut immediate };
+        let mut pending_retention = pending.pending_retention().map_err(CoreError::Sql)?;
         let mut after = None;
         loop {
             // The upsert's RI checks must also see writes outside a task's
@@ -242,8 +260,16 @@ pub(super) fn validate_append(state: &Relational, table: &TableDef, versions: st
             hydrate_with_probes(ParentRows::Changed(&constraints::FkPreimages::default()), &state.ext.constraints, &mut before, &mut page,
                 sink, &mut retention, true, &BTreeSet::new(), None, deferred_probes)?;
             rebuild(&mut page, &sink.indexes())?;
-            constraints::enforce(&mut page, &before, Vec::new(), pending,
+            let mut checks = DeferralState { modes: pending.modes.clone(), ..DeferralState::default() };
+            constraints::enforce(&mut page, &before, Vec::new(), &mut checks,
                 &mut || crate::cancellation::check().is_err(), clock).map_err(CoreError::Sql)?;
+            for (check, keys) in checks.pending {
+                let pending = pending.pending.entry(check).or_default();
+                for (key, reference) in keys {
+                    constraints::record_pending(&mut pending_retention, pending, key, reference)
+                        .map_err(CoreError::Sql)?;
+                }
+            }
         }
         if immediate_mode {
             paged_pending(state, &mut immediate, &[], &[], false, sink)?;

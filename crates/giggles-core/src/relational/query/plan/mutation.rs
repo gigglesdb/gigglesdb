@@ -1,7 +1,8 @@
 //! Joined mutations retain their statement snapshot and reuse the ordinary publisher.
 use super::*;
 use std::borrow::Cow;
-type Publisher<'a> = dyn FnMut(&Prepared) -> R<()> + 'a;
+type Publisher<'a> = dyn FnMut(&Prepared, &[u8], &SqlRow) -> R<bool> + 'a;
+use super::super::super::{row_sink, spill};
 type Point = (Vec<u8>, Vec<(String, Expr)>);
 
 fn collect_point(table: &TableDef, point: &Prepared) -> R<Point> {
@@ -669,9 +670,9 @@ impl Mutation {
             .describe(&snapshot)
             .map_err(crate::CoreError::Sql)?;
         let mut points = vec![];
-        let mut collect = |point: &Prepared| -> R<()> {
+        let mut collect = |point: &Prepared, _: &[u8], _: &SqlRow| -> R<bool> {
             points.push(collect_point(&table, point)?);
-            Ok(())
+            Ok(true)
         };
         let output = self
             .execute_inner(
@@ -683,6 +684,7 @@ impl Mutation {
                 &mut vec![],
                 None,
                 Some(&mut collect),
+                None,
             )
             .map_err(crate::CoreError::Sql)?;
         let keys = points
@@ -728,6 +730,38 @@ impl Mutation {
         generated.search_path = prepared.search_path.clone();
         state.execute_with_sink(&generated, &[], None, clock, sink, version_end, deferred)
     }
+    #[expect(clippy::too_many_arguments, reason = "shared CTE mutation queue and snapshot")]
+    pub(in crate::relational) fn paged_cte(
+        &self, state: &mut Relational, prepared: &Prepared, params: &[Value],
+        clock: Option<&super::super::super::clock::ExecutionClock>, sink: &mut impl row_sink::RowSink,
+        version_end: u64, source: &dyn scan::RowSource, work: &mut row_sink::paged_dml::ActionWork,
+    ) -> Result<SqlResult, crate::CoreError> {
+        let mut snapshot = state.clone();
+        let table = state.tables[&self.target].clone();
+        let descriptors = sink.indexes();
+        let mut output = spill::RowBuffer::new(Vec::new())?;
+        let mut action_error = None;
+        let mut output_error = None;
+        let mut publish = |point: &Prepared, key: &[u8], old: &SqlRow| {
+            row_sink::publish_plan_point(state, sink, work, point, &table, Some((key, old)),
+                clock, &descriptors, version_end, true).map(|result| result.affected != 0).map_err(|error| {
+                action_error = Some(error);
+                SqlError::Aborted
+            })
+        };
+        let mut emit = |row| output.push(row).map_err(|error| {
+            output_error = Some(error);
+            SqlError::Aborted
+        });
+        let result = self.execute_inner(&mut snapshot, prepared, params, clock,
+            &mut || crate::cancellation::check().is_err(), &mut vec![], Some(source),
+            Some(&mut publish), Some(&mut emit));
+        if let Some(error) = action_error.or(output_error) { return Err(error); }
+        let mut result = result.map_err(crate::CoreError::Sql)?;
+        output.finish(&mut result)?;
+        Ok(result)
+    }
+
     fn bulk_target(&self, state: &Relational) -> Option<TableDef> {
         if self.deleting {
             return None;
@@ -764,13 +798,13 @@ impl Mutation {
         injected_source: Option<&dyn scan::RowSource>,
     ) -> R<SqlResult> {
         let Some(table) = injected_source.is_none().then(|| self.bulk_target(state)).flatten() else {
-            return self.execute_inner(state, prepared, params, clock, cancel, events, injected_source, None);
+            return self.execute_inner(state, prepared, params, clock, cancel, events, injected_source, None, None);
         };
         let mut points = vec![];
-        let output = self.execute_inner(state, prepared, params, clock, cancel, events, None, Some(&mut |point| {
+        let output = self.execute_inner(state, prepared, params, clock, cancel, events, None, Some(&mut |point, _, _| {
             points.push(collect_point(&table, point)?);
-            Ok(())
-        }))?;
+            Ok(true)
+        }), None)?;
         let mut points = points.into_iter();
         loop {
             let chunk: Vec<_> = points.by_ref().take(MAX_ROWS).collect();
@@ -804,6 +838,7 @@ impl Mutation {
         events: &mut Vec<super::super::super::constraints::Event>,
         injected_source: Option<&dyn scan::RowSource>,
         mut publish: Option<&mut Publisher<'_>>,
+        mut emit: Option<&mut dyn FnMut(SqlRow) -> R<()>>,
     ) -> R<SqlResult> {
         let _metadata = functions::collation::ColumnScope::enter(&[], &[])?;
         let description = prepared.describe(state)?;
@@ -889,9 +924,13 @@ impl Mutation {
                 .borrow()
                 .charge(key.len() + std::mem::size_of::<Vec<u8>>())?;
             seen.insert(key.clone());
-            let old = snapshot.rows[&table.id]
-                .get(key)
-                .ok_or(SqlError::UnknownColumn)?;
+            let input_row;
+            let old = if emit.is_some() {
+                input_row = base.get(table, key)?.ok_or(SqlError::UnknownColumn)?;
+                input_row.row.as_ref()
+            } else {
+                snapshot.rows[&table.id].get(key).ok_or(SqlError::UnknownColumn)?
+            };
             let mut new = old.clone();
             let mut sets = vec![];
             for ((names, plan), direct) in self.groups.iter().zip(&direct) {
@@ -985,12 +1024,10 @@ impl Mutation {
             }
             point.search_path = prepared.search_path.clone();
             if let Some(publish) = publish.as_mut() {
-                retained
-                    .borrow()
-                    .charge(super::super::super::searched::retained_row_bytes(
-                        key, &new,
-                    )?)?;
-                publish(&point)?;
+                if emit.is_none() {
+                    retained.borrow().charge(super::super::super::searched::retained_row_bytes(key, &new)?)?;
+                }
+                if !publish(&point, key, old)? { continue; }
             } else {
                 state.execute_statement_inner(
                     &point,
@@ -1043,6 +1080,10 @@ impl Mutation {
                     .run(&snapshot, base, params, &parameters, clock, &execution)?
                     .rows
                 {
+                    if let Some(emit) = emit.as_mut() {
+                        emit(row)?;
+                        continue;
+                    }
                     if result.rows.len() >= scan::query_row_limit() {
                         return Err(SqlError::Limit);
                     }

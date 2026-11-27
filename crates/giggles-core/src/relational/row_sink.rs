@@ -21,6 +21,111 @@ pub(crate) enum SinkStatement<'a> {
     Catalog(&'a Prepared, SchemaBinding<'a>),
 }
 
+/// Retain a fixed read image before any mutation publishes its first page.
+pub(super) fn freeze_tables(
+    snapshot: &mut Relational, names: Vec<String>, sink: &mut impl RowSink,
+    charge: &mut impl FnMut(usize) -> R<()>,
+) -> Result<(), CoreError> {
+    let mut seen = BTreeSet::new();
+    for name in names {
+        let base_name = query::views::projection(snapshot, &name).map_err(CoreError::Sql)?
+            .map_or(name.as_str(), |view| view.base.as_str());
+        let Some(table) = snapshot.tables.get(base_name) else { continue; };
+        if !seen.insert(table.id) { continue; }
+        let rows = snapshot.rows.get_mut(&table.id).ok_or(CoreError::Sql(SqlError::UnknownTable))?;
+        sink.scan(table, &mut |row| {
+            let key = pk(table, &row.values)?;
+            charge(retained_bytes(&key, &row)?)?;
+            rows.insert(key, row);
+            Ok(())
+        })?;
+    }
+    snapshot.secondary = secondary_index::Sidecar::default();
+    Ok(())
+}
+
+#[expect(clippy::too_many_arguments, reason = "one writable CTE operation and its shared statement state")]
+pub(super) fn publish_cte(
+    state: &mut Relational, prepared: &Prepared, params: &[Value],
+    clock: Option<&clock::ExecutionClock>, sink: &mut impl RowSink, version_end: u64,
+    source: &dyn scan::RowSource, first_version: u64, work: &mut paged_dml::ActionWork,
+) -> Result<SqlResult, CoreError> {
+    let description = StatementDescription::new(prepared);
+    sink.set_conflict_floor(matches!(prepared.statement.get(), Statement::InsertMulti(insert)
+        if insert.updates_conflicts()).then_some(first_version));
+    match prepared.statement.get() {
+        Statement::InsertMulti(insert) if insert.needs_pages() => {
+            paged_insert::execute_with_input(state, &description, params, clock, sink,
+                version_end, None, Some((source, work)))
+        }
+        Statement::Insert { .. } | Statement::InsertExpressions(_) | Statement::InsertMulti(_) => {
+            state.execute_with_sink_actions(SinkStatement::Unbound(prepared), params, None,
+                clock, sink, version_end, None, Some(work), None)
+        }
+        Statement::Update { .. } | Statement::UpdateExpressions { .. } | Statement::Delete { .. } => {
+            paged_dml::cascade_pages(state, &description, params, clock, sink, version_end,
+                work, Some((source, first_version)))
+        }
+        Statement::Plan(plan) if let Some(merge) = plan.paged_merge(state) => {
+            let snapshot = state.clone();
+            merge.paged_actions(state, &snapshot, prepared, params, clock, sink,
+                version_end, work, source, true)
+        }
+        Statement::Plan(plan) if let Some(mutation) = plan.paged_mutation() => {
+            mutation.paged_cte(state, prepared, params, clock, sink, version_end, source, work)
+        }
+        _ => Err(CoreError::Sql(SqlError::Unsupported)),
+    }
+}
+
+/// Stage one selected mutation and publish its physical delta.
+#[expect(clippy::too_many_arguments, reason = "one selected merge action and its publication context")]
+pub(super) fn publish_plan_point(
+    state: &mut Relational, sink: &mut impl RowSink, work: &mut paged_dml::ActionWork,
+    point: &Prepared, table: &TableDef, old: Option<(&[u8], &SqlRow)>,
+    clock: Option<&clock::ExecutionClock>, descriptors: &[secondary_index::Descriptor],
+    version_end: u64, sibling_writes: bool,
+) -> Result<SqlResult, CoreError> {
+    if sibling_writes && let Some((key, old)) = old {
+        let mut current = false;
+        sink.with_row_source(&mut |source| {
+            current = source.get(table, key)?.is_some_and(|row| row.row.version == old.version);
+            Ok(())
+        })?;
+        if !current {
+            return Ok(SqlResult::default());
+        }
+    }
+    let before: DdlRows = old.into_iter().map(|(key, row)| (key.to_vec(), row.clone())).collect();
+    let mut page = state.clone();
+    page.rows.insert(table.id, before.clone());
+    page.suppress_foreign_keys();
+    rebuild(&mut page, descriptors)?;
+    let mut events = Vec::new();
+    let result = page.execute_statement_inner(point, &[], None,
+        || crate::cancellation::check().is_err(), clock, None, &mut events)
+        .map_err(CoreError::Sql)?;
+    state.next_version = page.next_version;
+    let after = &page.rows[&table.id];
+    work.publish(state, sink, table, before, after, events, None, descriptors, version_end)?;
+    if old.is_none() {
+        check_appended_rows(&page, point, table, after)?;
+    }
+    Ok(result)
+}
+
+fn check_appended_rows(
+    state: &Relational, prepared: &Prepared, table: &TableDef, rows: &DdlRows,
+) -> Result<(), CoreError> {
+    if let Some((_, written)) = constraints::insert_check_columns(state, prepared) {
+        for row in rows.values() {
+            crate::cancellation::check()?;
+            state.check_written_candidate(table, &row.values, &written).map_err(CoreError::Sql)?;
+        }
+    }
+    Ok(())
+}
+
 impl Prepared {
     // Insert pages replace input rows after schema binding. Preserve
     // their target identity when the page is bound again: a bare storage key
@@ -114,8 +219,8 @@ pub(crate) trait RowSink {
         false
     }
 
-    /// One page of a writing RI scan, pinned to the same snapshot until the
-    /// caller reaches EOF or restarts with no resume key.
+    /// One RI scan page. Sinks with concurrent child writers pin the snapshot
+    /// until the caller reaches EOF or restarts with no resume key.
     fn fk_action_page(
         &mut self, _table: &TableDef, _probe: Option<(&[u64], &[Value])>, _after: Option<Vec<u8>>,
     ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
@@ -198,7 +303,7 @@ pub(crate) trait RowSink {
         Err(CoreError::Sql(SqlError::Unsupported))
     }
 
-    fn begin_conflict_pages(&mut self, _floor: u64) {}
+    fn set_conflict_floor(&mut self, _floor: Option<u64>) {}
     fn conflict_lookup(
         &mut self,
         table: &TableDef,
@@ -517,6 +622,15 @@ impl Relational {
                 version_end,
                 deferred,
             );
+        }
+        if expected.is_none() && sink.streams_index_builds()
+            && let Statement::Plan(plan) = prepared.statement.get()
+            && plan.has_dml_ctes()
+            // The frozen paged CTE source cannot acquire row locks. The
+            // whole-statement executor passes through the live lock source.
+            && prepared.row_lock_command().is_none()
+        {
+            return plan.paged_dml_ctes(self, prepared, params, clock, sink, version_end, deferred);
         }
         if expected.is_none() && sink.streams_index_builds()
             && let Statement::Plan(plan)=prepared.statement.get()
@@ -975,7 +1089,10 @@ impl Relational {
                 let table = table.as_ref().expect("conflict page target");
                 let old = before.rows.remove(&table.id).unwrap();
                 let new = &self.rows[&table.id];
-                actions.publish(self, sink, table, old, new.clone(), events, None, &sink.indexes(), version_end)?;
+                actions.publish(self, sink, table, old, new, events, None, &sink.indexes(), version_end)?;
+                if append {
+                    check_appended_rows(self, prepared, table, new)?;
+                }
                 return Ok(result);
             }
             if writing {
@@ -1191,7 +1308,7 @@ fn point_target(
 #[path = "row_sink_constraints.rs"]
 mod constraint_rows;
 #[path = "row_sink_dml.rs"]
-mod paged_dml;
+pub(super) mod paged_dml;
 #[path = "row_sink_insert.rs"]
 mod paged_insert;
 use constraint_rows::{ParentRows, hydrate_with_probes, paged_pending, rebuild};

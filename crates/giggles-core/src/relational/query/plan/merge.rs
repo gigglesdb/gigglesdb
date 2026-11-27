@@ -3,7 +3,10 @@ use super::*;
 use mutation::{Mutation, projection, splits};
 const PRESENCE: &str = "\0merge_source";
 
-type Publisher<'a> = dyn FnMut(&Prepared) -> R<SqlResult> + 'a;
+type Publisher<'a> = dyn FnMut(&Prepared, &TableDef, Option<(&[u8], &SqlRow)>) -> R<SqlResult> + 'a;
+type ReturningSink<'a> = dyn FnMut(SqlRow) -> R<()> + 'a;
+use super::super::super::{row_sink, spill};
+use std::borrow::Cow;
 type Groups = Vec<(Vec<String>, Option<Plan>)>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -425,6 +428,11 @@ impl Merge {
     pub(super) fn has_returning(&self) -> bool {
         self.input.has_returning()
     }
+    pub(super) fn references_cte(&self, name: &str) -> bool {
+        cte::mutation_references(&self.input, name) != 0
+            || self.plans().any(|plan| cte::references(plan, name) != 0)
+    }
+
     fn plans(&self) -> impl Iterator<Item = &Plan> {
         self.clauses.iter().flat_map(|w| {
             w.condition.iter().chain(match &w.action {
@@ -730,11 +738,7 @@ impl Merge {
         }
     }
     fn paged_eligible(&self, state: &Relational) -> bool {
-        let Some(table) = state.tables.get(&self.input.target) else {
-            return false;
-        };
-        // FK-connected actions retain the statement-wide constraint queue.
-        !state.ext.constraints.iter().any(|(owner,cs)|cs.iter().any(|c|matches!(&c.kind,ConstraintKind::ForeignKey{ref_table,..} if *owner==table.id || *ref_table==table.id)))
+        state.tables.contains_key(&self.input.target)
     }
     #[expect(clippy::too_many_arguments, reason = "paged mutation context")]
     pub(in crate::relational) fn paged(
@@ -745,65 +749,62 @@ impl Merge {
         clock: Option<&super::super::super::clock::ExecutionClock>,
         sink: &mut impl super::super::super::row_sink::RowSink,
         version_end: u64,
-        mut deferred: Option<&mut super::super::super::DeferralState>,
+        deferred: Option<&mut super::super::super::DeferralState>,
     ) -> Result<SqlResult, crate::CoreError> {
         let _metadata = functions::collation::ColumnScope::enter(&[], &[]).map_err(crate::CoreError::Sql)?;
         let mut snapshot = state.clone();
-        let mut retained = scan::Retention::new(scan::retention_limit());
-        for name in self.read_tables() {
-            let Some(table) = snapshot.tables.get(&name) else {
-                continue;
-            };
-            let rows = snapshot
-                .rows
-                .get_mut(&table.id)
-                .ok_or(crate::CoreError::Sql(SqlError::UnknownTable))?;
-            sink.scan(table, &mut |row| {
-                let key = super::super::super::pk(table, &row.values)?;
-                retained.charge(super::super::super::searched::retained_row_bytes(
-                    &key, &row,
-                )?)?;
-                rows.insert(key, row);
-                Ok(())
-            })?;
-        }
-        snapshot.secondary = super::super::super::secondary_index::Sidecar::default();
+        let mut retained = scan::Retention::new(scan::WRITE_SOURCE_BYTES);
+        row_sink::freeze_tables(&mut snapshot, self.read_tables(), sink,
+            &mut |bytes| retained.charge(bytes))?;
+        let mut work = row_sink::paged_dml::ActionWork::new(deferred.as_deref().cloned().unwrap_or_default())?;
+        work.track_inserts();
+        let read_state = state.clone();
+        let result = self.paged_actions(state, &read_state, prepared, params, clock, sink,
+            version_end, &mut work, &scan::LegacyRows(&snapshot), false)?;
+        work.complete(state, sink, clock, version_end, deferred)?;
+        Ok(result)
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "paged MERGE with a shared mutation queue")]
+    pub(in crate::relational) fn paged_actions(
+        &self, state: &mut Relational, read_state: &Relational, prepared: &Prepared, params: &[Value],
+        clock: Option<&super::super::super::clock::ExecutionClock>, sink: &mut impl row_sink::RowSink,
+        version_end: u64, work: &mut row_sink::paged_dml::ActionWork,
+        source: &dyn scan::RowSource, sibling_writes: bool,
+    ) -> Result<SqlResult, crate::CoreError> {
+        let descriptors = sink.indexes();
+        let mut output = spill::RowBuffer::new(Vec::new())?;
         let mut source_error = None;
-        let mut publish = |point: &Prepared| -> R<SqlResult> {
-            let output = state
-                .execute_with_sink(
-                    point,
-                    &[],
-                    None,
-                    clock,
-                    sink,
-                    version_end,
-                    deferred.as_deref_mut(),
-                )
-                .map_err(|e| {
-                    source_error = Some(e);
-                    SqlError::Aborted
-                })?;
-            // Published rows now belong to the transaction; keep subsequent
-            // point publishers bounded, with occupancy checked by the sink.
-            state.rows.values_mut().for_each(BTreeMap::clear);
-            state.secondary = super::super::super::secondary_index::Sidecar::default();
-            Ok(output)
+        let mut output_error = None;
+        let mut publish = |point: &Prepared, table: &TableDef, old: Option<(&[u8], &SqlRow)>| {
+            row_sink::publish_plan_point(state, sink, work, point, table, old,
+                clock, &descriptors, version_end, sibling_writes).map_err(|error| {
+                source_error = Some(error);
+                SqlError::Aborted
+            })
         };
-        let result = self.execute_inner(
-            &mut snapshot,
+        let mut emit = |row| output.push(row).map_err(|error| {
+            output_error = Some(error);
+            SqlError::Aborted
+        });
+        let mut read_state = read_state.clone();
+        let result = scan::with_cursor_limit(scan::WRITE_SOURCE_BYTES, || self.execute_inner(
+            &mut read_state,
             prepared,
             params,
             clock,
             &mut || crate::cancellation::check().is_err(),
             &mut vec![],
-            None,
+            Some(source),
             Some(&mut publish),
-        );
-        if let Some(error) = source_error {
+            Some(&mut emit),
+        ));
+        if let Some(error) = source_error.or(output_error) {
             return Err(error);
         }
-        result.map_err(crate::CoreError::Sql)
+        let mut result = result.map_err(crate::CoreError::Sql)?;
+        output.finish(&mut result)?;
+        Ok(result)
     }
     #[expect(
         clippy::too_many_arguments,
@@ -820,7 +821,7 @@ impl Merge {
         injected: Option<&dyn scan::RowSource>,
     ) -> R<SqlResult> {
         self.execute_inner(
-            state, prepared, params, clock, cancel, events, injected, None,
+            state, prepared, params, clock, cancel, events, injected, None, None,
         )
     }
     #[expect(
@@ -837,6 +838,7 @@ impl Merge {
         events: &mut Vec<super::super::super::constraints::Event>,
         injected: Option<&dyn scan::RowSource>,
         mut publish: Option<&mut Publisher<'_>>,
+        mut emit: Option<&mut ReturningSink<'_>>,
     ) -> R<SqlResult> {
         let _metadata = functions::collation::ColumnScope::enter(&[], &[])?;
         let description = prepared.describe(state)?;
@@ -856,10 +858,25 @@ impl Merge {
             target: table.id,
         };
         let execution = Execution::new(cancel, &parameters);
-        let joined =
-            self.input
-                .from
-                .run(&catalog, &source, params, &parameters, clock, &execution)?;
+        let joined;
+        let mut candidates;
+        let rows: spill::StoreIter<'_, SqlRow> = if publish.is_some() {
+            // Resolve all join candidates before publishing any writes. Spool
+            // them in join order so the join inputs and hash need no space
+            // for a second full copy of the candidate rows.
+            candidates = spill::Store::new();
+            let mut spool = |row| {
+                let bytes = super::super::super::searched::retained_row_bytes(&[], &row)?;
+                candidates.push(row, bytes)
+            };
+            self.input.from.run_with_output(&catalog, &source, params, &parameters,
+                clock, &execution, Some(&mut spool))?;
+            candidates.finish()?;
+            candidates.iter()?
+        } else {
+            joined = self.input.from.run(&catalog, &source, params, &parameters, clock, &execution)?;
+            Box::new(joined.rows.iter().map(|row| Ok(Cow::Borrowed(row))))
+        };
         let key_index = shape.namespace.resolve(&ColumnRef {
             qualifier: Some(self.input.alias.clone()),
             name: mutation::KEY.into(),
@@ -878,7 +895,8 @@ impl Merge {
             rows: vec![],
             affected: 0,
         };
-        for matched in &joined.rows {
+        for matched in rows {
+            let matched = &*matched?;
             if execution.cancelled() {
                 return Err(SqlError::Aborted);
             }
@@ -929,7 +947,13 @@ impl Merge {
                     .borrow()
                     .charge(key.len() + std::mem::size_of::<Vec<u8>>())?;
             }
-            let old = key.and_then(|k| snapshot.rows[&table.id].get(k));
+            let input_row;
+            let old = if publish.is_some() {
+                input_row = key.map(|key| base.get(table, key)).transpose()?.flatten();
+                input_row.as_ref().map(|row| row.row.as_ref())
+            } else {
+                key.and_then(|key| snapshot.rows[&table.id].get(key))
+            };
             let mut new = old.cloned();
             let statement = match action {
                 Action::Update(groups) => {
@@ -1052,7 +1076,7 @@ impl Merge {
             let mut point = Prepared::engine(statement, prepared.domain, state.epoch);
             point.search_path = prepared.search_path.clone();
             let output = if let Some(publish) = publish.as_mut() {
-                publish(&point)?
+                publish(&point, table, key.zip(old).map(|(key, row)| (key.as_slice(), row)))?
             } else {
                 state.execute_statement_inner(
                     &point,
@@ -1064,6 +1088,9 @@ impl Merge {
                     events,
                 )?
             };
+            if publish.is_some() && output.affected == 0 {
+                return Err(SqlError::CardinalityViolation);
+            }
             if command == "INSERT" {
                 new = output.rows.first().map(|row| {
                     let mut physical = SqlRow {
@@ -1119,6 +1146,10 @@ impl Merge {
                     .run(&snapshot, base, params, &parameters, clock, &execution)?
                     .rows
                 {
+                    if let Some(emit) = emit.as_mut() {
+                        emit(row)?;
+                        continue;
+                    }
                     if result.rows.len() >= scan::query_row_limit() {
                         return Err(SqlError::Limit);
                     }

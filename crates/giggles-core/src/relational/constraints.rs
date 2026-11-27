@@ -69,6 +69,44 @@ impl PendingReference {
             Self::Parent(values) => Some(values),
         }
     }
+
+    fn retained_bytes(&self) -> usize {
+        // Charge the complete diagnostic tuple to each obligation, even if
+        // several children share its Arc.
+        self.parent_values().map_or(0, |values| values.iter().fold(16usize, |bytes, value| {
+            bytes.saturating_add(size_of::<Value>()).saturating_add(value_bytes(value))
+        }))
+    }
+}
+
+fn pending_key_bytes(key: &[u8]) -> usize {
+    key.len() + 96
+}
+
+pub(super) fn record_pending(
+    retention: &mut scan::Retention, keys: &mut PendingReferences,
+    key: Vec<u8>, reference: PendingReference,
+) -> R<()> {
+    match keys.entry(key) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            retention.charge(pending_key_bytes(entry.key()).saturating_add(reference.retained_bytes()))?;
+            entry.insert(reference);
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            let old = entry.get().retained_bytes();
+            let new = reference.retained_bytes();
+            retention.charge(new.saturating_sub(old))?;
+            retention.release(old.saturating_sub(new));
+            entry.insert(reference);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn release_pending(
+    retention: &mut scan::Retention, key: &[u8], reference: &PendingReference,
+) {
+    retention.release(pending_key_bytes(key).saturating_add(reference.retained_bytes()));
 }
 
 #[derive(Debug, Clone, Default)]
@@ -91,6 +129,22 @@ impl DeferralState {
                 bytes
             }
         })
+    }
+
+    pub(crate) fn v2_pending_bytes(&self) -> usize {
+        self.pending.values().flatten().fold(0usize, |bytes, (key, reference)| {
+            bytes.saturating_add(pending_key_bytes(key)).saturating_add(reference.retained_bytes())
+        })
+    }
+
+    pub(crate) fn check_v2_pending_bytes(bytes: usize) -> R<()> {
+        scan::Retention::new(scan::WRITE_SOURCE_BYTES).charge(bytes)
+    }
+
+    pub(super) fn pending_retention(&self) -> R<scan::Retention> {
+        let mut retention = scan::Retention::new(scan::WRITE_SOURCE_BYTES);
+        retention.charge(self.v2_pending_bytes())?;
+        Ok(retention)
     }
 }
 pub(super) fn parse_check(p: &mut Parser, name: Option<String>) -> R<Definition> {

@@ -8,6 +8,7 @@ pub(super) struct Relation<'a> {
     pub typmods: Vec<i32>,
     pub rows: Vec<SqlRow>,
     pub affected: u64,
+    pub(super) spilled: Option<super::super::super::spill::SpilledRows>,
     pub(super) scope: RetentionScope<'a>,
 }
 impl<'a> Relation<'a> {
@@ -17,6 +18,7 @@ impl<'a> Relation<'a> {
             typmods,
             rows: vec![],
             affected: 0,
+            spilled: None,
             scope: RetentionScope::new(execution),
         }
     }
@@ -99,6 +101,11 @@ impl scan::RowSource for Relation<'_> {
         _: &scan::KeyRange,
         _: scan::Direction,
     ) -> R<scan::SourceRows<'s>> {
+        if let Some(spill) = &self.spilled {
+            return Ok(Box::new(spill.scan()?.map(|row| {
+                row.map(|row| scan::SourceRow { key: Cow::Borrowed(&[]), row })
+            })));
+        }
         Ok(Box::new(self.rows.iter().map(|row| {
             Ok(scan::SourceRow {
                 key: Cow::Borrowed(&[]),

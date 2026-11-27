@@ -475,6 +475,8 @@ mod fk_target_codec;
 
 #[path = "fk_pk_birth.rs"] mod fk_pk_birth;
 
+#[path = "fk_bulk_paged.rs"]
+mod fk_bulk_paged;
 #[path = "fk_cross_type.rs"]
 mod fk_cross_type;
 #[path = "fk_type_pairs.rs"]

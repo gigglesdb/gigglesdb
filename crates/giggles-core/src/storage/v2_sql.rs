@@ -629,6 +629,11 @@ impl SqlSession {
                                 if self.v2_savepoints.len() >= 64 {
                                     return Err(CoreError::Sql(E::Limit));
                                 }
+                                let deferral_bytes = self.deferral.v2_pending_bytes();
+                                let captured = self.v2_savepoints.iter().fold(deferral_bytes, |bytes, saved| {
+                                    bytes.saturating_add(saved.deferral_bytes)
+                                });
+                                relational::DeferralState::check_v2_pending_bytes(captured).map_err(CoreError::Sql)?;
                                 // Capture only sequence versions in the in-memory overlay.
                                 // Committed predecessors are already rollback targets.
                                 let mut sequence_incarnations = BTreeMap::new();
@@ -648,6 +653,7 @@ impl SqlSession {
                                     sequence_incarnations,
                                     sequence_restore: Arc::new(()),
                                     deferral: self.deferral.clone(),
+                                    deferral_bytes,
                                     enum_transaction: self.enum_transaction.clone(),
                                     sequence_copy_leases: self.v2_sequence_copy_leases.clone(),
                                 });
@@ -715,7 +721,9 @@ impl SqlSession {
                     }
                     let mut freeze_marks = Vec::new();
                     let mut sequence_copy_lease = None;
-                    let mark = txn.statement_savepoint();
+                    // An implicit DML failure drops the entire transaction.
+                    // Only a surviving transaction needs per-write undo.
+                    let mark = (explicit || protected || ddl).then(|| txn.statement_savepoint());
                     let result = (|| {
                         let catalog_lock_mode = if ddl {
                             LockMode::AccessExclusive
@@ -1180,8 +1188,15 @@ impl SqlSession {
                             {
                                 range
                             } else {
-                                let count = if p.appends_select_rows() {
-                                    txn.append_version_budget()
+                                // Updating a referenced key can publish a
+                                // postimage for the parent and every child.
+                                let writes_fk_rows = old.ext.constraints.iter().any(|(child, constraints)| {
+                                    constraints.iter().any(|constraint| matches!(&constraint.kind,
+                                        ConstraintKind::ForeignKey { ref_table, .. }
+                                            if write_ids.contains(child) || write_ids.contains(ref_table)))
+                                });
+                                let count = if p.appends_select_rows() || writes_fk_rows {
+                                    txn.write_version_budget()
                                 } else {
                                     1_000_001
                                 };
@@ -1293,6 +1308,8 @@ impl SqlSession {
                                 context.as_ref(),
                             )?;
                             if input.finishing {
+                                relational::DeferralState::check_v2_pending_bytes(self.deferral.v2_pending_bytes())
+                                    .map_err(CoreError::Sql)?;
                                 return Ok(Default::default());
                             }
                         }
@@ -1395,6 +1412,10 @@ impl SqlSession {
                             return Err(error);
                         }
                         let result = result?;
+                        if writing {
+                            relational::DeferralState::check_v2_pending_bytes(self.deferral.v2_pending_bytes())
+                                .map_err(CoreError::Sql)?;
+                        }
                         if let Some(range) = self
                             .copy_input
                             .as_mut()
@@ -1550,10 +1571,12 @@ impl SqlSession {
                         freeze_marks = bound.copy_freeze_marks(&image, freeze_before);
                         Ok(result)
                     })();
-                    if result.is_err() {
-                        txn.rollback_to(&mark).map_err(CoreError::from)?;
+                    if let Some(mark) = mark {
+                        if result.is_err() {
+                            txn.rollback_to(&mark).map_err(CoreError::from)?;
+                        }
+                        txn.release(mark).map_err(CoreError::from)?;
                     }
-                    txn.release(mark).map_err(CoreError::from)?;
                     if self.v2_transaction.is_none() && !protected && let Ok(result) = &result {
                         if writing && let Some(check) = check_reply
                             && (!result.columns.is_empty() || !result.rows.is_empty())
@@ -2259,7 +2282,7 @@ impl RowSink for SqlRows<'_> {
 
     fn fk_empty_children(
         &mut self, table: &TableDef, columns: &[u64],
-        row_locks: bool, keys: &mut dyn Iterator<Item = (usize, Vec<relational::Value>)>,
+        action_page: bool, keys: &mut dyn Iterator<Item = (usize, Vec<relational::Value>)>,
     ) -> Vec<usize> {
         #[cfg(test)]
         if DISABLE_FK_CHILD_BATCH.get() { return Vec::new(); }
@@ -2272,9 +2295,9 @@ impl RowSink for SqlRows<'_> {
         #[cfg(test)]
         FK_CHILD_BATCHES.set(FK_CHILD_BATCHES.get() + 1);
         let mut check = |rows: &mut Self| rows.empty_child_positions(table, &access, keys);
-        // Both local paths take a fresh sequencer snapshot. The first probe's
-        // snapshot also covers queued events that would use the other path.
-        let empty = if row_locks {
+        // Match the first page of the skipped probe. Both local paths start
+        // at a fresh sequencer snapshot; only continuations reuse a snapshot.
+        let empty = if action_page {
             self.txn.begin_fk_action_page(None);
             let empty = check(self);
             self.txn.end_fk_action_page();
@@ -2291,6 +2314,14 @@ impl RowSink for SqlRows<'_> {
         &mut self, table: &TableDef, probe: Option<(&[u64], &[relational::Value])>,
         after: Option<Vec<u8>>,
     ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        // Cluster statements protect referencing tables with the component
+        // lock. The pinned action snapshot is specific to local storage.
+        if matches!(self.txn.services(), engine::txn::TxnServices::Cluster(_)) {
+            return match probe {
+                Some((columns, values)) => self.fk_child_page(table, columns, values, after),
+                None => self.fk_read_page(table, after),
+            };
+        }
         #[cfg(test)]
         FK_CHILD_PROBES.set(FK_CHILD_PROBES.get() + 1);
         let snapshot = self.fk_action_snapshot.take();
@@ -2654,8 +2685,8 @@ impl RowSink for SqlRows<'_> {
         Ok(Some((last, rows)))
     }
 
-    fn begin_conflict_pages(&mut self, floor: u64) {
-        self.conflict_floor = Some(floor);
+    fn set_conflict_floor(&mut self, floor: Option<u64>) {
+        self.conflict_floor = floor;
     }
     fn collated_lookup(
         &mut self,

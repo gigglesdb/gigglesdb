@@ -9,8 +9,11 @@ relational/query.rs join_rows get 1 | Logical row source reads use the caller's 
 relational/query/derived.rs materialize_derived get 1 | Logical row source reads use the caller's snapshot or transient statement image.
 relational/query/plan/correlation.rs get get 1 | Logical row source reads use the caller's snapshot or transient statement image.
 relational/query/plan/cte.rs get get 1 | Logical row source reads use the caller's snapshot or transient statement image.
+relational/query/plan/merge.rs execute_inner get 1 | Logical point read of the matched row through the caller's statement snapshot.
+relational/query/plan/mutation.rs execute_inner get 1 | Logical point read of the selected row through the caller's statement snapshot.
 relational/query/plan/mutation.rs get get 1 | Logical row source reads use the caller's snapshot or transient statement image.
 relational/row_sink.rs execute_with_sink_actions get 1 | Logical row source reads use the caller's snapshot or transient statement image.
+relational/row_sink.rs publish_plan_point get 1 | Logical point read through the transaction row source to check whether a sibling write replaced the selected row.
 relational/scan.rs contains get 1 | Logical row source reads use the caller's snapshot or transient statement image.
 relational/scan.rs get get 1 | Logical row source reads use the caller's snapshot or transient statement image.
 storage/cursor.rs index_scan get 1 | Cursor row-source lookup uses the cursor's pinned snapshot.

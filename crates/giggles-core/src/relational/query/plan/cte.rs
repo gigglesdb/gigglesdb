@@ -431,34 +431,95 @@ fn remap_filter(f: &mut Filter, alias: &str, name: &str) {
         }
     }
 }
-pub(super) fn references(plan: &Plan, name: &str) -> usize {
-    fn query_references(q: &Query, name: &str) -> usize {
-        let mut n = q.sources.iter().filter(|s| s.name == name).count();
-        if let Some(child) = q.derived() {
-            n += query_references(child, name);
-        }
-        for filter in q.filter.iter().chain(q.joins.iter().map(|j| &j.on)) {
-            let _ = filter.visit_subqueries(&mut |_, child| {
-                n += query_references(child, name);
-                Ok(())
-            });
-        }
-        n
+fn query_references(q: &Query, name: &str) -> usize {
+    let mut n = q.sources.iter().filter(|s| s.name == name).count();
+    if let Some(child) = q.derived() {
+        n += query_references(child, name);
     }
+    for filter in q.filter.iter().chain(q.joins.iter().map(|j| &j.on)) {
+        let _ = filter.visit_subqueries(&mut |_, child| {
+            n += query_references(child, name);
+            Ok(())
+        });
+    }
+    n
+}
+pub(super) fn mutation_references(mutation: &mutation::Mutation, name: &str) -> usize {
+    let mut n = 0;
+    mutation.from.visit_queries(&mut |q| n += query_references(q, name));
+    for expression in mutation.groups.iter().filter_map(|(_, p)| p.as_ref())
+        .chain([&mutation.predicate]).chain(mutation.returning.as_ref())
+    {
+        n += references(expression, name);
+    }
+    n
+}
+
+pub(super) fn references(plan: &Plan, name: &str) -> usize {
     let mut n = usize::from(plan.insert.as_ref().is_some_and(|insert| {
         dml::references(&insert.prepared, name)
     }));
     if let Some(mutation) = &plan.mutation {
-        mutation.from.visit_queries(&mut |q| n += query_references(q, name));
-        for expression in mutation.groups.iter().filter_map(|(_, p)| p.as_ref())
-            .chain([&mutation.predicate]).chain(mutation.returning.as_ref())
-        {
-            n += references(expression, name);
-        }
+        n += mutation_references(mutation, name);
     }
     plan.visit_queries(&mut |q| n += query_references(q, name));
     n
 }
+
+fn paged_references(plan: &Plan, name: &str) -> bool {
+    references(plan, name) != 0
+        || plan.merge.as_ref().is_some_and(|merge| merge.references_cte(name))
+}
+
+impl Cte {
+    fn depends_on(&self, name: &str) -> bool {
+        if let Some(dml) = &self.dml {
+            if let Statement::Plan(plan) = dml.statement.get() {
+                paged_references(plan, name)
+            } else {
+                dml::references(dml, name)
+            }
+        } else {
+            paged_references(&self.query, name)
+        }
+    }
+}
+
+/// A None entry runs the main statement. Anything it consumes must be
+/// materialized first. PostgreSQL finishes the other modifying CTEs in
+/// reverse declaration order, pulling in each one's dependencies as needed.
+fn paged_order<'p>(ctes: &'p [Cte], body: &Plan) -> Vec<Option<&'p Cte>> {
+    let mut scheduled = vec![false; ctes.len()];
+    for (index, cte) in ctes.iter().enumerate().rev() {
+        scheduled[index] = paged_references(body, &cte.name)
+            || ctes[index + 1..].iter().zip(&scheduled[index + 1..])
+                .any(|(later, needed)| *needed && later.depends_on(&cte.name));
+    }
+    let mut order: Vec<_> = ctes.iter().zip(&scheduled)
+        .filter_map(|(cte, needed)| needed.then_some(Some(cte))).collect();
+    order.push(None);
+
+    let mut pending: Vec<_> = ctes.iter().enumerate()
+        .filter(|(index, cte)| !scheduled[*index] && cte.dml.is_some())
+        .map(|(index, _)| (index, false)).collect();
+    while let Some((index, ready)) = pending.pop() {
+        if scheduled[index] {
+            continue;
+        }
+        let cte = &ctes[index];
+        if ready {
+            scheduled[index] = true;
+            order.push(Some(cte));
+        } else {
+            pending.push((index, true));
+            pending.extend(ctes[..index].iter().enumerate().rev()
+                .filter(|(earlier, dependency)| !scheduled[*earlier] && cte.depends_on(&dependency.name))
+                .map(|(earlier, _)| (earlier, false)));
+        }
+    }
+    order
+}
+
 fn recursive_parts(cte: &Cte) -> R<(&Plan, &Plan, bool)> {
     if !cte.query.ctes.is_empty()
         || !cte.query.order.is_empty()
@@ -804,9 +865,29 @@ pub(super) fn run<'e>(
     execution: &'e Execution<'_>,
 ) -> R<Relation<'e>> {
     run_inner(
-        plan, state, source, params, parameters, clock, execution, None,
+        plan, state, source, params, parameters, clock, execution, None, false,
     )
 }
+
+fn legacy_order<'p>(plan: &'p Plan, body: &Plan) -> Vec<Option<&'p Cte>> {
+    let needed = if body.mutation.is_some() || body.insert.is_some() {
+        let mut needed = vec![false; plan.ctes.len()];
+        for (index, cte) in plan.ctes.iter().enumerate().rev() {
+            needed[index] = cte.dml.is_some() || references(body, &cte.name) != 0
+                || plan.ctes[index + 1..].iter().zip(&needed[index + 1..]).any(|(later, needed)| {
+                    *needed && (references(&later.query, &cte.name) != 0
+                        || later.dml.as_ref().is_some_and(|dml| dml::references(dml, &cte.name)))
+                });
+        }
+        needed
+    } else {
+        vec![true; plan.ctes.len()]
+    };
+    plan.ctes.iter().zip(needed).filter_map(|(cte, needed)| needed.then_some(Some(cte)))
+        .chain(std::iter::once(None)).collect()
+}
+
+type ExecuteDml<'a, 'e> = dyn FnMut(&Prepared, &Relational, &dyn scan::RowSource) -> R<Relation<'e>> + 'a;
 
 #[expect(
     clippy::too_many_arguments,
@@ -820,45 +901,38 @@ pub(super) fn run_inner<'e>(
     parameters: &[Option<DataType>],
     clock: Option<&super::super::super::clock::ExecutionClock>,
     execution: &'e Execution<'_>,
-    mut writes: Option<(
-        &mut Relational,
-        &mut Vec<crate::relational::constraints::Event>,
-    )>,
+    mut writes: Option<&mut ExecuteDml<'_, 'e>>,
+    paged: bool,
 ) -> R<Relation<'e>> {
     let _metadata = functions::collation::ColumnScope::enter(&[], &[])?;
     let mut catalog = catalog(state);
     let mut materialized: Vec<(String, Relation<'e>)> = vec![];
     let mut body = plan.clone();
     body.ctes.clear();
-    let needed = if body.mutation.is_some() || body.insert.is_some() {
-        let mut needed = vec![false; plan.ctes.len()];
-        for (index, cte) in plan.ctes.iter().enumerate().rev() {
-            needed[index] = cte.dml.is_some() || references(&body, &cte.name) != 0
-                || plan.ctes[index + 1..].iter().zip(&needed[index + 1..]).any(|(later, needed)| {
-                    *needed && (references(&later.query, &cte.name) != 0
-                        || later.dml.as_ref().is_some_and(|dml| dml::references(dml, &cte.name)))
-                });
-        }
-        needed
-    } else {
-        vec![true; plan.ctes.len()]
-    };
-    for (cte, needed) in plan.ctes.iter().zip(needed) {
-        if !needed {
-            continue;
-        }
+    let order = if paged { paged_order(&plan.ctes, &body) } else { legacy_order(plan, &body) };
+    let mut body = Some(body);
+    let mut output = None;
+    for cte in order {
         let wrapper = VirtualRows {
             base: source,
             relations: materialized.iter().map(|(n, r)| (n.clone(), r)).collect(),
         };
+        let Some(cte) = cte else {
+            let body = body.take().expect("one main statement");
+            output = Some(if let Some(insert) = &body.insert {
+                writes.as_mut().ok_or(SqlError::Unsupported)?(&insert.prepared, &catalog, &wrapper)?
+            } else if body.mutation.is_some() || body.merge.is_some() {
+                let prepared = Prepared::engine(Statement::Plan(body), 0, state.epoch);
+                writes.as_mut().ok_or(SqlError::Unsupported)?(&prepared, &catalog, &wrapper)?
+            } else {
+                body.run(&catalog, &wrapper, params, parameters, clock, execution)?
+            });
+            continue;
+        };
         let mut rows = {
             let _limits = execution.subquery_limits();
             if let Some(dml) = &cte.dml {
-                let (target, events) = writes.as_mut().ok_or(SqlError::Unsupported)?;
-                dml::execute(
-                    dml, state, &catalog, &wrapper, target, events, params, parameters, clock,
-                    execution,
-                )?
+                writes.as_mut().ok_or(SqlError::Unsupported)?(dml, &catalog, &wrapper)?
             } else if cte.recursive {
                 recurse(
                     cte, &catalog, &wrapper, params, parameters, clock, execution,
@@ -887,20 +961,7 @@ pub(super) fn run_inner<'e>(
         )?;
         materialized.push((cte.name.clone(), rows));
     }
-    let wrapper = VirtualRows {
-        base: source,
-        relations: materialized.iter().map(|(n, r)| (n.clone(), r)).collect(),
-    };
-    if let Some(insert) = &body.insert {
-        let (target, events) = writes.as_mut().ok_or(SqlError::Unsupported)?;
-        return dml::execute(&insert.prepared, state, &catalog, &wrapper, target, events, params, parameters, clock, execution);
-    }
-    if body.mutation.is_some() || body.merge.is_some() {
-        let (target,events)=writes.as_mut().ok_or(SqlError::Unsupported)?;
-        let prepared=Prepared::engine(Statement::Plan(body),0,state.epoch);
-        return dml::execute(&prepared,state,&catalog,&wrapper,target,events,params,parameters,clock,execution);
-    }
-    body.run(&catalog, &wrapper, params, parameters, clock, execution)
+    Ok(output.expect("main statement executed"))
 }
 type PathKey = Vec<Vec<Value>>;
 type OrderKeys = (Option<PathKey>, Option<PathKey>);

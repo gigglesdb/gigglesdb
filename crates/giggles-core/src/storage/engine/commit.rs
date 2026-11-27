@@ -1348,7 +1348,7 @@ fn process_group<const PIPELINED: bool>(
     let mut pending_features = *features;
     let mut pending_subversion = *subversion;
     for item in group {
-        let pending = match item {
+        let mut pending = match item {
             Message::Commit(pending) => pending,
             Message::Highwater { key, value, reply } => {
                 match validate_highwater(kv, &key, &value, &highwaters) {
@@ -1377,7 +1377,7 @@ fn process_group<const PIPELINED: bool>(
             }
             _ => unreachable!("control messages are never grouped"),
         };
-        let request = &pending.request;
+        let request = &mut pending.request;
         let next_features = pending_features | request.features_or;
         let next_subversion = pending_subversion.max(request.minimum_subversion);
         let mut next_native = native.clone();
@@ -1467,18 +1467,20 @@ fn process_group<const PIPELINED: bool>(
             continue;
         }
         if !request.writes.is_empty() {
-            let keys: Keys = request.writes.keys().cloned().collect::<Vec<_>>().into();
-            for ((ks, key), value) in &request.writes {
-                let versioned = super::codec::user_key_seek_at(key, ts);
-                let tagged = match value {
+            let mut keys = Vec::with_capacity(request.writes.len());
+            for ((ks, key), value) in std::mem::take(&mut request.writes) {
+                let versioned = super::codec::user_key_seek_at(&key, ts);
+                let tagged = match &value {
                     Some(value) => super::mvcc::encode_live(value),
                     None => super::mvcc::encode_tombstone(),
                 };
-                batch.put(*ks, versioned, tagged);
-                if *ks == Keyspace::Catalog {
-                    catalog.insert(key.clone(), value.clone());
+                batch.put(ks, versioned, tagged);
+                if ks == Keyspace::Catalog {
+                    catalog.insert(key.clone(), value);
                 }
+                keys.push((ks, key));
             }
+            let keys: Keys = keys.into();
             // Later requests in this group validate against accepted predecessors.
             // Unpublished entries on Sync failure are harmless: the permanent
             // fence prevents every subsequent group from consulting this log.

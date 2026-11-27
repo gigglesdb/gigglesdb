@@ -2,6 +2,8 @@
 use super::*;
 use bind::Meta;
 use exec::Relation;
+use super::super::super::{row_sink, spill};
+use crate::CoreError;
 
 #[derive(Debug, Clone)]
 pub(super) struct MainInsert {
@@ -213,6 +215,81 @@ pub(super) fn execute<'e>(
 }
 
 impl Plan {
+    pub(in crate::relational) fn has_dml_ctes(&self) -> bool {
+        !self.ctes.is_empty() && !self.write_tables().is_empty()
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "paged writable CTE statement context")]
+    pub(in crate::relational) fn paged_dml_ctes(
+        &self, state: &mut Relational, prepared: &Prepared, params: &[Value],
+        clock: Option<&super::super::super::clock::ExecutionClock>,
+        sink: &mut impl row_sink::RowSink, version_end: u64,
+        deferred: Option<&mut super::super::super::DeferralState>,
+    ) -> Result<SqlResult, CoreError> {
+        scan::with_cursor_limit(scan::WRITE_SOURCE_BYTES, || {
+            let bound = self.bind(state, prepared.params, &prepared.parameter_types).map_err(CoreError::Sql)?;
+            let parameters: Vec<_> = bound.description.parameters.into_iter().map(Some).collect();
+            let mut snapshot = state.clone();
+            let mut cancel = || crate::cancellation::check().is_err();
+            let execution = Execution::new(&mut cancel, &parameters);
+            let retained = RetentionScope::new(&execution);
+            row_sink::freeze_tables(&mut snapshot, bound.plan.read_tables(), sink,
+                &mut |bytes| retained.borrow().charge(bytes))?;
+            let first_version = state.next_version;
+            let mut work = row_sink::paged_dml::ActionWork::new(deferred.as_deref().cloned().unwrap_or_default())?;
+            work.track_inserts();
+            let mut failure = None;
+            let mut publish = |p: &Prepared, catalog: &Relational, source: &dyn scan::RowSource| -> R<Relation<'_>> {
+                let mut candidate = state.clone();
+                for (name, table) in catalog.tables.iter().filter(|(name, _)| name.starts_with("\0plan_")) {
+                    std::sync::Arc::make_mut(&mut candidate.tables).insert(name.clone(), table.clone());
+                    candidate.rows.insert(table.id, BTreeMap::new());
+                }
+                if candidate.ext.columns != catalog.ext.columns {
+                    std::sync::Arc::make_mut(&mut candidate.ext).columns = catalog.ext.columns.clone();
+                }
+                let mut sub = p.clone();
+                sub.epoch = candidate.epoch;
+                sub.params = params.len();
+                sub.parameter_types.clone_from(&parameters);
+                sub.search_path.clone_from(&prepared.search_path);
+                let description = sub.describe(&candidate)?;
+                let (result, spilled) = spill::capture_returning(|| {
+                    row_sink::publish_cte(&mut candidate, &sub, params, clock, sink, version_end,
+                        source, first_version, &mut work)
+                });
+                let result = result.map_err(|error| {
+                    failure = Some(error);
+                    SqlError::Aborted
+                })?;
+                state.next_version = candidate.next_version;
+                let mut rows = Relation::new(description.columns, description.typmods, &execution);
+                rows.affected = result.affected;
+                rows.spilled = spilled;
+                for row in result.rows {
+                    rows.push(row)?;
+                }
+                Ok(rows)
+            };
+            let relation = cte::run_inner(&bound.plan, &snapshot, &scan::LegacyRows(&snapshot),
+                params, &parameters, clock, &execution, Some(&mut publish), true);
+            if let Some(error) = failure { return Err(error); }
+            let relation = relation.map_err(CoreError::Sql)?;
+            work.complete(state, sink, clock, version_end, deferred)?;
+            let mut output = SqlResult {
+                columns: relation.columns.into_iter().map(|column| column.name).collect(),
+                rows: Vec::new(),
+                affected: relation.affected,
+            };
+            if let Some(spilled) = relation.spilled {
+                spilled.publish(&mut output)?;
+            } else {
+                spill::RowBuffer::new(relation.rows)?.finish(&mut output)?;
+            }
+            Ok(output)
+        })
+    }
+
     #[expect(clippy::too_many_arguments, reason = "shared statement snapshot and optional injected source")]
     pub(in crate::relational) fn execute_dml(
         &self,
@@ -230,6 +307,10 @@ impl Plan {
         let parameters: Vec<_> = bound.description.parameters.into_iter().map(Some).collect();
         let snapshot = state.clone();
         let execution = Execution::new(cancel, &prepared.parameter_types);
+        let mut execute = |prepared: &Prepared, catalog: &Relational, source: &dyn scan::RowSource| {
+            dml::execute(prepared, &snapshot, catalog, source, state, events, params, &parameters,
+                clock, &execution)
+        };
         let relation = cte::run_inner(
             &bound.plan,
             &snapshot,
@@ -238,7 +319,8 @@ impl Plan {
             &parameters,
             clock,
             &execution,
-            Some((state, events)),
+            Some(&mut execute),
+            false,
         )?;
         let mut bytes = 0;
         for value in relation.rows.iter().flat_map(|r| &r.values) {

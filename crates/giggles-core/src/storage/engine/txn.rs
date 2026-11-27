@@ -760,10 +760,10 @@ impl Transaction {
         self.snapshot_error.as_ref()
     }
     #[allow(dead_code)] // R5-43
-    pub(crate) fn append_version_budget(&self) -> u64 {
-        // Each appended row has a physical key with an eight-byte table ID
-        // and a row payload with an eight-byte version. The write set must
-        // reject the statement before it can use more versions than this.
+    pub(crate) fn write_version_budget(&self) -> u64 {
+        // Each physical postimage has a key with an eight-byte table ID and
+        // a payload with an eight-byte version. Size the reservation from the
+        // write budget so it covers both direct and referential-action writes.
         const MIN_PHYSICAL_ROW_BYTES: usize = 2 * std::mem::size_of::<u64>();
         (self.services().write_set_bytes() / MIN_PHYSICAL_ROW_BYTES) as u64 + 1
     }
@@ -1485,6 +1485,11 @@ impl Transaction {
             return Ok(ts);
         }
         let snapshot = self.try_snapshot_ts()?;
+        // Commit consumes the transaction. Drop rollback and write-witness
+        // storage before the sequencer allocates its durable batch. The lock
+        // manager still owns all held locks and releases them in Drop.
+        self.locked.clear();
+        self.undo = Vec::new();
         if let TxnServices::Cluster(cluster) = self.services.as_ref().expect("transaction services") {
             // A fenced guard compares against one node's visible timestamp,
             // which a cluster does not have; guarded DDL arrives with Phase 11.

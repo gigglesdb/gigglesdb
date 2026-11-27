@@ -143,6 +143,18 @@ pub fn streaming<T>(f: impl FnOnce() -> T) -> (T, Option<SpilledRows>) {
     (value, SLOT.take())
 }
 
+/// Take an inner mutation's RETURNING spill without settling the outer statement.
+pub(crate) fn capture_returning<T>(f: impl FnOnce() -> T) -> (T, Option<SpilledRows>) {
+    struct Restore(Option<SpilledRows>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SLOT.set(self.0.take());
+        }
+    }
+    let _restore = Restore(SLOT.take());
+    streaming(f)
+}
+
 /// [`streaming`] for a task-session cursor (GD-0061): the spill it receives
 /// is read back only through that cursor, whose pages carry the statement's
 /// release tag and go through `release_page` like buffered rows.
@@ -330,8 +342,7 @@ impl RowBuffer {
         let mut file = writer.into_inner().map_err(|e| io(e.into_error()))?;
         file.seek(SeekFrom::Start(0)).map_err(io)?;
         let spilled = SpilledRows { reader: BufReader::new(file), remaining: self.count, temp, failed: None, after_commit: false };
-        result.rows = if armed() { SLOT.set(Some(spilled)); Vec::new() } else { spilled.materialise()? };
-        Ok(())
+        spilled.publish(result)
     }
 }
 
@@ -353,6 +364,67 @@ fn create(kind: &str) -> Result<(File, TempPath), CoreError> {
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let file = options.open(&path).map_err(io)?;
     Ok((file, TempPath(path)))
+}
+
+/// Preserve trigger order while retaining only a work_mem-sized prefix in
+/// memory. Reading consumes the buffer and owns its file until EOF or error.
+pub(super) struct Replay<T> {
+    memory: Vec<T>,
+    bytes: usize,
+    count: usize,
+    file: Option<(BufWriter<File>, TempPath)>,
+}
+
+impl<T> Default for Replay<T> {
+    fn default() -> Self {
+        Self { memory: Vec::new(), bytes: 0, count: 0, file: None }
+    }
+}
+
+impl<T: Serialize + DeserializeOwned> Replay<T> {
+    pub(super) fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub(super) fn push(&mut self, item: T, bytes: usize) -> Result<(), CoreError> {
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.file.is_none() && self.bytes > work_mem() {
+            let (file, path) = create("fk-triggers")?;
+            let mut writer = BufWriter::new(file);
+            for item in std::mem::take(&mut self.memory) {
+                write_item(&mut writer, &item)?;
+            }
+            self.file = Some((writer, path));
+        }
+        if let Some((writer, _)) = &mut self.file {
+            write_item(writer, &item)?;
+        } else {
+            self.memory.push(item);
+        }
+        self.count += 1;
+        Ok(())
+    }
+
+    pub(super) fn read(self) -> Result<impl Iterator<Item = Result<T, CoreError>>, CoreError> {
+        let mut memory = self.memory.into_iter();
+        let mut remaining = self.count;
+        let mut file = if let Some((writer, path)) = self.file {
+            let mut file = writer.into_inner().map_err(|error| io(error.into_error()))?;
+            file.seek(SeekFrom::Start(0)).map_err(io)?;
+            Some((BufReader::new(file), path))
+        } else {
+            None
+        };
+        Ok(std::iter::from_fn(move || {
+            let Some((reader, _)) = &mut file else { return memory.next().map(Ok); };
+            if remaining == 0 {
+                file = None;
+                return None;
+            }
+            remaining -= 1;
+            Some(read_item(reader))
+        }))
+    }
 }
 
 fn write_item<T: Serialize>(writer: &mut BufWriter<File>, item: &T) -> Result<(), CoreError> {
@@ -415,6 +487,27 @@ impl SpilledRows {
         // A write-only handle: the next read fails like a lost or damaged file.
         self.reader = BufReader::new(OpenOptions::new().write(true).open(&self.temp.0).expect("reopen"));
     }
+    pub(crate) fn scan(&self) -> Result<StoreIter<'_, SqlRow>, SqlError> {
+        let mut reader = BufReader::new(File::open(&self.temp.0).map_err(|e| sql_error(io(e)))?);
+        let mut remaining = self.remaining;
+        Ok(Box::new(std::iter::from_fn(move || {
+            remaining = remaining.checked_sub(1)?;
+            let item = read_item(&mut reader).map(Cow::Owned).map_err(sql_error);
+            if item.is_err() {
+                remaining = 0;
+            }
+            Some(item)
+        })))
+    }
+
+    pub(crate) fn publish(self, result: &mut SqlResult) -> Result<(), CoreError> {
+        if BOUNDED.get() && !STREAMING.get() {
+            return Err(CoreError::Sql(SqlError::Limit));
+        }
+        result.rows = if armed() { SLOT.set(Some(self)); Vec::new() } else { self.materialise()? };
+        Ok(())
+    }
+
     /// The backing temp file, removed when this handle drops.
     pub fn path(&self) -> &Path {
         &self.temp.0
@@ -1000,6 +1093,19 @@ mod tests {
         // Bounded callers fail at the result budget instead of spilling.
         let bounded_result = bounded(|| statement(|| spill_rows(20_000)));
         assert_eq!(bounded_result, Err(CoreError::Sql(SqlError::Limit)));
+        // An internal CTE can scan a spill repeatedly. Publishing it as
+        // the statement's result must still respect the outer caller's cap.
+        let bounded_cte = bounded(|| statement(|| {
+            let (result, spilled) = capture_returning(|| spill_rows(20_000));
+            let mut result = result?;
+            let spilled = spilled.expect("CTE spill");
+            for _ in 0..2 {
+                assert_eq!(SpilledRows::scan(&spilled).unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 20_000);
+            }
+            spilled.publish(&mut result)?;
+            Ok(result)
+        }));
+        assert_eq!(bounded_cte, Err(CoreError::Sql(SqlError::Limit)));
         assert_eq!(files(&dir), 0);
         set_thread_dir(None);
     }

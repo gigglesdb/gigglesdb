@@ -2288,6 +2288,7 @@ struct V2SavepointState {
     sequence_incarnations: BTreeMap<u64, u128>,
     sequence_restore: Arc<()>,
     deferral: relational::DeferralState,
+    deferral_bytes: usize,
     enum_transaction: relational::EnumTransaction,
     sequence_copy_leases: BTreeMap<u64, Arc<()>>,
 }
