@@ -23,6 +23,8 @@ struct Context {
     lock_timeout: Mutex<Option<Duration>>,
 }
 thread_local! { static CURRENT: RefCell<Option<Cancellation>> = const { RefCell::new(None) }; }
+#[cfg(test)]
+thread_local! { static CONTENDED_ITERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 impl Cancellation {
     pub fn new(deadline: Option<Instant>) -> Self {
         Self(Arc::new(Context {
@@ -125,6 +127,9 @@ impl Cancellation {
     }
     pub(crate) fn wait_slice(&self) -> Duration {
         const SLICE: Duration = Duration::from_millis(5);
+        if self.0.state.load(Ordering::Acquire) == 2 {
+            return SLICE; // A decided request ignores its deadline, like wait_remaining.
+        }
         self.0
             .deadline
             .lock()
@@ -329,6 +334,8 @@ impl<T> WaitMutex<T> {
         let mut notified = false;
         let mut aux = self.aux.lock().map_err(|_| CoreError::Fenced)?;
         loop {
+            #[cfg(test)]
+            CONTENDED_ITERATIONS.with(|count| count.set(count.get() + 1));
             check()?;
             match self.inner.try_lock() {
                 Ok(guard) => return Ok(self.guard(guard)),
@@ -354,6 +361,65 @@ impl<T> WaitMutex<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A decided request whose deadline passed, without sleeping for it.
+    fn decided_expired() -> Cancellation {
+        let c = Cancellation::new(Some(Instant::now() + Duration::from_secs(60)));
+        c.scope(|| crate::cancellation::decide().unwrap());
+        c.deadline(Instant::now() - Duration::from_secs(1));
+        c
+    }
+
+    #[test]
+    fn decided_expired_wait_slice_is_full() {
+        assert_eq!(decided_expired().wait_slice(), Duration::from_millis(5));
+        // An undecided request still clamps its slice to the deadline, so check() cancels on time.
+        let undecided = Cancellation::new(None);
+        undecided.deadline(Instant::now() - Duration::from_secs(1));
+        assert_eq!(undecided.wait_slice(), Duration::ZERO);
+        assert_eq!(undecided.check(), Err(CoreError::Cancelled));
+    }
+
+    #[test]
+    fn decided_expired_lock_does_not_spin() {
+        decided_expired().scope(|| {
+            let mutex = Arc::new(WaitMutex::new(()));
+            let other = mutex.clone();
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (contended_tx, contended_rx) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                let _guard = other.lock().unwrap();
+                held_tx.send(()).unwrap();
+                // Release only after the waiter reached the contended loop.
+                contended_rx.recv().unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+            });
+            held_rx.recv().unwrap();
+            CONTENDED_ITERATIONS.with(|count| count.set(0));
+            let started = Instant::now();
+            drop(mutex.lock_notified(move || contended_tx.send(()).unwrap()).unwrap());
+            let elapsed = started.elapsed();
+            holder.join().unwrap();
+            let iterations = CONTENDED_ITERATIONS.with(|count| count.get());
+            // A 5 ms slice gives at most one pass per elapsed millisecond; a spin does thousands.
+            let bound = elapsed.as_millis() as usize + 20;
+            assert!(iterations <= bound, "decided lock spun for {iterations} iterations in {elapsed:?}");
+        });
+    }
+
+    #[test]
+    fn decided_expired_guard_wait_sleeps() {
+        decided_expired().scope(|| {
+            let mutex = WaitMutex::new(());
+            let mut guard = mutex.lock_cancellable().unwrap();
+            let started = Instant::now();
+            // Several slices tolerate occasional spurious wakeups, with no upper bound.
+            for _ in 0..10 {
+                guard = guard.wait().unwrap();
+            }
+            assert!(started.elapsed() >= Duration::from_millis(20), "decided guard waits returned immediately");
+        });
+    }
+
     #[test]
     fn notification_wait_cap_and_decided_deadline() {
         let c = Cancellation::new(Some(Instant::now() + Duration::from_secs(60)));
