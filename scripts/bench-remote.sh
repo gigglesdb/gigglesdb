@@ -32,7 +32,11 @@
 #   --results-root <dir>    local results parent (default J:/gigglesdb-work/boat/bench)
 #   --profile               extra diagnostic repeat per GigglesDB target/client
 #                           after normal repeats (first mix/protocol group);
-#                           separate fp build <=1510s, profile phase <=1800s
+#                           separate fp build <=1510s (tip and base share
+#                           <=2120s with giggles-sql-base), profile phase
+#                           <=--profile-budget
+#   --profile-budget <s>    profile phase budget in seconds, 1-99999 (default 2700,
+#                           fits 4 profiles: 2 targets x 2 client counts)
 #   --ttl <seconds>         box lifetime, at most 7200 (default 7200)
 #   --slot-wait <seconds>   how long to wait for a free slot (default 1800)
 #   --data-root <box path>  server data parent dir on the box (default: probe
@@ -72,7 +76,7 @@ max_starts=200   # plan-included starts per day, all agents
 max_boxes=${GATE_MAX_BOXES:-10}   # concurrent boxes, account-wide, shared with gates
 type=large       # benches run on large only
 suite=matrix results_root=J:/gigglesdb-work/boat/bench
-tip='' base='' who='' ttl=7200 slot_wait=1800 build_snapshot=0 profile=0 slow_disk=off min_fsync_us=2000
+tip='' base='' who='' ttl=7200 slot_wait=1800 build_snapshot=0 profile=0 profile_budget=2700 slow_disk=off min_fsync_us=2000
 targets=pg,giggles-sql clients=8,32 mixes=read,write,tx protocols=all opset=common data_root=''
 warmup=30 duration=300 repeats=3 rows=1000 server_cpus='' client_cpus=''
 while [ $# -gt 0 ]; do
@@ -85,6 +89,7 @@ while [ $# -gt 0 ]; do
     --ttl) ttl=$2; shift 2 ;;
     --slot-wait) slot_wait=$2; shift 2 ;;
     --profile) profile=1; shift ;;
+    --profile-budget) profile_budget=$2; shift 2 ;;   # runner PROFILE_PHASE_BUDGET
     --slow-disk) slow_disk=$2; shift 2 ;;   # off|require|auto (runner SLOW_DISK)
     --min-fsync-us) min_fsync_us=$2; shift 2 ;;
     --build-snapshot) build_snapshot=1; shift ;;
@@ -103,7 +108,7 @@ while [ $# -gt 0 ]; do
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
-usage() { sed -n '2,47p' "$0" >&2; exit 2; }
+usage() { sed -n '2,51p' "$0" >&2; exit 2; }
 [ -n "$tip" ] && [ -n "$who" ] || usage
 [[ "$who" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "bad --who" >&2; exit 2; }
 who=bench-${who#bench-}
@@ -114,6 +119,7 @@ if [ "$suite" = agent-load ] && { [ "$profile" = 1 ] || [ "$build_snapshot" = 1 
 fi
 [[ "$slow_disk" =~ ^(off|require|auto)$ ]] || { echo "bad --slow-disk (off|require|auto)" >&2; exit 2; }
 [[ "$min_fsync_us" =~ ^[0-9]+$ ]] || { echo "bad --min-fsync-us (microseconds)" >&2; exit 2; }
+[[ "$profile_budget" =~ ^[1-9][0-9]{0,4}$ ]] || { echo "bad --profile-budget (1-99999 seconds)" >&2; exit 2; }
 if [ "$slow_disk" != off ] && { [ "$suite" != matrix ] || [ "$build_snapshot" = 1 ]; }; then
   echo "--slow-disk requires a matrix benchmark" >&2; exit 2
 fi
@@ -155,9 +161,16 @@ fi
 # Time estimate: each measured run costs warmup + duration + ~30s for server
 # restart, schema setup, seeding and teardown. Build and setup get a fixed 20
 # minutes. giggles-native runs once per (clients, mix), not per protocol.
-# Profiling adds 1510s for its build plus min(1800, 270 + targets * 900)s
-# for the phase, where targets counts non-pg target/client pairs (270s =
-# apt-get 190s plus perf version/sysctl checks; 900s = per-target worst case).
+# Profiling adds 1510s for its fp build (2120s when giggles-sql-base also gets
+# one: both builds share 2100s plus 10s kill-after each) plus
+# min(--profile-budget, 270 + targets * 450)s for the phase, where targets
+# counts non-pg target/client pairs (270s = apt-get 190s plus perf
+# version/sysctl checks; 450s = a typical target, about 370s measured).
+# The build charge is the timeout cap (the builds run before the measured
+# repeats, so it must not be underestimated); the phase charge is typical,
+# because the runner starts a profile target only with 900s left before
+# both --profile-budget and BOX_DEADLINE, so a late target is skipped, never
+# cut off, and measured results are never at risk.
 if [ "$suite" = matrix ]; then
 count() { echo "$1" | tr ',' '\n' | grep -c .; }
 nt=$(count "$targets"); per=$(( nt * $(count "$protocols") ))
@@ -174,9 +187,11 @@ if [ "$profile" = 1 ]; then
 fi
 profile_extra=0
 if [ "$profile" = 1 ] && [ "$profile_runs" -gt 0 ]; then
-  phase=$(( 270 + profile_runs * 900 ))
-  [ "$phase" -gt 1800 ] && phase=1800
-  profile_extra=$(( 1510 + phase ))
+  phase=$(( 270 + profile_runs * 450 ))
+  [ "$phase" -gt "$profile_budget" ] && phase=$profile_budget
+  fp_builds=1510
+  [[ ",$targets," == *",giggles-sql-base,"* ]] && fp_builds=2120
+  profile_extra=$(( fp_builds + phase ))
 fi
 est=$(( est + profile_extra ))
 else
@@ -463,7 +478,7 @@ if [ "$suite" = agent-load ]; then
   bj exec "$box" --detach -- bash -lc "$envs bash /home/user/bench-agent-load-runner.sh > /home/user/bench.out 2>&1" >/dev/null
 else
 # 6. Run the bench in the background on the box and wait for it.
-envs="BOX_DEADLINE=$(( started + ttl - 900 )) SLOW_DISK=$slow_disk MIN_FSYNC_US=$min_fsync_us PROFILE=$profile TARGETS=$targets CLIENTS=$clients MIXES=$mixes PROTOCOLS=$protocols OPSET=$opset WARMUP=$warmup DURATION=$duration REPEATS=$repeats ROWS=$rows"
+envs="BOX_DEADLINE=$(( started + ttl - 900 )) SLOW_DISK=$slow_disk MIN_FSYNC_US=$min_fsync_us PROFILE=$profile PROFILE_PHASE_BUDGET=$profile_budget TARGETS=$targets CLIENTS=$clients MIXES=$mixes PROTOCOLS=$protocols OPSET=$opset WARMUP=$warmup DURATION=$duration REPEATS=$repeats ROWS=$rows"
 [ -z "$base" ] || envs+=" BASE_COMMIT=$base"
 [ -n "$data_root" ] && envs+=" DATA_ROOT=$data_root"
 [ -n "$server_cpus" ] && envs+=" SERVER_CPUS=$server_cpus"

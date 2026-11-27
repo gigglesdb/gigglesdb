@@ -181,6 +181,16 @@ A separate build in `$CARGO_TARGET_DIR-profile` enables frame pointers and
 Build failure is nonfatal: on-CPU capture falls back to the normal binary
 with DWARF; off-CPU user stacks will then be poor.
 
+With `giggles-sql-base` among the targets, the base commit gets the same
+frame-pointer build in its own `$CARGO_TARGET_DIR-base-profile`, so base and
+tip profiles use the same build type and call graph and their CPU/op and
+stacks compare. The two builds share 2100 s (the tip at most 1500 s). If
+either one fails or times out, both base and tip are profiled with their
+measured release binaries and DWARF. `meta.json` records `profile_callgraph`
+(tip), `profile_base_callgraph` (equal to it, or null without a base) and
+`profile_build_parity`, for example `fp (base and tip)` or
+`release+dwarf: base fp build failed/timed out ...`.
+
 The benchmark snapshot installs `bpfcc-tools`, `bpftrace`, `sysstat`, running
 kernel headers, `linux-tools` (perf), and pinned inferno 0.12.8 (`--locked`).
 Run `scripts/bench-snapshot-setup.sh --probe-only` on the snapshot to check
@@ -229,11 +239,21 @@ budgets are clamped to the remaining target deadline minus 10 s; less than
 including tsx children. CPU perf data above 1 GB skips script/folding but
 still gets a bounded report. Raw files are deleted after processing.
 
-The phase budget is 1800 s, reserving 900 s before each target. Each target
+The phase budget is 2700 s (`--profile-budget <seconds>` overrides it; the
+runner gets it as `PROFILE_PHASE_BUDGET`), reserving 900 s before each target.
+A target took about 370 s in the GD-0084 slow-disk runs; 2700 s fits 4
+profiles (2 targets x 2 client counts) with each one's 900 s reserve, and the
+headroom covers a slow disk or a slow target. Each target
 allows up to 160 s server startup, clamps later steps to start + 840 s,
 and leaves room for final stop/kill. The matrix estimate adds
-`1510 + min(1800, 270 + profile_runs * 900)` seconds; `profile_runs` is
-non-pg targets times client counts. Split matrices exceeding the TTL allowance.
+`builds + min(budget, 270 + profile_runs * 450)` seconds, where `builds` is
+the worst-case timeout cap, 1510, or 2120 with `giggles-sql-base` (two fp
+builds sharing 2100 s; a typical fp build takes about 400-600 s), and
+`profile_runs` is non-pg targets times client counts. The phase term is a
+typical cost: the runner itself starts a target only with 900 s left before
+both the budget and `BOX_DEADLINE`, so an underestimate skips late profile
+targets (recorded in `progress.log`) and never cuts measured runs.
+`profile_base_build_seconds` is null when the base fp build was not attempted. Split matrices exceeding the TTL allowance.
 Progress and skipped steps appear in `progress.log` and the copied box
 `progress`. At TTL minus 600 s, the waiter attempts partial copy-back before
 deleting the box; failures after launch also attempt copy-back.
@@ -257,9 +277,11 @@ Names below use `<key>` such as `giggles-sql-c32`:
 
 Raw perf data and `raw-*` directories are excluded from download. `meta.json`
 (at the run root) records `profile_requested`, `profiling_ran` (CPU),
-`offcpu_ran`, `perf_version`, `profile_callgraph`, and `profile_build_seconds`.
+`offcpu_ran`, `perf_version`, `profile_callgraph`, `profile_build_seconds`,
+`profile_base_callgraph`, `profile_base_build_seconds`, `profile_build_parity`
+and `profile_phase_budget_seconds`.
 Check manifest statuses too: a nonempty off-CPU marker alone is not proof of
-valid stacks. Failures are in `logs/build-profile.log`,
+valid stacks. Failures are in `logs/build-profile.log`, `logs/build-base-profile.log`,
 `logs/profile-*.capture.txt` and `logs/perf-*`.
 
 Start with `wait-report-<key>.md`. Its main table ranks working waits; idle

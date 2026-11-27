@@ -11,7 +11,8 @@
 # SLOW_DISK=require found a fast disk (nothing ran).
 #
 # Environment (set by bench-remote.sh): TARGETS CLIENTS MIXES PROTOCOLS WARMUP
-# DURATION REPEATS ROWS OPSET [SERVER_CPUS CLIENT_CPUS DATA_ROOT BASE_COMMIT].
+# DURATION REPEATS ROWS OPSET [SERVER_CPUS CLIENT_CPUS DATA_ROOT BASE_COMMIT
+# PROFILE PROFILE_PHASE_BUDGET BOX_DEADLINE SLOW_DISK MIN_FSYNC_US].
 set -uo pipefail
 source "$HOME/bench.env"
 repo=/home/user/gigglesdb
@@ -21,7 +22,10 @@ PROFILE=${PROFILE:-0}
 BASE_COMMIT=${BASE_COMMIT:-}
 profile_ran=0
 perf_version=""
-PROFILE_PHASE_BUDGET=1800
+# Profile phase budget in seconds (bench-remote.sh --profile-budget). 2700 fits
+# 4 profiles (2 targets x 2 client counts): a target took about 370 s in the
+# GD-0084 slow-disk runs, and each one starts only with PROFILE_TARGET_WORST left.
+PROFILE_PHASE_BUDGET=${PROFILE_PHASE_BUDGET:-2700}
 PROFILE_TARGET_WORST=900
 PROFILE_TARGET_STEPS=840
 PROFILE_LOAD_SECONDS=360
@@ -122,6 +126,7 @@ emulate_slow_disk() { # dm-delay over a direct-I/O loop device; echoes the mount
   sudo -n dmsetup table ggslow >&2
   echo "$mnt"
 }
+[[ "$PROFILE_PHASE_BUDGET" =~ ^[1-9][0-9]{0,4}$ ]] || fail_setup "bad PROFILE_PHASE_BUDGET=$PROFILE_PHASE_BUDGET (1-99999 seconds)"
 case "$SLOW_DISK" in off|require|auto) ;; *) fail_setup "bad SLOW_DISK=$SLOW_DISK (off|require|auto)" ;; esac
 [[ "$MIN_FSYNC_US" =~ ^[0-9]+$ ]] || fail_setup "bad MIN_FSYNC_US=$MIN_FSYNC_US"
 if ! read -r fs_mean fs_p50 fs_p99 < <(fsync_probe "$data"); then
@@ -183,24 +188,69 @@ if [ -n "$BASE_COMMIT" ]; then
   gs_base=$CARGO_TARGET_DIR-base/release/giggles-server
   progress "base build done in ${base_build_s}s"
 fi
-gs_profile=$gs
-profile_callgraph=dwarf
-profile_build_seconds=0
-if [ "$PROFILE" = 1 ] && [[ ",$TARGETS," == *",giggles-sql,"* || ",$TARGETS," == *",giggles-native,"* ]]; then
+# Profile builds (--profile only; measured runs always use $gs / $gs_base).
+# The tip, and the base when giggles-sql-base is a target, get the same build
+# type so their profiled CPU/op and stacks compare: both frame pointers with
+# line tables (own target dirs $CARGO_TARGET_DIR-profile and -base-profile),
+# or, when either fp build fails or times out, both measured release binaries
+# with dwarf call graphs. The two builds share 2100 s (tip at most 1500),
+# plus 10 s kill-after each; bench-remote.sh budgets 2120 s for them.
+fp_build() { # fp_build <src-repo> <target-dir> <timeout-secs> <log-name>
+  ( cd "$1/crates/giggles-server" &&
+    CARGO_TARGET_DIR=$2 RUSTFLAGS="-C force-frame-pointers=yes" \
+    CARGO_PROFILE_RELEASE_DEBUG=line-tables-only timeout --kill-after=10 "$3" cargo build --release --bin giggles-server
+  ) > "$out/logs/$4.log" 2>&1
+}
+profile_builds() {
+  local s left limit=1500 base=0
+  gs_profile=$gs gs_base_profile=$gs_base profile_callgraph=dwarf profile_base_callgraph=''
+  # profile_base_build_seconds stays empty (null in meta.json) unless the base fp build ran.
+  profile_build_seconds=0 profile_base_build_seconds='' profile_build_parity='no profile build'
+  [ "$PROFILE" = 1 ] && [[ ",$TARGETS," == *",giggles-sql,"* || ",$TARGETS," == *",giggles-native,"* ]] || return 0
+  if [[ ",$TARGETS," == *",giggles-sql-base,"* ]] && [ -n "$gs_base" ]; then
+    base=1 limit=2100 profile_base_callgraph=dwarf
+  fi
   progress "cargo build --release giggles-server (profile: frame pointers)"
   s=$(date +%s)
-  if ( cd "$repo/crates/giggles-server" &&
-    CARGO_TARGET_DIR=$CARGO_TARGET_DIR-profile RUSTFLAGS="-C force-frame-pointers=yes" \
-    CARGO_PROFILE_RELEASE_DEBUG=line-tables-only timeout --kill-after=10 1500 cargo build --release --bin giggles-server
-  ) > "$out/logs/build-profile.log" 2>&1; then
-    gs_profile=$CARGO_TARGET_DIR-profile/release/giggles-server
-    profile_callgraph=fp
-  else
-    progress "profile build failed/timed out; using measured binary with dwarf fallback (see logs/build-profile.log)"
+  if ! fp_build "$repo" "$CARGO_TARGET_DIR-profile" 1500 build-profile; then
+    profile_build_seconds=$(( $(date +%s) - s ))
+    profile_build_parity='release+dwarf: tip fp build failed/timed out (see logs/build-profile.log)'
+    progress "profile build failed/timed out after ${profile_build_seconds}s; profiling the measured binaries with dwarf (see logs/build-profile.log)"
+    return 0
   fi
   profile_build_seconds=$(( $(date +%s) - s ))
-  progress "profile build done in ${profile_build_seconds}s ($profile_callgraph)"
-fi
+  progress "profile build done in ${profile_build_seconds}s (fp)"
+  if [ "$base" = 0 ]; then
+    gs_profile=$CARGO_TARGET_DIR-profile/release/giggles-server profile_callgraph=fp
+    profile_build_parity='fp (tip only)'
+    return 0
+  fi
+  left=$(( limit - profile_build_seconds ))
+  [ "$left" -le 1500 ] || left=1500
+  if [ "$left" -lt 60 ]; then
+    profile_build_parity="release+dwarf: no time left for the base fp build (${left}s of ${limit}s)"
+    progress "base profile build skipped (${left}s left); profiling base and tip measured binaries with dwarf"
+    return 0
+  fi
+  progress "cargo build --release giggles-server (profile: frame pointers, base $BASE_COMMIT, ${left}s)"
+  s=$(date +%s)
+  if fp_build "$base_repo" "$CARGO_TARGET_DIR-base-profile" "$left" build-base-profile; then
+    profile_base_build_seconds=$(( $(date +%s) - s ))
+    gs_profile=$CARGO_TARGET_DIR-profile/release/giggles-server profile_callgraph=fp
+    gs_base_profile=$CARGO_TARGET_DIR-base-profile/release/giggles-server profile_base_callgraph=fp
+    profile_build_parity='fp (base and tip)'
+    progress "base profile build done in ${profile_base_build_seconds}s (fp)"
+  else
+    profile_base_build_seconds=$(( $(date +%s) - s ))
+    profile_build_parity='release+dwarf: base fp build failed/timed out (see logs/build-base-profile.log)'
+    progress "base profile build failed/timed out after ${profile_base_build_seconds}s; profiling base and tip measured binaries with dwarf (see logs/build-base-profile.log)"
+  fi
+}
+profile_binary() { # profile_binary <target>: "<binary> <callgraph>" its profile uses
+  if [ "$1" = giggles-sql-base ]; then echo "$gs_base_profile $profile_base_callgraph"
+  else echo "$gs_profile $profile_callgraph"; fi
+}
+profile_builds
 
 pin_server() { taskset -c "$SERVER_CPUS" "$@"; }
 wait_line() { # wait_line <file> <pattern> <seconds>
@@ -700,13 +750,15 @@ if [ "$PROFILE" = 1 ] && { has giggles-sql || has giggles-native; }; then
     sudo -n timeout --kill-after=10 15 sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 > "$out/logs/perf-sysctl.txt" 2>&1 || progress "perf sysctl failed (captures may be unavailable)"
   fi
   if [ "$profile_ready" = 1 ]; then
-    gs=$gs_profile
+    # start_server picks $gs / $gs_base; both now name the profile binaries.
+    gs=$gs_profile gs_base=$gs_base_profile
+    progress "profile builds: $profile_build_parity"
     for c in "${C[@]}"; do for t in "${T[@]}"; do
       [ "$t" = pg ] && continue
       [ "$t" = giggles-native ] && [ "$native_support" = 0 ] && continue
       tag="profile-$t-c$c"
-      callgraph=$profile_callgraph
-      [ "$t" != giggles-sql-base ] || callgraph=dwarf
+      read -r _ callgraph < <(profile_binary "$t")
+      callgraph=${callgraph:-dwarf}
       elapsed=$(( $(date +%s) - phase_start ))
       if [ -n "$BOX_DEADLINE" ] && [ $(( $(date +%s) + PROFILE_TARGET_WORST )) -gt "$BOX_DEADLINE" ]; then
         progress "box deadline: skipping $tag and later targets ($(( BOX_DEADLINE - $(date +%s) ))s left)"
@@ -739,12 +791,17 @@ if [ "$PROFILE" = 1 ] && { has giggles-sql || has giggles-native; }; then
     if compgen -G "$out/profiles/ran-*" | grep -v "/ran-offcpu-" >/dev/null; then profile_ran=1; fi
   fi
 fi
-python3 - "$out/meta.json" "$PROFILE" "$profile_ran" "$perf_version" "$profile_callgraph" "$profile_build_seconds" <<'PYMETA'
+python3 - "$out/meta.json" "$PROFILE" "$profile_ran" "$perf_version" "$profile_callgraph" "$profile_build_seconds" \
+  "$profile_base_callgraph" "$profile_base_build_seconds" "$profile_build_parity" "$PROFILE_PHASE_BUDGET" <<'PYMETA'
 import json, sys, glob, os
-path, requested, ran, version, callgraph, build_seconds = sys.argv[1:]
+path, requested, ran, version, callgraph, build_seconds, base_callgraph, base_build_seconds, parity, budget = sys.argv[1:]
 meta = json.load(open(path))
+# profile_base_callgraph is null without a giggles-sql-base target; with one it
+# always equals profile_callgraph (fp for both, or dwarf for both).
 meta.update(offcpu_ran=bool(glob.glob(os.path.join(os.path.dirname(path), "profiles", "ran-offcpu-*"))), profile_requested=requested == "1", profiling_ran=ran == "1", perf_version=version or None,
-            profile_callgraph=callgraph, profile_build_seconds=int(build_seconds))
+            profile_callgraph=callgraph, profile_build_seconds=int(build_seconds),
+            profile_base_callgraph=base_callgraph or None, profile_base_build_seconds=int(base_build_seconds) if base_build_seconds else None,
+            profile_build_parity=parity, profile_phase_budget_seconds=int(budget))
 json.dump(meta, open(path, "w"), indent=1)
 PYMETA
 
