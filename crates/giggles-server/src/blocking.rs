@@ -5,12 +5,15 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub(crate) const MAX_BLOCKING: usize = 32;
 
 #[derive(Clone)]
-pub(crate) struct Blocking(Arc<Semaphore>);
+pub(crate) struct Blocking(Arc<Semaphore>, #[cfg(test)] Arc<std::sync::atomic::AtomicUsize>);
 
 impl Blocking {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(Semaphore::new(MAX_BLOCKING)))
+        Self(Arc::new(Semaphore::new(MAX_BLOCKING)), #[cfg(test)] Arc::default())
     }
+
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn test_waiters(&self) -> usize { self.1.load(std::sync::atomic::Ordering::SeqCst) }
 
     /// Permits held now (admitted and not yet returned).
     pub(crate) fn in_use(&self) -> usize {
@@ -32,6 +35,15 @@ impl Blocking {
             context.check()?;
             return Ok(permit);
         }
+        #[cfg(test)]
+        let _waiting = {
+            struct Waiting(Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for Waiting {
+                fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); }
+            }
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Waiting(self.1.clone())
+        };
         let acquire = self.0.clone().acquire_owned();
         tokio::pin!(acquire);
         loop {
@@ -81,7 +93,7 @@ impl Blocking {
 mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn admit_fast_path_cannot_overtake_queued_waiter() {
-        let pool = super::Blocking(std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+        let pool = super::Blocking(std::sync::Arc::new(tokio::sync::Semaphore::new(1)), Arc::default());
         let held = pool.0.clone().acquire_owned().await.unwrap();
         let context = giggles_core::Cancellation::new(None);
         let mut queued = Box::pin(pool.admit(&context));
@@ -242,7 +254,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn aborting_socket_waiter_retains_started_work_permit_until_actual_finish() {
-        let pool = Blocking(Arc::new(Semaphore::new(1)));
+        let pool = Blocking(Arc::new(Semaphore::new(1)), Arc::default());
         let worker = pool.clone();
         let (started, rx) = oneshot::channel();
         let (release, wait) = std::sync::mpsc::channel();
@@ -276,7 +288,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn panic_releases_admission_and_subsequent_work_succeeds() {
-        let pool = Blocking(Arc::new(Semaphore::new(1)));
+        let pool = Blocking(Arc::new(Semaphore::new(1)), Arc::default());
         assert!(
             pool.run(|| panic!("deliberate worker panic"))
                 .await

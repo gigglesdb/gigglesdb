@@ -170,7 +170,7 @@ async fn pinned_driver_cancel_autocommit_and_commit_at_each_decision_boundary() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_wrong_stale_cross_role_and_idle_keys_cannot_cancel_next_request() {
-    let f = Fixture::new().await;
+    let f = Fixture::new_limit(1).await;
     let (mut stale, old) = raw_key(&f).await;
     pg_send(&mut stale, b'X', &[]).await;
     drop(stale);

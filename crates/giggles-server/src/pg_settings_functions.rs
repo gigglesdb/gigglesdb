@@ -188,14 +188,14 @@ pub(crate) fn inventory_rows(
             let entry = entry.expect("registry entry");
             (
                 entry.display(settings.registry_base(entry), false),
-                entry.default.into(),
+                if name == "max_connections" { settings.registry_base(entry).into() } else { entry.default.into() },
                 settings.current.registered.contains_key(entry.name),
             )
         };
         let values = [
             Some(name), Some(current.as_str()), entry.and_then(|e| e.unit), entry.map(|e| e.category),
             entry.map(|e| e.short_desc), entry.and_then(|e| e.extra_desc), entry.map(|e| e.context_name),
-            entry.map(|e| e.kind.name()), Some(if source { "session" } else { "default" }),
+            entry.map(|e| e.kind.name()), Some(if name == "max_connections" && settings.max_connections.is_some() { "command line" } else if source { "session" } else { "default" }),
             entry.and_then(|e| e.min), entry.and_then(|e| e.max), None, entry.and_then(|e| e.boot),
             Some(reset.as_str()), None, None, None,
         ];

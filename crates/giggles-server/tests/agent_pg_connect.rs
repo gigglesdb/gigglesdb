@@ -372,3 +372,42 @@ fn config_rejects_unknown_key_and_empty_agent() {
     assert_eq!(loaded[0].fingerprint, "b".repeat(64));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn configured_certificate_listener_metadata_preserves_task_policy() {
+    let admin = admin();
+    create_task(&admin, "inc-436", "agent_exec");
+    let ca = certificate(None, false);
+    let agent = certificate(Some(&ca), false);
+    let server = AgentServer::start_limit(admin, ca, vec![], vec![binding(&agent, "agent_exec", &["inc-436"])], 5).await;
+    let (client, connection) = tokio_postgres::Config::new()
+        .host("localhost").hostaddr(server.agent.address.ip()).port(server.agent.address.port())
+        .user("agent_exec").dbname("giggles").ssl_mode(SslMode::Require)
+        .connect(MakeRustlsConnect::new(agent.client(&server.ca))).await.unwrap();
+    let driver = tokio::spawn(connection);
+    agent_support::assert_agent_settings_refused(&client).await;
+    drop(client);
+    driver.await.unwrap().unwrap();
+    server.agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn certificate_bound_listener_settings_survive_reset_and_rollback() {
+    let ca = certificate(None, false);
+    let cert = certificate(Some(&ca), false);
+    let server = AgentServer::start(admin(), ca, vec![Binding {
+        fingerprint: cert.fingerprint(), role: Role::Database { name: "incident_controller".into() },
+    }], vec![]).await;
+    let (_, gate) = watch::channel(true);
+    let pg = serve_pg_bound(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(), server.service.clone(), server.tls.clone(), 7, gate).await.unwrap();
+    let (client, connection) = tokio_postgres::Config::new()
+        .host("localhost").hostaddr(pg.address.ip()).port(pg.address.port())
+        .user("giggles").dbname("giggles").ssl_mode(SslMode::Require)
+        .connect(MakeRustlsConnect::new(cert.client(&server.ca))).await.unwrap();
+    let driver = tokio::spawn(connection);
+    agent_support::assert_listener_settings(&client, 7).await;
+    drop(client);
+    driver.await.unwrap().unwrap();
+    pg.shutdown().await.unwrap();
+    server.agent.shutdown().await.unwrap();
+}

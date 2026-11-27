@@ -118,7 +118,9 @@ pub async fn serve_pg_bound(
             }
         }
         let sem = Arc::new(Semaphore::new(connections));
-        let rejections = ConnectionRejections::new();
+        let rejections = ConnectionRejections::new().with_cancel(
+            task_service.clone(), crate::auth::listener::CancelListener::Bound,
+        );
         let accept = TlsAcceptor::from(config);
         let mut tasks = tokio::task::JoinSet::new();
         loop {
@@ -153,6 +155,7 @@ pub async fn serve_pg_bound(
                         };
                         session.connection=Some(shared);
                         session.backend_ssl=true;
+                        session.max_connections=Some(connections);
                         session.pgwire_listener_work = Some(work);
                         if let Err(error)=crate::pgwire::run(&mut stream,session).await {
                             eprintln!("protocol=postgres closed stage=wire io_kind={:?}",error.kind());

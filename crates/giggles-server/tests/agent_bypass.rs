@@ -788,3 +788,90 @@ async fn cancel_request_with_foreign_key_does_not_cancel_agent_backend() {
     drop((agent, foreign, ordinary));
     f.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overloaded_agent_cancel_keeps_certificate_and_sql_credential_namespaces_separate() {
+    use giggles_core::task::ProtectedPoint;
+    use std::sync::Mutex;
+    let f = ParityFixture::start().await;
+    let secret = issue(&f, TASK).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_, gate) = tokio::sync::watch::channel(true);
+    let pg = giggles_server::agent::serve_agent_pg_bound(listener, f.service.clone(), f.tls.clone(), 1, vec!["giggles".into()], gate).await.unwrap();
+    for certificate in [true, false] {
+        // Prefer still negotiates real TLS here. It also lets the driver's raw
+        // cancel API serialize its key into an in-memory stream with NoTls.
+        let tls = if certificate { f.agent.client(&f.ca) } else { f.app.client(&f.ca) };
+        let mut config = tokio_postgres::Config::new();
+        config.host("localhost").hostaddr(pg.address.ip()).port(pg.address.port())
+            .user(EXECUTOR).dbname("giggles").ssl_mode(SslMode::Prefer);
+        if !certificate { config.password(&secret); }
+        let (agent, connection) = config.connect(MakeRustlsConnect::new(tls)).await.unwrap();
+        tokio::spawn(connection);
+        let token = agent.cancel_token();
+        let (capture, mut captured) = tokio::io::duplex(64);
+        token.cancel_query_raw(capture, tokio_postgres::NoTls).await.unwrap();
+        let mut packet = Vec::new();
+        captured.read_to_end(&mut packet).await.unwrap();
+        assert_eq!(packet.len(), 16);
+        // A full listener refuses another startup but still accepts CancelRequest.
+        let refused = password_tls(&f, pg.address, &secret, None).await.unwrap_err();
+        assert_eq!(refused.code().unwrap().code(), "53300");
+        for correct in [false, true] {
+            let (entered, wait) = tokio::sync::oneshot::channel();
+            let entered = Mutex::new(Some(entered));
+            let (release, hold) = std::sync::mpsc::channel();
+            let hold = Mutex::new(hold);
+            // Pause the protected operation before SQL execution checks cancellation.
+            // AfterStatement is too late: completed work can commit despite a late cancel.
+            f.admin.set_protected_hook(Some(Arc::new(move |point| {
+                if point == ProtectedPoint::AfterHold && let Some(entered) = entered.lock().unwrap().take() {
+                    entered.send(()).unwrap();
+                    hold.lock().unwrap().recv_timeout(Duration::from_secs(8)).unwrap();
+                }
+            }))).unwrap();
+            let cancel = async {
+                tokio::time::timeout(Duration::from_secs(8), wait).await.unwrap().unwrap();
+                let cert = if certificate == correct { &f.agent } else { &f.app };
+                observed_agent_cancel(&f, pg.address, cert, &packet).await;
+                release.send(()).unwrap();
+            };
+            let id = 1 + usize::from(!certificate) * 2 + usize::from(correct);
+            let sql = format!("OPERATION 'overload-{certificate}-{correct}' UPDATE shipments SET status = 'queued' WHERE id = {id}");
+            let (result, ()) = tokio::join!(agent.simple_query(&sql), cancel);
+            f.admin.set_protected_hook(None).unwrap();
+            if correct {
+                let error = result.unwrap_err();
+                let error = error.as_db_error().unwrap();
+                assert_eq!(error.code().code(), "57014");
+                assert_eq!(error.message(), "canceling statement due to user request");
+            } else { result.unwrap(); }
+            // EOF confirms handling before the following statement is sent.
+            let cert = if certificate { &f.agent } else { &f.app };
+            observed_agent_cancel(&f, pg.address, cert, &packet).await;
+            agent.simple_query("SELECT id FROM shipments").await.unwrap();
+        }
+        drop(agent);
+        // Wait for the single slot to be returned before the other authentication path.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    pg.shutdown().await.unwrap();
+    f.stop().await;
+}
+
+async fn observed_agent_cancel(f: &ParityFixture, address: SocketAddr, cert: &TestCert, packet: &[u8]) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        socket.write_all(&[0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f]).await.unwrap();
+        assert_eq!(socket.read_u8().await.unwrap(), b'S');
+        let mut socket = TlsConnector::from(Arc::new(cert.client(&f.ca)))
+            .connect(ServerName::try_from("localhost").unwrap(), socket).await.unwrap();
+        socket.write_all(packet).await.unwrap();
+        socket.flush().await.unwrap();
+        match socket.read(&mut [0]).await {
+            Ok(0) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {},
+            other => panic!("CancelRequest must close without application bytes: {other:?}"),
+        }
+    }).await.expect("overload CancelRequest did not close");
+}

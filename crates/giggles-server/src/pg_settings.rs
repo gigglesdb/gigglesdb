@@ -191,6 +191,7 @@ pub(crate) struct SessionSettings {
     saved: Option<Settings>,
     pub defaults: Settings,
     pub queried: bool,
+    pub(crate) max_connections: Option<String>,
     local: BTreeMap<Show, (String, Option<u32>, bool)>,
     local_registered: BTreeMap<String, Option<String>>,
     savepoints: Vec<SavepointSettings>,
@@ -307,6 +308,9 @@ impl SessionSettings {
     }
 
     pub(crate) fn registry_base(&self, entry: &'static registry::Entry) -> &str {
+        if entry.name == "max_connections" && let Some(value) = &self.max_connections {
+            return value;
+        }
         self.current.registered.get(entry.name).map_or(entry.default, String::as_str)
     }
 

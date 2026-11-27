@@ -13,7 +13,8 @@ struct Fixture {
     issuer: Wire,
 }
 impl Fixture {
-    async fn start() -> Self {
+    async fn start() -> Self { Self::start_limit(8).await }
+    async fn start_limit(limit: usize) -> Self {
         let admin = admin();
         admin
             .roles()
@@ -35,7 +36,7 @@ impl Fixture {
         create_task(&admin, "inc-437", "agent_exec");
         let ca = certificate(None, false);
         let issuer = certificate(Some(&ca), false);
-        let server = AgentServer::start(
+        let server = AgentServer::start_limit(
             admin,
             ca,
             vec![Binding {
@@ -45,6 +46,7 @@ impl Fixture {
                 },
             }],
             vec![],
+            limit,
         )
         .await;
         let (ordinary, issuer) = ordinary_wire(&server, &issuer).await;
@@ -229,4 +231,14 @@ async fn cert_binding_still_works() {
     .await;
     assert_eq!(startup.status("session_authorization"), Some("agent_exec"));
     server.agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn configured_sql_credential_listener_metadata_preserves_task_policy() {
+    let mut f = Fixture::start_limit(7).await;
+    let (_, secret) = f.issue(None).await;
+    let client = f.connect("agent_exec", &secret, None).await.unwrap();
+    assert_agent_settings_refused(&client).await;
+    drop(client);
+    f.stop().await;
 }

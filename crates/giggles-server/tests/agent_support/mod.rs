@@ -251,6 +251,12 @@ impl AgentServer {
         ordinary: Vec<Binding>,
         agents: Vec<AgentBinding>,
     ) -> Self {
+        Self::start_limit(admin, ca, ordinary, agents, 8).await
+    }
+
+    pub async fn start_limit(
+        admin: Admin, ca: TestCert, ordinary: Vec<Binding>, agents: Vec<AgentBinding>, connections: usize,
+    ) -> Self {
         let server = certificate(Some(&ca), true);
         let service = Service::with_agent(
             admin.clone(),
@@ -272,7 +278,7 @@ impl AgentServer {
             socket,
             service.clone(),
             tls.clone(),
-            8,
+            connections,
             vec!["giggles".into()],
             start,
         )
@@ -1827,4 +1833,37 @@ pub mod parity {
         }
         expected.clone()
     }
+}
+
+/// Listener-owned settings survive session resets and transaction restoration.
+pub async fn assert_listener_settings(client: &tokio_postgres::Client, limit: usize) {
+    for sql in ["SELECT 1", "RESET ALL", "BEGIN; SAVEPOINT a; RESET ALL; ROLLBACK TO a; COMMIT", "BEGIN; RESET ALL; ROLLBACK"] {
+        client.batch_execute(sql).await.unwrap();
+        for sql in ["SHOW max_connections", "SELECT current_setting('max_connections')"] {
+            let row = client.query_one(sql, &[]).await.unwrap();
+            assert_eq!(row.columns()[0].type_().oid(), 25);
+            assert_eq!(row.get::<_, String>(0), limit.to_string());
+        }
+        let row = client.query_one("SELECT setting, source, reset_val FROM pg_settings WHERE name = 'max_connections'", &[]).await.unwrap();
+        for (i, expected) in [limit.to_string(), "command line".into(), limit.to_string()].iter().enumerate() {
+            assert_eq!(row.columns()[i].type_().oid(), 25);
+            assert_eq!(&row.get::<_, String>(i), expected);
+        }
+    }
+}
+
+pub async fn assert_agent_settings_refused(client: &tokio_postgres::Client) {
+    for sql in ["SHOW max_connections", "SELECT current_setting('max_connections')", "SELECT setting, source, reset_val FROM pg_settings WHERE name = 'max_connections'", "RESET ALL", "BEGIN", "SAVEPOINT a", "ROLLBACK"] {
+        let error = client.simple_query(sql).await.unwrap_err();
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), "0A000", "{sql}");
+        let expected = match sql {
+            "BEGIN" | "ROLLBACK" => "explicit transactions are not allowed in a task session",
+            "SAVEPOINT a" => "savepoints are not allowed in a task session",
+            sql if sql.contains("pg_settings") => "catalog queries are not allowed in a task session",
+            _ => "statement form is not allowed in a task session",
+        };
+        assert_eq!(error.message(), expected, "{sql}");
+    }
+    client.simple_query("SELECT 1").await.unwrap();
 }

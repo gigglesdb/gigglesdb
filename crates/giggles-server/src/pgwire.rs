@@ -215,6 +215,7 @@ pub(crate) fn error_message(code: &str, message: &'static str, out: &mut Vec<u8>
 }
 #[derive(Default)]
 struct Diagnostic {
+    cancel_backend: Option<Arc<crate::cancel::Backend>>,
     database_role: bool,
     task_session: bool,
     task_sql_error: bool,
@@ -883,7 +884,12 @@ fn diagnostic_error(
     b.push(b'M');
     let registry_error = diagnostic.and_then(|d| d.wire_registry_error.as_ref());
     let wire_message = registry_error.map(|error| error.message.as_str())
-        .or_else(|| diagnostic.and_then(|d| d.wire_message.as_deref()));
+        .or_else(|| diagnostic.and_then(|d| d.wire_message.as_deref()))
+        .or_else(|| {
+            (code == "57014" && diagnostic.and_then(|d| d.cancel_backend.as_ref())
+                .is_some_and(|backend| backend.user_cancelled()))
+                .then_some("canceling statement due to user request")
+        });
     z(wire_message.unwrap_or(message), &mut b);
     if let Some((diagnostic, key)) = diagnostic
         .filter(|_| matches!(code, "23001" | "23502" | "23503" | "23505" | "23514"))
@@ -4176,6 +4182,7 @@ pub(crate) async fn run_agent<S: AsyncRead + AsyncWrite + Unpin>(
     databases: &[String],
     shared: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
     work: Arc<giggles_core::DurableTracker>,
+    connections: usize,
 ) -> io::Result<()> {
     use crate::pgwire_startup::{
         StartupPolicy, parse_startup, read_startup_packet, reject_startup,
@@ -4219,6 +4226,7 @@ pub(crate) async fn run_agent<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
     session.connection = Some(shared);
+    session.max_connections = Some(connections);
     session.backend_ssl = true;
     session.database = Some(startup.database.clone());
     session.pgwire_listener_work = Some(work);
@@ -4236,6 +4244,7 @@ pub(crate) async fn run_agent_password<S: AsyncRead + AsyncWrite + Unpin>(
     databases: &[String],
     shared: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
     work: Arc<giggles_core::DurableTracker>,
+    connections: usize,
 ) -> io::Result<()> {
     use crate::pgwire_startup::{
         StartupPolicy, parse_startup, read_startup_packet, reject_startup,
@@ -4296,6 +4305,7 @@ pub(crate) async fn run_agent_password<S: AsyncRead + AsyncWrite + Unpin>(
             }
         };
     session.connection = Some(shared);
+    session.max_connections = Some(connections);
     session.backend_ssl = true;
     session.database = Some(startup.database.clone());
     session.pgwire_listener_work = Some(work);
@@ -4415,6 +4425,7 @@ impl State {
             || (matches!(tag, b'c' | b'f') && self.copy.as_ref().is_some_and(|c| c.simple));
         let context = active.context.clone();
         self.diagnostic = Diagnostic {
+            cancel_backend: Some(active.backend()),
             task_session: session.task().is_some(),
             phase: match tag {
                 b'Q' => "simple query",
@@ -4639,6 +4650,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
     }
     startup_settings.engine = session.service.admin.engine();
     startup_settings.session_authorization = session.session_user_name().unwrap_or("").into();
+    state.settings.max_connections = session.max_connections.map(|value| value.to_string());
     state.settings.defaults = startup_settings.clone();
     state.settings.current = startup_settings;
     session.set_time_zone(&state.settings.current.timezone);
@@ -4819,16 +4831,13 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                 if state.copy.is_some() {
                     state.copy_error(code, &mut session, &mut out);
                 } else {
-                    if message.is_some() {
-                        let diagnostic = Diagnostic {
-                            phase: "admission",
-                            wire_message: message,
-                            ..Diagnostic::default()
-                        };
-                        diagnostic_error(code, GENERIC_MESSAGE, Some(&diagnostic), &mut out);
-                    } else {
-                        error(code, &mut out);
-                    }
+                    let diagnostic = Diagnostic {
+                        phase: "admission",
+                        wire_message: message,
+                        cancel_backend: Some(active.backend()),
+                        ..Diagnostic::default()
+                    };
+                    diagnostic_error(code, GENERIC_MESSAGE, Some(&diagnostic), &mut out);
                     if tag == b'S' && state.implicit {
                         session.sql.rollback_without_settling();
                         state.settings.transaction(true, false, "ROLLBACK");

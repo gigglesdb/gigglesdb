@@ -853,3 +853,42 @@ async fn unnamed_archdocs_dml_after_search_ddl_legacy() {
 async fn unnamed_archdocs_dml_after_search_ddl_v2() {
     archdocs_unnamed_dml_after_search_ddl(Engine::V2).await;
 }
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn saturated_blocking_admission_user_cancel_has_exact_message_and_recovers() {
+    let f = Fixture::new(Engine::V2).await;
+    let mut stream = TcpStream::connect(f.pg.address).await.unwrap();
+    let body = b"\0\x03\0\0user\0owner\0database\0postgres\0\0";
+    stream.write_u32((body.len() + 4) as u32).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    let startup = wire_cycle(&mut stream).await;
+    let key = startup.iter().find(|(tag, _)| *tag == b'K').unwrap().1.clone();
+    let context = giggles_core::Cancellation::new(None);
+    let mut permits = Vec::new();
+    for _ in 0..crate::blocking::MAX_BLOCKING { permits.push(f.service.blocking.admit(&context).await.unwrap()); }
+    let sql = b"SELECT 1\0";
+    stream.write_u8(b'Q').await.unwrap();
+    stream.write_u32((sql.len()+4) as u32).await.unwrap();
+    stream.write_all(sql).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while f.service.blocking.test_waiters() == 0 { tokio::task::yield_now().await; }
+    }).await.expect("statement never entered saturated blocking admission");
+    let mut cancel = TcpStream::connect(f.pg.address).await.unwrap();
+    cancel.write_u32(16).await.unwrap();
+    cancel.write_u32(80877102).await.unwrap();
+    cancel.write_all(&key).await.unwrap();
+    assert_eq!(cancel.read(&mut [0]).await.unwrap(), 0);
+    let frames = wire_cycle(&mut stream).await;
+    let error = &frames.iter().find(|(tag, _)| *tag == b'E').unwrap().1;
+    assert!(error.split(|b| *b == 0).any(|v| v == b"C57014"));
+    assert!(error.split(|b| *b == 0).any(|v| v == b"Mcanceling statement due to user request"));
+    assert_eq!(frames.last().unwrap(), &(b'Z', b"I".to_vec()));
+    assert_eq!(f.service.blocking.in_use(), crate::blocking::MAX_BLOCKING);
+    drop(permits);
+    let next = wire_query(&mut stream, "SELECT 1").await;
+    assert!(next.iter().any(|(tag, _)| *tag == b'D'));
+    assert!(!next.iter().any(|(tag, _)| *tag == b'E'));
+    drop(stream);
+    f.stop().await;
+}

@@ -22,6 +22,7 @@ pub(crate) struct Backend {
     fingerprint: String,
     epoch: u64,
     open: AtomicBool,
+    user_cancelled: AtomicBool,
     active: Mutex<Option<Cancellation>>,
 }
 impl Registry {
@@ -36,8 +37,9 @@ impl Registry {
         if let Ok(active) = backend.active.lock()
             && backend.open.load(Ordering::Acquire)
             && let Some(context) = active.as_ref()
+            && context.cancel()
         {
-            context.cancel();
+            backend.user_cancelled.store(true, Ordering::Relaxed);
         }
     }
 
@@ -63,6 +65,7 @@ impl Registry {
                 fingerprint: fingerprint.into(),
                 epoch,
                 open: AtomicBool::new(true),
+                user_cancelled: AtomicBool::new(false),
                 active: Mutex::new(None),
             });
             entries.live.retain(|_, v| v.strong_count() > 0);
@@ -82,8 +85,9 @@ impl Registry {
         if let Ok(active) = backend.active.lock()
             && backend.open.load(Ordering::Acquire)
             && let Some(context) = active.as_ref()
+            && context.cancel()
         {
-            context.cancel();
+            backend.user_cancelled.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -94,7 +98,10 @@ impl Backend {
     }
     pub(crate) fn begin(self: &Arc<Self>, cancellable: bool) -> Active {
         let context = Cancellation::default();
-        *self.active.lock().expect("backend lock") = cancellable.then(|| context.clone());
+        let mut active = self.active.lock().expect("backend lock");
+        self.user_cancelled.store(false, Ordering::Relaxed);
+        *active = cancellable.then(|| context.clone());
+        drop(active);
         Active {
             backend: self.clone(),
             context,
@@ -104,6 +111,17 @@ impl Backend {
 pub(crate) struct Active {
     backend: Arc<Backend>,
     pub(crate) context: Cancellation,
+}
+impl Active {
+    pub(crate) fn backend(&self) -> Arc<Backend> { self.backend.clone() }
+}
+impl Backend {
+    pub(crate) fn user_cancelled(&self) -> bool {
+        // Cancellation wakes execution before returning. Share its lock so
+        // diagnostics cannot race the winning cancel's reason publication.
+        let _active = self.active.lock().expect("backend lock");
+        self.user_cancelled.load(Ordering::Relaxed)
+    }
 }
 impl Drop for Active {
     fn drop(&mut self) {
@@ -127,13 +145,16 @@ mod tests {
         registry.cancel_key("native:", backend.pid, backend.secret);
         registry.cancel_key("pgrole:", backend.pid, backend.secret ^ 1);
         assert!(active.context.check().is_ok());
+        assert!(!active.backend().user_cancelled());
         registry.cancel_key("pgrole:", backend.pid, backend.secret);
         assert_eq!(
             active.context.check(),
             Err(giggles_core::CoreError::Cancelled)
         );
+        assert!(active.backend().user_cancelled());
         drop(active);
         let next = backend.begin(true);
+        assert!(!next.backend().user_cancelled());
         backend.close();
         registry.cancel_key("pgrole:", backend.pid, backend.secret);
         assert!(next.context.check().is_ok());
@@ -174,6 +195,17 @@ mod tests {
         assert_ne!(replacement.pid, old_pid);
         assert_eq!(registry.0.lock().unwrap().live.len(), 1);
     }
+    #[test]
+    fn deadline_cancellation_is_not_reported_as_a_user_request() {
+        let registry = Registry::default();
+        let backend = registry.register("pgrole:owner", 1).unwrap();
+        let active = backend.begin(true);
+        active.context.deadline(std::time::Instant::now());
+        assert_eq!(active.context.check(), Err(giggles_core::CoreError::Cancelled));
+        registry.cancel_key("pgrole:", backend.pid, backend.secret);
+        assert!(!active.backend().user_cancelled());
+    }
+
     #[test]
     fn anti_reuse_history_is_bounded_and_fails_closed() {
         let registry = Registry::default();

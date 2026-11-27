@@ -188,7 +188,9 @@ pub async fn serve_agent_pg_bound(
             }
         }
         let sem = Arc::new(Semaphore::new(connections));
-        let rejections = crate::auth::listener::ConnectionRejections::new();
+        let rejections = crate::auth::listener::ConnectionRejections::new().with_cancel(
+            task_service.clone(), crate::auth::listener::CancelListener::Agent,
+        );
         let accept = TlsAcceptor::from(tls);
         let mut tasks = tokio::task::JoinSet::new();
         loop {
@@ -225,11 +227,11 @@ pub async fn serve_agent_pg_bound(
                             .filter(|fp| service.agent_known(fp));
                         let result = if let Some(fingerprint) = fingerprint {
                             crate::pgwire::run_agent(
-                                &mut stream, &service, &fingerprint, &databases, shared, work,
+                                &mut stream, &service, &fingerprint, &databases, shared, work, connections,
                             ).await
                         } else {
                             crate::pgwire::run_agent_password(
-                                &mut stream, &service, &databases, shared, work,
+                                &mut stream, &service, &databases, shared, work, connections,
                             ).await
                         };
                         if let Err(error) = result {

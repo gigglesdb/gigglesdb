@@ -199,6 +199,9 @@ struct Fixture {
     ca: Cert,
 }
 impl Fixture {
+    async fn new_limit(pg_limit: usize) -> Self {
+        Self::with_app_table_engine_limit("app", &["CREATE TABLE app (id BIGINT PRIMARY KEY, body TEXT, flag BOOLEAN, small SMALLINT, num INTEGER, data BYTEA)"], giggles_core::Engine::Legacy, pg_limit).await
+    }
     async fn new() -> Self {
         Self::with_task_resources(LegacyTaskResources {
             read_rows: 1_000_000,
@@ -218,6 +221,9 @@ impl Fixture {
         Self::with_app_table_engine(table, setup, giggles_core::Engine::Legacy).await
     }
     async fn with_app_table_engine(table: &str, setup: &[&str], engine: giggles_core::Engine) -> Self {
+        Self::with_app_table_engine_limit(table, setup, engine, 32).await
+    }
+    async fn with_app_table_engine_limit(table: &str, setup: &[&str], engine: giggles_core::Engine, pg_limit: usize) -> Self {
         let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
             "network-fixture-{}-{}-{}",
             std::process::id(),
@@ -308,7 +314,7 @@ impl Fixture {
             "127.0.0.1:0".parse().unwrap(),
             service.clone(),
             server_config.clone(),
-            32,
+            pg_limit,
         )
         .await
         .unwrap();

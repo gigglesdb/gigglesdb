@@ -74,11 +74,19 @@ impl Server {
     }
 
     async fn start_mode(root: &Path, first: bool, trust: bool) -> (Self, String) {
+        Self::start_limit(root, first, trust, None).await
+    }
+
+    async fn start_limit(root: &Path, first: bool, trust: bool, limit: Option<usize>) -> (Self, String) {
         let mut command = command(root);
         command.stderr(Stdio::from(
             std::fs::File::create(root.join("stderr")).unwrap(),
         ));
         command.arg("--dev");
+        if let Some(limit) = limit {
+            command.args(["--max-connections", &limit.to_string()]);
+        }
+
         if trust {
             command.arg("--trust-local");
         }
@@ -681,3 +689,5 @@ async fn dev_role_apis_trust_crud_h2c_and_scram() {
     .await
     .expect("dev API scenario exceeded bound");
 }
+
+include!("connection_limits_network.inc");

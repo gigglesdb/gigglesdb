@@ -60,7 +60,8 @@ pub async fn serve_postgresql_bound(
             }
         }
         let sem = Arc::new(Semaphore::new(listener.connections));
-        let rejections = ConnectionRejections::new();
+        let rejections = ConnectionRejections::new()
+            .with_cancel(task_service.clone(), CancelListener::Role);
         let accept = listener.tls_config.clone().map(TlsAcceptor::from);
         let mut tasks = JoinSet::new();
         loop {
@@ -114,15 +115,22 @@ pub(crate) struct ConnectionRejections {
     slots: Arc<Semaphore>,
     refused: std::cell::Cell<u64>,
     logged: std::cell::Cell<Option<std::time::Instant>>,
+    cancel: Option<(Arc<Service>, CancelListener)>,
 }
 
 impl ConnectionRejections {
     pub(crate) fn new() -> Self {
         Self {
+            cancel: None,
             slots: Arc::new(Semaphore::new(MAX_REJECTION_TASKS)),
             refused: std::cell::Cell::new(0),
             logged: std::cell::Cell::new(None),
         }
+    }
+
+    pub(crate) fn with_cancel(mut self, service: Arc<Service>, listener: CancelListener) -> Self {
+        self.cancel = Some((service, listener));
+        self
     }
 
     pub(crate) fn reject(
@@ -146,17 +154,31 @@ impl ConnectionRejections {
         let Ok(permit) = self.slots.clone().try_acquire_owned() else {
             return;
         };
+        let cancel = self.cancel.clone();
         let accept = accept.cloned();
         tasks.spawn(async move {
             let _permit = permit;
-            let _ = timeout(REJECTION_TIMEOUT, reject_connection(socket, accept)).await;
+            let _ = timeout(REJECTION_TIMEOUT, reject_connection(socket, accept, cancel)).await;
         });
     }
 }
 
-async fn reject_connection(socket: TcpStream, accept: Option<TlsAcceptor>) -> io::Result<()> {
+/// Selects exactly the cancellation authority used by the admitted path.
+#[derive(Clone, Copy)]
+pub(crate) enum CancelListener {
+    Role,
+    Bound,
+    Agent,
+}
+
+async fn reject_connection(
+    socket: TcpStream,
+    accept: Option<TlsAcceptor>,
+    cancel: Option<(Arc<Service>, CancelListener)>,
+) -> io::Result<()> {
     let mut stream: Box<dyn Stream> = Box::new(socket);
     let mut negotiations = 0;
+    let mut fingerprint = None;
     let mut ssl_seen = false;
     loop {
         let body = read_startup_packet(&mut stream).await?;
@@ -172,7 +194,11 @@ async fn reject_connection(socket: TcpStream, accept: Option<TlsAcceptor>) -> io
                     // A plaintext startup receives only the public error and is closed.
                     if let Some(accept) = &accept {
                         send(&mut stream, b"S").await?;
-                        stream = Box::new(accept.accept(stream).await?);
+                        let tls = accept.accept(stream).await?;
+                        fingerprint = tls.get_ref().1.peer_certificates()
+                            .and_then(|certs| certs.first())
+                            .map(|cert| crate::tls::fingerprint(cert.as_ref()));
+                        stream = Box::new(tls);
                         continue;
                     }
                 }
@@ -181,6 +207,31 @@ async fn reject_connection(socket: TcpStream, accept: Option<TlsAcceptor>) -> io
             196608 => {
                 fatal(&mut stream, "53300", "sorry, too many clients already").await?;
                 return stream.shutdown().await;
+            }
+            80877102 if body.len() == 12 => {
+                let pid = u32::from_be_bytes(body[4..8].try_into().unwrap());
+                let secret = u32::from_be_bytes(body[8..12].try_into().unwrap());
+                if let Some((service, listener)) = &cancel {
+                    match listener {
+                        CancelListener::Role => service.cancellations.cancel_key("pgrole:", pid, secret),
+                        CancelListener::Bound => {
+                            if let Some(fp) = &fingerprint && let Ok(session) = service.session(fp) {
+                                service.cancel_bound(&session, pid, secret);
+                            }
+                        }
+                        // As on the admitted path, only a known certificate uses
+                        // agent-map authority; SQL credentials use their secret key.
+                        CancelListener::Agent if ssl_seen && accept.is_some() => {
+                            if let Some(fp) = &fingerprint && service.agent_known(fp) {
+                                service.cancel_agent(fp, pid, secret);
+                            } else {
+                                service.cancellations.cancel_key("sqlcred:", pid, secret);
+                            }
+                        }
+                        CancelListener::Agent => {}
+                    }
+                }
+                return Ok(());
             }
             // CancelRequest has no response. Ignore malformed negotiations too.
             _ => return Ok(()),
@@ -291,6 +342,7 @@ async fn connection(
     };
     session.connection = Some(shared);
     session.backend_ssl = encrypted;
+    session.max_connections = Some(listener.connections);
     session.database = Some(startup.database.clone());
     session.pgwire_listener_work = Some(work);
     if !service.admission.request() {
