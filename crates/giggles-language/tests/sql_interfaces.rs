@@ -274,6 +274,10 @@ fn all_rows(sql: &mut SqlSession) -> SqlResult {
 fn core_sql_contract_corpus_preserves_values_versions_and_rejections() {
     let inventory = inventory();
     let (admin, mut sql) = fixture();
+    // PG 18.6 psql: CREATE TABLE. Temporal SQL PK creation is now supported.
+    sql.execute("CREATE TABLE dated (id TIMESTAMPTZ PRIMARY KEY)", &[], None)
+        .unwrap();
+    sql.execute("DROP TABLE dated", &[], None).unwrap();
     let catalog = admin.catalog().unwrap();
     let baseline = all_rows(&mut sql);
     for case in inventory.core_sql_cases {

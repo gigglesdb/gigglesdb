@@ -1389,14 +1389,18 @@ impl Transaction {
     pub(crate) fn require_features(&mut self, bits: u64) {
         self.features_or |= bits;
     }
-    pub(crate) fn set_secondary_index_features(&mut self, partial: bool, temporal: bool) {
-        use super::meta::{PARTIAL_INDEXES, TEMPORAL_INDEXES};
+    pub(crate) fn clear_key_types_on_commit(&mut self) {
+        self.raw.push(RawOp::ClearKeyTypes);
+    }
+    pub(crate) fn set_key_features(&mut self, partial: bool, temporal: bool, key_types: bool) {
+        use super::meta::{KEY_TYPES, PARTIAL_INDEXES, TEMPORAL_INDEXES};
         // Use the final catalog image so CREATE followed by DROP in the same
         // transaction cannot enable the feature without an index.
-        self.features_or &= !(PARTIAL_INDEXES | TEMPORAL_INDEXES);
+        self.features_or &= !(PARTIAL_INDEXES | TEMPORAL_INDEXES | KEY_TYPES);
         self.require_features(
             (if partial { PARTIAL_INDEXES } else { 0 })
-                | (if temporal { TEMPORAL_INDEXES } else { 0 }),
+                | (if temporal { TEMPORAL_INDEXES } else { 0 })
+                | (if key_types { KEY_TYPES } else { 0 }),
         );
     }
     pub(crate) fn require_subversion(&mut self, version: u32) {

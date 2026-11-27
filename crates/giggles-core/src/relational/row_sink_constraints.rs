@@ -221,10 +221,19 @@ pub(super) fn hydrate_with_probes(
                     }
                     // Deduplicate encoded probes without relying on Value's SQL order.
                     let probe_values = converted.as_deref().unwrap_or(&values);
+                    let canonical = probe_values.iter().zip(&targets)
+                        .map(|(value, &i)| {
+                            if supported {
+                                key_value(&target.columns[i].data_type, value)
+                            } else {
+                                std::borrow::Cow::Borrowed(value)
+                            }
+                        }).collect::<Vec<_>>();
+                    let refs = || canonical.iter().map(std::borrow::Cow::as_ref);
                     let signature = if probe_values.iter().any(Value::is_temporal) {
-                        secondary_index_adapter::encode_tuple(probe_values.iter())
+                        secondary_index_adapter::encode_tuple(refs())
                     } else {
-                        encode_key(probe_values)
+                        encode_key_iter(refs())
                     }.map_err(CoreError::Sql)?;
                     if !keys.insert(signature) {
                         continue;

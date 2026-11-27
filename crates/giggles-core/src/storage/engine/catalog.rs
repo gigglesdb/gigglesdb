@@ -1110,7 +1110,7 @@ impl Catalog {
                 // Admit these features from the final catalog overlay.
                 txn.require_features(bits & !(super::meta::UUID_ARRAY_COLUMNS
                     | super::meta::GENERATED_COLUMNS | super::meta::TEXT_SEARCH_TYPES
-                    | super::meta::GIN_INDEXES | super::meta::PARTIAL_INDEXES | super::meta::STORAGE_METADATA));
+                    | super::meta::GIN_INDEXES | super::meta::PARTIAL_INDEXES | super::meta::STORAGE_METADATA | super::meta::KEY_TYPES));
             }
         }
         self.lock_and_write(txn, &old_records, &new_records, deadline, cancel)?;
@@ -1118,7 +1118,8 @@ impl Catalog {
         let temporal = relational::secondary_index::has_temporal_indexes(
             &new.indexes, new.tables.values(),
         );
-        txn.set_secondary_index_features(partial, temporal);
+        let key_types = relational::secondary_index::has_key_types(&new.indexes, new.tables.values());
+        txn.set_key_features(partial, temporal, key_types);
         if !new.indexes.is_empty() {
             txn.require_features(super::meta::SECONDARY_INDEXES);
         }
@@ -1607,11 +1608,21 @@ impl Catalog {
         if final_view.has_uuid_arrays() {
             txn.require_features(super::meta::UUID_ARRAY_COLUMNS);
         }
-        txn.set_secondary_index_features(
+        let key_types = |view: &CatalogView| {
+            view.by_id.values().any(|entry| entry.def.primary_uses_key_types())
+                || view.indexes.values().any(|index| index.has_bpchar_key(&view.by_id[&index.table].def))
+        };
+        let has_key_types = key_types(&final_view);
+        // Publish the live catalog feature with the catalog generation.
+        if !has_key_types && key_types(latest) {
+            txn.clear_key_types_on_commit();
+        }
+        txn.set_key_features(
             !final_view.index_predicates.predicates.is_empty(),
             final_view.indexes.values().any(|index| {
                 index.has_temporal_key(&final_view.by_id[&index.table].def)
             }),
+            has_key_types,
         );
         if final_view.has_text_search_types() {
             txn.require_features(super::meta::TEXT_SEARCH_TYPES);

@@ -53,7 +53,8 @@ pub(crate) const TEXT_SEARCH_TYPES: u64 = 1 << 37;
 pub(crate) const GIN_INDEXES: u64 = 1 << 38;
 pub(crate) const USER_ROUTINES: u64 = 1 << 39;
 pub(crate) const STORAGE_METADATA: u64 = 1 << 40;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 39] = [
+pub(crate) const KEY_TYPES: u64 = 1 << 41;
+pub(crate) const FEATURE_TABLE: [(u64, &str); 40] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -93,6 +94,7 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 39] = [
     (GIN_INDEXES, "gin_indexes"),
     (USER_ROUTINES, "user_routines"),
     (STORAGE_METADATA, "storage_metadata"),
+    (KEY_TYPES, "key_types"),
 ];
 #[path = "meta_range.rs"]
 mod range_local;
@@ -521,10 +523,10 @@ pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
             | WRITE_FENCE
             | USER_COLLATIONS
             | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS | ROLE_MEMBERSHIP | WIDE_ROWS | UUID_ARRAY_COLUMNS
-            | ENUM_ARRAY_COLUMNS | ENUM_LABEL_IDENTITIES | WIDE_CATALOG | PARTIAL_INDEXES | TEMPORAL_INDEXES | GENERATED_COLUMNS | TEXT_SEARCH_TYPES | GIN_INDEXES | STORAGE_METADATA,
+            | ENUM_ARRAY_COLUMNS | ENUM_LABEL_IDENTITIES | WIDE_CATALOG | PARTIAL_INDEXES | TEMPORAL_INDEXES | GENERATED_COLUMNS | TEXT_SEARCH_TYPES | GIN_INDEXES | STORAGE_METADATA | KEY_TYPES,
     )
 }
-fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
+pub(in crate::storage) fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
     if bits & !allowed != 0 {
         return Err(FormatError::Unsupported("feature bits".into()));
     }

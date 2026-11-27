@@ -811,3 +811,30 @@ fn partial_index_format_envelope_rejects_deep_saved_predicate() {
     );
     assert!(matches!(normal(encoded), Err(CoreError::Corrupt(_))));
 }
+
+#[test]
+fn key_types_legacy_feature_tracks_live_keys() {
+    let mut state = empty(17);
+    let exec = |state: &mut State, sql: &str| {
+        let prepared = crate::relational::Prepared::parse(sql, 17, state.sql.epoch).unwrap();
+        state.sql.execute(&prepared, &[], None).unwrap();
+    };
+    exec(&mut state, "CREATE TABLE ordinary (id int PRIMARY KEY, code bpchar, day date)");
+    exec(&mut state, "INSERT INTO ordinary VALUES (1, 'unindexed ', '2024-01-01')");
+    let bits = |state: &State| feature_bits_present(state).unwrap() & KEY_TYPES;
+    assert_eq!(bits(&state), 0);
+
+    exec(&mut state, "CREATE TABLE calendar (day date PRIMARY KEY)");
+    exec(&mut state, "INSERT INTO calendar VALUES ('2024-01-02')");
+    exec(&mut state, "CREATE UNIQUE INDEX ordinary_code ON ordinary(code)");
+    assert_eq!(bits(&state), KEY_TYPES);
+    let encoded = records(&state).unwrap();
+    assert!(matches!(decode_bits_allowed(&encoded, 53, false, NEW_BITS & !KEY_TYPES),
+        Err(CoreError::Unsupported)));
+    state = normal(encoded).unwrap();
+    exec(&mut state, "DROP TABLE calendar");
+    assert_eq!(bits(&state), KEY_TYPES);
+    exec(&mut state, "DROP INDEX ordinary_code");
+    assert_eq!(bits(&state), 0);
+    assert_eq!(bits(&normal(records(&state).unwrap()).unwrap()), 0);
+}

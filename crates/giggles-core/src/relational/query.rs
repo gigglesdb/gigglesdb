@@ -276,7 +276,20 @@ pub(super) fn primary_key_candidate_supported(ty: &DataType) -> bool {
     matches!(ty, DataType::Boolean | DataType::SmallInt | DataType::Integer
         | DataType::BigInt | DataType::Text | DataType::Varchar | DataType::Bytes
         | DataType::Numeric | DataType::Real | DataType::DoublePrecision)
+        || ty.uses_key_types()
 }
+/// Raw parameters carry values but can lack a bound SQL type. Character
+/// comparisons need that type to decide which side loses trailing spaces.
+pub(super) fn key_parameter_compatible(column_type: &DataType, parameter_type: Option<&DataType>) -> bool {
+    match column_type {
+        DataType::Bpchar => matches!(parameter_type, Some(DataType::Bpchar | DataType::Varchar)),
+        DataType::Text | DataType::Varchar => {
+            matches!(parameter_type, Some(ty) if *ty != DataType::Bpchar)
+        }
+        _ => true,
+    }
+}
+
 pub(super) fn primary_key_literal_value(value: &Value, column: &ColumnDef) -> Option<Value> {
     primary_key_candidate_value(&Scalar::Literal(value.clone()), column, &[])
 }
@@ -1140,7 +1153,7 @@ impl Filter {
                 p.punct(')')?;
                 admit_expansion(&a, values.len())?;
                 constraints::enum_text::membership(&a, &values, not)
-                    .unwrap_or_else(|| Self::membership(&a, &values, not))
+                    .unwrap_or_else(|| Self::in_list(a, values, not))
             }
         } else if p.word("between") {
             let symmetric = p.word("symmetric");
@@ -1394,6 +1407,78 @@ impl Filter {
         Self::Logic(Box::new(Self::combine(&filters[..middle], and)), and,
             Box::new(Self::combine(&filters[middle..], and)))
     }
+    const IN_LIST: &str = "\0in_list";
+    const NOT_IN_LIST: &str = "\0not_in_list";
+
+    fn in_list(value: Scalar, mut list: Vec<Scalar>, not: bool) -> Self {
+        // Keep simple literal lists and integer point lookups in the ordinary
+        // predicate tree. Typed character operands can need a common type.
+        let integer_list = list
+            .iter()
+            .all(|v| matches!(v, Scalar::Literal(Value::Int(_)) | Scalar::Param(_)))
+            && list.iter().any(|v| matches!(v, Scalar::Literal(Value::Int(_))));
+        if list.len() > 1 && !integer_list && list.iter().any(|v| !matches!(v, Scalar::Literal(_))) {
+            list.insert(0, value);
+            return Self::Scalar(Scalar::Call(
+                if not { Self::NOT_IN_LIST } else { Self::IN_LIST }.into(),
+                list,
+            ));
+        }
+        Self::membership(&value, &list, not)
+    }
+
+    fn bind_in_list(
+        args: &[Scalar],
+        not: bool,
+        parameters: &[Option<DataType>],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+    ) -> R<BoundFilter> {
+        let (value, list) = args.split_first().ok_or(SqlError::InternalError)?;
+        let value_type = value.bind(resolve, tables, parameters)?.ty;
+        if matches!(value_type, DataType::Bpchar | DataType::Text | DataType::Varchar) {
+            let unknown = |item: &Scalar| matches!(item, Scalar::Literal(Value::Null | Value::Text(_)));
+            let mut common = (!unknown(value)).then(|| value_type.clone());
+            let mut constant = Vec::with_capacity(list.len());
+            let mut all_character = true;
+            let mut bpchar = value_type == DataType::Bpchar;
+            for item in list {
+                let mut has_column = false;
+                walk_scalar(item, &mut |scalar| {
+                    has_column |= matches!(scalar, Scalar::Column(_));
+                    Ok(())
+                })?;
+                constant.push(!has_column);
+                if has_column {
+                    continue;
+                }
+                let ty = item.bind(resolve, tables, parameters)?.ty;
+                bpchar |= ty == DataType::Bpchar;
+                all_character &= matches!(ty, DataType::Bpchar | DataType::Text | DataType::Varchar)
+                    || unknown(item);
+                if !unknown(item) {
+                    common.get_or_insert(ty);
+                }
+            }
+            // PG resolves two or more non-column RHS expressions together,
+            // taking the first known character type when all casts go both
+            // ways. RHS column expressions keep pairwise resolution.
+            if bpchar && all_character && constant.iter().filter(|&&c| c).count() > 1
+                && let Some(common) = common
+            {
+                let list = list.iter().zip(constant).map(|(item, constant)| {
+                    if constant {
+                        Scalar::Cast(Box::new(item.clone()), common.clone())
+                    } else {
+                        item.clone()
+                    }
+                }).collect::<Vec<_>>();
+                return Self::membership(value, &list, not).bind(parameters, resolve, tables);
+            }
+        }
+        Self::membership(value, list, not).bind(parameters, resolve, tables)
+    }
+
     // Split the list in half so large IN lists retain logarithmic filter depth.
     // Callers must call admit_expansion first: every entry clones the lhs.
     fn membership(a: &Scalar, values: &[Scalar], not: bool) -> Self {
@@ -1578,8 +1663,24 @@ impl Filter {
                     bv = bv.enum_rank(&ty)?;
                 }
 
-                if av.ty == DataType::Bpchar || bv.ty == DataType::Bpchar {
-                    return Err(SqlError::Unsupported);
+                let unknown =
+                    |a: &Scalar| matches!(a, Scalar::Literal(Value::Null | Value::Text(_)));
+                // A bpchar comparison uses the text operator for a
+                // text operand and the bpchar operator for a varchar operand.
+                match (&av.ty, &bv.ty) {
+                    (DataType::Bpchar, DataType::Text) if !unknown(b) => {
+                        av = bind(&Scalar::Cast(Box::new(a.clone()), DataType::Text))?;
+                    }
+                    (DataType::Text, DataType::Bpchar) if !unknown(a) => {
+                        bv = bind(&Scalar::Cast(Box::new(b.clone()), DataType::Text))?;
+                    }
+                    (DataType::Bpchar, DataType::Varchar) => {
+                        bv = bind(&Scalar::Cast(Box::new(b.clone()), DataType::Bpchar))?;
+                    }
+                    (DataType::Varchar, DataType::Bpchar) => {
+                        av = bind(&Scalar::Cast(Box::new(a.clone()), DataType::Bpchar))?;
+                    }
+                    _ => {}
                 }
                 if av.ty == DataType::Varchar {
                     av.ty = DataType::Text;
@@ -1587,8 +1688,6 @@ impl Filter {
                 if bv.ty == DataType::Varchar {
                     bv.ty = DataType::Text;
                 }
-                let unknown =
-                    |a: &Scalar| matches!(a, Scalar::Literal(Value::Null | Value::Text(_)));
                 if av.ty != bv.ty {
                     if unknown(a) {
                         av = bind(&Scalar::Cast(Box::new(a.clone()), bv.ty.clone()))?;
@@ -1835,7 +1934,7 @@ impl BoundFilter {
                         }
                         has_null |= element == Value::Null;
                         if element != Value::Null && (keys.is_some() || key_file.is_some()) {
-                            let key = encode_key(std::slice::from_ref(&element))?;
+                            let key = encode_transient_key(std::slice::from_ref(&element))?;
                             let bytes = key.len() + 4 * std::mem::size_of::<usize>();
                             let mut retention = execution.retention.borrow_mut();
                             if captured.is_some() && keys.is_some() && key_bytes + bytes > spill::in_hash_bytes() {
@@ -1884,7 +1983,7 @@ impl BoundFilter {
                         }
                         match functions::join_key(&lhs, &value.ty, column_type)? {
                             Some(key) => {
-                                let key = encode_key(&[key])?;
+                                let key = encode_transient_key(&[key])?;
                                 match &materialized.keys {
                                     InKeys::Hash(keys) => keys.contains(&key),
                                     InKeys::File(keys) => keys.contains(&key)?,
@@ -3247,8 +3346,10 @@ impl Query {
                 };
                 let outer_ty = &tables[outer.source].columns[outer.column].data_type;
                 let inner_ty = &tables[inner.source].columns[inner.column].data_type;
-                if functions::oid_integer_pair(outer_ty, inner_ty) {
-                    // The bound ON filter converts the integer before comparison.
+                if functions::oid_integer_pair(outer_ty, inner_ty)
+                    || *outer_ty == DataType::Bpchar || *inner_ty == DataType::Bpchar
+                {
+                    // The bound ON filter handles operand coercion and bpchar padding.
                     continue;
                 }
                 if !functions::comparable(outer_ty, inner_ty) {
@@ -3305,6 +3406,7 @@ impl Query {
                         && aggregate_filter::decode(condition).is_ok_and(|f| filter(&f))
                 }
                 Scalar::Call(name, args) if name == functions::CAST_TYPMOD || functions::collation::internal(name)
+                    || matches!(name.as_str(), Filter::IN_LIST | Filter::NOT_IN_LIST)
                     || name.starts_with(functions::ROW_ORDER_PREFIX) || advisory::is_key_expression(name) => {
                     args.iter().all(scalar)
                 }
@@ -3772,7 +3874,9 @@ impl Query {
             })
     }
     // Reuse the parser's mandatory AND bounds; residual SQL is still evaluated.
-    pub(super) fn v2_index_predicates(&self, params: &[Value]) -> Vec<(String, String, Value)> {
+    pub(super) fn v2_index_predicates(
+        &self, table: &TableDef, params: &[Value], parameter_types: &[Option<DataType>],
+    ) -> Vec<(String, String, Value)> {
         if self.clauses().is_some_and(|c| !c.view_reads.is_empty()) { return Vec::new(); }
         if self.sources.len() != 1 || !self.joins.is_empty() || self.has_in_subquery() {
             return Vec::new();
@@ -3782,7 +3886,14 @@ impl Query {
             .filter_map(|(column, op, expr)| {
                 let value = match expr {
                     Expr::Literal(value) => value.clone(),
-                    Expr::Param(n) => params.get(n.checked_sub(1)?)?.clone(),
+                    Expr::Param(n) => {
+                        let index = n.checked_sub(1)?;
+                        let ty = &table.columns.iter().find(|c| c.name == column.name)?.data_type;
+                        if !key_parameter_compatible(ty, parameter_types.get(index).and_then(Option::as_ref)) {
+                            return None;
+                        }
+                        params.get(index)?.clone()
+                    }
                 };
                 Some((column.name.clone(), op.clone(), value))
             })
@@ -3792,31 +3903,45 @@ impl Query {
     /// None preserves the paged scan for unsupported coercions or unbounded keys.
     pub(super) fn mutation_primary_keys(
         &self, state: &Relational, table: &TableDef, params: &[Value],
+        parameter_types: &[Option<DataType>],
     ) -> Option<Vec<Vec<Value>>> {
-        self.primary_key_candidates(state, table, params, 200).map(|(keys, _)| keys)
+        self.primary_key_candidates(state, table, params, 200, |i| {
+            parameter_types.get(i).and_then(Option::as_ref)
+        }).map(|(keys, _)| keys)
     }
-    fn primary_key_candidates(
+    fn primary_key_candidates<'p>(
         &self, state: &Relational, table: &TableDef, params: &[Value], max_keys: usize,
+        parameter_type: impl Fn(usize) -> Option<&'p DataType>,
     ) -> Option<(Vec<Vec<Value>>, bool)> {
+        let candidate = |scalar: &Scalar, column: &ColumnDef| {
+            if let Scalar::Param(n) = scalar
+                && !key_parameter_compatible(&column.data_type, parameter_type(n.checked_sub(1)?))
+            {
+                return None;
+            }
+            primary_key_candidate_value(scalar, column, params)
+        };
         if table.primary_key.iter().any(|i| !state.deterministic_column(table.columns[*i].id)) { return None; }
         // Keep one candidate page within the existing 200-row staging budgets.
         // Skipping a noncandidate must not skip an error/volatile expression that
         // the old scan would evaluate before a later key test. Restrict residuals
         // to total, exact comparisons and NULL/boolean tests over simple columns.
-        fn total(f: &Filter, table: &TableDef, params: &[Value]) -> bool {
+        fn total(f: &Filter, table: &TableDef, candidate: &impl Fn(&Scalar, &ColumnDef) -> Option<Value>) -> bool {
             let column = |s: &Scalar| match s {
-                Scalar::Column(c) => table.columns.iter().find(|d| d.name == c.name),
+                Scalar::Column(c) => table.columns.iter().enumerate().find(|(i, d)| {
+                    d.name == c.name && (!d.data_type.is_temporal() || table.primary_key.contains(i))
+                }).map(|(_, column)| column),
                 _ => None,
             };
             match f {
-                Filter::Logic(a, _, b) => total(a, table, params) && total(b, table, params),
-                Filter::Not(a) | Filter::Is(a, _, _) => total(a, table, params),
+                Filter::Logic(a, _, b) => total(a, table, candidate) && total(b, table, candidate),
+                Filter::Not(a) | Filter::Is(a, _, _) => total(a, table, candidate),
                 Filter::Compare(a, _, b) => {
                     if let Some(c) = column(a) {
                         if let Some(d) = column(b) {
                             primary_key_candidate_supported(&c.data_type) && c.data_type == d.data_type
-                        } else { primary_key_candidate_value(b, c, params).is_some() }
-                    } else if let Some(c) = column(b) { primary_key_candidate_value(a, c, params).is_some() }
+                        } else { candidate(b, c).is_some() }
+                    } else if let Some(c) = column(b) { candidate(a, c).is_some() }
                     else { false }
                 }
                 Filter::Null(s, _) => matches!(s, Scalar::Column(_) | Scalar::Literal(_)),
@@ -3825,18 +3950,18 @@ impl Query {
                 _ => false,
             }
         }
-        fn domain(f: &Filter, column: &ColumnDef, params: &[Value], max_keys: usize) -> Option<BTreeMap<Vec<u8>, Value>> {
+        fn domain(f: &Filter, column: &ColumnDef, candidate: &impl Fn(&Scalar, &ColumnDef) -> Option<Value>, max_keys: usize) -> Option<BTreeMap<Vec<u8>, Value>> {
             match f {
                 Filter::Compare(a, op, b) if op == "=" => {
                     let s = match (a, b) {
                         (Scalar::Column(c), s) | (s, Scalar::Column(c)) if c.name == column.name => s,
                         _ => return None,
                     };
-                    let v = primary_key_candidate_value(s, column, params)?;
-                    Some(BTreeMap::from([(encode_key(std::slice::from_ref(&v)).ok()?, v)]))
+                    let v = candidate(s, column)?;
+                    Some(BTreeMap::from([(encode_typed_key(std::iter::once((&column.data_type, &v))).ok()?, v)]))
                 }
                 Filter::Logic(a, and, b) => {
-                    let (a, b) = (domain(a, column, params, max_keys), domain(b, column, params, max_keys));
+                    let (a, b) = (domain(a, column, candidate, max_keys), domain(b, column, candidate, max_keys));
                     if *and {
                         // Either mandatory conjunct supplies a sound superset.
                         match (a, b) {
@@ -3855,7 +3980,36 @@ impl Query {
         if self.sources.len() != 1 || !self.joins.is_empty() || self.has_in_subquery()
             || table.hidden_rowid().is_some() || table.primary_key.is_empty()
             || table.columns.iter().any(|c| state.column_type(c.id).is_some()) { return None; }
-        let filter = self.filter.as_ref()?;
+        // Character IN lists retain their common-type binding. Once the key
+        // column is known to be integer, parameter-only lists can use the
+        // ordinary equality-domain classifier without changing that binding.
+        fn integer_lists<'a>(filter: &'a Filter, table: &TableDef) -> std::borrow::Cow<'a, Filter> {
+            use std::borrow::Cow;
+            match filter {
+                Filter::Scalar(Scalar::Call(name, args)) if name == Filter::IN_LIST => {
+                    if let Some((Scalar::Column(column), list)) = args.split_first()
+                        && table.columns.iter().any(|c| c.name == column.name
+                            && matches!(c.data_type, DataType::SmallInt | DataType::Integer | DataType::BigInt))
+                        && list.iter().all(|s| matches!(s, Scalar::Param(_) | Scalar::Literal(Value::Int(_) | Value::Null)))
+                    {
+                        return Cow::Owned(Filter::membership(&args[0], list, false));
+                    }
+                    Cow::Borrowed(filter)
+                }
+                Filter::Logic(a, and, b) => {
+                    let left = integer_lists(a, table);
+                    let right = integer_lists(b, table);
+                    if matches!(left, Cow::Borrowed(_)) && matches!(right, Cow::Borrowed(_)) {
+                        Cow::Borrowed(filter)
+                    } else {
+                        Cow::Owned(Filter::Logic(Box::new(left.into_owned()), *and, Box::new(right.into_owned())))
+                    }
+                }
+                _ => Cow::Borrowed(filter),
+            }
+        }
+        let filter = integer_lists(self.filter.as_ref()?, table);
+        let filter = filter.as_ref();
         // Leave NULL-key comparisons to the full WHERE evaluator, even when
         // another AND conjunct supplies a non-NULL candidate for the same key.
         fn null_key(f: &Filter, table: &TableDef, params: &[Value]) -> bool {
@@ -3886,16 +4040,16 @@ impl Query {
                 Expr::Literal(v) => Scalar::Literal(v.clone()),
                 Expr::Param(n) => Scalar::Param(*n),
             };
-            *op == "=" && primary_key_candidate_value(&scalar, &table.columns[*i], params).is_some()
+            *op == "=" && candidate(&scalar, &table.columns[*i]).is_some()
         });
-        if !exact_bounds && !total(filter, table, params) { return None; }
+        if !exact_bounds && !total(filter, table, &candidate) { return None; }
         // An exact domain contains each key column once, with only ORs within
         // that column's equality domain. Repeated AND bounds retain evaluation.
-        fn exact_column(f: &Filter, table: &TableDef, params: &[Value]) -> Option<usize> {
+        fn exact_column(f: &Filter, table: &TableDef, candidate: &impl Fn(&Scalar, &ColumnDef) -> Option<Value>) -> Option<usize> {
             match f {
                 Filter::Logic(a, false, b) => {
-                    let column = exact_column(a, table, params)?;
-                    (exact_column(b, table, params)? == column).then_some(column)
+                    let column = exact_column(a, table, candidate)?;
+                    (exact_column(b, table, candidate)? == column).then_some(column)
                 }
                 Filter::Compare(a, op, b) if op == "=" => {
                     let (c, s) = match (a, b) {
@@ -3903,31 +4057,31 @@ impl Query {
                         _ => return None,
                     };
                     let i = *table.primary_key.iter().find(|i| table.columns[**i].name == c.name)?;
-                    primary_key_candidate_value(s, &table.columns[i], params)?;
+                    candidate(s, &table.columns[i])?;
                     Some(i)
                 }
                 _ => None,
             }
         }
-        fn exact_columns(f: &Filter, table: &TableDef, params: &[Value], seen: &mut BTreeSet<usize>) -> bool {
+        fn exact_columns(f: &Filter, table: &TableDef, candidate: &impl Fn(&Scalar, &ColumnDef) -> Option<Value>, seen: &mut BTreeSet<usize>) -> bool {
             match f {
-                Filter::Logic(a, true, b) => exact_columns(a, table, params, seen)
-                    && exact_columns(b, table, params, seen),
-                _ => exact_column(f, table, params).is_some_and(|i| seen.insert(i)),
+                Filter::Logic(a, true, b) => exact_columns(a, table, candidate, seen)
+                    && exact_columns(b, table, candidate, seen),
+                _ => exact_column(f, table, candidate).is_some_and(|i| seen.insert(i)),
             }
         }
         let mut seen = BTreeSet::new();
-        let exact = exact_columns(filter, table, params, &mut seen) && seen.len() == table.primary_key.len();
+        let exact = exact_columns(filter, table, &candidate, &mut seen) && seen.len() == table.primary_key.len();
         let mut tuples = BTreeMap::from([(Vec::new(), Vec::new())]);
         for offset in &table.primary_key {
-            let values = domain(filter, &table.columns[*offset], params, max_keys)?;
+            let values = domain(filter, &table.columns[*offset], &candidate, max_keys)?;
             if tuples.len().checked_mul(values.len())? > max_keys { return None; }
             let mut next = BTreeMap::new();
             for prefix in tuples.into_values() {
                 for v in values.values() {
                     let mut tuple = prefix.clone();
                     tuple.push(v.clone());
-                    next.insert(encode_key(&tuple).ok()?, tuple);
+                    next.insert(encode_primary_key(table, &tuple).ok()?, tuple);
                 }
             }
             tuples = next;
@@ -4400,7 +4554,14 @@ impl Query {
                     if integer_width(old) && integer_width(ty) {
                         return Ok(true);
                     }
-                    if functions::comparable(old, ty) {
+                    if *ty == DataType::Bpchar && *old == DataType::Varchar {
+                        return Ok(true);
+                    }
+                    if functions::comparable(old, ty)
+                        || matches!((old, ty),
+                            (DataType::Text, DataType::Bpchar)
+                            | (DataType::Bpchar, DataType::Text | DataType::Varchar))
+                    {
                         // Cross-type comparisons run in the full filter. A
                         // converted column key can round and miss matching rows.
                         return Ok(false);
@@ -4453,9 +4614,6 @@ impl Query {
         let mut predicates = vec![];
         for (c, op, e) in &self.predicates {
             let c = resolve(c, tables.len()).inspect_err(|error| c.diagnose(error))?;
-            if tables[c.source].columns[c.column].data_type == DataType::Bpchar {
-                return Err(SqlError::Unsupported);
-            }
             let column = &tables[c.source].columns[c.column];
             if !state.byte_key_predicate(column, op) {
                 continue;
@@ -4570,7 +4728,10 @@ impl Query {
                         (None, d)
                     };
                     let item = match source_column {
-                        Some(column) if projection == ProjectionBinding::Describe && !functions::collation::has_column_metadata(d.id)
+                        // Nested DISTINCT and DISTINCT ON use the typed projection for equality.
+                        Some(column) if projection == ProjectionBinding::Describe
+                            && d.data_type != DataType::Bpchar
+                            && !functions::collation::has_column_metadata(d.id)
                             && !generated::is_virtual(d.id) => BoundItem::Column(column),
                         _ => BoundItem::Scalar(e),
                     };
@@ -4596,6 +4757,7 @@ impl Query {
                     });
                     if json_aggregate::result_type(*a).is_none()
                         && c.as_ref().is_some_and(|c| c.ty == DataType::Bpchar)
+                        && !bpchar_aggregate(*a)
                     {
                         return Err(SqlError::Unsupported);
                     }
@@ -4694,6 +4856,7 @@ impl Query {
                             let item = if let Some(value) = generated::virtual_binding(&tables, c)? {
                                 BoundItem::Scalar(functions::collation::column(value, d.id)?)
                             } else if functions::collation::has_column_metadata(d.id)
+                                || d.data_type == DataType::Bpchar
                                 || self.distinct() && d.data_type.is_array()
                             {
                                 BoundItem::Scalar(functions::collation::bound_column(c, &d)?)
@@ -4740,9 +4903,6 @@ impl Query {
                 let bound = e
                     .bind(&resolve, &tables, &parameters)?
                     .enum_sort(state, &tables);
-                if bound.ty == DataType::Bpchar {
-                    return Err(SqlError::Unsupported);
-                }
                 bound.require_collation()?;
                 if let Some(output) = output
                     && !self.distinct()
@@ -4984,7 +5144,7 @@ fn join_rows<'a>(
                             let candidate = candidate?;
                             let values = keys.iter().map(|(column, _)| candidate.row.values[*column].clone()).collect::<Vec<_>>();
                             if values.contains(&Value::Null) { continue; }
-                            let key = encode_key(&values)?;
+                            let key = encode_transient_key(&values)?;
                             let bytes = key.len().saturating_add(candidate.key.len())
                                 .saturating_add(std::mem::size_of::<(Vec<u8>, SqlRow)>())
                                 .saturating_add(candidate.row.values.iter().map(value_bytes).sum::<usize>());
@@ -5003,7 +5163,7 @@ fn join_rows<'a>(
                     if eligible && !bucket_disabled[depth] {
                         let values = keys.iter().map(|(_, value)| value.clone().unwrap_or(Value::Null)).collect::<Vec<_>>();
                         let candidates = if values.contains(&Value::Null) { Vec::new() } else {
-                            buckets[depth].as_ref().and_then(|b| b.get(&encode_key(&values).ok()?)).cloned().unwrap_or_default()
+                            buckets[depth].as_ref().and_then(|b| b.get(&encode_transient_key(&values).ok()?)).cloned().unwrap_or_default()
                         };
                         #[cfg(test)]
                         super::v2_join_cache_tests::BUCKET_PROBES.set(super::v2_join_cache_tests::BUCKET_PROBES.get() + 1);
@@ -5021,7 +5181,7 @@ fn join_rows<'a>(
                 } else {
                     let candidate = match join.key(&row)? {
                         Some(key) => {
-                            let key = (depth, encode_key(&key)?);
+                            let key = (depth, encode_primary_key(table, &key)?);
                             if let Some(cached) = point_cache.get(&key) {
                                 cached.as_ref().map(|(key, row)| scan::SourceRow {
                                     key: std::borrow::Cow::Owned(key.clone()),
@@ -5558,7 +5718,10 @@ impl BoundQuery<'_> {
             for (c, op, expr) in &self.query.predicates {
                 let offset = col(self.tables[0], &c.name)?;
                 let column = &self.tables[0].columns[offset];
-                if !state.byte_key_predicate(column, op) {
+                if !state.byte_key_predicate(column, op)
+                    || matches!(expr, Expr::Param(n)
+                        if !key_parameter_compatible(&column.data_type, self.parameters.get(n - 1)))
+                {
                     continue;
                 }
                 let mut value = expr.value(params)?;
@@ -5576,6 +5739,7 @@ impl BoundQuery<'_> {
                         | DataType::BigInt
                         | DataType::Text
                         | DataType::Varchar
+                        | DataType::Bpchar
                         | DataType::Bytes
                         | DataType::Numeric
                         | DataType::Real
@@ -5605,10 +5769,10 @@ impl BoundQuery<'_> {
         let cap = select_points::SELECT_KEY_CAP.get().unwrap_or(2048);
         let mut exact_points = false;
         let mut input = if points_enabled && self.tables.len() == 1 && self.joins.is_empty()
-            && let Some((keys, exact)) = self.query.primary_key_candidates(state, self.tables[0], params, cap)
+            && let Some((keys, exact)) = self.query.primary_key_candidates(state, self.tables[0], params, cap, |i| self.parameters.get(i))
         {
             exact_points = exact;
-            let mut keys = keys.iter().map(|key| encode_key(key)).collect::<R<Vec<_>>>()?;
+            let mut keys = keys.iter().map(|key| encode_primary_key(self.tables[0], key)).collect::<R<Vec<_>>>()?;
             keys.sort();
             keys.dedup();
             if matches!(direction, scan::Direction::Reverse) { keys.reverse(); }
@@ -6054,10 +6218,10 @@ impl BoundQuery<'_> {
         let select_key_cap = select_points::SELECT_KEY_CAP.get().unwrap_or(SELECT_PRIMARY_KEY_CAP);
         let mut exact_points = false;
         let input = if points_enabled && !empty_input && self.tables.len() == 1 && self.joins.is_empty()
-            && let Some((keys, exact)) = self.query.primary_key_candidates(state, self.tables[0], params, select_key_cap)
+            && let Some((keys, exact)) = self.query.primary_key_candidates(state, self.tables[0], params, select_key_cap, |i| self.parameters.get(i))
         {
             exact_points = exact;
-            let mut keys = keys.iter().map(|key| encode_key(key)).collect::<R<Vec<_>>>()?;
+            let mut keys = keys.iter().map(|key| encode_primary_key(self.tables[0], key)).collect::<R<Vec<_>>>()?;
             keys.sort();
             keys.dedup();
             let table = self.tables[0];
@@ -6703,6 +6867,11 @@ fn flush_distinct(
     }
     Ok(())
 }
+fn bpchar_aggregate(kind: Aggregate) -> bool {
+    matches!(kind.base(), Aggregate::Min | Aggregate::Max)
+        || kind.base() == Aggregate::Count && kind.distinct()
+}
+
 fn distinct_input_order(kind: Aggregate, input: Option<&BoundScalar>, a: &Value, b: &Value) -> R<Ordering> {
     if kind.base() == Aggregate::ArrayAgg {
         array_aggregate::compare_distinct(input, a, b)
@@ -7569,7 +7738,7 @@ mod mutation_primary_key_tests {
     }
     fn keys(state: &Relational, sql: &str, params: &[Value]) -> Option<Vec<Vec<Value>>> {
         let p = Prepared::parse(sql, 1, state.epoch).unwrap();
-        searched::target(&p).unwrap().mutation_primary_keys(state, &state.tables["t"], params)
+        searched::target(&p).unwrap().mutation_primary_keys(state, &state.tables["t"], params, &[])
     }
     #[test]
     fn equalities_membership_residuals_and_safe_fallbacks() {

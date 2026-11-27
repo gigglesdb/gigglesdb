@@ -287,6 +287,6 @@
     {"id":"reserved_repair_table","sql":"CREATE TABLE deliveries (id BIGINT PRIMARY KEY)","params":[],"rows":[],"error":"Reserved","reason":"Finite repair tables do not become generic application relations."},
     {"id":"comment","sql":"SELECT * FROM app -- comment","params":[],"rows":[[{"Int":1},{"Text":"first"},{"Bool":true}],[{"Int":2},{"Text":"second"},{"Bool":false}]],"error":null,"reason":"The lexer skips -- line comments and nested /* */ block comments (GD-0059 E1 A4, 2ae5e74), so this full scan returns every row."},
     {"id":"multiple_statements","sql":"SELECT * FROM app; DELETE FROM app WHERE id=1","params":[],"rows":[],"error":"Unsupported","reason":"One SQL statement per core call."},
-    {"id":"unsupported_timestamp","sql":"CREATE TABLE dated (id TIMESTAMPTZ PRIMARY KEY)","params":[],"rows":[],"error":"Unsupported","reason":"The proposed reference scalar family exceeds the current SQL type profile."}
+    {"id":"unsupported_interval","sql":"CREATE TABLE dated (id INTERVAL PRIMARY KEY)","params":[],"rows":[],"error":"Unsupported","reason":"Interval primary keys remain outside the SQL key type profile."}
   ]
 }

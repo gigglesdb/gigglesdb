@@ -682,3 +682,6 @@ mod sql_named_arguments;
 #[path = "sql_maintenance.rs"] mod sql_maintenance;
 
 #[path = "sql_storage_options.rs"] mod sql_storage_options;
+
+#[path = "key_types.rs"]
+mod key_types;

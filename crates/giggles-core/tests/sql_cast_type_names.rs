@@ -311,9 +311,15 @@ fn bpchar_cast_scalar_consumers_remain_fail_closed() {
     let fixture = Fixture::new("fail-closed");
     let mut session = fixture.session();
     let mut failures = Vec::new();
-    for sql in ["SELECT 'a'::char(3)='a'", "SELECT length('ab'::char(4))"] {
-        let actual = session.execute(sql, &[], None).map(|_| ());
-        let expected = Err(CoreError::Sql(E::Unsupported));
+    // PG 18.6 psql -A -t: t; 2.
+    for (sql, value) in [
+        ("SELECT 'a'::char(3)='a'", Value::Bool(true)),
+        ("SELECT length('ab'::char(4))", Value::Int(2)),
+    ] {
+        let actual = session
+            .execute(sql, &[], None)
+            .map(|r| r.rows.into_iter().map(|r| r.values).collect::<Vec<_>>());
+        let expected = Ok(vec![vec![value]]);
         if actual != expected {
             failures.push(format!("{sql}: {actual:?}, expected {expected:?}"));
         }
@@ -583,7 +589,10 @@ fn user_sql_cannot_name_internal_nul_routines() {
         // GD-0092 W0-6 `&` is the integer bitwise operator, so the call to that literal (non-NUL)
         // name is an unknown routine (42883); PG18.6 rejects \0000 in the scanner with 42601
         // ("invalid Unicode escape value"). No NUL-named internal routine is reachable.
-        (r#"SELECT U&"\0000cast:typmod"('x', 3)"#, E::UndefinedFunction),
+        (
+            r#"SELECT U&"\0000cast:typmod"('x', 3)"#,
+            E::UndefinedFunction,
+        ),
         (
             r#"SELECT U&"\0000aggregate-filter:apply"(1)"#,
             E::UndefinedFunction,

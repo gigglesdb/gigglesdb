@@ -359,7 +359,12 @@ pub(super) fn cascade_value(
         // PostgreSQL reports 0A000 when a cascade casts a special numeric to integer.
         return Err(SqlError::Unsupported);
     }
-    let value = query::assignment::convert(value.clone(), &parent.data_type, &child.data_type, None)?;
+    let value = if matches!(child.data_type, DataType::Text | DataType::Varchar) {
+        key_value(&parent.data_type, value).into_owned()
+    } else {
+        value.clone()
+    };
+    let value = query::assignment::convert(value, &parent.data_type, &child.data_type, None)?;
     coerce_to_column(state, child, value)
 }
 

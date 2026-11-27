@@ -12,9 +12,10 @@ pub(crate) const GENERATED_COLUMNS: u64 = crate::storage::engine::meta::GENERATE
 const WIDE_CATALOG: u64 = super::engine::meta::WIDE_CATALOG;
 pub(crate) const PARTIAL_INDEXES: u64 = 1 << 33;
 pub(crate) const TEMPORAL_INDEXES: u64 = 1 << 34;
+pub(crate) const KEY_TYPES: u64 = super::engine::meta::KEY_TYPES;
 pub(super) const NEW_BITS: u64 =
     0x3c0 | KEY_DEPENDENCY_IDENTITY | USER_COLLATIONS | COLUMN_COLLATIONS | UUID_ARRAY_COLUMNS | WIDE_CATALOG
-        | PARTIAL_INDEXES | TEMPORAL_INDEXES | GENERATED_COLUMNS | TEXT_SEARCH_TYPES | GIN_INDEXES;
+        | PARTIAL_INDEXES | TEMPORAL_INDEXES | GENERATED_COLUMNS | TEXT_SEARCH_TYPES | GIN_INDEXES | KEY_TYPES;
 pub(super) const ROLE_BOOTSTRAP: u64 = 1 << 9;
 
 /// E1 B0b: true when the base namespace-5 extension is nonempty.
@@ -70,6 +71,9 @@ pub(super) fn feature_bits_present(s: &State) -> Result<u64, CoreError> {
     let temporal_indexes = crate::relational::secondary_index::has_temporal_indexes(
         s.sql.secondary_descriptors_engine(), s.sql.tables.values(),
     );
+    let key_types = crate::relational::secondary_index::has_key_types(
+        s.sql.secondary_descriptors_engine(), s.sql.tables.values(),
+    );
     Ok(u64::from(typed)
         | (u64::from(s.native_outcomes.is_some()) << 1)
         | (u64::from(s.sql.has_secondary_indexes_engine()) << 2)
@@ -82,6 +86,7 @@ pub(super) fn feature_bits_present(s: &State) -> Result<u64, CoreError> {
         | if wide_catalog_present(s) { WIDE_CATALOG } else { 0 }
         | if s.sql.has_partial_indexes_engine() { PARTIAL_INDEXES } else { 0 }
         | if temporal_indexes { TEMPORAL_INDEXES } else { 0 }
+        | if key_types { KEY_TYPES } else { 0 }
         | if !s.sql.catalog_ext().column_collations.is_empty() { COLUMN_COLLATIONS } else { 0 }
         | if !s.sql.catalog_ext().collations.is_empty() { USER_COLLATIONS } else { 0 }
         | if text_search_types_present(s) { TEXT_SEARCH_TYPES } else { 0 }
@@ -104,6 +109,15 @@ pub(super) fn decode_bits(
     format: u32,
     import: bool,
 ) -> Result<Option<u64>, CoreError> {
+    decode_bits_allowed(records, format, import, NEW_BITS)
+}
+
+fn decode_bits_allowed(
+    records: &BTreeMap<Vec<u8>, Vec<u8>>,
+    format: u32,
+    import: bool,
+    allowed: u64,
+) -> Result<Option<u64>, CoreError> {
     let record = records.get(&vec![10]);
     if format != 53 {
         if record.is_some() {
@@ -117,7 +131,7 @@ pub(super) fn decode_bits(
         .and_then(|v| v.as_slice().try_into().ok())
         .ok_or_else(|| CoreError::Corrupt("missing or malformed feature record".into()))?;
     let bits = u64::from_be_bytes(bytes);
-    if bits & !(63 | NEW_BITS) != 0 {
+    if bits & !(63 | allowed) != 0 {
         return Err(CoreError::Unsupported);
     }
     if import && bits & ROLE_BOOTSTRAP != 0 {

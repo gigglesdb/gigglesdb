@@ -211,7 +211,7 @@ fn descriptors(state: &Relational, ds: &[Descriptor], cancel: &mut impl FnMut() 
         }
         for p in &t.primary_key {
             let c = t.columns.get(*p).ok_or(SqlError::Type)?;
-            if !c.not_null || c.data_type.is_temporal() || Kind::for_type(&c.data_type).is_none() {
+            if !c.not_null || c.data_type == DataType::Interval || Kind::for_type(&c.data_type).is_none() {
                 return Err(SqlError::Unsupported);
             }
         }
@@ -226,6 +226,10 @@ fn descriptors(state: &Relational, ds: &[Descriptor], cancel: &mut impl FnMut() 
     }
     Ok(())
 }
+fn row_component<'a>(t: &TableDef, id: u64, values: &'a [Value]) -> std::borrow::Cow<'a, Value> {
+    let i = column(t, id).expect("admitted column");
+    key_value(&t.columns[i].data_type, &values[i])
+}
 fn row_size(t: &TableDef, key: &[u8], r: &SqlRow, ds: &[Descriptor]) -> R<(usize, usize)> {
     if r.values.len() != t.columns.len() {
         return Err(SqlError::Type);
@@ -235,7 +239,21 @@ fn row_size(t: &TableDef, key: &[u8], r: &SqlRow, ds: &[Descriptor]) -> R<(usize
     for (v, c) in r.values.iter().zip(&t.columns) {
         check(v, c)?;
     }
-    let pk = tuple_len(t.primary_key.iter().map(|p| &r.values[*p]))?;
+    let pk = if t.primary_uses_key_types() {
+        let mut len = 0;
+        for &i in &t.primary_key {
+            let value = key_value(&t.columns[i].data_type, &r.values[i]);
+            let component = match value.as_ref() {
+                Value::TimeTz(_) => 13,
+                other => scalar_len(other)?,
+            };
+            len = add(len, component)?;
+            cap(len, si::MAX_COMPONENT)?;
+        }
+        len
+    } else {
+        tuple_len(t.primary_key.iter().map(|p| &r.values[*p]))?
+    };
     if pk != key.len() {
         return Err(SqlError::Type);
     }
@@ -245,7 +263,8 @@ fn row_size(t: &TableDef, key: &[u8], r: &SqlRow, ds: &[Descriptor]) -> R<(usize
         let tuple = tuple_len(
             d.columns
                 .iter()
-                .map(|id| &r.values[column(t, *id).expect("admitted column")]),
+                .map(|id| row_component(t, *id, &r.values)).collect::<Vec<_>>()
+                .iter().map(std::borrow::Cow::as_ref),
         )?;
         let combined = add(tuple, pk)?;
         cap(combined, si::MAX_KEY)?;
@@ -397,7 +416,8 @@ fn encoded(
         let tuple = encode_tuple(
             d.columns
                 .iter()
-                .map(|id| &row.values[column(t, *id).expect("admitted column")]),
+                .map(|id| row_component(t, *id, &row.values)).collect::<Vec<_>>()
+                .iter().map(std::borrow::Cow::as_ref),
         )?;
         let has_null = d.columns.iter().any(|id| {
             matches!(

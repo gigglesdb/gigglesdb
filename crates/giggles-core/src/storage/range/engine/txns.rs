@@ -4,13 +4,15 @@ use std::collections::HashSet;
 use super::prepared::{Prepared, Writes};
 use super::{RangeEngine, txn_error, txn_id};
 use crate::storage::engine::{
+    catalog_codec::{self, CatalogKind},
     codec,
     commit::{CommitRequest, RawOp},
     content_check,
     hlc::Ts,
+    indexes,
     kv::{Durability, Keyspace, WriteBatch},
     locks::{LockKey, LockMode},
-    meta::{RangeLocalKey, range_local_key},
+    meta::{KEY_TYPES, RangeLocalKey, range_local_key},
     mvcc,
 };
 use crate::storage::range::keys::{is_versioned, keyspace_of};
@@ -26,17 +28,38 @@ fn first_key(writes: &[RangeWrite]) -> Option<Vec<u8>> {
 /// Feature bits the catalog content of `writes` needs. A gateway's own feature bits never reach
 /// the range (the range interface carries none), so the leader derives the bits from the
 /// content its sequencer validates against them (design.md Changes, Track A open item (d)).
-fn derived_features(writes: &Writes) -> Result<u64, RangeError> {
-    let corrupt =
-        |e: crate::storage::engine::meta::FormatError| RangeError::Corrupt(format!("{e:?}"));
+fn derived_features(
+    writes: &Writes,
+    mut read_table: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, RangeError>,
+) -> Result<u64, RangeError> {
+    let corrupt = |e| RangeError::Corrupt(format!("{e:?}"));
     let mut bits = 0;
     for ((ks, key), value) in writes {
-        if *ks != Keyspace::Catalog {
+        if *ks != Keyspace::Catalog || content_check::is_cluster_system_key(key) {
             continue;
         }
         bits |= content_check::required_bits_for_catalog_key(key).map_err(corrupt)?;
         if let Some(value) = value {
             bits |= content_check::required_bits_for_catalog_value(key, value).map_err(corrupt)?;
+            if bits & KEY_TYPES == 0
+                && catalog_codec::classify_catalog_key(key) == Ok(CatalogKind::Index)
+            {
+                let descriptor = indexes::decode_descriptor(value)
+                    .map_err(|e| RangeError::Corrupt(e.to_string()))?;
+                let table_key = catalog_codec::table_key(descriptor.table);
+                // The system range owns both records. An index can refer to a table
+                // written in this transaction or to one already in the catalog.
+                let table = match writes.get(&(Keyspace::Catalog, table_key.clone())) {
+                    Some(table) => table.clone(),
+                    None => read_table(&table_key)?,
+                };
+                let table = table.ok_or_else(|| RangeError::Corrupt("index table is absent".into()))?;
+                let (table, _) = catalog_codec::decode_table(&table)
+                    .map_err(|e| RangeError::Corrupt(e.to_string()))?;
+                if descriptor.has_bpchar_key(&table.def) {
+                    bits |= KEY_TYPES;
+                }
+            }
         }
     }
     Ok(bits)
@@ -68,6 +91,15 @@ impl Drop for Reserved<'_> {
 }
 
 impl RangeEngine {
+    fn derived_features(&self, writes: &Writes) -> Result<u64, RangeError> {
+        // Derive from published catalog state, like the local engine's catalog reads.
+        // In-flight physical versions beyond the sequencer's visible frontier must not count.
+        let visible = self.seq.visible_ts();
+        derived_features(writes, |key| {
+            mvcc::read_at(self.kv.as_ref(), Keyspace::Catalog, key, visible).map_err(txn_error)
+        })
+    }
+
     /// Marks `txn` busy (one commit or prepare at a time), after any running one ends. The
     /// transaction must hold a lease here in this term, unless every write is catalog-only.
     fn begin(&self, txn: ClusterTxnId, writes: &[RangeWrite]) -> Result<Begun<'_>, RangeError> {
@@ -192,7 +224,7 @@ impl RangeEngine {
             }
         };
         let writes = self.checked_writes(txn, writes)?;
-        let features_or = derived_features(&writes)?;
+        let features_or = self.derived_features(&writes)?;
         let result = self.seq.submit(CommitRequest {
             snapshot: self.seq.visible_ts(),
             writes,
@@ -238,7 +270,7 @@ impl RangeEngine {
         let writes = self.checked_writes(txn, writes)?;
         // Finalize writes the versions without the sequencer: the bits their content needs
         // are made durable first, here, through it.
-        let features_or = derived_features(&writes)?;
+        let features_or = self.derived_features(&writes)?;
         if features_or != 0 {
             self.seq
                 .submit(CommitRequest {
@@ -335,5 +367,52 @@ impl RangeEngine {
         }
         self.end_txn(txn);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::relational::{Prepared, Relational};
+    use crate::storage::engine::catalog::{CatalogParts, parts_records};
+
+    #[test]
+    fn derives_key_types_for_bpchar_indexes_on_an_integer_primary_key() {
+        let mut state = Relational::default();
+        for sql in [
+            "CREATE TABLE codes (id int PRIMARY KEY, code bpchar, ordinary text)",
+            "CREATE UNIQUE INDEX code_idx ON codes(code)",
+            "CREATE INDEX ordinary_idx ON codes(ordinary)",
+        ] {
+            let prepared = Prepared::parse(sql, 1, state.epoch).unwrap();
+            state.execute(&prepared, &[], None).unwrap();
+        }
+        let (tables, ext, _, _) = state.catalog_parts();
+        let table_key = catalog_codec::table_key(tables["codes"].id);
+        let indexes = state.secondary_descriptors_engine().to_vec();
+        let records = parts_records(&CatalogParts {
+            tables,
+            ext,
+            indexes: indexes.clone(),
+            ..CatalogParts::default()
+        }).unwrap();
+        let table = &records[&table_key];
+
+        for index in indexes {
+            let descriptor_key = indexes::descriptor_key(index.id);
+            let mut writes = Writes::from([(
+                (Keyspace::Catalog, descriptor_key.clone()),
+                Some(records[&descriptor_key].clone()),
+            )]);
+            let expected = if index.name == "code_idx" { KEY_TYPES } else { 0 };
+            let existing_table = derived_features(&writes, |key| {
+                assert_eq!(key, table_key);
+                Ok(Some(table.clone()))
+            }).unwrap();
+            assert_eq!(existing_table & KEY_TYPES, expected);
+            writes.insert((Keyspace::Catalog, table_key.clone()), Some(table.clone()));
+            let staged_table = derived_features(&writes, |_| panic!("table is in writes")).unwrap();
+            assert_eq!(staged_table & KEY_TYPES, expected);
+        }
     }
 }

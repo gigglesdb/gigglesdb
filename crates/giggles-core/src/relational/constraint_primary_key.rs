@@ -78,7 +78,11 @@ pub(super) fn add(
     for name in columns {
         column_ident(name)?;
         let offset = col(table, name)?;
-        generated_columns::check_virtual_primary(state, &table.columns[offset])?;
+        let column = &table.columns[offset];
+        if column.data_type == DataType::Interval || column.data_type.is_text_search() {
+            return Err(SqlError::Unsupported);
+        }
+        generated_columns::check_virtual_primary(state, column)?;
         if offset == hidden {
             return Err(SqlError::Reserved);
         }

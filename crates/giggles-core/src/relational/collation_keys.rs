@@ -37,7 +37,7 @@ pub(super) fn detail_text(value: &Value) -> Option<String> {
 pub(crate) struct Key {
     pub(crate) columns: Vec<usize>,
     collators: Vec<Option<Arc<giggles_icu::Collator>>>,
-    arrays: Vec<bool>,
+    types: Vec<DataType>,
     predicate: Option<partial_index::BoundPredicate>,
 }
 impl Key {
@@ -85,8 +85,8 @@ impl Key {
             };
             collators.push(collator);
         }
-        let arrays = columns.iter().map(|i| table.columns[*i].data_type == DataType::TextArray).collect();
-        Ok(Self { columns, collators, arrays, predicate: None })
+        let types = columns.iter().map(|i| table.columns[*i].data_type.clone()).collect();
+        Ok(Self { columns, collators, types, predicate: None })
     }
     pub(crate) fn for_index(
         state: &Relational, table: &TableDef, index: &secondary_index::Descriptor,
@@ -120,7 +120,11 @@ impl Key {
         )
     }
     pub(crate) fn values(&self, values: &[Value]) -> R<Option<Vec<u8>>> {
-        if values.len() != self.columns.len() {
+        self.values_as(values, &self.types)
+    }
+
+    pub(super) fn values_as(&self, values: &[Value], types: &[DataType]) -> R<Option<Vec<u8>>> {
+        if values.len() != self.columns.len() || values.len() != types.len() {
             return Err(SqlError::Type);
         }
         if values.contains(&Value::Null) {
@@ -128,8 +132,9 @@ impl Key {
         }
         let mut transformed = Vec::with_capacity(values.len());
         let mut bytes = 0usize;
-        for ((value, collator), array) in values.iter().zip(&self.collators).zip(&self.arrays) {
-            let value = equality_value(value, collator.as_deref(), *array)?;
+        for ((value, collator), ty) in values.iter().zip(&self.collators).zip(types) {
+            let value = key_value(ty, value);
+            let value = equality_value(&value, collator.as_deref(), *ty == DataType::TextArray)?;
             bytes = bytes
                 .checked_add(value_bytes(&value))
                 .ok_or(SqlError::Limit)?;
@@ -169,7 +174,10 @@ fn detailed_duplicate(
     v2: bool,
 ) -> Option<SqlError> {
     if !v2 && !build && !partial && !primary_has_uuid(table) && !has_uuid_columns(table, positions)
-        && !positions.iter().any(|i| table.columns[*i].data_type.is_temporal())
+        && !positions.iter().any(|i| {
+            let ty = &table.columns[*i].data_type;
+            ty.is_temporal() || *ty == DataType::Bpchar
+        })
     {
         return None;
     }
@@ -254,7 +262,7 @@ impl Relational {
     }
 
     pub(crate) fn primary_duplicate_values(&self, table: &TableDef, values: &[Value]) -> SqlError {
-        if self.v2_unique_reporting || primary_has_uuid(table) || self.primary_has_nondeterministic_collation(table) {
+        if self.v2_unique_reporting || primary_has_uuid(table) || table.primary_uses_key_types() || self.primary_has_nondeterministic_collation(table) {
             return self.primary_duplicate(table, values);
         }
         if let Some(name) = self.primary_key_constraint_name(table) {
@@ -268,7 +276,7 @@ impl Relational {
 
     pub(crate) fn primary_collision_name(&self, table: &TableDef) -> String {
         let name = self.primary_key_constraint_name(table).unwrap_or_default();
-        if self.v2_unique_reporting || primary_has_uuid(table) || self.primary_has_generated(table)
+        if self.v2_unique_reporting || primary_has_uuid(table) || table.primary_uses_key_types() || self.primary_has_generated(table)
             || self.primary_has_nondeterministic_collation(table)
         {
             schema_binding::relation_key(self.table_schema(table.id), &name)
@@ -278,7 +286,7 @@ impl Relational {
     }
 
     pub(crate) fn primary_duplicate(&self, table: &TableDef, row: &[Value]) -> SqlError {
-        if self.v2_unique_reporting || primary_has_uuid(table) || self.primary_has_generated(table)
+        if self.v2_unique_reporting || primary_has_uuid(table) || table.primary_uses_key_types() || self.primary_has_generated(table)
             || self.primary_has_nondeterministic_collation(table)
         {
             return key_duplicate(table, &self.primary_collision_name(table), &table.primary_key, row, false)
@@ -345,7 +353,7 @@ impl Relational {
                 && !index.columns.iter().any(|id| {
                     table.columns.iter().any(|column| {
                         column.id == *id
-                            && (column.data_type == DataType::Uuid || column.data_type.is_temporal())
+                            && (column.data_type == DataType::Uuid || column.data_type.is_temporal() || column.data_type == DataType::Bpchar)
                     })
                 })
             {
@@ -448,6 +456,22 @@ mod tests {
         assert_eq!(take_sql_error_message().as_deref(), Some("malformed array literal: \"{a,b\""));
         assert_eq!(equality_value(&Value::Int(1), Some(&c), true), Err(SqlError::InternalError));
     }
+    #[test]
+    fn bpchar_equality_keys_trim_before_collation() {
+        let mut state = Relational::default();
+        sql(&mut state, "CREATE COLLATION ci(provider=icu,locale='und-u-ks-level2',deterministic=false)");
+        sql(&mut state, "CREATE TABLE t(k bpchar COLLATE ci PRIMARY KEY, v bpchar COLLATE ci UNIQUE)");
+        let table = &state.tables["t"];
+        let primary = Key::new(&state, table, &[table.columns[0].id], None).unwrap();
+        let unique = Key::for_index(&state, table, &state.secondary.descriptors()[0]).unwrap();
+        for key in [primary, unique] {
+            assert!(key.nondeterministic());
+            let tuple = |text: &str| key.values(&[Value::Text(text.into())]).unwrap();
+            assert_eq!(tuple("a "), tuple("A"));
+            assert_ne!(tuple("a\t"), tuple("A"));
+        }
+    }
+
     #[test]
     fn equality_keys_do_not_change_primary_or_secondary_wire_bytes() {
         let mut state = Relational::default();

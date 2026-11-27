@@ -85,7 +85,7 @@ pub(super) fn run(
             .map(|index| row[*index].as_ref().clone())
             .collect::<Vec<_>>();
         let encoded =
-            crate::relational::encode_key(&key).map_err(|error| core(CoreError::Sql(error)))?;
+            crate::relational::encode_primary_key(table, &key).map_err(|error| core(CoreError::Sql(error)))?;
         if !unique.insert(encoded.clone()) {
             return Err(Error::DuplicateTarget);
         }
@@ -106,7 +106,7 @@ pub(super) fn run(
             .map(|column| row.values[*column].clone())
             .collect::<Vec<_>>();
         let encoded =
-            crate::relational::encode_key(&key).map_err(|error| core(CoreError::Sql(error)))?;
+            crate::relational::encode_primary_key(table, &key).map_err(|error| core(CoreError::Sql(error)))?;
         existing_keys.insert(encoded, index);
     }
     let targets = keys

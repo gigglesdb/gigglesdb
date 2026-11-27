@@ -6810,6 +6810,83 @@ pub(crate) fn crash_now() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_types_reject_indexed_retypes_atomically() {
+        let mut engines = vec![Engine::Legacy];
+        if cfg!(feature = "engine-rocksdb") {
+            engines.push(Engine::V2);
+        }
+        for engine in engines {
+            let path = fresh("key-types-retype");
+            let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
+            let mut session = admin.sql_session();
+            let key_types_present = || {
+                let bits = match &admin.inner.backend {
+                    Backend::Legacy(db) => {
+                        let read = db.begin_read().unwrap();
+                        let records = read.open_table(RECORDS).unwrap();
+                        records.get(&[10_u8][..]).unwrap().map_or(0, |entry| {
+                            u64::from_be_bytes(entry.value().try_into().unwrap())
+                        })
+                    }
+                    Backend::V2(_) => engine::meta::validate_meta(admin.test_v2().kv.as_ref())
+                        .unwrap().features,
+                };
+                bits & engine::meta::KEY_TYPES != 0
+            };
+            for (definition, index, value, probe, targets, unique, bit) in [
+                ("k char(3) PRIMARY KEY, id int", None, "'a'", "'a  '",
+                    &["text", "char(5)", "char(3)"][..], true, true),
+                ("k char(3) UNIQUE, id int PRIMARY KEY", None, "'a'", "'a  '",
+                    &["text", "varchar(5)"], true, true),
+                ("k timestamptz PRIMARY KEY, id int", None, "'2024-01-02 00:00+00'",
+                    "'2024-01-01 19:00-05'", &["text"], true, true),
+                ("k date PRIMARY KEY, id int", None, "'2024-01-02'", "'2024-01-02'",
+                    &["text", "timestamp"], true, true),
+                ("k date UNIQUE, id int PRIMARY KEY", None, "'2024-01-02'", "'2024-01-02'",
+                    &["text"], true, false),
+                ("k bpchar, id int PRIMARY KEY", Some("CREATE INDEX keyed_k ON keyed(k)"),
+                    "'a  '", "'a'", &["text"], false, true),
+                ("k text, id int PRIMARY KEY", Some("CREATE INDEX keyed_k ON keyed(k)"),
+                    "'a'", "'a'", &["bpchar", "date", "interval"], false, false),
+                ("k date, id int PRIMARY KEY", Some("CREATE INDEX keyed_k ON keyed(k)"),
+                    "'2024-01-02'", "'2024-01-02'", &["text"], false, false),
+                ("k interval, id int PRIMARY KEY", Some("CREATE INDEX keyed_k ON keyed(k)"),
+                    "INTERVAL '1 day'", "INTERVAL '1 day'", &["text"], false, false),
+            ] {
+                session.execute(&format!("CREATE TABLE keyed ({definition})"), &[], None).unwrap();
+                session.execute(&format!("INSERT INTO keyed VALUES ({value}, 1)"), &[], None).unwrap();
+                if let Some(index) = index {
+                    session.execute(index, &[], None).unwrap();
+                }
+                let lookup = format!("SELECT id FROM keyed WHERE k = {probe}");
+                let before = session.execute("SELECT * FROM keyed", &[], None).unwrap();
+                assert_eq!(key_types_present(), bit, "{engine:?}: {definition}");
+                for target in targets {
+                    let alter = format!("ALTER TABLE keyed ALTER COLUMN k TYPE {target}");
+                    let error = session.execute(&alter, &[], None).unwrap_err();
+                    assert_eq!(crate::sqlstate(&error), "0A000", "{engine:?}: {alter}: {error:?}");
+                    assert_eq!(session.execute("SELECT * FROM keyed", &[], None).unwrap(), before);
+                    let rows = session.execute(&lookup, &[], None).unwrap().rows;
+                    assert_eq!(rows.len(), 1, "{engine:?}: {alter}: {lookup}");
+                    assert_eq!(rows[0].values, [relational::Value::Int(1)]);
+                    assert_eq!(key_types_present(), bit, "{engine:?}: {alter}");
+                    if unique {
+                        let insert = format!("INSERT INTO keyed VALUES ({probe}, 2)");
+                        let error = session.execute(&insert, &[], None).unwrap_err();
+                        assert_eq!(crate::sqlstate(&error), "23505", "{engine:?}: {insert}: {error:?}");
+                    }
+                }
+                session.execute("DROP TABLE keyed", &[], None).unwrap();
+                assert!(!key_types_present());
+            }
+            drop(session);
+            drop(admin);
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
     #[test]
     fn preparation_precheck_budgets_restore_and_preserve_legacy() {
         use relational::{Prepared, SqlError};
@@ -7081,7 +7158,7 @@ mod tests {
             assert!(from_records(r).is_err());
         }
     }
-    fn fresh(name: &str) -> std::path::PathBuf {
+    pub(super) fn fresh(name: &str) -> std::path::PathBuf {
         let root = crate::test_artifact_root();
         fs::create_dir_all(&root).unwrap();
         root.join(format!(

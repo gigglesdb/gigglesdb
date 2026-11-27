@@ -700,13 +700,14 @@ pub(super) fn execute(
                 let reference = column_collations::resolve_column(
                     &candidate, &new, type_id, collation.as_deref(), path
                 )?;
-                let unsupported_primary_key = table.primary_key.contains(&at)
-                    && (new.data_type.is_temporal() || new.data_type == DataType::Bpchar);
-                let unsupported_secondary_key = new.data_type == DataType::Bpchar
-                    && candidate.secondary_descriptors_engine().iter().any(|index| {
-                        index.table == table.id && index.columns.contains(&old.id)
-                    });
-                if unsupported_primary_key || unsupported_secondary_key {
+                // Retyping either side of a typed key would require rebuilding the stored keys.
+                let typed_key = |ty: &DataType| ty.is_temporal() || *ty == DataType::Bpchar;
+                if (typed_key(&old.data_type) || typed_key(&new.data_type))
+                    && (table.primary_key.contains(&at)
+                        || candidate.secondary_descriptors_engine().iter().any(|index| {
+                            index.table == table.id && index.columns.contains(&old.id)
+                        }))
+                {
                     return Err(SqlError::Unsupported);
                 }
                 let old_type_id = candidate.ext.columns.get(&old.id).and_then(|c| c.type_id);

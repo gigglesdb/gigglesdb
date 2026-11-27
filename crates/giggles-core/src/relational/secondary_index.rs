@@ -66,6 +66,7 @@ pub(crate) enum Kind {
     Integer,
     BigInt,
     Text,
+    Bpchar,
     Bytes,
     Date,
     Time,
@@ -84,6 +85,7 @@ impl Kind {
             "Integer" => Ok(Self::Integer),
             "BigInt" => Ok(Self::BigInt),
             "Text" => Ok(Self::Text),
+            "Bpchar" => Ok(Self::Bpchar),
             "Bytes" => Ok(Self::Bytes),
             "Date" => Ok(Self::Date),
             "Time" => Ok(Self::Time),
@@ -104,6 +106,7 @@ impl Kind {
             DataType::BigInt => "BigInt",
             // Canonical lowercase UUID text preserves UUID byte order.
             DataType::Text | DataType::Varchar | DataType::Uuid => "Text",
+            DataType::Bpchar => "Bpchar",
             DataType::Bytes => "Bytes",
             DataType::Date => "Date",
             DataType::Time => "Time",
@@ -135,6 +138,12 @@ pub(crate) struct Descriptor {
     pub predicate: Option<super::partial_index::Predicate>,
 }
 impl Descriptor {
+    pub(crate) fn has_bpchar_key(&self, table: &super::TableDef) -> bool {
+        table.id == self.table && table.columns.iter().any(|column| {
+            column.data_type == super::DataType::Bpchar && self.columns.contains(&column.id)
+        })
+    }
+
     pub(crate) fn has_temporal_key(&self, table: &super::TableDef) -> bool {
         table.id == self.table && table.columns.iter().any(|column| {
             column.data_type.is_temporal() && self.columns.contains(&column.id)
@@ -145,6 +154,23 @@ impl Descriptor {
         self.columns.contains(&id) || self.predicate.as_ref().is_some_and(|p| p.columns.contains(&id))
     }
 }
+pub(crate) fn has_key_types<'a>(
+    descriptors: &[Descriptor],
+    mut tables: impl Iterator<Item = &'a super::TableDef> + Clone,
+) -> bool {
+    let tables_by_id = tables.clone();
+    if tables.any(super::TableDef::primary_uses_key_types) {
+        return true;
+    }
+    if descriptors.is_empty() {
+        return false;
+    }
+    let by_id: BTreeMap<_, _> = tables_by_id.map(|table| (table.id, table)).collect();
+    descriptors.iter().any(|index| {
+        by_id.get(&index.table).is_some_and(|table| index.has_bpchar_key(table))
+    })
+}
+
 pub(crate) fn has_temporal_indexes<'a>(
     descriptors: &[Descriptor],
     tables: impl Iterator<Item = &'a super::TableDef>,
@@ -844,7 +870,7 @@ mod tests {
     #[test]
     fn explicit_kind_admission() {
         for k in [
-            "Boolean", "SmallInt", "Integer", "BigInt", "Text", "Bytes",
+            "Boolean", "SmallInt", "Integer", "BigInt", "Text", "Bpchar", "Bytes",
             "Date", "Time", "TimeTz", "Timestamp", "TimestampTz", "Interval",
         ] {
             assert!(Kind::from_engine_name(k).is_ok());

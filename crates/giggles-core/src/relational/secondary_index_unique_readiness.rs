@@ -258,7 +258,7 @@ fn metadata<'a, F: FnMut() -> bool>(
     schema_binding::validate_key(&d.name)?;
     for p in &t.primary_key {
         let ty = &t.columns[*p].data_type;
-        if ty.is_temporal() {
+        if *ty == DataType::Interval {
             return Err(SqlError::Unsupported);
         }
         supported(ty)?;
@@ -382,7 +382,8 @@ fn validate<'a>(
             None
         } else {
             Some(secondary_index_adapter::encode_tuple(
-                positions.iter().map(|i| &row.values[*i]),
+                positions.iter().map(|&i| key_value(&t.columns[i].data_type, &row.values[i]))
+                    .collect::<Vec<_>>().iter().map(std::borrow::Cow::as_ref),
             )?)
         };
         tuples.push(tuple);

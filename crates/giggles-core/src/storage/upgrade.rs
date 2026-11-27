@@ -293,12 +293,7 @@ fn legacy_rows(
         .map_err(CoreError::Sql)?
         .map(|row| {
             let row = row.map_err(CoreError::Sql)?.row.into_owned();
-            let pk = table
-                .primary_key
-                .iter()
-                .map(|i| row.values[*i].clone())
-                .collect::<Vec<_>>();
-            Ok((engine::codec::pk_bytes(&pk)?, row))
+            Ok((engine::codec::row_pk_bytes(table, &row.values)?, row))
         })
         .collect()
 }
@@ -557,4 +552,65 @@ fn verify(
 #[cfg(feature = "engine-rocksdb")]
 fn digest(rows: &BTreeMap<Vec<u8>, relational::SqlRow>) -> Result<[u8; 32], CoreError> {
     Ok(Sha256::digest(encode(rows)?).into())
+}
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+mod tests {
+    use super::*;
+    use relational::Value;
+
+    #[test]
+    fn upgrade_preserves_char_and_date_keys() {
+        let root = super::super::tests::fresh("upgrade-key-types");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("database");
+        let legacy = Admin::create_engine(&path, Limits::default(), Engine::Legacy).unwrap();
+        let mut session = legacy.sql_session();
+        for sql in [
+            "CREATE TABLE countries (code char(3) PRIMARY KEY, id int)",
+            "INSERT INTO countries VALUES ('a', 1), ('b', 2)",
+            "CREATE TABLE calendar (day date PRIMARY KEY, id int)",
+            "INSERT INTO calendar VALUES ('2024-01-02', 1), ('infinity', 2)",
+            "CREATE TABLE labels (id int PRIMARY KEY, label bpchar UNIQUE)",
+            "INSERT INTO labels VALUES (1, 'first  '), (2, 'second')",
+        ] {
+            session.execute(sql, &[], None).unwrap();
+        }
+        let queries = [
+            "SELECT code, id FROM countries ORDER BY id",
+            "SELECT day, id FROM calendar ORDER BY id",
+            "SELECT id, label FROM labels ORDER BY id",
+        ];
+        let rows = |session: &mut SqlSession, sql| {
+            session.execute(sql, &[], None).unwrap().rows.into_iter()
+                .map(|row| row.values)
+                .collect::<Vec<_>>()
+        };
+        let before = queries.map(|sql| rows(&mut session, sql));
+        drop(session);
+        drop(legacy);
+
+        Admin::upgrade_to_v2(&path, Limits::default()).unwrap();
+        let v2 = Admin::open(&path, Limits::default()).unwrap();
+        assert_eq!(v2.engine(), Engine::V2);
+        let bits = engine::meta::validate_meta(v2.test_v2().kv.as_ref()).unwrap().features;
+        assert_ne!(bits & engine::meta::KEY_TYPES, 0);
+        let mut session = v2.sql_session();
+        assert_eq!(queries.map(|sql| rows(&mut session, sql)), before);
+        for (lookup, duplicate) in [
+            ("SELECT id FROM countries WHERE code = 'a  '",
+                "INSERT INTO countries VALUES ('a  ', 3)"),
+            ("SELECT id FROM calendar WHERE day = '2024-01-02'",
+                "INSERT INTO calendar VALUES ('2024-01-02', 3)"),
+            ("SELECT id FROM labels WHERE label = 'first'",
+                "INSERT INTO labels VALUES (3, 'first')"),
+        ] {
+            assert_eq!(rows(&mut session, lookup), vec![vec![Value::Int(1)]], "{lookup}");
+            let error = session.execute(duplicate, &[], None).unwrap_err();
+            assert_eq!(crate::sqlstate(&error), "23505", "{duplicate}: {error:?}");
+        }
+        drop(session);
+        drop(v2);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -89,9 +89,6 @@ impl Relational {
         if self.relation_name_taken(name) {
             return Err(SqlError::DuplicateTable);
         }
-        if table.primary_key.iter().any(|p| table.columns[*p].data_type.is_temporal()) {
-            return Err(SqlError::Unsupported);
-        }
         for id in columns
             .iter()
             .copied()

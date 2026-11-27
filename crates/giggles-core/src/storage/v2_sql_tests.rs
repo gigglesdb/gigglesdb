@@ -2655,3 +2655,44 @@ fn waiting_sql_ddl_catalog_publication_matches_durable_reload() {
     assert_eq!(parts.tables["a"].columns[1].name, "first_change");
     assert_eq!(parts.tables["b"].columns[1].name, "second_change");
 }
+
+#[test]
+fn key_types_v2_feature_tracks_live_keys() {
+    let mut f = Fixture::new();
+    let bit = engine::meta::KEY_TYPES;
+    let features = |f: &Fixture| engine::meta::validate_meta(f.db().kv.as_ref()).unwrap().features;
+    f.execute("CREATE TABLE ordinary (id int PRIMARY KEY, keep text)");
+    f.execute("INSERT INTO ordinary VALUES (1, 'unindexed ')");
+    let key = engine::catalog_codec::table_key(f.parts().tables["ordinary"].id);
+    let ordinary = |f: &Fixture| f.catalog_bytes().into_iter()
+        .filter(|(physical, _)| physical.starts_with(&key))
+        .collect::<Vec<_>>();
+    let bytes = ordinary(&f);
+    assert_eq!(bytes.len(), 1);
+    assert_eq!(features(&f) & bit, 0);
+
+    let mut s = f.admin().sql_session();
+    for sql in ["BEGIN", "CREATE TABLE scratch (k char(3) PRIMARY KEY)", "DROP TABLE scratch", "COMMIT"] {
+        s.execute(sql, &[], None).unwrap();
+    }
+    drop(s);
+    assert_eq!(features(&f) & bit, 0);
+
+    f.execute("CREATE TABLE calendar (day date PRIMARY KEY)");
+    f.execute("INSERT INTO calendar VALUES ('2024-01-02')");
+    let bits = features(&f);
+    assert_ne!(bits & bit, 0);
+    let old_mask = engine::meta::FEATURE_TABLE[..39].iter().fold(0, |mask, (bit, _)| mask | bit);
+    assert!(engine::meta::check_features_allowed(bits, old_mask).is_err());
+    assert!(engine::content_check::check(f.db().kv.as_ref(), features(&f) & !bit).is_err());
+    f.execute("CREATE TABLE codes (id int PRIMARY KEY, code bpchar UNIQUE)");
+    f.execute("DROP TABLE calendar");
+    assert_ne!(features(&f) & bit, 0);
+    assert!(engine::content_check::check(f.db().kv.as_ref(), features(&f) & !bit).is_err());
+    f.reopen();
+    f.execute("DROP TABLE codes");
+    assert_eq!(features(&f) & bit, 0);
+    f.reopen();
+    assert_eq!(features(&f) & bit, 0);
+    assert_eq!(ordinary(&f), bytes);
+}

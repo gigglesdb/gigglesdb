@@ -1223,9 +1223,10 @@ fn v2_inserts_upserts_and_typed_keys_read_only_their_keys() {
     assert_eq!(dump(&left, "items"), dump(&right, "items"));
     let read = format!("transaction {{ items where {}; }}", vec!["id=1"; 20_000].join(" or "));
     assert_eq!(engine.execute_transaction_text(&read, &Bindings::new()).map(|_| ()), Err(Error::Limit));
-    // Temporal values have no key encoding in SQL either, so no temporal key exists to look up.
-    sql(&right, "create table tk(k timestamp primary key)");
-    assert!(!matches!(sql(&right, "insert into tk values('2020-01-01 00:00:00')"), Step::Success(_)));
+    // SQL temporal PKs are supported; native creation deliberately has a narrower contract.
+    assert!(matches!(sql(&right, "create table tk(k timestamp primary key)"), Step::Success(_)));
+    // PG 18.6 psql: INSERT 0 1. SQL need not refuse because native creation refuses.
+    assert!(matches!(sql(&right, "insert into tk values('2020-01-01 00:00:00')"), Step::Success(_)));
     // Explain names the V2 access path; legacy keeps its stages.
     for (text, stage) in [
         ("explain items where id=7", Stage::PrimaryKeyLookup),

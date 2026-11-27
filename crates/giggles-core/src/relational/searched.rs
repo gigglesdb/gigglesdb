@@ -114,7 +114,7 @@ pub(super) fn route(
     // The sink checks every target (including absent keys) before paging writes.
     if let Some(expected) = &prepared.native_delete {
         let versions = expected.iter().map(|(key, version)|
-            Ok((encode_key(key)?, *version))).collect::<R<BTreeMap<_, _>>>()?;
+            Ok((encode_primary_key(table, key)?, *version))).collect::<R<BTreeMap<_, _>>>()?;
         for (key, row) in &matched {
             if versions.get(key) != Some(&row.version) { return Err(SqlError::Version); }
         }
@@ -325,7 +325,7 @@ impl Prepared {
             let table = &state.tables[self.table().unwrap()];
             let source = scan::LegacyRows(state);
             for (key, version) in targets {
-                if scan::RowSource::get(&source, table, &encode_key(key)?)?
+                if scan::RowSource::get(&source, table, &encode_primary_key(table, key)?)?
                     .is_none_or(|row| row.row.version != *version) {
                     return Err(SqlError::Version);
                 }

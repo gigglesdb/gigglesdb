@@ -713,9 +713,6 @@ pub(super) fn bind<'a>(
     let mut slots = vec![];
     for (index, s) in groups.into_iter().enumerate() {
         let mut b = s.bind(resolve, tables, &parameters)?;
-        if b.ty == DataType::Bpchar {
-            return Err(SqlError::Unsupported);
-        }
         b.require_collation()?;
         slots.push(col(
             format!("__group_slot_{}", slots.len()),
@@ -780,7 +777,9 @@ pub(super) fn bind<'a>(
             return Err(error);
         }
         let b = arg.bind(resolve, tables, &parameters)?;
-        if json_aggregate::result_type(a).is_none() && b.ty == DataType::Bpchar {
+        if json_aggregate::result_type(a).is_none() && b.ty == DataType::Bpchar
+            && !bpchar_aggregate(a)
+        {
             return Err(SqlError::Unsupported);
         }
         aggregate_order::check_types(&b)?;
@@ -1027,17 +1026,23 @@ pub(super) fn bind<'a>(
     let predicates = q.predicates.iter().filter_map(|(c, op, e)| {
         let c = resolve(c, tables.len()).ok()?;
         let ty = &tables[c.source].columns[c.column].data_type;
-        if op != "=" && ty.is_array() {
+        if op != "=" && ty.is_array()
+            || *ty == DataType::Bpchar
+                && functions::collation::has_column(tables[c.source].columns[c.column].id)
+        {
             return None;
         }
         // Range selection is optional; the bound WHERE remains authoritative.
         let safe = match e {
             Expr::Literal(v) => check(v, &tables[c.source].columns[c.column]).is_ok()
                 && !comparison_requires_filter(v, ty).ok()?,
-            Expr::Param(n) => parameters.get(n - 1) == Some(&Some(ty.clone())),
+            Expr::Param(n) => {
+                let parameter = parameters.get(n - 1).and_then(Option::as_ref);
+                parameter == Some(ty)
+                    || *ty == DataType::Bpchar && parameter == Some(&DataType::Varchar)
+            }
         };
-        (*ty != DataType::Bpchar && safe)
-            .then_some((c, op.as_str(), e))
+        safe.then_some((c, op.as_str(), e))
     }).collect();
     let parameters = parameters
         .into_iter()
@@ -1092,7 +1097,7 @@ impl KeyOrder {
     fn of(scalar: &BoundScalar) -> Option<Self> {
         let collation = scalar.explicit_collation().expect("bound collation");
         let enum_type = scalar.enum_definition();
-        (collation.is_some() || scalar.ty.is_array() || enum_type.is_some() || scalar.ty.is_text_search()).then(|| Self {
+        (collation.is_some() || scalar.ty.is_array() || scalar.ty == DataType::Bpchar || enum_type.is_some() || scalar.ty.is_text_search()).then(|| Self {
             collation: collation.map(str::to_owned),
             ty: scalar.ty.clone(),
             enum_type: enum_type.cloned(),

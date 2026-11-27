@@ -202,6 +202,7 @@ fn primary_and_secondary_key_types_are_admitted_separately_even_when_empty() {
         DataType::Numeric,
         DataType::Real,
         DataType::DoublePrecision,
+        DataType::Bpchar,
         DataType::Date,
         DataType::Time,
         DataType::TimeTz,
@@ -212,15 +213,19 @@ fn primary_and_secondary_key_types_are_admitted_separately_even_when_empty() {
         let (mut state, d) = fixture(vec![]);
         let table = std::sync::Arc::make_mut(&mut state.tables).get_mut("things").unwrap();
         table.columns[1].data_type = ty.clone();
-        if ty.is_temporal() {
+        if ty.is_temporal() || ty == DataType::Bpchar {
             assert!(result(&state, &d).is_ok(), "{ty:?}");
         } else {
             assert_eq!(error(&state, &d), SqlError::Unsupported);
         }
         let table = std::sync::Arc::make_mut(&mut state.tables).get_mut("things").unwrap();
         table.columns[1].data_type = DataType::Text;
-        table.columns[0].data_type = ty;
-        assert_eq!(error(&state, &d), SqlError::Unsupported);
+        table.columns[0].data_type = ty.clone();
+        if ty.uses_key_types() {
+            assert!(result(&state, &d).is_ok(), "{ty:?}");
+        } else {
+            assert_eq!(error(&state, &d), SqlError::Unsupported);
+        }
     }
 }
 

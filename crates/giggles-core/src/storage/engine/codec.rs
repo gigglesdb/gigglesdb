@@ -52,10 +52,49 @@ pub(crate) fn pk_bytes_iter<'a>(
     Ok(encode_key_iter(values)?)
 }
 
+pub(crate) fn typed_pk_bytes(
+    table: &crate::relational::TableDef,
+    values: &[Value],
+) -> Result<Vec<u8>, CodecError> {
+    if values.contains(&Value::Null) {
+        return Err(CodecError::NullInKey);
+    }
+    Ok(crate::relational::encode_primary_key(table, values)?)
+}
+
+pub(crate) fn row_pk_bytes(
+    table: &crate::relational::TableDef,
+    row: &[Value],
+) -> Result<Vec<u8>, CodecError> {
+    if table.primary_key.iter().any(|&i| row.get(i) == Some(&Value::Null)) {
+        return Err(CodecError::NullInKey);
+    }
+    Ok(crate::relational::pk(table, row)?)
+}
+
+pub(crate) fn ascending_index_tuple<'a>(
+    table: &crate::relational::TableDef,
+    columns: &[u64],
+    values: impl ExactSizeIterator<Item = &'a Value>,
+) -> Result<Vec<u8>, CodecError> {
+    if values.len() > columns.len() {
+        return Err(CodecError::Arity);
+    }
+    let values = columns.iter().zip(values).map(|(id, value)| {
+        let column = table.columns.iter().find(|column| column.id == *id)
+            .ok_or(CodecError::Sql(SqlError::UnknownColumn))?;
+        Ok(crate::relational::key_value(&column.data_type, value))
+    }).collect::<Result<Vec<_>, CodecError>>()?;
+    let mut out = Vec::new();
+    append_index_tuple(&mut out, values.iter().map(|value| (value.as_ref(), Direction::Asc)))?;
+    Ok(out)
+}
+
 /// Components are prefix-free for a fixed schema (arity and directions).
 /// NULL is the single byte `FF`, never a component tag, so a UNIQUE index's
 /// NULL tuple with a PK suffix is not prefix-related to a non-NULL tuple of the
 /// same arity (GD-0084 Q40).
+#[cfg(test)]
 pub(crate) fn index_tuple_bytes(
     values: &[Value],
     dirs: &[Direction],

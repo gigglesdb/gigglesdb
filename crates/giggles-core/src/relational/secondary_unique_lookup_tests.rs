@@ -447,6 +447,11 @@ fn key_types_are_checked_even_on_an_empty_source_and_null_probe() {
             let mut t = t.clone();
             t.columns[pos].data_type = typ.clone();
             std::sync::Arc::make_mut(&mut s.tables).insert(t.name.clone(), t.clone());
+            if typ.uses_key_types() && pos == 0 {
+                assert!(lookup(&s, &t, &d, &eq()).unwrap().is_none());
+                assert!(lookup(&s, &t, &d, &[Value::Null, Value::Null]).unwrap().is_none());
+                continue;
+            }
             if typ.is_temporal() && pos != 0 {
                 assert_eq!(lookup(&s, &t, &d, &eq()), Err(SqlError::Type));
                 assert!(lookup(&s, &t, &d, &[Value::Null, Value::Null]).unwrap().is_none());
@@ -649,6 +654,33 @@ fn optimized_lookup_polls_at_each_cold_and_warm_callback() {
             }
         }
     }
+}
+
+#[test]
+fn optimized_lookup_seeks_by_canonical_bpchar_and_timestamptz() {
+    let (mut source, mut table, _) = fixture();
+    table.columns[2].data_type = DataType::Bpchar;
+    table.columns[3].data_type = DataType::TimestampTz;
+    std::sync::Arc::make_mut(&mut source.tables).insert(table.name.clone(), table.clone());
+
+    let timestamptz = |text| Value::TimestampTz(TimestampTz::parse(text, &Default::default()).unwrap());
+    let row = source.rows.get_mut(&table.id).unwrap().values_mut().next().unwrap();
+    row.values[2] = Value::Text("a".into());
+    row.values[3] = timestamptz("2024-01-01 12:00:00+00");
+    source.secondary = si::Sidecar::default();
+    source
+        .secondary_configure_test(table.id, "selected", &[4, 5], || false)
+        .unwrap();
+    mark_unique(&mut source);
+
+    let descriptor = &source.secondary.descriptors()[0];
+    let proof = source.secondary_validated_engine(|| false).unwrap();
+    let (key, row) = source.rows[&table.id].first_key_value().unwrap();
+    let mut lookup = UniqueLookup::new(proof, &table, source.epoch);
+    let probe = [Value::Text("a  ".into()), timestamptz("2024-01-01 07:00:00-05")];
+    let validations = Relational::secondary_validation_count();
+    assert_eq!(lookup.lookup(descriptor, &probe, &limits(), || false), Ok(Some((key.as_slice(), row))));
+    assert_eq!(Relational::secondary_validation_count(), validations);
 }
 
 #[test]

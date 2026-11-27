@@ -181,10 +181,11 @@ impl Relational {
             .collect::<R<Vec<_>>>()?;
         tick(&mut cancel)?;
         let bound = |endpoint: Option<Endpoint<'_>>| {
-            let values = || req.equal.iter().map(|(_, v)| v)
-                .chain(endpoint.map(|e| e.value));
-            tuple_len(values())?;
-            encode_tuple(values())
+            let values = req.equal.iter().map(|(_, v)| v).chain(endpoint.map(|e| e.value))
+                .zip(&cols).map(|(v, c)| key_value(&c.data_type, v)).collect::<Vec<_>>();
+            let refs = || values.iter().map(std::borrow::Cow::as_ref);
+            tuple_len(refs())?;
+            encode_tuple(refs())
         };
         let low_endpoint = req.range.and_then(|r| r.lower);
         let high_endpoint = req.range.and_then(|r| r.upper);

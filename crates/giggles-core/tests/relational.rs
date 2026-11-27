@@ -435,8 +435,9 @@ fn strict_rejection_matrix_and_resource_bounds() {
             .is_empty()
     );
     run(&mut s, "CREATE TABLE decimals (id DECIMAL PRIMARY KEY)");
+    run(&mut s, "CREATE TABLE timestamps (id TIMESTAMPTZ PRIMARY KEY)");
     for q in [
-        "CREATE TABLE timestamps (id TIMESTAMPTZ PRIMARY KEY)",
+        "CREATE TABLE spans (id INTERVAL PRIMARY KEY)",
         "SELECT * FROM safe; DELETE FROM safe WHERE id=1",
         "WITH x AS (DELETE FROM safe) SELECT * FROM x",
     ] {

@@ -183,9 +183,7 @@ impl SqlSession {
             let cmp = |a: &SqlRow, b: &SqlRow| {
                 bound.1.map_or(std::cmp::Ordering::Equal, |cmp| cmp(a, b)).then_with(|| {
                     let key = |row: &SqlRow| {
-                        crate::storage::engine::codec::pk_bytes(
-                            &table.primary_key.iter().map(|i| row.values[*i].clone()).collect::<Vec<_>>()
-                        ).map_err(|error| *sort_error.borrow_mut() = Some(error)).ok()
+                        crate::storage::engine::codec::row_pk_bytes(table, &row.values).map_err(|error| *sort_error.borrow_mut() = Some(error)).ok()
                     };
                     key(a).cmp(&key(b))
                 })
@@ -308,7 +306,7 @@ impl SqlSession {
             let meter = StatementMeter::default();
             let visited: Result<(), E> = (|| {
                 for key in keys {
-                    if scope.as_ref().is_some_and(|scope| crate::relational::encode_key(key).is_ok_and(|key| !scope.contains_key(&key))) { continue; }
+                    if scope.as_ref().is_some_and(|scope| crate::relational::encode_primary_key(table, key).is_ok_and(|key| !scope.contains_key(&key))) { continue; }
                     self.visit_native_key_v2(&db, table, key,
                         &mut scoped(scope.as_ref(), &meter, visit, map), map)?;
                 }

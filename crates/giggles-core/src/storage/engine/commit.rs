@@ -299,6 +299,7 @@ pub(crate) struct CommitRequest {
 }
 #[derive(Clone, Debug)]
 pub(crate) enum RawOp {
+    ClearKeyTypes,
     XactCommitted { xid: u64 },
     DeleteCounter { key: Vec<u8> },
     PutCounter { key: Vec<u8>, value: Vec<u8> },
@@ -919,6 +920,7 @@ fn request_bytes(request: &CommitRequest) -> usize {
             .raw
             .iter()
             .map(|op| match op {
+                RawOp::ClearKeyTypes => 0,
                 RawOp::XactCommitted { .. } => 17,
                 RawOp::DeleteCounter { key } => key.len(),
                 RawOp::PutCounter { key, value } => key.len() + value.len(),
@@ -1378,7 +1380,10 @@ fn process_group<const PIPELINED: bool>(
             _ => unreachable!("control messages are never grouped"),
         };
         let request = &mut pending.request;
-        let next_features = pending_features | request.features_or;
+        let mut next_features = pending_features | request.features_or;
+        if request.raw.iter().any(|op| matches!(op, RawOp::ClearKeyTypes)) {
+            next_features &= !super::meta::KEY_TYPES;
+        }
         let next_subversion = pending_subversion.max(request.minimum_subversion);
         let mut next_native = native.clone();
         if super::meta::check_subversion(next_subversion, super::meta::CURRENT_SUBVERSION).is_err()
@@ -1416,6 +1421,7 @@ fn process_group<const PIPELINED: bool>(
                     .map_or(true, |required| required & !next_features != 0)
             })
             || request.raw.iter().any(|op| match op {
+                RawOp::ClearKeyTypes => !request.writes.keys().any(|(space, _)| *space == Keyspace::Catalog),
                 RawOp::XactCommitted { .. } => false,
                 RawOp::DeleteCounter { key } => !valid_counter_key(key),
                 RawOp::PutCounter { key, value } => {
@@ -1494,6 +1500,7 @@ fn process_group<const PIPELINED: bool>(
         }
         for op in &request.raw {
             match op {
+                RawOp::ClearKeyTypes => {}
                 RawOp::XactCommitted { xid } => batch.put(
                     Keyspace::Seq,
                     super::xact::marker_key(*xid),

@@ -992,7 +992,7 @@ impl SqlSession {
                                 let rows = bound.upsert_lock_rows(&binding, &parts.indexes, params, clock)?;
                                 let physical = rows.primary_keys.iter().map(|key| {
                                     let mut physical = table.id.to_be_bytes().to_vec();
-                                    physical.extend(codec::pk_bytes(key).ok()?);
+                                    physical.extend(codec::typed_pk_bytes(table, key).ok()?);
                                     Some(physical)
                                 }).collect::<Option<BTreeSet<_>>>()?;
                                 let witnesses = if let Some((descriptor, rows)) = rows.unique {
@@ -1040,7 +1040,7 @@ impl SqlSession {
                             {
                                 let physical = keys.iter().map(|key| {
                                     let mut physical = table.id.to_be_bytes().to_vec();
-                                    physical.extend(codec::pk_bytes(key)?);
+                                    physical.extend(codec::typed_pk_bytes(table, key)?);
                                     Ok(physical)
                                 }).collect::<Result<BTreeSet<_>, CoreError>>()?;
                                 for key in physical {
@@ -1053,7 +1053,7 @@ impl SqlSession {
                             if let Some(keys) = candidates {
                                 let physical = keys.iter().map(|key| {
                                     let mut physical = table.id.to_be_bytes().to_vec();
-                                    physical.extend(codec::pk_bytes(key)?);
+                                    physical.extend(codec::typed_pk_bytes(table, key)?);
                                     Ok(physical)
                                 }).collect::<Result<BTreeSet<_>, CoreError>>()?;
                                 let retention_limit = relational::scan::retention_limit();
@@ -1935,14 +1935,12 @@ impl<'a> FkChildAccess<'a> {
         Some(Self { index, positions })
     }
 
-    fn prefix<'v>(&self, value: impl Fn(usize) -> &'v relational::Value) -> Result<Vec<u8>, CoreError> {
+    fn prefix<'v>(&self, table: &TableDef, value: impl Fn(usize) -> &'v relational::Value) -> Result<Vec<u8>, CoreError> {
         let ordered = self.positions.iter().map(|&i| value(i));
-        if self.index.is_some() {
-            let mut prefix = Vec::new();
-            codec::append_index_tuple(&mut prefix, ordered.map(|v| (v, codec::Direction::Asc)))?;
-            Ok(prefix)
+        if let Some(index) = self.index {
+            Ok(codec::ascending_index_tuple(table, &index.columns, ordered)?)
         } else {
-            Ok(codec::pk_bytes_iter(ordered)?)
+            Ok(codec::typed_pk_bytes(table, &ordered.cloned().collect::<Vec<_>>())?)
         }
     }
 }
@@ -1996,18 +1994,16 @@ impl SqlRows<'_> {
     /// Whether the committed version of `row` is newer than `ts`.
     fn fk_changed(&self, table: &TableDef, row: &[relational::Value], ts: engine::hlc::Ts)
         -> Result<bool, CoreError> {
-        let pk = table.primary_key.iter().map(|i| row[*i].clone()).collect::<Vec<_>>();
         let mut physical = table.id.to_be_bytes().to_vec();
-        physical.extend(codec::pk_bytes(&pk)?);
+        physical.extend(codec::row_pk_bytes(table, row)?);
         Ok(self.txn.changed_since(Keyspace::Rows, &physical, ts)?)
     }
     /// Follow every committed version since the fixed snapshot. KEY SHARE may
     /// follow non-key updates, but cannot resurrect a deleted or re-keyed tuple.
     fn fk_key_changed_since(&mut self, table: &TableDef, row: &SqlRow)
         -> Result<bool, CoreError> {
-        let pk = table.primary_key.iter().map(|i| row.values[*i].clone()).collect::<Vec<_>>();
         let mut physical = table.id.to_be_bytes().to_vec();
-        physical.extend(codec::pk_bytes(&pk)?);
+        physical.extend(codec::row_pk_bytes(table, &row.values)?);
         let ts = self.txn.snapshot_ts();
         let engine::txn::TxnServices::Local { seq, .. } = self.txn.services() else {
             unreachable!("local FK crosscheck");
@@ -2126,14 +2122,13 @@ impl RowSink for SqlRows<'_> {
                     .eq(columns.iter().copied());
                 let lock = if primary {
                     let mut key = table.id.to_be_bytes().to_vec();
-                    key.extend(codec::pk_bytes(values)?);
+                    key.extend(codec::typed_pk_bytes(table, values)?);
                     Some((Keyspace::Rows, key))
                 } else if let Some(index) = self.parts.indexes.iter()
                     .find(|d| d.table == table.id && d.unique && d.predicate.is_none() && d.columns == columns)
                 {
                     let mut key = index.id.to_be_bytes().to_vec();
-                    key.extend(codec::index_tuple_bytes(values,
-                        &vec![codec::Direction::Asc; values.len()])?);
+                    key.extend(codec::ascending_index_tuple(table, &index.columns, values.iter())?);
                     Some((Keyspace::Index, key))
                 } else {
                     // TODO(GD-0075): lock FK parents without an exact primary/unique key.
@@ -2201,8 +2196,7 @@ impl RowSink for SqlRows<'_> {
                 })?;
                 Ok(parents)
             })?;
-            let keys = parents.iter().map(|row| codec::pk_bytes(&table.primary_key.iter()
-                .map(|i| row.values[*i].clone()).collect::<Vec<_>>()))
+            let keys = parents.iter().map(|row| codec::row_pk_bytes(table, &row.values))
                 .collect::<Result<BTreeSet<_>, _>>()?;
             if keys.is_subset(&locked) { break parents; }
             // A lock wait can replace a UNIQUE witness with a different PK.
@@ -2244,9 +2238,8 @@ impl RowSink for SqlRows<'_> {
     ) -> Result<Option<SqlRow>, CoreError> {
         let deadline = crate::task::limits::lock_deadline();
         let cancel = || crate::cancellation::check().is_err();
-        let pk = table.primary_key.iter().map(|&i| row.values[i].clone()).collect::<Vec<_>>();
         let mut key = table.id.to_be_bytes().to_vec();
-        key.extend(codec::pk_bytes(&pk)?);
+        key.extend(codec::row_pk_bytes(table, &row.values)?);
         let bytes = if matches!(mode, FkRowLock::KeyShare) {
             self.txn.lock_row_key(table.id, &key[8..], LockMode::Shared, deadline, &cancel)
                 .map_err(crate::task::limits::lock_error)?;
@@ -2421,7 +2414,7 @@ impl RowSink for SqlRows<'_> {
             #[cfg(test)]
             MUTATION_POINT_READS.set(MUTATION_POINT_READS.get() + 1);
             if self.scope_of(table).is_some_and(|(scope, _)|
-                relational::encode_key(key).is_ok_and(|key| !scope.contains_key(&key))) { continue; }
+                relational::encode_primary_key(table, key).is_ok_and(|key| !scope.contains_key(&key))) { continue; }
             if let Some(row) = self.db.rows.get(self.txn, &entry, key)? {
                 #[cfg(test)]
                 MUTATION_ROWS_READ.set(MUTATION_ROWS_READ.get() + 1);
@@ -2646,7 +2639,7 @@ impl RowSink for SqlRows<'_> {
         let page = if let Some(access) = FkChildAccess::select(&self.parts.indexes, table, columns,
             values.contains(&relational::Value::Null))
         {
-            let prefix = access.prefix(|i| &values[i])?;
+            let prefix = access.prefix(table, |i| &values[i])?;
             let entry = self.child_table_entry(table);
             let mut rows = DdlRows::new();
             let mut collect = |row: engine::rows::Row| {
@@ -2680,8 +2673,13 @@ impl RowSink for SqlRows<'_> {
             self.read_page(table, after)?
         };
         let Some((last, mut rows)) = page else { return Ok(None); };
-        rows.retain(|_, row| columns.iter().zip(values).all(|(id, value)|
-            row.values[table.columns.iter().position(|c| c.id == *id).unwrap()] == *value));
+        let probe = columns.iter().zip(values).map(|(id, value)| {
+            let offset = table.columns.iter().position(|column| column.id == *id).unwrap();
+            (offset, relational::key_value(&table.columns[offset].data_type, value))
+        }).collect::<Vec<_>>();
+        rows.retain(|_, row| probe.iter().all(|(offset, value)| {
+            relational::key_value(&table.columns[*offset].data_type, &row.values[*offset]) == *value
+        }));
         Ok(Some((last, rows)))
     }
 
@@ -2893,8 +2891,7 @@ impl RowSink for SqlRows<'_> {
                     (Keyspace::Index, key)
                 } else {
                     let mut key = table.id.to_be_bytes().to_vec();
-                    key.extend(codec::pk_bytes(&table.primary_key.iter()
-                        .map(|i| row.values[*i].clone()).collect::<Vec<_>>())?);
+                    key.extend(codec::row_pk_bytes(table, &row.values)?);
                     (Keyspace::Rows, key)
                 };
                 let occupied = self.txn.lock_for_write(
@@ -2971,8 +2968,7 @@ impl RowSink for SqlRows<'_> {
             && fk_referenced(self.parts, table.id) {
             let keys = before.iter().filter(|(key, old)| after.get(*key).is_none_or(|new|
                 fk_key_changed(table, &self.parts.indexes, &old.values, &new.values)))
-                .map(|(_, row)| codec::pk_bytes(&table.primary_key.iter()
-                    .map(|i| row.values[*i].clone()).collect::<Vec<_>>()))
+                .map(|(_, row)| codec::row_pk_bytes(table, &row.values))
                 .collect::<Result<BTreeSet<_>, _>>()?;
             for key in keys {
                 self.txn.lock_row_write_group(table.id, &key,
@@ -3000,13 +2996,7 @@ impl RowSink for SqlRows<'_> {
                 continue;
             }
             let mut physical = table.id.to_be_bytes().to_vec();
-            physical.extend(codec::pk_bytes(
-                &table
-                    .primary_key
-                    .iter()
-                    .map(|i| row.values[*i].clone())
-                    .collect::<Vec<_>>(),
-            )?);
+            physical.extend(codec::row_pk_bytes(table, &row.values)?);
             if self
                 .txn
                 .lock_for_write(Keyspace::Rows, &physical, crate::task::limits::lock_deadline(), &|| {
@@ -3085,13 +3075,8 @@ impl RowSink for SqlRows<'_> {
                 continue;
             }
             let row = old.or(new).expect("changed row");
-            let pk = table
-                .primary_key
-                .iter()
-                .map(|i| row.values[*i].clone())
-                .collect::<Vec<_>>();
             let mut physical = table.id.to_be_bytes().to_vec();
-            physical.extend(codec::pk_bytes(&pk)?);
+            physical.extend(codec::row_pk_bytes(table, &row.values)?);
             changes.insert(physical, (old, new));
         }
         self.publish_row_changes(table, changes.iter())
@@ -3111,7 +3096,7 @@ impl SqlRows<'_> {
         let mut tuples = Vec::new();
         for (position, values) in keys {
             crate::cancellation::check()?;
-            let prefix = access.prefix(|i| &values[i])?;
+            let prefix = access.prefix(table, |i| &values[i])?;
             tuples.push((prefix, position));
         }
         tuples.sort_unstable();
@@ -3157,7 +3142,7 @@ impl SqlRows<'_> {
         }
         let changes = after.iter().map(|(key, row)| {
             debug_assert_eq!(
-                codec::pk_bytes_iter(table.primary_key.iter().map(|i| &row.values[*i])).as_deref(),
+                codec::row_pk_bytes(table, &row.values).as_deref(),
                 Ok(key.as_slice()),
             );
             let mut physical = Vec::with_capacity(8 + key.len());
@@ -3296,8 +3281,7 @@ pub(super) fn secondary_read_native(
         input_bytes = input_bytes.checked_add(relational::value_bytes(value))
             .ok_or(CoreError::Sql(SqlError::Limit))?;
         if input_bytes >= relational::MAX_ROW_BYTES { return Err(CoreError::Sql(SqlError::Limit)); }
-        checks.push((i, op.to_owned(), codec::index_tuple_bytes(
-            std::slice::from_ref(value), &[codec::Direction::Asc])?));
+        checks.push((i, op.to_owned(), codec::ascending_index_tuple(table, &[column.id], std::iter::once(value))?));
         predicates.push((column.name.clone(), op.to_owned(), value.clone()));
         Ok(())
     };
@@ -3323,7 +3307,7 @@ pub(super) fn secondary_read_native(
         // including remaining equality columns and a composite range suffix.
         for (i, op, bound) in &checks {
             if row.values[*i] == Value::Null { return Ok(()); }
-            let value = codec::index_tuple_bytes(std::slice::from_ref(&row.values[*i]), &[codec::Direction::Asc])?;
+            let value = codec::ascending_index_tuple(table, &[table.columns[*i].id], std::iter::once(&row.values[*i]))?;
             let matches = match op.as_str() {
                 "=" => value == *bound, ">" => value > *bound, ">=" => value >= *bound,
                 "<" => value < *bound, "<=" => value <= *bound, _ => unreachable!(),
@@ -3474,7 +3458,7 @@ impl SqlRows<'_> {
             #[cfg(test)]
             MUTATION_POINT_READS.set(MUTATION_POINT_READS.get() + 1);
             if self.scope_of(table).is_some_and(|(scope, _)|
-                relational::encode_key(key).is_ok_and(|key| !scope.contains_key(&key))) { continue; }
+                relational::encode_primary_key(table, key).is_ok_and(|key| !scope.contains_key(&key))) { continue; }
             if let Some(row) = self.db.rows.get(self.txn, &entry, key)? {
                 #[cfg(test)]
                 MUTATION_ROWS_READ.set(MUTATION_ROWS_READ.get() + 1);
@@ -3546,9 +3530,7 @@ impl SqlRows<'_> {
             })
             .find_map(|d| order(&d.columns[..columns.len()]).map(|order| (d, order)))
         {
-            let values = order.iter().map(|i| values[*i].clone()).collect::<Vec<_>>();
-            let tuple =
-                codec::index_tuple_bytes(&values, &vec![codec::Direction::Asc; values.len()])?;
+            let tuple = codec::ascending_index_tuple(table, &d.columns, order.iter().map(|i| &values[*i]))?;
             return engine::indexes::visit(
                 self.txn,
                 &entry,
@@ -3613,7 +3595,7 @@ impl SqlRows<'_> {
             Some(old) if old.0 < new.0 || (old.0 == new.0 && !old.1) => Some(old),
             _ => Some(new),
         };
-        for (name, op, value) in self.prepared.v2_index_predicates(self.params) {
+        for (name, op, value) in self.prepared.v2_index_predicates(table, self.params) {
             let Value::Int(n) = value else { continue };
             if name != column.name || relational::check(&value, column).is_err() {
                 continue;
@@ -3649,7 +3631,7 @@ impl SqlRows<'_> {
         Some((bound(lo)?, bound(hi)?))
     }
     fn scan_index(&self, table: &TableDef) -> Option<IndexRange> {
-        self.scan_index_predicates(table, &self.prepared.v2_index_predicates(self.params))
+        self.scan_index_predicates(table, &self.prepared.v2_index_predicates(table, self.params))
     }
     fn scan_index_predicates(&self, table: &TableDef, predicates: &[(String, String, relational::Value)]) -> Option<IndexRange> {
         (!self.writing).then(|| Self::index_range(self.parts, table, predicates)).flatten()
@@ -3690,10 +3672,7 @@ impl SqlRows<'_> {
                             continue;
                         }
                         if op != "=" && !byte_ordered {continue;}
-                        let tuple = codec::index_tuple_bytes(
-                            std::slice::from_ref(value),
-                            &[codec::Direction::Asc],
-                        )
+                        let tuple = codec::ascending_index_tuple(table, &[column.id], std::iter::once(value))
                         .ok()?;
                         // Intersect mandatory AND predicates in half-open tuple
                         // space so both sides of a narrow range reach the store.

@@ -920,12 +920,10 @@ fn correlation_casts(engine: Engine) {
             let select = format!(
                 "SELECT o.id, (SELECT count(*) FROM f3_{name} i WHERE i.v = {literal} AND i.f = o.k) FROM f3_o o ORDER BY o.id"
             );
-            if name == "character" {
-                // Both engines currently reject direct bpchar comparisons.
-                let error = s.execute_at(&select, &[], None, &CLOCK).expect_err(&select);
-                assert_eq!(sqlstate(&error), "0A000", "{select}");
-                continue;
-            }
+            // PG 18.6 psql -A -t for character (char(5) 'AB' = char(2) 'AB'):
+            // 1|1
+            // 2|0
+            // The second inner row is NULL and the correlation selects the matching f.
             assert_eq!(
                 rows(&mut s, &select),
                 [

@@ -327,7 +327,7 @@ fn plan_unique_conflict_evaluated<'s>(
     if !include_pk {
         for index in &table.primary_key {
             if !table.columns.get(*index).is_some_and(|column| {
-                !column.data_type.is_temporal() && supports_arbiter(column, semantics)
+                column.data_type != crate::relational::DataType::Interval && supports_arbiter(column, semantics)
             }) {
                 return Err(Error::Unsupported.into());
             }
@@ -378,8 +378,12 @@ fn plan_unique_conflict_evaluated<'s>(
                         .collect::<Vec<_>>();
                     lookup.lookup(target, &values, &limits, &mut *cancel).map_err(sql)?
                 } else {
+                    // The equality tuple uses secondary temporal framing.
+                    // Probe the primary map with the row-key representation.
+                    let key = table.primary_uses_key_types()
+                        .then(|| crate::relational::pk(table, row)).transpose().map_err(sql)?;
                     base.expect("PK base map")
-                        .get_key_value(tuple)
+                        .get_key_value(key.as_ref().unwrap_or(tuple))
                         .map(|(key, row)| (key.as_slice(), row))
                 };
             }
@@ -388,13 +392,7 @@ fn plan_unique_conflict_evaluated<'s>(
         let key = if hidden_rowid.is_some() {
             Vec::new()
         } else {
-            crate::relational::encode_key(
-                &table
-                    .primary_key
-                    .iter()
-                    .map(|index| row[*index].clone())
-                    .collect::<Vec<_>>(),
-            )
+            crate::relational::pk(table, row)
             .map_err(sql)?
         };
         resolved.push(Resolved {
@@ -620,7 +618,8 @@ fn plan_unique_conflict_evaluated<'s>(
     let final_keys = (0..incoming.len())
         .map(|index| {
             if semantics == Semantics::Sql && postimages[index].changed() {
-                crate::relational::encode_key(
+                crate::relational::encode_primary_key(
+                    table,
                     &table
                         .primary_key
                         .iter()

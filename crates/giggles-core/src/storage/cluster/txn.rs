@@ -1151,6 +1151,7 @@ impl ClusterTxnServices {
         let mut dropped_counters = Vec::new();
         for op in commit.raw {
             match op {
+                RawOp::ClearKeyTypes => {}
                 RawOp::XactCommitted { xid } => marker_xid = Some(xid),
                 // Retired with the definition; deleted on the system range after commit.
                 RawOp::DeleteCounter { key } => dropped_counters.push(key),

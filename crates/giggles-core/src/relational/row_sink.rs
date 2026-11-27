@@ -148,7 +148,7 @@ pub(crate) fn retained_bytes(key: &[u8], row: &SqlRow) -> R<usize> {
 }
 
 pub(crate) fn reduction_range(table: &TableDef, p: &Prepared, params: &[Value]) -> Option<scan::KeyRange> {
-    let predicates = p.v2_index_predicates(params).into_iter().filter_map(|(column, op, value)| {
+    let predicates = p.v2_index_predicates(table, params).into_iter().filter_map(|(column, op, value)| {
         let c = table.columns.iter().find(|c| c.name == column)?;
         if !table.primary_key.iter().any(|i| table.columns[*i].id == c.id)
             || op != "=" && c.data_type.is_array()
@@ -545,7 +545,7 @@ impl Relational {
             let table = &self.tables[prepared.table().unwrap()];
             sink.with_row_source(&mut |source| {
                 for (key, version) in targets {
-                    let key = encode_key(key)?;
+                    let key = encode_primary_key(table, key)?;
                     if source.get(table, &key)?.is_none_or(|row| row.row.version != *version) {
                         return Err(SqlError::Version);
                     }
@@ -1292,9 +1292,19 @@ fn point_target(
             return None;
         }
         let value = predicates.iter().find_map(|p| {
-            (p.column == column.name && p.op == "=")
-                .then(|| p.value.value(params).ok())
-                .flatten()
+            if p.column != column.name || p.op != "=" {
+                return None;
+            }
+            if searched::target(prepared).is_some()
+                && let Expr::Param(n) = &p.value
+                && !query::key_parameter_compatible(
+                    &column.data_type,
+                    prepared.parameter_types.get(n - 1).and_then(Option::as_ref),
+                )
+            {
+                return None;
+            }
+            p.value.value(params).ok()
         })?;
         if value == Value::Null || check(&value, column).is_err() {
             return None;

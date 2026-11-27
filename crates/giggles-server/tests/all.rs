@@ -486,3 +486,6 @@ mod named_arguments_network;
 
 #[cfg(feature = "engine-rocksdb")]
 #[path = "storage_options_network.rs"] mod storage_options_network;
+
+#[path = "key_types_network.rs"]
+mod key_types_network;

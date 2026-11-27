@@ -118,7 +118,7 @@ impl Relational {
             check(value, &table.columns[*index])?;
         }
         tick(&mut cancel)?;
-        let key = encode_key(values)?;
+        let key = encode_primary_key(table, values)?;
         tick(&mut cancel)?;
         Ok(key)
     }

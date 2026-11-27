@@ -52,7 +52,7 @@ fn point_keys(state: &Relational, prepared: &Prepared, params: &[Value],
 ) -> Option<Vec<Vec<Value>>> {
     let table = state.tables.get(prepared.table()?)?;
     let mut point_keys = if prepared.native_delete.is_some() { native_lock_key(state, prepared, table) } else { searched::target(prepared)
-        .and_then(|q| q.mutation_primary_keys(state, table, params)) };
+        .and_then(|q| q.mutation_primary_keys(state, table, params, &prepared.parameter_types)) };
     // Preserve the page executor's RETURNING and UNIQUE error order.
     let returning = match prepared.statement.get() {
         Statement::Update { returning, .. } | Statement::UpdateExpressions { returning, .. }
@@ -86,7 +86,7 @@ fn native_lock_key(state: &Relational, prepared: &Prepared, table: &TableDef) ->
         for (key, _) in rows {
             let single = Prepared::delete_engine(table, key.clone(), prepared.domain, state).ok()?;
             let key = native_lock_key(state, &single, table)?.pop()?;
-            keys.insert(encode_key(&key).ok()?, key);
+            keys.insert(encode_primary_key(table, &key).ok()?, key);
         }
         return Some(keys.into_values().collect());
     }
@@ -100,7 +100,7 @@ fn native_lock_key(state: &Relational, prepared: &Prepared, table: &TableDef) ->
     if predicates.len() != table.primary_key.len() { return None; }
     let key = table.primary_key.iter().map(|i| {
         let column = &table.columns[*i];
-        if !state.deterministic_column(column.id) { return None; }
+        if column.data_type.uses_key_types() || !state.deterministic_column(column.id) { return None; }
         let mut matches = predicates.iter().filter(|p| p.column == column.name);
         let Predicate { op, value: Expr::Literal(value), .. } = matches.next()? else { return None; };
         if op != "=" || matches.next().is_some() { return None; }
@@ -297,7 +297,7 @@ impl Prepared {
     fn delete_point_keys(&self, state: &Relational, params: &[Value], table: &TableDef) -> Option<Vec<Vec<Value>>> {
         let keys = if self.native_delete.is_some() { native_lock_key(state, self, table)? }
         else if let Some(query) = searched::target(self) {
-            query.mutation_primary_keys(state, table, params)?
+            query.mutation_primary_keys(state, table, params, &self.parameter_types)?
         } else { native_lock_key(state, self, table)? };
         // Native targets were already admitted by the request budget. Keep the
         // SQL cap; both paths still prelock parents in physical order and use
@@ -551,7 +551,9 @@ pub(super) fn cascade_eligible(state: &Relational, prepared: &Prepared) -> bool 
                         ty != &parent.columns.iter().find(|c| c.id == *b).unwrap().data_type
                             || !matches!(ty, DataType::Boolean | DataType::SmallInt | DataType::Integer
                                 | DataType::BigInt | DataType::Text | DataType::Varchar | DataType::Bytes
-                                | DataType::Uuid)
+                                | DataType::Uuid | DataType::Bpchar | DataType::Date
+                                | DataType::Time | DataType::TimeTz | DataType::Timestamp
+                                | DataType::TimestampTz)
                     }) { return false; }
                     paged = true;
                     if matches!(action, catalog_ext::Action::Cascade | catalog_ext::Action::SetNull | catalog_ext::Action::SetDefault) {
@@ -605,7 +607,7 @@ pub(super) fn cascade_pages(
         let point_keys = if prepared.native_delete.is_some() {
             native_lock_key(state, prepared, &table)
         } else {
-            searched::target(prepared).and_then(|q| q.mutation_primary_keys(state, &table, params))
+            searched::target(prepared).and_then(|q| q.mutation_primary_keys(state, &table, params, &prepared.parameter_types))
         };
         point_keys
             .map(|keys| sink.mutation_candidates(&table, &keys)).transpose()?.flatten()
@@ -1757,6 +1759,31 @@ mod native_lock_tests {
                 let p = Prepared::delete_engine(&table, vec![Value::Int(1)], 1, &state).unwrap();
                 assert!(p.mutation_lock_keys(&state, &[], &[]).is_none());
                 assert_eq!(p.fk_delete_lock_keys(&state, &[]).is_some(), !deferred && action != "SET DEFAULT");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod key_types_paging_tests {
+    use super::*;
+
+    #[test]
+    fn typed_references_use_paged_cascades() {
+        for ty in ["char(3)", "date", "time", "timetz", "timestamp", "timestamptz"] {
+            for action in ["CASCADE", "RESTRICT"] {
+                let mut state = Relational::default();
+                for sql in [
+                    format!("CREATE TABLE p(k {ty} PRIMARY KEY)"),
+                    format!("CREATE TABLE c(k {ty} REFERENCES p ON DELETE {action} ON UPDATE {action})"),
+                ] {
+                    let p = Prepared::parse(&sql, 1, state.epoch).unwrap();
+                    state.execute(&p, &[], None).unwrap();
+                }
+                for sql in ["DELETE FROM p", "UPDATE p SET k = k"] {
+                    let p = Prepared::parse(sql, 1, state.epoch).unwrap();
+                    assert!(cascade_eligible(&state, &p), "{ty} {action}: {sql}");
+                }
             }
         }
     }

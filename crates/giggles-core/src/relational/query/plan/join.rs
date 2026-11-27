@@ -1221,7 +1221,7 @@ impl From {
                 })
                 .collect::<R<Option<Vec<_>>>>()?
                 .map(|values| {
-                    encode_key(
+                    encode_transient_key(
                         &values
                             .into_iter()
                             .zip(&key_metadata)

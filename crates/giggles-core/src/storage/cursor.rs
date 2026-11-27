@@ -653,15 +653,14 @@ impl RowSource for V2Snapshot {
         // NULL sorts last in this codec and cannot satisfy these comparisons.
         let mut hi = prefix.clone();
         hi.push(0xff);
-        for (_, op, value) in predicates
+        for (offset, op, value) in predicates
             .iter()
             .filter(|(c, _, _)| index.columns.first() == Some(&table.columns[*c].id))
         {
             let mut key = prefix.clone();
             key.extend(
-                engine::codec::index_tuple_bytes(
-                    std::slice::from_ref(value),
-                    &[engine::codec::Direction::Asc],
+                engine::codec::ascending_index_tuple(
+                    table, &[table.columns[*offset].id], std::iter::once(value),
                 )
                 .map_err(|e| self.error(e))?,
             );

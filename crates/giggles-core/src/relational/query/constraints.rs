@@ -49,10 +49,13 @@ pub(in crate::relational) fn constraint_key_supported(
 
 fn fk_specific_key(child: &DataType, parent: &DataType, direction: FkKeyDirection) -> bool {
     use DataType::*;
-    // Only the child-to-parent probe can trim bpchar to compare with text.
+    // Mixed character FKs probe in the parent's operator family. The reverse
+    // lookup may have several text spellings and must compare child rows.
     matches!(
         (direction, child, parent),
         (FkKeyDirection::ToParent, Bpchar, Text | Varchar)
+            | (FkKeyDirection::ToParent, Text | Varchar, Bpchar)
+            | (_, Bpchar, Bpchar)
             | (_, Date | Timestamp, Date | Timestamp)
             | (_, Time, Time)
             | (_, TimeTz, TimeTz)
@@ -73,6 +76,9 @@ pub(in crate::relational) fn constraint_key(
         }
         if source == target {
             return Ok(Some(value.clone()));
+        }
+        if *target == DataType::Bpchar {
+            return Ok(Some(key_value(target, value).into_owned()));
         }
         if *source == DataType::Bpchar {
             let Value::Text(text) = value else {

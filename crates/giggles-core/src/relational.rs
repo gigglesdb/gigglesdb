@@ -675,6 +675,10 @@ pub struct TableDef {
 pub const HIDDEN_ROWID: &str = "giggles_rowid";
 
 impl TableDef {
+    pub(crate) fn primary_uses_key_types(&self) -> bool {
+        self.primary_key.iter().any(|&i| self.columns[i].data_type.uses_key_types())
+    }
+
     /// Recognize the persisted heap marker without trusting catalog offsets.
     pub fn hidden_rowid(&self) -> Option<usize> {
         let [index] = self.primary_key.as_slice() else {
@@ -920,6 +924,9 @@ fn infer_mutation_parameter(
             query::assignment::compatible(ty, target)
         } else {
             ty == target || (integer_type(ty) && integer_type(target))
+                || matches!((ty, target),
+                    (DataType::Bpchar, DataType::Text | DataType::Varchar)
+                    | (DataType::Text | DataType::Varchar, DataType::Bpchar))
         };
         if !compatible {
             return Err(if assignment {
@@ -1047,12 +1054,27 @@ fn append_key_iter<'a>(
     let start = out.len();
     for v in values {
         match v {
-            Value::Date(_)
-            | Value::Time(_)
-            | Value::TimeTz(_)
-            | Value::Timestamp(_)
-            | Value::TimestampTz(_)
-            | Value::Interval(_) => return Err(SqlError::Unsupported),
+            Value::Date(date) => {
+                out.push(8);
+                out.extend((i64::from(date.days()) ^ i64::MIN).to_be_bytes());
+            }
+            Value::Time(time) => {
+                out.push(9);
+                out.extend((time.microseconds() ^ i64::MIN).to_be_bytes());
+            }
+            Value::TimeTz(time) => {
+                out.push(10);
+                out.extend(secondary_index_keys::zoned_time_bytes(*time));
+            }
+            Value::Timestamp(timestamp) => {
+                out.push(11);
+                out.extend((timestamp.microseconds() ^ i64::MIN).to_be_bytes());
+            }
+            Value::TimestampTz(timestamp) => {
+                out.push(12);
+                out.extend((timestamp.microseconds() ^ i64::MIN).to_be_bytes());
+            }
+            Value::Interval(_) => return Err(SqlError::Unsupported),
             Value::Numeric(n) => {
                 out.push(5);
                 numeric::key(n, out);
@@ -1099,13 +1121,53 @@ fn escaped(b: &[u8], out: &mut Vec<u8>) {
     }
     out.extend([0, 0]);
 }
-fn pk(t: &TableDef, v: &[Value]) -> R<Vec<u8>> {
-    encode_key(
-        &t.primary_key
-            .iter()
-            .map(|i| v.get(*i).cloned().ok_or(SqlError::InternalError))
-            .collect::<R<Vec<_>>>()?,
-    )
+/// SQL bpchar keys ignore trailing ASCII spaces. The stored value keeps its padding.
+pub(crate) fn key_value<'a>(ty: &DataType, value: &'a Value) -> std::borrow::Cow<'a, Value> {
+    if *ty == DataType::Bpchar && let Value::Text(text) = value {
+        let trimmed = text.trim_end_matches(' ');
+        if trimmed.len() != text.len() {
+            return std::borrow::Cow::Owned(Value::Text(trimmed.to_owned()));
+        }
+    }
+    std::borrow::Cow::Borrowed(value)
+}
+
+/// Encode ordered PK values, or a leading prefix of a composite PK.
+pub(crate) fn encode_primary_key(table: &TableDef, values: &[Value]) -> R<Vec<u8>> {
+    if values.len() > table.primary_key.len() {
+        return Err(SqlError::Type);
+    }
+    encode_typed_key(table.primary_key.iter().zip(values)
+        .map(|(&i, value)| (&table.columns[i].data_type, value)))
+}
+
+fn encode_typed_key<'a>(
+    values: impl ExactSizeIterator<Item = (&'a DataType, &'a Value)> + Clone,
+) -> R<Vec<u8>> {
+    if !values.clone().any(|(ty, _)| *ty == DataType::Bpchar) {
+        return encode_key_iter(values.map(|(_, value)| value));
+    }
+    if values.len() > MAX_COLUMNS {
+        return Err(SqlError::Limit);
+    }
+    payload_bound(values.clone().map(|(_, value)| value))?;
+    let values = values.map(|(ty, value)| key_value(ty, value)).collect::<Vec<_>>();
+    encode_key_iter(values.iter().map(std::borrow::Cow::as_ref))
+}
+
+/// Preserve the original untyped encoding domain for transient non-key uses.
+fn encode_transient_key(values: &[Value]) -> R<Vec<u8>> {
+    if values.iter().any(Value::is_temporal) {
+        return Err(SqlError::Unsupported);
+    }
+    encode_key(values)
+}
+
+pub(crate) fn pk(t: &TableDef, v: &[Value]) -> R<Vec<u8>> {
+    if t.primary_key.iter().any(|&i| i >= v.len()) {
+        return Err(SqlError::InternalError);
+    }
+    encode_typed_key(t.primary_key.iter().map(|&i| (&t.columns[i].data_type, &v[i])))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2351,7 +2413,8 @@ fn validate_create_columns(
         column_names.validate(key)?;
         if columns.iter().any(|column| {
             column.name == *key
-                && (column.data_type.is_temporal() || column.data_type == DataType::Bpchar || column.data_type.is_text_search())
+                && (column.data_type == DataType::Interval || column.data_type.is_text_search()
+                    || matches!(column_names, ColumnNamePolicy::Native) && column.data_type.uses_key_types())
         }) {
             return Err(SqlError::Unsupported);
         }
@@ -2945,7 +3008,7 @@ impl Prepared {
         let mut keys = BTreeSet::new();
         for (key, _) in &rows {
             Self::engine_key(table, key.clone())?;
-            keys.insert(encode_key(key)?);
+            keys.insert(encode_primary_key(table, key)?);
         }
         let name = state.table_key(table);
         let mut prepared = Self::engine(Statement::Delete {
@@ -3314,9 +3377,9 @@ impl Prepared {
             columns,
         })
     }
-    pub(crate) fn v2_index_predicates(&self, params: &[Value]) -> Vec<(String, String, Value)> {
+    pub(crate) fn v2_index_predicates(&self, table: &TableDef, params: &[Value]) -> Vec<(String, String, Value)> {
         match self.statement.get() {
-            Statement::Query(query) => query.v2_index_predicates(params),
+            Statement::Query(query) => query.v2_index_predicates(table, params, &self.parameter_types),
             _ => Vec::new(),
         }
     }
@@ -4439,7 +4502,7 @@ fn bounds(t: &TableDef, preds: &[Predicate], params: &[Value]) -> R<Bounds> {
     for i in &t.primary_key {
         let Some(ps) = by.get(i) else { break };
         if ps.len() == 1 && ps[0].0 == "=" {
-            prefix.extend(encode_key(&[ps[0].1.clone()])?);
+            prefix.extend(encode_typed_key(std::iter::once((&t.columns[*i].data_type, &ps[0].1)))?);
             consumed += 1;
         } else {
             break;
@@ -4466,7 +4529,7 @@ fn bounds(t: &TableDef, preds: &[Predicate], params: &[Value]) -> R<Bounds> {
         let mut has_high = false;
         for (op, v) in ps {
             let mut b = prefix.clone();
-            b.extend(encode_key(std::slice::from_ref(v))?);
+            b.extend(encode_typed_key(std::iter::once((&t.columns[t.primary_key[consumed]].data_type, v)))?);
             match *op {
                 ">" | ">=" => {
                     if has_low {
@@ -4510,14 +4573,30 @@ fn bounds(t: &TableDef, preds: &[Predicate], params: &[Value]) -> R<Bounds> {
 }
 impl Relational {
     fn mutation_bounds(
-        &self, prepared: &Prepared, table: &TableDef, predicates: &[Predicate], params: &[Value],
+        &self, description: &StatementDescriptionInput<'_>,
+        table: &TableDef, predicates: &[Predicate], params: &[Value],
     ) -> R<Bounds> {
         // A searched SQL mutation compares values. Internal point publishers
         // (including joined DML and MERGE) already hold the selected row's key.
-        if searched::target(prepared).is_some() {
+        if searched::target(description.prepared()).is_some() {
+            let mut parameter_types = None;
             for p in predicates {
-                if !self.byte_key_predicate(&table.columns[col(table, &p.column)?], &p.op) {
+                let column = &table.columns[col(table, &p.column)?];
+                if !self.byte_key_predicate(column, &p.op) {
                     return Err(SqlError::Unbounded);
+                }
+                if let Expr::Param(n) = &p.value
+                    && matches!(column.data_type, DataType::Bpchar | DataType::Text | DataType::Varchar)
+                {
+                    if parameter_types.is_none() {
+                        parameter_types = Some(description.searched_parameters(self)?);
+                    }
+                    let ty = parameter_types.as_ref()
+                        .and_then(|types| types.get(n - 1))
+                        .and_then(Option::as_ref);
+                    if !query::key_parameter_compatible(&column.data_type, ty) {
+                        return Err(SqlError::Unbounded);
+                    }
                 }
             }
         }
@@ -4553,6 +4632,11 @@ pub fn parse_string_literal(sql: &str) -> R<String> {
 }
 
 impl DataType {
+    pub(crate) fn uses_key_types(&self) -> bool {
+        matches!(self, Self::Bpchar | Self::Date | Self::Time | Self::TimeTz
+            | Self::Timestamp | Self::TimestampTz)
+    }
+
     pub fn is_temporal(&self) -> bool {
         matches!(
             self,
@@ -4669,7 +4753,7 @@ impl Relational {
         for (value, index) in key.iter().zip(&table.primary_key) {
             check(value, &table.columns[*index])?;
         }
-        let encoded = encode_key(key)?;
+        let encoded = encode_primary_key(table, key)?;
         self.rows
             .get(&table.id)
             .and_then(|rows| rows.get(&encoded))
@@ -5718,7 +5802,7 @@ impl Relational {
                 name, predicates, ..
             } => {
                 let t = self.tables.get(name).ok_or_else(|| missing_relation(name))?;
-                let b = match self.mutation_bounds(prepared, t, predicates, params) {
+                let b = match self.mutation_bounds(&description, t, predicates, params) {
                     Ok(b)
                         if b.point
                             && !searched::target(prepared)
@@ -5828,7 +5912,7 @@ impl Relational {
                 name, predicates, ..
             } => {
                 let t = self.tables.get(name).ok_or_else(|| missing_relation(name))?;
-                let b = match self.mutation_bounds(prepared, t, predicates, params) {
+                let b = match self.mutation_bounds(&description, t, predicates, params) {
                     Ok(b)
                         if b.point
                             && !searched::target(prepared)

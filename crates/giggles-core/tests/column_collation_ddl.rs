@@ -170,9 +170,10 @@ fn cascade_primary_and_last_column_and_character_types() {
             "CREATE TABLE words(v varchar(10) COLLATE ci PRIMARY KEY,n char(5) COLLATE ci)",
         );
         run(&mut s, "INSERT INTO words VALUES('abc','ABC')");
+        // PG 18.6 psql -A -t: t (varchar/bpchar with nondeterministic ci).
         assert_eq!(
-            s.execute("SELECT v=n FROM words", &[], None),
-            Err(CoreError::Sql(E::Unsupported))
+            run(&mut s, "SELECT v=n FROM words"),
+            vec![vec![V::Bool(true)]]
         );
         run(
             &mut s,

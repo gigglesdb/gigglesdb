@@ -137,8 +137,7 @@ impl Source<'_> {
 impl RowSource for Source<'_> {
     fn lock_row(&self, table: &TableDef, values: &[relational::Value], mode: scan::RowLock, wait: scan::RowWait)
         -> Result<Option<SqlRow>, SqlError> {
-        let key = codec::pk_bytes(&table.primary_key.iter().map(|i| values[*i].clone()).collect::<Vec<_>>())
-            .map_err(|e| self.error(e.into()))?;
+        let key = codec::row_pk_bytes(table, values).map_err(|e| self.error(e.into()))?;
         let mut rows = self.rows.borrow_mut();
         let deadline = if wait == scan::RowWait::Wait { crate::task::limits::lock_deadline() }
             else { Some(std::time::Instant::now()) };
@@ -209,12 +208,12 @@ impl RowSource for Source<'_> {
         let Some(values) = values else { return Ok(Some(Box::new(std::iter::empty()))); };
         // Combined outer keys can exceed one row's key budget; retain the scan fallback.
         let range = if let Some(descriptor) = index.as_ref() {
-            let Ok(tuple) = codec::index_tuple_bytes(&values, &vec![codec::Direction::Asc; values.len()])
+            let Ok(tuple) = codec::ascending_index_tuple(table, &ids, values.iter())
                 else { return Ok(None); };
             return self.pages(table, &scan::KeyRange { lo: Bound::Unbounded, hi: Bound::Unbounded },
                 scan::Direction::Forward, Some((descriptor.clone(), Bound::Included(tuple.clone()), Bound::Included(tuple))), page_rows).map(Some);
         } else {
-            let Ok(prefix) = codec::pk_bytes(&values) else { return Ok(None); };
+            let Ok(prefix) = codec::typed_pk_bytes(table, &values) else { return Ok(None); };
             scan::KeyRange { lo: Bound::Included(prefix.clone()),
                 hi: engine::indexes::successor(prefix).map_or(Bound::Unbounded, Bound::Excluded) }
         };

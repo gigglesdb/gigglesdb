@@ -51,16 +51,27 @@ fn temporal_projection_casts_null_parameters_and_nesting() {
 }
 #[test]
 fn temporal_key_codec_fails_closed() {
-    for v in [
+    for (index, value) in [
         Value::Date(Date::from_days(0).unwrap()),
         Value::Time(PgTime::from_microseconds(0).unwrap()),
         Value::TimeTz(TimeTz::new(PgTime::from_microseconds(0).unwrap(), 0).unwrap()),
         Value::Timestamp(Timestamp::from_microseconds(0).unwrap()),
         Value::TimestampTz(TimestampTz::from_microseconds(0).unwrap()),
-        Value::Interval(Interval::new(0, 0, 0)),
-    ] {
-        assert_eq!(encode_key(&[v]), Err(SqlError::Unsupported));
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // PG 18.6 accepts these key types (basis.md); this additive codec is GigglesDB-specific.
+        // PG 18.6 psql -A -t:
+        // 2000-01-01|00:00:00|00:00:00+00|2000-01-01 00:00:00|2000-01-01 00:00:00+00
+        let bytes = encode_key(&[value]).unwrap();
+        assert_eq!(bytes[0], 8 + index as u8);
+        assert_eq!(bytes.len(), if index == 2 { 13 } else { 9 });
     }
+    assert_eq!(
+        encode_key(&[Value::Interval(Interval::new(0, 0, 0))]),
+        Err(SqlError::Unsupported)
+    );
 }
 
 #[test]

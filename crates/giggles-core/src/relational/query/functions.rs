@@ -1934,6 +1934,12 @@ impl Scalar {
             return Ok(BoundScalar { ty: DataType::Text, node: Node::TriggerCall(name.into()) });
         }
         match name {
+            Filter::IN_LIST | Filter::NOT_IN_LIST => Ok(BoundScalar {
+                ty: DataType::Boolean,
+                node: Node::Predicate(Box::new(Filter::bind_in_list(
+                    args, name == Filter::NOT_IN_LIST, parameters, resolve, tables,
+                )?)),
+            }),
             array_constructor::NAME => array_constructor::bind(args, array_constructor::Binding::Inferred, resolve, tables, parameters),
             // The regular call path leaves jsonb_build_object validation to evaluation.
             name if name != json_aggregate::OBJECT && json_array::name(name).is_some() => {
@@ -2421,6 +2427,14 @@ impl Scalar {
                 } else {
                     Node::Call(name.into(), args)
                 },
+            });
+        }
+        if matches!(args.as_slice(), [arg] if arg.ty == DataType::Bpchar)
+            && matches!(name, "length" | "char_length" | "character_length" | "octet_length")
+        {
+            return Ok(BoundScalar {
+                ty: DataType::Integer,
+                node: Node::Call(name.into(), args),
             });
         }
         if args
@@ -3451,6 +3465,13 @@ impl BoundScalar {
                 {
                     return Ok(Value::Null);
                 }
+                if matches!(n.as_str(), "length" | "char_length" | "character_length")
+                    && matches!(args.as_slice(), [arg] if arg.ty == DataType::Bpchar)
+                    && let [Value::Text(value)] = values.as_slice()
+                {
+                    let count = value.trim_end_matches(' ').chars().count();
+                    return Ok(Value::Int(i64::from(i32::try_from(count).map_err(|_| SqlError::Overflow)?)));
+                }
                 if text_search::known(n) {
                     let value = text_search::eval(n, args, &values)?;
                     charge(budget, &value)?;
@@ -4220,6 +4241,11 @@ impl Scalar {
             }
             Self::SubstringOrder(args) => {
                 Self::infer_substring_order(args, parameters, resolve, tables)?;
+            }
+            Self::Call(name, args) if matches!(name.as_str(), Filter::IN_LIST | Filter::NOT_IN_LIST) => {
+                let (value, list) = args.split_first().ok_or(SqlError::InternalError)?;
+                Filter::membership(value, list, name == Filter::NOT_IN_LIST)
+                    .infer(parameters, resolve, tables)?;
             }
             Self::Call(n, args)
                 if matches!(

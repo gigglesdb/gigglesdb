@@ -86,6 +86,9 @@ pub(crate) fn required_bits_for_catalog_value(
             if !metadata.gin.is_empty() {
                 required |= super::meta::GIN_INDEXES;
             }
+            if entry.def.primary_uses_key_types() {
+                required |= super::meta::KEY_TYPES;
+            }
             if !metadata.storage.is_empty() {
                 required |= super::meta::STORAGE_METADATA;
             }
@@ -521,6 +524,9 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
         if !task.revoked && !tables.contains_key(&task.table) {
             return Err(corrupt("live task table is absent"));
         }
+    }
+    if indexes.values().any(|index| tables.get(&index.table).is_some_and(|table| index.has_bpchar_key(table))) {
+        required |= super::meta::KEY_TYPES;
     }
     let mut parts = super::catalog::CatalogParts { sql_views: views, ..Default::default() };
     parts.tables = tables.into_iter().map(|(id, t)| (id.to_string(), t)).collect();

@@ -2673,13 +2673,6 @@ fn native_access(session: &mut SqlSession, table: &TableDef, filter: &Bound, rea
         || table.primary_key.is_empty() || table.hidden_rowid().is_some() {
         return Ok(primary);
     }
-    // Index visits restore physical PK order before applying LIMIT. Temporal
-    // keys have no pk_bytes encoding, so preserve the full-scan fallback.
-    if table.primary_key.iter().any(|index| matches!(table.columns[*index].data_type,
-        DataType::Date | DataType::Time | DataType::TimeTz | DataType::Timestamp
-        | DataType::TimestampTz | DataType::Interval)) {
-        return Ok(NativeAccess::Full);
-    }
     let mut predicates = Vec::new();
     let mut pending = vec![filter];
     while let Some(term) = pending.pop() {
@@ -2700,9 +2693,9 @@ fn primary_native_access(table: &TableDef, filter: &Bound, reading: bool) -> Nat
         return NativeAccess::Full;
     }
     if let Some(keys) = primary_key_points(table, filter) {
-        let sorted = keys.into_iter().map(|key| Some((pk_bytes(&key).ok()?, key)))
+        let sorted = keys.into_iter().map(|key| Some((crate::storage::engine::codec::typed_pk_bytes(table, &key).ok()?, key)))
             .collect::<Option<BTreeMap<_, _>>>();
-        // NULL and temporal keys have no encoding: preserve the scan fallback.
+        // NULL has no PK encoding. Preserve the scan fallback.
         return sorted.map_or(NativeAccess::Full, |keys| NativeAccess::Keys(keys.into_values().collect()));
     }
     let [index] = table.primary_key.as_slice() else { return NativeAccess::Full };
@@ -3307,7 +3300,7 @@ fn insert_many_deferred(
             .map(|i| row[*i].as_ref().clone())
             .collect::<Vec<_>>();
         let encoded =
-            crate::relational::encode_key(&key).map_err(|error| core(CoreError::Sql(error)))?;
+            crate::relational::encode_primary_key(table, &key).map_err(|error| core(CoreError::Sql(error)))?;
         if !unique.insert(encoded.clone()) {
             return Err(Error::DuplicateTarget);
         }
@@ -3327,7 +3320,7 @@ fn insert_many_deferred(
             .map(|i| row.values[*i].clone())
             .collect::<Vec<_>>();
         let encoded =
-            crate::relational::encode_key(&key).map_err(|error| core(CoreError::Sql(error)))?;
+            crate::relational::encode_primary_key(table, &key).map_err(|error| core(CoreError::Sql(error)))?;
         if unique.contains(&encoded) {
             return Err(core(CoreError::Sql(SqlError::Duplicate)));
         }

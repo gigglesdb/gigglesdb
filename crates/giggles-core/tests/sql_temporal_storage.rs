@@ -41,10 +41,18 @@ fn temporal_primary_key_rejects_empty_definition_before_catalog_change() {
         "timestamptz",
         "interval",
     ] {
-        assert_eq!(
-            s.execute(&format!("CREATE TABLE bad(id {t} PRIMARY KEY)"), &[], None),
-            Err(giggles_core::CoreError::Sql(SqlError::Unsupported))
-        );
+        let result = s.execute(&format!("CREATE TABLE bad(id {t} PRIMARY KEY)"), &[], None);
+        if t == "interval" {
+            // Interval keys remain unsupported by GigglesDB.
+            assert_eq!(
+                result,
+                Err(giggles_core::CoreError::Sql(SqlError::Unsupported))
+            );
+        } else {
+            // PG 18.6 psql: CREATE TABLE (each type; verbatim output in basis.md).
+            result.unwrap();
+            s.execute("DROP TABLE bad", &[], None).unwrap();
+        }
     }
     s.execute("CREATE TABLE bad(id BIGINT PRIMARY KEY)", &[], None)
         .unwrap();

@@ -422,6 +422,9 @@ pub(in crate::relational::query) fn compare(
         .unwrap_or_else(|_| cmp(a, b));
     }
     match (a, b) {
+        (Value::Text(a), Value::Text(b)) if *ty == DataType::Bpchar => {
+            compare_text(collation, a.trim_end_matches(' '), b.trim_end_matches(' '))
+        }
         (Value::Text(a), Value::Text(b)) => compare_text(collation, a, b),
         _ => cmp(a, b),
     }
@@ -471,18 +474,7 @@ pub(in crate::relational::query) fn compare_pair(
     if a.ty.is_array() {
         return array_order::compare(&a.ty, d.name, av, bv);
     }
-    let trim = |v: &Value, ty: &DataType| {
-        if *ty == DataType::Bpchar {
-            if let Value::Text(t) = v {
-                return Value::Text(t.trim_end_matches(' ').into());
-            }
-            v.clone()
-        } else {
-            v.clone()
-        }
-    };
-    let (av, bv) = (trim(av, &a.ty), trim(bv, &b.ty));
-    Ok(compare(d.name, &av, &bv, &a.ty))
+    Ok(compare(d.name, av, bv, &a.ty))
 }
 
 fn indeterminate<T>() -> R<T> {

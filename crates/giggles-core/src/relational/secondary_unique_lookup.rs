@@ -6,6 +6,7 @@
 use super::secondary_index::{self as si, Descriptor};
 use super::secondary_index_adapter::{ValidatedSecondary, encode_tuple, tuple_len};
 use super::*;
+use std::borrow::Cow;
 
 pub(crate) struct Limits {
     /// Conservative copy/temporary-byte reservation, at most 64 MiB.
@@ -145,12 +146,12 @@ impl SourceAdmission {
     }
 }
 
-fn check_probe(
+fn check_probe<'a>(
     table: &TableDef,
     expected: &Descriptor,
-    equal: &[Value],
+    equal: &'a [Value],
     ds: &[Descriptor],
-) -> R<u64> {
+) -> R<(u64, Vec<Cow<'a, Value>>)> {
     if expected.table != table.id
         || !expected.unique
         || expected.columns.is_empty()
@@ -170,6 +171,7 @@ fn check_probe(
     {
         return Err(SqlError::Unsupported);
     }
+    let mut canonical = Vec::with_capacity(equal.len());
     for (id, v) in expected.columns.iter().zip(equal) {
         let c = table
             .columns
@@ -178,28 +180,30 @@ fn check_probe(
             .ok_or(SqlError::UnknownColumn)?;
         supported(c)?;
         check(v, c)?;
+        canonical.push(key_value(&c.data_type, v));
     }
     if table.primary_key.is_empty() {
         return Err(SqlError::Type);
     }
     for p in &table.primary_key {
         let c = table.columns.get(*p).ok_or(SqlError::Type)?;
-        if c.data_type.is_temporal() {
+        if c.data_type == DataType::Interval {
             return Err(SqlError::Unsupported);
         }
         supported(c)?;
     }
-    Ok(d.id)
+    Ok((d.id, canonical))
 }
 
-fn probe_tuple(equal: &[Value], cancel: &mut impl FnMut() -> bool) -> R<Option<Vec<u8>>> {
-    if equal.iter().any(|v| matches!(v, Value::Null)) {
+fn probe_tuple(canonical: &[Cow<'_, Value>], cancel: &mut impl FnMut() -> bool) -> R<Option<Vec<u8>>> {
+    let values = || canonical.iter().map(Cow::as_ref);
+    if values().any(|v| matches!(v, Value::Null)) {
         tick(cancel)?;
         return Ok(None);
     }
-    let n = tuple_len(equal.iter())?;
+    let n = tuple_len(values())?;
     cap(n, si::MAX_COMPONENT)?;
-    let tuple = encode_tuple(equal.iter())?;
+    let tuple = encode_tuple(values())?;
     tick(cancel)?;
     Ok(Some(tuple))
 }
@@ -312,13 +316,13 @@ impl<'s, 't> UniqueLookup<'s, 't> {
         };
         admission.reserve(bytes, limits)?;
         let sidecar = self.validated.sidecar();
-        let index = check_probe(self.table, expected, equal, sidecar.descriptors())?;
+        let (index, canonical) = check_probe(self.table, expected, equal, sidecar.descriptors())?;
         tick(&mut cancel)?;
         let (base, reuse_proof) = self.access_rows(&mut cancel)?;
         if !reuse_proof {
-            return lookup_uncertified(sidecar, base, index, equal, &mut cancel);
+            return lookup_uncertified(sidecar, base, index, &canonical, &mut cancel);
         }
-        let Some(tuple) = probe_tuple(equal, &mut cancel)? else {
+        let Some(tuple) = probe_tuple(&canonical, &mut cancel)? else {
             return Ok(None);
         };
         let entries = self
@@ -350,10 +354,10 @@ impl Relational {
     ) -> R<Winner<'_>> {
         let bytes = probe_bytes(table, expected, equal, limits)?;
         SourceAdmission::new(self)?.reserve(bytes, limits)?;
-        let index = check_probe(table, expected, equal, self.secondary.descriptors())?;
+        let (index, canonical) = check_probe(table, expected, equal, self.secondary.descriptors())?;
         tick(&mut cancel)?;
         let (sidecar, base) = self.secondary_access_engine(table, epoch, &mut cancel)?;
-        lookup_uncertified(sidecar, base, index, equal, &mut cancel)
+        lookup_uncertified(sidecar, base, index, &canonical, &mut cancel)
     }
 }
 
@@ -361,10 +365,10 @@ fn lookup_uncertified<'a>(
     sidecar: &si::Sidecar,
     base: &'a BaseRows,
     index: u64,
-    equal: &[Value],
+    canonical: &[Cow<'_, Value>],
     cancel: &mut impl FnMut() -> bool,
 ) -> R<Winner<'a>> {
-    let Some(tuple) = probe_tuple(equal, cancel)? else {
+    let Some(tuple) = probe_tuple(canonical, cancel)? else {
         return Ok(None);
     };
     let entries = sidecar

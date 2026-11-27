@@ -292,7 +292,7 @@ fn user_key(entry: &TableEntry, pk: &[Value]) -> Result<Vec<u8>, CoreError> {
         }
         relational::check(value, &entry.def.columns[index]).map_err(CoreError::Sql)?;
     }
-    Ok(prefixed(&entry.def.id.to_be_bytes(), &codec::pk_bytes(pk)?))
+    Ok(prefixed(&entry.def.id.to_be_bytes(), &codec::typed_pk_bytes(&entry.def, pk)?))
 }
 
 pub(super) fn decode(key: &[u8], encoded: &[u8], columns: usize) -> Result<Row, CoreError> {

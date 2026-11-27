@@ -204,13 +204,13 @@ fn entries_for<'a>(
                 continue;
             }
             let values = offsets.iter().map(|i| &row.values[*i]);
-            let pk = codec::pk_bytes_iter(table.primary_key.iter().map(|i| &row.values[*i]))?;
+            let pk = codec::row_pk_bytes(table, &row.values)?;
             // SQL UNIQUE permits multiple NULL tuples; their physical entries
             // use the same PK suffix as non-unique indexes.
             let suffix = !d.unique || values.clone().any(|v| matches!(v, Value::Null));
             let mut key = Vec::with_capacity(8 + values.len() * 9 + if suffix { pk.len() } else { 0 });
             key.extend(d.id.to_be_bytes());
-            codec::append_index_tuple(&mut key, values.map(|value| (value, codec::Direction::Asc)))?;
+            key.extend(codec::ascending_index_tuple(table, &d.columns, values)?);
             if suffix {
                 key.extend(&pk);
             }

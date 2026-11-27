@@ -1,5 +1,5 @@
 //! Memcomparable secondary components. Primary keys use the separate row codec.
-use super::{Interval, R, Value, append_key_iter, escaped};
+use super::{Interval, R, TimeTz, Value, append_key_iter, escaped};
 
 enum TemporalKey {
     Scalar(i64),
@@ -14,15 +14,7 @@ impl TemporalKey {
             Value::Time(time) => Self::Scalar(time.microseconds()),
             Value::Timestamp(timestamp) => Self::Scalar(timestamp.microseconds()),
             Value::TimestampTz(timestamp) => Self::Scalar(timestamp.microseconds()),
-            Value::TimeTz(time) => {
-                // PostgreSQL compares the UTC-adjusted time, then seconds west.
-                let west = -time.offset_east();
-                let utc = time.time().microseconds() + i64::from(west) * 1_000_000;
-                let mut bytes = [0; 12];
-                bytes[..8].copy_from_slice(&(utc ^ i64::MIN).to_be_bytes());
-                bytes[8..].copy_from_slice(&(west ^ i32::MIN).to_be_bytes());
-                Self::ZonedTime(bytes)
-            }
+            Value::TimeTz(time) => Self::ZonedTime(zoned_time_bytes(time)),
             Value::Interval(span) => {
                 // The comparison span must fit even with maximum months, days
                 // and microseconds. PostgreSQL compares every month as 30 days.
@@ -47,6 +39,16 @@ impl TemporalKey {
             Self::Scalar(_) => unreachable!("scalar temporal key"),
         }
     }
+}
+
+pub(super) fn zoned_time_bytes(time: TimeTz) -> [u8; 12] {
+    // PostgreSQL compares the UTC-adjusted time, then seconds west.
+    let west = -time.offset_east();
+    let utc = time.time().microseconds() + i64::from(west) * 1_000_000;
+    let mut bytes = [0; 12];
+    bytes[..8].copy_from_slice(&(utc ^ i64::MIN).to_be_bytes());
+    bytes[8..].copy_from_slice(&(west ^ i32::MIN).to_be_bytes());
+    bytes
 }
 
 pub(super) fn temporal_len(value: &Value) -> Option<usize> {
